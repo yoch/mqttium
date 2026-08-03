@@ -1,0 +1,192 @@
+name: Release readiness audit
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - .release-readiness-trigger
+      - .github/workflows/release-readiness-audit.yml
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install audit tooling
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install \
+            build \
+            twine \
+            check-wheel-contents \
+            check-manifest \
+            'validate-pyproject[all]' \
+            pyroma \
+            bandit
+
+      - name: Repository hygiene report
+        run: |
+          set -euo pipefail
+          {
+            echo '== tracked files =='
+            git ls-files
+            echo
+            echo '== legacy-name references =='
+            grep -RIn --exclude-dir=.git --exclude='release-readiness-audit.yml' -E 'mqttnext|MQTTNext|MQTTNEXT' . || true
+            echo
+            echo '== temporary/bootstrap references =='
+            grep -RIn --exclude-dir=.git --exclude='release-readiness-audit.yml' -E 'bootstrap-trigger|standalone-ci-check|release-readiness-trigger' . || true
+            echo
+            echo '== TODO/FIXME/WIP markers =='
+            grep -RIn --exclude-dir=.git -E 'TODO|FIXME|XXX|\bWIP\b' src tests docs examples benchmarks pyproject.toml README.md || true
+            echo
+            echo '== license and copyright markers =='
+            grep -RIn --exclude-dir=.git -E 'Copyright|SPDX-License-Identifier|Eclipse|Paho' src tests docs examples benchmarks LICENSE NOTICE PROVENANCE.md README.md || true
+            echo
+            echo '== generated files tracked accidentally =='
+            git ls-files | grep -E '(^|/)(__pycache__|\.pytest_cache|\.mypy_cache|\.ruff_cache|dist|build|.*\.egg-info)(/|$)|\.py[co]$' || true
+          } | tee /tmp/repository-hygiene.txt
+
+          test -z "$(git ls-files | grep -E '(^|/)(__pycache__|\.pytest_cache|\.mypy_cache|\.ruff_cache|dist|build|.*\.egg-info)(/|$)|\.py[co]$' || true)"
+          test -z "$(grep -RIl --exclude-dir=.git -E 'mqttnext|MQTTNext|MQTTNEXT' src tests examples benchmarks || true)"
+
+      - name: Validate project metadata
+        run: |
+          set -euo pipefail
+          validate-pyproject pyproject.toml
+          pyroma --min 9 .
+
+      - name: Build distributions
+        run: |
+          set -euo pipefail
+          rm -rf dist build
+          python -m build
+          twine check --strict dist/*
+          check-wheel-contents dist/*.whl
+          check-manifest --ignore '.github/**,.release-readiness-trigger'
+          unzip -l dist/*.whl | tee /tmp/wheel-contents.txt
+          tar -tzf dist/*.tar.gz | tee /tmp/sdist-contents.txt
+
+      - name: Validate distribution metadata and contents
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile
+          import email
+          import tarfile
+
+          wheel = next(Path('dist').glob('*.whl'))
+          sdist = next(Path('dist').glob('*.tar.gz'))
+
+          with ZipFile(wheel) as archive:
+              names = archive.namelist()
+              metadata_name = next(name for name in names if name.endswith('.dist-info/METADATA'))
+              metadata = email.message_from_bytes(archive.read(metadata_name))
+              assert metadata['Name'] == 'mqttium', metadata['Name']
+              assert metadata['Version'] == '0.1.0a1', metadata['Version']
+              assert metadata['Requires-Python'] == '>=3.11', metadata['Requires-Python']
+              assert any(name == 'mqttium/py.typed' for name in names), 'wheel is missing mqttium/py.typed'
+              assert any(name.endswith('.dist-info/licenses/LICENSE') for name in names), 'wheel is missing LICENSE'
+              assert any(name.endswith('.dist-info/licenses/NOTICE') for name in names), 'wheel is missing NOTICE'
+
+          with tarfile.open(sdist, 'r:gz') as archive:
+              names = archive.getnames()
+              required = ('LICENSE', 'NOTICE', 'README.md', 'CHANGELOG.md', 'PROVENANCE.md', 'SECURITY.md')
+              for filename in required:
+                  assert any(name.endswith('/' + filename) for name in names), f'sdist is missing {filename}'
+          PY
+
+      - name: Install wheel in an isolated environment
+        run: |
+          set -euo pipefail
+          python -m venv /tmp/mqttium-wheel-env
+          /tmp/mqttium-wheel-env/bin/python -m pip install --upgrade pip
+          /tmp/mqttium-wheel-env/bin/python -m pip install --no-deps dist/*.whl
+          cd /tmp
+          /tmp/mqttium-wheel-env/bin/python -I - <<'PY'
+          import importlib
+          import importlib.metadata
+          import pkgutil
+          import mqttium
+
+          assert mqttium.__version__ == '0.1.0a1'
+          assert importlib.metadata.version('mqttium') == '0.1.0a1'
+          failures = []
+          for module in pkgutil.walk_packages(mqttium.__path__, mqttium.__name__ + '.'):
+              try:
+                  importlib.import_module(module.name)
+              except Exception as exc:
+                  failures.append((module.name, repr(exc)))
+          assert not failures, failures
+          PY
+          /tmp/mqttium-wheel-env/bin/python -m pip check
+
+      - name: Run source quality and tests
+        run: |
+          set -euo pipefail
+          python -m pip install -e '.[dev,fuzz]'
+          ruff format --check src tests benchmarks
+          ruff check src tests benchmarks
+          mypy src/mqttium
+          python -m compileall -q src
+          python -m pytest -q tests/unit --cov=mqttium --cov-report=term-missing --cov-fail-under=80
+          for seed in 1 2 3; do
+            PYTHONPATH=src python tests/fuzz/fuzz.py --seed "$seed" --iterations 20000
+          done
+          PYTHONPATH=src python -m pytest -q tests/fuzz/test_hypothesis_fuzz.py
+
+      - name: Static security scan
+        run: |
+          set -euo pipefail
+          bandit -q -r src -f txt -o /tmp/bandit.txt || {
+            cat /tmp/bandit.txt
+            exit 1
+          }
+          cat /tmp/bandit.txt
+
+      - name: Mosquitto integration tests
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mosquitto
+          printf 'listener 11883 127.0.0.1\nallow_anonymous true\npersistence false\n' > /tmp/mosq-release-audit.conf
+          mosquitto -c /tmp/mosq-release-audit.conf -d
+          for i in $(seq 1 30); do
+            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && break
+            sleep 0.2
+          done
+          python -m pytest -q tests/integration
+
+      - name: Confirm PyPI project name is unclaimed
+        run: |
+          set -euo pipefail
+          status="$(curl -sS -o /tmp/pypi-mqttium.json -w '%{http_code}' https://pypi.org/pypi/mqttium/json)"
+          echo "PyPI mqttium JSON status: $status"
+          test "$status" = '404'
+
+      - name: Upload audit evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mqttium-release-readiness-${{ github.run_id }}
+          path: |
+            dist/*
+            /tmp/repository-hygiene.txt
+            /tmp/wheel-contents.txt
+            /tmp/sdist-contents.txt
+            /tmp/bandit.txt
+            /tmp/pypi-mqttium.json
+          if-no-files-found: warn
+          retention-days: 30
