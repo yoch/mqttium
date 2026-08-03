@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import enum
 import threading
+from collections import deque
 from contextlib import suppress
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -104,6 +105,9 @@ class Client:
         self._started = threading.Event()
         self._topic_callbacks = TopicMatcher()
         self._in_callback = False
+        self._qos0_pending: deque[tuple[str, bytes, bool]] = deque()
+        self._qos0_lock = threading.Lock()
+        self._qos0_drain_scheduled = False
 
         self.on_connect: Callable[..., Any] | None = None
         self.on_disconnect: Callable[..., Any] | None = None
@@ -306,6 +310,53 @@ class Client:
             return 1
         return 0
 
+    def _enqueue_qos0_publish(
+        self,
+        topic: str,
+        payload: bytes,
+        retain: bool,
+    ) -> None:
+        """Queue one QoS 0 request without handing control to the loop per call."""
+        assert self._loop is not None
+        schedule = False
+        with self._qos0_lock:
+            self._qos0_pending.append((topic, payload, retain))
+            if not self._qos0_drain_scheduled:
+                self._qos0_drain_scheduled = True
+                schedule = True
+        if schedule:
+            self._loop.call_soon_threadsafe(self._drain_qos0_publishes)
+
+    def _drain_qos0_publishes(self) -> None:
+        """Move a coalesced QoS 0 batch into the engine on its owning loop."""
+        with self._qos0_lock:
+            batch = list(self._qos0_pending)
+            self._qos0_pending.clear()
+            self._qos0_drain_scheduled = False
+
+        errors: list[BaseException] = []
+        queued = False
+        with self._async._state_mutex:
+            for topic, payload, retain in batch:
+                try:
+                    self._async._engine.queue_publish(
+                        topic,
+                        payload,
+                        qos=QoS.AT_MOST_ONCE,
+                        retain=retain,
+                    )
+                except BaseException as exc:
+                    errors.append(exc)
+                else:
+                    queued = True
+            if queued:
+                self._async._collect_effects_locked()
+
+        if queued:
+            self._async._schedule_effect_flush()
+        for error in errors:
+            self._async._spawn_callback(self._dispatch_publish, None, error)
+
     def publish(
         self,
         topic: str,
@@ -313,36 +364,78 @@ class Client:
         qos: int = 0,
         retain: bool = False,
     ) -> MQTTMessageInfo:
-        """Non-blocking publish: queue on the loop, return a live receipt at once.
+        """Queue a publish without waiting for TCP writer progress.
 
-        Off-loop callers allocate the packet id under ``AsyncClient._state_mutex``
-        and return immediately — they never wait for the asyncio loop or the
-        TCP writer. A coalesced ``call_soon_threadsafe`` wakes the effect flush.
+        QoS 0 requests are coalesced in a thread-safe façade queue and consumed
+        on the network loop. QoS 1/2 wait only for the loop to allocate the MID
+        and register the receipt; effect draining remains asynchronous.
         """
         data = payload.encode("utf-8") if isinstance(payload, str) else payload
+        requested_qos = QoS(qos)
         if self._loop is None:
             self.loop_start()
         assert self._loop is not None
 
-        with self._async._state_mutex:
-            handle = self._async._engine.queue_publish(topic, data, qos=qos, retain=retain)
-            receipt = PublishReceipt(
-                mid=handle.mid,
-                qos=handle.qos,
-                _event=None if handle.qos == QoS.AT_MOST_ONCE else asyncio.Event(),
-            )
-            if handle.mid is not None:
-                self._async._receipts[handle.mid] = receipt
+        if requested_qos is QoS.AT_MOST_ONCE:
+            receipt = PublishReceipt(mid=None, qos=requested_qos, _event=None)
+            self._enqueue_qos0_publish(topic, data, retain)
+            return MQTTMessageInfo(mid=None, _receipt=receipt, _loop=self._loop)
 
-        # Wake the loop to drain SEND effects (coalesced by _schedule_effect_flush).
-        self._loop.call_soon_threadsafe(self._async._schedule_effect_flush)
-        if receipt.qos == QoS.AT_MOST_ONCE:
-            self._loop.call_soon_threadsafe(
-                self._async._spawn_callback,
-                self._dispatch_publish,
-                receipt.mid,
-                None,
-            )
+        if self._on_loop_in_callback():
+            with self._async._state_mutex:
+                handle = self._async._engine.queue_publish(
+                    topic,
+                    data,
+                    qos=requested_qos,
+                    retain=retain,
+                )
+                assert handle.mid is not None
+                receipt = PublishReceipt(
+                    mid=handle.mid,
+                    qos=handle.qos,
+                    _event=asyncio.Event(),
+                )
+                self._async._receipts[handle.mid] = receipt
+                self._async._collect_effects_locked()
+            self._async._schedule_effect_flush()
+            return MQTTMessageInfo(mid=receipt.mid, _receipt=receipt, _loop=self._loop)
+
+        handoff: dict[str, Any] = {}
+        done = threading.Event()
+
+        async def _queue() -> None:
+            try:
+                async with self._async._engine_lock:
+                    with self._async._state_mutex:
+                        handle = self._async._engine.queue_publish(
+                            topic,
+                            data,
+                            qos=requested_qos,
+                            retain=retain,
+                        )
+                        assert handle.mid is not None
+                        receipt = PublishReceipt(
+                            mid=handle.mid,
+                            qos=handle.qos,
+                            _event=asyncio.Event(),
+                        )
+                        self._async._receipts[handle.mid] = receipt
+                        self._async._collect_effects_locked()
+                        handoff["receipt"] = receipt
+                self._async._schedule_effect_flush()
+            except BaseException as exc:
+                handoff["error"] = exc
+            finally:
+                done.set()
+
+        fut = asyncio.run_coroutine_threadsafe(_queue(), self._loop)
+        if not done.wait(timeout=5.0):
+            fut.cancel()
+            raise RuntimeError("publish handoff to event loop timed out")
+        error = handoff.get("error")
+        if error is not None:
+            raise error
+        receipt = handoff["receipt"]
         return MQTTMessageInfo(mid=receipt.mid, _receipt=receipt, _loop=self._loop)
 
     def _dispatch_publish(self, mid: int | None, error: BaseException | None) -> None:

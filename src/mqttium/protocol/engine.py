@@ -345,6 +345,9 @@ class ProtocolEngine:
             wire = packet.encode_write_item(self.config.protocol)
             self._check_outbound_size(wire)
             self._send(wire)
+            # Completion follows SEND in the effect stream so compatibility
+            # callbacks cannot run before outbound queue acceptance.
+            self._emit(EffectKind.PUBLISH_COMPLETE, None)
             return PublishHandle(mid=None, qos=qos)
 
         mid = self.packet_ids.allocate()

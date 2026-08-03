@@ -1037,16 +1037,13 @@ class AsyncClient:
                 async with self._engine_lock:
                     self._engine.mark_inbound_delivered(msg.mid)
         elif kind is EffectKind.PUBLISH_COMPLETE:
-            mid: int = effect.data
-            # Receipt is normally retired under ``_engine_lock`` in
-            # ``_collect_effects_locked``. Keep a defensive settle for any
-            # completion that bypassed that path.
-            self._settle_outbound_locked(mid, error=None)
+            # Receipts were already settled atomically in _collect_effects_locked.
+            # Re-settling here could target a newer publish that reused this MID.
+            mid: int | None = effect.data
             if self.on_publish is not None:
                 await self._enqueue_callback(self.on_publish, mid, None)
         elif kind is EffectKind.PUBLISH_FAILED:
             failure: PublishFailure = effect.data
-            self._settle_outbound_locked(failure.mid, error=failure.reason)
             if self.on_publish is not None:
                 await self._enqueue_callback(self.on_publish, failure.mid, failure.reason)
         elif kind is EffectKind.SUBACK:
