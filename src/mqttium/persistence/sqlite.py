@@ -15,7 +15,7 @@ import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from mqttium.enums import InboundQoSState, OutboundQoSState, QoS
 from mqttium.types import InboundMessage, OutboundMessage, Properties
@@ -145,9 +145,16 @@ class SqliteInflightStore:
         self._out_seq = self._max_seq("outbound")
         self._in_seq = self._max_seq("inbound")
 
-    def _max_seq(self, table: str) -> int:
-        row = self._conn.execute(f"SELECT COALESCE(MAX(seq), 0) FROM {table}").fetchone()
-        assert row is not None
+    def _max_seq(self, table: Literal["outbound", "inbound"]) -> int:
+        if table == "outbound":
+            query = "SELECT COALESCE(MAX(seq), 0) FROM outbound"
+        elif table == "inbound":
+            query = "SELECT COALESCE(MAX(seq), 0) FROM inbound"
+        else:
+            raise ValueError(f"Unsupported inflight table: {table}")
+        row = self._conn.execute(query).fetchone()
+        if row is None:
+            raise RuntimeError(f"Failed to read maximum sequence from {table}")
         return int(row[0])
 
     @contextmanager
