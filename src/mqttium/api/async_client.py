@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import ssl
+import threading
 import time
 from collections import deque
 from itertools import islice
@@ -156,6 +157,10 @@ class AsyncClient:
         self._reconnect_task: asyncio.Task[None] | None = None
         self._lifecycle_lock = asyncio.Lock()
         self._engine_lock = asyncio.Lock()
+        # Cross-thread engine/receipt mutations for the Paho compat façade.
+        # Held around queue_publish + receipt registration so off-loop publish
+        # can allocate a mid without waiting for the asyncio loop tick.
+        self._state_mutex = threading.RLock()
         self._effect_flush_lock = asyncio.Lock()
         self._pending_effects: deque[EngineEffect] = deque()
         self._callback_queue: asyncio.Queue[CallbackJob] = asyncio.Queue(
@@ -409,24 +414,25 @@ class AsyncClient:
     ) -> PublishReceipt:
         data = payload.encode("utf-8") if isinstance(payload, str) else payload
         async with self._engine_lock:
-            handle = self._engine.queue_publish(
-                topic,
-                data,
-                qos=qos,
-                retain=retain,
-                properties=properties,
-            )
-            if handle.qos == QoS.AT_MOST_ONCE:
-                receipt = PublishReceipt(mid=None, qos=handle.qos, _event=None)
-            else:
-                assert handle.mid is not None
-                receipt = PublishReceipt(
-                    mid=handle.mid,
-                    qos=handle.qos,
-                    _event=asyncio.Event(),
+            with self._state_mutex:
+                handle = self._engine.queue_publish(
+                    topic,
+                    data,
+                    qos=qos,
+                    retain=retain,
+                    properties=properties,
                 )
-                self._receipts[handle.mid] = receipt
-            self._collect_effects_locked()
+                if handle.qos == QoS.AT_MOST_ONCE:
+                    receipt = PublishReceipt(mid=None, qos=handle.qos, _event=None)
+                else:
+                    assert handle.mid is not None
+                    receipt = PublishReceipt(
+                        mid=handle.mid,
+                        qos=handle.qos,
+                        _event=asyncio.Event(),
+                    )
+                    self._receipts[handle.mid] = receipt
+                self._collect_effects_locked()
         await self._drain_effects(nowait=nowait)
         return receipt
 
@@ -481,12 +487,13 @@ class AsyncClient:
                     )
 
                 async with self._engine_lock:
-                    handles = self._engine.queue_publish_many(requests)
-                    for handle in handles:
-                        receipt._register(handle.mid)
-                        if handle.mid is not None:
-                            self._batch_receipts[handle.mid] = receipt
-                    self._collect_effects_locked()
+                    with self._state_mutex:
+                        handles = self._engine.queue_publish_many(requests)
+                        for handle in handles:
+                            receipt._register(handle.mid)
+                            if handle.mid is not None:
+                                self._batch_receipts[handle.mid] = receipt
+                        self._collect_effects_locked()
                 await self._drain_effects(nowait=nowait)
         except asyncio.CancelledError:
             raise
@@ -604,17 +611,20 @@ class AsyncClient:
                 # avoiding N await points for N/100 batches.
                 handled = 0
                 async with self._engine_lock:
-                    # Commit protocol state before any generated ACK/replay
-                    # bytes are released to the writer.
-                    store_batch = getattr(self._engine.store, "batch", None)
-                    with store_batch() if store_batch is not None else nullcontext():
-                        while True:
-                            n = self._decoder.process_packets(self._engine.handle_raw, limit=256)
-                            if n == 0:
-                                break
-                            handled += n
-                    if handled:
-                        self._collect_effects_locked()
+                    with self._state_mutex:
+                        # Commit protocol state before any generated ACK/replay
+                        # bytes are released to the writer.
+                        store_batch = getattr(self._engine.store, "batch", None)
+                        with store_batch() if store_batch is not None else nullcontext():
+                            while True:
+                                n = self._decoder.process_packets(
+                                    self._engine.handle_raw, limit=256
+                                )
+                                if n == 0:
+                                    break
+                                handled += n
+                        if handled:
+                            self._collect_effects_locked()
                 if handled:
                     await self._drain_effects()
         except asyncio.CancelledError:
@@ -876,9 +886,44 @@ class AsyncClient:
         sends: list[EngineEffect] = []
         events: list[EngineEffect] = []
         for effect in self._engine.take_effects():
-            (sends if effect.kind is EffectKind.SEND else events).append(effect)
+            kind = effect.kind
+            if kind is EffectKind.SEND:
+                sends.append(effect)
+            elif kind is EffectKind.PUBLISH_COMPLETE:
+                # Retire the receipt before the engine lock is released. Packet
+                # ids are freed when the PUBACK/PUBCOMP is handled; without this,
+                # a concurrent queue_publish can reuse the mid and overwrite
+                # ``_receipts[mid]`` before the completion is applied.
+                self._settle_outbound_locked(effect.data, error=None)
+                if self.on_publish is not None:
+                    events.append(effect)
+            elif kind is EffectKind.PUBLISH_FAILED:
+                failure: PublishFailure = effect.data
+                self._settle_outbound_locked(failure.mid, error=failure.reason)
+                if self.on_publish is not None:
+                    events.append(effect)
+            else:
+                events.append(effect)
         self._pending_effects.extend(sends)
         self._pending_effects.extend(events)
+
+    def _settle_outbound_locked(
+        self,
+        mid: int | None,
+        *,
+        error: BaseException | None,
+    ) -> None:
+        if mid is None:
+            return
+        receipt = self._receipts.pop(mid, None)
+        if receipt is not None:
+            if error is not None:
+                receipt._error = error
+            if receipt._event is not None:
+                receipt._event.set()
+        batch = self._batch_receipts.pop(mid, None)
+        if batch is not None:
+            batch._complete(mid, error)
 
     def _schedule_effect_flush(self) -> None:
         # A producer may request another flush while the current task is
@@ -920,7 +965,8 @@ class AsyncClient:
 
     async def _flush_effects(self, *, nowait: bool = False) -> None:
         async with self._engine_lock:
-            self._collect_effects_locked()
+            with self._state_mutex:
+                self._collect_effects_locked()
         await self._drain_effects(nowait=nowait)
 
     async def _drain_effects(self, *, nowait: bool = False) -> None:
@@ -992,24 +1038,15 @@ class AsyncClient:
                     self._engine.mark_inbound_delivered(msg.mid)
         elif kind is EffectKind.PUBLISH_COMPLETE:
             mid: int = effect.data
-            receipt = self._receipts.pop(mid, None)
-            if receipt is not None and receipt._event is not None:
-                receipt._event.set()
-            batch = self._batch_receipts.pop(mid, None)
-            if batch is not None:
-                batch._complete(mid)
+            # Receipt is normally retired under ``_engine_lock`` in
+            # ``_collect_effects_locked``. Keep a defensive settle for any
+            # completion that bypassed that path.
+            self._settle_outbound_locked(mid, error=None)
             if self.on_publish is not None:
                 await self._enqueue_callback(self.on_publish, mid, None)
         elif kind is EffectKind.PUBLISH_FAILED:
             failure: PublishFailure = effect.data
-            receipt = self._receipts.pop(failure.mid, None)
-            if receipt is not None:
-                receipt._error = failure.reason
-                if receipt._event is not None:
-                    receipt._event.set()
-            batch = self._batch_receipts.pop(failure.mid, None)
-            if batch is not None:
-                batch._complete(failure.mid, failure.reason)
+            self._settle_outbound_locked(failure.mid, error=failure.reason)
             if self.on_publish is not None:
                 await self._enqueue_callback(self.on_publish, failure.mid, failure.reason)
         elif kind is EffectKind.SUBACK:

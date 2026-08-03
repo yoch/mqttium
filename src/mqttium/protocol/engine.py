@@ -762,8 +762,9 @@ class ProtocolEngine:
         if msg is None or msg.state is not OutboundQoSState.WAIT_PUBACK:
             return
         self.store.delete_out(ack.mid)
-        self.packet_ids.release(ack.mid)
         self.flow.release()
+        # Emit completion before releasing the packet id so the client can
+        # retire the matching receipt while the mid is still reserved.
         if ack.reason_code >= 128:
             self._emit(
                 EffectKind.PUBLISH_FAILED,
@@ -774,6 +775,7 @@ class ProtocolEngine:
             )
         else:
             self._emit(EffectKind.PUBLISH_COMPLETE, ack.mid)
+        self.packet_ids.release(ack.mid)
         self._drain_queue()
 
     def _on_pubrec(self, raw: RawPacket) -> None:
@@ -788,7 +790,6 @@ class ProtocolEngine:
             return
         if rec.reason_code >= 128:
             self.store.delete_out(rec.mid)
-            self.packet_ids.release(rec.mid)
             self.flow.release()
             self._emit(
                 EffectKind.PUBLISH_FAILED,
@@ -797,6 +798,7 @@ class ProtocolEngine:
                     reason=ProtocolError(f"PUBREC reason_code={rec.reason_code}"),
                 ),
             )
+            self.packet_ids.release(rec.mid)
             self._drain_queue()
             return
         msg.state = OutboundQoSState.WAIT_PUBCOMP
@@ -855,8 +857,9 @@ class ProtocolEngine:
         if msg is None or msg.state is not OutboundQoSState.WAIT_PUBCOMP:
             return
         self.store.delete_out(comp.mid)
-        self.packet_ids.release(comp.mid)
         self.flow.release()
+        # See _on_puback: complete before free so receipts cannot be overwritten
+        # by a concurrent queue_publish that reuses the packet id.
         if comp.reason_code >= 128:
             self._emit(
                 EffectKind.PUBLISH_FAILED,
@@ -867,6 +870,7 @@ class ProtocolEngine:
             )
         else:
             self._emit(EffectKind.PUBLISH_COMPLETE, comp.mid)
+        self.packet_ids.release(comp.mid)
         self._drain_queue()
 
     def _on_suback(self, raw: RawPacket) -> None:

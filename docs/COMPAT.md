@@ -38,6 +38,7 @@ Helpers one-shot : préférer `mqttium.helpers` (async natif) plutôt que
 | Republish QoS>0 non conforme sur clean session | Comportement historique flou | **Strict MQTT** | Correctness > bug-compat |
 | MID pour QoS 0 | Alloué | `None` | Pas d’identifiant protocolaire ; info locale inutile |
 | Appels bloquants **depuis** un callback réseau | Souvent « ça passe » | **Interdit** (RuntimeError) | Deadlock certain avec notre writer unique |
+| `publish()` hors thread réseau | File sous lock + retour immédiat | File sous ``_state_mutex`` + retour immédiat (wake loop coalescé) | L’ancien handoff ``run_coroutine_threadsafe`` + ``await _flush_effects()`` sérialisait chaque publish derrière le writer (~5k msg/s) |
 | WebSocket / proxy / socks | Large surface | WS via `AsyncClient.connect_ws` ; pas via façade sync | Couche transport séparée ; pas de monolithe |
 | Persistence fichier Paho | Formats historiques | `SqliteInflightStore` sur `AsyncClient` | Pas de format binaire Paho |
 | `suppress_exceptions` | Oui | Non | Les erreurs doivent remonter |
