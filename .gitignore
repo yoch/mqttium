@@ -1,13 +1,21 @@
-# mqttium artifacts
-*.egg-info/
-.pytest_cache/
+# Python bytecode and caches
 __pycache__/
+*.py[cod]
+.pytest_cache/
 .mypy_cache/
 .ruff_cache/
-dist/
-build/
-*.pyc
-.venv/
-tests/fuzz/artifacts/
 .hypothesis/
+
+# Virtual environments and packaging
+.venv/
+*.egg-info/
+build/
+dist/
+
+# Test and analysis output
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+tests/fuzz/artifacts/
 benchmarks/results/
