@@ -49,6 +49,9 @@ fuzz = [
     "hypothesis>=6.100",
     "pytest>=8",
 ]
+security = [
+    "bandit>=1.8",
+]
 release = [
     "build>=1.2",
     "check-wheel-contents>=0.6",
