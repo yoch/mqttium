@@ -28,7 +28,7 @@ jobs:
       - run: ruff format --check src tests benchmarks
       - run: ruff check src tests benchmarks
       - run: mypy src/mqttium
-      - run: bandit -q -r src
+      - run: bandit -q -ll -r src
       - run: python -m pytest -q tests/unit --cov=mqttium --cov-report=term-missing --cov-fail-under=80
 
   test:
