@@ -1,8 +1,16 @@
 # Security policy
 
-MQTTium is currently an early-alpha project. Security fixes are applied to the
-latest development line only until a stable release policy is established.
+## Supported versions
 
-Please do not disclose suspected vulnerabilities in a public issue. Contact the
-maintainer privately through the email address associated with the GitHub
-profile, including reproduction steps, impact and any proposed mitigation.
+Until MQTTium reaches a stable release, security fixes are applied to the latest
+published `0.x` release and the `main` development branch.
+
+## Reporting a vulnerability
+
+Do not disclose suspected vulnerabilities in a public issue. Use GitHub's
+private vulnerability reporting flow:
+
+https://github.com/yoch/mqttium/security/advisories/new
+
+Include affected versions, reproduction steps, expected impact, and any known
+mitigation. You should receive an initial acknowledgement within seven days.
