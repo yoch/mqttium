@@ -1,0 +1,10 @@
+name: Documentation
+description: Report missing or unclear documentation
+title: "[Docs]: "
+body:
+  - type: textarea
+    id: details
+    attributes:
+      label: Documentation issue
+    validations:
+      required: true
