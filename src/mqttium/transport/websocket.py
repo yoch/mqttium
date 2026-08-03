@@ -240,8 +240,10 @@ def _validate_handshake_response(head: bytes, key: str) -> None:
     if len(parts) < 2 or parts[1] != "101":
         raise ConnectionError(f"WebSocket handshake failed: {status_line}")
     headers = _parse_http_headers(lines[1:])
+    accept_source = (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()
+    # RFC 6455 mandates SHA-1 here as a non-security protocol transform.
     expected = base64.b64encode(
-        hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()
+        hashlib.sha1(accept_source, usedforsecurity=False).digest()
     ).decode("ascii")
     if headers.get("sec-websocket-accept") != expected:
         raise ConnectionError("WebSocket accept key mismatch")
