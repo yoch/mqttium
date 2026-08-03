@@ -1,0 +1,13 @@
+# mqttium artifacts
+*.egg-info/
+.pytest_cache/
+__pycache__/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+*.pyc
+.venv/
+tests/fuzz/artifacts/
+.hypothesis/
+benchmarks/results/

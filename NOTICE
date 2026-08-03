@@ -1,0 +1,8 @@
+MQTTium
+Copyright 2026 Yoch Melka
+
+Initial development occurred as the mqttnext subtree of
+https://github.com/yoch/paho.mqtt.python.
+
+See PROVENANCE.md for the exact source commit, pull requests, validation record,
+and licensing note used for this spin-out.

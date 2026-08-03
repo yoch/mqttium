@@ -1,0 +1,70 @@
+"""Shared typed models used across layers."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+
+from mqttium.enums import InboundQoSState, OutboundQoSState, QoS
+
+
+@dataclass(slots=True)
+class Properties:
+    """Minimal MQTT 5 property bag.
+
+    Values that may repeat (user properties, subscription identifiers) are lists.
+    Singletons are stored directly. Full validation by packet type lands in phase 1.
+    """
+
+    values: dict[str, Any] = field(default_factory=dict)
+
+    def get(self, name: str, default: Any = None) -> Any:
+        return self.values.get(name, default)
+
+    def set(self, name: str, value: Any) -> None:
+        self.values[name] = value
+
+    def add_user_property(self, key: str, value: str) -> None:
+        items = self.values.setdefault("user_property", [])
+        items.append((key, value))
+
+    def __bool__(self) -> bool:
+        return bool(self.values)
+
+
+@dataclass(slots=True, frozen=True)
+class Message:
+    topic: str
+    payload: bytes
+    qos: QoS = QoS.AT_MOST_ONCE
+    retain: bool = False
+    dup: bool = False
+    mid: int | None = None
+    properties: Properties | None = None
+
+
+@dataclass(slots=True)
+class OutboundMessage:
+    mid: int
+    topic: str
+    payload: bytes
+    qos: QoS
+    retain: bool
+    state: OutboundQoSState
+    dup: bool = False
+    properties: Properties | None = None
+    encoded_publish: bytes | tuple[bytes, bytes] | None = None
+    encoded_pubrel: bytes | None = None
+
+
+@dataclass(slots=True)
+class InboundMessage:
+    mid: int
+    topic: str
+    payload: bytes
+    qos: QoS
+    retain: bool
+    state: InboundQoSState
+    delivered: bool = False
+    properties: Properties | None = None
+    user_acked: bool = False  # manual_ack: app called ack() before PUBREL
