@@ -1,82 +1,65 @@
-"""Topic filter matcher (prefix trie), adapted from the proven Paho approach.
+"""Topic-filter matching for callback dispatch.
 
-Kept as a small standalone module so dispatch stays outside the protocol engine.
+The matcher intentionally uses a compact, explicit representation rather than
+sharing protocol-engine state. Exact and wildcard filters retain insertion order,
+and values may legitimately be ``None``.
 """
 
 from __future__ import annotations
 
-from typing import Any
 from collections.abc import Iterator
+from typing import Any
 
 
 class TopicMatcher:
-    """Map topic filters (with ``+`` / ``#``) to values; iterate matches for a topic."""
-
-    class Node:
-        __slots__ = ("children", "content")
-
-        def __init__(self) -> None:
-            self.children: dict[str, TopicMatcher.Node] = {}
-            self.content: Any = None
+    """Map MQTT topic filters to values and iterate matches for a topic."""
 
     def __init__(self) -> None:
-        self._root = self.Node()
+        self._entries: dict[str, tuple[tuple[str, ...], Any]] = {}
 
-    def __setitem__(self, key: str, value: Any) -> None:
-        node = self._root
-        for sym in key.split("/"):
-            node = node.children.setdefault(sym, self.Node())
-        node.content = value
+    def __setitem__(self, topic_filter: str, value: Any) -> None:
+        self._entries[topic_filter] = (tuple(topic_filter.split("/")), value)
 
-    def __getitem__(self, key: str) -> Any:
-        node = self._root
+    def __getitem__(self, topic_filter: str) -> Any:
         try:
-            for sym in key.split("/"):
-                node = node.children[sym]
+            return self._entries[topic_filter][1]
         except KeyError as exc:
-            raise KeyError(key) from exc
-        if node.content is None:
-            raise KeyError(key)
-        return node.content
+            raise KeyError(topic_filter) from exc
 
-    def __delitem__(self, key: str) -> None:
-        path: list[tuple[TopicMatcher.Node, str, TopicMatcher.Node]] = []
-        parent, node = None, self._root
+    def __delitem__(self, topic_filter: str) -> None:
         try:
-            for part in key.split("/"):
-                parent, node = node, node.children[part]
-                path.append((parent, part, node))
+            del self._entries[topic_filter]
         except KeyError as exc:
-            raise KeyError(key) from exc
-        node.content = None
-        for parent, part, child in reversed(path):
-            if child.children or child.content is not None:
-                break
-            del parent.children[part]
+            raise KeyError(topic_filter) from exc
 
     def iter_match(self, topic: str) -> Iterator[Any]:
-        parts = topic.split("/")
-        allow_wildcard = not topic.startswith("$")
-        # Iterative DFS (explicit stack) — no recursion limit on deep topics.
-        stack: list[tuple[TopicMatcher.Node, int]] = [(self._root, 0)]
-        while stack:
-            node, index = stack.pop()
-            if index == len(parts):
-                if node.content is not None:
-                    yield node.content
-                # ``foo/#`` must also match ``foo`` (zero levels under the parent).
-                if "#" in node.children and (allow_wildcard or index > 0):
-                    content = node.children["#"].content
-                    if content is not None:
-                        yield content
-                continue
-            part = parts[index]
-            if "#" in node.children and (allow_wildcard or index > 0):
-                content = node.children["#"].content
-                if content is not None:
-                    yield content
-            if "+" in node.children and (allow_wildcard or index > 0):
-                stack.append((node.children["+"], index + 1))
-            child = node.children.get(part)
-            if child is not None:
-                stack.append((child, index + 1))
+        """Yield values whose MQTT filters match ``topic`` in insertion order."""
+
+        topic_levels = tuple(topic.split("/"))
+        is_system_topic = topic.startswith("$")
+        for filter_levels, value in self._entries.values():
+            if self._matches(filter_levels, topic_levels, is_system_topic):
+                yield value
+
+    @staticmethod
+    def _matches(
+        filter_levels: tuple[str, ...],
+        topic_levels: tuple[str, ...],
+        is_system_topic: bool,
+    ) -> bool:
+        if not filter_levels:
+            return not topic_levels
+        if is_system_topic and filter_levels[0] in {"+", "#"}:
+            return False
+
+        topic_index = 0
+        for filter_index, level in enumerate(filter_levels):
+            if level == "#":
+                return filter_index == len(filter_levels) - 1
+            if topic_index >= len(topic_levels):
+                return False
+            if level != "+" and level != topic_levels[topic_index]:
+                return False
+            topic_index += 1
+
+        return topic_index == len(topic_levels)
