@@ -1,0 +1,45 @@
+name: Prepublication audit
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - .prepublish-trigger
+      - .github/workflows/prepublish-audit.yml
+      - pyproject.toml
+      - src/mqttium/**
+      - README.md
+      - LICENSE
+      - NOTICE
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: python -m pip install ".[release]"
+      - run: validate-pyproject pyproject.toml
+      - run: python -m build
+      - run: twine check --strict dist/*
+      - run: check-wheel-contents dist/*.whl
+      - name: Confirm PyPI name is unclaimed
+        run: |
+          set -euo pipefail
+          status="$(curl --retry 4 --retry-all-errors -sS -o /tmp/pypi-mqttium.json -w '%{http_code}' https://pypi.org/pypi/mqttium/json)"
+          echo "PyPI API status for mqttium: $status"
+          test "$status" = "404"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mqttium-prepublication-${{ github.run_id }}
+          path: |
+            dist/*
+            /tmp/pypi-mqttium.json
+          if-no-files-found: error
+          retention-days: 30
