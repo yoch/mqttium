@@ -15,14 +15,20 @@ jobs:
   quality:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - run: python -m pip install -e ".[dev]"
+      - run: python -m pip install -e ".[dev,security]"
+      - name: Repository hygiene
+        run: |
+          set -euo pipefail
+          test -z "$(git ls-files | grep -E '(^|/)(__pycache__|\.pytest_cache|\.mypy_cache|\.ruff_cache|dist|build|.*\.egg-info)(/|$)|(^|/)\.coverage($|\.)|\.py[co]$' || true)"
+          test -z "$(grep -RIl --exclude-dir=.git -E 'mqttnext|MQTTNext|MQTTNEXT' src tests examples benchmarks || true)"
       - run: ruff format --check src tests benchmarks
       - run: ruff check src tests benchmarks
       - run: mypy src/mqttium
+      - run: bandit -q -ll -r src
       - run: python -m pytest -q tests/unit --cov=mqttium --cov-report=term-missing --cov-fail-under=80
 
   test:
@@ -30,10 +36,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
       - run: python -m pip install -e ".[dev]"
@@ -54,8 +60,8 @@ jobs:
   fuzz:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - run: python -m pip install -e ".[fuzz]"
@@ -69,10 +75,64 @@ jobs:
   package:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - run: python -m pip install build twine
+      - run: python -m pip install ".[release]"
+      - run: validate-pyproject pyproject.toml
       - run: python -m build
-      - run: twine check dist/*
+      - run: twine check --strict dist/*
+      - run: check-wheel-contents dist/*.whl
+      - name: Validate distribution contents
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile
+          import email
+          import tarfile
+
+          wheel = next(Path("dist").glob("*.whl"))
+          sdist = next(Path("dist").glob("*.tar.gz"))
+
+          with ZipFile(wheel) as archive:
+              names = archive.namelist()
+              metadata_name = next(name for name in names if name.endswith(".dist-info/METADATA"))
+              metadata = email.message_from_bytes(archive.read(metadata_name))
+              assert metadata["Name"] == "mqttium"
+              assert metadata["Version"] == "0.1.0a1"
+              assert metadata["Requires-Python"] == ">=3.11"
+              assert metadata["License-Expression"] == "Apache-2.0"
+              assert "mqttium/py.typed" in names
+              assert any(name.endswith(".dist-info/licenses/LICENSE") for name in names)
+              assert any(name.endswith(".dist-info/licenses/NOTICE") for name in names)
+
+          with tarfile.open(sdist, "r:gz") as archive:
+              names = archive.getnames()
+              for filename in (
+                  "LICENSE",
+                  "NOTICE",
+                  "README.md",
+                  "CHANGELOG.md",
+                  "PROVENANCE.md",
+                  "SECURITY.md",
+              ):
+                  assert any(name.endswith("/" + filename) for name in names), filename
+          PY
+      - name: Install and import the built wheel
+        run: |
+          python -m venv /tmp/mqttium-wheel
+          /tmp/mqttium-wheel/bin/python -m pip install --no-deps dist/*.whl
+          cd /tmp
+          /tmp/mqttium-wheel/bin/python -I - <<'PY'
+          import importlib
+          import importlib.metadata
+          import pkgutil
+          import mqttium
+
+          assert mqttium.__version__ == "0.1.0a1"
+          assert importlib.metadata.version("mqttium") == "0.1.0a1"
+          for module in pkgutil.walk_packages(mqttium.__path__, mqttium.__name__ + "."):
+              importlib.import_module(module.name)
+          PY
+          /tmp/mqttium-wheel/bin/python -m pip check

@@ -27,9 +27,21 @@ A/B run whose artifact digest was:
 
 `sha256:3357e8f1928860ac1f42f74810fefea68adb29d04af50450cddbdc6fa43abefe`
 
-## Licensing note
+## Licensing review
 
-MQTTium is intended as an independent implementation and is distributed under
-Apache-2.0. Initial development occurred inside a fork of Eclipse Paho. A
-file-level provenance and license review should be completed before the first
-public package release, particularly for compatibility-facing material.
+The initial file-level review was completed before the first package release:
+
+- MQTTium's protocol, transport, persistence and public API implementations are
+  original code distributed under Apache-2.0;
+- the Paho compatibility package implements documented public behaviour and
+  does not vendor Paho source files;
+- tests and documentation reference Paho and gmqtt for behavioural comparison
+  and migration guidance only;
+- the original trie matcher, whose structure followed Paho's matcher closely,
+  was replaced with an independent flat-filter implementation before release;
+- no generated coverage databases, benchmark results or upstream license files
+  are included as package source.
+
+References to Eclipse Paho and gmqtt are nominative interoperability and
+provenance references. Their names and licenses do not apply to MQTTium's
+independent implementation.

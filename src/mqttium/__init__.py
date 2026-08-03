@@ -1,9 +1,4 @@
-"""mqttium — async-native MQTT client (reliable async-native MQTT client).
-
-Designed from scratch using lessons from Eclipse Paho MQTT Python performance
-work and the gmqtt asyncio architecture, without inheriting either codebase's
-protocol-engine debt.
-"""
+"""MQTTium — a reliable, async-native MQTT client for Python."""
 
 from __future__ import annotations
 

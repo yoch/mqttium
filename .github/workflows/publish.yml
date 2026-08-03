@@ -1,0 +1,77 @@
+name: Publish to PyPI
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Verify release source and package version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git merge-base --is-ancestor HEAD origin/main
+          python - <<'PY'
+          import ast
+          import os
+          from pathlib import Path
+
+          tree = ast.parse(Path("src/mqttium/__init__.py").read_text(encoding="utf-8"))
+          version = None
+          for node in tree.body:
+              if not isinstance(node, ast.Assign):
+                  continue
+              if any(isinstance(target, ast.Name) and target.id == "__version__" for target in node.targets):
+                  if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+                      version = node.value.value
+                      break
+          if version is None:
+              raise SystemExit("could not read __version__ from src/mqttium/__init__.py")
+
+          tag_version = os.environ["RELEASE_TAG"].removeprefix("v")
+          if tag_version != version:
+              raise SystemExit(f"release tag {tag_version!r} does not match package {version!r}")
+          PY
+      - run: python -m pip install ".[release]"
+      - run: validate-pyproject pyproject.toml
+      - run: python -m build
+      - run: twine check --strict dist/*
+      - run: check-wheel-contents dist/*.whl
+      - uses: actions/upload-artifact@v7
+        with:
+          name: python-distributions
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    environment:
+      name: pypi
+      url: https://pypi.org/p/mqttium
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: python-distributions
+          path: dist/
+      - name: Publish distributions with PyPI Trusted Publishing
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          print-hash: true
