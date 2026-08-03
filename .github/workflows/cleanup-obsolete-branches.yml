@@ -1,0 +1,45 @@
+name: Cleanup obsolete branches
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - .cleanup-obsolete-branches
+      - .github/workflows/cleanup-obsolete-branches.yml
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    if: github.head_ref == 'agent/cleanup-branches'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Delete obsolete technical branches
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          branches=(
+            agent/bootstrap-trigger
+            agent/standalone-ci-check
+            agent/release-readiness-audit
+            agent/release-readiness
+            agent/cleanup-branches
+          )
+          for branch in "${branches[@]}"; do
+            encoded="${branch//\//%2F}"
+            status="$(curl -sS -o /tmp/delete-response.json -w '%{http_code}' \
+              -X DELETE \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "https://api.github.com/repos/${REPOSITORY}/git/refs/heads/${encoded}")"
+            if [[ "$status" != 204 && "$status" != 422 ]]; then
+              cat /tmp/delete-response.json
+              echo "Failed to delete ${branch}: HTTP ${status}" >&2
+              exit 1
+            fi
+            echo "Deleted or already absent: ${branch}"
+          done
