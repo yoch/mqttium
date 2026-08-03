@@ -51,7 +51,6 @@ fuzz = [
 ]
 release = [
     "build>=1.2",
-    "check-manifest>=0.51",
     "check-wheel-contents>=0.6",
     "twine>=6",
     "validate-pyproject[all]>=0.24",
