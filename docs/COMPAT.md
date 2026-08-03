@@ -38,7 +38,7 @@ Helpers one-shot : préférer `mqttium.helpers` (async natif) plutôt que
 | Republish QoS>0 non conforme sur clean session | Comportement historique flou | **Strict MQTT** | Correctness > bug-compat |
 | MID pour QoS 0 | Alloué | `None` | Pas d’identifiant protocolaire ; info locale inutile |
 | Appels bloquants **depuis** un callback réseau | Souvent « ça passe » | **Interdit** (RuntimeError) | Deadlock certain avec notre writer unique |
-| `publish()` hors thread réseau | File sous lock + retour immédiat | File sous ``_state_mutex`` + retour immédiat (wake loop coalescé) | L’ancien handoff ``run_coroutine_threadsafe`` + ``await _flush_effects()`` sérialisait chaque publish derrière le writer (~5k msg/s) |
+| `publish()` hors thread réseau | File interne + retour immédiat | QoS0 : file façade coalescée consommée par le loop ; QoS1/2 : handoff court pour le MID | Aucun publish n’attend le writer ; le moteur reste possédé par le thread réseau |
 | WebSocket / proxy / socks | Large surface | WS via `AsyncClient.connect_ws` ; pas via façade sync | Couche transport séparée ; pas de monolithe |
 | Persistence fichier Paho | Formats historiques | `SqliteInflightStore` sur `AsyncClient` | Pas de format binaire Paho |
 | `suppress_exceptions` | Oui | Non | Les erreurs doivent remonter |
@@ -94,3 +94,5 @@ PUBCOMP = correct + stable. Réévaluer avec métriques avant de rouvrir.
 
 - `tests/unit/test_compat_paho.py` — connect/publish/callbacks/filtres
 - `tests/unit/test_compat_lib_subset.py` — jalon D (miroir comportemental `tests/lib`)
+- `tests/unit/test_compat_publish_perf.py` — ordre des effets, réutilisation des MID et coalescence QoS0
+- `tests/integration/test_compat_publish_perf.py` — callbacks et livraison QoS0 de bout en bout
