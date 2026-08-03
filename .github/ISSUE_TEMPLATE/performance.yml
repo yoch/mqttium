@@ -1,0 +1,16 @@
+name: Performance report
+description: Report a reproducible performance regression
+title: "[Performance]: "
+body:
+  - type: textarea
+    id: benchmark
+    attributes:
+      label: Benchmark and environment
+    validations:
+      required: true
+  - type: textarea
+    id: results
+    attributes:
+      label: Results
+    validations:
+      required: true
