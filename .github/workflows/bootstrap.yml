@@ -1,0 +1,563 @@
+name: Bootstrap MQTTium spin-out
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/bootstrap.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  spinout:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      SOURCE_REPOSITORY: yoch/paho.mqtt.python
+      SOURCE_SHA: bcdff1a22889c90ec635f658aee13fb318038af0
+      OUT: /tmp/mqttium-tree
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build clean MQTTium tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$OUT" /tmp/mqttium-source /tmp/mqttium-source.tar.gz
+          mkdir -p "$OUT" /tmp/mqttium-source
+          curl -fsSL "https://github.com/${SOURCE_REPOSITORY}/archive/${SOURCE_SHA}.tar.gz" \
+            -o /tmp/mqttium-source.tar.gz
+          tar -xzf /tmp/mqttium-source.tar.gz -C /tmp/mqttium-source
+          SOURCE_ROOT="$(find /tmp/mqttium-source -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+          cp -a "$SOURCE_ROOT/mqttnext/." "$OUT/"
+          mv "$OUT/src/mqttnext" "$OUT/src/mqttium"
+
+          python - <<'PY'
+          from pathlib import Path
+
+          root = Path("/tmp/mqttium-tree")
+          replacements = (
+              ("MQTTNEXT", "MQTTIUM"),
+              ("MQTTNext", "MQTTium"),
+              ("mqttnext", "mqttium"),
+          )
+          for path in root.rglob("*"):
+              if not path.is_file() or path.is_symlink():
+                  continue
+              raw = path.read_bytes()
+              if b"\0" in raw:
+                  continue
+              try:
+                  text = raw.decode("utf-8")
+              except UnicodeDecodeError:
+                  continue
+              for old, new in replacements:
+                  text = text.replace(old, new)
+              path.write_text(text, encoding="utf-8")
+
+          pyproject = root / "pyproject.toml"
+          text = pyproject.read_text(encoding="utf-8")
+          text = text.replace(
+              'description = "Correctness-first async-native MQTT client"',
+              'description = "Reliable async-native MQTT client for Python"',
+          )
+          text = text.replace('{ name = "yoch" }', '{ name = "Yoch Melka" }')
+          marker = "dependencies = []\n"
+          urls = (
+              "dependencies = []\n\n"
+              "[project.urls]\n"
+              'Homepage = "https://github.com/yoch/mqttium"\n'
+              'Repository = "https://github.com/yoch/mqttium"\n'
+              'Issues = "https://github.com/yoch/mqttium/issues"\n'
+          )
+          if "[project.urls]" not in text:
+              text = text.replace(marker, urls)
+          pyproject.write_text(text, encoding="utf-8")
+
+          init = root / "src/mqttium/__init__.py"
+          text = init.read_text(encoding="utf-8")
+          text = text.replace("0.0.1.dev0", "0.1.0a1")
+          text = text.replace(
+              "work-in-progress reference implementation",
+              "reliable async-native MQTT client",
+          )
+          init.write_text(text, encoding="utf-8")
+          PY
+
+          curl -fsSL https://www.apache.org/licenses/LICENSE-2.0.txt -o "$OUT/LICENSE"
+
+          cat > "$OUT/README.md" <<'EOF'
+          # MQTTium
+
+          **MQTTium is a reliable, async-native MQTT client for modern Python.**
+
+          It combines a synchronous protocol engine with an `asyncio` API, bounded
+          backpressure, durable inflight persistence, explicit delivery receipts,
+          and complete MQTT QoS state machines.
+
+          > **Status:** early alpha (`0.1.0a1`). The implementation is extensively
+          > tested, but the public API may still change before the first stable release.
+
+          ## Why MQTTium
+
+          - MQTT 3.1.1 and MQTT 5 support;
+          - QoS 0, 1 and 2 with one authoritative protocol state machine;
+          - TCP, TLS, WebSocket and Unix transports;
+          - reconnect and session replay;
+          - bounded callback and async-iterator delivery;
+          - manual acknowledgement;
+          - in-memory and SQLite inflight persistence;
+          - aggregate `publish_many()` with bounded memory and measured throughput gains;
+          - an additive Paho VERSION2 compatibility façade, isolated from the native API.
+
+          Python **3.11+** is supported. MQTTium is licensed under **Apache-2.0**.
+
+          ## Development installation
+
+          MQTTium has not yet been published to PyPI. Install the repository in editable
+          mode while the prerelease API is being finalized:
+
+          ```bash
+          git clone https://github.com/yoch/mqttium.git
+          cd mqttium
+          python -m pip install -e ".[dev]"
+          ```
+
+          ## Quick start
+
+          ```python
+          import asyncio
+
+          from mqttium.api import AsyncClient
+
+
+          async def main() -> None:
+              client = AsyncClient("demo-client")
+              await client.connect("127.0.0.1", 1883)
+              await client.subscribe("demo/#")
+
+              receipt = await client.publish("demo/hello", b"world", qos=1)
+              await receipt.wait()
+
+              await client.disconnect()
+
+
+          asyncio.run(main())
+          ```
+
+          ## Batched publishing
+
+          `publish_many()` consumes iterables in bounded chunks and returns one aggregate
+          receipt rather than creating one task or event per message:
+
+          ```python
+          from mqttium.api import PublishMessage
+
+          batch = await client.publish_many(
+              PublishMessage("telemetry/device-1", payload, qos=1)
+              for payload in payloads
+          )
+          await batch.wait()
+          ```
+
+          The retained A/B benchmark measured publisher-throughput geomean improvements
+          of **36.9% for QoS 0**, **15.9% for QoS 1**, and **7.0% for QoS 2** against
+          equivalent individual publishing pipelines on the validated source tree.
+
+          ## Validation
+
+          The initial spin-out baseline contains:
+
+          - 245 unit tests;
+          - Mosquitto integration tests on Python 3.11, 3.12 and 3.13;
+          - deterministic and Hypothesis-based fuzzing;
+          - Ruff formatting and linting;
+          - mypy validation;
+          - an 80% coverage gate;
+          - delivery, persistence, TCP, TLS and WAN-profile benchmarks.
+
+          ## Documentation
+
+          - [`docs/DESIGN.md`](docs/DESIGN.md) — architecture and invariants
+          - [`docs/IMPLEMENTATION-GUIDE.md`](docs/IMPLEMENTATION-GUIDE.md) — protocol contracts
+          - [`docs/COMPAT.md`](docs/COMPAT.md) — Paho compatibility surface
+          - [`docs/MIGRATION.md`](docs/MIGRATION.md) — migration guidance
+          - [`docs/BENCHMARKING.md`](docs/BENCHMARKING.md) — benchmark validity contract
+          - [`docs/FUZZING.md`](docs/FUZZING.md) — fuzzing strategy
+          - [`docs/ROADMAP.md`](docs/ROADMAP.md) — release work
+          - [`PROVENANCE.md`](PROVENANCE.md) — source history and extraction record
+
+          ## Contributing
+
+          See [`CONTRIBUTING.md`](CONTRIBUTING.md). Security reports should follow
+          [`SECURITY.md`](SECURITY.md).
+          EOF
+
+          cat > "$OUT/PROVENANCE.md" <<'EOF'
+          # Provenance
+
+          MQTTium was initially developed as the independent `mqttnext/` subtree in
+          [`yoch/paho.mqtt.python`](https://github.com/yoch/paho.mqtt.python).
+
+          ## Spin-out source
+
+          - source commit: `bcdff1a22889c90ec635f658aee13fb318038af0`;
+          - production-hardening line: pull request #6;
+          - measured core optimizations: pull request #8;
+          - aggregate `publish_many()` implementation: pull request #9.
+
+          The dedicated repository was created by extracting only the `mqttnext/`
+          subtree from that exact commit, moving it to the repository root, renaming the
+          Python distribution and import package to `mqttium`, and rebuilding the GitHub
+          workflows for a standalone repository. No `mqttnext` compatibility alias is
+          retained.
+
+          ## Validation inherited from the source tree
+
+          The exact production code was validated with 245 unit tests, Mosquitto
+          integration on Python 3.11/3.12/3.13, Ruff, mypy, deterministic fuzzing,
+          Hypothesis fuzzing, and an 80% coverage gate.
+
+          The final retained `publish_many()` benchmark decision was based on a paired
+          A/B run whose artifact digest was:
+
+          `sha256:3357e8f1928860ac1f42f74810fefea68adb29d04af50450cddbdc6fa43abefe`
+
+          ## Licensing note
+
+          MQTTium is intended as an independent implementation and is distributed under
+          Apache-2.0. Initial development occurred inside a fork of Eclipse Paho. A
+          file-level provenance and license review should be completed before the first
+          public package release, particularly for compatibility-facing material.
+          EOF
+
+          cat > "$OUT/NOTICE" <<'EOF'
+          MQTTium
+          Copyright 2026 Yoch Melka
+
+          Initial development occurred as the mqttnext subtree of
+          https://github.com/yoch/paho.mqtt.python.
+
+          See PROVENANCE.md for the exact source commit, pull requests, validation record,
+          and licensing note used for this spin-out.
+          EOF
+
+          cat > "$OUT/CHANGELOG.md" <<'EOF'
+          # Changelog
+
+          All notable changes to MQTTium will be documented here.
+
+          The format follows Keep a Changelog and versions follow Semantic Versioning.
+
+          ## [Unreleased]
+
+          ### Added
+
+          - Dedicated MQTTium repository and package identity.
+          - Standalone CI, benchmark, packaging and governance files.
+
+          ## [0.1.0a1] - 2026-08-03
+
+          ### Added
+
+          - Initial async-native MQTT 3.1.1/5 client spin-out.
+          - QoS 0/1/2, reconnect, persistence and multiple transports.
+          - Aggregate `publish_many()` pipeline with bounded memory.
+          - Additive Paho VERSION2 compatibility façade.
+          EOF
+
+          cat > "$OUT/SECURITY.md" <<'EOF'
+          # Security policy
+
+          MQTTium is currently an early-alpha project. Security fixes are applied to the
+          latest development line only until a stable release policy is established.
+
+          Please do not disclose suspected vulnerabilities in a public issue. Contact the
+          maintainer privately through the email address associated with the GitHub
+          profile, including reproduction steps, impact and any proposed mitigation.
+          EOF
+
+          cat > "$OUT/CONTRIBUTING.md" <<'EOF'
+          # Contributing
+
+          Contributions are welcome while MQTTium is being prepared for its first public
+          package release.
+
+          ## Development
+
+          ```bash
+          python -m pip install -e ".[dev]"
+          ruff format --check src tests benchmarks
+          ruff check src tests benchmarks
+          mypy src/mqttium
+          python -m pytest -q tests/unit
+          ```
+
+          Integration tests require a local Mosquitto broker on the port configured by
+          the test suite.
+
+          ## Pull requests
+
+          Keep changes focused, add tests for observable behavior, and document any API,
+          protocol-state or persistence invariant that changes. Performance changes must
+          include a comparable benchmark and may not weaken correctness checks.
+          EOF
+
+          cat > "$OUT/CODE_OF_CONDUCT.md" <<'EOF'
+          # Code of conduct
+
+          Be respectful, constructive and technically honest. Harassment, personal
+          attacks, discriminatory behavior and knowingly misleading security or
+          performance claims are not accepted. Maintainers may remove contributions or
+          restrict participation when necessary to keep the project safe and productive.
+          EOF
+
+          mkdir -p "$OUT/.github/workflows" "$OUT/.github/ISSUE_TEMPLATE"
+
+          cat > "$OUT/.github/workflows/ci.yml" <<'EOF'
+          name: CI
+
+          on:
+            push:
+            pull_request:
+
+          permissions:
+            contents: read
+
+          jobs:
+            quality:
+              runs-on: ubuntu-24.04
+              steps:
+                - uses: actions/checkout@v4
+                - uses: actions/setup-python@v5
+                  with:
+                    python-version: "3.12"
+                - run: python -m pip install -e ".[dev]"
+                - run: ruff format --check src tests benchmarks
+                - run: ruff check src tests benchmarks
+                - run: mypy src/mqttium
+                - run: python -m pytest -q tests/unit --cov=mqttium --cov-report=term-missing --cov-fail-under=80
+
+            test:
+              runs-on: ubuntu-24.04
+              strategy:
+                fail-fast: false
+                matrix:
+                  python-version: ["3.11", "3.12", "3.13"]
+              steps:
+                - uses: actions/checkout@v4
+                - uses: actions/setup-python@v5
+                  with:
+                    python-version: ${{ matrix.python-version }}
+                - run: python -m pip install -e ".[dev]"
+                - run: python -m pytest -q tests/unit
+                - name: Start Mosquitto
+                  run: |
+                    sudo apt-get update -qq
+                    sudo apt-get install -y -qq mosquitto
+                    printf 'listener 11883 127.0.0.1\nallow_anonymous true\npersistence false\n' > /tmp/mosq-ci.conf
+                    mosquitto -c /tmp/mosq-ci.conf -d
+                    for i in $(seq 1 30); do
+                      (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+                      sleep 0.2
+                    done
+                    exit 1
+                - run: python -m pytest -q tests/integration
+
+            fuzz:
+              runs-on: ubuntu-24.04
+              steps:
+                - uses: actions/checkout@v4
+                - uses: actions/setup-python@v5
+                  with:
+                    python-version: "3.12"
+                - run: python -m pip install -e ".[fuzz]"
+                - name: Seeded fuzzing
+                  run: |
+                    for seed in 1 2 3; do
+                      PYTHONPATH=src python tests/fuzz/fuzz.py --seed "$seed" --iterations 20000
+                    done
+                - run: PYTHONPATH=src python -m pytest -q tests/fuzz/test_hypothesis_fuzz.py
+
+            package:
+              runs-on: ubuntu-24.04
+              steps:
+                - uses: actions/checkout@v4
+                - uses: actions/setup-python@v5
+                  with:
+                    python-version: "3.12"
+                - run: python -m pip install build twine
+                - run: python -m build
+                - run: twine check dist/*
+          EOF
+
+          cat > "$OUT/.github/workflows/benchmarks.yml" <<'EOF'
+          name: Benchmarks
+
+          on:
+            workflow_dispatch:
+            schedule:
+              - cron: "17 2 * * 0"
+            pull_request:
+              paths:
+                - benchmarks/**
+                - src/mqttium/api/**
+                - src/mqttium/compat/**
+                - src/mqttium/persistence/**
+                - src/mqttium/protocol/**
+                - .github/workflows/benchmarks.yml
+
+          permissions:
+            contents: read
+
+          concurrency:
+            group: ${{ github.workflow }}-${{ github.ref }}
+            cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+          jobs:
+            benchmark:
+              runs-on: ubuntu-24.04
+              timeout-minutes: 40
+              env:
+                PYTHONUNBUFFERED: "1"
+                PIP_DISABLE_PIP_VERSION_CHECK: "1"
+              steps:
+                - uses: actions/checkout@v4
+                - uses: actions/setup-python@v5
+                  with:
+                    python-version: "3.12"
+                - name: Install dependencies
+                  run: |
+                    python -m pip install -e ".[dev]" paho-mqtt==2.1.0 gmqtt==0.7.0
+                    sudo apt-get update -qq
+                    sudo apt-get install -y -qq mosquitto mosquitto-clients openssl iproute2
+                - name: Start isolated TCP and TLS broker
+                  run: |
+                    mkdir -p /tmp/mqttium-bench
+                    openssl req -x509 -newkey rsa:2048 -nodes \
+                      -keyout /tmp/mqttium-bench/key.pem \
+                      -out /tmp/mqttium-bench/cert.pem \
+                      -days 1 -subj '/CN=localhost' \
+                      -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1'
+                    chmod 0644 /tmp/mqttium-bench/key.pem /tmp/mqttium-bench/cert.pem
+                    cat > /tmp/mqttium-bench/mosquitto.conf <<'MOSQ'
+                    user root
+                    persistence false
+                    allow_anonymous true
+                    max_inflight_messages 1000
+                    max_queued_messages 100000
+                    max_queued_bytes 0
+                    connection_messages false
+                    log_type error
+                    listener 11883 127.0.0.1
+                    listener 18884 127.0.0.1
+                    cafile /tmp/mqttium-bench/cert.pem
+                    certfile /tmp/mqttium-bench/cert.pem
+                    keyfile /tmp/mqttium-bench/key.pem
+                    require_certificate false
+                    MOSQ
+                    mosquitto -c /tmp/mqttium-bench/mosquitto.conf > /tmp/mqttium-bench/mosquitto.log 2>&1 &
+                    for i in $(seq 1 50); do
+                      (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && \
+                      (echo > /dev/tcp/127.0.0.1/18884) >/dev/null 2>&1 && exit 0
+                      sleep 0.2
+                    done
+                    cat /tmp/mqttium-bench/mosquitto.log
+                    exit 1
+                - run: python benchmarks/compare_libs.py --output /tmp/mqttium-bench/compare.json
+                - run: python benchmarks/realworld.py --port 11883 --profile local --output /tmp/mqttium-bench/realworld-tcp.json
+                - run: python benchmarks/realworld.py --host localhost --port 18884 --cafile /tmp/mqttium-bench/cert.pem --profile local-tls --count 1500 --output /tmp/mqttium-bench/realworld-tls.json
+                - run: python benchmarks/application_stress.py --output /tmp/mqttium-bench/application-stress.json
+                - name: WAN-profile delivery
+                  run: |
+                    sudo tc qdisc replace dev lo root netem delay 20ms 5ms distribution normal loss 0.1%
+                    trap 'sudo tc qdisc del dev lo root || true' EXIT
+                    python benchmarks/realworld.py --port 11883 --profile wan-20ms-jitter5ms-loss0.1pct --count 1500 --subscriber-timeout 180 --output /tmp/mqttium-bench/realworld-wan.json
+                    sudo tc qdisc del dev lo root
+                    trap - EXIT
+                - uses: actions/upload-artifact@v4
+                  if: always()
+                  with:
+                    name: mqttium-benchmarks-${{ github.run_id }}
+                    path: |
+                      /tmp/mqttium-bench/*.json
+                      /tmp/mqttium-bench/mosquitto.log
+                    if-no-files-found: warn
+                    retention-days: 30
+          EOF
+
+          cat > "$OUT/.github/ISSUE_TEMPLATE/bug_report.yml" <<'EOF'
+          name: Bug report
+          description: Report reproducible incorrect behavior
+          title: "[Bug]: "
+          body:
+            - type: textarea
+              id: description
+              attributes:
+                label: Description
+                description: What happened and what did you expect?
+              validations:
+                required: true
+            - type: textarea
+              id: reproduction
+              attributes:
+                label: Minimal reproduction
+                render: python
+              validations:
+                required: true
+            - type: input
+              id: environment
+              attributes:
+                label: Environment
+                description: MQTTium, Python, broker and operating-system versions
+              validations:
+                required: true
+          EOF
+
+          cat > "$OUT/.github/pull_request_template.md" <<'EOF'
+          ## Summary
+
+          ## Behavioral or protocol impact
+
+          ## Validation
+
+          ## Benchmark evidence, when performance-related
+          EOF
+
+      - name: Validate renamed tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$OUT"
+          python -m pip install -e ".[dev]" build twine
+          ruff format --check src tests benchmarks
+          ruff check src tests benchmarks
+          mypy src/mqttium
+          python -m pytest -q tests/unit --cov=mqttium --cov-report=term-missing --cov-fail-under=80
+          python -m build
+          twine check dist/*
+
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mosquitto
+          printf 'listener 11883 127.0.0.1\nallow_anonymous true\npersistence false\n' > /tmp/mosq-bootstrap.conf
+          mosquitto -c /tmp/mosq-bootstrap.conf -d
+          for i in $(seq 1 30); do
+            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && break
+            sleep 0.2
+          done
+          python -m pytest -q tests/integration
+
+      - name: Publish clean single-commit history
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout --orphan mqttium-root
+          git rm -rf .
+          cp -a "$OUT/." .
+          git add -A
+          git commit -m "Initial MQTTium spin-out"
+          git push --force origin HEAD:main
