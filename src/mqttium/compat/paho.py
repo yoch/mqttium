@@ -19,12 +19,17 @@ from mqttium.api.async_client import AsyncClient
 from mqttium.api.models import PublishReceipt
 from mqttium.dispatch.matcher import TopicMatcher
 from mqttium.enums import MQTTProtocolVersion, QoS
+from mqttium.errors import FlowControlError
 from mqttium.packets import ConnAckPacket
 from mqttium.types import Message, Properties
 
 
 class CallbackAPIVersion(enum.Enum):
     VERSION2 = 2
+
+
+MQTT_ERR_SUCCESS = 0
+MQTT_ERR_QUEUE_SIZE = 15
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +50,10 @@ class MQTTMessageInfo:
 
     def wait_for_publish(self, timeout: float | None = None) -> None:
         """Block until the publish completes; raise on protocol/transport error."""
+        if self.rc == MQTT_ERR_QUEUE_SIZE:
+            raise ValueError("Message is not queued due to ERR_QUEUE_SIZE")
+        if self.rc != MQTT_ERR_SUCCESS:
+            raise RuntimeError(f"Message publish failed with rc={self.rc}")
         if self._receipt is None or self._receipt.is_done():
             if self._receipt is not None and self._receipt._error is not None:
                 raise self._receipt._error
@@ -55,6 +64,10 @@ class MQTTMessageInfo:
         fut.result(timeout)
 
     def is_published(self) -> bool:
+        if self.rc == MQTT_ERR_QUEUE_SIZE:
+            raise ValueError("Message is not queued due to ERR_QUEUE_SIZE")
+        if self.rc != MQTT_ERR_SUCCESS:
+            raise RuntimeError(f"Message publish failed with rc={self.rc}")
         return self._receipt is None or self._receipt.is_done()
 
 
@@ -89,6 +102,8 @@ class Client:
         protocol: MQTTProtocolVersion = MQTTProtocolVersion.MQTTv311,
         clean_session: bool | None = None,
         clean_start: bool = True,
+        max_pending_outbound_messages: int | None = 10_000,
+        max_pending_outbound_bytes: int | None = 64 * 1024 * 1024,
     ) -> None:
         if callback_api_version is not CallbackAPIVersion.VERSION2:
             raise ValueError("mqttium.compat.paho only supports CallbackAPIVersion.VERSION2")
@@ -99,6 +114,9 @@ class Client:
             client_id=client_id,
             protocol=protocol,
             clean_start=clean_start,
+            max_pending_outbound_messages=max_pending_outbound_messages,
+            max_pending_outbound_bytes=max_pending_outbound_bytes,
+            publish_backpressure="error",
         )
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
@@ -121,6 +139,30 @@ class Client:
 
     def user_data_set(self, userdata: Any) -> None:
         self._run_loop_mutation(lambda: setattr(self, "_userdata", userdata))
+
+    def max_queued_messages_set(self, queue_size: int) -> None:
+        if queue_size < 0:
+            raise ValueError("queue_size must be non-negative")
+        # Paho uses zero for unlimited; the native MQTTium API uses None.
+        value = None if queue_size == 0 else queue_size
+        self._run_loop_mutation(
+            lambda: setattr(
+                self._async._engine.config,
+                "max_pending_outbound_messages",
+                value,
+            )
+        )
+
+    def max_queued_bytes_set(self, queue_size: int | None) -> None:
+        if queue_size is not None and queue_size < 0:
+            raise ValueError("queue_size must be non-negative or None")
+        self._run_loop_mutation(
+            lambda: setattr(
+                self._async._engine.config,
+                "max_pending_outbound_bytes",
+                queue_size,
+            )
+        )
 
     def username_pw_set(self, username: str, password: bytes | str | None = None) -> None:
         pwd = password.encode("utf-8") if isinstance(password, str) else password
@@ -257,8 +299,8 @@ class Client:
         assert self._loop is not None
 
         if self._on_loop_in_callback():
-            with self._async._state_mutex:
-                result = command()
+            result = command()
+            self._async._collect_effects_locked()
             self._async._schedule_effect_flush()
             return result
 
@@ -267,11 +309,8 @@ class Client:
 
         async def _run() -> None:
             try:
-                async with self._async._engine_lock:
-                    with self._async._state_mutex:
-                        handoff["result"] = command()
-                        self._async._collect_effects_locked()
-                await self._async._drain_effects()
+                handoff["result"] = command()
+                await self._async._flush_effects()
             except BaseException as exc:  # propagate the real loop-side failure
                 handoff["error"] = exc
             finally:
@@ -336,23 +375,20 @@ class Client:
 
         errors: list[BaseException] = []
         queued = False
-        with self._async._state_mutex:
-            for topic, payload, retain in batch:
-                try:
-                    self._async._engine.queue_publish(
-                        topic,
-                        payload,
-                        qos=QoS.AT_MOST_ONCE,
-                        retain=retain,
-                    )
-                except BaseException as exc:
-                    errors.append(exc)
-                else:
-                    queued = True
-            if queued:
-                self._async._collect_effects_locked()
-
+        for topic, payload, retain in batch:
+            try:
+                self._async._engine.queue_publish(
+                    topic,
+                    payload,
+                    qos=QoS.AT_MOST_ONCE,
+                    retain=retain,
+                )
+            except BaseException as exc:
+                errors.append(exc)
+            else:
+                queued = True
         if queued:
+            self._async._collect_effects_locked()
             self._async._schedule_effect_flush()
         for error in errors:
             self._async._spawn_callback(self._dispatch_publish, None, error)
@@ -366,9 +402,9 @@ class Client:
     ) -> MQTTMessageInfo:
         """Queue a publish without waiting for TCP writer progress.
 
-        QoS 0 requests are coalesced in a thread-safe façade queue and consumed
-        on the network loop. QoS 1/2 wait only for the loop to allocate the MID
-        and register the receipt; effect draining remains asynchronous.
+        QoS 0 uses a coalesced façade queue. QoS 1/2 wait only for loop-side MID
+        allocation and receipt registration; admission failures return
+        ``MQTT_ERR_QUEUE_SIZE``.
         """
         data = payload.encode("utf-8") if isinstance(payload, str) else payload
         requested_qos = QoS(qos)
@@ -382,7 +418,31 @@ class Client:
             return MQTTMessageInfo(mid=None, _receipt=receipt, _loop=self._loop)
 
         if self._on_loop_in_callback():
-            with self._async._state_mutex:
+            try:
+                handle = self._async._engine.queue_publish(
+                    topic,
+                    data,
+                    qos=requested_qos,
+                    retain=retain,
+                )
+            except FlowControlError:
+                return MQTTMessageInfo(mid=None, rc=MQTT_ERR_QUEUE_SIZE)
+            assert handle.mid is not None
+            receipt = PublishReceipt(
+                mid=handle.mid,
+                qos=handle.qos,
+                _event=asyncio.Event(),
+            )
+            self._async._register_publish_receipt(handle.mid, receipt)
+            self._async._collect_effects_locked()
+            self._async._schedule_effect_flush()
+            return MQTTMessageInfo(mid=receipt.mid, _receipt=receipt, _loop=self._loop)
+
+        handoff: dict[str, Any] = {}
+        done = threading.Event()
+
+        async def _queue() -> None:
+            try:
                 handle = self._async._engine.queue_publish(
                     topic,
                     data,
@@ -395,33 +455,9 @@ class Client:
                     qos=handle.qos,
                     _event=asyncio.Event(),
                 )
-                self._async._receipts[handle.mid] = receipt
+                self._async._register_publish_receipt(handle.mid, receipt)
                 self._async._collect_effects_locked()
-            self._async._schedule_effect_flush()
-            return MQTTMessageInfo(mid=receipt.mid, _receipt=receipt, _loop=self._loop)
-
-        handoff: dict[str, Any] = {}
-        done = threading.Event()
-
-        async def _queue() -> None:
-            try:
-                async with self._async._engine_lock:
-                    with self._async._state_mutex:
-                        handle = self._async._engine.queue_publish(
-                            topic,
-                            data,
-                            qos=requested_qos,
-                            retain=retain,
-                        )
-                        assert handle.mid is not None
-                        receipt = PublishReceipt(
-                            mid=handle.mid,
-                            qos=handle.qos,
-                            _event=asyncio.Event(),
-                        )
-                        self._async._receipts[handle.mid] = receipt
-                        self._async._collect_effects_locked()
-                        handoff["receipt"] = receipt
+                handoff["receipt"] = receipt
                 self._async._schedule_effect_flush()
             except BaseException as exc:
                 handoff["error"] = exc
@@ -433,6 +469,8 @@ class Client:
             fut.cancel()
             raise RuntimeError("publish handoff to event loop timed out")
         error = handoff.get("error")
+        if isinstance(error, FlowControlError):
+            return MQTTMessageInfo(mid=None, rc=MQTT_ERR_QUEUE_SIZE)
         if error is not None:
             raise error
         receipt = handoff["receipt"]

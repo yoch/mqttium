@@ -41,6 +41,10 @@ class Message:
     dup: bool = False
     mid: int | None = None
     properties: Properties | None = None
+    # Internal delivery accounting. Public Message instances remain frozen;
+    # AsyncClient mutates only these private slots with object.__setattr__.
+    _delivery_logical_bytes: int = field(default=0, init=False, repr=False, compare=False)
+    _delivery_references: int = field(default=0, init=False, repr=False, compare=False)
 
 
 @dataclass(slots=True)
@@ -55,6 +59,36 @@ class OutboundMessage:
     properties: Properties | None = None
     encoded_publish: bytes | tuple[bytes, bytes] | None = None
     encoded_pubrel: bytes | None = None
+    logical_size: int = 0
+
+
+@dataclass(slots=True, frozen=True)
+class OutboundMessageSummary:
+    """Payload-free durable outbound metadata used for lazy replay queues."""
+
+    mid: int
+    topic: str
+    payload_size: int
+    qos: QoS
+    retain: bool
+    state: OutboundQoSState
+    dup: bool = False
+    properties: Properties | None = None
+    logical_size: int = 0
+
+    @classmethod
+    def from_message(cls, message: OutboundMessage) -> OutboundMessageSummary:
+        return cls(
+            mid=message.mid,
+            topic=message.topic,
+            payload_size=len(message.payload),
+            qos=message.qos,
+            retain=message.retain,
+            state=message.state,
+            dup=message.dup,
+            properties=message.properties,
+            logical_size=message.logical_size,
+        )
 
 
 @dataclass(slots=True)

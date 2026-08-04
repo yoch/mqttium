@@ -138,3 +138,20 @@ async def test_full_message_queue_close_loses_nothing() -> None:
     async for msg in client.messages():
         received.append(msg.topic)
     assert received == ["t/0", "t/1", "t/2", "t/3"]
+
+
+async def test_sequential_qos1_receipts_survive_immediate_mid_reuse() -> None:
+    """A completed MID can be reused before its completion effect is applied."""
+    client, fake = _client_with_fake()
+    await client.connect("fake", 1883, timeout=2.0)
+
+    receipts = []
+    for index in range(250):
+        receipts.append(await client.publish("reuse/qos1", str(index), qos=1))
+        if len(receipts) >= 100:
+            await asyncio.wait_for(receipts[-100].wait(), timeout=2.0)
+
+    await asyncio.wait_for(asyncio.gather(*(receipt.wait() for receipt in receipts)), timeout=5.0)
+    assert all(receipt.is_done() for receipt in receipts)
+    assert not client._receipts
+    await client.disconnect()
