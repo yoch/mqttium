@@ -40,9 +40,7 @@ def test_oversized_publish_is_processed_alone(
     monkeypatch.setattr(paho_compat, "_PUBLISH_BATCH_MAX_BYTES", 20)
     requests = [
         paho_compat._PendingPublish("small", b"x", False, QoS.AT_MOST_ONCE, None),
-        paho_compat._PendingPublish(
-            "oversized", b"x" * 20, False, QoS.AT_MOST_ONCE, None
-        ),
+        paho_compat._PendingPublish("oversized", b"x" * 20, False, QoS.AT_MOST_ONCE, None),
         paho_compat._PendingPublish("tail", b"x", False, QoS.AT_MOST_ONCE, None),
     ]
     for request in requests:
