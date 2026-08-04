@@ -1,0 +1,98 @@
+name: Finalize PR 18
+
+on:
+  pull_request:
+    types: [synchronize]
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: finalize-pr18
+  cancel-in-progress: false
+
+jobs:
+  finalize:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: audit/design-hardening
+          fetch-depth: 0
+
+      - name: Fix the legacy test helper and clean triggers
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('tests/unit/test_compat_publish_perf.py')
+          text = path.read_text()
+          old = '''    engine.store.put_out(
+              OutboundMessage(
+                  mid=mid,
+                  topic="t",
+                  payload=b"x",
+                  qos=QoS.AT_LEAST_ONCE,
+                  retain=False,
+                  state=OutboundQoSState.WAIT_PUBACK,
+              )
+          )
+          engine.take_effects()
+          '''
+          new = '''    engine.store.put_out(
+              OutboundMessage(
+                  mid=mid,
+                  topic="t",
+                  payload=b"x",
+                  qos=QoS.AT_LEAST_ONCE,
+                  retain=False,
+                  state=OutboundQoSState.WAIT_PUBACK,
+              )
+          )
+          engine._reserve_outbound(engine._outbound_logical_size("t", b"x", None))
+          engine.take_effects()
+          '''
+          if text.count(old) != 1:
+              raise SystemExit('expected exactly one legacy helper block')
+          path.write_text(text.replace(old, new, 1))
+          PY
+          rm .github/EMPTY_COMMIT_TRIGGER
+          rm .github/workflows/finalize-pr18.yml
+          git diff --check
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - run: python -m pip install -e '.[dev,security]'
+
+      - name: Quality and unit tests
+        run: |
+          ruff format tests/unit/test_compat_publish_perf.py
+          ruff format --check src tests benchmarks
+          ruff check src tests benchmarks
+          mypy src/mqttium
+          bandit -q -ll -r src
+          python -m pytest -q tests/unit --cov=mqttium --cov-report=term-missing --cov-fail-under=80
+
+      - name: Integration tests
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mosquitto
+          printf 'listener 11883 127.0.0.1\nallow_anonymous true\npersistence false\n' > /tmp/mosq-ci.conf
+          mosquitto -c /tmp/mosq-ci.conf -d
+          for i in $(seq 1 30); do
+            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && break
+            sleep 0.2
+          done
+          python -m pytest -q tests/integration
+
+      - name: Commit clean final state
+        run: |
+          git config user.name 'ChatGPT'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'Fix reservation setup in publish ordering test'
+          git push origin HEAD:audit/design-hardening
