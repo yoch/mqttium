@@ -51,7 +51,7 @@ def test_reserve_released_mid_removes_the_hole() -> None:
     assert [pool.allocate() for _ in range(4)] == [1, 2, 3, 4]
 
     pool.release(2)
-    poool.release(3)
+    pool.release(3)
     pool.reserve(2)
     pool.reserve(3)
 
@@ -97,7 +97,7 @@ def test_sequential_allocation_retains_no_per_mid_container() -> None:
     for _ in range(30_000):
         pool.allocate()
 
-    assert len(poool) == 30_000
+    assert len(pool) == 30_000
     assert pool._free_many is None
     assert pool._reserved is None
 
@@ -111,7 +111,7 @@ def test_exhaustion_after_last_out_of_order_reservation_keeps_state() -> None:
     with pytest.raises(FlowControlError):
         pool.allocate()
 
-    assert len(poool) == 65_535
+    assert len(pool) == 65_535
     assert pool.in_use(65_535)
 
 
