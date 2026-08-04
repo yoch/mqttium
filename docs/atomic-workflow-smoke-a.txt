@@ -1,3 +1,0 @@
-Atomic Git workflow smoke test.
-
-File A proves that multiple files can be staged in one unpublished commit.
