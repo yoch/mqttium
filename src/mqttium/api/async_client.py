@@ -16,7 +16,6 @@ import ssl
 import time
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
-from contextlib import nullcontext
 from itertools import islice
 from typing import Any, Literal, Never
 
@@ -788,8 +787,7 @@ class AsyncClient:
                 # byte backpressure all the way to transport.read().
                 while True:
                     async with self._engine_lock:
-                        store_batch = getattr(self._engine.store, "batch", None)
-                        with store_batch() if store_batch is not None else nullcontext():
+                        with self._engine.store.batch():
                             handled = self._decoder.process_packets(
                                 self._engine.handle_raw,
                                 limit=256,

@@ -113,8 +113,11 @@ When touching this area, keep `_effect_enqueued`/`_effect_applied` balanced — 
 ### Other structure
 
 - `codec/` — VBI, bounded incremental decoder (`buffer.py`), MQTT-UTF-8 primitives, MQTT 5 property
-  table (`properties.py`, with encode/decode validation per packet type).
-- `packets/__init__.py` — one module holding every packet dataclass and its encode/decode.
+  table (`properties.py`, with encode/decode validation per packet type), and fixed-header/flags
+  validation (`packet_validation.py`).
+- `packets/` — one module per packet family (`connect.py`, `publish.py`, `subscription.py`,
+  `acks.py`, `control.py`) over shared framing helpers in `_common.py`. `__init__.py` only
+  re-exports; keep `__all__` in sync when adding a packet type.
 - `persistence/` — `InflightStore` is a `Protocol`; `MemoryInflightStore` and `SqliteInflightStore`
   implement it. The engine hydrates packet ids and the offline queue from the store at construction,
   so durable restart works without extra API. `PagedInflightStore` is an opt-in extension
@@ -127,8 +130,11 @@ When touching this area, keep `_effect_enqueued`/`_effect_applied` balanced — 
   dedicated thread + loop. It is a strict consumer of the native API; the core must never import or
   accommodate it. Intentional divergences are documented in `docs/COMPAT.md` and enforced by
   `tests/unit/test_compat_confinement.py`.
-- `protocol/__init__.py` re-exports lazily through `__getattr__` to break the
-  `packets → protocol.validate → protocol → engine → packets` cycle. Do not add eager imports there.
+- `protocol/` — `effects.py` (the `EngineEffect` vocabulary), `config.py` (`EngineConfig` and the
+  allowlist of runtime-mutable fields), `engine.py` (the state machine). `__init__.py` re-exports
+  lazily through `__getattr__` so `import mqttium.protocol` does not drag in the engine, the codec
+  and the persistence layer; do not add eager imports there. `packets` must never import
+  `protocol` — that dependency is what the `codec/packet_validation.py` split removed.
 
 ## Conventions
 
