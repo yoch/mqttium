@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - fix/compat-qosn-coalesced-mid-queue
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: write
