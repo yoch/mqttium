@@ -65,7 +65,7 @@ async def test_transport_loss_fails_subscriptions_but_preserves_publish_receipt(
         await unsub
     assert client._sub_futs == {}
     assert client._unsub_futs == {}
-    assert list(client._receipts[13]) == [receipt]
+    assert client._receipts[13] is receipt
     assert not publish_event.is_set()
 
     if client._reconnect_task is not None:

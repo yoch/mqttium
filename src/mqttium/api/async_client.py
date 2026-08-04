@@ -15,10 +15,10 @@ import asyncio
 import ssl
 import time
 from collections import deque
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
+from contextlib import nullcontext
 from dataclasses import dataclass
 from itertools import islice
-from contextlib import nullcontext
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from typing import Any, Literal, Never
 
 from mqttium.api.models import (
@@ -36,12 +36,18 @@ from mqttium.errors import (
     MQTTError,
     MQTTTimeoutError,
     MalformedPacketError,
-    PublishBatchError,
     MessageDeliveryError,
+    PublishBatchError,
     PacketTooLargeError,
     ProtocolError,
 )
-from mqttium.packets import AuthPacket, ConnAckPacket, SubscribeOptions, encode_disconnect
+from mqttium.packets import (
+    AuthPacket,
+    ConnAckPacket,
+    PublishPacket,
+    SubscribeOptions,
+    encode_disconnect,
+)
 from mqttium.protocol.engine import (
     DisconnectInfo,
     EffectKind,
@@ -74,26 +80,6 @@ CallbackJob = tuple[Callable[..., Any], tuple[Any, ...], int | None]
 class _DeliveryReservation:
     logical_bytes: int
     references: int
-
-
-@dataclass(slots=True)
-class _EffectWaiter:
-    target: int
-    future: asyncio.Future[None]
-
-
-@dataclass(slots=True)
-class _PendingEffect:
-    effect: EngineEffect
-    epoch: int
-
-    @property
-    def kind(self) -> EffectKind:
-        return self.effect.kind
-
-    @property
-    def data(self) -> Any:
-        return self.effect.data
 
 
 class _StaleConnectionEffect(Exception):
@@ -210,17 +196,22 @@ class AsyncClient:
         self._lifecycle_lock = asyncio.Lock()
         self._engine_lock = asyncio.Lock()
         self._effect_flush_lock = asyncio.Lock()
-        self._pending_effects: deque[_PendingEffect] = deque()
+        self._pending_effects: deque[EngineEffect] = deque()
+        self._pending_effect_epoch: int | None = None
         self._connection_epoch = 0
         self._effect_enqueued = 0
         self._effect_applied = 0
-        self._effect_waiters: deque[_EffectWaiter] = deque()
+        self._effect_progress = asyncio.Event()
+        self._effect_waiters = 0
+        self._effect_error: BaseException | None = None
         self._callback_queue: asyncio.Queue[CallbackJob] = asyncio.Queue(
             maxsize=max_pending_callbacks
         )
         self._callback_worker_task: asyncio.Task[None] | None = None
         self._effect_flush_task: asyncio.Task[None] | None = None
         self._effect_flush_requested = False
+        self._effect_draining_inline = False
+        self._publish_waiters = 0
         self._delivery_timeout = delivery_timeout
         self._callback_shutdown_timeout = callback_shutdown_timeout
         self._outbound: asyncio.Queue[WriteItem] = asyncio.Queue()
@@ -229,10 +220,10 @@ class AsyncClient:
         self._max_outbound_messages = max_outbound_messages
         self._outbound_space = asyncio.Condition()
         self._outbound_waiters = 0
-        self._publish_space = asyncio.Condition()
+        self._publish_space = asyncio.Event()
         self._connack_fut: asyncio.Future[ConnAckPacket] | None = None
-        self._receipts: dict[int, deque[PublishReceipt]] = {}
-        self._batch_receipts: dict[int, deque[PublishBatchReceipt]] = {}
+        self._receipts: dict[int, PublishReceipt | deque[PublishReceipt]] = {}
+        self._batch_receipts: dict[int, PublishBatchReceipt | deque[PublishBatchReceipt]] = {}
         self._sub_futs: dict[int, asyncio.Future[SubscribeResult]] = {}
         self._unsub_futs: dict[int, asyncio.Future[UnsubscribeResult]] = {}
         self._messages: asyncio.Queue[Message] = asyncio.Queue(maxsize=self._max_pending_messages)
@@ -467,64 +458,57 @@ class AsyncClient:
         nowait: bool = False,
     ) -> PublishReceipt:
         data = payload.encode("utf-8") if isinstance(payload, str) else payload
-        receipt = await self._admit_publish(
-            topic,
-            data,
-            qos=qos,
-            retain=retain,
-            properties=properties,
-            nowait=nowait,
-        )
-        if nowait:
-            self._schedule_effect_flush()
-        else:
-            await self._drain_effects()
-        return receipt
-
-    async def _admit_publish(
-        self,
-        topic: str,
-        payload: bytes,
-        *,
-        qos: int | QoS,
-        retain: bool,
-        properties: Properties | None,
-        nowait: bool,
-    ) -> PublishReceipt:
         while True:
-            async with self._publish_space:
-                async with self._engine_lock:
-                    try:
-                        handle = self._engine.queue_publish(
-                            topic,
-                            payload,
-                            qos=qos,
-                            retain=retain,
-                            properties=properties,
+            wait_for_space = False
+            async with self._engine_lock:
+                try:
+                    if nowait:
+                        self._check_nowait_publish_capacity(
+                            topic, data, qos, retain, properties
                         )
-                    except FlowControlError:
-                        if (
-                            nowait
-                            or self._publish_backpressure == "error"
-                            or not self._engine.can_ever_admit_publish(
-                                topic, payload, qos, properties
-                            )
-                        ):
-                            raise
+                    handle = self._engine.queue_publish(
+                        topic,
+                        data,
+                        qos=qos,
+                        retain=retain,
+                        properties=properties,
+                    )
+                except FlowControlError:
+                    if (
+                        nowait
+                        or self._publish_backpressure == "error"
+                        or not self._engine.can_ever_admit_publish(
+                            topic, data, qos, properties
+                        )
+                    ):
+                        raise
+                    self._publish_space.clear()
+                    self._publish_waiters += 1
+                    wait_for_space = True
+                else:
+                    if handle.qos == QoS.AT_MOST_ONCE:
+                        receipt = PublishReceipt(mid=None, qos=handle.qos, _event=None)
                     else:
-                        if handle.qos == QoS.AT_MOST_ONCE:
-                            receipt = PublishReceipt(mid=None, qos=handle.qos, _event=None)
-                        else:
-                            assert handle.mid is not None
-                            receipt = PublishReceipt(
-                                mid=handle.mid,
-                                qos=handle.qos,
-                                _event=asyncio.Event(),
-                            )
-                            self._register_publish_receipt(handle.mid, receipt)
-                        self._collect_effects_locked()
-                        return receipt
+                        assert handle.mid is not None
+                        receipt = PublishReceipt(
+                            mid=handle.mid,
+                            qos=handle.qos,
+                            _event=asyncio.Event(),
+                        )
+                        self._register_publish_receipt(handle.mid, receipt)
+                    self._collect_effects_locked()
+                    self._drain_effects_inline()
+            if not wait_for_space:
+                if self._pending_effects:
+                    if nowait:
+                        self._schedule_effect_flush()
+                    else:
+                        await self._drain_effects()
+                return receipt
+            try:
                 await self._publish_space.wait()
+            finally:
+                self._publish_waiters -= 1
 
     async def _admit_publish_many(
         self,
@@ -534,25 +518,35 @@ class AsyncClient:
         nowait: bool,
     ) -> None:
         while True:
-            async with self._publish_space:
-                async with self._engine_lock:
-                    try:
-                        handles = self._engine.queue_publish_many(requests)
-                    except FlowControlError:
-                        if (
-                            nowait
-                            or self._publish_backpressure == "error"
-                            or not self._engine.can_ever_admit_publish_many(requests)
-                        ):
-                            raise
-                    else:
-                        for handle in handles:
-                            receipt._register(handle.mid)
-                            if handle.mid is not None:
-                                self._register_batch_receipt(handle.mid, receipt)
-                        self._collect_effects_locked()
-                        return
-                await self._publish_space.wait()
+            wait_for_space = False
+            async with self._engine_lock:
+                try:
+                    if nowait:
+                        self._check_nowait_publish_many_capacity(requests)
+                    handles = self._engine.queue_publish_many(requests)
+                except FlowControlError:
+                    if (
+                        nowait
+                        or self._publish_backpressure == "error"
+                        or not self._engine.can_ever_admit_publish_many(requests)
+                    ):
+                        raise
+                    self._publish_space.clear()
+                    self._publish_waiters += 1
+                    wait_for_space = True
+                else:
+                    for handle in handles:
+                        receipt._register(handle.mid)
+                        if handle.mid is not None:
+                            self._register_batch_receipt(handle.mid, receipt)
+                    self._collect_effects_locked()
+                    self._drain_effects_inline()
+                    return
+            if wait_for_space:
+                try:
+                    await self._publish_space.wait()
+                finally:
+                    self._publish_waiters -= 1
 
     async def publish_many(
         self,
@@ -753,7 +747,8 @@ class AsyncClient:
                     if not handled:
                         break
                     await self._drain_effects()
-                    await asyncio.sleep(0)
+                    if handled >= 256:
+                        await asyncio.sleep(0)
         except asyncio.CancelledError:
             raise
         except (PacketTooLargeError, MalformedPacketError, ProtocolError) as exc:
@@ -888,6 +883,99 @@ class AsyncClient:
             if self._transport is not None:
                 await self._transport.close()
 
+    def _can_enqueue_outbound_size(
+        self,
+        size: int,
+        *,
+        queued_messages: int | None = None,
+        queued_bytes: int | None = None,
+    ) -> bool:
+        messages = self._outbound.qsize() if queued_messages is None else queued_messages
+        bytes_used = self._outbound_bytes if queued_bytes is None else queued_bytes
+        if messages >= self._max_outbound_messages:
+            return False
+        return bytes_used + size <= self._max_outbound_bytes or (
+            messages == 0 and bytes_used == 0
+        )
+
+    def _preview_publish_write(
+        self,
+        topic: str,
+        payload: bytes,
+        qos: QoS | int,
+        retain: bool,
+        properties: Properties | None,
+    ) -> WriteItem:
+        level = QoS(qos)
+        return PublishPacket(
+            topic=topic,
+            payload=payload,
+            qos=level,
+            retain=retain,
+            dup=False,
+            mid=None if level == QoS.AT_MOST_ONCE else 1,
+            properties=properties,
+        ).encode_write_item(self._engine.config.protocol)
+
+    def _check_nowait_publish_capacity(
+        self,
+        topic: str,
+        payload: bytes,
+        qos: QoS | int,
+        retain: bool,
+        properties: Properties | None,
+    ) -> None:
+        level = QoS(qos)
+        will_send = self._engine.state == ConnectionState.CONNECTED and (
+            level == QoS.AT_MOST_ONCE or self._engine.flow.available > 0
+        )
+        if not will_send:
+            return
+        size = item_size(
+            self._preview_publish_write(topic, payload, level, retain, properties)
+        )
+        if not self._can_enqueue_outbound_size(size):
+            raise FlowControlError("Outbound backpressure limit reached")
+
+    def _check_nowait_publish_many_capacity(
+        self,
+        requests: list[tuple[str, bytes, QoS | int, bool, Properties | None]],
+    ) -> None:
+        if self._engine.state != ConnectionState.CONNECTED:
+            return
+        messages = self._outbound.qsize()
+        bytes_used = self._outbound_bytes
+        flow_available = self._engine.flow.available
+        for topic, payload, qos, retain, properties in requests:
+            level = QoS(qos)
+            if level != QoS.AT_MOST_ONCE:
+                if flow_available <= 0:
+                    continue
+                flow_available -= 1
+            size = item_size(
+                self._preview_publish_write(topic, payload, level, retain, properties)
+            )
+            if not self._can_enqueue_outbound_size(
+                size,
+                queued_messages=messages,
+                queued_bytes=bytes_used,
+            ):
+                raise FlowControlError("Outbound backpressure limit reached")
+            messages += 1
+            bytes_used += size
+
+    def _try_enqueue_outbound(self, item: WriteItem, *, epoch: int | None = None) -> bool:
+        if epoch is None:
+            epoch = self._connection_epoch
+        if epoch != self._connection_epoch:
+            raise _StaleConnectionEffect
+        size = item_size(item)
+        if not self._can_enqueue_outbound_size(size):
+            return False
+        self._outbound.put_nowait(item)
+        self._outbound_bytes += size
+        return True
+
     async def _enqueue_outbound(
         self,
         item: WriteItem,
@@ -897,21 +985,9 @@ class AsyncClient:
     ) -> None:
         if epoch is None:
             epoch = self._connection_epoch
-        if epoch != self._connection_epoch:
-            raise _StaleConnectionEffect
-        size = item_size(item)
-        # Fast path (no Condition): safe under asyncio's cooperative scheduling
-        # as long as we do not await between the capacity check and the update.
-        messages_full = self._outbound.qsize() >= self._max_outbound_messages
-        bytes_blocked = self._outbound_bytes + size > self._max_outbound_bytes and not (
-            self._outbound_bytes == 0 and self._outbound.empty()
-        )
-        if not messages_full and not bytes_blocked:
-            if epoch != self._connection_epoch:
-                raise _StaleConnectionEffect
-            self._outbound.put_nowait(item)
-            self._outbound_bytes += size
+        if self._try_enqueue_outbound(item, epoch=epoch):
             return
+        size = item_size(item)
         if nowait:
             raise FlowControlError("Outbound backpressure limit reached")
 
@@ -1027,14 +1103,103 @@ class AsyncClient:
         return self._engine.config.keepalive
 
     def _collect_effects_locked(self) -> None:
-        sends: list[EngineEffect] = []
-        events: list[EngineEffect] = []
-        for effect in self._engine.take_effects():
-            (sends if effect.kind is EffectKind.SEND else events).append(effect)
+        effects = self._engine.take_effects()
+        if not effects:
+            return
         epoch = self._connection_epoch
-        self._pending_effects.extend(_PendingEffect(effect, epoch) for effect in sends)
-        self._pending_effects.extend(_PendingEffect(effect, epoch) for effect in events)
-        self._effect_enqueued += len(sends) + len(events)
+
+        # Normal publish/PUBACK traffic produces exactly one immediately
+        # applicable effect. Do not account or queue that effect at all: the
+        # counters exist only to coordinate genuinely asynchronous slow paths.
+        if len(effects) == 1 and not self._pending_effects:
+            if self._apply_effect_inline(effects[0], epoch):
+                return
+
+        if len(effects) > 1:
+            effects = [
+                *(effect for effect in effects if effect.kind is EffectKind.SEND),
+                *(effect for effect in effects if effect.kind is not EffectKind.SEND),
+            ]
+        if not self._pending_effects:
+            self._pending_effect_epoch = epoch
+        self._pending_effects.extend(effects)
+        self._effect_enqueued += len(effects)
+
+    def _complete_effect(self) -> None:
+        self._effect_applied += 1
+        if self._effect_waiters:
+            self._effect_progress.set()
+
+    def _apply_effect_inline(self, effect: EngineEffect, epoch: int) -> bool:
+        if epoch != self._connection_epoch:
+            return True
+        kind = effect.kind
+        if kind is EffectKind.SEND:
+            return self._try_enqueue_outbound(effect.data, epoch=epoch)
+        if kind is EffectKind.CONNACK and self.on_connect is None:
+            connack: ConnAckPacket = effect.data
+            if self._connack_fut is not None and not self._connack_fut.done():
+                self._connack_fut.set_result(connack)
+            return True
+        if kind is EffectKind.PUBLISH_COMPLETE and self.on_publish is None:
+            mid: int = effect.data
+            receipt = self._pop_publish_receipt(mid)
+            if receipt is not None and receipt._event is not None:
+                receipt._event.set()
+            batch = self._pop_batch_receipt(mid)
+            if batch is not None:
+                batch._complete(mid)
+            self._notify_publish_space()
+            return True
+        if kind is EffectKind.PUBLISH_FAILED and self.on_publish is None:
+            failure: PublishFailure = effect.data
+            receipt = self._pop_publish_receipt(failure.mid)
+            if receipt is not None:
+                receipt._error = failure.reason
+                if receipt._event is not None:
+                    receipt._event.set()
+            batch = self._pop_batch_receipt(failure.mid)
+            if batch is not None:
+                batch._complete(failure.mid, failure.reason)
+            self._notify_publish_space()
+            return True
+        if kind is EffectKind.SUBACK:
+            sub_result = SubscribeResult.from_packet(effect.data)
+            sub_fut = self._sub_futs.pop(sub_result.mid, None)
+            if sub_fut is not None and not sub_fut.done():
+                sub_fut.set_result(sub_result)
+            return True
+        if kind is EffectKind.UNSUBACK:
+            unsub_result = UnsubscribeResult.from_packet(effect.data)
+            unsub_fut = self._unsub_futs.pop(unsub_result.mid, None)
+            if unsub_fut is not None and not unsub_fut.done():
+                unsub_fut.set_result(unsub_result)
+            return True
+        if kind is EffectKind.PINGRESP:
+            self._ping_pending = False
+            return True
+        return False
+
+    def _drain_effects_inline(self) -> None:
+        if self._effect_draining_inline or self._effect_flush_lock.locked():
+            return
+        epoch = self._pending_effect_epoch
+        if epoch is None:
+            return
+        self._effect_draining_inline = True
+        try:
+            while self._pending_effects:
+                effect = self._pending_effects[0]
+                if not self._apply_effect_inline(effect, epoch):
+                    break
+                self._pending_effects.popleft()
+                self._complete_effect()
+            if not self._pending_effects:
+                self._pending_effect_epoch = None
+        finally:
+            self._effect_draining_inline = False
+        if self._pending_effects:
+            self._schedule_effect_flush()
 
     def _schedule_effect_flush(self) -> None:
         # The flusher owns effect progress independently of producer task
@@ -1055,32 +1220,41 @@ class AsyncClient:
             while True:
                 self._effect_flush_requested = False
                 while self._pending_effects:
-                    pending = self._pending_effects[0]
-                    if pending.epoch != self._connection_epoch:
+                    effect = self._pending_effects[0]
+                    epoch = self._pending_effect_epoch
+                    if epoch is None:
+                        self._pending_effects.clear()
+                        break
+                    if epoch != self._connection_epoch:
                         self._pending_effects.popleft()
-                        self._effect_applied += 1
-                        self._resolve_effect_waiters()
+                        self._complete_effect()
                         continue
                     try:
                         await self._apply_effect(
-                            pending.effect,
+                            effect,
                             nowait=False,
-                            epoch=pending.epoch,
+                            epoch=epoch,
                         )
                     except asyncio.CancelledError:
                         raise
                     except _StaleConnectionEffect:
-                        self._pending_effects.popleft()
-                        self._effect_applied += 1
-                        self._resolve_effect_waiters()
+                        if self._pending_effects and self._pending_effects[0] is effect:
+                            self._pending_effects.popleft()
+                            self._complete_effect()
                     except BaseException as exc:
-                        self._pending_effects.popleft()
-                        self._effect_applied += 1
-                        self._fail_effect_waiters(exc)
+                        if self._pending_effects and self._pending_effects[0] is effect:
+                            self._pending_effects.popleft()
+                            self._complete_effect()
+                        self._effect_error = exc
+                        if self._effect_waiters:
+                            self._effect_progress.set()
+                        raise
                     else:
-                        self._pending_effects.popleft()
-                        self._effect_applied += 1
-                        self._resolve_effect_waiters()
+                        if self._pending_effects and self._pending_effects[0] is effect:
+                            self._pending_effects.popleft()
+                            self._complete_effect()
+                    if not self._pending_effects:
+                        self._pending_effect_epoch = None
                 if not self._effect_flush_requested:
                     return
 
@@ -1092,7 +1266,6 @@ class AsyncClient:
         except asyncio.CancelledError:
             return
         except Exception as exc:
-            self._fail_effect_waiters(exc)
             asyncio.get_running_loop().call_exception_handler(
                 {
                     "message": "mqttium scheduled effect flush failed",
@@ -1110,28 +1283,28 @@ class AsyncClient:
         await self._drain_effects()
 
     async def _drain_effects(self, *, nowait: bool = False) -> None:
+        self._drain_effects_inline()
         if nowait:
-            self._schedule_effect_flush()
+            if self._pending_effects:
+                self._schedule_effect_flush()
             return
         target = self._effect_enqueued
         if self._effect_applied >= target:
             return
-        future = asyncio.get_running_loop().create_future()
-        self._effect_waiters.append(_EffectWaiter(target=target, future=future))
-        self._schedule_effect_flush()
-        await asyncio.shield(future)
-
-    def _resolve_effect_waiters(self) -> None:
-        while self._effect_waiters and self._effect_waiters[0].target <= self._effect_applied:
-            waiter = self._effect_waiters.popleft()
-            if not waiter.future.done():
-                waiter.future.set_result(None)
-
-    def _fail_effect_waiters(self, exc: BaseException) -> None:
-        while self._effect_waiters:
-            waiter = self._effect_waiters.popleft()
-            if not waiter.future.done():
-                waiter.future.set_exception(exc)
+        self._effect_waiters += 1
+        try:
+            while self._effect_applied < target:
+                if self._effect_error is not None:
+                    error = self._effect_error
+                    self._effect_error = None
+                    raise error
+                self._effect_progress.clear()
+                self._schedule_effect_flush()
+                if self._effect_applied >= target:
+                    break
+                await asyncio.shield(self._effect_progress.wait())
+        finally:
+            self._effect_waiters -= 1
 
     async def _apply_effect(
         self,
@@ -1215,7 +1388,7 @@ class AsyncClient:
                 batch._complete(mid)
             if self.on_publish is not None:
                 await self._enqueue_callback(self.on_publish, mid, None)
-            await self._notify_publish_space()
+            self._notify_publish_space()
         elif kind is EffectKind.PUBLISH_FAILED:
             failure: PublishFailure = effect.data
             receipt = self._pop_publish_receipt(failure.mid)
@@ -1228,7 +1401,7 @@ class AsyncClient:
                 batch._complete(failure.mid, failure.reason)
             if self.on_publish is not None:
                 await self._enqueue_callback(self.on_publish, failure.mid, failure.reason)
-            await self._notify_publish_space()
+            self._notify_publish_space()
         elif kind is EffectKind.SUBACK:
             sub_result = SubscribeResult.from_packet(effect.data)
             sub_fut = self._sub_futs.pop(sub_result.mid, None)
@@ -1313,9 +1486,9 @@ class AsyncClient:
             property_bytes = len(encode_properties(message.properties, PUBLISH))
         return len(message.payload) + len(message.topic.encode("utf-8")) + property_bytes
 
-    async def _notify_publish_space(self) -> None:
-        async with self._publish_space:
-            self._publish_space.notify_all()
+    def _notify_publish_space(self) -> None:
+        if self._publish_waiters:
+            self._publish_space.set()
 
     async def _reset_message_stream(self) -> None:
         if not self._closed.is_set():
@@ -1465,30 +1638,52 @@ class AsyncClient:
         # producers are released because durable QoS work continues via replay.
         discarded = len(self._pending_effects)
         self._pending_effects.clear()
+        self._pending_effect_epoch = None
         self._effect_applied += discarded
-        self._resolve_effect_waiters()
+        if self._effect_waiters:
+            self._effect_progress.set()
 
     def _register_publish_receipt(self, mid: int, receipt: PublishReceipt) -> None:
-        self._receipts.setdefault(mid, deque()).append(receipt)
+        current = self._receipts.get(mid)
+        if current is None:
+            self._receipts[mid] = receipt
+        elif isinstance(current, deque):
+            current.append(receipt)
+        else:
+            self._receipts[mid] = deque((current, receipt))
 
     def _pop_publish_receipt(self, mid: int) -> PublishReceipt | None:
-        receipts = self._receipts.get(mid)
-        if not receipts:
+        current = self._receipts.get(mid)
+        if current is None:
             return None
-        receipt = receipts.popleft()
-        if not receipts:
+        if not isinstance(current, deque):
+            return self._receipts.pop(mid)
+        receipt = current.popleft()
+        if len(current) == 1:
+            self._receipts[mid] = current[0]
+        elif not current:
             self._receipts.pop(mid, None)
         return receipt
 
     def _register_batch_receipt(self, mid: int, receipt: PublishBatchReceipt) -> None:
-        self._batch_receipts.setdefault(mid, deque()).append(receipt)
+        current = self._batch_receipts.get(mid)
+        if current is None:
+            self._batch_receipts[mid] = receipt
+        elif isinstance(current, deque):
+            current.append(receipt)
+        else:
+            self._batch_receipts[mid] = deque((current, receipt))
 
     def _pop_batch_receipt(self, mid: int) -> PublishBatchReceipt | None:
-        receipts = self._batch_receipts.get(mid)
-        if not receipts:
+        current = self._batch_receipts.get(mid)
+        if current is None:
             return None
-        receipt = receipts.popleft()
-        if not receipts:
+        if not isinstance(current, deque):
+            return self._batch_receipts.pop(mid)
+        receipt = current.popleft()
+        if len(current) == 1:
+            self._batch_receipts[mid] = current[0]
+        elif not current:
             self._batch_receipts.pop(mid, None)
         return receipt
 
@@ -1503,13 +1698,18 @@ class AsyncClient:
         self._unsub_futs.clear()
 
     def _fail_pending(self, exc: BaseException) -> None:
-        for receipts in self._receipts.values():
+        for current in self._receipts.values():
+            receipts = current if isinstance(current, deque) else (current,)
             for receipt in receipts:
                 receipt._error = exc
                 if receipt._event is not None:
                     receipt._event.set()
         self._receipts.clear()
-        batches = {batch for receipts in self._batch_receipts.values() for batch in receipts}
+        batches = {
+            batch
+            for current in self._batch_receipts.values()
+            for batch in (current if isinstance(current, deque) else (current,))
+        }
         self._batch_receipts.clear()
         for batch in batches:
             batch._fail_remaining(exc)
@@ -1566,7 +1766,7 @@ class AsyncClient:
         self._decoder.clear()
         async with self._outbound_space:
             self._outbound_space.notify_all()
-        await self._notify_publish_space()
+        self._notify_publish_space()
         if self._reader_task is not current:
             self._reader_task = None
         if self._writer_task is not current:
@@ -1576,6 +1776,8 @@ class AsyncClient:
         if self._effect_flush_task is not current:
             self._effect_flush_task = None
             self._effect_flush_requested = False
+        self._effect_draining_inline = False
+        self._publish_waiters = 0
         if not preserve_reconnect and self._reconnect_task is not current:
             self._reconnect_task = None
         if self._transport is not None:
