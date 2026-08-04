@@ -3,6 +3,7 @@ name: Apply PR 18 audit fixes
 on:
   pull_request:
     types: [synchronize]
+    branches: [main]
 
 permissions:
   contents: write
@@ -13,7 +14,7 @@ concurrency:
 
 jobs:
   apply:
-    if: github.event.pull_request.head.ref == 'audit/design-hardening'
+    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
       - name: Check out the PR head
@@ -22,12 +23,9 @@ jobs:
           ref: audit/design-hardening
           fetch-depth: 0
 
-      - name: Apply the reviewed patches
+      - name: Apply exact reviewed replacements
         run: |
-          mapfile -t patches < <(find .github/pr18-audit-fixes -type f -name '*.patch' | sort)
-          test "${#patches[@]}" -eq 7
-          git apply --check "${patches[@]}"
-          git apply "${patches[@]}"
+          python .github/pr18-audit-fixes/apply.py
           rm -rf .github/pr18-audit-fixes
           rm .github/workflows/apply-pr18-audit-fixes.yml
           git diff --check
@@ -43,11 +41,11 @@ jobs:
 
       - name: Format and static checks
         run: |
-          ruff format src/mqttium/api/async_client.py src/mqttium/protocol/engine.py src/mqttium/compat/paho.py src/mqttium/persistence/__init__.py tests/unit/test_design_hardening_followups.py
+          ruff format src tests benchmarks
           ruff check src tests benchmarks
           mypy src/mqttium
 
-      - name: Targeted regression tests
+      - name: Regression tests
         run: |
           python -m pytest -q \
             tests/unit/test_design_hardening_followups.py \
