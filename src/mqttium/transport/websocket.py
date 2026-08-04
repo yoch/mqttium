@@ -117,10 +117,18 @@ class WebSocketTransport:
 
     async def close(self) -> None:
         self._closing = True
-        with suppress(Exception):
-            self._writer.write(_mask_client_frame(0x8, b""))
-            await self._writer.drain()
-        await _close_stream_writer(self._writer)
+        try:
+            with suppress(Exception):
+                self._writer.write(_mask_client_frame(0x8, b""))
+                await self._writer.drain()
+            await _close_stream_writer(self._writer)
+        finally:
+            # No buffered frame can be reused after the underlying stream is
+            # closed. Release connection-scoped storage immediately even when
+            # the transport object remains referenced by the client.
+            self._recv_buf.clear()
+            self._pending_control.clear()
+            self._fragment = None
 
     def is_closing(self) -> bool:
         return self._closing or self._writer.is_closing()
@@ -288,8 +296,16 @@ def _mask_client_frame(opcode: int, payload: bytes) -> bytes:
         header.append(0x80 | 127)
         header.extend(struct.pack("!Q", ln))
     header.extend(mask)
-    masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
-    return bytes(header) + masked
+
+    # Build the masked frame in one mutable allocation. The previous version
+    # first allocated a full masked payload and then copied it again while
+    # concatenating the header, doubling peak temporary payload storage.
+    payload_start = len(header)
+    frame = bytearray(payload_start + ln)
+    frame[:payload_start] = header
+    for index, value in enumerate(payload):
+        frame[payload_start + index] = value ^ mask[index & 3]
+    return bytes(frame)
 
 
 def _parse_frame(
