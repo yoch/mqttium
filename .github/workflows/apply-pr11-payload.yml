@@ -23,7 +23,7 @@ jobs:
         run: |
           set -euo pipefail
           cat .mqttium-upload/part-* | base64 --decode > /tmp/mqttium-pr11-final.tar.gz
-          echo '931a3e069bfd54bdd9efccb7b737104b2cac73415decb343f0654922fe230abe  /tmp/mqttium-pr11-final.tar.gz' | sha256sum --check
+          echo '04f5635693c2ed04825d067974e5162109264a435fbe451819c64c775bd1ad8d  /tmp/mqttium-pr11-final.tar.gz' | sha256sum --check
           git fetch origin main
           git reset --hard origin/main
           tar -xzf /tmp/mqttium-pr11-final.tar.gz
