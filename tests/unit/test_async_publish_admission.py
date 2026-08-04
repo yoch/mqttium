@@ -8,9 +8,11 @@ import pytest
 
 from mqttium.api import PublishMessage
 from mqttium.api.async_client import AsyncClient
-from mqttium.enums import ConnectionState
-from mqttium.errors import FlowControlError, PublishBatchError
+from mqttium.enums import ConnectionState, PacketType
+from mqttium.errors import FlowControlError, MQTTError, PublishBatchError
+from mqttium.packets import encode_frame
 from mqttium.protocol.engine import EffectKind, EngineEffect
+from mqttium.protocol.reconnect import ReconnectPolicy
 
 
 async def _complete(client: AsyncClient, mid: int) -> None:
@@ -152,3 +154,91 @@ async def test_nowait_batch_writer_rejection_is_atomic() -> None:
     assert not list(client._engine.store.out_items())
     assert not client._batch_receipts
     assert not client._pending_effects
+
+
+class _ClosingTransport:
+    """Answers CONNECT with a session-present CONNACK, then closes on demand."""
+
+    def __init__(self) -> None:
+        self._rx: asyncio.Queue[bytes] = asyncio.Queue()
+        self._closing = False
+
+    async def write(self, data: bytes) -> None:
+        if data and data[0] == PacketType.CONNECT:
+            # session_present=1 keeps queued QoS 1 messages replayable, so the
+            # admission budget stays occupied across the disconnect.
+            self._rx.put_nowait(encode_frame(PacketType.CONNACK, 0, b"\x01\x00"))
+
+    async def read(self, n: int = 65536) -> bytes:
+        return await self._rx.get()
+
+    async def close(self) -> None:
+        self.drop()
+
+    def is_closing(self) -> bool:
+        return self._closing
+
+    def drop(self) -> None:
+        self._closing = True
+        self._rx.put_nowait(b"")
+
+
+async def _connect(client: AsyncClient) -> _ClosingTransport:
+    transport = _ClosingTransport()
+
+    async def factory(host: str, port: int, *, ssl: object = None) -> _ClosingTransport:
+        return transport
+
+    client._transport_factory = factory  # type: ignore[assignment]
+    await client.connect("fake", 1883)
+    return transport
+
+
+async def test_parked_publish_fails_when_the_connection_is_gone_for_good() -> None:
+    """Admission capacity is only released by an ACK: without a connection to
+    deliver one, a parked publish() would wait forever."""
+    client = AsyncClient(
+        client_id="c",
+        clean_start=False,
+        max_pending_outbound_messages=1,
+        reconnect=ReconnectPolicy(enabled=False),
+    )
+    transport = await _connect(client)
+    await client.publish("admission/first", b"one", qos=1)
+
+    parked = asyncio.create_task(client.publish("admission/second", b"two", qos=1))
+    await asyncio.sleep(0)
+    assert not parked.done()
+    assert client._publish_waiters == 1
+
+    transport.drop()
+
+    with pytest.raises(MQTTError):
+        await asyncio.wait_for(parked, timeout=1.0)
+    assert client._publish_waiters == 0
+
+
+async def test_parked_publish_keeps_waiting_while_reconnect_is_pending() -> None:
+    client = AsyncClient(
+        client_id="c",
+        clean_start=False,
+        max_pending_outbound_messages=1,
+        reconnect=ReconnectPolicy(enabled=True, initial_delay=30.0),
+    )
+    transport = await _connect(client)
+    await client.publish("admission/first", b"one", qos=1)
+
+    parked = asyncio.create_task(client.publish("admission/second", b"two", qos=1))
+    await asyncio.sleep(0)
+    assert not parked.done()
+
+    transport.drop()
+    await asyncio.sleep(0.1)
+
+    assert not parked.done(), "a reconnecting client must keep the producer parked"
+
+    parked.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await parked
+    assert client._publish_waiters == 0
+    await client.disconnect()

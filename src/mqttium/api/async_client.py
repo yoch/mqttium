@@ -273,6 +273,9 @@ class AsyncClient:
         self._message_ready = asyncio.Event()
         self._closed = asyncio.Event()
         self._disconnect_exc: BaseException | None = None
+        # Set once a connection is torn down, cleared by the next connect. Read
+        # by _publish_wait_failure(); _closed is set too late in teardown to use.
+        self._teardown_final = False
         self._last_outbound = 0.0
         self._ping_pending = False
         self._ping_deadline = 0.0
@@ -427,6 +430,7 @@ class AsyncClient:
             self._transport = transport
             self._closed.clear()
             self._disconnect_exc = None
+            self._teardown_final = False
             self._last_disconnect = None
             self._decoder.clear()
             self._outbound = asyncio.Queue()
@@ -514,13 +518,16 @@ class AsyncClient:
                         retain=retain,
                         properties=properties,
                     )
-                except FlowControlError:
+                except FlowControlError as flow_exc:
                     if (
                         nowait
                         or self._publish_backpressure == "error"
                         or not self._engine.can_ever_admit_publish(topic, data, qos, properties)
                     ):
                         raise
+                    terminal = self._publish_wait_failure()
+                    if terminal is not None:
+                        raise terminal from flow_exc
                     self._publish_space.clear()
                     self._publish_waiters += 1
                     wait_for_space = True
@@ -563,13 +570,16 @@ class AsyncClient:
                     if nowait:
                         self._check_nowait_publish_many_capacity(requests)
                     handles = self._engine.queue_publish_many(requests)
-                except FlowControlError:
+                except FlowControlError as flow_exc:
                     if (
                         nowait
                         or self._publish_backpressure == "error"
                         or not self._engine.can_ever_admit_publish_many(requests)
                     ):
                         raise
+                    terminal = self._publish_wait_failure()
+                    if terminal is not None:
+                        raise terminal from flow_exc
                     self._publish_space.clear()
                     self._publish_waiters += 1
                     wait_for_space = True
@@ -1670,6 +1680,17 @@ class AsyncClient:
         if self._publish_waiters:
             self._publish_space.set()
 
+    def _publish_wait_failure(self) -> BaseException | None:
+        """Why a producer must not park on outbound admission capacity.
+
+        Admission capacity is only released by an ACK, so once the connection is
+        gone for good nothing can ever wake a parked ``publish()``. Reconnect in
+        progress is not terminal: the replayed session still settles the budget.
+        """
+        if not self._teardown_final or self._will_reconnect():
+            return None
+        return self._disconnect_exc or MQTTError("Connection closed")
+
     async def _reset_message_stream(self) -> None:
         if not self._closed.is_set():
             return
@@ -1910,6 +1931,10 @@ class AsyncClient:
         for batch in batches:
             batch._fail_remaining(exc)
         self._fail_non_replayable(exc)
+        # Producers parked on outbound admission hold no receipt, so the loops
+        # above cannot reach them. Wake them to re-check _publish_wait_failure().
+        self._teardown_final = True
+        self._notify_publish_space()
 
     async def _send_fatal_disconnect(self, exc: BaseException) -> None:
         """Best-effort normative DISCONNECT before a fatal close (MQTT 5).
@@ -1962,6 +1987,7 @@ class AsyncClient:
         self._decoder.clear()
         async with self._outbound_space:
             self._outbound_space.notify_all()
+        self._teardown_final = True
         self._notify_publish_space()
         if self._reader_task is not current:
             self._reader_task = None
@@ -1973,7 +1999,6 @@ class AsyncClient:
             self._effect_flush_task = None
             self._effect_flush_requested = False
         self._effect_draining_inline = False
-        self._publish_waiters = 0
         if not preserve_reconnect and self._reconnect_task is not current:
             self._reconnect_task = None
         if self._transport is not None:

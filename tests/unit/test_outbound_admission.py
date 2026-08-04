@@ -2,16 +2,26 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from mqttium.codec.buffer import IncrementalDecoder
 from mqttium.codec.properties import PUBLISH, encode_properties
 from mqttium.enums import MQTTProtocolVersion, OutboundQoSState, PacketType, QoS
-from mqttium.errors import FlowControlError
+from mqttium.errors import FlowControlError, MQTTError
 from mqttium.packets import PubAckPacket, PubCompPacket, PubRecPacket, encode_frame
 from mqttium.persistence.memory import MemoryInflightStore
+from mqttium.persistence.sqlite import SqliteInflightStore
 from mqttium.protocol.engine import EngineConfig, ProtocolEngine
 from mqttium.types import OutboundMessage, Properties
+
+
+def _make_store(kind: str, tmp_path: Path) -> MemoryInflightStore | SqliteInflightStore:
+    """SqliteInflightStore.batch() rolls back, MemoryInflightStore does not."""
+    if kind == "sqlite":
+        return SqliteInflightStore(tmp_path / "admission.db")
+    return MemoryInflightStore()
 
 
 def _feed_connack_ok(engine: ProtocolEngine) -> None:
@@ -158,12 +168,15 @@ def test_qos2_releases_encoded_publish_after_pubrec_but_keeps_budget() -> None:
     assert engine.pending_outbound_bytes == 0
 
 
-def test_publish_many_rollback_restores_admission_counters() -> None:
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+def test_publish_many_rollback_restores_admission_counters(store_kind: str, tmp_path: Path) -> None:
+    store = _make_store(store_kind, tmp_path)
     engine = ProtocolEngine(
         EngineConfig(
             max_pending_outbound_messages=2,
             max_pending_outbound_bytes=None,
-        )
+        ),
+        store=store,
     )
 
     with pytest.raises(FlowControlError):
@@ -179,6 +192,35 @@ def test_publish_many_rollback_restores_admission_counters() -> None:
     assert engine.pending_outbound_bytes == 0
     assert len(engine.packet_ids) == 0
     assert list(engine.store.out_items()) == []
+
+
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+def test_publish_many_rollback_after_validation_failure_frees_bytes(
+    store_kind: str, tmp_path: Path
+) -> None:
+    """A transactional store rolls its batch back before the engine's except
+    clause runs, so per-record sizes are gone; the byte budget must still clear.
+    """
+    store = _make_store(store_kind, tmp_path)
+    engine = ProtocolEngine(
+        EngineConfig(max_pending_outbound_bytes=4096),
+        store=store,
+    )
+
+    for _ in range(3):
+        with pytest.raises(MQTTError):
+            engine.queue_publish_many(
+                [
+                    ("admission/valid", b"payload", QoS.AT_LEAST_ONCE, False, None),
+                    ("admission/+/invalid", b"payload", QoS.AT_LEAST_ONCE, False, None),
+                ]
+            )
+        assert engine.pending_outbound_messages == 0
+        assert engine.pending_outbound_bytes == 0
+
+    # The budget must still admit a full-size publish after the failed batches.
+    handle = engine.queue_publish("admission/after", b"x" * 4000, qos=1)
+    assert handle.mid is not None
 
 
 def test_hydrated_records_are_counted_even_above_new_limits() -> None:

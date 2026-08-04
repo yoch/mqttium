@@ -453,6 +453,11 @@ class ProtocolEngine:
         effect_start = len(self._effects)
         queued_start = len(self._queued)
         inflight_start = self.flow.inflight
+        # A transactional store rolls its batch back before this frame's except
+        # clause runs, so the per-record sizes are unrecoverable by then. Restore
+        # the admission counters wholesale instead of releasing record by record.
+        pending_messages_start = self._pending_outbound_messages
+        pending_bytes_start = self._pending_outbound_bytes
         handles: list[PublishHandle] = []
         try:
             with self.store.batch():
@@ -475,8 +480,10 @@ class ProtocolEngine:
             for handle in handles:
                 if handle.mid is None:
                     continue
-                self._discard_outbound_store_record(handle.mid)
+                self._delete_outbound_store_record(handle.mid)
                 self.packet_ids.release(handle.mid)
+            self._pending_outbound_messages = pending_messages_start
+            self._pending_outbound_bytes = pending_bytes_start
             raise
         return handles
 
@@ -1205,6 +1212,10 @@ class ProtocolEngine:
         if stored is None:
             stored = self.store.get_out(mid)
         logical_size = self._stored_outbound_logical_size(stored) if stored is not None else 0
+        self._delete_outbound_store_record(mid)
+        self._release_outbound_reservation(logical_size)
+
+    def _delete_outbound_store_record(self, mid: int) -> None:
         try:
             self.store.delete_out(mid)
         except Exception:
@@ -1212,7 +1223,6 @@ class ProtocolEngine:
             # surfaced separately by the read/client boundary and must not leak
             # flow slots or packet identifiers in memory.
             pass
-        self._release_outbound_reservation(logical_size)
 
     def _complete_outbound_record(
         self,
