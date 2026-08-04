@@ -1,0 +1,95 @@
+name: ChatGPT Persistent Workbench
+
+on:
+  repository_dispatch:
+    types: [cgw-command]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+  actions: write
+
+concurrency:
+  group: cgw-${{ github.repository }}-${{ github.event.client_payload.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  workbench:
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+      - ${{ vars.CGW_RUNNER_LABEL || 'cgw' }}
+    timeout-minutes: 120
+    env:
+      CGW_ROOT: ${{ vars.CGW_ROOT || '/srv/chatgpt-workbench' }}
+      CGW_ALLOWED_IMAGES: ${{ vars.CGW_ALLOWED_IMAGES || 'python:3.12-bookworm,node:24-bookworm,ubuntu:24.04' }}
+      CGW_JOB_BRANCH: chatgpt-workbench-jobs
+      CGW_REPOSITORY: ${{ github.repository }}
+      CGW_PR_NUMBER: ${{ github.event.client_payload.pull_request.number }}
+      CGW_HEAD_REF: ${{ github.event.client_payload.pull_request.head.ref }}
+      CGW_HEAD_SHA: ${{ github.event.client_payload.pull_request.head.sha }}
+      CGW_HEAD_REPO: ${{ github.event.client_payload.pull_request.head.repo.full_name }}
+      CGW_JOB_ID: ${{ github.event.client_payload.slash_command.args.named.job }}
+      CGW_ISSUE_NUMBER: ${{ github.event.client_payload.github.payload.issue.number }}
+      CGW_COMMENT_ID: ${{ github.event.client_payload.github.payload.comment.id }}
+      CGW_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+    steps:
+      - name: Reject invalid dispatch
+        run: |
+          set -euo pipefail
+          test -n "$CGW_JOB_ID"
+          test "$CGW_HEAD_REPO" = "$CGW_REPOSITORY"
+          [[ "$CGW_JOB_ID" =~ ^[A-Za-z0-9._-]{1,80}$ ]]
+
+      - name: Check out trusted controller
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: control
+          persist-credentials: false
+
+      - name: Fetch, apply, and validate
+        id: execute
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python control/.github/chatgpt-workbench/processor.py execute
+
+      - name: Commit and push
+        id: push
+        if: steps.execute.outcome == 'success'
+        env:
+          CGW_PUSH_TOKEN: ${{ secrets.CGW_PUSH_TOKEN }}
+        run: |
+          set -euo pipefail
+          python control/.github/chatgpt-workbench/processor.py push
+
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: cgw-${{ env.CGW_JOB_ID }}-${{ github.run_id }}
+          path: ${{ env.CGW_ROOT }}/results/${{ github.repository }}/${{ env.CGW_JOB_ID }}
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Post result
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXECUTE_OUTCOME: ${{ steps.execute.outcome }}
+          PUSH_OUTCOME: ${{ steps.push.outcome }}
+        run: |
+          set -euo pipefail
+          python control/.github/chatgpt-workbench/processor.py comment
+
+      - name: Fail unsuccessful workbench run
+        if: always()
+        run: |
+          test "${{ steps.execute.outcome }}" = "success"
+          test "${{ steps.push.outcome }}" = "success"
