@@ -3,12 +3,6 @@ name: ChatGPT Workbench Dispatch
 on:
   issue_comment:
     types: [created]
-  pull_request_target:
-    types: [edited]
-  push:
-    branches: [main]
-    paths:
-      - .github/chatgpt-workbench/dispatch-requests/**
 
 permissions:
   contents: write
@@ -18,26 +12,18 @@ permissions:
 jobs:
   dispatch:
     if: >-
-      (github.event_name == 'issue_comment' &&
-       github.event.issue.pull_request &&
-       startsWith(github.event.comment.body, '/cgw ')) ||
-      (github.event_name == 'pull_request_target' &&
-       contains(github.event.pull_request.body, '<!-- cgw-bootstrap:')) ||
-      (github.event_name == 'push' &&
-       startsWith(github.event.head_commit.message, 'CGW dispatch '))
+      github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/cgw ')
     runs-on: ubuntu-24.04
     steps:
       - name: Validate and dispatch trusted slash command
         env:
           GH_TOKEN: ${{ github.token }}
-          CGW_EVENT_NAME: ${{ github.event_name }}
           CGW_REPOSITORY: ${{ github.repository }}
-          CGW_ISSUE_NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+          CGW_ISSUE_NUMBER: ${{ github.event.issue.number }}
           CGW_COMMENT_ID: ${{ github.event.comment.id }}
           CGW_COMMENT_BODY: ${{ github.event.comment.body }}
           CGW_COMMENTER: ${{ github.event.comment.user.login }}
-          CGW_PR_BODY: ${{ github.event.pull_request.body }}
-          CGW_PUSH_MESSAGE: ${{ github.event.head_commit.message }}
           CGW_REQUIRED_PERMISSION: ${{ vars.CGW_REQUIRED_PERMISSION || 'admin' }}
         run: |
           set -euo pipefail
@@ -50,9 +36,17 @@ jobs:
           import urllib.request
 
           token = os.environ["GH_TOKEN"]
-          event_name = os.environ["CGW_EVENT_NAME"]
           repository = os.environ["CGW_REPOSITORY"]
+          issue_number = int(os.environ["CGW_ISSUE_NUMBER"])
+          comment_id = int(os.environ["CGW_COMMENT_ID"])
+          commenter = os.environ["CGW_COMMENTER"]
           required = os.environ["CGW_REQUIRED_PERMISSION"].strip().lower()
+          body = os.environ["CGW_COMMENT_BODY"].strip()
+
+          match = re.fullmatch(r"/cgw\s+job=([A-Za-z0-9._-]{1,80})", body)
+          if not match:
+              raise SystemExit("Invalid /cgw command syntax")
+          job_id = match.group(1)
 
           def api(path, *, method="GET", payload=None):
               data = None if payload is None else json.dumps(payload).encode("utf-8")
@@ -78,57 +72,15 @@ jobs:
                       f"GitHub API {method} {path} failed: {exc.code} {detail}"
                   ) from exc
 
-          command_re = re.compile(r"/cgw\s+job=([A-Za-z0-9._-]{1,80})")
-
-          def find_command(issue_number, job_id):
-              expected_command = f"/cgw job={job_id}"
-              comments = api(
-                  f"/repos/{repository}/issues/{issue_number}/comments?per_page=100"
-              )
-              command_comment = next(
-                  (
-                      item
-                      for item in reversed(comments)
-                      if str(item.get("body", "")).strip() == expected_command
-                  ),
-                  None,
-              )
-              if command_comment is None:
-                  raise SystemExit("Matching /cgw command comment not found")
-              return int(command_comment["id"]), command_comment["user"]["login"]
-
-          if event_name == "issue_comment":
-              issue_number = int(os.environ["CGW_ISSUE_NUMBER"])
-              body = os.environ["CGW_COMMENT_BODY"].strip()
-              match = command_re.fullmatch(body)
-              if not match:
-                  raise SystemExit("Invalid /cgw command syntax")
-              job_id = match.group(1)
-              comment_id = int(os.environ["CGW_COMMENT_ID"])
-              commenter = os.environ["CGW_COMMENTER"]
-          elif event_name == "pull_request_target":
-              issue_number = int(os.environ["CGW_ISSUE_NUMBER"])
-              marker = re.search(
-                  r"<!--\s*cgw-bootstrap:([A-Za-z0-9._-]{1,80})\s*-->",
-                  os.environ.get("CGW_PR_BODY", ""),
-              )
-              if not marker:
-                  raise SystemExit("No workbench bootstrap marker")
-              job_id = marker.group(1)
-              comment_id, commenter = find_command(issue_number, job_id)
-          elif event_name == "push":
-              message = os.environ.get("CGW_PUSH_MESSAGE", "").splitlines()[0]
-              match = re.fullmatch(
-                  r"CGW dispatch pr=([0-9]+) job=([A-Za-z0-9._-]{1,80})",
-                  message,
-              )
-              if not match:
-                  raise SystemExit("Invalid CGW dispatch commit message")
-              issue_number = int(match.group(1))
-              job_id = match.group(2)
-              comment_id, commenter = find_command(issue_number, job_id)
-          else:
-              raise SystemExit(f"Unsupported event: {event_name}")
+          def try_reaction(content):
+              try:
+                  api(
+                      f"/repos/{repository}/issues/comments/{comment_id}/reactions",
+                      method="POST",
+                      payload={"content": content},
+                  )
+              except Exception as exc:
+                  print(f"Warning: cannot add {content!r} reaction: {exc}")
 
           levels = {
               "none": 0,
@@ -150,14 +102,6 @@ jobs:
               )
 
           pull_request = api(f"/repos/{repository}/pulls/{issue_number}")
-          compact_pr = {
-              "number": pull_request["number"],
-              "head": {
-                  "ref": pull_request["head"]["ref"],
-                  "sha": pull_request["head"]["sha"],
-                  "repo": {"full_name": pull_request["head"]["repo"]["full_name"]},
-              },
-          }
           client_payload = {
               "slash_command": {
                   "command": "cgw",
@@ -167,7 +111,16 @@ jobs:
                       "named": {"job": job_id},
                   },
               },
-              "pull_request": compact_pr,
+              "pull_request": {
+                  "number": pull_request["number"],
+                  "head": {
+                      "ref": pull_request["head"]["ref"],
+                      "sha": pull_request["head"]["sha"],
+                      "repo": {
+                          "full_name": pull_request["head"]["repo"]["full_name"]
+                      },
+                  },
+              },
               "github": {
                   "payload": {
                       "issue": {"number": issue_number},
@@ -177,19 +130,11 @@ jobs:
               },
           }
 
-          api(
-              f"/repos/{repository}/issues/comments/{comment_id}/reactions",
-              method="POST",
-              payload={"content": "eyes"},
-          )
+          try_reaction("eyes")
           api(
               f"/repos/{repository}/dispatches",
               method="POST",
               payload={"event_type": "cgw-command", "client_payload": client_payload},
           )
-          api(
-              f"/repos/{repository}/issues/comments/{comment_id}/reactions",
-              method="POST",
-              payload={"content": "rocket"},
-          )
+          try_reaction("rocket")
           PY
