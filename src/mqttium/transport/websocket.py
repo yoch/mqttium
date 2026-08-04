@@ -44,7 +44,7 @@ class WebSocketTransport:
         self._writer = writer
         self._recv_buf = bytearray()
         self._closing = False
-        self._pending_control: list[bytes] = []
+        self._pending_control: list[bytearray] = []
         self._max_frame_size = max_frame_size
         # Reassembled fragmented binary message (FIN=0 sequence).
         self._fragment: bytearray | None = None
@@ -282,7 +282,7 @@ async def _close_stream_writer(writer: asyncio.StreamWriter) -> None:
         await writer.wait_closed()
 
 
-def _mask_client_frame(opcode: int, payload: bytes) -> bytes:
+def _mask_client_frame(opcode: int, payload: bytes) -> bytearray:
     mask = os.urandom(4)
     header = bytearray()
     header.append(0x80 | (opcode & 0x0F))
@@ -297,15 +297,15 @@ def _mask_client_frame(opcode: int, payload: bytes) -> bytes:
         header.extend(struct.pack("!Q", ln))
     header.extend(mask)
 
-    # Build the masked frame in one mutable allocation. The previous version
-    # first allocated a full masked payload and then copied it again while
-    # concatenating the header, doubling peak temporary payload storage.
+    # Build and return the complete frame in one allocation. StreamWriter
+    # accepts writable buffer objects, and this frame is never mutated after it
+    # is handed off, so converting it to bytes would only add a full-size copy.
     payload_start = len(header)
     frame = bytearray(payload_start + ln)
     frame[:payload_start] = header
     for index, value in enumerate(payload):
         frame[payload_start + index] = value ^ mask[index & 3]
-    return bytes(frame)
+    return frame
 
 
 def _parse_frame(
