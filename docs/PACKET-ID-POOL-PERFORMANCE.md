@@ -36,7 +36,7 @@ The selected allocator tracks:
 
 - `_next`: the first identifier that has not crossed the allocation frontier;
 - `_free_one`: one scalar hole for the common ACK then immediate reuse path;
-- `_free`: an optional set created only when several holes coexist;
+- `_free_many`: an optional set created only when several holes coexist;
 - `_reserved`: an optional set for out-of-order persistent-session hydration.
 
 Sequential allocation and sequential hydration retain no object per live MID.
