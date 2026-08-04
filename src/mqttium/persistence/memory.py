@@ -68,6 +68,8 @@ class MemoryInflightStore:
         return iter(self._out.values())
 
     def clear_out(self) -> None:
+        old = self._out
+        old.clear()
         self._out = {}
 
     def put_in(self, msg: InboundMessage) -> None:
@@ -91,4 +93,6 @@ class MemoryInflightStore:
         return iter(self._in.values())
 
     def clear_in(self) -> None:
+        old = self._in
+        old.clear()
         self._in = {}
