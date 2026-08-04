@@ -28,6 +28,22 @@ def test_packet_id_pool_releases_peak_containers_when_idle() -> None:
     assert pool.allocate() == 1
 
 
+def test_packet_id_pool_clear_releases_peak_containers() -> None:
+    pool = PacketIdPool()
+    for _ in range(1_000):
+        pool.allocate()
+    original_used = pool._used
+    original_free = pool._free
+
+    pool.clear()
+
+    assert pool._used == set()
+    assert pool._free == []
+    assert pool._used is not original_used
+    assert pool._free is not original_free
+    assert pool.allocate() == 1
+
+
 def test_memory_store_releases_outbound_hash_capacity_when_empty() -> None:
     store = MemoryInflightStore()
     original = store._out
@@ -67,8 +83,9 @@ def test_memory_store_releases_inbound_hash_capacity_when_empty() -> None:
 @pytest.mark.parametrize("size", [0, 1, 125, 126, 65_535, 65_536])
 def test_websocket_masking_round_trips_payload(size: int) -> None:
     payload = bytes(index & 0xFF for index in range(size))
-    frame = bytearray(_mask_client_frame(0x2, payload))
+    frame = _mask_client_frame(0x2, payload)
 
+    assert isinstance(frame, bytearray)
     parsed = _parse_frame(frame, max(size, 1), expect_masked=True)
 
     assert parsed == (True, 0x2, payload)
@@ -77,10 +94,10 @@ def test_websocket_masking_round_trips_payload(size: int) -> None:
 
 class _FakeWriter:
     def __init__(self) -> None:
-        self.written: list[bytes] = []
+        self.written: list[bytes | bytearray] = []
         self.closed = False
 
-    def write(self, data: bytes) -> None:
+    def write(self, data: bytes | bytearray) -> None:
         self.written.append(data)
 
     async def drain(self) -> None:
@@ -100,7 +117,7 @@ async def test_websocket_close_releases_connection_buffers() -> None:
     writer = _FakeWriter()
     transport = WebSocketTransport(object(), writer)  # type: ignore[arg-type]
     transport._recv_buf.extend(b"buffered-frame")
-    transport._pending_control.append(b"control-frame")
+    transport._pending_control.append(bytearray(b"control-frame"))
     transport._fragment = bytearray(b"fragmented-message")
 
     await transport.close()
