@@ -72,6 +72,13 @@ jobs:
           exit 1
       - name: Comparable publisher benchmark
         run: python benchmarks/compare_libs.py --output /tmp/mqttium-bench/compare.json
+      - name: Compat QoS 1 submission handoff A/B
+        run: |
+          python benchmarks/compat_qosn_submit_ab.py \
+            --count 4000 \
+            --repeat 5 \
+            --workers 8 \
+            --output /tmp/mqttium-bench/compat-qosn-submit.json
       - name: Confirmed local TCP delivery
         run: python benchmarks/realworld.py --port 11883 --profile local --output /tmp/mqttium-bench/realworld-tcp.json
       - name: Confirmed TLS delivery

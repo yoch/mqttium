@@ -6,6 +6,13 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Changed
+
+- Coalesced Paho-compatible QoS 0/1/2 cross-thread publishing onto bounded
+  network-loop batches, with atomic queue-size refusal and cancellation-safe
+  MID handoff semantics.
+  Drains are capped at 256 requests or 1 MiB of logical topic-plus-payload bytes.
+
 ## [0.1.0a1] - 2026-08-03
 
 ### Added
