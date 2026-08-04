@@ -1,0 +1,24 @@
+name: Export workbench
+
+on:
+  push:
+    branches:
+      - agent/memory-perf-workbench
+    paths:
+      - .github/workflows/export-workbench.yml
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: Archive checkout
+        run: tar --exclude=.git -czf /tmp/mqttium-workbench.tar.gz .
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mqttium-memory-perf-workbench
+          path: /tmp/mqttium-workbench.tar.gz
+          retention-days: 1
