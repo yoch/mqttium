@@ -1,4 +1,4 @@
-name: Format final memory performance patch
+name: Fix final memory performance typing
 
 on:
   push:
@@ -11,7 +11,7 @@ permissions:
   contents: write
 
 jobs:
-  format:
+  type-fix:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
@@ -21,12 +21,31 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - name: Format and publish
+      - name: Apply, validate and publish
         run: |
-          python -m pip install "ruff==0.16.1"
-          ruff format src/mqttium/api/async_client.py src/mqttium/protocol/engine.py
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/mqttium/api/async_client.py")
+          content = path.read_text()
+          replacements = {
+              "        self._wakeup_next(self._getters)\n": "        self._wakeup_next(self._getters)  # type: ignore[attr-defined]\n",
+              "                    job = (self.on_message, (msg,), None)\n": "                    job: CallbackJob = (self.on_message, (msg,), None)\n",
+              "        if not isinstance(current, deque):\n            return self._receipts.pop(mid)\n": "        if not isinstance(current, deque):\n            self._receipts.pop(mid, None)\n            return current\n",
+              "        if not isinstance(current, deque):\n            return self._batch_receipts.pop(mid)\n": "        if not isinstance(current, deque):\n            self._batch_receipts.pop(mid, None)\n            return current\n",
+          }
+          for before, after in replacements.items():
+              if before not in content:
+                  raise RuntimeError(f"Expected block not found: {before!r}")
+              content = content.replace(before, after, 1)
+          path.write_text(content)
+          PY
+          python -m pip install -e ".[dev]"
+          ruff format src/mqttium/api/async_client.py
+          ruff check src/mqttium/api/async_client.py
+          mypy src/mqttium
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add src/mqttium/api/async_client.py src/mqttium/protocol/engine.py
-          git commit -m "Format final memory performance paths"
+          git add src/mqttium/api/async_client.py
+          git commit -m "Fix final memory performance typing"
           git push origin HEAD:agent/memory-profile-overhaul
