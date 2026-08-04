@@ -78,6 +78,20 @@ SCENARIOS = (
         notes="Unconsumed public iterator delivery queue at its configured capacity.",
     ),
     ScenarioSpec(
+        name="protocol_bounded_queue_4k",
+        runner="protocol_bounded_queue",
+        count=6_000,
+        payload_size=4_096,
+        notes="QoS 1 queue capped by an 8 MiB logical byte budget.",
+    ),
+    ScenarioSpec(
+        name="iterator_delivery_budget_4k",
+        runner="iterator_delivery_budget",
+        count=6_000,
+        payload_size=4_096,
+        notes="Iterator delivery paused by a shared 8 MiB logical byte budget.",
+    ),
+    ScenarioSpec(
         name="memory_store_4k",
         runner="memory_store",
         count=12_000,
@@ -207,7 +221,13 @@ def run_protocol_qos_queue(spec: ScenarioSpec) -> dict[str, Any]:
     snapshots = [probe.snapshot("baseline")]
     probe.reset_python_peak()
     started = time.perf_counter()
-    engine = ProtocolEngine(EngineConfig(max_queued=0))
+    engine = ProtocolEngine(
+        EngineConfig(
+            max_queued=0,
+            max_pending_outbound_messages=None,
+            max_pending_outbound_bytes=None,
+        )
+    )
     for index in range(spec.count):
         engine.queue_publish(
             _TOPIC,
@@ -227,6 +247,51 @@ def run_protocol_qos_queue(spec: ScenarioSpec) -> dict[str, Any]:
     engine.store.clear_out()
     engine.packet_ids.clear()
     engine.take_effects()
+    del engine
+    snapshots.append(probe.snapshot("released"))
+    trimmed = _malloc_trim()
+    snapshots.append(probe.snapshot("released_after_malloc_trim", malloc_trim=trimmed))
+    return _finalize(spec, started, snapshots)
+
+
+def run_protocol_bounded_queue(spec: ScenarioSpec) -> dict[str, Any]:
+    from mqttium.errors import FlowControlError
+
+    probe = MemoryProbe()
+    snapshots = [probe.snapshot("baseline")]
+    probe.reset_python_peak()
+    started = time.perf_counter()
+    logical_size = _logical_message_bytes(spec.payload_size)
+    byte_limit = max(logical_size, min(8 * _MIB, (spec.count // 2) * logical_size))
+    engine = ProtocolEngine(
+        EngineConfig(
+            max_pending_outbound_messages=None,
+            max_pending_outbound_bytes=byte_limit,
+        )
+    )
+    rejected = 0
+    for index in range(spec.count):
+        try:
+            engine.queue_publish(
+                _TOPIC,
+                _payload(index, spec.payload_size),
+                qos=QoS.AT_LEAST_ONCE,
+            )
+        except FlowControlError:
+            rejected += 1
+    snapshots.append(
+        probe.snapshot(
+            "loaded",
+            attempted_messages=spec.count,
+            accepted_messages=engine.pending_outbound_messages,
+            rejected_messages=rejected,
+            pending_logical_bytes=engine.pending_outbound_bytes,
+            configured_byte_limit=byte_limit,
+        )
+    )
+    engine._queued.clear()
+    engine.store.clear_out()
+    engine.packet_ids.clear()
     del engine
     snapshots.append(probe.snapshot("released"))
     trimmed = _malloc_trim()
@@ -267,6 +332,57 @@ async def _run_iterator_delivery_queue(spec: ScenarioSpec) -> dict[str, Any]:
 
 def run_iterator_delivery_queue(spec: ScenarioSpec) -> dict[str, Any]:
     return asyncio.run(_run_iterator_delivery_queue(spec))
+
+
+async def _run_iterator_delivery_budget(spec: ScenarioSpec) -> dict[str, Any]:
+    probe = MemoryProbe()
+    snapshots = [probe.snapshot("baseline")]
+    probe.reset_python_peak()
+    started = time.perf_counter()
+    logical_size = _logical_message_bytes(spec.payload_size)
+    maximum_capacity = max(1, spec.count - 1)
+    capacity = min(maximum_capacity, (8 * _MIB) // logical_size)
+    byte_limit = capacity * logical_size
+    client = AsyncClient(
+        message_delivery="iterator",
+        max_pending_messages=spec.count,
+        max_pending_delivery_bytes=byte_limit,
+        delivery_timeout=30.0,
+    )
+    for index in range(capacity):
+        await client._apply_effect(_message_effect(index, spec.payload_size), nowait=False)
+    blocked = asyncio.create_task(
+        client._apply_effect(_message_effect(capacity, spec.payload_size), nowait=False)
+    )
+    await asyncio.sleep(0)
+    snapshots.append(
+        probe.snapshot(
+            "loaded",
+            attempted_messages=capacity + 1,
+            accepted_messages=client._messages.qsize(),
+            blocked_message=not blocked.done(),
+            pending_logical_bytes=client.pending_delivery_bytes,
+            configured_byte_limit=byte_limit,
+        )
+    )
+    blocked.cancel()
+    try:
+        await blocked
+    except asyncio.CancelledError:
+        pass
+    while not client._messages.empty():
+        message = client._messages.get_nowait()
+        client._messages.task_done()
+        await client._release_delivery_reference(id(message))
+    del client
+    snapshots.append(probe.snapshot("released"))
+    trimmed = _malloc_trim()
+    snapshots.append(probe.snapshot("released_after_malloc_trim", malloc_trim=trimmed))
+    return _finalize(spec, started, snapshots)
+
+
+def run_iterator_delivery_budget(spec: ScenarioSpec) -> dict[str, Any]:
+    return asyncio.run(_run_iterator_delivery_budget(spec))
 
 
 def run_memory_store(spec: ScenarioSpec) -> dict[str, Any]:
@@ -336,7 +452,9 @@ def run_sqlite_hydration(spec: ScenarioSpec) -> dict[str, Any]:
 
 RUNNERS: dict[str, Callable[[ScenarioSpec], dict[str, Any]]] = {
     "protocol_qos_queue": run_protocol_qos_queue,
+    "protocol_bounded_queue": run_protocol_bounded_queue,
     "iterator_delivery_queue": run_iterator_delivery_queue,
+    "iterator_delivery_budget": run_iterator_delivery_budget,
     "memory_store": run_memory_store,
     "sqlite_hydration": run_sqlite_hydration,
 }

@@ -94,6 +94,17 @@ Fills the public iterator delivery queue with 6,000 unique 4 KiB messages and no
 consumer. It establishes the baseline for count-only inbound backpressure before
 a shared byte budget is introduced.
 
+### `protocol_bounded_queue_4k`
+
+Attempts 6,000 unique 4 KiB QoS 1 messages with no count limit and an 8 MiB
+logical byte limit. It verifies that admission rejects excess messages without
+retaining packet identifiers or store records.
+
+### `iterator_delivery_budget_4k`
+
+Fills an iterator delivery budget to approximately 8 MiB and verifies that the
+next message remains blocked until the consumer releases a reference.
+
 ### `memory_store_4k`
 
 Stores 12,000 unique 4 KiB outbound records in `MemoryInflightStore`, then clears
@@ -102,8 +113,9 @@ the store. It measures active retention and idle-container cleanup.
 ### `sqlite_hydration_4k`
 
 Creates 6,000 queued 4 KiB records without retaining a Python list, then opens a
-new store and constructs `ProtocolEngine`. It measures the current eager
-`fetchall()`/object hydration path.
+new store and constructs `ProtocolEngine`. It measures paged payload-free
+hydration and lazy payload materialization. Full payloads are loaded only when a
+protocol inflight slot becomes available.
 
 ## Running locally
 

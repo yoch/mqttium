@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import threading
 
+import pytest
+
 from mqttium.codec.buffer import IncrementalDecoder
 from mqttium.codec.primitives import pack_u16
 from mqttium.compat.paho import CallbackAPIVersion, Client
@@ -153,3 +155,37 @@ def test_off_loop_qos0_on_publish_keeps_handoff_path() -> None:
 
 async def _noop() -> None:
     return None
+
+
+def test_publish_returns_queue_size_rc_when_admission_is_full() -> None:
+    client = Client(
+        CallbackAPIVersion.VERSION2,
+        client_id="queue-full",
+        max_pending_outbound_messages=1,
+        max_pending_outbound_bytes=None,
+    )
+    client.loop_start()
+    try:
+        first = client.publish("queue/first", b"one", qos=1)
+        assert first.rc == 0
+        assert first.mid is not None
+
+        rejected = client.publish("queue/rejected", b"two", qos=1)
+        assert rejected.rc == 15
+        assert rejected.mid is None
+        with pytest.raises(ValueError, match="ERR_QUEUE_SIZE"):
+            rejected.wait_for_publish(timeout=0.01)
+        with pytest.raises(ValueError, match="ERR_QUEUE_SIZE"):
+            rejected.is_published()
+
+        assert client._async._engine.pending_outbound_messages == 1
+        assert len(client._async._engine.packet_ids) == 1
+        assert len(client._async._receipts) == 1
+    finally:
+        client.loop_stop()
+
+
+def test_paho_zero_queue_setting_maps_to_unlimited() -> None:
+    client = Client(CallbackAPIVersion.VERSION2, client_id="queue-unlimited")
+    client.max_queued_messages_set(0)
+    assert client._async._engine.config.max_pending_outbound_messages is None

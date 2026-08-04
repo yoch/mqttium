@@ -193,3 +193,47 @@ def test_batch_receipt_does_not_retain_completed_mid_history() -> None:
     assert receipt.pending_count == 0
     assert not hasattr(receipt, "mids")
     assert not hasattr(receipt, "_mids")
+
+
+def test_batch_receipt_bounds_failure_details_and_keeps_totals() -> None:
+    receipt = PublishBatchReceipt(max_failure_details=2)
+    failures = [RuntimeError("one"), ValueError("two"), RuntimeError("three")]
+    for mid in range(1, 4):
+        receipt._register(mid)
+    for mid, failure in enumerate(failures, start=1):
+        receipt._complete(mid, failure)
+    receipt._seal()
+
+    assert receipt.failure_count == 3
+    assert len(receipt.failures) == 2
+    assert receipt.failure_counts == {"RuntimeError": 2, "ValueError": 1}
+
+
+async def test_batch_receipt_failure_sink_receives_every_failure() -> None:
+    streamed: list[tuple[int, BaseException]] = []
+    receipt = PublishBatchReceipt(
+        max_failure_details=1,
+        failure_sink=lambda index, error: streamed.append((index, error)),
+    )
+    for mid in range(1, 4):
+        receipt._register(mid)
+        receipt._complete(mid, RuntimeError(str(mid)))
+    receipt._seal()
+
+    with pytest.raises(PublishBatchError) as raised:
+        await receipt.wait()
+
+    assert [index for index, _error in streamed] == [0, 1, 2]
+    assert raised.value.failure_count == 3
+    assert raised.value.failure_counts == {"RuntimeError": 3}
+    assert len(raised.value.failures) == 1
+
+
+def test_batch_receipt_can_disable_failure_detail_retention() -> None:
+    receipt = PublishBatchReceipt(max_failure_details=0)
+    receipt._register(1)
+    receipt._complete(1, RuntimeError("failure"))
+    receipt._seal()
+
+    assert receipt.failure_count == 1
+    assert receipt.failures == {}

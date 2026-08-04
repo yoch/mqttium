@@ -15,6 +15,7 @@ import asyncio
 import ssl
 import time
 from collections import deque
+from dataclasses import dataclass
 from itertools import islice
 from contextlib import nullcontext
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
@@ -28,6 +29,7 @@ from mqttium.api.models import (
     UnsubscribeResult,
 )
 from mqttium.codec.buffer import DEFAULT_MAX_PACKET_SIZE, IncrementalDecoder
+from mqttium.codec.properties import PUBLISH, encode_properties
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, QoS
 from mqttium.errors import (
     FlowControlError,
@@ -64,7 +66,38 @@ OnDisconnect = Callable[[BaseException | None], Any]
 OnPublish = Callable[[int | None, BaseException | None], Any]
 OnAuth = Callable[[AuthPacket], Any]
 MessageDelivery = Literal["auto", "iterator", "callback", "both"]
-CallbackJob = tuple[Callable[..., Any], tuple[Any, ...]]
+PublishBackpressure = Literal["wait", "error"]
+CallbackJob = tuple[Callable[..., Any], tuple[Any, ...], int | None]
+
+
+@dataclass(slots=True)
+class _DeliveryReservation:
+    logical_bytes: int
+    references: int
+
+
+@dataclass(slots=True)
+class _EffectWaiter:
+    target: int
+    future: asyncio.Future[None]
+
+
+@dataclass(slots=True)
+class _PendingEffect:
+    effect: EngineEffect
+    epoch: int
+
+    @property
+    def kind(self) -> EffectKind:
+        return self.effect.kind
+
+    @property
+    def data(self) -> Any:
+        return self.effect.data
+
+
+class _StaleConnectionEffect(Exception):
+    pass
 
 
 class AsyncClient:
@@ -79,6 +112,9 @@ class AsyncClient:
         password: bytes | str | None = None,
         local_receive_maximum: int = 100,
         max_outbound_inflight: int | None = None,
+        max_pending_outbound_messages: int | None = 10_000,
+        max_pending_outbound_bytes: int | None = 64 * 1024 * 1024,
+        publish_backpressure: PublishBackpressure = "wait",
         connect_properties: Properties | None = None,
         will: Message | None = None,
         will_properties: Properties | None = None,
@@ -91,6 +127,7 @@ class AsyncClient:
         max_outbound_messages: int = 10_000,
         max_pending_messages: int = 65_536,
         max_pending_callbacks: int = 1_024,
+        max_pending_delivery_bytes: int | None = 64 * 1024 * 1024,
         delivery_timeout: float = 1.0,
         callback_shutdown_timeout: float = 5.0,
         message_delivery: MessageDelivery = "auto",
@@ -100,10 +137,21 @@ class AsyncClient:
     ) -> None:
         if message_delivery not in ("auto", "iterator", "callback", "both"):
             raise ValueError("message_delivery must be 'auto', 'iterator', 'callback', or 'both'")
+        if publish_backpressure not in ("wait", "error"):
+            raise ValueError("publish_backpressure must be 'wait' or 'error'")
+        if (
+            max_pending_outbound_messages is not None
+            and max_pending_outbound_messages < 0
+        ):
+            raise ValueError("max_pending_outbound_messages must be non-negative or None")
+        if max_pending_outbound_bytes is not None and max_pending_outbound_bytes < 0:
+            raise ValueError("max_pending_outbound_bytes must be non-negative or None")
         if max_pending_messages <= 0:
             raise ValueError("max_pending_messages must be greater than 0")
         if max_pending_callbacks <= 0:
             raise ValueError("max_pending_callbacks must be greater than 0")
+        if max_pending_delivery_bytes is not None and max_pending_delivery_bytes < 0:
+            raise ValueError("max_pending_delivery_bytes must be non-negative or None")
         if delivery_timeout <= 0:
             raise ValueError("delivery_timeout must be greater than 0")
         if callback_shutdown_timeout <= 0:
@@ -123,7 +171,13 @@ class AsyncClient:
         if password is not None and not isinstance(password, (bytes, str)):
             raise ValueError("password must be bytes, str, or None")
         self._message_delivery = message_delivery
+        self._publish_backpressure = publish_backpressure
         self._max_pending_messages = max_pending_messages
+        self._max_pending_delivery_bytes = max_pending_delivery_bytes
+        self._pending_delivery_bytes = 0
+        self._pending_delivery_high_water_bytes = 0
+        self._delivery_reservations: dict[int, _DeliveryReservation] = {}
+        self._delivery_space = asyncio.Condition()
         effective_max_packet_size = (
             maximum_packet_size if maximum_packet_size is not None else DEFAULT_MAX_PACKET_SIZE
         )
@@ -138,6 +192,8 @@ class AsyncClient:
                 password=pwd,
                 local_receive_maximum=local_receive_maximum,
                 max_outbound_inflight=max_outbound_inflight,
+                max_pending_outbound_messages=max_pending_outbound_messages,
+                max_pending_outbound_bytes=max_pending_outbound_bytes,
                 connect_properties=connect_properties,
                 will=will,
                 will_properties=will_properties,
@@ -157,7 +213,11 @@ class AsyncClient:
         self._lifecycle_lock = asyncio.Lock()
         self._engine_lock = asyncio.Lock()
         self._effect_flush_lock = asyncio.Lock()
-        self._pending_effects: deque[EngineEffect] = deque()
+        self._pending_effects: deque[_PendingEffect] = deque()
+        self._connection_epoch = 0
+        self._effect_enqueued = 0
+        self._effect_applied = 0
+        self._effect_waiters: deque[_EffectWaiter] = deque()
         self._callback_queue: asyncio.Queue[CallbackJob] = asyncio.Queue(
             maxsize=max_pending_callbacks
         )
@@ -172,6 +232,7 @@ class AsyncClient:
         self._max_outbound_messages = max_outbound_messages
         self._outbound_space = asyncio.Condition()
         self._outbound_waiters = 0
+        self._publish_space = asyncio.Condition()
         self._connack_fut: asyncio.Future[ConnAckPacket] | None = None
         self._receipts: dict[int, PublishReceipt] = {}
         self._batch_receipts: dict[int, PublishBatchReceipt] = {}
@@ -229,7 +290,7 @@ class AsyncClient:
         timeout: float | None = None,
     ) -> ConnAckPacket:
         async with self._lifecycle_lock:
-            self._reset_message_stream()
+            await self._reset_message_stream()
             self._host = host
             self._port = port
             self._ssl = ssl
@@ -252,7 +313,7 @@ class AsyncClient:
     ) -> ConnAckPacket:
         """Connect over a Unix domain socket (AF_UNIX)."""
         async with self._lifecycle_lock:
-            self._reset_message_stream()
+            await self._reset_message_stream()
             self._unix_path = path
             self._ws_url = None
             self._ws_headers = None
@@ -284,7 +345,7 @@ class AsyncClient:
     ) -> ConnAckPacket:
         """Connect over MQTT-over-WebSocket (``ws://`` / ``wss://``)."""
         async with self._lifecycle_lock:
-            self._reset_message_stream()
+            await self._reset_message_stream()
             self._ws_url = url
             self._ws_headers = extra_headers
             self._unix_path = None
@@ -323,6 +384,7 @@ class AsyncClient:
         # Effects belong to a protocol/transport epoch. QoS replay and
         # inbound redelivery are rebuilt from the engine/store after
         # CONNACK; no old effect may cross into the new connection.
+        await self._invalidate_connection_epoch()
         self._discard_connection_effects()
         try:
             try:
@@ -408,27 +470,92 @@ class AsyncClient:
         nowait: bool = False,
     ) -> PublishReceipt:
         data = payload.encode("utf-8") if isinstance(payload, str) else payload
-        async with self._engine_lock:
-            handle = self._engine.queue_publish(
-                topic,
-                data,
-                qos=qos,
-                retain=retain,
-                properties=properties,
-            )
-            if handle.qos == QoS.AT_MOST_ONCE:
-                receipt = PublishReceipt(mid=None, qos=handle.qos, _event=None)
-            else:
-                assert handle.mid is not None
-                receipt = PublishReceipt(
-                    mid=handle.mid,
-                    qos=handle.qos,
-                    _event=asyncio.Event(),
-                )
-                self._receipts[handle.mid] = receipt
-            self._collect_effects_locked()
-        await self._drain_effects(nowait=nowait)
+        receipt = await self._admit_publish(
+            topic,
+            data,
+            qos=qos,
+            retain=retain,
+            properties=properties,
+            nowait=nowait,
+        )
+        if nowait:
+            self._schedule_effect_flush()
+        else:
+            await self._drain_effects()
         return receipt
+
+    async def _admit_publish(
+        self,
+        topic: str,
+        payload: bytes,
+        *,
+        qos: int | QoS,
+        retain: bool,
+        properties: Properties | None,
+        nowait: bool,
+    ) -> PublishReceipt:
+        while True:
+            async with self._publish_space:
+                async with self._engine_lock:
+                    try:
+                        handle = self._engine.queue_publish(
+                            topic,
+                            payload,
+                            qos=qos,
+                            retain=retain,
+                            properties=properties,
+                        )
+                    except FlowControlError:
+                        if (
+                            nowait
+                            or self._publish_backpressure == "error"
+                            or not self._engine.can_ever_admit_publish(
+                                topic, payload, qos, properties
+                            )
+                        ):
+                            raise
+                    else:
+                        if handle.qos == QoS.AT_MOST_ONCE:
+                            receipt = PublishReceipt(mid=None, qos=handle.qos, _event=None)
+                        else:
+                            assert handle.mid is not None
+                            receipt = PublishReceipt(
+                                mid=handle.mid,
+                                qos=handle.qos,
+                                _event=asyncio.Event(),
+                            )
+                            self._receipts[handle.mid] = receipt
+                        self._collect_effects_locked()
+                        return receipt
+                await self._publish_space.wait()
+
+    async def _admit_publish_many(
+        self,
+        requests: list[tuple[str, bytes, QoS | int, bool, Properties | None]],
+        receipt: PublishBatchReceipt,
+        *,
+        nowait: bool,
+    ) -> None:
+        while True:
+            async with self._publish_space:
+                async with self._engine_lock:
+                    try:
+                        handles = self._engine.queue_publish_many(requests)
+                    except FlowControlError:
+                        if (
+                            nowait
+                            or self._publish_backpressure == "error"
+                            or not self._engine.can_ever_admit_publish_many(requests)
+                        ):
+                            raise
+                    else:
+                        for handle in handles:
+                            receipt._register(handle.mid)
+                            if handle.mid is not None:
+                                self._batch_receipts[handle.mid] = receipt
+                        self._collect_effects_locked()
+                        return
+                await self._publish_space.wait()
 
     async def publish_many(
         self,
@@ -436,6 +563,8 @@ class AsyncClient:
         *,
         chunk_size: int = 256,
         nowait: bool = False,
+        max_failure_details: int | None = 128,
+        failure_sink: Callable[[int, BaseException], None] | None = None,
     ) -> PublishBatchReceipt:
         """Publish a batch with bounded memory and aggregate completion.
 
@@ -445,7 +574,10 @@ class AsyncClient:
         """
         if chunk_size <= 0:
             raise ValueError("chunk_size must be greater than 0")
-        receipt = PublishBatchReceipt()
+        receipt = PublishBatchReceipt(
+            max_failure_details=max_failure_details,
+            failure_sink=failure_sink,
+        )
         iterator = iter(messages)
         flow_limit = self._engine.flow.limit
         # Bound retained QoS state to one active protocol window plus one
@@ -480,19 +612,26 @@ class AsyncClient:
                         )
                     )
 
-                async with self._engine_lock:
-                    handles = self._engine.queue_publish_many(requests)
-                    for handle in handles:
-                        receipt._register(handle.mid)
-                        if handle.mid is not None:
-                            self._batch_receipts[handle.mid] = receipt
-                    self._collect_effects_locked()
-                await self._drain_effects(nowait=nowait)
+                await self._admit_publish_many(
+                    requests,
+                    receipt,
+                    nowait=nowait,
+                )
+                if nowait:
+                    self._schedule_effect_flush()
+                else:
+                    await self._drain_effects()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             receipt._seal()
-            raise PublishBatchError(cause=exc, receipt=receipt) from exc
+            raise PublishBatchError(
+                receipt.failures,
+                failure_count=receipt.failure_count,
+                failure_counts=dict(receipt.failure_counts),
+                cause=exc,
+                receipt=receipt,
+            ) from exc
 
         receipt._seal()
         return receipt
@@ -568,7 +707,10 @@ class AsyncClient:
         # source of truth and is drained before the stream terminates.
         while True:
             try:
-                yield self._messages.get_nowait()
+                message = self._messages.get_nowait()
+                self._messages.task_done()
+                await self._release_delivery_reference(id(message))
+                yield message
                 continue
             except asyncio.QueueEmpty:
                 if self._closed.is_set():
@@ -598,25 +740,23 @@ class AsyncClient:
                 if not data:
                     break
                 self._decoder.feed(data)
-                # Drain the whole buffer before waiting on the socket again —
-                # a fixed packet cap would strand frames when the peer pauses.
-                # One flush per read keeps SEND-before-MESSAGE ordering while
-                # avoiding N await points for N/100 batches.
-                handled = 0
-                async with self._engine_lock:
-                    # Commit protocol state before any generated ACK/replay
-                    # bytes are released to the writer.
-                    store_batch = getattr(self._engine.store, "batch", None)
-                    with store_batch() if store_batch is not None else nullcontext():
-                        while True:
-                            n = self._decoder.process_packets(self._engine.handle_raw, limit=256)
-                            if n == 0:
-                                break
-                            handled += n
-                    if handled:
-                        self._collect_effects_locked()
-                if handled:
+                # Process one bounded packet batch at a time. Applying its
+                # effects before decoding the next batch propagates delivery
+                # byte backpressure all the way to transport.read().
+                while True:
+                    async with self._engine_lock:
+                        store_batch = getattr(self._engine.store, "batch", None)
+                        with store_batch() if store_batch is not None else nullcontext():
+                            handled = self._decoder.process_packets(
+                                self._engine.handle_raw,
+                                limit=256,
+                            )
+                        if handled:
+                            self._collect_effects_locked()
+                    if not handled:
+                        break
                     await self._drain_effects()
+                    await asyncio.sleep(0)
         except asyncio.CancelledError:
             raise
         except (PacketTooLargeError, MalformedPacketError, ProtocolError) as exc:
@@ -631,6 +771,7 @@ class AsyncClient:
             if not self._will_reconnect():
                 self._fail_pending(exc)
         finally:
+            await self._invalidate_connection_epoch()
             async with self._engine_lock:
                 self._engine.notify_transport_closed()
                 self._collect_effects_locked()
@@ -750,7 +891,17 @@ class AsyncClient:
             if self._transport is not None:
                 await self._transport.close()
 
-    async def _enqueue_outbound(self, item: WriteItem, *, nowait: bool = False) -> None:
+    async def _enqueue_outbound(
+        self,
+        item: WriteItem,
+        *,
+        nowait: bool = False,
+        epoch: int | None = None,
+    ) -> None:
+        if epoch is None:
+            epoch = self._connection_epoch
+        if epoch != self._connection_epoch:
+            raise _StaleConnectionEffect
         size = item_size(item)
         # Fast path (no Condition): safe under asyncio's cooperative scheduling
         # as long as we do not await between the capacity check and the update.
@@ -759,6 +910,8 @@ class AsyncClient:
             self._outbound_bytes == 0 and self._outbound.empty()
         )
         if not messages_full and not bytes_blocked:
+            if epoch != self._connection_epoch:
+                raise _StaleConnectionEffect
             self._outbound.put_nowait(item)
             self._outbound_bytes += size
             return
@@ -767,6 +920,8 @@ class AsyncClient:
 
         async with self._outbound_space:
             while True:
+                if epoch != self._connection_epoch:
+                    raise _StaleConnectionEffect
                 messages_full = self._outbound.qsize() >= self._max_outbound_messages
                 # Allow a single oversized item into an empty queue (segmented
                 # payloads can exceed max_outbound_bytes by the MQTT header).
@@ -784,6 +939,8 @@ class AsyncClient:
                     await self._outbound_space.wait()
                 finally:
                     self._outbound_waiters -= 1
+            if epoch != self._connection_epoch:
+                raise _StaleConnectionEffect
             self._outbound.put_nowait(item)
             self._outbound_bytes += size
 
@@ -877,13 +1034,14 @@ class AsyncClient:
         events: list[EngineEffect] = []
         for effect in self._engine.take_effects():
             (sends if effect.kind is EffectKind.SEND else events).append(effect)
-        self._pending_effects.extend(sends)
-        self._pending_effects.extend(events)
+        epoch = self._connection_epoch
+        self._pending_effects.extend(_PendingEffect(effect, epoch) for effect in sends)
+        self._pending_effects.extend(_PendingEffect(effect, epoch) for effect in events)
+        self._effect_enqueued += len(sends) + len(events)
 
     def _schedule_effect_flush(self) -> None:
-        # A producer may request another flush while the current task is
-        # blocked on outbound backpressure. Record that wakeup rather than
-        # silently coalescing it away.
+        # The flusher owns effect progress independently of producer task
+        # cancellation. Multiple producers only signal the same worker.
         self._effect_flush_requested = True
         task = self._effect_flush_task
         if task is not None and not task.done():
@@ -896,11 +1054,38 @@ class AsyncClient:
         task.add_done_callback(self._effect_flush_done)
 
     async def _run_scheduled_effect_flush(self) -> None:
-        while True:
-            self._effect_flush_requested = False
-            await self._flush_effects()
-            if not self._effect_flush_requested:
-                return
+        async with self._effect_flush_lock:
+            while True:
+                self._effect_flush_requested = False
+                while self._pending_effects:
+                    pending = self._pending_effects[0]
+                    if pending.epoch != self._connection_epoch:
+                        self._pending_effects.popleft()
+                        self._effect_applied += 1
+                        self._resolve_effect_waiters()
+                        continue
+                    try:
+                        await self._apply_effect(
+                            pending.effect,
+                            nowait=False,
+                            epoch=pending.epoch,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except _StaleConnectionEffect:
+                        self._pending_effects.popleft()
+                        self._effect_applied += 1
+                        self._resolve_effect_waiters()
+                    except BaseException as exc:
+                        self._pending_effects.popleft()
+                        self._effect_applied += 1
+                        self._fail_effect_waiters(exc)
+                    else:
+                        self._pending_effects.popleft()
+                        self._effect_applied += 1
+                        self._resolve_effect_waiters()
+                if not self._effect_flush_requested:
+                    return
 
     def _effect_flush_done(self, task: asyncio.Task[None]) -> None:
         if self._effect_flush_task is task:
@@ -910,6 +1095,7 @@ class AsyncClient:
         except asyncio.CancelledError:
             return
         except Exception as exc:
+            self._fail_effect_waiters(exc)
             asyncio.get_running_loop().call_exception_handler(
                 {
                     "message": "mqttium scheduled effect flush failed",
@@ -921,33 +1107,45 @@ class AsyncClient:
     async def _flush_effects(self, *, nowait: bool = False) -> None:
         async with self._engine_lock:
             self._collect_effects_locked()
-        await self._drain_effects(nowait=nowait)
+        if nowait:
+            self._schedule_effect_flush()
+            return
+        await self._drain_effects()
 
     async def _drain_effects(self, *, nowait: bool = False) -> None:
-        async with self._effect_flush_lock:
-            while self._pending_effects:
-                effect = self._pending_effects[0]
-                try:
-                    await self._apply_effect(effect, nowait=nowait)
-                except asyncio.CancelledError:
-                    raise
-                except FlowControlError:
-                    raise
-                except Exception:
-                    self._pending_effects.popleft()
-                    raise
-                else:
-                    self._pending_effects.popleft()
+        if nowait:
+            self._schedule_effect_flush()
+            return
+        target = self._effect_enqueued
+        if self._effect_applied >= target:
+            return
+        future = asyncio.get_running_loop().create_future()
+        self._effect_waiters.append(_EffectWaiter(target=target, future=future))
+        self._schedule_effect_flush()
+        await asyncio.shield(future)
+
+    def _resolve_effect_waiters(self) -> None:
+        while self._effect_waiters and self._effect_waiters[0].target <= self._effect_applied:
+            waiter = self._effect_waiters.popleft()
+            if not waiter.future.done():
+                waiter.future.set_result(None)
+
+    def _fail_effect_waiters(self, exc: BaseException) -> None:
+        while self._effect_waiters:
+            waiter = self._effect_waiters.popleft()
+            if not waiter.future.done():
+                waiter.future.set_exception(exc)
 
     async def _apply_effect(
         self,
         effect: EngineEffect,
         *,
         nowait: bool,
+        epoch: int | None = None,
     ) -> None:
         kind = effect.kind
         if kind is EffectKind.SEND:
-            await self._enqueue_outbound(effect.data, nowait=nowait)
+            await self._enqueue_outbound(effect.data, nowait=nowait, epoch=epoch)
         elif kind is EffectKind.CONNACK:
             connack: ConnAckPacket = effect.data
             if self._connack_fut is not None and not self._connack_fut.done():
@@ -960,6 +1158,7 @@ class AsyncClient:
                 await self._enqueue_outbound(
                     encode_disconnect(0x8C, self._engine.config.protocol),
                     nowait=nowait,
+                    epoch=epoch,
                 )
                 return
             response = await asyncio.wait_for(
@@ -982,11 +1181,30 @@ class AsyncClient:
             iterator_delivery = self._message_delivery in ("iterator", "both") or (
                 self._message_delivery == "auto" and self.on_message is None
             )
-            if iterator_delivery:
-                await self._put_message(msg)
-            if callback_delivery:
-                assert self.on_message is not None
-                await self._enqueue_callback(self.on_message, msg)
+            references = int(iterator_delivery) + int(callback_delivery)
+            delivery_key: int | None = None
+            iterator_enqueued = False
+            callback_enqueued = False
+            if references:
+                delivery_key = await self._reserve_delivery(msg, references)
+            try:
+                if iterator_delivery:
+                    await self._put_message(msg)
+                    iterator_enqueued = True
+                if callback_delivery:
+                    assert self.on_message is not None
+                    await self._enqueue_callback(
+                        self.on_message,
+                        msg,
+                        delivery_key=delivery_key,
+                    )
+                    callback_enqueued = True
+            except BaseException:
+                if delivery_key is not None:
+                    unqueued = references - int(iterator_enqueued) - int(callback_enqueued)
+                    for _ in range(unqueued):
+                        await self._release_delivery_reference(delivery_key)
+                raise
             if msg.mid is not None:
                 async with self._engine_lock:
                     self._engine.mark_inbound_delivered(msg.mid)
@@ -1000,6 +1218,7 @@ class AsyncClient:
                 batch._complete(mid)
             if self.on_publish is not None:
                 await self._enqueue_callback(self.on_publish, mid, None)
+            await self._notify_publish_space()
         elif kind is EffectKind.PUBLISH_FAILED:
             failure: PublishFailure = effect.data
             receipt = self._receipts.pop(failure.mid, None)
@@ -1012,6 +1231,7 @@ class AsyncClient:
                 batch._complete(failure.mid, failure.reason)
             if self.on_publish is not None:
                 await self._enqueue_callback(self.on_publish, failure.mid, failure.reason)
+            await self._notify_publish_space()
         elif kind is EffectKind.SUBACK:
             sub_result = SubscribeResult.from_packet(effect.data)
             sub_fut = self._sub_futs.pop(sub_result.mid, None)
@@ -1039,11 +1259,81 @@ class AsyncClient:
             never: Never = kind
             raise MQTTError(f"Unhandled effect {never!r}")
 
-    def _reset_message_stream(self) -> None:
-        if self._closed.is_set():
-            self._messages = asyncio.Queue(maxsize=self._max_pending_messages)
-            self._message_ready = asyncio.Event()
-            self._closed.clear()
+    @property
+    def pending_delivery_bytes(self) -> int:
+        return self._pending_delivery_bytes
+
+    @property
+    def pending_delivery_high_water_bytes(self) -> int:
+        return self._pending_delivery_high_water_bytes
+
+    async def _reserve_delivery(self, message: Message, references: int) -> int:
+        logical_bytes = self._delivery_logical_size(message)
+        limit = self._max_pending_delivery_bytes
+        if limit is not None and logical_bytes > limit:
+            raise MessageDeliveryError(
+                f"Message requires {logical_bytes} delivery bytes, exceeding limit {limit}"
+            )
+        async with self._delivery_space:
+            while limit is not None and self._pending_delivery_bytes + logical_bytes > limit:
+                await self._delivery_space.wait()
+            key = id(message)
+            if key in self._delivery_reservations:
+                raise MQTTError("Duplicate delivery reservation for one Message object")
+            self._delivery_reservations[key] = _DeliveryReservation(
+                logical_bytes=logical_bytes,
+                references=references,
+            )
+            self._pending_delivery_bytes += logical_bytes
+            self._pending_delivery_high_water_bytes = max(
+                self._pending_delivery_high_water_bytes,
+                self._pending_delivery_bytes,
+            )
+            return key
+
+    async def _release_delivery_reference(self, key: int) -> None:
+        async with self._delivery_space:
+            reservation = self._delivery_reservations.get(key)
+            if reservation is None:
+                return
+            reservation.references -= 1
+            if reservation.references > 0:
+                return
+            self._delivery_reservations.pop(key, None)
+            self._pending_delivery_bytes = max(
+                0,
+                self._pending_delivery_bytes - reservation.logical_bytes,
+            )
+            self._delivery_space.notify_all()
+
+    def _delivery_logical_size(self, message: Message) -> int:
+        property_bytes = 0
+        if (
+            self._engine.config.protocol == MQTTProtocolVersion.MQTTv5
+            and message.properties is not None
+            and message.properties.values
+        ):
+            property_bytes = len(encode_properties(message.properties, PUBLISH))
+        return len(message.payload) + len(message.topic.encode("utf-8")) + property_bytes
+
+    async def _notify_publish_space(self) -> None:
+        async with self._publish_space:
+            self._publish_space.notify_all()
+
+    async def _reset_message_stream(self) -> None:
+        if not self._closed.is_set():
+            return
+        while True:
+            try:
+                message = self._messages.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            else:
+                self._messages.task_done()
+                await self._release_delivery_reference(id(message))
+        self._messages = asyncio.Queue(maxsize=self._max_pending_messages)
+        self._message_ready = asyncio.Event()
+        self._closed.clear()
 
     async def _put_message(self, message: Message) -> None:
         try:
@@ -1070,13 +1360,18 @@ class AsyncClient:
         """Compatibility entry point for loop-thread callback producers."""
         self._ensure_callback_worker()
         try:
-            self._callback_queue.put_nowait((callback, args))
+            self._callback_queue.put_nowait((callback, args, None))
         except asyncio.QueueFull as exc:
             raise MessageDeliveryError("Callback delivery queue is full") from exc
 
-    async def _enqueue_callback(self, callback: Callable[..., Any], *args: Any) -> None:
+    async def _enqueue_callback(
+        self,
+        callback: Callable[..., Any],
+        *args: Any,
+        delivery_key: int | None = None,
+    ) -> None:
         self._ensure_callback_worker()
-        job = (callback, args)
+        job = (callback, args, delivery_key)
         try:
             self._callback_queue.put_nowait(job)
         except asyncio.QueueFull:
@@ -1093,7 +1388,7 @@ class AsyncClient:
     async def _callback_worker(self) -> None:
         try:
             while True:
-                callback, args = await self._callback_queue.get()
+                callback, args, delivery_key = await self._callback_queue.get()
                 try:
                     await self._invoke(callback, *args)
                 except asyncio.CancelledError:
@@ -1101,6 +1396,8 @@ class AsyncClient:
                 except Exception as exc:
                     self._report_callback_error(callback, exc)
                 finally:
+                    if delivery_key is not None:
+                        await self._release_delivery_reference(delivery_key)
                     self._callback_queue.task_done()
         except asyncio.CancelledError:
             raise
@@ -1139,19 +1436,40 @@ class AsyncClient:
         self._callback_worker_task = None
         while True:
             try:
-                self._callback_queue.get_nowait()
+                _callback, _args, delivery_key = self._callback_queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
             else:
+                if delivery_key is not None:
+                    await self._release_delivery_reference(delivery_key)
                 self._callback_queue.task_done()
+
+    async def _invalidate_connection_epoch(self) -> None:
+        self._connection_epoch += 1
+        async with self._outbound_space:
+            self._outbound_space.notify_all()
+
+    def _discard_outbound_queue(self) -> None:
+        while True:
+            try:
+                self._outbound.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            else:
+                self._outbound.task_done()
+        self._outbound_bytes = 0
 
     def _discard_connection_effects(self) -> None:
         # Every pending effect was derived from the old protocol/transport
         # epoch. Session replay, failures and inbound redelivery are rebuilt
         # from the engine/store after the next CONNACK; retaining an old
         # MESSAGE or completion effect can duplicate delivery just as surely
-        # as retaining old wire bytes can duplicate a publish.
+        # as retaining old wire bytes can duplicate a publish. Committed
+        # producers are released because durable QoS work continues via replay.
+        discarded = len(self._pending_effects)
         self._pending_effects.clear()
+        self._effect_applied += discarded
+        self._resolve_effect_waiters()
 
     def _fail_non_replayable(self, exc: BaseException) -> None:
         for sub_fut in self._sub_futs.values():
@@ -1204,6 +1522,7 @@ class AsyncClient:
         return result
 
     async def _force_close(self, *, preserve_reconnect: bool = False) -> None:
+        await self._invalidate_connection_epoch()
         current = asyncio.current_task()
         tasks = [
             self._reader_task,
@@ -1221,8 +1540,11 @@ class AsyncClient:
                 except (asyncio.CancelledError, Exception):
                     pass
         self._discard_connection_effects()
+        self._discard_outbound_queue()
+        self._decoder.clear()
         async with self._outbound_space:
             self._outbound_space.notify_all()
+        await self._notify_publish_space()
         if self._reader_task is not current:
             self._reader_task = None
         if self._writer_task is not current:

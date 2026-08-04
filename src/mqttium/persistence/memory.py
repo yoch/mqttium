@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from itertools import islice
 from contextlib import AbstractContextManager, nullcontext
 from typing import Protocol
 
-from mqttium.types import InboundMessage, OutboundMessage
+from mqttium.types import InboundMessage, OutboundMessage, OutboundMessageSummary
 
 
 class InflightStore(Protocol):
@@ -17,6 +18,10 @@ class InflightStore(Protocol):
     def delete_out(self, mid: int) -> bool: ...
     def update_out(self, msg: OutboundMessage) -> None: ...
     def out_items(self) -> Iterator[OutboundMessage]: ...
+    def out_pages(self, page_size: int = 256) -> Iterator[tuple[OutboundMessage, ...]]: ...
+    def out_summary_pages(
+        self, page_size: int = 256
+    ) -> Iterator[tuple[OutboundMessageSummary, ...]]: ...
     def clear_out(self) -> None: ...
 
     def put_in(self, msg: InboundMessage) -> None: ...
@@ -24,6 +29,7 @@ class InflightStore(Protocol):
     def pop_in(self, mid: int) -> InboundMessage | None: ...
     def update_in(self, msg: InboundMessage) -> None: ...
     def in_items(self) -> Iterator[InboundMessage]: ...
+    def in_pages(self, page_size: int = 256) -> Iterator[tuple[InboundMessage, ...]]: ...
     def clear_in(self) -> None: ...
 
 
@@ -67,6 +73,21 @@ class MemoryInflightStore:
     def out_items(self) -> Iterator[OutboundMessage]:
         return iter(self._out.values())
 
+    def out_pages(self, page_size: int = 256) -> Iterator[tuple[OutboundMessage, ...]]:
+        if page_size <= 0:
+            raise ValueError("page_size must be positive")
+        mids = iter(tuple(self._out))
+        while page := tuple(islice(mids, page_size)):
+            messages = tuple(self._out[mid] for mid in page if mid in self._out)
+            if messages:
+                yield messages
+
+    def out_summary_pages(
+        self, page_size: int = 256
+    ) -> Iterator[tuple[OutboundMessageSummary, ...]]:
+        for page in self.out_pages(page_size):
+            yield tuple(OutboundMessageSummary.from_message(message) for message in page)
+
     def clear_out(self) -> None:
         old = self._out
         old.clear()
@@ -91,6 +112,15 @@ class MemoryInflightStore:
 
     def in_items(self) -> Iterator[InboundMessage]:
         return iter(self._in.values())
+
+    def in_pages(self, page_size: int = 256) -> Iterator[tuple[InboundMessage, ...]]:
+        if page_size <= 0:
+            raise ValueError("page_size must be positive")
+        mids = iter(tuple(self._in))
+        while page := tuple(islice(mids, page_size)):
+            messages = tuple(self._in[mid] for mid in page if mid in self._in)
+            if messages:
+                yield messages
 
     def clear_in(self) -> None:
         old = self._in

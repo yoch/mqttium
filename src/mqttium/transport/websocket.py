@@ -28,6 +28,7 @@ class WebSocketTransport:
         "_closing",
         "_pending_control",
         "_max_frame_size",
+        "_max_write_batch_bytes",
         "_fragment",
     )
 
@@ -37,15 +38,19 @@ class WebSocketTransport:
         writer: asyncio.StreamWriter,
         *,
         max_frame_size: int = 16 * 1024 * 1024,
+        max_write_batch_bytes: int = 1 * 1024 * 1024,
     ) -> None:
         if max_frame_size <= 0:
             raise ValueError("max_frame_size must be positive")
+        if max_write_batch_bytes <= 0:
+            raise ValueError("max_write_batch_bytes must be positive")
         self._reader = reader
         self._writer = writer
         self._recv_buf = bytearray()
         self._closing = False
         self._pending_control: list[bytes] = []
         self._max_frame_size = max_frame_size
+        self._max_write_batch_bytes = max_write_batch_bytes
         # Reassembled fragmented binary message (FIN=0 sequence).
         self._fragment: bytearray | None = None
 
@@ -58,6 +63,7 @@ class WebSocketTransport:
         extra_headers: dict[str, str] | None = None,
         timeout: float = 30.0,
         max_frame_size: int = 16 * 1024 * 1024,
+        max_write_batch_bytes: int = 1 * 1024 * 1024,
     ) -> WebSocketTransport:
         host, port, path, use_ssl = _parse_websocket_endpoint(url, ssl)
         key = base64.b64encode(os.urandom(16)).decode("ascii")
@@ -74,7 +80,12 @@ class WebSocketTransport:
         except BaseException:
             await _close_stream_writer(writer)
             raise
-        transport = cls(reader, writer, max_frame_size=max_frame_size)
+        transport = cls(
+            reader,
+            writer,
+            max_frame_size=max_frame_size,
+            max_write_batch_bytes=max_write_batch_bytes,
+        )
         transport._recv_buf.extend(leftover)
         return transport
 
@@ -89,9 +100,27 @@ class WebSocketTransport:
         if not parts:
             return
         await self._flush_control()
-        # One binary frame per MQTT chunk keeps framing simple and correct.
-        frames = [_mask_client_frame(0x2, p) for p in parts]
+        # Bound temporary masked-frame retention by bytes, not only by the
+        # writer's item count. One oversized MQTT item is emitted alone.
+        frames: list[bytes] = []
+        batch_bytes = 0
+        for part in parts:
+            frame = _mask_client_frame(0x2, part)
+            frame_size = len(frame)
+            if frames and batch_bytes + frame_size > self._max_write_batch_bytes:
+                await self._write_frame_batch(frames)
+                batch_bytes = 0
+            frames.append(frame)
+            batch_bytes += frame_size
+            if batch_bytes >= self._max_write_batch_bytes:
+                await self._write_frame_batch(frames)
+                batch_bytes = 0
+        if frames:
+            await self._write_frame_batch(frames)
+
+    async def _write_frame_batch(self, frames: list[bytes]) -> None:
         self._writer.writelines(frames)
+        frames.clear()
         if write_buffer_needs_drain(self._writer):
             await self._writer.drain()
 

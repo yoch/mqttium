@@ -46,14 +46,18 @@ class PublishBatchError(MQTTError):
         self,
         failures: dict[int, BaseException] | None = None,
         *,
+        failure_count: int | None = None,
+        failure_counts: dict[str, int] | None = None,
         cause: BaseException | None = None,
         receipt: object | None = None,
     ) -> None:
         self.failures = dict(failures or {})
+        self.failure_count = len(self.failures) if failure_count is None else failure_count
+        self.failure_counts = dict(failure_counts or {})
         self.cause = cause
         self.receipt = receipt
         if cause is not None:
             message = f"Batch submission failed: {cause}"
         else:
-            message = f"{len(self.failures)} publication(s) failed in batch"
+            message = f"{self.failure_count} publication(s) failed in batch"
         super().__init__(message)

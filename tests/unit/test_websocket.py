@@ -224,3 +224,60 @@ async def test_failed_handshake_closes_stream() -> None:
     finally:
         server.close()
         await server.wait_closed()
+
+
+class _WriteBufferTransport:
+    def get_write_buffer_size(self) -> int:
+        return 0
+
+
+class _BatchWriter:
+    def __init__(self) -> None:
+        self.transport = _WriteBufferTransport()
+        self.batches: list[list[bytes]] = []
+
+    def writelines(self, frames: list[bytes]) -> None:
+        self.batches.append(list(frames))
+
+    async def drain(self) -> None:
+        return None
+
+
+async def test_write_many_bounds_masked_frame_batches_by_bytes() -> None:
+    writer = _BatchWriter()
+    transport = WebSocketTransport(
+        None,  # type: ignore[arg-type]
+        writer,  # type: ignore[arg-type]
+        max_write_batch_bytes=160,
+    )
+    parts = [b"x" * 100, b"y" * 100, b"z" * 20]
+
+    await transport.write_many(parts)
+
+    assert len(writer.batches) == 2
+    assert all(sum(map(len, batch)) <= 160 for batch in writer.batches)
+    decoded = []
+    for batch in writer.batches:
+        for encoded in batch:
+            frame = bytearray(encoded)
+            parsed = _parse_frame(frame, 1024, expect_masked=True)
+            assert parsed is not None
+            decoded.append(parsed[2])
+    assert decoded == parts
+
+
+async def test_write_many_groups_frames_within_byte_budget() -> None:
+    writer = _BatchWriter()
+    transport = WebSocketTransport(
+        None,  # type: ignore[arg-type]
+        writer,  # type: ignore[arg-type]
+        max_write_batch_bytes=256,
+    )
+    parts = [b"a" * 40, b"b" * 40, b"c" * 40, b"d" * 200]
+
+    await transport.write_many(parts)
+
+    assert len(writer.batches) == 2
+    assert len(writer.batches[0]) == 3
+    assert len(writer.batches[1]) == 1
+    assert sum(map(len, writer.batches[0])) <= 256

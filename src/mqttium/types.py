@@ -57,6 +57,33 @@ class OutboundMessage:
     encoded_pubrel: bytes | None = None
 
 
+@dataclass(slots=True, frozen=True)
+class OutboundMessageSummary:
+    """Payload-free durable outbound metadata used for lazy replay queues."""
+
+    mid: int
+    topic: str
+    payload_size: int
+    qos: QoS
+    retain: bool
+    state: OutboundQoSState
+    dup: bool = False
+    properties: Properties | None = None
+
+    @classmethod
+    def from_message(cls, message: OutboundMessage) -> OutboundMessageSummary:
+        return cls(
+            mid=message.mid,
+            topic=message.topic,
+            payload_size=len(message.payload),
+            qos=message.qos,
+            retain=message.retain,
+            state=message.state,
+            dup=message.dup,
+            properties=message.properties,
+        )
+
+
 @dataclass(slots=True)
 class InboundMessage:
     mid: int

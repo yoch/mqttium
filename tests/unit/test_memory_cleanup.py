@@ -112,3 +112,40 @@ async def test_websocket_close_releases_connection_buffers() -> None:
     assert transport._recv_buf == bytearray()
     assert transport._pending_control == []
     assert transport._fragment is None
+
+
+async def test_force_close_discards_writer_queue_and_decoder_buffer() -> None:
+    from mqttium.api import AsyncClient
+
+    client = AsyncClient()
+    client._outbound.put_nowait(b"one")
+    client._outbound.put_nowait(b"two")
+    client._outbound_bytes = 6
+    client._decoder.feed(b"partial")
+
+    await client._force_close()
+
+    assert client._outbound.empty()
+    assert client._outbound_bytes == 0
+    assert client._decoder.buffered == 0
+
+
+async def test_reset_message_stream_releases_abandoned_iterator_delivery() -> None:
+    from mqttium.api import AsyncClient
+    from mqttium.protocol.engine import EffectKind, EngineEffect
+    from mqttium.types import Message
+
+    client = AsyncClient(
+        message_delivery="iterator",
+        max_pending_delivery_bytes=1024,
+    )
+    message = Message(topic="reset", payload=b"payload")
+    await client._apply_effect(EngineEffect(EffectKind.MESSAGE, message), nowait=False)
+    assert client.pending_delivery_bytes > 0
+    client._closed.set()
+
+    await client._reset_message_stream()
+
+    assert client._messages.empty()
+    assert client.pending_delivery_bytes == 0
+    assert client._delivery_reservations == {}
