@@ -6,77 +6,149 @@ Inbound QoS 2 identifiers live in a separate namespace and must never be freed h
 
 from __future__ import annotations
 
-from contextlib import suppress
-
 from mqttium.errors import FlowControlError
 
 
 class PacketIdPool:
-    __slots__ = ("_used", "_free", "_next", "_size")
+    """Allocate MQTT packet identifiers without retaining every live MID.
+
+    Identifiers below ``_next`` have crossed the allocation frontier and are in
+    use unless recorded in ``_free_one`` or ``_free``. Identifiers at or above
+    the frontier have not been issued unless they appear in ``_reserved``.
+
+    Normal sequential allocation therefore needs no per-identifier container.
+    The common release-then-allocate path uses one scalar free slot and only
+    creates sets when multiple holes or out-of-order reservations coexist.
+    """
+
+    __slots__ = ("_free", "_free_one", "_next", "_reserved")
+
+    _MAX_ID = 65_535
 
     def __init__(self) -> None:
-        # MQTT packet identifiers are 1..65535 inclusive.
-        self._used: set[int] = set()
-        self._free: list[int] = []
-        self._next = 1  # next never-issued id
-        self._size = 65535
+        self._free_one = 0
+        self._free: set[int] | None = None
+        self._reserved: set[int] | None = None
+        self._next = 1
 
     def __len__(self) -> int:
-        return len(self._used)
+        free_count = 1 if self._free_one else 0
+        if self._free is not None:
+            free_count += len(self._free)
+        reserved_count = 0 if self._reserved is None else len(self._reserved)
+        return self._next - 1 - free_count + reserved_count
 
     @property
     def available(self) -> int:
-        return self._size - len(self._used)
+        return self._MAX_ID - len(self)
 
     def allocate(self) -> int:
-        if len(self._used) >= self._size:
+        mid = self._free_one
+        if mid:
+            self._free_one = 0
+            return mid
+
+        free = self._free
+        if free:
+            mid = free.pop()
+            if not free:
+                self._free = None
+            return mid
+
+        mid = self._next
+        reserved = self._reserved
+        if reserved is not None:
+            while mid in reserved:
+                reserved.remove(mid)
+                mid += 1
+            if not reserved:
+                self._reserved = None
+            self._next = mid
+
+        if mid > self._MAX_ID:
             raise FlowControlError("No free MQTT packet identifiers")
-        if self._free:
-            mid = self._free.pop()
-            self._used.add(mid)
-            return mid
-        # Skip ids reserved via hydrate (store) that precede _next.
-        while self._next <= self._size and self._next in self._used:
-            self._next += 1
-        if self._next <= self._size:
-            mid = self._next
-            self._next += 1
-            self._used.add(mid)
-            return mid
-        # All ids have been issued at least once; scan for a hole.
-        for candidate in range(1, self._size + 1):
-            if candidate not in self._used:
-                self._used.add(candidate)
-                return candidate
-        raise FlowControlError("No free MQTT packet identifiers")
+        self._next = mid + 1
+        return mid
 
     def reserve(self, mid: int) -> None:
         """Mark an existing MID as in-use (e.g. hydrated from persistence)."""
-        if mid < 1 or mid > self._size:
+        if mid < 1 or mid > self._MAX_ID:
             raise ValueError(f"Invalid packet id {mid}")
-        self._used.add(mid)
-        # Keep free-list coherent if this id was previously released.
-        with suppress(ValueError):
-            self._free.remove(mid)
+
+        frontier = self._next
+        if mid < frontier:
+            if self._free_one == mid:
+                self._free_one = 0
+                return
+            free = self._free
+            if free is not None and mid in free:
+                free.remove(mid)
+                if not free:
+                    self._free = None
+            return
+
+        if mid == frontier:
+            frontier += 1
+            reserved = self._reserved
+            if reserved is not None:
+                while frontier in reserved:
+                    reserved.remove(frontier)
+                    frontier += 1
+                if not reserved:
+                    self._reserved = None
+            self._next = frontier
+            return
+
+        reserved = self._reserved
+        if reserved is None:
+            self._reserved = {mid}
+        else:
+            reserved.add(mid)
 
     def release(self, mid: int) -> None:
-        if mid not in self._used:
+        if mid < 1 or mid > self._MAX_ID:
             return
-        self._used.remove(mid)
-        if not self._used:
-            # Replace peak-sized containers once the pool becomes idle so a
-            # burst that used many packet identifiers does not permanently
-            # retain their set/list capacity.
-            self._used = set()
-            self._free = []
-            self._next = 1
-            return
-        self._free.append(mid)
+
+        if mid < self._next:
+            if self._free_one == mid:
+                return
+            free = self._free
+            if free is not None and mid in free:
+                return
+            if not self._free_one:
+                self._free_one = mid
+            elif free is None:
+                self._free = {mid}
+            else:
+                free.add(mid)
+        else:
+            reserved = self._reserved
+            if reserved is None or mid not in reserved:
+                return
+            reserved.remove(mid)
+            if not reserved:
+                self._reserved = None
+
+        if self._reserved is None:
+            free_count = 1 if self._free_one else 0
+            if self._free is not None:
+                free_count += len(self._free)
+            if free_count == self._next - 1:
+                self.clear()
 
     def in_use(self, mid: int) -> bool:
-        return mid in self._used
+        if mid < 1 or mid > self._MAX_ID:
+            return False
+        if mid < self._next:
+            if self._free_one == mid:
+                return False
+            free = self._free
+            return free is None or mid not in free
+        reserved = self._reserved
+        return reserved is not None and mid in reserved
 
     def clear(self) -> None:
-        self._used = set()
-        self._free = []
+        self._free_one = 0
+        self._free = None
+        self._reserved = None
         self._next = 1
