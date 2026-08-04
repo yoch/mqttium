@@ -26,13 +26,13 @@ l'ordre d'autorité est : spec MQTT (3.1.1 / 5.0) > ce guide > DESIGN.md.
    `OutboundQoSState`/`InboundQoSState`. `_queued` n'est qu'un index ordonné
    des messages en état `QUEUED` — tout message de `_queued` est aussi dans
    le store avec cet état, et réciproquement.
-9. **Propriétaire unique des ressources sortantes** : une publication QoS 1/2
+7. **Propriétaire unique des ressources sortantes** : une publication QoS 1/2
    acquiert quatre ressources — budget d'admission, MID, ligne de store, slot
    `FlowControl`. `OutboundSession` (`protocol/outbound.py`) est le seul à les
    acquérir et à les restituer ; `ProtocolEngine` ne touche jamais les
    compteurs. Toute nouvelle opération sortante doit passer par lui, sans quoi
    un rollback partiel redevient possible.
-10. **Admission tout-ou-rien, une seule primitive d'annulation** :
+8. **Admission tout-ou-rien, une seule primitive d'annulation** :
     `queue_publish()` et `queue_publish_many()` défont leurs acquisitions via
     `OutboundSession._rollback()`, dans un ordre unique — effets, index de file,
     slots de flow, lignes de store, MID, budget. L'appelant ne fait que
@@ -44,9 +44,16 @@ l'ordre d'autorité est : spec MQTT (3.1.1 / 5.0) > ce guide > DESIGN.md.
     libération unitaire compterait deux fois. Contrat vérifié par injection de
     faute après chaque acquisition dans
     `tests/unit/test_outbound_transaction.py`, contre store mémoire *et* SQLite.
-7. **Callbacks hors section critique** : aucun verrou/état moteur tenu pendant
+9. **Propriétaire unique de l'état entrant** : `InboundSession`
+    (`protocol/inbound.py`) possède les alias entrants, le compteur local
+    `Receive Maximum`, les lignes QoS entrantes, l'ACK manuel et le replay. Les
+    handlers `PUBLISH` / `PUBREL` lui sont liés directement, sans wrapper moteur
+    sur le chemin chaud. Il émet néanmoins via l'unique flux d'effets de
+    `ProtocolEngine`, afin que l'ordre avec `CONNACK` et `DISCONNECTED` reste
+    observable en un seul endroit.
+10. **Callbacks hors section critique** : aucun verrou/état moteur tenu pendant
    un callback ; un callback peut appeler `publish()` sans deadlock.
-8. **Pas de retransmission sur connexion vivante** : les PUBLISH/PUBREL ne sont
+11. **Pas de retransmission sur connexion vivante** : les PUBLISH/PUBREL ne sont
    rejoués **qu'à la reconnexion** (session présente), avec DUP=1 pour les
    PUBLISH. Jamais de timer de retransmission en cours de session (conforme
    MQTT ≥3.1.1).

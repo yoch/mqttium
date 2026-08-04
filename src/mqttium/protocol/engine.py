@@ -14,7 +14,6 @@ from mqttium.codec.buffer import RawPacket
 from mqttium.codec.packet_validation import validate_raw_packet
 from mqttium.enums import (
     ConnectionState,
-    InboundQoSState,
     MQTTProtocolVersion,
     OutboundQoSState,
     PacketType,
@@ -27,7 +26,6 @@ from mqttium.packets import (
     DisconnectPacket,
     PubAckPacket,
     PubCompPacket,
-    PublishPacket,
     PubRecPacket,
     PubRelPacket,
     SubAckPacket,
@@ -42,7 +40,6 @@ from mqttium.packets import (
 from mqttium.persistence.memory import (
     InflightStore,
     MemoryInflightStore,
-    PagedInflightStore,
 )
 from mqttium.protocol.config import EngineConfig
 from mqttium.protocol.effects import (
@@ -53,17 +50,13 @@ from mqttium.protocol.effects import (
     PublishHandle,
 )
 from mqttium.protocol.flow_control import FlowControl
+from mqttium.protocol.inbound import InboundSession
 from mqttium.protocol.negotiated import NegotiatedSettings
 from mqttium.protocol.outbound import OutboundSession
 from mqttium.protocol.packet_ids import PacketIdPool
-from mqttium.topics import (
-    validate_received_publish_topic,
-    validate_subscribe_filter,
-)
+from mqttium.topics import validate_subscribe_filter
 from mqttium.transport.writes import WriteItem, item_size
 from mqttium.types import (
-    InboundMessage,
-    Message,
     OutboundMessage,
     OutboundMessageSummary,
     Properties,
@@ -111,29 +104,24 @@ class ProtocolEngine:
         self.config = config or EngineConfig()
         self.config._attached = True
         self.store = store or MemoryInflightStore()
-        # Resolved once: a store either pages or it does not, for its lifetime.
-        self._paged_store = self.store if isinstance(self.store, PagedInflightStore) else None
         self.state = ConnectionState.NEW
         self.session_present = False
         self.negotiated = NegotiatedSettings()
         self._pending_connect = False
         self._effects: list[EngineEffect] = []
-        # Owns outbound QoS: budget, packet ids, flow window, queue and replay.
+        # Each direction owns its protocol state; the engine keeps connection
+        # state, packet dispatch and the one ordered effect stream.
         self.outbound = OutboundSession(self)
-        # Inbound topic aliases (connection-scoped).
-        self._topic_aliases: dict[int, str] = {}
+        self.inbound = InboundSession(self)
         # After a durable session is established, next CONNECT uses Clean Start 0.
         self._prefer_session_resume = False
-        # Server→client QoS>0 not yet fully acknowledged (Receive Maximum).
-        self._inbound_inflight = 0
         self._auth_method: str | None = None
-        self._recovered_inbound_mids = {msg.mid for msg in self.store.in_items()}
         self._handlers = {
             PacketType.CONNACK: self._on_connack,
-            PacketType.PUBLISH: self._on_publish,
+            PacketType.PUBLISH: self.inbound.on_publish,
             PacketType.PUBACK: self._on_puback,
             PacketType.PUBREC: self._on_pubrec,
-            PacketType.PUBREL: self._on_pubrel,
+            PacketType.PUBREL: self.inbound.on_pubrel,
             PacketType.PUBCOMP: self._on_pubcomp,
             PacketType.SUBACK: self._on_suback,
             PacketType.UNSUBACK: self._on_unsuback,
@@ -179,12 +167,41 @@ class ProtocolEngine:
         return self.outbound._queued
 
     @property
+    def _paged_store(self) -> object | None:
+        """Compatibility view of the outbound store pagination capability."""
+        return self.outbound._paged_store
+
+    @property
     def pending_outbound_messages(self) -> int:
         return self.outbound.pending_messages
 
     @property
     def pending_outbound_bytes(self) -> int:
         return self.outbound.pending_bytes
+
+    # --- inbound facade ----------------------------------------------------
+    # Preserve the diagnostic/test surface that pre-dates InboundSession while
+    # keeping the state itself under one owner.
+
+    @property
+    def _topic_aliases(self) -> dict[int, str]:
+        return self.inbound._aliases
+
+    @property
+    def _inbound_inflight(self) -> int:
+        return self.inbound._inflight
+
+    @_inbound_inflight.setter
+    def _inbound_inflight(self, value: int) -> None:
+        self.inbound._inflight = value
+
+    @property
+    def _recovered_inbound_mids(self) -> set[int]:
+        return self.inbound._recovered_mids
+
+    @_recovered_inbound_mids.setter
+    def _recovered_inbound_mids(self, value: set[int]) -> None:
+        self.inbound._recovered_mids = value
 
     def can_ever_admit_publish(
         self,
@@ -225,11 +242,10 @@ class ProtocolEngine:
         )
         self.state = ConnectionState.CONNECTING
         self._pending_connect = True
-        self._topic_aliases.clear()
+        self.inbound.start_connection()
         # Negotiated capabilities are connection-scoped. Queued messages are
         # validated against the new values only after the next CONNACK.
         self.negotiated = NegotiatedSettings()
-        self._inbound_inflight = 0
 
         clean_start = self.config.clean_start
         if self._prefer_session_resume:
@@ -374,7 +390,7 @@ class ProtocolEngine:
     def notify_transport_closed(self) -> None:
         was = self.state
         self.state = ConnectionState.DISCONNECTED
-        self._topic_aliases.clear()
+        self.inbound.transport_closed()
         self._pending_connect = False
         # Release sub/unsub MIDs still in flight — no ACK will arrive now.
         if self._pending_sub_mids:
@@ -460,9 +476,7 @@ class ProtocolEngine:
         outbound = self.outbound
         if not connack.session_present:
             outbound.purge_after_clean_session(sub_mids_pending=bool(self._pending_sub_mids))
-            self.store.clear_in()
-            self._recovered_inbound_mids.clear()
-            self._inbound_inflight = 0
+            self.inbound.discard_session()
             outbound.flow.reset()
             # Re-apply negotiated limit after reset.
             outbound.flow.apply_broker_receive_maximum(
@@ -476,140 +490,11 @@ class ProtocolEngine:
         outbound.fail_queued_violating_negotiation()
         self._emit(EffectKind.CONNACK, connack)
         if connack.session_present:
-            self._replay_inbound_session()
+            self.inbound.replay_session()
         outbound.drain()
 
-    def _on_publish(self, raw: RawPacket) -> None:
-        packet = PublishPacket.decode(raw.flags, raw.remaining, self.config.protocol)
-        topic = self._resolve_inbound_topic(packet)
-        validate_received_publish_topic(topic, utf8_validated=True)
-
-        if packet.qos == QoS.AT_MOST_ONCE:
-            self._emit(
-                EffectKind.MESSAGE,
-                Message(
-                    topic=topic,
-                    payload=packet.payload,
-                    qos=packet.qos,
-                    retain=packet.retain,
-                    dup=packet.dup,
-                    mid=None,
-                    properties=packet.properties,
-                ),
-            )
-            return
-
-        assert packet.mid is not None
-        if packet.qos == QoS.EXACTLY_ONCE:
-            existing = self.store.get_in(packet.mid)
-            if existing is not None:
-                self._send(PubRecPacket(mid=packet.mid).encode(self.config.protocol))
-                return
-
-        if packet.qos == QoS.AT_LEAST_ONCE and self.config.manual_ack:
-            # A duplicate QoS1 publish reuses the existing Receive Maximum slot,
-            # but is surfaced again so an application can complete manual ACK
-            # after a reconnect or callback cancellation.
-            existing = self.store.get_in(packet.mid)
-            if existing is not None and existing.state is InboundQoSState.WAIT_PUBACK:
-                self._emit_inbound_message(existing, dup=True)
-                return
-
-        self._acquire_inbound_slot()
-        if packet.qos == QoS.AT_LEAST_ONCE:
-            self._emit(
-                EffectKind.MESSAGE,
-                Message(
-                    topic=topic,
-                    payload=packet.payload,
-                    qos=packet.qos,
-                    retain=packet.retain,
-                    dup=packet.dup,
-                    mid=packet.mid,
-                    properties=packet.properties,
-                ),
-            )
-            if self.config.manual_ack:
-                self.store.put_in(
-                    InboundMessage(
-                        mid=packet.mid,
-                        topic=topic,
-                        payload=packet.payload,
-                        qos=packet.qos,
-                        retain=packet.retain,
-                        state=InboundQoSState.WAIT_PUBACK,
-                        delivered=False,
-                        properties=packet.properties,
-                    )
-                )
-            else:
-                self._send(PubAckPacket(mid=packet.mid).encode(self.config.protocol))
-                self._release_inbound_slot()
-            return
-
-        inbound = InboundMessage(
-            mid=packet.mid,
-            topic=topic,
-            payload=packet.payload,
-            qos=packet.qos,
-            retain=packet.retain,
-            state=InboundQoSState.WAIT_PUBREL,
-            delivered=False,
-            properties=packet.properties,
-        )
-        self.store.put_in(inbound)
-        self._emit(
-            EffectKind.MESSAGE,
-            Message(
-                topic=topic,
-                payload=packet.payload,
-                qos=packet.qos,
-                retain=packet.retain,
-                dup=packet.dup,
-                mid=packet.mid,
-                properties=packet.properties,
-            ),
-        )
-        self._send(PubRecPacket(mid=packet.mid).encode(self.config.protocol))
-
     def mark_inbound_delivered(self, mid: int) -> None:
-        inbound = self.store.get_in(mid)
-        if inbound is None or inbound.delivered:
-            return
-        inbound.delivered = True
-        self.store.update_in(inbound)
-
-    def _emit_inbound_message(self, inbound: InboundMessage, *, dup: bool) -> None:
-        self._emit(
-            EffectKind.MESSAGE,
-            Message(
-                topic=inbound.topic,
-                payload=inbound.payload,
-                qos=inbound.qos,
-                retain=inbound.retain,
-                dup=dup,
-                mid=inbound.mid,
-                properties=inbound.properties,
-            ),
-        )
-
-    def _replay_inbound_session(self) -> None:
-        inbound_items = list(self.store.in_items())
-        self._inbound_inflight = len(inbound_items)
-        recovered = self._recovered_inbound_mids
-        for inbound in inbound_items:
-            should_redeliver = not inbound.delivered
-            if inbound.mid in recovered and self.config.manual_ack:
-                if inbound.state in (
-                    InboundQoSState.WAIT_PUBACK,
-                    InboundQoSState.WAIT_USER_ACK,
-                ):
-                    should_redeliver = True
-                elif inbound.state is InboundQoSState.WAIT_PUBREL and not inbound.user_acked:
-                    should_redeliver = True
-            if should_redeliver:
-                self._emit_inbound_message(inbound, dup=True)
-        recovered.clear()
+        self.inbound.mark_delivered(mid)
 
     def _on_puback(self, raw: RawPacket) -> None:
         ack = PubAckPacket.decode(raw.remaining, self.config.protocol)
@@ -666,46 +551,9 @@ class ProtocolEngine:
         # and has caused intermittent multi-second stalls under load.
         self._send(msg.encoded_pubrel)
 
-    def _on_pubrel(self, raw: RawPacket) -> None:
-        rel = PubRelPacket.decode(raw.remaining, self.config.protocol)
-        inbound = self.store.get_in(rel.mid)
-        if inbound is None:
-            # Orphan PUBREL: idempotent PUBCOMP (v5 reason 0x92 optional later).
-            self._send(PubCompPacket(mid=rel.mid).encode(self.config.protocol))
-            return
-        if self.config.manual_ack and not inbound.user_acked:
-            inbound.state = InboundQoSState.WAIT_USER_ACK
-            self.store.update_in(inbound)
-            return
-        self.store.pop_in(rel.mid)
-        self._send(PubCompPacket(mid=rel.mid).encode(self.config.protocol))
-        self._release_inbound_slot()
-
     def ack(self, mid: int) -> None:
-        """Complete a deferred inbound ACK (manual_ack mode).
-
-        QoS 1: send PUBACK. QoS 2: mark ready / send PUBCOMP if PUBREL already seen.
-        """
-        if not self.config.manual_ack:
-            raise ProtocolError("manual_ack is disabled")
-        inbound = self.store.get_in(mid)
-        if inbound is None:
-            raise ProtocolError(f"No pending inbound ack for mid={mid}")
-        if inbound.state is InboundQoSState.WAIT_PUBACK:
-            self.store.pop_in(mid)
-            self._send(PubAckPacket(mid=mid).encode(self.config.protocol))
-            self._release_inbound_slot()
-            return
-        if inbound.state is InboundQoSState.WAIT_PUBREL:
-            inbound.user_acked = True
-            self.store.update_in(inbound)
-            return
-        if inbound.state is InboundQoSState.WAIT_USER_ACK:
-            self.store.pop_in(mid)
-            self._send(PubCompPacket(mid=mid).encode(self.config.protocol))
-            self._release_inbound_slot()
-            return
-        raise ProtocolError(f"Inbound mid={mid} is not awaiting ack (state={inbound.state!r})")
+        """Complete a deferred inbound ACK in manual-ack mode."""
+        self.inbound.ack(mid)
 
     def _on_pubcomp(self, raw: RawPacket) -> None:
         comp = PubCompPacket.decode(raw.remaining, self.config.protocol)
@@ -841,36 +689,6 @@ class ProtocolEngine:
             ).encode(self.config.protocol)
         )
 
-    def _inbound_store_pages(self) -> Iterable[tuple[InboundMessage, ...]]:
-        if self._paged_store is not None:
-            yield from self._paged_store.in_pages()
-        else:
-            yield tuple(self.store.in_items())
-
-    def _resolve_inbound_topic(self, packet: PublishPacket) -> str:
-        if self.config.protocol != MQTTProtocolVersion.MQTTv5:
-            return packet.topic
-        props = packet.properties
-        alias = props.get("topic_alias") if props else None
-        if alias is None:
-            if not packet.topic:
-                raise ProtocolError("PUBLISH with empty topic and no topic alias")
-            return packet.topic
-        alias = int(alias)
-        max_alias = self.config.topic_alias_maximum
-        # max_alias == 0 means inbound aliases are not accepted.
-        if alias == 0 or alias > max_alias:
-            # MQTT 5 §3.3.2.3.5: DISCONNECT 0x94 (Topic Alias invalid).
-            self._protocol_disconnect(0x94, f"Invalid topic alias {alias}")
-            raise ProtocolError(f"Invalid topic alias {alias}")
-        if packet.topic:
-            self._topic_aliases[alias] = packet.topic
-            return packet.topic
-        if alias not in self._topic_aliases:
-            self._protocol_disconnect(0x94, f"Unknown topic alias {alias}")
-            raise ProtocolError(f"Unknown topic alias {alias}")
-        return self._topic_aliases[alias]
-
     def _check_outbound_size(self, wire: WriteItem) -> None:
         limit = self.negotiated.maximum_packet_size
         size = item_size(wire)
@@ -894,28 +712,6 @@ class ProtocolEngine:
             and not self.negotiated.subscription_identifier_available
         ):
             raise ProtocolError("Broker does not support subscription identifiers")
-
-    def _acquire_inbound_slot(self) -> None:
-        limit = self.config.local_receive_maximum
-        if self._inbound_inflight >= limit:
-            # MQTT 5 §3.3.4: DISCONNECT 0x93 (Receive Maximum exceeded).
-            self._protocol_disconnect(0x93, "Receive Maximum exceeded")
-            raise ProtocolError("Receive Maximum exceeded")
-        self._inbound_inflight += 1
-
-    def _protocol_disconnect(self, reason_code: int, message: str) -> None:
-        """Emit a normative DISCONNECT before the transport is torn down."""
-        if self.config.protocol == MQTTProtocolVersion.MQTTv5:
-            self._send(encode_disconnect(reason_code, self.config.protocol))
-        self.state = ConnectionState.DISCONNECTED
-        self._emit(
-            EffectKind.DISCONNECTED,
-            DisconnectInfo(reason_code=reason_code, from_broker=False),
-        )
-
-    def _release_inbound_slot(self) -> None:
-        if self._inbound_inflight > 0:
-            self._inbound_inflight -= 1
 
     def _update_session_resume_preference(self) -> None:
         """Next CONNECT should use Clean Start 0 when the session is durable."""

@@ -36,6 +36,7 @@ flowchart TB
   subgraph engine [Protocol Engine - sync, testable]
     PE[ProtocolEngine]
     OUT[OutboundSession]
+    IN[InboundSession]
     SES[Session]
     QOS[QoS1 / QoS2 machines]
     PID[PacketIdPool]
@@ -60,11 +61,13 @@ flowchart TB
   AC --> CD
   AC --> RP
   PE --> OUT
+  PE --> IN
   PE --> SES
   PE --> QOS
   OUT --> PID
   OUT --> FC
   OUT --> store
+  IN --> store
   PE --> store
   AC --> DEC
   AC --> ENC
@@ -102,6 +105,19 @@ L'ordre relatif des effets sortants et des effets de connexion est observable
 par `AsyncClient` — notamment les `PUBLISH_FAILED` de purge émis **avant**
 l'effet `CONNACK` lorsque le broker a jeté la session.
 
+Toute la réception PUBLISH appartient symétriquement à `InboundSession`
+(`protocol/inbound.py`), qui possède seul :
+
+- les alias de topic entrants, remis à zéro à chaque connexion réseau ;
+- le compteur local `Receive Maximum` ;
+- les enregistrements QoS 1/2 entrants du store ;
+- le suivi `delivered` / `user_acked`, l'ACK manuel et le replay après restart.
+
+Les handlers `PUBLISH` et `PUBREL` pointent directement sur cette session :
+l'extraction n'ajoute donc aucun appel intermédiaire au chemin entrant. Comme
+`OutboundSession`, elle émet dans l'unique flux d'effets du moteur et ne possède
+pas l'état de connexion.
+
 ## Modules
 
 ```text
@@ -114,7 +130,7 @@ mqttium/
 │   ├── types.py
 │   ├── codec/            # VBI, buffer, primitives UTF-8/bin
 │   ├── packets/          # types + encode/decode par paquet
-│   ├── protocol/         # engine, outbound, effects, config, ids, flow, keepalive
+│   ├── protocol/         # engine, inbound/outbound, effects, config, ids, flow
 │   ├── transport/        # TCP/TLS (WS plus tard)
 │   ├── persistence/      # memory (+ sqlite plus tard)
 │   ├── dispatch/         # matcher, callbacks
