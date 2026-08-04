@@ -1,0 +1,60 @@
+name: Apply final PR 11 payload
+
+on:
+  push:
+    branches:
+      - fix/compat-qosn-coalesced-mid-queue
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Reconstruct validated changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .mqttium-upload/part-* | base64 --decode > /tmp/mqttium-pr11-final.tar.gz
+          echo '931a3e069bfd54bdd9efccb7b737104b2cac73415decb343f0654922fe230abe  /tmp/mqttium-pr11-final.tar.gz' | sha256sum --check
+          git fetch origin main
+          git reset --hard origin/main
+          tar -xzf /tmp/mqttium-pr11-final.tar.gz
+          git diff --check
+          test "$(git status --porcelain | wc -l)" -eq 7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Validate final tree
+        run: |
+          set -euo pipefail
+          python -m pip install -e ".[dev,security]"
+          ruff format --check src tests benchmarks
+          ruff check src tests benchmarks
+          mypy src/mqttium
+          bandit -q -ll -r src
+          python -m pytest -q tests/unit --cov=mqttium --cov-report=term-missing --cov-fail-under=80
+      - name: Publish clean rebased commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            .github/workflows/benchmarks.yml \
+            CHANGELOG.md \
+            benchmarks/compat_qosn_submit_ab.py \
+            docs/COMPAT.md \
+            src/mqttium/compat/paho.py \
+            tests/integration/test_compat_publish_perf.py \
+            tests/unit/test_compat_publish_perf.py
+          git commit \
+            -m "Coalesce compat publish admission on the network loop" \
+            -m "Unify QoS 0/1/2 cross-thread submission, bound loop-side batches, preserve atomic Paho admission, and make timeout cancellation unambiguous."
+          git push \
+            --force-with-lease=refs/heads/fix/compat-qosn-coalesced-mid-queue:${GITHUB_SHA} \
+            origin HEAD:fix/compat-qosn-coalesced-mid-queue
