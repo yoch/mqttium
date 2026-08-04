@@ -33,6 +33,7 @@ MQTT_ERR_SUCCESS = 0
 MQTT_ERR_QUEUE_SIZE = 15
 
 _PUBLISH_HANDOFF_TIMEOUT = 5.0
+_LOOP_HANDOFF_TIMEOUT = 5.0
 _PUBLISH_BATCH_MAX_MESSAGES = 256
 _PUBLISH_BATCH_MAX_BYTES = 1 * 1024 * 1024
 
@@ -180,30 +181,24 @@ class Client:
         # Paho uses zero for unlimited; the native MQTTium API uses None.
         value = None if queue_size == 0 else queue_size
         self._run_loop_mutation(
-            lambda: setattr(
-                self._async._engine.config,
-                "max_pending_outbound_messages",
-                value,
-            )
+            lambda: self._async._engine.config.update(max_pending_outbound_messages=value)
         )
 
     def max_queued_bytes_set(self, queue_size: int | None) -> None:
         if queue_size is not None and queue_size < 0:
             raise ValueError("queue_size must be non-negative or None")
         self._run_loop_mutation(
-            lambda: setattr(
-                self._async._engine.config,
-                "max_pending_outbound_bytes",
-                queue_size,
-            )
+            lambda: self._async._engine.config.update(max_pending_outbound_bytes=queue_size)
         )
 
     def username_pw_set(self, username: str, password: bytes | str | None = None) -> None:
         pwd = password.encode("utf-8") if isinstance(password, str) else password
 
         def _set_credentials() -> None:
-            self._async._engine.config.username = username
-            self._async._engine.config.password = pwd
+            self._async._engine.config.update(
+                username=username,
+                password=pwd,
+            )
 
         self._run_loop_mutation(_set_credentials)
 
@@ -221,7 +216,7 @@ class Client:
             qos=QoS(qos),
             retain=retain,
         )
-        self._run_loop_mutation(lambda: setattr(self._async._engine.config, "will", message))
+        self._run_loop_mutation(lambda: self._async._engine.config.update(will=message))
 
     def message_callback_add(self, sub: str, callback: Callable[..., Any]) -> None:
         self._run_loop_mutation(lambda: self._topic_callbacks.__setitem__(sub, callback))
@@ -302,40 +297,63 @@ class Client:
             return fut
         return fut.result(timeout)
 
+    def _await_on_loop(
+        self,
+        command: Callable[[], Any],
+        *,
+        flush_effects: bool,
+        what: str,
+    ) -> Any:
+        """Run a short synchronous command on the network loop and wait for it.
+
+        The single bounded cross-thread handoff: nothing off the network thread
+        may touch AsyncClient or engine state directly. The loop-side failure is
+        re-raised on the calling thread rather than being swallowed.
+        """
+        loop = self._loop
+        assert loop is not None
+
+        handoff: dict[str, Any] = {}
+        done = threading.Event()
+
+        async def _run() -> None:
+            try:
+                handoff["result"] = command()
+                if flush_effects:
+                    await self._async._flush_effects()
+            except BaseException as exc:
+                handoff["error"] = exc
+            finally:
+                done.set()
+
+        fut = asyncio.run_coroutine_threadsafe(_run(), loop)
+        if not done.wait(timeout=_LOOP_HANDOFF_TIMEOUT):
+            fut.cancel()
+            raise RuntimeError(f"{what} handoff to event loop timed out")
+        error = handoff.get("error")
+        if error is not None:
+            raise error
+        return handoff.get("result")
+
     def _run_loop_mutation(self, mutation: Callable[[], Any]) -> Any:
-        """Run a short synchronous mutation on the network loop when active."""
+        """Apply a configuration mutation, on the network loop when one exists.
+
+        Before ``loop_start`` there is no loop to protect, so the mutation runs
+        directly on the caller's thread.
+        """
         loop = self._loop
         thread = self._thread
         if loop is None or not loop.is_running() or thread is None:
             return mutation()
         if threading.current_thread() is thread:
             return mutation()
-
-        handoff: dict[str, Any] = {}
-        done = threading.Event()
-
-        def _run() -> None:
-            try:
-                handoff["result"] = mutation()
-            except BaseException as exc:
-                handoff["error"] = exc
-            finally:
-                done.set()
-
-        loop.call_soon_threadsafe(_run)
-        if not done.wait(timeout=5.0):
-            raise RuntimeError("mutation handoff to event loop timed out")
-        error = handoff.get("error")
-        if error is not None:
-            raise error
-        return handoff.get("result")
+        return self._await_on_loop(mutation, flush_effects=False, what="mutation")
 
     def _queue_loop_command(self, command: Callable[[], Any]) -> Any:
         """Run an engine command on the dedicated loop and flush its effects.
 
         Callback code already executes on that loop, so it may run the short
-        synchronous engine command directly. Calls from other threads use a
-        bounded handoff and never mutate AsyncClient state off-loop.
+        synchronous engine command directly.
         """
         if self._loop is None:
             self.loop_start()
@@ -347,29 +365,10 @@ class Client:
             self._async._drain_effects_inline()
             return result
 
-        handoff: dict[str, Any] = {}
-        done = threading.Event()
-
-        async def _run() -> None:
-            try:
-                handoff["result"] = command()
-                await self._async._flush_effects()
-            except BaseException as exc:  # propagate the real loop-side failure
-                handoff["error"] = exc
-            finally:
-                done.set()
-
-        fut = asyncio.run_coroutine_threadsafe(_run(), self._loop)
-        if not done.wait(timeout=5.0):
-            fut.cancel()
-            raise RuntimeError("command handoff to event loop timed out")
-        error = handoff.get("error")
-        if error is not None:
-            raise error
-        return handoff["result"]
+        return self._await_on_loop(command, flush_effects=True, what="command")
 
     def connect(self, host: str, port: int = 1883, keepalive: int = 60) -> int:
-        self._run_loop_mutation(lambda: setattr(self._async._engine.config, "keepalive", keepalive))
+        self._run_loop_mutation(lambda: self._async._engine.config.update(keepalive=keepalive))
         self._submit(self._async.connect(host, port))
         return 0
 

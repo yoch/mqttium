@@ -224,7 +224,6 @@ def run_protocol_qos_queue(spec: ScenarioSpec) -> dict[str, Any]:
     started = time.perf_counter()
     engine = ProtocolEngine(
         EngineConfig(
-            max_queued=0,
             max_pending_outbound_messages=None,
             max_pending_outbound_bytes=None,
         )

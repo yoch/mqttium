@@ -58,6 +58,7 @@ def _prime_qos1(engine: ProtocolEngine) -> int:
             state=OutboundQoSState.WAIT_PUBACK,
         )
     )
+    engine._reserve_outbound(engine._outbound_logical_size("t", b"x", None))
     engine.take_effects()
     return mid
 

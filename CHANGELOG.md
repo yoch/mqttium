@@ -21,9 +21,16 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - Bounded failure retention for `publish_many()`: `max_failure_details`
   (default 128) and `failure_sink`, plus `PublishBatchError.failure_count` and
   `PublishBatchError.failure_counts`.
-- Paged inflight-store access on the `InflightStore` protocol — `out_pages()`,
-  `out_summary_pages()` and `in_pages()` — used to hydrate a persistent session
-  without materialising every payload at once.
+- `PagedInflightStore`, an opt-in protocol extending `InflightStore` with
+  `out_pages()`, `out_summary_pages()` and `in_pages()`. The engine uses it to
+  hydrate a persistent session without materialising every payload at once, and
+  falls back to the eager path for a store that does not implement it. Both
+  shipped stores implement it.
+- `EngineConfig.update()`, which validates a candidate atomically before
+  changing fields and restricts derived-state changes after engine attachment.
+- Removed the legacy public `EngineConfig.max_queued` field. Use
+  `max_pending_outbound_messages` and `max_pending_outbound_bytes`; `None`
+  disables either limit while zero rejects new QoS 1/2 publications.
 - Paho façade: `max_queued_messages_set()`, `max_queued_bytes_set()` (no Paho
   equivalent) and `MQTT_ERR_QUEUE_SIZE` (15) for admission refusals.
 
@@ -37,9 +44,7 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - Connection epochs are attached to every engine effect, so work in flight from
   a dead connection can no longer touch its successor.
 - SQLite session hydration reads keyset-paginated pages and a payload-free
-  summary projection instead of loading every row eagerly. A third-party
-  `InflightStore` that does not implement the new page methods still works, but
-  silently falls back to the eager path.
+  summary projection instead of loading every row eagerly.
 - WebSocket `write_many()` flushes in batches bounded by
   `max_write_batch_bytes` (1 MiB); an oversized item is written alone.
 - Coalesced Paho-compatible QoS 0/1/2 cross-thread publishing onto bounded

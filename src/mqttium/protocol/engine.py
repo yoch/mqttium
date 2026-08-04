@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, replace
 from enum import Enum, auto
 from typing import Any
 
@@ -42,7 +42,11 @@ from mqttium.packets import (
     encode_disconnect,
     encode_pingreq,
 )
-from mqttium.persistence.memory import InflightStore, MemoryInflightStore
+from mqttium.persistence.memory import (
+    InflightStore,
+    MemoryInflightStore,
+    PagedInflightStore,
+)
 from mqttium.protocol.flow_control import FlowControl
 from mqttium.protocol.negotiated import NegotiatedSettings
 from mqttium.protocol.packet_ids import PacketIdPool
@@ -92,6 +96,19 @@ _ALLOWED_PACKETS_BY_STATE: dict[ConnectionState, frozenset[PacketType]] = {
         }
     ),
 }
+
+_RUNTIME_MUTABLE_ENGINE_CONFIG_FIELDS = frozenset(
+    {
+        "keepalive",
+        "username",
+        "password",
+        "will",
+        "will_properties",
+        "max_pending_outbound_messages",
+        "max_pending_outbound_bytes",
+        "accept_auth",
+    }
+)
 
 
 class EffectKind(Enum):
@@ -151,8 +168,6 @@ class EngineConfig:
     # None disables the corresponding limit; zero rejects every new QoS>0 publish.
     max_pending_outbound_messages: int | None = 10_000
     max_pending_outbound_bytes: int | None = 64 * 1024 * 1024
-    # Legacy queue-only cap. Zero keeps its historical meaning (unlimited).
-    max_queued: int = 0
     connect_properties: Properties | None = None
     will: Message | None = field(default=None, repr=False)
     will_properties: Properties | None = None
@@ -163,6 +178,7 @@ class EngineConfig:
     # When False, inbound AUTH is rejected with DISCONNECT 0x8C (legacy stub).
     # AsyncClient sets this True when an auth_handler is registered.
     accept_auth: bool = False
+    _attached: bool = field(default=False, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not 0 <= self.keepalive <= 65535:
@@ -180,14 +196,34 @@ class EngineConfig:
             raise ValueError("max_pending_outbound_messages must be non-negative or None")
         if self.max_pending_outbound_bytes is not None and self.max_pending_outbound_bytes < 0:
             raise ValueError("max_pending_outbound_bytes must be non-negative or None")
-        if self.max_queued < 0:
-            raise ValueError("max_queued must be non-negative")
         if self.maximum_packet_size is not None and not (
             2 <= self.maximum_packet_size <= 268_435_460
         ):
             raise ValueError("maximum_packet_size must be between 2 and 268435460")
         if not 0 <= self.topic_alias_maximum <= 65535:
             raise ValueError("topic_alias_maximum must be between 0 and 65535")
+
+    def update(self, **changes: Any) -> None:
+        """Validate a candidate configuration, then commit its changed fields.
+
+        No mutation occurs when validation raises, including type errors. Once
+        attached to a ProtocolEngine, only fields without derived engine state
+        may be changed through this method.
+        """
+        known = {f.name for f in fields(self) if f.init}
+        unknown = set(changes) - known
+        if unknown:
+            raise AttributeError(f"unknown EngineConfig fields: {sorted(unknown)}")
+        if self._attached:
+            unsafe = set(changes) - _RUNTIME_MUTABLE_ENGINE_CONFIG_FIELDS
+            if unsafe:
+                raise AttributeError(
+                    "EngineConfig fields require a new ProtocolEngine once attached: "
+                    f"{sorted(unsafe)}"
+                )
+        candidate = replace(self, **changes)
+        for name in changes:
+            setattr(self, name, getattr(candidate, name))
 
 
 class ProtocolEngine:
@@ -199,7 +235,10 @@ class ProtocolEngine:
         store: InflightStore | None = None,
     ) -> None:
         self.config = config or EngineConfig()
+        self.config._attached = True
         self.store = store or MemoryInflightStore()
+        # Resolved once: a store either pages or it does not, for its lifetime.
+        self._paged_store = self.store if isinstance(self.store, PagedInflightStore) else None
         self.packet_ids = PacketIdPool()
         self.flow = FlowControl(self.config.local_receive_maximum)
         self.state = ConnectionState.NEW
@@ -405,9 +444,14 @@ class ProtocolEngine:
             self._emit(EffectKind.PUBLISH_COMPLETE, None)
             return PublishHandle(mid=None, qos=qos)
 
+        # One property encode and one topic measurement feed both the wire-size
+        # check and the logical budget.
+        topic_bytes, wire_property_bytes, logical_property_bytes = self._outbound_size_parts(
+            topic, properties
+        )
         # Validate packet size before reserving local memory or a packet id.
-        self._check_outbound_publish_budget(topic, payload, qos, properties)
-        logical_size = self._outbound_logical_size(topic, payload, properties)
+        self._check_outbound_publish_wire_size(topic_bytes, wire_property_bytes, len(payload), qos)
+        logical_size = len(payload) + topic_bytes + logical_property_bytes
         self._reserve_outbound(logical_size)
         mid: int | None = None
         msg: OutboundMessage | None = None
@@ -429,8 +473,6 @@ class ProtocolEngine:
             if self.state == ConnectionState.CONNECTED and self._try_launch_outbound(msg):
                 return PublishHandle(mid=mid, qos=qos)
 
-            if self.config.max_queued and len(self._queued) >= self.config.max_queued:
-                raise FlowControlError("Outbound queue full")
             self.store.put_out(msg)
             self._queued.append(msg)
             return PublishHandle(mid=mid, qos=qos)
@@ -1146,22 +1188,16 @@ class ProtocolEngine:
     def _outbound_store_summary_pages(
         self,
     ) -> Iterable[tuple[OutboundMessage | OutboundMessageSummary, ...]]:
-        pages = getattr(self.store, "out_summary_pages", None)
-        if pages is not None:
-            yield from pages()
-            return
-        full_pages = getattr(self.store, "out_pages", None)
-        if full_pages is not None:
-            yield from full_pages()
-            return
-        yield tuple(self.store.out_items())
+        if self._paged_store is not None:
+            yield from self._paged_store.out_summary_pages()
+        else:
+            yield tuple(self.store.out_items())
 
     def _inbound_store_pages(self) -> Iterable[tuple[InboundMessage, ...]]:
-        pages = getattr(self.store, "in_pages", None)
-        if pages is not None:
-            yield from pages()
-            return
-        yield tuple(self.store.in_items())
+        if self._paged_store is not None:
+            yield from self._paged_store.in_pages()
+        else:
+            yield tuple(self.store.in_items())
 
     def _replay_outbound_message(self, msg: OutboundMessage | OutboundMessageSummary) -> None:
         try:
@@ -1207,13 +1243,12 @@ class ProtocolEngine:
     def _discard_outbound_store_record(
         self,
         mid: int,
-        stored: OutboundMessage | OutboundMessageSummary | None = None,
+        stored: OutboundMessage | OutboundMessageSummary,
     ) -> None:
-        if stored is None:
-            stored = self.store.get_out(mid)
-        logical_size = self._stored_outbound_logical_size(stored) if stored is not None else 0
+        # `stored` is required: recovering it from the store here is what leaked
+        # the byte budget when a transactional store had already rolled back.
         self._delete_outbound_store_record(mid)
-        self._release_outbound_reservation(logical_size)
+        self._release_outbound_reservation(self._stored_outbound_logical_size(stored))
 
     def _delete_outbound_store_record(self, mid: int) -> None:
         try:
@@ -1227,13 +1262,10 @@ class ProtocolEngine:
     def _complete_outbound_record(
         self,
         mid: int,
-        stored: OutboundMessage | OutboundMessageSummary | None = None,
+        stored: OutboundMessage | OutboundMessageSummary,
     ) -> None:
-        if stored is None:
-            stored = self.store.get_out(mid)
-        logical_size = self._stored_outbound_logical_size(stored) if stored is not None else 0
         self.store.delete_out(mid)
-        self._release_outbound_reservation(logical_size)
+        self._release_outbound_reservation(self._stored_outbound_logical_size(stored))
 
     def _reserve_outbound(self, logical_size: int) -> None:
         message_limit = self.config.max_pending_outbound_messages
@@ -1246,9 +1278,15 @@ class ProtocolEngine:
         self._pending_outbound_bytes += logical_size
 
     def _release_outbound_reservation(self, logical_size: int) -> None:
-        if self._pending_outbound_messages > 0:
-            self._pending_outbound_messages -= 1
-        self._pending_outbound_bytes = max(0, self._pending_outbound_bytes - logical_size)
+        if self._pending_outbound_messages <= 0:
+            raise AssertionError("outbound message reservation underflow")
+        if logical_size < 0 or logical_size > self._pending_outbound_bytes:
+            raise AssertionError(
+                "outbound byte reservation underflow: "
+                f"release={logical_size}, pending={self._pending_outbound_bytes}"
+            )
+        self._pending_outbound_messages -= 1
+        self._pending_outbound_bytes -= logical_size
 
     def _outbound_logical_size(
         self,
@@ -1335,15 +1373,46 @@ class ProtocolEngine:
                 f"Encoded packet size {size} exceeds broker maximum_packet_size {limit}"
             )
 
-    def _check_outbound_publish_budget(
+    def _outbound_size_parts(
         self,
         topic: str,
-        payload: bytes,
-        qos: QoS,
         properties: Properties | None,
+    ) -> tuple[int, int, int]:
+        """Topic bytes, wire property bytes, logical property bytes — one encode.
+
+        The wire size must count MQTT 5's mandatory property-length byte even
+        when there are no properties; the logical budget accounts for
+        application data only, so it does not.
+        """
+        topic_bytes = len(topic) if topic.isascii() else len(topic.encode("utf-8"))
+        if self.config.protocol != MQTTProtocolVersion.MQTTv5:
+            return topic_bytes, 0, 0
+        if properties is None or not properties.values:
+            # An empty property table encodes to the single length byte 0x00.
+            return topic_bytes, 1, 0
+        wire_property_bytes = len(encode_properties(properties, PUBLISH))
+        logical_property_bytes = (
+            wire_property_bytes if properties is not None and properties.values else 0
+        )
+        return topic_bytes, wire_property_bytes, logical_property_bytes
+
+    def _check_outbound_publish_wire_size(
+        self,
+        topic_bytes: int,
+        wire_property_bytes: int,
+        payload_size: int,
+        qos: QoS,
     ) -> None:
         """Cheap upper bound vs negotiated maximum_packet_size (before full encode)."""
-        self._check_outbound_publish_size(topic, len(payload), qos, properties)
+        limit = self.negotiated.maximum_packet_size
+        if limit is None:
+            return
+        remaining = 2 + topic_bytes + (2 if qos else 0) + wire_property_bytes + payload_size
+        encoded_size = 1 + len(encode_vbi(remaining)) + remaining
+        if encoded_size > limit:
+            raise PacketTooLargeError(
+                f"Encoded packet size {encoded_size} exceeds broker maximum_packet_size {limit}"
+            )
 
     def _check_outbound_publish_size(
         self,
@@ -1352,19 +1421,8 @@ class ProtocolEngine:
         qos: QoS,
         properties: Properties | None,
     ) -> None:
-        limit = self.negotiated.maximum_packet_size
-        if limit is None:
-            return
-        topic_len = len(topic.encode("utf-8"))
-        properties_len = 0
-        if self.config.protocol == MQTTProtocolVersion.MQTTv5:
-            properties_len = len(encode_properties(properties, PUBLISH))
-        remaining = 2 + topic_len + (2 if qos else 0) + properties_len + payload_size
-        encoded_size = 1 + len(encode_vbi(remaining)) + remaining
-        if encoded_size > limit:
-            raise PacketTooLargeError(
-                f"Encoded packet size {encoded_size} exceeds broker maximum_packet_size {limit}"
-            )
+        topic_bytes, wire_property_bytes, _ = self._outbound_size_parts(topic, properties)
+        self._check_outbound_publish_wire_size(topic_bytes, wire_property_bytes, payload_size, qos)
 
     def _check_subscribe_capabilities(
         self,

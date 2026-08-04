@@ -1155,6 +1155,12 @@ class AsyncClient:
             return
         epoch = self._connection_epoch
 
+        # One tag covers the connection-scoped deque. On an epoch change,
+        # transport effects are discarded while terminal publish results are
+        # retained and re-tagged so their receipts cannot be stranded.
+        if self._pending_effects and self._pending_effect_epoch != epoch:
+            self._discard_connection_effects()
+
         # Normal publish/PUBACK traffic produces exactly one immediately
         # applicable effect. Do not account or queue that effect at all: the
         # counters exist only to coordinate genuinely asynchronous slow paths.
@@ -1189,26 +1195,11 @@ class AsyncClient:
                 self._connack_fut.set_result(connack)
             return True
         if kind is EffectKind.PUBLISH_COMPLETE and self.on_publish is None:
-            mid: int = effect.data
-            receipt = self._pop_publish_receipt(mid)
-            if receipt is not None and receipt._event is not None:
-                receipt._event.set()
-            batch = self._pop_batch_receipt(mid)
-            if batch is not None:
-                batch._complete(mid)
-            self._notify_publish_space()
+            self._settle_publish(effect.data, None)
             return True
         if kind is EffectKind.PUBLISH_FAILED and self.on_publish is None:
             failure: PublishFailure = effect.data
-            receipt = self._pop_publish_receipt(failure.mid)
-            if receipt is not None:
-                receipt._error = failure.reason
-                if receipt._event is not None:
-                    receipt._event.set()
-            batch = self._pop_batch_receipt(failure.mid)
-            if batch is not None:
-                batch._complete(failure.mid, failure.reason)
-            self._notify_publish_space()
+            self._settle_publish(failure.mid, failure.reason)
             return True
         if kind is EffectKind.SUBACK:
             sub_result = SubscribeResult.from_packet(effect.data)
@@ -1233,6 +1224,11 @@ class AsyncClient:
         epoch = self._pending_effect_epoch
         if epoch is None:
             return
+        if epoch != self._connection_epoch:
+            self._discard_connection_effects()
+            epoch = self._pending_effect_epoch
+            if epoch is None:
+                return
         self._effect_draining_inline = True
         try:
             while self._pending_effects:
@@ -1273,8 +1269,7 @@ class AsyncClient:
                         self._pending_effects.clear()
                         break
                     if epoch != self._connection_epoch:
-                        self._pending_effects.popleft()
-                        self._complete_effect()
+                        self._discard_connection_effects()
                         continue
                     try:
                         await self._apply_effect(
@@ -1490,29 +1485,15 @@ class AsyncClient:
                 async with self._engine_lock:
                     self._engine.mark_inbound_delivered(msg.mid)
         elif kind is EffectKind.PUBLISH_COMPLETE:
-            mid: int = effect.data
-            receipt = self._pop_publish_receipt(mid)
-            if receipt is not None and receipt._event is not None:
-                receipt._event.set()
-            batch = self._pop_batch_receipt(mid)
-            if batch is not None:
-                batch._complete(mid)
+            mid: int | None = effect.data
+            self._settle_publish(mid, None)
             if self.on_publish is not None:
                 await self._enqueue_callback(self.on_publish, mid, None)
-            self._notify_publish_space()
         elif kind is EffectKind.PUBLISH_FAILED:
             failure: PublishFailure = effect.data
-            receipt = self._pop_publish_receipt(failure.mid)
-            if receipt is not None:
-                receipt._error = failure.reason
-                if receipt._event is not None:
-                    receipt._event.set()
-            batch = self._pop_batch_receipt(failure.mid)
-            if batch is not None:
-                batch._complete(failure.mid, failure.reason)
+            self._settle_publish(failure.mid, failure.reason)
             if self.on_publish is not None:
                 await self._enqueue_callback(self.on_publish, failure.mid, failure.reason)
-            self._notify_publish_space()
         elif kind is EffectKind.SUBACK:
             sub_result = SubscribeResult.from_packet(effect.data)
             sub_fut = self._sub_futs.pop(sub_result.mid, None)
@@ -1675,6 +1656,28 @@ class AsyncClient:
             len(message.topic) if message.topic.isascii() else len(message.topic.encode("utf-8"))
         )
         return len(message.payload) + topic_bytes + property_bytes
+
+    def _settle_publish(self, mid: int | None, reason: BaseException | None) -> None:
+        """Retire the receipt and batch entry for one publication.
+
+        Receipts are keyed FIFO per identifier and the engine emits completion
+        before releasing the identifier, which is what keeps a reused MID from
+        settling a stale receipt. Both effect application paths go through here
+        so those two rules cannot drift apart.
+        """
+        # QoS 0 carries no packet identifier: its receipt is never registered
+        # and its batch entry completes at submission.
+        if mid is not None:
+            receipt = self._pop_publish_receipt(mid)
+            if receipt is not None:
+                if reason is not None:
+                    receipt._error = reason
+                if receipt._event is not None:
+                    receipt._event.set()
+            batch = self._pop_batch_receipt(mid)
+            if batch is not None:
+                batch._complete(mid, reason)
+        self._notify_publish_space()
 
     def _notify_publish_space(self) -> None:
         if self._publish_waiters:
@@ -1844,16 +1847,49 @@ class AsyncClient:
                 self._outbound.task_done()
         self._outbound_bytes = 0
 
-    def _discard_connection_effects(self) -> None:
-        # Every pending effect was derived from the old protocol/transport
-        # epoch. Session replay, failures and inbound redelivery are rebuilt
-        # from the engine/store after the next CONNACK; retaining an old
-        # MESSAGE or completion effect can duplicate delivery just as surely
-        # as retaining old wire bytes can duplicate a publish. Committed
-        # producers are released because durable QoS work continues via replay.
-        discarded = len(self._pending_effects)
-        self._pending_effects.clear()
-        self._pending_effect_epoch = None
+    def _discard_connection_effects(self, *, settle_publish: bool = False) -> None:
+        """Drop transport-scoped effects while preserving terminal publishes.
+
+        SEND, MESSAGE and connection-control effects belong to one transport
+        epoch and are rebuilt from engine/store state. PUBLISH_COMPLETE and
+        PUBLISH_FAILED are different: the store record has already been retired,
+        so losing either would strand its receipt or batch forever. They survive
+        an epoch change and are re-tagged for normal ordered application.
+
+        Final teardown cannot leave an effect worker behind. In that case
+        ``settle_publish`` retires the local handles immediately and queues the
+        optional user callback before the callback worker is drained.
+        """
+        retained: deque[EngineEffect] = deque()
+        discarded = 0
+        for effect in self._pending_effects:
+            if effect.kind not in (
+                EffectKind.PUBLISH_COMPLETE,
+                EffectKind.PUBLISH_FAILED,
+            ):
+                discarded += 1
+                continue
+            if not settle_publish:
+                retained.append(effect)
+                continue
+
+            if effect.kind is EffectKind.PUBLISH_COMPLETE:
+                mid: int | None = effect.data
+                reason: BaseException | None = None
+            else:
+                failure: PublishFailure = effect.data
+                mid = failure.mid
+                reason = failure.reason
+            self._settle_publish(mid, reason)
+            if self.on_publish is not None:
+                try:
+                    self._spawn_callback(self.on_publish, mid, reason)
+                except MessageDeliveryError as exc:
+                    self._report_callback_error(self.on_publish, exc)
+            discarded += 1
+
+        self._pending_effects = retained
+        self._pending_effect_epoch = self._connection_epoch if retained else None
         self._effect_applied += discarded
         if self._effect_waiters:
             self._effect_progress.set()
@@ -1982,7 +2018,7 @@ class AsyncClient:
                     await task
                 except (asyncio.CancelledError, Exception):
                     pass
-        self._discard_connection_effects()
+        self._discard_connection_effects(settle_publish=True)
         self._discard_outbound_queue()
         self._decoder.clear()
         async with self._outbound_space:

@@ -28,7 +28,7 @@ frames together until the 65 535 packet-identifier space ran out.
 
 | Audit item | Decision taken | Where |
 | --- | --- | --- |
-| Outbound QoS admission | Independent **count and byte** budgets, reserved before the packet id and the store write. Rejected: reusing the count-only `max_queued` (payload-blind) and one global weighted budget (couples unrelated subsystems, hard to reason about). | `protocol/engine.py` — `_reserve_outbound`, `queue_publish` |
+| Outbound QoS admission | Independent **count and byte** budgets, reserved before the packet id and the store write. Rejected: reusing the count-only `max_queued` (payload-blind, since removed) and one global weighted budget (couples unrelated subsystems, hard to reason about). | `protocol/engine.py` — `_reserve_outbound`, `queue_publish` |
 | Cancellation semantics | Cancellation stops *waiting*; it never rolls back a publication already committed to the protocol, which would make delivery non-deterministic. | `api/async_client.py` — `_admit_publish` |
 | Effect flushing | One dedicated flusher task, with an inline fast path for the common single-effect case so throughput is unaffected. | `api/async_client.py` — `_apply_effect_inline`, `_run_scheduled_effect_flush` |
 | Connection-epoch cleanup | Every effect carries the epoch of the connection that produced it; the epoch is bumped on disconnect and stale effects are dropped. | `api/async_client.py` — `_invalidate_connection_epoch` |

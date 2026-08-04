@@ -21,7 +21,6 @@ from mqttium.protocol.reconnect import ReconnectPolicy
         ("local_receive_maximum", 0),
         ("local_receive_maximum", 65536),
         ("max_outbound_inflight", 0),
-        ("max_queued", -1),
         ("maximum_packet_size", 1),
         ("topic_alias_maximum", -1),
         ("topic_alias_maximum", 65536),
