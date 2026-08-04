@@ -7,7 +7,7 @@ on:
 permissions:
   contents: read
   issues: write
-  pull-requests: read
+  pull-requests: write
   actions: write
 
 concurrency:
@@ -23,7 +23,7 @@ jobs:
       - ${{ vars.CGW_RUNNER_LABEL || 'cgw' }}
     timeout-minutes: 120
     env:
-      CGW_ROOT: ${{ vars.CGW_ROOT || '/srv/chatgpt-workbench' }}
+      CGW_ROOT: ${{ vars.CGW_ROOT || '/home/yoch/chatgpt-workbench' }}
       CGW_ALLOWED_IMAGES: ${{ vars.CGW_ALLOWED_IMAGES || 'python:3.12-bookworm,node:24-bookworm,ubuntu:24.04' }}
       CGW_JOB_BRANCH: chatgpt-workbench-jobs
       CGW_REPOSITORY: ${{ github.repository }}
