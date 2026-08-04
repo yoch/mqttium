@@ -135,7 +135,8 @@ class PacketIdPool:
         if mid < 1 or mid > self._MAX_ID:
             return
 
-        if mid < self._next:
+        frontier = self._next
+        if mid < frontier:
             if self._free_one == mid:
                 return
             free = self._free_many
@@ -147,16 +148,20 @@ class PacketIdPool:
                 self._free_many = {mid}
             else:
                 free.add(mid)
-            self._free_count += 1
-        else:
-            reserved = self._reserved
-            if reserved is None or mid not in reserved:
-                return
-            reserved.remove(mid)
-            if not reserved:
-                self._reserved = None
+            free_count = self._free_count + 1
+            self._free_count = free_count
+            if free_count == frontier - 1 and self._reserved is None:
+                self.clear()
+            return
 
-        if self._reserved is None and self._free_count == self._next - 1:
+        reserved = self._reserved
+        if reserved is None or mid not in reserved:
+            return
+        reserved.remove(mid)
+        if reserved:
+            return
+        self._reserved = None
+        if self._free_count == frontier - 1:
             self.clear()
 
     def in_use(self, mid: int) -> bool:
