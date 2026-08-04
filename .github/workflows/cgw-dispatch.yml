@@ -3,6 +3,8 @@ name: ChatGPT Workbench Dispatch
 on:
   issue_comment:
     types: [created]
+  pull_request_target:
+    types: [edited]
 
 permissions:
   contents: write
@@ -12,18 +14,23 @@ permissions:
 jobs:
   dispatch:
     if: >-
-      github.event.issue.pull_request &&
-      startsWith(github.event.comment.body, '/cgw ')
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request &&
+       startsWith(github.event.comment.body, '/cgw ')) ||
+      (github.event_name == 'pull_request_target' &&
+       contains(github.event.pull_request.body, '<!-- cgw-bootstrap:'))
     runs-on: ubuntu-24.04
     steps:
       - name: Validate and dispatch trusted slash command
         env:
           GH_TOKEN: ${{ github.token }}
+          CGW_EVENT_NAME: ${{ github.event_name }}
           CGW_REPOSITORY: ${{ github.repository }}
-          CGW_ISSUE_NUMBER: ${{ github.event.issue.number }}
+          CGW_ISSUE_NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
           CGW_COMMENT_ID: ${{ github.event.comment.id }}
           CGW_COMMENT_BODY: ${{ github.event.comment.body }}
           CGW_COMMENTER: ${{ github.event.comment.user.login }}
+          CGW_PR_BODY: ${{ github.event.pull_request.body }}
           CGW_REQUIRED_PERMISSION: ${{ vars.CGW_REQUIRED_PERMISSION || 'admin' }}
         run: |
           set -euo pipefail
@@ -36,17 +43,10 @@ jobs:
           import urllib.request
 
           token = os.environ["GH_TOKEN"]
+          event_name = os.environ["CGW_EVENT_NAME"]
           repository = os.environ["CGW_REPOSITORY"]
           issue_number = int(os.environ["CGW_ISSUE_NUMBER"])
-          comment_id = int(os.environ["CGW_COMMENT_ID"])
-          commenter = os.environ["CGW_COMMENTER"]
           required = os.environ["CGW_REQUIRED_PERMISSION"].strip().lower()
-          body = os.environ["CGW_COMMENT_BODY"].strip()
-
-          match = re.fullmatch(r"/cgw\s+job=([A-Za-z0-9._-]{1,80})", body)
-          if not match:
-              raise SystemExit("Invalid /cgw command syntax")
-          job_id = match.group(1)
 
           def api(path, *, method="GET", payload=None):
               data = None if payload is None else json.dumps(payload).encode("utf-8")
@@ -68,13 +68,59 @@ jobs:
                       return json.load(response)
               except urllib.error.HTTPError as exc:
                   detail = exc.read().decode("utf-8", errors="replace")
-                  raise RuntimeError(f"GitHub API {method} {path} failed: {exc.code} {detail}") from exc
+                  raise RuntimeError(
+                      f"GitHub API {method} {path} failed: {exc.code} {detail}"
+                  ) from exc
 
-          levels = {"none": 0, "read": 1, "triage": 2, "write": 3, "maintain": 4, "admin": 5}
+          command_re = re.compile(r"/cgw\s+job=([A-Za-z0-9._-]{1,80})")
+          if event_name == "issue_comment":
+              body = os.environ["CGW_COMMENT_BODY"].strip()
+              match = command_re.fullmatch(body)
+              if not match:
+                  raise SystemExit("Invalid /cgw command syntax")
+              job_id = match.group(1)
+              comment_id = int(os.environ["CGW_COMMENT_ID"])
+              commenter = os.environ["CGW_COMMENTER"]
+          elif event_name == "pull_request_target":
+              marker = re.search(
+                  r"<!--\s*cgw-bootstrap:([A-Za-z0-9._-]{1,80})\s*-->",
+                  os.environ.get("CGW_PR_BODY", ""),
+              )
+              if not marker:
+                  raise SystemExit("No workbench bootstrap marker")
+              job_id = marker.group(1)
+              expected_command = f"/cgw job={job_id}"
+              comments = api(
+                  f"/repos/{repository}/issues/{issue_number}/comments?per_page=100"
+              )
+              command_comment = next(
+                  (
+                      item
+                      for item in reversed(comments)
+                      if str(item.get("body", "")).strip() == expected_command
+                  ),
+                  None,
+              )
+              if command_comment is None:
+                  raise SystemExit("Matching /cgw command comment not found")
+              comment_id = int(command_comment["id"])
+              commenter = command_comment["user"]["login"]
+          else:
+              raise SystemExit(f"Unsupported event: {event_name}")
+
+          levels = {
+              "none": 0,
+              "read": 1,
+              "triage": 2,
+              "write": 3,
+              "maintain": 4,
+              "admin": 5,
+          }
           if required not in levels:
               raise SystemExit(f"Unsupported required permission: {required}")
           permission = api(
-              f"/repos/{repository}/collaborators/{urllib.parse.quote(commenter, safe='')}/permission"
+              f"/repos/{repository}/collaborators/"
+              f"{urllib.parse.quote(commenter, safe='')}/permission"
           )["permission"]
           if levels.get(permission, -1) < levels[required]:
               raise SystemExit(
