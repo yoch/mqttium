@@ -1,0 +1,169 @@
+# Memory Benchmark Methodology
+
+## Purpose
+
+`benchmarks/memory_profile.py` measures memory retained by MQTTium paths that are
+not adequately described by throughput benchmarks. It is designed to answer:
+
+- which layer owns the retained bytes;
+- whether memory growth is proportional to configured logical capacity;
+- how much memory remains after queues and stores are drained;
+- whether a change improves memory without relying on a historical process peak;
+- how memory changes compare with throughput and latency changes.
+
+The benchmark is diagnostic. It is not a universal prediction of production RSS.
+Allocator, Python, libc, SQLite, TLS, and kernel versions affect absolute values.
+Comparisons should use the same runner image and Python version whenever possible.
+
+## Process isolation
+
+Every scenario runs in a fresh child process. This is required because
+`resource.getrusage(...).ru_maxrss` is a process-lifetime maximum and Python's
+allocator can retain arenas after objects are released.
+
+The parent process only launches children and aggregates their JSON output. A
+scenario therefore cannot inherit another scenario's peak RSS, Python arenas,
+SQLite cache, or queue contents.
+
+## Memory sources
+
+Each phase records:
+
+- **RSS**: resident memory currently mapped into the process;
+- **USS**: memory unique to the process;
+- **PSS**: shared pages divided proportionally between processes;
+- **max RSS**: process-lifetime peak for this isolated child;
+- **traced current**: current allocations visible to `tracemalloc`;
+- **traced peak**: peak Python-traced allocations since the scenario reset;
+- **logical counters**: MQTTium messages, packet identifiers, records, and
+  payload/topic bytes owned by the scenario.
+
+RSS includes memory that `tracemalloc` cannot see, including parts of SQLite,
+OpenSSL, libc, socket buffers, extension modules, and interpreter internals.
+
+## Logical byte accounting
+
+The agreed logical admission model counts:
+
+```text
+payload bytes + UTF-8 topic bytes + encoded property bytes
+```
+
+It intentionally does not add a guessed fixed Python-object overhead. The
+benchmark still exposes the real RSS and USS amplification caused by objects and
+containers, especially through the 64-byte-payload protocol scenario.
+
+Current baseline scenarios do not attach MQTT properties, so their logical total
+is payload plus topic. Property-heavy scenarios will be added when admission
+accounting is implemented.
+
+## Phases
+
+Most scenarios emit these snapshots:
+
+1. `baseline`: imports are complete and garbage collection has run;
+2. `loaded`: the target queue or store owns all requested messages;
+3. `released`: MQTTium state has been drained or cleared and garbage collection
+   has run;
+4. `released_after_malloc_trim`: on glibc Linux, `malloc_trim(0)` was attempted
+   to distinguish live retention from reclaimable allocator arenas.
+
+The SQLite scenario uses `baseline_before_hydration`. Database creation happens
+before that phase, then garbage collection and allocator trimming are requested.
+The measured operation is opening and hydrating the durable session.
+
+`malloc_trim` is diagnostic only. MQTTium does not call it in normal operation.
+
+## Baseline scenarios
+
+### `protocol_qos_queue_64b`
+
+Queues 30,000 unique QoS 1 messages while disconnected. It emphasizes per-message
+Python object, dictionary, deque, receipt-adjacent, and packet-id overhead rather
+than payload size.
+
+### `protocol_qos_queue_4k`
+
+Queues 12,000 unique 4 KiB QoS 1 messages while disconnected. It exposes the
+unbounded protocol queue and its payload retention independently of the writer
+queue.
+
+### `iterator_delivery_queue_4k`
+
+Fills the public iterator delivery queue with 6,000 unique 4 KiB messages and no
+consumer. It establishes the baseline for count-only inbound backpressure before
+a shared byte budget is introduced.
+
+### `memory_store_4k`
+
+Stores 12,000 unique 4 KiB outbound records in `MemoryInflightStore`, then clears
+the store. It measures active retention and idle-container cleanup.
+
+### `sqlite_hydration_4k`
+
+Creates 6,000 queued 4 KiB records without retaining a Python list, then opens a
+new store and constructs `ProtocolEngine`. It measures the current eager
+`fetchall()`/object hydration path.
+
+## Running locally
+
+Install benchmark dependencies and run:
+
+```bash
+python -m pip install -e ".[dev]" "psutil>=6"
+python benchmarks/memory_profile.py \
+  --label local-baseline \
+  --output /tmp/mqttium-memory-profile.json
+```
+
+For a faster smoke run:
+
+```bash
+python benchmarks/memory_profile.py \
+  --scale 0.1 \
+  --label local-smoke \
+  --output /tmp/mqttium-memory-profile-smoke.json
+```
+
+`--scale` changes message counts but not payload sizes.
+
+## Comparing commits
+
+For each scenario, compare at least:
+
+- loaded RSS, USS, and traced-current deltas from baseline;
+- traced peak and isolated max RSS;
+- released RSS/USS before and after optional allocator trimming;
+- logical message and byte counts;
+- operation duration;
+- existing publisher, delivery, TLS, WAN, and persistence throughput results.
+
+A memory correction is not complete if it lowers RSS by silently reducing the
+workload, dropping messages, changing QoS guarantees, or introducing an
+unreported throughput/latency regression.
+
+## Interpretation rules
+
+- A large `traced_current` delta indicates live Python-owned objects.
+- A large RSS delta with a much smaller traced delta suggests native allocations,
+  allocator fragmentation, SQLite, TLS, or other non-traced memory.
+- A large `released` delta that falls after `malloc_trim` indicates reclaimable
+  allocator retention rather than live MQTTium references.
+- A large delta remaining after drain and trim suggests a live reference or a
+  native subsystem that retains memory intentionally.
+- A logical byte limit should be evaluated against logical counters; RSS is used
+  to measure amplification, not as the admission counter itself.
+
+## Planned extensions
+
+The same output schema will be extended with:
+
+- property-heavy outbound messages;
+- blocking and immediate-refusal admission behavior;
+- cancellation before and after the commit point;
+- Paho-compatible queue saturation;
+- shared iterator/callback delivery byte accounting;
+- WebSocket byte-bounded batches;
+- paged and lazy SQLite replay;
+- reconnect and connection-epoch cleanup;
+- QoS 2 phase-two record compaction.
