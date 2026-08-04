@@ -120,3 +120,34 @@ async def test_resumed_session_rebuilds_exactly_one_publish() -> None:
     assert len(publishes) == 1
     assert publishes[0].dup is True
     await client._force_close()
+
+
+async def test_collecting_after_an_epoch_bump_does_not_tag_fresh_effects_stale() -> None:
+    """One tag covers the whole deque, so it must never span two epochs.
+
+    Teardown bumps the epoch while effects may still be pending. If the fresh
+    effects inherited the old tag, the flusher would discard the whole deque as
+    stale — including the effects belonging to the current epoch.
+    """
+    client = AsyncClient(client_id="c")
+    # More than one effect skips the single-effect inline fast path, so these
+    # stay pending and tagged with the current epoch.
+    client._engine._emit(EffectKind.PINGRESP, None)
+    client._engine._emit(EffectKind.PINGRESP, None)
+    client._collect_effects_locked()
+    assert len(client._pending_effects) == 2
+    stale = list(client._pending_effects)
+
+    await client._invalidate_connection_epoch()
+
+    client._engine._emit(EffectKind.SUBACK, None)
+    client._engine._emit(EffectKind.UNSUBACK, None)
+    client._collect_effects_locked()
+
+    assert client._pending_effect_epoch == client._connection_epoch
+    assert [effect.kind for effect in client._pending_effects] == [
+        EffectKind.SUBACK,
+        EffectKind.UNSUBACK,
+    ], "stale effects must be dropped, not merged under the new tag"
+    assert not any(effect is old for old in stale for effect in client._pending_effects)
+    assert client._effect_enqueued == client._effect_applied + len(client._pending_effects)

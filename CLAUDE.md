@@ -117,7 +117,9 @@ When touching this area, keep `_effect_enqueued`/`_effect_applied` balanced — 
 - `packets/__init__.py` — one module holding every packet dataclass and its encode/decode.
 - `persistence/` — `InflightStore` is a `Protocol`; `MemoryInflightStore` and `SqliteInflightStore`
   implement it. The engine hydrates packet ids and the offline queue from the store at construction,
-  so durable restart works without extra API.
+  so durable restart works without extra API. `PagedInflightStore` is an opt-in extension
+  (`out_pages`/`out_summary_pages`/`in_pages`) that keeps replay memory proportional to page size;
+  the engine resolves it once with `isinstance` and otherwise falls back to the eager path.
 - `transport/` — `AsyncTransport` protocol over TCP/TLS, Unix and WebSocket. A `WriteItem` is either
   `bytes` or a `(header, payload)` tuple: payloads past `SEGMENT_THRESHOLD` (1 MiB) are written as
   two consecutive writes instead of being concatenated.

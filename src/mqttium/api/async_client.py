@@ -1155,6 +1155,13 @@ class AsyncClient:
             return
         epoch = self._connection_epoch
 
+        # One tag covers the whole deque, so it may never mix epochs: anything
+        # still pending from a previous connection is stale by definition and is
+        # dropped here. Without this, effects from the *current* epoch would
+        # inherit the old tag and be discarded with it.
+        if self._pending_effects and self._pending_effect_epoch != epoch:
+            self._discard_connection_effects()
+
         # Normal publish/PUBACK traffic produces exactly one immediately
         # applicable effect. Do not account or queue that effect at all: the
         # counters exist only to coordinate genuinely asynchronous slow paths.
@@ -1189,26 +1196,11 @@ class AsyncClient:
                 self._connack_fut.set_result(connack)
             return True
         if kind is EffectKind.PUBLISH_COMPLETE and self.on_publish is None:
-            mid: int = effect.data
-            receipt = self._pop_publish_receipt(mid)
-            if receipt is not None and receipt._event is not None:
-                receipt._event.set()
-            batch = self._pop_batch_receipt(mid)
-            if batch is not None:
-                batch._complete(mid)
-            self._notify_publish_space()
+            self._settle_publish(effect.data, None)
             return True
         if kind is EffectKind.PUBLISH_FAILED and self.on_publish is None:
             failure: PublishFailure = effect.data
-            receipt = self._pop_publish_receipt(failure.mid)
-            if receipt is not None:
-                receipt._error = failure.reason
-                if receipt._event is not None:
-                    receipt._event.set()
-            batch = self._pop_batch_receipt(failure.mid)
-            if batch is not None:
-                batch._complete(failure.mid, failure.reason)
-            self._notify_publish_space()
+            self._settle_publish(failure.mid, failure.reason)
             return True
         if kind is EffectKind.SUBACK:
             sub_result = SubscribeResult.from_packet(effect.data)
@@ -1490,29 +1482,15 @@ class AsyncClient:
                 async with self._engine_lock:
                     self._engine.mark_inbound_delivered(msg.mid)
         elif kind is EffectKind.PUBLISH_COMPLETE:
-            mid: int = effect.data
-            receipt = self._pop_publish_receipt(mid)
-            if receipt is not None and receipt._event is not None:
-                receipt._event.set()
-            batch = self._pop_batch_receipt(mid)
-            if batch is not None:
-                batch._complete(mid)
+            mid: int | None = effect.data
+            self._settle_publish(mid, None)
             if self.on_publish is not None:
                 await self._enqueue_callback(self.on_publish, mid, None)
-            self._notify_publish_space()
         elif kind is EffectKind.PUBLISH_FAILED:
             failure: PublishFailure = effect.data
-            receipt = self._pop_publish_receipt(failure.mid)
-            if receipt is not None:
-                receipt._error = failure.reason
-                if receipt._event is not None:
-                    receipt._event.set()
-            batch = self._pop_batch_receipt(failure.mid)
-            if batch is not None:
-                batch._complete(failure.mid, failure.reason)
+            self._settle_publish(failure.mid, failure.reason)
             if self.on_publish is not None:
                 await self._enqueue_callback(self.on_publish, failure.mid, failure.reason)
-            self._notify_publish_space()
         elif kind is EffectKind.SUBACK:
             sub_result = SubscribeResult.from_packet(effect.data)
             sub_fut = self._sub_futs.pop(sub_result.mid, None)
@@ -1675,6 +1653,28 @@ class AsyncClient:
             len(message.topic) if message.topic.isascii() else len(message.topic.encode("utf-8"))
         )
         return len(message.payload) + topic_bytes + property_bytes
+
+    def _settle_publish(self, mid: int | None, reason: BaseException | None) -> None:
+        """Retire the receipt and batch entry for one publication.
+
+        Receipts are keyed FIFO per identifier and the engine emits completion
+        before releasing the identifier, which is what keeps a reused MID from
+        settling a stale receipt. Both effect application paths go through here
+        so those two rules cannot drift apart.
+        """
+        # QoS 0 carries no packet identifier: its receipt is never registered
+        # and its batch entry completes at submission.
+        if mid is not None:
+            receipt = self._pop_publish_receipt(mid)
+            if receipt is not None:
+                if reason is not None:
+                    receipt._error = reason
+                if receipt._event is not None:
+                    receipt._event.set()
+            batch = self._pop_batch_receipt(mid)
+            if batch is not None:
+                batch._complete(mid, reason)
+        self._notify_publish_space()
 
     def _notify_publish_space(self) -> None:
         if self._publish_waiters:

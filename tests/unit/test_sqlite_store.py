@@ -6,7 +6,9 @@ import base64
 from pathlib import Path
 
 from mqttium.enums import InboundQoSState, OutboundQoSState, QoS
+from mqttium.persistence.memory import MemoryInflightStore, PagedInflightStore
 from mqttium.persistence.sqlite import SqliteInflightStore
+from mqttium.protocol.engine import EngineConfig, ProtocolEngine
 from mqttium.types import InboundMessage, OutboundMessage, Properties
 
 
@@ -248,3 +250,38 @@ def test_engine_sqlite_hydration_keeps_payloads_lazy(tmp_path: Path) -> None:
     assert all(isinstance(item, OutboundMessageSummary) for item in engine._queued)
     assert engine.pending_outbound_bytes == 4 * (4096 + len("a/b"))
     store.close()
+
+
+def test_shipped_stores_satisfy_the_paged_protocol(tmp_path: Path) -> None:
+    assert isinstance(MemoryInflightStore(), PagedInflightStore)
+    assert isinstance(SqliteInflightStore(tmp_path / "paged.db"), PagedInflightStore)
+
+
+def test_engine_falls_back_to_eager_replay_for_a_non_paged_store() -> None:
+    """A store predating the page methods keeps working; it only loses the
+    memory benefit, so the fallback must stay reachable and correct."""
+
+    class UnpagedStore(MemoryInflightStore):
+        out_pages = None  # type: ignore[assignment]
+        out_summary_pages = None  # type: ignore[assignment]
+        in_pages = None  # type: ignore[assignment]
+
+    store = UnpagedStore()
+    assert not isinstance(store, PagedInflightStore)
+    for mid in range(1, 4):
+        store.put_out(
+            OutboundMessage(
+                mid=mid,
+                topic="fallback/topic",
+                payload=b"payload",
+                qos=QoS.AT_LEAST_ONCE,
+                retain=False,
+                state=OutboundQoSState.QUEUED,
+            )
+        )
+
+    engine = ProtocolEngine(EngineConfig(), store=store)
+
+    assert engine._paged_store is None
+    assert engine.pending_outbound_messages == 3
+    assert [msg.mid for msg in engine._queued] == [1, 2, 3]

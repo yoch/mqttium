@@ -101,17 +101,34 @@ Conséquences pour le code existant :
 
 ## Implémentations tierces d’`InflightStore`
 
-Le Protocol `InflightStore` gagne trois méthodes de pagination : `out_pages()`,
-`out_summary_pages()` et `in_pages()`. Elles servent à réhydrater une session
-persistante sans matérialiser tous les payloads en même temps —
-`out_summary_pages()` en particulier ne sélectionne jamais la colonne payload.
+`InflightStore` est inchangé. La pagination est une **extension optionnelle**,
+`PagedInflightStore`, qui ajoute `out_pages()`, `out_summary_pages()` et
+`in_pages()`. Elles servent à réhydrater une session persistante sans
+matérialiser tous les payloads en même temps — `out_summary_pages()` en
+particulier ne sélectionne jamais la colonne payload.
 
-Un store tiers qui ne les implémente pas **continue de fonctionner**, mais
-retombe silencieusement sur le chemin eager (`out_items()` intégral). Sur un
-jeu de 6 000 messages de 4 KiB, cela représente la différence entre ~4,5 MiB et
-~50 MiB de pic alloué à la reconnexion. Implémenter les trois méthodes en
-suivant `SqliteInflightStore` (pagination par clé `WHERE seq > ? ORDER BY seq
-LIMIT ?`) si la volumétrie le justifie.
+Un store tiers qui ne l’implémente pas **continue de fonctionner** : le moteur
+détecte l’absence (`isinstance`, une seule fois à la construction) et retombe
+sur le chemin eager (`out_items()` intégral). Sur un jeu de 6 000 messages de
+4 KiB, c’est la différence entre ~4,5 MiB et ~50 MiB de pic alloué à la
+reconnexion. Implémenter les trois méthodes en suivant `SqliteInflightStore`
+(pagination par clé `WHERE seq > ? ORDER BY seq LIMIT ?`) si la volumétrie le
+justifie :
+
+```python
+from mqttium.persistence.memory import PagedInflightStore
+
+class MonStore:
+    ...
+
+assert isinstance(MonStore(), PagedInflightStore)  # sinon : chemin eager
+```
+
+## Mutation d’`EngineConfig`
+
+Les limites se modifient via `config.update(max_pending_outbound_bytes=...)`,
+qui revalide les plages. Une affectation directe d’attribut contourne les
+contrôles de `__post_init__`.
 
 ## Helpers one-shot
 
