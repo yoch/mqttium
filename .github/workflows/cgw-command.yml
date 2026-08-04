@@ -51,6 +51,20 @@ jobs:
           path: control
           persist-credentials: false
 
+      - name: Adapt controller to local Docker daemon
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("control/.github/chatgpt-workbench/processor.py")
+          source = path.read_text()
+          needle = '        "--init",\n'
+          if needle not in source:
+              raise SystemExit("Expected Docker --init option not found")
+          path.write_text(source.replace(needle, "", 1))
+          PY
+
       - name: Fetch, apply, and validate
         id: execute
         continue-on-error: true
