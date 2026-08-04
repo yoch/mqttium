@@ -139,10 +139,7 @@ class AsyncClient:
             raise ValueError("message_delivery must be 'auto', 'iterator', 'callback', or 'both'")
         if publish_backpressure not in ("wait", "error"):
             raise ValueError("publish_backpressure must be 'wait' or 'error'")
-        if (
-            max_pending_outbound_messages is not None
-            and max_pending_outbound_messages < 0
-        ):
+        if max_pending_outbound_messages is not None and max_pending_outbound_messages < 0:
             raise ValueError("max_pending_outbound_messages must be non-negative or None")
         if max_pending_outbound_bytes is not None and max_pending_outbound_bytes < 0:
             raise ValueError("max_pending_outbound_bytes must be non-negative or None")

@@ -178,10 +178,7 @@ class EngineConfig:
             and self.max_pending_outbound_messages < 0
         ):
             raise ValueError("max_pending_outbound_messages must be non-negative or None")
-        if (
-            self.max_pending_outbound_bytes is not None
-            and self.max_pending_outbound_bytes < 0
-        ):
+        if self.max_pending_outbound_bytes is not None and self.max_pending_outbound_bytes < 0:
             raise ValueError("max_pending_outbound_bytes must be non-negative or None")
         if self.max_queued < 0:
             raise ValueError("max_queued must be non-negative")
@@ -1117,9 +1114,7 @@ class ProtocolEngine:
                 continue
             self._queued.popleft()
 
-    def _hydrate_outbound_message(
-        self, msg: OutboundMessage | OutboundMessageSummary
-    ) -> None:
+    def _hydrate_outbound_message(self, msg: OutboundMessage | OutboundMessageSummary) -> None:
         self.packet_ids.reserve(msg.mid)
         logical_size = self._stored_outbound_logical_size(msg)
         self._outbound_logical_sizes[msg.mid] = logical_size
@@ -1154,9 +1149,7 @@ class ProtocolEngine:
             return
         yield tuple(self.store.in_items())
 
-    def _replay_outbound_message(
-        self, msg: OutboundMessage | OutboundMessageSummary
-    ) -> None:
+    def _replay_outbound_message(self, msg: OutboundMessage | OutboundMessageSummary) -> None:
         try:
             self._validate_outbound_against_negotiated(msg)
         except (ProtocolError, PacketTooLargeError) as exc:
@@ -1234,9 +1227,7 @@ class ProtocolEngine:
         payload: bytes,
         properties: Properties | None,
     ) -> int:
-        return self._outbound_logical_size_from_size(
-            topic, len(payload), properties
-        )
+        return self._outbound_logical_size_from_size(topic, len(payload), properties)
 
     def _outbound_logical_size_from_size(
         self,
@@ -1267,13 +1258,9 @@ class ProtocolEngine:
         self, stored: OutboundMessage | OutboundMessageSummary
     ) -> int:
         payload_size = (
-            len(stored.payload)
-            if isinstance(stored, OutboundMessage)
-            else stored.payload_size
+            len(stored.payload) if isinstance(stored, OutboundMessage) else stored.payload_size
         )
-        return self._outbound_logical_size_from_size(
-            stored.topic, payload_size, stored.properties
-        )
+        return self._outbound_logical_size_from_size(stored.topic, payload_size, stored.properties)
 
     def _resolve_inbound_topic(self, packet: PublishPacket) -> str:
         if self.config.protocol != MQTTProtocolVersion.MQTTv5:
@@ -1315,9 +1302,7 @@ class ProtocolEngine:
         properties: Properties | None,
     ) -> None:
         """Cheap upper bound vs negotiated maximum_packet_size (before full encode)."""
-        self._check_outbound_publish_size(
-            topic, len(payload), qos, properties
-        )
+        self._check_outbound_publish_size(topic, len(payload), qos, properties)
 
     def _check_outbound_publish_size(
         self,
@@ -1408,20 +1393,14 @@ class ProtocolEngine:
                     f"topic_alias {alias} exceeds broker topic_alias_maximum "
                     f"{self.negotiated.topic_alias_maximum}"
                 )
-        encoded_publish = (
-            msg.encoded_publish if isinstance(msg, OutboundMessage) else None
-        )
+        encoded_publish = msg.encoded_publish if isinstance(msg, OutboundMessage) else None
         if encoded_publish is not None:
             self._check_outbound_size(encoded_publish)
         else:
             payload_size = (
-                len(msg.payload)
-                if isinstance(msg, OutboundMessage)
-                else msg.payload_size
+                len(msg.payload) if isinstance(msg, OutboundMessage) else msg.payload_size
             )
-            self._check_outbound_publish_size(
-                msg.topic, payload_size, msg.qos, msg.properties
-            )
+            self._check_outbound_publish_size(msg.topic, payload_size, msg.qos, msg.properties)
 
     def _fail_queued_violating_negotiation(self) -> None:
         kept: deque[OutboundMessage | OutboundMessageSummary] = deque()
