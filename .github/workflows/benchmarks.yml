@@ -90,6 +90,10 @@ jobs:
           python benchmarks/realworld.py --port 11883 --profile wan-20ms-jitter5ms-loss0.1pct --count 1500 --subscriber-timeout 180 --output /tmp/mqttium-bench/realworld-wan.json
           sudo tc qdisc del dev lo root
           trap - EXIT
+      - name: Package temporary source snapshot
+        run: |
+          tar -czf /tmp/mqttium-bench/source-snapshot.tar.gz \
+            .github benchmarks docs examples src tests pyproject.toml
       - name: Upload measurements
         if: always()
         uses: actions/upload-artifact@v7
@@ -97,6 +101,7 @@ jobs:
           name: mqttium-benchmarks-${{ github.run_id }}
           path: |
             /tmp/mqttium-bench/*.json
+            /tmp/mqttium-bench/*.tar.gz
             /tmp/mqttium-bench/mosquitto.log
           if-no-files-found: warn
           retention-days: 30
