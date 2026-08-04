@@ -500,6 +500,7 @@ class ProtocolEngine:
         # the admission counters wholesale instead of releasing record by record.
         pending_messages_start = self._pending_outbound_messages
         pending_bytes_start = self._pending_outbound_bytes
+        packet_ids_empty_start = len(self.packet_ids) == 0
         handles: list[PublishHandle] = []
         try:
             with self.store.batch():
@@ -523,7 +524,11 @@ class ProtocolEngine:
                 if handle.mid is None:
                     continue
                 self._delete_outbound_store_record(handle.mid)
-                self.packet_ids.release(handle.mid)
+                if not packet_ids_empty_start:
+                    self.packet_ids.release(handle.mid)
+            if packet_ids_empty_start:
+                # Every live MID was allocated by this failed atomic batch.
+                self.packet_ids.clear()
             self._pending_outbound_messages = pending_messages_start
             self._pending_outbound_bytes = pending_bytes_start
             raise
@@ -619,9 +624,14 @@ class ProtocolEngine:
         self._topic_aliases.clear()
         self._pending_connect = False
         # Release sub/unsub MIDs still in flight — no ACK will arrive now.
-        for mid in self._pending_sub_mids:
-            self.packet_ids.release(mid)
-        self._pending_sub_mids.clear()
+        if self._pending_sub_mids:
+            if self._pending_outbound_messages == 0:
+                # No publish MID survives this transport: reset in constant time.
+                self.packet_ids.clear()
+            else:
+                for mid in self._pending_sub_mids:
+                    self.packet_ids.release(mid)
+            self._pending_sub_mids.clear()
         if was != ConnectionState.DISCONNECTED:
             self._emit(EffectKind.DISCONNECTED, DisconnectInfo(from_broker=False))
 
@@ -695,12 +705,17 @@ class ProtocolEngine:
         self.session_present = connack.session_present
         self._update_session_resume_preference()
         if not connack.session_present:
+            # _queued mirrors every outbound record that must survive a missing
+            # broker session. With no queued or SUB/UNSUB work, all packet ids
+            # belong to the inflight records discarded below.
+            clear_abandoned_packet_ids = not self._queued and not self._pending_sub_mids
             for page in self._outbound_store_summary_pages():
                 for msg in page:
                     if msg.state is OutboundQoSState.QUEUED:
                         continue
                     self._complete_outbound_record(msg.mid, msg)
-                    self.packet_ids.release(msg.mid)
+                    if not clear_abandoned_packet_ids:
+                        self.packet_ids.release(msg.mid)
                     self._emit(
                         EffectKind.PUBLISH_FAILED,
                         PublishFailure(
@@ -710,6 +725,8 @@ class ProtocolEngine:
                             ),
                         ),
                     )
+            if clear_abandoned_packet_ids:
+                self.packet_ids.clear()
             self.store.clear_in()
             self._recovered_inbound_mids.clear()
             self._inbound_inflight = 0
