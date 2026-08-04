@@ -5,7 +5,7 @@ on:
     types: [created]
 
 permissions:
-  contents: read
+  contents: write
   issues: write
   pull-requests: read
 
@@ -16,13 +16,112 @@ jobs:
       startsWith(github.event.comment.body, '/cgw ')
     runs-on: ubuntu-24.04
     steps:
-      - name: Dispatch trusted slash command
-        uses: peter-evans/slash-command-dispatch@v5
-        with:
-          token: ${{ secrets.CGW_DISPATCH_TOKEN }}
-          reaction-token: ${{ github.token }}
-          commands: cgw
-          permission: ${{ vars.CGW_REQUIRED_PERMISSION || 'admin' }}
-          issue-type: pull-request
-          event-type-suffix: -command
-          dispatch-type: repository
+      - name: Validate and dispatch trusted slash command
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CGW_REPOSITORY: ${{ github.repository }}
+          CGW_ISSUE_NUMBER: ${{ github.event.issue.number }}
+          CGW_COMMENT_ID: ${{ github.event.comment.id }}
+          CGW_COMMENT_BODY: ${{ github.event.comment.body }}
+          CGW_COMMENTER: ${{ github.event.comment.user.login }}
+          CGW_REQUIRED_PERMISSION: ${{ vars.CGW_REQUIRED_PERMISSION || 'admin' }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          token = os.environ["GH_TOKEN"]
+          repository = os.environ["CGW_REPOSITORY"]
+          issue_number = int(os.environ["CGW_ISSUE_NUMBER"])
+          comment_id = int(os.environ["CGW_COMMENT_ID"])
+          commenter = os.environ["CGW_COMMENTER"]
+          required = os.environ["CGW_REQUIRED_PERMISSION"].strip().lower()
+          body = os.environ["CGW_COMMENT_BODY"].strip()
+
+          match = re.fullmatch(r"/cgw\s+job=([A-Za-z0-9._-]{1,80})", body)
+          if not match:
+              raise SystemExit("Invalid /cgw command syntax")
+          job_id = match.group(1)
+
+          def api(path, *, method="GET", payload=None):
+              data = None if payload is None else json.dumps(payload).encode("utf-8")
+              request = urllib.request.Request(
+                  f"https://api.github.com{path}",
+                  data=data,
+                  method=method,
+                  headers={
+                      "Authorization": f"Bearer {token}",
+                      "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "User-Agent": "chatgpt-persistent-workbench-dispatch",
+                  },
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      if response.status == 204:
+                          return None
+                      return json.load(response)
+              except urllib.error.HTTPError as exc:
+                  detail = exc.read().decode("utf-8", errors="replace")
+                  raise RuntimeError(f"GitHub API {method} {path} failed: {exc.code} {detail}") from exc
+
+          levels = {"none": 0, "read": 1, "triage": 2, "write": 3, "maintain": 4, "admin": 5}
+          if required not in levels:
+              raise SystemExit(f"Unsupported required permission: {required}")
+          permission = api(
+              f"/repos/{repository}/collaborators/{urllib.parse.quote(commenter, safe='')}/permission"
+          )["permission"]
+          if levels.get(permission, -1) < levels[required]:
+              raise SystemExit(
+                  f"User {commenter} has permission {permission}; {required} is required"
+              )
+
+          pull_request = api(f"/repos/{repository}/pulls/{issue_number}")
+          compact_pr = {
+              "number": pull_request["number"],
+              "head": {
+                  "ref": pull_request["head"]["ref"],
+                  "sha": pull_request["head"]["sha"],
+                  "repo": {"full_name": pull_request["head"]["repo"]["full_name"]},
+              },
+          }
+          client_payload = {
+              "slash_command": {
+                  "command": "cgw",
+                  "args": {
+                      "all": f"job={job_id}",
+                      "unnamed": {"all": ""},
+                      "named": {"job": job_id},
+                  },
+              },
+              "pull_request": compact_pr,
+              "github": {
+                  "payload": {
+                      "issue": {"number": issue_number},
+                      "comment": {"id": comment_id},
+                      "repository": {"full_name": repository},
+                  }
+              },
+          }
+
+          api(
+              f"/repos/{repository}/issues/comments/{comment_id}/reactions",
+              method="POST",
+              payload={"content": "eyes"},
+          )
+          api(
+              f"/repos/{repository}/dispatches",
+              method="POST",
+              payload={"event_type": "cgw-command", "client_payload": client_payload},
+          )
+          api(
+              f"/repos/{repository}/issues/comments/{comment_id}/reactions",
+              method="POST",
+              payload={"content": "rocket"},
+          )
+          PY
