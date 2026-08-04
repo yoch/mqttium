@@ -5,7 +5,7 @@ on:
     types: [cgw-command]
 
 permissions:
-  contents: read
+  contents: write
   issues: write
   pull-requests: write
   actions: write
@@ -83,7 +83,7 @@ jobs:
         id: push
         if: steps.execute.outcome == 'success'
         env:
-          CGW_PUSH_TOKEN: ${{ secrets.CGW_PUSH_TOKEN }}
+          CGW_PUSH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           python control/.github/chatgpt-workbench/processor.py push
