@@ -77,6 +77,6 @@ class PacketIdPool:
         return mid in self._used
 
     def clear(self) -> None:
-        self._used.clear()
-        self._free.clear()
+        self._used = set()
+        self._free = []
         self._next = 1
