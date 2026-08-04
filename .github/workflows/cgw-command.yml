@@ -3,19 +3,92 @@ name: ChatGPT Persistent Workbench
 on:
   repository_dispatch:
     types: [cgw-command]
+  pull_request:
+    paths:
+      - .github/chatgpt-workbench/processor.py
+      - .github/workflows/cgw-command.yml
 
 permissions:
-  contents: write
+  contents: read
   issues: write
   pull-requests: write
-  actions: write
 
 concurrency:
-  group: cgw-${{ github.repository }}-${{ github.event.client_payload.pull_request.number }}
+  group: cgw-${{ github.repository }}-${{ github.event.client_payload.pull_request.number || github.event.pull_request.number || github.run_id }}
   cancel-in-progress: false
 
 jobs:
+  controller-smoke:
+    if: github.event_name == 'pull_request'
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+      - ${{ vars.CGW_RUNNER_LABEL || 'cgw' }}
+    timeout-minutes: 15
+    env:
+      CGW_DOCKER_SNAP_COMPAT: ${{ vars.CGW_DOCKER_SNAP_COMPAT || 'false' }}
+      CGW_DOCKER_UID: ${{ vars.CGW_DOCKER_UID }}
+      CGW_DOCKER_GID: ${{ vars.CGW_DOCKER_GID }}
+    steps:
+      - name: Check out controller branch
+        uses: actions/checkout@v7
+
+      - name: Validate Python syntax
+        run: python -m py_compile .github/chatgpt-workbench/processor.py
+
+      - name: Exercise Docker bind mounts
+        shell: bash
+        run: |
+          set -euo pipefail
+          smoke_root="$(mktemp -d "$RUNNER_TEMP/cgw-controller-smoke.XXXXXX")"
+          trap 'rm -rf "$smoke_root"' EXIT
+          workspace="$smoke_root/workspace"
+          cache="$smoke_root/cache"
+          mkdir -p "$workspace" "$cache"
+          echo "host file" > "$workspace/input.txt"
+
+          python - "$workspace" "$cache" <<'PY'
+          import importlib.util
+          import sys
+          from pathlib import Path
+
+          processor_path = Path(".github/chatgpt-workbench/processor.py")
+          spec = importlib.util.spec_from_file_location("cgw_processor", processor_path)
+          if spec is None or spec.loader is None:
+              raise SystemExit("Cannot load processor.py")
+          processor = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(processor)
+
+          completed = processor.docker_command(
+              Path(sys.argv[1]),
+              Path(sys.argv[2]),
+              {
+                  "name": "controller smoke",
+                  "image": "ubuntu:24.04",
+                  "command": """
+          set -e
+          test "$(cat input.txt)" = "host file"
+          echo "written from container" > output.txt
+          mkdir -p "$XDG_CACHE_HOME"
+          echo "cache works" > "$XDG_CACHE_HOME/test.txt"
+          """,
+                  "timeout": 120,
+                  "network": False,
+              },
+          )
+          print(completed.stdout, end="")
+          print(completed.stderr, end="", file=sys.stderr)
+          raise SystemExit(completed.returncode)
+          PY
+
+          test "$(cat "$workspace/output.txt")" = "written from container"
+          test "$(cat "$cache/xdg/test.txt")" = "cache works"
+          test "$(stat -c %u "$workspace/output.txt")" = "$(id -u)"
+          test "$(stat -c %g "$workspace/output.txt")" = "$(id -g)"
+
   workbench:
+    if: github.event_name == 'repository_dispatch'
     runs-on:
       - self-hosted
       - linux
@@ -23,8 +96,11 @@ jobs:
       - ${{ vars.CGW_RUNNER_LABEL || 'cgw' }}
     timeout-minutes: 120
     env:
-      CGW_ROOT: /home/yoch/chatgpt-workbench
+      CGW_ROOT: ${{ vars.CGW_ROOT || '/home/yoch/chatgpt-workbench' }}
       CGW_ALLOWED_IMAGES: ${{ vars.CGW_ALLOWED_IMAGES || 'python:3.12-bookworm,node:24-bookworm,ubuntu:24.04' }}
+      CGW_DOCKER_SNAP_COMPAT: ${{ vars.CGW_DOCKER_SNAP_COMPAT || 'false' }}
+      CGW_DOCKER_UID: ${{ vars.CGW_DOCKER_UID }}
+      CGW_DOCKER_GID: ${{ vars.CGW_DOCKER_GID }}
       CGW_JOB_BRANCH: chatgpt-workbench-jobs
       CGW_REPOSITORY: ${{ github.repository }}
       CGW_PR_NUMBER: ${{ github.event.client_payload.pull_request.number }}
@@ -45,30 +121,11 @@ jobs:
           [[ "$CGW_JOB_ID" =~ ^[A-Za-z0-9._-]{1,80}$ ]]
 
       - name: Check out trusted controller
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event.repository.default_branch }}
           path: control
           persist-credentials: false
-
-      - name: Adapt controller to local Docker daemon
-        run: |
-          set -euo pipefail
-          python - <<'PY'
-          from pathlib import Path
-
-          path = Path("control/.github/chatgpt-workbench/processor.py")
-          source = path.read_text()
-          replacements = (
-              ('        "--init",\n', ""),
-              ('        "--security-opt",\n        "no-new-privileges",\n', ""),
-          )
-          for needle, replacement in replacements:
-              if needle not in source:
-                  raise SystemExit(f"Expected Docker option not found: {needle!r}")
-              source = source.replace(needle, replacement, 1)
-          path.write_text(source)
-          PY
 
       - name: Fetch, apply, and validate
         id: execute
@@ -83,7 +140,7 @@ jobs:
         id: push
         if: steps.execute.outcome == 'success'
         env:
-          CGW_PUSH_TOKEN: ${{ github.token }}
+          CGW_PUSH_TOKEN: ${{ secrets.CGW_PUSH_TOKEN }}
         run: |
           set -euo pipefail
           python control/.github/chatgpt-workbench/processor.py push

@@ -31,6 +31,30 @@ def env(name: str) -> str:
     return value
 
 
+def optional_env(name: str, default: str) -> str:
+    value = os.environ.get(name, "").strip()
+    return value or default
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise WorkbenchError(f"Invalid boolean environment variable {name}: {value}")
+
+
+def env_numeric_id(name: str, default: int) -> str:
+    value = optional_env(name, str(default))
+    if not value.isdigit():
+        raise WorkbenchError(f"Invalid numeric environment variable {name}: {value}")
+    return value
+
+
 def run(
     args: list[str],
     *,
@@ -213,11 +237,24 @@ def docker_command(
 ) -> subprocess.CompletedProcess[str]:
     cache.mkdir(parents=True, exist_ok=True)
     network = "bridge" if item["network"] else "none"
+    docker_uid = env_numeric_id("CGW_DOCKER_UID", os.getuid())
+    docker_gid = env_numeric_id("CGW_DOCKER_GID", os.getgid())
+    snap_compat = env_bool("CGW_DOCKER_SNAP_COMPAT")
+
     args = [
         "docker",
         "run",
         "--rm",
-        "--init",
+        "--user",
+        f"{docker_uid}:{docker_gid}",
+    ]
+    if not snap_compat:
+        args += [
+            "--init",
+            "--security-opt",
+            "no-new-privileges",
+        ]
+    args += [
         "--network",
         network,
         "--cpus",
@@ -226,12 +263,10 @@ def docker_command(
         "4g",
         "--pids-limit",
         "512",
-        "--security-opt",
-        "no-new-privileges",
         "--cap-drop",
         "ALL",
         "-e",
-        "HOME=/tmp/home",
+        "HOME=/tmp",
         "-e",
         "XDG_CACHE_HOME=/cache/xdg",
         "-e",
@@ -326,6 +361,7 @@ def execute() -> None:
         state = {
             "job": job,
             "status": status,
+            "push_status": "pending" if job["push"] else "disabled",
             "records": records,
             "workspace": str(p["workspace"]),
         }
@@ -341,6 +377,8 @@ def push() -> None:
     if state["status"] != "success":
         raise WorkbenchError("Cannot push failed job")
     if not job["push"]:
+        state["push_status"] = "disabled"
+        p["state"].write_text(json.dumps(state, indent=2) + "\n")
         return
     token = env("CGW_PUSH_TOKEN")
     with p["lock"].open("w") as lock_file:
@@ -381,6 +419,7 @@ def push() -> None:
             cwd=p["workspace"],
         )
         state["commit_sha"] = sha
+        state["push_status"] = "success"
         p["state"].write_text(json.dumps(state, indent=2) + "\n")
 
 
@@ -390,8 +429,19 @@ def comment() -> None:
     if p["state"].exists():
         state = json.loads(p["state"].read_text())
     execute_outcome = os.environ.get("EXECUTE_OUTCOME", "unknown")
-    push_outcome = os.environ.get("PUSH_OUTCOME", "unknown")
-    ok = execute_outcome == "success" and push_outcome in {"success", "skipped"}
+    workflow_push_outcome = os.environ.get("PUSH_OUTCOME", "unknown")
+    state_push_status = state.get("push_status")
+    if workflow_push_outcome == "failure":
+        push_status = "failure"
+    elif state_push_status in {"disabled", "success"}:
+        push_status = state_push_status
+    else:
+        push_status = workflow_push_outcome
+    ok = execute_outcome == "success" and push_status in {
+        "success",
+        "disabled",
+        "skipped",
+    }
     icon = "✅" if ok else "❌"
     lines = [
         f"<!-- cgw-result:{env('CGW_JOB_ID')} -->",
@@ -399,7 +449,7 @@ def comment() -> None:
         "",
         f"- **Job:** `{env('CGW_JOB_ID')}`",
         f"- **Execution:** `{execute_outcome}`",
-        f"- **Push:** `{push_outcome}`",
+        f"- **Push:** `{push_status}`",
     ]
     if state.get("commit_sha"):
         lines.append(f"- **Commit:** `{state['commit_sha']}`")
