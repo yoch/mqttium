@@ -6,7 +6,7 @@ It combines a synchronous protocol engine with an `asyncio` API, bounded
 backpressure, durable inflight persistence, explicit delivery receipts, and
 complete MQTT QoS state machines.
 
-> **Status:** alpha (`0.1.0a1`). The implementation is extensively tested, but
+> **Status:** alpha (`0.1.0a2`). The implementation is extensively tested, but
 > the public API may still change before the first stable release.
 
 ## Features
@@ -81,11 +81,35 @@ against equivalent individual publishing pipelines on the validated source
 tree. Benchmark methodology and limitations are documented in
 [`docs/BENCHMARKING.md`](docs/BENCHMARKING.md).
 
+## Bounded memory
+
+Every queue that can grow with application load is bounded by default, so a
+producer that outruns its broker is slowed down rather than allowed to exhaust
+the process:
+
+```python
+client = AsyncClient(
+    max_pending_outbound_messages=10_000,   # unfinished QoS 1/2 publications
+    max_pending_outbound_bytes=64 * 1024**2,  # their logical topic+payload+properties
+    max_pending_delivery_bytes=64 * 1024**2,  # inbound messages awaiting a consumer
+    publish_backpressure="wait",            # or "error" to refuse immediately
+)
+```
+
+`publish()` waits for capacity by default and raises `FlowControlError` under
+`publish_backpressure="error"` or with `nowait=True`. A refusal is atomic: no
+packet identifier is allocated and no store record is written. Pass `None` for
+any limit to restore unbounded queueing.
+
+These defaults are new in `0.1.0a2`; before them a QoS 1/2 producer could queue
+until the 65 535 packet-identifier space was exhausted. See
+[`docs/MIGRATION.md`](docs/MIGRATION.md).
+
 ## Validation
 
 The release gates include:
 
-- more than 240 unit tests;
+- more than 300 unit tests;
 - Mosquitto integration tests on Python 3.11, 3.12, 3.13 and 3.14;
 - deterministic and Hypothesis-based fuzzing;
 - Ruff formatting and linting;

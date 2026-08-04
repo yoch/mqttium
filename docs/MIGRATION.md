@@ -70,6 +70,49 @@ Points protocolaires corrigés vs gmqtt :
 - `Receive Maximum` ≠ espace de packet identifiers
 - Parser incrémental non allocateur par octet
 
+## Limites d’admission bornées par défaut
+
+Depuis la série non publiée, toutes les files qui croissent avec la charge
+applicative sont bornées par défaut. Auparavant un producteur QoS 1/2 pouvait
+empiler jusqu’à épuisement de l’espace des 65 535 identifiants de paquet.
+
+```python
+client = AsyncClient(
+    max_pending_outbound_messages=10_000,      # publications QoS 1/2 non terminées
+    max_pending_outbound_bytes=64 * 1024**2,   # leur taille logique topic+payload+propriétés
+    max_pending_delivery_bytes=64 * 1024**2,   # messages entrants en attente de consommateur
+    publish_backpressure="wait",               # ou "error" pour refuser immédiatement
+)
+```
+
+Conséquences pour le code existant :
+
+- `publish()` attend la capacité par défaut. Sous `publish_backpressure="error"`
+  ou avec `nowait=True`, il lève `FlowControlError`. Le refus est atomique :
+  ni identifiant de paquet alloué, ni enregistrement de store écrit.
+- Un `publish()` garé sur la capacité échoue si la connexion est définitivement
+  perdue ; il continue d’attendre pendant une reconnexion en cours.
+- `publish_many()` ne retient au plus que `max_failure_details` (128) détails
+  d’échec. Les totaux restent exacts via `PublishBatchError.failure_count` et
+  `failure_counts` ; utiliser `failure_sink=` pour tout capturer.
+- Passer `None` sur une limite restaure le comportement non borné d’avant.
+- Façade Paho : la saturation renvoie `MQTT_ERR_QUEUE_SIZE` (15), et
+  `max_queued_messages_set()` / `max_queued_bytes_set()` ajustent ces limites.
+
+## Implémentations tierces d’`InflightStore`
+
+Le Protocol `InflightStore` gagne trois méthodes de pagination : `out_pages()`,
+`out_summary_pages()` et `in_pages()`. Elles servent à réhydrater une session
+persistante sans matérialiser tous les payloads en même temps —
+`out_summary_pages()` en particulier ne sélectionne jamais la colonne payload.
+
+Un store tiers qui ne les implémente pas **continue de fonctionner**, mais
+retombe silencieusement sur le chemin eager (`out_items()` intégral). Sur un
+jeu de 6 000 messages de 4 KiB, cela représente la différence entre ~4,5 MiB et
+~50 MiB de pic alloué à la reconnexion. Implémenter les trois méthodes en
+suivant `SqliteInflightStore` (pagination par clé `WHERE seq > ? ORDER BY seq
+LIMIT ?`) si la volumétrie le justifie.
+
 ## Helpers one-shot
 
 ```python

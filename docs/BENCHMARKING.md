@@ -21,3 +21,19 @@ Comparisons must use equivalent public completion semantics and rotate execution
 order where warm-up could matter. A result is omitted rather than manufactured
 with library-specific barriers. CI uploads JSON artefacts and never commits or
 pushes generated numbers.
+
+## Memory regression thresholds
+
+`benchmarks/memory_profile.py` is guarded by `benchmarks/check_memory_thresholds.py`,
+which the benchmarks workflow runs immediately after the profile and which fails
+the build on a breach.
+
+`benchmarks/memory_thresholds.json` is versioned deliberately. It holds
+*limits*, not measurements, so it does not violate the artefact-only rule above:
+no generated number is committed. It bounds the tracemalloc peak — a count of
+Python allocations, comparable across runners, unlike absolute RSS — and
+asserts each scenario's logical counters exactly, so a benchmark that quietly
+stopped doing equivalent work cannot pass as an improvement.
+
+Reference values live in `docs/MEMORY-RESULTS.md`. Raising a threshold is a
+reviewable change and needs a reason.

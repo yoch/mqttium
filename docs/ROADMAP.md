@@ -19,6 +19,29 @@ roadmap tracks work that remains relevant after the standalone spin-out.
 - [ ] Extend broker interoperability beyond Mosquitto to at least two independent implementations.
 - [ ] Publish reproducible release benchmark artefacts from pinned runner profiles.
 
+## Remaining memory work
+
+Carried over from [`MEMORY-PROFILE-FOLLOW-UP.md`](MEMORY-PROFILE-FOLLOW-UP.md),
+which records what already shipped.
+
+- [ ] Bound each ingress batch by bytes, not only by the 256-packet count.
+- [ ] Specialised in-buffer PUBLISH decode, to remove the payload-sized copies
+      large inbound messages still cost.
+- [ ] Full QoS 2 phase-two compaction (release topic, payload and properties,
+      not only the encoded frame).
+- [ ] Benchmark the QoS 1 / pre-PUBREC frame policy: re-encode on retransmission
+      versus a size-based policy.
+- [ ] Complete the counter surface — effect queue, writer, decoder, WebSocket
+      buffers, receipts, an outbound-budget high-water mark, and one unified
+      stats snapshot. Constraint: no `logging`, per
+      [`LOGGING.md`](LOGGING.md).
+- [ ] Add memory-benchmark scenarios for the paths currently covered only by
+      unit tests (property-heavy outbound, immediate refusal, cancellation
+      around the commit point, Paho queue saturation, shared iterator/callback
+      accounting, WebSocket byte-bounded batches, reconnect/epoch cleanup).
+- [ ] Assert that outbound admission counters return to zero after a sustained
+      load drains.
+
 ## Optional extensions
 
 - [ ] Concrete enhanced-authentication plugins such as SCRAM where broker demand justifies them.

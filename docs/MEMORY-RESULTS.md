@@ -5,11 +5,30 @@
 The before-state was captured on GitHub Actions benchmark run 22 from commit
 `1a9fe49bd6b2a3018f26171668cb5b18f44a0066`. The after-state below was captured
 locally with the same scenario counts and payload sizes after the admission,
-delivery-budget, pagination, and lazy-hydration changes. GitHub Actions will
-produce the authoritative after artifact for the pull request head.
+delivery-budget, pagination, and lazy-hydration changes.
 
 Absolute RSS varies by runner. The important comparisons are logical work,
 relative amplification, and whether configured budgets cap retained state.
+
+### Re-verification
+
+The table below was measured on top of the admission and delivery-budget work
+alone. It was re-run at full scale on a different machine after the coalesced
+Paho publish path and the two admission fixes landed, to confirm the bounded
+paths were not disturbed:
+
+| Scenario | This doc | Re-run | Verdict |
+|---|---:|---:|---|
+| SQLite hydration, RSS delta | 11.12 MiB | 11.62 MiB | bounded path intact |
+| SQLite hydration, traced peak | 4.51 MiB | 4.28 MiB | bounded path intact |
+| Bounded QoS queue, traced peak | — | 8.64 MiB | at the 8 MiB configured budget |
+| Bounded delivery budget, traced peak | — | 8.50 MiB | at the 8 MiB configured budget |
+
+The **machine-independent** invariants of the outbound byte budget below —
+6,000 attempted, 2,042 accepted, 3,958 rejected, 8,388,536 bytes retained
+against an 8,388,608-byte limit — reproduced exactly, and the `released` phase
+returns traced current allocation to ~0.003 MiB. These are the figures to check
+a future run against; absolute RSS and msg/s are not comparable across runners.
 
 ## Main results
 
@@ -148,3 +167,20 @@ with 204k and 272k respectively in the original GitHub baseline artifact.
 `pending_delivery_bytes` reports the exact-accounted large-message pool;
 `delivery_small_budget_bytes` and `delivery_small_message_limit` expose the
 static fast-path reservation.
+
+The eligible size is narrower than "small telemetry" suggests, because the
+per-message limit is the reserved slice divided by the configured queue counts
+(`max_pending_messages` + `max_pending_callbacks` + 2), and `max_pending_messages`
+defaults to 65 536. Measured with otherwise default settings:
+
+| Configuration | Small budget | Per-message limit |
+|---|---:|---:|
+| defaults (`message_delivery="auto"`) | 8 MiB | 126 B |
+| `message_delivery="iterator"` | 8 MiB | 127 B |
+| `message_delivery="callback"` | 8 MiB | 8176 B |
+| `max_pending_delivery_bytes=8 MiB` | 0 | partition disabled |
+
+Eligibility tests `len(payload) + 4 * len(topic)`, so a 20-character topic
+leaves 46 payload bytes at the default limit. Lower `max_pending_messages` to
+widen the fast path. Everything outside it takes the exact-accounting path,
+which is correct but not free — the total bound holds either way.

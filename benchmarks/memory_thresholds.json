@@ -1,0 +1,46 @@
+{
+  "_comment": [
+    "Regression thresholds for benchmarks/memory_profile.py, checked by",
+    "benchmarks/check_memory_thresholds.py. These are limits, not measurements:",
+    "they are hand-set and versioned deliberately, unlike benchmark results,",
+    "which are build artefacts (see docs/BENCHMARKING.md).",
+    "",
+    "max_traced_peak_mib is a tracemalloc figure, so it measures Python",
+    "allocations rather than RSS and is comparable across runners. Each value is",
+    "the reference peak recorded in docs/MEMORY-RESULTS.md rounded up by ~25%.",
+    "",
+    "logical is an exact-match assertion on the scenario's 'loaded' counters. It",
+    "is machine-independent and catches a benchmark that silently stopped doing",
+    "the same work, which a memory number alone would reward."
+  ],
+  "scenarios": {
+    "protocol_qos_queue_64b": {
+      "max_traced_peak_mib": 14.6,
+      "logical": {"queued_messages": 30000, "queued_logical_bytes": 2280000, "packet_ids": 30000, "store_records": 30000}
+    },
+    "protocol_qos_queue_4k": {
+      "max_traced_peak_mib": 63.8,
+      "logical": {"queued_messages": 12000, "queued_logical_bytes": 49296000, "packet_ids": 12000, "store_records": 12000}
+    },
+    "iterator_delivery_queue_4k": {
+      "max_traced_peak_mib": 31.5,
+      "logical": {"iterator_messages": 6000, "iterator_logical_bytes": 24648000}
+    },
+    "protocol_bounded_queue_4k": {
+      "max_traced_peak_mib": 10.8,
+      "logical": {"attempted_messages": 6000, "accepted_messages": 2042, "rejected_messages": 3958, "pending_logical_bytes": 8388536, "configured_byte_limit": 8388608}
+    },
+    "iterator_delivery_budget_4k": {
+      "max_traced_peak_mib": 10.7,
+      "logical": {"attempted_messages": 2043, "accepted_messages": 2042, "blocked_message": true, "pending_logical_bytes": 8388536, "configured_byte_limit": 8388536}
+    },
+    "memory_store_4k": {
+      "max_traced_peak_mib": 62.0,
+      "logical": {"store_records": 12000, "store_logical_bytes": 49296000}
+    },
+    "sqlite_hydration_4k": {
+      "max_traced_peak_mib": 5.7,
+      "logical": {"queued_messages": 6000, "packet_ids": 6000, "store_records": 6000, "store_logical_bytes": 24648000}
+    }
+  }
+}

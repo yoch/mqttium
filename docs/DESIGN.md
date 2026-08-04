@@ -118,6 +118,56 @@ mqttium/
 - Un pool **par client** ; les MID entrants ne sont **jamais** `free()` dans
   le pool sortant.
 - Séparer clairement : IDs sortants (PUBLISH/SUB/UNSUB) vs tracking entrant QoS2.
+- Optimisation mémoire : quand le pool se vide, `release()` **rebind** ses
+  conteneurs et remet `_next = 1` au lieu de les `clear()`, afin de rendre la
+  capacité de hachage accumulée sous charge. Conséquence : un client à un seul
+  message en vol réutilise en permanence le MID 1. **La sûreté repose alors
+  entièrement** sur deux invariants de correction, à ne jamais casser
+  ensemble :
+  1. le moteur émet `PUBLISH_COMPLETE` / `PUBLISH_FAILED` **avant** de libérer
+     le MID (`_on_puback` / `_on_pubrec` / `_on_pubcomp`) ;
+  2. le client indexe les receipts en FIFO par MID
+     (`_register_publish_receipt` / `_pop_publish_receipt`).
+  Sans eux, un ACK tardif réglerait le receipt d’une publication ultérieure
+  ayant recyclé le même identifiant.
+
+### Admission sortante (mémoire logique)
+
+- Deux compteurs moteur bornent les publications QoS 1/2 non terminées :
+  `max_pending_outbound_messages` et `max_pending_outbound_bytes`. La taille
+  logique est `payload + topic UTF-8 + propriétés PUBLISH encodées` ; aucun
+  surcoût fixe par objet n’est facturé.
+- Ordre obligatoire dans `queue_publish` : validation de taille → calcul de la
+  taille logique → **réservation** → allocation du MID → écriture store. Un
+  refus est donc atomique.
+- `queue_publish_many` snapshote les deux compteurs à l’entrée et les
+  **restaure intégralement** en rollback : un store transactionnel
+  (`SqliteInflightStore.batch()`) annule ses écritures avant que la clause
+  `except` ne s’exécute, donc les tailles par enregistrement sont déjà perdues
+  à cet instant.
+- `can_ever_admit_publish()` ne regarde que les limites **configurées**, jamais
+  l’état courant : il distingue « attendre » de « jamais admissible ».
+- Côté client, un producteur garé sur la capacité ne détient aucun receipt.
+  C’est `_publish_wait_failure()` qui le fait échouer lorsque la connexion est
+  définitivement perdue — la capacité n’étant libérée que par un acquittement,
+  il attendrait sinon indéfiniment. Une reconnexion en cours n’est pas
+  terminale : la session rejouée finira par solder le budget.
+
+### Budget de livraison entrante
+
+- `max_pending_delivery_bytes` est **partagé** entre l’itérateur et les
+  callbacks. Un message est facturé une seule fois et libéré quand la dernière
+  référence disparaît (`Message._delivery_references`).
+- Une fraction (1/8) du budget est réservée aux petits messages, pour qu’un gros
+  payload ne puisse pas affamer la télémétrie. La partition est désactivée
+  automatiquement si elle réduirait la capacité pour un paquet unique.
+
+### Epochs de connexion
+
+- Chaque effet moteur porte l’epoch de la connexion qui l’a produit. À la
+  déconnexion l’epoch est incrémenté et les effets périmés sont rejetés : c’est
+  ce qui empêche du travail en vol d’une connexion morte de toucher la
+  suivante.
 
 ### FlowControl
 

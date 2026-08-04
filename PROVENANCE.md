@@ -18,9 +18,14 @@ retained.
 
 ## Validation inherited from the source tree
 
-The exact production code was validated with 245 unit tests, Mosquitto
-integration on Python 3.11/3.12/3.13, Ruff, mypy, deterministic fuzzing,
-Hypothesis fuzzing, and an 80% coverage gate.
+At the time of the spin-out, the exact production code was validated with 245
+unit tests, Mosquitto integration on Python 3.11/3.12/3.13, Ruff, mypy,
+deterministic fuzzing, Hypothesis fuzzing, and an 80% coverage gate.
+
+This repository has moved on since: the standalone gates now run more than 300
+unit tests and Mosquitto integration across Python 3.11, 3.12, 3.13 and 3.14,
+plus Bandit and distribution validation. See `CONTRIBUTING.md` for the current
+list.
 
 The final retained `publish_many()` benchmark decision was based on a paired
 A/B run whose artifact digest was:

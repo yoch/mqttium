@@ -8,9 +8,11 @@ on:
     paths:
       - benchmarks/**
       - src/mqttium/api/**
+      - src/mqttium/codec/**
       - src/mqttium/compat/**
       - src/mqttium/persistence/**
       - src/mqttium/protocol/**
+      - src/mqttium/transport/**
       - .github/workflows/benchmarks.yml
 
 permissions:
@@ -90,6 +92,10 @@ jobs:
           python benchmarks/memory_profile.py \
             --label "${GITHUB_SHA}" \
             --output /tmp/mqttium-bench/memory-profile.json
+      - name: Memory regression thresholds
+        run: |
+          python benchmarks/check_memory_thresholds.py \
+            --profile /tmp/mqttium-bench/memory-profile.json
       - name: Confirmed WAN-profile delivery
         run: |
           sudo tc qdisc replace dev lo root netem delay 20ms 5ms distribution normal loss 0.1%
