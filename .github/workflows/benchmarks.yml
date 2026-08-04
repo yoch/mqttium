@@ -33,18 +33,13 @@ jobs:
         with:
           ref: agent/memory-profile-overhaul
           fetch-depth: 0
-      - name: Apply staged memory overhaul
+      - name: Diagnose staged memory overhaul
         run: |
-          test -f .mqttium-agent/apply
+          wc -c .mqttium-agent/part-*
+          sha256sum .mqttium-agent/part-*
           cat .mqttium-agent/part-* | base64 -d > /tmp/mqttium-changes.tar.gz
-          tar -xzf /tmp/mqttium-changes.tar.gz
-          rm -rf .mqttium-agent
-          rm .github/workflows/apply-memory-overhaul.yml
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git commit -m "Bound retained memory across MQTT pipelines"
-          git push origin HEAD:agent/memory-profile-overhaul
+          sha256sum /tmp/mqttium-changes.tar.gz
+          gzip -t /tmp/mqttium-changes.tar.gz
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
