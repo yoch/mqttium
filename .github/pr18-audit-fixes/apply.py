@@ -44,7 +44,13 @@ def apply_hunk(text: str, old: str, new: str, expected_line: int, label: str) ->
 def apply_patch(path: Path) -> None:
     raw_lines = path.read_text().splitlines(keepends=True)
     # Repair accidental transcript markers in the staged test patch.
-    lines = [line[1:] if line.startswith("*+") else line for line in raw_lines]
+    lines = []
+    for line in raw_lines:
+        if line.startswith("+*+"):
+            line = "+" + line[3:]
+        elif line.startswith("*+"):
+            line = line[1:]
+        lines.append(line)
 
     old_header = next(line for line in lines if line.startswith("--- ")).split(maxsplit=1)[1].strip()
     new_header = next(line for line in lines if line.startswith("+++ ")).split(maxsplit=1)[1].strip()
