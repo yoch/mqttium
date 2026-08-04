@@ -26,8 +26,11 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   hydrate a persistent session without materialising every payload at once, and
   falls back to the eager path for a store that does not implement it. Both
   shipped stores implement it.
-- `EngineConfig.update()`, which re-validates after mutating. Plain attribute
-  assignment bypasses the range checks in `__post_init__`.
+- `EngineConfig.update()`, which validates a candidate atomically before
+  changing fields and restricts derived-state changes after engine attachment.
+- Removed the legacy public `EngineConfig.max_queued` field. Use
+  `max_pending_outbound_messages` and `max_pending_outbound_bytes`; `None`
+  disables either limit while zero rejects new QoS 1/2 publications.
 - Paho façade: `max_queued_messages_set()`, `max_queued_bytes_set()` (no Paho
   equivalent) and `MQTT_ERR_QUEUE_SIZE` (15) for admission refusals.
 

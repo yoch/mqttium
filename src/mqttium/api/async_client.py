@@ -1155,10 +1155,9 @@ class AsyncClient:
             return
         epoch = self._connection_epoch
 
-        # One tag covers the whole deque, so it may never mix epochs: anything
-        # still pending from a previous connection is stale by definition and is
-        # dropped here. Without this, effects from the *current* epoch would
-        # inherit the old tag and be discarded with it.
+        # One tag covers the connection-scoped deque. On an epoch change,
+        # transport effects are discarded while terminal publish results are
+        # retained and re-tagged so their receipts cannot be stranded.
         if self._pending_effects and self._pending_effect_epoch != epoch:
             self._discard_connection_effects()
 
@@ -1225,6 +1224,11 @@ class AsyncClient:
         epoch = self._pending_effect_epoch
         if epoch is None:
             return
+        if epoch != self._connection_epoch:
+            self._discard_connection_effects()
+            epoch = self._pending_effect_epoch
+            if epoch is None:
+                return
         self._effect_draining_inline = True
         try:
             while self._pending_effects:
@@ -1265,8 +1269,7 @@ class AsyncClient:
                         self._pending_effects.clear()
                         break
                     if epoch != self._connection_epoch:
-                        self._pending_effects.popleft()
-                        self._complete_effect()
+                        self._discard_connection_effects()
                         continue
                     try:
                         await self._apply_effect(
@@ -1844,16 +1847,49 @@ class AsyncClient:
                 self._outbound.task_done()
         self._outbound_bytes = 0
 
-    def _discard_connection_effects(self) -> None:
-        # Every pending effect was derived from the old protocol/transport
-        # epoch. Session replay, failures and inbound redelivery are rebuilt
-        # from the engine/store after the next CONNACK; retaining an old
-        # MESSAGE or completion effect can duplicate delivery just as surely
-        # as retaining old wire bytes can duplicate a publish. Committed
-        # producers are released because durable QoS work continues via replay.
-        discarded = len(self._pending_effects)
-        self._pending_effects.clear()
-        self._pending_effect_epoch = None
+    def _discard_connection_effects(self, *, settle_publish: bool = False) -> None:
+        """Drop transport-scoped effects while preserving terminal publishes.
+
+        SEND, MESSAGE and connection-control effects belong to one transport
+        epoch and are rebuilt from engine/store state. PUBLISH_COMPLETE and
+        PUBLISH_FAILED are different: the store record has already been retired,
+        so losing either would strand its receipt or batch forever. They survive
+        an epoch change and are re-tagged for normal ordered application.
+
+        Final teardown cannot leave an effect worker behind. In that case
+        ``settle_publish`` retires the local handles immediately and queues the
+        optional user callback before the callback worker is drained.
+        """
+        retained: deque[EngineEffect] = deque()
+        discarded = 0
+        for effect in self._pending_effects:
+            if effect.kind not in (
+                EffectKind.PUBLISH_COMPLETE,
+                EffectKind.PUBLISH_FAILED,
+            ):
+                discarded += 1
+                continue
+            if not settle_publish:
+                retained.append(effect)
+                continue
+
+            if effect.kind is EffectKind.PUBLISH_COMPLETE:
+                mid: int | None = effect.data
+                reason: BaseException | None = None
+            else:
+                failure: PublishFailure = effect.data
+                mid = failure.mid
+                reason = failure.reason
+            self._settle_publish(mid, reason)
+            if self.on_publish is not None:
+                try:
+                    self._spawn_callback(self.on_publish, mid, reason)
+                except MessageDeliveryError as exc:
+                    self._report_callback_error(self.on_publish, exc)
+            discarded += 1
+
+        self._pending_effects = retained
+        self._pending_effect_epoch = self._connection_epoch if retained else None
         self._effect_applied += discarded
         if self._effect_waiters:
             self._effect_progress.set()
@@ -1982,7 +2018,7 @@ class AsyncClient:
                     await task
                 except (asyncio.CancelledError, Exception):
                     pass
-        self._discard_connection_effects()
+        self._discard_connection_effects(settle_publish=True)
         self._discard_outbound_queue()
         self._decoder.clear()
         async with self._outbound_space:

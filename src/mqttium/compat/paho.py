@@ -195,8 +195,10 @@ class Client:
         pwd = password.encode("utf-8") if isinstance(password, str) else password
 
         def _set_credentials() -> None:
-            self._async._engine.config.username = username
-            self._async._engine.config.password = pwd
+            self._async._engine.config.update(
+                username=username,
+                password=pwd,
+            )
 
         self._run_loop_mutation(_set_credentials)
 
@@ -214,7 +216,7 @@ class Client:
             qos=QoS(qos),
             retain=retain,
         )
-        self._run_loop_mutation(lambda: setattr(self._async._engine.config, "will", message))
+        self._run_loop_mutation(lambda: self._async._engine.config.update(will=message))
 
     def message_callback_add(self, sub: str, callback: Callable[..., Any]) -> None:
         self._run_loop_mutation(lambda: self._topic_callbacks.__setitem__(sub, callback))
@@ -366,7 +368,7 @@ class Client:
         return self._await_on_loop(command, flush_effects=True, what="command")
 
     def connect(self, host: str, port: int = 1883, keepalive: int = 60) -> int:
-        self._run_loop_mutation(lambda: setattr(self._async._engine.config, "keepalive", keepalive))
+        self._run_loop_mutation(lambda: self._async._engine.config.update(keepalive=keepalive))
         self._submit(self._async.connect(host, port))
         return 0
 

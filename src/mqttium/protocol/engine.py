@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Iterable
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from enum import Enum, auto
 from typing import Any
 
@@ -97,6 +97,19 @@ _ALLOWED_PACKETS_BY_STATE: dict[ConnectionState, frozenset[PacketType]] = {
     ),
 }
 
+_RUNTIME_MUTABLE_ENGINE_CONFIG_FIELDS = frozenset(
+    {
+        "keepalive",
+        "username",
+        "password",
+        "will",
+        "will_properties",
+        "max_pending_outbound_messages",
+        "max_pending_outbound_bytes",
+        "accept_auth",
+    }
+)
+
 
 class EffectKind(Enum):
     SEND = auto()
@@ -165,6 +178,7 @@ class EngineConfig:
     # When False, inbound AUTH is rejected with DISCONNECT 0x8C (legacy stub).
     # AsyncClient sets this True when an auth_handler is registered.
     accept_auth: bool = False
+    _attached: bool = field(default=False, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not 0 <= self.keepalive <= 65535:
@@ -190,24 +204,26 @@ class EngineConfig:
             raise ValueError("topic_alias_maximum must be between 0 and 65535")
 
     def update(self, **changes: Any) -> None:
-        """Mutate fields and re-validate.
+        """Validate a candidate configuration, then commit its changed fields.
 
-        Plain attribute assignment bypasses ``__post_init__``, so anything
-        changing a limit after construction goes through here. On a rejected
-        value the previous configuration is restored.
+        No mutation occurs when validation raises, including type errors. Once
+        attached to a ProtocolEngine, only fields without derived engine state
+        may be changed through this method.
         """
-        unknown = set(changes) - {f.name for f in fields(self)}
+        known = {f.name for f in fields(self) if f.init}
+        unknown = set(changes) - known
         if unknown:
             raise AttributeError(f"unknown EngineConfig fields: {sorted(unknown)}")
-        previous = {name: getattr(self, name) for name in changes}
-        for name, value in changes.items():
-            setattr(self, name, value)
-        try:
-            self.__post_init__()
-        except ValueError:
-            for name, value in previous.items():
-                setattr(self, name, value)
-            raise
+        if self._attached:
+            unsafe = set(changes) - _RUNTIME_MUTABLE_ENGINE_CONFIG_FIELDS
+            if unsafe:
+                raise AttributeError(
+                    "EngineConfig fields require a new ProtocolEngine once attached: "
+                    f"{sorted(unsafe)}"
+                )
+        candidate = replace(self, **changes)
+        for name in changes:
+            setattr(self, name, getattr(candidate, name))
 
 
 class ProtocolEngine:
@@ -219,6 +235,7 @@ class ProtocolEngine:
         store: InflightStore | None = None,
     ) -> None:
         self.config = config or EngineConfig()
+        self.config._attached = True
         self.store = store or MemoryInflightStore()
         # Resolved once: a store either pages or it does not, for its lifetime.
         self._paged_store = self.store if isinstance(self.store, PagedInflightStore) else None
@@ -1261,9 +1278,13 @@ class ProtocolEngine:
         self._pending_outbound_bytes += logical_size
 
     def _release_outbound_reservation(self, logical_size: int) -> None:
-        # Every caller releases a reservation it made, so no clamping: an
-        # accounting error must surface as a negative counter in tests, not
-        # drift silently as a leak.
+        if self._pending_outbound_messages <= 0:
+            raise AssertionError("outbound message reservation underflow")
+        if logical_size < 0 or logical_size > self._pending_outbound_bytes:
+            raise AssertionError(
+                "outbound byte reservation underflow: "
+                f"release={logical_size}, pending={self._pending_outbound_bytes}"
+            )
         self._pending_outbound_messages -= 1
         self._pending_outbound_bytes -= logical_size
 

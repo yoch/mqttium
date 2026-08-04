@@ -126,9 +126,25 @@ assert isinstance(MonStore(), PagedInflightStore)  # sinon : chemin eager
 
 ## Mutation d’`EngineConfig`
 
-Les limites se modifient via `config.update(max_pending_outbound_bytes=...)`,
-qui revalide les plages. Une affectation directe d’attribut contourne les
-contrôles de `__post_init__`.
+Les limites se modifient via `config.update(max_pending_outbound_bytes=...)`.
+La méthode valide d’abord une copie : une valeur rejetée, y compris pour une
+erreur de type, ne laisse donc aucune mutation partielle.
+
+Une fois la configuration attachée à un `ProtocolEngine`, `update()` accepte
+uniquement les réglages qui n’ont pas d’état dérivé dans le moteur : keepalive,
+credentials, will, limites d’admission et authentification. Changer le protocole,
+`local_receive_maximum` ou `maximum_packet_size` exige de construire un nouveau
+moteur/client.
+
+## Suppression d’`EngineConfig.max_queued`
+
+Le champ public historique `max_queued` est supprimé. Son `0` signifiait
+« illimité », contrairement aux nouvelles limites où `0` refuse toute
+publication QoS 1/2.
+
+Utiliser `max_pending_outbound_messages` pour une limite en nombre et
+`max_pending_outbound_bytes` pour une limite mémoire. `None` désactive la limite
+correspondante.
 
 ## Helpers one-shot
 
