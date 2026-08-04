@@ -81,6 +81,12 @@ jobs:
             --repeat 5 \
             --workers 8 \
             --output /tmp/mqttium-bench/compat-qosn-submit.json
+      - name: Packet identifier pool A/B
+        run: |
+          python benchmarks/packet_id_pool_ab.py \
+            --count 30000 \
+            --repeat 7 \
+            --output /tmp/mqttium-bench/packet-id-pool.json
       - name: Confirmed local TCP delivery
         run: python benchmarks/realworld.py --port 11883 --profile local --output /tmp/mqttium-bench/realworld-tcp.json
       - name: Confirmed TLS delivery
