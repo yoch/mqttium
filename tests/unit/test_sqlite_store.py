@@ -167,3 +167,84 @@ def test_delete_out_uses_single_delete_without_select(tmp_path: Path) -> None:
         "DELETE FROM outbound WHERE mid=7",
     ]
     store.close()
+
+
+def test_sqlite_outbound_pages_preserve_order_and_size(tmp_path: Path) -> None:
+    store = SqliteInflightStore(tmp_path / "pages.db")
+    with store.batch():
+        for mid in range(1, 8):
+            store.put_out(outbound(mid))
+
+    pages = list(store.out_pages(page_size=3))
+
+    assert [[message.mid for message in page] for page in pages] == [
+        [1, 2, 3],
+        [4, 5, 6],
+        [7],
+    ]
+    store.close()
+
+
+def test_sqlite_outbound_pages_tolerate_deletion_between_pages(tmp_path: Path) -> None:
+    store = SqliteInflightStore(tmp_path / "page-delete.db")
+    with store.batch():
+        for mid in range(1, 7):
+            store.put_out(outbound(mid))
+
+    pages = store.out_pages(page_size=2)
+    assert [message.mid for message in next(pages)] == [1, 2]
+    assert store.delete_out(3) is True
+
+    assert [[message.mid for message in page] for page in pages] == [[4, 5], [6]]
+    store.close()
+
+
+def test_sqlite_pages_reject_non_positive_size(tmp_path: Path) -> None:
+    store = SqliteInflightStore(tmp_path / "invalid-page.db")
+
+    import pytest
+
+    with pytest.raises(ValueError, match="page_size must be positive"):
+        next(store.out_pages(page_size=0))
+    with pytest.raises(ValueError, match="page_size must be positive"):
+        next(store.in_pages(page_size=-1))
+    store.close()
+
+
+def test_sqlite_outbound_summary_pages_do_not_select_payload(tmp_path: Path) -> None:
+    store = SqliteInflightStore(tmp_path / "summaries.db")
+    store.put_out(outbound())
+    trace: list[str] = []
+    store._conn.set_trace_callback(trace.append)
+
+    pages = list(store.out_summary_pages(page_size=2))
+
+    assert len(pages) == 1
+    assert pages[0][0].mid == 7
+    assert pages[0][0].payload_size == len(b"payload")
+    selects = [statement for statement in trace if statement.lstrip().startswith("SELECT")]
+    assert selects
+    assert all("payload_size" in statement for statement in selects)
+    assert all("SELECT *" not in statement for statement in selects)
+    store.close()
+
+
+def test_engine_sqlite_hydration_keeps_payloads_lazy(tmp_path: Path) -> None:
+    from mqttium.protocol.engine import EngineConfig, ProtocolEngine
+    from mqttium.types import OutboundMessageSummary
+
+    path = tmp_path / "lazy-hydration.db"
+    store = SqliteInflightStore(path)
+    with store.batch():
+        for mid in range(1, 5):
+            message = outbound(mid)
+            message.state = OutboundQoSState.QUEUED
+            message.payload = bytes([mid]) * 4096
+            store.put_out(message)
+
+    engine = ProtocolEngine(EngineConfig(clean_start=False), store=store)
+
+    assert len(engine._queued) == 4
+    assert all(isinstance(item, OutboundMessageSummary) for item in engine._queued)
+    assert engine.pending_outbound_bytes == 4 * (4096 + len("a/b"))
+    store.close()

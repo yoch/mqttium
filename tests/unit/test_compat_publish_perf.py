@@ -93,27 +93,27 @@ async def test_old_completion_cannot_settle_reused_mid() -> None:
     old_receipt = PublishReceipt(mid=mid, qos=QoS.AT_LEAST_ONCE, _event=asyncio.Event())
     old_batch = PublishBatchReceipt()
     old_batch._register(mid)
-    client._receipts[mid] = old_receipt
-    client._batch_receipts[mid] = old_batch
+    client._register_publish_receipt(mid, old_receipt)
+    client._register_batch_receipt(mid, old_batch)
     client._engine._emit(EffectKind.PUBLISH_COMPLETE, mid)
-    with client._state_mutex:
-        client._collect_effects_locked()
-    assert old_receipt.is_done()
-    assert old_batch.pending_count == 0
+    client._collect_effects_locked()
+    assert not old_receipt.is_done()
+    assert client._pending_effects
     effect = client._pending_effects.popleft()
 
     new_receipt = PublishReceipt(mid=mid, qos=QoS.AT_LEAST_ONCE, _event=asyncio.Event())
     new_batch = PublishBatchReceipt()
     new_batch._register(mid)
-    client._receipts[mid] = new_receipt
-    client._batch_receipts[mid] = new_batch
+    client._register_publish_receipt(mid, new_receipt)
+    client._register_batch_receipt(mid, new_batch)
 
     await client._apply_effect(effect, nowait=False)
     await client._callback_queue.join()
-    assert client._receipts[mid] is new_receipt
-    assert client._batch_receipts[mid] is new_batch
+    assert old_receipt.is_done()
+    assert old_batch.pending_count == 0
     assert not new_receipt.is_done()
     assert new_batch.pending_count == 1
+    assert client._pop_publish_receipt(mid) is new_receipt
     await client._shutdown_callback_worker(drain=True)
 
 
@@ -123,25 +123,25 @@ async def test_old_failure_cannot_fail_reused_mid() -> None:
     client.on_publish = lambda *_args: None
     mid = 9
     old_receipt = PublishReceipt(mid=mid, qos=QoS.AT_LEAST_ONCE, _event=asyncio.Event())
-    client._receipts[mid] = old_receipt
+    client._register_publish_receipt(mid, old_receipt)
     failure = ProtocolError("old publish failed")
     client._engine._emit(
         EffectKind.PUBLISH_FAILED,
         PublishFailure(mid=mid, reason=failure),
     )
-    with client._state_mutex:
-        client._collect_effects_locked()
-    assert old_receipt.is_done()
-    assert old_receipt._error is failure
+    client._collect_effects_locked()
+    assert not old_receipt.is_done()
     effect = client._pending_effects.popleft()
 
     new_receipt = PublishReceipt(mid=mid, qos=QoS.AT_LEAST_ONCE, _event=asyncio.Event())
-    client._receipts[mid] = new_receipt
+    client._register_publish_receipt(mid, new_receipt)
     await client._apply_effect(effect, nowait=False)
     await client._callback_queue.join()
-    assert client._receipts[mid] is new_receipt
+    assert old_receipt.is_done()
+    assert old_receipt._error is failure
     assert not new_receipt.is_done()
     assert new_receipt._error is None
+    assert client._pop_publish_receipt(mid) is new_receipt
     await client._shutdown_callback_worker(drain=True)
 
 

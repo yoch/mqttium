@@ -60,14 +60,23 @@ class PacketIdPool:
             self._free.remove(mid)
 
     def release(self, mid: int) -> None:
-        if mid in self._used:
-            self._used.discard(mid)
-            self._free.append(mid)
+        if mid not in self._used:
+            return
+        self._used.remove(mid)
+        if not self._used:
+            # Replace peak-sized containers once the pool becomes idle so a
+            # burst that used many packet identifiers does not permanently
+            # retain their set/list capacity.
+            self._used = set()
+            self._free = []
+            self._next = 1
+            return
+        self._free.append(mid)
 
     def in_use(self, mid: int) -> bool:
         return mid in self._used
 
     def clear(self) -> None:
-        self._used.clear()
-        self._free.clear()
+        self._used = set()
+        self._free = []
         self._next = 1

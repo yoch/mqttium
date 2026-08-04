@@ -54,6 +54,7 @@ async def _cancel_send_under_backpressure(client: AsyncClient) -> int:
         await publishing
     assert any(effect.kind is EffectKind.SEND for effect in client._pending_effects)
     mid = next(iter(client._receipts))
+    await client._invalidate_connection_epoch()
     client._engine.notify_transport_closed()
     client._engine.take_effects()
     return mid

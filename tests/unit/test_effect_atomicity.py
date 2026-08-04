@@ -91,22 +91,29 @@ async def test_scheduled_flush_records_wakeup_while_active() -> None:
     release = asyncio.Event()
     calls = 0
 
-    async def controlled_flush(*, nowait: bool = False) -> None:
+    async def controlled_apply(effect, *, nowait: bool, epoch: int | None = None) -> None:
         nonlocal calls
         calls += 1
         if calls == 1:
             started.set()
             await release.wait()
 
-    client._flush_effects = controlled_flush  # type: ignore[method-assign]
+    client._apply_effect = controlled_apply  # type: ignore[method-assign]
+    client._engine._emit(EffectKind.MESSAGE, Message(topic="first", payload=b"1"))
+    client._collect_effects_locked()
     client._schedule_effect_flush()
     await started.wait()
+
+    client._engine._emit(EffectKind.MESSAGE, Message(topic="second", payload=b"2"))
+    client._collect_effects_locked()
     client._schedule_effect_flush()
     release.set()
+
     task = client._effect_flush_task
     assert task is not None
     await task
     assert calls == 2
+    assert client._effect_applied == 2
 
 
 def test_effect_collection_stably_prioritizes_sends() -> None:

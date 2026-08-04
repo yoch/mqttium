@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from types import MappingProxyType
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 
 from mqttium.enums import QoS
 from mqttium.errors import PublishBatchError
@@ -30,6 +30,10 @@ class PublishBatchReceipt:
     __slots__ = (
         "_pending",
         "_failures",
+        "_failure_count",
+        "_failure_counts",
+        "_max_failure_details",
+        "_failure_sink",
         "_done",
         "_progress",
         "_sealed",
@@ -38,12 +42,23 @@ class PublishBatchReceipt:
         "_fatal",
     )
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        max_failure_details: int | None = 128,
+        failure_sink: Callable[[int, BaseException], None] | None = None,
+    ) -> None:
+        if max_failure_details is not None and max_failure_details < 0:
+            raise ValueError("max_failure_details must be non-negative or None")
         # At most the client's bounded pending window is retained. MQTT
         # packet identifiers may be reused during a long batch, so failures are
         # keyed by the stable zero-based input index stored as the value.
         self._pending: dict[int, int] = {}
         self._failures: dict[int, BaseException] = {}
+        self._failure_count = 0
+        self._failure_counts: dict[str, int] = {}
+        self._max_failure_details = max_failure_details
+        self._failure_sink = failure_sink
         self._done = asyncio.Event()
         self._progress = asyncio.Event()
         self._sealed = False
@@ -65,7 +80,18 @@ class PublishBatchReceipt:
 
     @property
     def failures(self) -> Mapping[int, BaseException]:
+        """Bounded failure details keyed by stable input index."""
         return MappingProxyType(self._failures)
+
+    @property
+    def failure_count(self) -> int:
+        """Total failures, including details omitted by the retention limit."""
+        return self._failure_count
+
+    @property
+    def failure_counts(self) -> Mapping[str, int]:
+        """Total failures grouped by exception class name."""
+        return MappingProxyType(self._failure_counts)
 
     def is_done(self) -> bool:
         return self._done.is_set()
@@ -75,11 +101,18 @@ class PublishBatchReceipt:
         if self._fatal is not None:
             raise PublishBatchError(
                 self._failures,
+                failure_count=self._failure_count,
+                failure_counts=self._failure_counts,
                 cause=self._fatal,
                 receipt=self,
             ) from self._fatal
-        if self._failures:
-            raise PublishBatchError(self._failures, receipt=self)
+        if self._failure_count:
+            raise PublishBatchError(
+                self._failures,
+                failure_count=self._failure_count,
+                failure_counts=self._failure_counts,
+                receipt=self,
+            )
 
     def _register(self, mid: int | None) -> None:
         index = self._submitted
@@ -95,7 +128,7 @@ class PublishBatchReceipt:
             return
         self._completed += 1
         if error is not None:
-            self._failures[index] = error
+            self._record_failure(index, error)
         self._progress.set()
         self._finish_if_ready()
 
@@ -106,12 +139,22 @@ class PublishBatchReceipt:
     def _fail_remaining(self, error: BaseException) -> None:
         self._fatal = error
         for index in self._pending.values():
-            self._failures.setdefault(index, error)
+            self._record_failure(index, error)
         self._completed += len(self._pending)
         self._pending.clear()
         self._sealed = True
         self._progress.set()
         self._done.set()
+
+    def _record_failure(self, index: int, error: BaseException) -> None:
+        self._failure_count += 1
+        name = type(error).__name__
+        self._failure_counts[name] = self._failure_counts.get(name, 0) + 1
+        limit = self._max_failure_details
+        if limit is None or len(self._failures) < limit:
+            self._failures[index] = error
+        if self._failure_sink is not None:
+            self._failure_sink(index, error)
 
     async def _wait_pending_at_most(self, limit: int) -> None:
         while len(self._pending) > limit:

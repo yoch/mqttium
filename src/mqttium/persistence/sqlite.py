@@ -18,7 +18,12 @@ from pathlib import Path
 from typing import Any, Literal
 
 from mqttium.enums import InboundQoSState, OutboundQoSState, QoS
-from mqttium.types import InboundMessage, OutboundMessage, Properties
+from mqttium.types import (
+    InboundMessage,
+    OutboundMessage,
+    OutboundMessageSummary,
+    Properties,
+)
 
 
 def _decode_payload(data: bytes | str) -> bytes:
@@ -78,6 +83,19 @@ def _row_to_out(row: sqlite3.Row) -> OutboundMessage:
         mid=int(row["mid"]),
         topic=str(row["topic"]),
         payload=_decode_payload(row["payload"]),
+        qos=QoS(int(row["qos"])),
+        retain=bool(row["retain"]),
+        state=OutboundQoSState(int(row["state"])),
+        dup=bool(row["dup"]),
+        properties=_props_from_json(row["properties"]),
+    )
+
+
+def _row_to_out_summary(row: sqlite3.Row) -> OutboundMessageSummary:
+    return OutboundMessageSummary(
+        mid=int(row["mid"]),
+        topic=str(row["topic"]),
+        payload_size=int(row["payload_size"]),
         qos=QoS(int(row["qos"])),
         retain=bool(row["retain"]),
         state=OutboundQoSState(int(row["state"])),
@@ -257,9 +275,47 @@ class SqliteInflightStore:
             self._commit_if_needed()
 
     def out_items(self) -> Iterator[OutboundMessage]:
-        with self._lock:
-            rows = self._conn.execute("SELECT * FROM outbound ORDER BY seq").fetchall()
-        return iter(_row_to_out(row) for row in rows)
+        for page in self.out_pages():
+            yield from page
+
+    def out_pages(self, page_size: int = 256) -> Iterator[tuple[OutboundMessage, ...]]:
+        if page_size <= 0:
+            raise ValueError("page_size must be positive")
+        after_seq = -1
+        while True:
+            with self._lock:
+                rows = self._conn.execute(
+                    "SELECT * FROM outbound WHERE seq>? ORDER BY seq LIMIT ?",
+                    (after_seq, page_size),
+                ).fetchall()
+            if not rows:
+                return
+            after_seq = int(rows[-1]["seq"])
+            yield tuple(_row_to_out(row) for row in rows)
+
+    def out_summary_pages(
+        self, page_size: int = 256
+    ) -> Iterator[tuple[OutboundMessageSummary, ...]]:
+        if page_size <= 0:
+            raise ValueError("page_size must be positive")
+        after_seq = -1
+        while True:
+            with self._lock:
+                rows = self._conn.execute(
+                    """
+                    SELECT mid, topic, length(payload) AS payload_size, qos,
+                           retain, state, dup, properties, seq
+                    FROM outbound
+                    WHERE seq>?
+                    ORDER BY seq
+                    LIMIT ?
+                    """,
+                    (after_seq, page_size),
+                ).fetchall()
+            if not rows:
+                return
+            after_seq = int(rows[-1]["seq"])
+            yield tuple(_row_to_out_summary(row) for row in rows)
 
     def clear_out(self) -> None:
         with self._lock:
@@ -331,9 +387,23 @@ class SqliteInflightStore:
             self._commit_if_needed()
 
     def in_items(self) -> Iterator[InboundMessage]:
-        with self._lock:
-            rows = self._conn.execute("SELECT * FROM inbound ORDER BY seq").fetchall()
-        return iter(_row_to_in(row) for row in rows)
+        for page in self.in_pages():
+            yield from page
+
+    def in_pages(self, page_size: int = 256) -> Iterator[tuple[InboundMessage, ...]]:
+        if page_size <= 0:
+            raise ValueError("page_size must be positive")
+        after_seq = -1
+        while True:
+            with self._lock:
+                rows = self._conn.execute(
+                    "SELECT * FROM inbound WHERE seq>? ORDER BY seq LIMIT ?",
+                    (after_seq, page_size),
+                ).fetchall()
+            if not rows:
+                return
+            after_seq = int(rows[-1]["seq"])
+            yield tuple(_row_to_in(row) for row in rows)
 
     def clear_in(self) -> None:
         with self._lock:

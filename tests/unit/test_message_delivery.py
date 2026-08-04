@@ -82,7 +82,7 @@ async def test_explicit_reconnect_resets_closed_message_stream() -> None:
     client._closed.set()
     client._message_ready.set()
 
-    client._reset_message_stream()
+    await client._reset_message_stream()
 
     assert client._messages is not original
     assert client._messages.maxsize == 2
