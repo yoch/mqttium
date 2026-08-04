@@ -1,0 +1,22 @@
+name: Export pre-memory workbench
+
+on:
+  pull_request:
+    branches:
+      - agent/memory-cleanup-basics
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: Archive checkout
+        run: tar --exclude=.git -czf /tmp/mqttium-pre-memory.tar.gz .
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mqttium-pre-memory-workbench
+          path: /tmp/mqttium-pre-memory.tar.gz
+          retention-days: 1
