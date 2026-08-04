@@ -1,6 +1,9 @@
 name: Export workbench
 
 on:
+  pull_request:
+    branches:
+      - agent/memory-profile-overhaul
   push:
     branches:
       - agent/memory-perf-workbench
