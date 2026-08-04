@@ -3,7 +3,9 @@
 Importing the engine eagerly here would pull the whole state machine, the packet
 codec and the persistence layer into every ``import mqttium.protocol``. Public
 names stay available through module-level ``__getattr__`` without loading
-unrelated layers.
+unrelated layers. The directional ``InboundSession`` and ``OutboundSession``
+objects remain engine implementation details and are intentionally not
+re-exported here.
 """
 
 from __future__ import annotations
