@@ -1,0 +1,21 @@
+diff --git a/src/mqttium/compat/paho.py b/src/mqttium/compat/paho.py
+--- a/src/mqttium/compat/paho.py
++++ b/src/mqttium/compat/paho.py
+@@ -196,3 +196,5 @@
+         def _set_credentials() -> None:
+-            self._async._engine.config.username = username
+-            self._async._engine.config.password = pwd
++            self._async._engine.config.update(
++                username=username,
++                password=pwd,
++            )
+@@ -220 +220 @@
+-        self._run_loop_mutation(lambda: setattr(self._async._engine.config, "will", message))
++        self._run_loop_mutation(lambda: self._async._engine.config.update(will=message))
+@@ -369,3 +369,5 @@
+     def connect(self, host: str, port: int = 1883, keepalive: int = 60) -> int:
+-        self._run_loop_mutation(lambda: setattr(self._async._engine.config, "keepalive", keepalive))
++        self._run_loop_mutation(
++            lambda: self._async._engine.config.update(keepalive=keepalive)
++        )
+         self._submit(self._async.connect(host, port))

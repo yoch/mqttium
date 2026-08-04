@@ -1,0 +1,65 @@
+name: Apply PR 18 audit fixes
+
+on:
+  push:
+    branches:
+      - audit/design-hardening
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apply-pr18-audit-fixes
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    if: github.event.head_commit.message == 'Stage PR 18 audit fixes'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the exact staging commit
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Apply the reviewed patches
+        run: |
+          mapfile -t patches < <(find .github/pr18-audit-fixes -type f -name '*.patch' | sort)
+          test "${#patches[@]}" -eq 7
+          git apply --check "${patches[@]}"
+          git apply "${patches[@]}"
+          rm -rf .github/pr18-audit-fixes
+          rm .github/workflows/apply-pr18-audit-fixes.yml
+          git diff --check
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install test dependencies
+        run: python -m pip install -e '.[dev,security]'
+
+      - name: Format and static checks
+        run: |
+          ruff format src/mqttium/api/async_client.py src/mqttium/protocol/engine.py src/mqttium/compat/paho.py src/mqttium/persistence/__init__.py tests/unit/test_design_hardening_followups.py
+          ruff check src tests benchmarks
+          mypy src/mqttium
+
+      - name: Targeted regression tests
+        run: |
+          python -m pytest -q \
+            tests/unit/test_design_hardening_followups.py \
+            tests/unit/test_reconnect_stale_effects.py \
+            tests/unit/test_config_contracts.py \
+            tests/unit/test_async_publish_admission.py \
+            tests/unit/test_sqlite_store.py
+
+      - name: Commit the validated result
+        run: |
+          git config user.name 'ChatGPT'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'Address PR 18 audit findings'
+          git push origin HEAD:audit/design-hardening
