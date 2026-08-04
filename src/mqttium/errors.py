@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 
 class MQTTError(Exception):
     """Base error for mqttium."""
@@ -44,7 +46,7 @@ class PublishBatchError(MQTTError):
 
     def __init__(
         self,
-        failures: dict[int, BaseException] | None = None,
+        failures: Mapping[int, BaseException] | None = None,
         *,
         failure_count: int | None = None,
         failure_counts: dict[str, int] | None = None,
