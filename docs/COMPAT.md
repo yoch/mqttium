@@ -98,11 +98,11 @@ receipts, connection epochs, and effect ordering are committed together on the
 network loop. Protecting only `queue_publish()` with an extra mutex would leave
 other engine paths and lifecycle transitions outside the same critical section.
 
-The compatibility façade instead uses one thread-safe ingress queue. A bounded
-loop callback batch performs admission, MID allocation, receipt registration,
-effect collection, and the inline writer fast path without an `await` in the
-commit section. The batch is capped at 256 requests and 1 MiB of logical topic
-plus payload bytes so a producer burst cannot monopolize the network loop.
+The compatibility façade instead uses one thread-safe ingress queue. Each loop
+callback drains at most 256 requests and targets at most 1 MiB of logical topic
+plus payload bytes. A single request larger than that target is processed alone,
+so these limits bound work per drain rather than total ingress memory; they do
+not impose a new payload-size limit.
 
 QoS 1/2 callers wait on a cancel-aware cross-thread result only until that
 commit completes. If the handoff times out before admission begins, the request
@@ -129,5 +129,6 @@ under concurrent publishers.
 - `tests/unit/test_compat_paho.py` — connection, publishing, callbacks, and filters
 - `tests/unit/test_compat_lib_subset.py` — behavioral compatibility subset
 - `tests/unit/test_compat_publish_perf.py` — effect ordering, MID reuse, mixed-QoS coalescing, cancellation, loop shutdown, and concurrent QoS 1 admission
+- `tests/unit/test_compat_publish_edges.py` — oversized drain handling and complete QoS 2 publish handshake
 - `tests/integration/test_compat_publish_perf.py` — end-to-end QoS 0 and concurrent QoS 1 callbacks and delivery
 - `benchmarks/compat_qosn_submit_ab.py` — coroutine, callback, and coalesced QoS 1 submit-rate/latency comparison
