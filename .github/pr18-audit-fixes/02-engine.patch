@@ -1,9 +1,13 @@
 diff --git a/src/mqttium/protocol/engine.py b/src/mqttium/protocol/engine.py
 --- a/src/mqttium/protocol/engine.py
 +++ b/src/mqttium/protocol/engine.py
-@@ -10 +10 @@
+@@ -9,5 +9,5 @@
+ from collections import deque
+ from collections.abc import Iterable
 -from dataclasses import dataclass, field, fields
 +from dataclasses import dataclass, field, fields, replace
+ from enum import Enum, auto
+ from typing import Any
 @@ -88,2 +88,15 @@
  }
 +
