@@ -32,6 +32,18 @@ l'ordre d'autorité est : spec MQTT (3.1.1 / 5.0) > ce guide > DESIGN.md.
    acquérir et à les restituer ; `ProtocolEngine` ne touche jamais les
    compteurs. Toute nouvelle opération sortante doit passer par lui, sans quoi
    un rollback partiel redevient possible.
+10. **Admission tout-ou-rien, une seule primitive d'annulation** :
+    `queue_publish()` et `queue_publish_many()` défont leurs acquisitions via
+    `OutboundSession._rollback()`, dans un ordre unique — effets, index de file,
+    slots de flow, lignes de store, MID, budget. L'appelant ne fait que
+    *snapshoter* (trois lectures locales), de sorte que le chemin nominal ne
+    paie rien et que les deux voies ne peuvent pas diverger. Le budget est
+    restauré en bloc depuis le snapshot et jamais relâché enregistrement par
+    enregistrement : un store transactionnel a déjà annulé son batch quand
+    l'`except` s'exécute, donc les tailles unitaires sont perdues et une seconde
+    libération unitaire compterait deux fois. Contrat vérifié par injection de
+    faute après chaque acquisition dans
+    `tests/unit/test_outbound_transaction.py`, contre store mémoire *et* SQLite.
 7. **Callbacks hors section critique** : aucun verrou/état moteur tenu pendant
    un callback ; un callback peut appeler `publish()` sans deadlock.
 8. **Pas de retransmission sur connexion vivante** : les PUBLISH/PUBREL ne sont

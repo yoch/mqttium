@@ -76,6 +76,10 @@ Two layers, strictly separated:
     connection state — it reads `state`/`negotiated` back from the engine and emits through
     `ProtocolEngine._emit`/`_send` so effect ordering stays observable in one place.
     `engine.flow`, `engine.packet_ids` and `engine._queued` are read-only views onto it.
+    Both publish entry points unwind through the single `_rollback()` primitive; callers only
+    snapshot, so the success path pays nothing and the two cannot drift. Admission is
+    all-or-nothing and fault-injected in `tests/unit/test_outbound_transaction.py` — extend it
+    when you add an acquisition step.
 - **`api/async_client.py` — `AsyncClient`**: the asyncio adapter. Owns the transport, the reader
   task, the single writer task, keepalive/reconnect timers, callbacks, delivery queues, and turns
   effects into futures, receipts and messages.
