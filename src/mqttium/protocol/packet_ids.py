@@ -21,22 +21,20 @@ class PacketIdPool:
     creates sets when multiple holes or out-of-order reservations coexist.
     """
 
-    __slots__ = ("_free_many", "_free_one", "_next", "_reserved")
+    __slots__ = ("_free_count", "_free_many", "_free_one", "_next", "_reserved")
 
     _MAX_ID = 65_535
 
     def __init__(self) -> None:
+        self._free_count = 0
         self._free_one = 0
         self._free_many: set[int] | None = None
         self._reserved: set[int] | None = None
         self._next = 1
 
     def __len__(self) -> int:
-        free_count = 1 if self._free_one else 0
-        if self._free_many is not None:
-            free_count += len(self._free_many)
         reserved_count = 0 if self._reserved is None else len(self._reserved)
-        return self._next - 1 - free_count + reserved_count
+        return self._next - 1 - self._free_count + reserved_count
 
     @property
     def available(self) -> int:
@@ -70,6 +68,7 @@ class PacketIdPool:
         mid = self._free_one
         if mid:
             self._free_one = 0
+            self._free_count -= 1
             return mid
 
         free = self._free_many
@@ -77,6 +76,7 @@ class PacketIdPool:
             mid = free.pop()
             if not free:
                 self._free_many = None
+            self._free_count -= 1
             return mid
 
         mid = self._next
@@ -103,10 +103,12 @@ class PacketIdPool:
         if mid < frontier:
             if self._free_one == mid:
                 self._free_one = 0
+                self._free_count -= 1
                 return
             free = self._free_many
             if free is not None and mid in free:
                 free.remove(mid)
+                self._free_count -= 1
                 if not free:
                     self._free_many = None
             return
@@ -145,6 +147,7 @@ class PacketIdPool:
                 self._free_many = {mid}
             else:
                 free.add(mid)
+            self._free_count += 1
         else:
             reserved = self._reserved
             if reserved is None or mid not in reserved:
@@ -153,12 +156,8 @@ class PacketIdPool:
             if not reserved:
                 self._reserved = None
 
-        if self._reserved is None:
-            free_count = 1 if self._free_one else 0
-            if self._free_many is not None:
-                free_count += len(self._free_many)
-            if free_count == self._next - 1:
-                self.clear()
+        if self._reserved is None and self._free_count == self._next - 1:
+            self.clear()
 
     def in_use(self, mid: int) -> bool:
         if mid < 1 or mid > self._MAX_ID:
@@ -172,6 +171,7 @@ class PacketIdPool:
         return reserved is not None and mid in reserved
 
     def clear(self) -> None:
+        self._free_count = 0
         self._free_one = 0
         self._free_many = None
         self._reserved = None
