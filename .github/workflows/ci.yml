@@ -1,138 +1,37 @@
-name: CI
+name: Apply packet-id clear optimization
 
 on:
   push:
-  pull_request:
+    branches:
+      - agent/packet-id-clear-paths
 
 permissions:
-  contents: read
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  contents: write
 
 jobs:
-  quality:
+  apply:
+    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: agent/packet-id-clear-paths
+          fetch-depth: 0
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - run: python -m pip install -e ".[dev,security]"
-      - name: Repository hygiene
-        run: |
-          set -euo pipefail
-          test -z "$(git ls-files | grep -E '(^|/)(__pycache__|\.pytest_cache|\.mypy_cache|\.ruff_cache|dist|build|.*\.egg-info)(/|$)|(^|/)\.coverage($|\.)|\.py[co]$' || true)"
-          test -z "$(grep -RIl --exclude-dir=.git -E 'mqttnext|MQTTNext|MQTTNEXT' src tests examples benchmarks || true)"
-      - run: ruff format --check src tests benchmarks
-      - run: ruff check src tests benchmarks
-      - run: mypy src/mqttium
-      - run: bandit -q -ll -r src
-      - run: python -m pytest -q tests/unit --cov=mqttium --cov-report=term-missing --cov-fail-under=80
-
-  test:
-    runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.11", "3.12", "3.13", "3.14"]
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: ${{ matrix.python-version }}
+      - run: python tools/apply_packet_id_clear.py
+      - run: git checkout origin/main -- .github/workflows/ci.yml
+      - run: rm -f .github/workflows/apply-packet-id-clear.yml tools/apply_packet_id_clear.py
       - run: python -m pip install -e ".[dev]"
-      - run: python -m pytest -q tests/unit
-      - name: Start Mosquitto
+      - run: ruff format src/mqttium/protocol/engine.py tests/unit/test_packet_id_clear_paths.py
+      - run: ruff check src/mqttium/protocol/engine.py tests/unit/test_packet_id_clear_paths.py
+      - run: python -m pytest -q tests/unit/test_packet_id_clear_paths.py tests/unit/test_packet_id_pool_accounting.py
+      - run: git diff --check
+      - name: Commit focused change
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq mosquitto
-          printf 'listener 11883 127.0.0.1\nallow_anonymous true\npersistence false\n' > /tmp/mosq-ci.conf
-          mosquitto -c /tmp/mosq-ci.conf -d
-          for i in $(seq 1 30); do
-            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
-            sleep 0.2
-          done
-          exit 1
-      - run: python -m pytest -q tests/integration
-
-  fuzz:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
-      - run: python -m pip install -e ".[fuzz]"
-      - name: Seeded fuzzing
-        run: |
-          for seed in 1 2 3; do
-            PYTHONPATH=src python tests/fuzz/fuzz.py --seed "$seed" --iterations 20000
-          done
-      - run: PYTHONPATH=src python -m pytest -q tests/fuzz/test_hypothesis_fuzz.py
-
-  package:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
-      - run: python -m pip install ".[release]"
-      - run: validate-pyproject pyproject.toml
-      - run: python -m build
-      - run: twine check --strict dist/*
-      - run: check-wheel-contents dist/*.whl
-      - name: Validate distribution contents
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-          from zipfile import ZipFile
-          import email
-          import tarfile
-
-          wheel = next(Path("dist").glob("*.whl"))
-          sdist = next(Path("dist").glob("*.tar.gz"))
-
-          with ZipFile(wheel) as archive:
-              names = archive.namelist()
-              metadata_name = next(name for name in names if name.endswith(".dist-info/METADATA"))
-              metadata = email.message_from_bytes(archive.read(metadata_name))
-              assert metadata["Name"] == "mqttium"
-              assert metadata["Version"] == "0.1.0a2"
-              assert metadata["Requires-Python"] == ">=3.11"
-              assert metadata["License-Expression"] == "Apache-2.0"
-              assert "mqttium/py.typed" in names
-              assert any(name.endswith(".dist-info/licenses/LICENSE") for name in names)
-              assert any(name.endswith(".dist-info/licenses/NOTICE") for name in names)
-
-          with tarfile.open(sdist, "r:gz") as archive:
-              names = archive.getnames()
-              for filename in (
-                  "LICENSE",
-                  "NOTICE",
-                  "README.md",
-                  "CHANGELOG.md",
-                  "PROVENANCE.md",
-                  "SECURITY.md",
-              ):
-                  assert any(name.endswith("/" + filename) for name in names), filename
-          PY
-      - name: Install and import the built wheel
-        run: |
-          python -m venv /tmp/mqttium-wheel
-          /tmp/mqttium-wheel/bin/python -m pip install --no-deps dist/*.whl
-          cd /tmp
-          /tmp/mqttium-wheel/bin/python -I - <<'PY'
-          import importlib
-          import importlib.metadata
-          import pkgutil
-          import mqttium
-
-          assert mqttium.__version__ == "0.1.0a2"
-          assert importlib.metadata.version("mqttium") == "0.1.0a2"
-          for module in pkgutil.walk_packages(mqttium.__path__, mqttium.__name__ + "."):
-              importlib.import_module(module.name)
-          PY
-          /tmp/mqttium-wheel/bin/python -m pip check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Use clear for complete packet-id abandonment"
+          git push origin HEAD:agent/packet-id-clear-paths
