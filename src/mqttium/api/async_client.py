@@ -231,8 +231,8 @@ class AsyncClient:
         self._outbound_waiters = 0
         self._publish_space = asyncio.Condition()
         self._connack_fut: asyncio.Future[ConnAckPacket] | None = None
-        self._receipts: dict[int, PublishReceipt] = {}
-        self._batch_receipts: dict[int, PublishBatchReceipt] = {}
+        self._receipts: dict[int, deque[PublishReceipt]] = {}
+        self._batch_receipts: dict[int, deque[PublishBatchReceipt]] = {}
         self._sub_futs: dict[int, asyncio.Future[SubscribeResult]] = {}
         self._unsub_futs: dict[int, asyncio.Future[UnsubscribeResult]] = {}
         self._messages: asyncio.Queue[Message] = asyncio.Queue(maxsize=self._max_pending_messages)
@@ -521,7 +521,7 @@ class AsyncClient:
                                 qos=handle.qos,
                                 _event=asyncio.Event(),
                             )
-                            self._receipts[handle.mid] = receipt
+                            self._register_publish_receipt(handle.mid, receipt)
                         self._collect_effects_locked()
                         return receipt
                 await self._publish_space.wait()
@@ -549,7 +549,7 @@ class AsyncClient:
                         for handle in handles:
                             receipt._register(handle.mid)
                             if handle.mid is not None:
-                                self._batch_receipts[handle.mid] = receipt
+                                self._register_batch_receipt(handle.mid, receipt)
                         self._collect_effects_locked()
                         return
                 await self._publish_space.wait()
@@ -1207,10 +1207,10 @@ class AsyncClient:
                     self._engine.mark_inbound_delivered(msg.mid)
         elif kind is EffectKind.PUBLISH_COMPLETE:
             mid: int = effect.data
-            receipt = self._receipts.pop(mid, None)
+            receipt = self._pop_publish_receipt(mid)
             if receipt is not None and receipt._event is not None:
                 receipt._event.set()
-            batch = self._batch_receipts.pop(mid, None)
+            batch = self._pop_batch_receipt(mid)
             if batch is not None:
                 batch._complete(mid)
             if self.on_publish is not None:
@@ -1218,12 +1218,12 @@ class AsyncClient:
             await self._notify_publish_space()
         elif kind is EffectKind.PUBLISH_FAILED:
             failure: PublishFailure = effect.data
-            receipt = self._receipts.pop(failure.mid, None)
+            receipt = self._pop_publish_receipt(failure.mid)
             if receipt is not None:
                 receipt._error = failure.reason
                 if receipt._event is not None:
                     receipt._event.set()
-            batch = self._batch_receipts.pop(failure.mid, None)
+            batch = self._pop_batch_receipt(failure.mid)
             if batch is not None:
                 batch._complete(failure.mid, failure.reason)
             if self.on_publish is not None:
@@ -1468,6 +1468,30 @@ class AsyncClient:
         self._effect_applied += discarded
         self._resolve_effect_waiters()
 
+    def _register_publish_receipt(self, mid: int, receipt: PublishReceipt) -> None:
+        self._receipts.setdefault(mid, deque()).append(receipt)
+
+    def _pop_publish_receipt(self, mid: int) -> PublishReceipt | None:
+        receipts = self._receipts.get(mid)
+        if not receipts:
+            return None
+        receipt = receipts.popleft()
+        if not receipts:
+            self._receipts.pop(mid, None)
+        return receipt
+
+    def _register_batch_receipt(self, mid: int, receipt: PublishBatchReceipt) -> None:
+        self._batch_receipts.setdefault(mid, deque()).append(receipt)
+
+    def _pop_batch_receipt(self, mid: int) -> PublishBatchReceipt | None:
+        receipts = self._batch_receipts.get(mid)
+        if not receipts:
+            return None
+        receipt = receipts.popleft()
+        if not receipts:
+            self._batch_receipts.pop(mid, None)
+        return receipt
+
     def _fail_non_replayable(self, exc: BaseException) -> None:
         for sub_fut in self._sub_futs.values():
             if not sub_fut.done():
@@ -1479,12 +1503,13 @@ class AsyncClient:
         self._unsub_futs.clear()
 
     def _fail_pending(self, exc: BaseException) -> None:
-        for receipt in self._receipts.values():
-            receipt._error = exc
-            if receipt._event is not None:
-                receipt._event.set()
+        for receipts in self._receipts.values():
+            for receipt in receipts:
+                receipt._error = exc
+                if receipt._event is not None:
+                    receipt._event.set()
         self._receipts.clear()
-        batches = set(self._batch_receipts.values())
+        batches = {batch for receipts in self._batch_receipts.values() for batch in receipts}
         self._batch_receipts.clear()
         for batch in batches:
             batch._fail_remaining(exc)

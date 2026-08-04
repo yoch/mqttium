@@ -55,7 +55,7 @@ async def test_transport_loss_fails_subscriptions_but_preserves_publish_receipt(
         qos=QoS.AT_LEAST_ONCE,
         _event=publish_event,
     )
-    client._receipts[13] = receipt
+    client._register_publish_receipt(13, receipt)
 
     await client._read_loop()
 
@@ -65,7 +65,7 @@ async def test_transport_loss_fails_subscriptions_but_preserves_publish_receipt(
         await unsub
     assert client._sub_futs == {}
     assert client._unsub_futs == {}
-    assert client._receipts[13] is receipt
+    assert list(client._receipts[13]) == [receipt]
     assert not publish_event.is_set()
 
     if client._reconnect_task is not None:
@@ -83,10 +83,13 @@ async def test_fail_pending_still_fails_all_operation_types() -> None:
     client._sub_futs[1] = sub
     client._unsub_futs[2] = unsub
     event = asyncio.Event()
-    client._receipts[3] = PublishReceipt(
-        mid=3,
-        qos=QoS.AT_LEAST_ONCE,
-        _event=event,
+    client._register_publish_receipt(
+        3,
+        PublishReceipt(
+            mid=3,
+            qos=QoS.AT_LEAST_ONCE,
+            _event=event,
+        ),
     )
     error = MQTTError("terminal")
 

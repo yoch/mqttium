@@ -375,7 +375,7 @@ class Client:
                 _event=None if handle.qos == QoS.AT_MOST_ONCE else asyncio.Event(),
             )
             if handle.mid is not None:
-                self._async._receipts[handle.mid] = receipt
+                self._async._register_publish_receipt(handle.mid, receipt)
 
             self._async._collect_effects_locked()
             self._async._schedule_effect_flush()
@@ -397,7 +397,7 @@ class Client:
                     _event=None if handle.qos == QoS.AT_MOST_ONCE else asyncio.Event(),
                 )
                 if handle.mid is not None:
-                    self._async._receipts[handle.mid] = receipt
+                    self._async._register_publish_receipt(handle.mid, receipt)
                 handoff["receipt"] = receipt
                 await self._async._flush_effects()
             except BaseException as exc:
