@@ -1,0 +1,3 @@
+Atomic Git workflow smoke test.
+
+File B proves that publication is all-or-nothing at the branch-ref step.
