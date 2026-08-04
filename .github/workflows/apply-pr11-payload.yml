@@ -22,6 +22,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          echo '58852a00d48cd9e2f05df25e5916d57087cb16ebbaf31bbf7e4220d267e7a2d1  .mqttium-upload/part-00' | sha256sum --check
+          echo '76b69f904fd8f32419fb4cbbb527d18bc260a70c66693ff4836fba6927df3eac  .mqttium-upload/part-01' | sha256sum --check
+          echo '2c71e6bde50a12c0fa07f9e8e8c0d8677c2294979c7d57146f5dfc69e76b411e  .mqttium-upload/part-02' | sha256sum --check
+          echo '7e7487ac9ee5e27b440a30dfe601450b62727b1d06fd00ce26bac9e97eeca115  .mqttium-upload/part-03' | sha256sum --check
+          echo '97d500610a1a0241b136de21ed26cc676068a7cb24cbc2e8a178a7a49156ef0d  .mqttium-upload/part-04' | sha256sum --check
+          echo 'd7fae189aff9a06e463f6a86abcef59daae134c1701b78b6c036649c4a32fbdb  .mqttium-upload/part-05' | sha256sum --check
+          echo '3c15e7ef76a41c9ea2f02b9c78e9c380ddd88f7a1a5e716e11513ce53b6bdf8e  .mqttium-upload/part-06' | sha256sum --check
           cat .mqttium-upload/part-* | base64 --decode > /tmp/mqttium-pr11-final.tar.gz
           echo '04f5635693c2ed04825d067974e5162109264a435fbe451819c64c775bd1ad8d  /tmp/mqttium-pr11-final.tar.gz' | sha256sum --check
           git fetch origin main
