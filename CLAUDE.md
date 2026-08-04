@@ -67,8 +67,15 @@ Two layers, strictly separated:
 - **`protocol/engine.py` — `ProtocolEngine`**: the correctness core. Pure synchronous state machine:
   no `asyncio`, no sockets, no user callbacks, no wall clock, no `await`. Packets and commands go
   in (`handle_raw`, `queue_publish`, `begin_connect`, …), `EngineEffect` objects come out via
-  `take_effects()`. All QoS 1/2 state, session replay, packet-id allocation, flow control and
-  negotiation validation live here — which is why it is unit-testable without a network.
+  `take_effects()`. It owns connection state, negotiation, packet dispatch and inbound QoS —
+  which is why it is unit-testable without a network. It delegates all outbound publication to:
+  - **`protocol/outbound.py` — `OutboundSession`** (`engine.outbound`): admission budget, packet
+    ids, flow window, the `QUEUED` deque, outbound store records, replay and hydration. A QoS 1/2
+    publish acquires four resources (budget, mid, store row, flow slot); this is the one component
+    that acquires and releases them, which is what makes rollback auditable. It does *not* own
+    connection state — it reads `state`/`negotiated` back from the engine and emits through
+    `ProtocolEngine._emit`/`_send` so effect ordering stays observable in one place.
+    `engine.flow`, `engine.packet_ids` and `engine._queued` are read-only views onto it.
 - **`api/async_client.py` — `AsyncClient`**: the asyncio adapter. Owns the transport, the reader
   task, the single writer task, keepalive/reconnect timers, callbacks, delivery queues, and turns
   effects into futures, receipts and messages.

@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-import mqttium.protocol.engine as engine_module
+import mqttium.protocol.outbound as outbound_module
 from mqttium.api.async_client import AsyncClient
 from mqttium.enums import MQTTProtocolVersion
 from mqttium.protocol.engine import EngineConfig, ProtocolEngine
@@ -52,14 +52,14 @@ def test_publish_admission_encodes_properties_once(monkeypatch: pytest.MonkeyPat
     advertised a maximum packet size.
     """
     calls = 0
-    original = engine_module.encode_properties
+    original = outbound_module.encode_properties
 
     def counting(properties: object, packet_type: object) -> bytes:
         nonlocal calls
         calls += 1
         return original(properties, packet_type)
 
-    monkeypatch.setattr(engine_module, "encode_properties", counting)
+    monkeypatch.setattr(outbound_module, "encode_properties", counting)
 
     properties = Properties()
     properties.add_user_property("source", "contract")

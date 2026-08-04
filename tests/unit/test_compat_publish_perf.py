@@ -36,7 +36,7 @@ class _TracingEngine(ProtocolEngine):
     def __init__(self) -> None:
         self.trace: list[tuple[str, Any]] = []
         super().__init__()
-        self.packet_ids = _TracingPacketIds(self.trace)
+        self.outbound.packet_ids = _TracingPacketIds(self.trace)
 
     def _emit(self, kind: EffectKind, data: Any = None) -> None:
         if kind in (EffectKind.PUBLISH_COMPLETE, EffectKind.PUBLISH_FAILED):
@@ -58,7 +58,7 @@ def _prime_qos1(engine: ProtocolEngine) -> int:
             state=OutboundQoSState.WAIT_PUBACK,
         )
     )
-    engine._reserve_outbound(engine._outbound_logical_size("t", b"x", None))
+    engine.outbound._reserve(engine.outbound.logical_size("t", b"x", None))
     engine.take_effects()
     return mid
 

@@ -26,6 +26,12 @@ l'ordre d'autorité est : spec MQTT (3.1.1 / 5.0) > ce guide > DESIGN.md.
    `OutboundQoSState`/`InboundQoSState`. `_queued` n'est qu'un index ordonné
    des messages en état `QUEUED` — tout message de `_queued` est aussi dans
    le store avec cet état, et réciproquement.
+9. **Propriétaire unique des ressources sortantes** : une publication QoS 1/2
+   acquiert quatre ressources — budget d'admission, MID, ligne de store, slot
+   `FlowControl`. `OutboundSession` (`protocol/outbound.py`) est le seul à les
+   acquérir et à les restituer ; `ProtocolEngine` ne touche jamais les
+   compteurs. Toute nouvelle opération sortante doit passer par lui, sans quoi
+   un rollback partiel redevient possible.
 7. **Callbacks hors section critique** : aucun verrou/état moteur tenu pendant
    un callback ; un callback peut appeler `publish()` sans deadlock.
 8. **Pas de retransmission sur connexion vivante** : les PUBLISH/PUBREL ne sont

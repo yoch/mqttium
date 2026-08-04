@@ -18,7 +18,7 @@ from mqttium.protocol.reconnect import ReconnectPolicy
 async def _complete(client: AsyncClient, mid: int) -> None:
     stored = client._engine.store.get_out(mid)
     assert stored is not None
-    client._engine._complete_outbound_record(mid, stored)
+    client._engine.outbound.complete_record(mid, stored)
     client._engine.packet_ids.release(mid)
     await client._apply_effect(
         EngineEffect(kind=EffectKind.PUBLISH_COMPLETE, data=mid),

@@ -144,14 +144,14 @@ def test_outbound_reservation_underflow_raises_without_corrupting_counters() -> 
     engine = ProtocolEngine()
 
     with pytest.raises(AssertionError, match="message reservation underflow"):
-        engine._release_outbound_reservation(0)
+        engine.outbound._release_reservation(0)
     assert engine.pending_outbound_messages == 0
     assert engine.pending_outbound_bytes == 0
 
-    engine._pending_outbound_messages = 1
-    engine._pending_outbound_bytes = 4
+    engine.outbound._pending_messages = 1
+    engine.outbound._pending_bytes = 4
     with pytest.raises(AssertionError, match="byte reservation underflow"):
-        engine._release_outbound_reservation(5)
+        engine.outbound._release_reservation(5)
     assert engine.pending_outbound_messages == 1
     assert engine.pending_outbound_bytes == 4
 

@@ -12,8 +12,6 @@ from typing import Any
 
 from mqttium.codec.buffer import RawPacket
 from mqttium.codec.packet_validation import validate_raw_packet
-from mqttium.codec.properties import PUBLISH, encode_properties
-from mqttium.codec.vbi import encode_vbi
 from mqttium.enums import (
     ConnectionState,
     InboundQoSState,
@@ -56,9 +54,9 @@ from mqttium.protocol.effects import (
 )
 from mqttium.protocol.flow_control import FlowControl
 from mqttium.protocol.negotiated import NegotiatedSettings
+from mqttium.protocol.outbound import OutboundSession
 from mqttium.protocol.packet_ids import PacketIdPool
 from mqttium.topics import (
-    validate_publish_topic,
     validate_received_publish_topic,
     validate_subscribe_filter,
 )
@@ -71,12 +69,10 @@ from mqttium.types import (
     Properties,
 )
 from mqttium.errors import (
-    FlowControlError,
     MalformedPacketError,
     NotConnectedError,
     PacketTooLargeError,
     ProtocolError,
-    SessionDiscardedError,
 )
 
 
@@ -117,16 +113,13 @@ class ProtocolEngine:
         self.store = store or MemoryInflightStore()
         # Resolved once: a store either pages or it does not, for its lifetime.
         self._paged_store = self.store if isinstance(self.store, PagedInflightStore) else None
-        self.packet_ids = PacketIdPool()
-        self.flow = FlowControl(self.config.local_receive_maximum)
         self.state = ConnectionState.NEW
         self.session_present = False
         self.negotiated = NegotiatedSettings()
         self._pending_connect = False
         self._effects: list[EngineEffect] = []
-        self._queued: deque[OutboundMessage | OutboundMessageSummary] = deque()
-        self._pending_outbound_messages = 0
-        self._pending_outbound_bytes = 0
+        # Owns outbound QoS: budget, packet ids, flow window, queue and replay.
+        self.outbound = OutboundSession(self)
         # Inbound topic aliases (connection-scoped).
         self._topic_aliases: dict[int, str] = {}
         # After a durable session is established, next CONNECT uses Clean Start 0.
@@ -150,9 +143,7 @@ class ProtocolEngine:
             PacketType.AUTH: self._on_auth,
         }
         # Hydrate packet ids + offline queue from a durable store (restart).
-        for page in self._outbound_store_summary_pages():
-            for msg in page:
-                self._hydrate_outbound_message(msg)
+        self.outbound.hydrate()
         # MIDs of in-flight SUBSCRIBE/UNSUBSCRIBE (never collide with PUBLISH).
         self._pending_sub_mids: set[int] = set()
 
@@ -161,13 +152,39 @@ class ProtocolEngine:
         self._effects = []
         return effects
 
+    # --- outbound facade ---------------------------------------------------
+    # The session owns this state. These views keep the engine's public surface
+    # (and the tests, benchmarks and fuzzer that use it) exactly as it was when
+    # these were plain attributes — including assignment, which tests use to
+    # inject instrumented pools.
+
+    @property
+    def packet_ids(self) -> PacketIdPool:
+        return self.outbound.packet_ids
+
+    @packet_ids.setter
+    def packet_ids(self, pool: PacketIdPool) -> None:
+        self.outbound.packet_ids = pool
+
+    @property
+    def flow(self) -> FlowControl:
+        return self.outbound.flow
+
+    @flow.setter
+    def flow(self, flow: FlowControl) -> None:
+        self.outbound.flow = flow
+
+    @property
+    def _queued(self) -> deque[OutboundMessage | OutboundMessageSummary]:
+        return self.outbound._queued
+
     @property
     def pending_outbound_messages(self) -> int:
-        return self._pending_outbound_messages
+        return self.outbound.pending_messages
 
     @property
     def pending_outbound_bytes(self) -> int:
-        return self._pending_outbound_bytes
+        return self.outbound.pending_bytes
 
     def can_ever_admit_publish(
         self,
@@ -176,31 +193,13 @@ class ProtocolEngine:
         qos: QoS | int,
         properties: Properties | None = None,
     ) -> bool:
-        if QoS(qos) == QoS.AT_MOST_ONCE:
-            return True
-        message_limit = self.config.max_pending_outbound_messages
-        if message_limit is not None and message_limit < 1:
-            return False
-        byte_limit = self.config.max_pending_outbound_bytes
-        logical_size = self._outbound_logical_size(topic, payload, properties)
-        return byte_limit is None or logical_size <= byte_limit
+        return self.outbound.can_ever_admit(topic, payload, qos, properties)
 
     def can_ever_admit_publish_many(
         self,
         messages: Iterable[tuple[str, bytes, QoS | int, bool, Properties | None]],
     ) -> bool:
-        pending_count = 0
-        pending_bytes = 0
-        for topic, payload, qos, _retain, properties in messages:
-            if QoS(qos) == QoS.AT_MOST_ONCE:
-                continue
-            pending_count += 1
-            pending_bytes += self._outbound_logical_size(topic, payload, properties)
-        message_limit = self.config.max_pending_outbound_messages
-        if message_limit is not None and pending_count > message_limit:
-            return False
-        byte_limit = self.config.max_pending_outbound_bytes
-        return byte_limit is None or pending_bytes <= byte_limit
+        return self.outbound.can_ever_admit_many(messages)
 
     def _emit(self, kind: EffectKind, data: Any = None) -> None:
         self._effects.append(EngineEffect(kind=kind, data=data))
@@ -278,139 +277,15 @@ class ProtocolEngine:
         retain: bool = False,
         properties: Properties | None = None,
     ) -> PublishHandle:
-        qos = QoS(qos)
-        allow_empty = bool(
-            properties
-            and properties.get("topic_alias")
-            and self.config.protocol == MQTTProtocolVersion.MQTTv5
+        return self.outbound.queue_publish(
+            topic, payload, qos=qos, retain=retain, properties=properties
         )
-        validate_publish_topic(topic, allow_empty=allow_empty)
-
-        if self.state == ConnectionState.CONNECTED:
-            if qos > self.negotiated.maximum_qos:
-                raise ProtocolError(
-                    f"QoS {int(qos)} exceeds broker maximum_qos {self.negotiated.maximum_qos}"
-                )
-            if retain and not self.negotiated.retain_available:
-                raise ProtocolError("Broker does not support retain")
-            if properties and properties.get("topic_alias") is not None:
-                alias = int(properties.get("topic_alias"))
-                if alias > self.negotiated.topic_alias_maximum:
-                    raise ProtocolError(
-                        f"topic_alias {alias} exceeds broker topic_alias_maximum "
-                        f"{self.negotiated.topic_alias_maximum}"
-                    )
-
-        if self.state != ConnectionState.CONNECTED and qos == QoS.AT_MOST_ONCE:
-            raise NotConnectedError("Cannot publish QoS 0 while disconnected")
-
-        if qos == QoS.AT_MOST_ONCE:
-            packet = PublishPacket(
-                topic=topic,
-                payload=payload,
-                qos=qos,
-                retain=retain,
-                dup=False,
-                mid=None,
-                properties=properties,
-            )
-            wire = packet.encode_write_item(self.config.protocol)
-            self._check_outbound_size(wire)
-            self._send(wire)
-            # Completion follows SEND so compatibility on_publish cannot run
-            # before the outbound queue has accepted the frame.
-            self._emit(EffectKind.PUBLISH_COMPLETE, None)
-            return PublishHandle(mid=None, qos=qos)
-
-        # One property encode and one topic measurement feed both the wire-size
-        # check and the logical budget.
-        topic_bytes, wire_property_bytes, logical_property_bytes = self._outbound_size_parts(
-            topic, properties
-        )
-        # Validate packet size before reserving local memory or a packet id.
-        self._check_outbound_publish_wire_size(topic_bytes, wire_property_bytes, len(payload), qos)
-        logical_size = len(payload) + topic_bytes + logical_property_bytes
-        self._reserve_outbound(logical_size)
-        mid: int | None = None
-        msg: OutboundMessage | None = None
-        try:
-            mid = self.packet_ids.allocate()
-            msg = OutboundMessage(
-                mid=mid,
-                topic=topic,
-                payload=payload,
-                qos=qos,
-                retain=retain,
-                state=OutboundQoSState.QUEUED,
-                properties=properties,
-                logical_size=logical_size,
-            )
-
-            # Defer wire encode until launch: avoids double work when messages sit
-            # in the Receive Maximum queue.
-            if self.state == ConnectionState.CONNECTED and self._try_launch_outbound(msg):
-                return PublishHandle(mid=mid, qos=qos)
-
-            self.store.put_out(msg)
-            self._queued.append(msg)
-            return PublishHandle(mid=mid, qos=qos)
-        except BaseException:
-            if mid is None:
-                self._release_outbound_reservation(logical_size)
-            else:
-                self.packet_ids.release(mid)
-                if msg is None:
-                    self._release_outbound_reservation(logical_size)
-                else:
-                    self._discard_outbound_store_record(mid, msg)
-            raise
 
     def queue_publish_many(
         self,
         messages: Iterable[tuple[str, bytes, QoS | int, bool, Properties | None]],
     ) -> list[PublishHandle]:
-        """Queue one bounded chunk atomically with respect to engine/store state."""
-        effect_start = len(self._effects)
-        queued_start = len(self._queued)
-        inflight_start = self.flow.inflight
-        # A transactional store rolls its batch back before this frame's except
-        # clause runs, so the per-record sizes are unrecoverable by then. Restore
-        # the admission counters wholesale instead of releasing record by record.
-        pending_messages_start = self._pending_outbound_messages
-        pending_bytes_start = self._pending_outbound_bytes
-        packet_ids_empty_start = len(self.packet_ids) == 0
-        handles: list[PublishHandle] = []
-        try:
-            with self.store.batch():
-                for topic, payload, qos, retain, properties in messages:
-                    handles.append(
-                        self.queue_publish(
-                            topic,
-                            payload,
-                            qos=qos,
-                            retain=retain,
-                            properties=properties,
-                        )
-                    )
-        except BaseException:
-            del self._effects[effect_start:]
-            while len(self._queued) > queued_start:
-                self._queued.pop()
-            while self.flow.inflight > inflight_start:
-                self.flow.release()
-            for handle in handles:
-                if handle.mid is None:
-                    continue
-                self._delete_outbound_store_record(handle.mid)
-                if not packet_ids_empty_start:
-                    self.packet_ids.release(handle.mid)
-            if packet_ids_empty_start:
-                # Every live MID was allocated by this failed atomic batch.
-                self.packet_ids.clear()
-            self._pending_outbound_messages = pending_messages_start
-            self._pending_outbound_bytes = pending_bytes_start
-            raise
-        return handles
+        return self.outbound.queue_publish_many(messages)
 
     def queue_subscribe(
         self,
@@ -441,7 +316,7 @@ class ProtocolEngine:
                 self._check_subscribe_capabilities(topic, properties)
                 subscriptions.append(Subscription(topic=topic, options=options))
 
-        mid = self.packet_ids.allocate()
+        mid = self.outbound.packet_ids.allocate()
         try:
             packet = SubscribePacket(
                 mid=mid,
@@ -451,7 +326,7 @@ class ProtocolEngine:
             wire = packet.encode(self.config.protocol)
             self._check_outbound_size(wire)
         except Exception:
-            self.packet_ids.release(mid)
+            self.outbound.packet_ids.release(mid)
             raise
         self._pending_sub_mids.add(mid)
         self._send(wire)
@@ -469,13 +344,13 @@ class ProtocolEngine:
             raise ProtocolError("unsubscribe requires at least one topic")
         for topic in topic_list:
             validate_subscribe_filter(topic)
-        mid = self.packet_ids.allocate()
+        mid = self.outbound.packet_ids.allocate()
         try:
             packet = UnsubscribePacket(mid=mid, topics=topic_list)
             wire = packet.encode(self.config.protocol)
             self._check_outbound_size(wire)
         except Exception:
-            self.packet_ids.release(mid)
+            self.outbound.packet_ids.release(mid)
             raise
         self._pending_sub_mids.add(mid)
         self._send(wire)
@@ -503,12 +378,12 @@ class ProtocolEngine:
         self._pending_connect = False
         # Release sub/unsub MIDs still in flight — no ACK will arrive now.
         if self._pending_sub_mids:
-            if self._pending_outbound_messages == 0:
+            if self.outbound.pending_messages == 0:
                 # No publish MID survives this transport: reset in constant time.
-                self.packet_ids.clear()
+                self.outbound.packet_ids.clear()
             else:
                 for mid in self._pending_sub_mids:
-                    self.packet_ids.release(mid)
+                    self.outbound.packet_ids.release(mid)
             self._pending_sub_mids.clear()
         if was != ConnectionState.DISCONNECTED:
             self._emit(EffectKind.DISCONNECTED, DisconnectInfo(from_broker=False))
@@ -573,7 +448,7 @@ class ProtocolEngine:
             requested_session_expiry=requested_expiry,
             local_client_id=self.config.client_id,
         )
-        self.flow.apply_broker_receive_maximum(
+        self.outbound.flow.apply_broker_receive_maximum(
             self.negotiated.receive_maximum,
             self.config.local_receive_maximum,
             self.config.max_outbound_inflight,
@@ -582,47 +457,27 @@ class ProtocolEngine:
         self.state = ConnectionState.CONNECTED
         self.session_present = connack.session_present
         self._update_session_resume_preference()
+        outbound = self.outbound
         if not connack.session_present:
-            # _queued mirrors every outbound record that must survive a missing
-            # broker session. With no queued or SUB/UNSUB work, all packet ids
-            # belong to the inflight records discarded below.
-            clear_abandoned_packet_ids = not self._queued and not self._pending_sub_mids
-            for page in self._outbound_store_summary_pages():
-                for msg in page:
-                    if msg.state is OutboundQoSState.QUEUED:
-                        continue
-                    self._complete_outbound_record(msg.mid, msg)
-                    if not clear_abandoned_packet_ids:
-                        self.packet_ids.release(msg.mid)
-                    self._emit(
-                        EffectKind.PUBLISH_FAILED,
-                        PublishFailure(
-                            mid=msg.mid,
-                            reason=SessionDiscardedError(
-                                "Publish lost: clean session replaced the previous one"
-                            ),
-                        ),
-                    )
-            if clear_abandoned_packet_ids:
-                self.packet_ids.clear()
+            outbound.purge_after_clean_session(sub_mids_pending=bool(self._pending_sub_mids))
             self.store.clear_in()
             self._recovered_inbound_mids.clear()
             self._inbound_inflight = 0
-            self.flow.reset()
+            outbound.flow.reset()
             # Re-apply negotiated limit after reset.
-            self.flow.apply_broker_receive_maximum(
+            outbound.flow.apply_broker_receive_maximum(
                 self.negotiated.receive_maximum,
                 self.config.local_receive_maximum,
                 self.config.max_outbound_inflight,
             )
         else:
-            self._replay_session()
+            outbound.replay_session()
 
-        self._fail_queued_violating_negotiation()
+        outbound.fail_queued_violating_negotiation()
         self._emit(EffectKind.CONNACK, connack)
         if connack.session_present:
             self._replay_inbound_session()
-        self._drain_queue()
+        outbound.drain()
 
     def _on_publish(self, raw: RawPacket) -> None:
         packet = PublishPacket.decode(raw.flags, raw.remaining, self.config.protocol)
@@ -761,8 +616,8 @@ class ProtocolEngine:
         msg = self.store.get_out(ack.mid)
         if msg is None or msg.state is not OutboundQoSState.WAIT_PUBACK:
             return
-        self._complete_outbound_record(ack.mid, msg)
-        self.flow.release()
+        self.outbound.complete_record(ack.mid, msg)
+        self.outbound.flow.release()
         # Emit before freeing the packet id so FIFO receipt settlement remains
         # ordered even if a concurrent publish reuses the mid immediately.
         if ack.reason_code >= 128:
@@ -775,8 +630,8 @@ class ProtocolEngine:
             )
         else:
             self._emit(EffectKind.PUBLISH_COMPLETE, ack.mid)
-        self.packet_ids.release(ack.mid)
-        self._drain_queue()
+        self.outbound.packet_ids.release(ack.mid)
+        self.outbound.drain()
 
     def _on_pubrec(self, raw: RawPacket) -> None:
         rec = PubRecPacket.decode(raw.remaining, self.config.protocol)
@@ -789,8 +644,8 @@ class ProtocolEngine:
         if msg.state is not OutboundQoSState.WAIT_PUBREC:
             return
         if rec.reason_code >= 128:
-            self._complete_outbound_record(rec.mid, msg)
-            self.flow.release()
+            self.outbound.complete_record(rec.mid, msg)
+            self.outbound.flow.release()
             self._emit(
                 EffectKind.PUBLISH_FAILED,
                 PublishFailure(
@@ -798,8 +653,8 @@ class ProtocolEngine:
                     reason=ProtocolError(f"PUBREC reason_code={rec.reason_code}"),
                 ),
             )
-            self.packet_ids.release(rec.mid)
-            self._drain_queue()
+            self.outbound.packet_ids.release(rec.mid)
+            self.outbound.drain()
             return
         msg.state = OutboundQoSState.WAIT_PUBCOMP
         msg.encoded_publish = None
@@ -857,8 +712,8 @@ class ProtocolEngine:
         msg = self.store.get_out(comp.mid)
         if msg is None or msg.state is not OutboundQoSState.WAIT_PUBCOMP:
             return
-        self._complete_outbound_record(comp.mid, msg)
-        self.flow.release()
+        self.outbound.complete_record(comp.mid, msg)
+        self.outbound.flow.release()
         if comp.reason_code >= 128:
             self._emit(
                 EffectKind.PUBLISH_FAILED,
@@ -869,8 +724,8 @@ class ProtocolEngine:
             )
         else:
             self._emit(EffectKind.PUBLISH_COMPLETE, comp.mid)
-        self.packet_ids.release(comp.mid)
-        self._drain_queue()
+        self.outbound.packet_ids.release(comp.mid)
+        self.outbound.drain()
 
     def _on_suback(self, raw: RawPacket) -> None:
         ack = SubAckPacket.decode(raw.remaining, self.config.protocol)
@@ -879,7 +734,7 @@ class ProtocolEngine:
             self._emit(EffectKind.PROTOCOL_ERROR, f"SUBACK for unknown mid {ack.mid}")
             return
         self._pending_sub_mids.discard(ack.mid)
-        self.packet_ids.release(ack.mid)
+        self.outbound.packet_ids.release(ack.mid)
         self._emit(EffectKind.SUBACK, ack)
 
     def _on_unsuback(self, raw: RawPacket) -> None:
@@ -888,7 +743,7 @@ class ProtocolEngine:
             self._emit(EffectKind.PROTOCOL_ERROR, f"UNSUBACK for unknown mid {ack.mid}")
             return
         self._pending_sub_mids.discard(ack.mid)
-        self.packet_ids.release(ack.mid)
+        self.outbound.packet_ids.release(ack.mid)
         self._emit(EffectKind.UNSUBACK, ack)
 
     def _on_pingresp(self, raw: RawPacket) -> None:
@@ -986,255 +841,11 @@ class ProtocolEngine:
             ).encode(self.config.protocol)
         )
 
-    def _launch_outbound(self, msg: OutboundMessage) -> None:
-        if msg.encoded_publish is None:
-            msg.encoded_publish = PublishPacket(
-                topic=msg.topic,
-                payload=msg.payload,
-                qos=msg.qos,
-                retain=msg.retain,
-                dup=msg.dup,
-                mid=msg.mid,
-                properties=msg.properties,
-            ).encode_write_item(self.config.protocol)
-        self._check_outbound_size(msg.encoded_publish)
-        if msg.qos == QoS.AT_LEAST_ONCE:
-            msg.state = OutboundQoSState.WAIT_PUBACK
-        else:
-            msg.state = OutboundQoSState.WAIT_PUBREC
-        self.store.put_out(msg)
-        self._send(msg.encoded_publish)
-
-    def _try_launch_outbound(self, msg: OutboundMessage) -> bool:
-        if not self.flow.try_acquire():
-            return False
-        try:
-            self._launch_outbound(msg)
-        except Exception:
-            self.flow.release()
-            raise
-        return True
-
-    def _retransmit_outbound(self, msg: OutboundMessage) -> None:
-        if msg.state in (
-            OutboundQoSState.WAIT_PUBACK,
-            OutboundQoSState.WAIT_PUBREC,
-        ):
-            msg.dup = True
-            msg.encoded_publish = PublishPacket(
-                topic=msg.topic,
-                payload=msg.payload,
-                qos=msg.qos,
-                retain=msg.retain,
-                dup=True,
-                mid=msg.mid,
-                properties=msg.properties,
-            ).encode_write_item(self.config.protocol)
-            self._check_outbound_size(msg.encoded_publish)
-            self.store.update_out(msg)
-            self._send(msg.encoded_publish)
-            return
-        if msg.state is OutboundQoSState.WAIT_PUBCOMP:
-            if msg.encoded_pubrel is None:
-                msg.encoded_pubrel = PubRelPacket(mid=msg.mid).encode(self.config.protocol)
-                self.store.update_out(msg)
-            self._check_outbound_size(msg.encoded_pubrel)
-            self._send(msg.encoded_pubrel)
-            return
-        raise ProtocolError(f"Cannot retransmit outbound state {msg.state!r}")
-
-    def _drain_queue(self) -> None:
-        while self._queued and self.flow.available > 0:
-            if not self.flow.try_acquire():
-                break
-            stored = self._queued[0]
-            try:
-                msg = self._materialize_outbound(stored)
-                if msg.state is OutboundQoSState.QUEUED:
-                    self._launch_outbound(msg)
-                else:
-                    self._retransmit_outbound(msg)
-            except Exception as exc:
-                self.flow.release()
-                self._queued.popleft()
-                self._discard_outbound_store_record(stored.mid, stored)
-                self.packet_ids.release(stored.mid)
-                self._emit(
-                    EffectKind.PUBLISH_FAILED,
-                    PublishFailure(mid=stored.mid, reason=exc),
-                )
-                continue
-            self._queued.popleft()
-
-    def _hydrate_outbound_message(self, msg: OutboundMessage | OutboundMessageSummary) -> None:
-        self.packet_ids.reserve(msg.mid)
-        logical_size = self._stored_outbound_logical_size(msg)
-        self._pending_outbound_messages += 1
-        self._pending_outbound_bytes += logical_size
-        if msg.state is OutboundQoSState.QUEUED:
-            self._queued.append(msg)
-        elif msg.state in (
-            OutboundQoSState.WAIT_PUBACK,
-            OutboundQoSState.WAIT_PUBREC,
-            OutboundQoSState.WAIT_PUBCOMP,
-        ):
-            self.flow.try_acquire()
-
-    def _outbound_store_summary_pages(
-        self,
-    ) -> Iterable[tuple[OutboundMessage | OutboundMessageSummary, ...]]:
-        if self._paged_store is not None:
-            yield from self._paged_store.out_summary_pages()
-        else:
-            yield tuple(self.store.out_items())
-
     def _inbound_store_pages(self) -> Iterable[tuple[InboundMessage, ...]]:
         if self._paged_store is not None:
             yield from self._paged_store.in_pages()
         else:
             yield tuple(self.store.in_items())
-
-    def _replay_outbound_message(self, msg: OutboundMessage | OutboundMessageSummary) -> None:
-        try:
-            self._validate_outbound_against_negotiated(msg)
-        except (ProtocolError, PacketTooLargeError) as exc:
-            self._discard_outbound_store_record(msg.mid, msg)
-            self.packet_ids.release(msg.mid)
-            self._emit(
-                EffectKind.PUBLISH_FAILED,
-                PublishFailure(mid=msg.mid, reason=exc),
-            )
-            return
-        if msg.state is OutboundQoSState.QUEUED:
-            self._queued.append(msg)
-            return
-        if not self.flow.try_acquire():
-            self._queued.append(msg)
-            return
-        try:
-            self._retransmit_outbound(self._materialize_outbound(msg))
-        except Exception as exc:
-            self.flow.release()
-            self._discard_outbound_store_record(msg.mid, msg)
-            self.packet_ids.release(msg.mid)
-            self._emit(
-                EffectKind.PUBLISH_FAILED,
-                PublishFailure(mid=msg.mid, reason=exc),
-            )
-
-    def _replay_session(self) -> None:
-        self.flow.reset()
-        self.flow.apply_broker_receive_maximum(
-            self.negotiated.receive_maximum,
-            self.config.local_receive_maximum,
-            self.config.max_outbound_inflight,
-        )
-        self._queued.clear()
-        for page in self._outbound_store_summary_pages():
-            for msg in page:
-                self._replay_outbound_message(msg)
-        self._drain_queue()
-
-    def _discard_outbound_store_record(
-        self,
-        mid: int,
-        stored: OutboundMessage | OutboundMessageSummary,
-    ) -> None:
-        # `stored` is required: recovering it from the store here is what leaked
-        # the byte budget when a transactional store had already rolled back.
-        self._delete_outbound_store_record(mid)
-        self._release_outbound_reservation(self._stored_outbound_logical_size(stored))
-
-    def _delete_outbound_store_record(self, mid: int) -> None:
-        try:
-            self.store.delete_out(mid)
-        except Exception:
-            # Preserve the original launch/validation failure. A broken store is
-            # surfaced separately by the read/client boundary and must not leak
-            # flow slots or packet identifiers in memory.
-            pass
-
-    def _complete_outbound_record(
-        self,
-        mid: int,
-        stored: OutboundMessage | OutboundMessageSummary,
-    ) -> None:
-        self.store.delete_out(mid)
-        self._release_outbound_reservation(self._stored_outbound_logical_size(stored))
-
-    def _reserve_outbound(self, logical_size: int) -> None:
-        message_limit = self.config.max_pending_outbound_messages
-        if message_limit is not None and self._pending_outbound_messages >= message_limit:
-            raise FlowControlError("Pending outbound message limit reached")
-        byte_limit = self.config.max_pending_outbound_bytes
-        if byte_limit is not None and self._pending_outbound_bytes + logical_size > byte_limit:
-            raise FlowControlError("Pending outbound byte limit reached")
-        self._pending_outbound_messages += 1
-        self._pending_outbound_bytes += logical_size
-
-    def _release_outbound_reservation(self, logical_size: int) -> None:
-        if self._pending_outbound_messages <= 0:
-            raise AssertionError("outbound message reservation underflow")
-        if logical_size < 0 or logical_size > self._pending_outbound_bytes:
-            raise AssertionError(
-                "outbound byte reservation underflow: "
-                f"release={logical_size}, pending={self._pending_outbound_bytes}"
-            )
-        self._pending_outbound_messages -= 1
-        self._pending_outbound_bytes -= logical_size
-
-    def _outbound_logical_size(
-        self,
-        topic: str,
-        payload: bytes,
-        properties: Properties | None,
-    ) -> int:
-        return self._outbound_logical_size_from_size(topic, len(payload), properties)
-
-    def _outbound_logical_size_from_size(
-        self,
-        topic: str,
-        payload_size: int,
-        properties: Properties | None,
-    ) -> int:
-        property_bytes = 0
-        if (
-            self.config.protocol == MQTTProtocolVersion.MQTTv5
-            and properties is not None
-            and properties.values
-        ):
-            property_bytes = len(encode_properties(properties, PUBLISH))
-        topic_bytes = len(topic) if topic.isascii() else len(topic.encode("utf-8"))
-        return payload_size + topic_bytes + property_bytes
-
-    def _materialize_outbound(
-        self, stored: OutboundMessage | OutboundMessageSummary
-    ) -> OutboundMessage:
-        if isinstance(stored, OutboundMessage):
-            return stored
-        message = self.store.get_out(stored.mid)
-        if message is None:
-            raise ProtocolError(f"Missing durable outbound record mid={stored.mid}")
-        if message.logical_size <= 0:
-            message.logical_size = self._stored_outbound_logical_size(stored)
-        return message
-
-    def _stored_outbound_logical_size(
-        self, stored: OutboundMessage | OutboundMessageSummary
-    ) -> int:
-        if stored.logical_size > 0:
-            return stored.logical_size
-        payload_size = (
-            len(stored.payload) if isinstance(stored, OutboundMessage) else stored.payload_size
-        )
-        logical_size = self._outbound_logical_size_from_size(
-            stored.topic, payload_size, stored.properties
-        )
-        if isinstance(stored, OutboundMessage):
-            stored.logical_size = logical_size
-        else:
-            object.__setattr__(stored, "logical_size", logical_size)
-        return logical_size
 
     def _resolve_inbound_topic(self, packet: PublishPacket) -> str:
         if self.config.protocol != MQTTProtocolVersion.MQTTv5:
@@ -1267,57 +878,6 @@ class ProtocolEngine:
             raise PacketTooLargeError(
                 f"Encoded packet size {size} exceeds broker maximum_packet_size {limit}"
             )
-
-    def _outbound_size_parts(
-        self,
-        topic: str,
-        properties: Properties | None,
-    ) -> tuple[int, int, int]:
-        """Topic bytes, wire property bytes, logical property bytes — one encode.
-
-        The wire size must count MQTT 5's mandatory property-length byte even
-        when there are no properties; the logical budget accounts for
-        application data only, so it does not.
-        """
-        topic_bytes = len(topic) if topic.isascii() else len(topic.encode("utf-8"))
-        if self.config.protocol != MQTTProtocolVersion.MQTTv5:
-            return topic_bytes, 0, 0
-        if properties is None or not properties.values:
-            # An empty property table encodes to the single length byte 0x00.
-            return topic_bytes, 1, 0
-        wire_property_bytes = len(encode_properties(properties, PUBLISH))
-        logical_property_bytes = (
-            wire_property_bytes if properties is not None and properties.values else 0
-        )
-        return topic_bytes, wire_property_bytes, logical_property_bytes
-
-    def _check_outbound_publish_wire_size(
-        self,
-        topic_bytes: int,
-        wire_property_bytes: int,
-        payload_size: int,
-        qos: QoS,
-    ) -> None:
-        """Cheap upper bound vs negotiated maximum_packet_size (before full encode)."""
-        limit = self.negotiated.maximum_packet_size
-        if limit is None:
-            return
-        remaining = 2 + topic_bytes + (2 if qos else 0) + wire_property_bytes + payload_size
-        encoded_size = 1 + len(encode_vbi(remaining)) + remaining
-        if encoded_size > limit:
-            raise PacketTooLargeError(
-                f"Encoded packet size {encoded_size} exceeds broker maximum_packet_size {limit}"
-            )
-
-    def _check_outbound_publish_size(
-        self,
-        topic: str,
-        payload_size: int,
-        qos: QoS,
-        properties: Properties | None,
-    ) -> None:
-        topic_bytes, wire_property_bytes, _ = self._outbound_size_parts(topic, properties)
-        self._check_outbound_publish_wire_size(topic_bytes, wire_property_bytes, payload_size, qos)
 
     def _check_subscribe_capabilities(
         self,
@@ -1364,51 +924,3 @@ class ProtocolEngine:
             self._prefer_session_resume = bool(expiry)
         else:
             self._prefer_session_resume = not self.config.clean_start
-
-    def _validate_outbound_against_negotiated(
-        self, msg: OutboundMessage | OutboundMessageSummary
-    ) -> None:
-        if msg.state is OutboundQoSState.WAIT_PUBCOMP:
-            pubrel = msg.encoded_pubrel if isinstance(msg, OutboundMessage) else None
-            if pubrel is None:
-                pubrel = PubRelPacket(mid=msg.mid).encode(self.config.protocol)
-            self._check_outbound_size(pubrel)
-            return
-        if int(msg.qos) > self.negotiated.maximum_qos:
-            raise ProtocolError(
-                f"QoS {int(msg.qos)} exceeds broker maximum_qos {self.negotiated.maximum_qos}"
-            )
-        if msg.retain and not self.negotiated.retain_available:
-            raise ProtocolError("Broker does not support retain")
-        if msg.properties and msg.properties.get("topic_alias") is not None:
-            alias = int(msg.properties.get("topic_alias"))
-            if alias > self.negotiated.topic_alias_maximum:
-                raise ProtocolError(
-                    f"topic_alias {alias} exceeds broker topic_alias_maximum "
-                    f"{self.negotiated.topic_alias_maximum}"
-                )
-        encoded_publish = msg.encoded_publish if isinstance(msg, OutboundMessage) else None
-        if encoded_publish is not None:
-            self._check_outbound_size(encoded_publish)
-        else:
-            payload_size = (
-                len(msg.payload) if isinstance(msg, OutboundMessage) else msg.payload_size
-            )
-            self._check_outbound_publish_size(msg.topic, payload_size, msg.qos, msg.properties)
-
-    def _fail_queued_violating_negotiation(self) -> None:
-        kept: deque[OutboundMessage | OutboundMessageSummary] = deque()
-        while self._queued:
-            msg = self._queued.popleft()
-            try:
-                self._validate_outbound_against_negotiated(msg)
-            except (ProtocolError, PacketTooLargeError) as exc:
-                self._discard_outbound_store_record(msg.mid, msg)
-                self.packet_ids.release(msg.mid)
-                self._emit(
-                    EffectKind.PUBLISH_FAILED,
-                    PublishFailure(mid=msg.mid, reason=exc),
-                )
-                continue
-            kept.append(msg)
-        self._queued = kept
