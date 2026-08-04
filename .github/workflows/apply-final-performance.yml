@@ -1,4 +1,4 @@
-name: Apply final memory performance patch
+name: Format final memory performance patch
 
 on:
   push:
@@ -11,26 +11,22 @@ permissions:
   contents: write
 
 jobs:
-  apply:
+  format:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: agent/final-perf-publisher
+          ref: agent/memory-profile-overhaul
           fetch-depth: 0
-      - name: Verify and publish final patch
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Format and publish
         run: |
-          cat .mqttium-agent/final-part-* | base64 -d > /tmp/mqttium-final-files.tar.xz
-          echo "bdbe189b2fe54fba37b1f3d5c7c948f384fc95cdf422de73251cf1c09b5ddcc3  /tmp/mqttium-final-files.tar.xz" | sha256sum -c -
-          tar -tJf /tmp/mqttium-final-files.tar.xz
-          tar -xJf /tmp/mqttium-final-files.tar.xz
-          rm -rf .mqttium-agent
-          rm .github/workflows/apply-final-performance.yml
-          git reset --mixed b9a4b6e02215f36bbd074c49bb27aa715567b2bc
-          python -m compileall -q src tests benchmarks
+          python -m pip install "ruff==0.16.1"
+          ruff format src/mqttium/api/async_client.py src/mqttium/protocol/engine.py
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git commit -m "Preserve memory bounds without publish throughput loss"
-          echo "FINAL_COMMIT=$(git rev-parse HEAD)"
+          git add src/mqttium/api/async_client.py src/mqttium/protocol/engine.py
+          git commit -m "Format final memory performance paths"
           git push origin HEAD:agent/memory-profile-overhaul
