@@ -34,7 +34,7 @@ jobs:
           python-version: "3.12"
       - name: Install dependencies
         run: |
-          python -m pip install -e ".[dev]" paho-mqtt==2.1.0 gmqtt==0.7.0
+          python -m pip install -e ".[dev]" paho-mqtt==2.1.0 gmqtt==0.7.0 "psutil>=6"
           sudo apt-get update -qq
           sudo apt-get install -y -qq mosquitto mosquitto-clients openssl iproute2
       - name: Start isolated TCP and TLS broker
@@ -78,6 +78,11 @@ jobs:
         run: python benchmarks/realworld.py --host localhost --port 18884 --cafile /tmp/mqttium-bench/cert.pem --profile local-tls --count 1500 --output /tmp/mqttium-bench/realworld-tls.json
       - name: Application delivery and persistence stress
         run: python benchmarks/application_stress.py --output /tmp/mqttium-bench/application-stress.json
+      - name: Isolated memory profile
+        run: |
+          python benchmarks/memory_profile.py \
+            --label "${GITHUB_SHA}" \
+            --output /tmp/mqttium-bench/memory-profile.json
       - name: Confirmed WAN-profile delivery
         run: |
           sudo tc qdisc replace dev lo root netem delay 20ms 5ms distribution normal loss 0.1%
