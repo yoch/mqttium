@@ -39,8 +39,8 @@ For one-shot helpers, prefer the async-native `mqttium.helpers` API instead of
 | `connect_async` | Supported | Not supported | Use `AsyncClient` for native asynchronous operation |
 | Non-compliant QoS > 0 republish with a clean session | Historically ambiguous | **Strict MQTT behavior** | Correctness takes precedence over bug compatibility |
 | MID for QoS 0 | Allocated | `None` | QoS 0 has no protocol packet identifier |
-| Blocking calls from a network callback | Often tolerated | **Rejected** with `RuntimeError` | They would deadlock the single-writer architecture |
-| Off-network-thread `publish()` | Internal queue and immediate return | QoS 0 uses a coalesced façade queue consumed by the loop; QoS 1/2 use a short MID-allocation handoff | No publish waits for writer progress, and the protocol engine remains owned by the network thread |
+| Blocking calls from the network thread | Often tolerated from callbacks | **Rejected** with `RuntimeError` | Waiting on the same loop would deadlock the single-writer architecture |
+| Off-network-thread `publish()` | Internal queue and immediate return | QoS 0/1/2 share a coalesced façade queue; QoS 1/2 wait only for loop-side admission and MID allocation | No publish waits for writer progress, ordering is preserved across QoS levels, and the protocol engine remains loop-owned |
 | WebSocket / proxy / SOCKS support | Broad surface | WebSocket through `AsyncClient.connect_ws`; not through the sync façade | Keep transport concerns separate from compatibility concerns |
 | Paho file persistence formats | Supported | `SqliteInflightStore` through `AsyncClient` | Do not reproduce Paho-specific binary persistence formats |
 | `suppress_exceptions` | Supported | Not supported | Errors must remain observable |
@@ -89,6 +89,34 @@ intermittent stalls under load through an accumulation of `WAIT_PUBCOMP`
 messages and writer-queue pressure. The local window therefore remains held
 until PUBCOMP. Reconsider this only with supporting measurements.
 
+### 8. Mutating the protocol engine directly from publisher threads
+
+**Rejected.** A direct cross-thread prototype can produce a much higher raw
+submission rate because it skips the loop handoff entirely, but it breaks the
+central ownership invariant of the client. Engine, store, packet identifiers,
+receipts, connection epochs, and effect ordering are committed together on the
+network loop. Protecting only `queue_publish()` with an extra mutex would leave
+other engine paths and lifecycle transitions outside the same critical section.
+
+The compatibility façade instead uses one thread-safe ingress queue. A bounded
+loop callback batch performs admission, MID allocation, receipt registration,
+effect collection, and the inline writer fast path without an `await` in the
+commit section. The batch is capped at 256 requests and 1 MiB of logical topic
+plus payload bytes so a producer burst cannot monopolize the network loop.
+
+QoS 1/2 callers wait on a cancel-aware cross-thread result only until that
+commit completes. If the handoff times out before admission begins, the request
+is cancelled and its payload reference is released. If admission has already
+begun, the caller receives the authoritative committed result rather than a
+false timeout followed by a real publish. Pending requests are also failed when
+the compatibility loop stops.
+
+The A/B benchmark in `benchmarks/compat_qosn_submit_ab.py` compares the old
+per-message coroutine handoff, a safe one-callback-per-message alternative, and
+the coalesced queue. The callback alternative is useful as a low-contention
+reference; the coalesced path reduces cross-thread wakeups and tail latency
+under concurrent publishers.
+
 ## Recommended migration path
 
 1. New code → `mqttium.api.AsyncClient`
@@ -100,5 +128,6 @@ until PUBCOMP. Reconsider this only with supporting measurements.
 
 - `tests/unit/test_compat_paho.py` — connection, publishing, callbacks, and filters
 - `tests/unit/test_compat_lib_subset.py` — behavioral compatibility subset
-- `tests/unit/test_compat_publish_perf.py` — effect ordering, MID reuse, and QoS 0 coalescing
-- `tests/integration/test_compat_publish_perf.py` — end-to-end QoS 0 callbacks and delivery
+- `tests/unit/test_compat_publish_perf.py` — effect ordering, MID reuse, mixed-QoS coalescing, cancellation, loop shutdown, and concurrent QoS 1 admission
+- `tests/integration/test_compat_publish_perf.py` — end-to-end QoS 0 and concurrent QoS 1 callbacks and delivery
+- `benchmarks/compat_qosn_submit_ab.py` — coroutine, callback, and coalesced QoS 1 submit-rate/latency comparison
