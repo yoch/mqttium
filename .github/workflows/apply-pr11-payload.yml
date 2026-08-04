@@ -55,6 +55,21 @@ jobs:
           git commit \
             -m "Coalesce compat publish admission on the network loop" \
             -m "Unify QoS 0/1/2 cross-thread submission, bound loop-side batches, preserve atomic Paho admission, and make timeout cancellation unambiguous."
+          final_sha="$(git rev-parse HEAD)"
+          base_sha="$(git rev-parse origin/main)"
+          test "${final_sha}" != "${base_sha}"
+          mapfile -t changed < <(git diff-tree --no-commit-id --name-only -r "${final_sha}" | sort)
+          expected=(
+            .github/workflows/benchmarks.yml
+            CHANGELOG.md
+            benchmarks/compat_qosn_submit_ab.py
+            docs/COMPAT.md
+            src/mqttium/compat/paho.py
+            tests/integration/test_compat_publish_perf.py
+            tests/unit/test_compat_publish_perf.py
+          )
+          mapfile -t expected < <(printf '%s\n' "${expected[@]}" | sort)
+          test "${changed[*]}" = "${expected[*]}"
           git push \
             --force-with-lease=refs/heads/fix/compat-qosn-coalesced-mid-queue:${GITHUB_SHA} \
-            origin HEAD:fix/compat-qosn-coalesced-mid-queue
+            origin "+${final_sha}:refs/heads/fix/compat-qosn-coalesced-mid-queue"
