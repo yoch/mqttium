@@ -40,6 +40,29 @@ jobs:
           git fetch origin main
           git reset --hard origin/main
           tar -xzf /tmp/mqttium-pr11-final.tar.gz
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/mqttium/compat/paho.py")
+          text = path.read_text()
+          old = """        for future, info, error in results:
+                      if error is not None:
+                          future.set_exception(error)
+                      else:
+                          assert info is not None
+                          future.set_result(info)
+          """
+          new = """        for future, result_info, error in results:
+                      if error is not None:
+                          future.set_exception(error)
+                      else:
+                          assert result_info is not None
+                          future.set_result(result_info)
+          """
+          if old not in text:
+              raise SystemExit("typing correction target not found")
+          path.write_text(text.replace(old, new))
+          PY
           git diff --check
           test "$(git status --porcelain | wc -l)" -eq 7
       - uses: actions/setup-python@v7
