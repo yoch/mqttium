@@ -22,40 +22,22 @@ jobs:
           ref: audit/design-hardening
           fetch-depth: 0
 
-      - name: Fix the legacy test helper and clean triggers
+      - name: Fix helper and remove temporary files
         run: |
           python - <<'PY'
           from pathlib import Path
 
           path = Path('tests/unit/test_compat_publish_perf.py')
           text = path.read_text()
-          old = '''    engine.store.put_out(
-              OutboundMessage(
-                  mid=mid,
-                  topic="t",
-                  payload=b"x",
-                  qos=QoS.AT_LEAST_ONCE,
-                  retain=False,
-                  state=OutboundQoSState.WAIT_PUBACK,
-              )
+          old = '    engine.take_effects()\n    return mid\n'
+          new = (
+              '    engine._reserve_outbound('\
+              'engine._outbound_logical_size("t", b"x", None))\n'
+              '    engine.take_effects()\n'
+              '    return mid\n'
           )
-          engine.take_effects()
-          '''
-          new = '''    engine.store.put_out(
-              OutboundMessage(
-                  mid=mid,
-                  topic="t",
-                  payload=b"x",
-                  qos=QoS.AT_LEAST_ONCE,
-                  retain=False,
-                  state=OutboundQoSState.WAIT_PUBACK,
-              )
-          )
-          engine._reserve_outbound(engine._outbound_logical_size("t", b"x", None))
-          engine.take_effects()
-          '''
           if text.count(old) != 1:
-              raise SystemExit('expected exactly one legacy helper block')
+              raise SystemExit(f'expected one helper tail, found {text.count(old)}')
           path.write_text(text.replace(old, new, 1))
           PY
           rm .github/EMPTY_COMMIT_TRIGGER
@@ -68,7 +50,7 @@ jobs:
 
       - run: python -m pip install -e '.[dev,security]'
 
-      - name: Quality and unit tests
+      - name: Quality and full unit tests
         run: |
           ruff format tests/unit/test_compat_publish_perf.py
           ruff format --check src tests benchmarks
