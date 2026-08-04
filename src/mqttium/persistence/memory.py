@@ -46,10 +46,18 @@ class MemoryInflightStore:
         return self._out.get(mid)
 
     def pop_out(self, mid: int) -> OutboundMessage | None:
-        return self._out.pop(mid, None)
+        msg = self._out.pop(mid, None)
+        if msg is not None and not self._out:
+            self._out = {}
+        return msg
 
     def delete_out(self, mid: int) -> bool:
-        return self._out.pop(mid, None) is not None
+        deleted = self._out.pop(mid, None) is not None
+        if deleted and not self._out:
+            # Drop the peak-sized hash table after the last inflight record is
+            # acknowledged instead of retaining its capacity indefinitely.
+            self._out = {}
+        return deleted
 
     def update_out(self, msg: OutboundMessage) -> None:
         if msg.mid not in self._out:
@@ -60,7 +68,7 @@ class MemoryInflightStore:
         return iter(self._out.values())
 
     def clear_out(self) -> None:
-        self._out.clear()
+        self._out = {}
 
     def put_in(self, msg: InboundMessage) -> None:
         self._in[msg.mid] = msg
@@ -69,7 +77,10 @@ class MemoryInflightStore:
         return self._in.get(mid)
 
     def pop_in(self, mid: int) -> InboundMessage | None:
-        return self._in.pop(mid, None)
+        msg = self._in.pop(mid, None)
+        if msg is not None and not self._in:
+            self._in = {}
+        return msg
 
     def update_in(self, msg: InboundMessage) -> None:
         if msg.mid not in self._in:
@@ -80,4 +91,4 @@ class MemoryInflightStore:
         return iter(self._in.values())
 
     def clear_in(self) -> None:
-        self._in.clear()
+        self._in = {}
