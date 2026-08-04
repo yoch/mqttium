@@ -26,11 +26,17 @@ def test_free_count_tracks_release_allocate_and_reserve() -> None:
 
 def test_duplicate_release_does_not_change_free_count() -> None:
     pool = PacketIdPool()
-    mid = pool.allocate()
+    first = pool.allocate()
+    second = pool.allocate()
 
-    pool.release(mid)
-    pool.release(mid)
+    pool.release(first)
+    pool.release(first)
 
+    assert pool._free_count == 1
+    assert len(pool) == 1
+    assert pool.in_use(second)
+
+    pool.release(second)
     assert pool._free_count == 0
     assert len(pool) == 0
     assert pool.allocate() == 1
