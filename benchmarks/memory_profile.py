@@ -21,9 +21,9 @@ import sys
 import tempfile
 import time
 import tracemalloc
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Coroutine
+from typing import Any, Callable
 
 try:
     import resource
@@ -195,9 +195,7 @@ def _finalize(
         "count": spec.count,
         "payload_size": spec.payload_size,
         "logical_message_bytes": _logical_message_bytes(spec.payload_size),
-        "logical_total_mib": (
-            spec.count * _logical_message_bytes(spec.payload_size) / _MIB
-        ),
+        "logical_total_mib": (spec.count * _logical_message_bytes(spec.payload_size) / _MIB),
         "seconds": time.perf_counter() - started,
         "notes": spec.notes,
         "snapshots": snapshots,
@@ -220,9 +218,7 @@ def run_protocol_qos_queue(spec: ScenarioSpec) -> dict[str, Any]:
         probe.snapshot(
             "loaded",
             queued_messages=len(engine._queued),
-            queued_logical_bytes=(
-                len(engine._queued) * _logical_message_bytes(spec.payload_size)
-            ),
+            queued_logical_bytes=(len(engine._queued) * _logical_message_bytes(spec.payload_size)),
             packet_ids=len(engine.packet_ids),
             store_records=sum(1 for _ in engine.store.out_items()),
         )
@@ -285,9 +281,7 @@ def run_memory_store(spec: ScenarioSpec) -> dict[str, Any]:
         probe.snapshot(
             "loaded",
             store_records=sum(1 for _ in store.out_items()),
-            store_logical_bytes=(
-                spec.count * _logical_message_bytes(spec.payload_size)
-            ),
+            store_logical_bytes=(spec.count * _logical_message_bytes(spec.payload_size)),
         )
     )
     store.clear_out()
@@ -325,9 +319,7 @@ def run_sqlite_hydration(spec: ScenarioSpec) -> dict[str, Any]:
                 queued_messages=len(engine._queued),
                 packet_ids=len(engine.packet_ids),
                 store_records=sum(1 for _ in store.out_items()),
-                store_logical_bytes=(
-                    spec.count * _logical_message_bytes(spec.payload_size)
-                ),
+                store_logical_bytes=(spec.count * _logical_message_bytes(spec.payload_size)),
             )
         )
         engine._queued.clear()
@@ -383,14 +375,18 @@ def _scaled_spec(spec: ScenarioSpec, scale: float) -> ScenarioSpec:
     )
 
 
+def _format_optional(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.2f}"
+
+
 def _run_child(spec: ScenarioSpec, output: Path) -> None:
     result = RUNNERS[spec.runner](spec)
     output.write_text(json.dumps(result, indent=2))
     loaded = result["snapshots"][1]
     print(
-        f"{spec.name}: rss_delta={loaded['rss_delta_mib']:.2f} MiB "
-        f"uss_delta={loaded['uss_delta_mib']:.2f} MiB "
-        f"traced_peak={loaded['traced_peak_mib']:.2f} MiB"
+        f"{spec.name}: rss_delta={_format_optional(loaded['rss_delta_mib'])} MiB "
+        f"uss_delta={_format_optional(loaded['uss_delta_mib'])} MiB "
+        f"traced_peak={_format_optional(loaded['traced_peak_mib'])} MiB"
     )
 
 
