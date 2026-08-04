@@ -50,3 +50,18 @@ def test_high_reservation_release_does_not_change_low_hole_count() -> None:
     assert pool._free_count == 0
     assert len(pool) == 0
     assert pool.allocate() == 1
+
+
+def test_final_high_reservation_release_clears_existing_low_holes() -> None:
+    pool = PacketIdPool()
+    low = pool.allocate()
+    pool.reserve(100)
+
+    pool.release(low)
+    assert pool._free_count == 1
+    assert len(pool) == 1
+
+    pool.release(100)
+    assert pool._free_count == 0
+    assert len(pool) == 0
+    assert pool.allocate() == 1
