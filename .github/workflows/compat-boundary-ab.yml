@@ -1,0 +1,62 @@
+name: Deterministic Paho boundary A/B
+
+on:
+  push:
+    branches:
+      - agent/paho-native-publish-boundary
+
+permissions:
+  contents: write
+
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: candidate
+          token: ${{ secrets.CGW_PUSH_TOKEN }}
+          fetch-depth: 0
+      - uses: actions/checkout@v7
+        with:
+          ref: bccbf9fcd449329a96bf0b92786a481ab487995e
+          path: base
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Run deterministic boundary comparison
+        run: |
+          python candidate/.github/compat_boundary_ab.py \
+            --base-root base \
+            --candidate-root candidate \
+            --repeat 21 \
+            --cpu 0 \
+            --output /tmp/compat-boundary-ab.json
+      - name: Check regression budget
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          data = json.loads(Path('/tmp/compat-boundary-ab.json').read_text())
+          for item in data['scenarios']:
+              ratio = item['median_candidate_over_base']
+              print(f"{item['name']}={ratio:.4f}")
+              if ratio < 0.98:
+                  raise SystemExit(f"{item['name']} regression exceeds 2%")
+          PY
+      - name: Upload measurements
+        uses: actions/upload-artifact@v7
+        with:
+          name: compat-boundary-ab-${{ github.run_id }}
+          path: /tmp/compat-boundary-ab.json
+          retention-days: 30
+      - name: Remove temporary harness
+        working-directory: candidate
+        run: |
+          rm -f .github/compat_boundary_ab.py .github/workflows/compat-boundary-ab.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Remove temporary Paho boundary A/B harness"
+          git push origin HEAD:agent/paho-native-publish-boundary
