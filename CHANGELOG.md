@@ -26,6 +26,16 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - `benchmarks/persistence_index_ab.py`, a rotated A/B of the durable `seq`
   indices over a realistic mixed profile (batched acknowledgement lots,
   reconnect replay, event-loop lag percentiles).
+- Decision counters on the two runtime pumps, so their strategies can be
+  changed against evidence rather than intuition. `WriterStats` gains `batches`,
+  `batched_items`, `batched_bytes`, `segmented_writes` and
+  `enqueue_suspensions`; `EffectStats` gains `batches`, `multi_effect_batches`,
+  `reordered_batches`, `inline_effects`, `scheduled_effects` and
+  `apply_suspensions`.
+- `AsyncTransport.stats()`, an optional method a transport may implement to
+  report its own buffer occupancy. A transport that does not is reported
+  through `TransportStats.unavailable()` instead of being probed attribute by
+  attribute from the client.
 
 ### Changed
 
@@ -38,6 +48,17 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - `SqliteInflightStore.batch()` is lazy: `BEGIN IMMEDIATE` is deferred to the
   first mutation, so a read-only ingress lot takes no write lock and pays no
   commit.
+- `ClientStats.protocol` is replaced by `ClientStats.outbound` and
+  `ClientStats.inbound`, each produced by the session that owns the state.
+  `AsyncClient.stats()` now only assembles the sections instead of reaching
+  through `outbound._queued`, `inbound._inflight` and transport attributes, so
+  a private field can move without touching the client.
+- `EffectPump` partitions a multi-effect batch SEND-first in a single pass, and
+  leaves the list alone when it was already ordered. The two-generator form it
+  replaces walked the batch twice and always rebuilt the list. This is what pays
+  for the new counters: a batch of eight effects is ~11% faster than before, and
+  a QoS 0 publish — which emits SEND plus PUBLISH_COMPLETE, so it takes this
+  path — is ~4-5% faster end to end.
 - Ordered pagination no longer re-issues `WHERE seq>? ORDER BY seq LIMIT ?` per
   page, which re-scanned and re-sorted the table each time and made a full
   replay quadratic. One sorted metadata pass produces the ordered identifiers,

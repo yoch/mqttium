@@ -6,6 +6,8 @@ import asyncio
 from contextlib import suppress
 from typing import Protocol
 
+from mqttium.transport.stats import TransportStats
+
 _WRITE_BUFFER_HIGH_WATER = 64 * 1024
 
 
@@ -20,6 +22,15 @@ class AsyncTransport(Protocol):
     async def read(self, n: int = 65536) -> bytes: ...
     async def close(self) -> None: ...
     def is_closing(self) -> bool: ...
+
+    def stats(self) -> TransportStats:
+        """Report buffer occupancy for diagnostics.
+
+        Optional: a transport that does not implement it is reported through
+        `TransportStats.unavailable()` rather than being probed attribute by
+        attribute from the client.
+        """
+        ...
 
 
 class StreamTransport:
@@ -62,6 +73,17 @@ class StreamTransport:
     def pending_write_bytes(self) -> int:
         transport = self._writer.transport
         return 0 if transport is None else transport.get_write_buffer_size()
+
+    def stats(self) -> TransportStats:
+        return TransportStats(
+            kind=type(self).__name__,
+            closing=self.is_closing(),
+            pending_write_bytes=self.pending_write_bytes,
+            buffered_read_bytes=0,
+            fragmented_read_bytes=0,
+            pending_control_frames=0,
+            pending_control_bytes=0,
+        )
 
     async def _drain_if_needed(self) -> None:
         if write_buffer_needs_drain(self._writer):

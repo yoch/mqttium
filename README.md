@@ -136,15 +136,18 @@ until the 65 535 packet-identifier space was exhausted. See
 
 ```python
 snapshot = client.stats()
-print(snapshot.protocol.pending_outbound_bytes)
+print(snapshot.outbound.pending_bytes)
+print(snapshot.inbound.inflight)
 print(snapshot.writer.queued_bytes)
 print(snapshot.delivery.pending_bytes)
 ```
 
-The snapshot also includes lifetime high-water marks, task state, receipt counts,
-decoder buffering and WebSocket/stream transport buffers. It is intended to be
-called on the client's owning event loop. See
-[`docs/API-STABILITY.md`](docs/API-STABILITY.md).
+Each section is produced by the component that owns the state — the two protocol
+sessions, the effect and write pumps, the transport — and `stats()` only
+assembles them. The snapshot also includes lifetime high-water marks, batching
+decision counters, task state, receipt counts, decoder buffering and
+WebSocket/stream transport buffers. It is intended to be called on the client's
+owning event loop. See [`docs/API-STABILITY.md`](docs/API-STABILITY.md).
 
 ## Validation
 

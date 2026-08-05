@@ -54,6 +54,15 @@ The snapshot is diagnostic rather than transactional: related counters are read
 consecutively on the owning loop and represent one practically consistent view,
 not a lock-free cross-thread atomic transaction.
 
+Each section is produced by the component that owns the state, and `stats()`
+only assembles them: `OutboundStats` and `InboundStats` come from the two
+protocol sessions (`mqttium.protocol.stats`), `EffectStats` and `WriterStats`
+from the effect and write pumps, and `TransportStats` from the transport itself
+(`mqttium.transport.stats`). A transport may implement `stats()` to report its
+own buffer occupancy; one that does not is reported through
+`TransportStats.unavailable()`, so the method stays optional for third-party
+transports.
+
 ## Compatibility façade
 
 `mqttium.compat` follows the narrower policy in [`COMPAT.md`](COMPAT.md). Only
