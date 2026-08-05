@@ -1,0 +1,89 @@
+name: Paired Regression
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - benchmarks/**
+      - src/mqttium/api/**
+      - src/mqttium/codec/**
+      - src/mqttium/protocol/**
+      - src/mqttium/transport/**
+      - .github/workflows/paired-regression.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  paired:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    steps:
+      - name: Check out candidate
+        uses: actions/checkout@v7
+        with:
+          path: candidate
+      - name: Check out base
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.base.sha || 'main' }}
+          path: base
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install broker
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mosquitto mosquitto-clients
+          mkdir -p /tmp/mqttium-paired
+          cat > /tmp/mqttium-paired/mosquitto.conf <<'MOSQ'
+          persistence false
+          allow_anonymous true
+          max_inflight_messages 1000
+          max_queued_messages 100000
+          max_queued_bytes 0
+          connection_messages false
+          log_type error
+          listener 11883 127.0.0.1
+          MOSQ
+          mosquitto -c /tmp/mqttium-paired/mosquitto.conf \
+            > /tmp/mqttium-paired/mosquitto.log 2>&1 &
+          for i in $(seq 1 50); do
+            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            sleep 0.2
+          done
+          cat /tmp/mqttium-paired/mosquitto.log
+          exit 1
+      - name: Paired microbenchmarks
+        run: |
+          python candidate/benchmarks/paired_regression.py \
+            --base-root base \
+            --candidate-root candidate \
+            --repeat 11 \
+            --output /tmp/mqttium-paired/micro.json
+      - name: Paired network and latency sweep
+        run: |
+          python candidate/benchmarks/paired_network.py \
+            --base-root base \
+            --candidate-root candidate \
+            --repeat 5 \
+            --windows 1,5,20,100 \
+            --payloads 64,4096 \
+            --output /tmp/mqttium-paired/network.json
+      - name: Upload paired measurements
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: paired-regression-${{ github.run_id }}
+          path: |
+            /tmp/mqttium-paired/*.json
+            /tmp/mqttium-paired/mosquitto.log
+          if-no-files-found: warn
+          retention-days: 30
