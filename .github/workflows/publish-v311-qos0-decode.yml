@@ -29,7 +29,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Build candidate
-        run: python harness/.github/scripts/build_v311_qos0_decode_pr_v2.py candidate
+        run: python harness/.github/scripts/build_v311_qos0_decode_pr_v3.py candidate
       - name: Validate exact tree
         working-directory: candidate
         run: |
