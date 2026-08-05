@@ -34,6 +34,8 @@ class WritePump:
         self.on_failure = on_failure
         self.queue: asyncio.Queue[WriteItem] = asyncio.Queue()
         self.queued_bytes = 0
+        self.high_water_messages = 0
+        self.high_water_bytes = 0
         self.space = asyncio.Condition()
         self.waiters = 0
         self.task: asyncio.Task[None] | None = None
@@ -179,6 +181,11 @@ class WritePump:
         try:
             while True:
                 first = await queue.get()
+                queued_messages = queue.qsize() + 1
+                if queued_messages > self.high_water_messages:
+                    self.high_water_messages = queued_messages
+                if self.queued_bytes > self.high_water_bytes:
+                    self.high_water_bytes = self.queued_bytes
                 batch: list[WriteItem] = [first]
                 while len(batch) < 256:
                     try:

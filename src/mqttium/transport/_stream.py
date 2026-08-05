@@ -58,6 +58,11 @@ class StreamTransport:
     def is_closing(self) -> bool:
         return self._writer.is_closing()
 
+    @property
+    def pending_write_bytes(self) -> int:
+        transport = self._writer.transport
+        return 0 if transport is None else transport.get_write_buffer_size()
+
     async def _drain_if_needed(self) -> None:
         if write_buffer_needs_drain(self._writer):
             await self._writer.drain()

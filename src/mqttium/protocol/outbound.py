@@ -58,6 +58,8 @@ class OutboundSession:
         "_queued",
         "_paged_store",
         "_pending_bytes",
+        "_pending_high_water_bytes",
+        "_pending_high_water_messages",
         "_pending_messages",
         "config",
         "flow",
@@ -78,6 +80,8 @@ class OutboundSession:
         self._queued: deque[OutboundMessage | OutboundMessageSummary] = deque()
         self._pending_messages = 0
         self._pending_bytes = 0
+        self._pending_high_water_messages = 0
+        self._pending_high_water_bytes = 0
 
     # --- effect emission ---------------------------------------------------
     # Always routed through the engine, never into a cached list: take_effects()
@@ -102,6 +106,14 @@ class OutboundSession:
     @property
     def pending_bytes(self) -> int:
         return self._pending_bytes
+
+    @property
+    def pending_high_water_messages(self) -> int:
+        return self._pending_high_water_messages
+
+    @property
+    def pending_high_water_bytes(self) -> int:
+        return self._pending_high_water_bytes
 
     def can_ever_admit(
         self,
@@ -154,6 +166,10 @@ class OutboundSession:
                 "outbound byte reservation underflow: "
                 f"release={logical_size}, pending={self._pending_bytes}"
             )
+        if self._pending_messages > self._pending_high_water_messages:
+            self._pending_high_water_messages = self._pending_messages
+        if self._pending_bytes > self._pending_high_water_bytes:
+            self._pending_high_water_bytes = self._pending_bytes
         self._pending_messages -= 1
         self._pending_bytes -= logical_size
 

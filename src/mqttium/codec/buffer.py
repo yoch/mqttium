@@ -31,7 +31,7 @@ class RawPacket:
 
 
 class IncrementalDecoder:
-    __slots__ = ("_buf", "_start", "_max_packet_size")
+    __slots__ = ("_buf", "_start", "_max_packet_size", "_high_water")
 
     def __init__(self, max_packet_size: int = DEFAULT_MAX_PACKET_SIZE) -> None:
         if max_packet_size < 2:
@@ -39,10 +39,15 @@ class IncrementalDecoder:
         self._buf = bytearray()
         self._start = 0
         self._max_packet_size = max_packet_size
+        self._high_water = 0
 
     @property
     def buffered(self) -> int:
         return len(self._buf) - self._start
+
+    @property
+    def high_water(self) -> int:
+        return self._high_water
 
     @property
     def max_packet_size(self) -> int:
@@ -60,6 +65,9 @@ class IncrementalDecoder:
         if self._start and self._start > _COMPACT_THRESHOLD:
             self._compact()
         self._buf.extend(data)
+        buffered = len(self._buf) - self._start
+        if buffered > self._high_water:
+            self._high_water = buffered
 
     def clear(self) -> None:
         self._buf.clear()
