@@ -57,9 +57,7 @@ def test_replay_pages_are_bounded_before_payload_hydration(
 ) -> None:
     payload = b"x" * 700_000
     store = (
-        MemoryInflightStore()
-        if kind == "memory"
-        else SqliteInflightStore(tmp_path / "bounded.db")
+        MemoryInflightStore() if kind == "memory" else SqliteInflightStore(tmp_path / "bounded.db")
     )
     fill(store, [payload, payload, payload])
 
@@ -158,9 +156,7 @@ def test_sqlite_sizes_pages_without_selecting_payloads(tmp_path: Path) -> None:
     assert len(index_selects) == 1
     assert "length(payload)" in index_selects[0]
     payload_selects = [
-        line
-        for line in trace
-        if "properties, payload FROM inbound WHERE mid IN" in line
+        line for line in trace if "properties, payload FROM inbound WHERE mid IN" in line
     ]
     assert len(payload_selects) == 1
     assert "IN (1)" in payload_selects[0]

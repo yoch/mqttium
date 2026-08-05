@@ -301,8 +301,7 @@ class MemoryInflightStore:
                 continue
             message_bytes = len(message.payload) + len(message.topic.encode("utf-8"))
             if messages and (
-                len(messages) >= max_messages
-                or hydrated_bytes + message_bytes > max_bytes
+                len(messages) >= max_messages or hydrated_bytes + message_bytes > max_bytes
             ):
                 yield tuple(messages)
                 messages = []

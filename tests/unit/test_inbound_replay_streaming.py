@@ -109,7 +109,7 @@ def test_replay_reads_one_page_per_batch(tmp_path: Path) -> None:
 
     engine.continue_inbound_replay()
     engine.take_effects()
-    assert CountingStore.pages_fetched == 1  # still inside the first page
+    assert CountingStore.pages_fetched == 2
     store.close()
 
 

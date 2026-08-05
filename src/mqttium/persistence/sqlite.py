@@ -706,13 +706,9 @@ class SqliteInflightStore:
             sub = mids[offset : offset + _MAX_SQL_VARIABLES]
             placeholders = ",".join("?" * len(sub))
             with self._lock:
-                rows = self._conn.execute(
-                    f"{_IN_PAGE_SQL} ({placeholders})", sub
-                ).fetchall()
+                rows = self._conn.execute(f"{_IN_PAGE_SQL} ({placeholders})", sub).fetchall()
             by_mid.update((int(row["mid"]), row) for row in rows)
-        return tuple(
-            _row_to_in(row) for mid in mids if (row := by_mid.get(mid)) is not None
-        )
+        return tuple(_row_to_in(row) for mid in mids if (row := by_mid.get(mid)) is not None)
 
     def in_replay_pages(
         self,
@@ -730,9 +726,7 @@ class SqliteInflightStore:
         for row in index:
             mid = int(row["mid"])
             message_bytes = int(row["replay_size"] or 0)
-            if mids and (
-                len(mids) >= max_messages or hydrated_bytes + message_bytes > max_bytes
-            ):
+            if mids and (len(mids) >= max_messages or hydrated_bytes + message_bytes > max_bytes):
                 page = self._in_messages_for_mids(tuple(mids))
                 if page:
                     yield page
