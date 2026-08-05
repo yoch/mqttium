@@ -51,9 +51,15 @@ l'ordre d'autorité est : spec MQTT (3.1.1 / 5.0) > ce guide > DESIGN.md.
     sur le chemin chaud. Il émet néanmoins via l'unique flux d'effets de
     `ProtocolEngine`, afin que l'ordre avec `CONNACK` et `DISCONNECTED` reste
     observable en un seul endroit.
-10. **Callbacks hors section critique** : aucun verrou/état moteur tenu pendant
+10. **Propriétaire unique du pipeline d'effets** : `EffectPump`
+    (`api/_effects.py`) possède la deque, l'epoch, les compteurs et le worker de
+    flush. `AsyncClient` interprète chaque effet mais ne duplique aucun de ces
+    états. Un effet unique applicable inline ne doit payer ni enqueue, ni
+    compteur, ni création de task ; ce contrat est couvert par
+    `tests/unit/test_effect_pump.py` et les benchmarks appariés.
+11. **Callbacks hors section critique** : aucun verrou/état moteur tenu pendant
    un callback ; un callback peut appeler `publish()` sans deadlock.
-11. **Pas de retransmission sur connexion vivante** : les PUBLISH/PUBREL ne sont
+12. **Pas de retransmission sur connexion vivante** : les PUBLISH/PUBREL ne sont
    rejoués **qu'à la reconnexion** (session présente), avec DUP=1 pour les
    PUBLISH. Jamais de timer de retransmission en cours de session (conforme
    MQTT ≥3.1.1).

@@ -1,7 +1,10 @@
 """Fresh-process confirmed-delivery MQTT benchmark.
 
 A real ``mosquitto_sub`` process validates every payload. Publisher ACK
-throughput and subscriber delivery throughput are reported separately.
+throughput and subscriber delivery throughput are reported separately. Latency
+is measured from immediately before the application calls ``publish`` and
+therefore includes local admission and queue residence; sweep ``--window`` when
+diagnosing latency/throughput trade-offs.
 """
 
 from __future__ import annotations
@@ -28,7 +31,6 @@ from mqttium.protocol.reconnect import ReconnectPolicy
 
 
 HEADER_HEX_BYTES = 32
-WINDOW = 100
 
 
 @dataclass
@@ -38,6 +40,7 @@ class Result:
     profile: str
     payload_bytes: int
     count: int
+    window: int
     publisher_ack_msg_s: float
     delivered_msg_s: float
     latency_p50_ms: float
@@ -66,7 +69,8 @@ def environment(args: argparse.Namespace) -> dict[str, object]:
         "port": args.port,
         "transport": "tls" if args.cafile else "tcp",
         "profile": args.profile,
-        "window": WINDOW,
+        "window": args.window,
+        "latency_origin": "immediately_before_publish_call",
         "versions": {
             "mqttium": package_version("mqttium"),
             "paho-mqtt": package_version("paho-mqtt"),
@@ -133,10 +137,11 @@ async def publish_mqttium(
     count: int,
     size: int,
     context,
+    window: int,
 ) -> float:
     client = AsyncClient(
         client_id=f"real-mn-{os.getpid()}",
-        max_outbound_inflight=WINDOW,
+        max_outbound_inflight=window,
         reconnect=ReconnectPolicy(enabled=False),
     )
     await client.connect(host, port, ssl=context, timeout=10.0)
@@ -144,7 +149,7 @@ async def publish_mqttium(
     started = time.perf_counter()
     for sequence in range(count):
         pending.append(await client.publish(topic, make_payload(sequence, size), qos=1))
-        if len(pending) >= WINDOW:
+        if len(pending) >= window:
             await pending.pop(0).wait()
     await asyncio.gather(*(receipt.wait() for receipt in pending))
     elapsed = time.perf_counter() - started
@@ -159,14 +164,15 @@ def publish_paho(
     count: int,
     size: int,
     cafile: str | None,
+    window: int,
 ) -> float:
     connected = threading.Event()
     client = mqtt.Client(
         mqtt.CallbackAPIVersion.VERSION2,
         client_id=f"real-paho-{os.getpid()}",
     )
-    client.max_inflight_messages_set(WINDOW)
-    client.max_queued_messages_set(WINDOW * 2)
+    client.max_inflight_messages_set(window)
+    client.max_queued_messages_set(window * 2)
     if cafile:
         client.tls_set(ca_certs=cafile)
 
@@ -188,7 +194,7 @@ def publish_paho(
             client.loop_stop()
             raise RuntimeError(f"Paho publish failed rc={info.rc}")
         pending.append(info)
-        if len(pending) >= WINDOW:
+        if len(pending) >= window:
             pending.pop(0).wait_for_publish(timeout=30.0)
     for info in pending:
         info.wait_for_publish(timeout=30.0)
@@ -221,6 +227,7 @@ def child(args: argparse.Namespace) -> None:
                 args.count,
                 args.payload_bytes,
                 context,
+                args.window,
             )
         )
     else:
@@ -231,6 +238,7 @@ def child(args: argparse.Namespace) -> None:
             args.count,
             args.payload_bytes,
             args.cafile,
+            args.window,
         )
     try:
         process.wait(timeout=args.subscriber_timeout)
@@ -267,6 +275,7 @@ def child(args: argparse.Namespace) -> None:
         profile=args.profile,
         payload_bytes=args.payload_bytes,
         count=args.count,
+        window=args.window,
         publisher_ack_msg_s=args.count / ack_seconds,
         delivered_msg_s=args.count / delivery_seconds,
         latency_p50_ms=statistics.median(latencies),
@@ -312,6 +321,8 @@ def parent(args: argparse.Namespace) -> None:
                 args.profile,
                 "--subscriber-timeout",
                 str(args.subscriber_timeout),
+                "--window",
+                str(args.window),
             ]
             if args.cafile:
                 command.extend(["--cafile", args.cafile])
@@ -358,6 +369,7 @@ def parse() -> argparse.Namespace:
     parser.add_argument("--profile", default="local")
     parser.add_argument("--payload-bytes", type=int, default=64)
     parser.add_argument("--count", type=int, default=3_000)
+    parser.add_argument("--window", type=int, default=100)
     parser.add_argument("--subscriber-timeout", type=float, default=120.0)
     parser.add_argument("--output", type=Path, default=Path("/tmp/realworld.json"))
     return parser.parse_args()

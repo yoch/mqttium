@@ -82,6 +82,20 @@ flowchart TB
 utilisateurs. Il consomme des `IncomingPacket` et produit des
 `EngineEffect` (paquets à émettre, événements applicatifs, transitions).
 
+### Application ordonnée des effets
+
+`AsyncClient` interprète les `EngineEffect` parce qu'il possède le transport,
+les futures, les receipts, les callbacks et les files de livraison. L'état de
+sérialisation de cette interprétation appartient toutefois à `EffectPump`
+(`api/_effects.py`) : deque ordonnée, epoch de connexion, compteurs de progrès
+et worker de flush.
+
+Le cas nominal d'un seul effet immédiatement applicable ne passe jamais par la
+deque, les compteurs ou un task : `AsyncClient` lie directement les opérations
+du pump sur l'instance et l'effet est appliqué inline. Les effets asynchrones
+seuls sont tagués par epoch et repris par le worker. Les anciens attributs de
+diagnostic d'`AsyncClient` sont des vues en lecture, pas un second état.
+
 ### Découpage interne du moteur
 
 `ProtocolEngine` orchestre la machine d'état de connexion et le dispatch des

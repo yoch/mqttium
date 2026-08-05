@@ -19,6 +19,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from itertools import islice
 from typing import Any, Literal, Never
 
+from mqttium.api._effects import EffectPump, StaleConnectionEffect
 from mqttium.api.models import (
     PublishBatchReceipt,
     PublishMessage,
@@ -75,10 +76,6 @@ DeliveryToken = int | Message | None
 CallbackJob = tuple[Callable[..., Any], tuple[Any, ...], DeliveryToken]
 TrackedIteratorMessage = tuple[Message, Message]
 IteratorQueueItem = Message | TrackedIteratorMessage
-
-
-class _StaleConnectionEffect(Exception):
-    pass
 
 
 class _DeliveryQueue(asyncio.Queue[IteratorQueueItem]):
@@ -201,15 +198,16 @@ class AsyncClient:
         self._reconnect_task: asyncio.Task[None] | None = None
         self._lifecycle_lock = asyncio.Lock()
         self._engine_lock = asyncio.Lock()
-        self._effect_flush_lock = asyncio.Lock()
-        self._pending_effects: deque[EngineEffect] = deque()
-        self._pending_effect_epoch: int | None = None
         self._connection_epoch = 0
-        self._effect_enqueued = 0
-        self._effect_applied = 0
-        self._effect_progress = asyncio.Event()
-        self._effect_waiters = 0
-        self._effect_error: BaseException | None = None
+        self._effect_pump = EffectPump(self)
+        # Bind the pump operations directly on the client. This keeps existing
+        # internal/Paho call sites stable and avoids an extra wrapper frame on
+        # the single-effect hot path.
+        self._collect_effects_locked = self._effect_pump.collect_from_engine
+        self._drain_effects_inline = self._effect_pump.drain_inline
+        self._schedule_effect_flush = self._effect_pump.schedule
+        self._drain_effects = self._effect_pump.drain
+        self._discard_connection_effects = self._effect_pump.discard_connection_effects
         self._callback_queue: asyncio.Queue[CallbackJob] = asyncio.Queue(
             maxsize=max_pending_callbacks
         )
@@ -248,9 +246,6 @@ class AsyncClient:
                 self._delivery_small_message_limit = candidate_small_limit
                 self._delivery_accounted_limit = candidate_accounted_limit
         self._callback_worker_task: asyncio.Task[None] | None = None
-        self._effect_flush_task: asyncio.Task[None] | None = None
-        self._effect_flush_requested = False
-        self._effect_draining_inline = False
         self._publish_waiters = 0
         self._delivery_timeout = delivery_timeout
         self._callback_shutdown_timeout = callback_shutdown_timeout
@@ -297,6 +292,28 @@ class AsyncClient:
         self.on_disconnect: OnDisconnect | None = None
         self.on_publish: OnPublish | None = None
         self.auth_handler: OnAuth | None = auth_handler
+
+    # Diagnostic compatibility views. Effect state has one owner in EffectPump;
+    # these historical read-only names remain for tests and instrumentation.
+    @property
+    def _pending_effects(self) -> deque[EngineEffect]:
+        return self._effect_pump.pending
+
+    @property
+    def _pending_effect_epoch(self) -> int | None:
+        return self._effect_pump.pending_epoch
+
+    @property
+    def _effect_enqueued(self) -> int:
+        return self._effect_pump.enqueued
+
+    @property
+    def _effect_applied(self) -> int:
+        return self._effect_pump.applied
+
+    @property
+    def _effect_flush_task(self) -> asyncio.Task[None] | None:
+        return self._effect_pump.task
 
     @property
     def state(self) -> ConnectionState:
@@ -1013,7 +1030,7 @@ class AsyncClient:
         if epoch is None:
             epoch = self._connection_epoch
         if epoch != self._connection_epoch:
-            raise _StaleConnectionEffect
+            raise StaleConnectionEffect
         size = item_size(item)
         if not self._can_enqueue_outbound_size(size):
             return False
@@ -1039,7 +1056,7 @@ class AsyncClient:
         async with self._outbound_space:
             while True:
                 if epoch != self._connection_epoch:
-                    raise _StaleConnectionEffect
+                    raise StaleConnectionEffect
                 messages_full = self._outbound.qsize() >= self._max_outbound_messages
                 # Allow a single oversized item into an empty queue (segmented
                 # payloads can exceed max_outbound_bytes by the MQTT header).
@@ -1058,7 +1075,7 @@ class AsyncClient:
                 finally:
                     self._outbound_waiters -= 1
             if epoch != self._connection_epoch:
-                raise _StaleConnectionEffect
+                raise StaleConnectionEffect
             self._outbound.put_nowait(item)
             self._outbound_bytes += size
 
@@ -1147,40 +1164,6 @@ class AsyncClient:
             return negotiated
         return self._engine.config.keepalive
 
-    def _collect_effects_locked(self) -> None:
-        effects = self._engine.take_effects()
-        if not effects:
-            return
-        epoch = self._connection_epoch
-
-        # One tag covers the connection-scoped deque. On an epoch change,
-        # transport effects are discarded while terminal publish results are
-        # retained and re-tagged so their receipts cannot be stranded.
-        if self._pending_effects and self._pending_effect_epoch != epoch:
-            self._discard_connection_effects()
-
-        # Normal publish/PUBACK traffic produces exactly one immediately
-        # applicable effect. Do not account or queue that effect at all: the
-        # counters exist only to coordinate genuinely asynchronous slow paths.
-        if len(effects) == 1 and not self._pending_effects:
-            if self._apply_effect_inline(effects[0], epoch):
-                return
-
-        if len(effects) > 1:
-            effects = [
-                *(effect for effect in effects if effect.kind is EffectKind.SEND),
-                *(effect for effect in effects if effect.kind is not EffectKind.SEND),
-            ]
-        if not self._pending_effects:
-            self._pending_effect_epoch = epoch
-        self._pending_effects.extend(effects)
-        self._effect_enqueued += len(effects)
-
-    def _complete_effect(self) -> None:
-        self._effect_applied += 1
-        if self._effect_waiters:
-            self._effect_progress.set()
-
     def _apply_effect_inline(self, effect: EngineEffect, epoch: int) -> bool:
         if epoch != self._connection_epoch:
             return True
@@ -1216,104 +1199,6 @@ class AsyncClient:
             return True
         return False
 
-    def _drain_effects_inline(self) -> None:
-        if self._effect_draining_inline or self._effect_flush_lock.locked():
-            return
-        epoch = self._pending_effect_epoch
-        if epoch is None:
-            return
-        if epoch != self._connection_epoch:
-            self._discard_connection_effects()
-            epoch = self._pending_effect_epoch
-            if epoch is None:
-                return
-        self._effect_draining_inline = True
-        try:
-            while self._pending_effects:
-                effect = self._pending_effects[0]
-                if not self._apply_effect_inline(effect, epoch):
-                    break
-                self._pending_effects.popleft()
-                self._complete_effect()
-            if not self._pending_effects:
-                self._pending_effect_epoch = None
-        finally:
-            self._effect_draining_inline = False
-        if self._pending_effects:
-            self._schedule_effect_flush()
-
-    def _schedule_effect_flush(self) -> None:
-        # The flusher owns effect progress independently of producer task
-        # cancellation. Multiple producers only signal the same worker.
-        self._effect_flush_requested = True
-        task = self._effect_flush_task
-        if task is not None and not task.done():
-            return
-        task = asyncio.create_task(
-            self._run_scheduled_effect_flush(),
-            name="mqttium-effect-flush",
-        )
-        self._effect_flush_task = task
-        task.add_done_callback(self._effect_flush_done)
-
-    async def _run_scheduled_effect_flush(self) -> None:
-        async with self._effect_flush_lock:
-            while True:
-                self._effect_flush_requested = False
-                while self._pending_effects:
-                    effect = self._pending_effects[0]
-                    epoch = self._pending_effect_epoch
-                    if epoch is None:
-                        self._pending_effects.clear()
-                        break
-                    if epoch != self._connection_epoch:
-                        self._discard_connection_effects()
-                        continue
-                    try:
-                        await self._apply_effect(
-                            effect,
-                            nowait=False,
-                            epoch=epoch,
-                        )
-                    except asyncio.CancelledError:
-                        raise
-                    except _StaleConnectionEffect:
-                        if self._pending_effects and self._pending_effects[0] is effect:
-                            self._pending_effects.popleft()
-                            self._complete_effect()
-                    except BaseException as exc:
-                        if self._pending_effects and self._pending_effects[0] is effect:
-                            self._pending_effects.popleft()
-                            self._complete_effect()
-                        self._effect_error = exc
-                        if self._effect_waiters:
-                            self._effect_progress.set()
-                        raise
-                    else:
-                        if self._pending_effects and self._pending_effects[0] is effect:
-                            self._pending_effects.popleft()
-                            self._complete_effect()
-                    if not self._pending_effects:
-                        self._pending_effect_epoch = None
-                if not self._effect_flush_requested:
-                    return
-
-    def _effect_flush_done(self, task: asyncio.Task[None]) -> None:
-        if self._effect_flush_task is task:
-            self._effect_flush_task = None
-        try:
-            task.result()
-        except asyncio.CancelledError:
-            return
-        except Exception as exc:
-            asyncio.get_running_loop().call_exception_handler(
-                {
-                    "message": "mqttium scheduled effect flush failed",
-                    "exception": exc,
-                    "task": task,
-                }
-            )
-
     async def _flush_effects(self, *, nowait: bool = False) -> None:
         async with self._engine_lock:
             self._collect_effects_locked()
@@ -1321,30 +1206,6 @@ class AsyncClient:
             self._schedule_effect_flush()
             return
         await self._drain_effects()
-
-    async def _drain_effects(self, *, nowait: bool = False) -> None:
-        self._drain_effects_inline()
-        if nowait:
-            if self._pending_effects:
-                self._schedule_effect_flush()
-            return
-        target = self._effect_enqueued
-        if self._effect_applied >= target:
-            return
-        self._effect_waiters += 1
-        try:
-            while self._effect_applied < target:
-                if self._effect_error is not None:
-                    error = self._effect_error
-                    self._effect_error = None
-                    raise error
-                self._effect_progress.clear()
-                self._schedule_effect_flush()
-                if self._effect_applied >= target:
-                    break
-                await asyncio.shield(self._effect_progress.wait())
-        finally:
-            self._effect_waiters -= 1
 
     async def _apply_effect(
         self,
@@ -1845,52 +1706,21 @@ class AsyncClient:
                 self._outbound.task_done()
         self._outbound_bytes = 0
 
-    def _discard_connection_effects(self, *, settle_publish: bool = False) -> None:
-        """Drop transport-scoped effects while preserving terminal publishes.
-
-        SEND, MESSAGE and connection-control effects belong to one transport
-        epoch and are rebuilt from engine/store state. PUBLISH_COMPLETE and
-        PUBLISH_FAILED are different: the store record has already been retired,
-        so losing either would strand its receipt or batch forever. They survive
-        an epoch change and are re-tagged for normal ordered application.
-
-        Final teardown cannot leave an effect worker behind. In that case
-        ``settle_publish`` retires the local handles immediately and queues the
-        optional user callback before the callback worker is drained.
-        """
-        retained: deque[EngineEffect] = deque()
-        discarded = 0
-        for effect in self._pending_effects:
-            if effect.kind not in (
-                EffectKind.PUBLISH_COMPLETE,
-                EffectKind.PUBLISH_FAILED,
-            ):
-                discarded += 1
-                continue
-            if not settle_publish:
-                retained.append(effect)
-                continue
-
-            if effect.kind is EffectKind.PUBLISH_COMPLETE:
-                mid: int | None = effect.data
-                reason: BaseException | None = None
-            else:
-                failure: PublishFailure = effect.data
-                mid = failure.mid
-                reason = failure.reason
-            self._settle_publish(mid, reason)
-            if self.on_publish is not None:
-                try:
-                    self._spawn_callback(self.on_publish, mid, reason)
-                except MessageDeliveryError as exc:
-                    self._report_callback_error(self.on_publish, exc)
-            discarded += 1
-
-        self._pending_effects = retained
-        self._pending_effect_epoch = self._connection_epoch if retained else None
-        self._effect_applied += discarded
-        if self._effect_waiters:
-            self._effect_progress.set()
+    def _settle_terminal_effect(self, effect: EngineEffect) -> None:
+        """Settle one terminal publish effect during final teardown."""
+        if effect.kind is EffectKind.PUBLISH_COMPLETE:
+            mid: int | None = effect.data
+            reason: BaseException | None = None
+        else:
+            failure: PublishFailure = effect.data
+            mid = failure.mid
+            reason = failure.reason
+        self._settle_publish(mid, reason)
+        if self.on_publish is not None:
+            try:
+                self._spawn_callback(self.on_publish, mid, reason)
+            except MessageDeliveryError as exc:
+                self._report_callback_error(self.on_publish, exc)
 
     def _register_publish_receipt(self, mid: int, receipt: PublishReceipt) -> None:
         current = self._receipts.get(mid)
@@ -2029,10 +1859,10 @@ class AsyncClient:
             self._writer_task = None
         if self._keepalive_task is not current:
             self._keepalive_task = None
-        if self._effect_flush_task is not current:
-            self._effect_flush_task = None
-            self._effect_flush_requested = False
-        self._effect_draining_inline = False
+        if self._effect_pump.task is not current:
+            self._effect_pump.task = None
+            self._effect_pump.flush_requested = False
+        self._effect_pump.draining_inline = False
         if not preserve_reconnect and self._reconnect_task is not current:
             self._reconnect_task = None
         if self._transport is not None:

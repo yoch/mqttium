@@ -1,0 +1,225 @@
+"""Ordered runtime application of protocol-engine effects.
+
+``EffectPump`` owns the connection-scoped effect deque and the asynchronous
+flusher. The client remains the interpreter of individual effects because it
+owns transports, futures, receipts, callbacks and delivery queues.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections import deque
+from typing import TYPE_CHECKING, Protocol
+
+from mqttium.protocol.effects import EffectKind, EngineEffect
+
+if TYPE_CHECKING:
+    from mqttium.protocol.engine import ProtocolEngine
+
+
+class StaleConnectionEffect(Exception):
+    """An effect was produced for a transport epoch that is no longer current."""
+
+
+class EffectOwner(Protocol):
+    _connection_epoch: int
+    _engine: ProtocolEngine
+
+    def _apply_effect_inline(self, effect: EngineEffect, epoch: int) -> bool: ...
+
+    async def _apply_effect(
+        self,
+        effect: EngineEffect,
+        *,
+        nowait: bool,
+        epoch: int | None = None,
+    ) -> None: ...
+
+    def _settle_terminal_effect(self, effect: EngineEffect) -> None: ...
+
+
+class EffectPump:
+    """Serialize engine effects without charging the single-effect fast path.
+
+    A lone immediately-applicable effect is interpreted inline and never enters
+    the deque or progress counters. Only genuinely asynchronous work is tagged
+    with a connection epoch and owned by the scheduled flusher.
+    """
+
+    def __init__(self, owner: EffectOwner) -> None:
+        self.owner = owner
+        self.lock = asyncio.Lock()
+        self.pending: deque[EngineEffect] = deque()
+        self.pending_epoch: int | None = None
+        self.enqueued = 0
+        self.applied = 0
+        self.progress = asyncio.Event()
+        self.waiters = 0
+        self.error: BaseException | None = None
+        self.task: asyncio.Task[None] | None = None
+        self.flush_requested = False
+        self.draining_inline = False
+
+    def collect_from_engine(self) -> None:
+        effects = self.owner._engine.take_effects()
+        if not effects:
+            return
+        epoch = self.owner._connection_epoch
+
+        if self.pending and self.pending_epoch != epoch:
+            self.discard_connection_effects()
+
+        if len(effects) == 1 and not self.pending:
+            if self.owner._apply_effect_inline(effects[0], epoch):
+                return
+
+        if len(effects) > 1:
+            effects = [
+                *(effect for effect in effects if effect.kind is EffectKind.SEND),
+                *(effect for effect in effects if effect.kind is not EffectKind.SEND),
+            ]
+        if not self.pending:
+            self.pending_epoch = epoch
+        self.pending.extend(effects)
+        self.enqueued += len(effects)
+
+    def _complete(self) -> None:
+        self.applied += 1
+        if self.waiters:
+            self.progress.set()
+
+    def drain_inline(self) -> None:
+        if self.draining_inline or self.lock.locked():
+            return
+        epoch = self.pending_epoch
+        if epoch is None:
+            return
+        if epoch != self.owner._connection_epoch:
+            self.discard_connection_effects()
+            epoch = self.pending_epoch
+            if epoch is None:
+                return
+        self.draining_inline = True
+        try:
+            while self.pending:
+                effect = self.pending[0]
+                if not self.owner._apply_effect_inline(effect, epoch):
+                    break
+                self.pending.popleft()
+                self._complete()
+            if not self.pending:
+                self.pending_epoch = None
+        finally:
+            self.draining_inline = False
+        if self.pending:
+            self.schedule()
+
+    def schedule(self) -> None:
+        self.flush_requested = True
+        task = self.task
+        if task is not None and not task.done():
+            return
+        task = asyncio.create_task(self._run_scheduled(), name="mqttium-effect-flush")
+        self.task = task
+        task.add_done_callback(self._done)
+
+    async def _run_scheduled(self) -> None:
+        async with self.lock:
+            while True:
+                self.flush_requested = False
+                while self.pending:
+                    effect = self.pending[0]
+                    epoch = self.pending_epoch
+                    if epoch is None:
+                        self.pending.clear()
+                        break
+                    if epoch != self.owner._connection_epoch:
+                        self.discard_connection_effects()
+                        continue
+                    try:
+                        await self.owner._apply_effect(effect, nowait=False, epoch=epoch)
+                    except asyncio.CancelledError:
+                        raise
+                    except StaleConnectionEffect:
+                        if self.pending and self.pending[0] is effect:
+                            self.pending.popleft()
+                            self._complete()
+                    except BaseException as exc:
+                        if self.pending and self.pending[0] is effect:
+                            self.pending.popleft()
+                            self._complete()
+                        self.error = exc
+                        if self.waiters:
+                            self.progress.set()
+                        raise
+                    else:
+                        if self.pending and self.pending[0] is effect:
+                            self.pending.popleft()
+                            self._complete()
+                    if not self.pending:
+                        self.pending_epoch = None
+                if not self.flush_requested:
+                    return
+
+    def _done(self, task: asyncio.Task[None]) -> None:
+        if self.task is task:
+            self.task = None
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            asyncio.get_running_loop().call_exception_handler(
+                {
+                    "message": "mqttium scheduled effect flush failed",
+                    "exception": exc,
+                    "task": task,
+                }
+            )
+
+    async def drain(self, *, nowait: bool = False) -> None:
+        self.drain_inline()
+        if nowait:
+            if self.pending:
+                self.schedule()
+            return
+        target = self.enqueued
+        if self.applied >= target:
+            return
+        self.waiters += 1
+        try:
+            while self.applied < target:
+                if self.error is not None:
+                    error = self.error
+                    self.error = None
+                    raise error
+                self.progress.clear()
+                self.schedule()
+                if self.applied >= target:
+                    break
+                await asyncio.shield(self.progress.wait())
+        finally:
+            self.waiters -= 1
+
+    def discard_connection_effects(self, *, settle_publish: bool = False) -> None:
+        """Drop transport effects and preserve or settle terminal publishes."""
+        retained: deque[EngineEffect] = deque()
+        discarded = 0
+        for effect in self.pending:
+            if effect.kind not in (
+                EffectKind.PUBLISH_COMPLETE,
+                EffectKind.PUBLISH_FAILED,
+            ):
+                discarded += 1
+                continue
+            if not settle_publish:
+                retained.append(effect)
+                continue
+            self.owner._settle_terminal_effect(effect)
+            discarded += 1
+
+        self.pending = retained
+        self.pending_epoch = self.owner._connection_epoch if retained else None
+        self.applied += discarded
+        if self.waiters:
+            self.progress.set()

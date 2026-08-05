@@ -17,7 +17,7 @@ import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable
+from collections.abc import Callable
 
 
 @dataclass
