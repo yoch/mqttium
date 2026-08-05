@@ -57,6 +57,27 @@ class PagedInflightStore(InflightStore, Protocol):
 
 
 @runtime_checkable
+class BoundedInboundReplayStore(InflightStore, Protocol):
+    """Opt-in extension for payload hydration bounded by messages and bytes.
+
+    Every yielded page must contain at most ``max_messages`` records and
+    at most ``max_bytes`` of payload plus UTF-8 topic data. A single record
+    larger than ``max_bytes`` is yielded alone, because replay cannot make
+    progress without materialising it.
+    """
+
+    def in_count(self) -> int:
+        """Return the durable inbound record count without reading payloads."""
+        ...
+
+    def in_replay_pages(
+        self,
+        max_messages: int = 64,
+        max_bytes: int = 1 << 20,
+    ) -> Iterator[tuple[InboundMessage, ...]]: ...
+
+
+@runtime_checkable
 class TransitionInflightStore(InflightStore, Protocol):
     """Opt-in extension: conditional, payload-free record transitions.
 
@@ -259,6 +280,40 @@ class MemoryInflightStore:
             messages = tuple(self._in[mid] for mid in page if mid in self._in)
             if messages:
                 yield messages
+
+    def in_count(self) -> int:
+        return len(self._in)
+
+    def in_replay_pages(
+        self,
+        max_messages: int = 64,
+        max_bytes: int = 1 << 20,
+    ) -> Iterator[tuple[InboundMessage, ...]]:
+        if max_messages <= 0:
+            raise ValueError("max_messages must be positive")
+        if max_bytes <= 0:
+            raise ValueError("max_bytes must be positive")
+        messages: list[InboundMessage] = []
+        hydrated_bytes = 0
+        for mid in tuple(self._in):
+            message = self._in.get(mid)
+            if message is None:
+                continue
+            message_bytes = len(message.payload) + len(message.topic.encode("utf-8"))
+            if messages and (
+                len(messages) >= max_messages or hydrated_bytes + message_bytes > max_bytes
+            ):
+                yield tuple(messages)
+                messages = []
+                hydrated_bytes = 0
+            messages.append(message)
+            hydrated_bytes += message_bytes
+            if len(messages) >= max_messages or hydrated_bytes >= max_bytes:
+                yield tuple(messages)
+                messages = []
+                hydrated_bytes = 0
+        if messages:
+            yield tuple(messages)
 
     def clear_in(self) -> None:
         old = self._in

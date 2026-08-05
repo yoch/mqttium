@@ -60,6 +60,10 @@ _IN_PAGE_SQL = (
     " FROM inbound WHERE mid IN"
 )
 _IN_INDEX_PAGE_SQL = "SELECT mid, state, user_acked FROM inbound WHERE mid IN"
+_IN_REPLAY_INDEX_SQL = (
+    "SELECT mid, length(payload) + length(CAST(topic AS BLOB)) AS replay_size"
+    " FROM inbound ORDER BY seq"
+)
 
 SQLITE_SCHEMA_VERSION = 2
 """Durable schema revision stored in ``PRAGMA user_version``.
@@ -688,6 +692,60 @@ class SqliteInflightStore:
 
     def in_pages(self, page_size: int = 256) -> Iterator[tuple[InboundMessage, ...]]:
         yield from self._pages("inbound", _IN_PAGE_SQL, page_size, _row_to_in)
+
+    def in_count(self) -> int:
+        with self._lock:
+            row = self._conn.execute("SELECT COUNT(*) FROM inbound").fetchone()
+        if row is None:
+            raise RuntimeError("Failed to count inbound records")
+        return int(row[0])
+
+    def _in_messages_for_mids(self, mids: tuple[int, ...]) -> tuple[InboundMessage, ...]:
+        by_mid: dict[int, sqlite3.Row] = {}
+        for offset in range(0, len(mids), _MAX_SQL_VARIABLES):
+            sub = mids[offset : offset + _MAX_SQL_VARIABLES]
+            placeholders = ",".join("?" * len(sub))
+            with self._lock:
+                rows = self._conn.execute(f"{_IN_PAGE_SQL} ({placeholders})", sub).fetchall()
+            by_mid.update((int(row["mid"]), row) for row in rows)
+        return tuple(_row_to_in(row) for mid in mids if (row := by_mid.get(mid)) is not None)
+
+    def in_replay_pages(
+        self,
+        max_messages: int = 64,
+        max_bytes: int = 1 << 20,
+    ) -> Iterator[tuple[InboundMessage, ...]]:
+        if max_messages <= 0:
+            raise ValueError("max_messages must be positive")
+        if max_bytes <= 0:
+            raise ValueError("max_bytes must be positive")
+        index_mids = array("q")
+        index_sizes = array("q")
+        with self._lock:
+            for row in self._conn.execute(_IN_REPLAY_INDEX_SQL):
+                index_mids.append(int(row["mid"]))
+                index_sizes.append(int(row["replay_size"] or 0))
+        mids: list[int] = []
+        hydrated_bytes = 0
+        for mid, message_bytes in zip(index_mids, index_sizes, strict=True):
+            if mids and (len(mids) >= max_messages or hydrated_bytes + message_bytes > max_bytes):
+                page = self._in_messages_for_mids(tuple(mids))
+                if page:
+                    yield page
+                mids = []
+                hydrated_bytes = 0
+            mids.append(mid)
+            hydrated_bytes += message_bytes
+            if len(mids) >= max_messages or hydrated_bytes >= max_bytes:
+                page = self._in_messages_for_mids(tuple(mids))
+                if page:
+                    yield page
+                mids = []
+                hydrated_bytes = 0
+        if mids:
+            page = self._in_messages_for_mids(tuple(mids))
+            if page:
+                yield page
 
     def clear_in(self) -> None:
         with self._lock:
