@@ -1,0 +1,95 @@
+name: Refine byte-bounded replay pages
+
+on:
+  push:
+    branches: [agent/byte-bounded-inbound-replay]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: agent/byte-bounded-inbound-replay
+          fetch-depth: 0
+      - name: Refine page sizing
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: str, old: str, new: str) -> None:
+              target = Path(path)
+              text = target.read_text()
+              if text.count(old) != 1:
+                  raise SystemExit(f"expected one match in {path}, found {text.count(old)}")
+              target.write_text(text.replace(old, new))
+
+          replace_once(
+              "src/mqttium/protocol/inbound.py",
+              '''            pages = bounded.in_replay_pages(
+                          REPLAY_BATCH_MESSAGES,
+                          REPLAY_BATCH_BYTES,
+                      )
+          ''',
+              '''            pages = bounded.in_replay_pages(
+                          REPLAY_SCAN_LIMIT,
+                          REPLAY_BATCH_BYTES,
+                      )
+          ''',
+          )
+
+          replace_once(
+              "src/mqttium/persistence/sqlite.py",
+              '''        with self._lock:
+                      index = self._conn.execute(_IN_REPLAY_INDEX_SQL).fetchall()
+                  mids: list[int] = []
+                  hydrated_bytes = 0
+                  for row in index:
+                      mid = int(row["mid"])
+                      message_bytes = int(row["replay_size"] or 0)
+          ''',
+              '''        index_mids = array("q")
+                  index_sizes = array("q")
+                  with self._lock:
+                      for row in self._conn.execute(_IN_REPLAY_INDEX_SQL):
+                          index_mids.append(int(row["mid"]))
+                          index_sizes.append(int(row["replay_size"] or 0))
+                  mids: list[int] = []
+                  hydrated_bytes = 0
+                  for mid, message_bytes in zip(index_mids, index_sizes, strict=True):
+          ''',
+          )
+
+          replace_once(
+              "tests/unit/test_inbound_replay_streaming.py",
+              '''def test_replay_reads_one_page_per_batch(tmp_path: Path) -> None:
+          ''',
+              '''def test_replay_reuses_one_bounded_page_across_effect_batches(tmp_path: Path) -> None:
+          ''',
+          )
+
+          replace_once(
+              "tests/unit/test_inbound_replay_streaming.py",
+              '''    assert CountingStore.pages_fetched == 2
+          ''',
+              '''    assert CountingStore.pages_fetched == 1  # still inside the first bounded page
+          ''',
+          )
+
+          Path(".github/workflows/refine-byte-bounded-replay.yml").unlink()
+          PY
+          python -m pip install -q ruff==0.16.1
+          ruff format \
+            src/mqttium/persistence/sqlite.py \
+            src/mqttium/protocol/inbound.py \
+            tests/unit/test_inbound_replay_streaming.py
+          git diff --check
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git commit -m "Keep replay hydration pages efficient and byte bounded"
+          git push origin HEAD:agent/byte-bounded-inbound-replay
