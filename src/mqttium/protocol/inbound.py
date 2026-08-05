@@ -254,8 +254,20 @@ class InboundSession:
                 engine._send(PubCompPacket(mid=rel.mid).encode(config.protocol))
                 return
             if meta.state is InboundQoSState.WAIT_USER_ACK:
-                # Duplicate PUBREL while application acknowledgement is still
-                # pending: retain the record and keep PUBCOMP deferred.
+                if config.manual_ack:
+                    # Duplicate PUBREL while application acknowledgement is
+                    # pending: retain the record and keep PUBCOMP deferred.
+                    return
+                # The persisted session may have been reopened with manual ACK
+                # disabled. Complete the already-received QoS 2 handshake rather
+                # than leaving WAIT_USER_ACK permanently stuck.
+                completed = transitions.complete_in(rel.mid, InboundQoSState.WAIT_USER_ACK)
+                if completed is None:
+                    raise ProtocolError(
+                        f"Inbound mid={rel.mid} changed while completing PUBREL"
+                    )
+                engine._send(PubCompPacket(mid=rel.mid).encode(config.protocol))
+                self._release_slot()
                 return
             if meta.state is not InboundQoSState.WAIT_PUBREL:
                 raise ProtocolError(
@@ -268,9 +280,7 @@ class InboundSession:
                     InboundQoSState.WAIT_USER_ACK,
                 )
                 if changed is None:
-                    raise ProtocolError(
-                        f"Inbound mid={rel.mid} changed while processing PUBREL"
-                    )
+                    raise ProtocolError(f"Inbound mid={rel.mid} changed while processing PUBREL")
                 return
             completed = transitions.complete_in(rel.mid, InboundQoSState.WAIT_PUBREL)
             if completed is None:
@@ -285,6 +295,13 @@ class InboundSession:
             engine._send(PubCompPacket(mid=rel.mid).encode(config.protocol))
             return
         if inbound.state is InboundQoSState.WAIT_USER_ACK:
+            if config.manual_ack:
+                return
+            completed = store.pop_in(rel.mid)
+            if completed is None:
+                raise ProtocolError(f"Inbound mid={rel.mid} disappeared while completing PUBREL")
+            engine._send(PubCompPacket(mid=rel.mid).encode(config.protocol))
+            self._release_slot()
             return
         if inbound.state is not InboundQoSState.WAIT_PUBREL:
             raise ProtocolError(
