@@ -56,6 +56,7 @@ class DecoderStats:
     buffered_bytes: int
     high_water_bytes: int
     max_packet_size: int
+    ingress_batch_limit_bytes: int
 
 
 @dataclass(slots=True, frozen=True)

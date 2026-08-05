@@ -12,6 +12,7 @@ def test_initial_stats_snapshot_is_immutable_and_side_effect_free() -> None:
     client = AsyncClient(
         max_outbound_messages=7,
         max_outbound_bytes=1234,
+        max_ingress_batch_bytes=2048,
         max_pending_messages=11,
         max_pending_callbacks=13,
     )
@@ -30,6 +31,7 @@ def test_initial_stats_snapshot_is_immutable_and_side_effect_free() -> None:
     assert snapshot.delivery.iterator_limit == 11
     assert snapshot.delivery.callback_limit == 13
     assert snapshot.decoder.buffered_bytes == 0
+    assert snapshot.decoder.ingress_batch_limit_bytes == 2048
     assert snapshot.receipts.publish == 0
     assert snapshot.transport.kind is None
     assert not any(
@@ -132,3 +134,9 @@ async def test_writer_worker_records_lifetime_high_water_without_enqueue_overhea
     assert snapshot.writer.queued_bytes == 0
     assert snapshot.writer.high_water_messages == 1
     assert snapshot.writer.high_water_bytes == 4
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_client_rejects_invalid_ingress_batch_limit(value: int) -> None:
+    with pytest.raises(ValueError, match="max_ingress_batch_bytes"):
+        AsyncClient(max_ingress_batch_bytes=value)

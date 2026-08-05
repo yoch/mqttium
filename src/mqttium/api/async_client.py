@@ -125,6 +125,7 @@ class AsyncClient:
         ack_timeout: float = 30.0,
         max_outbound_bytes: int = 1 * 1024 * 1024,
         max_outbound_messages: int = 10_000,
+        max_ingress_batch_bytes: int = 1 * 1024 * 1024,
         max_pending_messages: int = 65_536,
         max_pending_callbacks: int = 1_024,
         max_pending_delivery_bytes: int | None = 64 * 1024 * 1024,
@@ -157,6 +158,8 @@ class AsyncClient:
             raise ValueError("max_outbound_messages must be greater than 0")
         if max_outbound_bytes <= 0:
             raise ValueError("max_outbound_bytes must be greater than 0")
+        if max_ingress_batch_bytes <= 0:
+            raise ValueError("max_ingress_batch_bytes must be greater than 0")
         if ack_timeout <= 0:
             raise ValueError("ack_timeout must be greater than 0")
         if ping_timeout is not None and ping_timeout <= 0:
@@ -203,6 +206,7 @@ class AsyncClient:
             store=store,
         )
         self._decoder = IncrementalDecoder(max_packet_size=effective_max_packet_size)
+        self._max_ingress_batch_bytes = max_ingress_batch_bytes
         self._transport: AsyncTransport | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._keepalive_task: asyncio.Task[None] | None = None
@@ -465,6 +469,7 @@ class AsyncClient:
                 buffered_bytes=self._decoder.buffered,
                 high_water_bytes=self._decoder.high_water,
                 max_packet_size=self._decoder.max_packet_size,
+                ingress_batch_limit_bytes=self._max_ingress_batch_bytes,
             ),
             delivery=DeliveryStats(
                 iterator_queued=self._messages.qsize(),
@@ -1132,9 +1137,10 @@ class AsyncClient:
                 while True:
                     async with self._engine_lock:
                         with self._engine.store.batch():
-                            handled = self._decoder.process_packets(
+                            handled, handled_bytes = self._decoder.process_packets_bounded(
                                 self._engine.handle_raw,
                                 limit=256,
+                                max_bytes=self._max_ingress_batch_bytes,
                             )
                         if handled:
                             self._collect_effects_locked()
@@ -1142,7 +1148,7 @@ class AsyncClient:
                         break
                     if self._pending_effects:
                         await self._drain_effects()
-                    if handled >= 256:
+                    if handled >= 256 or handled_bytes >= self._max_ingress_batch_bytes:
                         await asyncio.sleep(0)
         except asyncio.CancelledError:
             raise
