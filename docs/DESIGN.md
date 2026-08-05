@@ -191,6 +191,37 @@ store et slots de flow contrôle aussi leur libération terminale. Les deux
 sessions émettent dans l'unique flux d'effets du moteur et ne possèdent pas
 l'état de connexion.
 
+### Copies d'un PUBLISH entrant
+
+Le chemin d'ingress complet — `feed()`, `next_packet()`, `PublishPacket.decode()`
+— allouait **3 fois** la taille du payload par message. L'audit attribuait ces
+trois copies au buffer, au corps et au payload ; la mesure en a désigné une
+quatrième cause, plus bête : `bytes(bytearray[a:b])` copie **deux fois**, une
+première fois en découpant un nouveau `bytearray`, une seconde en le convertissant
+en `bytes`. Passer par une `memoryview` transitoire ne copie qu'une fois.
+
+Mesuré sur le chemin complet (`benchmarks/codec_allocations.py`) :
+
+| payload | avant | après | MiB/s avant | après |
+| ------- | ----: | ----: | ----------: | ----: |
+| 4 Kio   | 3,09× | 2,19× |       346,9 | 328,2 |
+| 64 Kio  | 3,01× | 2,01× |      2512,2 | 2958,6 |
+| 1 Mio   | 3,00× | 2,00× |       441,8 | 652,5 |
+| 8 Mio   | 3,00× | 2,00× |       394,0 | 564,8 |
+
+Le seuil `_VIEW_COPY_THRESHOLD` vaut 4 Kio : l'objet `memoryview` coûte plus que
+la copie évitée sur les petites frames, qui sont le chemin chaud. Comparaison
+appariée en processus, ordre alterné, 11 répétitions : 1 Kio 0,996, 4 Kio 0,989,
+8 Kio 1,027, 16 Kio 1,021. La `memoryview` est transitoire et libérée avant toute
+mutation du buffer : aucune vue du buffer réutilisable n'est exposée, l'invariant
+« octets possédés » est inchangé.
+
+Il reste **deux** copies : celle du corps possédé par le décodeur (exigée par
+l'invariant) et le découpage du payload dans `PublishPacket.decode()`. Descendre
+à une seule copie demande la spécialisation `DecodedPublish` de l'audit §7.2,
+c'est-à-dire parser l'en-tête PUBLISH dans le décodeur — une complexité nettement
+supérieure pour la moitié du gain déjà obtenu ici.
+
 ### Contrat de persistance : transitions conditionnelles
 
 `InflightStore` reste l'interface minimale « objets complets ». Deux extensions
