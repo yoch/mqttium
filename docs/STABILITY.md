@@ -36,13 +36,14 @@ PYTHONPATH=src python benchmarks/soak.py \
 `.github/workflows/finalization.yml` provides:
 
 - a short Mosquitto run on pull requests for MQTT 3.1.1 and MQTT 5;
-- scheduled and manually configurable Mosquitto runs on Ubuntu and macOS;
-- scheduled/manual interoperability runs against pinned EMQX and HiveMQ
+- manually configurable Mosquitto runs on Ubuntu and macOS;
+- manually triggered interoperability runs against pinned EMQX and HiveMQ
   Community Edition images;
 - retained JSON artefacts and broker logs.
 
 The workflow is intentionally separate from normal CI so the permanent unit,
-integration, packaging and fuzzing gates remain fast.
+integration, packaging and fuzzing gates remain fast. Extended macOS and
+multi-broker campaigns run only through `workflow_dispatch`.
 
 ## Acceptance criteria
 

@@ -159,9 +159,10 @@ The release gates include:
 - wheel, source-distribution and isolated-install validation;
 - delivery, persistence, TCP, TLS and WAN-profile benchmarks.
 
-A separate finalisation workflow runs reconnect/backpressure soaks on Linux and
-macOS and interoperability campaigns against multiple brokers. Its acceptance
-criteria are documented in [`docs/STABILITY.md`](docs/STABILITY.md).
+A separate finalisation workflow runs short reconnect/backpressure soaks on
+Linux for relevant pull requests. Extended Linux/macOS soaks and interoperability
+campaigns against multiple brokers are available by manual dispatch. Their
+acceptance criteria are documented in [`docs/STABILITY.md`](docs/STABILITY.md).
 
 ## Documentation
 
