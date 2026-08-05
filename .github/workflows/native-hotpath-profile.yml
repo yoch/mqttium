@@ -1,0 +1,230 @@
+name: Native hotpath stage profile
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - agent/native-hotpath-architecture-study
+    paths:
+      - .github/workflows/native-hotpath-profile.yml
+
+permissions:
+  contents: read
+
+jobs:
+  profile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    env:
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install clients and broker
+        run: |
+          python -m pip install -e ".[dev]" gmqtt==0.7.0
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mosquitto
+      - name: Start isolated Mosquitto
+        run: |
+          mkdir -p /tmp/mqttium-profile
+          cat > /tmp/mqttium-profile/mosquitto.conf <<'MOSQ'
+          persistence false
+          allow_anonymous true
+          max_inflight_messages 1000
+          max_queued_messages 1000000
+          max_queued_bytes 0
+          connection_messages false
+          log_type error
+          listener 11883 127.0.0.1
+          MOSQ
+          mosquitto -c /tmp/mqttium-profile/mosquitto.conf \
+            > /tmp/mqttium-profile/mosquitto.log 2>&1 &
+          for i in $(seq 1 60); do
+            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            sleep 0.2
+          done
+          exit 1
+      - name: Recover corrected native harness
+        run: |
+          python - <<'PY'
+          import base64
+          import gzip
+          from pathlib import Path
+
+          workflow = Path('.github/workflows/native-hotpath-study.yml').read_text().splitlines()
+          start = next(i for i, line in enumerate(workflow) if "cat > /tmp/native-hotpath.b64" in line) + 1
+          end = next(i for i in range(start, len(workflow)) if workflow[i].strip() == "B64")
+          payload = "".join(line.strip() for line in workflow[start:end])
+          source = gzip.decompress(base64.b64decode(payload)).decode()
+          source = source.replace("max_pending_callbacks=max(65_536, count),", "max_pending_callbacks=8_192,")
+          source = source.replace("max_pending_callbacks=65_536,", "max_pending_callbacks=8_192,")
+          Path('/tmp/native_hotpath_matrix.py').write_text(source)
+          PY
+      - name: Profile complete direct ingress paths
+        run: |
+          python -m cProfile -o /tmp/mqttium-profile/ingress-mqttium-baseline.prof \
+            /tmp/native_hotpath_matrix.py --worker --scenario ingress_direct \
+            --variant mqttium-baseline --messages 100000
+          python -m cProfile -o /tmp/mqttium-profile/ingress-mqttium-sync-inline.prof \
+            /tmp/native_hotpath_matrix.py --worker --scenario ingress_direct \
+            --variant mqttium-sync-inline --messages 100000
+          python -m cProfile -o /tmp/mqttium-profile/ingress-gmqtt.prof \
+            /tmp/native_hotpath_matrix.py --worker --scenario ingress_direct \
+            --variant gmqtt --messages 100000
+      - name: Profile complete RTT paths
+        run: |
+          python -m cProfile -o /tmp/mqttium-profile/rtt-mqttium-await.prof \
+            /tmp/native_hotpath_matrix.py --worker --scenario rtt \
+            --variant mqttium-await --pairs 5000 --window 32
+          python -m cProfile -o /tmp/mqttium-profile/rtt-mqttium-sync-inline.prof \
+            /tmp/native_hotpath_matrix.py --worker --scenario rtt \
+            --variant mqttium-sync-inline-nowait --pairs 5000 --window 32
+          python -m cProfile -o /tmp/mqttium-profile/rtt-gmqtt.prof \
+            /tmp/native_hotpath_matrix.py --worker --scenario rtt \
+            --variant gmqtt --pairs 5000 --window 32
+      - name: Export readable profiles
+        run: |
+          python - <<'PY'
+          import io
+          import pstats
+          from pathlib import Path
+
+          root = Path('/tmp/mqttium-profile')
+          for profile in root.glob('*.prof'):
+              chunks = []
+              for key in ('tottime', 'cumulative'):
+                  stream = io.StringIO()
+                  pstats.Stats(profile, stream=stream).strip_dirs().sort_stats(key).print_stats(60)
+                  chunks.append(f'### sorted by {key}\n{stream.getvalue()}')
+              profile.with_suffix('.txt').write_text('\n'.join(chunks))
+          PY
+      - name: Decompose synchronous MQTTium ingress core
+        run: |
+          cat > /tmp/decompose_ingress.py <<'PY'
+          from __future__ import annotations
+
+          import gc
+          import json
+          import statistics
+          import struct
+          import time
+
+          from mqttium.codec.buffer import IncrementalDecoder
+          from mqttium.enums import ConnectionState, MQTTProtocolVersion
+          from mqttium.packets import PublishPacket
+          from mqttium.protocol.config import EngineConfig
+          from mqttium.protocol.engine import ProtocolEngine
+
+          COUNT = 300_000
+          TOPIC = 'bench/native-hotpath/telemetry'
+          PAYLOAD = b't' * 256
+          PROTOCOL = MQTTProtocolVersion.MQTTv311
+
+          def vbi(value: int) -> bytes:
+              out = bytearray()
+              while True:
+                  value, digit = divmod(value, 128)
+                  if value:
+                      digit |= 0x80
+                  out.append(digit)
+                  if not value:
+                      return bytes(out)
+
+          topic = TOPIC.encode()
+          body = struct.pack('!H', len(topic)) + topic + PAYLOAD
+          frame = b'\x30' + vbi(len(body)) + body
+          per_chunk = max(1, (256 * 1024) // len(frame))
+          chunk = frame * per_chunk
+
+          def run(factory):
+              rates = []
+              for _ in range(7):
+                  decoder = IncrementalDecoder()
+                  handler = factory()
+                  remaining = COUNT
+                  seen = 0
+                  gc.collect()
+                  started = time.perf_counter()
+                  while remaining:
+                      take = min(per_chunk, remaining)
+                      decoder.feed(chunk if take == per_chunk else frame * take)
+                      remaining -= take
+                      while decoder.buffered:
+                          processed, _bytes = decoder.process_packets_bounded(
+                              handler,
+                              protocol=PROTOCOL,
+                              limit=256,
+                              max_bytes=1 << 20,
+                          )
+                          if not processed:
+                              break
+                          seen += processed
+                  elapsed = time.perf_counter() - started
+                  assert seen == COUNT
+                  rates.append(COUNT / elapsed)
+              return {'median': statistics.median(rates), 'samples': rates}
+
+          def noop_factory():
+              return lambda raw: None
+
+          def minimal_factory():
+              def handle(raw):
+                  remaining = raw.remaining
+                  length = (remaining[0] << 8) | remaining[1]
+                  remaining[2:2 + length].decode('utf-8')
+                  remaining[2 + length:]
+              return handle
+
+          def packet_factory():
+              return lambda raw: PublishPacket.decode(raw.flags, raw.remaining, PROTOCOL)
+
+          def inbound_factory():
+              engine = ProtocolEngine(EngineConfig(protocol=PROTOCOL))
+              engine.state = ConnectionState.CONNECTED
+              def handle(raw):
+                  engine.inbound.on_publish(raw)
+                  engine.take_effects()
+              return handle
+
+          def engine_factory():
+              engine = ProtocolEngine(EngineConfig(protocol=PROTOCOL))
+              engine.state = ConnectionState.CONNECTED
+              def handle(raw):
+                  engine.handle_raw(raw)
+                  engine.take_effects()
+              return handle
+
+          result = {
+              'decoder_raw': run(noop_factory),
+              'decoder_minimal_publish': run(minimal_factory),
+              'decoder_publish_packet': run(packet_factory),
+              'decoder_inbound_session': run(inbound_factory),
+              'decoder_protocol_engine': run(engine_factory),
+          }
+          print(json.dumps(result, indent=2))
+          open('/tmp/mqttium-profile/ingress-decomposition.json', 'w').write(json.dumps(result, indent=2) + '\n')
+          PY
+          python /tmp/decompose_ingress.py
+      - name: Fixed-work allocation peaks
+        run: |
+          python /tmp/native_hotpath_matrix.py --worker --trace \
+            --scenario ingress_direct --variant mqttium-baseline --messages 50000 \
+            > /tmp/mqttium-profile/trace-ingress-mqttium-baseline.jsonl
+          python /tmp/native_hotpath_matrix.py --worker --trace \
+            --scenario ingress_direct --variant mqttium-sync-inline --messages 50000 \
+            > /tmp/mqttium-profile/trace-ingress-mqttium-sync-inline.jsonl
+          python /tmp/native_hotpath_matrix.py --worker --trace \
+            --scenario ingress_direct --variant gmqtt --messages 50000 \
+            > /tmp/mqttium-profile/trace-ingress-gmqtt.jsonl
+      - name: Upload profile evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-hotpath-profile-${{ github.run_id }}
+          path: /tmp/mqttium-profile/*
+          if-no-files-found: warn
+          retention-days: 30
