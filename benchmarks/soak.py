@@ -129,7 +129,7 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
             await asyncio.wait_for(batch.wait(), timeout=args.timeout)
             expected += args.messages_per_cycle
             await _wait_until(
-                lambda: received >= expected,
+                lambda expected=expected: received >= expected,
                 timeout=args.timeout,
                 description=f"delivery of cycle {cycle}",
             )
@@ -147,7 +147,7 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
                     raise RuntimeError("publisher transport disappeared before forced reconnect")
                 await transport.close()
                 await _wait_until(
-                    lambda: (
+                    lambda previous_epoch=previous_epoch: (
                         publisher.is_connected
                         and publisher.stats().connection_epoch > previous_epoch
                     ),
