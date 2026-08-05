@@ -67,14 +67,30 @@ Two layers, strictly separated:
 - **`protocol/engine.py` — `ProtocolEngine`**: the correctness core. Pure synchronous state machine:
   no `asyncio`, no sockets, no user callbacks, no wall clock, no `await`. Packets and commands go
   in (`handle_raw`, `queue_publish`, `begin_connect`, …), `EngineEffect` objects come out via
-  `take_effects()`. All QoS 1/2 state, session replay, packet-id allocation, flow control and
-  negotiation validation live here — which is why it is unit-testable without a network.
+  `take_effects()`. It owns connection state, negotiation, packet dispatch and the one ordered
+  effect stream, while directional MQTT publication state has one owner on each side:
+  - **`protocol/outbound.py` — `OutboundSession`** (`engine.outbound`): admission budget, packet
+    ids, flow window, the `QUEUED` deque, outbound store records, replay and hydration. A QoS 1/2
+    publish acquires four resources (budget, mid, store row, flow slot); this is the one component
+    that acquires and releases them, which is what makes rollback auditable. It does *not* own
+    connection state — it reads `state`/`negotiated` back from the engine and emits through
+    `ProtocolEngine._emit`/`_send` so effect ordering stays observable in one place.
+    `engine.flow`, `engine.packet_ids` and `engine._queued` remain compatibility views for tests,
+    benchmarks and instrumentation. Both publish entry points unwind through the single
+    `_rollback()` primitive; callers only snapshot, so the success path pays nothing and the two
+    cannot drift. Admission is all-or-nothing and fault-injected in
+    `tests/unit/test_outbound_transaction.py` — extend it when you add an acquisition step.
+  - **`protocol/inbound.py` — `InboundSession`** (`engine.inbound`): inbound topic aliases, the
+    local Receive Maximum counter, persisted QoS 1/2 records, manual acknowledgement and restart
+    redelivery. `PUBLISH` and `PUBREL` dispatch directly to its bound handlers, avoiding an extra
+    wrapper frame on the ingress hot path. It emits through the engine's shared effect stream;
+    connection state and negotiated settings remain on `ProtocolEngine`.
 - **`api/async_client.py` — `AsyncClient`**: the asyncio adapter. Owns the transport, the reader
   task, the single writer task, keepalive/reconnect timers, callbacks, delivery queues, and turns
   effects into futures, receipts and messages.
 
-Anything protocol-shaped belongs in the engine; anything with a timer, socket or callback belongs in
-the client. Do not leak `asyncio` into `protocol/`.
+Anything protocol-shaped belongs in the engine or one of its directional sessions; anything with a
+timer, socket or callback belongs in the client. Do not leak `asyncio` into `protocol/`.
 
 ### Invariants that tests actively enforce
 
@@ -91,8 +107,9 @@ surfaces as a confusing failure elsewhere:
    unfinished QoS 1/2 PUBLISHes and is what CONNACK `Receive Maximum` adjusts. Inbound QoS 2 ids are
    never freed into the outbound pool.
 5. **One source of truth.** QoS state lives in the `InflightStore` plus the `OutboundQoSState` /
-   `InboundQoSState` values; the engine's `_queued` deque is only an ordered index of `QUEUED`
-   messages and must stay in sync both ways.
+   `InboundQoSState` values; the outbound `_queued` deque is only an ordered index of `QUEUED`
+   messages and must stay in sync both ways. Inbound aliases, receive-window count and recovery
+   markers live only in `InboundSession`; engine underscore attributes exposing them are views.
 6. **Callbacks outside critical sections.** No engine lock is held during a callback; a callback may
    call `publish()` without deadlocking.
 7. **No in-session retransmission.** PUBLISH/PUBREL are replayed only on reconnect with a present
@@ -113,13 +130,17 @@ When touching this area, keep `_effect_enqueued`/`_effect_applied` balanced — 
 ### Other structure
 
 - `codec/` — VBI, bounded incremental decoder (`buffer.py`), MQTT-UTF-8 primitives, MQTT 5 property
-  table (`properties.py`, with encode/decode validation per packet type).
-- `packets/__init__.py` — one module holding every packet dataclass and its encode/decode.
+  table (`properties.py`, with encode/decode validation per packet type), and fixed-header/flags
+  validation (`packet_validation.py`).
+- `packets/` — one module per packet family (`connect.py`, `publish.py`, `subscription.py`,
+  `acks.py`, `control.py`) over shared framing helpers in `_common.py`. `__init__.py` only
+  re-exports; keep `__all__` in sync when adding a packet type.
 - `persistence/` — `InflightStore` is a `Protocol`; `MemoryInflightStore` and `SqliteInflightStore`
-  implement it. The engine hydrates packet ids and the offline queue from the store at construction,
-  so durable restart works without extra API. `PagedInflightStore` is an opt-in extension
-  (`out_pages`/`out_summary_pages`/`in_pages`) that keeps replay memory proportional to page size;
-  the engine resolves it once with `isinstance` and otherwise falls back to the eager path.
+  implement it. `OutboundSession` hydrates packet ids and the offline queue from the store at
+  construction, while `InboundSession` recovers inbound delivery markers. `PagedInflightStore` is
+  an opt-in extension (`out_pages`/`out_summary_pages`/`in_pages`) that keeps replay memory
+  proportional to page size; the outbound session resolves it once with `isinstance` and otherwise
+  falls back to the eager path.
 - `transport/` — `AsyncTransport` protocol over TCP/TLS, Unix and WebSocket. A `WriteItem` is either
   `bytes` or a `(header, payload)` tuple: payloads past `SEGMENT_THRESHOLD` (1 MiB) are written as
   two consecutive writes instead of being concatenated.
@@ -127,8 +148,12 @@ When touching this area, keep `_effect_enqueued`/`_effect_applied` balanced — 
   dedicated thread + loop. It is a strict consumer of the native API; the core must never import or
   accommodate it. Intentional divergences are documented in `docs/COMPAT.md` and enforced by
   `tests/unit/test_compat_confinement.py`.
-- `protocol/__init__.py` re-exports lazily through `__getattr__` to break the
-  `packets → protocol.validate → protocol → engine → packets` cycle. Do not add eager imports there.
+- `protocol/` — `effects.py` (the `EngineEffect` vocabulary), `config.py` (`EngineConfig` and the
+  allowlist of runtime-mutable fields), `engine.py` (connection/dispatch/effect orchestration),
+  `outbound.py` and `inbound.py` (directional publication state). `__init__.py` re-exports lazily
+  through `__getattr__` so `import mqttium.protocol` does not drag in the engine, the codec and the
+  persistence layer; the directional sessions stay internal. `packets` must never import
+  `protocol` — that dependency is what the `codec/packet_validation.py` split removed.
 
 ## Conventions
 

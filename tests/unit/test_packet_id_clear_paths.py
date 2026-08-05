@@ -103,7 +103,7 @@ def test_transport_close_keeps_publish_ids_when_releasing_subscriptions() -> Non
     engine.state = ConnectionState.CONNECTED
     publish_mid = pool.allocate()
     sub_mid = pool.allocate()
-    engine._pending_outbound_messages = 1
+    engine.outbound._pending_messages = 1
     engine._pending_sub_mids.add(sub_mid)
 
     engine.notify_transport_closed()

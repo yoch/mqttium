@@ -136,3 +136,9 @@ jobs:
               importlib.import_module(module.name)
           PY
           /tmp/mqttium-wheel/bin/python -m pip check
+      - name: Upload distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: distributions-${{ github.sha }}
+          path: dist/*
+          if-no-files-found: error

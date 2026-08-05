@@ -35,6 +35,8 @@ flowchart TB
 
   subgraph engine [Protocol Engine - sync, testable]
     PE[ProtocolEngine]
+    OUT[OutboundSession]
+    IN[InboundSession]
     SES[Session]
     QOS[QoS1 / QoS2 machines]
     PID[PacketIdPool]
@@ -58,10 +60,14 @@ flowchart TB
   PC --> SC
   AC --> CD
   AC --> RP
+  PE --> OUT
+  PE --> IN
   PE --> SES
   PE --> QOS
-  PE --> PID
-  PE --> FC
+  OUT --> PID
+  OUT --> FC
+  OUT --> store
+  IN --> store
   PE --> store
   AC --> DEC
   AC --> ENC
@@ -76,6 +82,42 @@ flowchart TB
 utilisateurs. Il consomme des `IncomingPacket` et produit des
 `EngineEffect` (paquets à émettre, événements applicatifs, transitions).
 
+### Découpage interne du moteur
+
+`ProtocolEngine` orchestre la machine d'état de connexion et le dispatch des
+paquets. Toute la publication sortante appartient à `OutboundSession`
+(`protocol/outbound.py`), qui possède seul :
+
+- le budget d'admission (`max_pending_outbound_messages` / `_bytes`) ;
+- le `PacketIdPool` (partagé : le moteur y alloue aussi les MID SUB/UNSUB) ;
+- la fenêtre `FlowControl` ;
+- la file `_queued` des messages en état `QUEUED` ;
+- les enregistrements sortants du store, le replay et la ré-hydratation.
+
+Une publication QoS 1/2 acquiert quatre ressources — budget, MID, ligne de
+store, slot de flow — et un seul composant les acquiert et les restitue, ce qui
+est la raison d'être de l'extraction.
+
+`OutboundSession` ne possède **pas** l'état de connexion : il relit `state` et
+`negotiated` depuis le moteur (tous deux réassignés à chaque connexion) et émet
+via `ProtocolEngine._emit` / `_send`, jamais dans une liste d'effets à lui.
+L'ordre relatif des effets sortants et des effets de connexion est observable
+par `AsyncClient` — notamment les `PUBLISH_FAILED` de purge émis **avant**
+l'effet `CONNACK` lorsque le broker a jeté la session.
+
+Toute la réception PUBLISH appartient symétriquement à `InboundSession`
+(`protocol/inbound.py`), qui possède seul :
+
+- les alias de topic entrants, remis à zéro à chaque connexion réseau ;
+- le compteur local `Receive Maximum` ;
+- les enregistrements QoS 1/2 entrants du store ;
+- le suivi `delivered` / `user_acked`, l'ACK manuel et le replay après restart.
+
+Les handlers `PUBLISH` et `PUBREL` pointent directement sur cette session :
+l'extraction n'ajoute donc aucun appel intermédiaire au chemin entrant. Comme
+`OutboundSession`, elle émet dans l'unique flux d'effets du moteur et ne possède
+pas l'état de connexion.
+
 ## Modules
 
 ```text
@@ -88,7 +130,7 @@ mqttium/
 │   ├── types.py
 │   ├── codec/            # VBI, buffer, primitives UTF-8/bin
 │   ├── packets/          # types + encode/decode par paquet
-│   ├── protocol/         # engine, session, qos, ids, flow, keepalive
+│   ├── protocol/         # engine, inbound/outbound, effects, config, ids, flow
 │   ├── transport/        # TCP/TLS (WS plus tard)
 │   ├── persistence/      # memory (+ sqlite plus tard)
 │   ├── dispatch/         # matcher, callbacks

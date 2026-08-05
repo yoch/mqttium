@@ -13,7 +13,7 @@ from mqttium.protocol.engine import (
     EngineConfig,
     ProtocolEngine,
 )
-from mqttium.protocol.validate import validate_raw_packet
+from mqttium.codec.packet_validation import validate_raw_packet
 from mqttium.types import Properties
 
 
