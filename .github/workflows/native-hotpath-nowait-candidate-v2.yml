@@ -7,6 +7,8 @@ on:
       - agent/native-hotpath-architecture-study
     paths:
       - .github/workflows/native-hotpath-nowait-candidate-v2.yml
+      - .github/scripts/apply_nowait_size_candidate.py
+      - benchmarks/experimental/paired_nowait_candidate.py
 
 permissions:
   contents: read
