@@ -21,13 +21,14 @@ finalisation architecture pass.
 Automation is implemented in `.github/workflows/finalization.yml`; successful
 workflow definitions are not counted as evidence until their run artefacts are
 retained and reviewed. Extended macOS and multi-broker campaigns are launched
-manually. See [`STABILITY.md`](STABILITY.md).
+manually. See [`STABILITY.md`](STABILITY.md) and the retained
+[2026-08-05 campaign record](STABLE-RELEASE-EVIDENCE-2026-08-05.md).
 
-- [ ] Retain successful reconnect, session and backpressure soak runs on Linux
+- [x] Retain successful reconnect, session and backpressure soak runs on Linux
       and macOS for MQTT 3.1.1 and MQTT 5.
-- [ ] Retain successful interoperability runs against Mosquitto, EMQX and HiveMQ
+- [x] Retain successful interoperability runs against Mosquitto, EMQX and HiveMQ
       Community Edition.
-- [ ] Publish reproducible release benchmark artefacts from pinned runner
+- [x] Publish reproducible release benchmark artefacts from pinned runner
       profiles.
 - [ ] Review the evidence and promote the API candidate to the first non-alpha
       release.

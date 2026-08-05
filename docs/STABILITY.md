@@ -45,6 +45,15 @@ The workflow is intentionally separate from normal CI so the permanent unit,
 integration, packaging and fuzzing gates remain fast. Extended macOS and
 multi-broker campaigns run only through `workflow_dispatch`.
 
+## Retained evidence
+
+The campaign run against `main` at
+`0006198de800228c1d1b92790f56e074d791608d` is recorded in
+[`STABLE-RELEASE-EVIDENCE-2026-08-05.md`](STABLE-RELEASE-EVIDENCE-2026-08-05.md).
+It retains the run URLs, workload totals and artifact digests for Linux, macOS,
+Mosquitto, EMQX and HiveMQ under MQTT 3.1.1 and MQTT 5, together with the full
+benchmark and paired-regression runs for the same final source tree.
+
 ## Acceptance criteria
 
 A stable-release candidate requires retained successful runs showing:
