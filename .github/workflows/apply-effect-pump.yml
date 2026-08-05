@@ -1,0 +1,51 @@
+name: Apply EffectPump patch
+
+on:
+  push:
+    branches:
+      - agent/effect-pump
+    paths:
+      - .github/effect-pump.patch.zlib.b64
+      - .github/workflows/apply-effect-pump.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: agent/effect-pump
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Apply and validate structural change
+        run: |
+          python - <<'PY'
+          import base64
+          import zlib
+          from pathlib import Path
+
+          encoded = Path('.github/effect-pump.patch.zlib.b64').read_text().strip()
+          Path('/tmp/effect-pump.patch').write_bytes(zlib.decompress(base64.b64decode(encoded)))
+          PY
+          git apply /tmp/effect-pump.patch
+          rm .github/effect-pump.patch.zlib.b64
+          rm .github/workflows/apply-effect-pump.yml
+          python -m pip install -e ".[dev,security]"
+          ruff format src tests benchmarks
+          ruff check src tests benchmarks
+          mypy src/mqttium
+          bandit -q -ll -r src
+          python -m pytest -q tests/unit
+      - name: Commit validated change
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Extract ordered effect pumping from AsyncClient"
+          git push origin HEAD:agent/effect-pump
