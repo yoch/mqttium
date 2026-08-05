@@ -18,6 +18,11 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Changed
 
+- The bounded transport writer has been extracted into `WritePump`, which now
+  solely owns queue ordering, byte/count backpressure, batching, the writer task
+  and `last_outbound`. `AsyncClient` retains transport lifecycle and writer
+  failure policy, while direct-bound enqueue methods preserve the SEND hot path.
+
 - The Paho façade now uses a narrow loop-bound `AsyncClient` adapter boundary
   rather than accessing the protocol engine, receipt registries and effect pump
   directly. Its cross-thread batching is preserved: QoS 0 uses receiptless

@@ -34,6 +34,8 @@ SCENARIOS = (
     "ingress_engine_qos0",
     "effect_send_inline",
     "effect_batch_inline",
+    "writer_try_enqueue",
+    "writer_enqueue_async",
     "async_publish_nowait_qos0",
     "native_publish_nowait_qos0",
     "compat_publish_qos1",
@@ -54,6 +56,34 @@ def _measure(fn: Callable[[], None], *, operations: int, warmup: int) -> WorkerR
         fn()
     elapsed = time.perf_counter() - started
     return WorkerResult("", elapsed, operations, operations / elapsed)
+
+
+class _DiscardQueue:
+    """Queue-shaped sink so admission benchmarks do not time cleanup."""
+
+    __slots__ = ()
+
+    def qsize(self) -> int:
+        return 0
+
+    def empty(self) -> bool:
+        return True
+
+    def put_nowait(self, item: object) -> None:
+        return None
+
+
+def _install_discard_writer(client: object) -> None:
+    queue = _DiscardQueue()
+    pump = getattr(client, "_write_pump", None)
+    if pump is None:
+        client._outbound = queue
+        client._max_outbound_messages = 1 << 30
+        client._max_outbound_bytes = 1 << 60
+    else:
+        pump.queue = queue
+        pump.max_messages = 1 << 30
+        pump.max_bytes = 1 << 60
 
 
 def _worker(args: argparse.Namespace) -> None:
@@ -106,8 +136,35 @@ def _worker(args: argparse.Namespace) -> None:
             engine.take_effects()
 
         result = _measure(run_ingress, operations=80_000, warmup=2_000)
+    elif scenario == "writer_try_enqueue":
+        client = AsyncClient(client_id="paired-writer-try")
+        _install_discard_writer(client)
+        item = b"x"
+
+        def run_writer_try() -> None:
+            if not client._try_enqueue_outbound(item):
+                raise RuntimeError("writer try-enqueue unexpectedly refused")
+
+        result = _measure(run_writer_try, operations=160_000, warmup=3_000)
+    elif scenario == "writer_enqueue_async":
+        client = AsyncClient(client_id="paired-writer-async")
+        _install_discard_writer(client)
+        item = b"x"
+
+        async def run_writer_async() -> WorkerResult:
+            warmup = 2_000
+            operations = 60_000
+            for index in range(warmup + operations):
+                if index == warmup:
+                    started = time.perf_counter()
+                await client._enqueue_outbound(item)
+            elapsed = time.perf_counter() - started
+            return WorkerResult(scenario, elapsed, operations, operations / elapsed)
+
+        result = asyncio.run(run_writer_async())
     elif scenario == "async_publish_nowait_qos0":
         client = AsyncClient(client_id="paired-async-nowait")
+        _install_discard_writer(client)
         client._engine.state = ConnectionState.CONNECTED
         publish_payload = b"x"
 
@@ -118,15 +175,13 @@ def _worker(args: argparse.Namespace) -> None:
                 if index == warmup:
                     started = time.perf_counter()
                 await client.publish(topic, publish_payload, qos=0, nowait=True)
-                item = client._outbound.get_nowait()
-                client._outbound_bytes -= len(item)
-                client._outbound.task_done()
             elapsed = time.perf_counter() - started
             return WorkerResult(scenario, elapsed, operations, operations / elapsed)
 
         result = asyncio.run(run_async_nowait())
     elif scenario == "native_publish_nowait_qos0":
         client = AsyncClient(client_id="paired-native-nowait")
+        _install_discard_writer(client)
         client._engine.state = ConnectionState.CONNECTED
         payload = b"x"
         use_native = hasattr(client, "publish_nowait")
@@ -141,9 +196,6 @@ def _worker(args: argparse.Namespace) -> None:
                     client.publish_nowait(topic, payload, qos=0)
                 else:
                     await client.publish(topic, payload, qos=0, nowait=True)
-                item = client._outbound.get_nowait()
-                client._outbound_bytes -= len(item)
-                client._outbound.task_done()
             elapsed = time.perf_counter() - started
             return WorkerResult(scenario, elapsed, operations, operations / elapsed)
 
@@ -223,6 +275,7 @@ def _worker(args: argparse.Namespace) -> None:
             client.loop_stop()
     elif scenario in ("effect_send_inline", "effect_batch_inline"):
         client = AsyncClient(client_id="paired-effects")
+        _install_discard_writer(client)
         client._engine.state = ConnectionState.CONNECTED
         batch_size = 1 if scenario == "effect_send_inline" else 8
 
@@ -230,13 +283,6 @@ def _worker(args: argparse.Namespace) -> None:
             for _ in range(batch_size):
                 client._engine._emit(EffectKind.SEND, b"x")
             client._collect_effects_locked()
-            while True:
-                try:
-                    item = client._outbound.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
-                client._outbound_bytes -= len(item)
-                client._outbound.task_done()
 
         result = _measure(
             run_effects,
