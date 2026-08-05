@@ -28,6 +28,7 @@ from mqttium.packets import (
     encode_disconnect,
 )
 from mqttium.protocol.effects import DisconnectInfo, EffectKind
+from mqttium.protocol.stats import InboundStats
 from mqttium.topics import validate_received_publish_topic
 from mqttium.types import InboundMessage, Message
 
@@ -150,6 +151,15 @@ class InboundSession:
     def replay_pending(self) -> bool:
         """True while restart redelivery still has batches to emit."""
         return self._replay is not None
+
+    def stats(self) -> InboundStats:
+        """Snapshot this session's own accounting."""
+        return InboundStats(
+            inflight=self._inflight,
+            receive_maximum=self.config.local_receive_maximum,
+            topic_aliases=len(self._aliases),
+            replay_pending=self._replay is not None,
+        )
 
     # --- packet handlers ---------------------------------------------------
 

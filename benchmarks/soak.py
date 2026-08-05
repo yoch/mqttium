@@ -27,10 +27,11 @@ def _protocol(value: str) -> MQTTProtocolVersion:
 def _idle_violations(client: AsyncClient) -> list[str]:
     stats = client.stats()
     checks = {
-        "protocol.pending_outbound_messages": stats.protocol.pending_outbound_messages,
-        "protocol.pending_outbound_bytes": stats.protocol.pending_outbound_bytes,
-        "protocol.queued_outbound_messages": stats.protocol.queued_outbound_messages,
-        "protocol.flow_inflight": stats.protocol.flow_inflight,
+        "outbound.pending_messages": stats.outbound.pending_messages,
+        "outbound.pending_bytes": stats.outbound.pending_bytes,
+        "outbound.queued_messages": stats.outbound.queued_messages,
+        "outbound.flow_inflight": stats.outbound.flow_inflight,
+        "inbound.inflight": stats.inbound.inflight,
         "writer.queued_messages": stats.writer.queued_messages,
         "writer.queued_bytes": stats.writer.queued_bytes,
         "effects.pending": stats.effects.pending,
@@ -169,8 +170,8 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
             "forced_reconnects": reconnects,
             "elapsed_s": time.perf_counter() - started,
             "publisher_high_water": {
-                "pending_messages": (publisher_stats.protocol.pending_outbound_high_water_messages),
-                "pending_bytes": publisher_stats.protocol.pending_outbound_high_water_bytes,
+                "pending_messages": publisher_stats.outbound.pending_high_water_messages,
+                "pending_bytes": publisher_stats.outbound.pending_high_water_bytes,
                 "writer_messages": publisher_stats.writer.high_water_messages,
                 "writer_bytes": publisher_stats.writer.high_water_bytes,
                 "decoder_bytes": publisher_stats.decoder.high_water_bytes,

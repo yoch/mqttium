@@ -1,6 +1,7 @@
 """Transport package."""
 
 from mqttium.transport._stream import AsyncTransport
+from mqttium.transport.stats import TransportStats
 from mqttium.transport.tcp import TcpTransport
 from mqttium.transport.unix import UnixSocketTransport
 from mqttium.transport.websocket import WebSocketTransport
@@ -10,6 +11,7 @@ __all__ = [
     "AsyncTransport",
     "SEGMENT_THRESHOLD",
     "TcpTransport",
+    "TransportStats",
     "UnixSocketTransport",
     "WebSocketTransport",
     "WriteItem",
