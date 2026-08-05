@@ -31,9 +31,31 @@ jobs:
       - name: Build candidate from clean main branch
         run: |
           python harness/.github/scripts/apply_batched_message_effects.py candidate
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("candidate/CHANGELOG.md")
+          heading = "### Changed\n\n"
+          text = path.read_text()
+          first = text.index(heading) + len(heading)
+          path.write_text(
+              text[:first]
+              + text[first:].replace(heading, "### Changed (existing release)\n\n")
+          )
+          PY
           python harness/.github/scripts/publish_qos0_batch_candidate.py \
             --candidate candidate \
             --harness harness
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("candidate/CHANGELOG.md")
+          path.write_text(
+              path.read_text().replace(
+                  "### Changed (existing release)\n\n", "### Changed\n\n"
+              )
+          )
+          PY
       - name: Install validation dependencies
         working-directory: candidate
         run: python -m pip install -e ".[dev]"
