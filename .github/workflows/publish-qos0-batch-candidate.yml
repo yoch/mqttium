@@ -75,7 +75,7 @@ jobs:
           bandit -q -ll -r src
       - name: Full unit suite
         working-directory: candidate
-        run: python -m pytest -q tests/unit
+        run: timeout --signal=INT --kill-after=10s 120s python -m pytest -vv -x tests/unit
       - name: Start isolated broker
         run: |
           sudo apt-get update -qq
