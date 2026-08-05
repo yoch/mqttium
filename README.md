@@ -19,6 +19,7 @@ complete MQTT QoS state machines.
 - manual acknowledgement;
 - in-memory and SQLite inflight persistence;
 - aggregate `publish_many()` with bounded memory and measured throughput gains;
+- synchronous loop-bound `publish_nowait()` for non-suspending native producers;
 - an additive Paho VERSION2 compatibility façade, isolated from the native API;
 - inline type information for type checkers.
 
@@ -59,6 +60,28 @@ async def main() -> None:
 
 asyncio.run(main())
 ```
+
+## Non-suspending publishing
+
+A producer already executing on the client's event loop can submit without
+creating or awaiting a coroutine:
+
+```python
+receipt = client.publish_nowait("telemetry/device-1", payload, qos=1)
+# Continue synchronously, then observe completion later if needed.
+await receipt.wait()
+```
+
+`publish_nowait()` either admits the publication immediately or raises
+`FlowControlError`; it never waits for engine or writer capacity. It returns the
+normal `PublishReceipt`, so QoS 1/2 completion is observed in the same way as
+with `publish()`.
+
+The method follows the same ownership rule as `asyncio.Queue.put_nowait()`: it
+is intended for the client's owning event-loop thread, not as a generic
+thread-safe API. Cross-thread synchronous callers should use an adapter such as
+`mqttium.compat.paho.Client`, which coalesces submissions before handing a
+bounded batch to the loop.
 
 ## Batched publishing
 
