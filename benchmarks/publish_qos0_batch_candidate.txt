@@ -1,1 +1,1 @@
-Export the exact multi-message-only candidate after full validation and smoke checks.
+Publish the eight validated non-workflow files, then squash after connector workflow updates.
