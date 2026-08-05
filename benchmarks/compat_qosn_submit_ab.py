@@ -26,7 +26,6 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from mqttium.api.models import PublishReceipt
 from mqttium.compat.paho import CallbackAPIVersion, Client, MQTTMessageInfo
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, QoS
 
@@ -72,22 +71,15 @@ def _new_client(name: str) -> Client:
 
 
 def _commit_one_on_loop(client: Client, payload: bytes) -> int:
-    handle = client._async._engine.queue_publish(
+    receipt = client._async._queue_publish_on_loop(
         _TOPIC,
         payload,
         qos=QoS.AT_LEAST_ONCE,
         retain=False,
     )
-    assert handle.mid is not None
-    receipt = PublishReceipt(
-        mid=handle.mid,
-        qos=handle.qos,
-        _event=asyncio.Event(),
-    )
-    client._async._register_publish_receipt(handle.mid, receipt)
-    client._async._collect_effects_locked()
-    client._async._drain_effects_inline()
-    return handle.mid
+    assert receipt.mid is not None
+    client._async._finalize_loop_commands()
+    return receipt.mid
 
 
 def _publish_coroutine_handoff(client: Client, payload: bytes) -> int:

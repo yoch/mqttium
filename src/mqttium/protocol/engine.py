@@ -140,6 +140,10 @@ class ProtocolEngine:
         self._effects = []
         return effects
 
+    def reconfigure(self, **changes: Any) -> None:
+        """Validate and apply fields that are safe to change after construction."""
+        self.config.update(**changes)
+
     # --- outbound facade ---------------------------------------------------
     # The session owns this state. These views keep the engine's public surface
     # (and the tests, benchmarks and fuzzer that use it) exactly as it was when
