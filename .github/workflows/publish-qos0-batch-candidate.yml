@@ -8,7 +8,7 @@ on:
       - benchmarks/publish_qos0_batch_candidate.txt
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   publish:
@@ -130,3 +130,21 @@ jobs:
             /tmp/native-rtt-smoke.json
             /tmp/direct-ingress-smoke.json
           retention-days: 14
+      - name: Publish non-workflow files
+        working-directory: candidate
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add \
+            CHANGELOG.md \
+            benchmarks/direct_ingress_hotpath.py \
+            benchmarks/native_rtt_ingress.py \
+            benchmarks/paired_native_hotpaths.py \
+            docs/NATIVE-HOTPATH-PROFILE.md \
+            src/mqttium/api/_effects.py \
+            src/mqttium/api/async_client.py \
+            tests/unit/test_batched_message_effects.py
+          git diff --cached --check
+          test "$(git rev-list --count origin/main..HEAD)" -eq 0
+          git commit -m 'Batch small QoS 0 message delivery'
+          git push origin HEAD:agent/qos0-message-batch-delivery
