@@ -248,7 +248,11 @@ class MemoryInflightStore:
             return None
         msg.state = new_state
         if compact:
-            # Only PUBREL is retransmissible from here on.
+            # The PUBLISH phase is over. PUBREL needs only the packet id and
+            # protocol version, so no application data should survive PUBREC.
+            msg.topic = ""
+            msg.payload = b""
+            msg.properties = None
             msg.encoded_publish = None
         return OutboundRecordMeta(mid=mid, state=new_state, logical_size=msg.logical_size)
 

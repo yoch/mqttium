@@ -65,13 +65,15 @@ _IN_REPLAY_INDEX_SQL = (
     " FROM inbound ORDER BY seq"
 )
 
-SQLITE_SCHEMA_VERSION = 2
+SQLITE_SCHEMA_VERSION = 3
 """Durable schema revision stored in ``PRAGMA user_version``.
 
 * 1 — the original schema, which carried no version marker at all.
 * 2 — adds ``outbound.logical_size``, drops the never-read ``extra`` column,
   and moves ``payload`` last so metadata reads never traverse BLOB overflow
   pages.
+* 3 — compacts outbound QoS 2 records already in ``WAIT_PUBCOMP`` by removing
+  topic, payload and PUBLISH properties while preserving settlement metadata.
 """
 
 
@@ -216,6 +218,8 @@ class SqliteInflightStore:
             self._create_schema()
             if version < 2 and legacy:
                 self._migrate_to_v2()
+            if version < 3 and legacy:
+                self._migrate_to_v3()
             conn.execute(f"PRAGMA user_version={SQLITE_SCHEMA_VERSION}")
         except BaseException:
             # One transaction for the whole upgrade: an interrupted migration
@@ -293,6 +297,22 @@ class SqliteInflightStore:
             " delivered, user_acked, topic, properties, payload FROM inbound",
             "DROP TABLE inbound",
             "ALTER TABLE inbound__v2 RENAME TO inbound",
+        )
+
+    def _migrate_to_v3(self) -> None:
+        """Discard PUBLISH application data after the QoS 2 PUBREC phase.
+
+        A ``WAIT_PUBCOMP`` record only retransmits PUBREL. Its original logical
+        size remains durable so the admission budget is released exactly once
+        when PUBCOMP eventually settles the record.
+        """
+        self._conn.execute(
+            """
+            UPDATE outbound
+            SET topic='', properties=NULL, payload=X''
+            WHERE state=?
+            """,
+            (int(OutboundQoSState.WAIT_PUBCOMP),),
         )
 
     def _rebuild_table(self, table: str, *statements: str) -> None:
@@ -603,16 +623,24 @@ class SqliteInflightStore:
             if row is None or int(row["state"]) != int(expected_state):
                 return None
             self._ensure_write_transaction()
-            cursor = self._conn.execute(
-                "UPDATE outbound SET state=? WHERE mid=? AND state=? AND seq=?",
-                (int(new_state), mid, int(expected_state), int(row["seq"])),
-            )
+            if compact:
+                cursor = self._conn.execute(
+                    """
+                    UPDATE outbound
+                    SET state=?, topic='', properties=NULL, payload=X''
+                    WHERE mid=? AND state=? AND seq=?
+                    """,
+                    (int(new_state), mid, int(expected_state), int(row["seq"])),
+                )
+            else:
+                cursor = self._conn.execute(
+                    "UPDATE outbound SET state=? WHERE mid=? AND state=? AND seq=?",
+                    (int(new_state), mid, int(expected_state), int(row["seq"])),
+                )
             if cursor.rowcount == 0:
                 self._commit_if_needed()
                 return None
             self._commit_if_needed()
-            # `compact` needs no work here: the encoded PUBLISH frame is a
-            # memory-only field this store has never persisted.
             return OutboundRecordMeta(
                 mid=mid,
                 state=new_state,

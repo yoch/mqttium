@@ -46,7 +46,7 @@ which records what already shipped.
       QoS 1 load drains.
 - [ ] Specialised in-buffer PUBLISH decode, if profiling still shows
       payload-sized copies as a material peak after ingress batching.
-- [ ] Full QoS 2 phase-two compaction (release topic, payload and properties,
+- [x] Full QoS 2 phase-two compaction (release topic, payload and properties,
       not only the encoded frame).
 - [ ] Benchmark the QoS 1 / pre-PUBREC frame policy: re-encode on retransmission
       versus a size-based policy.

@@ -29,6 +29,11 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Changed
 
+- Outbound QoS 2 records are fully compacted after PUBREC: topic, payload and
+  PUBLISH properties are removed atomically while the original logical size is
+  retained until PUBCOMP releases admission accounting. SQLite schema 3 also
+  compacts pre-existing WAIT_PUBCOMP rows during migration.
+
 - Inbound restart redelivery is now incremental and backpressured. Replay
   restores the Receive Maximum window from a payload-free index, then emits
   bounded batches driven by an internal `CONTINUE_INBOUND_REPLAY` effect, so

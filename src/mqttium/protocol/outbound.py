@@ -476,6 +476,11 @@ class OutboundSession:
             self._fail_after_pubrec(rec.mid, rec.reason_code)
             return
         msg.state = OutboundQoSState.WAIT_PUBCOMP
+        # Third-party stores without the transition extension still receive
+        # the same phase-two compaction as the built-in stores.
+        msg.topic = ""
+        msg.payload = b""
+        msg.properties = None
         msg.encoded_publish = None
         if msg.encoded_pubrel is None:
             msg.encoded_pubrel = PubRelPacket(mid=rec.mid).encode(self.config.protocol)
