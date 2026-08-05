@@ -43,8 +43,6 @@ def main() -> None:
     TEST.write_text(
         '''from __future__ import annotations
 
-import asyncio
-
 import pytest
 
 from mqttium.api import AsyncClient
