@@ -21,9 +21,7 @@ def main() -> None:
     for run in range(args.runs):
         rtt_samples.append(await _rtt_once(args.rtt_pairs, 32, f"{args.label}-{run}"))
     for run in range(args.runs):
-        ingress_samples.append(
-            await _ingress_once(args.ingress_messages, f"{args.label}-{run}")
-        )
+        ingress_samples.append(await _ingress_once(args.ingress_messages, f"{args.label}-{run}"))
 
     def aggregate(name: str, samples: list[Sample]) -> dict[str, Any]:
 '''
