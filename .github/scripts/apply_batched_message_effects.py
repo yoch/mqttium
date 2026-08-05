@@ -84,13 +84,12 @@ def patch_client(root: Path) -> None:
         if not callback_delivery and not iterator_delivery:
             return 0
         small_limit = self._delivery_small_message_limit
-        manual_ack = self._engine.config.manual_ack
         applied = 0
         for effect in effects:
             if effect.kind is not EffectKind.MESSAGE:
                 break
             msg: Message = effect.data
-            if msg.mid is not None and (manual_ack or msg.qos == QoS.EXACTLY_ONCE):
+            if msg.qos != QoS.AT_MOST_ONCE:
                 break
             if small_limit is not None:
                 if (
@@ -144,7 +143,7 @@ def _effect(*, qos: QoS = QoS.AT_MOST_ONCE, mid: int | None = None) -> EngineEff
 
 
 @pytest.mark.asyncio
-async def test_small_callback_messages_apply_as_one_synchronous_batch() -> None:
+async def test_small_qos0_callback_messages_apply_as_one_synchronous_batch() -> None:
     client = AsyncClient(message_delivery="callback")
     seen: list[Message] = []
     client.on_message = seen.append
@@ -180,46 +179,35 @@ def test_batch_stops_before_half_delivering_both_mode() -> None:
     client._callback_queue.task_done()
 
 
-@pytest.mark.parametrize(
-    ("client", "effect"),
-    [
-        (
-            AsyncClient(message_delivery="callback", manual_ack=True),
-            _effect(qos=QoS.AT_LEAST_ONCE, mid=7),
-        ),
-        (
-            AsyncClient(message_delivery="callback"),
-            _effect(qos=QoS.EXACTLY_ONCE, mid=7),
-        ),
-    ],
-)
-def test_batch_defers_messages_requiring_persistence_mark(
-    client: AsyncClient,
-    effect: EngineEffect,
-) -> None:
+@pytest.mark.parametrize("qos", [QoS.AT_LEAST_ONCE, QoS.EXACTLY_ONCE])
+def test_batch_defers_acknowledged_messages(qos: QoS) -> None:
+    client = AsyncClient(message_delivery="callback")
     client.on_message = lambda _message: None
 
     applied = client._apply_message_effect_batch_inline(
-        deque([effect]), client._connection_epoch
+        deque([_effect(qos=qos, mid=7)]), client._connection_epoch
     )
 
     assert applied == 0
     assert client._callback_queue.empty()
 
 
-@pytest.mark.asyncio
-async def test_auto_acked_qos1_is_safe_for_batched_delivery() -> None:
-    client = AsyncClient(message_delivery="callback")
-    client.on_message = lambda _message: None
+def test_batch_stops_at_first_non_qos0_effect() -> None:
+    client = AsyncClient(message_delivery="iterator")
+    effects = deque(
+        [
+            _effect(),
+            _effect(qos=QoS.AT_LEAST_ONCE, mid=7),
+            _effect(),
+        ]
+    )
 
     applied = client._apply_message_effect_batch_inline(
-        deque([_effect(qos=QoS.AT_LEAST_ONCE, mid=7)]),
-        client._connection_epoch,
+        effects, client._connection_epoch
     )
 
     assert applied == 1
-    assert client._callback_queue.qsize() == 1
-    await client._shutdown_callback_worker(drain=False)
+    assert client._messages.qsize() == 1
 '''
     )
 
