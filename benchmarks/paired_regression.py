@@ -342,7 +342,8 @@ def _parent(args: argparse.Namespace) -> None:
         "scenarios": [],
     }
 
-    for scenario in SCENARIOS:
+    scenarios = (args.scenario,) if args.scenario is not None else SCENARIOS
+    for scenario in scenarios:
         pairs: list[dict[str, object]] = []
         ratios: list[float] = []
         for index in range(args.repeat):

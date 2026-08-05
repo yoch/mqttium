@@ -248,3 +248,37 @@ def test_hydrated_records_are_counted_even_above_new_limits() -> None:
     with pytest.raises(FlowControlError):
         engine.queue_publish("admission/new", b"payload", qos=1)
     assert len(engine.packet_ids) == 3
+
+
+def test_sustained_qos1_load_returns_admission_counters_to_zero() -> None:
+    engine = ProtocolEngine(
+        EngineConfig(
+            max_pending_outbound_messages=100,
+            max_pending_outbound_bytes=1024 * 1024,
+        )
+    )
+    engine.begin_connect()
+    _feed_connack_ok(engine)
+
+    for cycle in range(20):
+        handles = [
+            engine.queue_publish(
+                f"admission/sustained/{cycle}/{index}",
+                b"payload" * 8,
+                qos=1,
+            )
+            for index in range(50)
+        ]
+        engine.take_effects()
+        for handle in handles:
+            assert handle.mid is not None
+            _feed(engine, PubAckPacket(mid=handle.mid).encode())
+        engine.take_effects()
+        assert engine.pending_outbound_messages == 0
+        assert engine.pending_outbound_bytes == 0
+        assert engine.flow.inflight == 0
+        assert len(engine.packet_ids) == 0
+        assert list(engine.store.out_items()) == []
+
+    assert engine.outbound.pending_high_water_messages == 50
+    assert engine.outbound.pending_high_water_bytes > 0
