@@ -39,8 +39,12 @@ def _sample(
         text=True,
         env=env,
     )
-    lines = [line for line in proc.stdout.splitlines() if line.strip()]
-    return json.loads(lines[-1])
+    result_line = next(
+        line.removeprefix("RESULT ")
+        for line in reversed(proc.stdout.splitlines())
+        if line.startswith("RESULT ")
+    )
+    return json.loads(result_line)
 
 
 def main() -> None:
