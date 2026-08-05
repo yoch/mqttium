@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import pytest
 
-from mqttium.codec.buffer import IncrementalDecoder
+from mqttium.codec.buffer import _VIEW_COPY_THRESHOLD, IncrementalDecoder
 from mqttium.codec.vbi import decode_vbi, encode_vbi, vbi_len
-from mqttium.enums import PacketType
+from mqttium.enums import PacketType, QoS
 from mqttium.errors import MalformedPacketError, PacketTooLargeError
 from mqttium.packets import PublishPacket, encode_frame
 
@@ -41,10 +41,10 @@ def test_vbi_rejects_overlong() -> None:
 @pytest.mark.parametrize(
     "encoded",
     [
-        b"\x80\x00",  # zero encoded on two bytes
-        b"\x81\x00",  # one encoded on two bytes
-        b"\xff\x00",  # 127 encoded on two bytes
-        b"\x80\x81\x00",  # 128 encoded on three bytes
+        b"\x80\x00",
+        b"\x81\x00",
+        b"\xff\x00",
+        b"\x80\x81\x00",
     ],
 )
 def test_vbi_rejects_non_canonical_encoding(encoded: bytes) -> None:
@@ -137,3 +137,65 @@ def test_decoder_bounded_batch_rejects_invalid_byte_limit(limit: int) -> None:
     decoder = IncrementalDecoder()
     with pytest.raises(ValueError, match="max_bytes"):
         decoder.process_packets_bounded(lambda packet: None, limit=1, max_bytes=limit)
+
+
+@pytest.mark.parametrize(
+    "payload_size",
+    [
+        0,
+        1,
+        _VIEW_COPY_THRESHOLD - 1,
+        _VIEW_COPY_THRESHOLD,
+        _VIEW_COPY_THRESHOLD + 1,
+        4 * _VIEW_COPY_THRESHOLD,
+    ],
+)
+def test_both_body_copy_branches_produce_identical_owned_bytes(payload_size: int) -> None:
+    payload = bytes(range(256)) * (payload_size // 256) + bytes(range(payload_size % 256))
+    assert len(payload) == payload_size
+    wire = PublishPacket(
+        topic="t/threshold",
+        payload=payload,
+        qos=QoS.AT_LEAST_ONCE,
+        retain=False,
+        dup=False,
+        mid=9,
+    ).encode()
+
+    decoder = IncrementalDecoder()
+    decoder.feed(wire)
+    raw = decoder.next_packet()
+
+    assert raw is not None
+    assert type(raw.remaining) is bytes
+    packet = PublishPacket.decode(raw.flags, raw.remaining)
+    assert packet.payload == payload
+    assert packet.topic == "t/threshold"
+
+    decoder.feed(wire)
+    again = decoder.next_packet()
+    assert again is not None
+    assert again.remaining == raw.remaining
+
+
+def test_a_large_body_is_not_aliased_to_the_reusable_buffer() -> None:
+    payload = b"\xa5" * (4 * _VIEW_COPY_THRESHOLD)
+    wire = PublishPacket(
+        topic="t/alias",
+        payload=payload,
+        qos=QoS.AT_MOST_ONCE,
+        retain=False,
+        dup=False,
+    ).encode()
+
+    decoder = IncrementalDecoder()
+    decoder.feed(wire)
+    raw = decoder.next_packet()
+    assert raw is not None
+
+    snapshot = bytes(raw.remaining)
+    decoder.feed(b"\xff" * 512)
+    decoder.clear()
+    decoder.feed(wire)
+    decoder.next_packet()
+    assert raw.remaining == snapshot
