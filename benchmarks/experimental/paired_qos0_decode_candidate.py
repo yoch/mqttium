@@ -78,6 +78,8 @@ def main() -> None:
                         messages=args.messages,
                     )
         cycles.append(row)
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps({"cycles": cycles}, indent=2) + "\n")
 
     summary: dict[str, Any] = {}
     for scenario in scenarios:
@@ -88,16 +90,9 @@ def main() -> None:
                 / row["samples"][scenario][variant]["base"]["rate"]
                 for row in cycles
             ]
-            lag_ratios = [
-                row["samples"][scenario][variant]["candidate"]["loop_lag_p95_ms"]
-                / row["samples"][scenario][variant]["base"]["loop_lag_p95_ms"]
-                for row in cycles
-                if row["samples"][scenario][variant]["base"]["loop_lag_p95_ms"] > 0
-            ]
             summary[scenario][variant] = {
                 "rate_ratio_median": statistics.median(rate_ratios),
                 "rate_ratios": rate_ratios,
-                "loop_lag_p95_ratio_median": statistics.median(lag_ratios),
                 "base_rate_median": statistics.median(
                     row["samples"][scenario][variant]["base"]["rate"] for row in cycles
                 ),
@@ -107,7 +102,6 @@ def main() -> None:
             }
 
     result = {"cycles": cycles, "summary": summary}
-    args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(summary, indent=2))
 
