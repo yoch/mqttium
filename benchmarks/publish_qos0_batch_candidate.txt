@@ -1,1 +1,1 @@
-Diagnose the blocked full unit suite before publishing the measured candidate.
+Validate and publish the multi-message-only QoS 0 batching candidate if the full suite and smoke pass.
