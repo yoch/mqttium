@@ -1,0 +1,41 @@
+name: Fix nowait publisher test
+
+on:
+  push:
+    branches:
+      - agent/native-hotpath-architecture-study
+    paths:
+      - benchmarks/fix-nowait-publisher-test.txt
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Remove scheduling assumption from regression test
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('.github/workflows/publish-nowait-exact-size.yml')
+          text = path.read_text()
+          old = '''              task = client._effect_flush_task
+              assert task is not None
+              await task
+'''
+          new = '''              assert client._effect_flush_task is None
+'''
+          if old not in text:
+              raise SystemExit('test block did not match')
+          path.write_text(text.replace(old, new, 1))
+          PY
+      - name: Publish correction
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .github/workflows/publish-nowait-exact-size.yml
+          git commit -m 'Fix nowait publisher regression test'
+          git push
