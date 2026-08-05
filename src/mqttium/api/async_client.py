@@ -331,6 +331,87 @@ class AsyncClient:
     def effective_client_id(self) -> str:
         return self.negotiated.effective_client_id(self._engine.config.client_id)
 
+    @property
+    def last_disconnect(self) -> DisconnectInfo | None:
+        """Details from the most recent broker or transport disconnect."""
+        return self._last_disconnect
+
+    @property
+    def _compat_connection_settings(self) -> tuple[str, int, int]:
+        """Loop-confined connection target used by the Paho adapter."""
+        return self._host, self._port, self._engine.config.keepalive
+
+    def _reconfigure(self, **changes: Any) -> None:
+        """Internal loop-confined configuration boundary for adapters."""
+        self._engine.reconfigure(**changes)
+
+    def _queue_publish_on_loop(
+        self,
+        topic: str,
+        payload: bytes,
+        *,
+        qos: int | QoS,
+        retain: bool,
+        properties: Properties | None = None,
+    ) -> PublishReceipt:
+        """Admit one publish and register its receipt without flushing.
+
+        The caller must already execute synchronously on the client's event loop.
+        Keeping finalization separate lets adapters commit a bounded batch and
+        collect/drain effects once.
+        """
+        handle = self._engine.queue_publish(
+            topic,
+            payload,
+            qos=qos,
+            retain=retain,
+            properties=properties,
+        )
+        if handle.qos == QoS.AT_MOST_ONCE:
+            return PublishReceipt(mid=None, qos=handle.qos, _event=None)
+        assert handle.mid is not None
+        receipt = PublishReceipt(
+            mid=handle.mid,
+            qos=handle.qos,
+            _event=asyncio.Event(),
+        )
+        self._register_publish_receipt(handle.mid, receipt)
+        return receipt
+
+    def _queue_qos0_on_loop(
+        self,
+        topic: str,
+        payload: bytes,
+        *,
+        retain: bool,
+        properties: Properties | None = None,
+    ) -> None:
+        """Admit QoS 0 without allocating a receipt, for batched adapters."""
+        self._engine.queue_publish(
+            topic,
+            payload,
+            qos=QoS.AT_MOST_ONCE,
+            retain=retain,
+            properties=properties,
+        )
+
+    def _finalize_loop_commands(self) -> None:
+        """Collect engine effects and apply/schedule them without suspending."""
+        self._collect_effects_locked()
+        self._drain_effects_inline()
+
+    def _queue_subscribe_on_loop(
+        self,
+        topics: str | Iterable[str | tuple[str, SubscribeOptions | int | QoS]],
+        *,
+        qos: int | QoS = 0,
+        properties: Properties | None = None,
+    ) -> int:
+        return self._engine.queue_subscribe(topics, qos=qos, properties=properties)
+
+    def _queue_unsubscribe_on_loop(self, topics: str | Iterable[str]) -> int:
+        return self._engine.queue_unsubscribe(topics)
+
     async def connect(
         self,
         host: str,
@@ -510,6 +591,42 @@ class AsyncClient:
                     pass
             await self._force_close()
 
+    def publish_nowait(
+        self,
+        topic: str,
+        payload: bytes | str = b"",
+        *,
+        qos: int | QoS = 0,
+        retain: bool = False,
+        properties: Properties | None = None,
+    ) -> PublishReceipt:
+        """Queue a publication synchronously on the owning event-loop thread.
+
+        This is the non-suspending counterpart to ``publish(..., nowait=True)``.
+        It never waits for engine or writer capacity and raises ``FlowControlError``
+        immediately when either bound is full. Like ``asyncio.Queue.put_nowait()``,
+        it is loop-bound rather than thread-safe; cross-thread producers need an
+        adapter that hands work to the owning loop.
+        """
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "publish_nowait() must be called from the client's event-loop thread"
+            ) from exc
+        data = payload.encode("utf-8") if isinstance(payload, str) else payload
+        self._check_nowait_publish_capacity(topic, data, qos, retain, properties)
+        receipt = self._queue_publish_on_loop(
+            topic,
+            data,
+            qos=qos,
+            retain=retain,
+            properties=properties,
+        )
+        assert receipt is not None
+        self._finalize_loop_commands()
+        return receipt
+
     async def publish(
         self,
         topic: str,
@@ -527,13 +644,14 @@ class AsyncClient:
                 try:
                     if nowait:
                         self._check_nowait_publish_capacity(topic, data, qos, retain, properties)
-                    handle = self._engine.queue_publish(
+                    receipt = self._queue_publish_on_loop(
                         topic,
                         data,
                         qos=qos,
                         retain=retain,
                         properties=properties,
                     )
+                    assert receipt is not None
                 except FlowControlError as flow_exc:
                     if (
                         nowait
@@ -548,18 +666,7 @@ class AsyncClient:
                     self._publish_waiters += 1
                     wait_for_space = True
                 else:
-                    if handle.qos == QoS.AT_MOST_ONCE:
-                        receipt = PublishReceipt(mid=None, qos=handle.qos, _event=None)
-                    else:
-                        assert handle.mid is not None
-                        receipt = PublishReceipt(
-                            mid=handle.mid,
-                            qos=handle.qos,
-                            _event=asyncio.Event(),
-                        )
-                        self._register_publish_receipt(handle.mid, receipt)
-                    self._collect_effects_locked()
-                    self._drain_effects_inline()
+                    self._finalize_loop_commands()
             if not wait_for_space:
                 if self._pending_effects:
                     if nowait:
@@ -699,7 +806,7 @@ class AsyncClient:
     ) -> None:
         """Send a client AUTH packet (MQTT 5 continue / re-authenticate)."""
         async with self._engine_lock:
-            self._engine.config.accept_auth = True
+            self._engine.reconfigure(accept_auth=True)
             self._engine.queue_auth(reason_code=reason_code, properties=properties)
             self._collect_effects_locked()
         await self._drain_effects()
@@ -707,7 +814,7 @@ class AsyncClient:
     def set_auth_handler(self, handler: OnAuth | None) -> None:
         """Register or clear the enhanced-authentication handler."""
         self.auth_handler = handler
-        self._engine.config.accept_auth = handler is not None
+        self._engine.reconfigure(accept_auth=handler is not None)
 
     async def subscribe(
         self,
@@ -719,7 +826,7 @@ class AsyncClient:
     ) -> SubscribeResult:
         loop = asyncio.get_running_loop()
         async with self._engine_lock:
-            mid = self._engine.queue_subscribe(
+            mid = self._queue_subscribe_on_loop(
                 topics,
                 qos=qos,
                 properties=properties,
@@ -744,7 +851,7 @@ class AsyncClient:
     ) -> UnsubscribeResult:
         loop = asyncio.get_running_loop()
         async with self._engine_lock:
-            mid = self._engine.queue_unsubscribe(topics)
+            mid = self._queue_unsubscribe_on_loop(topics)
             fut: asyncio.Future[UnsubscribeResult] = loop.create_future()
             self._unsub_futs[mid] = fut
             self._collect_effects_locked()

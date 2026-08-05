@@ -34,6 +34,7 @@ SCENARIOS = (
     "ingress_engine_qos0",
     "effect_send_inline",
     "effect_batch_inline",
+    "native_publish_nowait_qos0",
 )
 
 
@@ -102,6 +103,29 @@ def _worker(args: argparse.Namespace) -> None:
             engine.take_effects()
 
         result = _measure(run_ingress, operations=80_000, warmup=2_000)
+    elif scenario == "native_publish_nowait_qos0":
+        client = AsyncClient(client_id="paired-native-nowait")
+        client._engine.state = ConnectionState.CONNECTED
+        payload = b"x"
+        use_native = hasattr(client, "publish_nowait")
+
+        async def run_native() -> WorkerResult:
+            warmup = 2_000
+            operations = 60_000
+            for index in range(warmup + operations):
+                if index == warmup:
+                    started = time.perf_counter()
+                if use_native:
+                    client.publish_nowait(topic, payload, qos=0)
+                else:
+                    await client.publish(topic, payload, qos=0, nowait=True)
+                item = client._outbound.get_nowait()
+                client._outbound_bytes -= len(item)
+                client._outbound.task_done()
+            elapsed = time.perf_counter() - started
+            return WorkerResult(scenario, elapsed, operations, operations / elapsed)
+
+        result = asyncio.run(run_native())
     elif scenario in ("effect_send_inline", "effect_batch_inline"):
         client = AsyncClient(client_id="paired-effects")
         client._engine.state = ConnectionState.CONNECTED

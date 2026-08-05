@@ -181,21 +181,21 @@ class Client:
         # Paho uses zero for unlimited; the native MQTTium API uses None.
         value = None if queue_size == 0 else queue_size
         self._run_loop_mutation(
-            lambda: self._async._engine.config.update(max_pending_outbound_messages=value)
+            lambda: self._async._reconfigure(max_pending_outbound_messages=value)
         )
 
     def max_queued_bytes_set(self, queue_size: int | None) -> None:
         if queue_size is not None and queue_size < 0:
             raise ValueError("queue_size must be non-negative or None")
         self._run_loop_mutation(
-            lambda: self._async._engine.config.update(max_pending_outbound_bytes=queue_size)
+            lambda: self._async._reconfigure(max_pending_outbound_bytes=queue_size)
         )
 
     def username_pw_set(self, username: str, password: bytes | str | None = None) -> None:
         pwd = password.encode("utf-8") if isinstance(password, str) else password
 
         def _set_credentials() -> None:
-            self._async._engine.config.update(
+            self._async._reconfigure(
                 username=username,
                 password=pwd,
             )
@@ -216,7 +216,7 @@ class Client:
             qos=QoS(qos),
             retain=retain,
         )
-        self._run_loop_mutation(lambda: self._async._engine.config.update(will=message))
+        self._run_loop_mutation(lambda: self._async._reconfigure(will=message))
 
     def message_callback_add(self, sub: str, callback: Callable[..., Any]) -> None:
         self._run_loop_mutation(lambda: self._topic_callbacks.__setitem__(sub, callback))
@@ -320,7 +320,7 @@ class Client:
             try:
                 handoff["result"] = command()
                 if flush_effects:
-                    await self._async._flush_effects()
+                    self._async._finalize_loop_commands()
             except BaseException as exc:
                 handoff["error"] = exc
             finally:
@@ -361,24 +361,19 @@ class Client:
 
         if self._on_network_thread():
             result = command()
-            self._async._collect_effects_locked()
-            self._async._drain_effects_inline()
+            self._async._finalize_loop_commands()
             return result
 
         return self._await_on_loop(command, flush_effects=True, what="command")
 
     def connect(self, host: str, port: int = 1883, keepalive: int = 60) -> int:
-        self._run_loop_mutation(lambda: self._async._engine.config.update(keepalive=keepalive))
+        self._run_loop_mutation(lambda: self._async._reconfigure(keepalive=keepalive))
         self._submit(self._async.connect(host, port))
         return 0
 
     def reconnect(self) -> int:
         host, port, keepalive = self._run_loop_mutation(
-            lambda: (
-                self._async._host,
-                self._async._port,
-                self._async._engine.config.keepalive,
-            )
+            lambda: self._async._compat_connection_settings
         )
         if not host:
             raise RuntimeError("reconnect() called before connect()")
@@ -473,24 +468,17 @@ class Client:
                 )
 
     def _commit_qosn_publish_on_loop(self, request: _PendingPublish) -> MQTTMessageInfo:
-        handle = self._async._engine.queue_publish(
+        receipt = self._async._queue_publish_on_loop(
             request.topic,
             request.payload if request.payload is not None else b"",
             qos=request.qos,
             retain=request.retain,
         )
-        assert handle.mid is not None
-        receipt = PublishReceipt(
-            mid=handle.mid,
-            qos=handle.qos,
-            _event=asyncio.Event(),
-        )
-        self._async._register_publish_receipt(handle.mid, receipt)
+        assert receipt is not None and receipt.mid is not None
         return MQTTMessageInfo(mid=receipt.mid, _receipt=receipt, _loop=self._loop)
 
     def _finalize_publish_effects(self) -> None:
-        self._async._collect_effects_locked()
-        self._async._drain_effects_inline()
+        self._async._finalize_loop_commands()
 
     def _drain_publish_requests(self) -> None:
         """Commit a bounded mixed-QoS batch on the owning network loop."""
@@ -512,10 +500,9 @@ class Client:
                 continue
             try:
                 if request.qos is QoS.AT_MOST_ONCE:
-                    self._async._engine.queue_publish(
+                    self._async._queue_qos0_on_loop(
                         request.topic,
                         request.payload if request.payload is not None else b"",
-                        qos=request.qos,
                         retain=request.retain,
                     )
                     committed = True
@@ -614,21 +601,18 @@ class Client:
 
         if self._on_network_thread():
             try:
-                if requested_qos is QoS.AT_MOST_ONCE:
-                    self._async._engine.queue_publish(
-                        topic,
-                        data,
-                        qos=requested_qos,
-                        retain=retain,
-                    )
-                    info = MQTTMessageInfo(
-                        mid=None,
-                        _receipt=PublishReceipt(mid=None, qos=requested_qos, _event=None),
-                        _loop=self._loop,
-                    )
-                else:
-                    request = _PendingPublish(topic, data, retain, requested_qos, None)
-                    info = self._commit_qosn_publish_on_loop(request)
+                receipt = self._async._queue_publish_on_loop(
+                    topic,
+                    data,
+                    qos=requested_qos,
+                    retain=retain,
+                )
+                assert receipt is not None
+                info = MQTTMessageInfo(
+                    mid=receipt.mid,
+                    _receipt=receipt,
+                    _loop=self._loop,
+                )
             except FlowControlError:
                 return MQTTMessageInfo(mid=None, rc=MQTT_ERR_QUEUE_SIZE)
             self._finalize_publish_effects()
@@ -672,11 +656,11 @@ class Client:
 
     def subscribe(self, topic: str, qos: int = 0) -> tuple[int, int]:
         """Paho-style: return ``(0, mid)`` without awaiting SUBACK."""
-        mid = self._queue_loop_command(lambda: self._async._engine.queue_subscribe(topic, qos=qos))
+        mid = self._queue_loop_command(lambda: self._async._queue_subscribe_on_loop(topic, qos=qos))
         return (0, mid)
 
     def unsubscribe(self, topic: str) -> tuple[int, int]:
-        mid = self._queue_loop_command(lambda: self._async._engine.queue_unsubscribe(topic))
+        mid = self._queue_loop_command(lambda: self._async._queue_unsubscribe_on_loop(topic))
         return (0, mid)
 
     def _on_loop_in_callback(self) -> bool:
@@ -720,7 +704,7 @@ class Client:
         cb = self.on_disconnect
         if cb is None:
             return
-        info = self._async._last_disconnect
+        info = self._async.last_disconnect
         from_broker = bool(info and info.from_broker)
         reason = info.reason_code if info is not None else (0 if exc is None else 1)
         props = info.properties if info is not None else None

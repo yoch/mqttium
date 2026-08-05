@@ -96,6 +96,20 @@ du pump sur l'instance et l'effet est appliqué inline. Les effets asynchrones
 seuls sont tagués par epoch et repris par le worker. Les anciens attributs de
 diagnostic d'`AsyncClient` sont des vues en lecture, pas un second état.
 
+### Commandes loop-bound et façade Paho
+
+`AsyncClient.publish_nowait()` est une primitive synchrone mais attachée au
+thread de l'event loop, analogue à `asyncio.Queue.put_nowait()`. Elle partage
+l'admission, la création des receipts et l'application coalescée des effets
+avec `publish()`, sans créer de coroutine. Elle n'est volontairement pas une
+API thread-safe : la façade Paho garde sa file inter-thread bornée et commit
+un batch sur le loop avant de finaliser les effets une seule fois.
+
+La façade Paho ne touche plus directement `ProtocolEngine`, les registres de
+receipts ou `EffectPump`. Elle passe par une petite frontière interne
+loop-confined d'`AsyncClient`, afin de préserver le batching et les fast paths
+sans introduire de bus de commandes générique.
+
 ### Découpage interne du moteur
 
 `ProtocolEngine` orchestre la machine d'état de connexion et le dispatch des
