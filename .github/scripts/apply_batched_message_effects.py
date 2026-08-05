@@ -35,6 +35,7 @@ def patch_effects(root: Path) -> None:
                         await self.owner._apply_effect(effect, nowait=False, epoch=epoch)
 '''
     new = '''                while self.pending:
+                    effect = self.pending[0]
                     epoch = self.pending_epoch
                     if epoch is None:
                         self.pending.clear()
@@ -42,18 +43,18 @@ def patch_effects(root: Path) -> None:
                     if epoch != self.owner._connection_epoch:
                         self.discard_connection_effects()
                         continue
-                    applied_inline = self.owner._apply_message_effect_batch_inline(
-                        self.pending, epoch
-                    )
-                    if applied_inline:
-                        for _ in range(applied_inline):
-                            self.pending.popleft()
-                            self.inline_effects += 1
-                            self._complete()
-                        if not self.pending:
-                            self.pending_epoch = None
-                        continue
-                    effect = self.pending[0]
+                    if effect.kind is EffectKind.MESSAGE:
+                        applied_inline = self.owner._apply_message_effect_batch_inline(
+                            self.pending, epoch
+                        )
+                        if applied_inline:
+                            for _ in range(applied_inline):
+                                self.pending.popleft()
+                                self.inline_effects += 1
+                                self._complete()
+                            if not self.pending:
+                                self.pending_epoch = None
+                            continue
                     try:
                         await self.owner._apply_effect(effect, nowait=False, epoch=epoch)
 '''
@@ -71,6 +72,9 @@ def patch_client(root: Path) -> None:
         epoch: int,
     ) -> int:
         if epoch != self._connection_epoch or not effects:
+            return 0
+        first: Message = effects[0].data
+        if first.qos != QoS.AT_MOST_ONCE:
             return 0
         callback = self.on_message
         callback_delivery = callback is not None and self._message_delivery in (
