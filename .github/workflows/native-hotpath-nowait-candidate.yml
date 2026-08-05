@@ -1,0 +1,237 @@
+name: Native hotpath nowait sizing candidate
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - agent/native-hotpath-architecture-study
+    paths:
+      - .github/workflows/native-hotpath-nowait-candidate.yml
+
+permissions:
+  contents: read
+
+jobs:
+  candidate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    steps:
+      - name: Check out study harness
+        uses: actions/checkout@v7
+        with:
+          path: harness
+      - name: Check out base
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          path: base
+      - name: Check out candidate
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          path: candidate
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install shared dependencies and broker
+        run: |
+          python -m pip install pytest ruff mypy bandit gmqtt==0.7.0
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mosquitto
+      - name: Apply exact-size candidate
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          outbound_path = Path('candidate/src/mqttium/protocol/outbound.py')
+          outbound = outbound_path.read_text()
+          old_import = 'from mqttium.codec.vbi import encode_vbi\n'
+          assert old_import in outbound
+          outbound = outbound.replace(old_import, 'from mqttium.codec.vbi import vbi_len\n', 1)
+
+          marker = '''    def _check_publish_wire_size(\n        self,\n        topic_bytes: int,\n        wire_property_bytes: int,\n        payload_size: int,\n        qos: QoS,\n    ) -> None:\n'''
+          assert marker in outbound
+          helpers = '''    @staticmethod\n    def _publish_wire_size_from_parts(\n        topic_bytes: int,\n        wire_property_bytes: int,\n        payload_size: int,\n        qos: QoS,\n    ) -> int:\n        remaining = 2 + topic_bytes + (2 if qos else 0) + wire_property_bytes + payload_size\n        return 1 + vbi_len(remaining) + remaining\n\n    def publish_wire_size(\n        self,\n        topic: str,\n        payload_size: int,\n        qos: QoS | int,\n        properties: Properties | None,\n    ) -> int:\n        level = QoS(qos)\n        topic_bytes, wire_property_bytes, _ = self.size_parts(topic, properties)\n        return self._publish_wire_size_from_parts(\n            topic_bytes, wire_property_bytes, payload_size, level\n        )\n\n'''
+          outbound = outbound.replace(marker, helpers + marker, 1)
+          old_size = '''        remaining = 2 + topic_bytes + (2 if qos else 0) + wire_property_bytes + payload_size\n        encoded_size = 1 + len(encode_vbi(remaining)) + remaining\n'''
+          new_size = '''        encoded_size = self._publish_wire_size_from_parts(\n            topic_bytes, wire_property_bytes, payload_size, qos\n        )\n'''
+          assert old_size in outbound
+          outbound = outbound.replace(old_size, new_size, 1)
+          outbound_path.write_text(outbound)
+
+          client_path = Path('candidate/src/mqttium/api/async_client.py')
+          client = client_path.read_text()
+          client = client.replace(
+              'from mqttium.transport.writes import WriteItem, item_size\n',
+              'from mqttium.transport.writes import WriteItem\n',
+              1,
+          )
+          old_preview = '''    def _preview_publish_write(\n        self,\n        topic: str,\n        payload: bytes,\n        qos: QoS | int,\n        retain: bool,\n        properties: Properties | None,\n    ) -> WriteItem:\n        level = QoS(qos)\n        return PublishPacket(\n            topic=topic,\n            payload=payload,\n            qos=level,\n            retain=retain,\n            dup=False,\n            mid=None if level == QoS.AT_MOST_ONCE else 1,\n            properties=properties,\n        ).encode_write_item(self._engine.config.protocol)\n\n'''
+          new_preview = '''    def _preview_publish_size(\n        self,\n        topic: str,\n        payload: bytes,\n        qos: QoS | int,\n        properties: Properties | None,\n    ) -> int:\n        return self._engine.outbound.publish_wire_size(\n            topic, len(payload), qos, properties\n        )\n\n'''
+          assert old_preview in client
+          client = client.replace(old_preview, new_preview, 1)
+          old_single = 'size = item_size(self._preview_publish_write(topic, payload, level, retain, properties))'
+          new_single = 'size = self._preview_publish_size(topic, payload, level, properties)'
+          assert old_single in client
+          client = client.replace(old_single, new_single, 1)
+          old_many = 'size = item_size(self._preview_publish_write(topic, payload, level, retain, properties))'
+          assert old_many in client
+          client = client.replace(old_many, new_single, 1)
+          client_path.write_text(client)
+          PY
+          git -C candidate diff --check
+      - name: Validate candidate source
+        working-directory: candidate
+        run: |
+          python -m pip install -e ".[dev,security]"
+          ruff format src/mqttium/api/async_client.py src/mqttium/protocol/outbound.py
+          ruff format --check src tests benchmarks
+          ruff check src tests benchmarks
+          mypy src/mqttium
+          bandit -q -ll -r src
+          python -m pytest -q tests/unit
+      - name: Start isolated Mosquitto
+        run: |
+          mkdir -p /tmp/mqttium-nowait
+          cat > /tmp/mqttium-nowait/mosquitto.conf <<'MOSQ'
+          persistence false
+          allow_anonymous true
+          max_inflight_messages 1000
+          max_queued_messages 1000000
+          max_queued_bytes 0
+          connection_messages false
+          log_type error
+          listener 11883 127.0.0.1
+          MOSQ
+          mosquitto -c /tmp/mqttium-nowait/mosquitto.conf \
+            > /tmp/mqttium-nowait/mosquitto.log 2>&1 &
+          for i in $(seq 1 60); do
+            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            sleep 0.2
+          done
+          exit 1
+      - name: Recover corrected native harness
+        run: |
+          python - <<'PY'
+          import base64
+          import gzip
+          from pathlib import Path
+
+          workflow = Path('harness/.github/workflows/native-hotpath-study.yml').read_text().splitlines()
+          start = next(i for i, line in enumerate(workflow) if "cat > /tmp/native-hotpath.b64" in line) + 1
+          end = next(i for i in range(start, len(workflow)) if workflow[i].strip() == "B64")
+          payload = "".join(line.strip() for line in workflow[start:end])
+          source = gzip.decompress(base64.b64decode(payload)).decode()
+          source = source.replace("max_pending_callbacks=max(65_536, count),", "max_pending_callbacks=8_192,")
+          source = source.replace("max_pending_callbacks=65_536,", "max_pending_callbacks=8_192,")
+          Path('/tmp/native_hotpath_matrix.py').write_text(source)
+          PY
+          python -m py_compile /tmp/native_hotpath_matrix.py
+      - name: Rotated RTT A/B
+        run: |
+          cat > /tmp/paired_nowait.py <<'PY'
+          from __future__ import annotations
+
+          import json
+          import os
+          import statistics
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          roots = {'base': Path('base').resolve(), 'candidate': Path('candidate').resolve()}
+          variants = ('mqttium-await', 'mqttium-nowait', 'mqttium-sync-inline-nowait')
+          cycles = []
+
+          def sample(root, variant, cycle):
+              env = os.environ.copy()
+              env['PYTHONPATH'] = str(roots[root] / 'src')
+              proc = subprocess.run(
+                  [
+                      sys.executable, '/tmp/native_hotpath_matrix.py', '--worker',
+                      '--scenario', 'rtt', '--variant', variant,
+                      '--pairs', '12000', '--window', '32',
+                  ],
+                  check=True, capture_output=True, text=True, env=env,
+              )
+              lines = [line for line in proc.stdout.splitlines() if line.strip()]
+              return json.loads(lines[-1])
+
+          for cycle in range(7):
+              order = ('base', 'candidate') if cycle % 2 == 0 else ('candidate', 'base')
+              row = {'cycle': cycle, 'order': order, 'samples': {}}
+              for variant in variants:
+                  row['samples'][variant] = {}
+                  for root in order:
+                      row['samples'][variant][root] = sample(root, variant, cycle)
+              cycles.append(row)
+
+          summary = {}
+          for variant in variants:
+              ratios = [
+                  row['samples'][variant]['candidate']['rate']
+                  / row['samples'][variant]['base']['rate']
+                  for row in cycles
+              ]
+              p50_ratios = [
+                  row['samples'][variant]['candidate']['p50_ms']
+                  / row['samples'][variant]['base']['p50_ms']
+                  for row in cycles
+              ]
+              p95_ratios = [
+                  row['samples'][variant]['candidate']['p95_ms']
+                  / row['samples'][variant]['base']['p95_ms']
+                  for row in cycles
+              ]
+              summary[variant] = {
+                  'rate_ratio_median': statistics.median(ratios),
+                  'rate_ratios': ratios,
+                  'p50_ratio_median': statistics.median(p50_ratios),
+                  'p95_ratio_median': statistics.median(p95_ratios),
+                  'base_rate_median': statistics.median(
+                      row['samples'][variant]['base']['rate'] for row in cycles
+                  ),
+                  'candidate_rate_median': statistics.median(
+                      row['samples'][variant]['candidate']['rate'] for row in cycles
+                  ),
+              }
+          result = {'cycles': cycles, 'summary': summary}
+          Path('/tmp/mqttium-nowait/paired-nowait.json').write_text(json.dumps(result, indent=2) + '\n')
+          print(json.dumps(summary, indent=2))
+          PY
+          python /tmp/paired_nowait.py
+      - name: Verify encode count under profile
+        run: |
+          PYTHONPATH=candidate/src python -m cProfile -o /tmp/mqttium-nowait/candidate.prof \
+            /tmp/native_hotpath_matrix.py --worker --scenario rtt \
+            --variant mqttium-sync-inline-nowait --pairs 5000 --window 32
+          python - <<'PY'
+          import json
+          import pstats
+          from pathlib import Path
+
+          stats = pstats.Stats('/tmp/mqttium-nowait/candidate.prof')
+          calls = 0
+          total = 0.0
+          for (filename, _line, func), (_cc, nc, tt, _ct, _callers) in stats.stats.items():
+              if filename.endswith('/packets/publish.py') and func == 'encode_write_item':
+                  calls += nc
+                  total += tt
+          result = {'encode_write_item_calls': calls, 'encode_write_item_self_seconds': total}
+          assert calls == 10_000, result
+          Path('/tmp/mqttium-nowait/profile-count.json').write_text(json.dumps(result, indent=2) + '\n')
+          print(json.dumps(result, indent=2))
+          PY
+      - name: Upload candidate evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-hotpath-nowait-candidate-${{ github.run_id }}
+          path: |
+            /tmp/mqttium-nowait/*.json
+            /tmp/mqttium-nowait/mosquitto.log
+          if-no-files-found: warn
+          retention-days: 30
