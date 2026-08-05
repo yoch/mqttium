@@ -1,0 +1,320 @@
+name: Native hotpath decomposition
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - agent/native-hotpath-architecture-study
+    paths:
+      - .github/workflows/native-hotpath-decompose.yml
+
+permissions:
+  contents: read
+
+jobs:
+  decompose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install package
+        run: python -m pip install -e ".[dev]" gmqtt==0.7.0
+      - name: Decompose synchronous MQTTium ingress core
+        run: |
+          mkdir -p /tmp/mqttium-decompose
+          cat > /tmp/decompose_ingress.py <<'PY'
+          from __future__ import annotations
+
+          import gc
+          import json
+          import statistics
+          import struct
+          import time
+
+          from mqttium.codec.buffer import IncrementalDecoder
+          from mqttium.enums import ConnectionState, MQTTProtocolVersion
+          from mqttium.packets import PublishPacket
+          from mqttium.protocol.engine import EngineConfig, ProtocolEngine
+
+          COUNT = 300_000
+          TOPIC = 'bench/native-hotpath/telemetry'
+          PAYLOAD = b't' * 256
+          PROTOCOL = MQTTProtocolVersion.MQTTv311
+
+          def vbi(value: int) -> bytes:
+              out = bytearray()
+              while True:
+                  value, digit = divmod(value, 128)
+                  if value:
+                      digit |= 0x80
+                  out.append(digit)
+                  if not value:
+                      return bytes(out)
+
+          topic = TOPIC.encode()
+          body = struct.pack('!H', len(topic)) + topic + PAYLOAD
+          frame = b'\x30' + vbi(len(body)) + body
+          per_chunk = max(1, (256 * 1024) // len(frame))
+          chunk = frame * per_chunk
+
+          def run(factory):
+              rates = []
+              effect_counts = []
+              for _ in range(7):
+                  decoder = IncrementalDecoder()
+                  handler, effects = factory()
+                  remaining = COUNT
+                  seen = 0
+                  gc.collect()
+                  started = time.perf_counter()
+                  while remaining:
+                      take = min(per_chunk, remaining)
+                      decoder.feed(chunk if take == per_chunk else frame * take)
+                      remaining -= take
+                      while decoder.buffered:
+                          processed, _bytes = decoder.process_packets_bounded(
+                              handler,
+                              limit=256,
+                              max_bytes=1 << 20,
+                          )
+                          if not processed:
+                              break
+                          seen += processed
+                  elapsed = time.perf_counter() - started
+                  assert seen == COUNT
+                  rates.append(COUNT / elapsed)
+                  effect_counts.append(effects())
+              return {
+                  'median': statistics.median(rates),
+                  'samples': rates,
+                  'effects_median': statistics.median(effect_counts),
+              }
+
+          def noop_factory():
+              return (lambda raw: None), (lambda: 0)
+
+          def minimal_factory():
+              def handle(raw):
+                  remaining = raw.remaining
+                  length = (remaining[0] << 8) | remaining[1]
+                  remaining[2:2 + length].decode('utf-8')
+                  remaining[2 + length:]
+              return handle, (lambda: 0)
+
+          def packet_factory():
+              return (
+                  lambda raw: PublishPacket.decode(raw.flags, raw.remaining, PROTOCOL),
+                  lambda: 0,
+              )
+
+          def inbound_factory():
+              engine = ProtocolEngine(EngineConfig(protocol=PROTOCOL))
+              engine.state = ConnectionState.CONNECTED
+              effect_count = 0
+              def handle(raw):
+                  nonlocal effect_count
+                  engine.inbound.on_publish(raw)
+                  effect_count += len(engine.take_effects())
+              return handle, lambda: effect_count
+
+          def engine_factory():
+              engine = ProtocolEngine(EngineConfig(protocol=PROTOCOL))
+              engine.state = ConnectionState.CONNECTED
+              effect_count = 0
+              def handle(raw):
+                  nonlocal effect_count
+                  engine.handle_raw(raw)
+                  effect_count += len(engine.take_effects())
+              return handle, lambda: effect_count
+
+          result = {
+              'decoder_raw': run(noop_factory),
+              'decoder_minimal_publish': run(minimal_factory),
+              'decoder_publish_packet': run(packet_factory),
+              'decoder_inbound_session': run(inbound_factory),
+              'decoder_protocol_engine': run(engine_factory),
+          }
+          print(json.dumps(result, indent=2))
+          open('/tmp/mqttium-decompose/ingress-decomposition.json', 'w').write(
+              json.dumps(result, indent=2) + '\n'
+          )
+          PY
+          python /tmp/decompose_ingress.py
+      - name: Measure exact-size versus preview encode
+        run: |
+          cat > /tmp/measure_sizes.py <<'PY'
+          from __future__ import annotations
+
+          import json
+          import statistics
+          import time
+
+          from mqttium.api import AsyncClient
+          from mqttium.enums import QoS
+          from mqttium.packets import PublishPacket
+          from mqttium.codec.vbi import encode_vbi
+
+          COUNT = 200_000
+          TOPIC = 'bench/rtt/request'
+          PAYLOAD = b'r' * 64
+
+          client = AsyncClient()
+          protocol = client._engine.config.protocol
+
+          def preview_encode():
+              item = PublishPacket(
+                  topic=TOPIC,
+                  payload=PAYLOAD,
+                  qos=QoS.AT_LEAST_ONCE,
+                  retain=False,
+                  dup=False,
+                  mid=1,
+                  properties=None,
+              ).encode_write_item(protocol)
+              return len(item) if isinstance(item, bytes) else len(item[0]) + len(item[1])
+
+          topic_bytes = len(TOPIC.encode('utf-8'))
+          remaining = 2 + topic_bytes + 2 + len(PAYLOAD)
+          expected = 1 + len(encode_vbi(remaining)) + remaining
+
+          def exact_arithmetic():
+              topic_size = len(TOPIC) if TOPIC.isascii() else len(TOPIC.encode('utf-8'))
+              remaining_size = 2 + topic_size + 2 + len(PAYLOAD)
+              return 1 + len(encode_vbi(remaining_size)) + remaining_size
+
+          assert preview_encode() == expected == exact_arithmetic()
+
+          def bench(fn):
+              samples = []
+              value = None
+              for _ in range(11):
+                  started = time.perf_counter()
+                  for _ in range(COUNT):
+                      value = fn()
+                  samples.append(COUNT / (time.perf_counter() - started))
+              return {'median_ops_s': statistics.median(samples), 'samples': samples, 'value': value}
+
+          result = {'preview_encode': bench(preview_encode), 'exact_arithmetic': bench(exact_arithmetic)}
+          print(json.dumps(result, indent=2))
+          open('/tmp/mqttium-decompose/nowait-size-micro.json', 'w').write(
+              json.dumps(result, indent=2) + '\n'
+          )
+          PY
+          python /tmp/measure_sizes.py
+      - name: Fixed-work allocation peaks
+        run: |
+          python - <<'PY'
+          import asyncio
+          import json
+          import struct
+          import tracemalloc
+          from collections import deque
+
+          from mqttium.api import AsyncClient
+
+          PAYLOAD = b't' * 256
+          TOPIC = 'bench/direct/telemetry'
+          COUNT = 50_000
+
+          def vbi(value):
+              out = bytearray()
+              while True:
+                  value, digit = divmod(value, 128)
+                  if value:
+                      digit |= 0x80
+                  out.append(digit)
+                  if not value:
+                      return bytes(out)
+
+          topic = TOPIC.encode()
+          body = struct.pack('!H', len(topic)) + topic + PAYLOAD
+          frame = b'\x30' + vbi(len(body)) + body
+
+          class Transport:
+              def __init__(self):
+                  self.incoming = asyncio.Queue()
+                  self.pending = deque()
+                  self.closing = False
+              async def write(self, data):
+                  kind = data[0] >> 4
+                  if kind == 1:
+                      self.incoming.put_nowait(b'\x20\x02\x00\x00')
+                  elif kind == 8:
+                      pos = 1
+                      while data[pos] & 0x80:
+                          pos += 1
+                      pos += 1
+                      self.incoming.put_nowait(b'\x90\x03' + data[pos:pos+2] + b'\x00')
+              async def write_many(self, parts):
+                  for part in parts:
+                      await self.write(part)
+              async def read(self, n=65536):
+                  if self.pending:
+                      data = self.pending.popleft()
+                  else:
+                      data = await self.incoming.get()
+                  if data is None:
+                      return b''
+                  if len(data) > n:
+                      self.pending.appendleft(data[n:])
+                      return data[:n]
+                  return data
+              async def close(self):
+                  self.closing = True
+                  self.incoming.put_nowait(None)
+              def is_closing(self):
+                  return self.closing
+
+          async def run():
+              transport = Transport()
+              client = AsyncClient(message_delivery='callback', max_pending_callbacks=8192)
+              async def factory(*args, **kwargs):
+                  return transport
+              client._transport_factory = factory
+              delivered = 0
+              done = asyncio.Event()
+              def receive(message):
+                  nonlocal delivered
+                  delivered += 1
+                  if delivered == COUNT:
+                      done.set()
+              client.on_message = receive
+              await client.connect('probe', 0)
+              await client.subscribe(TOPIC, qos=0)
+              per = max(1, 65536 // len(frame))
+              tracemalloc.start()
+              for start in range(0, COUNT, per):
+                  transport.incoming.put_nowait(frame * min(per, COUNT-start))
+              await done.wait()
+              current, peak = tracemalloc.get_traced_memory()
+              tracemalloc.stop()
+              stats = client.stats()
+              await client.disconnect()
+              return {
+                  'delivered': delivered,
+                  'current_bytes': current,
+                  'peak_bytes': peak,
+                  'callback_high_water': stats.delivery.callback_queued,
+                  'decoder_high_water': stats.decoder.high_water_bytes,
+              }
+
+          result = asyncio.run(run())
+          print(json.dumps(result, indent=2))
+          open('/tmp/mqttium-decompose/ingress-tracemalloc.json', 'w').write(
+              json.dumps(result, indent=2) + '\n'
+          )
+          PY
+      - name: Upload decomposition evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-hotpath-decomposition-${{ github.run_id }}
+          path: /tmp/mqttium-decompose/*
+          if-no-files-found: warn
+          retention-days: 30
