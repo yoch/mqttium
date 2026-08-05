@@ -1,0 +1,143 @@
+name: Native RTT paired probe
+
+on:
+  push:
+    branches:
+      - agent/native-rtt-ingress-hotpath
+    paths:
+      - .github/workflows/native-rtt-paired-probe.yml
+
+permissions:
+  contents: read
+
+jobs:
+  paired:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out candidate
+        uses: actions/checkout@v7
+        with:
+          path: candidate
+      - name: Check out base
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          path: base
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Start isolated broker
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mosquitto
+          printf 'listener 11883 127.0.0.1\nallow_anonymous true\npersistence false\nmax_queued_messages 1000000\n' > /tmp/mqttium-rtt.conf
+          mosquitto -c /tmp/mqttium-rtt.conf -d
+          for i in $(seq 1 60); do
+            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            sleep 0.25
+          done
+          exit 1
+      - name: Prepare isolated environments
+        run: |
+          cp candidate/benchmarks/native_rtt_ingress.py /tmp/native_rtt_ingress.py
+          python -m venv /tmp/mqttium-base
+          python -m venv /tmp/mqttium-candidate
+          /tmp/mqttium-base/bin/pip install -e ./base
+          /tmp/mqttium-candidate/bin/pip install -e ./candidate
+          mkdir -p /tmp/native-rtt-paired
+      - name: Six ABBA cycles
+        run: |
+          set -euo pipefail
+          for cycle in $(seq 1 6); do
+            PYTHONPATH=base/src /tmp/mqttium-base/bin/python /tmp/native_rtt_ingress.py \
+              --scenario rtt --runs 1 --rtt-pairs 16000 \
+              --label "base-${cycle}-a" \
+              --output "/tmp/native-rtt-paired/base-${cycle}-a.json"
+            PYTHONPATH=candidate/src /tmp/mqttium-candidate/bin/python /tmp/native_rtt_ingress.py \
+              --scenario rtt --runs 1 --rtt-pairs 16000 \
+              --label "candidate-${cycle}-a" \
+              --output "/tmp/native-rtt-paired/candidate-${cycle}-a.json"
+            PYTHONPATH=candidate/src /tmp/mqttium-candidate/bin/python /tmp/native_rtt_ingress.py \
+              --scenario rtt --runs 1 --rtt-pairs 16000 \
+              --label "candidate-${cycle}-b" \
+              --output "/tmp/native-rtt-paired/candidate-${cycle}-b.json"
+            PYTHONPATH=base/src /tmp/mqttium-base/bin/python /tmp/native_rtt_ingress.py \
+              --scenario rtt --runs 1 --rtt-pairs 16000 \
+              --label "base-${cycle}-b" \
+              --output "/tmp/native-rtt-paired/base-${cycle}-b.json"
+          done
+      - name: Compare paired cycles
+        run: |
+          python - <<'PY'
+          import json
+          import statistics
+          from pathlib import Path
+
+          root = Path('/tmp/native-rtt-paired')
+          cycles = []
+          base_rates = []
+          candidate_rates = []
+          base_p50 = []
+          candidate_p50 = []
+          base_p95 = []
+          candidate_p95 = []
+          base_suspensions = []
+          candidate_suspensions = []
+          for cycle in range(1, 7):
+              docs = {
+                  key: json.loads((root / f'{key}-{cycle}-{side}.json').read_text())
+                  for key in ('base', 'candidate')
+                  for side in ('a', 'b')
+              }
+              base = [docs[f'base-{side}']['rtt'] for side in ('a', 'b')]
+              candidate = [docs[f'candidate-{side}']['rtt'] for side in ('a', 'b')]
+              b_rate = statistics.median(item['rate_median'] for item in base)
+              c_rate = statistics.median(item['rate_median'] for item in candidate)
+              cycle_ratio = c_rate / b_rate
+              cycles.append({'cycle': cycle, 'base': b_rate, 'candidate': c_rate, 'ratio': cycle_ratio})
+              base_rates.extend(item['rate_median'] for item in base)
+              candidate_rates.extend(item['rate_median'] for item in candidate)
+              base_p50.extend(item['p50_ms_median'] for item in base)
+              candidate_p50.extend(item['p50_ms_median'] for item in candidate)
+              base_p95.extend(item['p95_ms_median'] for item in base)
+              candidate_p95.extend(item['p95_ms_median'] for item in candidate)
+              for item in base:
+                  counters = item['counters'][0]
+                  base_suspensions.append(
+                      counters['initiator_effect_suspensions']
+                      + counters['responder_effect_suspensions']
+                  )
+              for item in candidate:
+                  counters = item['counters'][0]
+                  candidate_suspensions.append(
+                      counters['initiator_effect_suspensions']
+                      + counters['responder_effect_suspensions']
+                  )
+          result = {
+              'cycles': cycles,
+              'rate': {
+                  'base_median': statistics.median(base_rates),
+                  'candidate_median': statistics.median(candidate_rates),
+                  'paired_ratio_median': statistics.median(item['ratio'] for item in cycles),
+              },
+              'latency': {
+                  'base_p50_median': statistics.median(base_p50),
+                  'candidate_p50_median': statistics.median(candidate_p50),
+                  'base_p95_median': statistics.median(base_p95),
+                  'candidate_p95_median': statistics.median(candidate_p95),
+              },
+              'effect_suspensions': {
+                  'base_median': statistics.median(base_suspensions),
+                  'candidate_median': statistics.median(candidate_suspensions),
+              },
+          }
+          (root / 'comparison.json').write_text(json.dumps(result, indent=2) + '\n')
+          print(json.dumps(result, indent=2))
+          PY
+      - name: Upload measurements
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-rtt-paired-${{ github.run_id }}
+          path: /tmp/native-rtt-paired
+          retention-days: 14
