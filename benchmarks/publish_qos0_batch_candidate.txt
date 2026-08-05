@@ -1,1 +1,1 @@
-Republish the clean candidate validated by run 31049968366 after publication-script correction.
+Publish the clean candidate validated by run 31049968366 using the repository CI lint scope.
