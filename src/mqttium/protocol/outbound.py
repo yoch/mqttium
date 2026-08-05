@@ -44,6 +44,7 @@ from mqttium.persistence.memory import PagedInflightStore, TransitionInflightSto
 from mqttium.protocol.effects import EffectKind, PublishFailure, PublishHandle
 from mqttium.protocol.flow_control import FlowControl
 from mqttium.protocol.packet_ids import PacketIdPool
+from mqttium.protocol.stats import OutboundStats
 from mqttium.topics import validate_publish_topic
 from mqttium.transport.writes import WriteItem
 from mqttium.types import OutboundMessage, OutboundMessageSummary, Properties
@@ -177,6 +178,26 @@ class OutboundSession:
             self._pending_high_water_bytes = self._pending_bytes
         self._pending_messages -= 1
         self._pending_bytes -= logical_size
+
+    def stats(self) -> OutboundStats:
+        """Snapshot this session's own accounting.
+
+        The high-water fields are sampled lazily on release, so a snapshot taken
+        while records are still in flight compares them against the live value.
+        """
+        flow = self.flow
+        return OutboundStats(
+            pending_messages=self._pending_messages,
+            pending_bytes=self._pending_bytes,
+            pending_high_water_messages=max(
+                self._pending_high_water_messages, self._pending_messages
+            ),
+            pending_high_water_bytes=max(self._pending_high_water_bytes, self._pending_bytes),
+            queued_messages=len(self._queued),
+            flow_inflight=flow.inflight,
+            flow_limit=flow.limit,
+            packet_ids_in_use=len(self.packet_ids),
+        )
 
     # --- admission rollback --------------------------------------------------
 

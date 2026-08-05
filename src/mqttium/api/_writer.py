@@ -13,6 +13,7 @@ from collections.abc import Awaitable, Callable
 
 from mqttium.api._effects import StaleConnectionEffect
 from mqttium.errors import FlowControlError
+from mqttium.api.stats import WriterStats
 from mqttium.transport._stream import AsyncTransport
 from mqttium.transport.writes import WriteItem, item_size
 
@@ -42,10 +43,39 @@ class WritePump:
         self.transport: AsyncTransport | None = None
         self.epoch = 0
         self.last_outbound = 0.0
+        # Decision counters. The writer's batching strategy cannot be changed
+        # honestly without knowing how often it actually batches, how large the
+        # batches get, and how often a producer had to wait — so they are
+        # recorded before any of that is tuned. All are plain increments on
+        # paths that already allocate or await.
+        self.batches = 0
+        self.batched_items = 0
+        self.batched_bytes = 0
+        self.segmented_writes = 0
+        self.enqueue_suspensions = 0
 
     @property
     def queued_messages(self) -> int:
         return self.queue.qsize()
+
+    def stats(self) -> WriterStats:
+        """Snapshot the queue and the batching decisions taken so far."""
+        queued_messages = self.queue.qsize()
+        return WriterStats(
+            queued_messages=queued_messages,
+            queued_bytes=self.queued_bytes,
+            high_water_messages=max(self.high_water_messages, queued_messages),
+            high_water_bytes=max(self.high_water_bytes, self.queued_bytes),
+            max_messages=self.max_messages,
+            max_bytes=self.max_bytes,
+            waiters=self.waiters,
+            last_outbound=self.last_outbound,
+            batches=self.batches,
+            batched_items=self.batched_items,
+            batched_bytes=self.batched_bytes,
+            segmented_writes=self.segmented_writes,
+            enqueue_suspensions=self.enqueue_suspensions,
+        )
 
     def _sample_high_water(self, queued_messages: int | None = None) -> None:
         messages = self.queue.qsize() if queued_messages is None else queued_messages
@@ -162,6 +192,7 @@ class WritePump:
                 if self.queue.empty() and self.queued_bytes == 0:
                     break
                 self.waiters += 1
+                self.enqueue_suspensions += 1
                 try:
                     await self.space.wait()
                 finally:
@@ -197,12 +228,15 @@ class WritePump:
                         batch.append(queue.get_nowait())
                     except asyncio.QueueEmpty:
                         break
+                self.batches += 1
+                self.batched_items += len(batch)
                 try:
                     # Coalesce contiguous small frames into one writelines call.
                     # Never await drain() after the batch (deadlocks vs reader ACK).
                     contiguous: list[bytes] = []
                     for data in batch:
                         if isinstance(data, tuple):
+                            self.segmented_writes += 1
                             await self._write_contiguous(transport, contiguous)
                             for part in data:
                                 await transport.write(part)
@@ -215,6 +249,7 @@ class WritePump:
                     for data in batch:
                         released += item_size(data)
                         queue.task_done()
+                    self.batched_bytes += released
                     async with self.space:
                         self.queued_bytes = max(0, self.queued_bytes - released)
                         if self.waiters:

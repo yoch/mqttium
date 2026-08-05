@@ -11,6 +11,7 @@ import asyncio
 from collections import deque
 from typing import TYPE_CHECKING, Protocol
 
+from mqttium.api.stats import EffectStats
 from mqttium.protocol.effects import EffectKind, EngineEffect
 
 if TYPE_CHECKING:
@@ -60,25 +61,51 @@ class EffectPump:
         self.task: asyncio.Task[None] | None = None
         self.flush_requested = False
         self.draining_inline = False
+        # Decision counters. The SEND-first partition protects an ordering that
+        # is easy to break and hard to debug, so before changing how batches are
+        # represented it has to be clear how often several effects even arrive
+        # together, and how often the inline fast path actually carries them.
+        self.batches = 0
+        self.multi_effect_batches = 0
+        self.reordered_batches = 0
+        self.inline_effects = 0
+        self.apply_suspensions = 0
 
     def collect_from_engine(self) -> None:
         effects = self.owner._engine.take_effects()
         if not effects:
             return
         epoch = self.owner._connection_epoch
+        self.batches += 1
 
         if self.pending and self.pending_epoch != epoch:
             self.discard_connection_effects()
 
         if len(effects) == 1 and not self.pending:
             if self.owner._apply_effect_inline(effects[0], epoch):
+                self.inline_effects += 1
                 return
 
         if len(effects) > 1:
-            effects = [
-                *(effect for effect in effects if effect.kind is EffectKind.SEND),
-                *(effect for effect in effects if effect.kind is not EffectKind.SEND),
-            ]
+            self.multi_effect_batches += 1
+            # Partition SEND-first in one pass, and let that same pass answer
+            # whether the batch needed it: a SEND seen after a non-SEND is
+            # exactly the condition. The two-generator form this replaces walked
+            # the batch twice and always rebuilt the list, even for the common
+            # batch that was already ordered.
+            sends: list[EngineEffect] = []
+            others: list[EngineEffect] = []
+            out_of_order = False
+            for effect in effects:
+                if effect.kind is EffectKind.SEND:
+                    if others:
+                        out_of_order = True
+                    sends.append(effect)
+                else:
+                    others.append(effect)
+            if out_of_order:
+                self.reordered_batches += 1
+                effects = sends + others
         if not self.pending:
             self.pending_epoch = epoch
         self.pending.extend(effects)
@@ -86,6 +113,22 @@ class EffectPump:
         pending = len(self.pending)
         if pending > self.pending_high_water:
             self.pending_high_water = pending
+
+    def stats(self) -> EffectStats:
+        """Snapshot the deque and the ordering decisions taken so far."""
+        pending = len(self.pending)
+        return EffectStats(
+            pending=pending,
+            pending_high_water=max(self.pending_high_water, pending),
+            enqueued=self.enqueued,
+            applied=self.applied,
+            waiters=self.waiters,
+            batches=self.batches,
+            multi_effect_batches=self.multi_effect_batches,
+            reordered_batches=self.reordered_batches,
+            inline_effects=self.inline_effects,
+            apply_suspensions=self.apply_suspensions,
+        )
 
     def _complete(self) -> None:
         self.applied += 1
@@ -110,6 +153,7 @@ class EffectPump:
                 if not self.owner._apply_effect_inline(effect, epoch):
                     break
                 self.pending.popleft()
+                self.inline_effects += 1
                 self._complete()
             if not self.pending:
                 self.pending_epoch = None
@@ -191,6 +235,7 @@ class EffectPump:
         if self.applied >= target:
             return
         self.waiters += 1
+        self.apply_suspensions += 1
         try:
             while self.applied < target:
                 if self.error is not None:

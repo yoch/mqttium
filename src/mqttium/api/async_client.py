@@ -32,12 +32,9 @@ from mqttium.api.stats import (
     ClientStats,
     DecoderStats,
     DeliveryStats,
-    EffectStats,
-    ProtocolStats,
     ReceiptStats,
     TaskStats,
     TransportStats,
-    WriterStats,
 )
 from mqttium.codec.buffer import DEFAULT_MAX_PACKET_SIZE, IncrementalDecoder
 from mqttium.codec.properties import PUBLISH, encode_properties
@@ -405,19 +402,11 @@ class AsyncClient:
             batch_ids.update(id(batch) for batch in batches)
 
         transport = self._transport
-        transport_stats = TransportStats(
-            kind=None if transport is None else type(transport).__name__,
-            closing=False if transport is None else transport.is_closing(),
-            pending_write_bytes=int(getattr(transport, "pending_write_bytes", 0)),
-            buffered_read_bytes=int(getattr(transport, "buffered_read_bytes", 0)),
-            fragmented_read_bytes=int(getattr(transport, "fragmented_read_bytes", 0)),
-            pending_control_frames=int(getattr(transport, "pending_control_frames", 0)),
-            pending_control_bytes=int(getattr(transport, "pending_control_bytes", 0)),
-        )
-        outbound = self._engine.outbound
+        report = getattr(transport, "stats", None)
+        transport_stats = report() if report is not None else TransportStats.unavailable(transport)
+        engine = self._engine
         effect_pump = self._effect_pump
         write_pump = self._write_pump
-        flow = outbound.flow
         return ClientStats(
             state=self._engine.state,
             connection_epoch=self._connection_epoch,
@@ -430,38 +419,10 @@ class AsyncClient:
                 effect_flush=running(effect_pump.task),
                 callback_worker=running(self._callback_worker_task),
             ),
-            protocol=ProtocolStats(
-                pending_outbound_messages=outbound.pending_messages,
-                pending_outbound_bytes=outbound.pending_bytes,
-                pending_outbound_high_water_messages=max(
-                    outbound.pending_high_water_messages, outbound.pending_messages
-                ),
-                pending_outbound_high_water_bytes=max(
-                    outbound.pending_high_water_bytes, outbound.pending_bytes
-                ),
-                queued_outbound_messages=len(outbound._queued),
-                flow_inflight=flow.inflight,
-                flow_limit=flow.limit,
-                packet_ids_in_use=len(outbound.packet_ids),
-                inbound_inflight=self._engine.inbound._inflight,
-            ),
-            effects=EffectStats(
-                pending=len(effect_pump.pending),
-                pending_high_water=effect_pump.pending_high_water,
-                enqueued=effect_pump.enqueued,
-                applied=effect_pump.applied,
-                waiters=effect_pump.waiters,
-            ),
-            writer=WriterStats(
-                queued_messages=write_pump.queued_messages,
-                queued_bytes=write_pump.queued_bytes,
-                high_water_messages=max(write_pump.high_water_messages, write_pump.queued_messages),
-                high_water_bytes=max(write_pump.high_water_bytes, write_pump.queued_bytes),
-                max_messages=write_pump.max_messages,
-                max_bytes=write_pump.max_bytes,
-                waiters=write_pump.waiters,
-                last_outbound=write_pump.last_outbound,
-            ),
+            outbound=engine.outbound.stats(),
+            inbound=engine.inbound.stats(),
+            effects=effect_pump.stats(),
+            writer=write_pump.stats(),
             decoder=DecoderStats(
                 buffered_bytes=self._decoder.buffered,
                 high_water_bytes=self._decoder.high_water,
