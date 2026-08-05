@@ -71,7 +71,9 @@ def patch_client(root: Path) -> None:
         effects: deque[EngineEffect],
         epoch: int,
     ) -> int:
-        if epoch != self._connection_epoch or not effects:
+        # A batch of one cannot amortize any dispatch work and must keep the
+        # established per-effect hook used by scheduling and instrumentation.
+        if epoch != self._connection_epoch or len(effects) < 2:
             return 0
         first: Message = effects[0].data
         if first.qos != QoS.AT_MOST_ONCE:
@@ -167,6 +169,17 @@ async def test_small_qos0_callback_messages_apply_as_one_synchronous_batch() -> 
     await client._shutdown_callback_worker(drain=False)
 
 
+def test_single_message_keeps_the_established_effect_path() -> None:
+    client = AsyncClient(message_delivery="iterator")
+
+    applied = client._apply_message_effect_batch_inline(
+        deque([_effect()]), client._connection_epoch
+    )
+
+    assert applied == 0
+    assert client._messages.empty()
+
+
 def test_batch_stops_before_half_delivering_both_mode() -> None:
     client = AsyncClient(
         message_delivery="both",
@@ -178,7 +191,7 @@ def test_batch_stops_before_half_delivering_both_mode() -> None:
     client._callback_queue.put_nowait(sentinel)
 
     applied = client._apply_message_effect_batch_inline(
-        deque([_effect()]), client._connection_epoch
+        deque([_effect(), _effect()]), client._connection_epoch
     )
 
     assert applied == 0
@@ -193,7 +206,7 @@ def test_batch_defers_acknowledged_messages(qos: QoS) -> None:
     client.on_message = lambda _message: None
 
     applied = client._apply_message_effect_batch_inline(
-        deque([_effect(qos=qos, mid=7)]), client._connection_epoch
+        deque([_effect(qos=qos, mid=7), _effect()]), client._connection_epoch
     )
 
     assert applied == 0
