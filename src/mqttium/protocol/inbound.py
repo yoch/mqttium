@@ -295,8 +295,8 @@ class InboundSession:
         if inbound.state is InboundQoSState.WAIT_USER_ACK:
             if config.manual_ack:
                 return
-            completed = store.pop_in(rel.mid)
-            if completed is None:
+            popped = store.pop_in(rel.mid)
+            if popped is None:
                 raise ProtocolError(f"Inbound mid={rel.mid} disappeared while completing PUBREL")
             engine._send(PubCompPacket(mid=rel.mid).encode(config.protocol))
             self._release_slot()
@@ -309,8 +309,8 @@ class InboundSession:
             inbound.state = InboundQoSState.WAIT_USER_ACK
             store.update_in(inbound)
             return
-        completed = store.pop_in(rel.mid)
-        if completed is None:
+        popped = store.pop_in(rel.mid)
+        if popped is None:
             raise ProtocolError(f"Inbound mid={rel.mid} disappeared while completing PUBREL")
         engine._send(PubCompPacket(mid=rel.mid).encode(config.protocol))
         self._release_slot()
