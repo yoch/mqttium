@@ -162,6 +162,27 @@ class WebSocketTransport:
     def is_closing(self) -> bool:
         return self._closing or self._writer.is_closing()
 
+    @property
+    def pending_write_bytes(self) -> int:
+        transport = self._writer.transport
+        return 0 if transport is None else transport.get_write_buffer_size()
+
+    @property
+    def buffered_read_bytes(self) -> int:
+        return len(self._recv_buf)
+
+    @property
+    def fragmented_read_bytes(self) -> int:
+        return 0 if self._fragment is None else len(self._fragment)
+
+    @property
+    def pending_control_frames(self) -> int:
+        return len(self._pending_control)
+
+    @property
+    def pending_control_bytes(self) -> int:
+        return sum(map(len, self._pending_control))
+
     async def _flush_control(self) -> None:
         if not self._pending_control:
             return

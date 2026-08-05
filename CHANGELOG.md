@@ -8,6 +8,16 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Added
 
+- `AsyncClient.stats()` and immutable `ClientStats` snapshots covering protocol
+  admission, effect and writer queues, decoder and transport buffers, delivery
+  budgets, receipts, task state and lifetime high-water marks. Statistics are
+  maintained without logging or background sampling.
+- `max_ingress_batch_bytes` on `AsyncClient`. The reader now drains packets in
+  batches bounded by both 256 packets and a byte target, while still allowing
+  one individually oversized packet to make progress.
+- A reconnect/backpressure soak harness plus scheduled Linux, macOS, EMQX and
+  HiveMQ interoperability automation with retained JSON measurements.
+- A documented public API candidate and stable-release acceptance policy.
 - `AsyncClient.publish_nowait()`, a synchronous, non-suspending publication
   method for producers already executing on the client's event loop. It performs
   immediate engine and writer-capacity checks, returns the normal
@@ -16,8 +26,16 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - `ProtocolEngine.reconfigure()`, the validated configuration boundary used by
   runtime adapters instead of mutating the attached configuration directly.
 
+### Fixed
+
+- `benchmarks/paired_regression.py --scenario` is now honoured in parent mode
+  instead of silently running the full scenario matrix.
+
 ### Changed
 
+- `OutboundSession` now handles `PUBACK`, `PUBREC` and `PUBCOMP` directly, so
+  the component that acquires publication budget, packet identifiers, store
+  records and flow slots also releases them through terminal acknowledgement.
 - The bounded transport writer has been extracted into `WritePump`, which now
   solely owns queue ordering, byte/count backpressure, batching, the writer task
   and `last_outbound`. `AsyncClient` retains transport lifecycle and writer

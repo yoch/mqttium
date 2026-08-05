@@ -31,7 +31,7 @@ class RawPacket:
 
 
 class IncrementalDecoder:
-    __slots__ = ("_buf", "_start", "_max_packet_size")
+    __slots__ = ("_buf", "_start", "_max_packet_size", "_high_water")
 
     def __init__(self, max_packet_size: int = DEFAULT_MAX_PACKET_SIZE) -> None:
         if max_packet_size < 2:
@@ -39,10 +39,15 @@ class IncrementalDecoder:
         self._buf = bytearray()
         self._start = 0
         self._max_packet_size = max_packet_size
+        self._high_water = 0
 
     @property
     def buffered(self) -> int:
         return len(self._buf) - self._start
+
+    @property
+    def high_water(self) -> int:
+        return self._high_water
 
     @property
     def max_packet_size(self) -> int:
@@ -60,6 +65,9 @@ class IncrementalDecoder:
         if self._start and self._start > _COMPACT_THRESHOLD:
             self._compact()
         self._buf.extend(data)
+        buffered = len(self._buf) - self._start
+        if buffered > self._high_water:
+            self._high_water = buffered
 
     def clear(self) -> None:
         self._buf.clear()
@@ -126,6 +134,37 @@ class IncrementalDecoder:
             callback(packet)
             n += 1
         return n
+
+    def process_packets_bounded(
+        self,
+        callback: Callable[[RawPacket], None],
+        *,
+        limit: int,
+        max_bytes: int,
+    ) -> tuple[int, int]:
+        """Decode one count- and byte-bounded packet batch.
+
+        ``max_bytes`` is a target rather than a packet-size limit: the packet
+        that reaches the target is included, so one individually larger packet
+        is always allowed to make progress. Five bytes of fixed-header overhead
+        are conservatively charged per packet.
+        """
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        if max_bytes <= 0:
+            raise ValueError("max_bytes must be positive")
+        count = 0
+        decoded_bytes = 0
+        for _ in range(limit):
+            packet = self.next_packet()
+            if packet is None:
+                break
+            callback(packet)
+            count += 1
+            decoded_bytes += len(packet.remaining) + 5
+            if decoded_bytes >= max_bytes:
+                break
+        return count, decoded_bytes
 
     def _compact(self) -> None:
         if self._start <= 0:

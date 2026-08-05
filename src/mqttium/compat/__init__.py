@@ -1,4 +1,4 @@
-"""Compatibilité Paho — phase 3 (VERSION2).
+"""Compatibilité Paho VERSION2.
 
 Politique détaillée : ``docs/COMPAT.md``.
 """

@@ -1,7 +1,8 @@
 # Roadmap
 
 The protocol, transport and compatibility foundations are implemented. This
-roadmap tracks work that remains relevant after the standalone spin-out.
+roadmap tracks the evidence and optimisations still required after the
+finalisation architecture pass.
 
 ## Completed release foundations
 
@@ -11,40 +12,53 @@ roadmap tracks work that remains relevant after the standalone spin-out.
 - [x] Add isolated wheel-install and Mosquitto integration smoke tests.
 - [x] Add reproducible benchmark workflows and an OIDC-based PyPI release workflow.
 - [x] Complete the initial file-level provenance review.
+- [x] Give `EffectPump`, `WritePump`, `InboundSession` and `OutboundSession`
+      authoritative ownership of their runtime/protocol state.
+- [x] Document the public API candidate and compatibility/deprecation policy.
 
-## Before a stable release
+## Stable-release campaign
 
-- [ ] Freeze and document the public API and compatibility policy.
-- [ ] Run sustained reconnect, session and backpressure soak tests on Linux and macOS.
-- [ ] Extend broker interoperability beyond Mosquitto to at least two independent implementations.
-- [ ] Publish reproducible release benchmark artefacts from pinned runner profiles.
+Automation is implemented in `.github/workflows/finalization.yml`; successful
+workflow definitions are not counted as evidence until their run artefacts are
+retained and reviewed. See [`STABILITY.md`](STABILITY.md).
 
-## Remaining memory work
+- [ ] Retain successful reconnect, session and backpressure soak runs on Linux
+      and macOS for MQTT 3.1.1 and MQTT 5.
+- [ ] Retain successful interoperability runs against Mosquitto, EMQX and HiveMQ
+      Community Edition.
+- [ ] Publish reproducible release benchmark artefacts from pinned runner
+      profiles.
+- [ ] Review the evidence and promote the API candidate to the first non-alpha
+      release.
+
+## Remaining memory and performance work
 
 Carried over from [`MEMORY-PROFILE-FOLLOW-UP.md`](MEMORY-PROFILE-FOLLOW-UP.md),
 which records what already shipped.
 
-- [ ] Bound each ingress batch by bytes, not only by the 256-packet count.
-- [ ] Specialised in-buffer PUBLISH decode, to remove the payload-sized copies
-      large inbound messages still cost.
+- [x] Bound each ingress batch by bytes as well as the 256-packet count.
+- [x] Provide one immutable stats snapshot for effect, writer, decoder,
+      WebSocket, delivery, receipt and outbound-admission counters, including
+      high-water marks.
+- [x] Assert that outbound admission counters return to zero after sustained
+      QoS 1 load drains.
+- [ ] Specialised in-buffer PUBLISH decode, if profiling still shows
+      payload-sized copies as a material peak after ingress batching.
 - [ ] Full QoS 2 phase-two compaction (release topic, payload and properties,
       not only the encoded frame).
 - [ ] Benchmark the QoS 1 / pre-PUBREC frame policy: re-encode on retransmission
       versus a size-based policy.
-- [ ] Complete the counter surface — effect queue, writer, decoder, WebSocket
-      buffers, receipts, an outbound-budget high-water mark, and one unified
-      stats snapshot. Constraint: no `logging`, per
-      [`LOGGING.md`](LOGGING.md).
-- [ ] Add memory-benchmark scenarios for the paths currently covered only by
-      unit tests (property-heavy outbound, immediate refusal, cancellation
-      around the commit point, Paho queue saturation, shared iterator/callback
-      accounting, WebSocket byte-bounded batches, reconnect/epoch cleanup).
-- [ ] Assert that outbound admission counters return to zero after a sustained
-      load drains.
+- [ ] Add memory-benchmark scenarios for property-heavy outbound, immediate
+      refusal, cancellation around commit, Paho saturation, shared delivery,
+      WebSocket batching and reconnect/epoch cleanup.
 
 ## Optional extensions
 
-- [ ] Concrete enhanced-authentication plugins such as SCRAM where broker demand justifies them.
+- [ ] Extract inbound application delivery into a dedicated controller only if
+      soak results or future delivery policies show a concrete ownership or
+      maintenance benefit.
+- [ ] Concrete enhanced-authentication plugins such as SCRAM where broker demand
+      justifies them.
 - [ ] Additional Paho compatibility surface only when backed by behavioural tests.
 - [ ] Long-running fuzz campaigns and corpus retention outside normal pull-request CI.
 
@@ -56,4 +70,5 @@ which records what already shipped.
 - deterministic plus Hypothesis fuzzing;
 - wheel, sdist and isolated-install validation;
 - subscriber-confirmed TCP, TLS and controlled WAN-profile benchmarks;
+- scheduled reconnect/backpressure and multi-broker interoperability artefacts;
 - no generated benchmark, coverage or build artefacts committed to source.

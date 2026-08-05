@@ -53,6 +53,7 @@ class EffectPump:
         self.pending_epoch: int | None = None
         self.enqueued = 0
         self.applied = 0
+        self.pending_high_water = 0
         self.progress = asyncio.Event()
         self.waiters = 0
         self.error: BaseException | None = None
@@ -82,6 +83,9 @@ class EffectPump:
             self.pending_epoch = epoch
         self.pending.extend(effects)
         self.enqueued += len(effects)
+        pending = len(self.pending)
+        if pending > self.pending_high_water:
+            self.pending_high_water = pending
 
     def _complete(self) -> None:
         self.applied += 1
