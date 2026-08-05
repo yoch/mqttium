@@ -248,27 +248,55 @@ class InboundSession:
         if transitions is not None:
             meta = transitions.in_meta(rel.mid)
             if meta is None:
-                # Orphan PUBREL: idempotent PUBCOMP (v5 reason 0x92 optional).
+                # An already-completed QoS 2 exchange answers duplicate PUBREL
+                # idempotently. MQTT 5 permits 0x92 but success is interoperable
+                # with brokers that retry across reconnects.
                 engine._send(PubCompPacket(mid=rel.mid).encode(config.protocol))
                 return
-            if config.manual_ack and not meta.user_acked:
-                transitions.transition_in(rel.mid, meta.state, InboundQoSState.WAIT_USER_ACK)
+            if meta.state is InboundQoSState.WAIT_USER_ACK:
+                # Duplicate PUBREL while application acknowledgement is still
+                # pending: retain the record and keep PUBCOMP deferred.
                 return
-            transitions.complete_in(rel.mid, meta.state)
+            if meta.state is not InboundQoSState.WAIT_PUBREL:
+                raise ProtocolError(
+                    f"PUBREL for inbound mid={rel.mid} in invalid state {meta.state!r}"
+                )
+            if config.manual_ack and not meta.user_acked:
+                changed = transitions.transition_in(
+                    rel.mid,
+                    InboundQoSState.WAIT_PUBREL,
+                    InboundQoSState.WAIT_USER_ACK,
+                )
+                if changed is None:
+                    raise ProtocolError(
+                        f"Inbound mid={rel.mid} changed while processing PUBREL"
+                    )
+                return
+            completed = transitions.complete_in(rel.mid, InboundQoSState.WAIT_PUBREL)
+            if completed is None:
+                raise ProtocolError(f"Inbound mid={rel.mid} changed while completing PUBREL")
             engine._send(PubCompPacket(mid=rel.mid).encode(config.protocol))
             self._release_slot()
             return
 
         inbound = store.get_in(rel.mid)
         if inbound is None:
-            # Orphan PUBREL: idempotent PUBCOMP (v5 reason 0x92 optional later).
+            # Orphan PUBREL: idempotent PUBCOMP.
             engine._send(PubCompPacket(mid=rel.mid).encode(config.protocol))
             return
+        if inbound.state is InboundQoSState.WAIT_USER_ACK:
+            return
+        if inbound.state is not InboundQoSState.WAIT_PUBREL:
+            raise ProtocolError(
+                f"PUBREL for inbound mid={rel.mid} in invalid state {inbound.state!r}"
+            )
         if config.manual_ack and not inbound.user_acked:
             inbound.state = InboundQoSState.WAIT_USER_ACK
             store.update_in(inbound)
             return
-        store.pop_in(rel.mid)
+        completed = store.pop_in(rel.mid)
+        if completed is None:
+            raise ProtocolError(f"Inbound mid={rel.mid} disappeared while completing PUBREL")
         engine._send(PubCompPacket(mid=rel.mid).encode(config.protocol))
         self._release_slot()
 
@@ -301,15 +329,21 @@ class InboundSession:
                 raise ProtocolError(f"No pending inbound ack for mid={mid}")
             state = meta.state
             if state is InboundQoSState.WAIT_PUBACK:
-                transitions.complete_in(mid, state)
+                completed = transitions.complete_in(mid, state)
+                if completed is None:
+                    raise ProtocolError(f"Inbound mid={mid} changed while acknowledging")
                 self._engine._send(PubAckPacket(mid=mid).encode(config.protocol))
                 self._release_slot()
                 return
             if state is InboundQoSState.WAIT_PUBREL:
-                transitions.transition_in(mid, state, state, user_acked=True)
+                changed = transitions.transition_in(mid, state, state, user_acked=True)
+                if changed is None:
+                    raise ProtocolError(f"Inbound mid={mid} changed while acknowledging")
                 return
             if state is InboundQoSState.WAIT_USER_ACK:
-                transitions.complete_in(mid, state)
+                completed = transitions.complete_in(mid, state)
+                if completed is None:
+                    raise ProtocolError(f"Inbound mid={mid} changed while acknowledging")
                 self._engine._send(PubCompPacket(mid=mid).encode(config.protocol))
                 self._release_slot()
                 return
@@ -319,7 +353,8 @@ class InboundSession:
         if inbound is None:
             raise ProtocolError(f"No pending inbound ack for mid={mid}")
         if inbound.state is InboundQoSState.WAIT_PUBACK:
-            store.pop_in(mid)
+            if store.pop_in(mid) is None:
+                raise ProtocolError(f"Inbound mid={mid} disappeared while acknowledging")
             self._engine._send(PubAckPacket(mid=mid).encode(config.protocol))
             self._release_slot()
             return
@@ -328,7 +363,8 @@ class InboundSession:
             store.update_in(inbound)
             return
         if inbound.state is InboundQoSState.WAIT_USER_ACK:
-            store.pop_in(mid)
+            if store.pop_in(mid) is None:
+                raise ProtocolError(f"Inbound mid={mid} disappeared while acknowledging")
             self._engine._send(PubCompPacket(mid=mid).encode(config.protocol))
             self._release_slot()
             return
