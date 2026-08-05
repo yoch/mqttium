@@ -1,0 +1,412 @@
+name: Apply byte-bounded replay patch
+
+on:
+  push:
+    branches: [agent/byte-bounded-inbound-replay]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: agent/byte-bounded-inbound-replay
+          fetch-depth: 0
+      - name: Apply source patch
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: str, old: str, new: str) -> None:
+              target = Path(path)
+              text = target.read_text()
+              if text.count(old) != 1:
+                  raise SystemExit(f"expected one match in {path}, found {text.count(old)}")
+              target.write_text(text.replace(old, new))
+
+          replace_once(
+              "src/mqttium/persistence/memory.py",
+              '''@runtime_checkable
+          class TransitionInflightStore(InflightStore, Protocol):
+          ''',
+              '''@runtime_checkable
+          class BoundedInboundReplayStore(InflightStore, Protocol):
+              """Opt-in extension for payload hydration bounded by messages and bytes.
+
+              Every yielded page must contain at most ``max_messages`` records and
+              at most ``max_bytes`` of payload plus UTF-8 topic data. A single record
+              larger than ``max_bytes`` is yielded alone, because replay cannot make
+              progress without materialising it.
+              """
+
+              def in_count(self) -> int:
+                  """Return the durable inbound record count without reading payloads."""
+                  ...
+
+              def in_replay_pages(
+                  self,
+                  max_messages: int = 64,
+                  max_bytes: int = 1 << 20,
+              ) -> Iterator[tuple[InboundMessage, ...]]: ...
+
+
+          @runtime_checkable
+          class TransitionInflightStore(InflightStore, Protocol):
+          ''',
+          )
+
+          replace_once(
+              "src/mqttium/persistence/memory.py",
+              '''    def in_pages(self, page_size: int = 256) -> Iterator[tuple[InboundMessage, ...]]:
+                  if page_size <= 0:
+                      raise ValueError("page_size must be positive")
+                  mids = iter(tuple(self._in))
+                  while page := tuple(islice(mids, page_size)):
+                      messages = tuple(self._in[mid] for mid in page if mid in self._in)
+                      if messages:
+                          yield messages
+
+              def clear_in(self) -> None:
+          ''',
+              '''    def in_pages(self, page_size: int = 256) -> Iterator[tuple[InboundMessage, ...]]:
+                  if page_size <= 0:
+                      raise ValueError("page_size must be positive")
+                  mids = iter(tuple(self._in))
+                  while page := tuple(islice(mids, page_size)):
+                      messages = tuple(self._in[mid] for mid in page if mid in self._in)
+                      if messages:
+                          yield messages
+
+              def in_count(self) -> int:
+                  return len(self._in)
+
+              def in_replay_pages(
+                  self,
+                  max_messages: int = 64,
+                  max_bytes: int = 1 << 20,
+              ) -> Iterator[tuple[InboundMessage, ...]]:
+                  if max_messages <= 0:
+                      raise ValueError("max_messages must be positive")
+                  if max_bytes <= 0:
+                      raise ValueError("max_bytes must be positive")
+                  messages: list[InboundMessage] = []
+                  hydrated_bytes = 0
+                  for mid in tuple(self._in):
+                      message = self._in.get(mid)
+                      if message is None:
+                          continue
+                      message_bytes = len(message.payload) + len(message.topic.encode("utf-8"))
+                      if messages and (
+                          len(messages) >= max_messages
+                          or hydrated_bytes + message_bytes > max_bytes
+                      ):
+                          yield tuple(messages)
+                          messages = []
+                          hydrated_bytes = 0
+                      messages.append(message)
+                      hydrated_bytes += message_bytes
+                      if len(messages) >= max_messages or hydrated_bytes >= max_bytes:
+                          yield tuple(messages)
+                          messages = []
+                          hydrated_bytes = 0
+                  if messages:
+                      yield tuple(messages)
+
+              def clear_in(self) -> None:
+          ''',
+          )
+
+          replace_once(
+              "src/mqttium/persistence/sqlite.py",
+              '''_IN_INDEX_PAGE_SQL = "SELECT mid, state, user_acked FROM inbound WHERE mid IN"
+          ''',
+              '''_IN_INDEX_PAGE_SQL = "SELECT mid, state, user_acked FROM inbound WHERE mid IN"
+          _IN_REPLAY_INDEX_SQL = (
+              "SELECT mid, length(payload) + length(CAST(topic AS BLOB)) AS replay_size"
+              " FROM inbound ORDER BY seq"
+          )
+          ''',
+          )
+
+          replace_once(
+              "src/mqttium/persistence/sqlite.py",
+              '''    def in_pages(self, page_size: int = 256) -> Iterator[tuple[InboundMessage, ...]]:
+                  yield from self._pages("inbound", _IN_PAGE_SQL, page_size, _row_to_in)
+
+              def clear_in(self) -> None:
+          ''',
+              '''    def in_pages(self, page_size: int = 256) -> Iterator[tuple[InboundMessage, ...]]:
+                  yield from self._pages("inbound", _IN_PAGE_SQL, page_size, _row_to_in)
+
+              def in_count(self) -> int:
+                  with self._lock:
+                      row = self._conn.execute("SELECT COUNT(*) FROM inbound").fetchone()
+                  if row is None:
+                      raise RuntimeError("Failed to count inbound records")
+                  return int(row[0])
+
+              def _in_messages_for_mids(self, mids: tuple[int, ...]) -> tuple[InboundMessage, ...]:
+                  by_mid: dict[int, sqlite3.Row] = {}
+                  for offset in range(0, len(mids), _MAX_SQL_VARIABLES):
+                      sub = mids[offset : offset + _MAX_SQL_VARIABLES]
+                      placeholders = ",".join("?" * len(sub))
+                      with self._lock:
+                          rows = self._conn.execute(
+                              f"{_IN_PAGE_SQL} ({placeholders})", sub
+                          ).fetchall()
+                      by_mid.update((int(row["mid"]), row) for row in rows)
+                  return tuple(
+                      _row_to_in(row) for mid in mids if (row := by_mid.get(mid)) is not None
+                  )
+
+              def in_replay_pages(
+                  self,
+                  max_messages: int = 64,
+                  max_bytes: int = 1 << 20,
+              ) -> Iterator[tuple[InboundMessage, ...]]:
+                  if max_messages <= 0:
+                      raise ValueError("max_messages must be positive")
+                  if max_bytes <= 0:
+                      raise ValueError("max_bytes must be positive")
+                  with self._lock:
+                      index = self._conn.execute(_IN_REPLAY_INDEX_SQL).fetchall()
+                  mids: list[int] = []
+                  hydrated_bytes = 0
+                  for row in index:
+                      mid = int(row["mid"])
+                      message_bytes = int(row["replay_size"] or 0)
+                      if mids and (
+                          len(mids) >= max_messages or hydrated_bytes + message_bytes > max_bytes
+                      ):
+                          page = self._in_messages_for_mids(tuple(mids))
+                          if page:
+                              yield page
+                          mids = []
+                          hydrated_bytes = 0
+                      mids.append(mid)
+                      hydrated_bytes += message_bytes
+                      if len(mids) >= max_messages or hydrated_bytes >= max_bytes:
+                          page = self._in_messages_for_mids(tuple(mids))
+                          if page:
+                              yield page
+                          mids = []
+                          hydrated_bytes = 0
+                  if mids:
+                      page = self._in_messages_for_mids(tuple(mids))
+                      if page:
+                          yield page
+
+              def clear_in(self) -> None:
+          ''',
+          )
+
+          replace_once(
+              "src/mqttium/protocol/inbound.py",
+              '''from mqttium.persistence.memory import PagedInflightStore, TransitionInflightStore
+          ''',
+              '''from mqttium.persistence.memory import (
+              BoundedInboundReplayStore,
+              PagedInflightStore,
+              TransitionInflightStore,
+          )
+          ''',
+          )
+
+          replace_once(
+              "src/mqttium/protocol/inbound.py",
+              '''    __slots__ = ("_pages", "_page", "_offset")
+
+              def __init__(self, pages: Iterator[tuple[InboundMessage, ...]]) -> None:
+                  self._pages = pages
+                  self._page: tuple[InboundMessage, ...] = ()
+                  self._offset = 0
+
+              def next_message(self) -> InboundMessage | None:
+                  while self._offset >= len(self._page):
+                      page = next(self._pages, None)
+                      if page is None:
+                          return None
+                      self._page = page
+                      self._offset = 0
+                  message = self._page[self._offset]
+                  self._offset += 1
+                  return message
+          ''',
+              '''    __slots__ = ("_pages", "_page", "_offset", "_pending")
+
+              def __init__(self, pages: Iterator[tuple[InboundMessage, ...]]) -> None:
+                  self._pages = pages
+                  self._page: tuple[InboundMessage, ...] = ()
+                  self._offset = 0
+                  self._pending: InboundMessage | None = None
+
+              def next_message(self) -> InboundMessage | None:
+                  if self._pending is not None:
+                      message = self._pending
+                      self._pending = None
+                      return message
+                  while self._offset >= len(self._page):
+                      page = next(self._pages, None)
+                      if page is None:
+                          return None
+                      self._page = page
+                      self._offset = 0
+                  message = self._page[self._offset]
+                  self._offset += 1
+                  return message
+
+              def push_back(self, message: InboundMessage) -> None:
+                  if self._pending is not None:
+                      raise AssertionError("replay cursor already has a pending message")
+                  self._pending = message
+          ''',
+          )
+
+          replace_once(
+              "src/mqttium/protocol/inbound.py",
+              '''        "_engine",
+                  "_inflight",
+                  "_paged_store",
+          ''',
+              '''        "_bounded_replay_store",
+                  "_engine",
+                  "_inflight",
+                  "_paged_store",
+          ''',
+          )
+
+          replace_once(
+              "src/mqttium/protocol/inbound.py",
+              '''        self._transitions = self.store if isinstance(self.store, TransitionInflightStore) else None
+                  self._paged_store = self.store if isinstance(self.store, PagedInflightStore) else None
+          ''',
+              '''        self._transitions = self.store if isinstance(self.store, TransitionInflightStore) else None
+                  self._paged_store = self.store if isinstance(self.store, PagedInflightStore) else None
+                  self._bounded_replay_store = (
+                      self.store if isinstance(self.store, BoundedInboundReplayStore) else None
+                  )
+          ''',
+          )
+
+          replace_once(
+              "src/mqttium/protocol/inbound.py",
+              '''        paged = self._paged_store
+                  transitions = self._transitions
+                  if paged is None or transitions is None:
+                      # A store without the paging or metadata extensions keeps the
+                      # original eager behaviour: correct, just not bounded.
+                      inbound_items = list(self.store.in_items())
+                      self._inflight = len(inbound_items)
+                      for inbound in inbound_items:
+                          if self._should_redeliver(inbound):
+                              self._emit_message(inbound, dup=True)
+                      self._recovered_mids.clear()
+                      return
+
+                  # The Receive Maximum window must be restored in full before the first
+                  # redelivery, so the count is taken from the index — no payload read.
+                  persisted = 0
+                  for page in transitions.in_index_pages(REPLAY_PAGE_SIZE):
+                      persisted += len(page)
+                  self._inflight = persisted
+                  if persisted == 0:
+                      self._recovered_mids.clear()
+                      return
+                  self._replay = InboundReplayCursor(iter(paged.in_pages(REPLAY_PAGE_SIZE)))
+                  self.drain_replay()
+          ''',
+              '''        paged = self._paged_store
+                  bounded = self._bounded_replay_store
+                  transitions = self._transitions
+                  if transitions is None or (bounded is None and paged is None):
+                      # A store without the paging or metadata extensions keeps the
+                      # original eager behaviour: correct, just not bounded.
+                      inbound_items = list(self.store.in_items())
+                      self._inflight = len(inbound_items)
+                      for inbound in inbound_items:
+                          if self._should_redeliver(inbound):
+                              self._emit_message(inbound, dup=True)
+                      self._recovered_mids.clear()
+                      return
+
+                  # Built-in stores count directly without re-scanning the index that
+                  # construction already traversed. Third-party paged stores keep the
+                  # metadata-only fallback.
+                  if bounded is not None:
+                      persisted = bounded.in_count()
+                      pages = bounded.in_replay_pages(
+                          REPLAY_BATCH_MESSAGES,
+                          REPLAY_BATCH_BYTES,
+                      )
+                  else:
+                      persisted = 0
+                      for page in transitions.in_index_pages(REPLAY_PAGE_SIZE):
+                          persisted += len(page)
+                      assert paged is not None
+                      pages = paged.in_pages(REPLAY_PAGE_SIZE)
+                  self._inflight = persisted
+                  if persisted == 0:
+                      self._recovered_mids.clear()
+                      return
+                  self._replay = InboundReplayCursor(iter(pages))
+                  self.drain_replay()
+          ''',
+          )
+
+          replace_once(
+              "src/mqttium/protocol/inbound.py",
+              '''            scanned += 1
+                      if not self._should_redeliver(inbound):
+                          continue
+                      self._emit_message(inbound, dup=True)
+                      emitted += 1
+                      emitted_bytes += len(inbound.payload) + len(inbound.topic)
+                  self._engine._emit(EffectKind.CONTINUE_INBOUND_REPLAY, None)
+          ''',
+              '''            if not self._should_redeliver(inbound):
+                          scanned += 1
+                          continue
+                      message_bytes = len(inbound.payload) + len(inbound.topic.encode("utf-8"))
+                      if emitted and emitted_bytes + message_bytes > REPLAY_BATCH_BYTES:
+                          cursor.push_back(inbound)
+                          break
+                      scanned += 1
+                      self._emit_message(inbound, dup=True)
+                      emitted += 1
+                      emitted_bytes += message_bytes
+                  self._engine._emit(EffectKind.CONTINUE_INBOUND_REPLAY, None)
+          ''',
+          )
+
+          replace_once(
+              "tests/unit/test_inbound_replay_streaming.py",
+              '''        def in_pages(  # type: ignore[override]
+                      self, page_size: int = 256
+                  ) -> Iterator[tuple[InboundMessage, ...]]:
+                      for page in super().in_pages(page_size):
+                          CountingStore.pages_fetched += 1
+                          yield page
+          ''',
+              '''        def in_replay_pages(  # type: ignore[override]
+                      self,
+                      max_messages: int = 64,
+                      max_bytes: int = 1 << 20,
+                  ) -> Iterator[tuple[InboundMessage, ...]]:
+                      for page in super().in_replay_pages(max_messages, max_bytes):
+                          CountingStore.pages_fetched += 1
+                          yield page
+          ''',
+          )
+
+          Path(".github/workflows/apply-byte-bounded-replay.yml").unlink()
+          PY
+          git diff --check
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git commit -m "Bound inbound replay hydration by bytes"
+          git push origin HEAD:agent/byte-bounded-inbound-replay
