@@ -73,6 +73,12 @@ replace_once(
 
 test_path = Path("tests/unit/test_native_publish_nowait.py")
 test_text = test_path.read_text()
+if "import asyncio\n" not in test_text:
+    test_text = test_text.replace(
+        "from __future__ import annotations\n\n",
+        "from __future__ import annotations\n\nimport asyncio\n",
+        1,
+    )
 needle = """async def test_publish_nowait_registers_qos1_receipt() -> None:
 """
 new_test = '''async def test_publish_nowait_rejects_a_different_running_loop() -> None:
