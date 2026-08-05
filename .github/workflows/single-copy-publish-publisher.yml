@@ -31,7 +31,7 @@ jobs:
           ruff check src tests benchmarks
           mypy src
           bandit -q -ll -r src
-          python -m pytest -q tests/unit/test_single_copy_publish_decode.py tests/unit/test_codec.py tests/unit/test_engine.py
+          python -m pytest -q tests/unit/test_single_copy_publish_decode.py tests/unit/test_codec.py
           python -m pytest -q tests/unit
       - name: Profile allocations
         run: |
