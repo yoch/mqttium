@@ -1,0 +1,93 @@
+name: Native hotpath architecture study
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - agent/native-hotpath-architecture-study
+    paths:
+      - .github/workflows/native-hotpath-study.yml
+      - benchmarks/native-hotpath-study-trigger.txt
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-hotpath-study-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  study:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 70
+    env:
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install clients and broker
+        run: |
+          python -m pip install -e ".[dev]" gmqtt==0.7.0
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mosquitto
+      - name: Start isolated Mosquitto
+        run: |
+          mkdir -p /tmp/mqttium-hotpath
+          cat > /tmp/mqttium-hotpath/mosquitto.conf <<'MOSQ'
+          persistence false
+          allow_anonymous true
+          max_inflight_messages 1000
+          max_queued_messages 1000000
+          max_queued_bytes 0
+          connection_messages false
+          log_type error
+          listener 11883 127.0.0.1
+          MOSQ
+          mosquitto -c /tmp/mqttium-hotpath/mosquitto.conf \
+            > /tmp/mqttium-hotpath/mosquitto.log 2>&1 &
+          for i in $(seq 1 60); do
+            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            sleep 0.2
+          done
+          cat /tmp/mqttium-hotpath/mosquitto.log
+          exit 1
+      - name: Materialize experimental native harness
+        shell: bash
+        run: |
+          cat > /tmp/native-hotpath.b64 <<'B64'
+          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
+          B64
+          base64 -d /tmp/native-hotpath.b64 | gzip -d > /tmp/native_hotpath_matrix.py
+          python -m py_compile /tmp/native_hotpath_matrix.py
+      - name: Smoke native variants
+        run: |
+          python /tmp/native_hotpath_matrix.py --worker \
+            --scenario ingress_direct --variant mqttium-baseline --messages 10000
+          python /tmp/native_hotpath_matrix.py --worker \
+            --scenario ingress_direct --variant gmqtt --messages 10000
+          python /tmp/native_hotpath_matrix.py --worker \
+            --scenario rtt --variant mqttium-nowait --pairs 1000 --window 32
+          python /tmp/native_hotpath_matrix.py --worker \
+            --scenario rtt --variant gmqtt --pairs 1000 --window 32
+      - name: Run rotated native architecture matrix
+        run: |
+          python /tmp/native_hotpath_matrix.py \
+            --scenario all \
+            --cycles 4 \
+            --messages 120000 \
+            --pairs 8000 \
+            --window 32 \
+            --output /tmp/mqttium-hotpath/native-hotpath-matrix.json
+      - name: Upload study evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-hotpath-study-${{ github.run_id }}
+          path: |
+            /tmp/mqttium-hotpath/native-hotpath-matrix.json
+            /tmp/mqttium-hotpath/mosquitto.log
+          if-no-files-found: warn
+          retention-days: 30
