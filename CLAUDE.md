@@ -127,6 +127,14 @@ Every effect carries a **connection epoch**. On disconnect the epoch is bumped a
 dropped, which is how in-flight work from a dead connection is prevented from touching the new one.
 When touching this area, keep `_effect_enqueued`/`_effect_applied` balanced — waiters rely on them.
 
+`CONTINUE_INBOUND_REPLAY` is the one effect the client answers by re-entering the engine.
+`InboundSession.replay_session()` emits a bounded batch of redeliveries and then this marker;
+applying it takes `_engine_lock` and asks for the next batch. That is what puts delivery
+backpressure *between* batches instead of after all of them, and keeps replay memory proportional
+to one batch. It carries the epoch like everything else, so a disconnect mid-replay drops it and
+the cursor is abandoned at the next `begin_connect()`. A direct `ProtocolEngine` consumer that is
+not `AsyncClient` must pump `continue_inbound_replay()` itself while `inbound.replay_pending`.
+
 ### Other structure
 
 - `codec/` — VBI, bounded incremental decoder (`buffer.py`), MQTT-UTF-8 primitives, MQTT 5 property
@@ -137,10 +145,31 @@ When touching this area, keep `_effect_enqueued`/`_effect_applied` balanced — 
   re-exports; keep `__all__` in sync when adding a packet type.
 - `persistence/` — `InflightStore` is a `Protocol`; `MemoryInflightStore` and `SqliteInflightStore`
   implement it. `OutboundSession` hydrates packet ids and the offline queue from the store at
-  construction, while `InboundSession` recovers inbound delivery markers. `PagedInflightStore` is
-  an opt-in extension (`out_pages`/`out_summary_pages`/`in_pages`) that keeps replay memory
-  proportional to page size; the outbound session resolves it once with `isinstance` and otherwise
-  falls back to the eager path.
+  construction, while `InboundSession` recovers inbound delivery markers. Two opt-in extensions,
+  each resolved once with `isinstance` and each with a working fallback:
+  - `PagedInflightStore` (`out_pages`/`out_summary_pages`/`in_pages`) keeps replay memory
+    proportional to page size; without it the sessions fall back to the eager path.
+  - `TransitionInflightStore` adds atomic, conditional, **payload-free** transitions
+    (`complete_out`, `transition_out`, `contains_in`, `in_meta`, `mark_in_delivered`,
+    `transition_in`, `complete_in`, `in_index_pages`, `set_out_logical_size`). The store never owns
+    the state machine: `expected_state`/`new_state` come from the session, and the store only
+    guarantees the mutation is atomic, returning `None` when the record is absent or has moved on.
+    This is what lets a PUBACK settle a multi-megabyte publication without reading the BLOB.
+    Budget accounting then relies on the persisted `logical_size`; legacy rows carrying 0 are
+    recomputed once at hydration and written back.
+
+  `SqliteInflightStore` versions its schema in `PRAGMA user_version` (`SQLITE_SCHEMA_VERSION`,
+  currently 2). Migrations run in one transaction, so an interrupted upgrade reopens at the
+  starting version; a newer schema is refused. `batch()` is lazy — `BEGIN IMMEDIATE` is deferred to
+  the first mutation, so a read-only ingress lot takes no write lock. Two storage decisions are
+  load-bearing and measured, not cosmetic: **`payload` is declared last** (SQLite walks the columns
+  before the one you want, and a BLOB spills to overflow pages, so a metadata column placed after
+  it costs an overflow traversal on reads that never wanted the payload), and there is
+  **deliberately no `seq` index** — ordered pagination is one sorted metadata pass
+  (`_ordered_mids`) followed by primary-key page reads, which beat the indexed page-per-query form
+  while costing nothing on every publish. `benchmarks/persistence_index_ab.py` keeps that
+  falsifiable. Pages snapshot their identifiers up front, so a page whose records were acknowledged
+  meanwhile comes back *shorter* — same contract as `MemoryInflightStore`.
 - `transport/` — `AsyncTransport` protocol over TCP/TLS, Unix and WebSocket. A `WriteItem` is either
   `bytes` or a `(header, payload)` tuple: payloads past `SEGMENT_THRESHOLD` (1 MiB) are written as
   two consecutive writes instead of being concatenated.

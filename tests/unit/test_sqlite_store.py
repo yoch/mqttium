@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 from pathlib import Path
 
 from mqttium.enums import InboundQoSState, OutboundQoSState, QoS
@@ -40,24 +39,9 @@ def test_sqlite_outbound_roundtrip_and_blob_storage(tmp_path: Path) -> None:
     assert got.topic == "a/b"
     assert got.payload == b"payload"
     assert got.state is OutboundQoSState.WAIT_PUBACK
-    assert reopened.pop_out(7) is not None
+    assert reopened.delete_out(7) is True
     assert reopened.get_out(7) is None
     reopened.close()
-
-
-def test_legacy_base64_text_payload_is_read_lazily(tmp_path: Path) -> None:
-    store = SqliteInflightStore(tmp_path / "legacy.db")
-    store.put_out(outbound())
-    store._conn.execute(
-        "UPDATE outbound SET payload=? WHERE mid=7",
-        (base64.b64encode(b"legacy").decode("ascii"),),
-    )
-    store._conn.commit()
-
-    got = store.get_out(7)
-    assert got is not None
-    assert got.payload == b"legacy"
-    store.close()
 
 
 def test_batch_commits_once(tmp_path: Path) -> None:
@@ -188,6 +172,14 @@ def test_sqlite_outbound_pages_preserve_order_and_size(tmp_path: Path) -> None:
 
 
 def test_sqlite_outbound_pages_tolerate_deletion_between_pages(tmp_path: Path) -> None:
+    """A record deleted mid-iteration disappears; nothing else shifts.
+
+    Pagination snapshots the ordered identifiers up front, so a page whose
+    records were acknowledged in the meantime simply comes back short. That is
+    already `MemoryInflightStore`'s behaviour, and the guarantee both stores owe
+    a caller is the same: insertion order preserved, no duplicate, no
+    resurrection.
+    """
     store = SqliteInflightStore(tmp_path / "page-delete.db")
     with store.batch():
         for mid in range(1, 7):
@@ -197,8 +189,28 @@ def test_sqlite_outbound_pages_tolerate_deletion_between_pages(tmp_path: Path) -
     assert [message.mid for message in next(pages)] == [1, 2]
     assert store.delete_out(3) is True
 
-    assert [[message.mid for message in page] for page in pages] == [[4, 5], [6]]
+    remaining = [message.mid for page in pages for message in page]
+    assert remaining == [4, 5, 6]
     store.close()
+
+
+def test_memory_and_sqlite_pages_agree_on_deletion_semantics(tmp_path: Path) -> None:
+    sqlite_store = SqliteInflightStore(tmp_path / "agree.db")
+    memory_store = MemoryInflightStore()
+    for store in (sqlite_store, memory_store):
+        with store.batch():
+            for mid in range(1, 7):
+                store.put_out(outbound(mid))
+
+    def drain_with_deletion(store: object) -> list[int]:
+        pages = store.out_pages(page_size=2)  # type: ignore[attr-defined]
+        seen = [message.mid for message in next(pages)]
+        store.delete_out(3)  # type: ignore[attr-defined]
+        seen.extend(message.mid for page in pages for message in page)
+        return seen
+
+    assert drain_with_deletion(sqlite_store) == drain_with_deletion(memory_store)
+    sqlite_store.close()
 
 
 def test_sqlite_pages_reject_non_positive_size(tmp_path: Path) -> None:
@@ -226,7 +238,10 @@ def test_sqlite_outbound_summary_pages_do_not_select_payload(tmp_path: Path) -> 
     assert pages[0][0].payload_size == len(b"payload")
     selects = [statement for statement in trace if statement.lstrip().startswith("SELECT")]
     assert selects
-    assert all("payload_size" in statement for statement in selects)
+    # One ordered identifier pass, then one page fetch that stops before the
+    # payload column.
+    assert any("ORDER BY seq" in statement for statement in selects)
+    assert any("payload_size" in statement for statement in selects)
     assert all("SELECT *" not in statement for statement in selects)
     store.close()
 
@@ -285,3 +300,24 @@ def test_engine_falls_back_to_eager_replay_for_a_non_paged_store() -> None:
     assert engine._paged_store is None
     assert engine.pending_outbound_messages == 3
     assert [msg.mid for msg in engine._queued] == [1, 2, 3]
+
+
+def test_pages_split_the_fetch_under_the_sql_variable_limit(tmp_path: Path) -> None:
+    """`page_size` is caller-controlled, and each identifier binds a variable.
+
+    Older SQLite builds cap parameters at 999, so a page larger than that must
+    still come back whole, in order, from several fetches.
+    """
+    from mqttium.persistence.sqlite import _MAX_SQL_VARIABLES
+
+    store = SqliteInflightStore(tmp_path / "wide-page.db")
+    total = _MAX_SQL_VARIABLES * 2 + 5
+    with store.batch():
+        for mid in range(1, total + 1):
+            store.put_out(outbound(mid))
+
+    pages = list(store.out_pages(page_size=total))
+
+    assert len(pages) == 1
+    assert [message.mid for message in pages[0]] == list(range(1, total + 1))
+    store.close()

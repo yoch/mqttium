@@ -7,7 +7,14 @@ from itertools import islice
 from contextlib import AbstractContextManager, nullcontext
 from typing import Protocol, runtime_checkable
 
-from mqttium.types import InboundMessage, OutboundMessage, OutboundMessageSummary
+from mqttium.enums import InboundQoSState, OutboundQoSState
+from mqttium.types import (
+    InboundMessage,
+    InboundRecordMeta,
+    OutboundMessage,
+    OutboundMessageSummary,
+    OutboundRecordMeta,
+)
 
 
 class InflightStore(Protocol):
@@ -17,7 +24,6 @@ class InflightStore(Protocol):
     def batch(self) -> AbstractContextManager[None]: ...
     def put_out(self, msg: OutboundMessage) -> None: ...
     def get_out(self, mid: int) -> OutboundMessage | None: ...
-    def pop_out(self, mid: int) -> OutboundMessage | None: ...
     def delete_out(self, mid: int) -> bool: ...
     def update_out(self, msg: OutboundMessage) -> None: ...
     def out_items(self) -> Iterator[OutboundMessage]: ...
@@ -50,6 +56,84 @@ class PagedInflightStore(InflightStore, Protocol):
     def in_pages(self, page_size: int = 256) -> Iterator[tuple[InboundMessage, ...]]: ...
 
 
+@runtime_checkable
+class TransitionInflightStore(InflightStore, Protocol):
+    """Opt-in extension: conditional, payload-free record transitions.
+
+    The base interface only exposes whole objects, so settling a PUBACK means
+    asking a durable store to rebuild a multi-megabyte message just to delete
+    its row. These methods carry the *decision* — the state the session expects
+    and the state it wants — and return metadata only.
+
+    The store does not own the state machine. ``expected_state`` and
+    ``new_state`` always come from the session; the store only guarantees that
+    the durable mutation is atomic and conditional, returning ``None`` when the
+    record is absent or no longer in the expected state. A store that does not
+    implement this protocol keeps working through the whole-object path.
+    """
+
+    def set_out_logical_size(self, mid: int, logical_size: int) -> bool:
+        """Persist a logical size recomputed after reading a legacy record."""
+        ...
+
+    def out_meta(self, mid: int) -> OutboundRecordMeta | None:
+        """Read one outbound record's state and logical size, nothing else."""
+        ...
+
+    def complete_out(
+        self,
+        mid: int,
+        expected_state: OutboundQoSState,
+    ) -> OutboundRecordMeta | None: ...
+
+    def transition_out(
+        self,
+        mid: int,
+        expected_state: OutboundQoSState,
+        new_state: OutboundQoSState,
+        *,
+        compact: bool = False,
+    ) -> OutboundRecordMeta | None:
+        """Move one outbound record between states.
+
+        ``compact`` says the PUBLISH phase is over and only PUBREL can still be
+        retransmitted, so retransmission material kept for the publish frame may
+        be released.
+        """
+        ...
+
+    def contains_in(self, mid: int) -> bool: ...
+
+    def in_meta(self, mid: int) -> InboundRecordMeta | None: ...
+
+    def in_index_pages(self, page_size: int = 256) -> Iterator[tuple[InboundRecordMeta, ...]]:
+        """Page the inbound index without reading a single payload.
+
+        Restart recovery needs the identifier set and the record count, not the
+        messages; reading them back was the largest allocation a reconnect made.
+        """
+        ...
+
+    def mark_in_delivered(self, mid: int) -> bool:
+        """Flag a record as delivered; False when absent or already flagged."""
+        ...
+
+    def transition_in(
+        self,
+        mid: int,
+        expected_state: InboundQoSState,
+        new_state: InboundQoSState,
+        *,
+        user_acked: bool | None = None,
+    ) -> InboundRecordMeta | None: ...
+
+    def complete_in(
+        self,
+        mid: int,
+        expected_state: InboundQoSState,
+    ) -> InboundRecordMeta | None: ...
+
+
 class MemoryInflightStore:
     """Ordered dict-backed store. Insertion order is retransmission order."""
 
@@ -67,12 +151,6 @@ class MemoryInflightStore:
 
     def get_out(self, mid: int) -> OutboundMessage | None:
         return self._out.get(mid)
-
-    def pop_out(self, mid: int) -> OutboundMessage | None:
-        msg = self._out.pop(mid, None)
-        if msg is not None and not self._out:
-            self._out = {}
-        return msg
 
     def delete_out(self, mid: int) -> bool:
         deleted = self._out.pop(mid, None) is not None
@@ -110,6 +188,49 @@ class MemoryInflightStore:
         old.clear()
         self._out = {}
 
+    # --- conditional transitions (TransitionInflightStore) ------------------
+
+    def set_out_logical_size(self, mid: int, logical_size: int) -> bool:
+        msg = self._out.get(mid)
+        if msg is None:
+            return False
+        msg.logical_size = logical_size
+        return True
+
+    def out_meta(self, mid: int) -> OutboundRecordMeta | None:
+        msg = self._out.get(mid)
+        if msg is None:
+            return None
+        return OutboundRecordMeta(mid=mid, state=msg.state, logical_size=msg.logical_size)
+
+    def complete_out(
+        self,
+        mid: int,
+        expected_state: OutboundQoSState,
+    ) -> OutboundRecordMeta | None:
+        msg = self._out.get(mid)
+        if msg is None or msg.state is not expected_state:
+            return None
+        self.delete_out(mid)
+        return OutboundRecordMeta(mid=mid, state=expected_state, logical_size=msg.logical_size)
+
+    def transition_out(
+        self,
+        mid: int,
+        expected_state: OutboundQoSState,
+        new_state: OutboundQoSState,
+        *,
+        compact: bool = False,
+    ) -> OutboundRecordMeta | None:
+        msg = self._out.get(mid)
+        if msg is None or msg.state is not expected_state:
+            return None
+        msg.state = new_state
+        if compact:
+            # Only PUBREL is retransmissible from here on.
+            msg.encoded_publish = None
+        return OutboundRecordMeta(mid=mid, state=new_state, logical_size=msg.logical_size)
+
     def put_in(self, msg: InboundMessage) -> None:
         self._in[msg.mid] = msg
 
@@ -143,3 +264,61 @@ class MemoryInflightStore:
         old = self._in
         old.clear()
         self._in = {}
+
+    # --- conditional transitions (TransitionInflightStore) ------------------
+
+    def contains_in(self, mid: int) -> bool:
+        return mid in self._in
+
+    def in_meta(self, mid: int) -> InboundRecordMeta | None:
+        msg = self._in.get(mid)
+        if msg is None:
+            return None
+        return InboundRecordMeta(mid=mid, state=msg.state, user_acked=msg.user_acked)
+
+    def in_index_pages(self, page_size: int = 256) -> Iterator[tuple[InboundRecordMeta, ...]]:
+        if page_size <= 0:
+            raise ValueError("page_size must be positive")
+        mids = iter(tuple(self._in))
+        while page := tuple(islice(mids, page_size)):
+            metas = tuple(
+                InboundRecordMeta(mid=mid, state=message.state, user_acked=message.user_acked)
+                for mid in page
+                if (message := self._in.get(mid)) is not None
+            )
+            if metas:
+                yield metas
+
+    def mark_in_delivered(self, mid: int) -> bool:
+        msg = self._in.get(mid)
+        if msg is None or msg.delivered:
+            return False
+        msg.delivered = True
+        return True
+
+    def transition_in(
+        self,
+        mid: int,
+        expected_state: InboundQoSState,
+        new_state: InboundQoSState,
+        *,
+        user_acked: bool | None = None,
+    ) -> InboundRecordMeta | None:
+        msg = self._in.get(mid)
+        if msg is None or msg.state is not expected_state:
+            return None
+        msg.state = new_state
+        if user_acked is not None:
+            msg.user_acked = user_acked
+        return InboundRecordMeta(mid=mid, state=new_state, user_acked=msg.user_acked)
+
+    def complete_in(
+        self,
+        mid: int,
+        expected_state: InboundQoSState,
+    ) -> InboundRecordMeta | None:
+        msg = self._in.get(mid)
+        if msg is None or msg.state is not expected_state:
+            return None
+        self.pop_in(mid)
+        return InboundRecordMeta(mid=mid, state=msg.state, user_acked=msg.user_acked)

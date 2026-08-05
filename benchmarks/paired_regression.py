@@ -40,6 +40,10 @@ SCENARIOS = (
     "native_publish_nowait_qos0",
     "compat_publish_qos1",
     "compat_publish_qos0_batch",
+    "qos1_cycle_memory",
+    "qos1_cycle_sqlite",
+    "qos2_cycle_sqlite",
+    "ingress_publish_qos1",
 )
 
 
@@ -90,7 +94,7 @@ def _worker(args: argparse.Namespace) -> None:
     _pin(args.cpu)
     from mqttium.api.async_client import AsyncClient
     from mqttium.codec.buffer import IncrementalDecoder
-    from mqttium.enums import ConnectionState, MQTTProtocolVersion, QoS
+    from mqttium.enums import ConnectionState, MQTTProtocolVersion, PacketType, QoS
     from mqttium.packets import PublishPacket
     from mqttium.protocol.effects import EffectKind
     from mqttium.protocol.engine import EngineConfig, ProtocolEngine
@@ -136,6 +140,100 @@ def _worker(args: argparse.Namespace) -> None:
             engine.take_effects()
 
         result = _measure(run_ingress, operations=80_000, warmup=2_000)
+    elif scenario in ("qos1_cycle_memory", "qos1_cycle_sqlite", "qos2_cycle_sqlite"):
+        # One full publish/acknowledge cycle: admission, launch, and the
+        # settlement path that has to release the store row, the flow slot, the
+        # packet id and the byte budget.
+        import shutil
+        import tempfile
+
+        from mqttium.packets import PubAckPacket, PubCompPacket, PubRecPacket, encode_frame
+        from mqttium.persistence.memory import MemoryInflightStore
+        from mqttium.persistence.sqlite import SqliteInflightStore
+
+        directory = tempfile.mkdtemp(prefix="mqttium-paired-")
+        store: object
+        if scenario == "qos1_cycle_memory":
+            store = MemoryInflightStore()
+        else:
+            store = SqliteInflightStore(Path(directory) / "inflight.db")
+        payload_4k = b"z" * 4096
+        qos = QoS.EXACTLY_ONCE if scenario == "qos2_cycle_sqlite" else QoS.AT_LEAST_ONCE
+        engine = ProtocolEngine(
+            EngineConfig(
+                client_id="paired-cycle",
+                protocol=MQTTProtocolVersion.MQTTv311,
+                max_pending_outbound_messages=None,
+                max_pending_outbound_bytes=None,
+            ),
+            store=store,  # type: ignore[arg-type]
+        )
+        engine.begin_connect()
+        decoder = IncrementalDecoder()
+        decoder.feed(encode_frame(PacketType.CONNACK, 0, b"\x00\x00"))
+        engine.handle_raw(decoder.drain_packets()[0])
+        engine.take_effects()
+
+        def feed(wire: bytes) -> None:
+            local = IncrementalDecoder()
+            local.feed(wire)
+            engine.handle_raw(local.drain_packets()[0])
+
+        if qos == QoS.AT_LEAST_ONCE:
+
+            def run_cycle() -> None:
+                handle = engine.queue_publish(topic, payload_4k, qos=1)
+                engine.take_effects()
+                feed(PubAckPacket(mid=handle.mid or 0).encode())
+                engine.take_effects()
+        else:
+
+            def run_cycle() -> None:
+                handle = engine.queue_publish(topic, payload_4k, qos=2)
+                engine.take_effects()
+                mid = handle.mid or 0
+                feed(PubRecPacket(mid=mid).encode())
+                engine.take_effects()
+                feed(PubCompPacket(mid=mid).encode())
+                engine.take_effects()
+
+        try:
+            result = _measure(run_cycle, operations=5_000, warmup=500)
+        finally:
+            close = getattr(store, "close", None)
+            if close is not None:
+                close()
+            shutil.rmtree(directory, ignore_errors=True)
+    elif scenario == "ingress_publish_qos1":
+        from mqttium.packets import encode_frame
+        from mqttium.persistence.memory import MemoryInflightStore
+
+        engine = ProtocolEngine(
+            EngineConfig(client_id="paired-ingress-qos1", protocol=MQTTProtocolVersion.MQTTv311),
+            store=MemoryInflightStore(),
+        )
+        engine.begin_connect()
+        decoder = IncrementalDecoder()
+        decoder.feed(encode_frame(PacketType.CONNACK, 0, b"\x00\x00"))
+        engine.handle_raw(decoder.drain_packets()[0])
+        engine.take_effects()
+        inbound_wire = PublishPacket(
+            topic=topic,
+            payload=payload,
+            qos=QoS.AT_LEAST_ONCE,
+            retain=False,
+            dup=False,
+            mid=17,
+        ).encode(MQTTProtocolVersion.MQTTv311)
+        inbound_decoder = IncrementalDecoder()
+        inbound_decoder.feed(inbound_wire)
+        inbound_raw = inbound_decoder.drain_packets()[0]
+
+        def run_inbound() -> None:
+            engine.handle_raw(inbound_raw)
+            engine.take_effects()
+
+        result = _measure(run_inbound, operations=60_000, warmup=2_000)
     elif scenario == "writer_try_enqueue":
         client = AsyncClient(client_id="paired-writer-try")
         _install_discard_writer(client)

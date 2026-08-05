@@ -40,7 +40,7 @@ from mqttium.packets import (
     PubRecPacket,
     PubRelPacket,
 )
-from mqttium.persistence.memory import PagedInflightStore
+from mqttium.persistence.memory import PagedInflightStore, TransitionInflightStore
 from mqttium.protocol.effects import EffectKind, PublishFailure, PublishHandle
 from mqttium.protocol.flow_control import FlowControl
 from mqttium.protocol.packet_ids import PacketIdPool
@@ -57,6 +57,7 @@ class OutboundSession:
         "_engine",
         "_queued",
         "_paged_store",
+        "_transitions",
         "_pending_bytes",
         "_pending_high_water_bytes",
         "_pending_high_water_messages",
@@ -75,6 +76,10 @@ class OutboundSession:
         self.store = engine.store
         # Resolved once: a store either pages or it does not, for its lifetime.
         self._paged_store = self.store if isinstance(self.store, PagedInflightStore) else None
+        # Same contract for conditional transitions: acknowledgement handling
+        # settles records without ever materialising a payload when the store
+        # supports it, and falls back to the whole-object path when it does not.
+        self._transitions = self.store if isinstance(self.store, TransitionInflightStore) else None
         self.packet_ids = PacketIdPool()
         self.flow = FlowControl(self.config.local_receive_maximum)
         self._queued: deque[OutboundMessage | OutboundMessageSummary] = deque()
@@ -398,12 +403,30 @@ class OutboundSession:
 
     # --- broker acknowledgements -------------------------------------------
 
+    def _settle(self, mid: int, expected_state: OutboundQoSState) -> bool:
+        """Delete a record and release its budget iff it is in `expected_state`.
+
+        With a transition-capable store this never reads the payload back: a
+        PUBACK for an 8 MiB publication touches metadata columns only. Without
+        one it degrades to the original read-then-delete.
+        """
+        transitions = self._transitions
+        if transitions is not None:
+            meta = transitions.complete_out(mid, expected_state)
+            if meta is None:
+                return False
+            self._release_reservation(meta.logical_size)
+            return True
+        msg = self.store.get_out(mid)
+        if msg is None or msg.state is not expected_state:
+            return False
+        self.complete_record(mid, msg)
+        return True
+
     def on_puback(self, raw: RawPacket) -> None:
         ack = PubAckPacket.decode(raw.remaining, self.config.protocol)
-        msg = self.store.get_out(ack.mid)
-        if msg is None or msg.state is not OutboundQoSState.WAIT_PUBACK:
+        if not self._settle(ack.mid, OutboundQoSState.WAIT_PUBACK):
             return
-        self.complete_record(ack.mid, msg)
         self.flow.release()
         # Emit before freeing the packet id so FIFO receipt settlement remains
         # ordered even if a concurrent publish reuses the mid immediately.
@@ -416,37 +439,64 @@ class OutboundSession:
 
     def on_pubrec(self, raw: RawPacket) -> None:
         rec = PubRecPacket.decode(raw.remaining, self.config.protocol)
+        transitions = self._transitions
+        if transitions is not None:
+            # Two metadata statements replace a full record read plus update:
+            # the PUBLISH phase is over, so nothing but the state is needed.
+            meta = transitions.out_meta(rec.mid)
+            if meta is None:
+                self._send_orphan_pubrel(rec.mid)
+                return
+            if meta.state is not OutboundQoSState.WAIT_PUBREC:
+                return
+            if rec.reason_code >= 128:
+                self._fail_after_pubrec(rec.mid, rec.reason_code)
+                return
+            transitions.transition_out(
+                rec.mid,
+                OutboundQoSState.WAIT_PUBREC,
+                OutboundQoSState.WAIT_PUBCOMP,
+                compact=True,
+            )
+            # Keep the local flow slot until PUBCOMP. MQTT 5 allows releasing at
+            # PUBREC, but freeing early lets WAIT_PUBCOMP accumulate without
+            # bound and has caused intermittent multi-second stalls under load.
+            self._send(PubRelPacket(mid=rec.mid).encode(self.config.protocol))
+            return
+
         msg = self.store.get_out(rec.mid)
         if msg is None:
-            # Orphan PUBREC: reply PUBREL with 0x92 when MQTT 5.
-            reason = 0x92 if self.config.protocol == MQTTProtocolVersion.MQTTv5 else 0
-            self._send(PubRelPacket(mid=rec.mid, reason_code=reason).encode(self.config.protocol))
+            self._send_orphan_pubrel(rec.mid)
             return
         if msg.state is not OutboundQoSState.WAIT_PUBREC:
             return
         if rec.reason_code >= 128:
-            self.complete_record(rec.mid, msg)
-            self.flow.release()
-            self._fail(rec.mid, ProtocolError(f"PUBREC reason_code={rec.reason_code}"))
-            self.packet_ids.release(rec.mid)
-            self.drain()
+            self._fail_after_pubrec(rec.mid, rec.reason_code)
             return
         msg.state = OutboundQoSState.WAIT_PUBCOMP
         msg.encoded_publish = None
         if msg.encoded_pubrel is None:
             msg.encoded_pubrel = PubRelPacket(mid=rec.mid).encode(self.config.protocol)
         self.store.update_out(msg)
-        # Keep the local flow slot until PUBCOMP. MQTT 5 allows releasing at
-        # PUBREC, but freeing early lets WAIT_PUBCOMP accumulate without bound
-        # and has caused intermittent multi-second stalls under load.
         self._send(msg.encoded_pubrel)
+
+    def _send_orphan_pubrel(self, mid: int) -> None:
+        """Answer a PUBREC with no matching record: PUBREL, 0x92 when MQTT 5."""
+        reason = 0x92 if self.config.protocol == MQTTProtocolVersion.MQTTv5 else 0
+        self._send(PubRelPacket(mid=mid, reason_code=reason).encode(self.config.protocol))
+
+    def _fail_after_pubrec(self, mid: int, reason_code: int) -> None:
+        if not self._settle(mid, OutboundQoSState.WAIT_PUBREC):
+            return
+        self.flow.release()
+        self._fail(mid, ProtocolError(f"PUBREC reason_code={reason_code}"))
+        self.packet_ids.release(mid)
+        self.drain()
 
     def on_pubcomp(self, raw: RawPacket) -> None:
         comp = PubCompPacket.decode(raw.remaining, self.config.protocol)
-        msg = self.store.get_out(comp.mid)
-        if msg is None or msg.state is not OutboundQoSState.WAIT_PUBCOMP:
+        if not self._settle(comp.mid, OutboundQoSState.WAIT_PUBCOMP):
             return
-        self.complete_record(comp.mid, msg)
         self.flow.release()
         if comp.reason_code >= 128:
             self._fail(comp.mid, ProtocolError(f"PUBCOMP reason_code={comp.reason_code}"))
@@ -675,13 +725,21 @@ class OutboundSession:
 
     def hydrate(self) -> None:
         """Recover packet ids and the offline queue from a durable store."""
-        for page in self.store_summary_pages():
-            for msg in page:
-                self._hydrate_message(msg)
+        with self.store.batch():
+            for page in self.store_summary_pages():
+                for msg in page:
+                    self._hydrate_message(msg)
 
     def _hydrate_message(self, msg: OutboundMessage | OutboundMessageSummary) -> None:
         self.packet_ids.reserve(msg.mid)
+        unknown_size = msg.logical_size <= 0
         logical_size = self.stored_logical_size(msg)
+        if unknown_size and self._transitions is not None:
+            # Records written before the store persisted logical sizes would
+            # otherwise release nothing from the byte budget when a
+            # metadata-only acknowledgement settles them. One write per legacy
+            # record, inside the hydration batch, and never again.
+            self._transitions.set_out_logical_size(msg.mid, logical_size)
         self._pending_messages += 1
         self._pending_bytes += logical_size
         if msg.state is OutboundQoSState.QUEUED:

@@ -91,6 +91,28 @@ class OutboundMessageSummary:
         )
 
 
+@dataclass(slots=True, frozen=True)
+class OutboundRecordMeta:
+    """Everything a durable outbound transition has to return.
+
+    Deliberately payload-free: a PUBACK for a multi-megabyte publication must
+    settle its record without the store ever reading the BLOB back.
+    """
+
+    mid: int
+    state: OutboundQoSState
+    logical_size: int
+
+
+@dataclass(slots=True, frozen=True)
+class InboundRecordMeta:
+    """Payload-free inbound record metadata (see :class:`OutboundRecordMeta`)."""
+
+    mid: int
+    state: InboundQoSState
+    user_acked: bool
+
+
 @dataclass(slots=True)
 class InboundMessage:
     mid: int
