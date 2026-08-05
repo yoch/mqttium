@@ -47,8 +47,16 @@ class WritePump:
     def queued_messages(self) -> int:
         return self.queue.qsize()
 
+    def _sample_high_water(self, queued_messages: int | None = None) -> None:
+        messages = self.queue.qsize() if queued_messages is None else queued_messages
+        if messages > self.high_water_messages:
+            self.high_water_messages = messages
+        if self.queued_bytes > self.high_water_bytes:
+            self.high_water_bytes = self.queued_bytes
+
     def reset(self) -> None:
         """Start a new transport epoch with an empty queue."""
+        self._sample_high_water()
         self.queue = asyncio.Queue()
         self.queued_bytes = 0
 
@@ -87,6 +95,7 @@ class WritePump:
             self.space.notify_all()
 
     def discard(self) -> None:
+        self._sample_high_water()
         while True:
             try:
                 self.queue.get_nowait()
@@ -181,11 +190,7 @@ class WritePump:
         try:
             while True:
                 first = await queue.get()
-                queued_messages = queue.qsize() + 1
-                if queued_messages > self.high_water_messages:
-                    self.high_water_messages = queued_messages
-                if self.queued_bytes > self.high_water_bytes:
-                    self.high_water_bytes = self.queued_bytes
+                self._sample_high_water(queue.qsize() + 1)
                 batch: list[WriteItem] = [first]
                 while len(batch) < 256:
                     try:

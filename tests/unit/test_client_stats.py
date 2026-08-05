@@ -86,11 +86,8 @@ def test_stats_reports_current_state_and_lifetime_high_water_marks() -> None:
     drained = client.stats()
     assert drained.writer.queued_messages == 0
     assert drained.writer.queued_bytes == 0
-    # The production writer samples queue peaks per drained batch. This test
-    # used a queue without a running writer, so only the loaded snapshot can
-    # include that current queue level.
-    assert drained.writer.high_water_messages == 0
-    assert drained.writer.high_water_bytes == 0
+    assert drained.writer.high_water_messages == 1
+    assert drained.writer.high_water_bytes == 4
     assert drained.decoder.buffered_bytes == 0
     assert drained.decoder.high_water_bytes == 1
     assert drained.effects.pending == 0
