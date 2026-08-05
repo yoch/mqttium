@@ -263,9 +263,7 @@ class InboundSession:
                 # than leaving WAIT_USER_ACK permanently stuck.
                 completed = transitions.complete_in(rel.mid, InboundQoSState.WAIT_USER_ACK)
                 if completed is None:
-                    raise ProtocolError(
-                        f"Inbound mid={rel.mid} changed while completing PUBREL"
-                    )
+                    raise ProtocolError(f"Inbound mid={rel.mid} changed while completing PUBREL")
                 engine._send(PubCompPacket(mid=rel.mid).encode(config.protocol))
                 self._release_slot()
                 return
