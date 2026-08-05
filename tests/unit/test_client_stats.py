@@ -22,8 +22,10 @@ def test_initial_stats_snapshot_is_immutable_and_side_effect_free() -> None:
     assert isinstance(snapshot, ClientStats)
     assert snapshot.state is ConnectionState.NEW
     assert snapshot.connection_epoch == 0
-    assert snapshot.protocol.pending_outbound_messages == 0
-    assert snapshot.protocol.pending_outbound_bytes == 0
+    assert snapshot.outbound.pending_messages == 0
+    assert snapshot.outbound.pending_bytes == 0
+    assert snapshot.inbound.inflight == 0
+    assert snapshot.inbound.replay_pending is False
     assert snapshot.writer.queued_messages == 0
     assert snapshot.writer.queued_bytes == 0
     assert snapshot.writer.max_messages == 7
@@ -64,12 +66,12 @@ def test_stats_reports_current_state_and_lifetime_high_water_marks() -> None:
     client._collect_effects_locked()
 
     loaded = client.stats()
-    assert loaded.protocol.pending_outbound_messages == 1
-    assert loaded.protocol.pending_outbound_bytes == 3
-    assert loaded.protocol.pending_outbound_high_water_messages == 1
-    assert loaded.protocol.pending_outbound_high_water_bytes == 3
-    assert loaded.protocol.queued_outbound_messages == 1
-    assert loaded.protocol.packet_ids_in_use == 1
+    assert loaded.outbound.pending_messages == 1
+    assert loaded.outbound.pending_bytes == 3
+    assert loaded.outbound.pending_high_water_messages == 1
+    assert loaded.outbound.pending_high_water_bytes == 3
+    assert loaded.outbound.queued_messages == 1
+    assert loaded.outbound.packet_ids_in_use == 1
     assert loaded.writer.queued_messages == 1
     assert loaded.writer.queued_bytes == 4
     assert loaded.writer.high_water_messages == 1
@@ -137,3 +139,112 @@ async def test_writer_worker_records_lifetime_high_water_without_enqueue_overhea
 def test_client_rejects_invalid_ingress_batch_limit(value: int) -> None:
     with pytest.raises(ValueError, match="max_ingress_batch_bytes"):
         AsyncClient(max_ingress_batch_bytes=value)
+
+
+def test_each_owner_produces_its_own_snapshot() -> None:
+    """`stats()` assembles; it does not reach into anyone's private fields."""
+    client = AsyncClient()
+
+    snapshot = client.stats()
+
+    assert snapshot.outbound == client._engine.outbound.stats()
+    assert snapshot.inbound == client._engine.inbound.stats()
+    assert snapshot.effects == client._effect_pump.stats()
+    assert snapshot.writer == client._write_pump.stats()
+
+
+def test_transport_without_a_stats_method_reports_unavailable() -> None:
+    client = AsyncClient()
+    transport = _RecordingTransport()
+    client._transport = transport
+
+    snapshot = client.stats()
+
+    assert snapshot.transport.kind == "_RecordingTransport"
+    assert snapshot.transport.closing is False
+    assert snapshot.transport.pending_write_bytes == 0
+
+
+@pytest.mark.asyncio
+async def test_writer_decision_counters_describe_the_batches_it_wrote() -> None:
+    client = AsyncClient(max_outbound_messages=8, max_outbound_bytes=4096)
+    transport = _RecordingTransport()
+    client._write_pump.start(transport)
+    try:
+        # A segmented item is written apart from the coalesced run around it.
+        await client._enqueue_outbound(b"aa")
+        await client._enqueue_outbound((b"header", b"payload"))
+        await client._enqueue_outbound(b"bb")
+        await client._write_pump.join()
+    finally:
+        await client._write_pump.stop()
+
+    writer = client.stats().writer
+    assert writer.batches >= 1
+    assert writer.batched_items == 3
+    assert writer.batched_bytes == len(b"aa") + len(b"headerpayload") + len(b"bb")
+    assert writer.segmented_writes == 1
+    assert writer.enqueue_suspensions == 0
+
+
+def test_effect_counters_separate_inline_from_reordered_batches() -> None:
+    client = AsyncClient()
+
+    # One effect, applied inline: no deque, no reordering.
+    client._engine._emit(EffectKind.SEND, b"x")
+    client._collect_effects_locked()
+    inline = client.stats().effects
+    assert inline.batches == 1
+    assert inline.inline_effects == 1
+    assert inline.multi_effect_batches == 0
+    assert inline.reordered_batches == 0
+
+    # A batch whose SEND trails a non-SEND has to be partitioned.
+    client._engine._emit(
+        EffectKind.MESSAGE,
+        Message(topic="in", payload=b"payload", qos=QoS.AT_MOST_ONCE),
+    )
+    client._engine._emit(EffectKind.SEND, b"y")
+    client._collect_effects_locked()
+    reordered = client.stats().effects
+    assert reordered.batches == 2
+    assert reordered.multi_effect_batches == 1
+    assert reordered.reordered_batches == 1
+    assert reordered.enqueued == 2
+
+
+def test_an_already_ordered_batch_is_counted_but_not_reordered() -> None:
+    client = AsyncClient()
+
+    client._engine._emit(EffectKind.SEND, b"x")
+    client._engine._emit(
+        EffectKind.MESSAGE,
+        Message(topic="in", payload=b"payload", qos=QoS.AT_MOST_ONCE),
+    )
+    client._collect_effects_locked()
+
+    effects = client.stats().effects
+    assert effects.multi_effect_batches == 1
+    assert effects.reordered_batches == 0
+
+
+def test_protocol_stats_compatibility_aggregate_matches_directional_sections() -> None:
+    client = AsyncClient()
+
+    snapshot = client.stats()
+
+    assert snapshot.protocol.pending_outbound_messages == snapshot.outbound.pending_messages
+    assert snapshot.protocol.pending_outbound_bytes == snapshot.outbound.pending_bytes
+    assert (
+        snapshot.protocol.pending_outbound_high_water_messages
+        == snapshot.outbound.pending_high_water_messages
+    )
+    assert (
+        snapshot.protocol.pending_outbound_high_water_bytes
+        == snapshot.outbound.pending_high_water_bytes
+    )
+    assert snapshot.protocol.queued_outbound_messages == snapshot.outbound.queued_messages
+    assert snapshot.protocol.flow_inflight == snapshot.outbound.flow_inflight
+    assert snapshot.protocol.flow_limit == snapshot.outbound.flow_limit
+    assert snapshot.protocol.packet_ids_in_use == snapshot.outbound.packet_ids_in_use
+    assert snapshot.protocol.inbound_inflight == snapshot.inbound.inflight

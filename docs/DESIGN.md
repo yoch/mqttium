@@ -115,11 +115,26 @@ backpressure de livraison. Le paquet qui atteint la cible reste inclus, afin
 qu'un paquet individuellement plus grand puisse toujours progresser.
 
 `AsyncClient.stats()` construit à la demande un arbre `ClientStats` immuable.
-Les compteurs appartiennent aux composants qui possèdent déjà l'état :
-`OutboundSession`, `EffectPump`, `WritePump`, decoder, livraison, receipts et
-transports. Aucun logger, sampler périodique ou registre parallèle n'est ajouté.
-Les high-water marks du writer sont relevés par batch dans le worker, et non sur
-chaque admission du hot path.
+Chaque section est produite par le composant qui possède l'état, et `stats()` ne
+fait que les assembler : `OutboundSession.stats()`, `InboundSession.stats()`,
+`EffectPump.stats()`, `WritePump.stats()` et `transport.stats()`. Le client ne
+traverse donc plus `outbound._queued`, `inbound._inflight` ni les attributs d'un
+transport : un champ privé peut évoluer sans le toucher, et chaque propriétaire
+calcule ses propres invariants au même endroit. Un transport tiers qui
+n'implémente pas `stats()` est rapporté via `TransportStats.unavailable()`.
+
+Les types de snapshot vivent chez leur propriétaire — `protocol/stats.py` et
+`transport/stats.py` — pour que la dépendance continue d'aller de l'adaptateur
+runtime vers le cœur, et non l'inverse. `api/stats.py` les réexporte.
+
+Aucun logger, sampler périodique ou registre parallèle n'est ajouté. Les
+high-water marks du writer sont relevés par batch dans le worker, et non sur
+chaque admission du hot path. Les compteurs de décision (`batches`,
+`multi_effect_batches`, `reordered_batches`, `inline_effects`,
+`segmented_writes`, `enqueue_suspensions`, …) existent pour qu'une modification
+du batching writer ou de la représentation des lots d'effets s'appuie sur des
+mesures plutôt que sur une intuition ; leur coût est vérifié par
+`paired_regression.py`.
 
 ### Commandes loop-bound et façade Paho
 

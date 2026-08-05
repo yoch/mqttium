@@ -12,6 +12,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from mqttium.transport._stream import write_buffer_needs_drain
+from mqttium.transport.stats import TransportStats
 
 _MAX_HANDSHAKE_BYTES = 64 * 1024
 _MAX_CONTROL_PAYLOAD = 125
@@ -182,6 +183,17 @@ class WebSocketTransport:
     @property
     def pending_control_bytes(self) -> int:
         return sum(map(len, self._pending_control))
+
+    def stats(self) -> TransportStats:
+        return TransportStats(
+            kind=type(self).__name__,
+            closing=self.is_closing(),
+            pending_write_bytes=self.pending_write_bytes,
+            buffered_read_bytes=self.buffered_read_bytes,
+            fragmented_read_bytes=self.fragmented_read_bytes,
+            pending_control_frames=self.pending_control_frames,
+            pending_control_bytes=self.pending_control_bytes,
+        )
 
     async def _flush_control(self) -> None:
         if not self._pending_control:

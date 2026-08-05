@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from mqttium.enums import ConnectionState
+from mqttium.protocol.stats import InboundStats, OutboundStats
+from mqttium.transport.stats import TransportStats
 
 
 @dataclass(slots=True, frozen=True)
@@ -19,6 +21,8 @@ class TaskStats:
 
 @dataclass(slots=True, frozen=True)
 class ProtocolStats:
+    """Deprecated aggregate retained for pre-stable compatibility."""
+
     pending_outbound_messages: int
     pending_outbound_bytes: int
     pending_outbound_high_water_messages: int
@@ -37,6 +41,14 @@ class EffectStats:
     enqueued: int
     applied: int
     waiters: int
+    # Decision counters: how often several effects arrive together, how often
+    # that actually required reordering, and how much rode the inline fast path.
+    # Effects that did not is `enqueued`, so there is no separate counter.
+    batches: int
+    multi_effect_batches: int
+    reordered_batches: int
+    inline_effects: int
+    apply_suspensions: int
 
 
 @dataclass(slots=True, frozen=True)
@@ -49,6 +61,13 @@ class WriterStats:
     max_bytes: int
     waiters: int
     last_outbound: float
+    # Decision counters: batch count and shape, plus how often a producer had to
+    # wait for queue space.
+    batches: int
+    batched_items: int
+    batched_bytes: int
+    segmented_writes: int
+    enqueue_suspensions: int
 
 
 @dataclass(slots=True, frozen=True)
@@ -83,23 +102,14 @@ class ReceiptStats:
 
 
 @dataclass(slots=True, frozen=True)
-class TransportStats:
-    kind: str | None
-    closing: bool
-    pending_write_bytes: int
-    buffered_read_bytes: int
-    fragmented_read_bytes: int
-    pending_control_frames: int
-    pending_control_bytes: int
-
-
-@dataclass(slots=True, frozen=True)
 class ClientStats:
     """One point-in-time, side-effect-free runtime snapshot.
 
-    High-water fields are measured over the lifetime of the client or protocol
-    engine. Calling :meth:`AsyncClient.stats` does not enable background
-    sampling and does not reset any counter.
+    Every section is produced by the component that owns the state — the two
+    protocol sessions, the effect pump, the write pump and the transport — so
+    this class only assembles them. High-water fields are measured over the
+    lifetime of the client or protocol engine. Calling :meth:`AsyncClient.stats`
+    does not enable background sampling and does not reset any counter.
     """
 
     state: ConnectionState
@@ -107,6 +117,8 @@ class ClientStats:
     reconnect_attempt: int
     tasks: TaskStats
     protocol: ProtocolStats
+    outbound: OutboundStats
+    inbound: InboundStats
     effects: EffectStats
     writer: WriterStats
     decoder: DecoderStats
@@ -120,6 +132,8 @@ __all__ = [
     "DecoderStats",
     "DeliveryStats",
     "EffectStats",
+    "InboundStats",
+    "OutboundStats",
     "ProtocolStats",
     "ReceiptStats",
     "TaskStats",
