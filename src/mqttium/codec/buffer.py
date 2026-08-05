@@ -116,9 +116,20 @@ class IncrementalDecoder:
         #
         # `bytes(buf[a:b])` copies twice: slicing a bytearray builds another
         # bytearray, which `bytes()` then copies again. Going through a
-        # memoryview copies once. The view is transient and released before the
-        # buffer is touched, so no memoryview of the reusable buffer is ever
-        # handed out — the owned-bytes invariant is unchanged.
+        # memoryview copies once.
+        #
+        # Why not just `buf[a:b]`? It is indeed a single copy, and on its own the
+        # fastest of the three. But it is a *mutable* bytearray, and that escapes
+        # one level further: `PublishPacket.decode` slices the payload straight
+        # out of it, so `Message.payload` would become a bytearray — unhashable,
+        # and mutable by the application while the inflight store holds the same
+        # object. Converting it back costs exactly the copy just saved; measured
+        # end to end, paired and alternated, that variant is 1.04x to 1.17x
+        # slower. A memoryview is the only single-copy route to immutable bytes.
+        #
+        # The view is transient and released before the buffer is touched, so no
+        # memoryview of the reusable buffer is ever handed out — the owned-bytes
+        # invariant is unchanged.
         #
         # Only worth it above `_VIEW_COPY_THRESHOLD`: the memoryview object costs
         # more than the second copy saves on small frames, and small frames are
