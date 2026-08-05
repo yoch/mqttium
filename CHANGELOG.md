@@ -6,6 +6,27 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Added
+
+- `AsyncClient.publish_nowait()`, a synchronous, non-suspending publication
+  method for producers already executing on the client's event loop. It performs
+  immediate engine and writer-capacity checks, returns the normal
+  `PublishReceipt`, and coalesces asynchronous effect completion without
+  creating a publication coroutine.
+- `ProtocolEngine.reconfigure()`, the validated configuration boundary used by
+  runtime adapters instead of mutating the attached configuration directly.
+
+### Changed
+
+- The Paho façade now uses a narrow loop-bound `AsyncClient` adapter boundary
+  rather than accessing the protocol engine, receipt registries and effect pump
+  directly. Its cross-thread batching is preserved: QoS 0 uses receiptless
+  batched admission, while QoS 1/2 receives the authoritative MID and registered
+  receipt before releasing the calling thread.
+- The native `await publish()` hot path remains inline rather than routing
+  through adapter wrappers; paired measurements found the wrapper version
+  2.36% slower, while the retained path is performance-neutral against `main`.
+
 ## [0.1.0a2] - 2026-08-04
 
 ### Added
