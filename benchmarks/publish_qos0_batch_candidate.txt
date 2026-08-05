@@ -1,1 +1,1 @@
-Publish the clean candidate validated by run 31049968366 using the repository CI lint scope.
+Publish the clean candidate validated by run 31049968366 using CI-equivalent lint and test commands.
