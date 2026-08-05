@@ -31,6 +31,13 @@ débit en permettant le batching, mais peut mécaniquement augmenter les
 percentiles de latence. Le paramètre `--window` doit être balayé avant de
 qualifier une variation de régression.
 
+Une calibration appariée avec un code identique des deux côtés a confirmé cette
+relation : la médiane locale reste sous la milliseconde aux fenêtres 1 et 5,
+augmente à la fenêtre 20, puis devient à la fois plus élevée et beaucoup plus
+bruitée à la fenêtre 100, surtout pour les payloads de 4 Kio. Une valeur isolée
+à grande fenêtre mesure donc principalement la résidence dans le pipeline et la
+variabilité du runner ; elle ne suffit pas à établir une régression du moteur.
+
 Pour une modification sensible aux chemins chauds,
 `paired_regression.py` et `paired_network.py` exécutent `main` et le candidat
 sur le même runner, en ordre alterné et dans des interpréteurs frais. Les
