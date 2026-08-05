@@ -1,1 +1,1 @@
-Build, validate and publish the parity-aligned MQTT 3.1.1 QoS 0 direct-message decode.
+Build, validate and publish the finalized MQTT 3.1.1 QoS 0 direct-message decode.
