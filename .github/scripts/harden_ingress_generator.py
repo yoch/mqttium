@@ -23,6 +23,11 @@ def main() -> None:
     text = replace_once(text, "import struct\nimport time\n", "import struct\nimport threading\nimport time\n")
     text = replace_once(
         text,
+        "from dataclasses import asdict, dataclass\n",
+        "from dataclasses import dataclass\n",
+    )
+    text = replace_once(
+        text,
         "def _raw_publish_worker(topic: str, count: int, worker_id: int, connections: int = 8) -> None:\n",
         "def _raw_publish_worker(\n"
         "    topic: str,\n"
