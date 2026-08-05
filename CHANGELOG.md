@@ -36,6 +36,9 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   report its own buffer occupancy. A transport that does not is reported
   through `TransportStats.unavailable()` instead of being probed attribute by
   attribute from the client.
+- `benchmarks/codec_allocations.py`, which reports bytes allocated per inbound
+  message as a multiple of the payload across 64 B to 8 MiB, MQTT 3.1.1 and 5,
+  and contiguous, random and byte-by-byte fragmentation.
 
 ### Changed
 
@@ -53,6 +56,17 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   `AsyncClient.stats()` now only assembles the sections instead of reaching
   through `outbound._queued`, `inbound._inflight` and transport attributes, so
   a private field can move without touching the client.
+- An inbound PUBLISH payload is copied twice instead of three times.
+  `IncrementalDecoder.next_packet()` built the owned body with
+  `bytes(bytearray[a:b])`, which slices into a second bytearray and then copies
+  that again; going through a transient memoryview copies once. Measured over
+  the full ingress path (`feed` → `next_packet` → `PublishPacket.decode`):
+  allocation per message drops from 3.00x the payload to 2.00x, and throughput
+  rises 18% at 64 KiB, 48% at 1 MiB and 43% at 8 MiB. Applied only above 4 KiB,
+  where a paired in-process comparison puts the crossover — small frames are the
+  hot path and the memoryview costs more there than the copy it saves. No
+  memoryview of the reusable buffer is ever handed out, so the owned-bytes
+  invariant is unchanged.
 - `EffectPump` partitions a multi-effect batch SEND-first in a single pass, and
   leaves the list alone when it was already ordered. The two-generator form it
   replaces walked the batch twice and always rebuilt the list. This is what pays

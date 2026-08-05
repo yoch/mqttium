@@ -19,6 +19,12 @@ from mqttium.errors import MalformedPacketError, PacketTooLargeError
 # Default local ceiling before CONNACK negotiation (256 MiB is the MQTT max).
 DEFAULT_MAX_PACKET_SIZE = 16 * 1024 * 1024
 _COMPACT_THRESHOLD = 64 * 1024
+# Body size from which the body is copied through a memoryview instead of
+# `bytes(bytearray[a:b])` — see next_packet. Paired end-to-end decode, alternated
+# in-process over 11 repeats: 1 KiB 0.996, 4 KiB 0.989, 8 KiB 1.027, 16 KiB
+# 1.021. So 4 KiB gives up ~1% throughput to stop allocating a second full copy
+# of every payload, and everything larger gains on both counts.
+_VIEW_COPY_THRESHOLD = 4096
 
 
 @dataclass(slots=True, frozen=True)
@@ -106,8 +112,25 @@ class IncrementalDecoder:
         flags = header & 0x0F
         body_start = start + fixed_header_len
         body_end = start + total
-        # Copy body out so callers never alias the reusable buffer.
-        body = bytes(buf[body_start:body_end])
+        # Copy the body out so callers never alias the reusable buffer.
+        #
+        # `bytes(buf[a:b])` copies twice: slicing a bytearray builds another
+        # bytearray, which `bytes()` then copies again. Going through a
+        # memoryview copies once. The view is transient and released before the
+        # buffer is touched, so no memoryview of the reusable buffer is ever
+        # handed out — the owned-bytes invariant is unchanged.
+        #
+        # Only worth it above `_VIEW_COPY_THRESHOLD`: the memoryview object costs
+        # more than the second copy saves on small frames, and small frames are
+        # the hot path.
+        if remaining_length >= _VIEW_COPY_THRESHOLD:
+            view = memoryview(buf)
+            try:
+                body = bytes(view[body_start:body_end])
+            finally:
+                view.release()
+        else:
+            body = bytes(buf[body_start:body_end])
         self._start = body_end
         if self._start == len(self._buf):
             # Reuse the buffer object (avoid allocating a fresh bytearray).
