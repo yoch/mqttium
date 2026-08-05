@@ -1,0 +1,69 @@
+name: Validate owning-loop enforcement
+
+on:
+  push:
+    branches:
+      - agent/paho-native-publish-boundary
+
+permissions:
+  contents: write
+
+jobs:
+  guard:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: candidate
+          token: ${{ secrets.CGW_PUSH_TOKEN }}
+          fetch-depth: 0
+      - uses: actions/checkout@v7
+        with:
+          ref: bccbf9fcd449329a96bf0b92786a481ab487995e
+          path: base
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Apply owner-loop guard
+        working-directory: candidate
+        run: python .github/add_owner_loop_guard.py
+      - name: Validate source and tests
+        working-directory: candidate
+        run: |
+          python -m pip install -e '.[dev]'
+          ruff format src tests benchmarks
+          ruff check src tests benchmarks
+          mypy src
+          PYTHONPATH=. pytest -q tests/unit
+      - name: Verify native publishing performance
+        run: |
+          python candidate/benchmarks/paired_regression.py \
+            --base-root base \
+            --candidate-root candidate \
+            --repeat 11 \
+            --output /tmp/owner-loop-paired.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          data = json.loads(Path('/tmp/owner-loop-paired.json').read_text())
+          ratios = {item['name']: item['median_candidate_over_base'] for item in data['scenarios']}
+          for name in ('async_publish_nowait_qos0', 'native_publish_nowait_qos0', 'compat_publish_qos1', 'compat_publish_qos0_batch'):
+              print(f'{name}={ratios[name]:.4f}')
+          if ratios['async_publish_nowait_qos0'] < 0.98:
+              raise SystemExit('native async publish regression exceeds 2%')
+          if ratios['native_publish_nowait_qos0'] < 1.0:
+              raise SystemExit('publish_nowait no longer improves on the coroutine path')
+          if ratios['compat_publish_qos1'] < 0.98:
+              raise SystemExit('Paho QoS1 regression exceeds 2%')
+          if ratios['compat_publish_qos0_batch'] < 0.98:
+              raise SystemExit('Paho QoS0 batch regression exceeds 2%')
+          PY
+      - name: Commit clean guarded branch
+        working-directory: candidate
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Enforce the publish_nowait owning-loop contract"
+          git push origin HEAD:agent/paho-native-publish-boundary
