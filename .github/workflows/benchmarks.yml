@@ -81,6 +81,11 @@ jobs:
             --repeat 5 \
             --workers 8 \
             --output /tmp/mqttium-bench/compat-qosn-submit.json
+      - name: QoS 1 and pre-PUBREC frame policy
+        run: |
+          python benchmarks/qos1_frame_policy.py \
+            --repeat 5 \
+            --output /tmp/mqttium-bench/qos1-frame-policy.json
       - name: Packet identifier pool A/B
         run: |
           python benchmarks/packet_id_pool_ab.py \
