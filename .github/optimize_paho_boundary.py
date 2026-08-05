@@ -75,9 +75,11 @@ replace_once(
 )
 replace_once(
     paho_path,
-    """        self._async._finalize_loop_commands()
+    """    def _finalize_publish_effects(self) -> None:
+        self._async._finalize_loop_commands()
 """,
-    """        self._finalize_async_commands()
+    """    def _finalize_publish_effects(self) -> None:
+        self._finalize_async_commands()
 """,
 )
 replace_once(
