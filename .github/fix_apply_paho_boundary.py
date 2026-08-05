@@ -111,15 +111,4 @@ if text.count(old_batch) != 1:
     raise SystemExit(f"expected one Paho QoS0 batch call, found {text.count(old_batch)}")
 text = text.replace(old_batch, new_batch, 1)
 
-old_return = """                return receipt
-            try:
-"""
-new_return = """                assert receipt is not None
-            return receipt
-            try:
-"""
-if text.count(old_return) != 1:
-    raise SystemExit(f"expected one async receipt return, found {text.count(old_return)}")
-text = text.replace(old_return, new_return, 1)
-
 path.write_text(text)
