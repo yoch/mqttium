@@ -169,9 +169,7 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
             "forced_reconnects": reconnects,
             "elapsed_s": time.perf_counter() - started,
             "publisher_high_water": {
-                "pending_messages": (
-                    publisher_stats.protocol.pending_outbound_high_water_messages
-                ),
+                "pending_messages": (publisher_stats.protocol.pending_outbound_high_water_messages),
                 "pending_bytes": publisher_stats.protocol.pending_outbound_high_water_bytes,
                 "writer_messages": publisher_stats.writer.high_water_messages,
                 "writer_bytes": publisher_stats.writer.high_water_bytes,

@@ -397,8 +397,7 @@ class AsyncClient:
             return task is not None and not task.done()
 
         publish_receipts = sum(
-            len(current) if isinstance(current, deque) else 1
-            for current in self._receipts.values()
+            len(current) if isinstance(current, deque) else 1 for current in self._receipts.values()
         )
         batch_ids: set[int] = set()
         for current in self._batch_receipts.values():
@@ -456,9 +455,7 @@ class AsyncClient:
             writer=WriterStats(
                 queued_messages=write_pump.queued_messages,
                 queued_bytes=write_pump.queued_bytes,
-                high_water_messages=max(
-                    write_pump.high_water_messages, write_pump.queued_messages
-                ),
+                high_water_messages=max(write_pump.high_water_messages, write_pump.queued_messages),
                 high_water_bytes=max(write_pump.high_water_bytes, write_pump.queued_bytes),
                 max_messages=write_pump.max_messages,
                 max_bytes=write_pump.max_bytes,
