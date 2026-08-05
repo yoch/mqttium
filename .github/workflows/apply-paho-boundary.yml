@@ -39,24 +39,25 @@ jobs:
               '    def _drain_publish_requests(self) -> None:\\n',
           )
           marker = 'paho_text = Path(paho_path).read_text()\n'
-          fix = '''replace_once(
-              paho_path,
-              """                    self._async._engine.queue_publish(
+          fix = '''paho_file = Path(paho_path)
+          paho_source = paho_file.read_text()
+          old_qos0 = """                    self._async._engine.queue_publish(
                                       topic,
                                       data,
                                       qos=requested_qos,
                                       retain=retain,
                                   )
-              """,
-              """                    self._async._queue_publish_on_loop(
+          """
+          new_qos0 = """                    self._async._queue_publish_on_loop(
                                       topic,
                                       data,
                                       qos=requested_qos,
                                       retain=retain,
                                       create_qos0_receipt=False,
                                   )
-              """,
-          )
+          """
+          if old_qos0 in paho_source:
+              paho_file.write_text(paho_source.replace(old_qos0, new_qos0, 1))
 
           '''
           if marker not in text:
