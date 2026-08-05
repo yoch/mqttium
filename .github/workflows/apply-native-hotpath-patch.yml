@@ -1,0 +1,41 @@
+name: Apply native hotpath patch
+
+on:
+  push:
+    branches:
+      - agent/native-rtt-ingress-hotpath
+    paths:
+      - .github/scripts/apply_qos1_delivery_mark_patch.py
+      - .github/workflows/apply-native-hotpath-patch.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e ".[dev]"
+      - name: Apply patch and tests
+        run: python .github/scripts/apply_qos1_delivery_mark_patch.py
+      - name: Validate targeted change
+        run: |
+          ruff format src/mqttium/api/async_client.py tests/unit/test_native_delivery_hotpath.py
+          ruff check src/mqttium/api/async_client.py tests/unit/test_native_delivery_hotpath.py
+          mypy src/mqttium
+          pytest -q tests/unit/test_native_delivery_hotpath.py tests/unit/test_delivery_backpressure.py
+      - name: Publish experiment
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/mqttium/api/async_client.py tests/unit/test_native_delivery_hotpath.py
+          git commit -m 'Skip redundant QoS 1 delivery persistence marks'
+          git push origin HEAD:agent/native-rtt-ingress-hotpath
