@@ -113,6 +113,34 @@ def test_engine_never_emits_two_700k_messages_in_one_replay_batch() -> None:
     assert len(second_messages) == 1
 
 
+def test_disconnect_discards_a_message_pushed_back_by_the_emission_guard() -> None:
+    class LoosePageStore(MemoryInflightStore):
+        def in_replay_pages(
+            self,
+            max_messages: int = 64,
+            max_bytes: int = 1 << 20,
+        ) -> Iterator[tuple[InboundMessage, ...]]:
+            del max_messages, max_bytes
+            yield tuple(self.in_items())
+
+    payload = b"x" * 700_000
+    store = LoosePageStore()
+    fill(store, [payload, payload])
+    engine = ProtocolEngine(
+        EngineConfig(client_id="pending-replay", clean_start=False),
+        store=store,
+    )
+
+    first = resume_effects(engine)
+    assert len(message_effects(first)) == 1
+    assert engine.inbound.replay_pending is True
+
+    engine.notify_transport_closed()
+    engine.begin_connect()
+
+    assert engine.inbound.replay_pending is False
+
+
 def test_direct_count_avoids_a_second_inbound_index_scan() -> None:
     class CountingStore(MemoryInflightStore):
         index_calls = 0
