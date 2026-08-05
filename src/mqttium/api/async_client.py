@@ -1344,12 +1344,61 @@ class AsyncClient:
             return negotiated
         return self._engine.config.keepalive
 
+    def _message_delivery_plan(self, msg: Message) -> tuple[bool, bool, bool]:
+        callback_delivery = self.on_message is not None and self._message_delivery in (
+            "auto",
+            "callback",
+            "both",
+        )
+        iterator_delivery = self._message_delivery in ("iterator", "both") or (
+            self._message_delivery == "auto" and self.on_message is None
+        )
+        references = int(iterator_delivery) + int(callback_delivery)
+        small_limit = self._delivery_small_message_limit
+        small_delivery = bool(
+            references
+            and (
+                small_limit is None
+                or (
+                    small_limit > 0
+                    # Empty MQTT 5 property tables contribute no logical bytes.
+                    and not msg.properties
+                    # Four bytes per code point is a cheap UTF-8 upper bound.
+                    and len(msg.payload) + 4 * len(msg.topic) <= small_limit
+                )
+            )
+        )
+        return callback_delivery, iterator_delivery, small_delivery
+
     def _apply_effect_inline(self, effect: EngineEffect, epoch: int) -> bool:
         if epoch != self._connection_epoch:
             return True
         kind = effect.kind
         if kind is EffectKind.SEND:
             return self._try_enqueue_outbound(effect.data, epoch=epoch)
+        if kind is EffectKind.MESSAGE:
+            msg: Message = effect.data
+            callback_delivery, iterator_delivery, small_delivery = self._message_delivery_plan(msg)
+            if not small_delivery:
+                return False
+            if msg.mid is not None and (
+                self._engine.config.manual_ack or msg.qos == QoS.EXACTLY_ONCE
+            ):
+                return False
+            # Check every destination before mutating either queue: the
+            # async fallback must never observe a half-delivered `both`.
+            if iterator_delivery and self._messages.full():
+                return False
+            if callback_delivery and self._callback_queue.full():
+                return False
+            if iterator_delivery:
+                self._messages.put_nowait(msg)
+                self._message_ready.set()
+            if callback_delivery:
+                assert self.on_message is not None
+                self._ensure_callback_worker()
+                self._callback_queue.put_nowait((self.on_message, (msg,), None))
+            return True
         if kind is EffectKind.CONNACK and self.on_connect is None:
             connack: ConnAckPacket = effect.data
             if self._connack_fut is not None and not self._connack_fut.done():
@@ -1424,29 +1473,8 @@ class AsyncClient:
                     self._collect_effects_locked()
         elif kind is EffectKind.MESSAGE:
             msg: Message = effect.data
-            callback_delivery = self.on_message is not None and self._message_delivery in (
-                "auto",
-                "callback",
-                "both",
-            )
-            iterator_delivery = self._message_delivery in ("iterator", "both") or (
-                self._message_delivery == "auto" and self.on_message is None
-            )
+            callback_delivery, iterator_delivery, small_delivery = self._message_delivery_plan(msg)
             references = int(iterator_delivery) + int(callback_delivery)
-            small_limit = self._delivery_small_message_limit
-            small_delivery = references and (
-                small_limit is None
-                or (
-                    small_limit > 0
-                    # An MQTT 5 PUBLISH without properties decodes to an empty
-                    # `Properties`, not to None: testing truthiness rather than
-                    # identity is what keeps those messages on the fast path.
-                    # An empty table contributes no logical bytes, so the bound
-                    # below stays a valid upper bound of _delivery_logical_size.
-                    and not msg.properties
-                    and len(msg.payload) + 4 * len(msg.topic) <= small_limit
-                )
-            )
             if small_delivery:
                 if iterator_delivery:
                     try:
