@@ -13,6 +13,8 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-24.04
+    env:
+      PYTHONPATH: .:src
     steps:
       - uses: actions/checkout@v7
         with:
@@ -29,8 +31,8 @@ jobs:
           ruff check src tests
           mypy src
           bandit -q -ll -r src
-          pytest -q tests/unit/test_qos2_phase_two_compaction.py tests/unit/test_store_transitions.py tests/unit/test_sqlite_migration.py
-          pytest -q tests/unit
+          python -m pytest -q tests/unit/test_qos2_phase_two_compaction.py tests/unit/test_store_transitions.py tests/unit/test_sqlite_migration.py
+          python -m pytest -q tests/unit
       - name: Commit final tree
         run: |
           rm .github/workflows/qos2-compaction-publisher.yml
