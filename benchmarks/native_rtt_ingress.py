@@ -287,10 +287,14 @@ async def _ingress_once(count: int, run_id: str) -> Sample:
 async def _run(args: argparse.Namespace) -> dict[str, Any]:
     rtt_samples: list[Sample] = []
     ingress_samples: list[Sample] = []
-    for run in range(args.runs):
-        rtt_samples.append(await _rtt_once(args.rtt_pairs, 32, f"{args.label}-{run}"))
-    for run in range(args.runs):
-        ingress_samples.append(await _ingress_once(args.ingress_messages, f"{args.label}-{run}"))
+    if args.scenario in ("all", "rtt"):
+        for run in range(args.runs):
+            rtt_samples.append(await _rtt_once(args.rtt_pairs, 32, f"{args.label}-{run}"))
+    if args.scenario in ("all", "ingress"):
+        for run in range(args.runs):
+            ingress_samples.append(
+                await _ingress_once(args.ingress_messages, f"{args.label}-{run}")
+            )
 
     def aggregate(name: str, samples: list[Sample]) -> dict[str, Any]:
         rates = [sample.rate for sample in samples]
@@ -305,11 +309,12 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             "counters": [sample.counters for sample in samples],
         }
 
-    return {
-        "label": args.label,
-        "rtt": aggregate("rtt_qos1_w32", rtt_samples),
-        "ingress": aggregate("ingress_qos0_exact_telemetry256", ingress_samples),
-    }
+    result: dict[str, Any] = {"label": args.label}
+    if rtt_samples:
+        result["rtt"] = aggregate("rtt_qos1_w32", rtt_samples)
+    if ingress_samples:
+        result["ingress"] = aggregate("ingress_qos0_exact_telemetry256", ingress_samples)
+    return result
 
 
 def main() -> None:
@@ -317,6 +322,7 @@ def main() -> None:
     parser.add_argument("--label", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--runs", type=int, default=5)
+    parser.add_argument("--scenario", choices=("all", "rtt", "ingress"), default="all")
     parser.add_argument("--rtt-pairs", type=int, default=8_000)
     parser.add_argument("--ingress-messages", type=int, default=120_000)
     args = parser.parse_args()
