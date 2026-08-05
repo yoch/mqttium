@@ -44,6 +44,7 @@ jobs:
           git apply --check /tmp/effect-pump.patch
           git apply /tmp/effect-pump.patch
           sed -i 's/from typing import Callable/from collections.abc import Callable/' benchmarks/paired_regression.py
+          sed -i '/^import asyncio$/d' tests/unit/test_effect_pump.py
           rm -f .github/effect-pump.patch.zlib.b64
           rm -f .github/effect-pump.patch.part-*
           rm -f .github/effect-pump.patch.ready
