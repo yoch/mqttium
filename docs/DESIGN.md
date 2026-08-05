@@ -96,6 +96,22 @@ du pump sur l'instance et l'effet est appliqué inline. Les effets asynchrones
 seuls sont tagués par epoch et repris par le worker. Les anciens attributs de
 diagnostic d'`AsyncClient` sont des vues en lecture, pas un second état.
 
+### Writer et backpressure réseau
+
+La file de transport, son budget en octets/messages, la condition de réveil,
+le task writer, le batching/coalescing et `last_outbound` appartiennent à
+`WritePump` (`api/_writer.py`). `AsyncClient` conserve le transport, l'epoch de
+connexion et la politique de panne : le pump signale une erreur, le client
+notifie alors le moteur, solde les receipts si nécessaire et ferme le transport.
+
+Les opérations `can_enqueue_size`, `try_enqueue` et `enqueue` sont liées
+directement sur l'instance `AsyncClient`, comme celles d'`EffectPump`, afin de
+ne pas ajouter un wrapper au chemin SEND. L'algorithme de batch reste inchangé :
+256 items maximum, coalescing des frames contiguës, écriture segmentée sans
+copie des gros payloads et réveil des producteurs seulement après restitution
+du budget. Les anciens attributs privés du client sont des vues de compatibilité
+pour les tests et l'instrumentation, jamais un second état.
+
 ### Commandes loop-bound et façade Paho
 
 `AsyncClient.publish_nowait()` est une primitive synchrone mais attachée au

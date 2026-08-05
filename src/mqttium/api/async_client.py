@@ -19,7 +19,8 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from itertools import islice
 from typing import Any, Literal, Never
 
-from mqttium.api._effects import EffectPump, StaleConnectionEffect
+from mqttium.api._effects import EffectPump
+from mqttium.api._writer import WritePump
 from mqttium.api.models import (
     PublishBatchReceipt,
     PublishMessage,
@@ -193,7 +194,6 @@ class AsyncClient:
         self._decoder = IncrementalDecoder(max_packet_size=effective_max_packet_size)
         self._transport: AsyncTransport | None = None
         self._reader_task: asyncio.Task[None] | None = None
-        self._writer_task: asyncio.Task[None] | None = None
         self._keepalive_task: asyncio.Task[None] | None = None
         self._reconnect_task: asyncio.Task[None] | None = None
         self._lifecycle_lock = asyncio.Lock()
@@ -209,6 +209,16 @@ class AsyncClient:
         self._schedule_effect_flush = self._effect_pump.schedule
         self._drain_effects = self._effect_pump.drain
         self._discard_connection_effects = self._effect_pump.discard_connection_effects
+        self._write_pump = WritePump(
+            max_bytes=max_outbound_bytes,
+            max_messages=max_outbound_messages,
+            on_failure=self._writer_failed,
+        )
+        # Bind the queue operations directly, preserving the existing SEND and
+        # async enqueue call cost while moving their state to one owner.
+        self._can_enqueue_outbound_size = self._write_pump.can_enqueue_size
+        self._try_enqueue_outbound = self._write_pump.try_enqueue
+        self._enqueue_outbound = self._write_pump.enqueue
         self._callback_queue: asyncio.Queue[CallbackJob] = asyncio.Queue(
             maxsize=max_pending_callbacks
         )
@@ -250,12 +260,6 @@ class AsyncClient:
         self._publish_waiters = 0
         self._delivery_timeout = delivery_timeout
         self._callback_shutdown_timeout = callback_shutdown_timeout
-        self._outbound: asyncio.Queue[WriteItem] = asyncio.Queue()
-        self._outbound_bytes = 0
-        self._max_outbound_bytes = max_outbound_bytes
-        self._max_outbound_messages = max_outbound_messages
-        self._outbound_space = asyncio.Condition()
-        self._outbound_waiters = 0
         self._publish_space = asyncio.Event()
         self._connack_fut: asyncio.Future[ConnAckPacket] | None = None
         self._receipts: dict[int, PublishReceipt | deque[PublishReceipt]] = {}
@@ -271,7 +275,6 @@ class AsyncClient:
         # Set once a connection is torn down, cleared by the next connect. Read
         # by _publish_wait_failure(); _closed is set too late in teardown to use.
         self._teardown_final = False
-        self._last_outbound = 0.0
         self._ping_pending = False
         self._ping_deadline = 0.0
         self._connected_at = 0.0
@@ -315,6 +318,56 @@ class AsyncClient:
     @property
     def _effect_flush_task(self) -> asyncio.Task[None] | None:
         return self._effect_pump.task
+
+    # Historical private writer views remain for tests and instrumentation.
+    # WritePump is the sole state owner; runtime code does not use these views.
+    @property
+    def _writer_task(self) -> asyncio.Task[None] | None:
+        return self._write_pump.task
+
+    @property
+    def _outbound(self) -> asyncio.Queue[WriteItem]:
+        return self._write_pump.queue
+
+    @property
+    def _outbound_bytes(self) -> int:
+        return self._write_pump.queued_bytes
+
+    @_outbound_bytes.setter
+    def _outbound_bytes(self, value: int) -> None:
+        self._write_pump.queued_bytes = value
+
+    @property
+    def _max_outbound_bytes(self) -> int:
+        return self._write_pump.max_bytes
+
+    @_max_outbound_bytes.setter
+    def _max_outbound_bytes(self, value: int) -> None:
+        self._write_pump.max_bytes = value
+
+    @property
+    def _max_outbound_messages(self) -> int:
+        return self._write_pump.max_messages
+
+    @_max_outbound_messages.setter
+    def _max_outbound_messages(self, value: int) -> None:
+        self._write_pump.max_messages = value
+
+    @property
+    def _outbound_space(self) -> asyncio.Condition:
+        return self._write_pump.space
+
+    @property
+    def _outbound_waiters(self) -> int:
+        return self._write_pump.waiters
+
+    @property
+    def _last_outbound(self) -> float:
+        return self._write_pump.last_outbound
+
+    @_last_outbound.setter
+    def _last_outbound(self, value: float) -> None:
+        self._write_pump.last_outbound = value
 
     @property
     def state(self) -> ConnectionState:
@@ -563,12 +616,11 @@ class AsyncClient:
             self._teardown_final = False
             self._last_disconnect = None
             self._decoder.clear()
-            self._outbound = asyncio.Queue()
-            self._outbound_bytes = 0
+            self._write_pump.reset()
             self._ping_pending = False
             connect_packet = self._engine.begin_connect()
             self._connack_fut = loop.create_future()
-            self._writer_task = asyncio.create_task(self._write_loop(), name="mqttium-writer")
+            self._write_pump.start(transport)
             await self._enqueue_outbound(connect_packet)
             self._reader_task = asyncio.create_task(self._read_loop(), name="mqttium-reader")
             try:
@@ -578,7 +630,7 @@ class AsyncClient:
             if connack.reason_code != 0:
                 raise ProtocolError(f"Connection refused: reason_code={connack.reason_code}")
             self._connected_at = time.monotonic()
-            self._last_outbound = time.monotonic()
+            self._write_pump.last_outbound = time.monotonic()
             self._keepalive_task = asyncio.create_task(
                 self._keepalive_loop(), name="mqttium-keepalive"
             )
@@ -617,8 +669,9 @@ class AsyncClient:
                 await self._enqueue_outbound(packet)
                 try:
                     # Skip the wait if the writer already died (connection lost).
-                    if self._writer_task is not None and not self._writer_task.done():
-                        await asyncio.wait_for(self._outbound.join(), timeout=5.0)
+                    writer_task = self._write_pump.task
+                    if writer_task is not None and not writer_task.done():
+                        await asyncio.wait_for(self._write_pump.join(), timeout=5.0)
                 except TimeoutError:
                     pass
             await self._force_close()
@@ -1001,19 +1054,9 @@ class AsyncClient:
             if not will_reconnect:
                 self._fail_pending(self._disconnect_exc)
                 # Wake any publish() parked on outbound backpressure.
-                async with self._outbound_space:
-                    self._outbound_space.notify_all()
+                await self._write_pump.wake_waiters()
                 # Cancel writer + close transport so no task/fd leaks.
-                if (
-                    self._writer_task is not None
-                    and self._writer_task is not asyncio.current_task()
-                ):
-                    self._writer_task.cancel()
-                    try:
-                        await self._writer_task
-                    except (asyncio.CancelledError, Exception):
-                        pass
-                    self._writer_task = None
+                await self._write_pump.stop()
                 if self._transport is not None:
                     try:
                         await self._transport.close()
@@ -1043,81 +1086,19 @@ class AsyncClient:
             and self._reconnect.should_retry(reason, self._engine.config.protocol)
         )
 
-    async def _write_contiguous(self, transport: AsyncTransport, parts: list[bytes]) -> None:
-        if not parts:
-            return
-        write_many = getattr(transport, "write_many", None)
-        if write_many is not None:
-            await write_many(parts)
-        else:
-            for part in parts:
-                await transport.write(part)
-        parts.clear()
-
-    async def _write_loop(self) -> None:
-        assert self._transport is not None
-        try:
-            while True:
-                first = await self._outbound.get()
-                batch: list[WriteItem] = [first]
-                while len(batch) < 256:
-                    try:
-                        batch.append(self._outbound.get_nowait())
-                    except asyncio.QueueEmpty:
-                        break
-                try:
-                    # Coalesce contiguous small frames into one writelines call.
-                    # Never await drain() after the batch (deadlocks vs reader ACK).
-                    contiguous: list[bytes] = []
-                    transport = self._transport
-                    if transport is None:
-                        raise ConnectionError("Transport closed while writer was active")
-
-                    for data in batch:
-                        if isinstance(data, tuple):
-                            await self._write_contiguous(transport, contiguous)
-                            for part in data:
-                                await transport.write(part)
-                        else:
-                            contiguous.append(data)
-                    await self._write_contiguous(transport, contiguous)
-                    self._last_outbound = time.monotonic()
-                finally:
-                    released = 0
-                    for data in batch:
-                        released += item_size(data)
-                        self._outbound.task_done()
-                    async with self._outbound_space:
-                        self._outbound_bytes = max(0, self._outbound_bytes - released)
-                        if self._outbound_waiters:
-                            self._outbound_space.notify_all()
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            self._disconnect_exc = exc
-            if not self._will_reconnect():
-                self._fail_pending(exc)
-            async with self._engine_lock:
-                self._engine.notify_transport_closed()
-                self._collect_effects_locked()
-            await self._drain_effects()
-            self._closed.set()
-            # Close transport so the reader unblocks and runs shared cleanup.
-            if self._transport is not None:
-                await self._transport.close()
-
-    def _can_enqueue_outbound_size(
-        self,
-        size: int,
-        *,
-        queued_messages: int | None = None,
-        queued_bytes: int | None = None,
-    ) -> bool:
-        messages = self._outbound.qsize() if queued_messages is None else queued_messages
-        bytes_used = self._outbound_bytes if queued_bytes is None else queued_bytes
-        if messages >= self._max_outbound_messages:
-            return False
-        return bytes_used + size <= self._max_outbound_bytes or (messages == 0 and bytes_used == 0)
+    async def _writer_failed(self, exc: BaseException) -> None:
+        """Apply AsyncClient's connection policy after a writer failure."""
+        self._disconnect_exc = exc
+        if not self._will_reconnect():
+            self._fail_pending(exc)
+        async with self._engine_lock:
+            self._engine.notify_transport_closed()
+            self._collect_effects_locked()
+        await self._drain_effects()
+        self._closed.set()
+        # Close transport so the reader unblocks and runs shared cleanup.
+        if self._transport is not None:
+            await self._transport.close()
 
     def _preview_publish_write(
         self,
@@ -1162,8 +1143,8 @@ class AsyncClient:
     ) -> None:
         if self._engine.state != ConnectionState.CONNECTED:
             return
-        messages = self._outbound.qsize()
-        bytes_used = self._outbound_bytes
+        messages = self._write_pump.queued_messages
+        bytes_used = self._write_pump.queued_bytes
         flow_available = self._engine.flow.available
         for topic, payload, qos, retain, properties in requests:
             level = QoS(qos)
@@ -1181,59 +1162,6 @@ class AsyncClient:
             messages += 1
             bytes_used += size
 
-    def _try_enqueue_outbound(self, item: WriteItem, *, epoch: int | None = None) -> bool:
-        if epoch is None:
-            epoch = self._connection_epoch
-        if epoch != self._connection_epoch:
-            raise StaleConnectionEffect
-        size = item_size(item)
-        if not self._can_enqueue_outbound_size(size):
-            return False
-        self._outbound.put_nowait(item)
-        self._outbound_bytes += size
-        return True
-
-    async def _enqueue_outbound(
-        self,
-        item: WriteItem,
-        *,
-        nowait: bool = False,
-        epoch: int | None = None,
-    ) -> None:
-        if epoch is None:
-            epoch = self._connection_epoch
-        if self._try_enqueue_outbound(item, epoch=epoch):
-            return
-        size = item_size(item)
-        if nowait:
-            raise FlowControlError("Outbound backpressure limit reached")
-
-        async with self._outbound_space:
-            while True:
-                if epoch != self._connection_epoch:
-                    raise StaleConnectionEffect
-                messages_full = self._outbound.qsize() >= self._max_outbound_messages
-                # Allow a single oversized item into an empty queue (segmented
-                # payloads can exceed max_outbound_bytes by the MQTT header).
-                bytes_blocked = self._outbound_bytes + size > self._max_outbound_bytes and not (
-                    self._outbound_bytes == 0 and self._outbound.empty()
-                )
-                if not messages_full and not bytes_blocked:
-                    break
-                # Escape hatch: if the writer is idle but space accounting is
-                # wedged, do not block protocol forever.
-                if self._outbound.empty() and self._outbound_bytes == 0:
-                    break
-                self._outbound_waiters += 1
-                try:
-                    await self._outbound_space.wait()
-                finally:
-                    self._outbound_waiters -= 1
-            if epoch != self._connection_epoch:
-                raise StaleConnectionEffect
-            self._outbound.put_nowait(item)
-            self._outbound_bytes += size
-
     async def _keepalive_loop(self) -> None:
         try:
             while not self._closed.is_set():
@@ -1249,7 +1177,7 @@ class AsyncClient:
                         return
                     await asyncio.sleep(min(0.5, self._ping_deadline - now))
                     continue
-                due = self._last_outbound + k
+                due = self._write_pump.last_outbound + k
                 if now >= due:
                     async with self._engine_lock:
                         self._engine.queue_ping()
@@ -1848,18 +1776,7 @@ class AsyncClient:
 
     async def _invalidate_connection_epoch(self) -> None:
         self._connection_epoch += 1
-        async with self._outbound_space:
-            self._outbound_space.notify_all()
-
-    def _discard_outbound_queue(self) -> None:
-        while True:
-            try:
-                self._outbound.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            else:
-                self._outbound.task_done()
-        self._outbound_bytes = 0
+        await self._write_pump.advance_epoch(self._connection_epoch)
 
     def _settle_terminal_effect(self, effect: EngineEffect) -> None:
         """Settle one terminal publish effect during final teardown."""
@@ -1988,7 +1905,6 @@ class AsyncClient:
         current = asyncio.current_task()
         tasks = [
             self._reader_task,
-            self._writer_task,
             self._keepalive_task,
             self._effect_flush_task,
         ]
@@ -2001,17 +1917,15 @@ class AsyncClient:
                     await task
                 except (asyncio.CancelledError, Exception):
                     pass
+        await self._write_pump.stop()
         self._discard_connection_effects(settle_publish=True)
-        self._discard_outbound_queue()
+        self._write_pump.discard()
         self._decoder.clear()
-        async with self._outbound_space:
-            self._outbound_space.notify_all()
+        await self._write_pump.wake_waiters()
         self._teardown_final = True
         self._notify_publish_space()
         if self._reader_task is not current:
             self._reader_task = None
-        if self._writer_task is not current:
-            self._writer_task = None
         if self._keepalive_task is not current:
             self._keepalive_task = None
         if self._effect_pump.task is not current:
