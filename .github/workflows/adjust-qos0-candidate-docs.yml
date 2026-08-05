@@ -1,0 +1,71 @@
+name: Adjust QoS 0 candidate documentation
+
+on:
+  push:
+    branches:
+      - agent/native-rtt-ingress-hotpath
+    paths:
+      - benchmarks/adjust_qos0_candidate_docs.txt
+
+permissions:
+  contents: write
+
+jobs:
+  adjust:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: agent/qos0-message-batch-delivery
+          fetch-depth: 0
+      - name: Align documentation with final guarded A/B
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          doc = Path("docs/NATIVE-HOTPATH-PROFILE.md")
+          text = doc.read_text()
+          replacements = {
+              "| Median direct ingress | 73,640 msg/s | 77,664 msg/s | +5.53% |\n| Paired cycle range | — | — | +3.75% to +6.99% |":
+                  "| Median direct ingress | 74,697 msg/s | 79,367 msg/s | +6.42% |\n| Paired cycle range | — | — | +4.86% to +7.01% |",
+              "The retained QoS 0-only batch hook is invoked only when the next pending effect is\na `MESSAGE`, and returns immediately for non-QoS0 messages. Final QoS 1 ABBA\nresults were neutral:":
+                  "The retained QoS 0-only batch hook is invoked only when at least two effects are\npending and the next one is a `MESSAGE`; a single message retains the established\nper-effect path. The hook returns immediately for non-QoS0 messages. Final QoS 1\nABBA results were neutral:",
+              "| Median RTT capacity | 6,266 pairs/s | 6,277 pairs/s | -0.23% paired median |\n| p50 latency | 4.637 ms | 4.663 ms | +0.56% |\n| p95 latency | 5.757 ms | 5.718 ms | -0.67% |\n| Combined writer batches | 6,131 | 6,101 | no increase |\n\nOne noisy cycle was slower while the other four were within or above baseline;":
+                  "| Median RTT capacity | 6,395 pairs/s | 6,416 pairs/s | -0.07% paired median |\n| p50 latency | 4.529 ms | 4.582 ms | +1.18% |\n| p95 latency | 5.615 ms | 5.398 ms | -3.87% |\n| Combined writer batches | 6,137 | 6,065 | no increase |\n\nAll five paired cycles were within 1.6% of baseline;",
+              "Only consecutive messages satisfying all of these conditions use the batch path:\n\n- effect kind is `MESSAGE` and QoS is 0;":
+                  "Only runs of at least two consecutive messages satisfying all of these conditions\nuse the batch path; an isolated message keeps the established per-effect path:\n\n- effect kind is `MESSAGE` and QoS is 0;",
+              "The final experimental A/B is retained in GitHub Actions run `31049968366`.":
+                  "The final multi-message-only A/B is retained in GitHub Actions run `31051690479`.",
+          }
+          for old, new in replacements.items():
+              if text.count(old) != 1:
+                  raise RuntimeError(f"unexpected documentation context for {old!r}")
+              text = text.replace(old, new, 1)
+          doc.write_text(text)
+
+          changelog = Path("CHANGELOG.md")
+          text = changelog.read_text()
+          old = (
+              "  ordering remain unchanged; QoS 1, QoS 2, manual acknowledgement, large\n"
+              "  messages and exact byte accounting keep the existing path. A controlled\n"
+              "  decode-to-callback A/B improved median telemetry ingress by 5.5%, while\n"
+          )
+          new = (
+              "  ordering remain unchanged; isolated messages, QoS 1, QoS 2, manual\n"
+              "  acknowledgement, large messages and exact byte accounting keep the existing\n"
+              "  path. A controlled decode-to-callback A/B improved median telemetry ingress\n"
+              "  by 6.4%, while\n"
+          )
+          if text.count(old) != 1:
+              raise RuntimeError("unexpected changelog context")
+          changelog.write_text(text.replace(old, new, 1))
+          PY
+          git diff --check
+      - name: Publish documentation correction
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add CHANGELOG.md docs/NATIVE-HOTPATH-PROFILE.md
+          git commit -m 'Align native hotpath profile with final A/B'
+          git push origin HEAD:agent/qos0-message-batch-delivery
