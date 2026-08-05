@@ -53,3 +53,8 @@ def test_paho_uses_the_async_client_adapter_boundary() -> None:
         "self._async._drain_effects_inline",
     ):
         assert forbidden not in source
+
+
+def test_disconnect_metadata_boundary_is_private() -> None:
+    assert not hasattr(AsyncClient, "last_disconnect")
+    assert hasattr(AsyncClient, "_last_disconnect_info")

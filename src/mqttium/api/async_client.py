@@ -332,8 +332,8 @@ class AsyncClient:
         return self.negotiated.effective_client_id(self._engine.config.client_id)
 
     @property
-    def last_disconnect(self) -> DisconnectInfo | None:
-        """Details from the most recent broker or transport disconnect."""
+    def _last_disconnect_info(self) -> DisconnectInfo | None:
+        """Loop-confined disconnect metadata used by compatibility adapters."""
         return self._last_disconnect
 
     @property
@@ -623,7 +623,6 @@ class AsyncClient:
             retain=retain,
             properties=properties,
         )
-        assert receipt is not None
         self._finalize_loop_commands()
         return receipt
 
@@ -651,7 +650,6 @@ class AsyncClient:
                         retain=retain,
                         properties=properties,
                     )
-                    assert receipt is not None
                 except FlowControlError as flow_exc:
                     if (
                         nowait

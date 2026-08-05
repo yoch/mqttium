@@ -77,7 +77,7 @@ def _commit_one_on_loop(client: Client, payload: bytes) -> int:
         qos=QoS.AT_LEAST_ONCE,
         retain=False,
     )
-    assert receipt is not None and receipt.mid is not None
+    assert receipt.mid is not None
     client._async._finalize_loop_commands()
     return receipt.mid
 

@@ -474,7 +474,7 @@ class Client:
             qos=request.qos,
             retain=request.retain,
         )
-        assert receipt is not None and receipt.mid is not None
+        assert receipt.mid is not None
         return MQTTMessageInfo(mid=receipt.mid, _receipt=receipt, _loop=self._loop)
 
     def _finalize_publish_effects(self) -> None:
@@ -607,7 +607,6 @@ class Client:
                     qos=requested_qos,
                     retain=retain,
                 )
-                assert receipt is not None
                 info = MQTTMessageInfo(
                     mid=receipt.mid,
                     _receipt=receipt,
@@ -704,7 +703,7 @@ class Client:
         cb = self.on_disconnect
         if cb is None:
             return
-        info = self._async.last_disconnect
+        info = self._async._last_disconnect_info
         from_broker = bool(info and info.from_broker)
         reason = info.reason_code if info is not None else (0 if exc is None else 1)
         props = info.properties if info is not None else None
