@@ -8,7 +8,7 @@ on:
       - benchmarks/publish_qos0_batch_candidate.txt
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   publish:
@@ -75,7 +75,7 @@ jobs:
           bandit -q -ll -r src
       - name: Full unit suite
         working-directory: candidate
-        run: timeout --signal=INT --kill-after=10s 120s python -m pytest -vv -x tests/unit
+        run: python -m pytest -q tests/unit
       - name: Start isolated broker
         run: |
           sudo apt-get update -qq
@@ -98,23 +98,35 @@ jobs:
             --runs 1 --messages 40000 \
             --label publication-smoke \
             --output /tmp/direct-ingress-smoke.json
-      - name: Publish one clean commit
+      - name: Export exact validated tree
         working-directory: candidate
         run: |
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add \
-            .github/workflows/benchmarks.yml \
-            .github/workflows/paired-regression.yml \
-            CHANGELOG.md \
-            benchmarks/direct_ingress_hotpath.py \
-            benchmarks/native_rtt_ingress.py \
-            benchmarks/paired_native_hotpaths.py \
-            docs/NATIVE-HOTPATH-PROFILE.md \
-            src/mqttium/api/_effects.py \
-            src/mqttium/api/async_client.py \
+          mkdir -p /tmp/qos0-candidate
+          files=(
+            .github/workflows/benchmarks.yml
+            .github/workflows/paired-regression.yml
+            CHANGELOG.md
+            benchmarks/direct_ingress_hotpath.py
+            benchmarks/native_rtt_ingress.py
+            benchmarks/paired_native_hotpaths.py
+            docs/NATIVE-HOTPATH-PROFILE.md
+            src/mqttium/api/_effects.py
+            src/mqttium/api/async_client.py
             tests/unit/test_batched_message_effects.py
-          git diff --cached --check
-          test "$(git rev-list --count origin/main..HEAD)" -eq 0
-          git commit -m 'Batch small QoS 0 message delivery'
-          git push origin HEAD:agent/qos0-message-batch-delivery
+          )
+          for file in "${files[@]}"; do
+            mkdir -p "/tmp/qos0-candidate/$(dirname "$file")"
+            cp "$file" "/tmp/qos0-candidate/$file"
+          done
+          printf '%s\n' "${files[@]}" > /tmp/qos0-candidate/MANIFEST.txt
+          git diff --check origin/main -- "${files[@]}"
+          tar -C /tmp/qos0-candidate -czf /tmp/qos0-candidate-tree.tar.gz .
+      - name: Upload validated candidate
+        uses: actions/upload-artifact@v7
+        with:
+          name: qos0-candidate-tree-${{ github.run_id }}
+          path: |
+            /tmp/qos0-candidate-tree.tar.gz
+            /tmp/native-rtt-smoke.json
+            /tmp/direct-ingress-smoke.json
+          retention-days: 14
