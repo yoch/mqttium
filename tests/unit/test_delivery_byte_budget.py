@@ -7,9 +7,10 @@ import asyncio
 import pytest
 
 from mqttium.api.async_client import AsyncClient
+from mqttium.enums import MQTTProtocolVersion
 from mqttium.errors import MessageDeliveryError
 from mqttium.protocol.engine import EffectKind, EngineEffect
-from mqttium.types import Message
+from mqttium.types import Message, Properties
 
 
 def _effect(topic: str, payload: bytes) -> EngineEffect:
@@ -191,3 +192,62 @@ def test_small_pool_is_disabled_if_it_reduces_single_packet_capacity() -> None:
     assert client.delivery_small_budget_bytes == 0
     assert client.delivery_small_message_limit == 0
     assert client._delivery_accounted_limit == 8 * 1024 * 1024
+
+
+def _small_pool_client(protocol: MQTTProtocolVersion) -> AsyncClient:
+    """A client whose small-message fast path is enabled (see the test above)."""
+    return AsyncClient(
+        message_delivery="iterator",
+        max_pending_messages=4,
+        max_pending_delivery_bytes=64 * 1024 * 1024,
+        protocol=protocol,
+    )
+
+
+async def test_mqtt5_publish_without_properties_uses_the_small_fast_path() -> None:
+    # decode_properties() returns an empty Properties() rather than None for a
+    # zero-length MQTT 5 property table, so identity testing would have pushed
+    # every property-less v5 PUBLISH into exact accounting.
+    client = _small_pool_client(MQTTProtocolVersion.MQTTv5)
+    message = Message(topic="small/topic", payload=b"payload", properties=Properties())
+
+    await client._apply_effect(EngineEffect(EffectKind.MESSAGE, message), nowait=False)
+
+    assert client.pending_delivery_bytes == 0
+    assert client._messages.qsize() == 1
+
+
+async def test_mqtt5_publish_with_properties_stays_exactly_accounted() -> None:
+    client = _small_pool_client(MQTTProtocolVersion.MQTTv5)
+    properties = Properties()
+    properties.add_user_property("k", "v")
+    message = Message(topic="small/topic", payload=b"payload", properties=properties)
+
+    await client._apply_effect(EngineEffect(EffectKind.MESSAGE, message), nowait=False)
+
+    assert client.pending_delivery_bytes == client._delivery_logical_size(message)
+    assert client.pending_delivery_bytes > len(message.topic) + len(message.payload)
+
+
+async def test_mqtt311_delivery_is_unchanged_by_the_truthiness_test() -> None:
+    client = _small_pool_client(MQTTProtocolVersion.MQTTv311)
+    message = Message(topic="small/topic", payload=b"payload")
+
+    await client._apply_effect(EngineEffect(EffectKind.MESSAGE, message), nowait=False)
+
+    assert client.pending_delivery_bytes == 0
+    assert client._messages.qsize() == 1
+
+
+async def test_disabled_small_pool_still_accounts_property_less_mqtt5() -> None:
+    client = AsyncClient(
+        message_delivery="iterator",
+        max_pending_delivery_bytes=8 * 1024 * 1024,
+        protocol=MQTTProtocolVersion.MQTTv5,
+    )
+    assert client.delivery_small_message_limit == 0
+    message = Message(topic="small/topic", payload=b"payload", properties=Properties())
+
+    await client._apply_effect(EngineEffect(EffectKind.MESSAGE, message), nowait=False)
+
+    assert client.pending_delivery_bytes == len(message.topic) + len(message.payload)

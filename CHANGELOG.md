@@ -6,6 +6,64 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Added
+
+- `TransitionInflightStore`, an optional store extension for atomic, conditional
+  and payload-free record transitions (`complete_out`, `transition_out`,
+  `contains_in`, `in_meta`, `mark_in_delivered`, `transition_in`, `complete_in`,
+  `in_index_pages`, `set_out_logical_size`). `MemoryInflightStore` and
+  `SqliteInflightStore` implement it; a store that does not keeps working
+  through the existing whole-object path. Acknowledgement handling, the inbound
+  duplicate check and delivery marking no longer read a payload back, so a
+  PUBACK for a multi-megabyte publication settles on metadata alone.
+- Durable schema versioning through `PRAGMA user_version`
+  (`SQLITE_SCHEMA_VERSION`). Schema 2 adds a persisted `outbound.logical_size`
+  and declares `payload` last, so metadata reads never traverse BLOB overflow
+  pages. Databases written by schema 1 are rebuilt in a single transaction on
+  open — an interrupted migration reopens as schema 1 rather than as half of
+  two — and a database written by a newer MQTTium is refused instead of
+  reinterpreted.
+- `benchmarks/persistence_index_ab.py`, a rotated A/B of the durable `seq`
+  indices over a realistic mixed profile (batched acknowledgement lots,
+  reconnect replay, event-loop lag percentiles).
+
+### Changed
+
+- Inbound restart redelivery is now incremental and backpressured. Replay
+  restores the Receive Maximum window from a payload-free index, then emits
+  bounded batches driven by an internal `CONTINUE_INBOUND_REPLAY` effect, so
+  delivery backpressure applies *between* batches. Peak allocation during a
+  4,000 x 1 KiB session replay dropped from 5.9 MiB to 0.76 MiB. Stores without
+  the paging and metadata extensions keep the previous eager behaviour.
+- `SqliteInflightStore.batch()` is lazy: `BEGIN IMMEDIATE` is deferred to the
+  first mutation, so a read-only ingress lot takes no write lock and pays no
+  commit.
+- Ordered pagination no longer re-issues `WHERE seq>? ORDER BY seq LIMIT ?` per
+  page, which re-scanned and re-sorted the table each time and made a full
+  replay quadratic. One sorted metadata pass produces the ordered identifiers,
+  then each page is read back by primary key. On 10,000 x 4 KiB records this is
+  faster than the indexed page-per-query form while adding nothing to every
+  publish: no `seq` index is created, and any left by an earlier build is
+  dropped on open. `SqliteInflightStore` pages now match `MemoryInflightStore`
+  exactly when records are deleted mid-iteration — the page comes back shorter,
+  with insertion order preserved and no duplicate or resurrected record.
+
+### Removed
+
+- `InflightStore.pop_out()`. The library never called it — `get_out()` plus
+  `delete_out()` cover every path — so it was surface a third-party store had
+  to implement for nothing. `pop_in()` stays; the inbound acknowledgement
+  fallback still uses it.
+- The `outbound.extra` column, written on every insert and never read.
+- The base64-text payload reader. Payloads are always stored as BLOBs, so the
+  fallback only existed for a storage format no writer produces.
+
+### Fixed
+
+- MQTT 5 PUBLISH packets without properties decode to an empty `Properties`
+  rather than `None`, so the small-message delivery fast path tested identity
+  and pushed every property-less v5 message into exact byte accounting.
+
 ## [0.1.0a3] - 2026-08-05
 
 ### Added

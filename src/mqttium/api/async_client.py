@@ -1463,7 +1463,12 @@ class AsyncClient:
                 small_limit is None
                 or (
                     small_limit > 0
-                    and msg.properties is None
+                    # An MQTT 5 PUBLISH without properties decodes to an empty
+                    # `Properties`, not to None: testing truthiness rather than
+                    # identity is what keeps those messages on the fast path.
+                    # An empty table contributes no logical bytes, so the bound
+                    # below stays a valid upper bound of _delivery_logical_size.
+                    and not msg.properties
                     and len(msg.payload) + 4 * len(msg.topic) <= small_limit
                 )
             )
@@ -1579,6 +1584,16 @@ class AsyncClient:
                         await self._transport.close()
                     except Exception:
                         pass
+        elif kind is EffectKind.CONTINUE_INBOUND_REPLAY:
+            # The previous batch of redeliveries has been applied — and waited
+            # on, if delivery backpressure kicked in — so the engine may produce
+            # the next one. Re-entering under the lock is what keeps peak memory
+            # proportional to one batch rather than to the whole session.
+            if epoch is not None and epoch != self._connection_epoch:
+                return
+            async with self._engine_lock:
+                self._engine.continue_inbound_replay()
+                self._collect_effects_locked()
         elif kind is EffectKind.PROTOCOL_ERROR:
             raise ProtocolError(str(effect.data))
         else:

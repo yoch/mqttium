@@ -492,6 +492,14 @@ class ProtocolEngine:
             self.inbound.replay_session()
         outbound.drain()
 
+    def continue_inbound_replay(self) -> None:
+        """Emit the next bounded batch of restart redeliveries.
+
+        Called by the runtime when it applies `CONTINUE_INBOUND_REPLAY`, i.e.
+        once the previous batch has cleared delivery backpressure.
+        """
+        self.inbound.drain_replay()
+
     def mark_inbound_delivered(self, mid: int) -> None:
         self.inbound.mark_delivered(mid)
 

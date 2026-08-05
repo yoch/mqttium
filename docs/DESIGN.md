@@ -176,6 +176,92 @@ store et slots de flow contrôle aussi leur libération terminale. Les deux
 sessions émettent dans l'unique flux d'effets du moteur et ne possèdent pas
 l'état de connexion.
 
+### Contrat de persistance : transitions conditionnelles
+
+`InflightStore` reste l'interface minimale « objets complets ». Deux extensions
+optionnelles, résolues une seule fois par session via `isinstance` :
+
+- `PagedInflightStore` — pagination du replay (`out_pages`,
+  `out_summary_pages`, `in_pages`) ;
+- `TransitionInflightStore` — transitions **atomiques, conditionnelles et sans
+  payload** (`complete_out`, `transition_out`, `contains_in`, `in_meta`,
+  `mark_in_delivered`, `transition_in`, `complete_in`, `in_index_pages`,
+  `set_out_logical_size`).
+
+Le store ne possède jamais la machine d'état : `expected_state` et `new_state`
+viennent toujours de la session, et le store garantit seulement l'atomicité de
+la mutation, en renvoyant `None` quand l'enregistrement est absent ou n'est plus
+dans l'état attendu. Un store tiers qui n'implémente pas ces protocoles continue
+d'utiliser le chemin objet complet : correct, simplement plus coûteux.
+
+Conséquence directe : un `PUBACK` pour une publication de plusieurs mégaoctets
+ne relit plus le BLOB pour supprimer sa ligne. La comptabilité du budget repose
+alors sur `logical_size`, désormais persisté (schéma SQLite 2) ; les
+enregistrements écrits par un schéma antérieur le voient recalculé une fois à
+l'hydratation, puis réécrit.
+
+### Schéma durable versionné
+
+`SqliteInflightStore` inscrit sa révision dans `PRAGMA user_version`
+(`SQLITE_SCHEMA_VERSION`). L'ouverture migre en **une seule transaction** : une
+migration interrompue rouvre dans la version de départ, jamais dans un état
+intermédiaire. Une base écrite par une version plus récente est refusée.
+
+`batch()` est paresseux : `BEGIN IMMEDIATE` n'est émis qu'à la première
+mutation, de sorte qu'un lot d'ingress purement lecture (QoS 0, PINGRESP, ACK
+sans effet) ne prend aucun verrou d'écriture et ne paie aucun commit.
+
+### Ordre des colonnes et pagination ordonnée
+
+Deux décisions de stockage, mesurées plutôt que supposées.
+
+**`payload` est déclaré en dernier.** SQLite atteint une colonne en parcourant
+celles déclarées avant elle, et un payload de quelques centaines d'octets
+déborde en pages d'overflow. Toute colonne de métadonnées placée après
+`payload` coûtait donc un parcours d'overflow sur une lecture qui ne voulait
+pas le payload — y compris le `SELECT state, logical_size` de chaque `PUBACK`.
+
+**Aucun index sur `seq`.** La pagination ordonnée n'utilise pas
+`WHERE seq>? ORDER BY seq LIMIT ?` réémis par page : cette forme rescanne et
+retrie la table à chaque page, ce qui rendait un replay complet quadratique. À
+la place, `_ordered_mids()` fait **une seule passe triée sur les métadonnées**
+(8 octets par enregistrement, soit moins d'un demi-mégaoctet pour 60 000
+enregistrements), puis chaque page est relue par clé primaire.
+
+Mesuré sur 10 000 enregistrements de 4 Kio :
+
+| variante                                 | publish+ACK/s | lag p95 | replay sortant | replay entrant | démarrage |
+| ---------------------------------------- | ------------: | ------: | -------------: | -------------: | --------: |
+| index `seq` (les deux)                   |         2 885 | 192,7 ms |        970,6 ms |        171,6 ms |   130,5 ms |
+| index `inbound(seq)` seul                |         6 165 |  24,9 ms |       1004,9 ms |        168,9 ms |   135,0 ms |
+| **aucun index (retenu)**                 |     **6 138** | **25,5 ms** |    **981,6 ms** |    **174,4 ms** |  **151,9 ms** |
+
+Avec le schéma `payload`-en-dernier, les index n'apportent plus rien au replay
+ni au démarrage, et coûtent la moitié du débit de publication durable ainsi
+qu'un lag p95 7,7× pire. `benchmarks/persistence_index_ab.py` recrée les trois
+variantes pour que cette décision reste réfutable.
+
+Conséquence sur le contrat de pagination : les identifiants sont figés au début
+de l'itération, donc une page dont des enregistrements ont été acquittés entre
+temps revient **plus courte**. C'est déjà le comportement de
+`MemoryInflightStore` ; la garantie due à l'appelant est identique des deux
+côtés — ordre d'insertion préservé, ni doublon ni résurrection.
+
+### Replay entrant incrémental
+
+`InboundSession.replay_session()` n'émet plus toutes les redélivrances d'un
+coup. Il restaure d'abord la fenêtre `Receive Maximum` à partir de l'index
+(`in_index_pages`, sans payload), puis émet un lot borné (messages, octets et
+enregistrements parcourus) suivi d'un effet interne
+`CONTINUE_INBOUND_REPLAY`. `AsyncClient` applique ce marqueur en rentrant
+brièvement sous `_engine_lock` et en demandant le lot suivant.
+
+La backpressure de livraison s'exerce donc **entre** les lots, et le pic mémoire
+devient proportionnel à un lot au lieu de la session entière (mesuré : 5,9 Mio →
+0,76 Mio sur 4 000 messages de 1 Kio). L'effet de continuation porte l'époque de
+connexion comme tous les autres : une déconnexion en cours de replay l'élimine,
+et le curseur est abandonné au prochain `begin_connect()`.
+
 ## Modules
 
 ```text

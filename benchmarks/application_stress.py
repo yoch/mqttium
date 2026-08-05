@@ -178,7 +178,7 @@ def persistence_cycle(name: str, store, count: int, *, batched: bool) -> Sample:
             record.dup = True
             store.update_out(record)
         for record in records:
-            if store.pop_out(record.mid) is None:
+            if not store.delete_out(record.mid):
                 raise RuntimeError(f"missing persistence record mid={record.mid}")
     return sample(
         name,
