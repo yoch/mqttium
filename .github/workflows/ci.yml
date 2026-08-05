@@ -100,7 +100,7 @@ jobs:
               metadata_name = next(name for name in names if name.endswith(".dist-info/METADATA"))
               metadata = email.message_from_bytes(archive.read(metadata_name))
               assert metadata["Name"] == "mqttium"
-              assert metadata["Version"] == "0.1.0a2"
+              assert metadata["Version"] == "0.1.0a3"
               assert metadata["Requires-Python"] == ">=3.11"
               assert metadata["License-Expression"] == "Apache-2.0"
               assert "mqttium/py.typed" in names
@@ -130,8 +130,8 @@ jobs:
           import pkgutil
           import mqttium
 
-          assert mqttium.__version__ == "0.1.0a2"
-          assert importlib.metadata.version("mqttium") == "0.1.0a2"
+          assert mqttium.__version__ == "0.1.0a3"
+          assert importlib.metadata.version("mqttium") == "0.1.0a3"
           for module in pkgutil.walk_packages(mqttium.__path__, mqttium.__name__ + "."):
               importlib.import_module(module.name)
           PY

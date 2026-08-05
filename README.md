@@ -6,7 +6,7 @@ It combines a synchronous protocol engine with an `asyncio` API, bounded
 backpressure, durable inflight persistence, explicit delivery receipts, and
 complete MQTT QoS state machines.
 
-> **Status:** alpha (`0.1.0a2`). The implementation is extensively tested, but
+> **Status:** alpha (`0.1.0a3`). The implementation is extensively tested, but
 > the public API may still change before the first stable release.
 
 ## Features

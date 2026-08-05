@@ -6,6 +6,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.1.0a3] - 2026-08-05
+
 ### Added
 
 - `AsyncClient.stats()` and immutable `ClientStats` snapshots covering protocol
@@ -41,7 +43,6 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   solely owns queue ordering, byte/count backpressure, batching, the writer task
   and `last_outbound`. `AsyncClient` retains transport lifecycle and writer
   failure policy, while direct-bound enqueue methods preserve the SEND hot path.
-
 - The Paho façade now uses a narrow loop-bound `AsyncClient` adapter boundary
   rather than accessing the protocol engine, receipt registries and effect pump
   directly. Its cross-thread batching is preserved: QoS 0 uses receiptless
@@ -143,6 +144,7 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - Pre-spin-out comparative analysis and generated coverage data from the
   published source tree.
 
-[Unreleased]: https://github.com/yoch/mqttium/compare/v0.1.0a2...HEAD
+[Unreleased]: https://github.com/yoch/mqttium/compare/v0.1.0a3...HEAD
+[0.1.0a3]: https://github.com/yoch/mqttium/compare/v0.1.0a2...v0.1.0a3
 [0.1.0a2]: https://github.com/yoch/mqttium/compare/v0.1.0a1...v0.1.0a2
 [0.1.0a1]: https://github.com/yoch/mqttium/releases/tag/v0.1.0a1
