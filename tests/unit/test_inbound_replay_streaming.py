@@ -91,10 +91,12 @@ def test_replay_reads_one_page_per_batch(tmp_path: Path) -> None:
     class CountingStore(SqliteInflightStore):
         pages_fetched = 0
 
-        def in_pages(  # type: ignore[override]
-            self, page_size: int = 256
+        def in_replay_pages(  # type: ignore[override]
+            self,
+            max_messages: int = 64,
+            max_bytes: int = 1 << 20,
         ) -> Iterator[tuple[InboundMessage, ...]]:
-            for page in super().in_pages(page_size):
+            for page in super().in_replay_pages(max_messages, max_bytes):
                 CountingStore.pages_fetched += 1
                 yield page
 

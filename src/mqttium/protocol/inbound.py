@@ -14,7 +14,11 @@ from typing import TYPE_CHECKING
 from mqttium.codec.buffer import RawPacket
 from mqttium.enums import ConnectionState, InboundQoSState, MQTTProtocolVersion, QoS
 from mqttium.errors import ProtocolError
-from mqttium.persistence.memory import PagedInflightStore, TransitionInflightStore
+from mqttium.persistence.memory import (
+    BoundedInboundReplayStore,
+    PagedInflightStore,
+    TransitionInflightStore,
+)
 from mqttium.packets import (
     PubAckPacket,
     PubCompPacket,
@@ -48,14 +52,19 @@ class InboundReplayCursor:
     only the current page of messages is alive at any time.
     """
 
-    __slots__ = ("_pages", "_page", "_offset")
+    __slots__ = ("_pages", "_page", "_offset", "_pending")
 
     def __init__(self, pages: Iterator[tuple[InboundMessage, ...]]) -> None:
         self._pages = pages
         self._page: tuple[InboundMessage, ...] = ()
         self._offset = 0
+        self._pending: InboundMessage | None = None
 
     def next_message(self) -> InboundMessage | None:
+        if self._pending is not None:
+            message = self._pending
+            self._pending = None
+            return message
         while self._offset >= len(self._page):
             page = next(self._pages, None)
             if page is None:
@@ -66,12 +75,18 @@ class InboundReplayCursor:
         self._offset += 1
         return message
 
+    def push_back(self, message: InboundMessage) -> None:
+        if self._pending is not None:
+            raise AssertionError("replay cursor already has a pending message")
+        self._pending = message
+
 
 class InboundSession:
     """Authoritative inbound QoS and connection-scoped alias state."""
 
     __slots__ = (
         "_aliases",
+        "_bounded_replay_store",
         "_engine",
         "_inflight",
         "_paged_store",
@@ -93,6 +108,9 @@ class InboundSession:
         # materialise an inbound payload.
         self._transitions = self.store if isinstance(self.store, TransitionInflightStore) else None
         self._paged_store = self.store if isinstance(self.store, PagedInflightStore) else None
+        self._bounded_replay_store = (
+            self.store if isinstance(self.store, BoundedInboundReplayStore) else None
+        )
         self._aliases: dict[int, str] = {}
         self._inflight = 0
         self._replay: InboundReplayCursor | None = None
@@ -394,8 +412,9 @@ class InboundSession:
         gets a chance to apply delivery backpressure.
         """
         paged = self._paged_store
+        bounded = self._bounded_replay_store
         transitions = self._transitions
-        if paged is None or transitions is None:
+        if transitions is None or (bounded is None and paged is None):
             # A store without the paging or metadata extensions keeps the
             # original eager behaviour: correct, just not bounded.
             inbound_items = list(self.store.in_items())
@@ -406,16 +425,26 @@ class InboundSession:
             self._recovered_mids.clear()
             return
 
-        # The Receive Maximum window must be restored in full before the first
-        # redelivery, so the count is taken from the index — no payload read.
-        persisted = 0
-        for page in transitions.in_index_pages(REPLAY_PAGE_SIZE):
-            persisted += len(page)
+        # Built-in stores count directly without re-scanning the index that
+        # construction already traversed. Third-party paged stores keep the
+        # metadata-only fallback.
+        if bounded is not None:
+            persisted = bounded.in_count()
+            pages = bounded.in_replay_pages(
+                REPLAY_BATCH_MESSAGES,
+                REPLAY_BATCH_BYTES,
+            )
+        else:
+            persisted = 0
+            for page in transitions.in_index_pages(REPLAY_PAGE_SIZE):
+                persisted += len(page)
+            assert paged is not None
+            pages = paged.in_pages(REPLAY_PAGE_SIZE)
         self._inflight = persisted
         if persisted == 0:
             self._recovered_mids.clear()
             return
-        self._replay = InboundReplayCursor(iter(paged.in_pages(REPLAY_PAGE_SIZE)))
+        self._replay = InboundReplayCursor(iter(pages))
         self.drain_replay()
 
     def drain_replay(self) -> None:
@@ -440,12 +469,17 @@ class InboundSession:
                 self._replay = None
                 self._recovered_mids.clear()
                 return
-            scanned += 1
             if not self._should_redeliver(inbound):
+                scanned += 1
                 continue
+            message_bytes = len(inbound.payload) + len(inbound.topic.encode("utf-8"))
+            if emitted and emitted_bytes + message_bytes > REPLAY_BATCH_BYTES:
+                cursor.push_back(inbound)
+                break
+            scanned += 1
             self._emit_message(inbound, dup=True)
             emitted += 1
-            emitted_bytes += len(inbound.payload) + len(inbound.topic)
+            emitted_bytes += message_bytes
         self._engine._emit(EffectKind.CONTINUE_INBOUND_REPLAY, None)
 
     def _should_redeliver(self, inbound: InboundMessage) -> bool:
