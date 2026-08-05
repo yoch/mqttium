@@ -1,0 +1,64 @@
+name: Publish v311 QoS 0 direct decode
+
+on:
+  push:
+    branches:
+      - agent/native-hotpath-architecture-study
+    paths:
+      - benchmarks/publish-v311-qos0-decode.txt
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Check out study harness
+        uses: actions/checkout@v7
+        with:
+          path: harness
+      - name: Check out clean target branch
+        uses: actions/checkout@v7
+        with:
+          ref: agent/v311-qos0-direct-message-decode
+          path: candidate
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Build candidate
+        run: python harness/.github/scripts/build_v311_qos0_decode_pr.py candidate
+      - name: Validate exact tree
+        working-directory: candidate
+        run: |
+          python -m pip install -e ".[dev,security,fuzz]"
+          ruff format \
+            src/mqttium/protocol/inbound.py \
+            tests/unit/test_qos0_v311_decode_fastpath.py \
+            benchmarks/qos0_v311_decode.py
+          ruff format --check src tests benchmarks
+          ruff check src tests benchmarks
+          mypy src/mqttium
+          bandit -q -ll -r src
+          python -m pytest -q tests/unit
+          PYTHONPATH=src python -m pytest -q tests/fuzz/test_hypothesis_fuzz.py
+          python benchmarks/qos0_v311_decode.py \
+            --count 100000 --repeat 5 --output /tmp/qos0-v311-decode.json
+          git diff --check
+      - name: Publish one commit
+        working-directory: candidate
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add \
+            CHANGELOG.md \
+            benchmarks/qos0_v311_decode.py \
+            docs/QOS0-V311-DECODE.md \
+            src/mqttium/protocol/inbound.py \
+            tests/unit/test_qos0_v311_decode_fastpath.py
+          git diff --cached --check
+          test "$(git rev-list --count origin/main..HEAD)" -eq 0
+          git commit -m 'Decode MQTT 3.1.1 QoS 0 directly to Message'
+          git push origin HEAD:agent/v311-qos0-direct-message-decode
