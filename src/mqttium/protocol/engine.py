@@ -15,7 +15,6 @@ from mqttium.codec.packet_validation import validate_raw_packet
 from mqttium.enums import (
     ConnectionState,
     MQTTProtocolVersion,
-    OutboundQoSState,
     PacketType,
     QoS,
 )
@@ -24,10 +23,6 @@ from mqttium.packets import (
     ConnAckPacket,
     ConnectPacket,
     DisconnectPacket,
-    PubAckPacket,
-    PubCompPacket,
-    PubRecPacket,
-    PubRelPacket,
     SubAckPacket,
     SubscribeOptions,
     SubscribePacket,
@@ -46,7 +41,7 @@ from mqttium.protocol.effects import (
     DisconnectInfo,
     EffectKind,
     EngineEffect,
-    PublishFailure,
+    PublishFailure as PublishFailure,
     PublishHandle,
 )
 from mqttium.protocol.flow_control import FlowControl
@@ -119,10 +114,10 @@ class ProtocolEngine:
         self._handlers = {
             PacketType.CONNACK: self._on_connack,
             PacketType.PUBLISH: self.inbound.on_publish,
-            PacketType.PUBACK: self._on_puback,
-            PacketType.PUBREC: self._on_pubrec,
+            PacketType.PUBACK: self.outbound.on_puback,
+            PacketType.PUBREC: self.outbound.on_pubrec,
             PacketType.PUBREL: self.inbound.on_pubrel,
-            PacketType.PUBCOMP: self._on_pubcomp,
+            PacketType.PUBCOMP: self.outbound.on_pubcomp,
             PacketType.SUBACK: self._on_suback,
             PacketType.UNSUBACK: self._on_unsuback,
             PacketType.PINGRESP: self._on_pingresp,
@@ -500,84 +495,9 @@ class ProtocolEngine:
     def mark_inbound_delivered(self, mid: int) -> None:
         self.inbound.mark_delivered(mid)
 
-    def _on_puback(self, raw: RawPacket) -> None:
-        ack = PubAckPacket.decode(raw.remaining, self.config.protocol)
-        msg = self.store.get_out(ack.mid)
-        if msg is None or msg.state is not OutboundQoSState.WAIT_PUBACK:
-            return
-        self.outbound.complete_record(ack.mid, msg)
-        self.outbound.flow.release()
-        # Emit before freeing the packet id so FIFO receipt settlement remains
-        # ordered even if a concurrent publish reuses the mid immediately.
-        if ack.reason_code >= 128:
-            self._emit(
-                EffectKind.PUBLISH_FAILED,
-                PublishFailure(
-                    mid=ack.mid,
-                    reason=ProtocolError(f"PUBACK reason_code={ack.reason_code}"),
-                ),
-            )
-        else:
-            self._emit(EffectKind.PUBLISH_COMPLETE, ack.mid)
-        self.outbound.packet_ids.release(ack.mid)
-        self.outbound.drain()
-
-    def _on_pubrec(self, raw: RawPacket) -> None:
-        rec = PubRecPacket.decode(raw.remaining, self.config.protocol)
-        msg = self.store.get_out(rec.mid)
-        if msg is None:
-            # Orphan PUBREC: reply PUBREL with 0x92 when MQTT 5.
-            reason = 0x92 if self.config.protocol == MQTTProtocolVersion.MQTTv5 else 0
-            self._send(PubRelPacket(mid=rec.mid, reason_code=reason).encode(self.config.protocol))
-            return
-        if msg.state is not OutboundQoSState.WAIT_PUBREC:
-            return
-        if rec.reason_code >= 128:
-            self.outbound.complete_record(rec.mid, msg)
-            self.outbound.flow.release()
-            self._emit(
-                EffectKind.PUBLISH_FAILED,
-                PublishFailure(
-                    mid=rec.mid,
-                    reason=ProtocolError(f"PUBREC reason_code={rec.reason_code}"),
-                ),
-            )
-            self.outbound.packet_ids.release(rec.mid)
-            self.outbound.drain()
-            return
-        msg.state = OutboundQoSState.WAIT_PUBCOMP
-        msg.encoded_publish = None
-        if msg.encoded_pubrel is None:
-            msg.encoded_pubrel = PubRelPacket(mid=rec.mid).encode(self.config.protocol)
-        self.store.update_out(msg)
-        # Keep the local flow slot until PUBCOMP. MQTT 5 allows releasing at
-        # PUBREC, but freeing early lets WAIT_PUBCOMP accumulate without bound
-        # and has caused intermittent multi-second stalls under load.
-        self._send(msg.encoded_pubrel)
-
     def ack(self, mid: int) -> None:
         """Complete a deferred inbound ACK in manual-ack mode."""
         self.inbound.ack(mid)
-
-    def _on_pubcomp(self, raw: RawPacket) -> None:
-        comp = PubCompPacket.decode(raw.remaining, self.config.protocol)
-        msg = self.store.get_out(comp.mid)
-        if msg is None or msg.state is not OutboundQoSState.WAIT_PUBCOMP:
-            return
-        self.outbound.complete_record(comp.mid, msg)
-        self.outbound.flow.release()
-        if comp.reason_code >= 128:
-            self._emit(
-                EffectKind.PUBLISH_FAILED,
-                PublishFailure(
-                    mid=comp.mid,
-                    reason=ProtocolError(f"PUBCOMP reason_code={comp.reason_code}"),
-                ),
-            )
-        else:
-            self._emit(EffectKind.PUBLISH_COMPLETE, comp.mid)
-        self.outbound.packet_ids.release(comp.mid)
-        self.outbound.drain()
 
     def _on_suback(self, raw: RawPacket) -> None:
         ack = SubAckPacket.decode(raw.remaining, self.config.protocol)

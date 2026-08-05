@@ -17,6 +17,7 @@ from collections import deque
 from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
+from mqttium.codec.buffer import RawPacket
 from mqttium.codec.properties import PUBLISH, encode_properties
 from mqttium.codec.vbi import encode_vbi
 from mqttium.enums import (
@@ -32,7 +33,13 @@ from mqttium.errors import (
     ProtocolError,
     SessionDiscardedError,
 )
-from mqttium.packets import PublishPacket, PubRelPacket
+from mqttium.packets import (
+    PubAckPacket,
+    PubCompPacket,
+    PublishPacket,
+    PubRecPacket,
+    PubRelPacket,
+)
 from mqttium.persistence.memory import PagedInflightStore
 from mqttium.protocol.effects import EffectKind, PublishFailure, PublishHandle
 from mqttium.protocol.flow_control import FlowControl
@@ -372,6 +379,65 @@ class OutboundSession:
             )
             raise
         return handles
+
+    # --- broker acknowledgements -------------------------------------------
+
+    def on_puback(self, raw: RawPacket) -> None:
+        ack = PubAckPacket.decode(raw.remaining, self.config.protocol)
+        msg = self.store.get_out(ack.mid)
+        if msg is None or msg.state is not OutboundQoSState.WAIT_PUBACK:
+            return
+        self.complete_record(ack.mid, msg)
+        self.flow.release()
+        # Emit before freeing the packet id so FIFO receipt settlement remains
+        # ordered even if a concurrent publish reuses the mid immediately.
+        if ack.reason_code >= 128:
+            self._fail(ack.mid, ProtocolError(f"PUBACK reason_code={ack.reason_code}"))
+        else:
+            self._emit(EffectKind.PUBLISH_COMPLETE, ack.mid)
+        self.packet_ids.release(ack.mid)
+        self.drain()
+
+    def on_pubrec(self, raw: RawPacket) -> None:
+        rec = PubRecPacket.decode(raw.remaining, self.config.protocol)
+        msg = self.store.get_out(rec.mid)
+        if msg is None:
+            # Orphan PUBREC: reply PUBREL with 0x92 when MQTT 5.
+            reason = 0x92 if self.config.protocol == MQTTProtocolVersion.MQTTv5 else 0
+            self._send(PubRelPacket(mid=rec.mid, reason_code=reason).encode(self.config.protocol))
+            return
+        if msg.state is not OutboundQoSState.WAIT_PUBREC:
+            return
+        if rec.reason_code >= 128:
+            self.complete_record(rec.mid, msg)
+            self.flow.release()
+            self._fail(rec.mid, ProtocolError(f"PUBREC reason_code={rec.reason_code}"))
+            self.packet_ids.release(rec.mid)
+            self.drain()
+            return
+        msg.state = OutboundQoSState.WAIT_PUBCOMP
+        msg.encoded_publish = None
+        if msg.encoded_pubrel is None:
+            msg.encoded_pubrel = PubRelPacket(mid=rec.mid).encode(self.config.protocol)
+        self.store.update_out(msg)
+        # Keep the local flow slot until PUBCOMP. MQTT 5 allows releasing at
+        # PUBREC, but freeing early lets WAIT_PUBCOMP accumulate without bound
+        # and has caused intermittent multi-second stalls under load.
+        self._send(msg.encoded_pubrel)
+
+    def on_pubcomp(self, raw: RawPacket) -> None:
+        comp = PubCompPacket.decode(raw.remaining, self.config.protocol)
+        msg = self.store.get_out(comp.mid)
+        if msg is None or msg.state is not OutboundQoSState.WAIT_PUBCOMP:
+            return
+        self.complete_record(comp.mid, msg)
+        self.flow.release()
+        if comp.reason_code >= 128:
+            self._fail(comp.mid, ProtocolError(f"PUBCOMP reason_code={comp.reason_code}"))
+        else:
+            self._emit(EffectKind.PUBLISH_COMPLETE, comp.mid)
+        self.packet_ids.release(comp.mid)
+        self.drain()
 
     # --- launching and retransmission ---------------------------------------
 
