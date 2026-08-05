@@ -1,1 +1,1 @@
-Publish the clean candidate validated by run 31049968366.
+Republish the clean candidate validated by run 31049968366 after publication-script correction.
