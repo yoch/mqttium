@@ -87,7 +87,7 @@ def test_continuations_replay_every_record_exactly_once() -> None:
     assert engine.inbound.replay_pending is False
 
 
-def test_replay_reads_one_page_per_batch(tmp_path: Path) -> None:
+def test_replay_reuses_one_bounded_page_across_effect_batches(tmp_path: Path) -> None:
     class CountingStore(SqliteInflightStore):
         pages_fetched = 0
 
@@ -109,7 +109,7 @@ def test_replay_reads_one_page_per_batch(tmp_path: Path) -> None:
 
     engine.continue_inbound_replay()
     engine.take_effects()
-    assert CountingStore.pages_fetched == 2
+    assert CountingStore.pages_fetched == 1  # still inside the first bounded page
     store.close()
 
 

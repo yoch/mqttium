@@ -431,7 +431,7 @@ class InboundSession:
         if bounded is not None:
             persisted = bounded.in_count()
             pages = bounded.in_replay_pages(
-                REPLAY_BATCH_MESSAGES,
+                REPLAY_SCAN_LIMIT,
                 REPLAY_BATCH_BYTES,
             )
         else:

@@ -719,13 +719,15 @@ class SqliteInflightStore:
             raise ValueError("max_messages must be positive")
         if max_bytes <= 0:
             raise ValueError("max_bytes must be positive")
+        index_mids = array("q")
+        index_sizes = array("q")
         with self._lock:
-            index = self._conn.execute(_IN_REPLAY_INDEX_SQL).fetchall()
+            for row in self._conn.execute(_IN_REPLAY_INDEX_SQL):
+                index_mids.append(int(row["mid"]))
+                index_sizes.append(int(row["replay_size"] or 0))
         mids: list[int] = []
         hydrated_bytes = 0
-        for row in index:
-            mid = int(row["mid"])
-            message_bytes = int(row["replay_size"] or 0)
+        for mid, message_bytes in zip(index_mids, index_sizes, strict=True):
             if mids and (len(mids) >= max_messages or hydrated_bytes + message_bytes > max_bytes):
                 page = self._in_messages_for_mids(tuple(mids))
                 if page:
