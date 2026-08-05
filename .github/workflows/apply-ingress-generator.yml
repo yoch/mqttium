@@ -1,0 +1,40 @@
+name: Apply ingress generator hardening
+
+on:
+  push:
+    branches:
+      - agent/native-rtt-ingress-hotpath
+    paths:
+      - .github/scripts/harden_ingress_generator.py
+      - .github/workflows/apply-ingress-generator.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e ".[dev]"
+      - name: Apply generator hardening
+        run: python .github/scripts/harden_ingress_generator.py
+      - name: Validate benchmark
+        run: |
+          ruff format benchmarks/native_rtt_ingress.py
+          ruff check benchmarks/native_rtt_ingress.py
+          python -m py_compile benchmarks/native_rtt_ingress.py
+      - name: Publish harness update
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add benchmarks/native_rtt_ingress.py
+          git commit -m 'Synchronize native ingress load generation'
+          git push origin HEAD:agent/native-rtt-ingress-hotpath
