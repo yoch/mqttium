@@ -35,9 +35,16 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   report its own buffer occupancy. A transport that does not is reported
   through `TransportStats.unavailable()` instead of being probed attribute by
   attribute from the client.
+- `benchmarks/qos1_frame_policy.py` and `docs/QOS1-FRAME-POLICY.md`, retaining
+  the allocation/replay A/B that selected the outbound PUBLISH frame policy.
 
 ### Changed
 
+- QoS 1 and pre-PUBREC QoS 2 records no longer retain contiguous encoded
+  PUBLISH frames after the initial SEND; those frames duplicated the payload
+  and replay already re-encoded them. Segmented `(header, payload)` items remain
+  cached because they share the payload, and replay sets DUP by replacing only
+  the small header before reusing the tuple on later reconnects.
 - Outbound QoS 2 records are fully compacted after PUBREC: topic, payload and
   PUBLISH properties are removed atomically while the original logical size is
   retained until PUBCOMP releases admission accounting. SQLite schema 3 also

@@ -86,16 +86,6 @@ The finalisation pass resolved three additional audit items:
 
 Still identified by the audit and not implemented:
 
-- **Decoder copies for large payloads.** A specialised in-buffer PUBLISH parse
-  remains conditional on profiling after the ingress byte bound. Public
-  zero-copy views remain rejected because they violate owned-byte semantics.
-- **Full QoS 2 phase-two compaction.** Only the encoded frame is released at
-  `WAIT_PUBCOMP`; topic, payload and properties are still retained.
-- **QoS 1 / pre-PUBREC frame policy.** Re-encoding on retransmission and a
-  size-based policy still require an A/B benchmark.
 - **Memory scenario coverage.** Property-heavy outbound, immediate refusal,
   cancellation around commit, Paho saturation, shared delivery, WebSocket
   batching and reconnect cleanup need numeric regression thresholds.
-- **Campaign evidence.** The soak and multi-broker workflow exists, but stable
-  release requires retained successful Linux, macOS, Mosquitto, EMQX and HiveMQ
-  run artefacts; see [`STABILITY.md`](STABILITY.md).

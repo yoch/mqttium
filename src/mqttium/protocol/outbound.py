@@ -53,6 +53,23 @@ if TYPE_CHECKING:
     from mqttium.protocol.engine import ProtocolEngine
 
 
+def _retain_publish_item(item: WriteItem) -> WriteItem | None:
+    """Keep only a segmented frame, whose payload is already shared."""
+    return item if not isinstance(item, bytes) else None
+
+
+def _mark_publish_dup(item: WriteItem) -> WriteItem:
+    """Set PUBLISH DUP by replacing only the first header byte."""
+    if isinstance(item, bytes):
+        if item[0] & 0x08:
+            return item
+        return bytes((item[0] | 0x08,)) + item[1:]
+    header, payload = item
+    if header[0] & 0x08:
+        return item
+    return (bytes((header[0] | 0x08,)) + header[1:], payload)
+
+
 class OutboundSession:
     __slots__ = (
         "_engine",
@@ -536,8 +553,9 @@ class OutboundSession:
     # --- launching and retransmission ---------------------------------------
 
     def _launch(self, msg: OutboundMessage) -> None:
-        if msg.encoded_publish is None:
-            msg.encoded_publish = PublishPacket(
+        wire = msg.encoded_publish
+        if wire is None:
+            wire = PublishPacket(
                 topic=msg.topic,
                 payload=msg.payload,
                 qos=msg.qos,
@@ -546,13 +564,17 @@ class OutboundSession:
                 mid=msg.mid,
                 properties=msg.properties,
             ).encode_write_item(self.config.protocol)
-        self._engine._check_outbound_size(msg.encoded_publish)
+        self._engine._check_outbound_size(wire)
         if msg.qos == QoS.AT_LEAST_ONCE:
             msg.state = OutboundQoSState.WAIT_PUBACK
         else:
             msg.state = OutboundQoSState.WAIT_PUBREC
+        # A contiguous frame owns another payload-sized bytes object and replay
+        # re-encodes it anyway. A segmented item owns only its small header; its
+        # payload is the application bytes already retained by the record.
+        msg.encoded_publish = _retain_publish_item(wire)
         self.store.put_out(msg)
-        self._send(msg.encoded_publish)
+        self._send(wire)
 
     def _try_launch(self, msg: OutboundMessage) -> bool:
         if not self.flow.try_acquire():
@@ -570,18 +592,27 @@ class OutboundSession:
             OutboundQoSState.WAIT_PUBREC,
         ):
             msg.dup = True
-            msg.encoded_publish = PublishPacket(
-                topic=msg.topic,
-                payload=msg.payload,
-                qos=msg.qos,
-                retain=msg.retain,
-                dup=True,
-                mid=msg.mid,
-                properties=msg.properties,
-            ).encode_write_item(self.config.protocol)
-            self._engine._check_outbound_size(msg.encoded_publish)
+            retained = msg.encoded_publish
+            if retained is None:
+                wire = PublishPacket(
+                    topic=msg.topic,
+                    payload=msg.payload,
+                    qos=msg.qos,
+                    retain=msg.retain,
+                    dup=True,
+                    mid=msg.mid,
+                    properties=msg.properties,
+                ).encode_write_item(self.config.protocol)
+            else:
+                # Segmented frames share the original payload. The first replay
+                # replaces only their small header; later replays reuse the
+                # already-DUP tuple. The bytes branch accepts legacy/custom-store
+                # records and drops their contiguous frame after this send.
+                wire = _mark_publish_dup(retained)
+            self._engine._check_outbound_size(wire)
+            msg.encoded_publish = _retain_publish_item(wire)
             self.store.update_out(msg)
-            self._send(msg.encoded_publish)
+            self._send(wire)
             return
         if msg.state is OutboundQoSState.WAIT_PUBCOMP:
             if msg.encoded_pubrel is None:
