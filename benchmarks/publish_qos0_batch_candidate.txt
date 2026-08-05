@@ -1,1 +1,1 @@
-Validate and publish the multi-message-only QoS 0 batching candidate if the full suite and smoke pass.
+Export the exact multi-message-only candidate after full validation and smoke checks.
