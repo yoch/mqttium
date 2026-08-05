@@ -20,6 +20,26 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
+      - name: Fix patch anchors
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('.github/apply_paho_boundary.py')
+          text = path.read_text()
+          text = text.replace(
+              '    def _commit_qosn_publish_on_loop(\\n',
+              '    def _commit_qosn_publish_on_loop(self, request: _PendingPublish) -> MQTTMessageInfo:\\n',
+          )
+          text = text.replace(
+              '    def _finalize_publish_effects(\\n',
+              '    def _finalize_publish_effects(self) -> None:\\n',
+          )
+          text = text.replace(
+              '    def _drain_publish_requests(\\n',
+              '    def _drain_publish_requests(self) -> None:\\n',
+          )
+          path.write_text(text)
+          PY
       - name: Apply refactor
         run: python .github/apply_paho_boundary.py
       - name: Install development dependencies
