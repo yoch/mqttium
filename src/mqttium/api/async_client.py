@@ -1463,7 +1463,9 @@ class AsyncClient:
                         self._callback_queue.put_nowait(job)
                     except asyncio.QueueFull:
                         await self._enqueue_callback_slow(job)
-                if msg.mid is not None:
+                if msg.mid is not None and (
+                    self._engine.config.manual_ack or msg.qos == QoS.EXACTLY_ONCE
+                ):
                     async with self._engine_lock:
                         self._engine.mark_inbound_delivered(msg.mid)
                 return
@@ -1525,7 +1527,9 @@ class AsyncClient:
                     for _ in range(unqueued):
                         self._release_delivery_reference_nowait(delivery_token)
                 raise
-            if msg.mid is not None:
+            if msg.mid is not None and (
+                self._engine.config.manual_ack or msg.qos == QoS.EXACTLY_ONCE
+            ):
                 async with self._engine_lock:
                     self._engine.mark_inbound_delivered(msg.mid)
         elif kind is EffectKind.PUBLISH_COMPLETE:
