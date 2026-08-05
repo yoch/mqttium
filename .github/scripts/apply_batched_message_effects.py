@@ -84,6 +84,7 @@ def patch_client(root: Path) -> None:
         if not callback_delivery and not iterator_delivery:
             return 0
         small_limit = self._delivery_small_message_limit
+        callback_worker_ready = False
         applied = 0
         for effect in effects:
             if effect.kind is not EffectKind.MESSAGE:
@@ -107,12 +108,15 @@ def patch_client(root: Path) -> None:
                 break
             if iterator_delivery:
                 self._messages.put_nowait(msg)
-                self._message_ready.set()
             if callback_delivery:
                 assert callback is not None
-                self._ensure_callback_worker()
+                if not callback_worker_ready:
+                    self._ensure_callback_worker()
+                    callback_worker_ready = True
                 self._callback_queue.put_nowait((callback, (msg,), None))
             applied += 1
+        if applied and iterator_delivery:
+            self._message_ready.set()
         return applied
 
 '''
@@ -208,6 +212,7 @@ def test_batch_stops_at_first_non_qos0_effect() -> None:
 
     assert applied == 1
     assert client._messages.qsize() == 1
+    assert client._message_ready.is_set()
 '''
     )
 
