@@ -108,7 +108,10 @@ un batch sur le loop avant de finaliser les effets une seule fois.
 La façade Paho ne touche plus directement `ProtocolEngine`, les registres de
 receipts ou `EffectPump`. Elle passe par une petite frontière interne
 loop-confined d'`AsyncClient`, afin de préserver le batching et les fast paths
-sans introduire de bus de commandes générique.
+sans introduire de bus de commandes générique. Le chemin natif
+`await publish()` garde volontairement l'admission, la création du receipt et
+le drainage inline : le faire passer par ces wrappers a mesuré 2,36 % plus lent
+sur le contrôle apparié, au-delà du budget de régression.
 
 ### Découpage interne du moteur
 
