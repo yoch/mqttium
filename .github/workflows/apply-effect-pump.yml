@@ -6,7 +6,6 @@ on:
       - agent/effect-pump
     paths:
       - .github/effect-pump.patch.zlib.b64
-      - .github/workflows/apply-effect-pump.yml
 
 permissions:
   contents: write
@@ -34,6 +33,7 @@ jobs:
           Path('/tmp/effect-pump.patch').write_bytes(zlib.decompress(base64.b64decode(encoded)))
           PY
           git apply /tmp/effect-pump.patch
+          sed -i 's/from typing import Callable/from collections.abc import Callable/' benchmarks/paired_regression.py
           rm .github/effect-pump.patch.zlib.b64
           rm .github/workflows/apply-effect-pump.yml
           python -m pip install -e ".[dev,security]"
