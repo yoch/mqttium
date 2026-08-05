@@ -179,6 +179,7 @@ class SqliteInflightStore:
         self._lock = threading.RLock()
         self._batch_depth = 0
         self._transaction_started = False
+        self._rollback_only = False
         self._conn = sqlite3.connect(self._path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._closed = False
@@ -387,23 +388,45 @@ class SqliteInflightStore:
         (QoS 0, PINGRESP, acknowledgements resolving nothing) mutate nothing at
         all. Deferring ``BEGIN IMMEDIATE`` to the first mutation keeps those
         lots from taking SQLite's write lock and from paying a commit.
+
+        Any exception crossing a nested batch marks the outer transaction
+        rollback-only. Catching that exception inside the outer block therefore
+        cannot accidentally commit the inner block's partial mutations.
         """
         with self._lock:
             outermost = self._batch_depth == 0
+            if outermost:
+                self._rollback_only = False
             self._batch_depth += 1
             try:
                 yield
             except BaseException:
                 self._batch_depth -= 1
-                if outermost and self._transaction_started:
-                    self._transaction_started = False
-                    self._conn.rollback()
+                self._rollback_only = True
+                if outermost:
+                    try:
+                        if self._transaction_started:
+                            self._conn.rollback()
+                    finally:
+                        self._transaction_started = False
+                        self._rollback_only = False
                 raise
             else:
                 self._batch_depth -= 1
-                if outermost and self._transaction_started:
+                if not outermost:
+                    return
+                rollback_only = self._rollback_only
+                try:
+                    if self._transaction_started:
+                        if rollback_only:
+                            self._conn.rollback()
+                        else:
+                            self._conn.commit()
+                finally:
                     self._transaction_started = False
-                    self._conn.commit()
+                    self._rollback_only = False
+                if rollback_only:
+                    raise RuntimeError("Cannot commit SQLite batch after nested batch failure")
 
     def _ensure_write_transaction(self) -> None:
         """Open the batch transaction on its first actual mutation."""
@@ -508,12 +531,15 @@ class SqliteInflightStore:
     # --- conditional transitions (TransitionInflightStore) ------------------
     #
     # Every method here reads metadata columns only and never touches `payload`
-    # or `properties`: settling a PUBACK for an 8 MiB publication must not
-    # allocate 8 MiB. The guarded read and the mutation run back to back under
-    # `self._lock` on a single connection, so no other caller can interleave;
-    # `DELETE ... RETURNING` would fold them into one statement but needs
-    # SQLite 3.35, which is not guaranteed across every Python 3.11–3.14 build
-    # MQTTium supports.
+    # or `properties`. The Python lock excludes callers sharing this instance;
+    # the SQL mutation also repeats the expected state and insertion sequence,
+    # so a second connection changing or replacing the row makes rowcount zero
+    # rather than allowing a stale read to settle a different record.
+
+    def _out_transition_row(self, mid: int) -> sqlite3.Row | None:
+        return self._conn.execute(
+            "SELECT state, logical_size, seq FROM outbound WHERE mid=?", (mid,)
+        ).fetchone()
 
     def set_out_logical_size(self, mid: int, logical_size: int) -> bool:
         with self._lock:
@@ -527,9 +553,7 @@ class SqliteInflightStore:
 
     def out_meta(self, mid: int) -> OutboundRecordMeta | None:
         with self._lock:
-            row = self._conn.execute(
-                "SELECT state, logical_size FROM outbound WHERE mid=?", (mid,)
-            ).fetchone()
+            row = self._out_transition_row(mid)
         if row is None:
             return None
         return OutboundRecordMeta(
@@ -544,13 +568,17 @@ class SqliteInflightStore:
         expected_state: OutboundQoSState,
     ) -> OutboundRecordMeta | None:
         with self._lock:
-            row = self._conn.execute(
-                "SELECT state, logical_size FROM outbound WHERE mid=?", (mid,)
-            ).fetchone()
+            row = self._out_transition_row(mid)
             if row is None or int(row["state"]) != int(expected_state):
                 return None
             self._ensure_write_transaction()
-            self._conn.execute("DELETE FROM outbound WHERE mid=?", (mid,))
+            cursor = self._conn.execute(
+                "DELETE FROM outbound WHERE mid=? AND state=? AND seq=?",
+                (mid, int(expected_state), int(row["seq"])),
+            )
+            if cursor.rowcount == 0:
+                self._commit_if_needed()
+                return None
             self._commit_if_needed()
             return OutboundRecordMeta(
                 mid=mid,
@@ -567,13 +595,17 @@ class SqliteInflightStore:
         compact: bool = False,
     ) -> OutboundRecordMeta | None:
         with self._lock:
-            row = self._conn.execute(
-                "SELECT state, logical_size FROM outbound WHERE mid=?", (mid,)
-            ).fetchone()
+            row = self._out_transition_row(mid)
             if row is None or int(row["state"]) != int(expected_state):
                 return None
             self._ensure_write_transaction()
-            self._conn.execute("UPDATE outbound SET state=? WHERE mid=?", (int(new_state), mid))
+            cursor = self._conn.execute(
+                "UPDATE outbound SET state=? WHERE mid=? AND state=? AND seq=?",
+                (int(new_state), mid, int(expected_state), int(row["seq"])),
+            )
+            if cursor.rowcount == 0:
+                self._commit_if_needed()
+                return None
             self._commit_if_needed()
             # `compact` needs no work here: the encoded PUBLISH frame is a
             # memory-only field this store has never persisted.
@@ -665,6 +697,11 @@ class SqliteInflightStore:
 
     # --- conditional transitions (TransitionInflightStore) ------------------
 
+    def _in_transition_row(self, mid: int) -> sqlite3.Row | None:
+        return self._conn.execute(
+            "SELECT state, user_acked, seq FROM inbound WHERE mid=?", (mid,)
+        ).fetchone()
+
     def contains_in(self, mid: int) -> bool:
         with self._lock:
             row = self._conn.execute("SELECT 1 FROM inbound WHERE mid=?", (mid,)).fetchone()
@@ -672,9 +709,7 @@ class SqliteInflightStore:
 
     def in_meta(self, mid: int) -> InboundRecordMeta | None:
         with self._lock:
-            row = self._conn.execute(
-                "SELECT state, user_acked FROM inbound WHERE mid=?", (mid,)
-            ).fetchone()
+            row = self._in_transition_row(mid)
         if row is None:
             return None
         return InboundRecordMeta(
@@ -704,22 +739,50 @@ class SqliteInflightStore:
         user_acked: bool | None = None,
     ) -> InboundRecordMeta | None:
         with self._lock:
-            meta = self.in_meta(mid)
-            if meta is None or meta.state is not expected_state:
+            row = self._in_transition_row(mid)
+            if row is None or int(row["state"]) != int(expected_state):
                 return None
+            old_user_acked = int(row["user_acked"])
             self._ensure_write_transaction()
             if user_acked is None:
-                self._conn.execute("UPDATE inbound SET state=? WHERE mid=?", (int(new_state), mid))
-            else:
-                self._conn.execute(
-                    "UPDATE inbound SET state=?, user_acked=? WHERE mid=?",
-                    (int(new_state), int(user_acked), mid),
+                cursor = self._conn.execute(
+                    """
+                    UPDATE inbound SET state=?
+                    WHERE mid=? AND state=? AND user_acked=? AND seq=?
+                    """,
+                    (
+                        int(new_state),
+                        mid,
+                        int(expected_state),
+                        old_user_acked,
+                        int(row["seq"]),
+                    ),
                 )
+                resulting_user_acked = bool(old_user_acked)
+            else:
+                cursor = self._conn.execute(
+                    """
+                    UPDATE inbound SET state=?, user_acked=?
+                    WHERE mid=? AND state=? AND user_acked=? AND seq=?
+                    """,
+                    (
+                        int(new_state),
+                        int(user_acked),
+                        mid,
+                        int(expected_state),
+                        old_user_acked,
+                        int(row["seq"]),
+                    ),
+                )
+                resulting_user_acked = user_acked
+            if cursor.rowcount == 0:
+                self._commit_if_needed()
+                return None
             self._commit_if_needed()
             return InboundRecordMeta(
                 mid=mid,
                 state=new_state,
-                user_acked=meta.user_acked if user_acked is None else user_acked,
+                user_acked=resulting_user_acked,
             )
 
     def complete_in(
@@ -728,10 +791,24 @@ class SqliteInflightStore:
         expected_state: InboundQoSState,
     ) -> InboundRecordMeta | None:
         with self._lock:
-            meta = self.in_meta(mid)
-            if meta is None or meta.state is not expected_state:
+            row = self._in_transition_row(mid)
+            if row is None or int(row["state"]) != int(expected_state):
                 return None
+            old_user_acked = int(row["user_acked"])
             self._ensure_write_transaction()
-            self._conn.execute("DELETE FROM inbound WHERE mid=?", (mid,))
+            cursor = self._conn.execute(
+                """
+                DELETE FROM inbound
+                WHERE mid=? AND state=? AND user_acked=? AND seq=?
+                """,
+                (mid, int(expected_state), old_user_acked, int(row["seq"])),
+            )
+            if cursor.rowcount == 0:
+                self._commit_if_needed()
+                return None
             self._commit_if_needed()
-            return meta
+            return InboundRecordMeta(
+                mid=mid,
+                state=expected_state,
+                user_acked=bool(old_user_acked),
+            )
