@@ -207,7 +207,8 @@ def test_batch_defers_messages_requiring_persistence_mark(
     assert client._callback_queue.empty()
 
 
-def test_auto_acked_qos1_is_safe_for_batched_delivery() -> None:
+@pytest.mark.asyncio
+async def test_auto_acked_qos1_is_safe_for_batched_delivery() -> None:
     client = AsyncClient(message_delivery="callback")
     client.on_message = lambda _message: None
 
@@ -218,6 +219,7 @@ def test_auto_acked_qos1_is_safe_for_batched_delivery() -> None:
 
     assert applied == 1
     assert client._callback_queue.qsize() == 1
+    await client._shutdown_callback_worker(drain=False)
 '''
     )
 
