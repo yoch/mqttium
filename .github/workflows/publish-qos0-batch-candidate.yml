@@ -58,7 +58,7 @@ jobs:
           PY
       - name: Install validation dependencies
         working-directory: candidate
-        run: python -m pip install -e ".[dev]"
+        run: python -m pip install -e ".[dev,security]"
       - name: Static validation
         working-directory: candidate
         run: |
@@ -69,12 +69,13 @@ jobs:
             benchmarks/native_rtt_ingress.py \
             benchmarks/direct_ingress_hotpath.py \
             benchmarks/paired_native_hotpaths.py
-          ruff check .
+          ruff format --check src tests benchmarks
+          ruff check src tests benchmarks
           mypy src/mqttium
-          bandit -q -r src/mqttium
+          bandit -q -ll -r src
       - name: Full unit suite
         working-directory: candidate
-        run: pytest -q
+        run: pytest -q tests/unit
       - name: Start isolated broker
         run: |
           sudo apt-get update -qq
