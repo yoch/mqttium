@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 env:
-  EXPERIMENT_STAGE: inline-small-delivery
+  EXPERIMENT_STAGE: synchronized-ingress
 
 jobs:
   probe:
