@@ -1,0 +1,225 @@
+name: Batched message effects probe
+
+on:
+  push:
+    branches:
+      - agent/native-rtt-ingress-hotpath
+    paths:
+      - .github/scripts/apply_batched_message_effects.py
+      - .github/workflows/batched-message-effects-probe.yml
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out harness
+        uses: actions/checkout@v7
+        with:
+          path: harness
+      - name: Check out base
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          path: base
+      - name: Check out candidate
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          path: candidate
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Build candidate from main
+        run: python harness/.github/scripts/apply_batched_message_effects.py candidate
+      - name: Validate targeted candidate
+        working-directory: candidate
+        run: |
+          python -m pip install -e ".[dev]"
+          ruff format src/mqttium/api/_effects.py src/mqttium/api/async_client.py tests/unit/test_batched_message_effects.py
+          ruff check src/mqttium/api/_effects.py src/mqttium/api/async_client.py tests/unit/test_batched_message_effects.py
+          mypy src/mqttium
+          pytest -q \
+            tests/unit/test_batched_message_effects.py \
+            tests/unit/test_delivery_backpressure.py \
+            tests/unit/test_delivery_byte_budget.py \
+            tests/unit/test_effect_pump.py
+      - name: Start isolated broker
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mosquitto
+          printf 'listener 11883 127.0.0.1\nallow_anonymous true\npersistence false\nmax_queued_messages 1000000\n' > /tmp/mqttium-batched-message.conf
+          mosquitto -c /tmp/mqttium-batched-message.conf -d
+          for i in $(seq 1 60); do
+            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            sleep 0.25
+          done
+          exit 1
+      - name: Prepare isolated benchmark environments
+        run: |
+          cp harness/benchmarks/native_rtt_ingress.py /tmp/native_rtt_ingress.py
+          cp harness/benchmarks/direct_ingress_hotpath.py /tmp/direct_ingress_hotpath.py
+          python -m venv /tmp/mqttium-base
+          python -m venv /tmp/mqttium-candidate
+          /tmp/mqttium-base/bin/pip install -e ./base
+          /tmp/mqttium-candidate/bin/pip install -e ./candidate
+          mkdir -p /tmp/batched-message-effects/{rtt,ingress}
+      - name: Five direct-ingress ABBA cycles
+        run: |
+          set -euo pipefail
+          for cycle in $(seq 1 5); do
+            PYTHONPATH=base/src /tmp/mqttium-base/bin/python /tmp/direct_ingress_hotpath.py \
+              --runs 1 --messages 160000 --label "base-${cycle}-a" \
+              --output "/tmp/batched-message-effects/ingress/base-${cycle}-a.json"
+            PYTHONPATH=candidate/src /tmp/mqttium-candidate/bin/python /tmp/direct_ingress_hotpath.py \
+              --runs 1 --messages 160000 --label "candidate-${cycle}-a" \
+              --output "/tmp/batched-message-effects/ingress/candidate-${cycle}-a.json"
+            PYTHONPATH=candidate/src /tmp/mqttium-candidate/bin/python /tmp/direct_ingress_hotpath.py \
+              --runs 1 --messages 160000 --label "candidate-${cycle}-b" \
+              --output "/tmp/batched-message-effects/ingress/candidate-${cycle}-b.json"
+            PYTHONPATH=base/src /tmp/mqttium-base/bin/python /tmp/direct_ingress_hotpath.py \
+              --runs 1 --messages 160000 --label "base-${cycle}-b" \
+              --output "/tmp/batched-message-effects/ingress/base-${cycle}-b.json"
+          done
+      - name: Five RTT ABBA cycles
+        run: |
+          set -euo pipefail
+          for cycle in $(seq 1 5); do
+            PYTHONPATH=base/src /tmp/mqttium-base/bin/python /tmp/native_rtt_ingress.py \
+              --scenario rtt --runs 1 --rtt-pairs 16000 --label "base-${cycle}-a" \
+              --output "/tmp/batched-message-effects/rtt/base-${cycle}-a.json"
+            PYTHONPATH=candidate/src /tmp/mqttium-candidate/bin/python /tmp/native_rtt_ingress.py \
+              --scenario rtt --runs 1 --rtt-pairs 16000 --label "candidate-${cycle}-a" \
+              --output "/tmp/batched-message-effects/rtt/candidate-${cycle}-a.json"
+            PYTHONPATH=candidate/src /tmp/mqttium-candidate/bin/python /tmp/native_rtt_ingress.py \
+              --scenario rtt --runs 1 --rtt-pairs 16000 --label "candidate-${cycle}-b" \
+              --output "/tmp/batched-message-effects/rtt/candidate-${cycle}-b.json"
+            PYTHONPATH=base/src /tmp/mqttium-base/bin/python /tmp/native_rtt_ingress.py \
+              --scenario rtt --runs 1 --rtt-pairs 16000 --label "base-${cycle}-b" \
+              --output "/tmp/batched-message-effects/rtt/base-${cycle}-b.json"
+          done
+      - name: Compare paired cycles
+        if: always()
+        run: |
+          python - <<'PY'
+          import json
+          import statistics
+          from pathlib import Path
+
+          root = Path('/tmp/batched-message-effects')
+
+          def load_cycle(directory: Path, cycle: int, kind: str, side: str):
+              return json.loads((directory / f'{kind}-{cycle}-{side}.json').read_text())
+
+          ingress_cycles = []
+          ingress_base = []
+          ingress_candidate = []
+          ingress_base_suspensions = []
+          ingress_candidate_suspensions = []
+          for cycle in range(1, 6):
+              base = [load_cycle(root / 'ingress', cycle, 'base', side) for side in ('a', 'b')]
+              candidate = [
+                  load_cycle(root / 'ingress', cycle, 'candidate', side)
+                  for side in ('a', 'b')
+              ]
+              b_rate = statistics.median(item['rate_median'] for item in base)
+              c_rate = statistics.median(item['rate_median'] for item in candidate)
+              ingress_cycles.append(
+                  {'cycle': cycle, 'base': b_rate, 'candidate': c_rate, 'ratio': c_rate / b_rate}
+              )
+              ingress_base.extend(item['rate_median'] for item in base)
+              ingress_candidate.extend(item['rate_median'] for item in candidate)
+              ingress_base_suspensions.extend(
+                  item['samples'][0]['effect_suspensions'] for item in base
+              )
+              ingress_candidate_suspensions.extend(
+                  item['samples'][0]['effect_suspensions'] for item in candidate
+              )
+
+          rtt_cycles = []
+          rtt_base = []
+          rtt_candidate = []
+          rtt_base_p50 = []
+          rtt_candidate_p50 = []
+          rtt_base_p95 = []
+          rtt_candidate_p95 = []
+          rtt_base_suspensions = []
+          rtt_candidate_suspensions = []
+          rtt_base_writer = []
+          rtt_candidate_writer = []
+          for cycle in range(1, 6):
+              base_docs = [load_cycle(root / 'rtt', cycle, 'base', side)['rtt'] for side in ('a', 'b')]
+              candidate_docs = [
+                  load_cycle(root / 'rtt', cycle, 'candidate', side)['rtt']
+                  for side in ('a', 'b')
+              ]
+              b_rate = statistics.median(item['rate_median'] for item in base_docs)
+              c_rate = statistics.median(item['rate_median'] for item in candidate_docs)
+              rtt_cycles.append(
+                  {'cycle': cycle, 'base': b_rate, 'candidate': c_rate, 'ratio': c_rate / b_rate}
+              )
+              rtt_base.extend(item['rate_median'] for item in base_docs)
+              rtt_candidate.extend(item['rate_median'] for item in candidate_docs)
+              rtt_base_p50.extend(item['p50_ms_median'] for item in base_docs)
+              rtt_candidate_p50.extend(item['p50_ms_median'] for item in candidate_docs)
+              rtt_base_p95.extend(item['p95_ms_median'] for item in base_docs)
+              rtt_candidate_p95.extend(item['p95_ms_median'] for item in candidate_docs)
+              for item in base_docs:
+                  counters = item['counters'][0]
+                  rtt_base_suspensions.append(
+                      counters['initiator_effect_suspensions']
+                      + counters['responder_effect_suspensions']
+                  )
+                  rtt_base_writer.append(
+                      counters['initiator_writer_batches']
+                      + counters['responder_writer_batches']
+                  )
+              for item in candidate_docs:
+                  counters = item['counters'][0]
+                  rtt_candidate_suspensions.append(
+                      counters['initiator_effect_suspensions']
+                      + counters['responder_effect_suspensions']
+                  )
+                  rtt_candidate_writer.append(
+                      counters['initiator_writer_batches']
+                      + counters['responder_writer_batches']
+                  )
+
+          result = {
+              'ingress': {
+                  'cycles': ingress_cycles,
+                  'base_median': statistics.median(ingress_base),
+                  'candidate_median': statistics.median(ingress_candidate),
+                  'paired_ratio_median': statistics.median(item['ratio'] for item in ingress_cycles),
+                  'base_effect_suspensions_median': statistics.median(ingress_base_suspensions),
+                  'candidate_effect_suspensions_median': statistics.median(ingress_candidate_suspensions),
+              },
+              'rtt': {
+                  'cycles': rtt_cycles,
+                  'base_median': statistics.median(rtt_base),
+                  'candidate_median': statistics.median(rtt_candidate),
+                  'paired_ratio_median': statistics.median(item['ratio'] for item in rtt_cycles),
+                  'base_p50_median': statistics.median(rtt_base_p50),
+                  'candidate_p50_median': statistics.median(rtt_candidate_p50),
+                  'base_p95_median': statistics.median(rtt_base_p95),
+                  'candidate_p95_median': statistics.median(rtt_candidate_p95),
+                  'base_effect_suspensions_median': statistics.median(rtt_base_suspensions),
+                  'candidate_effect_suspensions_median': statistics.median(rtt_candidate_suspensions),
+                  'base_writer_batches_median': statistics.median(rtt_base_writer),
+                  'candidate_writer_batches_median': statistics.median(rtt_candidate_writer),
+              },
+          }
+          (root / 'comparison.json').write_text(json.dumps(result, indent=2) + '\n')
+          print(json.dumps(result, indent=2))
+          PY
+      - name: Upload measurements
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: batched-message-effects-${{ github.run_id }}
+          path: /tmp/batched-message-effects
+          if-no-files-found: warn
+          retention-days: 14
