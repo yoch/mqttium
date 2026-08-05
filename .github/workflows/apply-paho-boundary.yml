@@ -38,6 +38,14 @@ jobs:
               '    def _drain_publish_requests(\\n',
               '    def _drain_publish_requests(self) -> None:\\n',
           )
+          old_end = '    "        if requested_qos is QoS.AT_MOST_ONCE:\\n",\n'
+          new_end = (
+              '    "        if requested_qos is QoS.AT_MOST_ONCE:\\n'
+              '            info = MQTTMessageInfo(\\n",\n'
+          )
+          if text.count(old_end) != 1:
+              raise SystemExit(f'expected one publish end anchor, found {text.count(old_end)}')
+          text = text.replace(old_end, new_end, 1)
           marker = 'paho_text = Path(paho_path).read_text()\n'
           fix = '''paho_file = Path(paho_path)
           paho_source = paho_file.read_text()
