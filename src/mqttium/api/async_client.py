@@ -378,6 +378,32 @@ class AsyncClient:
         self._register_publish_receipt(handle.mid, receipt)
         return receipt
 
+    def _queue_qosn_on_loop(
+        self,
+        topic: str,
+        payload: bytes,
+        *,
+        qos: QoS,
+        retain: bool,
+        properties: Properties | None = None,
+    ) -> PublishReceipt:
+        """Admit QoS 1/2 and register its receipt for loop-bound adapters."""
+        handle = self._engine.queue_publish(
+            topic,
+            payload,
+            qos=qos,
+            retain=retain,
+            properties=properties,
+        )
+        assert handle.mid is not None
+        receipt = PublishReceipt(
+            mid=handle.mid,
+            qos=handle.qos,
+            _event=asyncio.Event(),
+        )
+        self._register_publish_receipt(handle.mid, receipt)
+        return receipt
+
     def _queue_qos0_on_loop(
         self,
         topic: str,

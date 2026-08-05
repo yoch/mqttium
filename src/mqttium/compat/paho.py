@@ -151,6 +151,12 @@ class Client:
             max_pending_outbound_bytes=max_pending_outbound_bytes,
             publish_backpressure="error",
         )
+        # Cache the hot adapter boundary methods once. This avoids repeated
+        # AsyncClient attribute traversal in every Paho publication while keeping
+        # protocol and receipt state behind the AsyncClient boundary.
+        self._queue_qosn_on_loop = self._async._queue_qosn_on_loop
+        self._queue_qos0_on_loop = self._async._queue_qos0_on_loop
+        self._finalize_async_commands = self._async._finalize_loop_commands
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._started = threading.Event()
@@ -468,7 +474,7 @@ class Client:
                 )
 
     def _commit_qosn_publish_on_loop(self, request: _PendingPublish) -> MQTTMessageInfo:
-        receipt = self._async._queue_publish_on_loop(
+        receipt = self._queue_qosn_on_loop(
             request.topic,
             request.payload if request.payload is not None else b"",
             qos=request.qos,
@@ -478,7 +484,7 @@ class Client:
         return MQTTMessageInfo(mid=receipt.mid, _receipt=receipt, _loop=self._loop)
 
     def _finalize_publish_effects(self) -> None:
-        self._async._finalize_loop_commands()
+        self._finalize_async_commands()
 
     def _drain_publish_requests(self) -> None:
         """Commit a bounded mixed-QoS batch on the owning network loop."""
@@ -500,7 +506,7 @@ class Client:
                 continue
             try:
                 if request.qos is QoS.AT_MOST_ONCE:
-                    self._async._queue_qos0_on_loop(
+                    self._queue_qos0_on_loop(
                         request.topic,
                         request.payload if request.payload is not None else b"",
                         retain=request.retain,
@@ -601,12 +607,20 @@ class Client:
 
         if self._on_network_thread():
             try:
-                receipt = self._async._queue_publish_on_loop(
-                    topic,
-                    data,
-                    qos=requested_qos,
-                    retain=retain,
-                )
+                if requested_qos is QoS.AT_MOST_ONCE:
+                    receipt = self._async._queue_publish_on_loop(
+                        topic,
+                        data,
+                        qos=requested_qos,
+                        retain=retain,
+                    )
+                else:
+                    receipt = self._queue_qosn_on_loop(
+                        topic,
+                        data,
+                        qos=requested_qos,
+                        retain=retain,
+                    )
                 info = MQTTMessageInfo(
                     mid=receipt.mid,
                     _receipt=receipt,
