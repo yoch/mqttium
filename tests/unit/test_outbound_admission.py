@@ -137,7 +137,7 @@ def test_puback_releases_message_and_byte_reservations() -> None:
     assert replacement.mid is not None
 
 
-def test_qos2_releases_encoded_publish_after_pubrec_but_keeps_budget() -> None:
+def test_qos2_drops_contiguous_frame_on_launch_but_keeps_budget_to_pubcomp() -> None:
     engine = ProtocolEngine(
         EngineConfig(
             max_pending_outbound_messages=1,
@@ -151,7 +151,9 @@ def test_qos2_releases_encoded_publish_after_pubrec_but_keeps_budget() -> None:
     assert handle.mid is not None
     stored = engine.store.get_out(handle.mid)
     assert stored is not None
-    assert stored.encoded_publish is not None
+    # Admission tracks logical topic-plus-payload size, not the optional cached
+    # transport representation. A small contiguous frame is already gone.
+    assert stored.encoded_publish is None
     retained_bytes = engine.pending_outbound_bytes
 
     _feed(engine, PubRecPacket(mid=handle.mid).encode())

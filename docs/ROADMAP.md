@@ -50,8 +50,10 @@ which records what already shipped.
       [`PUBLISH-DECODE-PROFILE.md`](PUBLISH-DECODE-PROFILE.md).
 - [x] Full QoS 2 phase-two compaction (release topic, payload and properties,
       not only the encoded frame).
-- [ ] Benchmark the QoS 1 / pre-PUBREC frame policy: re-encode on retransmission
-      versus a size-based policy.
+- [x] Benchmark the QoS 1 / pre-PUBREC frame policy. Contiguous frames are
+      re-encoded instead of retained; segmented frames retain their shared
+      payload and patch only the DUP header. See
+      [`QOS1-FRAME-POLICY.md`](QOS1-FRAME-POLICY.md).
 - [ ] Add memory-benchmark scenarios for property-heavy outbound, immediate
       refusal, cancellation around commit, Paho saturation, shared delivery,
       WebSocket batching and reconnect/epoch cleanup.
