@@ -1,0 +1,79 @@
+name: Native RTT and ingress probe
+
+on:
+  push:
+    branches:
+      - agent/native-rtt-ingress-hotpath
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out candidate
+        uses: actions/checkout@v7
+        with:
+          path: candidate
+      - name: Check out base
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          path: base
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Start isolated broker
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mosquitto
+          printf 'listener 11883 127.0.0.1\nallow_anonymous true\npersistence false\nmax_queued_messages 1000000\n' > /tmp/mqttium-hotpath.conf
+          mosquitto -c /tmp/mqttium-hotpath.conf -d
+          for i in $(seq 1 60); do
+            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            sleep 0.25
+          done
+          exit 1
+      - name: Preserve benchmark
+        run: cp candidate/benchmarks/native_rtt_ingress.py /tmp/native_rtt_ingress.py
+      - name: Run base
+        run: |
+          python -m pip install -e ./base
+          PYTHONPATH=base/src python /tmp/native_rtt_ingress.py \
+            --label base \
+            --output /tmp/native-hotpath/base.json
+      - name: Run candidate
+        run: |
+          python -m pip uninstall -y mqttium
+          python -m pip install -e ./candidate
+          PYTHONPATH=candidate/src python /tmp/native_rtt_ingress.py \
+            --label candidate \
+            --output /tmp/native-hotpath/candidate.json
+      - name: Compare
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          root = Path('/tmp/native-hotpath')
+          base = json.loads((root / 'base.json').read_text())
+          candidate = json.loads((root / 'candidate.json').read_text())
+          comparison = {'base': base, 'candidate': candidate, 'ratios': {}}
+          for key in ('rtt', 'ingress'):
+              base_rate = base[key]['rate_median']
+              candidate_rate = candidate[key]['rate_median']
+              comparison['ratios'][key] = {
+                  'candidate_over_base': candidate_rate / base_rate,
+                  'percent': (candidate_rate / base_rate - 1.0) * 100.0,
+              }
+          (root / 'comparison.json').write_text(json.dumps(comparison, indent=2) + '\n')
+          print(json.dumps(comparison['ratios'], indent=2))
+          PY
+      - name: Upload measurements
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-hotpath-${{ github.run_id }}
+          path: /tmp/native-hotpath
+          retention-days: 14
