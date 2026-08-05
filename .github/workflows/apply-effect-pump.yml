@@ -5,7 +5,7 @@ on:
     branches:
       - agent/effect-pump
     paths:
-      - .github/effect-pump.patch.zlib.b64
+      - .github/effect-pump.patch.ready
 
 permissions:
   contents: write
@@ -22,19 +22,31 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - name: Apply and validate structural change
+      - name: Reassemble, verify and apply structural change
         run: |
           python - <<'PY'
           import base64
+          import hashlib
           import zlib
           from pathlib import Path
 
-          encoded = Path('.github/effect-pump.patch.zlib.b64').read_text().strip()
-          Path('/tmp/effect-pump.patch').write_bytes(zlib.decompress(base64.b64decode(encoded)))
+          parts = sorted(Path('.github').glob('effect-pump.patch.part-*'))
+          if not parts:
+              raise SystemExit('no patch segments')
+          encoded = ''.join(part.read_text().strip() for part in parts)
+          patch = zlib.decompress(base64.b64decode(encoded, validate=True))
+          digest = hashlib.sha256(patch).hexdigest()
+          expected = 'be136527c3acac1ac843602b74416f9861b9e9f01033f4ef2e24550963ecadeb'
+          if digest != expected:
+              raise SystemExit(f'patch digest mismatch: {digest}')
+          Path('/tmp/effect-pump.patch').write_bytes(patch)
           PY
+          git apply --check /tmp/effect-pump.patch
           git apply /tmp/effect-pump.patch
           sed -i 's/from typing import Callable/from collections.abc import Callable/' benchmarks/paired_regression.py
-          rm .github/effect-pump.patch.zlib.b64
+          rm -f .github/effect-pump.patch.zlib.b64
+          rm -f .github/effect-pump.patch.part-*
+          rm -f .github/effect-pump.patch.ready
           rm .github/workflows/apply-effect-pump.yml
           python -m pip install -e ".[dev,security]"
           ruff format src tests benchmarks
