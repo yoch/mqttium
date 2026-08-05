@@ -1,0 +1,232 @@
+name: Native hotpath QoS 0 decode candidate
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - agent/native-hotpath-architecture-study
+    paths:
+      - .github/workflows/native-hotpath-qos0-decode-candidate.yml
+      - .github/scripts/apply_qos0_v311_decode_candidate.py
+      - benchmarks/experimental/paired_qos0_decode_candidate.py
+
+permissions:
+  contents: read
+
+jobs:
+  candidate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 65
+    env:
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    steps:
+      - name: Check out study harness
+        uses: actions/checkout@v7
+        with:
+          path: harness
+      - name: Check out base
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          path: base
+      - name: Check out candidate
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          path: candidate
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install shared dependencies and broker
+        run: |
+          python -m pip install gmqtt==0.7.0
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mosquitto
+      - name: Apply specialized decode candidate
+        run: |
+          python harness/.github/scripts/apply_qos0_v311_decode_candidate.py candidate
+          cat > candidate/tests/unit/test_qos0_v311_decode_fastpath.py <<'PY'
+          from __future__ import annotations
+
+          import pytest
+
+          from mqttium.codec.buffer import RawPacket
+          from mqttium.codec.primitives import pack_u16, pack_utf8
+          from mqttium.enums import ConnectionState, MQTTProtocolVersion, PacketType, QoS
+          from mqttium.protocol.engine import EffectKind, EngineConfig, ProtocolEngine
+
+
+          def connected(protocol: MQTTProtocolVersion = MQTTProtocolVersion.MQTTv311) -> ProtocolEngine:
+              engine = ProtocolEngine(EngineConfig(protocol=protocol))
+              engine.state = ConnectionState.CONNECTED
+              return engine
+
+
+          @pytest.mark.parametrize(
+              ("topic", "payload", "retain"),
+              [
+                  ("bench/telemetry", b"payload", False),
+                  ("capteur/température", b"", True),
+                  ("a/b/c", b"x" * 4096, False),
+              ],
+          )
+          def test_v311_qos0_fastpath_preserves_message(topic: str, payload: bytes, retain: bool) -> None:
+              engine = connected()
+              engine.handle_raw(
+                  RawPacket(
+                      packet_type=PacketType.PUBLISH,
+                      flags=0x01 if retain else 0x00,
+                      remaining=pack_utf8(topic) + payload,
+                  )
+              )
+              effects = engine.take_effects()
+              assert [effect.kind for effect in effects] == [EffectKind.MESSAGE]
+              message = effects[0].data
+              assert message.topic == topic
+              assert message.payload == payload
+              assert message.qos is QoS.AT_MOST_ONCE
+              assert message.retain is retain
+              assert message.dup is False
+              assert message.mid is None
+              assert message.properties is None
+
+
+          def test_v311_qos0_dup_still_reports_protocol_error() -> None:
+              engine = connected()
+              engine.handle_raw(
+                  RawPacket(PacketType.PUBLISH, 0x08, pack_utf8("bench/dup") + b"x")
+              )
+              effects = engine.take_effects()
+              assert [effect.kind for effect in effects] == [EffectKind.PROTOCOL_ERROR]
+              assert "QoS 0 PUBLISH must not set DUP" in effects[0].data
+
+
+          def test_v311_qos0_wildcard_still_reports_protocol_error() -> None:
+              engine = connected()
+              engine.handle_raw(
+                  RawPacket(PacketType.PUBLISH, 0x00, pack_utf8("bench/+") + b"x")
+              )
+              effects = engine.take_effects()
+              assert [effect.kind for effect in effects] == [EffectKind.PROTOCOL_ERROR]
+
+
+          def test_qos1_keeps_generic_acknowledged_path() -> None:
+              engine = connected()
+              engine.handle_raw(
+                  RawPacket(
+                      PacketType.PUBLISH,
+                      0x02,
+                      pack_utf8("bench/qos1") + pack_u16(7) + b"payload",
+                  )
+              )
+              effects = engine.take_effects()
+              assert [effect.kind for effect in effects] == [EffectKind.MESSAGE, EffectKind.SEND]
+              assert effects[0].data.mid == 7
+              assert effects[0].data.qos is QoS.AT_LEAST_ONCE
+
+
+          def test_mqtt5_qos0_keeps_properties_path() -> None:
+              engine = connected(MQTTProtocolVersion.MQTTv5)
+              engine.handle_raw(
+                  RawPacket(
+                      PacketType.PUBLISH,
+                      0x00,
+                      pack_utf8("bench/v5") + b"\x00" + b"payload",
+                  )
+              )
+              effects = engine.take_effects()
+              assert [effect.kind for effect in effects] == [EffectKind.MESSAGE]
+              assert effects[0].data.topic == "bench/v5"
+              assert effects[0].data.payload == b"payload"
+          PY
+          git -C candidate diff --check
+      - name: Validate candidate
+        working-directory: candidate
+        run: |
+          python -m pip install -e ".[dev,security,fuzz]"
+          ruff format src/mqttium/protocol/inbound.py tests/unit/test_qos0_v311_decode_fastpath.py
+          ruff format --check src tests benchmarks
+          ruff check src tests benchmarks
+          mypy src/mqttium
+          bandit -q -ll -r src
+          python -m pytest -q tests/unit
+          PYTHONPATH=src python -m pytest -q tests/fuzz/test_hypothesis_fuzz.py
+      - name: Start isolated Mosquitto
+        run: |
+          mkdir -p /tmp/mqttium-qos0-decode
+          cat > /tmp/mqttium-qos0-decode/mosquitto.conf <<'MOSQ'
+          persistence false
+          allow_anonymous true
+          max_inflight_messages 1000
+          max_queued_messages 1000000
+          max_queued_bytes 0
+          connection_messages false
+          log_type error
+          listener 11883 127.0.0.1
+          MOSQ
+          mosquitto -c /tmp/mqttium-qos0-decode/mosquitto.conf \
+            > /tmp/mqttium-qos0-decode/mosquitto.log 2>&1 &
+          for i in $(seq 1 60); do
+            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            sleep 0.2
+          done
+          exit 1
+      - name: Recover corrected native harness
+        run: |
+          python - <<'PY'
+          import base64
+          import gzip
+          from pathlib import Path
+
+          workflow = Path('harness/.github/workflows/native-hotpath-study.yml').read_text().splitlines()
+          start = next(i for i, line in enumerate(workflow) if "cat > /tmp/native-hotpath.b64" in line) + 1
+          end = next(i for i in range(start, len(workflow)) if workflow[i].strip() == "B64")
+          payload = "".join(line.strip() for line in workflow[start:end])
+          source = gzip.decompress(base64.b64decode(payload)).decode()
+          source = source.replace("max_pending_callbacks=max(65_536, count),", "max_pending_callbacks=8_192,")
+          source = source.replace("max_pending_callbacks=65_536,", "max_pending_callbacks=8_192,")
+          Path('/tmp/native_hotpath_matrix.py').write_text(source)
+          PY
+          python -m py_compile /tmp/native_hotpath_matrix.py
+      - name: Rotated ingress A/B
+        run: |
+          python harness/benchmarks/experimental/paired_qos0_decode_candidate.py \
+            --base-root base \
+            --candidate-root candidate \
+            --harness /tmp/native_hotpath_matrix.py \
+            --cycles 7 \
+            --messages 180000 \
+            --output /tmp/mqttium-qos0-decode/paired-qos0-decode.json
+      - name: Verify generic PublishPacket decode leaves QoS 0 hotpath
+        run: |
+          PYTHONPATH=candidate/src python -m cProfile -o /tmp/mqttium-qos0-decode/candidate.prof \
+            /tmp/native_hotpath_matrix.py --worker --scenario ingress_direct \
+            --variant mqttium-baseline --messages 50000
+          python - <<'PY'
+          import json
+          import pstats
+          from pathlib import Path
+
+          stats = pstats.Stats('/tmp/mqttium-qos0-decode/candidate.prof')
+          calls = 0
+          for (filename, _line, func), (_cc, nc, _tt, _ct, _callers) in stats.stats.items():
+              if filename.endswith('/packets/publish.py') and func == 'decode':
+                  calls += nc
+          result = {'publish_packet_decode_calls': calls}
+          assert calls == 0, result
+          Path('/tmp/mqttium-qos0-decode/profile-count.json').write_text(
+              json.dumps(result, indent=2) + '\n'
+          )
+          print(json.dumps(result, indent=2))
+          PY
+      - name: Upload candidate evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-hotpath-qos0-decode-${{ github.run_id }}
+          path: |
+            /tmp/mqttium-qos0-decode/*.json
+            /tmp/mqttium-qos0-decode/mosquitto.log
+          if-no-files-found: warn
+          retention-days: 30
