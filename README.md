@@ -16,6 +16,7 @@ complete MQTT QoS state machines.
 - TCP, TLS, WebSocket and Unix transports;
 - reconnect and session replay;
 - bounded callback and async-iterator delivery;
+- immutable runtime statistics for queues, budgets, receipts and transports;
 - manual acknowledgement;
 - in-memory and SQLite inflight persistence;
 - aggregate `publish_many()` with bounded memory and measured throughput gains;
@@ -115,7 +116,8 @@ client = AsyncClient(
     max_pending_outbound_messages=10_000,   # unfinished QoS 1/2 publications
     max_pending_outbound_bytes=64 * 1024**2,  # their logical topic+payload+properties
     max_pending_delivery_bytes=64 * 1024**2,  # inbound messages awaiting a consumer
-    publish_backpressure="wait",            # or "error" to refuse immediately
+    max_ingress_batch_bytes=1 * 1024**2,      # decoded work before delivery is drained
+    publish_backpressure="wait",             # or "error" to refuse immediately
 )
 ```
 
@@ -127,6 +129,22 @@ any limit to restore unbounded queueing.
 These defaults are new in `0.1.0a2`; before them a QoS 1/2 producer could queue
 until the 65 535 packet-identifier space was exhausted. See
 [`docs/MIGRATION.md`](docs/MIGRATION.md).
+
+## Runtime statistics
+
+`stats()` returns a frozen snapshot without starting a sampler or emitting logs:
+
+```python
+snapshot = client.stats()
+print(snapshot.protocol.pending_outbound_bytes)
+print(snapshot.writer.queued_bytes)
+print(snapshot.delivery.pending_bytes)
+```
+
+The snapshot also includes lifetime high-water marks, task state, receipt counts,
+decoder buffering and WebSocket/stream transport buffers. It is intended to be
+called on the client's owning event loop. See
+[`docs/API-STABILITY.md`](docs/API-STABILITY.md).
 
 ## Validation
 
@@ -141,9 +159,15 @@ The release gates include:
 - wheel, source-distribution and isolated-install validation;
 - delivery, persistence, TCP, TLS and WAN-profile benchmarks.
 
+A separate finalisation workflow runs reconnect/backpressure soaks on Linux and
+macOS and interoperability campaigns against multiple brokers. Its acceptance
+criteria are documented in [`docs/STABILITY.md`](docs/STABILITY.md).
+
 ## Documentation
 
 - [`docs/DESIGN.md`](docs/DESIGN.md) — architecture and invariants
+- [`docs/API-STABILITY.md`](docs/API-STABILITY.md) — public API candidate and deprecations
+- [`docs/STABILITY.md`](docs/STABILITY.md) — soak and interoperability campaign
 - [`docs/IMPLEMENTATION-GUIDE.md`](docs/IMPLEMENTATION-GUIDE.md) — protocol contracts
 - [`docs/COMPAT.md`](docs/COMPAT.md) — Paho compatibility surface
 - [`docs/MIGRATION.md`](docs/MIGRATION.md) — migration guidance

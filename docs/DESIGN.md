@@ -1,20 +1,19 @@
 # Design — mqttium
 
-Nom de travail : **mqttium** (à renommer lors du spin-out vers un repo dédié).
 Objectif : implémentation MQTT Python de référence — async-native, correcte,
-performante, avec façade compatible Paho.
+performante, avec une façade de migration compatible Paho VERSION2.
 
 ## Cibles
 
 | Axe | Cible |
 | --- | --- |
-| Protocoles | MQTT 3.1.1 et 5.0 (3.1 en compat si demandé) |
-| Python | ≥ 3.11 (développement sur 3.12) |
-| Runtime | asyncio natif ; sync/thread via adaptateur |
-| Transports (v1) | TCP, TLS ; puis WebSocket, Unix |
+| Protocoles | MQTT 3.1.1 et 5.0 |
+| Python | 3.11 à 3.14 |
+| Runtime | `asyncio` natif ; thread dédié uniquement dans l’adaptateur Paho |
+| Transports | TCP, TLS, WebSocket et Unix |
 | Correctness | machines QoS 1/2 complètes ; Receive Maximum ; DUP/dedup |
-| Perf | hot paths alignés sur les GO de l’audit Paho |
-| API | `AsyncClient` + callbacks optionnels + `compat.paho` |
+| Mémoire | admission, writer, ingress et livraison bornés |
+| API | `AsyncClient`, diagnostics immuables et façade Paho additive |
 | Licence | Apache-2.0 (from-scratch ; voir `LICENSE`) |
 
 ## Architecture
@@ -23,57 +22,53 @@ performante, avec façade compatible Paho.
 flowchart TB
   subgraph api [API]
     AC[AsyncClient]
-    SC[SyncClient]
-    PC[compat.PahoClient]
+    CS[ClientStats]
+    PC[compat.Client VERSION2]
   end
 
-  subgraph runtime [Runtime]
-    CD[CallbackDispatcher]
-    RP[ReconnectPolicy]
-    TM[TimerWheel / keepalive]
+  subgraph runtime [Runtime asyncio]
+    EP[EffectPump]
+    WP[WritePump]
+    DL[Delivery queues + callback worker]
+    KA[Keepalive + reconnect policy]
   end
 
-  subgraph engine [Protocol Engine - sync, testable]
+  subgraph engine [Protocol Engine synchrone]
     PE[ProtocolEngine]
     OUT[OutboundSession]
     IN[InboundSession]
-    SES[Session]
-    QOS[QoS1 / QoS2 machines]
     PID[PacketIdPool]
-    FC[FlowControl ReceiveMaximum]
+    FC[FlowControl]
   end
 
-  subgraph io [I/O]
+  subgraph io [Codec et I/O]
     DEC[IncrementalDecoder]
-    ENC[PacketEncoder]
-    TR[Transport TCP/TLS/WS]
-    BUF[Bounded buffers]
+    TR[TCP / TLS / WebSocket / Unix]
   end
 
   subgraph store [Persistence]
     MEM[MemoryInflightStore]
-    SQL[SQLiteStore optional]
+    SQL[SqliteInflightStore]
   end
 
+  PC --> AC
   AC --> PE
-  SC --> AC
-  PC --> SC
-  AC --> CD
-  AC --> RP
+  AC --> EP
+  EP --> WP
+  AC --> DL
+  AC --> KA
+  AC --> DEC
+  WP --> TR
+  DEC --> PE
   PE --> OUT
   PE --> IN
-  PE --> SES
-  PE --> QOS
   OUT --> PID
   OUT --> FC
-  OUT --> store
-  IN --> store
-  PE --> store
-  AC --> DEC
-  AC --> ENC
-  AC --> TR
-  DEC --> BUF
-  ENC --> BUF
+  OUT --> MEM
+  OUT --> SQL
+  IN --> MEM
+  IN --> SQL
+  AC --> CS
 ```
 
 ### Règle d’or
@@ -111,6 +106,20 @@ ne pas ajouter un wrapper au chemin SEND. L'algorithme de batch reste inchangé 
 copie des gros payloads et réveil des producteurs seulement après restitution
 du budget. Les anciens attributs privés du client sont des vues de compatibilité
 pour les tests et l'instrumentation, jamais un second état.
+
+### Ingress borné et observabilité
+
+Le read loop traite au maximum 256 paquets et une cible configurable
+`max_ingress_batch_bytes` avant d'appliquer les effets et de propager la
+backpressure de livraison. Le paquet qui atteint la cible reste inclus, afin
+qu'un paquet individuellement plus grand puisse toujours progresser.
+
+`AsyncClient.stats()` construit à la demande un arbre `ClientStats` immuable.
+Les compteurs appartiennent aux composants qui possèdent déjà l'état :
+`OutboundSession`, `EffectPump`, `WritePump`, decoder, livraison, receipts et
+transports. Aucun logger, sampler périodique ou registre parallèle n'est ajouté.
+Les high-water marks du writer sont relevés par batch dans le worker, et non sur
+chaque admission du hot path.
 
 ### Commandes loop-bound et façade Paho
 
@@ -160,10 +169,12 @@ Toute la réception PUBLISH appartient symétriquement à `InboundSession`
 - les enregistrements QoS 1/2 entrants du store ;
 - le suivi `delivered` / `user_acked`, l'ACK manuel et le replay après restart.
 
-Les handlers `PUBLISH` et `PUBREL` pointent directement sur cette session :
-l'extraction n'ajoute donc aucun appel intermédiaire au chemin entrant. Comme
-`OutboundSession`, elle émet dans l'unique flux d'effets du moteur et ne possède
-pas l'état de connexion.
+Les handlers `PUBLISH` et `PUBREL` pointent directement sur cette session.
+Symétriquement, `PUBACK`, `PUBREC` et `PUBCOMP` pointent directement sur
+`OutboundSession`, de sorte que le propriétaire des budgets, MID, lignes de
+store et slots de flow contrôle aussi leur libération terminale. Les deux
+sessions émettent dans l'unique flux d'effets du moteur et ne possèdent pas
+l'état de connexion.
 
 ## Modules
 

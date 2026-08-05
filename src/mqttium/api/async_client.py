@@ -1,4 +1,4 @@
-"""Async-native MQTT client (phase 1).
+"""Async-native MQTT client.
 
 Owns the transport + IncrementalDecoder + ProtocolEngine loop.
 

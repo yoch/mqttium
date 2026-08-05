@@ -28,14 +28,14 @@ frames together until the 65 535 packet-identifier space ran out.
 
 | Audit item | Decision taken | Where |
 | --- | --- | --- |
-| Outbound QoS admission | Independent **count and byte** budgets, reserved before the packet id and the store write. Rejected: reusing the count-only `max_queued` (payload-blind, since removed) and one global weighted budget (couples unrelated subsystems, hard to reason about). | `protocol/engine.py` — `_reserve_outbound`, `queue_publish` |
+| Outbound QoS admission | Independent **count and byte** budgets, reserved before the packet id and the store write. Rejected: reusing the count-only `max_queued` (payload-blind, since removed) and one global weighted budget (couples unrelated subsystems, hard to reason about). | `protocol/outbound.py` — `_reserve`, `queue_publish` |
 | Cancellation semantics | Cancellation stops *waiting*; it never rolls back a publication already committed to the protocol, which would make delivery non-deterministic. | `api/async_client.py` — `_admit_publish` |
-| Effect flushing | One dedicated flusher task, with an inline fast path for the common single-effect case so throughput is unaffected. | `api/async_client.py` — `_apply_effect_inline`, `_run_scheduled_effect_flush` |
-| Connection-epoch cleanup | Every effect carries the epoch of the connection that produced it; the epoch is bumped on disconnect and stale effects are dropped. | `api/async_client.py` — `_invalidate_connection_epoch` |
+| Effect flushing | One dedicated flusher task, with an inline fast path for the common single-effect case so throughput is unaffected. | `api/_effects.py` — `EffectPump` |
+| Connection-epoch cleanup | Every effect carries the epoch of the connection that produced it; the epoch is bumped on disconnect and stale effects are dropped. | `api/_effects.py`, `api/_writer.py`, `api/async_client.py` |
 | Inbound delivery budgets | One byte budget shared by iterator and callback delivery, charged once per message and released on the last reference. A fraction is reserved for small messages so a large payload cannot starve telemetry. | `api/async_client.py`, `types.Message._delivery_references` |
-| QoS 2 state compaction | Minimal option only: the encoded PUBLISH frame is dropped at `WAIT_PUBCOMP`, where it can no longer be retransmitted. | `protocol/engine.py` — `_on_pubrec` |
+| QoS 2 state compaction | Minimal option only: the encoded PUBLISH frame is dropped at `WAIT_PUBCOMP`, where it can no longer be retransmitted. | `protocol/outbound.py` — `on_pubrec` |
 | WebSocket framing | Byte-bounded `write_many()` batching (1 MiB); an oversized item is written alone. Not pursued: one-buffer masking, forced fragmentation, native masking — none measured. | `transport/websocket.py` — `_write_frame_batch` |
-| SQLite replay and hydration | Keyset-paginated reads plus a payload-free `out_summary_pages()` projection; payloads are materialised only when a message is actually replayed. | `persistence/sqlite.py`, `protocol/engine.py` — `_materialize_outbound` |
+| SQLite replay and hydration | Keyset-paginated reads plus a payload-free `out_summary_pages()` projection; payloads are materialised only when a message is actually replayed. | `persistence/sqlite.py`, `protocol/outbound.py` — `materialize` |
 | Batch failure retention | Bounded detail retention (`max_failure_details`, default 128) with exact totals preserved and an optional `failure_sink`. | `api/models.py` — `PublishBatchReceipt._record_failure` |
 | Peak-container release | `PacketIdPool` and `MemoryInflightStore` rebind their containers when they empty; WebSocket buffers are released on close. | `protocol/packet_ids.py`, `persistence/memory.py`, `transport/websocket.py` |
 
@@ -65,40 +65,37 @@ Met:
 - WebSocket peak memory is proportional to a configured frame/batch budget;
 - benchmark samples are isolated and distinguish live retention from historical
   RSS peaks;
-- throughput and latency are reported alongside the memory improvements.
+- throughput and latency are reported alongside the memory improvements;
+- current outbound admission counters return to zero after sustained QoS 1 load
+  drains.
 
-Not met: "current internal counters return to zero after drain" is asserted for
-the inbound delivery budget but not for the outbound admission budget under a
-sustained load.
+## Finalisation update
+
+The finalisation pass resolved three additional audit items:
+
+- ingress decode work is now bounded by both packet count and
+  `max_ingress_batch_bytes`;
+- `AsyncClient.stats()` exposes one immutable snapshot for protocol admission,
+  effects, writer, decoder, transports, delivery and receipts, including
+  lifetime high-water marks;
+- a sustained QoS 1 regression test and the real-broker soak harness assert that
+  outbound counters, flow slots, writer entries, effects and receipts return to
+  zero after drain.
 
 ## Open
 
-Identified by the audit and **not** implemented. Tracked in
-[`ROADMAP.md`](ROADMAP.md).
+Still identified by the audit and not implemented:
 
-- **Ingress byte budget.** The read loop bounds each batch at 256 *packets*
-  (`api/async_client.py`, `_read_loop`), not at a byte count. A batch of large
-  PUBLISHes is still admitted whole.
-- **Decoder copies for large payloads.** A large inbound PUBLISH still costs
-  several payload-sized allocations. A specialised in-buffer PUBLISH parse was
-  designed but not built. Public zero-copy views were rejected outright: they
-  would break the owned-bytes invariant.
+- **Decoder copies for large payloads.** A specialised in-buffer PUBLISH parse
+  remains conditional on profiling after the ingress byte bound. Public
+  zero-copy views remain rejected because they violate owned-byte semantics.
 - **Full QoS 2 phase-two compaction.** Only the encoded frame is released at
   `WAIT_PUBCOMP`; topic, payload and properties are still retained.
-- **QoS 1 / pre-PUBREC frame policy.** Only "keep encoded frames" ships.
-  Re-encoding on retransmission, and a size-based policy, were never benchmarked.
-- **Observability.** Six counters exist (`pending_outbound_messages`,
-  `pending_outbound_bytes`, `pending_delivery_bytes`,
-  `pending_delivery_high_water_bytes`, `delivery_small_budget_bytes`,
-  `delivery_small_message_limit`). The audit specified roughly twenty, including
-  effect-queue, writer, decoder, WebSocket-buffer and receipt counters, a
-  high-water mark for the outbound budget, and one unified stats snapshot.
-  Constraint from [`LOGGING.md`](LOGGING.md): this may not be added through
-  `logging`.
-- **Benchmark scenario coverage.** `benchmarks/memory_profile.py` covers seven
-  scenarios. Property-heavy outbound, immediate-refusal admission, cancellation
-  around the commit point, Paho queue saturation, shared iterator/callback
-  accounting, WebSocket byte-bounded batches and reconnect/epoch cleanup are
-  covered by unit tests but by no memory measurement, so none of them is
-  regression-guarded by numbers.
-- **Soak tests.** No sustained reconnect/session/backpressure soak exists.
+- **QoS 1 / pre-PUBREC frame policy.** Re-encoding on retransmission and a
+  size-based policy still require an A/B benchmark.
+- **Memory scenario coverage.** Property-heavy outbound, immediate refusal,
+  cancellation around commit, Paho saturation, shared delivery, WebSocket
+  batching and reconnect cleanup need numeric regression thresholds.
+- **Campaign evidence.** The soak and multi-broker workflow exists, but stable
+  release requires retained successful Linux, macOS, Mosquitto, EMQX and HiveMQ
+  run artefacts; see [`STABILITY.md`](STABILITY.md).
