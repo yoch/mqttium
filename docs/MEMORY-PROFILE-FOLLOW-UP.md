@@ -1,9 +1,9 @@
 # Memory Profile Follow-up — status
 
-This document records what the memory audit of MQTTium `main` produced, which of
-its recommendations shipped, and which remain open. It supersedes the original
-decision document: every option that document presented as open has since been
-decided and implemented.
+This document records what the memory audit of MQTTium `main` produced and how
+its recommendations were closed. It supersedes the original decision document:
+every option that document presented as open has been decided, implemented and
+given a numeric regression guard where measurement is meaningful.
 
 Measurements live in [`MEMORY-BASELINE.md`](MEMORY-BASELINE.md) (before) and
 [`MEMORY-RESULTS.md`](MEMORY-RESULTS.md) (after); the harness contract is in
@@ -33,7 +33,7 @@ frames together until the 65 535 packet-identifier space ran out.
 | Effect flushing | One dedicated flusher task, with an inline fast path for the common single-effect case so throughput is unaffected. | `api/_effects.py` — `EffectPump` |
 | Connection-epoch cleanup | Every effect carries the epoch of the connection that produced it; the epoch is bumped on disconnect and stale effects are dropped. | `api/_effects.py`, `api/_writer.py`, `api/async_client.py` |
 | Inbound delivery budgets | One byte budget shared by iterator and callback delivery, charged once per message and released on the last reference. A fraction is reserved for small messages so a large payload cannot starve telemetry. | `api/async_client.py`, `types.Message._delivery_references` |
-| QoS 2 state compaction | Minimal option only: the encoded PUBLISH frame is dropped at `WAIT_PUBCOMP`, where it can no longer be retransmitted. | `protocol/outbound.py` — `on_pubrec` |
+| QoS 2 state compaction | Full phase-two compaction: topic, payload, PUBLISH properties and encoded frame are released after PUBREC while logical admission size remains until PUBCOMP. | `protocol/outbound.py` — `on_pubrec` |
 | WebSocket framing | Byte-bounded `write_many()` batching (1 MiB); an oversized item is written alone. Not pursued: one-buffer masking, forced fragmentation, native masking — none measured. | `transport/websocket.py` — `_write_frame_batch` |
 | SQLite replay and hydration | Keyset-paginated reads plus a payload-free `out_summary_pages()` projection; payloads are materialised only when a message is actually replayed. | `persistence/sqlite.py`, `protocol/outbound.py` — `materialize` |
 | Batch failure retention | Bounded detail retention (`max_failure_details`, default 128) with exact totals preserved and an optional `failure_sink`. | `api/models.py` — `PublishBatchReceipt._record_failure` |
@@ -61,7 +61,7 @@ Met:
 - closing a connection releases or invalidates all transport-epoch buffers;
 - a slow or absent consumer is bounded by both message and byte limits;
 - SQLite replay memory is proportional to page size, not total session size;
-- QoS 2 phase-two state does not retain the original encoded PUBLISH;
+- QoS 2 phase-two state retains neither topic, payload, properties nor the encoded PUBLISH;
 - WebSocket peak memory is proportional to a configured frame/batch budget;
 - benchmark samples are isolated and distinguish live retention from historical
   RSS peaks;
@@ -82,10 +82,21 @@ The finalisation pass resolved three additional audit items:
   outbound counters, flow slots, writer entries, effects and receipts return to
   zero after drain.
 
-## Open
+## Memory scenario closure
 
-Still identified by the audit and not implemented:
+The remaining coverage item is closed by seven isolated scenarios covering
+property-heavy outbound state, immediate refusal, cancellation before commit,
+Paho saturation, shared delivery, WebSocket batching and reconnect/epoch cleanup.
+Each scenario has exact logical-work assertions plus a `tracemalloc` peak limit.
 
-- **Memory scenario coverage.** Property-heavy outbound, immediate refusal,
-  cancellation around commit, Paho saturation, shared delivery, WebSocket
-  batching and reconnect cleanup need numeric regression thresholds.
+Two repeated CPython 3.12 / Ubuntu 24.04 probes produced identical traced peaks
+for all seven scenarios. Representative peaks were 15.00 MiB for 2,000
+property-heavy records, 6.44 MiB for 1,500 shared-delivery messages and 8.08 MiB
+for simultaneous writer/effect/decoder saturation. Immediate refusal peaked at
+0.05 MiB. Versioned limits are rounded roughly 25–30% above those observations;
+benchmark outputs remain workflow artefacts rather than committed baselines.
+
+No runtime change was justified by these measurements. After harness-owned
+references were removed, post-cleanup traced allocations fell to tens of
+kilobytes. Remaining RSS returned after diagnostic `malloc_trim`, identifying
+allocator arenas rather than live MQTTium ownership.

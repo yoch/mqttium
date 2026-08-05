@@ -16,31 +16,147 @@
   "scenarios": {
     "protocol_qos_queue_64b": {
       "max_traced_peak_mib": 14.6,
-      "logical": {"queued_messages": 30000, "queued_logical_bytes": 2280000, "packet_ids": 30000, "store_records": 30000}
+      "logical": {
+        "queued_messages": 30000,
+        "queued_logical_bytes": 2280000,
+        "packet_ids": 30000,
+        "store_records": 30000
+      }
     },
     "protocol_qos_queue_4k": {
       "max_traced_peak_mib": 63.8,
-      "logical": {"queued_messages": 12000, "queued_logical_bytes": 49296000, "packet_ids": 12000, "store_records": 12000}
+      "logical": {
+        "queued_messages": 12000,
+        "queued_logical_bytes": 49296000,
+        "packet_ids": 12000,
+        "store_records": 12000
+      }
     },
     "iterator_delivery_queue_4k": {
       "max_traced_peak_mib": 31.5,
-      "logical": {"iterator_messages": 6000, "iterator_logical_bytes": 24648000}
+      "logical": {
+        "iterator_messages": 6000,
+        "iterator_logical_bytes": 24648000
+      }
     },
     "protocol_bounded_queue_4k": {
       "max_traced_peak_mib": 10.8,
-      "logical": {"attempted_messages": 6000, "accepted_messages": 2042, "rejected_messages": 3958, "pending_logical_bytes": 8388536, "configured_byte_limit": 8388608}
+      "logical": {
+        "attempted_messages": 6000,
+        "accepted_messages": 2042,
+        "rejected_messages": 3958,
+        "pending_logical_bytes": 8388536,
+        "configured_byte_limit": 8388608
+      }
     },
     "iterator_delivery_budget_4k": {
       "max_traced_peak_mib": 10.7,
-      "logical": {"attempted_messages": 2043, "accepted_messages": 2042, "blocked_message": true, "pending_logical_bytes": 8388536, "configured_byte_limit": 8388536}
+      "logical": {
+        "attempted_messages": 2043,
+        "accepted_messages": 2042,
+        "blocked_message": true,
+        "pending_logical_bytes": 8388536,
+        "configured_byte_limit": 8388536
+      }
     },
     "memory_store_4k": {
       "max_traced_peak_mib": 62.0,
-      "logical": {"store_records": 12000, "store_logical_bytes": 49296000}
+      "logical": {
+        "store_records": 12000,
+        "store_logical_bytes": 49296000
+      }
     },
     "sqlite_hydration_4k": {
       "max_traced_peak_mib": 5.7,
-      "logical": {"queued_messages": 6000, "packet_ids": 6000, "store_records": 6000, "store_logical_bytes": 24648000}
+      "logical": {
+        "queued_messages": 6000,
+        "packet_ids": 6000,
+        "store_records": 6000,
+        "store_logical_bytes": 24648000
+      }
+    },
+    "property_heavy_outbound_4k": {
+      "max_traced_peak_mib": 19.0,
+      "logical": {
+        "queued_messages": 2000,
+        "pending_logical_bytes": 10058890,
+        "property_records": 2000,
+        "packet_ids": 2000,
+        "store_records": 2000
+      }
+    },
+    "immediate_refusal_4k": {
+      "max_traced_peak_mib": 0.25,
+      "logical": {
+        "attempted_messages": 20000,
+        "accepted_messages": 1,
+        "rejected_messages": 19999,
+        "packet_ids": 1,
+        "store_records": 1,
+        "pending_logical_bytes": 4108
+      }
+    },
+    "cancelled_admission_4k": {
+      "max_traced_peak_mib": 4.0,
+      "logical": {
+        "attempted_messages": 512,
+        "cancelled_messages": 511,
+        "publish_waiters": 0,
+        "pending_messages": 1,
+        "packet_ids": 1,
+        "store_records": 1,
+        "receipts": 1
+      }
+    },
+    "paho_saturation_4k": {
+      "max_traced_peak_mib": 3.5,
+      "logical": {
+        "attempted_messages": 5000,
+        "accepted_messages": 512,
+        "rejected_messages": 4488,
+        "configured_message_limit": 512,
+        "pending_messages": 512,
+        "packet_ids": 512,
+        "store_records": 512,
+        "pending_handoff": false
+      }
+    },
+    "shared_delivery_both_4k": {
+      "max_traced_peak_mib": 8.2,
+      "logical": {
+        "iterator_messages": 1500,
+        "callback_queued": 1499,
+        "callback_active": true,
+        "pending_logical_bytes": 6162000,
+        "shared_references": 3000
+      }
+    },
+    "websocket_batching_4k": {
+      "max_traced_peak_mib": 1.4,
+      "logical": {
+        "input_messages": 300,
+        "input_bytes": 1228800,
+        "writer_frames": 300,
+        "writer_batches": 2,
+        "max_observed_batch_bytes": 1046520,
+        "configured_batch_limit": 1048576,
+        "batches_within_limit": true,
+        "retained_receive_bytes": 0,
+        "retained_control_frames": 0
+      }
+    },
+    "reconnect_epoch_cleanup_4k": {
+      "max_traced_peak_mib": 10.2,
+      "logical": {
+        "writer_messages_before": 2000,
+        "pending_effects_before": 2000,
+        "decoder_bytes_before": 4096,
+        "writer_messages_after": 0,
+        "writer_bytes_after": 0,
+        "pending_effects_after": 0,
+        "decoder_bytes_after": 0,
+        "epoch_advanced": true
+      }
     }
   }
 }

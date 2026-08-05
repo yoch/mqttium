@@ -37,6 +37,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   attribute from the client.
 - `benchmarks/qos1_frame_policy.py` and `docs/QOS1-FRAME-POLICY.md`, retaining
   the allocation/replay A/B that selected the outbound PUBLISH frame policy.
+- Seven isolated memory scenarios for the audit's remaining risk paths, with
+  exact workload assertions and versioned `tracemalloc` peak thresholds.
 
 ### Changed
 

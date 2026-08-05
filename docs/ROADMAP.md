@@ -54,9 +54,10 @@ which records what already shipped.
       re-encoded instead of retained; segmented frames retain their shared
       payload and patch only the DUP header. See
       [`QOS1-FRAME-POLICY.md`](QOS1-FRAME-POLICY.md).
-- [ ] Add memory-benchmark scenarios for property-heavy outbound, immediate
+- [x] Add memory-benchmark scenarios for property-heavy outbound, immediate
       refusal, cancellation around commit, Paho saturation, shared delivery,
-      WebSocket batching and reconnect/epoch cleanup.
+      WebSocket batching and reconnect/epoch cleanup, with exact workload
+      assertions and versioned allocation thresholds.
 
 ## Optional extensions
 

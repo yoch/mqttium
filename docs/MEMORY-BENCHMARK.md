@@ -53,9 +53,10 @@ It intentionally does not add a guessed fixed Python-object overhead. The
 benchmark still exposes the real RSS and USS amplification caused by objects and
 containers, especially through the 64-byte-payload protocol scenario.
 
-Current baseline scenarios do not attach MQTT properties, so their logical total
-is payload plus topic. Property-heavy scenarios will be added when admission
-accounting is implemented.
+Most baseline scenarios do not attach MQTT properties, so their logical total is
+payload plus topic. `property_heavy_outbound_4k` attaches independently owned
+MQTT 5 property bags and verifies that encoded property bytes participate in
+outbound admission accounting.
 
 ## Phases
 
@@ -117,6 +118,50 @@ new store and constructs `ProtocolEngine`. It measures paged payload-free
 hydration and lazy payload materialization. Full payloads are loaded only when a
 protocol inflight slot becomes available.
 
+## Extended audit scenarios
+
+### `property_heavy_outbound_4k`
+
+Queues 2,000 disconnected MQTT 5 QoS 1 publications with independent expiry,
+content, response, correlation and user-property values. It measures the payload,
+property bag and encoded-property contribution without sharing one synthetic bag.
+
+### `immediate_refusal_4k`
+
+Attempts 20,000 QoS 1 publications against a one-message admission limit. Exactly
+one record and packet identifier must remain; every refusal is checked explicitly.
+
+### `cancelled_admission_4k`
+
+Keeps one publication admitted, parks 511 callers before the commit point and
+cancels them. The scenario verifies that no cancelled caller leaves a packet id,
+store record, receipt or admission waiter behind.
+
+### `paho_saturation_4k`
+
+Submits 5,000 synchronous Paho-compatible QoS 1 publications across the network
+thread boundary with a 512-message protocol limit. Accepted and rejected return
+codes, store records and packet identifiers must agree exactly.
+
+### `shared_delivery_both_4k`
+
+Fills iterator and callback delivery with 1,500 messages. Each message has two
+references but its logical bytes are charged once, then released after both
+consumers finish.
+
+### `websocket_batching_4k`
+
+Masks 300 frames through `write_many()`, enough to cross the 1 MiB batch boundary
+once. A counting writer deliberately retains no frame, so the measured peak is
+the transport's current batch rather than an artificial history of every write.
+
+### `reconnect_epoch_cleanup_4k`
+
+Saturates the writer queue, stale-effect deque and decoder, advances the
+connection epoch and force-closes the client. Exact counters require all three
+owners to be empty afterwards; the harness releases its own payload references
+before taking the post-cleanup snapshot.
+
 ## Running locally
 
 Install benchmark dependencies and run:
@@ -166,16 +211,9 @@ unreported throughput/latency regression.
 - A logical byte limit should be evaluated against logical counters; RSS is used
   to measure amplification, not as the admission counter itself.
 
-## Planned extensions
+## Coverage policy
 
-The same output schema will be extended with:
-
-- property-heavy outbound messages;
-- blocking and immediate-refusal admission behavior;
-- cancellation before and after the commit point;
-- Paho-compatible queue saturation;
-- shared iterator/callback delivery byte accounting;
-- WebSocket byte-bounded batches;
-- paged and lazy SQLite replay;
-- reconnect and connection-epoch cleanup;
-- QoS 2 phase-two record compaction.
+All memory paths identified by the audit now have isolated scenarios and
+versioned thresholds. New scenarios should be added only for a new owner,
+backpressure policy or measured regression risk; benchmark breadth is not a goal
+by itself.
