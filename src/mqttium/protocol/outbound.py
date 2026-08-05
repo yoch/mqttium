@@ -441,27 +441,29 @@ class OutboundSession:
         rec = PubRecPacket.decode(raw.remaining, self.config.protocol)
         transitions = self._transitions
         if transitions is not None:
-            # Two metadata statements replace a full record read plus update:
-            # the PUBLISH phase is over, so nothing but the state is needed.
-            meta = transitions.out_meta(rec.mid)
-            if meta is None:
-                self._send_orphan_pubrel(rec.mid)
-                return
-            if meta.state is not OutboundQoSState.WAIT_PUBREC:
-                return
             if rec.reason_code >= 128:
                 self._fail_after_pubrec(rec.mid, rec.reason_code)
                 return
-            transitions.transition_out(
+            # The transition itself is the authoritative state check. On the
+            # successful path this is one metadata read plus one conditional
+            # UPDATE; the result must be observed before PUBREL is emitted.
+            changed = transitions.transition_out(
                 rec.mid,
                 OutboundQoSState.WAIT_PUBREC,
                 OutboundQoSState.WAIT_PUBCOMP,
                 compact=True,
             )
-            # Keep the local flow slot until PUBCOMP. MQTT 5 allows releasing at
-            # PUBREC, but freeing early lets WAIT_PUBCOMP accumulate without
-            # bound and has caused intermittent multi-second stalls under load.
-            self._send(PubRelPacket(mid=rec.mid).encode(self.config.protocol))
+            if changed is not None:
+                # Keep the local flow slot until PUBCOMP. MQTT 5 allows releasing
+                # at PUBREC, but freeing early lets WAIT_PUBCOMP accumulate without
+                # bound and has caused intermittent multi-second stalls under load.
+                self._send(PubRelPacket(mid=rec.mid).encode(self.config.protocol))
+                return
+            # A failed transition can mean either an orphan or a duplicate/stale
+            # PUBREC. Only the true orphan receives the normative PUBREL answer;
+            # an existing record in another phase is left untouched.
+            if transitions.out_meta(rec.mid) is None:
+                self._send_orphan_pubrel(rec.mid)
             return
 
         msg = self.store.get_out(rec.mid)
