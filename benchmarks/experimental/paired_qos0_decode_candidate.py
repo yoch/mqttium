@@ -59,7 +59,7 @@ def main() -> None:
         "base": args.base_root.resolve(),
         "candidate": args.candidate_root.resolve(),
     }
-    scenarios = ("ingress_direct", "ingress_mosquitto")
+    scenarios = ("ingress_direct", "ingress_broker")
     variants = ("mqttium-baseline", "mqttium-sync-inline")
     cycles: list[dict[str, Any]] = []
     for cycle in range(args.cycles):
