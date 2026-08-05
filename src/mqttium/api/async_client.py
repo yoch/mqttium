@@ -53,7 +53,6 @@ from mqttium.errors import (
 from mqttium.packets import (
     AuthPacket,
     ConnAckPacket,
-    PublishPacket,
     SubscribeOptions,
     encode_disconnect,
 )
@@ -72,7 +71,7 @@ from mqttium.transport._stream import AsyncTransport
 from mqttium.transport.tcp import TcpTransport
 from mqttium.transport.unix import UnixSocketTransport
 from mqttium.transport.websocket import WebSocketTransport
-from mqttium.transport.writes import WriteItem, item_size
+from mqttium.transport.writes import WriteItem
 from mqttium.types import Message, Properties
 
 OnMessage = Callable[[Message], Any]
@@ -1197,24 +1196,14 @@ class AsyncClient:
         if self._transport is not None:
             await self._transport.close()
 
-    def _preview_publish_write(
+    def _preview_publish_size(
         self,
         topic: str,
         payload: bytes,
         qos: QoS | int,
-        retain: bool,
         properties: Properties | None,
-    ) -> WriteItem:
-        level = QoS(qos)
-        return PublishPacket(
-            topic=topic,
-            payload=payload,
-            qos=level,
-            retain=retain,
-            dup=False,
-            mid=None if level == QoS.AT_MOST_ONCE else 1,
-            properties=properties,
-        ).encode_write_item(self._engine.config.protocol)
+    ) -> int:
+        return self._engine.outbound.publish_wire_size(topic, len(payload), qos, properties)
 
     def _check_nowait_publish_capacity(
         self,
@@ -1230,7 +1219,7 @@ class AsyncClient:
         )
         if not will_send:
             return
-        size = item_size(self._preview_publish_write(topic, payload, level, retain, properties))
+        size = self._preview_publish_size(topic, payload, level, properties)
         if not self._can_enqueue_outbound_size(size):
             raise FlowControlError("Outbound backpressure limit reached")
 
@@ -1243,13 +1232,13 @@ class AsyncClient:
         messages = self._write_pump.queued_messages
         bytes_used = self._write_pump.queued_bytes
         flow_available = self._engine.flow.available
-        for topic, payload, qos, retain, properties in requests:
+        for topic, payload, qos, _retain, properties in requests:
             level = QoS(qos)
             if level != QoS.AT_MOST_ONCE:
                 if flow_available <= 0:
                     continue
                 flow_available -= 1
-            size = item_size(self._preview_publish_write(topic, payload, level, retain, properties))
+            size = self._preview_publish_size(topic, payload, level, properties)
             if not self._can_enqueue_outbound_size(
                 size,
                 queued_messages=messages,

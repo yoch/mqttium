@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING
 
 from mqttium.codec.buffer import RawPacket
 from mqttium.codec.properties import PUBLISH, encode_properties
-from mqttium.codec.vbi import encode_vbi
+from mqttium.codec.vbi import vbi_len
 from mqttium.enums import (
     ConnectionState,
     MQTTProtocolVersion,
@@ -744,6 +744,29 @@ class OutboundSession:
         )
         return topic_bytes, wire_property_bytes, logical_property_bytes
 
+    @staticmethod
+    def _publish_wire_size_from_parts(
+        topic_bytes: int,
+        wire_property_bytes: int,
+        payload_size: int,
+        qos: QoS,
+    ) -> int:
+        remaining = 2 + topic_bytes + (2 if qos else 0) + wire_property_bytes + payload_size
+        return 1 + vbi_len(remaining) + remaining
+
+    def publish_wire_size(
+        self,
+        topic: str,
+        payload_size: int,
+        qos: QoS | int,
+        properties: Properties | None,
+    ) -> int:
+        level = QoS(qos)
+        topic_bytes, wire_property_bytes, _ = self.size_parts(topic, properties)
+        return self._publish_wire_size_from_parts(
+            topic_bytes, wire_property_bytes, payload_size, level
+        )
+
     def _check_publish_wire_size(
         self,
         topic_bytes: int,
@@ -755,8 +778,9 @@ class OutboundSession:
         limit = self._engine.negotiated.maximum_packet_size
         if limit is None:
             return
-        remaining = 2 + topic_bytes + (2 if qos else 0) + wire_property_bytes + payload_size
-        encoded_size = 1 + len(encode_vbi(remaining)) + remaining
+        encoded_size = self._publish_wire_size_from_parts(
+            topic_bytes, wire_property_bytes, payload_size, qos
+        )
         if encoded_size > limit:
             raise PacketTooLargeError(
                 f"Encoded packet size {encoded_size} exceeds broker maximum_packet_size {limit}"
