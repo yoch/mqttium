@@ -10,11 +10,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import queue
 import socket
 import statistics
 import struct
+import threading
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -169,7 +171,14 @@ def _recv_exact(sock: socket.socket, size: int) -> bytes:
     return bytes(chunks)
 
 
-def _raw_publish_worker(topic: str, count: int, worker_id: int, connections: int = 8) -> None:
+def _raw_publish_worker(
+    topic: str,
+    count: int,
+    worker_id: int,
+    start_event: threading.Event,
+    ready: queue.SimpleQueue[None],
+    connections: int = 8,
+) -> float:
     frame = _publish_frame(topic, TELEMETRY_PAYLOAD)
     sockets: list[socket.socket] = []
     try:
@@ -181,6 +190,9 @@ def _raw_publish_worker(topic: str, count: int, worker_id: int, connections: int
             if _recv_exact(sock, 4) != b"\x20\x02\x00\x00":
                 raise ConnectionError("unexpected CONNACK for raw publisher")
             sockets.append(sock)
+        ready.put(None)
+        start_event.wait()
+        started = time.perf_counter()
         remaining = count
         batch_frames = 64
         cursor = 0
@@ -189,6 +201,7 @@ def _raw_publish_worker(topic: str, count: int, worker_id: int, connections: int
             sockets[cursor].sendall(frame * take)
             remaining -= take
             cursor = (cursor + 1) % len(sockets)
+        return time.perf_counter() - started
     finally:
         for sock in sockets:
             try:
@@ -224,13 +237,27 @@ async def _ingress_once(count: int, run_id: str) -> Sample:
         per_worker = [count // workers] * workers
         for index in range(count % workers):
             per_worker[index] += 1
-        started = time.perf_counter()
-        await asyncio.gather(
-            *(
-                asyncio.to_thread(_raw_publish_worker, topic, worker_count, worker_id)
-                for worker_id, worker_count in enumerate(per_worker)
+        start_event = threading.Event()
+        ready: queue.SimpleQueue[None] = queue.SimpleQueue()
+        publisher_tasks = [
+            asyncio.create_task(
+                asyncio.to_thread(
+                    _raw_publish_worker,
+                    topic,
+                    worker_count,
+                    worker_id,
+                    start_event,
+                    ready,
+                )
             )
-        )
+            for worker_id, worker_count in enumerate(per_worker)
+        ]
+        for _ in publisher_tasks:
+            await asyncio.to_thread(ready.get)
+        started = time.perf_counter()
+        start_event.set()
+        worker_durations = await asyncio.gather(*publisher_tasks)
+        offered_finished = time.perf_counter()
         await asyncio.wait_for(complete.wait(), timeout=30.0)
         elapsed = finished_at - started
         stats = subscriber.stats()
@@ -241,6 +268,9 @@ async def _ingress_once(count: int, run_id: str) -> Sample:
             p95_ms=None,
             counters={
                 "delivered": delivered,
+                "offered_rate": count / (offered_finished - started),
+                "slowest_publisher_seconds": max(worker_durations),
+                "post_offer_drain_seconds": max(0.0, finished_at - offered_finished),
                 "effect_batches": stats.effects.batches,
                 "effect_inline": stats.effects.inline_effects,
                 "effect_suspensions": stats.effects.apply_suspensions,
@@ -260,9 +290,7 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
     for run in range(args.runs):
         rtt_samples.append(await _rtt_once(args.rtt_pairs, 32, f"{args.label}-{run}"))
     for run in range(args.runs):
-        ingress_samples.append(
-            await _ingress_once(args.ingress_messages, f"{args.label}-{run}")
-        )
+        ingress_samples.append(await _ingress_once(args.ingress_messages, f"{args.label}-{run}"))
 
     def aggregate(name: str, samples: list[Sample]) -> dict[str, Any]:
         rates = [sample.rate for sample in samples]
