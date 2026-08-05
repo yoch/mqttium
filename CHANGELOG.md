@@ -15,8 +15,9 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - `max_ingress_batch_bytes` on `AsyncClient`. The reader now drains packets in
   batches bounded by both 256 packets and a byte target, while still allowing
   one individually oversized packet to make progress.
-- A reconnect/backpressure soak harness plus scheduled Linux, macOS, EMQX and
-  HiveMQ interoperability automation with retained JSON measurements.
+- A reconnect/backpressure soak harness plus pull-request Linux checks and
+  manually triggered Linux, macOS, EMQX and HiveMQ campaigns with retained JSON
+  measurements.
 - A documented public API candidate and stable-release acceptance policy.
 - `AsyncClient.publish_nowait()`, a synchronous, non-suspending publication
   method for producers already executing on the client's event loop. It performs

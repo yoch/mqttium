@@ -20,7 +20,8 @@ finalisation architecture pass.
 
 Automation is implemented in `.github/workflows/finalization.yml`; successful
 workflow definitions are not counted as evidence until their run artefacts are
-retained and reviewed. See [`STABILITY.md`](STABILITY.md).
+retained and reviewed. Extended macOS and multi-broker campaigns are launched
+manually. See [`STABILITY.md`](STABILITY.md).
 
 - [ ] Retain successful reconnect, session and backpressure soak runs on Linux
       and macOS for MQTT 3.1.1 and MQTT 5.
@@ -70,5 +71,5 @@ which records what already shipped.
 - deterministic plus Hypothesis fuzzing;
 - wheel, sdist and isolated-install validation;
 - subscriber-confirmed TCP, TLS and controlled WAN-profile benchmarks;
-- scheduled reconnect/backpressure and multi-broker interoperability artefacts;
+- manually triggered reconnect/backpressure and multi-broker interoperability artefacts;
 - no generated benchmark, coverage or build artefacts committed to source.
