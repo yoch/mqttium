@@ -44,8 +44,10 @@ which records what already shipped.
       high-water marks.
 - [x] Assert that outbound admission counters return to zero after sustained
       QoS 1 load drains.
-- [ ] Specialised in-buffer PUBLISH decode, if profiling still shows
-      payload-sized copies as a material peak after ingress batching.
+- [x] Profile specialised in-buffer PUBLISH decoding after ingress batching.
+      It did not reduce the remaining two-payload peak after the simple body-copy
+      correction and is therefore not shipped; see
+      [`PUBLISH-DECODE-PROFILE.md`](PUBLISH-DECODE-PROFILE.md).
 - [x] Full QoS 2 phase-two compaction (release topic, payload and properties,
       not only the encoded frame).
 - [ ] Benchmark the QoS 1 / pre-PUBREC frame policy: re-encode on retransmission
