@@ -1,0 +1,260 @@
+name: Native hotpath v311 QoS 1 decode
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - agent/native-hotpath-architecture-study
+    paths:
+      - .github/workflows/native-hotpath-v311-qos1-decode.yml
+
+permissions:
+  contents: read
+
+jobs:
+  candidate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 65
+    env:
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    steps:
+      - name: Check out study harness
+        uses: actions/checkout@v7
+        with:
+          path: harness
+      - name: Check out exact-size base
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          path: base
+      - name: Check out exact-size plus QoS 1 decode candidate
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          path: candidate
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install shared dependencies and broker
+        run: |
+          python -m pip install gmqtt==0.7.0
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mosquitto
+      - name: Apply candidates
+        run: |
+          python harness/.github/scripts/apply_nowait_size_candidate.py base
+          python harness/.github/scripts/apply_nowait_size_candidate.py candidate
+          python harness/.github/scripts/apply_v311_qos1_decode_candidate_v2.py candidate
+          cat > candidate/tests/unit/test_v311_qos1_decode_candidate.py <<'PY'
+          from __future__ import annotations
+
+          import pytest
+
+          from mqttium.codec.buffer import RawPacket
+          from mqttium.codec.primitives import pack_u16, pack_utf8
+          from mqttium.enums import ConnectionState, MQTTProtocolVersion, PacketType, QoS
+          from mqttium.errors import MalformedPacketError
+          from mqttium.packets import PublishPacket
+          from mqttium.protocol.engine import EffectKind, EngineConfig, ProtocolEngine
+          from mqttium.protocol.inbound import _decode_v311_qos1_fields
+
+
+          @pytest.mark.parametrize(
+              ("topic", "payload", "retain", "dup", "mid"),
+              [
+                  ("bench/request", b"payload", False, False, 1),
+                  ("capteur/température", b"", True, True, 65535),
+                  ("a/b/c", b"x" * 4096, False, True, 42),
+              ],
+          )
+          def test_fields_match_generic_publish_packet(
+              topic: str,
+              payload: bytes,
+              retain: bool,
+              dup: bool,
+              mid: int,
+          ) -> None:
+              flags = 0x02 | int(retain) | (0x08 if dup else 0)
+              raw = RawPacket(
+                  PacketType.PUBLISH,
+                  flags,
+                  pack_utf8(topic) + pack_u16(mid) + payload,
+              )
+              fields = _decode_v311_qos1_fields(raw)
+              packet = PublishPacket.decode(flags, raw.remaining, MQTTProtocolVersion.MQTTv311)
+              assert fields == (
+                  packet.topic,
+                  packet.payload,
+                  packet.mid,
+                  packet.retain,
+                  packet.dup,
+              )
+
+
+          def test_zero_packet_identifier_preserves_error() -> None:
+              raw = RawPacket(
+                  PacketType.PUBLISH,
+                  0x02,
+                  pack_utf8("bench/zero") + b"\x00\x00payload",
+              )
+              with pytest.raises(MalformedPacketError, match="PUBLISH packet identifier"):
+                  _decode_v311_qos1_fields(raw)
+
+
+          def test_auto_ack_path_avoids_generic_packet(monkeypatch) -> None:
+              calls = 0
+              original = PublishPacket.decode
+
+              def counted(*args, **kwargs):
+                  nonlocal calls
+                  calls += 1
+                  return original(*args, **kwargs)
+
+              monkeypatch.setattr(PublishPacket, "decode", counted)
+              engine = ProtocolEngine(EngineConfig(protocol=MQTTProtocolVersion.MQTTv311))
+              engine.state = ConnectionState.CONNECTED
+              engine.handle_raw(
+                  RawPacket(
+                      PacketType.PUBLISH,
+                      0x02,
+                      pack_utf8("bench/qos1") + pack_u16(7) + b"payload",
+                  )
+              )
+              effects = engine.take_effects()
+              assert [effect.kind for effect in effects] == [EffectKind.MESSAGE, EffectKind.SEND]
+              assert effects[0].data.mid == 7
+              assert effects[0].data.qos is QoS.AT_LEAST_ONCE
+              assert calls == 0
+
+
+          @pytest.mark.parametrize(
+              ("protocol", "flags", "remaining"),
+              [
+                  (
+                      MQTTProtocolVersion.MQTTv5,
+                      0x02,
+                      pack_utf8("bench/v5") + pack_u16(3) + b"\x00payload",
+                  ),
+                  (
+                      MQTTProtocolVersion.MQTTv311,
+                      0x04,
+                      pack_utf8("bench/qos2") + pack_u16(3) + b"payload",
+                  ),
+              ],
+          )
+          def test_property_and_qos2_paths_remain_generic(
+              monkeypatch,
+              protocol: MQTTProtocolVersion,
+              flags: int,
+              remaining: bytes,
+          ) -> None:
+              calls = 0
+              original = PublishPacket.decode
+
+              def counted(*args, **kwargs):
+                  nonlocal calls
+                  calls += 1
+                  return original(*args, **kwargs)
+
+              monkeypatch.setattr(PublishPacket, "decode", counted)
+              engine = ProtocolEngine(EngineConfig(protocol=protocol))
+              engine.state = ConnectionState.CONNECTED
+              engine.handle_raw(RawPacket(PacketType.PUBLISH, flags, remaining))
+              assert calls == 1
+          PY
+          git -C base diff --check
+          git -C candidate diff --check
+      - name: Validate candidate
+        working-directory: candidate
+        run: |
+          python -m pip install -e ".[dev,security,fuzz]"
+          ruff format \
+            src/mqttium/api/async_client.py \
+            src/mqttium/protocol/outbound.py \
+            src/mqttium/protocol/inbound.py \
+            tests/unit/test_v311_qos1_decode_candidate.py
+          ruff format --check src tests benchmarks
+          ruff check src tests benchmarks
+          mypy src/mqttium
+          bandit -q -ll -r src
+          python -m pytest -q tests/unit
+          PYTHONPATH=src python -m pytest -q tests/fuzz/test_hypothesis_fuzz.py
+      - name: Start isolated Mosquitto
+        run: |
+          mkdir -p /tmp/mqttium-qos1-decode
+          cat > /tmp/mqttium-qos1-decode/mosquitto.conf <<'MOSQ'
+          persistence false
+          allow_anonymous true
+          max_inflight_messages 1000
+          max_queued_messages 1000000
+          max_queued_bytes 0
+          connection_messages false
+          log_type error
+          listener 11883 127.0.0.1
+          MOSQ
+          mosquitto -c /tmp/mqttium-qos1-decode/mosquitto.conf \
+            > /tmp/mqttium-qos1-decode/mosquitto.log 2>&1 &
+          for i in $(seq 1 60); do
+            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            sleep 0.2
+          done
+          exit 1
+      - name: Recover corrected native harness
+        run: |
+          python - <<'PY'
+          import base64
+          import gzip
+          from pathlib import Path
+
+          workflow = Path('harness/.github/workflows/native-hotpath-study.yml').read_text().splitlines()
+          start = next(i for i, line in enumerate(workflow) if "cat > /tmp/native-hotpath.b64" in line) + 1
+          end = next(i for i in range(start, len(workflow)) if workflow[i].strip() == "B64")
+          payload = "".join(line.strip() for line in workflow[start:end])
+          source = gzip.decompress(base64.b64decode(payload)).decode()
+          source = source.replace("max_pending_callbacks=max(65_536, count),", "max_pending_callbacks=8_192,")
+          source = source.replace("max_pending_callbacks=65_536,", "max_pending_callbacks=8_192,")
+          Path('/tmp/native_hotpath_matrix.py').write_text(source)
+          PY
+      - name: Rotated native RTT A/B
+        run: |
+          python harness/benchmarks/experimental/paired_nowait_candidate.py \
+            --base-root base \
+            --candidate-root candidate \
+            --harness /tmp/native_hotpath_matrix.py \
+            --cycles 7 \
+            --pairs 12000 \
+            --window 32 \
+            --output /tmp/mqttium-qos1-decode/paired-qos1-decode.json
+      - name: Verify generic packet decode leaves v311 QoS 1 hotpath
+        run: |
+          PYTHONPATH=candidate/src python -m cProfile -o /tmp/mqttium-qos1-decode/candidate.prof \
+            /tmp/native_hotpath_matrix.py --worker --scenario rtt \
+            --variant mqttium-sync-inline-nowait --pairs 5000 --window 32
+          python - <<'PY'
+          import json
+          import pstats
+          from pathlib import Path
+
+          stats = pstats.Stats('/tmp/mqttium-qos1-decode/candidate.prof')
+          calls = 0
+          for (filename, _line, func), (_cc, nc, _tt, _ct, _callers) in stats.stats.items():
+              if filename.endswith('/packets/publish.py') and func == 'decode':
+                  calls += nc
+          result = {'publish_packet_decode_calls': calls}
+          assert calls == 0, result
+          Path('/tmp/mqttium-qos1-decode/profile-count.json').write_text(
+              json.dumps(result, indent=2) + '\n'
+          )
+          print(json.dumps(result, indent=2))
+          PY
+      - name: Upload candidate evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-hotpath-v311-qos1-decode-${{ github.run_id }}
+          path: |
+            /tmp/mqttium-qos1-decode/*.json
+            /tmp/mqttium-qos1-decode/mosquitto.log
+          if-no-files-found: warn
+          retention-days: 30
