@@ -1,0 +1,109 @@
+name: Native hotpath architecture study corrected
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - agent/native-hotpath-architecture-study
+    paths:
+      - .github/workflows/native-hotpath-study-corrected.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-hotpath-study-corrected-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  study:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 70
+    env:
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install clients and broker
+        run: |
+          python -m pip install -e ".[dev]" gmqtt==0.7.0
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mosquitto
+      - name: Start isolated Mosquitto
+        run: |
+          mkdir -p /tmp/mqttium-hotpath
+          cat > /tmp/mqttium-hotpath/mosquitto.conf <<'MOSQ'
+          persistence false
+          allow_anonymous true
+          max_inflight_messages 1000
+          max_queued_messages 1000000
+          max_queued_bytes 0
+          connection_messages false
+          log_type error
+          listener 11883 127.0.0.1
+          MOSQ
+          mosquitto -c /tmp/mqttium-hotpath/mosquitto.conf \
+            > /tmp/mqttium-hotpath/mosquitto.log 2>&1 &
+          for i in $(seq 1 60); do
+            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            sleep 0.2
+          done
+          cat /tmp/mqttium-hotpath/mosquitto.log
+          exit 1
+      - name: Recover and correct experimental harness
+        run: |
+          python - <<'PY'
+          import base64
+          import gzip
+          from pathlib import Path
+
+          workflow = Path('.github/workflows/native-hotpath-study.yml').read_text().splitlines()
+          start = next(i for i, line in enumerate(workflow) if "cat > /tmp/native-hotpath.b64" in line) + 1
+          end = next(i for i in range(start, len(workflow)) if workflow[i].strip() == "B64")
+          payload = "".join(line.strip() for line in workflow[start:end])
+          source = gzip.decompress(base64.b64decode(payload)).decode()
+          source = source.replace(
+              "max_pending_callbacks=max(65_536, count),",
+              "max_pending_callbacks=8_192,",
+          )
+          source = source.replace(
+              "max_pending_callbacks=65_536,",
+              "max_pending_callbacks=8_192,",
+          )
+          Path('/tmp/native_hotpath_matrix.py').write_text(source)
+          PY
+          python -m py_compile /tmp/native_hotpath_matrix.py
+      - name: Verify experimental paths activate
+        run: |
+          python /tmp/native_hotpath_matrix.py --worker \
+            --scenario ingress_direct --variant mqttium-queue-inline --messages 10000 \
+            > /tmp/queue-inline-smoke.txt
+          python /tmp/native_hotpath_matrix.py --worker \
+            --scenario ingress_direct --variant mqttium-sync-inline --messages 10000 \
+            > /tmp/sync-inline-smoke.txt
+          grep -E '"effect_queue_inline_messages": [1-9]' /tmp/queue-inline-smoke.txt
+          grep -E '"sync_inline_messages": [1-9]' /tmp/sync-inline-smoke.txt
+      - name: Run corrected rotated matrix
+        run: |
+          python /tmp/native_hotpath_matrix.py \
+            --scenario all \
+            --cycles 5 \
+            --messages 160000 \
+            --pairs 10000 \
+            --window 32 \
+            --output /tmp/mqttium-hotpath/native-hotpath-matrix-corrected.json
+      - name: Upload corrected evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-hotpath-study-corrected-${{ github.run_id }}
+          path: |
+            /tmp/mqttium-hotpath/native-hotpath-matrix-corrected.json
+            /tmp/mqttium-hotpath/mosquitto.log
+            /tmp/queue-inline-smoke.txt
+            /tmp/sync-inline-smoke.txt
+          if-no-files-found: warn
+          retention-days: 30
