@@ -320,7 +320,7 @@ class Client:
             try:
                 handoff["result"] = command()
                 if flush_effects:
-                    self._async._finalize_loop_commands()
+                    await self._async._flush_effects()
             except BaseException as exc:
                 handoff["error"] = exc
             finally:
