@@ -8,6 +8,9 @@ on:
 permissions:
   contents: read
 
+env:
+  EXPERIMENT_STAGE: inline-small-delivery
+
 jobs:
   probe:
     runs-on: ubuntu-24.04
