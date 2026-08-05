@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 
 import pytest
@@ -15,6 +16,28 @@ def test_publish_nowait_requires_a_running_loop() -> None:
     client = AsyncClient()
     with pytest.raises(RuntimeError, match="event-loop thread"):
         client.publish_nowait("native/off-loop", b"x")
+
+
+async def test_publish_nowait_rejects_a_different_running_loop() -> None:
+    client = AsyncClient(max_outbound_messages=8)
+    client._engine.state = ConnectionState.CONNECTED
+    client.publish_nowait("native/owner", b"x", qos=0)
+
+    errors: list[BaseException] = []
+
+    def run_other_loop() -> None:
+        async def attempt() -> None:
+            try:
+                client.publish_nowait("native/other-loop", b"x", qos=0)
+            except BaseException as exc:
+                errors.append(exc)
+
+        asyncio.run(attempt())
+
+    await asyncio.to_thread(run_other_loop)
+    assert len(errors) == 1
+    assert isinstance(errors[0], RuntimeError)
+    assert "different event loop" in str(errors[0])
 
 
 async def test_publish_nowait_registers_qos1_receipt() -> None:

@@ -198,6 +198,7 @@ class AsyncClient:
         self._reconnect_task: asyncio.Task[None] | None = None
         self._lifecycle_lock = asyncio.Lock()
         self._engine_lock = asyncio.Lock()
+        self._owner_loop: asyncio.AbstractEventLoop | None = None
         self._connection_epoch = 0
         self._effect_pump = EffectPump(self)
         # Bind the pump operations directly on the client. This keeps existing
@@ -536,6 +537,12 @@ class AsyncClient:
         ssl: ssl.SSLContext | bool | None = None,
         timeout: float = 30.0,
     ) -> ConnAckPacket:
+        loop = asyncio.get_running_loop()
+        owner_loop = self._owner_loop
+        if owner_loop is None:
+            self._owner_loop = loop
+        elif owner_loop is not loop:
+            raise RuntimeError("AsyncClient is bound to a different event loop")
         if self._engine.state in (ConnectionState.CONNECTED, ConnectionState.CONNECTING):
             raise ProtocolError("Already connected or connecting")
         # Effects belong to a protocol/transport epoch. QoS replay and
@@ -560,7 +567,6 @@ class AsyncClient:
             self._outbound_bytes = 0
             self._ping_pending = False
             connect_packet = self._engine.begin_connect()
-            loop = asyncio.get_running_loop()
             self._connack_fut = loop.create_future()
             self._writer_task = asyncio.create_task(self._write_loop(), name="mqttium-writer")
             await self._enqueue_outbound(connect_packet)
@@ -635,11 +641,16 @@ class AsyncClient:
         adapter that hands work to the owning loop.
         """
         try:
-            asyncio.get_running_loop()
+            loop = asyncio.get_running_loop()
         except RuntimeError as exc:
             raise RuntimeError(
                 "publish_nowait() must be called from the client's event-loop thread"
             ) from exc
+        owner_loop = self._owner_loop
+        if owner_loop is None:
+            self._owner_loop = loop
+        elif owner_loop is not loop:
+            raise RuntimeError("AsyncClient is bound to a different event loop")
         data = payload.encode("utf-8") if isinstance(payload, str) else payload
         self._check_nowait_publish_capacity(topic, data, qos, retain, properties)
         receipt = self._queue_publish_on_loop(
