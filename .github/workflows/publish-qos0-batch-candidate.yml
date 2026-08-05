@@ -1,0 +1,97 @@
+name: Publish QoS 0 batch candidate
+
+on:
+  push:
+    branches:
+      - agent/native-rtt-ingress-hotpath
+    paths:
+      - benchmarks/publish_qos0_batch_candidate.txt
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Check out publication harness
+        uses: actions/checkout@v7
+        with:
+          path: harness
+      - name: Check out clean candidate branch
+        uses: actions/checkout@v7
+        with:
+          ref: agent/qos0-message-batch-delivery
+          path: candidate
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Build candidate from clean main branch
+        run: |
+          python harness/.github/scripts/apply_batched_message_effects.py candidate
+          python harness/.github/scripts/publish_qos0_batch_candidate.py \
+            --candidate candidate \
+            --harness harness
+      - name: Install validation dependencies
+        working-directory: candidate
+        run: python -m pip install -e ".[dev]"
+      - name: Static validation
+        working-directory: candidate
+        run: |
+          ruff format \
+            src/mqttium/api/_effects.py \
+            src/mqttium/api/async_client.py \
+            tests/unit/test_batched_message_effects.py \
+            benchmarks/native_rtt_ingress.py \
+            benchmarks/direct_ingress_hotpath.py \
+            benchmarks/paired_native_hotpaths.py
+          ruff check .
+          mypy src/mqttium
+          bandit -q -r src/mqttium
+      - name: Full unit suite
+        working-directory: candidate
+        run: pytest -q
+      - name: Start isolated broker
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mosquitto
+          printf 'listener 11883 127.0.0.1\nallow_anonymous true\npersistence false\nmax_queued_messages 1000000\n' > /tmp/mqttium-publish.conf
+          mosquitto -c /tmp/mqttium-publish.conf -d
+          for i in $(seq 1 60); do
+            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            sleep 0.25
+          done
+          exit 1
+      - name: Benchmark smoke
+        working-directory: candidate
+        run: |
+          python benchmarks/native_rtt_ingress.py \
+            --scenario rtt --runs 1 --rtt-pairs 2000 \
+            --label publication-smoke \
+            --output /tmp/native-rtt-smoke.json
+          python benchmarks/direct_ingress_hotpath.py \
+            --runs 1 --messages 40000 \
+            --label publication-smoke \
+            --output /tmp/direct-ingress-smoke.json
+      - name: Publish one clean commit
+        working-directory: candidate
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add \
+            .github/workflows/benchmarks.yml \
+            .github/workflows/paired-regression.yml \
+            CHANGELOG.md \
+            benchmarks/direct_ingress_hotpath.py \
+            benchmarks/native_rtt_ingress.py \
+            benchmarks/paired_native_hotpaths.py \
+            docs/NATIVE-HOTPATH-PROFILE.md \
+            src/mqttium/api/_effects.py \
+            src/mqttium/api/async_client.py \
+            tests/unit/test_batched_message_effects.py
+          git diff --cached --check
+          test "$(git rev-list --count origin/main..HEAD)" -eq 0
+          git commit -m 'Batch small QoS 0 message delivery'
+          git push origin HEAD:agent/qos0-message-batch-delivery
