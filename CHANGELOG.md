@@ -6,6 +6,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.1.0a4] - 2026-08-06
+
 ### Added
 
 - `TransitionInflightStore`, an optional store extension for atomic, conditional
@@ -237,7 +239,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - Pre-spin-out comparative analysis and generated coverage data from the
   published source tree.
 
-[Unreleased]: https://github.com/yoch/mqttium/compare/v0.1.0a3...HEAD
+[Unreleased]: https://github.com/yoch/mqttium/compare/v0.1.0a4...HEAD
+[0.1.0a4]: https://github.com/yoch/mqttium/compare/v0.1.0a3...v0.1.0a4
 [0.1.0a3]: https://github.com/yoch/mqttium/compare/v0.1.0a2...v0.1.0a3
 [0.1.0a2]: https://github.com/yoch/mqttium/compare/v0.1.0a1...v0.1.0a2
 [0.1.0a1]: https://github.com/yoch/mqttium/releases/tag/v0.1.0a1

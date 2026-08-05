@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project
 
 MQTTium is a dependency-free, async-native MQTT 3.1.1 / 5.0 client (`src/mqttium`, Python 3.11–3.14,
-Apache-2.0, alpha `0.1.0a3`). Runtime dependencies must stay empty — tooling only lives in the
+Apache-2.0, alpha `0.1.0a4`). Runtime dependencies must stay empty — tooling only lives in the
 `dev`/`fuzz`/`security`/`release` extras.
 
 ## Commands
@@ -57,7 +57,7 @@ comparison).
 
 `.github/workflows/ci.yml` fails if any cache/build artefact is tracked by git, or if the strings
 `mqttnext`/`MQTTNext`/`MQTTNEXT` appear anywhere under `src tests examples benchmarks` (pre-spin-out
-name). The `package` job pins `0.1.0a3` in assertions — bumping the version in
+name). The `package` job pins `0.1.0a4` in assertions — bumping the version in
 `src/mqttium/__init__.py` (the hatch version source) requires updating that workflow too.
 
 ## Architecture
