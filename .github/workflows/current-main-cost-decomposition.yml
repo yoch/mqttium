@@ -1,0 +1,59 @@
+name: Current-main ingress cost decomposition
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - agent/native-hotpath-architecture-study
+    paths:
+      - benchmarks/experimental/current_main_cost_decomposition.py
+      - .github/workflows/current-main-cost-decomposition.yml
+
+permissions:
+  contents: read
+
+jobs:
+  decompose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    steps:
+      - name: Check out study harness
+        uses: actions/checkout@v7
+        with:
+          path: harness
+      - name: Check out exact current main
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          path: runtime
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Record revisions
+        run: |
+          mkdir -p /tmp/mqttium-costs
+          {
+            echo "harness=$(git -C harness rev-parse HEAD)"
+            echo "runtime=$(git -C runtime rev-parse HEAD)"
+            python --version
+          } | tee /tmp/mqttium-costs/revisions.txt
+      - name: Run rotated fresh-process decomposition
+        env:
+          PYTHONPATH: ${{ github.workspace }}/runtime/src
+        run: |
+          python harness/benchmarks/experimental/current_main_cost_decomposition.py \
+            --root runtime \
+            --cycles 7 \
+            --count 300000 \
+            --output /tmp/mqttium-costs/current-main-costs.json
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: current-main-cost-decomposition-${{ github.run_id }}
+          path: /tmp/mqttium-costs/*
+          if-no-files-found: warn
+          retention-days: 30
