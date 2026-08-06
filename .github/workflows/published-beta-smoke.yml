@@ -1,6 +1,10 @@
 name: Published beta smoke
 
 on:
+  pull_request:
+    paths:
+      - .github/workflows/published-beta-smoke.yml
+      - tests/installed_distribution_smoke.py
   workflow_dispatch:
     inputs:
       version:
@@ -15,8 +19,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: published-beta-smoke-${{ github.event.inputs.version || '0.2.0b1' }}
-  cancel-in-progress: false
+  group: published-beta-smoke-${{ github.event.inputs.version || '0.2.0b1' }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   installed-distribution:
