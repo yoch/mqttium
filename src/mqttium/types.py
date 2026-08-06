@@ -13,7 +13,8 @@ class Properties:
     """Minimal MQTT 5 property bag.
 
     Values that may repeat (user properties, subscription identifiers) are lists.
-    Singletons are stored directly. Full validation by packet type lands in phase 1.
+    Singletons are stored directly; packet encoders and decoders validate which
+    properties are legal for each MQTT packet type.
     """
 
     values: dict[str, Any] = field(default_factory=dict)

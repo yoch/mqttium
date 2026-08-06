@@ -6,6 +6,15 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Added
+
+- The supported native entry points now expose every type needed by public
+  `AsyncClient` signatures: messages, MQTT 5 properties, connection packets,
+  subscribe options, negotiated settings, reconnect policy and configuration
+  literals. The root package also exposes the operational exception hierarchy
+  and `ConnectionState`. `docs/API-STABILITY.md` classifies Stable, Provisional
+  and Internal surfaces independently of Python importability or `__all__`.
+
 ### Changed
 
 - Inbound delivery byte accounting is now kept outside public `Message`
