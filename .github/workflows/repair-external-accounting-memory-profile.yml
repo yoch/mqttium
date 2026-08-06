@@ -30,7 +30,7 @@ jobs:
           ruff format benchmarks/memory_profile.py
           ruff check benchmarks/memory_profile.py
           python benchmarks/memory_profile.py --child shared_delivery_both_4k --count 1500 --payload-size 4096 --output /tmp/shared-delivery-both.json
-          python -c 'import json; d=json.load(open("/tmp/shared-delivery-both.json")); x=next(s for s in d["snapshots"] if s["phase"]=="loaded")["details"]; assert x["shared_references"]==3000 and x["pending_logical_bytes"]>0'
+          python -c 'import json; d=json.load(open("/tmp/shared-delivery-both.json")); x=next(s for s in d["snapshots"] if s["phase"]=="loaded")["logical"]; assert x["shared_references"]==3000 and x["pending_logical_bytes"]>0'
       - name: Commit benchmark repair
         run: |
           rm .github/workflows/repair-external-accounting-memory-profile.yml
