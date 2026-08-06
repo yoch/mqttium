@@ -1,0 +1,61 @@
+name: Rebase PR 41 after PR 40
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - agent/native-hotpath-architecture-study
+    paths:
+      - .github/workflows/rebase-pr41-after-pr40.yml
+
+permissions:
+  contents: write
+
+jobs:
+  rebase:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out PR 41 branch
+        uses: actions/checkout@v7
+        with:
+          ref: agent/v311-qos0-direct-message-decode
+          fetch-depth: 0
+          path: target
+      - name: Rebase onto current main
+        working-directory: target
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          if ! git rebase origin/main; then
+            conflicts="$(git diff --name-only --diff-filter=U)"
+            if [ "$conflicts" != "CHANGELOG.md" ]; then
+              echo "Unexpected conflicts: $conflicts" >&2
+              exit 1
+            fi
+            git checkout --ours CHANGELOG.md
+            python - <<'PY'
+          from pathlib import Path
+
+          path = Path("CHANGELOG.md")
+          text = path.read_text()
+          marker = "### Changed\n\n"
+          entry = (
+              "- Inbound MQTT 3.1.1 QoS 0 PUBLISH packets now decode directly "
+              "into the delivered `Message`, avoiding a short-lived intermediate "
+              "`PublishPacket`; MQTT 5 and acknowledged QoS paths keep the generic "
+              "decoder.\n"
+          )
+          if entry not in text:
+              if marker not in text:
+                  raise SystemExit("Changed marker not found")
+              text = text.replace(marker, marker + entry, 1)
+          path.write_text(text)
+          PY
+            git add CHANGELOG.md
+            GIT_EDITOR=true git rebase --continue
+          fi
+          test "$(git rev-list --count origin/main..HEAD)" -eq 1
+          git diff --check origin/main...HEAD
+          git push --force-with-lease origin HEAD:agent/v311-qos0-direct-message-decode
