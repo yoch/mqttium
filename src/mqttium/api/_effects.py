@@ -28,6 +28,10 @@ class EffectOwner(Protocol):
 
     def _apply_effect_inline(self, effect: EngineEffect, epoch: int) -> bool: ...
 
+    def _apply_message_effect_batch_inline(
+        self, effects: deque[EngineEffect], epoch: int
+    ) -> int: ...
+
     async def _apply_effect(
         self,
         effect: EngineEffect,
@@ -184,6 +188,18 @@ class EffectPump:
                     if epoch != self.owner._connection_epoch:
                         self.discard_connection_effects()
                         continue
+                    if effect.kind is EffectKind.MESSAGE:
+                        applied_inline = self.owner._apply_message_effect_batch_inline(
+                            self.pending, epoch
+                        )
+                        if applied_inline:
+                            for _ in range(applied_inline):
+                                self.pending.popleft()
+                                self.inline_effects += 1
+                                self._complete()
+                            if not self.pending:
+                                self.pending_epoch = None
+                            continue
                     try:
                         await self.owner._apply_effect(effect, nowait=False, epoch=epoch)
                     except asyncio.CancelledError:
