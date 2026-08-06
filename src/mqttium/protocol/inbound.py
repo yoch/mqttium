@@ -12,8 +12,9 @@ from collections.abc import Iterator
 from typing import TYPE_CHECKING
 
 from mqttium.codec.buffer import RawPacket
+from mqttium.codec.primitives import unpack_utf8
 from mqttium.enums import ConnectionState, InboundQoSState, MQTTProtocolVersion, QoS
-from mqttium.errors import ProtocolError
+from mqttium.errors import MalformedPacketError, ProtocolError
 from mqttium.persistence.memory import (
     BoundedInboundReplayStore,
     PagedInflightStore,
@@ -80,6 +81,22 @@ class InboundReplayCursor:
         if self._pending is not None:
             raise AssertionError("replay cursor already has a pending message")
         self._pending = message
+
+
+def _decode_v311_qos0_message(raw: RawPacket) -> Message:
+    if raw.flags & 0x08:
+        raise MalformedPacketError("QoS 0 PUBLISH must not set DUP")
+    topic, payload_pos = unpack_utf8(raw.remaining)
+    validate_received_publish_topic(topic, utf8_validated=True)
+    return Message(
+        topic=topic,
+        payload=raw.remaining[payload_pos:],
+        qos=QoS.AT_MOST_ONCE,
+        retain=bool(raw.flags & 0x01),
+        dup=False,
+        mid=None,
+        properties=None,
+    )
 
 
 class InboundSession:
@@ -168,6 +185,9 @@ class InboundSession:
         engine = self._engine
         config = self.config
         store = self.store
+        if config.protocol is MQTTProtocolVersion.MQTTv311 and not (raw.flags & 0x06):
+            engine._emit(EffectKind.MESSAGE, _decode_v311_qos0_message(raw))
+            return
         packet = PublishPacket.decode(raw.flags, raw.remaining, config.protocol)
         topic = self._resolve_topic(packet)
         validate_received_publish_topic(topic, utf8_validated=True)
