@@ -6,6 +6,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.2.0b1] - 2026-08-06
+
 ### Added
 
 - The supported native entry points now expose every type needed by public
@@ -268,7 +270,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - Pre-spin-out comparative analysis and generated coverage data from the
   published source tree.
 
-[Unreleased]: https://github.com/yoch/mqttium/compare/v0.1.0a4...HEAD
+[Unreleased]: https://github.com/yoch/mqttium/compare/v0.2.0b1...HEAD
+[0.2.0b1]: https://github.com/yoch/mqttium/compare/v0.1.0a4...v0.2.0b1
 [0.1.0a4]: https://github.com/yoch/mqttium/compare/v0.1.0a3...v0.1.0a4
 [0.1.0a3]: https://github.com/yoch/mqttium/compare/v0.1.0a2...v0.1.0a3
 [0.1.0a2]: https://github.com/yoch/mqttium/compare/v0.1.0a1...v0.1.0a2
