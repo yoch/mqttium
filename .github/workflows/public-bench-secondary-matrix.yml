@@ -1,0 +1,111 @@
+name: Public benchmark secondary matrix
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - agent/native-hotpath-architecture-study
+    paths:
+      - .github/workflows/public-bench-secondary-matrix.yml
+
+permissions:
+  contents: read
+
+jobs:
+  matrix:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    steps:
+      - name: Check out study branch
+        uses: actions/checkout@v7
+        with:
+          path: study
+      - name: Check out exact MQTTium main
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          path: runtime
+      - name: Check out public benchmark main
+        uses: actions/checkout@v7
+        with:
+          repository: yoch/mqtt-python-client-bench
+          ref: main
+          path: public-bench
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install current MQTTium and benchmark clients
+        run: |
+          python -m pip install -e runtime
+          python -m pip install -e "public-bench[all]"
+          mkdir -p /tmp/public-bench-secondary
+          {
+            echo "study=$(git -C study rev-parse HEAD)"
+            echo "runtime=$(git -C runtime rev-parse HEAD)"
+            echo "public_bench=$(git -C public-bench rev-parse HEAD)"
+            python --version
+            python - <<'PY'
+          import importlib.metadata
+          for name in ("mqttium", "gmqtt", "paho-mqtt", "awscrt"):
+              try:
+                  print(f"{name}={importlib.metadata.version(name)}")
+              except importlib.metadata.PackageNotFoundError:
+                  print(f"{name}=missing")
+          PY
+          } | tee /tmp/public-bench-secondary/revisions.txt
+          python -m mqtt_client_bench.run clients -v \
+            | tee /tmp/public-bench-secondary/clients.txt
+      - name: Start managed broker
+        working-directory: public-bench
+        run: python -m mqtt_client_bench.run broker up
+      - name: Run same-runner ABBA comparisons
+        working-directory: public-bench
+        run: |
+          set -euo pipefail
+          run_compare() {
+            local clients="$1"
+            local scenario="$2"
+            local variant="$3"
+            local blocks="$4"
+            local slug="$5"
+            python -m mqtt_client_bench.run compare \
+              --clients "$clients" \
+              --scenario "$scenario" \
+              --variant-index "$variant" \
+              --blocks "$blocks" \
+              --profile standard \
+              --output "/tmp/public-bench-secondary/${slug}.json"
+          }
+
+          # MQTT 3.1.1 ingress QoS0, exact subscription.
+          run_compare gmqtt,mqttium sub_exact_telemetry 0 4 ingress-gmqtt-mqttium
+          run_compare paho,awscrt sub_exact_telemetry 0 2 ingress-paho-awscrt
+          run_compare paho,gmqtt sub_exact_telemetry 0 2 ingress-paho-gmqtt
+
+          # MQTT 3.1.1 publisher QoS0 and QoS1, telemetry payload.
+          run_compare gmqtt,mqttium pub_qos_sweep_telemetry 0 4 pub-qos0-gmqtt-mqttium
+          run_compare paho,awscrt pub_qos_sweep_telemetry 0 2 pub-qos0-paho-awscrt
+          run_compare paho,gmqtt pub_qos_sweep_telemetry 0 2 pub-qos0-paho-gmqtt
+          run_compare gmqtt,mqttium pub_qos_sweep_telemetry 1 4 pub-qos1-gmqtt-mqttium
+          run_compare paho,awscrt pub_qos_sweep_telemetry 1 2 pub-qos1-paho-awscrt
+          run_compare paho,gmqtt pub_qos_sweep_telemetry 1 2 pub-qos1-paho-gmqtt
+
+          # RTT capacity remains separate; AWS CRT is intentionally refused by
+          # the public benchmark because it cannot enforce TCP_NODELAY.
+          run_compare gmqtt,mqttium rtt_capacity_qos1 0 4 rtt-gmqtt-mqttium
+          run_compare paho,gmqtt rtt_capacity_qos1 0 2 rtt-paho-gmqtt
+      - name: Stop managed broker
+        if: always()
+        working-directory: public-bench
+        run: python -m mqtt_client_bench.run broker down || true
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: public-bench-secondary-${{ github.run_id }}
+          path: /tmp/public-bench-secondary/*
+          if-no-files-found: warn
+          retention-days: 30
