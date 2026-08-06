@@ -1,8 +1,8 @@
 # Public API stability policy
 
-MQTTium is currently an alpha release. This document defines the API contract
-proposed for the first beta and separates that contract from implementation
-objects that remain importable in Python.
+MQTTium is currently a beta release. This document defines the supported beta
+API contract and separates that contract from implementation objects that remain
+importable in Python.
 
 ## Support tiers
 
@@ -11,9 +11,9 @@ wildcard-import ergonomics only. Support is determined by the tables below.
 
 ### Stable
 
-Stable names are the native user-facing contract. Once the first non-alpha
-release is published, incompatible changes to these names follow SemVer and the
-deprecation policy below.
+Stable names are the native user-facing contract. Starting with `0.2.0b1`,
+incompatible changes to these names follow SemVer and the deprecation policy
+below.
 
 | Entry point | Supported names |
 | --- | --- |
@@ -142,8 +142,7 @@ Internal names have no deprecation guarantee.
 
 ## Release gate
 
-This classification becomes the first beta contract only after the P0 release
-gates are complete. A stable `1.0` additionally requires retained reconnect,
-backpressure and broker-interoperability evidence as described in
-[`STABILITY.md`](STABILITY.md), plus evidence that no major public redesign is
-expected.
+This classification is the beta contract starting with `0.2.0b1`. A stable
+`1.0` additionally requires retained reconnect, backpressure and
+broker-interoperability evidence as described in [`STABILITY.md`](STABILITY.md),
+plus evidence that no major public redesign is expected.
