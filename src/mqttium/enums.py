@@ -33,8 +33,8 @@ class PacketType(IntEnum):
     @classmethod
     def from_byte(cls, byte: int) -> PacketType:
         try:
-            return cls(byte & 0xF0)
-        except ValueError as exc:
+            return cls._value2member_map_[byte & 0xF0]
+        except KeyError as exc:
             raise MalformedPacketError(f"Unknown MQTT packet type byte 0x{byte:02x}") from exc
 
 
