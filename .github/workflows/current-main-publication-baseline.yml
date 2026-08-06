@@ -1,0 +1,77 @@
+name: Current-main publication baseline
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - agent/native-hotpath-architecture-study
+    paths:
+      - .github/workflows/current-main-publication-baseline.yml
+
+permissions:
+  contents: read
+
+jobs:
+  publication:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    steps:
+      - name: Check out exact current main
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          path: runtime
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install exact runtime and comparison clients
+        run: |
+          python -m pip install -e runtime
+          python -m pip install gmqtt==0.7.0 paho-mqtt==2.1.0
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mosquitto
+          mkdir -p /tmp/mqttium-publication
+          cat > /tmp/mqttium-publication/mosquitto.conf <<'MOSQ'
+          persistence false
+          allow_anonymous true
+          max_inflight_messages 1000
+          max_queued_messages 1000000
+          max_queued_bytes 0
+          connection_messages false
+          log_type error
+          listener 11883 127.0.0.1
+          MOSQ
+          mosquitto -c /tmp/mqttium-publication/mosquitto.conf \
+            > /tmp/mqttium-publication/mosquitto.log 2>&1 &
+          for i in $(seq 1 60); do
+            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            sleep 0.2
+          done
+          exit 1
+      - name: Record revisions
+        run: |
+          {
+            echo "runtime=$(git -C runtime rev-parse HEAD)"
+            python --version
+            python -m pip show gmqtt | grep '^Version:'
+            python -m pip show paho-mqtt | grep '^Version:'
+            mosquitto -h 2>&1 | head -1
+          } | tee /tmp/mqttium-publication/revisions.txt
+      - name: Run fresh exact-main publication comparison
+        working-directory: runtime
+        run: |
+          python benchmarks/compare_libs.py \
+            --count 12000 \
+            --output /tmp/mqttium-publication/publication-baseline.json \
+            | tee /tmp/mqttium-publication/publication-table.txt
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: current-main-publication-${{ github.run_id }}
+          path: /tmp/mqttium-publication/*
+          if-no-files-found: warn
+          retention-days: 30
