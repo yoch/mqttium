@@ -9,4 +9,5 @@ from apply_v311_qos1_decode_candidate_v3 import apply
 if __name__ == "__main__":
     if len(sys.argv) != 2:
         raise SystemExit("usage: apply_v311_qos1_decode_candidate_v2.py ROOT")
+    # Wrapper retained so the workflow path trigger stays stable across study revisions.
     apply(Path(sys.argv[1]))
