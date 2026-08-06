@@ -1,3 +1,5 @@
+from dataclasses import asdict
+
 from mqttium.api import AsyncClient
 from mqttium.types import Message
 
@@ -7,6 +9,15 @@ def test_message_has_only_public_delivery_data() -> None:
 
     assert not hasattr(message, "_delivery_logical_bytes")
     assert not hasattr(message, "_delivery_references")
+    assert list(asdict(message)) == [
+        "topic",
+        "payload",
+        "qos",
+        "retain",
+        "dup",
+        "mid",
+        "properties",
+    ]
 
 
 def test_single_consumer_uses_compact_integer_token() -> None:
