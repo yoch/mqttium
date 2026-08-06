@@ -34,7 +34,7 @@ def apply(root: Path) -> None:
 
 def _decode_v311_qos1_fields(
     raw: RawPacket,
-) -> tuple[str, bytes | bytearray | memoryview, int, bool, bool]:
+) -> tuple[str, bytes, int, bool, bool]:
     topic, pos = unpack_utf8(raw.remaining)
     validate_received_publish_topic(topic, utf8_validated=True)
     mid, pos = unpack_u16(raw.remaining, pos)
@@ -139,7 +139,7 @@ def _decode_v311_qos1_fields(
         self,
         *,
         topic: str,
-        payload: bytes | bytearray | memoryview,
+        payload: bytes,
         mid: int,
         retain: bool,
         dup: bool,
