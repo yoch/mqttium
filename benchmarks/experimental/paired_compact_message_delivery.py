@@ -66,9 +66,7 @@ def summarize_case(case: Case, samples: list[dict[str, Any]]) -> dict[str, Any]:
     blocks = sorted({int(sample["block"]) for sample in samples})
     block_deltas: list[float] = []
     for block in blocks:
-        base_rate = median(
-            [sample["rate"] for sample in base if int(sample["block"]) == block]
-        )
+        base_rate = median([sample["rate"] for sample in base if int(sample["block"]) == block])
         candidate_rate = median(
             [sample["rate"] for sample in candidate if int(sample["block"]) == block]
         )
@@ -130,9 +128,7 @@ def markdown(summaries: list[dict[str, Any]]) -> str:
                 blocks=item["blocks"],
                 base_lag=lag["base_median"],
                 candidate_lag=lag["candidate_median"],
-                completion=min(
-                    item["base_completion_min"], item["candidate_completion_min"]
-                ),
+                completion=min(item["base_completion_min"], item["candidate_completion_min"]),
             )
         )
     return "\n".join(lines)
