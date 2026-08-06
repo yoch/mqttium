@@ -86,8 +86,7 @@ def main() -> None:
     summary: dict[str, Any] = {}
     for variant in variants:
         rate_ratios = [
-            row["samples"][variant]["candidate"]["rate"]
-            / row["samples"][variant]["base"]["rate"]
+            row["samples"][variant]["candidate"]["rate"] / row["samples"][variant]["base"]["rate"]
             for row in cycles
         ]
         p50_ratios = [
