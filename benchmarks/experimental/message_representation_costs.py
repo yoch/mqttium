@@ -263,14 +263,10 @@ def _driver(root: Path, cycles: int, count: int, output: Path) -> None:
         rows.append({"cycle": cycle, "order": order, "samples": samples})
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps({"rows": rows}, indent=2) + "\n")
-    traces = {
-        stage: _sample(root, stage, min(count, 50_000), True) for stage in STAGES
-    }
+    traces = {stage: _sample(root, stage, min(count, 50_000), True) for stage in STAGES}
     medians = {
         stage: {
-            "ns_per_item": statistics.median(
-                row["samples"][stage]["ns_per_item"] for row in rows
-            ),
+            "ns_per_item": statistics.median(row["samples"][stage]["ns_per_item"] for row in rows),
             "rate": statistics.median(row["samples"][stage]["rate"] for row in rows),
             "shallow_size_bytes": traces[stage]["shallow_size_bytes"],
             "trace_peak_bytes": traces[stage]["trace_peak_bytes"],

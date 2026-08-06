@@ -296,8 +296,7 @@ async def _mqttium_case(
                     iterator_count if mode in ("iterator", "both_sync") else count,
                 )
                 / count,
-                "offered_rate": count
-                / max(1e-9, broker.offered_finished - broker.offered_started),
+                "offered_rate": count / max(1e-9, broker.offered_finished - broker.offered_started),
                 "post_offer_drain_ms": max(0.0, finished - broker.offered_finished) * 1000.0,
             }
         )
@@ -384,8 +383,7 @@ async def _gmqtt_case(
             {
                 "delivered": delivered,
                 "completion_ratio": delivered / count,
-                "offered_rate": count
-                / max(1e-9, broker.offered_finished - broker.offered_started),
+                "offered_rate": count / max(1e-9, broker.offered_finished - broker.offered_started),
                 "post_offer_drain_ms": max(0.0, finished - broker.offered_finished) * 1000.0,
             }
         )
@@ -528,9 +526,7 @@ def _driver(args: argparse.Namespace) -> None:
             "post_offer_drain_ms_median": statistics.median(
                 item["counters"]["post_offer_drain_ms"] for item in samples
             ),
-            "completion_ratio_min": min(
-                item["counters"]["completion_ratio"] for item in samples
-            ),
+            "completion_ratio_min": min(item["counters"]["completion_ratio"] for item in samples),
         }
         for key, samples in grouped.items()
     }
