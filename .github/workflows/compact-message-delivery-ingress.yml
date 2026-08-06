@@ -1,0 +1,58 @@
+name: Compact message delivery ingress experiment
+
+on:
+  push:
+    branches:
+      - agent/compact-message-delivery-experiment
+    paths:
+      - benchmarks/experimental/paired_compact_message_delivery.py
+      - .github/workflows/compact-message-delivery-ingress.yml
+
+permissions:
+  contents: read
+
+jobs:
+  paired-ingress:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out candidate
+        uses: actions/checkout@v7
+        with:
+          ref: agent/compact-message-delivery-experiment
+          path: candidate
+      - name: Check out exact baseline main
+        uses: actions/checkout@v7
+        with:
+          ref: 9207c6cebccbb0a7eb80476619a8ef0b016e14a6
+          path: baseline
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Record revisions
+        run: |
+          git -C baseline rev-parse HEAD
+          git -C candidate rev-parse HEAD
+          python --version
+          uname -a
+      - name: Recover the validated native ingress harness
+        run: |
+          git -C candidate fetch --depth=1 origin agent/native-hotpath-architecture-study
+          git -C candidate show FETCH_HEAD:benchmarks/experimental/native_ingress_delivery_matrix.py > /tmp/native_ingress_delivery_matrix.py
+      - name: Run fresh-process ABBA/BAAB matrix
+        env:
+          PYTHONPATH: candidate/src
+        run: |
+          python candidate/benchmarks/experimental/paired_compact_message_delivery.py \
+            --base-root baseline \
+            --candidate-root candidate \
+            --harness /tmp/native_ingress_delivery_matrix.py \
+            --blocks 4 \
+            --output results/compact-message-delivery-ingress.json \
+            | tee results/compact-message-delivery-ingress.txt
+      - name: Upload evidence
+        uses: actions/upload-artifact@v6
+        with:
+          name: compact-message-delivery-ingress-${{ github.run_id }}
+          path: results/
+          retention-days: 30
