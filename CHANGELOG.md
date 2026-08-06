@@ -44,6 +44,7 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Changed
 
+- `publish_nowait()` and `publish_many_nowait()` now compute the exact MQTT wire size for bounded-writer admission instead of encoding a disposable preview frame. QoS 1/2 now encode only the real publication after packet-ID allocation.
 - QoS 1 and pre-PUBREC QoS 2 records no longer retain contiguous encoded
   PUBLISH frames after the initial SEND; those frames duplicated the payload
   and replay already re-encoded them. Segmented `(header, payload)` items remain
