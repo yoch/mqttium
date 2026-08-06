@@ -1368,6 +1368,60 @@ class AsyncClient:
             return True
         return False
 
+    def _apply_message_effect_batch_inline(
+        self,
+        effects: deque[EngineEffect],
+        epoch: int,
+    ) -> int:
+        if epoch != self._connection_epoch or len(effects) < 2:
+            return 0
+        first: Message = effects[0].data
+        if first.qos != QoS.AT_MOST_ONCE:
+            return 0
+        callback = self.on_message
+        callback_delivery = callback is not None and self._message_delivery in (
+            "auto",
+            "callback",
+            "both",
+        )
+        iterator_delivery = self._message_delivery in ("iterator", "both") or (
+            self._message_delivery == "auto" and callback is None
+        )
+        if not callback_delivery and not iterator_delivery:
+            return 0
+        small_limit = self._delivery_small_message_limit
+        callback_worker_ready = False
+        applied = 0
+        for effect in effects:
+            if effect.kind is not EffectKind.MESSAGE:
+                break
+            msg: Message = effect.data
+            if msg.qos != QoS.AT_MOST_ONCE:
+                break
+            if small_limit is not None:
+                if (
+                    small_limit <= 0
+                    or msg.properties
+                    or len(msg.payload) + 4 * len(msg.topic) > small_limit
+                ):
+                    break
+            if iterator_delivery and self._messages.full():
+                break
+            if callback_delivery and self._callback_queue.full():
+                break
+            if iterator_delivery:
+                self._messages.put_nowait(msg)
+            if callback_delivery:
+                assert callback is not None
+                if not callback_worker_ready:
+                    self._ensure_callback_worker()
+                    callback_worker_ready = True
+                self._callback_queue.put_nowait((callback, (msg,), None))
+            applied += 1
+        if applied and iterator_delivery:
+            self._message_ready.set()
+        return applied
+
     async def _flush_effects(self, *, nowait: bool = False) -> None:
         async with self._engine_lock:
             self._collect_effects_locked()
