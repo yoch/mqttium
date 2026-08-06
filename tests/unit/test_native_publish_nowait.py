@@ -9,7 +9,10 @@ import pytest
 
 import mqttium.compat.paho as paho_compat
 from mqttium.api import AsyncClient
-from mqttium.enums import ConnectionState, QoS
+from mqttium.codec.buffer import IncrementalDecoder
+from mqttium.enums import ConnectionState, MQTTProtocolVersion, PacketType, QoS
+from mqttium.packets import PublishPacket
+from mqttium.types import Properties
 
 
 def test_publish_nowait_requires_a_running_loop() -> None:
@@ -81,3 +84,31 @@ def test_paho_uses_the_async_client_adapter_boundary() -> None:
 def test_disconnect_metadata_boundary_is_private() -> None:
     assert not hasattr(AsyncClient, "last_disconnect")
     assert hasattr(AsyncClient, "_last_disconnect_info")
+
+
+async def test_publish_nowait_direct_path_encodes_mqtt5_properties() -> None:
+    properties = Properties()
+    properties.set("content_type", "application/json")
+    properties.add_user_property("source", "native-fast-path")
+    client = AsyncClient(protocol=MQTTProtocolVersion.MQTTv5, max_outbound_messages=8)
+    client._engine.state = ConnectionState.CONNECTED
+
+    receipt = client.publish_nowait(
+        "native/mqtt5",
+        b'{"value": 42}',
+        qos=0,
+        properties=properties,
+    )
+
+    assert receipt.mid is None
+    item = client._outbound.get_nowait()
+    assert isinstance(item, bytes)
+    decoder = IncrementalDecoder()
+    decoder.feed(item)
+    raw = decoder.next_packet()
+    assert raw is not None
+    assert raw.packet_type is PacketType.PUBLISH
+    packet = PublishPacket.decode(raw.flags, raw.remaining, MQTTProtocolVersion.MQTTv5)
+    assert packet.topic == "native/mqtt5"
+    assert packet.payload == b'{"value": 42}'
+    assert packet.properties == properties

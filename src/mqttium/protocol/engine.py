@@ -135,6 +135,10 @@ class ProtocolEngine:
         self._effects = []
         return effects
 
+    @property
+    def has_pending_effects(self) -> bool:
+        return bool(self._effects)
+
     def reconfigure(self, **changes: Any) -> None:
         """Validate and apply fields that are safe to change after construction."""
         self.config.update(**changes)

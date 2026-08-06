@@ -6,6 +6,14 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Changed
+
+- Native QoS 0 publishing now prepares MQTT 3.1.1 and MQTT 5 PUBLISH frames
+  once and admits safe single or batched writes directly into the bounded writer.
+  Callback and effect-ordering cases keep the established protocol-engine path.
+- WebSocket client masking now uses lazy byte-translation tables instead of a
+  Python loop per payload byte, while retaining a fresh RFC 6455 mask per frame.
+
 ## [0.2.0b1] - 2026-08-06
 
 ### Added

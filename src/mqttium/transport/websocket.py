@@ -17,6 +17,7 @@ from mqttium.transport.stats import TransportStats
 _MAX_HANDSHAKE_BYTES = 64 * 1024
 _MAX_CONTROL_PAYLOAD = 125
 _MAX_PENDING_CONTROL = 16
+_XOR_TABLES: tuple[bytes, ...] | None = None
 
 
 class WebSocketTransport:
@@ -344,8 +345,37 @@ async def _close_stream_writer(writer: asyncio.StreamWriter) -> None:
         await writer.wait_closed()
 
 
-def _mask_client_frame(opcode: int, payload: bytes) -> bytes:
-    mask = os.urandom(4)
+def _xor_tables() -> tuple[bytes, ...]:
+    """Return the lazily-built byte translation tables used for masking."""
+
+    global _XOR_TABLES
+    tables = _XOR_TABLES
+    if tables is None:
+        tables = tuple(bytes(value ^ key for value in range(256)) for key in range(256))
+        _XOR_TABLES = tables
+    return tables
+
+
+def _mask_payload(payload: bytes, mask: bytes) -> bytes:
+    """Apply one RFC 6455 mask without a Python loop per payload byte."""
+
+    tables = _xor_tables()
+    masked = bytearray(len(payload))
+    for offset, key in enumerate(mask):
+        masked[offset::4] = payload[offset::4].translate(tables[key])
+    return bytes(masked)
+
+
+def _mask_client_frame(
+    opcode: int,
+    payload: bytes,
+    *,
+    mask: bytes | None = None,
+) -> bytes:
+    if mask is None:
+        mask = os.urandom(4)
+    elif len(mask) != 4:
+        raise ValueError("WebSocket mask must contain exactly four bytes")
     header = bytearray()
     header.append(0x80 | (opcode & 0x0F))
     ln = len(payload)
@@ -358,8 +388,7 @@ def _mask_client_frame(opcode: int, payload: bytes) -> bytes:
         header.append(0x80 | 127)
         header.extend(struct.pack("!Q", ln))
     header.extend(mask)
-    masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
-    return bytes(header) + masked
+    return bytes(header) + _mask_payload(payload, mask)
 
 
 def _parse_frame(

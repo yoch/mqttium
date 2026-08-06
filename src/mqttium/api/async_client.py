@@ -243,6 +243,7 @@ class AsyncClient:
         # async enqueue call cost while moving their state to one owner.
         self._can_enqueue_outbound_size = self._write_pump.can_enqueue_size
         self._try_enqueue_outbound = self._write_pump.try_enqueue
+        self._try_enqueue_outbound_many = self._write_pump.try_enqueue_many
         self._enqueue_outbound = self._write_pump.enqueue
         self._callback_queue: asyncio.Queue[CallbackJob] = asyncio.Queue(
             maxsize=max_pending_callbacks
@@ -540,6 +541,73 @@ class AsyncClient:
         self._register_publish_receipt(handle.mid, receipt)
         return receipt
 
+    def _direct_qos0_ready(self) -> bool:
+        """True when a native QoS 0 write can bypass the effect adapter safely."""
+
+        return (
+            self.on_publish is None
+            and not self._pending_effects
+            and not self._engine.has_pending_effects
+        )
+
+    def _try_direct_qos0_publish(
+        self,
+        topic: str,
+        payload: bytes,
+        *,
+        qos: QoS | int,
+        retain: bool,
+        properties: Properties | None,
+        nowait: bool,
+    ) -> PublishReceipt | None:
+        if QoS(qos) is not QoS.AT_MOST_ONCE or not self._direct_qos0_ready():
+            return None
+        item = self._engine.outbound.prepare_qos0(
+            topic,
+            payload,
+            retain=retain,
+            properties=properties,
+        )
+        if not self._try_enqueue_outbound(
+            item,
+            epoch=self._connection_epoch,
+        ):
+            if nowait:
+                raise FlowControlError("Outbound backpressure limit reached")
+            return None
+        return PublishReceipt(mid=None, qos=QoS.AT_MOST_ONCE, _event=None)
+
+    def _try_direct_qos0_many(
+        self,
+        requests: list[tuple[str, bytes, QoS | int, bool, Properties | None]],
+        receipt: PublishBatchReceipt,
+        *,
+        nowait: bool,
+    ) -> bool:
+        if not requests or not self._direct_qos0_ready():
+            return False
+        for _topic, _payload, qos, _retain, _properties in requests:
+            if QoS(qos) is not QoS.AT_MOST_ONCE:
+                return False
+
+        items: list[WriteItem] = []
+        for topic, payload, _qos, retain, properties in requests:
+            items.append(
+                self._engine.outbound.prepare_qos0(
+                    topic,
+                    payload,
+                    retain=retain,
+                    properties=properties,
+                )
+            )
+        if not self._try_enqueue_outbound_many(items, epoch=self._connection_epoch):
+            if nowait:
+                raise FlowControlError("Outbound backpressure limit reached")
+            return False
+        for _ in requests:
+            receipt._register(None)
+        return True
+
     def _queue_qosn_on_loop(
         self,
         topic: str,
@@ -813,6 +881,16 @@ class AsyncClient:
         elif owner_loop is not loop:
             raise RuntimeError("AsyncClient is bound to a different event loop")
         data = payload.encode("utf-8") if isinstance(payload, str) else payload
+        direct = self._try_direct_qos0_publish(
+            topic,
+            data,
+            qos=qos,
+            retain=retain,
+            properties=properties,
+            nowait=True,
+        )
+        if direct is not None:
+            return direct
         self._check_nowait_publish_capacity(topic, data, qos, retain, properties)
         receipt = self._queue_publish_on_loop(
             topic,
@@ -839,6 +917,16 @@ class AsyncClient:
             wait_for_space = False
             async with self._engine_lock:
                 try:
+                    direct = self._try_direct_qos0_publish(
+                        topic,
+                        data,
+                        qos=qos,
+                        retain=retain,
+                        properties=properties,
+                        nowait=nowait,
+                    )
+                    if direct is not None:
+                        return direct
                     if nowait:
                         self._check_nowait_publish_capacity(topic, data, qos, retain, properties)
                     # Keep the native async hot path inline. Routing these
@@ -899,6 +987,8 @@ class AsyncClient:
             wait_for_space = False
             async with self._engine_lock:
                 try:
+                    if self._try_direct_qos0_many(requests, receipt, nowait=nowait):
+                        return
                     if nowait:
                         self._check_nowait_publish_many_capacity(requests)
                     handles = self._engine.queue_publish_many(requests)
