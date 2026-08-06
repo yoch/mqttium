@@ -40,6 +40,11 @@ isolation are distinct costs.
 
 Experimental run: <https://github.com/yoch/mqttium/actions/runs/31057216680>
 
+The pull-request branch is rebased on the exact wire-size admission change from
+#40. The two changes affect independent inbound and outbound paths; the normal
+CI, benchmark, paired-regression and interoperability gates run again on the
+combined tree before merge.
+
 ## Risks
 
 The main risk is validation drift between the specialized and generic decoders.
