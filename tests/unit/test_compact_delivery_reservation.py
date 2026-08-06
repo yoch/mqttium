@@ -1,3 +1,5 @@
+"""Focused invariants for external delivery-accounting tokens."""
+
 from mqttium.api import AsyncClient
 from mqttium.types import Message
 
