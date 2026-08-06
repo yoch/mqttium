@@ -1,0 +1,59 @@
+name: Remaining object and receipt costs
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - agent/native-hotpath-architecture-study
+    paths:
+      - benchmarks/experimental/remaining_object_costs.py
+      - .github/workflows/remaining-object-costs.yml
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    steps:
+      - name: Check out study harness
+        uses: actions/checkout@v7
+        with:
+          path: harness
+      - name: Check out exact current main
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          path: runtime
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Record revisions
+        run: |
+          mkdir -p /tmp/mqttium-remaining-costs
+          {
+            echo "harness=$(git -C harness rev-parse HEAD)"
+            echo "runtime=$(git -C runtime rev-parse HEAD)"
+            python --version
+          } | tee /tmp/mqttium-remaining-costs/revisions.txt
+      - name: Run rotated fresh-process microbenchmarks
+        env:
+          PYTHONPATH: ${{ github.workspace }}/runtime/src
+        run: |
+          python harness/benchmarks/experimental/remaining_object_costs.py \
+            --root runtime \
+            --cycles 7 \
+            --count 500000 \
+            --output /tmp/mqttium-remaining-costs/remaining-object-costs.json
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: remaining-object-costs-${{ github.run_id }}
+          path: /tmp/mqttium-remaining-costs/*
+          if-no-files-found: warn
+          retention-days: 30
