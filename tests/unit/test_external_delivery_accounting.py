@@ -1,3 +1,5 @@
+"""Invariants for queue-owned inbound delivery accounting."""
+
 from dataclasses import asdict
 
 from mqttium.api import AsyncClient
