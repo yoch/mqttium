@@ -32,10 +32,30 @@ class PacketType(IntEnum):
 
     @classmethod
     def from_byte(cls, byte: int) -> PacketType:
-        try:
-            return cls(byte & 0xF0)
-        except ValueError as exc:
-            raise MalformedPacketError(f"Unknown MQTT packet type byte 0x{byte:02x}") from exc
+        packet_type = _PACKET_TYPES_BY_NIBBLE[(byte & 0xF0) >> 4]
+        if packet_type is None:
+            raise MalformedPacketError(f"Unknown MQTT packet type byte 0x{byte:02x}")
+        return packet_type
+
+
+_PACKET_TYPES_BY_NIBBLE: tuple[PacketType | None, ...] = (
+    None,
+    PacketType.CONNECT,
+    PacketType.CONNACK,
+    PacketType.PUBLISH,
+    PacketType.PUBACK,
+    PacketType.PUBREC,
+    PacketType.PUBREL,
+    PacketType.PUBCOMP,
+    PacketType.SUBSCRIBE,
+    PacketType.SUBACK,
+    PacketType.UNSUBSCRIBE,
+    PacketType.UNSUBACK,
+    PacketType.PINGREQ,
+    PacketType.PINGRESP,
+    PacketType.DISCONNECT,
+    PacketType.AUTH,
+)
 
 
 class QoS(IntEnum):
