@@ -1,0 +1,138 @@
+name: External delivery accounting benchmark
+
+on:
+  push:
+    branches:
+      - agent/external-delivery-accounting
+    paths:
+      - benchmarks/experimental/external_delivery_accounting_matrix.py
+      - .github/workflows/external-delivery-accounting-benchmark.yml
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    steps:
+      - name: Check out exact main
+        uses: actions/checkout@v7
+        with:
+          ref: 9207c6cebccbb0a7eb80476619a8ef0b016e14a6
+          path: main
+      - name: Check out exact first prototype
+        uses: actions/checkout@v7
+        with:
+          ref: e51d4218d0d1cfd6e1fa9f692f148ce125ab11a9
+          path: prototype
+      - name: Check out refined candidate
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          path: refined
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install broker and reference dependency
+        run: |
+          python -m pip install gmqtt==0.7.0
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mosquitto
+          mkdir -p /tmp/external-delivery-accounting/results
+          cat > /tmp/external-delivery-accounting/mosquitto.conf <<'MOSQ'
+          persistence false
+          allow_anonymous true
+          max_inflight_messages 1000
+          max_queued_messages 1000000
+          max_queued_bytes 0
+          connection_messages false
+          log_type error
+          listener 11883 127.0.0.1
+          MOSQ
+          mosquitto -c /tmp/external-delivery-accounting/mosquitto.conf \
+            > /tmp/external-delivery-accounting/mosquitto.log 2>&1 &
+          for i in $(seq 1 60); do
+            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            sleep 0.2
+          done
+          exit 1
+      - name: Record environment
+        run: |
+          {
+            echo "main=$(git -C main rev-parse HEAD)"
+            echo "prototype=$(git -C prototype rev-parse HEAD)"
+            echo "refined=$(git -C refined rev-parse HEAD)"
+            python --version
+            uname -a
+            mosquitto -h 2>&1 | head -1
+          } | tee /tmp/external-delivery-accounting/results/revisions.txt
+      - name: Recover validated direct ingress harness
+        run: |
+          git -C refined fetch --depth=1 origin agent/native-hotpath-architecture-study
+          git -C refined show FETCH_HEAD:benchmarks/experimental/native_ingress_delivery_matrix.py \
+            > /tmp/external-delivery-accounting/native_ingress_delivery_matrix.py
+          python -m py_compile /tmp/external-delivery-accounting/native_ingress_delivery_matrix.py
+      - name: Run three-way direct ingress and object matrix
+        run: |
+          python refined/benchmarks/experimental/external_delivery_accounting_matrix.py \
+            --main-root main \
+            --prototype-root prototype \
+            --refined-root refined \
+            --harness /tmp/external-delivery-accounting/native_ingress_delivery_matrix.py \
+            --blocks 6 \
+            --output /tmp/external-delivery-accounting/results/direct-three-way.json \
+            | tee /tmp/external-delivery-accounting/results/direct-three-way.txt
+      - name: Recover corrected native broker harness
+        run: |
+          git -C refined show FETCH_HEAD:.github/workflows/native-hotpath-study.yml \
+            > /tmp/external-delivery-accounting/native-hotpath-study.yml
+          python - <<'PY'
+          import base64
+          import gzip
+          from pathlib import Path
+
+          workflow = Path('/tmp/external-delivery-accounting/native-hotpath-study.yml').read_text().splitlines()
+          start = next(i for i, line in enumerate(workflow) if "cat > /tmp/native-hotpath.b64" in line) + 1
+          end = next(i for i in range(start, len(workflow)) if workflow[i].strip() == "B64")
+          payload = "".join(line.strip() for line in workflow[start:end])
+          source = gzip.decompress(base64.b64decode(payload)).decode()
+          source = source.replace("max_pending_callbacks=max(65_536, count),", "max_pending_callbacks=8_192,")
+          source = source.replace("max_pending_callbacks=65_536,", "max_pending_callbacks=8_192,")
+          Path('/tmp/external-delivery-accounting/native_hotpath.py').write_text(source)
+          PY
+          python -m py_compile /tmp/external-delivery-accounting/native_hotpath.py
+      - name: Run rotated Mosquitto confirmation
+        run: |
+          set -euo pipefail
+          for block in 0 1 2 3 4 5; do
+            case $((block % 3)) in
+              0) order="main prototype refined" ;;
+              1) order="prototype refined main" ;;
+              2) order="refined main prototype" ;;
+            esac
+            if (( block % 2 )); then
+              order=$(echo "$order" | awk '{print $3, $2, $1}')
+            fi
+            for variant in $order; do
+              PYTHONPATH="${{ github.workspace }}/$variant/src" \
+                python /tmp/external-delivery-accounting/native_hotpath.py \
+                  --scenario ingress_broker \
+                  --cycles 1 \
+                  --messages 240000 \
+                  --variants mqttium-baseline \
+                  --output "/tmp/external-delivery-accounting/results/broker-${block}-${variant}.json" \
+                  | tee "/tmp/external-delivery-accounting/results/broker-${block}-${variant}.txt"
+            done
+          done
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: external-delivery-accounting-${{ github.run_id }}
+          path: /tmp/external-delivery-accounting/results/*
+          if-no-files-found: warn
+          retention-days: 30
