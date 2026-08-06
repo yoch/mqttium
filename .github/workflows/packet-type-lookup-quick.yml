@@ -1,0 +1,140 @@
+name: Focused packet type lookup benchmark
+
+on:
+  push:
+    branches:
+      - agent/packet-type-lookup-experiment
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: agent/packet-type-lookup-experiment
+          path: candidate
+      - uses: actions/checkout@v7
+        with:
+          ref: c2e9d21ca68193aa94598e95b9cd13d0a9252cd3
+          path: base
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Write focused benchmark
+        run: |
+          cat > /tmp/lookup_quick.py <<'PY'
+          from __future__ import annotations
+
+          import argparse
+          import json
+          import os
+          import statistics
+          import subprocess
+          import sys
+          import time
+          from pathlib import Path
+
+          SCENARIOS = ("lookup", "decoder_p256", "engine_p256")
+
+          def measure(scenario: str) -> dict[str, float | int | str]:
+              from mqttium.codec.buffer import IncrementalDecoder
+              from mqttium.codec.primitives import pack_utf8
+              from mqttium.enums import ConnectionState, MQTTProtocolVersion, PacketType
+              from mqttium.protocol.engine import EngineConfig, ProtocolEngine
+
+              if scenario == "lookup":
+                  operations = 1_000_000
+                  for _ in range(20_000):
+                      PacketType.from_byte(0x30)
+                  started = time.perf_counter_ns()
+                  for _ in range(operations):
+                      PacketType.from_byte(0x30)
+                  elapsed = time.perf_counter_ns() - started
+                  return {"scenario": scenario, "operations": operations, "ops_per_s": operations * 1e9 / elapsed}
+
+              body = pack_utf8("bench/exact/telemetry") + b"x" * 256
+              remaining = len(body)
+              first = remaining % 128
+              rest = remaining // 128
+              encoded = bytes((first | 0x80, rest)) if rest else bytes((first,))
+              wire = b"\x30" + encoded + body
+              batch = 128
+              batches = 1_600 if scenario == "decoder_p256" else 700
+              operations = batch * batches
+              decoder = IncrementalDecoder()
+              if scenario == "decoder_p256":
+                  def consume(_packet):
+                      return None
+              else:
+                  engine = ProtocolEngine(EngineConfig(client_id="lookup", protocol=MQTTProtocolVersion.MQTTv311))
+                  engine.state = ConnectionState.CONNECTED
+                  def consume(packet):
+                      engine.handle_raw(packet)
+
+              for _ in range(20):
+                  decoder.feed(wire * batch)
+                  assert decoder.process_packets(consume, limit=batch) == batch
+                  if scenario == "engine_p256":
+                      engine.take_effects()
+              started = time.perf_counter_ns()
+              for _ in range(batches):
+                  decoder.feed(wire * batch)
+                  assert decoder.process_packets(consume, limit=batch) == batch
+                  if scenario == "engine_p256":
+                      engine.take_effects()
+              elapsed = time.perf_counter_ns() - started
+              return {"scenario": scenario, "operations": operations, "ops_per_s": operations * 1e9 / elapsed}
+
+          def child(root: Path, scenario: str) -> dict[str, object]:
+              env = os.environ.copy()
+              env["PYTHONPATH"] = str(root / "src")
+              result = subprocess.run(
+                  [sys.executable, __file__, "--worker", scenario],
+                  check=True,
+                  capture_output=True,
+                  text=True,
+                  env=env,
+              )
+              return json.loads(result.stdout)
+
+          parser = argparse.ArgumentParser()
+          parser.add_argument("--worker")
+          parser.add_argument("--base", type=Path)
+          parser.add_argument("--candidate", type=Path)
+          parser.add_argument("--output", type=Path)
+          parser.add_argument("--repeat", type=int, default=9)
+          args = parser.parse_args()
+          if args.worker:
+              print(json.dumps(measure(args.worker)))
+              raise SystemExit
+
+          report = {"base": str(args.base.resolve()), "candidate": str(args.candidate.resolve()), "repeat": args.repeat, "scenarios": []}
+          for scenario in SCENARIOS:
+              ratios = []
+              pairs = []
+              for index in range(args.repeat):
+                  order = ("base", "candidate") if index % 2 == 0 else ("candidate", "base")
+                  values = {}
+                  for variant in order:
+                      values[variant] = child(args.base if variant == "base" else args.candidate, scenario)
+                  ratio = values["candidate"]["ops_per_s"] / values["base"]["ops_per_s"]
+                  ratios.append(ratio)
+                  pairs.append({"order": order, "base_ops_per_s": values["base"]["ops_per_s"], "candidate_ops_per_s": values["candidate"]["ops_per_s"], "candidate_over_base": ratio})
+              row = {"name": scenario, "median_candidate_over_base": statistics.median(ratios), "min": min(ratios), "max": max(ratios), "positive_pairs": sum(x > 1 for x in ratios), "pairs": pairs}
+              report["scenarios"].append(row)
+              print(f"{scenario}: {row['median_candidate_over_base']:.4f}x, positive {row['positive_pairs']}/{args.repeat}")
+          args.output.parent.mkdir(parents=True, exist_ok=True)
+          args.output.write_text(json.dumps(report, indent=2) + "\n")
+          PY
+      - name: Run paired benchmark
+        run: |
+          python /tmp/lookup_quick.py --base base --candidate candidate --repeat 9 --output /tmp/results/focused.json
+      - uses: actions/upload-artifact@v7
+        with:
+          name: focused-packet-type-lookup-${{ github.run_id }}
+          path: /tmp/results/focused.json
+          retention-days: 30
