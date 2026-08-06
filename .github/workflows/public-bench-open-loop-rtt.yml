@@ -76,7 +76,7 @@ jobs:
               --scenario application_rtt_qos1 \
               --variant-index "$index" \
               --blocks 3 \
-              --profile standard \
+              --profile smoke \
               --output "/tmp/public-open-loop-rtt/rtt-${fractions[$index]}.json"
           done
       - name: Stop managed broker
