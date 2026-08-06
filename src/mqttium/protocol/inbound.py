@@ -12,7 +12,8 @@ from collections.abc import Iterator
 from typing import TYPE_CHECKING
 
 from mqttium.codec.buffer import RawPacket
-from mqttium.codec.primitives import unpack_utf8
+from mqttium.codec.packet_validation import require_nonzero_mid
+from mqttium.codec.primitives import unpack_u16, unpack_utf8
 from mqttium.enums import ConnectionState, InboundQoSState, MQTTProtocolVersion, QoS
 from mqttium.errors import MalformedPacketError, ProtocolError
 from mqttium.persistence.memory import (
@@ -31,7 +32,7 @@ from mqttium.packets import (
 from mqttium.protocol.effects import DisconnectInfo, EffectKind
 from mqttium.protocol.stats import InboundStats
 from mqttium.topics import validate_received_publish_topic
-from mqttium.types import InboundMessage, Message
+from mqttium.types import InboundMessage, Message, Properties
 
 if TYPE_CHECKING:
     from mqttium.protocol.engine import ProtocolEngine
@@ -97,6 +98,16 @@ def _decode_v311_qos0_message(raw: RawPacket) -> Message:
         mid=None,
         properties=None,
     )
+
+
+def _decode_v311_qos1_fields(
+    raw: RawPacket,
+) -> tuple[str, bytes, int, bool, bool]:
+    topic, pos = unpack_utf8(raw.remaining)
+    validate_received_publish_topic(topic, utf8_validated=True)
+    mid, pos = unpack_u16(raw.remaining, pos)
+    require_nonzero_mid(mid, "PUBLISH")
+    return topic, raw.remaining[pos:], mid, bool(raw.flags & 0x01), bool(raw.flags & 0x08)
 
 
 class InboundSession:
@@ -185,9 +196,22 @@ class InboundSession:
         engine = self._engine
         config = self.config
         store = self.store
-        if config.protocol is MQTTProtocolVersion.MQTTv311 and not (raw.flags & 0x06):
-            engine._emit(EffectKind.MESSAGE, _decode_v311_qos0_message(raw))
-            return
+        if config.protocol is MQTTProtocolVersion.MQTTv311:
+            qos = (raw.flags >> 1) & 0x03
+            if qos == int(QoS.AT_MOST_ONCE):
+                engine._emit(EffectKind.MESSAGE, _decode_v311_qos0_message(raw))
+                return
+            if qos == int(QoS.AT_LEAST_ONCE):
+                topic, payload, mid, retain, dup = _decode_v311_qos1_fields(raw)
+                self._on_qos1(
+                    topic=topic,
+                    payload=payload,
+                    mid=mid,
+                    retain=retain,
+                    dup=dup,
+                    properties=None,
+                )
+                return
         packet = PublishPacket.decode(raw.flags, raw.remaining, config.protocol)
         topic = self._resolve_topic(packet)
         validate_received_publish_topic(topic, utf8_validated=True)
@@ -221,47 +245,18 @@ class InboundSession:
                 engine._send(PubRecPacket(mid=packet.mid).encode(config.protocol))
                 return
 
-        if packet.qos == QoS.AT_LEAST_ONCE and config.manual_ack:
-            # A duplicate QoS1 publish reuses the existing Receive Maximum slot,
-            # but is surfaced again so an application can complete manual ACK
-            # after a reconnect or callback cancellation.
-            existing = store.get_in(packet.mid)
-            if existing is not None and existing.state is InboundQoSState.WAIT_PUBACK:
-                self._emit_message(existing, dup=True)
-                return
-
-        self._acquire_slot()
         if packet.qos == QoS.AT_LEAST_ONCE:
-            engine._emit(
-                EffectKind.MESSAGE,
-                Message(
-                    topic=topic,
-                    payload=packet.payload,
-                    qos=packet.qos,
-                    retain=packet.retain,
-                    dup=packet.dup,
-                    mid=packet.mid,
-                    properties=packet.properties,
-                ),
+            self._on_qos1(
+                topic=topic,
+                payload=packet.payload,
+                mid=packet.mid,
+                retain=packet.retain,
+                dup=packet.dup,
+                properties=packet.properties,
             )
-            if config.manual_ack:
-                store.put_in(
-                    InboundMessage(
-                        mid=packet.mid,
-                        topic=topic,
-                        payload=packet.payload,
-                        qos=packet.qos,
-                        retain=packet.retain,
-                        state=InboundQoSState.WAIT_PUBACK,
-                        delivered=False,
-                        properties=packet.properties,
-                    )
-                )
-            else:
-                engine._send(PubAckPacket(mid=packet.mid).encode(config.protocol))
-                self._release_slot()
             return
 
+        self._acquire_slot()
         inbound = InboundMessage(
             mid=packet.mid,
             topic=topic,
@@ -286,6 +281,57 @@ class InboundSession:
             ),
         )
         engine._send(PubRecPacket(mid=packet.mid).encode(config.protocol))
+
+    def _on_qos1(
+        self,
+        *,
+        topic: str,
+        payload: bytes,
+        mid: int,
+        retain: bool,
+        dup: bool,
+        properties: Properties | None,
+    ) -> None:
+        config = self.config
+        store = self.store
+        if config.manual_ack:
+            # A duplicate QoS1 publish reuses the existing Receive Maximum slot,
+            # but is surfaced again so an application can complete manual ACK
+            # after a reconnect or callback cancellation.
+            existing = store.get_in(mid)
+            if existing is not None and existing.state is InboundQoSState.WAIT_PUBACK:
+                self._emit_message(existing, dup=True)
+                return
+
+        self._acquire_slot()
+        self._engine._emit(
+            EffectKind.MESSAGE,
+            Message(
+                topic=topic,
+                payload=payload,
+                qos=QoS.AT_LEAST_ONCE,
+                retain=retain,
+                dup=dup,
+                mid=mid,
+                properties=properties,
+            ),
+        )
+        if config.manual_ack:
+            store.put_in(
+                InboundMessage(
+                    mid=mid,
+                    topic=topic,
+                    payload=payload,
+                    qos=QoS.AT_LEAST_ONCE,
+                    retain=retain,
+                    state=InboundQoSState.WAIT_PUBACK,
+                    delivered=False,
+                    properties=properties,
+                )
+            )
+        else:
+            self._engine._send(PubAckPacket(mid=mid).encode(config.protocol))
+            self._release_slot()
 
     def on_pubrel(self, raw: RawPacket) -> None:
         engine = self._engine

@@ -92,7 +92,7 @@ def test_v311_qos0_direct_decode_preserves_validation(
         _decode_v311_qos0_message(RawPacket(PacketType.PUBLISH, flags, remaining))
 
 
-def test_qos1_keeps_generic_acknowledged_path(monkeypatch) -> None:
+def test_qos1_uses_direct_acknowledged_path_after_composition(monkeypatch) -> None:
     calls = 0
     original = PublishPacket.decode
 
@@ -115,7 +115,7 @@ def test_qos1_keeps_generic_acknowledged_path(monkeypatch) -> None:
     assert [effect.kind for effect in effects] == [EffectKind.MESSAGE, EffectKind.SEND]
     assert effects[0].data.mid == 7
     assert effects[0].data.qos is QoS.AT_LEAST_ONCE
-    assert calls == 1
+    assert calls == 0
 
 
 def test_mqtt5_qos0_keeps_property_aware_path(monkeypatch) -> None:
