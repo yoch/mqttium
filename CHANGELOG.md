@@ -44,6 +44,7 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Changed
 
+- Inbound MQTT 3.1.1 QoS 1 PUBLISH packets now decode their delivery fields directly before entering the shared acknowledgement state machine, avoiding a short-lived intermediate `PublishPacket`; MQTT 5 and QoS 2 retain the generic decoder.
 - Inbound MQTT 3.1.1 QoS 0 PUBLISH packets now decode directly into the delivered `Message`, avoiding a short-lived intermediate `PublishPacket`; MQTT 5 and acknowledged QoS paths keep the generic decoder.
 - `publish_nowait()` and `publish_many_nowait()` now compute the exact MQTT wire size for bounded-writer admission instead of encoding a disposable preview frame. QoS 1/2 now encode only the real publication after packet-ID allocation.
 - QoS 1 and pre-PUBREC QoS 2 records no longer retain contiguous encoded
