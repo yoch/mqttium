@@ -744,6 +744,12 @@ async def _run_shared_delivery_both(spec: ScenarioSpec) -> dict[str, Any]:
             nowait=False,
         )
     await callback_started.wait()
+    shared_references = 0
+    for item in client._messages._queue:
+        if not isinstance(item, tuple):
+            continue
+        delivery_token = item[1]
+        shared_references += 1 if isinstance(delivery_token, int) else delivery_token.remaining
     snapshots.append(
         probe.snapshot(
             "loaded",
@@ -751,7 +757,7 @@ async def _run_shared_delivery_both(spec: ScenarioSpec) -> dict[str, Any]:
             callback_queued=client._callback_queue.qsize(),
             callback_active=True,
             pending_logical_bytes=client.pending_delivery_bytes,
-            shared_references=sum(message._delivery_references for message in messages),
+            shared_references=shared_references,
         )
     )
     while not client._messages.empty():

@@ -6,6 +6,14 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Changed
+
+- Inbound delivery byte accounting is now kept outside public `Message`
+  instances. One consumer carries the byte count directly; simultaneous
+  callback and iterator delivery share a compact two-reference reservation.
+  This removes private mutable state from the frozen model, makes each
+  `Message` 16 bytes smaller and preserves exact backpressure and queue bounds.
+
 ## [0.1.0a4] - 2026-08-06
 
 ### Added
