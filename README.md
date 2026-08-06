@@ -26,6 +26,14 @@ complete MQTT QoS state machines.
 
 Python **3.11–3.14** is supported. MQTTium is licensed under **Apache-2.0**.
 
+## API stability
+
+The native client is imported from `mqttium.api`; protocol enums and operational
+exceptions are imported from `mqttium`. Advanced protocol, persistence,
+transport, packet and Paho surfaces are classified separately as Provisional.
+See [`docs/API-STABILITY.md`](docs/API-STABILITY.md) for the exact Stable,
+Provisional and Internal boundaries.
+
 ## Installation
 
 ```bash
