@@ -23,18 +23,14 @@ jobs:
           python-version: "3.12"
       - name: Apply focused transformation
         run: python .github/scripts/apply_external_delivery_accounting.py
-      - name: Format and run focused tests
+      - name: Format and run unit tests
         run: |
           python -m pip install -e ".[dev]"
           ruff format src/mqttium/types.py src/mqttium/api/async_client.py \
             tests/unit/test_memory_cleanup.py tests/unit/test_external_delivery_accounting.py
           ruff check src/mqttium/types.py src/mqttium/api/async_client.py \
             tests/unit/test_memory_cleanup.py tests/unit/test_external_delivery_accounting.py
-          python -m pytest -q \
-            tests/unit/test_external_delivery_accounting.py \
-            tests/unit/test_memory_cleanup.py \
-            tests/unit/test_delivery_limits.py \
-            tests/unit/test_callback_worker.py
+          python -m pytest -q tests/unit
       - name: Remove one-shot transformer
         run: |
           rm .github/scripts/apply_external_delivery_accounting.py
