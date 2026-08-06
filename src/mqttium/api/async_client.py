@@ -1659,7 +1659,6 @@ class AsyncClient:
     ) -> DeliveryToken:
         # Keep the private signature stable for focused tests and experiments;
         # accounting state no longer lives on the public Message object.
-        _ = message, callback_delivery
         limit = self._delivery_accounted_limit
         if limit is not None and self._pending_delivery_bytes + logical_bytes > limit:
             return None
