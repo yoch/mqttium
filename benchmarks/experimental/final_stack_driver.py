@@ -113,19 +113,14 @@ def main() -> None:
     summary: dict[str, Any] = {}
     for scenario in cases:
         medians = {
-            label: statistics.median(
-                row["scenarios"][scenario][label]["rate"] for row in rows
-            )
+            label: statistics.median(row["scenarios"][scenario][label]["rate"] for row in rows)
             for label in labels
         }
         summary[scenario] = {
             "median_rates": medians,
-            "optimized_default_vs_main": medians["optimized-default"]
-            / medians["main-default"],
-            "optimized_default_vs_gmqtt": medians["optimized-default"]
-            / medians["gmqtt"],
-            "optimized_inline_vs_gmqtt": medians["optimized-inline"]
-            / medians["gmqtt"],
+            "optimized_default_vs_main": medians["optimized-default"] / medians["main-default"],
+            "optimized_default_vs_gmqtt": medians["optimized-default"] / medians["gmqtt"],
+            "optimized_inline_vs_gmqtt": medians["optimized-inline"] / medians["gmqtt"],
         }
         if scenario == "rtt":
             summary[scenario]["median_p50_ms"] = {
