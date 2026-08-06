@@ -30,7 +30,24 @@ jobs:
         with:
           python-version: "3.12"
       - name: Build composed candidate
-        run: python harness/.github/scripts/rebuild_qos1_after_qos0.py candidate
+        run: |
+          python harness/.github/scripts/rebuild_qos1_after_qos0.py candidate
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("candidate/tests/unit/test_qos0_v311_decode_fastpath.py")
+          text = path.read_text()
+          old = "def test_qos1_keeps_generic_acknowledged_path(monkeypatch) -> None:"
+          new = "def test_qos1_uses_direct_acknowledged_path_after_composition(monkeypatch) -> None:"
+          if old not in text:
+              raise RuntimeError("QoS0 composition test name did not match")
+          text = text.replace(old, new, 1)
+          marker = "    assert effects[0].data.qos is QoS.AT_LEAST_ONCE\n    assert calls == 1\n"
+          replacement = "    assert effects[0].data.qos is QoS.AT_LEAST_ONCE\n    assert calls == 0\n"
+          if marker not in text:
+              raise RuntimeError("QoS0 composition assertion did not match")
+          path.write_text(text.replace(marker, replacement, 1))
+          PY
       - name: Install validation dependencies
         working-directory: candidate
         run: python -m pip install -e ".[dev,security,fuzz]"
@@ -39,6 +56,7 @@ jobs:
         run: |
           ruff format \
             src/mqttium/protocol/inbound.py \
+            tests/unit/test_qos0_v311_decode_fastpath.py \
             tests/unit/test_qos1_v311_decode_fastpath.py \
             benchmarks/qos1_v311_decode.py
           ruff format --check src tests benchmarks
@@ -58,6 +76,7 @@ jobs:
           mkdir -p /tmp/qos1-rebase/docs
           cp candidate/CHANGELOG.md /tmp/qos1-rebase/CHANGELOG.md
           cp candidate/src/mqttium/protocol/inbound.py /tmp/qos1-rebase/src/mqttium/protocol/inbound.py
+          cp candidate/tests/unit/test_qos0_v311_decode_fastpath.py /tmp/qos1-rebase/tests/unit/test_qos0_v311_decode_fastpath.py
           cp candidate/tests/unit/test_qos1_v311_decode_fastpath.py /tmp/qos1-rebase/tests/unit/test_qos1_v311_decode_fastpath.py
           cp candidate/benchmarks/qos1_v311_decode.py /tmp/qos1-rebase/benchmarks/qos1_v311_decode.py
           cp candidate/docs/QOS1-V311-DECODE.md /tmp/qos1-rebase/docs/QOS1-V311-DECODE.md
