@@ -22,6 +22,7 @@ from mqttium.packets import (
 )
 from mqttium.persistence.sqlite import SqliteInflightStore
 from mqttium.protocol.engine import EngineConfig, ProtocolEngine
+from mqttium.types import Properties
 
 
 class BatchBrokerTransport:
@@ -81,6 +82,36 @@ def client_with_broker(
 
     client._transport_factory = factory
     return client, broker
+
+
+async def test_publish_many_qos0_encodes_mqtt5_properties() -> None:
+    client, broker = client_with_broker(protocol=MQTTProtocolVersion.MQTTv5)
+    await client.connect("fake", timeout=2.0)
+    properties = Properties()
+    properties.set("content_type", "application/json")
+    properties.add_user_property("source", "native-batch-fast-path")
+
+    receipt = await client.publish_many(
+        [
+            PublishMessage(
+                "batch/mqtt5",
+                f'{{"index": {index}}}',
+                qos=0,
+                properties=properties,
+            )
+            for index in range(40)
+        ],
+        chunk_size=13,
+    )
+    await asyncio.wait_for(client._outbound.join(), timeout=2.0)
+    await receipt.wait()
+
+    assert receipt.completed == 40
+    assert [packet.topic for packet in broker.publishes] == ["batch/mqtt5"] * 40
+    assert [packet.properties for packet in broker.publishes] == [properties] * 40
+    assert broker.publishes[0].payload == b'{"index": 0}'
+    assert broker.publishes[-1].payload == b'{"index": 39}'
+    await client.disconnect()
 
 
 async def test_publish_many_qos0_uses_immediate_aggregate_receipt() -> None:
