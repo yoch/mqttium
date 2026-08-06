@@ -15,6 +15,57 @@ from mqttium.transport.writes import SEGMENT_THRESHOLD, WriteItem
 from mqttium.types import Properties
 
 
+def encode_publish_item(
+    topic: str,
+    payload: bytes,
+    *,
+    qos: QoS | int,
+    retain: bool,
+    dup: bool,
+    mid: int | None,
+    properties: Properties | None,
+    protocol: MQTTProtocolVersion = MQTTProtocolVersion.MQTTv311,
+) -> WriteItem:
+    """Validate and encode one outbound PUBLISH exactly once."""
+
+    try:
+        level = QoS(qos)
+    except ValueError as exc:
+        raise ProtocolError(f"Invalid PUBLISH QoS {qos!r}") from exc
+    if level and mid is None:
+        raise ProtocolError("QoS > 0 PUBLISH requires a packet identifier")
+    if level == QoS.AT_MOST_ONCE and mid is not None:
+        raise ProtocolError("QoS 0 PUBLISH must not carry a packet identifier")
+    if level == QoS.AT_MOST_ONCE and dup:
+        raise ProtocolError("QoS 0 PUBLISH must not set DUP")
+    if mid is not None:
+        _require_outbound_mid(mid, PUBLISH)
+
+    flags = (int(level) << 1) | (0x01 if retain else 0) | (0x08 if dup else 0)
+    topic_bytes = encode_utf8(topic)
+    topic_size = len(topic_bytes)
+    props = _props_or_empty(properties, PUBLISH, protocol)
+    payload_size = len(payload)
+    remaining_length = 2 + topic_size + (2 if level else 0) + len(props) + payload_size
+
+    header = bytearray()
+    header.append(int(PacketType.PUBLISH) | flags)
+    append_vbi(header, remaining_length)
+    header.append((topic_size >> 8) & 0xFF)
+    header.append(topic_size & 0xFF)
+    header.extend(topic_bytes)
+    if level:
+        assert mid is not None
+        header.append((mid >> 8) & 0xFF)
+        header.append(mid & 0xFF)
+    header.extend(props)
+
+    if payload_size >= SEGMENT_THRESHOLD:
+        return bytes(header), bytes(payload)
+    header.extend(payload)
+    return bytes(header)
+
+
 @dataclass(slots=True, frozen=True)
 class PublishPacket:
     topic: str
@@ -35,56 +86,16 @@ class PublishPacket:
         self,
         protocol: MQTTProtocolVersion = MQTTProtocolVersion.MQTTv311,
     ) -> WriteItem:
-        try:
-            qos = QoS(self.qos)
-        except ValueError as exc:
-            raise ProtocolError(f"Invalid PUBLISH QoS {self.qos!r}") from exc
-        if qos and self.mid is None:
-            raise ProtocolError("QoS > 0 PUBLISH requires a packet identifier")
-        if qos == QoS.AT_MOST_ONCE and self.mid is not None:
-            raise ProtocolError("QoS 0 PUBLISH must not carry a packet identifier")
-        if qos == QoS.AT_MOST_ONCE and self.dup:
-            raise ProtocolError("QoS 0 PUBLISH must not set DUP")
-        if self.mid is not None:
-            _require_outbound_mid(self.mid, PUBLISH)
-
-        flags = 0
-        if self.retain:
-            flags |= 0x01
-        flags |= int(qos) << 1
-        if self.dup:
-            flags |= 0x08
-
-        topic_bytes = encode_utf8(self.topic)
-        topic_len = len(topic_bytes)
-
-        props = _props_or_empty(self.properties, PUBLISH, protocol)
-        payload = self.payload
-        payload_len = len(payload)
-        mid_len = 2 if qos else 0
-        remaining_length = 2 + topic_len + mid_len + len(props) + payload_len
-
-        # Append-built buffer beats pre-sized index writes for typical small
-        # PUBLISH frames (measured ~1.8× on QoS0 microbench).
-        out = bytearray()
-        out.append(int(PacketType.PUBLISH) | (flags & 0x0F))
-        append_vbi(out, remaining_length)
-        out.append((topic_len >> 8) & 0xFF)
-        out.append(topic_len & 0xFF)
-        out.extend(topic_bytes)
-        if qos:
-            assert self.mid is not None
-            mid = self.mid
-            out.append((mid >> 8) & 0xFF)
-            out.append(mid & 0xFF)
-        if props:
-            out.extend(props)
-
-        if payload_len >= SEGMENT_THRESHOLD and isinstance(payload, (bytes, bytearray)):
-            return (bytes(out), bytes(payload))
-        if payload_len:
-            out.extend(payload)
-        return bytes(out)
+        return encode_publish_item(
+            self.topic,
+            self.payload,
+            qos=self.qos,
+            retain=self.retain,
+            dup=self.dup,
+            mid=self.mid,
+            properties=self.properties,
+            protocol=protocol,
+        )
 
     @classmethod
     def decode(

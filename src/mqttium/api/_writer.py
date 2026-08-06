@@ -160,6 +160,39 @@ class WritePump:
         self.queued_bytes += size
         return True
 
+    def try_enqueue_many(
+        self,
+        items: list[WriteItem],
+        *,
+        epoch: int | None = None,
+    ) -> bool:
+        """Atomically append a bounded ordered batch without suspending."""
+
+        if epoch is None:
+            epoch = self.epoch
+        if epoch != self.epoch:
+            raise StaleConnectionEffect
+        if not items:
+            return True
+
+        messages = self.queue.qsize()
+        bytes_used = self.queued_bytes
+        for item in items:
+            size = item_size(item)
+            if not self.can_enqueue_size(
+                size,
+                queued_messages=messages,
+                queued_bytes=bytes_used,
+            ):
+                return False
+            messages += 1
+            bytes_used += size
+
+        for item in items:
+            self.queue.put_nowait(item)
+        self.queued_bytes = bytes_used
+        return True
+
     async def enqueue(
         self,
         item: WriteItem,

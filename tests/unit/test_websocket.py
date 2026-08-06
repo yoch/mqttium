@@ -281,3 +281,28 @@ async def test_write_many_groups_frames_within_byte_budget() -> None:
     assert len(writer.batches[0]) == 3
     assert len(writer.batches[1]) == 1
     assert sum(map(len, writer.batches[0])) <= 256
+
+
+@pytest.mark.parametrize("payload_size", [0, 1, 2, 3, 4, 5, 125, 126, 127, 65_535, 65_536])
+def test_vectorized_mask_matches_rfc_xor_at_length_boundaries(payload_size: int) -> None:
+    payload = bytes(range(251)) * (payload_size // 251) + bytes(range(payload_size % 251))
+    mask = b"\x12\x34\x56\x78"
+
+    frame = _mask_client_frame(0x2, payload, mask=mask)
+    header_size = 2 if payload_size < 126 else 4 if payload_size < 65_536 else 10
+    assert frame[header_size : header_size + 4] == mask
+    assert frame[header_size + 4 :] == bytes(
+        value ^ mask[index & 3] for index, value in enumerate(payload)
+    )
+
+    parsed = _parse_frame(
+        bytearray(frame),
+        max(payload_size, 1),
+        expect_masked=True,
+    )
+    assert parsed == (True, 0x2, payload)
+
+
+def test_mask_frame_rejects_non_four_byte_test_mask() -> None:
+    with pytest.raises(ValueError, match="four bytes"):
+        _mask_client_frame(0x2, b"payload", mask=b"bad")

@@ -40,6 +40,7 @@ from mqttium.packets import (
     PubRecPacket,
     PubRelPacket,
 )
+from mqttium.packets.publish import encode_publish_item
 from mqttium.persistence.memory import PagedInflightStore, TransitionInflightStore
 from mqttium.protocol.effects import EffectKind, PublishFailure, PublishHandle
 from mqttium.protocol.flow_control import FlowControl
@@ -277,17 +278,16 @@ class OutboundSession:
 
     # --- queueing ----------------------------------------------------------
 
-    def queue_publish(
+    def _validate_publish_request(
         self,
         topic: str,
-        payload: bytes = b"",
-        *,
-        qos: QoS | int = QoS.AT_MOST_ONCE,
-        retain: bool = False,
-        properties: Properties | None = None,
-    ) -> PublishHandle:
-        engine = self._engine
-        qos = QoS(qos)
+        qos: QoS | int,
+        retain: bool,
+        properties: Properties | None,
+    ) -> QoS:
+        """Validate one outbound PUBLISH against local and negotiated rules."""
+
+        level = QoS(qos)
         allow_empty = bool(
             properties
             and properties.get("topic_alias")
@@ -295,11 +295,12 @@ class OutboundSession:
         )
         validate_publish_topic(topic, allow_empty=allow_empty)
 
+        engine = self._engine
         if engine.state == ConnectionState.CONNECTED:
             negotiated = engine.negotiated
-            if qos > negotiated.maximum_qos:
+            if level > negotiated.maximum_qos:
                 raise ProtocolError(
-                    f"QoS {int(qos)} exceeds broker maximum_qos {negotiated.maximum_qos}"
+                    f"QoS {int(level)} exceeds broker maximum_qos {negotiated.maximum_qos}"
                 )
             if retain and not negotiated.retain_available:
                 raise ProtocolError("Broker does not support retain")
@@ -311,22 +312,69 @@ class OutboundSession:
                         f"{negotiated.topic_alias_maximum}"
                     )
 
-        if engine.state != ConnectionState.CONNECTED and qos == QoS.AT_MOST_ONCE:
+        if engine.state != ConnectionState.CONNECTED and level == QoS.AT_MOST_ONCE:
             raise NotConnectedError("Cannot publish QoS 0 while disconnected")
+        return level
+
+    def _prepare_qos0_validated(
+        self,
+        topic: str,
+        payload: bytes,
+        *,
+        retain: bool,
+        properties: Properties | None,
+    ) -> WriteItem:
+        item = encode_publish_item(
+            topic,
+            payload,
+            qos=QoS.AT_MOST_ONCE,
+            retain=retain,
+            dup=False,
+            mid=None,
+            properties=properties,
+            protocol=self.config.protocol,
+        )
+        self._engine._check_outbound_size(item)
+        return item
+
+    def prepare_qos0(
+        self,
+        topic: str,
+        payload: bytes,
+        *,
+        retain: bool = False,
+        properties: Properties | None = None,
+    ) -> WriteItem:
+        """Prepare a mutation-free QoS 0 publication for the native runtime."""
+
+        self._validate_publish_request(topic, QoS.AT_MOST_ONCE, retain, properties)
+        return self._prepare_qos0_validated(
+            topic,
+            payload,
+            retain=retain,
+            properties=properties,
+        )
+
+    def queue_publish(
+        self,
+        topic: str,
+        payload: bytes = b"",
+        *,
+        qos: QoS | int = QoS.AT_MOST_ONCE,
+        retain: bool = False,
+        properties: Properties | None = None,
+    ) -> PublishHandle:
+        engine = self._engine
+        qos = self._validate_publish_request(topic, qos, retain, properties)
 
         if qos == QoS.AT_MOST_ONCE:
-            packet = PublishPacket(
-                topic=topic,
-                payload=payload,
-                qos=qos,
+            item = self._prepare_qos0_validated(
+                topic,
+                payload,
                 retain=retain,
-                dup=False,
-                mid=None,
                 properties=properties,
             )
-            wire = packet.encode_write_item(self.config.protocol)
-            engine._check_outbound_size(wire)
-            self._send(wire)
+            self._send(item)
             # Completion follows SEND so compatibility on_publish cannot run
             # before the outbound queue has accepted the frame.
             self._emit(EffectKind.PUBLISH_COMPLETE, None)
