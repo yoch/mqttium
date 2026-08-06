@@ -1,0 +1,89 @@
+name: Repair external accounting memory profile
+
+on:
+  push:
+    branches:
+      - agent/external-delivery-accounting
+    paths:
+      - .github/workflows/repair-external-accounting-memory-profile.yml
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: agent/external-delivery-accounting
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Update queue-owned reservation measurement
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("benchmarks/memory_profile.py")
+          text = path.read_text()
+          old = '''    snapshots.append(
+        probe.snapshot(
+            "loaded",
+            iterator_messages=client._messages.qsize(),
+            callback_queued=client._callback_queue.qsize(),
+            callback_active=True,
+            pending_logical_bytes=client.pending_delivery_bytes,
+            shared_references=sum(message._delivery_references for message in messages),
+        )
+    )
+'''
+          new = '''    shared_references = 0
+    for item in client._messages._queue:
+        if not isinstance(item, tuple):
+            continue
+        delivery_token = item[1]
+        shared_references += (
+            1 if isinstance(delivery_token, int) else delivery_token.remaining
+        )
+    snapshots.append(
+        probe.snapshot(
+            "loaded",
+            iterator_messages=client._messages.qsize(),
+            callback_queued=client._callback_queue.qsize(),
+            callback_active=True,
+            pending_logical_bytes=client.pending_delivery_bytes,
+            shared_references=shared_references,
+        )
+    )
+'''
+          if text.count(old) != 1:
+              raise RuntimeError("unexpected shared delivery profile shape")
+          path.write_text(text.replace(old, new, 1))
+          PY
+          rm .github/workflows/repair-external-accounting-memory-profile.yml
+      - name: Validate focused profile
+        run: |
+          python -m pip install -e ".[dev]" "psutil>=6"
+          ruff format benchmarks/memory_profile.py
+          ruff check benchmarks/memory_profile.py
+          python benchmarks/memory_profile.py \
+            --child shared_delivery_both_4k \
+            --count 1500 \
+            --payload-size 4096 \
+            --output /tmp/shared-delivery-both.json
+          python - <<'PY'
+          import json
+
+          result = json.load(open("/tmp/shared-delivery-both.json"))
+          loaded = next(item for item in result["snapshots"] if item["phase"] == "loaded")
+          assert loaded["details"]["shared_references"] == 3000
+          assert loaded["details"]["pending_logical_bytes"] > 0
+          PY
+      - name: Commit benchmark repair
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add benchmarks/memory_profile.py .github
+          git commit -m "Measure queue-owned delivery reservations"
+          git push origin HEAD:agent/external-delivery-accounting
