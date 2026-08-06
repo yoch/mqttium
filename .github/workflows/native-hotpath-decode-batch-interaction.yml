@@ -56,11 +56,7 @@ jobs:
           ruff check src/mqttium/protocol/inbound.py src/mqttium/api/_effects.py src/mqttium/api/async_client.py
           mypy src/mqttium
           bandit -q -ll -r src
-          python -m pytest -q \
-            tests/unit/test_effect_pump.py \
-            tests/unit/test_delivery_byte_backpressure.py \
-            tests/unit/test_message_delivery_both.py \
-            tests/unit/test_callback_isolation.py
+          python -m pytest -q tests/unit
       - name: Start isolated Mosquitto
         run: |
           mkdir -p /tmp/mqttium-decode-batch
