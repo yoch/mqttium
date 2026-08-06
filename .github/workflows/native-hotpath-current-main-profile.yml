@@ -1,0 +1,160 @@
+name: Native hotpath current-main profile
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - agent/native-hotpath-architecture-study
+    paths:
+      - .github/workflows/native-hotpath-current-main-profile.yml
+
+permissions:
+  contents: read
+
+jobs:
+  profile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    steps:
+      - name: Check out study harness
+        uses: actions/checkout@v7
+        with:
+          path: harness
+      - name: Check out exact current main
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          path: runtime
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install clients and broker
+        run: |
+          python -m pip install gmqtt==0.7.0
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mosquitto
+          mkdir -p /tmp/mqttium-current-profile
+          cat > /tmp/mqttium-current-profile/mosquitto.conf <<'MOSQ'
+          persistence false
+          allow_anonymous true
+          max_inflight_messages 1000
+          max_queued_messages 1000000
+          max_queued_bytes 0
+          connection_messages false
+          log_type error
+          listener 11883 127.0.0.1
+          MOSQ
+          mosquitto -c /tmp/mqttium-current-profile/mosquitto.conf \
+            > /tmp/mqttium-current-profile/mosquitto.log 2>&1 &
+          for i in $(seq 1 60); do
+            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            sleep 0.2
+          done
+          exit 1
+      - name: Record revisions
+        run: |
+          {
+            echo "harness=$(git -C harness rev-parse HEAD)"
+            echo "runtime=$(git -C runtime rev-parse HEAD)"
+            python --version
+            python -m pip show gmqtt | grep '^Version:'
+            mosquitto -h 2>&1 | head -1
+          } | tee /tmp/mqttium-current-profile/revisions.txt
+      - name: Recover corrected native harness
+        run: |
+          python - <<'PY'
+          import base64
+          import gzip
+          from pathlib import Path
+
+          workflow = Path('harness/.github/workflows/native-hotpath-study.yml').read_text().splitlines()
+          start = next(i for i, line in enumerate(workflow) if "cat > /tmp/native-hotpath.b64" in line) + 1
+          end = next(i for i in range(start, len(workflow)) if workflow[i].strip() == "B64")
+          payload = "".join(line.strip() for line in workflow[start:end])
+          source = gzip.decompress(base64.b64decode(payload)).decode()
+          source = source.replace("max_pending_callbacks=max(65_536, count),", "max_pending_callbacks=8_192,")
+          source = source.replace("max_pending_callbacks=65_536,", "max_pending_callbacks=8_192,")
+          Path('/tmp/native_hotpath_matrix.py').write_text(source)
+          PY
+          python -m py_compile /tmp/native_hotpath_matrix.py
+      - name: Profile complete hot paths
+        env:
+          PYTHONPATH: ${{ github.workspace }}/runtime/src
+        run: |
+          python -m cProfile -o /tmp/mqttium-current-profile/ingress-mqttium-isolated.prof \
+            /tmp/native_hotpath_matrix.py --worker --scenario ingress_direct \
+            --variant mqttium-baseline --messages 140000
+          python -m cProfile -o /tmp/mqttium-current-profile/ingress-mqttium-inline.prof \
+            /tmp/native_hotpath_matrix.py --worker --scenario ingress_direct \
+            --variant mqttium-sync-inline --messages 140000
+          python -m cProfile -o /tmp/mqttium-current-profile/ingress-gmqtt.prof \
+            /tmp/native_hotpath_matrix.py --worker --scenario ingress_direct \
+            --variant gmqtt --messages 140000
+          python -m cProfile -o /tmp/mqttium-current-profile/rtt-mqttium-nowait.prof \
+            /tmp/native_hotpath_matrix.py --worker --scenario rtt \
+            --variant mqttium-nowait --pairs 7000 --window 32
+          python -m cProfile -o /tmp/mqttium-current-profile/rtt-mqttium-inline-nowait.prof \
+            /tmp/native_hotpath_matrix.py --worker --scenario rtt \
+            --variant mqttium-sync-inline-nowait --pairs 7000 --window 32
+          python -m cProfile -o /tmp/mqttium-current-profile/rtt-gmqtt.prof \
+            /tmp/native_hotpath_matrix.py --worker --scenario rtt \
+            --variant gmqtt --pairs 7000 --window 32
+      - name: Export readable profiles
+        run: |
+          python - <<'PY'
+          import io
+          import json
+          import pstats
+          from pathlib import Path
+
+          root = Path('/tmp/mqttium-current-profile')
+          summary = {}
+          for profile in root.glob('*.prof'):
+              chunks = []
+              for key in ('tottime', 'cumulative'):
+                  stream = io.StringIO()
+                  stats = pstats.Stats(profile, stream=stream).strip_dirs().sort_stats(key)
+                  stats.print_stats(80)
+                  chunks.append(f'### sorted by {key}\n{stream.getvalue()}')
+              profile.with_suffix('.txt').write_text('\n'.join(chunks))
+              stats = pstats.Stats(profile)
+              summary[profile.name] = {
+                  'total_calls': stats.total_calls,
+                  'primitive_calls': stats.prim_calls,
+                  'total_tt_s': stats.total_tt,
+              }
+          (root / 'profile-summary.json').write_text(json.dumps(summary, indent=2) + '\n')
+          PY
+      - name: Fixed-work allocation peaks
+        env:
+          PYTHONPATH: ${{ github.workspace }}/runtime/src
+        run: |
+          python /tmp/native_hotpath_matrix.py --worker --trace \
+            --scenario ingress_direct --variant mqttium-baseline --messages 70000 \
+            > /tmp/mqttium-current-profile/trace-ingress-mqttium-isolated.jsonl
+          python /tmp/native_hotpath_matrix.py --worker --trace \
+            --scenario ingress_direct --variant mqttium-sync-inline --messages 70000 \
+            > /tmp/mqttium-current-profile/trace-ingress-mqttium-inline.jsonl
+          python /tmp/native_hotpath_matrix.py --worker --trace \
+            --scenario ingress_direct --variant gmqtt --messages 70000 \
+            > /tmp/mqttium-current-profile/trace-ingress-gmqtt.jsonl
+          python /tmp/native_hotpath_matrix.py --worker --trace \
+            --scenario rtt --variant mqttium-nowait --pairs 5000 --window 32 \
+            > /tmp/mqttium-current-profile/trace-rtt-mqttium-nowait.jsonl
+          python /tmp/native_hotpath_matrix.py --worker --trace \
+            --scenario rtt --variant mqttium-sync-inline-nowait --pairs 5000 --window 32 \
+            > /tmp/mqttium-current-profile/trace-rtt-mqttium-inline-nowait.jsonl
+          python /tmp/native_hotpath_matrix.py --worker --trace \
+            --scenario rtt --variant gmqtt --pairs 5000 --window 32 \
+            > /tmp/mqttium-current-profile/trace-rtt-gmqtt.jsonl
+      - name: Upload current-main profile evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-hotpath-current-main-profile-${{ github.run_id }}
+          path: /tmp/mqttium-current-profile/*
+          if-no-files-found: warn
+          retention-days: 30
