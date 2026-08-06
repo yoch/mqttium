@@ -27,7 +27,8 @@ client.
 | `username_pw_set` / `will_set` / `user_data_set` | Supported | Configure before `connect` |
 | `is_connected` | Supported | |
 | `max_queued_messages_set(n)` | Supported | Bounds unfinished QoS 1/2 publications; `0` means unlimited, as in Paho |
-| `max_queued_bytes_set(n)` | **Additive** | No Paho equivalent; bounds the same queue by logical topic+payload+properties bytes |
+| `max_queued_bytes_set(n)` | **Additive** | No Paho equivalent; bounds unfinished native publications by logical bytes |
+| `max_pending_publish_requests` / `max_pending_publish_bytes` | **Additive constructor limits** | Hard bounds for requests retained in the cross-thread handoff before loop-side admission |
 
 For one-shot helpers, prefer the async-native `mqttium.helpers` API instead of
 `paho.mqtt.publish` or `paho.mqtt.subscribe`.
@@ -46,7 +47,7 @@ For one-shot helpers, prefer the async-native `mqttium.helpers` API instead of
 | WebSocket / proxy / SOCKS support | Broad surface | WebSocket through `AsyncClient.connect_ws`; not through the sync façade | Keep transport concerns separate from compatibility concerns |
 | Paho file persistence formats | Supported | `SqliteInflightStore` through `AsyncClient` | Do not reproduce Paho-specific binary persistence formats |
 | `suppress_exceptions` | Supported | Not supported | Errors must remain observable |
-| Queue saturation | Silently drops or grows without bound depending on `max_queued_messages` | `publish()` returns `MQTT_ERR_QUEUE_SIZE` (15) | The façade runs `publish_backpressure="error"`: a blocking API must refuse rather than stall the caller's thread |
+| Queue saturation | Silently drops or grows without bound depending on `max_queued_messages` | `publish()` returns `MQTT_ERR_QUEUE_SIZE` (15) | Both the cross-thread handoff and native unfinished-publication queue are bounded; a blocking API must refuse rather than stall the caller's thread |
 | `wait_for_publish()` / `is_published()` after a failed publish | Report success | **Raise** | Reporting a publication that never happened is worse than an exception |
 | Public `max_inflight_messages` | Coupled to MID handling | `local_receive_maximum` plus `FlowControl` | Receive Maximum is not the packet-identifier space |
 
@@ -102,11 +103,19 @@ receipts, connection epochs, and effect ordering are committed together on the
 network loop. Protecting only `queue_publish()` with an extra mutex would leave
 other engine paths and lifecycle transitions outside the same critical section.
 
-The compatibility façade instead uses one thread-safe ingress queue. Each loop
-callback drains at most 256 requests and targets at most 1 MiB of logical topic
-plus payload bytes. A single request larger than that target is processed alone,
-so these limits bound work per drain rather than total ingress memory; they do
-not impose a new payload-size limit.
+The compatibility façade instead uses one thread-safe ingress queue. Its retained
+requests are hard-bounded independently by `max_pending_publish_requests` and
+`max_pending_publish_bytes` (10,000 requests and 64 MiB by default). Admission
+reserves both limits before retaining the payload; saturation returns
+`MQTT_ERR_QUEUE_SIZE` without scheduling or mutating native protocol state. The
+reservation is released after loop-side admission, cancellation, scheduling
+failure, or shutdown.
+
+Each loop callback still drains at most 256 requests and targets at most 1 MiB
+of logical topic plus payload bytes. A single request larger than that *drain*
+target is processed alone. This batching target limits work per event-loop turn;
+the separate handoff byte limit is the actual retained-memory bound and must be
+configured high enough for the largest publication accepted by the façade.
 
 QoS 1/2 callers wait on a cancel-aware cross-thread result only until that
 commit completes. If the handoff times out before admission begins, the request

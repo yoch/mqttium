@@ -254,10 +254,11 @@ def test_mixed_qos_requests_preserve_ingress_order(monkeypatch: pytest.MonkeyPat
     qos1_enqueued = threading.Event()
     original_enqueue = client._enqueue_publish_request
 
-    def traced_enqueue(request) -> None:
-        original_enqueue(request)
-        if request.qos is QoS.AT_LEAST_ONCE:
+    def traced_enqueue(request) -> bool:
+        accepted = original_enqueue(request)
+        if accepted and request.qos is QoS.AT_LEAST_ONCE:
             qos1_enqueued.set()
+        return accepted
 
     monkeypatch.setattr(client, "_enqueue_publish_request", traced_enqueue)
 
@@ -490,6 +491,8 @@ def test_publish_timeout_cancels_before_admission(monkeypatch: pytest.MonkeyPatc
         assert client._async._engine.pending_outbound_messages == 0
         assert not client._async._engine.packet_ids
         assert not client._async._receipts
+        assert client._pending_publish_requests == 0
+        assert client._pending_publish_bytes == 0
     finally:
         release.set()
         client.loop_stop()
@@ -575,6 +578,8 @@ def test_loop_stop_fails_queued_qos1_publish(monkeypatch: pytest.MonkeyPatch) ->
         assert len(errors) == 1
         assert "stopped before publish admission" in str(errors[0])
         assert client._async._engine.pending_outbound_messages == 0
+        assert client._pending_publish_requests == 0
+        assert client._pending_publish_bytes == 0
     finally:
         release.set()
         if client._thread is not None:

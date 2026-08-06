@@ -101,7 +101,6 @@ class _PendingPublish:
     def discard_payload(self) -> None:
         self.topic = ""
         self.payload = None
-        self.logical_size = 0
 
 
 class MQTTMessage:
@@ -137,11 +136,17 @@ class Client:
         clean_start: bool = True,
         max_pending_outbound_messages: int | None = 10_000,
         max_pending_outbound_bytes: int | None = 64 * 1024 * 1024,
+        max_pending_publish_requests: int = 10_000,
+        max_pending_publish_bytes: int = 64 * 1024 * 1024,
     ) -> None:
         if callback_api_version is not CallbackAPIVersion.VERSION2:
             raise ValueError("mqttium.compat.paho only supports CallbackAPIVersion.VERSION2")
         if clean_session is not None:
             clean_start = bool(clean_session)
+        if max_pending_publish_requests <= 0:
+            raise ValueError("max_pending_publish_requests must be greater than 0")
+        if max_pending_publish_bytes <= 0:
+            raise ValueError("max_pending_publish_bytes must be greater than 0")
         self._userdata = userdata
         self._async = AsyncClient(
             client_id=client_id,
@@ -166,6 +171,10 @@ class Client:
         self._publish_pending: SimpleQueue[_PendingPublish] = SimpleQueue()
         self._publish_spillover: _PendingPublish | None = None
         self._publish_schedule_lock = threading.Lock()
+        self._max_pending_publish_requests = max_pending_publish_requests
+        self._max_pending_publish_bytes = max_pending_publish_bytes
+        self._pending_publish_requests = 0
+        self._pending_publish_bytes = 0
         self._publish_drain_scheduled = False
 
         self.on_connect: Callable[..., Any] | None = None
@@ -395,14 +404,25 @@ class Client:
     def _on_network_thread(self) -> bool:
         return threading.current_thread() is self._thread
 
-    def _enqueue_publish_request(self, request: _PendingPublish) -> None:
+    def _enqueue_publish_request(self, request: _PendingPublish) -> bool:
+        """Reserve bounded cross-thread ingress capacity and schedule one drain."""
         loop = self._loop
         if self._stopping.is_set() or loop is None or not loop.is_running():
             raise RuntimeError("network loop is not running")
 
-        self._publish_pending.put(request)
         schedule = False
         with self._publish_schedule_lock:
+            if self._stopping.is_set() or not loop.is_running():
+                raise RuntimeError("network loop is not running")
+            if (
+                self._pending_publish_requests >= self._max_pending_publish_requests
+                or self._pending_publish_bytes + request.logical_size
+                > self._max_pending_publish_bytes
+            ):
+                return False
+            self._pending_publish_requests += 1
+            self._pending_publish_bytes += request.logical_size
+            self._publish_pending.put(request)
             if not self._publish_drain_scheduled:
                 self._publish_drain_scheduled = True
                 schedule = True
@@ -410,12 +430,22 @@ class Client:
             try:
                 loop.call_soon_threadsafe(self._drain_publish_requests)
             except RuntimeError:
-                with self._publish_schedule_lock:
-                    self._publish_drain_scheduled = False
                 self._fail_pending_publish_requests(
                     RuntimeError("network loop stopped before publish admission")
                 )
                 raise
+        return True
+
+    def _release_publish_request_locked(self, request: _PendingPublish) -> None:
+        self._pending_publish_requests -= 1
+        self._pending_publish_bytes -= request.logical_size
+        if self._pending_publish_requests < 0 or self._pending_publish_bytes < 0:
+            raise RuntimeError("compat publish ingress accounting underflow")
+
+    def _release_publish_requests(self, requests: list[_PendingPublish]) -> None:
+        with self._publish_schedule_lock:
+            for request in requests:
+                self._release_publish_request_locked(request)
 
     def _take_publish_batch(self) -> tuple[list[_PendingPublish], bool]:
         batch: list[_PendingPublish] = []
@@ -454,8 +484,11 @@ class Client:
                     pending.append(self._publish_pending.get_nowait())
                 except Empty:
                     break
+            for request in pending:
+                self._release_publish_request_locked(request)
             self._publish_drain_scheduled = False
         for request in pending:
+            request.discard_payload()
             future = request.future
             if future is not None and not future.done():
                 future.set_exception(error)
@@ -494,45 +527,50 @@ class Client:
         ] = []
         committed = False
 
-        for request in batch:
-            future = request.future
-            if self._stopping.is_set():
-                if future is not None and not future.done():
-                    future.set_exception(
-                        RuntimeError("network loop stopped before publish admission")
-                    )
-                continue
-            if future is not None and not future.set_running_or_notify_cancel():
-                continue
-            try:
-                if request.qos is QoS.AT_MOST_ONCE:
-                    self._queue_qos0_on_loop(
-                        request.topic,
-                        request.payload if request.payload is not None else b"",
-                        retain=request.retain,
-                    )
-                    committed = True
-                else:
-                    info = self._commit_qosn_publish_on_loop(request)
-                    committed = True
-                    assert future is not None
-                    results.append((future, info, None))
-            except FlowControlError as exc:
-                if future is None:
-                    self._report_qos0_publish_error(exc)
-                else:
-                    results.append(
-                        (
-                            future,
-                            MQTTMessageInfo(mid=None, rc=MQTT_ERR_QUEUE_SIZE),
-                            None,
+        try:
+            for request in batch:
+                future = request.future
+                if self._stopping.is_set():
+                    if future is not None and not future.done():
+                        future.set_exception(
+                            RuntimeError("network loop stopped before publish admission")
                         )
-                    )
-            except BaseException as exc:
-                if future is None:
-                    self._report_qos0_publish_error(exc)
-                else:
-                    results.append((future, None, exc))
+                    continue
+                if future is not None and not future.set_running_or_notify_cancel():
+                    continue
+                try:
+                    if request.qos is QoS.AT_MOST_ONCE:
+                        self._queue_qos0_on_loop(
+                            request.topic,
+                            request.payload if request.payload is not None else b"",
+                            retain=request.retain,
+                        )
+                        committed = True
+                    else:
+                        info = self._commit_qosn_publish_on_loop(request)
+                        committed = True
+                        assert future is not None
+                        results.append((future, info, None))
+                except FlowControlError as exc:
+                    if future is None:
+                        self._report_qos0_publish_error(exc)
+                    else:
+                        results.append(
+                            (
+                                future,
+                                MQTTMessageInfo(mid=None, rc=MQTT_ERR_QUEUE_SIZE),
+                                None,
+                            )
+                        )
+                except BaseException as exc:
+                    if future is None:
+                        self._report_qos0_publish_error(exc)
+                    else:
+                        results.append((future, None, exc))
+        finally:
+            for request in batch:
+                request.discard_payload()
+            self._release_publish_requests(batch)
 
         if committed:
             try:
@@ -637,12 +675,17 @@ class Client:
                 _receipt=PublishReceipt(mid=None, qos=requested_qos, _event=None),
                 _loop=self._loop,
             )
-            self._enqueue_publish_request(_PendingPublish(topic, data, retain, requested_qos, None))
+            request = _PendingPublish(topic, data, retain, requested_qos, None)
+            if not self._enqueue_publish_request(request):
+                request.discard_payload()
+                return MQTTMessageInfo(mid=None, rc=MQTT_ERR_QUEUE_SIZE)
             return info
 
         future: Future[MQTTMessageInfo] = Future()
         request = _PendingPublish(topic, data, retain, requested_qos, future)
-        self._enqueue_publish_request(request)
+        if not self._enqueue_publish_request(request):
+            request.discard_payload()
+            return MQTTMessageInfo(mid=None, rc=MQTT_ERR_QUEUE_SIZE)
         try:
             return future.result(timeout=_PUBLISH_HANDOFF_TIMEOUT)
         except FutureTimeoutError as exc:
