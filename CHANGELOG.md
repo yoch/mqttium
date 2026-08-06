@@ -14,6 +14,14 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   This removes private mutable state from the frozen model, makes each
   `Message` 16 bytes smaller and preserves exact backpressure and queue bounds.
 
+### Fixed
+
+- The Paho compatibility façade now hard-bounds its cross-thread publish
+  handoff by request count and logical bytes. Saturation returns
+  `MQTT_ERR_QUEUE_SIZE`; reservations are released on admission, cancellation,
+  scheduling failure and shutdown, so publisher threads cannot bypass the
+  native client's memory guarantees with an unbounded ingress queue.
+
 ## [0.1.0a4] - 2026-08-06
 
 ### Added
