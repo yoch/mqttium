@@ -32,34 +32,42 @@ def _verify_version(expected_version: str) -> None:
     assert __version__ == expected_version
 
 
+async def _tls_protocol_roundtrip(
+    host: str,
+    port: int,
+    context: ssl.SSLContext,
+    protocol: MQTTProtocolVersion,
+) -> None:
+    topic = f"mqttium/beta-tls/{int(protocol)}"
+    payload = f"tls-{int(protocol)}".encode()
+    received: asyncio.Future[bytes] = asyncio.get_running_loop().create_future()
+    subscriber = AsyncClient(f"beta-tls-sub-{int(protocol)}", protocol=protocol)
+    publisher = AsyncClient(f"beta-tls-pub-{int(protocol)}", protocol=protocol)
+
+    def on_message(message: Message) -> None:
+        if message.topic == topic and not received.done():
+            received.set_result(message.payload)
+
+    subscriber.on_message = on_message
+    try:
+        await subscriber.connect(host, port, ssl=context, timeout=5)
+        await subscriber.subscribe(topic, qos=QoS.AT_LEAST_ONCE)
+        await publisher.connect(host, port, ssl=context, timeout=5)
+        receipt = await publisher.publish(topic, payload, qos=QoS.AT_LEAST_ONCE)
+        assert isinstance(receipt, PublishReceipt)
+        await receipt.wait()
+        assert await asyncio.wait_for(received, timeout=5) == payload
+    finally:
+        if publisher.is_connected:
+            await publisher.disconnect()
+        if subscriber.is_connected:
+            await subscriber.disconnect()
+
+
 async def _tls_roundtrip(host: str, port: int, ca_file: Path) -> None:
     context = ssl.create_default_context(cafile=str(ca_file))
-
     for protocol in (MQTTProtocolVersion.MQTTv311, MQTTProtocolVersion.MQTTv5):
-        topic = f"mqttium/beta-tls/{int(protocol)}"
-        payload = f"tls-{int(protocol)}".encode()
-        received: asyncio.Future[bytes] = asyncio.get_running_loop().create_future()
-        subscriber = AsyncClient(f"beta-tls-sub-{int(protocol)}", protocol=protocol)
-        publisher = AsyncClient(f"beta-tls-pub-{int(protocol)}", protocol=protocol)
-
-        def on_message(message: Message) -> None:
-            if message.topic == topic and not received.done():
-                received.set_result(message.payload)
-
-        subscriber.on_message = on_message
-        try:
-            await subscriber.connect(host, port, ssl=context, timeout=5)
-            await subscriber.subscribe(topic, qos=QoS.AT_LEAST_ONCE)
-            await publisher.connect(host, port, ssl=context, timeout=5)
-            receipt = await publisher.publish(topic, payload, qos=QoS.AT_LEAST_ONCE)
-            assert isinstance(receipt, PublishReceipt)
-            await receipt.wait()
-            assert await asyncio.wait_for(received, timeout=5) == payload
-        finally:
-            if publisher.is_connected:
-                await publisher.disconnect()
-            if subscriber.is_connected:
-                await subscriber.disconnect()
+        await _tls_protocol_roundtrip(host, port, context, protocol)
 
 
 def _write_sqlite(path: Path) -> None:
