@@ -81,9 +81,22 @@ OnPublish = Callable[[int | None, BaseException | None], Any]
 OnAuth = Callable[[AuthPacket], Any]
 MessageDelivery = Literal["auto", "iterator", "callback", "both"]
 PublishBackpressure = Literal["wait", "error"]
-DeliveryToken = int | Message | None
+
+
+class _SharedDeliveryReservation:
+    """One exact byte reservation shared by callback and iterator delivery."""
+
+    __slots__ = ("logical_bytes", "remaining")
+
+    def __init__(self, logical_bytes: int) -> None:
+        self.logical_bytes = logical_bytes
+        self.remaining = 2
+
+
+AccountedDeliveryToken = int | _SharedDeliveryReservation
+DeliveryToken = AccountedDeliveryToken | None
 CallbackJob = tuple[Callable[..., Any], tuple[Any, ...], DeliveryToken]
-TrackedIteratorMessage = tuple[Message, Message]
+TrackedIteratorMessage = tuple[Message, AccountedDeliveryToken]
 IteratorQueueItem = Message | TrackedIteratorMessage
 
 
@@ -1521,30 +1534,13 @@ class AsyncClient:
                     raise MessageDeliveryError(
                         f"Message requires {logical_bytes} delivery bytes, exceeding limit {limit}"
                     )
-                if limit is None or self._pending_delivery_bytes + logical_bytes <= limit:
-                    self._pending_delivery_bytes += logical_bytes
-                    if self._pending_delivery_bytes > self._pending_delivery_high_water_bytes:
-                        self._pending_delivery_high_water_bytes = self._pending_delivery_bytes
-                    if references == 1 and callback_delivery:
-                        delivery_token = logical_bytes
-                    else:
-                        if msg._delivery_logical_bytes or msg._delivery_references:
-                            raise MQTTError("Duplicate delivery reservation for one Message object")
-                        object.__setattr__(msg, "_delivery_logical_bytes", logical_bytes)
-                        if references > 1:
-                            object.__setattr__(msg, "_delivery_references", references)
-                        delivery_token = msg
-                else:
-                    delivery_token = await self._reserve_delivery_slow(
-                        msg,
-                        references,
-                        logical_bytes,
-                        callback_delivery=callback_delivery,
-                    )
+                delivery_token = self._try_reserve_delivery(logical_bytes, references)
+                if delivery_token is None:
+                    delivery_token = await self._reserve_delivery_slow(logical_bytes, references)
             try:
                 if iterator_delivery:
                     iterator_item: IteratorQueueItem = (
-                        (msg, delivery_token) if isinstance(delivery_token, Message) else msg
+                        (msg, delivery_token) if delivery_token is not None else msg
                     )
                     try:
                         self._messages.put_nowait(iterator_item)
@@ -1643,30 +1639,18 @@ class AsyncClient:
         """Maximum logical size eligible for the zero-accounting fast path."""
         return self._delivery_small_message_limit
 
-    def _try_reserve_delivery(
-        self,
-        message: Message,
-        references: int,
-        logical_bytes: int,
-        *,
-        callback_delivery: bool,
-    ) -> DeliveryToken:
+    def _try_reserve_delivery(self, logical_bytes: int, references: int) -> DeliveryToken:
         limit = self._delivery_accounted_limit
         if limit is not None and self._pending_delivery_bytes + logical_bytes > limit:
             return None
-        if message._delivery_logical_bytes or message._delivery_references:
-            raise MQTTError("Duplicate delivery reservation for one Message object")
         self._pending_delivery_bytes += logical_bytes
         if self._pending_delivery_bytes > self._pending_delivery_high_water_bytes:
             self._pending_delivery_high_water_bytes = self._pending_delivery_bytes
-        if references == 1 and callback_delivery:
-            # The callback job already needs a token slot, so carrying the byte
-            # count there avoids mutating or indexing the Message object.
+        if references == 1:
             return logical_bytes
-        object.__setattr__(message, "_delivery_logical_bytes", logical_bytes)
-        if references > 1:
-            object.__setattr__(message, "_delivery_references", references)
-        return message
+        # `references` is derived from callback_delivery + iterator_delivery,
+        # so the only remaining runtime case is exactly two consumers.
+        return _SharedDeliveryReservation(logical_bytes)
 
     async def _reserve_delivery(self, message: Message, references: int) -> DeliveryToken:
         logical_bytes = self._delivery_logical_size(message)
@@ -1675,70 +1659,44 @@ class AsyncClient:
             raise MessageDeliveryError(
                 f"Message requires {logical_bytes} delivery bytes, exceeding limit {limit}"
             )
-        callback_delivery = references == 1 and self.on_message is not None
-        token = self._try_reserve_delivery(
-            message, references, logical_bytes, callback_delivery=callback_delivery
-        )
+        token = self._try_reserve_delivery(logical_bytes, references)
         if token is not None:
             return token
-        return await self._reserve_delivery_slow(
-            message,
-            references,
-            logical_bytes,
-            callback_delivery=callback_delivery,
-        )
+        return await self._reserve_delivery_slow(logical_bytes, references)
 
-    async def _reserve_delivery_slow(
-        self,
-        message: Message,
-        references: int,
-        logical_bytes: int,
-        *,
-        callback_delivery: bool,
-    ) -> DeliveryToken:
+    async def _reserve_delivery_slow(self, logical_bytes: int, references: int) -> DeliveryToken:
         while True:
             self._delivery_waiters += 1
             try:
                 self._delivery_space.clear()
-                token = self._try_reserve_delivery(
-                    message,
-                    references,
-                    logical_bytes,
-                    callback_delivery=callback_delivery,
-                )
+                token = self._try_reserve_delivery(logical_bytes, references)
                 if token is not None:
                     return token
                 await self._delivery_space.wait()
             finally:
                 self._delivery_waiters -= 1
-            token = self._try_reserve_delivery(
-                message,
-                references,
-                logical_bytes,
-                callback_delivery=callback_delivery,
-            )
+            token = self._try_reserve_delivery(logical_bytes, references)
             if token is not None:
                 return token
 
-    def _release_delivery_reference_nowait(self, token: int | Message) -> None:
+    def _release_delivery_reference_nowait(self, token: AccountedDeliveryToken) -> None:
         if isinstance(token, int):
             self._pending_delivery_bytes -= token
         else:
-            references = token._delivery_references
-            if references > 1:
-                object.__setattr__(token, "_delivery_references", references - 1)
+            remaining = token.remaining
+            if remaining <= 0:
                 return
-            if references == 1:
-                object.__setattr__(token, "_delivery_references", 0)
-            logical_bytes = token._delivery_logical_bytes
-            if logical_bytes <= 0:
+            remaining -= 1
+            token.remaining = remaining
+            if remaining:
                 return
-            object.__setattr__(token, "_delivery_logical_bytes", 0)
+            logical_bytes = token.logical_bytes
+            token.logical_bytes = 0
             self._pending_delivery_bytes -= logical_bytes
         if self._delivery_waiters:
             self._delivery_space.set()
 
-    async def _release_delivery_reference(self, token: int | Message) -> None:
+    async def _release_delivery_reference(self, token: AccountedDeliveryToken) -> None:
         self._release_delivery_reference_nowait(token)
 
     def _delivery_logical_size(self, message: Message) -> int:
@@ -1877,12 +1835,7 @@ class AsyncClient:
                     self._report_callback_error(callback, exc)
                 finally:
                     if delivery_token is not None:
-                        if isinstance(delivery_token, int):
-                            self._pending_delivery_bytes -= delivery_token
-                            if self._delivery_waiters:
-                                self._delivery_space.set()
-                        else:
-                            self._release_delivery_reference_nowait(delivery_token)
+                        self._release_delivery_reference_nowait(delivery_token)
                     self._callback_queue.task_done()
         except asyncio.CancelledError:
             raise

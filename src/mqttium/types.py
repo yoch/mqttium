@@ -41,10 +41,6 @@ class Message:
     dup: bool = False
     mid: int | None = None
     properties: Properties | None = None
-    # Internal delivery accounting. Public Message instances remain frozen;
-    # AsyncClient mutates only these private slots with object.__setattr__.
-    _delivery_logical_bytes: int = field(default=0, init=False, repr=False, compare=False)
-    _delivery_references: int = field(default=0, init=False, repr=False, compare=False)
 
 
 @dataclass(slots=True)

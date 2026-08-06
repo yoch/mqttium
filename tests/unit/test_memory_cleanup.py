@@ -148,5 +148,5 @@ async def test_reset_message_stream_releases_abandoned_iterator_delivery() -> No
 
     assert client._messages.empty()
     assert client.pending_delivery_bytes == 0
-    assert message._delivery_references == 0
-    assert message._delivery_logical_bytes == 0
+    assert not hasattr(message, "_delivery_references")
+    assert not hasattr(message, "_delivery_logical_bytes")
