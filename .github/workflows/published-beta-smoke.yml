@@ -1,0 +1,81 @@
+name: Published beta smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Published MQTTium version to validate
+        required: true
+        default: 0.2.0b1
+        type: string
+  schedule:
+    - cron: "17 4 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: published-beta-smoke-${{ github.event.inputs.version || '0.2.0b1' }}
+  cancel-in-progress: false
+
+jobs:
+  installed-distribution:
+    name: Python ${{ matrix.python-version }} / ${{ matrix.distribution }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python-version: "3.11"
+            distribution: wheel
+          - python-version: "3.12"
+            distribution: wheel
+          - python-version: "3.13"
+            distribution: wheel
+          - python-version: "3.14"
+            distribution: wheel
+          - python-version: "3.12"
+            distribution: sdist
+    env:
+      MQTTIUM_VERSION: ${{ github.event.inputs.version || '0.2.0b1' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install published distribution
+        env:
+          DISTRIBUTION: ${{ matrix.distribution }}
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          if [ "$DISTRIBUTION" = "wheel" ]; then
+            python -m pip install --no-cache-dir --only-binary=mqttium "mqttium==$MQTTIUM_VERSION"
+          else
+            python -m pip install --no-cache-dir --no-binary=mqttium "mqttium==$MQTTIUM_VERSION"
+          fi
+          python -m pip check
+          python -I - <<'PY'
+          import importlib.metadata
+          import mqttium
+
+          print("mqttium", importlib.metadata.version("mqttium"), mqttium.__file__)
+          PY
+      - name: Start Mosquitto
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mosquitto
+          printf 'listener 11883 127.0.0.1\nallow_anonymous true\npersistence false\n' > /tmp/mosq-beta-smoke.conf
+          mosquitto -c /tmp/mosq-beta-smoke.conf -d
+          for _ in $(seq 1 30); do
+            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            sleep 0.2
+          done
+          exit 1
+      - name: Exercise Stable API and broker round trips
+        run: |
+          python -I tests/installed_distribution_smoke.py \
+            --expected-version "$MQTTIUM_VERSION" \
+            --host 127.0.0.1 \
+            --port 11883
