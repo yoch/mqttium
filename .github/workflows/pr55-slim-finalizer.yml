@@ -1,0 +1,86 @@
+name: PR 55 Slim Finalizer
+
+on:
+  push:
+    branches:
+      - chatgpt-workbench-jobs
+    paths:
+      - .github/workflows/pr55-slim-finalizer.yml
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    runs-on: ubuntu-slim
+    timeout-minutes: 15
+    steps:
+      - name: Check out target branch
+        uses: actions/checkout@v7
+        with:
+          ref: agent/rationalized-network-hotpaths
+          fetch-depth: 0
+          path: repo
+
+      - name: Check out signed job
+        uses: actions/checkout@v7
+        with:
+          ref: chatgpt-workbench-jobs
+          path: jobs
+          persist-credentials: false
+
+      - name: Apply and verify exact final patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd repo
+          expected_head=f5ae4a43c32f41548bfc831cf3f286e90a31ed6f
+          test "$(git rev-parse HEAD)" = "$expected_head"
+          python - <<'PY'
+          import base64
+          import gzip
+          import json
+          from pathlib import Path
+
+          encoded = Path('../jobs/.cgw/jobs/network-hotpaths-finalize-20260806.b64').read_text().strip()
+          encoded += '=' * (-len(encoded) % 4)
+          job = json.loads(gzip.decompress(base64.urlsafe_b64decode(encoded)))
+          assert job['expected_head'] == 'f5ae4a43c32f41548bfc831cf3f286e90a31ed6f'
+          Path('/tmp/network-hotpaths.patch').write_text(job['patch'])
+          PY
+          git apply --check --whitespace=error-all /tmp/network-hotpaths.patch
+          git apply --index --whitespace=error-all /tmp/network-hotpaths.patch
+          git diff --cached --check
+          check_blob() {
+            local path=$1 expected=$2 actual
+            actual=$(git hash-object "$path")
+            test "$actual" = "$expected" || {
+              echo "$path: expected $expected, got $actual" >&2
+              exit 1
+            }
+          }
+          check_blob CHANGELOG.md 3808155799ddcc368dc0bbfe280f77654c38a338
+          check_blob src/mqttium/api/_writer.py aba6dcda1705b0e86e15fcfcbed16e080f7f6680
+          check_blob src/mqttium/api/async_client.py a0fe36d4fcde987041023070585315d3d817c05a
+          check_blob src/mqttium/packets/publish.py 636e46533f3179a298da95e4183bf89d89c0246a
+          check_blob src/mqttium/protocol/engine.py b7ba3a9bceba5c3f46a8b82f74bccce976f5cfb6
+          check_blob src/mqttium/protocol/outbound.py 942d33fe798c844a9f2a97f3d1d526af7aed6d7a
+          check_blob src/mqttium/transport/websocket.py 879ceaa0cbc349475c79fb5bf5968ce2341751e5
+          check_blob tests/unit/test_native_publish_nowait.py 49fcf623a76291a05a705d51cb7301b73879c41b
+          check_blob tests/unit/test_publish_many.py 00f76755d3f431cec8d27703ab4de0ee9d15b4a0
+          check_blob tests/unit/test_websocket.py fb53c1be338c0b303a6e698c126bf3be64883e77
+          check_blob tests/unit/test_write_pump.py 34289b401856bcf3d45e0aa05998bfc867ae6195
+
+      - name: Build one clean commit and push
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd repo
+          base=fcd416057fd83f9294464f28e701879e00f8674f
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git reset --soft "$base"
+          git commit -m 'Optimize native MQTT network hot paths'
+          test "$(git rev-list --count "$base"..HEAD)" = 1
+          test "$(git diff --name-only "$base"..HEAD | wc -l)" = 11
+          git push --force-with-lease=refs/heads/agent/rationalized-network-hotpaths:f5ae4a43c32f41548bfc831cf3f286e90a31ed6f origin HEAD:refs/heads/agent/rationalized-network-hotpaths
