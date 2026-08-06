@@ -1,0 +1,76 @@
+name: Publish QoS1 rebase export
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - agent/native-hotpath-architecture-study
+    paths:
+      - .github/workflows/publish-qos1-rebase-export.yml
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out study harness
+        uses: actions/checkout@v7
+        with:
+          path: harness
+      - name: Check out current main
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          path: candidate
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Build exact validated tree
+        run: |
+          python harness/.github/scripts/rebuild_qos1_after_qos0.py candidate
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("candidate/tests/unit/test_qos0_v311_decode_fastpath.py")
+          text = path.read_text()
+          text = text.replace(
+              "def test_qos1_keeps_generic_acknowledged_path(monkeypatch) -> None:",
+              "def test_qos1_uses_direct_acknowledged_path_after_composition(monkeypatch) -> None:",
+              1,
+          )
+          text = text.replace(
+              "    assert effects[0].data.qos is QoS.AT_LEAST_ONCE\n    assert calls == 1\n",
+              "    assert effects[0].data.qos is QoS.AT_LEAST_ONCE\n    assert calls == 0\n",
+              1,
+          )
+          path.write_text(text)
+          PY
+          cd candidate
+          python -m pip install -q -e ".[dev]"
+          ruff format \
+            src/mqttium/protocol/inbound.py \
+            tests/unit/test_qos0_v311_decode_fastpath.py \
+            tests/unit/test_qos1_v311_decode_fastpath.py \
+            benchmarks/qos1_v311_decode.py
+          ruff format --check src tests benchmarks
+          ruff check src tests benchmarks
+          python -m pytest -q \
+            tests/unit/test_qos0_v311_decode_fastpath.py \
+            tests/unit/test_qos1_v311_decode_fastpath.py
+          git diff --check
+      - name: Publish temporary one-commit tree
+        working-directory: candidate
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add CHANGELOG.md \
+            src/mqttium/protocol/inbound.py \
+            tests/unit/test_qos0_v311_decode_fastpath.py \
+            tests/unit/test_qos1_v311_decode_fastpath.py \
+            benchmarks/qos1_v311_decode.py \
+            docs/QOS1-V311-DECODE.md
+          git commit -m "Decode MQTT 3.1.1 QoS 1 directly to fields"
+          git push --force origin HEAD:agent/qos1-rebase-export
