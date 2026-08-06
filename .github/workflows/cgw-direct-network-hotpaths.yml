@@ -1,0 +1,88 @@
+name: Direct Network Hotpaths Workbench
+
+on:
+  push:
+    branches:
+      - chatgpt-workbench-jobs
+    paths:
+      - .github/workflows/cgw-direct-network-hotpaths.yml
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: cgw-yoch-mqttium-55
+  cancel-in-progress: false
+
+jobs:
+  workbench:
+    if: github.event.head_commit.message == 'Run network hot path workbench directly'
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+      - ${{ vars.CGW_RUNNER_LABEL || 'cgw' }}
+    timeout-minutes: 120
+    env:
+      CGW_ROOT: ${{ vars.CGW_ROOT || '/home/yoch/chatgpt-workbench' }}
+      CGW_ALLOWED_IMAGES: ${{ vars.CGW_ALLOWED_IMAGES || 'python:3.12-bookworm,node:24-bookworm,ubuntu:24.04' }}
+      CGW_DOCKER_SNAP_COMPAT: ${{ vars.CGW_DOCKER_SNAP_COMPAT || 'false' }}
+      CGW_DOCKER_UID: ${{ vars.CGW_DOCKER_UID }}
+      CGW_DOCKER_GID: ${{ vars.CGW_DOCKER_GID }}
+      CGW_JOB_BRANCH: chatgpt-workbench-jobs
+      CGW_REPOSITORY: yoch/mqttium
+      CGW_PR_NUMBER: '55'
+      CGW_HEAD_REF: agent/rationalized-network-hotpaths
+      CGW_HEAD_SHA: f5ae4a43c32f41548bfc831cf3f286e90a31ed6f
+      CGW_HEAD_REPO: yoch/mqttium
+      CGW_JOB_ID: network-hotpaths-finalize-20260806
+      CGW_ISSUE_NUMBER: '55'
+      CGW_COMMENT_ID: '5207519386'
+      CGW_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+    steps:
+      - name: Check out trusted controller
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          path: control
+          persist-credentials: false
+
+      - name: Fetch, apply, and validate
+        id: execute
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python control/.github/chatgpt-workbench/processor.py execute
+
+      - name: Commit and push
+        id: push
+        if: steps.execute.outcome == 'success'
+        env:
+          CGW_PUSH_TOKEN: ${{ secrets.CGW_PUSH_TOKEN }}
+        run: python control/.github/chatgpt-workbench/processor.py push
+
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: cgw-${{ env.CGW_JOB_ID }}-${{ github.run_id }}
+          path: ${{ env.CGW_ROOT }}/results/${{ github.repository }}/${{ env.CGW_JOB_ID }}
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Post result
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXECUTE_OUTCOME: ${{ steps.execute.outcome }}
+          PUSH_OUTCOME: ${{ steps.push.outcome }}
+        run: python control/.github/chatgpt-workbench/processor.py comment
+
+      - name: Fail unsuccessful workbench run
+        if: always()
+        run: |
+          test "${{ steps.execute.outcome }}" = "success"
+          test "${{ steps.push.outcome }}" = "success"
