@@ -1,0 +1,93 @@
+name: Public benchmark open-loop RTT matrix
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - agent/native-hotpath-architecture-study
+    paths:
+      - .github/workflows/public-bench-open-loop-rtt.yml
+
+permissions:
+  contents: read
+
+jobs:
+  matrix:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    steps:
+      - name: Check out exact MQTTium main
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          path: runtime
+      - name: Check out public benchmark main
+        uses: actions/checkout@v7
+        with:
+          repository: yoch/mqtt-python-client-bench
+          ref: main
+          path: public-bench
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install exact runtime and public benchmark
+        run: |
+          python -m pip install -e runtime
+          python -m pip install -e "public-bench[all]"
+          mkdir -p /tmp/public-open-loop-rtt
+          {
+            echo "runtime=$(git -C runtime rev-parse HEAD)"
+            echo "public_bench=$(git -C public-bench rev-parse HEAD)"
+            python --version
+          } | tee /tmp/public-open-loop-rtt/revisions.txt
+      - name: Extend RTT fractions for this experiment only
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('public-bench/src/mqtt_client_bench/scenarios.py')
+          source = path.read_text()
+          start = source.index('name="application_rtt_qos1"')
+          tail = source[start:]
+          old = 'variants=tuple({"load_fraction": f} for f in (0.50, 0.90))'
+          if old not in tail:
+              raise SystemExit('application RTT variant target not found')
+          tail = tail.replace(
+              old,
+              'variants=tuple({"load_fraction": f} for f in (0.50, 0.75, 0.90, 1.00))',
+              1,
+          )
+          path.write_text(source[:start] + tail)
+          PY
+      - name: Start managed broker
+        working-directory: public-bench
+        run: python -m mqtt_client_bench.run broker up
+      - name: Run calibrated ABBA load fractions
+        working-directory: public-bench
+        run: |
+          set -euo pipefail
+          fractions=(50 75 90 100)
+          for index in 0 1 2 3; do
+            python -m mqtt_client_bench.run compare \
+              --clients gmqtt,mqttium \
+              --scenario application_rtt_qos1 \
+              --variant-index "$index" \
+              --blocks 3 \
+              --profile standard \
+              --output "/tmp/public-open-loop-rtt/rtt-${fractions[$index]}.json"
+          done
+      - name: Stop managed broker
+        if: always()
+        working-directory: public-bench
+        run: python -m mqtt_client_bench.run broker down || true
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: public-open-loop-rtt-${{ github.run_id }}
+          path: /tmp/public-open-loop-rtt/*
+          if-no-files-found: warn
+          retention-days: 30
