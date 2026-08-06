@@ -1,0 +1,283 @@
+name: Native hotpath v311 QoS 1 open-loop confirmation
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - agent/native-hotpath-architecture-study
+    paths:
+      - .github/workflows/native-hotpath-v311-qos1-openloop.yml
+
+permissions:
+  contents: read
+
+jobs:
+  confirm:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    steps:
+      - name: Check out study harness
+        uses: actions/checkout@v7
+        with:
+          path: harness
+      - name: Check out base
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          path: base
+      - name: Check out candidate
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          path: candidate
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install broker
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mosquitto
+          mkdir -p /tmp/mqttium-qos1-openloop
+          cat > /tmp/mqttium-qos1-openloop/mosquitto.conf <<'MOSQ'
+          persistence false
+          allow_anonymous true
+          max_inflight_messages 1000
+          max_queued_messages 1000000
+          max_queued_bytes 0
+          connection_messages false
+          log_type error
+          listener 11883 127.0.0.1
+          MOSQ
+          mosquitto -c /tmp/mqttium-qos1-openloop/mosquitto.conf \
+            > /tmp/mqttium-qos1-openloop/mosquitto.log 2>&1 &
+          for i in $(seq 1 60); do
+            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            sleep 0.2
+          done
+          exit 1
+      - name: Apply isolated candidates
+        run: |
+          python harness/.github/scripts/apply_nowait_size_candidate.py base
+          python harness/.github/scripts/apply_nowait_size_candidate.py candidate
+          python harness/.github/scripts/apply_v311_qos1_decode_candidate_v2.py candidate
+      - name: Materialize open-loop worker
+        run: |
+          cat > /tmp/qos1_openloop_worker.py <<'PY'
+          from __future__ import annotations
+
+          import argparse
+          import asyncio
+          import json
+          import statistics
+          import struct
+          import time
+
+          from mqttium.api import AsyncClient
+
+          REQUEST = "bench/openloop/request"
+          RESPONSE = "bench/openloop/response"
+
+
+          async def run(rate: float, duration: float) -> dict[str, object]:
+              initiator = AsyncClient(
+                  client_id=f"openloop-init-{time.time_ns()}",
+                  message_delivery="callback",
+                  max_pending_callbacks=8192,
+                  max_pending_outbound_messages=100000,
+              )
+              responder = AsyncClient(
+                  client_id=f"openloop-resp-{time.time_ns()}",
+                  message_delivery="callback",
+                  max_pending_callbacks=8192,
+                  max_pending_outbound_messages=100000,
+              )
+              latencies_ms: list[float] = []
+              completed = asyncio.Event()
+              total = int(rate * duration)
+              responder_submit_errors = 0
+              initiator_submit_errors = 0
+
+              def on_request(message) -> None:
+                  nonlocal responder_submit_errors
+                  try:
+                      responder.publish_nowait(RESPONSE, message.payload, qos=1)
+                  except Exception:
+                      responder_submit_errors += 1
+
+              def on_response(message) -> None:
+                  sent_ns, _sequence = struct.unpack("!QQ", message.payload)
+                  latencies_ms.append((time.perf_counter_ns() - sent_ns) / 1_000_000)
+                  if len(latencies_ms) >= total:
+                      completed.set()
+
+              responder.on_message = on_request
+              initiator.on_message = on_response
+              await responder.connect("127.0.0.1", 11883)
+              await initiator.connect("127.0.0.1", 11883)
+              await responder.subscribe(REQUEST, qos=1)
+              await initiator.subscribe(RESPONSE, qos=1)
+              await asyncio.sleep(0.1)
+
+              loop = asyncio.get_running_loop()
+              started = loop.time() + 0.05
+              for sequence in range(total):
+                  deadline = started + sequence / rate
+                  delay = deadline - loop.time()
+                  if delay > 0:
+                      await asyncio.sleep(delay)
+                  payload = struct.pack("!QQ", time.perf_counter_ns(), sequence)
+                  try:
+                      initiator.publish_nowait(REQUEST, payload, qos=1)
+                  except Exception:
+                      initiator_submit_errors += 1
+              offer_finished = loop.time()
+              try:
+                  await asyncio.wait_for(completed.wait(), timeout=max(10.0, duration * 3))
+              except TimeoutError:
+                  pass
+              drained = loop.time()
+
+              initiator_stats = initiator.stats()
+              responder_stats = responder.stats()
+              await initiator.disconnect()
+              await responder.disconnect()
+
+              ordered = sorted(latencies_ms)
+              def percentile(q: float) -> float | None:
+                  if not ordered:
+                      return None
+                  index = min(len(ordered) - 1, int(q * (len(ordered) - 1)))
+                  return ordered[index]
+
+              offered = total - initiator_submit_errors
+              return {
+                  "target_rate": rate,
+                  "duration": duration,
+                  "attempted": total,
+                  "offered": offered,
+                  "completed": len(latencies_ms),
+                  "completion_ratio": len(latencies_ms) / offered if offered else 0.0,
+                  "actual_offer_rate": offered / max(offer_finished - started, 1e-9),
+                  "drain_seconds": drained - offer_finished,
+                  "p50_ms": statistics.median(ordered) if ordered else None,
+                  "p95_ms": percentile(0.95),
+                  "p99_ms": percentile(0.99),
+                  "initiator_submit_errors": initiator_submit_errors,
+                  "responder_submit_errors": responder_submit_errors,
+                  "initiator_effect_suspensions": initiator_stats.effects.apply_suspensions,
+                  "responder_effect_suspensions": responder_stats.effects.apply_suspensions,
+                  "initiator_callback_high_water": initiator_stats.delivery.callback_queued,
+                  "responder_callback_high_water": responder_stats.delivery.callback_queued,
+                  "initiator_writer_batches": initiator_stats.writer.batches,
+                  "responder_writer_batches": responder_stats.writer.batches,
+              }
+
+
+          def main() -> None:
+              parser = argparse.ArgumentParser()
+              parser.add_argument("--rate", type=float, required=True)
+              parser.add_argument("--duration", type=float, default=3.0)
+              args = parser.parse_args()
+              print("RESULT " + json.dumps(asyncio.run(run(args.rate, args.duration))))
+
+
+          if __name__ == "__main__":
+              main()
+          PY
+          python -m py_compile /tmp/qos1_openloop_worker.py
+      - name: Run rotated open-loop A/B
+        run: |
+          cat > /tmp/qos1_openloop_driver.py <<'PY'
+          from __future__ import annotations
+
+          import json
+          import os
+          import statistics
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          roots = {"base": Path("base").resolve(), "candidate": Path("candidate").resolve()}
+          rates = (3000.0, 5400.0)
+          rows = []
+
+          def sample(root_name: str, rate: float) -> dict[str, object]:
+              env = os.environ.copy()
+              env["PYTHONPATH"] = str(roots[root_name] / "src")
+              proc = subprocess.run(
+                  [sys.executable, "/tmp/qos1_openloop_worker.py", "--rate", str(rate)],
+                  check=True,
+                  capture_output=True,
+                  text=True,
+                  env=env,
+              )
+              line = next(
+                  item.removeprefix("RESULT ")
+                  for item in reversed(proc.stdout.splitlines())
+                  if item.startswith("RESULT ")
+              )
+              return json.loads(line)
+
+          for cycle in range(7):
+              order = ("base", "candidate") if cycle % 2 == 0 else ("candidate", "base")
+              row = {"cycle": cycle, "order": order, "rates": {}}
+              for rate in rates:
+                  row["rates"][str(rate)] = {}
+                  for root_name in order:
+                      row["rates"][str(rate)][root_name] = sample(root_name, rate)
+              rows.append(row)
+
+          summary = {}
+          for rate in rates:
+              key = str(rate)
+              completion_delta = [
+                  row["rates"][key]["candidate"]["completion_ratio"]
+                  - row["rates"][key]["base"]["completion_ratio"]
+                  for row in rows
+              ]
+              p50_ratios = [
+                  row["rates"][key]["candidate"]["p50_ms"]
+                  / row["rates"][key]["base"]["p50_ms"]
+                  for row in rows
+              ]
+              p95_ratios = [
+                  row["rates"][key]["candidate"]["p95_ms"]
+                  / row["rates"][key]["base"]["p95_ms"]
+                  for row in rows
+              ]
+              summary[key] = {
+                  "completion_delta_median": statistics.median(completion_delta),
+                  "p50_ratio_median": statistics.median(p50_ratios),
+                  "p95_ratio_median": statistics.median(p95_ratios),
+                  "base_p50_median": statistics.median(
+                      row["rates"][key]["base"]["p50_ms"] for row in rows
+                  ),
+                  "candidate_p50_median": statistics.median(
+                      row["rates"][key]["candidate"]["p50_ms"] for row in rows
+                  ),
+                  "base_p95_median": statistics.median(
+                      row["rates"][key]["base"]["p95_ms"] for row in rows
+                  ),
+                  "candidate_p95_median": statistics.median(
+                      row["rates"][key]["candidate"]["p95_ms"] for row in rows
+                  ),
+              }
+          result = {"rows": rows, "summary": summary}
+          path = Path("/tmp/mqttium-qos1-openloop/openloop.json")
+          path.write_text(json.dumps(result, indent=2) + "\n")
+          print(json.dumps(summary, indent=2))
+          PY
+          python /tmp/qos1_openloop_driver.py
+      - name: Upload open-loop evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-hotpath-v311-qos1-openloop-${{ github.run_id }}
+          path: |
+            /tmp/mqttium-qos1-openloop/openloop.json
+            /tmp/mqttium-qos1-openloop/mosquitto.log
+          if-no-files-found: warn
+          retention-days: 30
