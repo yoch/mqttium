@@ -6,8 +6,9 @@ It combines a synchronous protocol engine with an `asyncio` API, bounded
 backpressure, durable inflight persistence, explicit delivery receipts, and
 complete MQTT QoS state machines.
 
-> **Status:** alpha (`0.1.0a4`). The implementation is extensively tested, but
-> the public API may still change before the first stable release.
+> **Status:** beta (`0.2.0b1`). The native Stable API tier follows the documented
+> compatibility policy; Provisional extension surfaces may still evolve before
+> the first stable release.
 
 ## Features
 
@@ -36,8 +37,10 @@ Provisional and Internal boundaries.
 
 ## Installation
 
+Install the current beta from PyPI:
+
 ```bash
-python -m pip install mqttium
+python -m pip install --pre mqttium
 ```
 
 To work on the unreleased development version:
@@ -161,7 +164,7 @@ owning event loop. See [`docs/API-STABILITY.md`](docs/API-STABILITY.md).
 
 The release gates include:
 
-- more than 300 unit tests;
+- more than 500 unit tests;
 - Mosquitto integration tests on Python 3.11, 3.12, 3.13 and 3.14;
 - deterministic and Hypothesis-based fuzzing;
 - Ruff formatting and linting;
@@ -178,8 +181,9 @@ acceptance criteria are documented in [`docs/STABILITY.md`](docs/STABILITY.md).
 ## Documentation
 
 - [`docs/DESIGN.md`](docs/DESIGN.md) — architecture and invariants
-- [`docs/API-STABILITY.md`](docs/API-STABILITY.md) — public API candidate and deprecations
+- [`docs/API-STABILITY.md`](docs/API-STABILITY.md) — public API policy and deprecations
 - [`docs/STABILITY.md`](docs/STABILITY.md) — soak and interoperability campaign
+- [`docs/RELEASING.md`](docs/RELEASING.md) — rehearsal, publication and failure handling
 - [`docs/IMPLEMENTATION-GUIDE.md`](docs/IMPLEMENTATION-GUIDE.md) — protocol contracts
 - [`docs/COMPAT.md`](docs/COMPAT.md) — Paho compatibility surface
 - [`docs/MIGRATION.md`](docs/MIGRATION.md) — migration guidance
