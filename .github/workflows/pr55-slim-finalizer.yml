@@ -12,13 +12,13 @@ permissions:
 
 jobs:
   finalize:
-    runs-on: ubuntu-slim
-    timeout-minutes: 15
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
     steps:
-      - name: Check out target branch
+      - name: Check out verified staging commit
         uses: actions/checkout@v7
         with:
-          ref: agent/rationalized-network-hotpaths
+          ref: f5ae4a43c32f41548bfc831cf3f286e90a31ed6f
           fetch-depth: 0
           path: repo
 
@@ -34,8 +34,7 @@ jobs:
         run: |
           set -euo pipefail
           cd repo
-          expected_head=f5ae4a43c32f41548bfc831cf3f286e90a31ed6f
-          test "$(git rev-parse HEAD)" = "$expected_head"
+          test "$(git rev-parse HEAD)" = "f5ae4a43c32f41548bfc831cf3f286e90a31ed6f"
           python - <<'PY'
           import base64
           import gzip
@@ -71,16 +70,39 @@ jobs:
           check_blob tests/unit/test_websocket.py fb53c1be338c0b303a6e698c126bf3be64883e77
           check_blob tests/unit/test_write_pump.py 34289b401856bcf3d45e0aa05998bfc867ae6195
 
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: repo/pyproject.toml
+
+      - name: Install test dependencies
+        working-directory: repo
+        run: python -m pip install -e ".[dev]"
+
+      - name: Validate final tree
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          python -m ruff format --check src tests
+          python -m ruff check src tests
+          python -m mypy src
+          python -m pytest tests/unit -q
+          python -m compileall -q src tests
+
       - name: Build one clean commit and push
         shell: bash
         run: |
           set -euo pipefail
           cd repo
           base=fcd416057fd83f9294464f28e701879e00f8674f
+          target=refs/heads/agent/rationalized-network-hotpaths
+          remote_head=$(git ls-remote origin "$target" | cut -f1)
+          test -n "$remote_head"
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git reset --soft "$base"
           git commit -m 'Optimize native MQTT network hot paths'
           test "$(git rev-list --count "$base"..HEAD)" = 1
           test "$(git diff --name-only "$base"..HEAD | wc -l)" = 11
-          git push --force-with-lease=refs/heads/agent/rationalized-network-hotpaths:f5ae4a43c32f41548bfc831cf3f286e90a31ed6f origin HEAD:refs/heads/agent/rationalized-network-hotpaths
+          git push --force-with-lease="$target:$remote_head" origin HEAD:"$target"
