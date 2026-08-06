@@ -1,0 +1,70 @@
+name: Rebuild QoS1 after QoS0
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - agent/native-hotpath-architecture-study
+    paths:
+      - .github/scripts/rebuild_qos1_after_qos0.py
+      - .github/workflows/rebuild-qos1-after-qos0.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out study harness
+        uses: actions/checkout@v7
+        with:
+          path: harness
+      - name: Check out current main
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          path: candidate
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Build composed candidate
+        run: python harness/.github/scripts/rebuild_qos1_after_qos0.py candidate
+      - name: Install validation dependencies
+        working-directory: candidate
+        run: python -m pip install -e ".[dev,security,fuzz]"
+      - name: Validate exact tree
+        working-directory: candidate
+        run: |
+          ruff format \
+            src/mqttium/protocol/inbound.py \
+            tests/unit/test_qos1_v311_decode_fastpath.py \
+            benchmarks/qos1_v311_decode.py
+          ruff format --check src tests benchmarks
+          ruff check src tests benchmarks
+          mypy src/mqttium
+          bandit -q -ll -r src
+          python -m pytest -q tests/unit
+          PYTHONPATH=src python -m pytest -q tests/fuzz/test_hypothesis_fuzz.py
+          python benchmarks/qos1_v311_decode.py \
+            --count 100000 --repeat 5 --output /tmp/qos1-v311-decode.json
+          git diff --check
+      - name: Export exact changed files
+        run: |
+          mkdir -p /tmp/qos1-rebase/src/mqttium/protocol
+          mkdir -p /tmp/qos1-rebase/tests/unit
+          mkdir -p /tmp/qos1-rebase/benchmarks
+          mkdir -p /tmp/qos1-rebase/docs
+          cp candidate/CHANGELOG.md /tmp/qos1-rebase/CHANGELOG.md
+          cp candidate/src/mqttium/protocol/inbound.py /tmp/qos1-rebase/src/mqttium/protocol/inbound.py
+          cp candidate/tests/unit/test_qos1_v311_decode_fastpath.py /tmp/qos1-rebase/tests/unit/test_qos1_v311_decode_fastpath.py
+          cp candidate/benchmarks/qos1_v311_decode.py /tmp/qos1-rebase/benchmarks/qos1_v311_decode.py
+          cp candidate/docs/QOS1-V311-DECODE.md /tmp/qos1-rebase/docs/QOS1-V311-DECODE.md
+          cp /tmp/qos1-v311-decode.json /tmp/qos1-rebase/qos1-v311-decode.json
+      - name: Upload validated tree
+        uses: actions/upload-artifact@v7
+        with:
+          name: qos1-after-qos0-${{ github.run_id }}
+          path: /tmp/qos1-rebase
+          retention-days: 7
