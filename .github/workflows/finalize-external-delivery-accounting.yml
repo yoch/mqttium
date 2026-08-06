@@ -28,17 +28,15 @@ jobs:
           path = Path("CHANGELOG.md")
           text = path.read_text()
           marker = "## [Unreleased]\n\n"
-          replacement = """## [Unreleased]
-
-### Changed
-
-- Inbound delivery byte accounting is now kept outside public `Message`
-  instances. One consumer carries the byte count directly; simultaneous
-  callback and iterator delivery share a compact two-reference reservation.
-  This removes private mutable state from the frozen model, makes each
-  `Message` 16 bytes smaller and preserves exact backpressure and queue bounds.
-
-"""
+          replacement = (
+              "## [Unreleased]\n\n"
+              "### Changed\n\n"
+              "- Inbound delivery byte accounting is now kept outside public `Message`\n"
+              "  instances. One consumer carries the byte count directly; simultaneous\n"
+              "  callback and iterator delivery share a compact two-reference reservation.\n"
+              "  This removes private mutable state from the frozen model, makes each\n"
+              "  `Message` 16 bytes smaller and preserves exact backpressure and queue bounds.\n\n"
+          )
           if text.count(marker) != 1:
               raise RuntimeError("unexpected Unreleased changelog marker")
           path.write_text(text.replace(marker, replacement, 1))
