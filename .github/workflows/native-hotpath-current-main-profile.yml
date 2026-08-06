@@ -80,6 +80,7 @@ jobs:
           Path('/tmp/native_hotpath_matrix.py').write_text(source)
           PY
           python -m py_compile /tmp/native_hotpath_matrix.py
+          cp /tmp/native_hotpath_matrix.py /tmp/mqttium-current-profile/native_hotpath_matrix.py
       - name: Profile complete hot paths
         env:
           PYTHONPATH: ${{ github.workspace }}/runtime/src
@@ -116,11 +117,11 @@ jobs:
               chunks = []
               for key in ('tottime', 'cumulative'):
                   stream = io.StringIO()
-                  stats = pstats.Stats(profile, stream=stream).strip_dirs().sort_stats(key)
+                  stats = pstats.Stats(str(profile), stream=stream).strip_dirs().sort_stats(key)
                   stats.print_stats(80)
                   chunks.append(f'### sorted by {key}\n{stream.getvalue()}')
               profile.with_suffix('.txt').write_text('\n'.join(chunks))
-              stats = pstats.Stats(profile)
+              stats = pstats.Stats(str(profile))
               summary[profile.name] = {
                   'total_calls': stats.total_calls,
                   'primitive_calls': stats.prim_calls,
