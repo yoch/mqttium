@@ -149,9 +149,9 @@ class QueueMessageStage(Stage):
 
 class QueueCallbackJobStage(Stage):
     def __init__(self) -> None:
-        self.queue: asyncio.Queue[
-            tuple[Callable[[Message], None], tuple[Message], None]
-        ] = asyncio.Queue()
+        self.queue: asyncio.Queue[tuple[Callable[[Message], None], tuple[Message], None]] = (
+            asyncio.Queue()
+        )
 
     @staticmethod
     def _callback(message: Message) -> None:
@@ -294,8 +294,7 @@ def _driver(root: Path, cycles: int, count: int, output: Path) -> None:
         rotated = labels[shift:] + labels[:shift]
         order = rotated if cycle % 2 == 0 else tuple(reversed(rotated))
         samples = {
-            stage: _sample(root=root, stage=stage, count=count, trace=False)
-            for stage in order
+            stage: _sample(root=root, stage=stage, count=count, trace=False) for stage in order
         }
         rows.append({"cycle": cycle, "order": order, "samples": samples})
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -311,16 +310,13 @@ def _driver(root: Path, cycles: int, count: int, output: Path) -> None:
     }
     medians = {
         stage: {
-            "rate": statistics.median(
-                row["samples"][stage]["rate"] for row in rows
-            ),
+            "rate": statistics.median(row["samples"][stage]["rate"] for row in rows),
             "ns_per_message": statistics.median(
                 row["samples"][stage]["ns_per_message"] for row in rows
             ),
             "gc_collections": [
                 statistics.median(
-                    row["samples"][stage]["gc_collections"][generation]
-                    for row in rows
+                    row["samples"][stage]["gc_collections"][generation] for row in rows
                 )
                 for generation in range(3)
             ],
