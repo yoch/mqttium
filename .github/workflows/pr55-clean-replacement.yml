@@ -1,0 +1,105 @@
+name: Build clean replacement for PR 55
+
+on:
+  pull_request:
+    types: [reopened]
+
+permissions:
+  contents: write
+
+jobs:
+  build-clean-branch:
+    if: github.event.pull_request.number == 55
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Check out immutable staging commit
+        uses: actions/checkout@v7
+        with:
+          ref: f5ae4a43c32f41548bfc831cf3f286e90a31ed6f
+          fetch-depth: 0
+          path: repo
+
+      - name: Check out verified payload
+        uses: actions/checkout@v7
+        with:
+          ref: 02f5fae33903a51c2348747cabba2bb937121157
+          path: jobs
+          persist-credentials: false
+
+      - name: Apply and verify exact patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd repo
+          test "$(git rev-parse HEAD)" = "f5ae4a43c32f41548bfc831cf3f286e90a31ed6f"
+          python - <<'PY'
+          import base64
+          import gzip
+          import hashlib
+          import json
+          from pathlib import Path
+
+          encoded = Path('../jobs/.cgw/jobs/network-hotpaths-finalize-20260806.b64').read_text().strip()
+          assert hashlib.sha256(encoded.encode()).hexdigest() == "12bc0f24455eaf97da30eb375edb2eef0506d6b842698ae4dfeb27292ac67e8d"
+          encoded += '=' * (-len(encoded) % 4)
+          job = json.loads(gzip.decompress(base64.urlsafe_b64decode(encoded)))
+          assert job['expected_head'] == 'f5ae4a43c32f41548bfc831cf3f286e90a31ed6f'
+          Path('/tmp/network-hotpaths.patch').write_text(job['patch'])
+          PY
+          git apply --check --whitespace=error-all /tmp/network-hotpaths.patch
+          git apply --index --whitespace=error-all /tmp/network-hotpaths.patch
+          git diff --cached --check
+          check_blob() {
+            local path=$1 expected=$2 actual
+            actual=$(git hash-object "$path")
+            test "$actual" = "$expected" || {
+              echo "$path: expected $expected, got $actual" >&2
+              exit 1
+            }
+          }
+          check_blob CHANGELOG.md 3808155799ddcc368dc0bbfe280f77654c38a338
+          check_blob src/mqttium/api/_writer.py aba6dcda1705b0e86e15fcfcbed16e080f7f6680
+          check_blob src/mqttium/api/async_client.py a0fe36d4fcde987041023070585315d3d817c05a
+          check_blob src/mqttium/packets/publish.py 636e46533f3179a298da95e4183bf89d89c0246a
+          check_blob src/mqttium/protocol/engine.py b7ba3a9bceba5c3f46a8b82f74bccce976f5cfb6
+          check_blob src/mqttium/protocol/outbound.py 942d33fe798c844a9f2a97f3d1d526af7aed6d7a
+          check_blob src/mqttium/transport/websocket.py 879ceaa0cbc349475c79fb5bf5968ce2341751e5
+          check_blob tests/unit/test_native_publish_nowait.py 49fcf623a76291a05a705d51cb7301b73879c41b
+          check_blob tests/unit/test_publish_many.py 00f76755d3f431cec8d27703ab4de0ee9d15b4a0
+          check_blob tests/unit/test_websocket.py fb53c1be338c0b303a6e698c126bf3be64883e77
+          check_blob tests/unit/test_write_pump.py 34289b401856bcf3d45e0aa05998bfc867ae6195
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: repo/pyproject.toml
+
+      - name: Validate final tree
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          python -m pip install -e ".[dev]"
+          python -m ruff format --check src tests
+          python -m ruff check src tests
+          python -m mypy src
+          python -m pytest tests/unit -q
+          python -m compileall -q src tests
+
+      - name: Push one clean commit to replacement branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd repo
+          base=fcd416057fd83f9294464f28e701879e00f8674f
+          target=refs/heads/agent/network-hotpaths-clean
+          expected=a1e3a546a7c39650c045dd6c88ade2f0c2fe61ab
+          test "$(git ls-remote origin "$target" | cut -f1)" = "$expected"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git reset --soft "$base"
+          git commit -m 'Optimize native MQTT network hot paths'
+          test "$(git rev-list --count "$base"..HEAD)" = 1
+          test "$(git diff --name-only "$base"..HEAD | wc -l)" = 11
+          git push --force-with-lease="$target:$expected" origin HEAD:"$target"
