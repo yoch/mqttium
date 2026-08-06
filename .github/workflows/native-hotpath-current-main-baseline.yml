@@ -1,0 +1,111 @@
+name: Native hotpath current-main baseline
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - agent/native-hotpath-architecture-study
+    paths:
+      - .github/workflows/native-hotpath-current-main-baseline.yml
+
+permissions:
+  contents: read
+
+jobs:
+  baseline:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    env:
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    steps:
+      - name: Check out study harness
+        uses: actions/checkout@v7
+        with:
+          path: harness
+      - name: Check out current main control A
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          path: current-a
+      - name: Check out current main control B
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          path: current-b
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install gmqtt and broker
+        run: |
+          python -m pip install gmqtt==0.7.0
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mosquitto
+          mkdir -p /tmp/mqttium-current-main
+          cat > /tmp/mqttium-current-main/mosquitto.conf <<'MOSQ'
+          persistence false
+          allow_anonymous true
+          max_inflight_messages 1000
+          max_queued_messages 1000000
+          max_queued_bytes 0
+          connection_messages false
+          log_type error
+          listener 11883 127.0.0.1
+          MOSQ
+          mosquitto -c /tmp/mqttium-current-main/mosquitto.conf \
+            > /tmp/mqttium-current-main/mosquitto.log 2>&1 &
+          for i in $(seq 1 60); do
+            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            sleep 0.2
+          done
+          cat /tmp/mqttium-current-main/mosquitto.log
+          exit 1
+      - name: Record exact source revisions
+        run: |
+          {
+            echo "harness=$(git -C harness rev-parse HEAD)"
+            echo "current_a=$(git -C current-a rev-parse HEAD)"
+            echo "current_b=$(git -C current-b rev-parse HEAD)"
+            python --version
+            python -m pip show gmqtt | grep '^Version:'
+            mosquitto -h 2>&1 | head -1
+          } | tee /tmp/mqttium-current-main/revisions.txt
+      - name: Recover corrected native harness
+        run: |
+          python - <<'PY'
+          import base64
+          import gzip
+          from pathlib import Path
+
+          workflow = Path('harness/.github/workflows/native-hotpath-study.yml').read_text().splitlines()
+          start = next(i for i, line in enumerate(workflow) if "cat > /tmp/native-hotpath.b64" in line) + 1
+          end = next(i for i in range(start, len(workflow)) if workflow[i].strip() == "B64")
+          payload = "".join(line.strip() for line in workflow[start:end])
+          source = gzip.decompress(base64.b64decode(payload)).decode()
+          source = source.replace("max_pending_callbacks=max(65_536, count),", "max_pending_callbacks=8_192,")
+          source = source.replace("max_pending_callbacks=65_536,", "max_pending_callbacks=8_192,")
+          Path('/tmp/native_hotpath_matrix.py').write_text(source)
+          PY
+          python -m py_compile /tmp/native_hotpath_matrix.py
+      - name: Run rotated current-main baseline
+        run: |
+          python harness/benchmarks/experimental/final_stack_driver.py \
+            --base-root current-a \
+            --optimized-root current-b \
+            --harness /tmp/native_hotpath_matrix.py \
+            --cycles 7 \
+            --messages 180000 \
+            --pairs 12000 \
+            --window 32 \
+            --output /tmp/mqttium-current-main/current-main-baseline.json
+      - name: Upload baseline evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-hotpath-current-main-${{ github.run_id }}
+          path: |
+            /tmp/mqttium-current-main/current-main-baseline.json
+            /tmp/mqttium-current-main/revisions.txt
+            /tmp/mqttium-current-main/mosquitto.log
+          if-no-files-found: warn
+          retention-days: 30
