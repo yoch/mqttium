@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from enum import IntEnum
+from typing import cast
 
 from mqttium.errors import MalformedPacketError
 
@@ -33,7 +34,7 @@ class PacketType(IntEnum):
     @classmethod
     def from_byte(cls, byte: int) -> PacketType:
         try:
-            return cls._value2member_map_[byte & 0xF0]
+            return cast(PacketType, cls._value2member_map_[byte & 0xF0])
         except KeyError as exc:
             raise MalformedPacketError(f"Unknown MQTT packet type byte 0x{byte:02x}") from exc
 
