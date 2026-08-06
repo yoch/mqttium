@@ -7,6 +7,7 @@ on:
       - agent/native-hotpath-architecture-study
     paths:
       - .github/workflows/native-hotpath-v311-qos1-decode.yml
+      - .github/scripts/apply_v311_qos1_decode_candidate_v2.py
 
 permissions:
   contents: read
