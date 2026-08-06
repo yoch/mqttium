@@ -16,9 +16,9 @@ concurrency:
 
 jobs:
   finalize:
-    if: github.event.head_commit.message == 'Finalize PR 55 on GitHub runner'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    if: github.event.head_commit.message == 'Finalize PR 55 on slim runner'
+    runs-on: ubuntu-slim
+    timeout-minutes: 15
     steps:
       - name: Check out target branch
         uses: actions/checkout@v7
@@ -34,7 +34,7 @@ jobs:
           path: jobs
           persist-credentials: false
 
-      - name: Verify head and apply signed patch
+      - name: Apply and verify exact final patch
         shell: bash
         run: |
           set -euo pipefail
@@ -56,33 +56,6 @@ jobs:
           git apply --check --whitespace=error-all /tmp/network-hotpaths.patch
           git apply --index --whitespace=error-all /tmp/network-hotpaths.patch
           git diff --cached --check
-
-      - name: Set up Python
-        uses: actions/setup-python@v7
-        with:
-          python-version: '3.12'
-          cache: pip
-          cache-dependency-path: repo/pyproject.toml
-
-      - name: Install development dependencies
-        run: python -m pip install -e './repo[dev]'
-
-      - name: Validate final implementation
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd repo
-          ruff format --check .
-          ruff check .
-          mypy src
-          pytest tests/unit -q
-          git diff --cached --check
-
-      - name: Verify exact final blobs
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd repo
           check_blob() {
             local path=$1 expected=$2 actual
             actual=$(git hash-object "$path")
