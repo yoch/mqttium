@@ -1,0 +1,45 @@
+name: Repair compact message experiment checks
+
+on:
+  push:
+    branches:
+      - agent/compact-message-delivery-experiment
+    paths:
+      - .github/workflows/repair-compact-message-experiment.yml
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: agent/compact-message-delivery-experiment
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: python -m pip install ruff==0.16.1
+      - name: Update assertions and format harness
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("tests/unit/test_memory_cleanup.py")
+          text = path.read_text()
+          old = '''    assert client._messages.empty()\n    assert client.pending_delivery_bytes == 0\n    assert message._delivery_references == 0\n    assert message._delivery_logical_bytes == 0\n'''
+          new = '''    assert client._messages.empty()\n    assert client.pending_delivery_bytes == 0\n    assert not hasattr(message, "_delivery_references")\n    assert not hasattr(message, "_delivery_logical_bytes")\n'''
+          if text.count(old) != 1:
+              raise RuntimeError("unexpected memory cleanup test content")
+          path.write_text(text.replace(old, new, 1))
+          PY
+          ruff format benchmarks/experimental/paired_compact_message_delivery.py tests/unit/test_memory_cleanup.py
+          ruff check benchmarks/experimental/paired_compact_message_delivery.py tests/unit/test_memory_cleanup.py
+      - name: Commit repairs
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add benchmarks/experimental/paired_compact_message_delivery.py tests/unit/test_memory_cleanup.py
+          git commit -m "Repair compact delivery experiment checks"
+          git push origin HEAD:agent/compact-message-delivery-experiment
