@@ -1,3 +1,4 @@
+# Fresh run after repairing the signed payload.
 name: PR 55 Slim Finalizer
 
 on:
@@ -38,10 +39,12 @@ jobs:
           python - <<'PY'
           import base64
           import gzip
+          import hashlib
           import json
           from pathlib import Path
 
           encoded = Path('../jobs/.cgw/jobs/network-hotpaths-finalize-20260806.b64').read_text().strip()
+          assert hashlib.sha256(encoded.encode()).hexdigest() == "12bc0f24455eaf97da30eb375edb2eef0506d6b842698ae4dfeb27292ac67e8d"
           encoded += '=' * (-len(encoded) % 4)
           job = json.loads(gzip.decompress(base64.urlsafe_b64decode(encoded)))
           assert job['expected_head'] == 'f5ae4a43c32f41548bfc831cf3f286e90a31ed6f'
@@ -98,7 +101,7 @@ jobs:
           base=fcd416057fd83f9294464f28e701879e00f8674f
           target=refs/heads/agent/rationalized-network-hotpaths
           remote_head=$(git ls-remote origin "$target" | cut -f1)
-          test -n "$remote_head"
+          test "$remote_head" = "f5ae4a43c32f41548bfc831cf3f286e90a31ed6f"
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git reset --soft "$base"
