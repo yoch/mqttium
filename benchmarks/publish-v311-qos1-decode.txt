@@ -1,0 +1,1 @@
+Build, validate and publish the MQTT 3.1.1 QoS 1 direct-field decoder.
