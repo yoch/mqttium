@@ -1,0 +1,205 @@
+name: Native hotpath final stack comparison
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - agent/native-hotpath-architecture-study
+    paths:
+      - .github/workflows/native-hotpath-final-stack.yml
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    env:
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    steps:
+      - name: Check out study harness
+        uses: actions/checkout@v7
+        with:
+          path: harness
+      - name: Check out current main
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          path: base
+      - name: Check out proposed stack
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          path: optimized
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install clients and broker
+        run: |
+          python -m pip install gmqtt==0.7.0
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mosquitto
+          mkdir -p /tmp/mqttium-final-stack
+          cat > /tmp/mqttium-final-stack/mosquitto.conf <<'MOSQ'
+          persistence false
+          allow_anonymous true
+          max_inflight_messages 1000
+          max_queued_messages 1000000
+          max_queued_bytes 0
+          connection_messages false
+          log_type error
+          listener 11883 127.0.0.1
+          MOSQ
+          mosquitto -c /tmp/mqttium-final-stack/mosquitto.conf \
+            > /tmp/mqttium-final-stack/mosquitto.log 2>&1 &
+          for i in $(seq 1 60); do
+            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            sleep 0.2
+          done
+          exit 1
+      - name: Apply proposed stack
+        run: |
+          python harness/.github/scripts/apply_nowait_size_candidate.py optimized
+          python harness/.github/scripts/apply_qos0_v311_decode_candidate.py optimized
+          python harness/.github/scripts/apply_qos0_effect_batch_candidate.py optimized
+          python harness/.github/scripts/apply_v311_qos1_decode_candidate_v2.py optimized
+          python -m py_compile \
+            optimized/src/mqttium/api/async_client.py \
+            optimized/src/mqttium/api/_effects.py \
+            optimized/src/mqttium/protocol/inbound.py \
+            optimized/src/mqttium/protocol/outbound.py
+          git -C optimized diff --check
+      - name: Recover corrected native harness
+        run: |
+          python - <<'PY'
+          import base64
+          import gzip
+          from pathlib import Path
+
+          workflow = Path('harness/.github/workflows/native-hotpath-study.yml').read_text().splitlines()
+          start = next(i for i, line in enumerate(workflow) if "cat > /tmp/native-hotpath.b64" in line) + 1
+          end = next(i for i in range(start, len(workflow)) if workflow[i].strip() == "B64")
+          payload = "".join(line.strip() for line in workflow[start:end])
+          source = gzip.decompress(base64.b64decode(payload)).decode()
+          source = source.replace("max_pending_callbacks=max(65_536, count),", "max_pending_callbacks=8_192,")
+          source = source.replace("max_pending_callbacks=65_536,", "max_pending_callbacks=8_192,")
+          Path('/tmp/native_hotpath_matrix.py').write_text(source)
+          PY
+          python -m py_compile /tmp/native_hotpath_matrix.py
+      - name: Run rotated stack comparison
+        run: |
+          cat > /tmp/final_stack_driver.py <<'PY'
+          from __future__ import annotations
+
+          import json
+          import os
+          import statistics
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          roots = {"base": Path("base").resolve(), "optimized": Path("optimized").resolve()}
+          cases = {
+              "ingress_direct": {
+                  "main-default": ("base", "mqttium-baseline"),
+                  "optimized-default": ("optimized", "mqttium-baseline"),
+                  "optimized-inline": ("optimized", "mqttium-sync-inline"),
+                  "gmqtt": ("base", "gmqtt"),
+              },
+              "ingress_broker": {
+                  "main-default": ("base", "mqttium-baseline"),
+                  "optimized-default": ("optimized", "mqttium-baseline"),
+                  "optimized-inline": ("optimized", "mqttium-sync-inline"),
+                  "gmqtt": ("base", "gmqtt"),
+              },
+              "rtt": {
+                  "main-default": ("base", "mqttium-nowait"),
+                  "optimized-default": ("optimized", "mqttium-nowait"),
+                  "optimized-inline": ("optimized", "mqttium-sync-inline-nowait"),
+                  "gmqtt": ("base", "gmqtt"),
+              },
+          }
+
+          def sample(scenario: str, root_name: str, variant: str) -> dict[str, object]:
+              env = os.environ.copy()
+              env["PYTHONPATH"] = str(roots[root_name] / "src")
+              command = [
+                  sys.executable,
+                  "/tmp/native_hotpath_matrix.py",
+                  "--worker",
+                  "--scenario",
+                  scenario,
+                  "--variant",
+                  variant,
+              ]
+              if scenario == "rtt":
+                  command += ["--pairs", "10000", "--window", "32"]
+              else:
+                  command += ["--messages", "160000"]
+              proc = subprocess.run(command, check=True, capture_output=True, text=True, env=env)
+              line = next(
+                  item.removeprefix("RESULT ")
+                  for item in reversed(proc.stdout.splitlines())
+                  if item.startswith("RESULT ")
+              )
+              return json.loads(line)
+
+          rows = []
+          labels = ("main-default", "optimized-default", "optimized-inline", "gmqtt")
+          for cycle in range(5):
+              order = labels if cycle % 2 == 0 else tuple(reversed(labels))
+              row = {"cycle": cycle, "order": order, "scenarios": {}}
+              for scenario, mapping in cases.items():
+                  row["scenarios"][scenario] = {}
+                  for label in order:
+                      root_name, variant = mapping[label]
+                      row["scenarios"][scenario][label] = sample(
+                          scenario, root_name, variant
+                      )
+              rows.append(row)
+
+          summary = {}
+          for scenario in cases:
+              medians = {
+                  label: statistics.median(
+                      row["scenarios"][scenario][label]["rate"] for row in rows
+                  )
+                  for label in labels
+              }
+              summary[scenario] = {
+                  "median_rates": medians,
+                  "optimized_default_vs_main": medians["optimized-default"] / medians["main-default"],
+                  "optimized_default_vs_gmqtt": medians["optimized-default"] / medians["gmqtt"],
+                  "optimized_inline_vs_gmqtt": medians["optimized-inline"] / medians["gmqtt"],
+              }
+              if scenario == "rtt":
+                  summary[scenario]["median_p50_ms"] = {
+                      label: statistics.median(
+                          row["scenarios"][scenario][label]["p50_ms"] for row in rows
+                      )
+                      for label in labels
+                  }
+                  summary[scenario]["median_p95_ms"] = {
+                      label: statistics.median(
+                          row["scenarios"][scenario][label]["p95_ms"] for row in rows
+                      )
+                      for label in labels
+                  }
+          result = {"rows": rows, "summary": summary}
+          path = Path("/tmp/mqttium-final-stack/final-stack.json")
+          path.write_text(json.dumps(result, indent=2) + "\n")
+          print(json.dumps(summary, indent=2))
+          PY
+          python /tmp/final_stack_driver.py
+      - name: Upload final-stack evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-hotpath-final-stack-${{ github.run_id }}
+          path: |
+            /tmp/mqttium-final-stack/final-stack.json
+            /tmp/mqttium-final-stack/mosquitto.log
+          if-no-files-found: warn
+          retention-days: 30
