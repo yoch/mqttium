@@ -1,7 +1,9 @@
 # Contributing
 
-Contributions are welcome while MQTTium is being prepared for its first public
-package release.
+Contributions and reproducible feedback are welcome during the MQTTium beta.
+Incorrect behaviour in a published beta should use the structured bug form and
+the evidence checklist in [`docs/BETA-REPORTING.md`](docs/BETA-REPORTING.md).
+Security vulnerabilities must follow the private process in [`SECURITY.md`](SECURITY.md).
 
 ## Development
 
@@ -31,6 +33,16 @@ CI additionally builds the distributions and asserts their contents
 (`validate-pyproject`, `python -m build`, `twine check --strict`,
 `check-wheel-contents`, wheel metadata and isolated-install checks), and fails
 if any cache or build artefact is tracked by git.
+
+## Bug reports
+
+Prefer a minimal complete reproducer against a published beta installed in a
+clean virtual environment. Include the MQTTium, Python, broker and operating-
+system versions, protocol, transport, relevant client options, complete
+traceback and a `ClientStats` snapshot when the owning event loop is responsive.
+Redact credentials, private keys, tokens, private addresses and sensitive
+payloads. See [`docs/BETA-REPORTING.md`](docs/BETA-REPORTING.md) for failure-
+specific evidence and triage criteria.
 
 ## Pull requests
 
