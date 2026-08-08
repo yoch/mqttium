@@ -408,6 +408,11 @@ class ProtocolEngine:
             self._emit(EffectKind.DISCONNECTED, DisconnectInfo(from_broker=False))
 
     def handle_raw(self, raw: RawPacket) -> None:
+        # DISCONNECT is the client's final MQTT Control Packet. The peer may still
+        # have packets already in flight before the transport actually closes, but
+        # dispatching them could emit ACKs or user-visible effects after DISCONNECT.
+        if self.state is ConnectionState.DISCONNECTING:
+            return
         try:
             validate_raw_packet(raw)
             allowed = _ALLOWED_PACKETS_BY_STATE.get(self.state, frozenset())
