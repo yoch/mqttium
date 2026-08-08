@@ -206,7 +206,7 @@ def _encode_value(ptype: PropType, value: Any) -> bytes:
             raise ProtocolError(f"Invalid uint32 property value: {value!r}")
         return pack_u32(value)
     if ptype is PropType.VBI:
-        if not isinstance(value, int) or value < 0:
+        if not isinstance(value, int) or not 0 <= value <= 268_435_455:
             raise ProtocolError(f"Invalid VBI property value: {value!r}")
         return encode_vbi(value)
     if ptype is PropType.STRING:
@@ -220,7 +220,10 @@ def _encode_value(ptype: PropType, value: Any) -> bytes:
     if ptype is PropType.BINARY:
         if not isinstance(value, (bytes, bytearray)):
             raise ProtocolError(f"Invalid binary property value: {value!r}")
-        return pack_binary(bytes(value))
+        try:
+            return pack_binary(bytes(value))
+        except ValueError as exc:
+            raise ProtocolError(f"Invalid binary property value: {exc}") from exc
     raise ProtocolError(f"Unknown property type {ptype}")
 
 
