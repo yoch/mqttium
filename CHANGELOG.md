@@ -14,6 +14,12 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - WebSocket client masking now uses lazy byte-translation tables instead of a
   Python loop per payload byte, while retaining a fresh RFC 6455 mask per frame.
 
+### Fixed
+
+- MQTT 5 property encoding now rejects out-of-range Variable Byte Integers and
+  oversized binary values with the public `ProtocolError` contract instead of
+  leaking low-level `ValueError` exceptions.
+
 ## [0.2.0b1] - 2026-08-06
 
 ### Added

@@ -120,3 +120,50 @@ def test_receive_maximum_zero_forbidden() -> None:
     props.set("receive_maximum", 0)
     with pytest.raises(ProtocolError, match="must not be zero"):
         encode_properties(props, CONNACK)
+
+
+@pytest.mark.parametrize("value", [-1, 268_435_456, "1", None])
+def test_subscription_identifier_rejects_invalid_vbi_values(value: object) -> None:
+    props = Properties()
+    props.set("subscription_identifier", value)
+
+    with pytest.raises(ProtocolError, match="Invalid VBI property value"):
+        encode_properties(props, PUBLISH)
+
+
+def test_subscription_identifier_accepts_maximum_vbi_value() -> None:
+    props = Properties()
+    props.set("subscription_identifier", 268_435_455)
+
+    encoded = encode_properties(props, PUBLISH)
+    decoded, offset = decode_properties(encoded, 0, PUBLISH)
+
+    assert offset == len(encoded)
+    assert decoded.get("subscription_identifier") == [268_435_455]
+
+
+def test_binary_property_rejects_values_larger_than_mqtt_u16_length() -> None:
+    props = Properties()
+    props.set("correlation_data", b"x" * 65_536)
+
+    with pytest.raises(ProtocolError, match="Binary data too long") as caught:
+        encode_properties(props, PUBLISH)
+
+    assert isinstance(caught.value.__cause__, ValueError)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        ("valid-key", 1),
+        (object(), "valid-value"),
+        ("missing-value",),
+        ["not", "a tuple"],
+    ],
+)
+def test_user_property_rejects_malformed_pairs(value: object) -> None:
+    props = Properties()
+    props.set("user_property", value)
+
+    with pytest.raises(ProtocolError, match="UTF-8|string-pair"):
+        encode_properties(props, PUBLISH)
