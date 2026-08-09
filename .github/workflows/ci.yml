@@ -43,7 +43,10 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: python -m pip install -e ".[dev]"
-      - run: python -m pytest -q tests/unit
+      - name: Require OpenSSL for TLS tests
+        run: python -c "import shutil; assert shutil.which('openssl'), 'OpenSSL is required for TLS tests'"
+      - name: Unit tests (including TLS, WebSocket, and cancellation)
+        run: python -m pytest -q -ra tests/unit
       - name: Start Mosquitto
         run: |
           sudo apt-get update -qq
@@ -55,7 +58,27 @@ jobs:
             sleep 0.2
           done
           exit 1
-      - run: python -m pytest -q tests/integration
+      - name: Mosquitto integration tests
+        run: python -m pytest -q tests/integration
+
+  cross-platform:
+    name: Cross-platform (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, windows-2025]
+        python-version: ["3.11", "3.14"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install -e ".[dev]"
+      - name: Require OpenSSL for TLS tests
+        run: python -c "import shutil; assert shutil.which('openssl'), 'OpenSSL is required for TLS tests'"
+      - name: Unit tests (including TLS, WebSocket, and cancellation)
+        run: python -m pytest -q -ra tests/unit
 
   fuzz:
     runs-on: ubuntu-24.04
