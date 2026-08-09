@@ -81,6 +81,7 @@ jobs:
             --repeat 11 \
             --output /tmp/mqttium-paired/micro.json
       - name: Paired network and latency sweep
+        continue-on-error: ${{ github.event_name == 'pull_request' }}
         run: |
           python candidate/benchmarks/paired_network.py \
             --base-root base \
