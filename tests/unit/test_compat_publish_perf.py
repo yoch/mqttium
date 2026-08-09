@@ -89,6 +89,19 @@ def test_qos0_effect_completion_follows_send() -> None:
     assert effects[-1].data is None
 
 
+def test_publish_receipts_remain_fifo_across_multiple_mid_reuses() -> None:
+    client = AsyncClient()
+    receipts = [
+        PublishReceipt(mid=7, qos=QoS.AT_LEAST_ONCE, _event=asyncio.Event()) for _ in range(3)
+    ]
+
+    for receipt in receipts:
+        client._register_publish_receipt(7, receipt)
+
+    assert [client._pop_publish_receipt(7) for _ in receipts] == receipts
+    assert 7 not in client._receipts
+
+
 @pytest.mark.asyncio
 async def test_old_completion_cannot_settle_reused_mid() -> None:
     client = AsyncClient()
