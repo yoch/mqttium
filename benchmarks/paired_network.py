@@ -67,12 +67,16 @@ def start_subscriber(host: str, port: int, topic: str, count: int):
         "%p",
     ]
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    arrivals: list[tuple[bytes, int]] = []
+    latencies: list[float] = []
+    sequences: list[int] = []
 
     def read() -> None:
         assert process.stdout is not None
         for line in process.stdout:
-            arrivals.append((line.rstrip(b"\n"), time.monotonic_ns()))
+            arrived_ns = time.monotonic_ns()
+            sequences.append(int(line[:16], 16))
+            sent_ns = int(line[16:HEADER_HEX_BYTES], 16)
+            latencies.append((arrived_ns - sent_ns) / 1_000_000)
 
     thread = threading.Thread(target=read, daemon=True)
     thread.start()
@@ -80,7 +84,7 @@ def start_subscriber(host: str, port: int, topic: str, count: int):
     if process.poll() is not None:
         assert process.stderr is not None
         raise RuntimeError(process.stderr.read().decode(errors="replace"))
-    return process, arrivals, thread
+    return process, latencies, sequences, thread
 
 
 async def publish(
@@ -117,7 +121,9 @@ async def publish(
 
 def worker(args: argparse.Namespace) -> None:
     topic = f"bench/paired/{os.getpid()}/{time.time_ns()}"
-    process, arrivals, thread = start_subscriber(args.host, args.port, topic, args.count)
+    process, latencies, sequences, thread = start_subscriber(
+        args.host, args.port, topic, args.count
+    )
     delivery_started = time.perf_counter()
     cpu_started = time.process_time()
     ack_seconds = asyncio.run(
@@ -137,18 +143,11 @@ def worker(args: argparse.Namespace) -> None:
         process.kill()
         process.wait()
     thread.join(timeout=2.0)
-    if len(arrivals) != args.count:
+    if len(latencies) != args.count:
         assert process.stderr is not None
         detail = process.stderr.read().decode(errors="replace")
-        raise TimeoutError(f"subscriber incomplete {len(arrivals)}/{args.count}: {detail}")
+        raise TimeoutError(f"subscriber incomplete {len(latencies)}/{args.count}: {detail}")
 
-    latencies: list[float] = []
-    sequences: list[int] = []
-    for raw, arrived_ns in arrivals:
-        sequence = int(raw[:16], 16)
-        sent_ns = int(raw[16:HEADER_HEX_BYTES], 16)
-        sequences.append(sequence)
-        latencies.append((arrived_ns - sent_ns) / 1_000_000)
     if sorted(sequences) != list(range(args.count)):
         raise RuntimeError("subscriber payload sequence mismatch")
 
