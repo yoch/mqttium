@@ -1,0 +1,138 @@
+name: Long fuzz campaigns
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/fuzz-campaign.yml
+      - tests/fuzz/**
+      - tests/unit/test_fuzz_*.py
+      - src/mqttium/codec/**
+      - src/mqttium/protocol/**
+      - src/mqttium/transport/websocket.py
+  schedule:
+    - cron: "41 2 * * *"
+  workflow_dispatch:
+    inputs:
+      campaign:
+        description: Campaign size
+        required: true
+        default: nightly
+        type: choice
+        options:
+          - nightly
+          - rc-24-cpu-hours
+      base_seed:
+        description: Reproducible base seed (0 through 2000000000)
+        required: true
+        default: "1"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  fuzz:
+    name: ${{ github.event_name == 'pull_request' && 'PR smoke' || inputs.campaign || 'nightly' }} (shard ${{ matrix.shard }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && inputs.campaign == 'rc-24-cpu-hours' && 300 || 35 }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(github.event_name == 'pull_request' && '[0]' || github.event_name == 'workflow_dispatch' && inputs.campaign == 'rc-24-cpu-hours' && '[0,1,2,3,4]' || '[0,1,2]') }}
+    env:
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      SHARD: ${{ matrix.shard }}
+      BASE_SEED: ${{ github.event_name == 'workflow_dispatch' && inputs.base_seed || github.run_number }}
+      CAMPAIGN: ${{ github.event_name == 'pull_request' && 'pr-smoke' || inputs.campaign || 'nightly' }}
+      DURATION_MINUTES: ${{ github.event_name == 'pull_request' && '1' || github.event_name == 'workflow_dispatch' && inputs.campaign == 'rc-24-cpu-hours' && '288' || '20' }}
+      HYPOTHESIS_PROFILE: ${{ github.event_name == 'pull_request' && 'ci' || 'aggressive' }}
+      BATCH_ITERATIONS: ${{ github.event_name == 'pull_request' && '20000' || '100000' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - run: python -m pip install -e ".[fuzz]"
+      - name: Run bounded deterministic and Hypothesis fuzzing
+        run: |
+          if [[ ! "$BASE_SEED" =~ ^[0-9]+$ ]] || (( BASE_SEED > 2000000000 )); then
+            echo "base_seed must be an integer between 0 and 2000000000" >&2
+            exit 2
+          fi
+
+          artifact_root="$RUNNER_TEMP/mqttium-fuzz/shard-$SHARD"
+          failure_dir="$artifact_root/failures"
+          hypothesis_dir="$artifact_root/hypothesis"
+          mkdir -p "$failure_dir" "$hypothesis_dir"
+
+          # Give every run and shard a disjoint practical seed namespace. Even
+          # at one completed batch per 100 ms, a shard cannot consume its
+          # 200,000-seed allocation during the 288-minute RC budget.
+          shard_seed=$((BASE_SEED * 1000000 + SHARD * 200000))
+          export HYPOTHESIS_STORAGE_DIRECTORY="$hypothesis_dir"
+          export ARTIFACT_ROOT="$artifact_root"
+          export SHARD_SEED="$shard_seed"
+
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          metadata = {
+              "base_seed": int(os.environ["BASE_SEED"]),
+              "batch_iterations": int(os.environ["BATCH_ITERATIONS"]),
+              "campaign": os.environ["CAMPAIGN"],
+              "commit": os.environ["GITHUB_SHA"],
+              "duration_minutes": int(os.environ["DURATION_MINUTES"]),
+              "hypothesis_profile": os.environ["HYPOTHESIS_PROFILE"],
+              "run_id": int(os.environ["GITHUB_RUN_ID"]),
+              "shard": int(os.environ["SHARD"]),
+              "shard_seed": int(os.environ["SHARD_SEED"]),
+              "targets": ["codec", "engine", "websocket"],
+          }
+          path = Path(os.environ["ARTIFACT_ROOT"]) / "metadata.json"
+          path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          PY
+
+          start_epoch=$(date +%s)
+          deadline_epoch=$((start_epoch + DURATION_MINUTES * 60))
+          {
+            echo "campaign=$CAMPAIGN shard=$SHARD seed=$shard_seed duration=${DURATION_MINUTES}m"
+            echo "Hypothesis profile=$HYPOTHESIS_PROFILE seed=$shard_seed"
+            PYTHONPATH=src python -m pytest -q tests/fuzz/test_hypothesis_fuzz.py \
+              --hypothesis-seed="$shard_seed"
+
+            batch=0
+            while (( $(date +%s) < deadline_epoch )); do
+              for target in codec engine websocket; do
+                if (( $(date +%s) >= deadline_epoch )); then
+                  break 2
+                fi
+                seed=$((shard_seed + batch))
+                echo "Seeded target=$target seed=$seed iterations=$BATCH_ITERATIONS batch=$batch"
+                PYTHONPATH=src python tests/fuzz/fuzz.py \
+                  --target "$target" \
+                  --seed "$seed" \
+                  --iterations "$BATCH_ITERATIONS" \
+                  --progress-every "$BATCH_ITERATIONS" \
+                  --artifacts-dir "$failure_dir"
+                batch=$((batch + 1))
+              done
+            done
+            elapsed_seconds=$(($(date +%s) - start_epoch))
+            echo "completed_batches=$batch elapsed_seconds=$elapsed_seconds"
+          } 2>&1 | tee "$artifact_root/campaign.log"
+      - name: Upload corpus, failures, metadata, and logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-${{ env.CAMPAIGN }}-shard-${{ matrix.shard }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/mqttium-fuzz/shard-${{ matrix.shard }}
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: ${{ github.event_name == 'workflow_dispatch' && inputs.campaign == 'rc-24-cpu-hours' && 90 || 30 }}
