@@ -183,6 +183,7 @@ class MemoryProbe:
         memory = self._process.memory_info()
         full = self._process.memory_full_info()
         traced_current, traced_peak = tracemalloc.get_traced_memory()
+        num_fds = getattr(self._process, "num_fds", None)
         return {
             "phase": phase,
             "rss_mib": memory.rss / _MIB,
@@ -191,6 +192,8 @@ class MemoryProbe:
             "max_rss_mib": _max_rss_mib(),
             "traced_current_mib": traced_current / _MIB,
             "traced_peak_mib": traced_peak / _MIB,
+            "process_threads": self._process.num_threads(),
+            "process_fds": num_fds() if num_fds is not None else None,
             "logical": logical,
         }
 

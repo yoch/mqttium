@@ -24,7 +24,7 @@ from collections.abc import Callable
 from concurrent.futures import Future
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from mqttium.compat.paho import CallbackAPIVersion, Client, MQTTMessageInfo
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, QoS
@@ -38,6 +38,10 @@ class Sample:
     latency_p50_us: float
     latency_p95_us: float
     latency_p99_us: float
+    drain_batches: int = 0
+    mean_batch_size: float = 0.0
+    max_batch_size: int = 0
+    pending_high_water: int = 0
 
 
 def _percentile(values: list[float], percentile: float) -> float:
@@ -48,12 +52,18 @@ def _percentile(values: list[float], percentile: float) -> float:
     return ordered[index]
 
 
-def _sample(count: int, elapsed: float, latencies: list[float]) -> Sample:
+def _sample(count: int, elapsed: float, latencies: list[float], client: Client) -> Sample:
+    benchmark: dict[str, Any] = cast(Any, client)._benchmark_state
+    batches: list[int] = benchmark["batch_sizes"]
     return Sample(
         messages_per_second=count / elapsed,
         latency_p50_us=_percentile(latencies, 0.50) * 1_000_000,
         latency_p95_us=_percentile(latencies, 0.95) * 1_000_000,
         latency_p99_us=_percentile(latencies, 0.99) * 1_000_000,
+        drain_batches=len(batches),
+        mean_batch_size=statistics.fmean(batches) if batches else 0.0,
+        max_batch_size=max(batches, default=0),
+        pending_high_water=benchmark["pending_high_water"],
     )
 
 
@@ -67,6 +77,27 @@ def _new_client(name: str) -> Client:
     )
     client.loop_start()
     client._async._engine.state = ConnectionState.CONNECTED
+    benchmark: dict[str, Any] = {"batch_sizes": [], "pending_high_water": 0}
+    cast(Any, client)._benchmark_state = benchmark
+    take_batch = client._take_publish_batch
+    enqueue = client._enqueue_publish_request
+
+    def measured_take_batch():
+        batch, has_more = take_batch()
+        benchmark["batch_sizes"].append(len(batch))
+        return batch, has_more
+
+    def measured_enqueue(request):
+        accepted = enqueue(request)
+        with client._publish_schedule_lock:
+            benchmark["pending_high_water"] = max(
+                benchmark["pending_high_water"],
+                client._pending_publish_requests,
+            )
+        return accepted
+
+    cast(Any, client)._take_publish_batch = measured_take_batch
+    cast(Any, client)._enqueue_publish_request = measured_enqueue
     return client
 
 
@@ -147,7 +178,7 @@ def _run_single(name: str, count: int) -> Sample:
             before = time.perf_counter()
             publish(client, str(index).encode())
             latencies.append(time.perf_counter() - before)
-        return _sample(count, time.perf_counter() - started, latencies)
+        return _sample(count, time.perf_counter() - started, latencies, client)
     finally:
         client.loop_stop()
 
@@ -195,7 +226,7 @@ def _run_multi(name: str, count: int, workers: int) -> Sample:
             raise RuntimeError("benchmark worker did not finish")
         if errors:
             raise errors[0]
-        return _sample(count, elapsed, latencies)
+        return _sample(count, elapsed, latencies, client)
     finally:
         client.loop_stop()
 
