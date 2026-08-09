@@ -2,6 +2,17 @@ name: Paired Regression
 
 on:
   workflow_dispatch:
+    inputs:
+      base_ref:
+        description: Baseline commit, branch, or tag
+        required: true
+        default: v0.2.0b2
+        type: string
+      candidate_ref:
+        description: Candidate commit, branch, or tag
+        required: true
+        default: main
+        type: string
   pull_request:
     paths:
       - benchmarks/**
@@ -29,11 +40,12 @@ jobs:
       - name: Check out candidate
         uses: actions/checkout@v7
         with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_ref || github.sha }}
           path: candidate
       - name: Check out base
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.pull_request.base.sha || 'main' }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.base_ref || github.event.pull_request.base.sha }}
           path: base
       - uses: actions/setup-python@v7
         with:
@@ -74,7 +86,8 @@ jobs:
             --base-root base \
             --candidate-root candidate \
             --repeat 5 \
-            --windows 1,5,20,100 \
+            --windows 1,8,32,64,128 \
+            --protocols 311,5 \
             --payloads 64,4096 \
             --output /tmp/mqttium-paired/network.json
       - name: Upload paired measurements
