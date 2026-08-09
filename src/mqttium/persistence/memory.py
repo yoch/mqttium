@@ -125,6 +125,10 @@ class TransitionInflightStore(InflightStore, Protocol):
 
     def contains_in(self, mid: int) -> bool: ...
 
+    def set_in_logical_size(self, mid: int, logical_size: int) -> bool:
+        """Persist a logical size recomputed after reading a legacy record."""
+        ...
+
     def in_meta(self, mid: int) -> InboundRecordMeta | None: ...
 
     def in_index_pages(self, page_size: int = 256) -> Iterator[tuple[InboundRecordMeta, ...]]:
@@ -329,11 +333,23 @@ class MemoryInflightStore:
     def contains_in(self, mid: int) -> bool:
         return mid in self._in
 
+    def set_in_logical_size(self, mid: int, logical_size: int) -> bool:
+        msg = self._in.get(mid)
+        if msg is None:
+            return False
+        msg.logical_size = logical_size
+        return True
+
     def in_meta(self, mid: int) -> InboundRecordMeta | None:
         msg = self._in.get(mid)
         if msg is None:
             return None
-        return InboundRecordMeta(mid=mid, state=msg.state, user_acked=msg.user_acked)
+        return InboundRecordMeta(
+            mid=mid,
+            state=msg.state,
+            user_acked=msg.user_acked,
+            logical_size=msg.logical_size,
+        )
 
     def in_index_pages(self, page_size: int = 256) -> Iterator[tuple[InboundRecordMeta, ...]]:
         if page_size <= 0:
@@ -341,7 +357,12 @@ class MemoryInflightStore:
         mids = iter(tuple(self._in))
         while page := tuple(islice(mids, page_size)):
             metas = tuple(
-                InboundRecordMeta(mid=mid, state=message.state, user_acked=message.user_acked)
+                InboundRecordMeta(
+                    mid=mid,
+                    state=message.state,
+                    user_acked=message.user_acked,
+                    logical_size=message.logical_size,
+                )
                 for mid in page
                 if (message := self._in.get(mid)) is not None
             )
@@ -369,7 +390,12 @@ class MemoryInflightStore:
         msg.state = new_state
         if user_acked is not None:
             msg.user_acked = user_acked
-        return InboundRecordMeta(mid=mid, state=new_state, user_acked=msg.user_acked)
+        return InboundRecordMeta(
+            mid=mid,
+            state=new_state,
+            user_acked=msg.user_acked,
+            logical_size=msg.logical_size,
+        )
 
     def complete_in(
         self,
@@ -380,4 +406,9 @@ class MemoryInflightStore:
         if msg is None or msg.state is not expected_state:
             return None
         self.pop_in(mid)
-        return InboundRecordMeta(mid=mid, state=msg.state, user_acked=msg.user_acked)
+        return InboundRecordMeta(
+            mid=mid,
+            state=msg.state,
+            user_acked=msg.user_acked,
+            logical_size=msg.logical_size,
+        )

@@ -4,11 +4,12 @@ The benchmarks workflow only uploaded JSON, so nothing turned red when retained
 memory grew. This compares a run against benchmarks/memory_thresholds.json and
 exits non-zero on a breach.
 
-Two independent checks per scenario:
+Checks per scenario:
 
 * ``max_traced_peak_mib`` bounds the tracemalloc peak. That measures Python
-  allocations rather than RSS, so it is comparable across runners; absolute RSS
-  is not, and is deliberately ignored here.
+  allocations and is comparable across runners.
+* Selected aggregate scenarios may also define ``max_loaded_rss_delta_mib``.
+  Those gates are deliberately limited to stable GitHub Actions runners.
 * ``logical`` asserts the scenario's ``loaded`` counters exactly. Without it a
   benchmark that silently stopped doing the same work would look like an
   improvement.
@@ -41,6 +42,14 @@ def traced_peak_mib(scenario: dict[str, Any]) -> float:
     return max(peaks, default=0.0)
 
 
+def loaded_rss_delta_mib(scenario: dict[str, Any]) -> float | None:
+    for snapshot in scenario.get("snapshots", []):
+        if snapshot.get("phase") == "loaded":
+            value = snapshot.get("rss_delta_mib")
+            return None if value is None else float(value)
+    return None
+
+
 def check(profile: dict[str, Any], thresholds: dict[str, Any]) -> list[str]:
     scenarios = {s["name"]: s for s in profile.get("scenarios", [])}
     failures: list[str] = []
@@ -55,6 +64,16 @@ def check(profile: dict[str, Any], thresholds: dict[str, Any]) -> list[str]:
         limit = limits["max_traced_peak_mib"]
         if peak > limit:
             failures.append(f"{name}: traced peak {peak:.2f} MiB exceeds {limit:.2f} MiB")
+
+        rss_limit = limits.get("max_loaded_rss_delta_mib")
+        if rss_limit is not None:
+            rss_delta = loaded_rss_delta_mib(scenario)
+            if rss_delta is None:
+                failures.append(f"{name}: loaded RSS delta is unavailable")
+            elif rss_delta > rss_limit:
+                failures.append(
+                    f"{name}: loaded RSS delta {rss_delta:.2f} MiB exceeds {rss_limit:.2f} MiB"
+                )
 
         counters = loaded_counters(scenario)
         for key, expected in limits.get("logical", {}).items():

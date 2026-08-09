@@ -6,7 +6,10 @@
     "which are build artefacts (see docs/BENCHMARKING.md).",
     "",
     "max_traced_peak_mib is a tracemalloc figure, so it measures Python",
-    "allocations rather than RSS and is comparable across runners. Each value is",
+    "allocations rather than RSS and is comparable across runners. The inbound",
+    "persistence scenario also has a deliberately generous GitHub Actions RSS",
+    "delta gate so aggregate process growth cannot escape the logical cap.",
+    "Each tracemalloc value is",
     "the reference peak recorded in docs/MEMORY-RESULTS.md rounded up by ~25%.",
     "",
     "logical is an exact-match assertion on the scenario's 'loaded' counters. It",
@@ -47,6 +50,20 @@
         "rejected_messages": 3958,
         "pending_logical_bytes": 8388536,
         "configured_byte_limit": 8388608
+      }
+    },
+    "inbound_bounded_persistence_4k": {
+      "max_traced_peak_mib": 12.0,
+      "max_loaded_rss_delta_mib": 32.0,
+      "logical": {
+        "attempted_messages": 2043,
+        "accepted_messages": 2042,
+        "rejected_messages": 1,
+        "pending_logical_bytes": 8388536,
+        "pending_high_water_bytes": 8388536,
+        "configured_byte_limit": 8388608,
+        "store_records": 2042,
+        "limit_respected": true
       }
     },
     "iterator_delivery_budget_4k": {

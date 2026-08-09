@@ -22,14 +22,16 @@ from mqttium.types import InboundMessage
 
 
 def inbound(mid: int, payload: bytes = b"body") -> InboundMessage:
+    topic = f"recover/{mid}"
     return InboundMessage(
         mid=mid,
-        topic=f"recover/{mid}",
+        topic=topic,
         payload=payload,
         qos=QoS.EXACTLY_ONCE,
         retain=False,
         state=InboundQoSState.WAIT_PUBREL,
         delivered=False,
+        logical_size=len(topic) + len(payload),
     )
 
 

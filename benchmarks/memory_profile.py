@@ -37,9 +37,11 @@ except ImportError as exc:  # pragma: no cover - actionable local error
     raise SystemExit("memory_profile.py requires psutil>=6") from exc
 
 from mqttium.api import AsyncClient
+from mqttium.codec.buffer import IncrementalDecoder
 from mqttium.compat.paho import Client as PahoClient
 from mqttium.compat.paho import MQTT_ERR_QUEUE_SIZE, MQTT_ERR_SUCCESS
-from mqttium.enums import MQTTProtocolVersion, OutboundQoSState, QoS
+from mqttium.enums import ConnectionState, MQTTProtocolVersion, OutboundQoSState, QoS
+from mqttium.packets import PublishPacket
 from mqttium.persistence.memory import MemoryInflightStore
 from mqttium.persistence.sqlite import SqliteInflightStore
 from mqttium.protocol.engine import EffectKind, EngineConfig, EngineEffect, ProtocolEngine
@@ -87,6 +89,13 @@ SCENARIOS = (
         count=6_000,
         payload_size=4_096,
         notes="QoS 1 queue capped by an 8 MiB logical byte budget.",
+    ),
+    ScenarioSpec(
+        name="inbound_bounded_persistence_4k",
+        runner="inbound_bounded_persistence",
+        count=6_000,
+        payload_size=4_096,
+        notes="Inbound QoS 2 persistence capped by an 8 MiB logical byte budget.",
     ),
     ScenarioSpec(
         name="iterator_delivery_budget_4k",
@@ -344,6 +353,60 @@ def run_protocol_bounded_queue(spec: ScenarioSpec) -> dict[str, Any]:
     engine._queued.clear()
     engine.store.clear_out()
     engine.packet_ids.clear()
+    del engine
+    snapshots.append(probe.snapshot("released"))
+    trimmed = _malloc_trim()
+    snapshots.append(probe.snapshot("released_after_malloc_trim", malloc_trim=trimmed))
+    return _finalize(spec, started, snapshots)
+
+
+def run_inbound_bounded_persistence(spec: ScenarioSpec) -> dict[str, Any]:
+    probe = MemoryProbe()
+    snapshots = [probe.snapshot("baseline")]
+    probe.reset_python_peak()
+    started = time.perf_counter()
+    logical_size = _logical_message_bytes(spec.payload_size)
+    byte_limit = max(logical_size, min(8 * _MIB, (spec.count // 2) * logical_size))
+    engine = ProtocolEngine(EngineConfig(max_pending_inbound_bytes=byte_limit))
+    engine.state = ConnectionState.CONNECTED
+    decoder = IncrementalDecoder()
+    attempted = 0
+    for index in range(spec.count):
+        attempted += 1
+        packet = PublishPacket(
+            topic=_TOPIC,
+            payload=_payload(index, spec.payload_size),
+            qos=QoS.EXACTLY_ONCE,
+            retain=False,
+            dup=False,
+            mid=index + 1,
+        )
+        decoder.feed(packet.encode())
+        raw = decoder.next_packet()
+        if raw is None:
+            raise AssertionError("complete benchmark packet did not decode")
+        engine.handle_raw(raw)
+        engine.take_effects()
+        if engine.state is ConnectionState.DISCONNECTED:
+            break
+    stats = engine.inbound.stats()
+    accepted = sum(1 for _ in engine.store.in_items())
+    snapshots.append(
+        probe.snapshot(
+            "loaded",
+            attempted_messages=attempted,
+            accepted_messages=accepted,
+            rejected_messages=attempted - accepted,
+            pending_logical_bytes=stats.pending_bytes,
+            pending_high_water_bytes=stats.pending_high_water_bytes,
+            configured_byte_limit=byte_limit,
+            store_records=accepted,
+            limit_respected=stats.pending_bytes <= byte_limit,
+        )
+    )
+    engine.store.clear_in()
+    engine.inbound.discard_session()
+    del decoder
     del engine
     snapshots.append(probe.snapshot("released"))
     trimmed = _malloc_trim()
@@ -909,6 +972,7 @@ def run_reconnect_epoch_cleanup(spec: ScenarioSpec) -> dict[str, Any]:
 RUNNERS: dict[str, Callable[[ScenarioSpec], dict[str, Any]]] = {
     "protocol_qos_queue": run_protocol_qos_queue,
     "protocol_bounded_queue": run_protocol_bounded_queue,
+    "inbound_bounded_persistence": run_inbound_bounded_persistence,
     "iterator_delivery_queue": run_iterator_delivery_queue,
     "iterator_delivery_budget": run_iterator_delivery_budget,
     "memory_store": run_memory_store,

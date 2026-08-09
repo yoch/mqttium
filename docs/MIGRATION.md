@@ -80,6 +80,7 @@ empiler jusqu’à épuisement de l’espace des 65 535 identifiants de paquet.
 client = AsyncClient(
     max_pending_outbound_messages=10_000,      # publications QoS 1/2 non terminées
     max_pending_outbound_bytes=64 * 1024**2,   # leur taille logique topic+payload+propriétés
+    max_pending_inbound_bytes=64 * 1024**2,    # QoS entrants conservés dans la session
     max_pending_delivery_bytes=64 * 1024**2,   # messages entrants en attente de consommateur
     publish_backpressure="wait",               # ou "error" pour refuser immédiatement
 )
@@ -96,6 +97,11 @@ Conséquences pour le code existant :
   d’échec. Les totaux restent exacts via `PublishBatchError.failure_count` et
   `failure_counts` ; utiliser `failure_sink=` pour tout capturer.
 - Passer `None` sur une limite restaure le comportement non borné d’avant.
+- `max_pending_inbound_bytes` borne séparément les QoS 2 entrants et les QoS 1
+  en acquittement manuel qui restent dans le store. Les sessions SQLite
+  historiques sont comptabilisées à leur première réouverture; si elles
+  dépassent déjà la nouvelle limite, elles peuvent se vider mais aucun nouvel
+  enregistrement n’est accepté avant le retour sous la limite.
 - Façade Paho : la saturation renvoie `MQTT_ERR_QUEUE_SIZE` (15), et
   `max_queued_messages_set()` / `max_queued_bytes_set()` ajustent ces limites.
 
@@ -126,7 +132,8 @@ assert isinstance(MonStore(), PagedInflightStore)  # sinon : chemin eager
 
 ## Mutation d’`EngineConfig`
 
-Les limites se modifient via `config.update(max_pending_outbound_bytes=...)`.
+Les limites se modifient via `config.update(max_pending_outbound_bytes=...)` ou
+`config.update(max_pending_inbound_bytes=...)`.
 La méthode valide d’abord une copie : une valeur rejetée, y compris pour une
 erreur de type, ne laisse donc aucune mutation partielle.
 

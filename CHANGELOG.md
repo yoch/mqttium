@@ -6,6 +6,13 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Added
+
+- `max_pending_inbound_bytes` now bounds persisted inbound QoS 2 and
+  manually-acknowledged QoS 1 application data at 64 MiB by default. Runtime
+  statistics expose current, high-water and configured byte values, and SQLite
+  schema 4 preserves exact accounting across restarts.
+
 ### Changed
 
 - Native QoS 0 publishing now prepares MQTT 3.1.1 and MQTT 5 PUBLISH frames

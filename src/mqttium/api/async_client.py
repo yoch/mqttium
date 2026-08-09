@@ -124,6 +124,7 @@ class AsyncClient:
         max_outbound_inflight: int | None = None,
         max_pending_outbound_messages: int | None = 10_000,
         max_pending_outbound_bytes: int | None = 64 * 1024 * 1024,
+        max_pending_inbound_bytes: int | None = 64 * 1024 * 1024,
         publish_backpressure: PublishBackpressure = "wait",
         connect_properties: Properties | None = None,
         will: Message | None = None,
@@ -154,6 +155,8 @@ class AsyncClient:
             raise ValueError("max_pending_outbound_messages must be non-negative or None")
         if max_pending_outbound_bytes is not None and max_pending_outbound_bytes < 0:
             raise ValueError("max_pending_outbound_bytes must be non-negative or None")
+        if max_pending_inbound_bytes is not None and max_pending_inbound_bytes < 0:
+            raise ValueError("max_pending_inbound_bytes must be non-negative or None")
         if max_pending_messages <= 0:
             raise ValueError("max_pending_messages must be greater than 0")
         if max_pending_callbacks <= 0:
@@ -205,6 +208,7 @@ class AsyncClient:
                 max_outbound_inflight=max_outbound_inflight,
                 max_pending_outbound_messages=max_pending_outbound_messages,
                 max_pending_outbound_bytes=max_pending_outbound_bytes,
+                max_pending_inbound_bytes=max_pending_inbound_bytes,
                 connect_properties=connect_properties,
                 will=will,
                 will_properties=will_properties,

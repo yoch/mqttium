@@ -108,6 +108,7 @@ class InboundRecordMeta:
     mid: int
     state: InboundQoSState
     user_acked: bool
+    logical_size: int = 0
 
 
 @dataclass(slots=True)
@@ -121,3 +122,4 @@ class InboundMessage:
     delivered: bool = False
     properties: Properties | None = None
     user_acked: bool = False  # manual_ack: app called ack() before PUBREL
+    logical_size: int = 0
