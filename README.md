@@ -6,7 +6,7 @@ It combines a synchronous protocol engine with an `asyncio` API, bounded
 backpressure, durable inflight persistence, explicit delivery receipts, and
 complete MQTT QoS state machines.
 
-> **Status:** beta (`0.2.0b1`). The native Stable API tier follows the documented
+> **Status:** beta (`0.2.0b3`). The native Stable API tier follows the documented
 > compatibility policy; Provisional extension surfaces may still evolve before
 > the first stable release.
 

@@ -3,6 +3,15 @@ name: Publish to PyPI
 on:
   release:
     types: [published]
+  pull_request:
+    paths:
+      - .github/workflows/publish.yml
+      - src/mqttium/__init__.py
+      - README.md
+      - CHANGELOG.md
+      - tests/installed_distribution_smoke.py
+      - tests/installed_distribution_resilience_smoke.py
+      - tests/installed_distribution_extended_smoke.py
   workflow_dispatch:
     inputs:
       tag:
@@ -21,22 +30,28 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      version: ${{ steps.release_metadata.outputs.version }}
     env:
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.release.tag_name }}
       RELEASE_PRERELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease || github.event.release.prerelease }}
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ env.RELEASE_TAG || github.sha }}
           fetch-depth: 0
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Verify release source and package version
+        id: release_metadata
         run: |
           set -euo pipefail
-          git fetch origin main
-          git merge-base --is-ancestor HEAD origin/main
+          if [ -n "$RELEASE_TAG" ]; then
+            git fetch origin main
+            git merge-base --is-ancestor HEAD origin/main
+          fi
           python - <<'PY'
           import ast
           import os
@@ -53,17 +68,20 @@ jobs:
               and isinstance(node.value.value, str)
           )
           expected_tag = f"v{version}"
-          if os.environ["RELEASE_TAG"] != expected_tag:
+          release_tag = os.environ["RELEASE_TAG"]
+          if release_tag and release_tag != expected_tag:
               raise SystemExit(
-                  f"release tag {os.environ['RELEASE_TAG']!r} does not match {expected_tag!r}"
+                  f"release tag {release_tag!r} does not match {expected_tag!r}"
               )
 
           is_prerelease = re.search(r"(?:a|b|rc)\d+|\.dev\d+", version) is not None
           release_is_prerelease = os.environ["RELEASE_PRERELEASE"].lower() == "true"
-          if is_prerelease != release_is_prerelease:
+          if release_tag and is_prerelease != release_is_prerelease:
               raise SystemExit(
                   "GitHub pre-release flag does not match the package version"
               )
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              print(f"version={version}", file=output)
           PY
       - run: python -m pip install ".[release]"
       - run: validate-pyproject pyproject.toml
@@ -93,8 +111,146 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  publish:
+  smoke-basic:
     needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python-version: "3.11"
+            distribution: wheel
+          - python-version: "3.12"
+            distribution: wheel
+          - python-version: "3.13"
+            distribution: wheel
+          - python-version: "3.14"
+            distribution: wheel
+          - python-version: "3.12"
+            distribution: sdist
+    env:
+      SOURCE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.release.tag_name || github.sha }}
+      PACKAGE_VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.SOURCE_REF }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: python-distributions
+          path: dist/
+      - name: Install the exact candidate distribution
+        env:
+          DISTRIBUTION: ${{ matrix.distribution }}
+        run: |
+          set -euo pipefail
+          if [ "$DISTRIBUTION" = wheel ]; then
+            python -m pip install --no-deps dist/*.whl
+          else
+            python -m pip install --no-deps dist/*.tar.gz
+          fi
+          python -m pip check
+      - name: Start Mosquitto
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mosquitto
+          printf 'listener 11883 127.0.0.1\nallow_anonymous true\npersistence false\n' > /tmp/mqttium-release-smoke.conf
+          mosquitto -c /tmp/mqttium-release-smoke.conf -d
+          for _ in $(seq 1 30); do
+            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            sleep 0.2
+          done
+          exit 1
+      - name: Exercise the installed Stable API
+        run: |
+          python -I tests/installed_distribution_smoke.py --expected-version "$PACKAGE_VERSION" --host 127.0.0.1 --port 11883
+
+  smoke-resilience:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      SOURCE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.release.tag_name || github.sha }}
+      PACKAGE_VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.SOURCE_REF }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v8
+        with:
+          name: python-distributions
+          path: dist/
+      - run: python -m pip install --no-deps dist/*.whl
+      - name: Start TCP, TLS, WebSocket, and Unix listeners
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mosquitto openssl
+          mkdir -p /tmp/mqttium-release-tls
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj '/CN=MQTTium Release Test CA' -keyout /tmp/mqttium-release-tls/ca.key -out /tmp/mqttium-release-tls/ca.crt
+          openssl req -newkey rsa:2048 -nodes -subj '/CN=localhost' -keyout /tmp/mqttium-release-tls/server.key -out /tmp/mqttium-release-tls/server.csr
+          printf 'subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n' > /tmp/mqttium-release-tls/server.ext
+          openssl x509 -req -days 1 -in /tmp/mqttium-release-tls/server.csr -CA /tmp/mqttium-release-tls/ca.crt -CAkey /tmp/mqttium-release-tls/ca.key -CAcreateserial -extfile /tmp/mqttium-release-tls/server.ext -out /tmp/mqttium-release-tls/server.crt
+          chmod 644 /tmp/mqttium-release-tls/server.key
+          cat > /tmp/mqttium-release.conf <<'EOF'
+          persistence false
+
+          listener 11886 127.0.0.1
+          protocol mqtt
+          allow_anonymous true
+
+          listener 18083 127.0.0.1
+          protocol websockets
+          socket_domain ipv4
+          allow_anonymous true
+
+          listener 0 /tmp/mqttium-release.sock
+          protocol mqtt
+          allow_anonymous true
+
+          listener 18884 127.0.0.1
+          protocol mqtt
+          allow_anonymous true
+          cafile /tmp/mqttium-release-tls/ca.crt
+          certfile /tmp/mqttium-release-tls/server.crt
+          keyfile /tmp/mqttium-release-tls/server.key
+          EOF
+          mosquitto -c /tmp/mqttium-release.conf -d
+          for _ in $(seq 1 50); do
+            tcp=0
+            ws=0
+            unix=0
+            (echo > /dev/tcp/127.0.0.1/11886) >/dev/null 2>&1 && tcp=1
+            (echo > /dev/tcp/127.0.0.1/18083) >/dev/null 2>&1 && ws=1
+            [ -S /tmp/mqttium-release.sock ] && unix=1
+            if [ "$tcp" = 1 ] && [ "$ws" = 1 ] && [ "$unix" = 1 ]; then
+              exit 0
+            fi
+            sleep 0.2
+          done
+          exit 1
+      - name: Exercise TLS and SQLite restart
+        run: |
+          python -I tests/installed_distribution_resilience_smoke.py tls --expected-version "$PACKAGE_VERSION" --host localhost --port 18884 --ca-file /tmp/mqttium-release-tls/ca.crt
+          python -I tests/installed_distribution_resilience_smoke.py sqlite-write --expected-version "$PACKAGE_VERSION" --database /tmp/mqttium-release.sqlite
+          python -I tests/installed_distribution_resilience_smoke.py sqlite-read --expected-version "$PACKAGE_VERSION" --database /tmp/mqttium-release.sqlite
+      - name: Exercise transports, Paho migration, cancellation, and shutdown
+        run: |
+          python -I tests/installed_distribution_extended_smoke.py websocket --expected-version "$PACKAGE_VERSION" --url ws://127.0.0.1:18083/mqtt
+          python -I tests/installed_distribution_extended_smoke.py unix --expected-version "$PACKAGE_VERSION" --socket /tmp/mqttium-release.sock
+          python -I tests/installed_distribution_extended_smoke.py paho --expected-version "$PACKAGE_VERSION" --host 127.0.0.1 --port 11886
+          python -I tests/installed_distribution_extended_smoke.py shutdown --expected-version "$PACKAGE_VERSION" --host 127.0.0.1 --port 11886
+
+  publish:
+    if: github.event_name != 'pull_request'
+    needs: [build, smoke-basic, smoke-resilience]
     runs-on: ubuntu-24.04
     environment:
       name: pypi
