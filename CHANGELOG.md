@@ -6,8 +6,13 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.2.0b3] - 2026-08-09
+
 ### Added
 
+- The release workflow now builds wheel and sdist once, smoke-tests those exact
+  artifacts across Python 3.11–3.14 plus TCP, TLS, WebSocket, Unix, SQLite,
+  Paho migration and clean shutdown, then publishes the same files.
 - Installed-distribution smoke coverage now exercises MQTT 3.1.1 and MQTT 5
   over WebSocket and Unix transports, the documented Paho VERSION2 migration
   subset, cancellation, and clean process shutdown. Stable exports and the
@@ -17,6 +22,17 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   statistics expose current, high-water and configured byte values, and SQLite
   schema 4 preserves exact accounting across restarts.
 
+### Fixed
+
+- Packets already in flight while a graceful disconnect is underway no longer
+  produce a spurious `ProtocolError`; terminal disconnect handling remains
+  authoritative.
+- MQTT 5 property encoding now rejects out-of-range Variable Byte Integers and
+  oversized binary values with the public `ProtocolError` contract instead of
+  leaking low-level `ValueError` exceptions.
+
+## [0.2.0b2] - 2026-08-07
+
 ### Changed
 
 - Native QoS 0 publishing now prepares MQTT 3.1.1 and MQTT 5 PUBLISH frames
@@ -24,12 +40,6 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   Callback and effect-ordering cases keep the established protocol-engine path.
 - WebSocket client masking now uses lazy byte-translation tables instead of a
   Python loop per payload byte, while retaining a fresh RFC 6455 mask per frame.
-
-### Fixed
-
-- MQTT 5 property encoding now rejects out-of-range Variable Byte Integers and
-  oversized binary values with the public `ProtocolError` contract instead of
-  leaking low-level `ValueError` exceptions.
 
 ## [0.2.0b1] - 2026-08-06
 
@@ -295,7 +305,9 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - Pre-spin-out comparative analysis and generated coverage data from the
   published source tree.
 
-[Unreleased]: https://github.com/yoch/mqttium/compare/v0.2.0b1...HEAD
+[Unreleased]: https://github.com/yoch/mqttium/compare/v0.2.0b3...HEAD
+[0.2.0b3]: https://github.com/yoch/mqttium/compare/v0.2.0b2...v0.2.0b3
+[0.2.0b2]: https://github.com/yoch/mqttium/compare/v0.2.0b1...v0.2.0b2
 [0.2.0b1]: https://github.com/yoch/mqttium/compare/v0.1.0a4...v0.2.0b1
 [0.1.0a4]: https://github.com/yoch/mqttium/compare/v0.1.0a3...v0.1.0a4
 [0.1.0a3]: https://github.com/yoch/mqttium/compare/v0.1.0a2...v0.1.0a3
