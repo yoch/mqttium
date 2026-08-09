@@ -175,7 +175,7 @@ class EffectPump:
         self.task = task
         task.add_done_callback(self._done)
 
-    async def _run_scheduled(self) -> None:
+    async def _run_scheduled(self) -> None:  # noqa: C901
         async with self.lock:
             while True:
                 self.flush_requested = False

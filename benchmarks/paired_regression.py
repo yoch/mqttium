@@ -90,7 +90,7 @@ def _install_discard_writer(client: object) -> None:
         pump.max_bytes = 1 << 60
 
 
-def _worker(args: argparse.Namespace) -> None:
+def _worker(args: argparse.Namespace) -> None:  # noqa: C901
     _pin(args.cpu)
     from mqttium.api.async_client import AsyncClient
     from mqttium.codec.buffer import IncrementalDecoder

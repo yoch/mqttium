@@ -77,7 +77,7 @@ async def test_compat_qos0_callbacks_and_delivery_are_exactly_once() -> None:
 
 
 @pytest.mark.asyncio
-async def test_compat_qos1_concurrent_submission_completes_exactly_once() -> None:
+async def test_compat_qos1_concurrent_submission_completes_exactly_once() -> None:  # noqa: C901
     count = 400
     workers = 8
     topic = f"integration/compat-qos1/{time.time_ns()}"

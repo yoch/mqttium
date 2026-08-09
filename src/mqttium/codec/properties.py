@@ -192,7 +192,7 @@ BY_ID: dict[int, PropertySpec] = {s.id: s for s in _SPECS}
 BY_NAME: dict[str, PropertySpec] = {s.name: s for s in _SPECS}
 
 
-def _encode_value(ptype: PropType, value: Any) -> bytes:
+def _encode_value(ptype: PropType, value: Any) -> bytes:  # noqa: C901
     if ptype is PropType.BYTE:
         if not isinstance(value, int) or not 0 <= value <= 255:
             raise ProtocolError(f"Invalid byte property value: {value!r}")

@@ -521,7 +521,7 @@ class Client:
     def _finalize_publish_effects(self) -> None:
         self._finalize_async_commands()
 
-    def _drain_publish_requests(self) -> None:
+    def _drain_publish_requests(self) -> None:  # noqa: C901
         """Commit a bounded mixed-QoS batch on the owning network loop."""
         batch, has_more = self._take_publish_batch()
         results: list[
