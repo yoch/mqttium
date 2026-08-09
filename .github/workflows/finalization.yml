@@ -4,9 +4,17 @@ on:
   workflow_dispatch:
     inputs:
       cycles:
-        description: Reconnect/publish cycles per protocol
+        description: Reconnect/publish cycles per protocol when duration is zero
         required: false
         default: "20"
+      duration_minutes:
+        description: Duration per protocol; zero selects the cycle count
+        required: false
+        default: "60"
+      warmup_cycles:
+        description: Unmeasured warmup cycles before resource snapshots
+        required: false
+        default: "2"
       messages_per_cycle:
         description: QoS 1 messages per cycle
         required: false
@@ -32,11 +40,13 @@ env:
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
   SOAK_CYCLES: ${{ github.event_name == 'pull_request' && '3' || inputs.cycles || '20' }}
   SOAK_MESSAGES: ${{ github.event_name == 'pull_request' && '100' || inputs.messages_per_cycle || '500' }}
+  SOAK_DURATION_MINUTES: ${{ github.event_name == 'pull_request' && '0' || inputs.duration_minutes || '60' }}
+  SOAK_WARMUP_CYCLES: ${{ github.event_name == 'pull_request' && '1' || inputs.warmup_cycles || '2' }}
 
 jobs:
   linux-soak:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -46,7 +56,7 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - run: python -m pip install -e "."
+      - run: python -m pip install -e "." "psutil>=6"
       - name: Start Mosquitto
         run: |
           sudo apt-get update -qq
@@ -64,6 +74,8 @@ jobs:
             --port 11883 \
             --protocol "${{ matrix.protocol }}" \
             --cycles "$SOAK_CYCLES" \
+            --duration-seconds "$((SOAK_DURATION_MINUTES * 60))" \
+            --warmup-cycles "$SOAK_WARMUP_CYCLES" \
             --messages-per-cycle "$SOAK_MESSAGES" \
             --output "/tmp/soak-mosquitto-${{ matrix.protocol }}.json"
       - uses: actions/upload-artifact@v7
@@ -77,7 +89,7 @@ jobs:
   macos-soak:
     if: github.event_name != 'pull_request'
     runs-on: macos-15
-    timeout-minutes: 40
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -87,7 +99,7 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - run: python -m pip install -e "."
+      - run: python -m pip install -e "." "psutil>=6"
       - name: Start Mosquitto
         run: |
           brew install mosquitto
@@ -104,6 +116,8 @@ jobs:
             --port 11883 \
             --protocol "${{ matrix.protocol }}" \
             --cycles "$SOAK_CYCLES" \
+            --duration-seconds "$((SOAK_DURATION_MINUTES * 60))" \
+            --warmup-cycles "$SOAK_WARMUP_CYCLES" \
             --messages-per-cycle "$SOAK_MESSAGES" \
             --output "/tmp/soak-macos-${{ matrix.protocol }}.json"
       - uses: actions/upload-artifact@v7
@@ -117,7 +131,7 @@ jobs:
   interoperability:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 150
     strategy:
       fail-fast: false
       matrix:
@@ -133,7 +147,7 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - run: python -m pip install -e "."
+      - run: python -m pip install -e "." "psutil>=6"
       - name: Start broker container
         run: |
           docker run -d --name mqttium-broker -p 11883:1883 "${{ matrix.image }}"
@@ -149,6 +163,8 @@ jobs:
             --port 11883 \
             --protocol 311 \
             --cycles "$SOAK_CYCLES" \
+            --duration-seconds "$((SOAK_DURATION_MINUTES * 60))" \
+            --warmup-cycles "$SOAK_WARMUP_CYCLES" \
             --messages-per-cycle "$SOAK_MESSAGES" \
             --output "/tmp/soak-${{ matrix.broker }}-311.json"
       - name: Run MQTT 5 interoperability soak
@@ -157,6 +173,8 @@ jobs:
             --port 11883 \
             --protocol 5 \
             --cycles "$SOAK_CYCLES" \
+            --duration-seconds "$((SOAK_DURATION_MINUTES * 60))" \
+            --warmup-cycles "$SOAK_WARMUP_CYCLES" \
             --messages-per-cycle "$SOAK_MESSAGES" \
             --output "/tmp/soak-${{ matrix.broker }}-5.json"
       - name: Broker logs
