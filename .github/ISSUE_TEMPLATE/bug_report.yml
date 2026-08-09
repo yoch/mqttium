@@ -1,25 +1,133 @@
-name: Bug report
-description: Report reproducible incorrect behavior
+name: Beta bug report
+description: Report reproducible incorrect behavior in a published MQTTium beta
 title: "[Bug]: "
+labels: ["bug"]
 body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing MQTTium. Please remove credentials, private keys, tokens, private broker addresses and sensitive payloads before submitting.
+
+  - type: input
+    id: mqttium_version
+    attributes:
+      label: MQTTium version
+      description: Output of `python -c "import mqttium; print(mqttium.__version__)"`
+      placeholder: 0.2.0b2
+    validations:
+      required: true
+
+  - type: input
+    id: python_version
+    attributes:
+      label: Python version
+      description: Output of `python --version`
+      placeholder: Python 3.12.11
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: Operating system and architecture
+      placeholder: Ubuntu 24.04 x86_64
+    validations:
+      required: true
+
+  - type: input
+    id: broker
+    attributes:
+      label: Broker and version
+      placeholder: Mosquitto 2.0.18
+    validations:
+      required: true
+
+  - type: dropdown
+    id: protocol
+    attributes:
+      label: MQTT protocol
+      options:
+        - MQTT 3.1.1
+        - MQTT 5
+        - Both
+        - Not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: transport
+    attributes:
+      label: Transport
+      options:
+        - TCP
+        - TLS
+        - WebSocket
+        - Unix socket
+        - Multiple transports
+        - Not applicable
+    validations:
+      required: true
+
+  - type: dropdown
+    id: surface
+    attributes:
+      label: API surface
+      options:
+        - Native AsyncClient
+        - Paho compatibility facade
+        - Helpers
+        - Persistence
+        - Transport or protocol extension
+        - Packaging or installation
+        - Not sure
+    validations:
+      required: true
+
   - type: textarea
     id: description
     attributes:
-      label: Description
-      description: What happened and what did you expect?
+      label: Observed and expected behavior
+      description: Explain what happened, what you expected, and whether it is intermittent.
     validations:
       required: true
+
   - type: textarea
     id: reproduction
     attributes:
       label: Minimal reproduction
+      description: Provide the smallest complete program that reproduces the problem, including relevant client options. Redact secrets.
       render: python
     validations:
       required: true
-  - type: input
-    id: environment
+
+  - type: textarea
+    id: traceback
     attributes:
-      label: Environment
-      description: MQTTium, Python, broker and operating-system versions
-    validations:
-      required: true
+      label: Traceback or failure output
+      description: Include the complete traceback and relevant broker-side error. Redact sensitive values.
+      render: shell
+
+  - type: textarea
+    id: stats
+    attributes:
+      label: ClientStats snapshot
+      description: When the owning event loop is still responsive, include `dataclasses.asdict(client.stats())`. Redact identifiers or topics when necessary.
+      render: json
+
+  - type: textarea
+    id: lifecycle
+    attributes:
+      label: Lifecycle and configuration details
+      description: Include delivery mode, manual acknowledgement, reconnect policy, relevant queue limits, timeouts, and the operation being cancelled or shut down.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Submission checks
+      options:
+        - label: I reproduced this with a published MQTTium beta rather than only an editable development checkout.
+          required: true
+        - label: I searched existing issues for the same behavior.
+          required: true
+        - label: I removed credentials, private keys, tokens, private addresses and sensitive payloads.
+          required: true
