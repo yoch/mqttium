@@ -2006,17 +2006,16 @@ class AsyncClient:
             self._receipts[mid] = deque((current, receipt))
 
     def _pop_publish_receipt(self, mid: int) -> PublishReceipt | None:
-        current = self._receipts.get(mid)
+        current = self._receipts.pop(mid, None)
         if current is None:
             return None
         if not isinstance(current, deque):
-            self._receipts.pop(mid, None)
             return current
         receipt = current.popleft()
         if len(current) == 1:
             self._receipts[mid] = current[0]
-        elif not current:
-            self._receipts.pop(mid, None)
+        elif current:
+            self._receipts[mid] = current
         return receipt
 
     def _register_batch_receipt(self, mid: int, receipt: PublishBatchReceipt) -> None:
