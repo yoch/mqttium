@@ -2,6 +2,17 @@ name: Paired Regression
 
 on:
   workflow_dispatch:
+    inputs:
+      base_ref:
+        description: Baseline commit, branch, or tag
+        required: true
+        default: v0.2.0b2
+        type: string
+      candidate_ref:
+        description: Candidate commit, branch, or tag
+        required: true
+        default: main
+        type: string
   pull_request:
     paths:
       - benchmarks/**
@@ -26,14 +37,20 @@ jobs:
       PYTHONUNBUFFERED: "1"
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
     steps:
+      - name: Check out benchmark harness
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          path: harness
       - name: Check out candidate
         uses: actions/checkout@v7
         with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_ref || github.sha }}
           path: candidate
       - name: Check out base
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.pull_request.base.sha || 'main' }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.base_ref || github.event.pull_request.base.sha }}
           path: base
       - uses: actions/setup-python@v7
         with:
@@ -63,19 +80,23 @@ jobs:
           exit 1
       - name: Paired microbenchmarks
         run: |
-          python candidate/benchmarks/paired_regression.py \
+          python harness/benchmarks/paired_regression.py \
             --base-root base \
             --candidate-root candidate \
             --repeat 11 \
             --output /tmp/mqttium-paired/micro.json
       - name: Paired network and latency sweep
+        continue-on-error: ${{ github.event_name == 'pull_request' }}
         run: |
-          python candidate/benchmarks/paired_network.py \
+          python harness/benchmarks/paired_network.py \
             --base-root base \
             --candidate-root candidate \
-            --repeat 5 \
-            --windows 1,5,20,100 \
+            --repeat 8 \
+            --windows 1,8,32,64,128 \
+            --protocols 311,5 \
             --payloads 64,4096 \
+            --count-small 20000 \
+            --count-large 8000 \
             --output /tmp/mqttium-paired/network.json
       - name: Upload paired measurements
         if: always()
