@@ -22,6 +22,10 @@ capacity check and encode only the real publication.
 No queue bound, backpressure mode, receipt lifecycle, packet identifier rule or
 wire representation changes.
 
+For QoS 0, the native direct-writer path is conditional on `on_publish is None`.
+When a publish callback is installed, MQTTium deliberately returns to the
+protocol-engine and `EffectPump` path to preserve callback completion ordering.
+
 ## Evidence
 
 A seven-cycle rotated native QoS 1 RTT comparison, 12,000 request/response pairs
