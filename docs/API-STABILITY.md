@@ -84,6 +84,12 @@ Constructor keyword arguments are part of the native contract. New optional
 keywords may be added compatibly. Existing stable defaults will not change after
 the first stable release without a documented migration path.
 
+`tests/unit/test_public_api_surface.py` is the executable contract for the
+canonical Stable exports, the retained alpha `PacketType` root import, all
+supported constructor keywords and defaults, and the parameter lists of Stable
+`AsyncClient` methods. Update the policy, changelog and migration guide before
+intentionally changing that snapshot.
+
 ## Canonical imports
 
 Use the supported entry points rather than implementation-module paths:

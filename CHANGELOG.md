@@ -8,6 +8,10 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Added
 
+- Installed-distribution smoke coverage now exercises MQTT 3.1.1 and MQTT 5
+  over WebSocket and Unix transports, the documented Paho VERSION2 migration
+  subset, cancellation, and clean process shutdown. Stable exports and the
+  `AsyncClient` constructor/method signatures are locked by regression tests.
 - `max_pending_inbound_bytes` now bounds persisted inbound QoS 2 and
   manually-acknowledged QoS 1 application data at 64 MiB by default. Runtime
   statistics expose current, high-water and configured byte values, and SQLite
