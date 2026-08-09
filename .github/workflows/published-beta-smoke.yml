@@ -10,7 +10,7 @@ on:
       version:
         description: Published MQTTium version to validate
         required: true
-        default: 0.2.0b2
+        default: 0.2.0b3
         type: string
   schedule:
     - cron: "17 4 * * 1"
@@ -19,7 +19,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: published-beta-smoke-${{ github.event.inputs.version || '0.2.0b2' }}-${{ github.ref }}
+  group: published-beta-smoke-${{ github.event.inputs.version || '0.2.0b3' }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -41,7 +41,7 @@ jobs:
           - python-version: "3.12"
             distribution: sdist
     env:
-      MQTTIUM_VERSION: ${{ github.event.inputs.version || '0.2.0b2' }}
+      MQTTIUM_VERSION: ${{ github.event.inputs.version || '0.2.0b3' }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
