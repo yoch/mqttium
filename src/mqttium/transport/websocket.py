@@ -391,7 +391,7 @@ def _mask_client_frame(
     return bytes(header) + _mask_payload(payload, mask)
 
 
-def _parse_frame(
+def _parse_frame(  # noqa: C901
     buf: bytearray,
     max_frame_size: int,
     *,

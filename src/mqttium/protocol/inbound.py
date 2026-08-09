@@ -385,7 +385,7 @@ class InboundSession:
             self._engine._send(PubAckPacket(mid=mid).encode(config.protocol))
             self._release_slot()
 
-    def on_pubrel(self, raw: RawPacket) -> None:
+    def on_pubrel(self, raw: RawPacket) -> None:  # noqa: C901
         engine = self._engine
         config = self.config
         store = self.store
@@ -477,7 +477,7 @@ class InboundSession:
         inbound.delivered = True
         self.store.update_in(inbound)
 
-    def ack(self, mid: int) -> None:
+    def ack(self, mid: int) -> None:  # noqa: C901
         """Complete a deferred PUBACK or PUBCOMP in manual-ack mode."""
         config = self.config
         if not config.manual_ack:

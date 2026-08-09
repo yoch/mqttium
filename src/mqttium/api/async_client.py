@@ -111,7 +111,7 @@ class _DeliveryQueue(asyncio.Queue[IteratorQueueItem]):
 
 
 class AsyncClient:
-    def __init__(
+    def __init__(  # noqa: C901
         self,
         client_id: str = "",
         *,
@@ -1201,7 +1201,7 @@ class AsyncClient:
             self._collect_effects_locked()
         await self._drain_effects()
 
-    async def _read_loop(self) -> None:
+    async def _read_loop(self) -> None:  # noqa: C901
         assert self._transport is not None
         try:
             while not self._transport.is_closing():
@@ -1537,7 +1537,7 @@ class AsyncClient:
             return
         await self._drain_effects()
 
-    async def _apply_effect(
+    async def _apply_effect(  # noqa: C901
         self,
         effect: EngineEffect,
         *,

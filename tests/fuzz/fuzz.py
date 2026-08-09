@@ -261,7 +261,7 @@ def _rand_publish_frame(rng: random.Random, proto: MQTTProtocolVersion) -> bytes
         return b""
 
 
-def fuzz_engine(
+def fuzz_engine(  # noqa: C901
     rng: random.Random, iterations: int, logger: FuzzLogger | None = None
 ) -> FuzzResult:
     result = FuzzResult("engine", iterations, 0, 0)
@@ -420,7 +420,7 @@ def _check_engine_invariants(engine: ProtocolEngine) -> None:
 # ---------------------------------------------------------------------------
 
 
-def fuzz_websocket(
+def fuzz_websocket(  # noqa: C901
     rng: random.Random, iterations: int, logger: FuzzLogger | None = None
 ) -> FuzzResult:
     from mqttium.transport.websocket import _parse_frame
