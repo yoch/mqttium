@@ -10,7 +10,7 @@ import pytest
 from mqttium.enums import InboundQoSState, OutboundQoSState, QoS
 from mqttium.persistence.sqlite import SQLITE_SCHEMA_VERSION, SqliteInflightStore
 from mqttium.protocol.engine import EngineConfig, ProtocolEngine
-from mqttium.types import OutboundMessage
+from mqttium.types import InboundMessage, OutboundMessage
 
 # The exact schema shipped before PRAGMA user_version existed: no logical_size
 # column, no seq index. Databases in this shape exist in the wild and must keep
@@ -110,6 +110,7 @@ def test_fresh_database_is_created_at_the_current_schema_version(tmp_path: Path)
 
     assert user_version(path) == SQLITE_SCHEMA_VERSION
     assert "logical_size" in column_order(path, "outbound")
+    assert "logical_size" in column_order(path, "inbound")
     assert "extra" not in column_order(path, "outbound")
     # Ordered pagination is served by a sorted metadata pass, not by a second
     # B-tree maintained on every publish.
@@ -139,6 +140,69 @@ def test_v1_database_migrates_without_losing_or_duplicating_records(tmp_path: Pa
     assert [msg.logical_size for msg in outbound] == [0, 0, 0]
     assert [msg.mid for msg in inbound] == [9]
     assert inbound[0].payload == b"inbound"
+    assert inbound[0].logical_size == 0
+
+
+def test_v3_inbound_size_is_backfilled_once_and_persisted(tmp_path: Path) -> None:
+    path = tmp_path / "v3-inbound.db"
+    store = SqliteInflightStore(path)
+    topic = "legacy/v3"
+    payload = b"retained"
+    store.put_in(
+        InboundMessage(
+            mid=17,
+            topic=topic,
+            payload=payload,
+            qos=QoS.EXACTLY_ONCE,
+            retain=False,
+            state=InboundQoSState.WAIT_PUBREL,
+            logical_size=len(topic) + len(payload),
+        )
+    )
+    store.close()
+
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        ALTER TABLE inbound RENAME TO inbound__v4;
+        CREATE TABLE inbound (
+            mid INTEGER PRIMARY KEY,
+            seq INTEGER NOT NULL,
+            qos INTEGER NOT NULL,
+            retain INTEGER NOT NULL,
+            state INTEGER NOT NULL,
+            delivered INTEGER NOT NULL,
+            user_acked INTEGER NOT NULL,
+            topic TEXT NOT NULL,
+            properties TEXT,
+            payload BLOB NOT NULL
+        );
+        INSERT INTO inbound
+        SELECT mid, seq, qos, retain, state, delivered, user_acked,
+               topic, properties, payload
+        FROM inbound__v4;
+        DROP TABLE inbound__v4;
+        PRAGMA user_version=3;
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    migrated = SqliteInflightStore(path)
+    record = migrated.get_in(17)
+    assert record is not None
+    assert record.logical_size == 0
+
+    engine = ProtocolEngine(EngineConfig(clean_start=False), store=migrated)
+    expected = len(topic) + len(payload)
+    assert engine.inbound.stats().pending_bytes == expected
+    migrated.close()
+
+    reopened = SqliteInflightStore(path)
+    persisted = reopened.get_in(17)
+    assert persisted is not None
+    assert persisted.logical_size == expected
+    reopened.close()
 
 
 def test_interrupted_migration_leaves_the_v1_database_intact(tmp_path: Path) -> None:

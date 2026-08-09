@@ -15,6 +15,11 @@ The benchmark is diagnostic. It is not a universal prediction of production RSS.
 Allocator, Python, libc, SQLite, TLS, and kernel versions affect absolute values.
 Comparisons should use the same runner image and Python version whenever possible.
 
+The `inbound_bounded_persistence_4k` scenario is the exception that also gates
+an aggregate process RSS delta: it fills QoS 2 persistence to an 8 MiB logical
+budget and verifies that the first excess message is refused. That RSS gate is
+evaluated on the stable GitHub Actions runner; local values remain diagnostic.
+
 ## Process isolation
 
 Every scenario runs in a fresh child process. This is required because

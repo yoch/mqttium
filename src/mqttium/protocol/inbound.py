@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 from mqttium.codec.buffer import RawPacket
 from mqttium.codec.packet_validation import require_nonzero_mid
 from mqttium.codec.primitives import unpack_u16, unpack_utf8
+from mqttium.codec.properties import PUBLISH, encode_properties
 from mqttium.enums import ConnectionState, InboundQoSState, MQTTProtocolVersion, QoS
 from mqttium.errors import MalformedPacketError, ProtocolError
 from mqttium.persistence.memory import (
@@ -119,6 +120,8 @@ class InboundSession:
         "_engine",
         "_inflight",
         "_paged_store",
+        "_pending_bytes",
+        "_pending_high_water_bytes",
         "_recovered_mids",
         "_replay",
         "_transitions",
@@ -143,17 +146,47 @@ class InboundSession:
         self._aliases: dict[int, str] = {}
         self._inflight = 0
         self._replay: InboundReplayCursor | None = None
-        self._recovered_mids = self._load_recovered_mids()
+        self._recovered_mids, self._pending_bytes = self._load_recovered_state()
+        self._pending_high_water_bytes = self._pending_bytes
 
-    def _load_recovered_mids(self) -> set[int]:
-        """Identifiers persisted by a previous run, without their payloads."""
+    def _load_recovered_state(self) -> tuple[set[int], int]:
+        """Restore persisted identifiers and their logical byte reservation."""
         transitions = self._transitions
         if transitions is None:
-            return {message.mid for message in self.store.in_items()}
+            eager_mids: set[int] = set()
+            pending_bytes = 0
+            for message in self.store.in_items():
+                eager_mids.add(message.mid)
+                size = message.logical_size or self.logical_size(
+                    message.topic,
+                    message.payload,
+                    message.properties,
+                )
+                message.logical_size = size
+                pending_bytes += size
+            return eager_mids, pending_bytes
         mids: set[int] = set()
+        pending_bytes = 0
+        unknown_sizes: set[int] = set()
         for page in transitions.in_index_pages(REPLAY_PAGE_SIZE):
-            mids.update(meta.mid for meta in page)
-        return mids
+            for meta in page:
+                mids.add(meta.mid)
+                if meta.logical_size > 0:
+                    pending_bytes += meta.logical_size
+                else:
+                    unknown_sizes.add(meta.mid)
+        if unknown_sizes:
+            for message in self.store.in_items():
+                if message.mid not in unknown_sizes:
+                    continue
+                size = self.logical_size(message.topic, message.payload, message.properties)
+                message.logical_size = size
+                if not transitions.set_in_logical_size(message.mid, size):
+                    raise RuntimeError(
+                        f"Inbound mid={message.mid} disappeared while restoring byte accounting"
+                    )
+                pending_bytes += size
+        return mids, pending_bytes
 
     # --- lifecycle ---------------------------------------------------------
 
@@ -174,6 +207,7 @@ class InboundSession:
         self._recovered_mids.clear()
         self._replay = None
         self._inflight = 0
+        self._pending_bytes = 0
 
     @property
     def replay_pending(self) -> bool:
@@ -187,6 +221,12 @@ class InboundSession:
             receive_maximum=self.config.local_receive_maximum,
             topic_aliases=len(self._aliases),
             replay_pending=self._replay is not None,
+            pending_bytes=self._pending_bytes,
+            pending_high_water_bytes=max(
+                self._pending_high_water_bytes,
+                self._pending_bytes,
+            ),
+            pending_byte_limit=self.config.max_pending_inbound_bytes,
         )
 
     # --- packet handlers ---------------------------------------------------
@@ -256,7 +296,8 @@ class InboundSession:
             )
             return
 
-        self._acquire_slot()
+        logical_size = self.logical_size(topic, packet.payload, packet.properties)
+        self._acquire_slot(logical_size)
         inbound = InboundMessage(
             mid=packet.mid,
             topic=topic,
@@ -266,8 +307,13 @@ class InboundSession:
             state=InboundQoSState.WAIT_PUBREL,
             delivered=False,
             properties=packet.properties,
+            logical_size=logical_size,
         )
-        store.put_in(inbound)
+        try:
+            store.put_in(inbound)
+        except Exception:
+            self._release_slot(logical_size)
+            raise
         engine._emit(
             EffectKind.MESSAGE,
             Message(
@@ -303,7 +349,26 @@ class InboundSession:
                 self._emit_message(existing, dup=True)
                 return
 
-        self._acquire_slot()
+        logical_size = self.logical_size(topic, payload, properties) if config.manual_ack else None
+        self._acquire_slot(logical_size)
+        if config.manual_ack:
+            try:
+                store.put_in(
+                    InboundMessage(
+                        mid=mid,
+                        topic=topic,
+                        payload=payload,
+                        qos=QoS.AT_LEAST_ONCE,
+                        retain=retain,
+                        state=InboundQoSState.WAIT_PUBACK,
+                        delivered=False,
+                        properties=properties,
+                        logical_size=logical_size or 0,
+                    )
+                )
+            except Exception:
+                self._release_slot(logical_size)
+                raise
         self._engine._emit(
             EffectKind.MESSAGE,
             Message(
@@ -316,20 +381,7 @@ class InboundSession:
                 properties=properties,
             ),
         )
-        if config.manual_ack:
-            store.put_in(
-                InboundMessage(
-                    mid=mid,
-                    topic=topic,
-                    payload=payload,
-                    qos=QoS.AT_LEAST_ONCE,
-                    retain=retain,
-                    state=InboundQoSState.WAIT_PUBACK,
-                    delivered=False,
-                    properties=properties,
-                )
-            )
-        else:
+        if not config.manual_ack:
             self._engine._send(PubAckPacket(mid=mid).encode(config.protocol))
             self._release_slot()
 
@@ -359,7 +411,7 @@ class InboundSession:
                 if completed is None:
                     raise ProtocolError(f"Inbound mid={rel.mid} changed while completing PUBREL")
                 engine._send(PubCompPacket(mid=rel.mid).encode(config.protocol))
-                self._release_slot()
+                self._release_slot(completed.logical_size)
                 return
             if meta.state is not InboundQoSState.WAIT_PUBREL:
                 raise ProtocolError(
@@ -378,7 +430,7 @@ class InboundSession:
             if completed is None:
                 raise ProtocolError(f"Inbound mid={rel.mid} changed while completing PUBREL")
             engine._send(PubCompPacket(mid=rel.mid).encode(config.protocol))
-            self._release_slot()
+            self._release_slot(completed.logical_size)
             return
 
         inbound = store.get_in(rel.mid)
@@ -393,7 +445,7 @@ class InboundSession:
             if popped is None:
                 raise ProtocolError(f"Inbound mid={rel.mid} disappeared while completing PUBREL")
             engine._send(PubCompPacket(mid=rel.mid).encode(config.protocol))
-            self._release_slot()
+            self._release_slot(self.stored_logical_size(popped))
             return
         if inbound.state is not InboundQoSState.WAIT_PUBREL:
             raise ProtocolError(
@@ -407,7 +459,7 @@ class InboundSession:
         if popped is None:
             raise ProtocolError(f"Inbound mid={rel.mid} disappeared while completing PUBREL")
         engine._send(PubCompPacket(mid=rel.mid).encode(config.protocol))
-        self._release_slot()
+        self._release_slot(self.stored_logical_size(popped))
 
     # --- application acknowledgement and replay ---------------------------
 
@@ -442,7 +494,7 @@ class InboundSession:
                 if completed is None:
                     raise ProtocolError(f"Inbound mid={mid} changed while acknowledging")
                 self._engine._send(PubAckPacket(mid=mid).encode(config.protocol))
-                self._release_slot()
+                self._release_slot(completed.logical_size)
                 return
             if state is InboundQoSState.WAIT_PUBREL:
                 changed = transitions.transition_in(mid, state, state, user_acked=True)
@@ -454,7 +506,7 @@ class InboundSession:
                 if completed is None:
                     raise ProtocolError(f"Inbound mid={mid} changed while acknowledging")
                 self._engine._send(PubCompPacket(mid=mid).encode(config.protocol))
-                self._release_slot()
+                self._release_slot(completed.logical_size)
                 return
             raise ProtocolError(f"Inbound mid={mid} is not awaiting ack (state={state!r})")
 
@@ -462,20 +514,22 @@ class InboundSession:
         if inbound is None:
             raise ProtocolError(f"No pending inbound ack for mid={mid}")
         if inbound.state is InboundQoSState.WAIT_PUBACK:
-            if store.pop_in(mid) is None:
+            popped = store.pop_in(mid)
+            if popped is None:
                 raise ProtocolError(f"Inbound mid={mid} disappeared while acknowledging")
             self._engine._send(PubAckPacket(mid=mid).encode(config.protocol))
-            self._release_slot()
+            self._release_slot(self.stored_logical_size(popped))
             return
         if inbound.state is InboundQoSState.WAIT_PUBREL:
             inbound.user_acked = True
             store.update_in(inbound)
             return
         if inbound.state is InboundQoSState.WAIT_USER_ACK:
-            if store.pop_in(mid) is None:
+            popped = store.pop_in(mid)
+            if popped is None:
                 raise ProtocolError(f"Inbound mid={mid} disappeared while acknowledging")
             self._engine._send(PubCompPacket(mid=mid).encode(config.protocol))
-            self._release_slot()
+            self._release_slot(self.stored_logical_size(popped))
             return
         raise ProtocolError(f"Inbound mid={mid} is not awaiting ack (state={inbound.state!r})")
 
@@ -610,16 +664,65 @@ class InboundSession:
             raise ProtocolError(f"Unknown topic alias {alias}")
         return self._aliases[alias]
 
-    def _acquire_slot(self) -> None:
+    def logical_size(
+        self,
+        topic: str,
+        payload: bytes,
+        properties: Properties | None,
+    ) -> int:
+        property_bytes = 0
+        if (
+            self.config.protocol == MQTTProtocolVersion.MQTTv5
+            and properties is not None
+            and properties.values
+        ):
+            property_bytes = len(encode_properties(properties, PUBLISH))
+        topic_bytes = len(topic) if topic.isascii() else len(topic.encode("utf-8"))
+        return len(payload) + topic_bytes + property_bytes
+
+    def stored_logical_size(self, message: InboundMessage) -> int:
+        if message.logical_size > 0:
+            return message.logical_size
+        message.logical_size = self.logical_size(
+            message.topic,
+            message.payload,
+            message.properties,
+        )
+        return message.logical_size
+
+    def _acquire_slot(self, logical_size: int | None = None) -> None:
         if self._inflight >= self.config.local_receive_maximum:
             # MQTT 5 §3.3.4: DISCONNECT 0x93 (Receive Maximum exceeded).
             self._protocol_disconnect(0x93)
             raise ProtocolError("Receive Maximum exceeded")
+        byte_limit = self.config.max_pending_inbound_bytes
+        if (
+            logical_size is not None
+            and byte_limit is not None
+            and self._pending_bytes + logical_size > byte_limit
+        ):
+            # MQTT 5 §4.13: DISCONNECT 0x97 (Quota exceeded).
+            self._protocol_disconnect(0x97)
+            raise ProtocolError("Pending inbound byte limit reached")
         self._inflight += 1
+        if logical_size is not None:
+            self._pending_bytes += logical_size
+            self._pending_high_water_bytes = max(
+                self._pending_high_water_bytes,
+                self._pending_bytes,
+            )
 
-    def _release_slot(self) -> None:
+    def _release_slot(self, logical_size: int | None = None) -> None:
         if self._inflight > 0:
             self._inflight -= 1
+        if logical_size is None:
+            return
+        if logical_size <= 0 or logical_size > self._pending_bytes:
+            raise AssertionError(
+                "inbound byte reservation underflow: "
+                f"release={logical_size}, pending={self._pending_bytes}"
+            )
+        self._pending_bytes -= logical_size
 
     def _protocol_disconnect(self, reason_code: int) -> None:
         """Emit a normative DISCONNECT before the transport is torn down."""

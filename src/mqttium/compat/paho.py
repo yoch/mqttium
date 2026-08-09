@@ -136,6 +136,7 @@ class Client:
         clean_start: bool = True,
         max_pending_outbound_messages: int | None = 10_000,
         max_pending_outbound_bytes: int | None = 64 * 1024 * 1024,
+        max_pending_inbound_bytes: int | None = 64 * 1024 * 1024,
         max_pending_publish_requests: int = 10_000,
         max_pending_publish_bytes: int = 64 * 1024 * 1024,
     ) -> None:
@@ -154,6 +155,7 @@ class Client:
             clean_start=clean_start,
             max_pending_outbound_messages=max_pending_outbound_messages,
             max_pending_outbound_bytes=max_pending_outbound_bytes,
+            max_pending_inbound_bytes=max_pending_inbound_bytes,
             publish_backpressure="error",
         )
         # Cache the hot adapter boundary methods once. This avoids repeated

@@ -363,6 +363,20 @@ mqttium/
   payload ne puisse pas affamer la télémétrie. La partition est désactivée
   automatiquement si elle réduirait la capacité pour un paquet unique.
 
+### Persistance entrante bornée
+
+- `max_pending_inbound_bytes` borne les données applicatives que le protocole
+  doit conserver pour les handshakes QoS 2 et QoS 1 avec `manual_ack=True`.
+  La taille logique est `payload + topic UTF-8 + propriétés PUBLISH encodées`.
+- La réservation est effectuée avant l’écriture du store. Une retransmission du
+  même MID réutilise la réservation existante; la transition qui supprime
+  réellement l’enregistrement la libère exactement une fois.
+- `inbound.logical_size` (schéma SQLite 4) permet de restaurer et solder le
+  budget sans lire le payload. Les lignes historiques de taille nulle sont
+  hydratées et backfillées une seule fois à l’ouverture.
+- Dépasser le quota produit MQTT 5 `DISCONNECT 0x97`; MQTT 3.1.1 ne disposant
+  pas de code de raison équivalent, la connexion est fermée.
+
 ### Epochs de connexion
 
 - Chaque effet moteur porte l’epoch de la connexion qui l’a produit. À la

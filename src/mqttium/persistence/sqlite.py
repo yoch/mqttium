@@ -56,16 +56,17 @@ _OUT_SUMMARY_PAGE_SQL = (
     " length(payload) AS payload_size FROM outbound WHERE mid IN"
 )
 _IN_PAGE_SQL = (
-    "SELECT mid, seq, qos, retain, state, delivered, user_acked, topic, properties, payload"
+    "SELECT mid, seq, qos, retain, state, delivered, user_acked, logical_size,"
+    " topic, properties, payload"
     " FROM inbound WHERE mid IN"
 )
-_IN_INDEX_PAGE_SQL = "SELECT mid, state, user_acked FROM inbound WHERE mid IN"
+_IN_INDEX_PAGE_SQL = "SELECT mid, state, user_acked, logical_size FROM inbound WHERE mid IN"
 _IN_REPLAY_INDEX_SQL = (
     "SELECT mid, length(payload) + length(CAST(topic AS BLOB)) AS replay_size"
     " FROM inbound ORDER BY seq"
 )
 
-SQLITE_SCHEMA_VERSION = 3
+SQLITE_SCHEMA_VERSION = 4
 """Durable schema revision stored in ``PRAGMA user_version``.
 
 * 1 — the original schema, which carried no version marker at all.
@@ -74,6 +75,8 @@ SQLITE_SCHEMA_VERSION = 3
   pages.
 * 3 — compacts outbound QoS 2 records already in ``WAIT_PUBCOMP`` by removing
   topic, payload and PUBLISH properties while preserving settlement metadata.
+* 4 — adds ``inbound.logical_size`` ahead of application data so persisted
+  inbound byte reservations survive restarts and settle without reading BLOBs.
 """
 
 
@@ -159,6 +162,7 @@ def _row_to_in_meta(row: sqlite3.Row) -> InboundRecordMeta:
         mid=int(row["mid"]),
         state=InboundQoSState(int(row["state"])),
         user_acked=bool(row["user_acked"]),
+        logical_size=int(row["logical_size"]),
     )
 
 
@@ -173,6 +177,7 @@ def _row_to_in(row: sqlite3.Row) -> InboundMessage:
         delivered=bool(row["delivered"]),
         properties=_props_from_json(row["properties"]),
         user_acked=bool(row["user_acked"]),
+        logical_size=int(row["logical_size"]),
     )
 
 
@@ -220,6 +225,8 @@ class SqliteInflightStore:
                 self._migrate_to_v2()
             if version < 3 and legacy:
                 self._migrate_to_v3()
+            if 2 <= version < 4 and legacy:
+                self._migrate_to_v4()
             conn.execute(f"PRAGMA user_version={SQLITE_SCHEMA_VERSION}")
         except BaseException:
             # One transaction for the whole upgrade: an interrupted migration
@@ -256,6 +263,7 @@ class SqliteInflightStore:
         state INTEGER NOT NULL,
         delivered INTEGER NOT NULL,
         user_acked INTEGER NOT NULL,
+        logical_size INTEGER NOT NULL DEFAULT 0,
         topic TEXT NOT NULL,
         properties TEXT,
         payload BLOB NOT NULL
@@ -294,7 +302,7 @@ class SqliteInflightStore:
             "inbound",
             f"CREATE TABLE inbound__v2 ({self.INBOUND_COLUMNS})",
             "INSERT INTO inbound__v2 SELECT mid, seq, qos, retain, state,"
-            " delivered, user_acked, topic, properties, payload FROM inbound",
+            " delivered, user_acked, 0, topic, properties, payload FROM inbound",
             "DROP TABLE inbound",
             "ALTER TABLE inbound__v2 RENAME TO inbound",
         )
@@ -313,6 +321,17 @@ class SqliteInflightStore:
             WHERE state=?
             """,
             (int(OutboundQoSState.WAIT_PUBCOMP),),
+        )
+
+    def _migrate_to_v4(self) -> None:
+        """Schema 2/3 → 4: durable inbound logical byte accounting."""
+        self._rebuild_table(
+            "inbound",
+            f"CREATE TABLE inbound__v4 ({self.INBOUND_COLUMNS})",
+            "INSERT INTO inbound__v4 SELECT mid, seq, qos, retain, state,"
+            " delivered, user_acked, 0, topic, properties, payload FROM inbound",
+            "DROP TABLE inbound",
+            "ALTER TABLE inbound__v4 RENAME TO inbound",
         )
 
     def _rebuild_table(self, table: str, *statements: str) -> None:
@@ -655,14 +674,15 @@ class SqliteInflightStore:
                 """
                 INSERT INTO inbound(
                     mid, topic, payload, qos, retain, state, delivered,
-                    properties, user_acked, seq
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    properties, user_acked, seq, logical_size
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(mid) DO UPDATE SET
                     topic=excluded.topic, payload=excluded.payload,
                     qos=excluded.qos, retain=excluded.retain,
                     state=excluded.state, delivered=excluded.delivered,
                     properties=excluded.properties,
-                    user_acked=excluded.user_acked
+                    user_acked=excluded.user_acked,
+                    logical_size=excluded.logical_size
                 """,
                 (
                     msg.mid,
@@ -675,6 +695,7 @@ class SqliteInflightStore:
                     _props_to_json(msg.properties),
                     int(msg.user_acked),
                     self._in_seq,
+                    int(msg.logical_size),
                 ),
             )
             self._commit_if_needed()
@@ -785,13 +806,23 @@ class SqliteInflightStore:
 
     def _in_transition_row(self, mid: int) -> sqlite3.Row | None:
         return self._conn.execute(
-            "SELECT state, user_acked, seq FROM inbound WHERE mid=?", (mid,)
+            "SELECT state, user_acked, logical_size, seq FROM inbound WHERE mid=?", (mid,)
         ).fetchone()
 
     def contains_in(self, mid: int) -> bool:
         with self._lock:
             row = self._conn.execute("SELECT 1 FROM inbound WHERE mid=?", (mid,)).fetchone()
         return row is not None
+
+    def set_in_logical_size(self, mid: int, logical_size: int) -> bool:
+        with self._lock:
+            self._ensure_write_transaction()
+            cursor = self._conn.execute(
+                "UPDATE inbound SET logical_size=? WHERE mid=?",
+                (int(logical_size), mid),
+            )
+            self._commit_if_needed()
+            return cursor.rowcount > 0
 
     def in_meta(self, mid: int) -> InboundRecordMeta | None:
         with self._lock:
@@ -802,6 +833,7 @@ class SqliteInflightStore:
             mid=mid,
             state=InboundQoSState(int(row["state"])),
             user_acked=bool(row["user_acked"]),
+            logical_size=int(row["logical_size"]),
         )
 
     def in_index_pages(self, page_size: int = 256) -> Iterator[tuple[InboundRecordMeta, ...]]:
@@ -869,6 +901,7 @@ class SqliteInflightStore:
                 mid=mid,
                 state=new_state,
                 user_acked=resulting_user_acked,
+                logical_size=int(row["logical_size"]),
             )
 
     def complete_in(
@@ -897,4 +930,5 @@ class SqliteInflightStore:
                 mid=mid,
                 state=expected_state,
                 user_acked=bool(old_user_acked),
+                logical_size=int(row["logical_size"]),
             )

@@ -33,6 +33,9 @@ class InboundStats:
     receive_maximum: int
     topic_aliases: int
     replay_pending: bool
+    pending_bytes: int
+    pending_high_water_bytes: int
+    pending_byte_limit: int | None
 
 
 __all__ = ["InboundStats", "OutboundStats"]

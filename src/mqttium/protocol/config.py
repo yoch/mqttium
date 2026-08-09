@@ -17,6 +17,7 @@ _RUNTIME_MUTABLE_ENGINE_CONFIG_FIELDS = frozenset(
         "will_properties",
         "max_pending_outbound_messages",
         "max_pending_outbound_bytes",
+        "max_pending_inbound_bytes",
         "accept_auth",
     }
 )
@@ -38,6 +39,9 @@ class EngineConfig:
     # None disables the corresponding limit; zero rejects every new QoS>0 publish.
     max_pending_outbound_messages: int | None = 10_000
     max_pending_outbound_bytes: int | None = 64 * 1024 * 1024
+    # Logical application bytes retained for inbound QoS handshakes. None
+    # disables the cap; zero rejects every new message that needs persistence.
+    max_pending_inbound_bytes: int | None = 64 * 1024 * 1024
     connect_properties: Properties | None = None
     will: Message | None = field(default=None, repr=False)
     will_properties: Properties | None = None
@@ -66,6 +70,8 @@ class EngineConfig:
             raise ValueError("max_pending_outbound_messages must be non-negative or None")
         if self.max_pending_outbound_bytes is not None and self.max_pending_outbound_bytes < 0:
             raise ValueError("max_pending_outbound_bytes must be non-negative or None")
+        if self.max_pending_inbound_bytes is not None and self.max_pending_inbound_bytes < 0:
+            raise ValueError("max_pending_inbound_bytes must be non-negative or None")
         if self.maximum_packet_size is not None and not (
             2 <= self.maximum_packet_size <= 268_435_460
         ):

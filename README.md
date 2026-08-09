@@ -126,6 +126,7 @@ the process:
 client = AsyncClient(
     max_pending_outbound_messages=10_000,   # unfinished QoS 1/2 publications
     max_pending_outbound_bytes=64 * 1024**2,  # their logical topic+payload+properties
+    max_pending_inbound_bytes=64 * 1024**2,   # persisted inbound QoS handshakes
     max_pending_delivery_bytes=64 * 1024**2,  # inbound messages awaiting a consumer
     max_ingress_batch_bytes=1 * 1024**2,      # decoded work before delivery is drained
     publish_backpressure="wait",             # or "error" to refuse immediately
@@ -136,6 +137,17 @@ client = AsyncClient(
 `publish_backpressure="error"` or with `nowait=True`. A refusal is atomic: no
 packet identifier is allocated and no store record is written. Pass `None` for
 any limit to restore unbounded queueing.
+
+The two inbound byte limits cover different lifetimes:
+`max_pending_inbound_bytes` bounds QoS 2 and manually acknowledged QoS 1 data
+retained by the session store, while `max_pending_delivery_bytes` bounds data
+waiting for callback or iterator consumers. MQTT 5 reports a persisted-session
+quota violation with reason `0x97`; MQTT 3.1.1 closes the connection.
+
+The writer also has an independent `max_outbound_bytes=1 MiB` default.
+`publish_nowait()` refuses immediately when that wire queue is full, so callers
+publishing large payloads should size this byte limit explicitly rather than
+assuming `max_outbound_messages` is the only binding constraint.
 
 These defaults are new in `0.1.0a2`; before them a QoS 1/2 producer could queue
 until the 65 535 packet-identifier space was exhausted. See
