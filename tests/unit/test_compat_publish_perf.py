@@ -394,6 +394,57 @@ def test_publish_batches_are_byte_bounded(monkeypatch: pytest.MonkeyPatch) -> No
     assert committed == ["a", "b", "c"]
 
 
+def test_publish_enqueued_during_finalization_schedules_next_drain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class LoopStub:
+        def __init__(self) -> None:
+            self.calls: list[tuple[Any, tuple[Any, ...]]] = []
+
+        def is_running(self) -> bool:
+            return True
+
+        def call_soon_threadsafe(self, callback: Any, *args: Any) -> None:
+            self.calls.append((callback, args))
+
+        def call_soon(self, callback: Any, *args: Any) -> None:
+            self.calls.append((callback, args))
+
+    client = Client(CallbackAPIVersion.VERSION2, client_id="tail-race")
+    client._async._engine.state = ConnectionState.CONNECTED
+    loop = LoopStub()
+    client._loop = cast(asyncio.AbstractEventLoop, loop)
+    committed: list[str] = []
+    original_queue_publish = client._async._engine.queue_publish
+
+    def traced_queue_publish(topic: str, *args: Any, **kwargs: Any):
+        committed.append(topic)
+        return original_queue_publish(topic, *args, **kwargs)
+
+    enqueue_tail = True
+
+    def finalize() -> None:
+        nonlocal enqueue_tail
+        client._async._engine.take_effects()
+        if enqueue_tail:
+            enqueue_tail = False
+            client.publish("tail/second", b"x", qos=0)
+
+    monkeypatch.setattr(client._async._engine, "queue_publish", traced_queue_publish)
+    monkeypatch.setattr(client, "_finalize_publish_effects", finalize)
+
+    client.publish("tail/first", b"x", qos=0)
+    assert len(loop.calls) == 1
+    callback, args = loop.calls.pop(0)
+    callback(*args)
+    assert len(loop.calls) == 1
+    callback, args = loop.calls.pop(0)
+    callback(*args)
+
+    assert committed == ["tail/first", "tail/second"]
+    assert not client._publish_drain_scheduled
+
+
 def test_concurrent_qos1_publish_coalesces_loop_drains(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

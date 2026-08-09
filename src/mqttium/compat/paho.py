@@ -605,26 +605,22 @@ class Client:
                 loop.call_soon(self._drain_publish_requests)
             return
 
-        # Close the producer race atomically with the scheduled flag. Producers
-        # enqueue before taking this lock, so either this callback adopts their
-        # request or they observe the cleared flag and schedule a new drain.
-        schedule = False
+        # Close the producer race atomically with the scheduled flag. Queue
+        # insertion uses the same lock, so an empty queue is authoritative here.
         with self._publish_schedule_lock:
-            try:
-                self._publish_spillover = self._publish_pending.get_nowait()
-            except Empty:
+            has_pending = not self._publish_pending.empty()
+            if not has_pending:
                 self._publish_drain_scheduled = False
-            else:
-                schedule = True
-        if schedule:
-            if self._stopping.is_set():
-                self._fail_pending_publish_requests(
-                    RuntimeError("network loop stopped before publish admission")
-                )
-                return
-            loop = self._loop
-            if loop is not None and loop.is_running():
-                loop.call_soon(self._drain_publish_requests)
+        if not has_pending:
+            return
+        if self._stopping.is_set():
+            self._fail_pending_publish_requests(
+                RuntimeError("network loop stopped before publish admission")
+            )
+            return
+        loop = self._loop
+        if loop is not None and loop.is_running():
+            loop.call_soon(self._drain_publish_requests)
 
     def publish(
         self,
