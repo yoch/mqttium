@@ -54,7 +54,7 @@ jobs:
           path: base
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.12"
+          python-version: "3.13"
       - name: Install broker
         run: |
           sudo apt-get update -qq
@@ -98,6 +98,15 @@ jobs:
             --count-small 20000 \
             --count-large 8000 \
             --output /tmp/mqttium-paired/network.json
+      - name: Native QoS 1 receipt/callback diagnostic
+        continue-on-error: true
+        run: |
+          python harness/benchmarks/paired_network.py \
+            --base-root base --candidate-root candidate \
+            --repeat 4 --windows 64 --protocols 311 \
+            --payloads 64 --completions receipt,callback \
+            --count-small 5000 \
+            --output /tmp/mqttium-paired/qos1-completion.json
       - name: Upload paired measurements
         if: always()
         uses: actions/upload-artifact@v7

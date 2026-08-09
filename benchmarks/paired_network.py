@@ -27,6 +27,7 @@ HEADER_HEX_BYTES = 32
 
 @dataclass
 class WorkerResult:
+    completion: str
     protocol: str
     payload_bytes: int
     count: int
@@ -36,7 +37,13 @@ class WorkerResult:
     latency_p50_ms: float
     latency_p95_ms: float
     latency_p99_ms: float
+    ack_latency_p50_ms: float
+    ack_latency_p95_ms: float
+    ack_latency_p99_ms: float
     cpu_seconds: float
+    effect_inline: int
+    effect_enqueued: int
+    effect_suspensions: int
 
 
 def percentile(values: list[float], fraction: float) -> float:
@@ -95,7 +102,8 @@ async def publish(
     size: int,
     window: int,
     protocol: str,
-) -> float:
+    completion: str,
+) -> tuple[float, dict[str, int], list[float]]:
     from mqttium.api import AsyncClient
     from mqttium.enums import MQTTProtocolVersion
     from mqttium.protocol.reconnect import ReconnectPolicy
@@ -108,15 +116,62 @@ async def publish(
     )
     await client.connect(host, port, timeout=10.0)
     pending = []
+    completed: asyncio.Queue[tuple[int, int]] = asyncio.Queue()
+    publish_started: dict[int, int] = {}
+    early_completion: dict[int, int] = {}
+    ack_latencies: list[float] = []
+    outstanding = 0
+    if completion == "callback":
+
+        def on_publish(mid: int | None, *_args: object) -> None:
+            assert mid is not None
+            finished = time.monotonic_ns()
+            if mid in publish_started:
+                completed.put_nowait((mid, finished))
+            else:
+                early_completion[mid] = finished
+
+        client.on_publish = on_publish
     started = time.perf_counter()
     for sequence in range(count):
-        pending.append(await client.publish(topic, make_payload(sequence, size), qos=1))
-        if len(pending) >= window:
-            await pending.pop(0).wait()
-    await asyncio.gather(*(receipt.wait() for receipt in pending))
+        published_ns = time.monotonic_ns()
+        receipt = await client.publish(topic, make_payload(sequence, size), qos=1)
+        if completion == "receipt":
+            pending.append((receipt, published_ns))
+            if len(pending) >= window:
+                oldest, sent_ns = pending.pop(0)
+                await oldest.wait()
+                ack_latencies.append((time.monotonic_ns() - sent_ns) / 1_000_000)
+        else:
+            assert receipt.mid is not None
+            publish_started[receipt.mid] = published_ns
+            if receipt.mid in early_completion:
+                completed.put_nowait((receipt.mid, early_completion.pop(receipt.mid)))
+            outstanding += 1
+            if outstanding >= window:
+                mid, finished = await completed.get()
+                ack_latencies.append((finished - publish_started.pop(mid)) / 1_000_000)
+                outstanding -= 1
+    if completion == "receipt":
+        for receipt, sent_ns in pending:
+            await receipt.wait()
+            ack_latencies.append((time.monotonic_ns() - sent_ns) / 1_000_000)
+    else:
+        for _ in range(outstanding):
+            mid, finished = await completed.get()
+            ack_latencies.append((finished - publish_started.pop(mid)) / 1_000_000)
     elapsed = time.perf_counter() - started
+    effects = client.stats().effects
     await client.disconnect()
-    return elapsed
+    return (
+        elapsed,
+        {
+            "inline": effects.inline_effects,
+            "enqueued": effects.enqueued,
+            "suspensions": effects.apply_suspensions,
+        },
+        ack_latencies,
+    )
 
 
 def worker(args: argparse.Namespace) -> None:
@@ -126,7 +181,7 @@ def worker(args: argparse.Namespace) -> None:
     )
     delivery_started = time.perf_counter()
     cpu_started = time.process_time()
-    ack_seconds = asyncio.run(
+    ack_seconds, effects, ack_latencies = asyncio.run(
         publish(
             args.host,
             args.port,
@@ -135,6 +190,7 @@ def worker(args: argparse.Namespace) -> None:
             args.payload_bytes,
             args.window,
             args.protocol,
+            args.completion,
         )
     )
     try:
@@ -153,6 +209,7 @@ def worker(args: argparse.Namespace) -> None:
 
     delivery_seconds = time.perf_counter() - delivery_started
     result = WorkerResult(
+        completion=args.completion,
         protocol=args.protocol,
         payload_bytes=args.payload_bytes,
         count=args.count,
@@ -162,7 +219,13 @@ def worker(args: argparse.Namespace) -> None:
         latency_p50_ms=statistics.median(latencies),
         latency_p95_ms=percentile(latencies, 0.95),
         latency_p99_ms=percentile(latencies, 0.99),
+        ack_latency_p50_ms=statistics.median(ack_latencies),
+        ack_latency_p95_ms=percentile(ack_latencies, 0.95),
+        ack_latency_p99_ms=percentile(ack_latencies, 0.99),
         cpu_seconds=time.process_time() - cpu_started,
+        effect_inline=effects["inline"],
+        effect_enqueued=effects["enqueued"],
+        effect_suspensions=effects["suspensions"],
     )
     print(json.dumps(asdict(result)))
 
@@ -176,6 +239,7 @@ def run_worker(
     count: int,
     window: int,
     protocol: str,
+    completion: str,
 ) -> WorkerResult:
     env = os.environ.copy()
     env["PYTHONPATH"] = str(root.resolve() / "src")
@@ -195,6 +259,8 @@ def run_worker(
         str(window),
         "--protocol",
         protocol,
+        "--completion",
+        completion,
         "--timeout",
         str(args.timeout),
     ]
@@ -226,6 +292,7 @@ def parent(args: argparse.Namespace) -> None:
     windows = [int(value) for value in args.windows.split(",")]
     payloads = [int(value) for value in args.payloads.split(",")]
     protocols = args.protocols.split(",")
+    completions = args.completions.split(",")
     payload: dict[str, object] = {
         "base_root": str(base),
         "candidate_root": str(candidate),
@@ -233,11 +300,12 @@ def parent(args: argparse.Namespace) -> None:
         "windows": windows,
         "payloads": payloads,
         "protocols": protocols,
+        "completions": completions,
         "scenarios": [],
     }
 
     failures: list[str] = []
-    for protocol, payload_bytes in product(protocols, payloads):
+    for protocol, payload_bytes, completion in product(protocols, payloads, completions):
         count = args.count_small if payload_bytes <= 256 else args.count_large
         for window in windows:
             pairs: list[dict[str, object]] = []
@@ -263,6 +331,7 @@ def parent(args: argparse.Namespace) -> None:
                         count=count,
                         window=window,
                         protocol=protocol,
+                        completion=completion,
                     )
                 base_result = measured["base"]
                 candidate_result = measured["candidate"]
@@ -293,6 +362,7 @@ def parent(args: argparse.Namespace) -> None:
             baseline_cv = coefficient_of_variation(base_ack_rates)
             scenario = {
                 "protocol": protocol,
+                "completion": completion,
                 "payload_bytes": payload_bytes,
                 "count": count,
                 "window": window,
@@ -307,14 +377,20 @@ def parent(args: argparse.Namespace) -> None:
                 "candidate_median_p95_ms": median(candidate_p95),
                 "pairs": pairs,
             }
-            payload["scenarios"].append(scenario)  # type: ignore[index]
-            label = f"protocol={protocol} payload={payload_bytes} window={window}"
+            scenarios_output = payload["scenarios"]
+            assert isinstance(scenarios_output, list)
+            scenarios_output.append(scenario)
+            label = (
+                f"protocol={protocol} completion={completion} "
+                f"payload={payload_bytes} window={window}"
+            )
             if baseline_cv > args.max_baseline_cv:
                 failures.append(f"{label}: baseline CV {baseline_cv:.2%}")
             if ratio < args.min_ack_ratio:
                 failures.append(f"{label}: candidate/base {ratio:.4f}")
             print(
-                f"protocol={protocol:3s} payload={payload_bytes:4d} window={window:3d} "
+                f"protocol={protocol:3s} completion={completion:8s} "
+                f"payload={payload_bytes:4d} window={window:3d} "
                 f"ack candidate/base={ratio:.4f} base_cv={baseline_cv:.2%} "
                 f"p50 base={median(base_p50):7.2f}ms "
                 f"candidate={median(candidate_p50):7.2f}ms "
@@ -338,10 +414,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--count", type=int, default=1_000)
     parser.add_argument("--window", type=int, default=20)
     parser.add_argument("--protocol", choices=("311", "5"), default="311")
+    parser.add_argument("--completion", choices=("receipt", "callback"), default="receipt")
     parser.add_argument("--timeout", type=float, default=120.0)
-    parser.add_argument("--repeat", type=int, default=5)
+    parser.add_argument("--repeat", type=int, default=8, help="even count forming ABBA cycles")
     parser.add_argument("--windows", default="1,8,32,64,128")
     parser.add_argument("--protocols", default="311,5")
+    parser.add_argument("--completions", default="receipt")
     parser.add_argument("--payloads", default="64,4096")
     parser.add_argument("--count-small", type=int, default=1_500)
     parser.add_argument("--count-large", type=int, default=750)
@@ -351,6 +429,10 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if not args.worker and (args.base_root is None or args.candidate_root is None):
         parser.error("--base-root and --candidate-root are required")
+    if not args.worker and (args.repeat <= 0 or args.repeat % 2):
+        parser.error("--repeat must be a positive even count (complete ABBA cycles)")
+    if any(value not in ("receipt", "callback") for value in args.completions.split(",")):
+        parser.error("--completions accepts receipt,callback")
     return args
 
 

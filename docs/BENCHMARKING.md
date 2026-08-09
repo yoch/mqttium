@@ -22,6 +22,13 @@ order where warm-up could matter. A result is omitted rather than manufactured
 with library-specific barriers. CI uploads JSON artefacts and never commits or
 pushes generated numbers.
 
+`runner_probe.py` records CPU affinity/model/governor, load, temperature, Python
+and broker metadata. Hosted CI records this context only. A dedicated performance
+runner must use `--enforce`; an ineligible machine produces no gate evidence.
+Paired network repeats must be even so each scenario completes exact ABBA cycles.
+The targeted QoS 1 run records receipt and callback completion separately plus
+the existing EffectPump decision counters.
+
 ## Interprétation de la latence
 
 `realworld.py` horodate immédiatement avant l'appel applicatif à `publish()`.
