@@ -73,10 +73,12 @@ Four non-runtime exceptions also predate the ratchet:
 `paired_regression._worker` (41), `fuzz_engine` (30), `fuzz_websocket` (16),
 and the concurrent Paho integration test (18).
 
-The inline `# noqa: C901` comments are the complete allowlist. New exceptions
-are not permitted. When an exempt function changes, its complexity must fall;
-the exemption is removed as soon as it reaches 15. A mechanical helper that
-only moves branches without clarifying ownership does not satisfy this rule.
+The remaining inline `# noqa: C901` comments are the complete current
+allowlist; the table preserves eliminated entries as part of the reference
+baseline. New exceptions are not permitted. When an exempt function changes,
+its complexity must fall; the exemption is removed as soon as it reaches 15.
+A mechanical helper that only moves branches without clarifying ownership does
+not satisfy this rule.
 
 ## Coupling and allocation-sensitive boundaries
 

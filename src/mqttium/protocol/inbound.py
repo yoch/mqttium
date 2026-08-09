@@ -33,7 +33,7 @@ from mqttium.packets import (
 from mqttium.protocol.effects import DisconnectInfo, EffectKind
 from mqttium.protocol.stats import InboundStats
 from mqttium.topics import validate_received_publish_topic
-from mqttium.types import InboundMessage, Message, Properties
+from mqttium.types import InboundMessage, InboundRecordMeta, Message, Properties
 
 if TYPE_CHECKING:
     from mqttium.protocol.engine import ProtocolEngine
@@ -477,61 +477,50 @@ class InboundSession:
         inbound.delivered = True
         self.store.update_in(inbound)
 
-    def ack(self, mid: int) -> None:  # noqa: C901
+    def ack(self, mid: int) -> None:
         """Complete a deferred PUBACK or PUBCOMP in manual-ack mode."""
         config = self.config
         if not config.manual_ack:
             raise ProtocolError("manual_ack is disabled")
         store = self.store
         transitions = self._transitions
-        if transitions is not None:
-            meta = transitions.in_meta(mid)
-            if meta is None:
-                raise ProtocolError(f"No pending inbound ack for mid={mid}")
-            state = meta.state
-            if state is InboundQoSState.WAIT_PUBACK:
-                completed = transitions.complete_in(mid, state)
-                if completed is None:
-                    raise ProtocolError(f"Inbound mid={mid} changed while acknowledging")
-                self._engine._send(PubAckPacket(mid=mid).encode(config.protocol))
-                self._release_slot(completed.logical_size)
-                return
-            if state is InboundQoSState.WAIT_PUBREL:
+        record: InboundMessage | InboundRecordMeta | None = (
+            transitions.in_meta(mid) if transitions is not None else store.get_in(mid)
+        )
+        if record is None:
+            raise ProtocolError(f"No pending inbound ack for mid={mid}")
+        state = record.state
+        if state is InboundQoSState.WAIT_PUBREL:
+            if isinstance(record, InboundMessage):
+                record.user_acked = True
+                store.update_in(record)
+            else:
+                assert transitions is not None
                 changed = transitions.transition_in(mid, state, state, user_acked=True)
                 if changed is None:
                     raise ProtocolError(f"Inbound mid={mid} changed while acknowledging")
-                return
-            if state is InboundQoSState.WAIT_USER_ACK:
-                completed = transitions.complete_in(mid, state)
-                if completed is None:
-                    raise ProtocolError(f"Inbound mid={mid} changed while acknowledging")
-                self._engine._send(PubCompPacket(mid=mid).encode(config.protocol))
-                self._release_slot(completed.logical_size)
-                return
+            return
+        if state not in (InboundQoSState.WAIT_PUBACK, InboundQoSState.WAIT_USER_ACK):
             raise ProtocolError(f"Inbound mid={mid} is not awaiting ack (state={state!r})")
 
-        inbound = store.get_in(mid)
-        if inbound is None:
-            raise ProtocolError(f"No pending inbound ack for mid={mid}")
-        if inbound.state is InboundQoSState.WAIT_PUBACK:
+        if isinstance(record, InboundMessage):
             popped = store.pop_in(mid)
             if popped is None:
                 raise ProtocolError(f"Inbound mid={mid} disappeared while acknowledging")
-            self._engine._send(PubAckPacket(mid=mid).encode(config.protocol))
-            self._release_slot(self.stored_logical_size(popped))
-            return
-        if inbound.state is InboundQoSState.WAIT_PUBREL:
-            inbound.user_acked = True
-            store.update_in(inbound)
-            return
-        if inbound.state is InboundQoSState.WAIT_USER_ACK:
-            popped = store.pop_in(mid)
-            if popped is None:
-                raise ProtocolError(f"Inbound mid={mid} disappeared while acknowledging")
-            self._engine._send(PubCompPacket(mid=mid).encode(config.protocol))
-            self._release_slot(self.stored_logical_size(popped))
-            return
-        raise ProtocolError(f"Inbound mid={mid} is not awaiting ack (state={inbound.state!r})")
+            logical_size = self.stored_logical_size(popped)
+        else:
+            assert transitions is not None
+            completed = transitions.complete_in(mid, state)
+            if completed is None:
+                raise ProtocolError(f"Inbound mid={mid} changed while acknowledging")
+            logical_size = completed.logical_size
+        packet = (
+            PubAckPacket(mid=mid)
+            if state is InboundQoSState.WAIT_PUBACK
+            else PubCompPacket(mid=mid)
+        )
+        self._engine._send(packet.encode(config.protocol))
+        self._release_slot(logical_size)
 
     def replay_session(self) -> None:
         """Restore Receive Maximum accounting and start redelivering.

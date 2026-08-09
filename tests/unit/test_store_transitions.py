@@ -383,3 +383,24 @@ def test_a_store_without_the_extension_handles_inbound_qos2_and_manual_ack() -> 
     engine.ack(8)
     assert sends(engine) == [PubCompPacket(mid=8).encode()]
     assert store.get_in(8) is None
+
+
+def test_a_store_without_the_extension_completes_inbound_qos1_manual_ack() -> None:
+    store = PlainInflightStore()
+    engine = connected_engine(store, manual_ack=True)
+    feed_engine(
+        engine,
+        PublishPacket(
+            topic="in/topic",
+            payload=b"body",
+            qos=QoS.AT_LEAST_ONCE,
+            retain=False,
+            dup=False,
+            mid=9,
+        ).encode(),
+    )
+
+    assert sends(engine) == []
+    engine.ack(9)
+    assert sends(engine) == [PubAckPacket(mid=9).encode()]
+    assert store.get_in(9) is None
