@@ -10,7 +10,7 @@ on:
       version:
         description: Published MQTTium version to validate
         required: true
-        default: 0.2.0b1
+        default: 0.2.0b2
         type: string
   schedule:
     - cron: "31 5 1 * *"
@@ -19,14 +19,14 @@ permissions:
   contents: read
 
 concurrency:
-  group: published-beta-resilience-${{ github.event.inputs.version || '0.2.0b1' }}-${{ github.ref }}
+  group: published-beta-resilience-${{ github.event.inputs.version || '0.2.0b2' }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   tls-and-sqlite:
     runs-on: ubuntu-24.04
     env:
-      MQTTIUM_VERSION: ${{ github.event.inputs.version || '0.2.0b1' }}
+      MQTTIUM_VERSION: ${{ github.event.inputs.version || '0.2.0b2' }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
