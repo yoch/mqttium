@@ -89,8 +89,8 @@ jobs:
             --windows 1,8,32,64,128 \
             --protocols 311,5 \
             --payloads 64,4096 \
-            --count-small 8000 \
-            --count-large 2000 \
+            --count-small 20000 \
+            --count-large 8000 \
             --output /tmp/mqttium-paired/network.json
       - name: Upload paired measurements
         if: always()
