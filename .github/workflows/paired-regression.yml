@@ -37,6 +37,11 @@ jobs:
       PYTHONUNBUFFERED: "1"
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
     steps:
+      - name: Check out benchmark harness
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          path: harness
       - name: Check out candidate
         uses: actions/checkout@v7
         with:
@@ -75,7 +80,7 @@ jobs:
           exit 1
       - name: Paired microbenchmarks
         run: |
-          python candidate/benchmarks/paired_regression.py \
+          python harness/benchmarks/paired_regression.py \
             --base-root base \
             --candidate-root candidate \
             --repeat 11 \
@@ -83,7 +88,7 @@ jobs:
       - name: Paired network and latency sweep
         continue-on-error: ${{ github.event_name == 'pull_request' }}
         run: |
-          python candidate/benchmarks/paired_network.py \
+          python harness/benchmarks/paired_network.py \
             --base-root base \
             --candidate-root candidate \
             --repeat 8 \
