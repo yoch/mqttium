@@ -4,12 +4,19 @@ from __future__ import annotations
 
 import asyncio
 import socket
+import sys
 import tempfile
 from pathlib import Path
 
 import pytest
 
 from mqttium.transport.unix import UnixSocketTransport
+
+
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="asyncio Unix domain socket APIs are unavailable on Windows",
+)
 
 
 @pytest.mark.asyncio
