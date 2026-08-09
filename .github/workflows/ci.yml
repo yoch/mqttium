@@ -32,28 +32,11 @@ jobs:
       - run: python -m pytest -q tests/unit --cov=mqttium --cov-report=term-missing --cov-fail-under=80
 
   test:
-    name: Tests (${{ matrix.os }}, Python ${{ matrix.python-version }})
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-24.04
-            python-version: "3.11"
-          - os: ubuntu-24.04
-            python-version: "3.12"
-          - os: ubuntu-24.04
-            python-version: "3.13"
-          - os: ubuntu-24.04
-            python-version: "3.14"
-          - os: macos-15
-            python-version: "3.11"
-          - os: macos-15
-            python-version: "3.14"
-          - os: windows-2025
-            python-version: "3.11"
-          - os: windows-2025
-            python-version: "3.14"
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -65,7 +48,6 @@ jobs:
       - name: Unit tests (including TLS, WebSocket, and cancellation)
         run: python -m pytest -q -ra tests/unit
       - name: Start Mosquitto
-        if: runner.os == 'Linux'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq mosquitto
@@ -77,8 +59,26 @@ jobs:
           done
           exit 1
       - name: Mosquitto integration tests
-        if: runner.os == 'Linux'
         run: python -m pytest -q tests/integration
+
+  cross-platform:
+    name: Cross-platform (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, windows-2025]
+        python-version: ["3.11", "3.14"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install -e ".[dev]"
+      - name: Require OpenSSL for TLS tests
+        run: python -c "import shutil; assert shutil.which('openssl'), 'OpenSSL is required for TLS tests'"
+      - name: Unit tests (including TLS, WebSocket, and cancellation)
+        run: python -m pytest -q -ra tests/unit
 
   fuzz:
     runs-on: ubuntu-24.04
