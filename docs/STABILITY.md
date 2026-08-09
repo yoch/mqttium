@@ -45,6 +45,12 @@ The workflow is intentionally separate from normal CI so the permanent unit,
 integration, packaging and fuzzing gates remain fast. Extended macOS and
 multi-broker campaigns run only through `workflow_dispatch`.
 
+The published-beta workflows separately install the exact PyPI artifact rather
+than the checkout. Their retained matrix covers wheel/sdist metadata and Stable
+imports on Python 3.11–3.14, TCP and TLS broker round trips, SQLite restart,
+WebSocket and Unix transports, the Paho VERSION2 migration subset, cancellation
+and clean shutdown. They are manually dispatchable for every beta candidate.
+
 ## Retained evidence
 
 The campaign run against `main` at
