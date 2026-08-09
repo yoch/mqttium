@@ -13,7 +13,7 @@ body:
     attributes:
       label: MQTTium version
       description: Output of `python -c "import mqttium; print(mqttium.__version__)"`
-      placeholder: 0.2.0b1
+      placeholder: 0.2.0b2
     validations:
       required: true
 
