@@ -149,6 +149,10 @@ The writer also has an independent `max_outbound_bytes=1 MiB` default.
 publishing large payloads should size this byte limit explicitly rather than
 assuming `max_outbound_messages` is the only binding constraint.
 
+Native QoS 0 uses its direct writer fast path only while `on_publish is None`.
+Installing that callback deliberately routes publications through the standard
+engine and `EffectPump` so completion callbacks retain their ordering semantics.
+
 These defaults are new in `0.1.0a2`; before them a QoS 1/2 producer could queue
 until the 65 535 packet-identifier space was exhausted. See
 [`docs/MIGRATION.md`](docs/MIGRATION.md).

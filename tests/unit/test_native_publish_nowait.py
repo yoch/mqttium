@@ -8,6 +8,7 @@ import inspect
 import pytest
 
 import mqttium.compat.paho as paho_compat
+import mqttium.protocol.outbound as outbound_module
 from mqttium.api import AsyncClient
 from mqttium.codec.buffer import IncrementalDecoder
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, PacketType, QoS
@@ -52,15 +53,21 @@ async def test_publish_nowait_registers_qos1_receipt() -> None:
     assert client._pop_publish_receipt(receipt.mid) is receipt
 
 
-async def test_publish_nowait_coalesces_async_effect_flush() -> None:
+async def test_publish_nowait_coalesces_async_effect_flush(monkeypatch) -> None:
     client = AsyncClient(max_outbound_messages=512)
     client._engine.state = ConnectionState.CONNECTED
     seen: list[int | None] = []
     client.on_publish = lambda mid, _error: seen.append(mid)
 
+    def direct_path_forbidden(*_args, **_kwargs):
+        raise AssertionError("on_publish must retain the standard effect path")
+
+    monkeypatch.setattr(type(client._engine.outbound), "prepare_qos0", direct_path_forbidden)
+
     for _ in range(100):
         client.publish_nowait("native/qos0", b"x", qos=0)
 
+    assert client._effect_pump.enqueued > 0
     task = client._effect_flush_task
     assert task is not None
     assert not task.done()
@@ -86,12 +93,21 @@ def test_disconnect_metadata_boundary_is_private() -> None:
     assert hasattr(AsyncClient, "_last_disconnect_info")
 
 
-async def test_publish_nowait_direct_path_encodes_mqtt5_properties() -> None:
+async def test_publish_nowait_direct_path_encodes_mqtt5_properties(monkeypatch) -> None:
     properties = Properties()
     properties.set("content_type", "application/json")
     properties.add_user_property("source", "native-fast-path")
     client = AsyncClient(protocol=MQTTProtocolVersion.MQTTv5, max_outbound_messages=8)
     client._engine.state = ConnectionState.CONNECTED
+    original_encode = outbound_module.encode_publish_item
+    encode_calls = 0
+
+    def counted_encode(*args, **kwargs):
+        nonlocal encode_calls
+        encode_calls += 1
+        return original_encode(*args, **kwargs)
+
+    monkeypatch.setattr(outbound_module, "encode_publish_item", counted_encode)
 
     receipt = client.publish_nowait(
         "native/mqtt5",
@@ -101,6 +117,10 @@ async def test_publish_nowait_direct_path_encodes_mqtt5_properties() -> None:
     )
 
     assert receipt.mid is None
+    assert encode_calls == 1
+    assert client._effect_pump.batches == 0
+    assert client._effect_pump.enqueued == 0
+    assert not client._engine.has_pending_effects
     item = client._outbound.get_nowait()
     assert isinstance(item, bytes)
     decoder = IncrementalDecoder()
