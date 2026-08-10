@@ -65,5 +65,5 @@ Python allocations, comparable across runners, unlike absolute RSS — and
 asserts each scenario's logical counters exactly, so a benchmark that quietly
 stopped doing equivalent work cannot pass as an improvement.
 
-Reference values live in `docs/MEMORY-RESULTS.md`. Raising a threshold is a
+Reference values live in [`reports/MEMORY-RESULTS.md`](reports/MEMORY-RESULTS.md). Raising a threshold is a
 reviewable change and needs a reason.

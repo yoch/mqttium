@@ -5,8 +5,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project
 
 MQTTium is a dependency-free, async-native MQTT 3.1.1 / 5.0 client (`src/mqttium`, Python 3.11–3.14,
-Apache-2.0, alpha `0.1.0a4`). Runtime dependencies must stay empty — tooling only lives in the
+Apache-2.0, beta `0.2.0b2`). Runtime dependencies must stay empty — tooling only lives in the
 `dev`/`fuzz`/`security`/`release` extras.
+
+Since `0.2.0b1` the public surface is tiered in `docs/API-STABILITY.md`: **Stable** (`mqttium`
+errors/enums, `mqttium.api`, `mqttium.helpers`) follows SemVer, **Provisional**
+(`compat`/`persistence`/`transport`/`protocol.ProtocolEngine`/`packets`/`codec`, `ClientStats`)
+may gain fields with a changelog entry, **Internal** (`InboundSession`, `OutboundSession`,
+`EffectPump`, `WritePump`, `EngineEffect`, `PacketIdPool`, underscore modules) has no guarantee
+even when importable. Check the tier before changing or re-exporting a name.
 
 ## Commands
 
@@ -37,6 +44,16 @@ printf 'listener 11883 127.0.0.1\nallow_anonymous true\npersistence false\n' > /
 mosquitto -c /tmp/mosq.conf -d
 ```
 
+CI installs Mosquitto and waits for the port before running them, so they do execute there — a
+local skip hides breakage until the `test` job (unit + integration on 3.11–3.14). The other jobs
+narrow the matrix deliberately: `quality` runs lint, mypy, bandit and the coverage gate on 3.12
+only, and `cross-platform` runs unit tests on macOS and Windows for 3.11/3.14 (it requires
+`openssl` on PATH for the TLS tests), so a Windows- or macOS-only break surfaces there.
+
+Unit tests that need a transport use `tests/support.py` — `QueueTransport` (a fake `AsyncTransport`
+collecting `WriteItem`s), `feed_engine()` to push raw wire bytes into a `ProtocolEngine`, and
+`write_item_bytes()` to flatten the `(header, payload)` form. Prefer them over ad-hoc doubles.
+
 ### Fuzzing
 
 ```bash
@@ -47,18 +64,29 @@ HYPOTHESIS_PROFILE=aggressive python -m pytest -q tests/fuzz/test_hypothesis_fuz
 
 ### Benchmarks
 
-`benchmarks/*.py` are standalone scripts (`perf_sprint.py` for regressions, `publish_many_ab.py`,
-`compare_libs.py`, `realworld.py`, `application_stress.py`, `memory_profile.py`). Results are build
-artefacts: never commit generated numbers, and follow the validity contract in
-`docs/BENCHMARKING.md` (paired A/B, medians, rotated order, `N/A` rather than a manufactured
-comparison).
+`benchmarks/*.py` are standalone scripts (`perf_sprint.py` for regressions, `paired_regression.py`
+and `paired_network.py` for candidate-vs-base runs, `publish_many_ab.py`, `compare_libs.py`,
+`realworld.py`, `application_stress.py`, `memory_profile.py`, `soak.py`, plus targeted A/Bs such as
+`persistence_index_ab.py` and `packet_id_pool_ab.py`). Results are build artefacts: never commit
+generated numbers, and follow the validity contract in `docs/BENCHMARKING.md` (paired A/B, medians,
+rotated order, `N/A` rather than a manufactured comparison). The one committed JSON,
+`benchmarks/memory_thresholds.json`, is a hand-set limit file checked by
+`check_memory_thresholds.py`, not a measurement.
 
 ### CI hygiene gates
 
 `.github/workflows/ci.yml` fails if any cache/build artefact is tracked by git, or if the strings
 `mqttnext`/`MQTTNext`/`MQTTNEXT` appear anywhere under `src tests examples benchmarks` (pre-spin-out
-name). The `package` job pins `0.1.0a4` in assertions — bumping the version in
-`src/mqttium/__init__.py` (the hatch version source) requires updating that workflow too.
+name). The `package` job reads the expected version out of `src/mqttium/__init__.py` by AST
+(`__version__` is the hatch version source, so a bump needs no workflow edit), then checks wheel
+metadata, `py.typed`, bundled licences, sdist contents, and imports every module of the installed
+wheel in an isolated interpreter — a module that only imports under `pythonpath = ["src"]` fails
+here.
+
+The release path has its own workflows: `prepublish-audit.yml` and `publish.yml` both require the
+git tag to be exactly `v{__version__}` and cross-check the GitHub pre-release flag against the
+`a`/`b`/`rc`/`.dev` suffix. `benchmarks.yml` and `paired-regression.yml` run the measurement suites
+against a broker and upload JSON artefacts; they never commit numbers.
 
 ## Architecture
 
@@ -85,9 +113,19 @@ Two layers, strictly separated:
     redelivery. `PUBLISH` and `PUBREL` dispatch directly to its bound handlers, avoiding an extra
     wrapper frame on the ingress hot path. It emits through the engine's shared effect stream;
     connection state and negotiated settings remain on `ProtocolEngine`.
-- **`api/async_client.py` — `AsyncClient`**: the asyncio adapter. Owns the transport, the reader
-  task, the single writer task, keepalive/reconnect timers, callbacks, delivery queues, and turns
-  effects into futures, receipts and messages.
+- **`api/async_client.py` — `AsyncClient`**: the asyncio adapter. Owns the transport lifecycle, the
+  reader task, keepalive/reconnect timers, callbacks, delivery queues, and turns effects into
+  futures, receipts and messages. Two runtime mechanisms are factored out into their own owners,
+  and the client keeps only read-only views of their state:
+  - `api/_writer.py` — `WritePump` owns the write queue, byte/count backpressure, batching, the
+    single writer task and the last-write timestamp. `AsyncClient` decides what a writer failure
+    does to protocol state; it does not touch the queue.
+  - `api/_effects.py` — `EffectPump` owns the connection-scoped effect deque, the inline/slow-path
+    accounting and the `mqttium-effect-flush` task. `AsyncClient._collect_effects_locked` is bound
+    to `EffectPump.collect_from_engine` at construction, and `_pending_effects`,
+    `_effect_enqueued`, `_effect_applied` are properties over the pump kept for tests and
+    instrumentation. Interpretation of individual effects stays on the client
+    (`_apply_effect_inline`), because that is what owns transports, futures and queues.
 
 Anything protocol-shaped belongs in the engine or one of its directional sessions; anything with a
 timer, socket or callback belongs in the client. Do not leak `asyncio` into `protocol/`.
@@ -117,9 +155,10 @@ surfaces as a confusing failure elsewhere:
 
 ### Effect pipeline (the subtle part of `AsyncClient`)
 
-`_collect_effects_locked()` drains the engine and applies the common single-effect case inline
-(`_apply_effect_inline`) with no accounting at all — the counters and the `_pending_effects` deque
-exist only for genuinely async slow paths (backpressure waits, callback dispatch). When several
+`_collect_effects_locked()` (i.e. `EffectPump.collect_from_engine` in `api/_effects.py`) drains the
+engine and applies the common single-effect case inline (`_apply_effect_inline`) with no accounting
+at all — the counters and the `_pending_effects` deque exist only for genuinely async slow paths
+(backpressure waits, callback dispatch). When several
 effects are produced, `SEND` effects are reordered first so wire order is preserved before any
 application-visible event fires; leftovers are drained by the `mqttium-effect-flush` task.
 
@@ -170,19 +209,31 @@ not `AsyncClient` must pump `continue_inbound_replay()` itself while `inbound.re
   while costing nothing on every publish. `benchmarks/persistence_index_ab.py` keeps that
   falsifiable. Pages snapshot their identifiers up front, so a page whose records were acknowledged
   meanwhile comes back *shorter* — same contract as `MemoryInflightStore`.
-- `transport/` — `AsyncTransport` protocol over TCP/TLS, Unix and WebSocket. A `WriteItem` is either
-  `bytes` or a `(header, payload)` tuple: payloads past `SEGMENT_THRESHOLD` (1 MiB) are written as
-  two consecutive writes instead of being concatenated.
+- `transport/` — `AsyncTransport` protocol over TCP/TLS, Unix and WebSocket. A `WriteItem`
+  (`writes.py`) is either `bytes` or a `(header, payload)` tuple: payloads past
+  `SEGMENT_THRESHOLD` (1 MiB) are written as two consecutive writes instead of being concatenated.
+- `dispatch/matcher.py` — `TopicMatcher`, the filter→callback index used for callback dispatch. It
+  deliberately duplicates a small amount of filter logic rather than sharing engine state, and
+  values may legitimately be `None`.
+- `helpers/` — one-shot `publish`/`subscribe` convenience APIs (the Paho `publish.single` /
+  `subscribe.simple` analogues). Stable API tier, but strictly a consumer of `AsyncClient`.
+- Statistics are snapshots, and each layer owns its own: `protocol/stats.py`
+  (`OutboundStats`/`InboundStats`, computed by the sessions), `transport/stats.py`
+  (`TransportStats`, with an `unavailable()` fallback so implementing `stats()` stays optional for
+  third-party transports), and `api/stats.py` (`ClientStats` and friends, which compose the rest).
+  The dependency always points from the runtime adapter towards the core, never back.
 - `compat/paho.py` — additive Paho `CallbackAPIVersion.VERSION2` façade running `AsyncClient` on a
   dedicated thread + loop. It is a strict consumer of the native API; the core must never import or
   accommodate it. Intentional divergences are documented in `docs/COMPAT.md` and enforced by
   `tests/unit/test_compat_confinement.py`.
 - `protocol/` — `effects.py` (the `EngineEffect` vocabulary), `config.py` (`EngineConfig` and the
   allowlist of runtime-mutable fields), `engine.py` (connection/dispatch/effect orchestration),
-  `outbound.py` and `inbound.py` (directional publication state). `__init__.py` re-exports lazily
-  through `__getattr__` so `import mqttium.protocol` does not drag in the engine, the codec and the
-  persistence layer; the directional sessions stay internal. `packets` must never import
-  `protocol` — that dependency is what the `codec/packet_validation.py` split removed.
+  `outbound.py` and `inbound.py` (directional publication state), plus the small owned pieces they
+  build on: `packet_ids.py`, `flow_control.py`, `negotiated.py` (CONNACK results, guide §3) and
+  `reconnect.py` (backoff policy and the terminal-reason-code sets, guide §5). `__init__.py`
+  re-exports lazily through `__getattr__` so `import mqttium.protocol` does not drag in the engine,
+  the codec and the persistence layer; the directional sessions stay internal. `packets` must never
+  import `protocol` — that dependency is what the `codec/packet_validation.py` split removed.
 
 ## Conventions
 
@@ -197,11 +248,26 @@ not `AsyncClient` must pump `continue_inbound_replay()` itself while `inbound.re
 - Ruff line length 100; `select = ["E4", "E7", "E9", "F", "B", "RUF006", "UP"]`. `RUF006` matters:
   keep a reference to every `asyncio.create_task`.
 - Performance changes need a comparable benchmark and may not weaken correctness checks; API,
-  protocol-state or persistence invariant changes must be documented.
+  protocol-state or persistence invariant changes must be documented. Anything user-visible goes
+  under `[Unreleased]` in `CHANGELOG.md`; an incompatible change to a Stable name additionally
+  needs a note in `docs/MIGRATION.md`.
 
 ## Documentation authority
 
-On conflict: the MQTT 3.1.1/5.0 spec > `docs/IMPLEMENTATION-GUIDE.md` (precise contracts: property
-table, CONNACK negotiation, keepalive, reconnect, timeouts, QoS decisions, backpressure budgets) >
-`docs/DESIGN.md` (architecture). `docs/DESIGN.md`, `docs/IMPLEMENTATION-GUIDE.md`, `docs/FUZZING.md`
-and `docs/LOGGING.md` are written in French; the rest of the repository is English.
+`docs/API-STABILITY.md` is authoritative for what may change and how; `docs/RELEASING.md` for the
+tag/publication procedure. On protocol behaviour, conflicts resolve as: the MQTT 3.1.1/5.0 spec >
+`docs/IMPLEMENTATION-GUIDE.md` (precise contracts: property table, CONNACK negotiation, keepalive,
+reconnect, timeouts, QoS decisions, backpressure budgets) > `docs/DESIGN.md` (architecture).
+`docs/DESIGN.md`, `docs/IMPLEMENTATION-GUIDE.md`, `docs/FUZZING.md` and `docs/LOGGING.md` are
+written in French; the rest of the repository is English.
+
+The directory is split by kind, and `docs/README.md` indexes both halves. Files directly under
+`docs/` are **contracts**: maintained descriptions of current behaviour, updated in the same change
+that contradicts them. Files under `docs/reports/` are **reports**: one-off records of a
+measurement, audit or decision, each naming the commit it describes. Read a report for rationale,
+never cite it as current behaviour, and never edit it to match new code — supersede it with a new
+report instead. A report never outranks a contract, whatever its date.
+
+When you add a document, put it on the right side of that line and add it to the matching index. A
+new hot-path A/B or campaign record is a report; only a change to what MQTTium guarantees touches a
+contract.

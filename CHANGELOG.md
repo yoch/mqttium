@@ -6,6 +6,13 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Changed
+
+- Documentation is now split by kind and indexed by `docs/README.md`: maintained
+  contracts stay directly under `docs/`, while dated measurements, audits and
+  campaign records moved to `docs/reports/`. Entries published before this
+  reorganisation refer to those reports by their former top-level `docs/` path.
+
 ## [0.2.0b3] - 2026-08-09
 
 ### Added

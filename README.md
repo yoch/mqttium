@@ -196,17 +196,25 @@ acceptance criteria are documented in [`docs/STABILITY.md`](docs/STABILITY.md).
 
 ## Documentation
 
+[`docs/README.md`](docs/README.md) indexes everything. The documents most
+readers want first:
+
 - [`docs/DESIGN.md`](docs/DESIGN.md) — architecture and invariants
 - [`docs/API-STABILITY.md`](docs/API-STABILITY.md) — public API policy and deprecations
-- [`docs/STABILITY.md`](docs/STABILITY.md) — soak and interoperability campaign
-- [`docs/RELEASING.md`](docs/RELEASING.md) — rehearsal, publication and failure handling
 - [`docs/IMPLEMENTATION-GUIDE.md`](docs/IMPLEMENTATION-GUIDE.md) — protocol contracts
 - [`docs/COMPAT.md`](docs/COMPAT.md) — Paho compatibility surface
 - [`docs/MIGRATION.md`](docs/MIGRATION.md) — migration guidance
+- [`docs/BETA-REPORTING.md`](docs/BETA-REPORTING.md) — reporting a beta issue
+- [`docs/STABILITY.md`](docs/STABILITY.md) — soak and interoperability campaign
 - [`docs/BENCHMARKING.md`](docs/BENCHMARKING.md) — benchmark validity contract
 - [`docs/FUZZING.md`](docs/FUZZING.md) — fuzzing strategy
+- [`docs/RELEASING.md`](docs/RELEASING.md) — rehearsal, publication and failure handling
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) — remaining stable-release work
 - [`PROVENANCE.md`](PROVENANCE.md) — source history and licensing review
+
+[`docs/reports/`](docs/reports/README.md) holds the dated measurements and
+audits behind those choices. They are historical records, not descriptions of
+current behaviour.
 
 ## Contributing and security
 
