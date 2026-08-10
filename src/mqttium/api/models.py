@@ -170,24 +170,45 @@ class PublishBatchReceipt:
 
 @dataclass(slots=True)
 class PublishReceipt:
-    """Handle returned by ``AsyncClient.publish``."""
+    """Handle returned by ``AsyncClient.publish``.
+
+    Completion is a flag, and the future behind :meth:`wait` is created only if
+    somebody actually waits. A publication that is never awaited -- the whole
+    point of ``publish_nowait`` -- therefore allocates no completion primitive
+    at all, and one that is awaited allocates a single future rather than an
+    ``asyncio.Event`` plus the future and waiter deque an event builds on top.
+
+    The future only ever carries ``None``. Failures live in ``_error`` and are
+    raised by :meth:`wait` after it resolves, so a receipt that fails and is
+    never awaited cannot leave an unretrieved exception behind -- which matters
+    here, because the library installs no logging to absorb one.
+    """
 
     mid: int | None
     qos: QoS
-    _event: asyncio.Event | None = None
+    _future: asyncio.Future[None] | None = None
     _error: BaseException | None = None
+    _settled: bool = False
+
+    def _settle(self) -> None:
+        """Mark completion and wake a waiter if one is parked."""
+        self._settled = True
+        future = self._future
+        if future is not None and not future.done():
+            future.set_result(None)
 
     async def wait(self) -> None:
-        if self.qos == QoS.AT_MOST_ONCE or self._event is None:
-            if self._error is not None:
-                raise self._error
-            return
-        await self._event.wait()
+        if self.qos != QoS.AT_MOST_ONCE and not self._settled:
+            future = self._future
+            if future is None:
+                future = asyncio.get_running_loop().create_future()
+                self._future = future
+            await future
         if self._error is not None:
             raise self._error
 
     def is_done(self) -> bool:
-        return self.qos == QoS.AT_MOST_ONCE or self._event is None or self._event.is_set()
+        return self.qos == QoS.AT_MOST_ONCE or self._settled
 
 
 @dataclass(slots=True)

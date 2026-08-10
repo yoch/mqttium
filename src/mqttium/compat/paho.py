@@ -688,7 +688,7 @@ class Client:
         if requested_qos is QoS.AT_MOST_ONCE:
             info = MQTTMessageInfo(
                 mid=None,
-                _receipt=PublishReceipt(mid=None, qos=requested_qos, _event=None),
+                _receipt=PublishReceipt(mid=None, qos=requested_qos),
                 _loop=self._loop,
             )
             request = _PendingPublish(topic, data, retain, requested_qos, None)

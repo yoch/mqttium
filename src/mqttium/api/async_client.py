@@ -535,13 +535,9 @@ class AsyncClient:
             properties=properties,
         )
         if handle.qos == QoS.AT_MOST_ONCE:
-            return PublishReceipt(mid=None, qos=handle.qos, _event=None)
+            return PublishReceipt(mid=None, qos=handle.qos)
         assert handle.mid is not None
-        receipt = PublishReceipt(
-            mid=handle.mid,
-            qos=handle.qos,
-            _event=asyncio.Event(),
-        )
+        receipt = PublishReceipt(mid=handle.mid, qos=handle.qos)
         self._register_publish_receipt(handle.mid, receipt)
         return receipt
 
@@ -582,7 +578,7 @@ class AsyncClient:
             if nowait:
                 raise FlowControlError(self._write_pump.refusal(item_size(item)))
             return None
-        return PublishReceipt(mid=None, qos=QoS.AT_MOST_ONCE, _event=None)
+        return PublishReceipt(mid=None, qos=QoS.AT_MOST_ONCE)
 
     def _try_direct_qos0_many(
         self,
@@ -635,11 +631,7 @@ class AsyncClient:
             properties=properties,
         )
         assert handle.mid is not None
-        receipt = PublishReceipt(
-            mid=handle.mid,
-            qos=handle.qos,
-            _event=asyncio.Event(),
-        )
+        receipt = PublishReceipt(mid=handle.mid, qos=handle.qos)
         self._register_publish_receipt(handle.mid, receipt)
         return receipt
 
@@ -948,14 +940,10 @@ class AsyncClient:
                         properties=properties,
                     )
                     if handle.qos == QoS.AT_MOST_ONCE:
-                        receipt = PublishReceipt(mid=None, qos=handle.qos, _event=None)
+                        receipt = PublishReceipt(mid=None, qos=handle.qos)
                     else:
                         assert handle.mid is not None
-                        receipt = PublishReceipt(
-                            mid=handle.mid,
-                            qos=handle.qos,
-                            _event=asyncio.Event(),
-                        )
+                        receipt = PublishReceipt(mid=handle.mid, qos=handle.qos)
                         self._register_publish_receipt(handle.mid, receipt)
                 except FlowControlError as flow_exc:
                     if (
@@ -1835,8 +1823,7 @@ class AsyncClient:
             if receipt is not None:
                 if reason is not None:
                     receipt._error = reason
-                if receipt._event is not None:
-                    receipt._event.set()
+                receipt._settle()
             # Most clients never call publish_many, so skip the lookup rather
             # than hashing every acknowledged identifier against an empty table.
             if self._batch_receipts:
@@ -2072,8 +2059,7 @@ class AsyncClient:
             receipts = current if isinstance(current, deque) else (current,)
             for receipt in receipts:
                 receipt._error = exc
-                if receipt._event is not None:
-                    receipt._event.set()
+                receipt._settle()
         self._receipts.clear()
         batches = {
             batch
