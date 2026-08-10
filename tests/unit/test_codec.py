@@ -265,7 +265,51 @@ def test_validate_utf8_does_not_encode_an_ascii_string(monkeypatch) -> None:
             return original(self, *args, **kwargs)
 
     primitives.validate_utf8(Tracking("sensors/temperature/room-12"))
-    assert encoded == []
+    assert encoded == [], "an ASCII topic must be validated without producing bytes"
 
+    # A non-ASCII string is encoded: once to reject surrogates, once to measure
+    # its byte length. Both are C-level and that branch is an order of
+    # magnitude cheaper than the character loop it replaced, so the count is
+    # not what this pins -- only that ASCII pays neither.
     primitives.validate_utf8(Tracking("capteurs/température"))
-    assert len(encoded) == 1, "a non-ASCII string still needs its byte length"
+    assert encoded
+
+
+@pytest.mark.parametrize(
+    ("text", "rule"),
+    [
+        ("capteurs/\x00/x", "1.5.4-2"),
+        ("capteurs/﻿/x", "1.5.4-3"),
+        ("capteurs/\ud800/x", "1.5.4-1"),
+        ("\udfff", "1.5.4-1"),
+        ("ascii\x00", "1.5.4-2"),
+    ],
+)
+def test_mqtt_utf8_rules_are_reported_individually(text: str, rule: str) -> None:
+    """Scanning in C must cite the same rule the character loop cited."""
+    from mqttium.codec.primitives import _validate_mqtt_utf8
+
+    with pytest.raises(MalformedPacketError, match=rule):
+        _validate_mqtt_utf8(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["capteurs/température", "温度センサー/建物A", "🎉/party/🎊", "plain/ascii", "", "é" * 300],
+)
+def test_valid_mqtt_utf8_is_accepted(text: str) -> None:
+    from mqttium.codec.primitives import _validate_mqtt_utf8
+
+    _validate_mqtt_utf8(text)
+
+
+def test_surrogate_detection_covers_the_whole_reserved_range() -> None:
+    """encode() rejects exactly D800-DFFF, which is what the loop tested."""
+    from mqttium.codec.primitives import _validate_mqtt_utf8
+
+    for code in (0xD800, 0xDBFF, 0xDC00, 0xDFFF):
+        with pytest.raises(MalformedPacketError, match="1.5.4-1"):
+            _validate_mqtt_utf8("ok/" + chr(code))
+    # the code points immediately outside the range stay valid
+    for code in (0xD7FF, 0xE000):
+        _validate_mqtt_utf8("ok/" + chr(code))
