@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from sys import getsizeof
-
 from mqttium.enums import InboundQoSState, OutboundQoSState, QoS
 from mqttium.persistence.memory import MemoryInflightStore
 from mqttium.protocol.packet_ids import PacketIdPool
@@ -45,53 +43,39 @@ def test_packet_id_pool_clear_releases_peak_containers() -> None:
 
 
 def test_memory_store_releases_outbound_hash_capacity_when_empty() -> None:
-    """A table that grew to a deep window must not retain that capacity.
-
-    Asserted on the released footprint rather than on object identity: a
-    shallow window drains to empty on every acknowledgement and has no
-    peak-sized table to drop.
-    """
     store = MemoryInflightStore()
-    for mid in range(1, 513):
-        store.put_out(
-            OutboundMessage(
-                mid=mid,
-                topic="memory/out",
-                payload=b"payload",
-                qos=QoS.AT_LEAST_ONCE,
-                retain=False,
-                state=OutboundQoSState.WAIT_PUBACK,
-            )
-        )
-    grown = getsizeof(store._out)
+    original = store._out
+    message = OutboundMessage(
+        mid=1,
+        topic="memory/out",
+        payload=b"payload",
+        qos=QoS.AT_LEAST_ONCE,
+        retain=False,
+        state=OutboundQoSState.WAIT_PUBACK,
+    )
+    store.put_out(message)
 
-    for mid in range(1, 513):
-        assert store.delete_out(mid) is True
-
+    assert store.delete_out(message.mid) is True
     assert store._out == {}
-    assert getsizeof(store._out) < grown / 8
+    assert store._out is not original
 
 
 def test_memory_store_releases_inbound_hash_capacity_when_empty() -> None:
     store = MemoryInflightStore()
-    for mid in range(1, 513):
-        store.put_in(
-            InboundMessage(
-                mid=mid,
-                topic="memory/in",
-                payload=b"payload",
-                qos=QoS.EXACTLY_ONCE,
-                retain=False,
-                state=InboundQoSState.WAIT_PUBREL,
-            )
-        )
-    grown = getsizeof(store._in)
+    original = store._in
+    message = InboundMessage(
+        mid=1,
+        topic="memory/in",
+        payload=b"payload",
+        qos=QoS.EXACTLY_ONCE,
+        retain=False,
+        state=InboundQoSState.WAIT_PUBREL,
+    )
+    store.put_in(message)
 
-    for mid in range(1, 513):
-        assert store.pop_in(mid) is not None
-
+    assert store.pop_in(message.mid) is message
     assert store._in == {}
-    assert getsizeof(store._in) < grown / 8
+    assert store._in is not original
 
 
 class _FakeWriter:

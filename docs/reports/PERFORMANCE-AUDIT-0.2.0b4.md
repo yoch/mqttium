@@ -152,14 +152,25 @@ number there, it has none.
    Defaults are unchanged*: widening one before a release would loosen a memory guarantee the memory
    campaign established. Documented in `README.md` and `docs/IMPLEMENTATION-GUIDE.md` §10.
 
-9. **The inflight tables were reallocated to release nothing.** `persistence/memory.py:189-195`,
-   `:281-286`. Both tables were replaced whenever the last record left, to drop a peak-sized hash
-   table. At an inflight window of 1 to 8 the table never grows but does drain to empty on every
-   acknowledgement, so the store allocated a fresh dict per message for no benefit. *Fixed* by
-   reading the emptied table's own footprint — a dict does not shrink on delete, so it still reports
-   what its peak demanded — rather than tracking a high-water mark on the insert path. The two
-   capacity tests asserted object identity after a single record, which pins the mechanism rather
-   than the guarantee; they now grow the table to 512 records and assert the released footprint.
+9. **The inflight tables were reallocated to release nothing — tried, measured, REVERTED.**
+   `persistence/memory.py`. Both tables are replaced whenever the last record leaves, to drop a
+   peak-sized hash table. At an inflight window of 1 to 8 the table never grows but does drain to
+   empty on every acknowledgement, so the store allocates a fresh dict per message for no benefit.
+   The candidate gated that reallocation on the emptied table's own footprint via `sys.getsizeof`,
+   which needs no high-water tracking on the insert path.
+
+   **The premise was wrong about which operation is expensive.** `sys.getsizeof` dispatches through
+   `__sizeof__` and measured **~151 ns**; the small-dict allocation it avoids comes off a freelist
+   and measured **~19 ns**. The gate made every drain-to-empty about eight times dearer — on exactly
+   the shallow-window path it was written to help. `qos1_cycle_memory` regressed to **0.976 with 1
+   of 11 pairs favouring the candidate**, consistently across two runs, while `qos1_cycle_sqlite`
+   (1.006) and `qos2_cycle_sqlite` (1.003) stayed neutral because they use the SQLite store and
+   never reach this code. That is a clean attribution: the memory store is the only component of
+   this change set that scenario touches.
+
+   Reverted; `memory.py` is AST-identical to `main`, with a comment recording the measurement. The
+   two capacity tests are restored untouched — they were only rewritten to accommodate the gate, and
+   with the gate gone the PR has no reason to modify them.
 
 ## Measured and rejected
 
@@ -167,6 +178,14 @@ number there, it has none.
   Measured on the corrected arms: ordered +1.86% with 4 of 11 cycles favouring base, reordered
   −2.55% with 8 of 11 favouring base. Reverted; `collect_from_engine` is the `main` implementation
   again, and the call site carries a comment so the idea is not re-proposed from first principles.
+- **Gating the inflight-table reallocation on `sys.getsizeof`** (finding 9). The probe costs ~151 ns
+  against ~19 ns for the allocation it avoids; `qos1_cycle_memory` regressed to 0.976 at 1 of 11
+  pairs while both SQLite cycle scenarios stayed neutral. Reverted.
+
+Both rejections share a shape worth naming: each was argued from allocation counting rather than
+from a measurement, and each turned out to trade a cheap operation for a dearer one. Allocation
+arguments are hypotheses, not evidence — the two changes in this set that survived contact with the
+paired harness are the ones that removed a *call*, not an *allocation*.
 - **`OutboundRecordMeta` allocated per acknowledgement** (`persistence/memory.py:231-240` →
   `protocol/outbound.py:504`), solely so the session can read `logical_size`. The type is already
   `slots=True, frozen=True`, and removing the allocation means changing the `TransitionInflightStore`
@@ -238,8 +257,26 @@ version of this section omitted:
 | `native_publish_nowait_qos0` | **1.081** | 4.0% | Every pair positive. |
 | `async_publish_nowait_qos0` | **1.068** | 2.0% | Every pair positive. |
 | `effect_batch_ordered` / `effect_batch_reordered` | 0.979 / 0.980 | 1.1% / 1.2% | Both arms measured the same branch; superseded below, and the change is reverted. |
-| `qos1_cycle_memory` / `qos1_cycle_sqlite` | 0.982 / 0.985 | 3.2% / 0.9% | Small, tight on the SQLite arm. |
+| `qos1_cycle_memory` / `qos1_cycle_sqlite` | 0.982 / 0.985 | 3.2% / 0.9% | The memory arm is the store gate (finding 9), also reverted. |
 | `compat_publish_qos1` | 0.948 | **12.2%** | Baseline too noisy to interpret; no claim. |
+
+### Final run, after both reverts
+
+Run on `94c8fbd`, the merge candidate. The three gains hold and are cleaner than in the first
+campaign — **every one of eleven pairs favours the candidate in all three**:
+
+| Scenario | Ratio | Base CV | Pairs favouring candidate |
+| --- | ---: | ---: | --- |
+| `compat_publish_qos0_batch` | **1.246** | 1.1% | 11 / 11 |
+| `native_publish_nowait_qos0` | **1.076** | 2.2% | 11 / 11 |
+| `async_publish_nowait_qos0` | **1.073** | 1.3% | 11 / 11 |
+| `effect_batch_ordered` | 1.003 | 1.4% | 6 / 11 — back to parity, as the revert predicts |
+| `effect_batch_reordered` | 0.995 | 1.2% | 5 / 11 — back to parity |
+
+`qos1_cycle_memory` was still 0.976 at 1/11 in this run, which is what identified finding 9; that
+revert landed after it and is not yet re-measured. `encode_qos1` reads 0.986 on code this PR does
+not touch at all, which sets the run's own noise floor at roughly 1.4% and is the reason nothing
+below about 2% is claimed here in either direction.
 
 **The effect-pump arms in that run measured the wrong branch.** Both scenarios as first written
 were `[SEND, COMPLETE, …]` interleavings, and the pump reorders as soon as a SEND follows a

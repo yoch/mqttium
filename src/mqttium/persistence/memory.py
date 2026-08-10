@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections.abc import Iterator
 from itertools import islice
 from contextlib import AbstractContextManager, nullcontext
-from sys import getsizeof
 from typing import Protocol, runtime_checkable
 
 from mqttium.enums import InboundQoSState, OutboundQoSState
@@ -16,16 +15,6 @@ from mqttium.types import (
     OutboundMessageSummary,
     OutboundRecordMeta,
 )
-
-
-# A dict does not shrink when entries are deleted, so an emptied table still
-# reports the footprint its peak occupancy demanded. Reading that back is what
-# lets the store drop a genuinely large table without tracking a high-water
-# mark on every insert. 2 KiB is the footprint of a table that held roughly 64
-# records; below it, reallocating on every drain-to-empty costs more than the
-# capacity it releases -- and a shallow inflight window drains to empty on
-# every acknowledgement.
-_COMPACT_TABLE_BYTES = 2048
 
 
 class InflightStore(Protocol):
@@ -190,9 +179,13 @@ class MemoryInflightStore:
 
     def delete_out(self, mid: int) -> bool:
         deleted = self._out.pop(mid, None) is not None
-        if deleted and not self._out and getsizeof(self._out) > _COMPACT_TABLE_BYTES:
+        if deleted and not self._out:
             # Drop the peak-sized hash table after the last inflight record is
             # acknowledged instead of retaining its capacity indefinitely.
+            # Gating this on sys.getsizeof to skip the reallocation for a
+            # shallow window was tried and reverted: the probe measured ~151 ns
+            # against ~19 ns for the allocation it avoids, and qos1_cycle_memory
+            # regressed accordingly. See docs/reports/PERFORMANCE-AUDIT-0.2.0b4.md.
             self._out = {}
         return deleted
 
@@ -279,7 +272,7 @@ class MemoryInflightStore:
 
     def pop_in(self, mid: int) -> InboundMessage | None:
         msg = self._in.pop(mid, None)
-        if msg is not None and not self._in and getsizeof(self._in) > _COMPACT_TABLE_BYTES:
+        if msg is not None and not self._in:
             self._in = {}
         return msg
 
