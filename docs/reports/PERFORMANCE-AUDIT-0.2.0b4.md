@@ -1,0 +1,417 @@
+# Performance audit for 0.2.0b4
+
+This audit re-reads the 2026-08-09 cross-client record
+([`CROSS-CLIENT-BENCHMARK-2026-08-09.md`](CROSS-CLIENT-BENCHMARK-2026-08-09.md), written against
+`0.2.0b2`) against the current tree, folds in the still-open performance work, and records the
+quick wins taken before the `0.2.0b4` tag. Like
+[`QUALITY-AUDIT-0.2.0b4.md`](QUALITY-AUDIT-0.2.0b4.md), it is an inventory rather than a claim that
+every item must be redesigned. The goal for this cycle was explicitly *not* expensive optimisation:
+it was to remove avoidable per-message work and design errors while the beta stabilises.
+
+## Reference and reproduction
+
+- Base commit: `4bdcdb3` (`main`, after `v0.2.0b3`).
+- Date: 2026-08-10.
+- Verified on CPython 3.12.13, Linux 6.8.0-136-lowlatency, glibc 2.39.
+- Unit suite 658 passed; `tests/integration` 8 passed against Mosquitto on `127.0.0.1:11883`;
+  `tests/fuzz/fuzz.py --seed 1 --iterations 20000` clean on codec, engine and websocket targets;
+  Hypothesis fuzz 4 passed; Ruff, mypy and Bandit clean.
+- `benchmarks/memory_profile.py` followed by `check_memory_thresholds.py`: every scenario within
+  its limit with `benchmarks/memory_thresholds.json` **unchanged**.
+
+No generated number is committed. Figures quoted from earlier work are cited to the run that
+produced them.
+
+## Verdict on the 0.2.0b2 record
+
+| Claim in the 2026-08-09 record | Verdict |
+| --- | --- |
+| Fastest client measured at QoS 0, in both identities | **Still true of the code.** The direct writer path is unchanged at `api/async_client.py:548-585`. |
+| The QoS 0 lead is silently conditional on `on_publish is None` | **Still true, now pinned.** PR #64 covered `publish_nowait` only; the async `publish()` entry, `publish_many`, both pending-effect gates and re-enabling after the callback is cleared are pinned here. |
+| QoS 1 costs ÷2.74 against QoS 0, and 2.95× gmqtt's PUBACK p50 at a matched offered rate | **Unverified here — not contradicted.** No harness in this repository paces offered load (`load_fraction` appears nowhere; `paired_network.py` is closed-loop at an in-flight window), so the quantity the record reports cannot currently be produced in-repo at all. Issue #39's figures are *RTT capacity*, a different quantity: a near-identical throughput ceiling and a 3× per-message latency at half that load are consistent, not in tension. See the note below. |
+| The benchmark adapter is not the explanation | **Still true.** |
+| The `on_publish is None` fast path is a pessimisation under load | **Mis-stated.** That A/B compared two *adapter* disciplines — awaiting each receipt versus correlating acks in a callback — not the internal branch. `_apply_effect_inline` and `_apply_effect` both call `_settle_publish` unconditionally; the callback only adds work on top. The result is a statement about how an application observes completion, and it argues for a cheaper receipt (finding 6), not against the branch. |
+| `_engine_lock` contention serialises the completion path | **Refuted.** #39 measured zero contention across the instrumented scenarios, and the reader's critical section contains no `await`, so the lock is never held across a suspension on the outbound QoS 1 path. |
+| The Paho façade plateaus at QoS ≥ 1 and barely benefits from pipelining | **Still true, and now root-caused.** See findings 7 and the escalation below. |
+| `max_outbound_bytes` default is surprising next to the message bound | **Still true.** Addressed by naming the bound rather than changing it (finding 8). |
+| Issue #57, `ProtocolError` while disconnecting | **Closed** by PR #58. |
+
+### Note on the QoS 1 latency claim
+
+An earlier revision of this audit dismissed the 2.95× using issue #39's RTT figures. That inference
+was invalid and is withdrawn. The two are different quantities, and the numbers below were read back
+from the bench's committed results rather than taken on trust:
+
+| Quantity | gmqtt | MQTTium | Ratio |
+| --- | ---: | ---: | ---: |
+| Calibrated publish capacity (msg/s) | 13 304 | 13 147 | 99% |
+| PUBACK p50 at `load_fraction` 0.5 (6 652 vs 6 573 msg/s offered) | 0.405 ms | 1.211 ms | **2.99×** |
+| `pub_qos1_inflight`, windows 1 → 20 → 100 | — | 4 279 → 10 862 → 14 467 | ×3.4 |
+
+A throughput ceiling within 1% and a threefold per-message latency at half that load are consistent:
+at a matched rate the slower client simply carries proportionally more in flight. The window sweep
+corroborates it independently — worst of its group with no pipelining, best with a deep window. So
+the three figures are **one finding**, not three competing ones: high fixed cost per completion,
+amortised well by pipelining. That is the shape the completion-path work in findings 1, 2 and 5
+targets, which is a reason to take the record seriously rather than to discount it.
+
+What remains true is that this repository has not reproduced it and currently cannot: the quantity
+requires paced open-loop load, and no harness here paces. Issue #39's withdrawal of cross-machine
+absolutes applies to comparing numbers across hosts; it does not apply to a same-runner interleaved
+ratio measured within one campaign, which is what this is.
+
+## Findings and what was done
+
+Each finding names the mechanism. Measured ratios are in "What CI measured"; where a finding has no
+number there, it has none.
+
+1. **The reader confirmed an empty buffer by decoding it again.**
+   `api/async_client.py:1215-1233`. `process_packets_bounded` stops early only when
+   `next_packet()` returns `None`, so a batch that reached neither the count nor the byte bound had
+   already drained the buffer. The loop re-entered anyway to observe `handled == 0`, costing a
+   second engine-lock acquisition, a second store batch context and a second bounded decode on
+   every read that did not saturate a bound — at a window-limited QoS 1 workload, once per
+   acknowledged message. *Fixed;* `_read_loop` complexity fell from 21 to 20. Pinned in
+   `tests/unit/test_read_loop_batching.py`, including the two bound-hitting cases that must still
+   re-enter.
+
+2. **Every acknowledgement probed the batch-receipt table.** `api/async_client.py:1821-1832`.
+   `_settle_publish` looked up `_batch_receipts` for every settled identifier, including for the
+   clients that never call `publish_many`; and `_pop_batch_receipt` still did the `get`-then-`pop`
+   pair that PR #72 removed from `_pop_publish_receipt`. *Both fixed.*
+
+3. **Every QoS 1/2 publish constructed a `QoS` enum to be rejected.** `api/async_client.py:567`,
+   `:597`. Both direct QoS 0 entry points converted before comparing. `QoS` is an `IntEnum`, so
+   comparing first is equivalent; an invalid level still raises `ValueError`, now only from
+   `_validate_publish_request`. *Fixed and pinned, including the invalid-level cases.*
+
+4. **Ordered effect batches built two partition lists and discarded them — tried, measured,
+   REVERTED.** `api/_effects.py:93-118`. The pump partitions SEND-first so wire order survives, and
+   it allocates both lists on every multi-effect batch even when nothing needs reordering. The
+   candidate detected first, allocation-free, and partitioned only when a `SEND` followed a
+   non-`SEND`, buying two allocations on an already-ordered batch at the cost of an extra scan on
+   the batch that must actually be reordered.
+
+   **The measurement did not support the trade, so the runtime change is reverted** and
+   `collect_from_engine` is byte-for-byte the `main` implementation again. Numbers and reasoning in
+   "What CI measured". What is kept: the two corrected paired scenarios, and the ordering pins in
+   `tests/unit/test_effect_pump.py`, which pin the SEND-first invariant rather than the mechanism
+   and therefore pass against either implementation. A comment at the call site records that the
+   split was tried and rejected, so it is not proposed again from first principles.
+
+   The premise was an allocation argument. Allocation arguments are cheap to make and this one was
+   worth about nothing measurable, against a real cost on the path every pipelined PUBACK takes.
+
+5. **Every QoS 1/2 publication allocated an `asyncio.Event`.** `api/models.py:171-205`. Awaiting one
+   costs two coroutine frames plus the future and waiter deque the event builds internally, and a
+   publication that is never awaited — the entire point of `publish_nowait` — paid for the event and
+   used none of it. *Fixed:* completion is a flag and the shared future behind `wait()` is created on
+   first use. The future only ever carries `None`; failures stay in `_error` and are raised after it
+   resolves, so a failed, never-awaited receipt cannot leave an unretrieved exception for asyncio's
+   default handler to print — which matters because `src/` installs no logging. Pinned, along with a
+   repeated settle that must not hit `InvalidStateError`.
+
+   **A regression this introduced, found in review and fixed.** An `asyncio.Event` gives every waiter
+   its own future, so cancelling one `wait()` isolates itself. A single shared future does not:
+   awaiting it directly meant a cancelled waiter cancelled *the shared future*, which took every
+   other waiter down with it and left the receipt permanently unresolvable — `_settle()` then found
+   the future already `done()` and skipped it. Reproduced, then fixed by attaching waiters through
+   `asyncio.shield`. The regression test fails without the shield. This is the isolation the `Event`
+   provided implicitly, and the cost of replacing a primitive with a cheaper one is having to
+   re-establish the guarantees it gave for free.
+
+   The shield does not give the gain back: an `Event` allocates a future *and* a waiter deque per
+   wait, so the shielded path still allocates less, and a never-awaited receipt still allocates
+   nothing at all.
+
+6. **`publish_nowait` sized packets the writer could not use.** `api/async_client.py:1328-1345`.
+   Admission sized the packet to ask whether it fit, and `queue_publish` sized it again — on MQTT 5
+   with properties, two `encode_properties` calls before the third that builds the real frame. This
+   is the defect PR #40 fixed *inside* the engine, left standing in the admission check outside it.
+   *Fixed* by observing that an empty writer queue admits a single item of any size, so the size
+   cannot change the answer. The batch path still sizes every request because it accumulates those
+   sizes. **Deliberately not fixed by threading the sized parts into `queue_publish`**, which would
+   widen the hottest signature in the library for a case the emptiness test already covers.
+
+7. **The Paho façade charged every user for a callback they never installed.**
+   `compat/paho.py:186-208`. `_async.on_publish` was assigned unconditionally at construction, and
+   the dispatcher returns immediately when the user's `on_publish` is `None`. So every façade user
+   paid a deque entry, a callback-queue hop, a worker wakeup and a coroutine per acknowledged
+   publication to reach a no-op — and could never satisfy `_direct_qos0_ready()`. *Fixed:*
+   `Client.on_publish` is a property that installs and clears the inner callback through
+   `_run_loop_mutation`. **Scope, stated precisely:** the façade reaches the engine through
+   `_queue_publish_on_loop`, not `AsyncClient.publish`, so this does not by itself route façade
+   traffic onto the direct QoS 0 writer path. What it removes is the per-completion callback hop.
+
+8. **The two writer bounds are of deliberately different magnitudes and neither error said so.**
+   `api/async_client.py:137-138`. `max_outbound_bytes` (1 MiB) against `max_outbound_messages`
+   (10 000) implies about 105 bytes per queued message, so the byte bound binds first as payloads
+   grow: 1 MiB admits roughly 16 outstanding 64 KiB publications, not 10 000. The external harness
+   saw 76% refusals at 64 KiB and 98% at 1 MiB until it sized the byte bound by hand. *`FlowControlError`
+   now names the bound and its configured value at every refusal site, built only on the error path.
+   Defaults are unchanged*: widening one before a release would loosen a memory guarantee the memory
+   campaign established. Documented in `README.md` and `docs/IMPLEMENTATION-GUIDE.md` §10.
+
+9. **The inflight tables were reallocated to release nothing — tried, measured, REVERTED.**
+   `persistence/memory.py`. Both tables are replaced whenever the last record leaves, to drop a
+   peak-sized hash table. At an inflight window of 1 to 8 the table never grows but does drain to
+   empty on every acknowledgement, so the store allocates a fresh dict per message for no benefit.
+   The candidate gated that reallocation on the emptied table's own footprint via `sys.getsizeof`,
+   which needs no high-water tracking on the insert path.
+
+   **The premise was wrong about which operation is expensive.** `sys.getsizeof` dispatches through
+   `__sizeof__` and measured **~151 ns**; the small-dict allocation it avoids comes off a freelist
+   and measured **~19 ns**. The gate made every drain-to-empty about eight times dearer — on exactly
+   the shallow-window path it was written to help. `qos1_cycle_memory` regressed to **0.976 with 1
+   of 11 pairs favouring the candidate**, consistently across two runs, while `qos1_cycle_sqlite`
+   (1.006) and `qos2_cycle_sqlite` (1.003) stayed neutral because they use the SQLite store and
+   never reach this code. That is a clean attribution: the memory store is the only component of
+   this change set that scenario touches.
+
+   Reverted; `memory.py` is AST-identical to `main`, with a comment recording the measurement. The
+   two capacity tests are restored untouched — they were only rewritten to accommodate the gate, and
+   with the gate gone the PR has no reason to modify them.
+
+## Measured and rejected
+
+- **Splitting the effect-pump partition into a detect pass and a partition pass** (finding 4).
+  Measured on the corrected arms: ordered +1.86% with 4 of 11 cycles favouring base, reordered
+  −2.55% with 8 of 11 favouring base. Reverted; `collect_from_engine` is the `main` implementation
+  again, and the call site carries a comment so the idea is not re-proposed from first principles.
+- **Gating the inflight-table reallocation on `sys.getsizeof`** (finding 9). The probe costs ~151 ns
+  against ~19 ns for the allocation it avoids; `qos1_cycle_memory` regressed to 0.976 at 1 of 11
+  pairs while both SQLite cycle scenarios stayed neutral. Reverted.
+
+Both rejections share a shape worth naming: each was argued from allocation counting rather than
+from a measurement, and each turned out to trade a cheap operation for a dearer one. Allocation
+arguments are hypotheses, not evidence — the two changes in this set that survived contact with the
+paired harness are the ones that removed a *call*, not an *allocation*.
+- **`OutboundRecordMeta` allocated per acknowledgement** (`persistence/memory.py:231-240` →
+  `protocol/outbound.py:504`), solely so the session can read `logical_size`. The type is already
+  `slots=True, frozen=True`, and removing the allocation means changing the `TransitionInflightStore`
+  protocol across both stores and CLAUDE.md's persistence contract. Complexity out of proportion to
+  the gain; left alone deliberately.
+- **Reordering `on_puback`'s emissions** so a single-ack batch never reaches the pump's reorder
+  branch. It helps only single-ack batches, and it works *only* because the pump partitions
+  SEND-first — creating exactly the `protocol/`↔`api/` coupling the layer separation exists to
+  prevent. Rejected; finding 4 covers the same cost without the coupling.
+- Issue #39's earlier rejections stand and should not be re-litigated: callback-worker batch drain
+  (≤1%, rejected twice), the queue-inline effect fast path (−7.7%/−8.6% with event-loop lag p95
+  rising from 2.1 ms to 9.7 ms), and a synchronous inline callback mode (a contract change to
+  blocking, exception, reentrancy and fairness semantics).
+
+## Open work folded in
+
+- **Issue #39, "Native hot-path performance program"** — stays open. It holds the deepest
+  measurement corpus in the project and its acceptance criteria gate every change above. This audit
+  belongs there as a comment, not as a replacement.
+- **PR #74, long fuzz campaigns** — draft. Reliability evidence for the beta rather than a
+  performance item; it should land before the tag regardless of this program.
+
+## Escalations: documented, not fixed
+
+- **The façade's per-message handoff.** `compat/paho.py:682-698`. A QoS ≥ 1 producer blocks on a
+  `concurrent.futures.Future` per message, so a single producer thread has an empty queue when the
+  drain runs: instrumentation counted 4 000 drains for 4 000 publications, against ~4.1–4.3 messages
+  per drain with eight producers. This is inherent to Paho's contract — `publish()` must return an
+  allocated MID, and MIDs are allocated on the loop. Escaping it means pre-allocating MIDs off-loop,
+  which breaks the packet-id and single-source-of-truth invariants, or adding an entry point outside
+  the Paho surface. Accepted as an architectural cost.
+- **`EngineConfig.local_receive_maximum = 65535`** (`protocol/config.py:34`) against `AsyncClient`'s
+  `100` (`api/async_client.py:124`). Direct engine consumers and client consumers get different
+  inbound windows and nothing explains the split. Documenting it is right; aligning a default before
+  a beta tag is not.
+
+## What CI measured
+
+The audit host produced nothing usable (below), but the PR's own `paired-regression` job did. Ratios
+are candidate over base, `4bdcdb3` against the change set, 11 rotated pairs per micro scenario and
+8 ABBA pairs per network cell.
+
+**Read this section against the commit it measured.** The figures below come from the run on
+`caa61bf`. Two later commits change what they describe: the corrected effect-pump arms, and the
+`asyncio.shield` in `PublishReceipt.wait()`, which is on the `--completions receipt` path the
+network cells exercise. They are superseded by the run on the final commit and are kept here only
+as the first usable measurement of the set.
+
+**End-to-end QoS 1 (`paired_network.py`): no claim survives. The sweep does not reproduce.**
+
+The first run reported all 20 cells positive, +0.6% to +7.3%, and an earlier revision of this
+section presented that as the headline result. It has not reproduced. Three runs on largely
+overlapping code:
+
+| Run | Median ack ratio | Cells positive | Spread |
+| --- | ---: | ---: | --- |
+| `caa61bf` | above 1 in every cell | 20 / 20 | +0.6% … +7.3% |
+| `94c8fbd` | **0.989** | 6 / 20 | 0.950 – 1.065 |
+| `1990ace` (merge candidate) | **0.993** | 9 / 20 | 0.925 – 1.085 |
+
+Individual cells swing by up to ±0.09 between consecutive runs, in both directions, on the same
+protocol/payload/window. Per-cell base CVs reach 6.6% against an effect being sought of 1–5%. On the
+merge candidate the harness's own criteria flag **three cells below the 0.95 regression threshold**
+(3.1.1/4 KiB/32 at 0.933, 5/64/32 at 0.948, 5/4 KiB/32 at 0.925) and **three cells above the 5%
+baseline-CV invalidation threshold**.
+
+So the sweep establishes neither a gain nor a regression at this effect size on a hosted runner, and
+**no end-to-end number is claimed for this change set in either direction**. Two corrections to how
+this was previously reported, both mine:
+
+- "No cell failing the harness gate" was inferred from an absent `failures` key in the output JSON.
+  The harness computes failures after writing that file and signals them by exit status, so the key
+  is never present and its absence means nothing. The step is additionally `continue-on-error` on
+  pull requests, so this measurement has never gated anything. On the merge candidate the gate did
+  fire (`baseline CV 5.20%`, exit code 1) while the step, the job, the run and the PR check all
+  reported success. Tracked as issue #77.
+- "p50 deltas mostly negative" was cited as supporting evidence. They are readable only on the
+  64-byte cells (−0.004 to −0.078 ms); on 4 KiB they ranged −14.4 ms to **+30.0 ms**, which is
+  pipeline residence and runner variability, not an engine effect.
+
+One hypothesis consistent with the two later runs sitting a hair under 1.0, offered as a hypothesis
+and not a finding: the network arm runs `--completions receipt`, so every publication awaits its
+receipt and therefore pays the `asyncio.shield` added to fix the cancellation regression. A cost of
+about a percent on the awaited path would be the correct trade for that fix, but the data cannot
+resolve a percent.
+
+**Micro scenarios: two clear gains, the rest neutral, and one regression that was mine.**
+
+| Scenario | Ratio | Base CV | Reading |
+| --- | ---: | ---: | --- |
+| `compat_publish_qos0_batch` | **1.241** | 1.0% | The façade callback fix. Every pair positive. |
+| `native_publish_nowait_qos0` | **1.081** | 4.0% | Every pair positive. |
+| `async_publish_nowait_qos0` | **1.068** | 2.0% | Every pair positive. |
+| `effect_batch_ordered` / `effect_batch_reordered` | 0.979 / 0.980 | 1.1% / 1.2% | Both arms measured the same branch; superseded below, and the change is reverted. |
+| `qos1_cycle_memory` / `qos1_cycle_sqlite` | 0.982 / 0.985 | 3.2% / 0.9% | The memory arm is the store gate (finding 9), also reverted. |
+| `compat_publish_qos1` | 0.948 | **12.2%** | Baseline too noisy to interpret; no claim. |
+
+### Final run, after both reverts — what this change set actually buys
+
+Run on `1990ace`, the merge candidate. Only three scenarios move, and they move in every pair:
+
+| Scenario | Ratio | Base CV | Pairs favouring candidate |
+| --- | ---: | ---: | --- |
+| `compat_publish_qos0_batch` | **1.239** | 2.2% | **11 / 11** |
+| `async_publish_nowait_qos0` | **1.075** | 2.0% | **11 / 11** |
+| `native_publish_nowait_qos0` | **1.065** | 1.1% | **11 / 11** |
+
+Those three are stable across all three campaigns at 11/11 pairs, and they are the only performance
+claim this PR makes. Everything else lands between 0.994 and 1.011, which is the run's noise band —
+`encode_qos1` reads 0.994 on code the PR does not touch at all.
+
+Both reverts are confirmed by the measurement that motivated them:
+
+| Scenario | Before revert | After revert |
+| --- | --- | --- |
+| `effect_batch_ordered` | 1.019 @ 7/11 | 1.009 @ 8/11 |
+| `effect_batch_reordered` | 0.975 @ 3/11 | 1.006 @ 7/11 |
+| `qos1_cycle_memory` | 0.976 @ **1/11** | **1.000 @ 5/11** |
+
+`qos1_cycle_memory` returning from 1-of-11 to 5-of-11 is the falsifiable check on finding 9's
+attribution, and it passed: had the regression come from somewhere else, reverting the store gate
+would not have moved it.
+
+**The effect-pump arms in that run measured the wrong branch.** Both scenarios as first written
+were `[SEND, COMPLETE, …]` interleavings, and the pump reorders as soon as a SEND follows a
+non-SEND, so *both* arms exercised the reordered path and the ordered path was never measured. The
+arms were corrected, with a unit test pinning each to the branch it names.
+
+### The corrected effect-pump measurement, and the decision it forced
+
+Run on `43bcada`, whose runtime is identical to the final commit — the commit after it changed only
+`CHANGELOG.md` and this report. 11 rotated pairs each:
+
+| Arm | Median | Pairs favouring candidate | Spread | Base CV |
+| --- | ---: | ---: | --- | ---: |
+| `effect_batch_ordered` (the arm the change exists for) | 1.0186 | **7 / 11** | 0.9268 – 1.2064 | 4.72% |
+| `effect_batch_reordered` (the arm it taxes) | 0.9745 | **3 / 11** | 0.9039 – 1.0273 | 3.33% |
+
+The ordered arm's pairs: 0.9624, 0.9268, 0.9916, 1.0546, **1.2064**, 0.9268, 1.0018, 1.0186, 1.0949,
+1.0354, 1.0538. Four of eleven cycles favour *base*, one by 7.3%, and a single 1.2064 outlier is
+what carries the median above neutral. Issue #39 rejected the inline-callback ingress claim on
+exactly this shape — a favourable median with cycles crossing neutral. The reordered arm, by
+contrast, is consistent: eight of eleven cycles favour base, median −2.55%.
+
+So the arm that was supposed to gain is indistinguishable from noise, and the arm that pays is the
+one every pipelined PUBACK batch takes. The condition set when the arms were corrected — *if the
+ordered arm does not repay the ~2%, revert rather than defend* — is **not met**, and the runtime
+change is reverted. No claim of an effect-pump gain survives in this PR.
+
+Two things worth stating, because they are the general lesson rather than this one case. First, the
+earlier −2% reading was correct even though the scenario behind it was wrong; the fix to the
+scenario did not rescue the change, it simply measured the other half of the trade. Second, nobody
+established how often real batches are already ordered, so even a clean ordered-arm win would not
+have settled it. An optimisation whose value depends on an unmeasured frequency is not ready.
+
+## What this cycle could not measure
+
+The paired harnesses were **also** run on the audit host, where they produced no usable evidence.
+
+- `benchmarks/paired_regression.py --repeat 9` on `compat_publish_qos1` returned a base-arm
+  coefficient of variation of **18.3%**, with the *same* code measuring between 6 249 and 13 171
+  ops/s across pairs. `docs/BENCHMARKING.md` invalidates a cell above 5%. An earlier run on the
+  effect scenarios was equally unstable (base 105k–186k ops/s). The host was not idle: the audit
+  itself was running on it. Per the validity contract this is reported as `N/A` rather than as a
+  manufactured comparison.
+- Local runs are therefore not the basis for anything here; the CI ratios above are. A dedicated
+  runner with `runner_probe.py --enforce` would still be worth having, because CI cannot speak to
+  absolute latency.
+- **Absolute latency remains unconfirmable in CI.** Hosted runners present no `performance`
+  governor, so the record's 1.17 ms and 2.99 ms p50 figures can be neither reproduced nor refuted
+  there; only same-runner *ratios* survive.
+- **Event-loop-lag fairness is not reported by `paired_network.py`.** Findings 1 and 4 both touch
+  scheduling boundaries, and a fairness regression would be invisible in CI. The EffectPump counters
+  (`inline_effects`, `reordered_batches`, `apply_suspensions`, `pending_high_water`) are the
+  available proxy and are asserted in unit tests; direct loop-lag evidence for those two changes is
+  absent.
+- **The cross-client matrix is not reproducible here.** It needs `mqtt-python-client-bench` with
+  per-role pinning across disjoint physical-core groups. The 0.2.0b2 rankings are therefore not
+  restated as current, and the comparison stays parked on #39 pending the external native-async
+  harness.
+
+## Second pass: a deterministic profile of realistic scenarios
+
+Run after the reverts above, on the same host, with call counts and allocation
+counts as the primary evidence — both are exact regardless of machine load, which
+is what made them usable here when wall-clock was not. Four redundancies came out
+of it, three of which were taken.
+
+| Finding | Mechanism | Result |
+| --- | --- | --- |
+| Acknowledgement frames | A success ack with no properties is a fixed four-byte frame in both protocol versions, assembled through the generic encoder | `PubAck.encode` **1259 → 432 ns**; inbound QoS 1 **14.2 → 11.0 µs** per message. Covers PUBREC/PUBREL/PUBCOMP too. |
+| `QoS()` in the publish encoder | Re-converted a value every internal caller had already converted; argument type instrumented on both paths and always a genuine member | `encode_qos1` **+17.3%**, 7 of 7 pairs [1.133, 1.208] |
+| Topic UTF-8 encoded twice | Validation called `encode_utf8` for its exception and discarded the bytes; the encoder produced them again | **−75 ns** per publication. Smaller than the ~293 ns first estimated: only the encoding half was redundant, the character scan runs either way. `native_publish_nowait_qos0` +2.8% at 8 of 11 pairs. |
+| MQTT UTF-8 rules scanned per code point | An interpreted loop with three comparisons per character. Two rules are substring searches; the third — no surrogates — is what strict UTF-8 already refuses, so it is left to the conversion each caller performs anyway rather than tested separately | Outbound validation of an accented topic **2798 → 436 ns (−84%)**, ASCII 361 → 336 ns. A non-ASCII publication now encodes its topic **twice instead of four times**. Shared with `unpack_utf8`, so ingress benefits too. |
+
+`item_size` computed twice per publication (~88 ns, 1%) was left alone: removing it
+means threading the size through, which is the same widening refused for
+`publish_nowait` sizing. Consistency matters more than 1%.
+
+Two controls did not move and are what make the rest readable: `ingress_engine_qos0`
+at 1.0067, and inbound QoS 0 at 7729 ns against 7740 ns before.
+
+Equivalence was established before the suite in every case: 370 acknowledgement
+combinations across four packet types and both protocols; 20 adversarial strings
+against the topic validator including both length boundaries in bytes rather than
+characters; and 50 083 inputs drawn from the whole code-point space against the
+replaced UTF-8 loop, with zero accept/reject divergences.
+
+Two properties of UTF-8 were checked exhaustively rather than assumed, because
+the last finding rests on them. Across all 1 114 112 code points, exactly 2 048
+fail strict UTF-8 encoding and they are exactly D800–DFFF, with a single reason,
+so attributing an encoding failure to [MQTT-1.5.4-1] is sound. And across all
+16 777 216 three-byte sequences — the length a surrogate would occupy — none
+decodes to a surrogate, which is why the inbound path needs no test of its own.
+
+The first version of that change did test surrogates separately, and review
+caught that this made a non-ASCII publication encode its topic four times: the
+callers already encode, and the check duplicated them. Moving the rule to the
+conversion removed two of the four and improved the result.
+
+## Before the tag
+
+1. Run the paired harnesses on the dedicated runner, or read CI's jobs, and attach the ratios to
+   issue #39 — every change above is currently unquantified.
+2. Sweep `paired_network.py --windows 1,8,32,64,128 --completions receipt,callback`, and settle the
+   completion-discipline question in-repo against the record's 5.13/4.19 ms, stating the
+   closed-loop-at-window versus open-loop-at-load-fraction difference.
+3. Land PR #74 and run a soak plus `application_stress.py`: finding 1 changes the ingress
+   backpressure loop and finding 9 changes store behaviour.

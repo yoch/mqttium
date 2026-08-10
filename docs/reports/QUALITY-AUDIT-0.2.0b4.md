@@ -108,7 +108,7 @@ make measurement easier.
 
 ## API and test protection
 
-The stable surface is defined in `API-STABILITY.md` and executable in
+The stable surface is defined in [`API-STABILITY.md`](../API-STABILITY.md) and executable in
 `tests/unit/test_public_api_surface.py`. It snapshots root/API exports, all
 constructor keywords and defaults, and parameter names for stable client
 methods. This audit changes neither stable nor provisional runtime APIs and adds

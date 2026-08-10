@@ -52,3 +52,9 @@ under `[Unreleased]` for anything user-visible. Performance changes must include
 a comparable benchmark and may not weaken correctness checks; follow the
 validity contract in [`docs/BENCHMARKING.md`](docs/BENCHMARKING.md) and never
 commit generated numbers.
+
+Documentation is indexed by [`docs/README.md`](docs/README.md) and split in two:
+contracts directly under `docs/` describe current behaviour and are updated with
+the code, while [`docs/reports/`](docs/reports/README.md) holds dated
+measurements and audits that are never revised after the fact. A benchmark
+write-up or campaign record belongs in `reports/`.

@@ -71,7 +71,7 @@ from mqttium.transport._stream import AsyncTransport
 from mqttium.transport.tcp import TcpTransport
 from mqttium.transport.unix import UnixSocketTransport
 from mqttium.transport.websocket import WebSocketTransport
-from mqttium.transport.writes import WriteItem
+from mqttium.transport.writes import WriteItem, item_size
 from mqttium.types import Message, Properties
 
 OnMessage = Callable[[Message], Any]
@@ -535,13 +535,9 @@ class AsyncClient:
             properties=properties,
         )
         if handle.qos == QoS.AT_MOST_ONCE:
-            return PublishReceipt(mid=None, qos=handle.qos, _event=None)
+            return PublishReceipt(mid=None, qos=handle.qos)
         assert handle.mid is not None
-        receipt = PublishReceipt(
-            mid=handle.mid,
-            qos=handle.qos,
-            _event=asyncio.Event(),
-        )
+        receipt = PublishReceipt(mid=handle.mid, qos=handle.qos)
         self._register_publish_receipt(handle.mid, receipt)
         return receipt
 
@@ -564,7 +560,10 @@ class AsyncClient:
         properties: Properties | None,
         nowait: bool,
     ) -> PublishReceipt | None:
-        if QoS(qos) is not QoS.AT_MOST_ONCE or not self._direct_qos0_ready():
+        # Compare before converting: every QoS 1/2 publish reaches this line and
+        # would otherwise construct an enum only to be rejected. Invalid values
+        # still raise ValueError from _validate_publish_request downstream.
+        if qos != QoS.AT_MOST_ONCE or not self._direct_qos0_ready():
             return None
         item = self._engine.outbound.prepare_qos0(
             topic,
@@ -577,9 +576,9 @@ class AsyncClient:
             epoch=self._connection_epoch,
         ):
             if nowait:
-                raise FlowControlError("Outbound backpressure limit reached")
+                raise FlowControlError(self._write_pump.refusal(item_size(item)))
             return None
-        return PublishReceipt(mid=None, qos=QoS.AT_MOST_ONCE, _event=None)
+        return PublishReceipt(mid=None, qos=QoS.AT_MOST_ONCE)
 
     def _try_direct_qos0_many(
         self,
@@ -591,7 +590,7 @@ class AsyncClient:
         if not requests or not self._direct_qos0_ready():
             return False
         for _topic, _payload, qos, _retain, _properties in requests:
-            if QoS(qos) is not QoS.AT_MOST_ONCE:
+            if qos != QoS.AT_MOST_ONCE:
                 return False
 
         items: list[WriteItem] = []
@@ -606,7 +605,7 @@ class AsyncClient:
             )
         if not self._try_enqueue_outbound_many(items, epoch=self._connection_epoch):
             if nowait:
-                raise FlowControlError("Outbound backpressure limit reached")
+                raise FlowControlError(self._write_pump.refusal_many(items))
             return False
         for _ in requests:
             receipt._register(None)
@@ -630,11 +629,7 @@ class AsyncClient:
             properties=properties,
         )
         assert handle.mid is not None
-        receipt = PublishReceipt(
-            mid=handle.mid,
-            qos=handle.qos,
-            _event=asyncio.Event(),
-        )
+        receipt = PublishReceipt(mid=handle.mid, qos=handle.qos)
         self._register_publish_receipt(handle.mid, receipt)
         return receipt
 
@@ -943,14 +938,10 @@ class AsyncClient:
                         properties=properties,
                     )
                     if handle.qos == QoS.AT_MOST_ONCE:
-                        receipt = PublishReceipt(mid=None, qos=handle.qos, _event=None)
+                        receipt = PublishReceipt(mid=None, qos=handle.qos)
                     else:
                         assert handle.mid is not None
-                        receipt = PublishReceipt(
-                            mid=handle.mid,
-                            qos=handle.qos,
-                            _event=asyncio.Event(),
-                        )
+                        receipt = PublishReceipt(mid=handle.mid, qos=handle.qos)
                         self._register_publish_receipt(handle.mid, receipt)
                 except FlowControlError as flow_exc:
                     if (
@@ -1222,12 +1213,15 @@ class AsyncClient:
                             )
                         if handled:
                             self._collect_effects_locked()
-                    if not handled:
-                        break
                     if self._pending_effects:
                         await self._drain_effects()
-                    if handled >= 256 or handled_bytes >= self._max_ingress_batch_bytes:
-                        await asyncio.sleep(0)
+                    # A batch that stopped short of both bounds emptied the
+                    # buffer, so there is nothing to decode until the next
+                    # read(). Re-entering only to observe handled == 0 cost a
+                    # second lock acquisition and bounded decode per read.
+                    if handled < 256 and handled_bytes < self._max_ingress_batch_bytes:
+                        break
+                    await asyncio.sleep(0)
         except asyncio.CancelledError:
             raise
         except (PacketTooLargeError, MalformedPacketError, ProtocolError) as exc:
@@ -1326,9 +1320,15 @@ class AsyncClient:
         )
         if not will_send:
             return
+        # An empty writer queue admits a single item of any size, so its size
+        # cannot change the answer. Sizing it anyway measured the topic and, on
+        # MQTT 5 with properties, encoded the property table a second time --
+        # queue_publish encodes it again immediately afterwards.
+        if not self._write_pump.queued_messages and not self._write_pump.queued_bytes:
+            return
         size = self._preview_publish_size(topic, payload, level, properties)
         if not self._can_enqueue_outbound_size(size):
-            raise FlowControlError("Outbound backpressure limit reached")
+            raise FlowControlError(self._write_pump.refusal(size))
 
     def _check_nowait_publish_many_capacity(
         self,
@@ -1351,7 +1351,13 @@ class AsyncClient:
                 queued_messages=messages,
                 queued_bytes=bytes_used,
             ):
-                raise FlowControlError("Outbound backpressure limit reached")
+                raise FlowControlError(
+                    self._write_pump.refusal(
+                        size,
+                        queued_messages=messages,
+                        queued_bytes=bytes_used,
+                    )
+                )
             messages += 1
             bytes_used += size
 
@@ -1821,11 +1827,13 @@ class AsyncClient:
             if receipt is not None:
                 if reason is not None:
                     receipt._error = reason
-                if receipt._event is not None:
-                    receipt._event.set()
-            batch = self._pop_batch_receipt(mid)
-            if batch is not None:
-                batch._complete(mid, reason)
+                receipt._settle()
+            # Most clients never call publish_many, so skip the lookup rather
+            # than hashing every acknowledged identifier against an empty table.
+            if self._batch_receipts:
+                batch = self._pop_batch_receipt(mid)
+                if batch is not None:
+                    batch._complete(mid, reason)
         self._notify_publish_space()
 
     def _notify_publish_space(self) -> None:
@@ -2028,17 +2036,16 @@ class AsyncClient:
             self._batch_receipts[mid] = deque((current, receipt))
 
     def _pop_batch_receipt(self, mid: int) -> PublishBatchReceipt | None:
-        current = self._batch_receipts.get(mid)
+        current = self._batch_receipts.pop(mid, None)
         if current is None:
             return None
         if not isinstance(current, deque):
-            self._batch_receipts.pop(mid, None)
             return current
         receipt = current.popleft()
         if len(current) == 1:
             self._batch_receipts[mid] = current[0]
-        elif not current:
-            self._batch_receipts.pop(mid, None)
+        elif current:
+            self._batch_receipts[mid] = current
         return receipt
 
     def _fail_non_replayable(self, exc: BaseException) -> None:
@@ -2056,8 +2063,7 @@ class AsyncClient:
             receipts = current if isinstance(current, deque) else (current,)
             for receipt in receipts:
                 receipt._error = exc
-                if receipt._event is not None:
-                    receipt._event.set()
+                receipt._settle()
         self._receipts.clear()
         batches = {
             batch

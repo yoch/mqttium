@@ -182,6 +182,10 @@ class MemoryInflightStore:
         if deleted and not self._out:
             # Drop the peak-sized hash table after the last inflight record is
             # acknowledged instead of retaining its capacity indefinitely.
+            # Gating this on sys.getsizeof to skip the reallocation for a
+            # shallow window was tried and reverted: the probe measured ~151 ns
+            # against ~19 ns for the allocation it avoids, and qos1_cycle_memory
+            # regressed accordingly. See docs/reports/PERFORMANCE-AUDIT-0.2.0b4.md.
             self._out = {}
         return deleted
 
