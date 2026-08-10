@@ -37,14 +37,29 @@ cd mqttium && HYPOTHESIS_PROFILE=aggressive python3 -m pytest tests/fuzz/test_hy
 
 ## CI
 
-Job `fuzz` dans `.github/workflows/mqttium.yml` : fuzzer seedé (3×20k) **et**
-hypothesis (profil `ci`).
+Le job `fuzz` de `.github/workflows/ci.yml` exécute le fuzzer seedé (3×20k) et
+Hypothesis (profil `ci`) sur chaque changement. Le workflow
+`.github/workflows/fuzz-campaign.yml` ajoute trois niveaux bornés :
+
+- une minute sur les PR qui touchent les cibles ou le harness ;
+- trois shards de 20 minutes chaque nuit ;
+- sur déclenchement manuel, une campagne de release candidate de cinq shards
+  de 288 minutes, soit 1 440 minutes (24 CPU-heures) de fuzzing mono-processus.
+
+La limite de chaque job RC est de 300 minutes : les douze minutes restantes
+sont réservées à l'installation et à l'upload. La durée de 288 minutes inclut
+le passage Hypothesis agressif, puis des lots seedés qui alternent `codec`,
+`engine` et `websocket` jusqu'à l'échéance.
 
 ## Reproductibilité
 
 - Seedé : `--seed N` reproduit exactement la séquence.
 - Hypothesis : tout échec est **shrinké** automatiquement et rejouable via la
-  base d’exemples (`.hypothesis/`) ou `@reproduce_failure`.
+  base d'exemples (`.hypothesis/`) ou `@reproduce_failure`.
+- Campagnes longues : le seed du shard et chaque seed de lot figurent dans
+  `metadata.json` et `campaign.log`. La quantité de lots achevés dépend de la
+  vitesse du runner, mais chaque lot reste exactement rejouable. Le corpus
+  Hypothesis, les inputs fautifs et les logs sont uploadés même après un échec.
 
 ## Logging temps réel & rejouabilité
 
@@ -66,7 +81,8 @@ Le fuzzer seedé logue sur **stderr** (flush immédiat, parseable) :
 Rejouer un cas : `--seed N` reproduit la séquence ; l’artefact `.bin` est
 l’input exact à renvoyer dans la cible.
 
-## Limites connues
+## Conservation
 
-- Un run « 24h » reste à brancher sur une CI dédiée si souhaité ; le harness
-  est prêt (`--iterations` élevé, `--seed` variable).
+Les artefacts nightly sont conservés 30 jours. Les cinq artefacts d'une
+campagne RC sont conservés 90 jours et contiennent le SHA, le profil, les
+seeds, le corpus Hypothesis, les inputs fautifs et le log complet.

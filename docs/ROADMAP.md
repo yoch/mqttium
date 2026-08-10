@@ -67,7 +67,7 @@ which records what already shipped.
 - [ ] Concrete enhanced-authentication plugins such as SCRAM where broker demand
       justifies them.
 - [ ] Additional Paho compatibility surface only when backed by behavioural tests.
-- [ ] Long-running fuzz campaigns and corpus retention outside normal pull-request CI.
+- [x] Long-running fuzz campaigns and corpus retention outside normal pull-request CI.
 
 ## Permanent quality gates
 
