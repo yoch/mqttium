@@ -23,6 +23,14 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   and could never satisfy the native client's direct QoS 0 precondition.
   `Client.on_publish` is now a property; reading and assigning it are
   unchanged, including from a non-loop thread.
+- Acknowledgement frames without a reason code or properties are emitted
+  directly instead of being assembled through the generic encoder, the publish
+  encoder no longer re-converts a `QoS` its caller has already validated, topic
+  validation no longer builds an encoded form it discards, and the MQTT UTF-8
+  rules are checked with string scans rather than a loop over code points. No
+  behaviour changes: the same inputs are accepted and rejected, and the only
+  visible difference is that a string breaking several UTF-8 rules at once may
+  now cite a different one of them.
 - `FlowControlError` from the bounded writer now names the bound that refused
   and its configured value, instead of reporting only that a limit was
   reached. `max_outbound_bytes` (1 MiB) and `max_outbound_messages` (10 000)

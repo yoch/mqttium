@@ -367,6 +367,33 @@ The paired harnesses were **also** run on the audit host, where they produced no
   restated as current, and the comparison stays parked on #39 pending the external native-async
   harness.
 
+## Second pass: a deterministic profile of realistic scenarios
+
+Run after the reverts above, on the same host, with call counts and allocation
+counts as the primary evidence — both are exact regardless of machine load, which
+is what made them usable here when wall-clock was not. Four redundancies came out
+of it, three of which were taken.
+
+| Finding | Mechanism | Result |
+| --- | --- | --- |
+| Acknowledgement frames | A success ack with no properties is a fixed four-byte frame in both protocol versions, assembled through the generic encoder | `PubAck.encode` **1259 → 432 ns**; inbound QoS 1 **14.2 → 11.0 µs** per message. Covers PUBREC/PUBREL/PUBCOMP too. |
+| `QoS()` in the publish encoder | Re-converted a value every internal caller had already converted; argument type instrumented on both paths and always a genuine member | `encode_qos1` **+17.3%**, 7 of 7 pairs [1.133, 1.208] |
+| Topic UTF-8 encoded twice | Validation called `encode_utf8` for its exception and discarded the bytes; the encoder produced them again | **−75 ns** per publication. Smaller than the ~293 ns first estimated: only the encoding half was redundant, the character scan runs either way. `native_publish_nowait_qos0` +2.8% at 8 of 11 pairs. |
+| MQTT UTF-8 rules scanned per code point | An interpreted loop with three comparisons per character; two rules are substring searches and the third is what the strict codec already refuses | **7× to 48×** faster. Outbound validation of an accented topic **2798 → 639 ns**; ASCII untouched. Shared with `unpack_utf8`, so ingress benefits too. |
+
+`item_size` computed twice per publication (~88 ns, 1%) was left alone: removing it
+means threading the size through, which is the same widening refused for
+`publish_nowait` sizing. Consistency matters more than 1%.
+
+Two controls did not move and are what make the rest readable: `ingress_engine_qos0`
+at 1.0067, and inbound QoS 0 at 7729 ns against 7740 ns before.
+
+Equivalence was established before the suite in every case: 370 acknowledgement
+combinations across four packet types and both protocols; 20 adversarial strings
+against the topic validator including both length boundaries in bytes rather than
+characters; and 60 147 inputs drawn from the whole code-point space against the
+replaced UTF-8 loop, with zero accept/reject divergences.
+
 ## Before the tag
 
 1. Run the paired harnesses on the dedicated runner, or read CI's jobs, and attach the ratios to
