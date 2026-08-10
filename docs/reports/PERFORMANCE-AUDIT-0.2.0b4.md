@@ -234,20 +234,41 @@ are candidate over base, `4bdcdb3` against the change set, 11 rotated pairs per 
 network cells exercise. They are superseded by the run on the final commit and are kept here only
 as the first usable measurement of the set.
 
-**End-to-end QoS 1 (`paired_network.py`), the workload this audit targets: better in every cell.**
-Publish-to-ack throughput ratios ran **+0.6% to +7.3%** across in-flight windows 1/8/32/64/128 on
-both MQTT 3.1.1 and MQTT 5 — 20 cells out of 20 positive, base-arm CVs 0.9–5.4%.
+**End-to-end QoS 1 (`paired_network.py`): no claim survives. The sweep does not reproduce.**
 
-The **throughput** ratios are what this supports, and only those. Two qualifications the first
-version of this section omitted:
+The first run reported all 20 cells positive, +0.6% to +7.3%, and an earlier revision of this
+section presented that as the headline result. It has not reproduced. Three runs on largely
+overlapping code:
 
-- One cell (3.1.1, 4 KiB, window 128) has a base-arm CV of **5.4%**, above the 5% at which
-  `docs/BENCHMARKING.md` invalidates a cell. It is not evidence.
-- The **p50 deltas are only readable on the 64-byte cells**, where they run −0.004 to −0.078 ms.
-  On the 4 KiB cells they range from −14.4 ms to **+30.0 ms**, which is not an engine effect: it is
-  the pipeline-residence and runner variability the contract warns about for large payloads at
-  depth. An earlier revision cited "p50 deltas mostly negative" as supporting evidence across the
-  board. That was wrong and is withdrawn; the large-payload latency cells say nothing either way.
+| Run | Median ack ratio | Cells positive | Spread |
+| --- | ---: | ---: | --- |
+| `caa61bf` | above 1 in every cell | 20 / 20 | +0.6% … +7.3% |
+| `94c8fbd` | **0.989** | 6 / 20 | 0.950 – 1.065 |
+| `1990ace` (merge candidate) | **0.993** | 9 / 20 | 0.925 – 1.085 |
+
+Individual cells swing by up to ±0.09 between consecutive runs, in both directions, on the same
+protocol/payload/window. Per-cell base CVs reach 6.6% against an effect being sought of 1–5%. On the
+merge candidate the harness's own criteria flag **three cells below the 0.95 regression threshold**
+(3.1.1/4 KiB/32 at 0.933, 5/64/32 at 0.948, 5/4 KiB/32 at 0.925) and **three cells above the 5%
+baseline-CV invalidation threshold**.
+
+So the sweep establishes neither a gain nor a regression at this effect size on a hosted runner, and
+**no end-to-end number is claimed for this change set in either direction**. Two corrections to how
+this was previously reported, both mine:
+
+- "No cell failing the harness gate" was inferred from an absent `failures` key in the output JSON.
+  The harness computes failures after writing that file and signals them by exit status, so the key
+  is never present and its absence means nothing. The step is additionally `continue-on-error` on
+  pull requests, so this measurement has never gated anything.
+- "p50 deltas mostly negative" was cited as supporting evidence. They are readable only on the
+  64-byte cells (−0.004 to −0.078 ms); on 4 KiB they ranged −14.4 ms to **+30.0 ms**, which is
+  pipeline residence and runner variability, not an engine effect.
+
+One hypothesis consistent with the two later runs sitting a hair under 1.0, offered as a hypothesis
+and not a finding: the network arm runs `--completions receipt`, so every publication awaits its
+receipt and therefore pays the `asyncio.shield` added to fix the cancellation regression. A cost of
+about a percent on the awaited path would be the correct trade for that fix, but the data cannot
+resolve a percent.
 
 **Micro scenarios: two clear gains, the rest neutral, and one regression that was mine.**
 
@@ -260,23 +281,31 @@ version of this section omitted:
 | `qos1_cycle_memory` / `qos1_cycle_sqlite` | 0.982 / 0.985 | 3.2% / 0.9% | The memory arm is the store gate (finding 9), also reverted. |
 | `compat_publish_qos1` | 0.948 | **12.2%** | Baseline too noisy to interpret; no claim. |
 
-### Final run, after both reverts
+### Final run, after both reverts — what this change set actually buys
 
-Run on `94c8fbd`, the merge candidate. The three gains hold and are cleaner than in the first
-campaign — **every one of eleven pairs favours the candidate in all three**:
+Run on `1990ace`, the merge candidate. Only three scenarios move, and they move in every pair:
 
 | Scenario | Ratio | Base CV | Pairs favouring candidate |
 | --- | ---: | ---: | --- |
-| `compat_publish_qos0_batch` | **1.246** | 1.1% | 11 / 11 |
-| `native_publish_nowait_qos0` | **1.076** | 2.2% | 11 / 11 |
-| `async_publish_nowait_qos0` | **1.073** | 1.3% | 11 / 11 |
-| `effect_batch_ordered` | 1.003 | 1.4% | 6 / 11 — back to parity, as the revert predicts |
-| `effect_batch_reordered` | 0.995 | 1.2% | 5 / 11 — back to parity |
+| `compat_publish_qos0_batch` | **1.239** | 2.2% | **11 / 11** |
+| `async_publish_nowait_qos0` | **1.075** | 2.0% | **11 / 11** |
+| `native_publish_nowait_qos0` | **1.065** | 1.1% | **11 / 11** |
 
-`qos1_cycle_memory` was still 0.976 at 1/11 in this run, which is what identified finding 9; that
-revert landed after it and is not yet re-measured. `encode_qos1` reads 0.986 on code this PR does
-not touch at all, which sets the run's own noise floor at roughly 1.4% and is the reason nothing
-below about 2% is claimed here in either direction.
+Those three are stable across all three campaigns at 11/11 pairs, and they are the only performance
+claim this PR makes. Everything else lands between 0.994 and 1.011, which is the run's noise band —
+`encode_qos1` reads 0.994 on code the PR does not touch at all.
+
+Both reverts are confirmed by the measurement that motivated them:
+
+| Scenario | Before revert | After revert |
+| --- | --- | --- |
+| `effect_batch_ordered` | 1.019 @ 7/11 | 1.009 @ 8/11 |
+| `effect_batch_reordered` | 0.975 @ 3/11 | 1.006 @ 7/11 |
+| `qos1_cycle_memory` | 0.976 @ **1/11** | **1.000 @ 5/11** |
+
+`qos1_cycle_memory` returning from 1-of-11 to 5-of-11 is the falsifiable check on finding 9's
+attribution, and it passed: had the regression come from somewhere else, reverting the store gate
+would not have moved it.
 
 **The effect-pump arms in that run measured the wrong branch.** Both scenarios as first written
 were `[SEND, COMPLETE, …]` interleavings, and the pump reorders as soon as a SEND follows a
