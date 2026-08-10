@@ -1222,12 +1222,15 @@ class AsyncClient:
                             )
                         if handled:
                             self._collect_effects_locked()
-                    if not handled:
-                        break
                     if self._pending_effects:
                         await self._drain_effects()
-                    if handled >= 256 or handled_bytes >= self._max_ingress_batch_bytes:
-                        await asyncio.sleep(0)
+                    # A batch that stopped short of both bounds emptied the
+                    # buffer, so there is nothing to decode until the next
+                    # read(). Re-entering only to observe handled == 0 cost a
+                    # second lock acquisition and bounded decode per read.
+                    if handled < 256 and handled_bytes < self._max_ingress_batch_bytes:
+                        break
+                    await asyncio.sleep(0)
         except asyncio.CancelledError:
             raise
         except (PacketTooLargeError, MalformedPacketError, ProtocolError) as exc:
