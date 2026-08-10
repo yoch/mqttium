@@ -7,7 +7,7 @@ import pytest
 from mqttium.codec.buffer import _VIEW_COPY_THRESHOLD, IncrementalDecoder
 from mqttium.codec.vbi import decode_vbi, encode_vbi, vbi_len
 from mqttium.enums import PacketType, QoS
-from mqttium.errors import MalformedPacketError, PacketTooLargeError
+from mqttium.errors import MalformedPacketError, PacketTooLargeError, ProtocolError
 from mqttium.packets import PublishPacket, encode_frame
 
 
@@ -199,3 +199,73 @@ def test_a_large_body_is_not_aliased_to_the_reusable_buffer() -> None:
     decoder.feed(wire)
     decoder.next_packet()
     assert raw.remaining == snapshot
+
+
+def test_validate_utf8_rejects_exactly_what_encode_utf8_rejects() -> None:
+    """The validator exists to skip the encode, not to change the rules."""
+    from mqttium.codec.primitives import encode_utf8, validate_utf8
+
+    cases = [
+        "sensors/t",
+        "a",
+        "",
+        "é",
+        "温度/センサー",
+        "🎉/emoji",
+        "mixed/é/x",
+        "x" * 65535,
+        "x" * 65536,
+        "é" * 32767,
+        "é" * 32768,
+        "a\x00b",
+        "\x00",
+        "﻿",
+        "a﻿b",
+        "\ud800",
+        "a\ud800b",
+        b"bytes",
+        None,
+        42,
+    ]
+
+    def outcome(fn, value):
+        try:
+            fn(value)
+        except ProtocolError:
+            return "reject"
+        return "accept"
+
+    for case in cases:
+        assert outcome(encode_utf8, case) == outcome(validate_utf8, case), repr(case)[:40]
+
+
+def test_validate_utf8_bounds_length_in_bytes_not_characters() -> None:
+    """The MQTT limit is 65535 bytes; skipping the encode must not lose that."""
+    from mqttium.codec.primitives import validate_utf8
+
+    validate_utf8("é" * 32767)  # 65534 bytes
+    with pytest.raises(ProtocolError, match="too long"):
+        validate_utf8("é" * 32768)  # 65536 bytes, only 32768 characters
+
+    validate_utf8("x" * 65535)
+    with pytest.raises(ProtocolError, match="too long"):
+        validate_utf8("x" * 65536)
+
+
+def test_validate_utf8_does_not_encode_an_ascii_string(monkeypatch) -> None:
+    """The whole point: an ASCII topic is validated without producing bytes."""
+    from mqttium.codec import primitives
+
+    encoded: list[str] = []
+    original = str.encode
+
+    class Tracking(str):
+        def encode(self, *args, **kwargs):  # type: ignore[override]
+            encoded.append(str(self))
+            return original(self, *args, **kwargs)
+
+    primitives.validate_utf8(Tracking("sensors/temperature/room-12"))
+    assert encoded == []
+
+    primitives.validate_utf8(Tracking("capteurs/température"))
+    assert len(encoded) == 1, "a non-ASCII string still needs its byte length"

@@ -35,6 +35,24 @@ def unpack_u32(buffer: bytes | bytearray | memoryview, offset: int = 0) -> tuple
     return _U32.unpack_from(buffer, offset)[0], offset + 4
 
 
+def validate_utf8(value: str) -> None:
+    """Apply the MQTT UTF-8 rules without building the encoded form.
+
+    For a caller that only wants the rejection -- topic validation, which runs
+    before the encoder that will produce the bytes anyway -- ``encode_utf8``
+    encodes a string whose result is then discarded. The rules themselves are
+    defined on code points, so only the length bound needs bytes, and a code
+    point never encodes to fewer than one byte: an ASCII string's character
+    count is already its byte count. Anything else has to be encoded to be
+    measured, but that path is dominated by the character scan above it.
+    """
+    if not isinstance(value, str):
+        raise ProtocolError(f"MQTT UTF-8 value must be str, got {type(value).__name__}")
+    _validate_mqtt_utf8(value, error_type=ProtocolError)
+    if len(value) > 65535 or (not value.isascii() and len(value.encode("utf-8")) > 65535):
+        raise ProtocolError("UTF-8 string too long for MQTT")
+
+
 def encode_utf8(value: str) -> bytes:
     """Validate and encode one MQTT UTF-8 string without its length prefix."""
     if not isinstance(value, str):
