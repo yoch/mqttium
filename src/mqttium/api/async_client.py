@@ -71,7 +71,7 @@ from mqttium.transport._stream import AsyncTransport
 from mqttium.transport.tcp import TcpTransport
 from mqttium.transport.unix import UnixSocketTransport
 from mqttium.transport.websocket import WebSocketTransport
-from mqttium.transport.writes import WriteItem
+from mqttium.transport.writes import WriteItem, item_size
 from mqttium.types import Message, Properties
 
 OnMessage = Callable[[Message], Any]
@@ -580,7 +580,7 @@ class AsyncClient:
             epoch=self._connection_epoch,
         ):
             if nowait:
-                raise FlowControlError("Outbound backpressure limit reached")
+                raise FlowControlError(self._write_pump.refusal(item_size(item)))
             return None
         return PublishReceipt(mid=None, qos=QoS.AT_MOST_ONCE, _event=None)
 
@@ -609,7 +609,9 @@ class AsyncClient:
             )
         if not self._try_enqueue_outbound_many(items, epoch=self._connection_epoch):
             if nowait:
-                raise FlowControlError("Outbound backpressure limit reached")
+                raise FlowControlError(
+                    self._write_pump.refusal(sum(item_size(item) for item in items))
+                )
             return False
         for _ in requests:
             receipt._register(None)
@@ -1334,7 +1336,7 @@ class AsyncClient:
             return
         size = self._preview_publish_size(topic, payload, level, properties)
         if not self._can_enqueue_outbound_size(size):
-            raise FlowControlError("Outbound backpressure limit reached")
+            raise FlowControlError(self._write_pump.refusal(size))
 
     def _check_nowait_publish_many_capacity(
         self,
@@ -1357,7 +1359,7 @@ class AsyncClient:
                 queued_messages=messages,
                 queued_bytes=bytes_used,
             ):
-                raise FlowControlError("Outbound backpressure limit reached")
+                raise FlowControlError(self._write_pump.refusal(size))
             messages += 1
             bytes_used += size
 

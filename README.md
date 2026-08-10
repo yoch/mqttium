@@ -147,7 +147,10 @@ quota violation with reason `0x97`; MQTT 3.1.1 closes the connection.
 The writer also has an independent `max_outbound_bytes=1 MiB` default.
 `publish_nowait()` refuses immediately when that wire queue is full, so callers
 publishing large payloads should size this byte limit explicitly rather than
-assuming `max_outbound_messages` is the only binding constraint.
+assuming `max_outbound_messages` is the only binding constraint. The two
+defaults imply about 105 bytes per queued message, so the byte bound is the one
+that binds first as payloads grow: 1 MiB admits roughly 16 outstanding 64 KiB
+publications, not 10 000. `FlowControlError` names whichever bound refused.
 
 Native QoS 0 uses its direct writer fast path only while `on_publish is None`.
 Installing that callback deliberately routes publications through the standard

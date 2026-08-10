@@ -8,6 +8,11 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Changed
 
+- `FlowControlError` from the bounded writer now names the bound that refused
+  and its configured value, instead of reporting only that a limit was
+  reached. `max_outbound_bytes` (1 MiB) and `max_outbound_messages` (10 000)
+  imply about 105 bytes per queued message, so the byte bound is the one that
+  binds as payloads grow; the defaults are unchanged.
 - Documentation is now split by kind and indexed by `docs/README.md`: maintained
   contracts stay directly under `docs/`, while dated measurements, audits and
   campaign records moved to `docs/reports/`. Entries published before this

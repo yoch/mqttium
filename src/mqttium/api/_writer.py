@@ -148,6 +148,25 @@ class WritePump:
             return False
         return bytes_used + size <= self.max_bytes or (messages == 0 and bytes_used == 0)
 
+    def refusal(self, size: int = 0) -> str:
+        """Name the bound that is refusing, for the error path only.
+
+        The two bounds default to very different magnitudes (10 000 messages
+        against 1 MiB), so a caller who sized the queue in messages meets the
+        byte bound first as soon as payloads grow. Saying which one refused is
+        the difference between a tunable and a mystery.
+        """
+        if self.queue.qsize() >= self.max_messages:
+            return (
+                "Outbound backpressure limit reached: "
+                f"max_outbound_messages={self.max_messages} is full"
+            )
+        return (
+            "Outbound backpressure limit reached: "
+            f"max_outbound_bytes={self.max_bytes} would be exceeded by a "
+            f"{size}-byte write with {self.queued_bytes} bytes already queued"
+        )
+
     def try_enqueue(self, item: WriteItem, *, epoch: int | None = None) -> bool:
         if epoch is None:
             epoch = self.epoch
@@ -206,7 +225,7 @@ class WritePump:
             return
         size = item_size(item)
         if nowait:
-            raise FlowControlError("Outbound backpressure limit reached")
+            raise FlowControlError(self.refusal(size))
 
         async with self.space:
             while True:

@@ -244,3 +244,32 @@ async def test_parked_publish_keeps_waiting_while_reconnect_is_pending() -> None
         await parked
     assert client._publish_waiters == 0
     await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_flow_control_error_names_the_message_bound() -> None:
+    client = AsyncClient(max_outbound_messages=1, max_outbound_bytes=1024 * 1024)
+    client._engine.state = ConnectionState.CONNECTED
+
+    client.publish_nowait("bound/messages", b"x", qos=0)
+    with pytest.raises(FlowControlError) as excinfo:
+        client.publish_nowait("bound/messages", b"x", qos=0)
+
+    message = str(excinfo.value)
+    assert "max_outbound_messages=1" in message
+    assert "max_outbound_bytes" not in message
+
+
+@pytest.mark.asyncio
+async def test_flow_control_error_names_the_byte_bound() -> None:
+    """The default pairing that makes large payloads surprising."""
+    client = AsyncClient(max_outbound_messages=10_000, max_outbound_bytes=4096)
+    client._engine.state = ConnectionState.CONNECTED
+
+    client.publish_nowait("bound/bytes", b"x" * 3000, qos=0)
+    with pytest.raises(FlowControlError) as excinfo:
+        client.publish_nowait("bound/bytes", b"x" * 3000, qos=0)
+
+    message = str(excinfo.value)
+    assert "max_outbound_bytes=4096" in message
+    assert "already queued" in message
