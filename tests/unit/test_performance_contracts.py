@@ -115,3 +115,82 @@ async def test_nowait_admission_still_refuses_when_the_writer_is_loaded() -> Non
     client.publish_nowait("contract/full", b"x" * 1800, qos=0)
     with pytest.raises(FlowControlError):
         client.publish_nowait("contract/full", b"x" * 1800, qos=0)
+
+
+def test_success_acks_encode_to_the_fixed_four_byte_frame() -> None:
+    """The shortcut must produce exactly what the generic encoder produced."""
+    from mqttium.enums import PacketType
+    from mqttium.packets.acks import PubAckPacket, PubCompPacket, PubRecPacket, PubRelPacket
+
+    cases = (
+        (PubAckPacket, PacketType.PUBACK, 0),
+        (PubRecPacket, PacketType.PUBREC, 0),
+        (PubRelPacket, PacketType.PUBREL, 0x02),
+        (PubCompPacket, PacketType.PUBCOMP, 0),
+    )
+    for cls, packet_type, flags in cases:
+        for protocol in (MQTTProtocolVersion.MQTTv311, MQTTProtocolVersion.MQTTv5):
+            for mid in (1, 255, 256, 65535):
+                encoded = cls(mid=mid).encode(protocol)
+                assert encoded == bytes((int(packet_type) | flags, 2, mid >> 8, mid & 0xFF)), (
+                    cls,
+                    protocol,
+                    mid,
+                )
+                assert len(encoded) == 4
+
+
+def test_acks_with_reason_or_properties_keep_the_generic_encoding() -> None:
+    """Only the zero-reason, no-property case may take the shortcut."""
+    from mqttium.packets.acks import PubAckPacket
+
+    with_reason = PubAckPacket(mid=9, reason_code=0x10).encode(MQTTProtocolVersion.MQTTv5)
+    assert len(with_reason) > 4
+    assert with_reason[2:4] == (9).to_bytes(2, "big")
+
+    properties = Properties()
+    properties.set("reason_string", "no matching subscribers")
+    with_props = PubAckPacket(mid=9, properties=properties).encode(MQTTProtocolVersion.MQTTv5)
+    assert len(with_props) > 4
+
+    # An empty table is not "properties" and must still take the shortcut.
+    assert len(PubAckPacket(mid=9, properties=Properties()).encode()) == 4
+
+
+def test_publish_encoder_accepts_int_and_enum_identically() -> None:
+    """Skipping the enum call for a real member must not change any output."""
+    from mqttium.enums import QoS
+    from mqttium.packets.publish import encode_publish_item
+
+    for level, mid in ((0, None), (1, 7), (2, 7)):
+        for protocol in (MQTTProtocolVersion.MQTTv311, MQTTProtocolVersion.MQTTv5):
+            as_int = encode_publish_item(
+                "a/b",
+                b"p",
+                qos=level,
+                retain=False,
+                dup=False,
+                mid=mid,
+                properties=None,
+                protocol=protocol,
+            )
+            as_enum = encode_publish_item(
+                "a/b",
+                b"p",
+                qos=QoS(level),
+                retain=False,
+                dup=False,
+                mid=mid,
+                properties=None,
+                protocol=protocol,
+            )
+            assert as_int == as_enum
+
+
+@pytest.mark.parametrize("bad", [3, -1, "0", None, 1.5])
+def test_publish_encoder_still_rejects_invalid_qos(bad: object) -> None:
+    from mqttium.errors import ProtocolError
+    from mqttium.packets.publish import encode_publish_item
+
+    with pytest.raises(ProtocolError):
+        encode_publish_item("a/b", b"p", qos=bad, retain=False, dup=False, mid=1, properties=None)
