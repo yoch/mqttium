@@ -259,7 +259,9 @@ this was previously reported, both mine:
 - "No cell failing the harness gate" was inferred from an absent `failures` key in the output JSON.
   The harness computes failures after writing that file and signals them by exit status, so the key
   is never present and its absence means nothing. The step is additionally `continue-on-error` on
-  pull requests, so this measurement has never gated anything.
+  pull requests, so this measurement has never gated anything. On the merge candidate the gate did
+  fire (`baseline CV 5.20%`, exit code 1) while the step, the job, the run and the PR check all
+  reported success. Tracked as issue #77.
 - "p50 deltas mostly negative" was cited as supporting evidence. They are readable only on the
   64-byte cells (−0.004 to −0.078 ms); on 4 KiB they ranged −14.4 ms to **+30.0 ms**, which is
   pipeline residence and runner variability, not an engine effect.
