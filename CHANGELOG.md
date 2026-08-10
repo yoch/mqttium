@@ -8,6 +8,13 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Changed
 
+- The Paho façade now installs its inner `on_publish` dispatcher only while
+  the user has set `Client.on_publish`, instead of unconditionally at
+  construction. Every façade user previously paid a callback-queue hop per
+  acknowledged publication to reach a dispatcher that returned immediately,
+  and could never satisfy the native client's direct QoS 0 precondition.
+  `Client.on_publish` is now a property; reading and assigning it are
+  unchanged, including from a non-loop thread.
 - `FlowControlError` from the bounded writer now names the bound that refused
   and its configured value, instead of reporting only that a limit was
   reached. `max_outbound_bytes` (1 MiB) and `max_outbound_messages` (10 000)

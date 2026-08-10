@@ -50,6 +50,7 @@ For one-shot helpers, prefer the async-native `mqttium.helpers` API instead of
 | Queue saturation | Silently drops or grows without bound depending on `max_queued_messages` | `publish()` returns `MQTT_ERR_QUEUE_SIZE` (15) | Both the cross-thread handoff and native unfinished-publication queue are bounded; a blocking API must refuse rather than stall the caller's thread |
 | `wait_for_publish()` / `is_published()` after a failed publish | Report success | **Raise** | Reporting a publication that never happened is worse than an exception |
 | Public `max_inflight_messages` | Coupled to MID handling | `local_receive_maximum` plus `FlowControl` | Receive Maximum is not the packet-identifier space |
+| `on_publish` assignment | Plain attribute | Property that installs and clears the inner `AsyncClient.on_publish` | The native client routes every completion through its callback queue while that callback exists, so installing a dispatcher unconditionally charged a queue hop per message to façade users who never set `on_publish` |
 
 ## Explicitly rejected designs
 

@@ -182,12 +182,30 @@ class Client:
         self.on_connect: Callable[..., Any] | None = None
         self.on_disconnect: Callable[..., Any] | None = None
         self.on_message: Callable[..., Any] | None = None
-        self.on_publish: Callable[..., Any] | None = None
+        self._on_publish: Callable[..., Any] | None = None
 
         self._async.on_connect = self._dispatch_connect
         self._async.on_disconnect = self._dispatch_disconnect
         self._async.on_message = self._dispatch_message
-        self._async.on_publish = self._dispatch_publish
+        # on_publish is installed on demand: see the property below.
+
+    @property
+    def on_publish(self) -> Callable[..., Any] | None:
+        return self._on_publish
+
+    @on_publish.setter
+    def on_publish(self, callback: Callable[..., Any] | None) -> None:
+        """Install the inner callback only while the façade user wants one.
+
+        The native client keeps its direct QoS 0 writer path only while
+        ``AsyncClient.on_publish`` is ``None``, and routes every QoS 1/2
+        completion through the callback queue when it is not. Installing the
+        dispatcher unconditionally therefore charged every façade user for a
+        callback they had not asked for, and cost them the fast path outright.
+        """
+        self._on_publish = callback
+        dispatch = self._dispatch_publish if callback is not None else None
+        self._run_loop_mutation(lambda: setattr(self._async, "on_publish", dispatch))
 
     def user_data_set(self, userdata: Any) -> None:
         self._run_loop_mutation(lambda: setattr(self, "_userdata", userdata))
