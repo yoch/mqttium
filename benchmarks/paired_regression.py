@@ -34,6 +34,8 @@ SCENARIOS = (
     "ingress_engine_qos0",
     "effect_send_inline",
     "effect_batch_inline",
+    "effect_batch_ordered",
+    "effect_batch_reordered",
     "writer_try_enqueue",
     "writer_enqueue_async",
     "async_publish_nowait_qos0",
@@ -387,6 +389,28 @@ def _worker(args: argparse.Namespace) -> None:  # noqa: C901
             operations=100_000 if batch_size == 1 else 30_000,
             warmup=2_000,
         )
+    elif scenario in ("effect_batch_ordered", "effect_batch_reordered"):
+        # The shape a pipelined PUBACK produces: the engine emits
+        # PUBLISH_COMPLETE and then drain() emits the launched SEND, so the
+        # pump must partition SEND-first. effect_batch_inline is all-SEND and
+        # never reaches that branch, so it cannot see this cost.
+        client = AsyncClient(client_id="paired-effect-order")
+        _install_discard_writer(client)
+        client._engine.state = ConnectionState.CONNECTED
+        reordered = scenario == "effect_batch_reordered"
+
+        def run_effect_order() -> None:
+            for _ in range(4):
+                if reordered:
+                    client._engine._emit(EffectKind.PUBLISH_COMPLETE, None)
+                    client._engine._emit(EffectKind.SEND, b"x")
+                else:
+                    client._engine._emit(EffectKind.SEND, b"x")
+                    client._engine._emit(EffectKind.PUBLISH_COMPLETE, None)
+            client._collect_effects_locked()
+            client._effect_pump.pending.clear()
+
+        result = _measure(run_effect_order, operations=30_000, warmup=2_000)
     else:
         raise ValueError(f"unknown scenario: {scenario}")
 

@@ -92,23 +92,31 @@ class EffectPump:
 
         if len(effects) > 1:
             self.multi_effect_batches += 1
-            # Partition SEND-first in one pass, and let that same pass answer
-            # whether the batch needed it: a SEND seen after a non-SEND is
-            # exactly the condition. The two-generator form this replaces walked
-            # the batch twice and always rebuilt the list, even for the common
-            # batch that was already ordered.
-            sends: list[EngineEffect] = []
-            others: list[EngineEffect] = []
+            # Detect before partitioning. A SEND seen after a non-SEND is
+            # exactly the condition, and answering it needs no allocation, so
+            # an already-ordered batch no longer builds two lists to discard.
+            # That is the shape of inbound delivery: a lot of MESSAGE effects
+            # with no SEND among them. A batch that does need reordering pays
+            # a few extra comparisons before the partition it would have run
+            # anyway, and the scan breaks at the first one it finds.
+            seen_other = False
             out_of_order = False
             for effect in effects:
                 if effect.kind is EffectKind.SEND:
-                    if others:
+                    if seen_other:
                         out_of_order = True
-                    sends.append(effect)
+                        break
                 else:
-                    others.append(effect)
+                    seen_other = True
             if out_of_order:
                 self.reordered_batches += 1
+                sends: list[EngineEffect] = []
+                others: list[EngineEffect] = []
+                for effect in effects:
+                    if effect.kind is EffectKind.SEND:
+                        sends.append(effect)
+                    else:
+                        others.append(effect)
                 effects = sends + others
         if not self.pending:
             self.pending_epoch = epoch
