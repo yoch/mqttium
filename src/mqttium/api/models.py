@@ -172,14 +172,15 @@ class PublishBatchReceipt:
 class PublishReceipt:
     """Handle returned by ``AsyncClient.publish``.
 
-    Completion is a flag, and the future behind :meth:`wait` is created only if
-    somebody actually waits. A publication that is never awaited -- the whole
-    point of ``publish_nowait`` -- therefore allocates no completion primitive
-    at all, and one that is awaited allocates a single future rather than an
-    ``asyncio.Event`` plus the future and waiter deque an event builds on top.
+    Completion is a flag, and the shared future behind :meth:`wait` is created
+    only if somebody actually waits. A publication that is never awaited -- the
+    whole point of ``publish_nowait`` -- therefore allocates no completion
+    primitive at all. Active waiters use shielded views of that shared future so
+    cancelling one wait cannot cancel completion for the receipt or other
+    waiters.
 
-    The future only ever carries ``None``. Failures live in ``_error`` and are
-    raised by :meth:`wait` after it resolves, so a receipt that fails and is
+    The shared future only ever carries ``None``. Failures live in ``_error`` and
+    are raised by :meth:`wait` after it resolves, so a receipt that fails and is
     never awaited cannot leave an unretrieved exception behind -- which matters
     here, because the library installs no logging to absorb one.
     """
@@ -203,7 +204,7 @@ class PublishReceipt:
             if future is None:
                 future = asyncio.get_running_loop().create_future()
                 self._future = future
-            await future
+            await asyncio.shield(future)
         if self._error is not None:
             raise self._error
 

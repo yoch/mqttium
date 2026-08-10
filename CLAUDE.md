@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project
 
 MQTTium is a dependency-free, async-native MQTT 3.1.1 / 5.0 client (`src/mqttium`, Python 3.11–3.14,
-Apache-2.0, beta `0.2.0b2`). Runtime dependencies must stay empty — tooling only lives in the
+Apache-2.0). Runtime dependencies must stay empty — tooling only lives in the
 `dev`/`fuzz`/`security`/`release` extras.
 
 Since `0.2.0b1` the public surface is tiered in `docs/API-STABILITY.md`: **Stable** (`mqttium`

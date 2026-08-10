@@ -145,3 +145,30 @@ async def test_receipt_awaited_before_completion_resolves_once() -> None:
     assert receipt.is_done()
     # A second settle must not raise InvalidStateError on the resolved future.
     receipt._settle()
+
+
+async def test_receipt_waiter_cancellation_is_isolated() -> None:
+    """Cancelling one wait must not cancel shared receipt completion."""
+    receipt = PublishReceipt(mid=42, qos=QoS.AT_LEAST_ONCE)
+
+    first = asyncio.create_task(receipt.wait())
+    second = asyncio.create_task(receipt.wait())
+    await asyncio.sleep(0)
+    assert receipt._future is not None
+
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+
+    assert receipt._future is not None
+    assert not receipt._future.cancelled()
+    assert not second.done()
+
+    # A later waiter must also remain attached to the same live completion.
+    third = asyncio.create_task(receipt.wait())
+    await asyncio.sleep(0)
+    assert not third.done()
+
+    receipt._settle()
+    await asyncio.gather(second, third)
+    assert receipt.is_done()
