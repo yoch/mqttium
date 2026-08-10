@@ -148,15 +148,27 @@ class WritePump:
             return False
         return bytes_used + size <= self.max_bytes or (messages == 0 and bytes_used == 0)
 
-    def refusal(self, size: int = 0) -> str:
+    def refusal(
+        self,
+        size: int = 0,
+        *,
+        queued_messages: int | None = None,
+        queued_bytes: int | None = None,
+    ) -> str:
         """Name the bound that is refusing, for the error path only.
 
         The two bounds default to very different magnitudes (10 000 messages
         against 1 MiB), so a caller who sized the queue in messages meets the
         byte bound first as soon as payloads grow. Saying which one refused is
         the difference between a tunable and a mystery.
+
+        The overrides mirror :meth:`can_enqueue_size`: a batch is admitted
+        against running totals rather than against the live queue, so the two
+        must be told the same state or this names the wrong bound.
         """
-        if self.queue.qsize() >= self.max_messages:
+        messages = self.queue.qsize() if queued_messages is None else queued_messages
+        bytes_used = self.queued_bytes if queued_bytes is None else queued_bytes
+        if messages >= self.max_messages:
             return (
                 "Outbound backpressure limit reached: "
                 f"max_outbound_messages={self.max_messages} is full"
@@ -164,8 +176,29 @@ class WritePump:
         return (
             "Outbound backpressure limit reached: "
             f"max_outbound_bytes={self.max_bytes} would be exceeded by a "
-            f"{size}-byte write with {self.queued_bytes} bytes already queued"
+            f"{size}-byte write with {bytes_used} bytes already queued"
         )
+
+    def refusal_many(self, items: list[WriteItem]) -> str:
+        """Name the bound that refused a batch, for the error path only.
+
+        Replays the running totals ``try_enqueue_many`` admits against, so the
+        reported bound is the one that stopped the batch rather than whatever
+        the live queue happens to show.
+        """
+        messages = self.queue.qsize()
+        bytes_used = self.queued_bytes
+        for item in items:
+            size = item_size(item)
+            if not self.can_enqueue_size(
+                size,
+                queued_messages=messages,
+                queued_bytes=bytes_used,
+            ):
+                return self.refusal(size, queued_messages=messages, queued_bytes=bytes_used)
+            messages += 1
+            bytes_used += size
+        return self.refusal()
 
     def try_enqueue(self, item: WriteItem, *, epoch: int | None = None) -> bool:
         if epoch is None:

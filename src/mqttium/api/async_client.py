@@ -605,9 +605,7 @@ class AsyncClient:
             )
         if not self._try_enqueue_outbound_many(items, epoch=self._connection_epoch):
             if nowait:
-                raise FlowControlError(
-                    self._write_pump.refusal(sum(item_size(item) for item in items))
-                )
+                raise FlowControlError(self._write_pump.refusal_many(items))
             return False
         for _ in requests:
             receipt._register(None)
@@ -1353,7 +1351,13 @@ class AsyncClient:
                 queued_messages=messages,
                 queued_bytes=bytes_used,
             ):
-                raise FlowControlError(self._write_pump.refusal(size))
+                raise FlowControlError(
+                    self._write_pump.refusal(
+                        size,
+                        queued_messages=messages,
+                        queued_bytes=bytes_used,
+                    )
+                )
             messages += 1
             bytes_used += size
 

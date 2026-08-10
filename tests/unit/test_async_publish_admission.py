@@ -273,3 +273,22 @@ async def test_flow_control_error_names_the_byte_bound() -> None:
     message = str(excinfo.value)
     assert "max_outbound_bytes=4096" in message
     assert "already queued" in message
+
+
+@pytest.mark.asyncio
+async def test_batch_refusal_names_the_bound_the_batch_actually_hit() -> None:
+    """publish_many admits against running totals, not the live queue.
+
+    With an empty writer, the message bound is only reached part-way through
+    the batch, so the error must not describe the byte bound it never hit.
+    """
+    client = AsyncClient(max_outbound_messages=3, max_outbound_bytes=64 * 1024 * 1024)
+    client._engine.state = ConnectionState.CONNECTED
+
+    requests = [PublishMessage("bound/batch", b"x", 0) for _ in range(8)]
+    with pytest.raises(PublishBatchError) as excinfo:
+        await client.publish_many(requests, nowait=True)
+
+    message = str(excinfo.value.cause)
+    assert "max_outbound_messages=3" in message
+    assert "max_outbound_bytes" not in message
