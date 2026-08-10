@@ -74,3 +74,44 @@ def test_publish_admission_encodes_properties_once(monkeypatch: pytest.MonkeyPat
     calls = 0
     engine.queue_publish("contract/topic", b"payload", qos=1)
     assert calls == 0, "an empty property table needs no encode"
+
+
+async def test_nowait_publish_encodes_properties_once(monkeypatch) -> None:
+    """Admission must not re-encode a property table queue_publish will encode."""
+    import mqttium.protocol.outbound as outbound_module
+    from mqttium.api import AsyncClient
+    from mqttium.enums import ConnectionState
+
+    original = outbound_module.encode_properties
+    calls = 0
+
+    def counting(properties: object, packet_type: object) -> bytes:
+        nonlocal calls
+        calls += 1
+        return original(properties, packet_type)
+
+    monkeypatch.setattr(outbound_module, "encode_properties", counting)
+
+    properties = Properties()
+    properties.add_user_property("source", "contract")
+    client = AsyncClient(protocol=MQTTProtocolVersion.MQTTv5, max_outbound_messages=64)
+    client._engine.state = ConnectionState.CONNECTED
+    client._engine.negotiated = replace(client._engine.negotiated, maximum_packet_size=1_000_000)
+
+    client.publish_nowait("contract/topic", b"payload", qos=1, properties=properties)
+
+    assert calls == 1
+
+
+async def test_nowait_admission_still_refuses_when_the_writer_is_loaded() -> None:
+    """Skipping the preview must only apply while the queue is genuinely empty."""
+    from mqttium.api import AsyncClient
+    from mqttium.enums import ConnectionState
+    from mqttium.errors import FlowControlError
+
+    client = AsyncClient(max_outbound_messages=10_000, max_outbound_bytes=2048)
+    client._engine.state = ConnectionState.CONNECTED
+
+    client.publish_nowait("contract/full", b"x" * 1800, qos=0)
+    with pytest.raises(FlowControlError):
+        client.publish_nowait("contract/full", b"x" * 1800, qos=0)

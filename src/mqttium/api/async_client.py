@@ -1334,6 +1334,12 @@ class AsyncClient:
         )
         if not will_send:
             return
+        # An empty writer queue admits a single item of any size, so its size
+        # cannot change the answer. Sizing it anyway measured the topic and, on
+        # MQTT 5 with properties, encoded the property table a second time --
+        # queue_publish encodes it again immediately afterwards.
+        if not self._write_pump.queued_messages and not self._write_pump.queued_bytes:
+            return
         size = self._preview_publish_size(topic, payload, level, properties)
         if not self._can_enqueue_outbound_size(size):
             raise FlowControlError(self._write_pump.refusal(size))
