@@ -9,10 +9,13 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 ### Changed
 
 - `PublishReceipt` no longer builds an `asyncio.Event` per QoS 1/2
-  publication. Completion is a flag, and the future behind `wait()` is created
-  only if something actually waits, so a publication that is never awaited
-  allocates no completion primitive at all. `wait()` and `is_done()` are
-  unchanged; the private `_event` field is replaced by `_future`/`_settled`.
+  publication. Completion is a flag, and the shared future behind `wait()` is
+  created only if something actually waits, so a publication that is never
+  awaited allocates no completion primitive at all. Waiters attach through
+  `asyncio.shield`, so cancelling one `wait()` cancels only that waiter and
+  leaves the receipt and any other waiter intact — the isolation a per-waiter
+  `Event` gave implicitly. `wait()` and `is_done()` are unchanged; the private
+  `_event` field is replaced by `_future`/`_settled`.
 - The Paho façade now installs its inner `on_publish` dispatcher only while
   the user has set `Client.on_publish`, instead of unconditionally at
   construction. Every façade user previously paid a callback-queue hop per

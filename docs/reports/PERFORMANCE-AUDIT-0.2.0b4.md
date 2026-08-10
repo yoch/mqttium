@@ -98,11 +98,24 @@ number there, it has none.
 5. **Every QoS 1/2 publication allocated an `asyncio.Event`.** `api/models.py:171-205`. Awaiting one
    costs two coroutine frames plus the future and waiter deque the event builds internally, and a
    publication that is never awaited — the entire point of `publish_nowait` — paid for the event and
-   used none of it. *Fixed:* completion is a flag and the future behind `wait()` is created on first
-   use. The future only ever carries `None`; failures stay in `_error` and are raised after it
+   used none of it. *Fixed:* completion is a flag and the shared future behind `wait()` is created on
+   first use. The future only ever carries `None`; failures stay in `_error` and are raised after it
    resolves, so a failed, never-awaited receipt cannot leave an unretrieved exception for asyncio's
    default handler to print — which matters because `src/` installs no logging. Pinned, along with a
    repeated settle that must not hit `InvalidStateError`.
+
+   **A regression this introduced, found in review and fixed.** An `asyncio.Event` gives every waiter
+   its own future, so cancelling one `wait()` isolates itself. A single shared future does not:
+   awaiting it directly meant a cancelled waiter cancelled *the shared future*, which took every
+   other waiter down with it and left the receipt permanently unresolvable — `_settle()` then found
+   the future already `done()` and skipped it. Reproduced, then fixed by attaching waiters through
+   `asyncio.shield`. The regression test fails without the shield. This is the isolation the `Event`
+   provided implicitly, and the cost of replacing a primitive with a cheaper one is having to
+   re-establish the guarantees it gave for free.
+
+   The shield does not give the gain back: an `Event` allocates a future *and* a waiter deque per
+   wait, so the shielded path still allocates less, and a never-awaited receipt still allocates
+   nothing at all.
 
 6. **`publish_nowait` sized packets the writer could not use.** `api/async_client.py:1328-1345`.
    Admission sized the packet to ask whether it fit, and `queue_publish` sized it again — on MQTT 5
@@ -181,14 +194,30 @@ number there, it has none.
 
 ## What CI measured
 
-The audit host produced nothing usable (below), but the PR's own `paired-regression` job did, with
-baseline coefficients of variation of 1–3% on most cells. Ratios are candidate over base, `4bdcdb3`
-against the change set, 11 rotated pairs per micro scenario and 8 ABBA pairs per network cell.
+The audit host produced nothing usable (below), but the PR's own `paired-regression` job did. Ratios
+are candidate over base, `4bdcdb3` against the change set, 11 rotated pairs per micro scenario and
+8 ABBA pairs per network cell.
+
+**Read this section against the commit it measured.** The figures below come from the run on
+`caa61bf`. Two later commits change what they describe: the corrected effect-pump arms, and the
+`asyncio.shield` in `PublishReceipt.wait()`, which is on the `--completions receipt` path the
+network cells exercise. They are superseded by the run on the final commit and are kept here only
+as the first usable measurement of the set.
 
 **End-to-end QoS 1 (`paired_network.py`), the workload this audit targets: better in every cell.**
-Publish-to-ack throughput ratios ran **+0.6% to +7.2%** across in-flight windows 1/8/32/64/128 on
-both MQTT 3.1.1 and MQTT 5, with p50 deltas mostly negative and no cell failing the harness gate.
-The cells at windows 1–32 carry the weight; 64 and 128 are directional, as the contract warns.
+Publish-to-ack throughput ratios ran **+0.6% to +7.3%** across in-flight windows 1/8/32/64/128 on
+both MQTT 3.1.1 and MQTT 5 — 20 cells out of 20 positive, base-arm CVs 0.9–5.4%.
+
+The **throughput** ratios are what this supports, and only those. Two qualifications the first
+version of this section omitted:
+
+- One cell (3.1.1, 4 KiB, window 128) has a base-arm CV of **5.4%**, above the 5% at which
+  `docs/BENCHMARKING.md` invalidates a cell. It is not evidence.
+- The **p50 deltas are only readable on the 64-byte cells**, where they run −0.004 to −0.078 ms.
+  On the 4 KiB cells they range from −14.4 ms to **+30.0 ms**, which is not an engine effect: it is
+  the pipeline-residence and runner variability the contract warns about for large payloads at
+  depth. An earlier revision cited "p50 deltas mostly negative" as supporting evidence across the
+  board. That was wrong and is withdrawn; the large-payload latency cells say nothing either way.
 
 **Micro scenarios: two clear gains, the rest neutral, and one regression that is mine.**
 
