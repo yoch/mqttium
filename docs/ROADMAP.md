@@ -22,7 +22,7 @@ Automation is implemented in `.github/workflows/finalization.yml`; successful
 workflow definitions are not counted as evidence until their run artefacts are
 retained and reviewed. Extended macOS and multi-broker campaigns are launched
 manually. See [`STABILITY.md`](STABILITY.md) and the retained
-[2026-08-05 campaign record](STABLE-RELEASE-EVIDENCE-2026-08-05.md).
+[2026-08-05 campaign record](reports/STABLE-RELEASE-EVIDENCE-2026-08-05.md).
 
 - [x] Retain successful reconnect, session and backpressure soak runs on Linux
       and macOS for MQTT 3.1.1 and MQTT 5.
@@ -35,7 +35,7 @@ manually. See [`STABILITY.md`](STABILITY.md) and the retained
 
 ## Remaining memory and performance work
 
-Carried over from [`MEMORY-PROFILE-FOLLOW-UP.md`](MEMORY-PROFILE-FOLLOW-UP.md),
+Carried over from [`reports/MEMORY-PROFILE-FOLLOW-UP.md`](reports/MEMORY-PROFILE-FOLLOW-UP.md),
 which records what already shipped.
 
 - [x] Bound each ingress batch by bytes as well as the 256-packet count.
@@ -47,13 +47,13 @@ which records what already shipped.
 - [x] Profile specialised in-buffer PUBLISH decoding after ingress batching.
       It did not reduce the remaining two-payload peak after the simple body-copy
       correction and is therefore not shipped; see
-      [`PUBLISH-DECODE-PROFILE.md`](PUBLISH-DECODE-PROFILE.md).
+      [`reports/PUBLISH-DECODE-PROFILE.md`](reports/PUBLISH-DECODE-PROFILE.md).
 - [x] Full QoS 2 phase-two compaction (release topic, payload and properties,
       not only the encoded frame).
 - [x] Benchmark the QoS 1 / pre-PUBREC frame policy. Contiguous frames are
       re-encoded instead of retained; segmented frames retain their shared
       payload and patch only the DUP header. See
-      [`QOS1-FRAME-POLICY.md`](QOS1-FRAME-POLICY.md).
+      [`reports/QOS1-FRAME-POLICY.md`](reports/QOS1-FRAME-POLICY.md).
 - [x] Add memory-benchmark scenarios for property-heavy outbound, immediate
       refusal, cancellation around commit, Paho saturation, shared delivery,
       WebSocket batching and reconnect/epoch cleanup, with exact workload
@@ -67,7 +67,7 @@ which records what already shipped.
 - [ ] Concrete enhanced-authentication plugins such as SCRAM where broker demand
       justifies them.
 - [ ] Additional Paho compatibility surface only when backed by behavioural tests.
-- [ ] Long-running fuzz campaigns and corpus retention outside normal pull-request CI.
+- [x] Long-running fuzz campaigns and corpus retention outside normal pull-request CI.
 
 ## Permanent quality gates
 

@@ -10,9 +10,11 @@ import pytest
 import mqttium.compat.paho as paho_compat
 import mqttium.protocol.outbound as outbound_module
 from mqttium.api import AsyncClient
+from mqttium.api.models import PublishMessage
 from mqttium.codec.buffer import IncrementalDecoder
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, PacketType, QoS
 from mqttium.packets import PublishPacket
+from mqttium.protocol.effects import EffectKind, EngineEffect
 from mqttium.types import Properties
 
 
@@ -93,6 +95,124 @@ def test_disconnect_metadata_boundary_is_private() -> None:
     assert hasattr(AsyncClient, "_last_disconnect_info")
 
 
+def _forbid_direct_path(client: AsyncClient, monkeypatch) -> None:
+    """Make any entry into the direct QoS 0 path an explicit failure."""
+
+    def direct_path_forbidden(*_args, **_kwargs):
+        raise AssertionError("the direct QoS 0 path must stay disabled here")
+
+    monkeypatch.setattr(type(client._engine.outbound), "prepare_qos0", direct_path_forbidden)
+
+
+async def test_await_publish_qos0_uses_the_direct_path() -> None:
+    client = AsyncClient(max_outbound_messages=8)
+    client._engine.state = ConnectionState.CONNECTED
+
+    receipt = await client.publish("native/await-qos0", b"x", qos=0)
+
+    assert receipt.mid is None
+    assert client._effect_pump.batches == 0
+    assert client._effect_pump.enqueued == 0
+    assert not client._engine.has_pending_effects
+    assert isinstance(client._outbound.get_nowait(), bytes)
+
+
+async def test_await_publish_qos0_keeps_the_effect_path_under_on_publish(monkeypatch) -> None:
+    client = AsyncClient(max_outbound_messages=8)
+    client._engine.state = ConnectionState.CONNECTED
+    client.on_publish = lambda _mid, _error: None
+    _forbid_direct_path(client, monkeypatch)
+
+    await client.publish("native/await-qos0", b"x", qos=0)
+
+    assert client._effect_pump.batches > 0
+    await client._shutdown_callback_worker(drain=False)
+
+
+async def test_publish_many_qos0_uses_the_direct_path() -> None:
+    client = AsyncClient(max_outbound_messages=8)
+    client._engine.state = ConnectionState.CONNECTED
+
+    receipt = await client.publish_many(
+        [PublishMessage("native/batch", b"a", 0), PublishMessage("native/batch", b"b", 0)]
+    )
+
+    assert receipt.submitted == 2
+    assert receipt.completed == 2
+    assert client._effect_pump.batches == 0
+    assert not client._engine.has_pending_effects
+    assert isinstance(client._outbound.get_nowait(), bytes)
+    assert isinstance(client._outbound.get_nowait(), bytes)
+
+
+async def test_publish_many_keeps_the_effect_path_under_on_publish(monkeypatch) -> None:
+    client = AsyncClient(max_outbound_messages=8)
+    client._engine.state = ConnectionState.CONNECTED
+    client.on_publish = lambda _mid, _error: None
+    _forbid_direct_path(client, monkeypatch)
+
+    await client.publish_many([PublishMessage("native/batch", b"a", 0)])
+
+    assert client._effect_pump.batches > 0
+    await client._shutdown_callback_worker(drain=False)
+
+
+async def test_publish_many_mixed_qos_keeps_the_effect_path(monkeypatch) -> None:
+    """One non-QoS-0 request disqualifies the whole batch."""
+    client = AsyncClient(max_outbound_messages=8)
+    client._engine.state = ConnectionState.CONNECTED
+    _forbid_direct_path(client, monkeypatch)
+
+    receipt = await client.publish_many(
+        [PublishMessage("native/batch", b"a", 0), PublishMessage("native/batch", b"b", 1)]
+    )
+
+    assert receipt.submitted == 2
+    assert client._effect_pump.batches > 0
+
+
+async def test_direct_path_is_gated_on_drained_effect_queues() -> None:
+    """Both pending-effect gates must independently disable the direct path."""
+    client = AsyncClient(max_outbound_messages=8)
+    client._engine.state = ConnectionState.CONNECTED
+
+    assert client._direct_qos0_ready() is True
+
+    client._engine._emit(EffectKind.SUBACK, None)
+    assert client._engine.has_pending_effects
+    assert client._direct_qos0_ready() is False
+
+    client._engine.take_effects()
+    assert client._direct_qos0_ready() is True
+
+    client._effect_pump.pending.append(EngineEffect(kind=EffectKind.SUBACK, data=None))
+    assert client._direct_qos0_ready() is False
+
+    client._effect_pump.pending.clear()
+    assert client._direct_qos0_ready() is True
+
+
+async def test_direct_path_returns_when_on_publish_is_cleared() -> None:
+    """Installing a callback disables the fast path; clearing it restores it."""
+    client = AsyncClient(max_outbound_messages=32)
+    client._engine.state = ConnectionState.CONNECTED
+
+    client.on_publish = lambda _mid, _error: None
+    assert client._direct_qos0_ready() is False
+    client.publish_nowait("native/gate", b"x", qos=0)
+    assert client._effect_pump.enqueued > 0
+
+    await client._drain_effects()
+    await client._callback_queue.join()
+    await client._shutdown_callback_worker(drain=False)
+
+    client.on_publish = None
+    assert client._direct_qos0_ready() is True
+    before = client._effect_pump.enqueued
+    client.publish_nowait("native/gate", b"x", qos=0)
+    assert client._effect_pump.enqueued == before
+
+
 async def test_publish_nowait_direct_path_encodes_mqtt5_properties(monkeypatch) -> None:
     properties = Properties()
     properties.set("content_type", "application/json")
@@ -132,3 +252,45 @@ async def test_publish_nowait_direct_path_encodes_mqtt5_properties(monkeypatch) 
     assert packet.topic == "native/mqtt5"
     assert packet.payload == b'{"value": 42}'
     assert packet.properties == properties
+
+
+@pytest.mark.parametrize("qos", [3, -1, 99])
+async def test_invalid_qos_still_raises_value_error(qos: int) -> None:
+    """Comparing before converting must not swallow an invalid level."""
+    client = AsyncClient(max_outbound_messages=8)
+    client._engine.state = ConnectionState.CONNECTED
+
+    with pytest.raises(ValueError):
+        await client.publish("native/invalid", b"x", qos=qos)
+    with pytest.raises(ValueError):
+        client.publish_nowait("native/invalid", b"x", qos=qos)
+
+
+async def test_qos1_rejection_constructs_no_qos_enum(monkeypatch) -> None:
+    """QoS 1/2 publishes reach the direct-path gate and must not pay for it."""
+    client = AsyncClient(max_outbound_messages=8)
+    client._engine.state = ConnectionState.CONNECTED
+
+    calls = 0
+    original_new = QoS.__new__
+
+    def counted_new(cls, value):
+        nonlocal calls
+        calls += 1
+        return original_new(cls, value)
+
+    monkeypatch.setattr(QoS, "__new__", counted_new)
+    client._try_direct_qos0_publish(
+        "native/qos1", b"x", qos=1, retain=False, properties=None, nowait=True
+    )
+
+    assert calls == 0
+
+
+async def test_int_and_enum_qos0_both_take_the_direct_path() -> None:
+    for level in (0, QoS.AT_MOST_ONCE):
+        client = AsyncClient(max_outbound_messages=8)
+        client._engine.state = ConnectionState.CONNECTED
+        receipt = client.publish_nowait("native/qos0", b"x", qos=level)
+        assert receipt.mid is None
+        assert client._effect_pump.enqueued == 0

@@ -28,10 +28,16 @@ def encode_publish_item(
 ) -> WriteItem:
     """Validate and encode one outbound PUBLISH exactly once."""
 
-    try:
-        level = QoS(qos)
-    except ValueError as exc:
-        raise ProtocolError(f"Invalid PUBLISH QoS {qos!r}") from exc
+    # Every internal caller has already validated and converted, so the common
+    # case is an exact QoS member. Re-running the enum call on it costs about
+    # 0.32 us -- roughly 4% of a QoS 0 publication -- to return its argument.
+    if type(qos) is QoS:
+        level = qos
+    else:
+        try:
+            level = QoS(qos)
+        except ValueError as exc:
+            raise ProtocolError(f"Invalid PUBLISH QoS {qos!r}") from exc
     if level and mid is None:
         raise ProtocolError("QoS > 0 PUBLISH requires a packet identifier")
     if level == QoS.AT_MOST_ONCE and mid is not None:

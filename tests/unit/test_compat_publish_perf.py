@@ -91,9 +91,7 @@ def test_qos0_effect_completion_follows_send() -> None:
 
 def test_publish_receipts_remain_fifo_across_multiple_mid_reuses() -> None:
     client = AsyncClient()
-    receipts = [
-        PublishReceipt(mid=7, qos=QoS.AT_LEAST_ONCE, _event=asyncio.Event()) for _ in range(3)
-    ]
+    receipts = [PublishReceipt(mid=7, qos=QoS.AT_LEAST_ONCE) for _ in range(3)]
 
     for receipt in receipts:
         client._register_publish_receipt(7, receipt)
@@ -107,7 +105,7 @@ async def test_old_completion_cannot_settle_reused_mid() -> None:
     client = AsyncClient()
     client.on_publish = lambda *_args: None
     mid = 7
-    old_receipt = PublishReceipt(mid=mid, qos=QoS.AT_LEAST_ONCE, _event=asyncio.Event())
+    old_receipt = PublishReceipt(mid=mid, qos=QoS.AT_LEAST_ONCE)
     old_batch = PublishBatchReceipt()
     old_batch._register(mid)
     client._register_publish_receipt(mid, old_receipt)
@@ -118,7 +116,7 @@ async def test_old_completion_cannot_settle_reused_mid() -> None:
     assert client._pending_effects
     effect = client._pending_effects.popleft()
 
-    new_receipt = PublishReceipt(mid=mid, qos=QoS.AT_LEAST_ONCE, _event=asyncio.Event())
+    new_receipt = PublishReceipt(mid=mid, qos=QoS.AT_LEAST_ONCE)
     new_batch = PublishBatchReceipt()
     new_batch._register(mid)
     client._register_publish_receipt(mid, new_receipt)
@@ -139,7 +137,7 @@ async def test_old_failure_cannot_fail_reused_mid() -> None:
     client = AsyncClient()
     client.on_publish = lambda *_args: None
     mid = 9
-    old_receipt = PublishReceipt(mid=mid, qos=QoS.AT_LEAST_ONCE, _event=asyncio.Event())
+    old_receipt = PublishReceipt(mid=mid, qos=QoS.AT_LEAST_ONCE)
     client._register_publish_receipt(mid, old_receipt)
     failure = ProtocolError("old publish failed")
     client._engine._emit(
@@ -150,7 +148,7 @@ async def test_old_failure_cannot_fail_reused_mid() -> None:
     assert not old_receipt.is_done()
     effect = client._pending_effects.popleft()
 
-    new_receipt = PublishReceipt(mid=mid, qos=QoS.AT_LEAST_ONCE, _event=asyncio.Event())
+    new_receipt = PublishReceipt(mid=mid, qos=QoS.AT_LEAST_ONCE)
     client._register_publish_receipt(mid, new_receipt)
     await client._apply_effect(effect, nowait=False)
     await client._callback_queue.join()
@@ -648,3 +646,63 @@ def test_loop_stop_fails_queued_qos1_publish(monkeypatch: pytest.MonkeyPatch) ->
         release.set()
         if client._thread is not None:
             client.loop_stop()
+
+
+@pytest.mark.asyncio
+async def test_batch_receipt_settles_fifo_across_three_registrations() -> None:
+    """Reusing one mid must settle its batch receipts in submission order."""
+    client = AsyncClient()
+    mid = 21
+    batches = [PublishBatchReceipt() for _ in range(3)]
+    for batch in batches:
+        batch._register(mid)
+        client._register_batch_receipt(mid, batch)
+
+    for index, batch in enumerate(batches):
+        assert client._pop_batch_receipt(mid) is batch
+        remaining = batches[index + 1 :]
+        assert all(other.pending_count == 1 for other in remaining)
+
+    assert client._pop_batch_receipt(mid) is None
+    assert mid not in client._batch_receipts
+
+
+@pytest.mark.asyncio
+async def test_batch_and_plain_receipts_share_a_reused_mid() -> None:
+    client = AsyncClient()
+    mid = 22
+    batch = PublishBatchReceipt()
+    batch._register(mid)
+    client._register_batch_receipt(mid, batch)
+    receipt = PublishReceipt(mid=mid, qos=QoS.AT_LEAST_ONCE)
+    client._register_publish_receipt(mid, receipt)
+
+    client._settle_publish(mid, None)
+
+    assert receipt.is_done()
+    assert batch.pending_count == 0
+    assert not client._batch_receipts
+    assert not client._receipts
+
+
+@pytest.mark.asyncio
+async def test_settling_skips_the_batch_table_when_no_batch_is_outstanding() -> None:
+    """A client that never calls publish_many must not hash acked mids twice."""
+    client = AsyncClient()
+    mid = 23
+    receipt = PublishReceipt(mid=mid, qos=QoS.AT_LEAST_ONCE)
+    client._register_publish_receipt(mid, receipt)
+
+    lookups = 0
+    original = type(client)._pop_batch_receipt
+
+    def counted(self, value):
+        nonlocal lookups
+        lookups += 1
+        return original(self, value)
+
+    client._pop_batch_receipt = counted.__get__(client)  # type: ignore[method-assign]
+    client._settle_publish(mid, None)
+
+    assert receipt.is_done()
+    assert lookups == 0

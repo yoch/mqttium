@@ -6,7 +6,7 @@ It combines a synchronous protocol engine with an `asyncio` API, bounded
 backpressure, durable inflight persistence, explicit delivery receipts, and
 complete MQTT QoS state machines.
 
-> **Status:** beta (`0.2.0b3`). The native Stable API tier follows the documented
+> **Status:** beta (`0.2.0b4`). The native Stable API tier follows the documented
 > compatibility policy; Provisional extension surfaces may still evolve before
 > the first stable release.
 
@@ -147,7 +147,10 @@ quota violation with reason `0x97`; MQTT 3.1.1 closes the connection.
 The writer also has an independent `max_outbound_bytes=1 MiB` default.
 `publish_nowait()` refuses immediately when that wire queue is full, so callers
 publishing large payloads should size this byte limit explicitly rather than
-assuming `max_outbound_messages` is the only binding constraint.
+assuming `max_outbound_messages` is the only binding constraint. The two
+defaults imply about 105 bytes per queued message, so the byte bound is the one
+that binds first as payloads grow: 1 MiB admits roughly 16 outstanding 64 KiB
+publications, not 10 000. `FlowControlError` names whichever bound refused.
 
 Native QoS 0 uses its direct writer fast path only while `on_publish is None`.
 Installing that callback deliberately routes publications through the standard
@@ -196,17 +199,25 @@ acceptance criteria are documented in [`docs/STABILITY.md`](docs/STABILITY.md).
 
 ## Documentation
 
+[`docs/README.md`](docs/README.md) indexes everything. The documents most
+readers want first:
+
 - [`docs/DESIGN.md`](docs/DESIGN.md) — architecture and invariants
 - [`docs/API-STABILITY.md`](docs/API-STABILITY.md) — public API policy and deprecations
-- [`docs/STABILITY.md`](docs/STABILITY.md) — soak and interoperability campaign
-- [`docs/RELEASING.md`](docs/RELEASING.md) — rehearsal, publication and failure handling
 - [`docs/IMPLEMENTATION-GUIDE.md`](docs/IMPLEMENTATION-GUIDE.md) — protocol contracts
 - [`docs/COMPAT.md`](docs/COMPAT.md) — Paho compatibility surface
 - [`docs/MIGRATION.md`](docs/MIGRATION.md) — migration guidance
+- [`docs/BETA-REPORTING.md`](docs/BETA-REPORTING.md) — reporting a beta issue
+- [`docs/STABILITY.md`](docs/STABILITY.md) — soak and interoperability campaign
 - [`docs/BENCHMARKING.md`](docs/BENCHMARKING.md) — benchmark validity contract
 - [`docs/FUZZING.md`](docs/FUZZING.md) — fuzzing strategy
+- [`docs/RELEASING.md`](docs/RELEASING.md) — rehearsal, publication and failure handling
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) — remaining stable-release work
 - [`PROVENANCE.md`](PROVENANCE.md) — source history and licensing review
+
+[`docs/reports/`](docs/reports/README.md) holds the dated measurements and
+audits behind those choices. They are historical records, not descriptions of
+current behaviour.
 
 ## Contributing and security
 

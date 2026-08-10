@@ -7,7 +7,7 @@ import pytest
 from mqttium.codec.buffer import _VIEW_COPY_THRESHOLD, IncrementalDecoder
 from mqttium.codec.vbi import decode_vbi, encode_vbi, vbi_len
 from mqttium.enums import PacketType, QoS
-from mqttium.errors import MalformedPacketError, PacketTooLargeError
+from mqttium.errors import MalformedPacketError, PacketTooLargeError, ProtocolError
 from mqttium.packets import PublishPacket, encode_frame
 
 
@@ -199,3 +199,142 @@ def test_a_large_body_is_not_aliased_to_the_reusable_buffer() -> None:
     decoder.feed(wire)
     decoder.next_packet()
     assert raw.remaining == snapshot
+
+
+def test_validate_utf8_rejects_exactly_what_encode_utf8_rejects() -> None:
+    """The validator exists to skip the encode, not to change the rules."""
+    from mqttium.codec.primitives import encode_utf8, validate_utf8
+
+    cases = [
+        "sensors/t",
+        "a",
+        "",
+        "é",
+        "温度/センサー",
+        "🎉/emoji",
+        "mixed/é/x",
+        "x" * 65535,
+        "x" * 65536,
+        "é" * 32767,
+        "é" * 32768,
+        "a\x00b",
+        "\x00",
+        "﻿",
+        "a﻿b",
+        "\ud800",
+        "a\ud800b",
+        b"bytes",
+        None,
+        42,
+    ]
+
+    def outcome(fn, value):
+        try:
+            fn(value)
+        except ProtocolError:
+            return "reject"
+        return "accept"
+
+    for case in cases:
+        assert outcome(encode_utf8, case) == outcome(validate_utf8, case), repr(case)[:40]
+
+
+def test_validate_utf8_bounds_length_in_bytes_not_characters() -> None:
+    """The MQTT limit is 65535 bytes; skipping the encode must not lose that."""
+    from mqttium.codec.primitives import validate_utf8
+
+    validate_utf8("é" * 32767)  # 65534 bytes
+    with pytest.raises(ProtocolError, match="too long"):
+        validate_utf8("é" * 32768)  # 65536 bytes, only 32768 characters
+
+    validate_utf8("x" * 65535)
+    with pytest.raises(ProtocolError, match="too long"):
+        validate_utf8("x" * 65536)
+
+
+def test_validate_utf8_does_not_encode_an_ascii_string(monkeypatch) -> None:
+    """The whole point: an ASCII topic is validated without producing bytes."""
+    from mqttium.codec import primitives
+
+    encoded: list[str] = []
+    original = str.encode
+
+    class Tracking(str):
+        def encode(self, *args, **kwargs):  # type: ignore[override]
+            encoded.append(str(self))
+            return original(self, *args, **kwargs)
+
+    primitives.validate_utf8(Tracking("sensors/temperature/room-12"))
+    assert encoded == [], "an ASCII topic must be validated without producing bytes"
+
+    # A non-ASCII string is encoded: once to reject surrogates, once to measure
+    # its byte length. Both are C-level and that branch is an order of
+    # magnitude cheaper than the character loop it replaced, so the count is
+    # not what this pins -- only that ASCII pays neither.
+    primitives.validate_utf8(Tracking("capteurs/température"))
+    assert encoded
+
+
+@pytest.mark.parametrize(
+    ("text", "rule"),
+    [
+        ("capteurs/\x00/x", "1.5.4-2"),
+        ("capteurs/﻿/x", "1.5.4-3"),
+        ("capteurs/\ud800/x", "1.5.4-1"),
+        ("\udfff", "1.5.4-1"),
+        ("ascii\x00", "1.5.4-2"),
+    ],
+)
+def test_mqtt_utf8_rules_are_reported_individually(text: str, rule: str) -> None:
+    """Each rule is cited by name, whichever entry point rejects the string.
+
+    Both entry points are checked because the surrogate rule is answered by the
+    conversion itself rather than by the shared scan, so the guarantee has to be
+    pinned where callers actually meet it.
+    """
+    from mqttium.codec.primitives import encode_utf8, validate_utf8
+
+    for entry in (encode_utf8, validate_utf8):
+        with pytest.raises(ProtocolError, match=rule):
+            entry(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["capteurs/température", "温度センサー/建物A", "🎉/party/🎊", "plain/ascii", "", "é" * 300],
+)
+def test_valid_mqtt_utf8_is_accepted(text: str) -> None:
+    from mqttium.codec.primitives import encode_utf8, validate_utf8
+
+    validate_utf8(text)
+    encode_utf8(text)
+
+
+def test_surrogate_detection_covers_the_whole_reserved_range() -> None:
+    """Strict UTF-8 refuses exactly D800-DFFF, which is what the loop tested."""
+    from mqttium.codec.primitives import encode_utf8, validate_utf8
+
+    for code in (0xD800, 0xDBFF, 0xDC00, 0xDFFF):
+        for entry in (encode_utf8, validate_utf8):
+            with pytest.raises(ProtocolError, match="1.5.4-1"):
+                entry("ok/" + chr(code))
+    # the code points immediately outside the range stay valid
+    for code in (0xD7FF, 0xE000):
+        validate_utf8("ok/" + chr(code))
+        encode_utf8("ok/" + chr(code))
+
+
+def test_a_strict_decode_cannot_produce_a_surrogate() -> None:
+    """Why the inbound path needs no surrogate test of its own.
+
+    Surrogates encode to exactly three bytes, so covering every three-byte
+    sequence covers the rule completely.
+    """
+    for first in (0xED,):  # the only lead byte that could reach D800-DFFF
+        for second in range(0x100):
+            for third in range(0x100):
+                try:
+                    text = bytes((first, second, third)).decode("utf-8")
+                except UnicodeDecodeError:
+                    continue
+                assert not any(0xD800 <= ord(c) <= 0xDFFF for c in text)

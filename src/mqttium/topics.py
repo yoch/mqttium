@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from mqttium.codec.primitives import encode_utf8
+from mqttium.codec.primitives import validate_utf8
 from mqttium.errors import MalformedPacketError, ProtocolError
 
 
@@ -80,6 +80,6 @@ def _validate_filter_levels(topic_filter: str) -> None:
 
 def _check_utf8_mqtt_topic(topic: str) -> None:
     try:
-        encode_utf8(topic)
+        validate_utf8(topic)
     except ProtocolError as exc:
         raise ProtocolError(f"Invalid MQTT topic: {exc}") from exc

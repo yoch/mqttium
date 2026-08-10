@@ -7,7 +7,7 @@ given a numeric regression guard where measurement is meaningful.
 
 Measurements live in [`MEMORY-BASELINE.md`](MEMORY-BASELINE.md) (before) and
 [`MEMORY-RESULTS.md`](MEMORY-RESULTS.md) (after); the harness contract is in
-[`MEMORY-BENCHMARK.md`](MEMORY-BENCHMARK.md).
+[`MEMORY-BENCHMARK.md`](../MEMORY-BENCHMARK.md).
 
 ## Audit model
 
@@ -45,7 +45,7 @@ from 50.62 MiB to 4.51 MiB traced peak. Deliberately unbounded scenarios are
 essentially unchanged, and publish throughput was preserved.
 
 Two defects in this work were found and fixed afterwards, both in paths no test
-exercised — see the `Fixed` section of [`../CHANGELOG.md`](../CHANGELOG.md):
+exercised — see the `Fixed` section of [`CHANGELOG.md`](../../CHANGELOG.md):
 the `publish_many` rollback leaked the byte budget on a transactional store, and
 a producer parked on admission capacity was never woken when the connection was
 lost for good.
