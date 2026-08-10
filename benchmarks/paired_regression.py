@@ -399,13 +399,19 @@ def _worker(args: argparse.Namespace) -> None:  # noqa: C901
         client._engine.state = ConnectionState.CONNECTED
         reordered = scenario == "effect_batch_reordered"
 
+        # Careful with the shapes: the pump reorders when it sees a SEND after
+        # a non-SEND, so an interleaved [SEND, COMPLETE, SEND, ...] batch is
+        # *also* reordered. The ordered arm therefore emits every SEND first,
+        # which is what an already-ordered batch looks like.
         def run_effect_order() -> None:
-            for _ in range(4):
-                if reordered:
+            if reordered:
+                for _ in range(4):
                     client._engine._emit(EffectKind.PUBLISH_COMPLETE, None)
                     client._engine._emit(EffectKind.SEND, b"x")
-                else:
+            else:
+                for _ in range(4):
                     client._engine._emit(EffectKind.SEND, b"x")
+                for _ in range(4):
                     client._engine._emit(EffectKind.PUBLISH_COMPLETE, None)
             client._collect_effects_locked()
             client._effect_pump.pending.clear()

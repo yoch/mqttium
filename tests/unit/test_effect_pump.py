@@ -125,3 +125,22 @@ def test_no_send_batch_is_not_counted_as_reordered() -> None:
 
     assert _collect(client, kinds) == kinds
     assert client._effect_pump.reordered_batches == 0
+
+
+def test_paired_benchmark_scenarios_exercise_the_branch_they_name() -> None:
+    """A benchmark arm that measures the wrong branch is worse than none.
+
+    The pump reorders as soon as a SEND follows a non-SEND, so an interleaved
+    batch is reordered too. This pins each named arm to the branch it claims.
+    """
+    ordered = [EffectKind.SEND] * 4 + [EffectKind.PUBLISH_COMPLETE] * 4
+    reordered = [EffectKind.PUBLISH_COMPLETE, EffectKind.SEND] * 4
+
+    client = AsyncClient(client_id="effect-scenario-ordered")
+    assert _collect(client, ordered) == ordered
+    assert client._effect_pump.multi_effect_batches == 1
+    assert client._effect_pump.reordered_batches == 0, "the ordered arm must not reorder"
+
+    other = AsyncClient(client_id="effect-scenario-reordered")
+    _collect(other, reordered)
+    assert other._effect_pump.reordered_batches == 1, "the reordered arm must reorder"

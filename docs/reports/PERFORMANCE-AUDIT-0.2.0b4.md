@@ -13,7 +13,7 @@ it was to remove avoidable per-message work and design errors while the beta sta
 - Base commit: `4bdcdb3` (`main`, after `v0.2.0b3`).
 - Date: 2026-08-10.
 - Verified on CPython 3.12.13, Linux 6.8.0-136-lowlatency, glibc 2.39.
-- Unit suite 656 passed; `tests/integration` 8 passed against Mosquitto on `127.0.0.1:11883`;
+- Unit suite 658 passed; `tests/integration` 8 passed against Mosquitto on `127.0.0.1:11883`;
   `tests/fuzz/fuzz.py --seed 1 --iterations 20000` clean on codec, engine and websocket targets;
   Hypothesis fuzz 4 passed; Ruff, mypy and Bandit clean.
 - `benchmarks/memory_profile.py` followed by `check_memory_thresholds.py`: every scenario within
@@ -62,8 +62,8 @@ ratio measured within one campaign, which is what this is.
 
 ## Findings and what was done
 
-Each finding names the mechanism, not an estimate. Magnitudes are deliberately absent where this
-cycle could not measure them — see "What this cycle could not measure".
+Each finding names the mechanism. Measured ratios are in "What CI measured"; where a finding has no
+number there, it has none.
 
 1. **The reader confirmed an empty buffer by decoding it again.**
    `api/async_client.py:1215-1233`. `process_packets_bounded` stops early only when
@@ -93,7 +93,7 @@ cycle could not measure them — see "What this cycle could not measure".
    non-`SEND`. A batch that does need reordering now pays a few extra comparisons before the same
    partition. `benchmarks/paired_regression.py` gains `effect_batch_ordered` and
    `effect_batch_reordered`; the existing `effect_batch_inline` is all-`SEND` and reaches neither
-   arm.
+   arm. **This is the one finding CI does not support**: see "What CI measured".
 
 5. **Every QoS 1/2 publication allocated an `asyncio.Event`.** `api/models.py:171-205`. Awaiting one
    costs two coroutine frames plus the future and waiter deque the event builds internally, and a
@@ -179,10 +179,44 @@ cycle could not measure them — see "What this cycle could not measure".
   inbound windows and nothing explains the split. Documenting it is right; aligning a default before
   a beta tag is not.
 
+## What CI measured
+
+The audit host produced nothing usable (below), but the PR's own `paired-regression` job did, with
+baseline coefficients of variation of 1–3% on most cells. Ratios are candidate over base, `4bdcdb3`
+against the change set, 11 rotated pairs per micro scenario and 8 ABBA pairs per network cell.
+
+**End-to-end QoS 1 (`paired_network.py`), the workload this audit targets: better in every cell.**
+Publish-to-ack throughput ratios ran **+0.6% to +7.2%** across in-flight windows 1/8/32/64/128 on
+both MQTT 3.1.1 and MQTT 5, with p50 deltas mostly negative and no cell failing the harness gate.
+The cells at windows 1–32 carry the weight; 64 and 128 are directional, as the contract warns.
+
+**Micro scenarios: two clear gains, the rest neutral, and one regression that is mine.**
+
+| Scenario | Ratio | Base CV | Reading |
+| --- | ---: | ---: | --- |
+| `compat_publish_qos0_batch` | **1.241** | 1.0% | The façade callback fix. Every pair positive. |
+| `native_publish_nowait_qos0` | **1.081** | 4.0% | Every pair positive. |
+| `async_publish_nowait_qos0` | **1.068** | 2.0% | Every pair positive. |
+| `effect_batch_ordered` / `effect_batch_reordered` | **0.979 / 0.980** | 1.1% / 1.2% | See below. |
+| `qos1_cycle_memory` / `qos1_cycle_sqlite` | 0.982 / 0.985 | 3.2% / 0.9% | Small, tight on the SQLite arm. |
+| `compat_publish_qos1` | 0.948 | **12.2%** | Baseline too noisy to interpret; no claim. |
+
+**The effect-pump arms measured the wrong branch.** Both scenarios as first written were
+`[SEND, COMPLETE, …]` interleavings, and the pump reorders as soon as a SEND follows a non-SEND — so
+*both* arms exercised the reordered path, and the ordered path that finding 4 was written to improve
+was never measured. The −2% is therefore the reordered path's extra detection scan, measured twice
+under two names, and it is real. The arms are corrected here, with a unit test pinning each to the
+branch it names, and the ordered arm's number is owed.
+
+Finding 4 stands for now on the aggregate rather than on its own microbenchmark: every pipelined
+PUBACK batch takes the reordered path, and the end-to-end QoS 1 numbers are positive at every window
+regardless. If the corrected ordered arm does not repay that ~2%, the change should be reverted
+rather than defended — it was justified by an allocation argument, and an allocation argument that
+does not show up in a measurement is not worth 2%.
+
 ## What this cycle could not measure
 
-The paired harnesses were run on the audit host and **produced no usable evidence**, so no throughput
-or latency claim is made for any change above.
+The paired harnesses were **also** run on the audit host, where they produced no usable evidence.
 
 - `benchmarks/paired_regression.py --repeat 9` on `compat_publish_qos1` returned a base-arm
   coefficient of variation of **18.3%**, with the *same* code measuring between 6 249 and 13 171
@@ -190,11 +224,9 @@ or latency claim is made for any change above.
   effect scenarios was equally unstable (base 105k–186k ops/s). The host was not idle: the audit
   itself was running on it. Per the validity contract this is reported as `N/A` rather than as a
   manufactured comparison.
-- Consequently the changes above are justified by **removed work that is visible in the code and
-  pinned by tests** — a decode call, a lock acquisition, a dict lookup, an enum construction, two
-  list allocations, an event, a duplicate property encode, a callback hop, a dict reallocation —
-  and not by a measured percentage. Confirming their size needs the dedicated runner with
-  `runner_probe.py --enforce`, or CI's paired jobs.
+- Local runs are therefore not the basis for anything here; the CI ratios above are. A dedicated
+  runner with `runner_probe.py --enforce` would still be worth having, because CI cannot speak to
+  absolute latency.
 - **Absolute latency remains unconfirmable in CI.** Hosted runners present no `performance`
   governor, so the record's 1.17 ms and 2.99 ms p50 figures can be neither reproduced nor refuted
   there; only same-runner *ratios* survive.
