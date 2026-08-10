@@ -24,6 +24,13 @@ superseded by the 2026-08-10 performance audit, which gives a verdict on each of
 cross-client rankings are not restated anywhere as current: they were produced by an external
 harness on a pinned host and have not been reproduced in this repository.
 
+Read the audit's verdict table before quoting the record. One of its conclusions — that the
+`on_publish is None` inline settle "does not pay off under load" — **is known to be wrong**: the
+experiment behind it varied the benchmark adapter's completion discipline at the same time, so it
+cannot attribute anything to that branch, and its author agrees. The record is left as written
+because a report states what was believed on its date; the correction lives in the audit. Its QoS 1
+latency measurement, by contrast, is unverified here rather than unsupported.
+
 ## Memory campaign
 
 Four documents from one audit: methodology lives in the

@@ -28,13 +28,37 @@ produced them.
 | --- | --- |
 | Fastest client measured at QoS 0, in both identities | **Still true of the code.** The direct writer path is unchanged at `api/async_client.py:548-585`. |
 | The QoS 0 lead is silently conditional on `on_publish is None` | **Still true, now pinned.** PR #64 covered `publish_nowait` only; the async `publish()` entry, `publish_many`, both pending-effect gates and re-enabling after the callback is cleared are pinned here. |
-| QoS 1 costs ÷2.74 against QoS 0, and 2.95× gmqtt's PUBACK p50 | **Never verified in this repository.** Issue #39's same-runner RTT figures put MQTTium at roughly 90% of gmqtt, which does not support a 3× framing, and #39 already withdrew cross-machine absolutes as evidence. Treat the in-repo number as authoritative until the external native-async harness is available. |
+| QoS 1 costs ÷2.74 against QoS 0, and 2.95× gmqtt's PUBACK p50 at a matched offered rate | **Unverified here — not contradicted.** No harness in this repository paces offered load (`load_fraction` appears nowhere; `paired_network.py` is closed-loop at an in-flight window), so the quantity the record reports cannot currently be produced in-repo at all. Issue #39's figures are *RTT capacity*, a different quantity: a near-identical throughput ceiling and a 3× per-message latency at half that load are consistent, not in tension. See the note below. |
 | The benchmark adapter is not the explanation | **Still true.** |
 | The `on_publish is None` fast path is a pessimisation under load | **Mis-stated.** That A/B compared two *adapter* disciplines — awaiting each receipt versus correlating acks in a callback — not the internal branch. `_apply_effect_inline` and `_apply_effect` both call `_settle_publish` unconditionally; the callback only adds work on top. The result is a statement about how an application observes completion, and it argues for a cheaper receipt (finding 6), not against the branch. |
 | `_engine_lock` contention serialises the completion path | **Refuted.** #39 measured zero contention across the instrumented scenarios, and the reader's critical section contains no `await`, so the lock is never held across a suspension on the outbound QoS 1 path. |
 | The Paho façade plateaus at QoS ≥ 1 and barely benefits from pipelining | **Still true, and now root-caused.** See findings 7 and the escalation below. |
 | `max_outbound_bytes` default is surprising next to the message bound | **Still true.** Addressed by naming the bound rather than changing it (finding 8). |
 | Issue #57, `ProtocolError` while disconnecting | **Closed** by PR #58. |
+
+### Note on the QoS 1 latency claim
+
+An earlier revision of this audit dismissed the 2.95× using issue #39's RTT figures. That inference
+was invalid and is withdrawn. The two are different quantities, and the numbers below were read back
+from the bench's committed results rather than taken on trust:
+
+| Quantity | gmqtt | MQTTium | Ratio |
+| --- | ---: | ---: | ---: |
+| Calibrated publish capacity (msg/s) | 13 304 | 13 147 | 99% |
+| PUBACK p50 at `load_fraction` 0.5 (6 652 vs 6 573 msg/s offered) | 0.405 ms | 1.211 ms | **2.99×** |
+| `pub_qos1_inflight`, windows 1 → 20 → 100 | — | 4 279 → 10 862 → 14 467 | ×3.4 |
+
+A throughput ceiling within 1% and a threefold per-message latency at half that load are consistent:
+at a matched rate the slower client simply carries proportionally more in flight. The window sweep
+corroborates it independently — worst of its group with no pipelining, best with a deep window. So
+the three figures are **one finding**, not three competing ones: high fixed cost per completion,
+amortised well by pipelining. That is the shape the completion-path work in findings 1, 2 and 5
+targets, which is a reason to take the record seriously rather than to discount it.
+
+What remains true is that this repository has not reproduced it and currently cannot: the quantity
+requires paced open-loop load, and no harness here paces. Issue #39's withdrawal of cross-machine
+absolutes applies to comparing numbers across hosts; it does not apply to a same-runner interleaved
+ratio measured within one campaign, which is what this is.
 
 ## Findings and what was done
 
