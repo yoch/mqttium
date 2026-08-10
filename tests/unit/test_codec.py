@@ -286,11 +286,17 @@ def test_validate_utf8_does_not_encode_an_ascii_string(monkeypatch) -> None:
     ],
 )
 def test_mqtt_utf8_rules_are_reported_individually(text: str, rule: str) -> None:
-    """Scanning in C must cite the same rule the character loop cited."""
-    from mqttium.codec.primitives import _validate_mqtt_utf8
+    """Each rule is cited by name, whichever entry point rejects the string.
 
-    with pytest.raises(MalformedPacketError, match=rule):
-        _validate_mqtt_utf8(text)
+    Both entry points are checked because the surrogate rule is answered by the
+    conversion itself rather than by the shared scan, so the guarantee has to be
+    pinned where callers actually meet it.
+    """
+    from mqttium.codec.primitives import encode_utf8, validate_utf8
+
+    for entry in (encode_utf8, validate_utf8):
+        with pytest.raises(ProtocolError, match=rule):
+            entry(text)
 
 
 @pytest.mark.parametrize(
@@ -298,18 +304,37 @@ def test_mqtt_utf8_rules_are_reported_individually(text: str, rule: str) -> None
     ["capteurs/température", "温度センサー/建物A", "🎉/party/🎊", "plain/ascii", "", "é" * 300],
 )
 def test_valid_mqtt_utf8_is_accepted(text: str) -> None:
-    from mqttium.codec.primitives import _validate_mqtt_utf8
+    from mqttium.codec.primitives import encode_utf8, validate_utf8
 
-    _validate_mqtt_utf8(text)
+    validate_utf8(text)
+    encode_utf8(text)
 
 
 def test_surrogate_detection_covers_the_whole_reserved_range() -> None:
-    """encode() rejects exactly D800-DFFF, which is what the loop tested."""
-    from mqttium.codec.primitives import _validate_mqtt_utf8
+    """Strict UTF-8 refuses exactly D800-DFFF, which is what the loop tested."""
+    from mqttium.codec.primitives import encode_utf8, validate_utf8
 
     for code in (0xD800, 0xDBFF, 0xDC00, 0xDFFF):
-        with pytest.raises(MalformedPacketError, match="1.5.4-1"):
-            _validate_mqtt_utf8("ok/" + chr(code))
+        for entry in (encode_utf8, validate_utf8):
+            with pytest.raises(ProtocolError, match="1.5.4-1"):
+                entry("ok/" + chr(code))
     # the code points immediately outside the range stay valid
     for code in (0xD7FF, 0xE000):
-        _validate_mqtt_utf8("ok/" + chr(code))
+        validate_utf8("ok/" + chr(code))
+        encode_utf8("ok/" + chr(code))
+
+
+def test_a_strict_decode_cannot_produce_a_surrogate() -> None:
+    """Why the inbound path needs no surrogate test of its own.
+
+    Surrogates encode to exactly three bytes, so covering every three-byte
+    sequence covers the rule completely.
+    """
+    for first in (0xED,):  # the only lead byte that could reach D800-DFFF
+        for second in range(0x100):
+            for third in range(0x100):
+                try:
+                    text = bytes((first, second, third)).decode("utf-8")
+                except UnicodeDecodeError:
+                    continue
+                assert not any(0xD800 <= ord(c) <= 0xDFFF for c in text)

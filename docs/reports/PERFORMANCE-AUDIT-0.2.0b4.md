@@ -379,7 +379,7 @@ of it, three of which were taken.
 | Acknowledgement frames | A success ack with no properties is a fixed four-byte frame in both protocol versions, assembled through the generic encoder | `PubAck.encode` **1259 → 432 ns**; inbound QoS 1 **14.2 → 11.0 µs** per message. Covers PUBREC/PUBREL/PUBCOMP too. |
 | `QoS()` in the publish encoder | Re-converted a value every internal caller had already converted; argument type instrumented on both paths and always a genuine member | `encode_qos1` **+17.3%**, 7 of 7 pairs [1.133, 1.208] |
 | Topic UTF-8 encoded twice | Validation called `encode_utf8` for its exception and discarded the bytes; the encoder produced them again | **−75 ns** per publication. Smaller than the ~293 ns first estimated: only the encoding half was redundant, the character scan runs either way. `native_publish_nowait_qos0` +2.8% at 8 of 11 pairs. |
-| MQTT UTF-8 rules scanned per code point | An interpreted loop with three comparisons per character; two rules are substring searches and the third is what the strict codec already refuses | **7× to 48×** faster. Outbound validation of an accented topic **2798 → 639 ns**; ASCII untouched. Shared with `unpack_utf8`, so ingress benefits too. |
+| MQTT UTF-8 rules scanned per code point | An interpreted loop with three comparisons per character. Two rules are substring searches; the third — no surrogates — is what strict UTF-8 already refuses, so it is left to the conversion each caller performs anyway rather than tested separately | Outbound validation of an accented topic **2798 → 436 ns (−84%)**, ASCII 361 → 336 ns. A non-ASCII publication now encodes its topic **twice instead of four times**. Shared with `unpack_utf8`, so ingress benefits too. |
 
 `item_size` computed twice per publication (~88 ns, 1%) was left alone: removing it
 means threading the size through, which is the same widening refused for
@@ -391,8 +391,20 @@ at 1.0067, and inbound QoS 0 at 7729 ns against 7740 ns before.
 Equivalence was established before the suite in every case: 370 acknowledgement
 combinations across four packet types and both protocols; 20 adversarial strings
 against the topic validator including both length boundaries in bytes rather than
-characters; and 60 147 inputs drawn from the whole code-point space against the
+characters; and 50 083 inputs drawn from the whole code-point space against the
 replaced UTF-8 loop, with zero accept/reject divergences.
+
+Two properties of UTF-8 were checked exhaustively rather than assumed, because
+the last finding rests on them. Across all 1 114 112 code points, exactly 2 048
+fail strict UTF-8 encoding and they are exactly D800–DFFF, with a single reason,
+so attributing an encoding failure to [MQTT-1.5.4-1] is sound. And across all
+16 777 216 three-byte sequences — the length a surrogate would occupy — none
+decodes to a surrogate, which is why the inbound path needs no test of its own.
+
+The first version of that change did test surrogates separately, and review
+caught that this made a non-ASCII publication encode its topic four times: the
+callers already encode, and the check duplicated them. Moving the rule to the
+conversion removed two of the four and improved the result.
 
 ## Before the tag
 

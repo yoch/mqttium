@@ -40,16 +40,24 @@ def validate_utf8(value: str) -> None:
 
     For a caller that only wants the rejection -- topic validation, which runs
     before the encoder that will produce the bytes anyway -- ``encode_utf8``
-    encodes a string whose result is then discarded. The rules themselves are
-    defined on code points, so only the length bound needs bytes, and a code
-    point never encodes to fewer than one byte: an ASCII string's character
-    count is already its byte count. Anything else has to be encoded to be
-    measured, but that path is dominated by the character scan above it.
+    encodes a string whose result is then discarded. A code point never encodes
+    to fewer than one byte, so an ASCII string's character count is already its
+    byte count and needs no encoding at all. Anything else is encoded exactly
+    once, for the length bound, and that same encoding answers the surrogate
+    rule.
     """
     if not isinstance(value, str):
         raise ProtocolError(f"MQTT UTF-8 value must be str, got {type(value).__name__}")
     _validate_mqtt_utf8(value, error_type=ProtocolError)
-    if len(value) > 65535 or (not value.isascii() and len(value.encode("utf-8")) > 65535):
+    if value.isascii():
+        if len(value) > 65535:
+            raise ProtocolError("UTF-8 string too long for MQTT")
+        return
+    try:
+        data = value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ProtocolError("[MQTT-1.5.4-1] Surrogate in UTF-8 data") from exc
+    if len(data) > 65535:
         raise ProtocolError("UTF-8 string too long for MQTT")
 
 
@@ -60,7 +68,9 @@ def encode_utf8(value: str) -> bytes:
     try:
         data = value.encode("utf-8")
     except UnicodeEncodeError as exc:
-        raise ProtocolError("Invalid MQTT UTF-8 string") from exc
+        # Surrogates are the only code points UTF-8 refuses, so this branch
+        # already answers [MQTT-1.5.4-1] and _validate_mqtt_utf8 need not.
+        raise ProtocolError("[MQTT-1.5.4-1] Surrogate in UTF-8 data") from exc
     _validate_mqtt_utf8(value, error_type=ProtocolError)
     if len(data) > 65535:
         raise ProtocolError("UTF-8 string too long for MQTT")
@@ -116,22 +126,16 @@ def _validate_mqtt_utf8(
     *,
     error_type: type[MalformedPacketError] | type[ProtocolError] = MalformedPacketError,
 ) -> None:
-    # Fast path: pure ASCII cannot contain surrogates or U+FEFF.
-    if text.isascii():
-        if "\x00" in text:
-            raise error_type("[MQTT-1.5.4-2] Null in UTF-8 data")
-        return
-    # Three scans in C rather than one interpreted loop over the characters.
-    # Two of the rules are substring searches; the third is exactly what the
-    # strict UTF-8 codec already refuses, so encoding answers it without a
-    # comparison per code point. Measured 7x to 48x faster than the loop this
-    # replaces, the wider margin being the longer string -- the loop was linear
-    # in Python, all three of these are linear in C.
+    # Two substring searches in C, rather than an interpreted loop running
+    # three comparisons per code point.
+    #
+    # The third rule -- no surrogates -- is deliberately absent. Surrogates are
+    # the only code points strict UTF-8 refuses, so every caller already
+    # answers that rule through the conversion it performs anyway: encode_utf8
+    # and validate_utf8 encode, and unpack_utf8 decodes, which cannot produce
+    # one. Testing it here as well made a non-ASCII publication encode its
+    # topic four times where twice is enough.
     if "\x00" in text:
         raise error_type("[MQTT-1.5.4-2] Null in UTF-8 data")
     if "﻿" in text:
         raise error_type("[MQTT-1.5.4-3] U+FEFF in UTF-8 data")
-    try:
-        text.encode("utf-8")
-    except UnicodeEncodeError as exc:
-        raise error_type("[MQTT-1.5.4-1] Surrogate in UTF-8 data") from exc
