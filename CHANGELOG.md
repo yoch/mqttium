@@ -6,6 +6,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.2.0b4] - 2026-08-11
+
 ### Changed
 
 - `PublishReceipt` no longer builds an `asyncio.Event` per QoS 1/2
@@ -340,7 +342,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - Pre-spin-out comparative analysis and generated coverage data from the
   published source tree.
 
-[Unreleased]: https://github.com/yoch/mqttium/compare/v0.2.0b3...HEAD
+[Unreleased]: https://github.com/yoch/mqttium/compare/v0.2.0b4...HEAD
+[0.2.0b4]: https://github.com/yoch/mqttium/compare/v0.2.0b3...v0.2.0b4
 [0.2.0b3]: https://github.com/yoch/mqttium/compare/v0.2.0b2...v0.2.0b3
 [0.2.0b2]: https://github.com/yoch/mqttium/compare/v0.2.0b1...v0.2.0b2
 [0.2.0b1]: https://github.com/yoch/mqttium/compare/v0.1.0a4...v0.2.0b1
