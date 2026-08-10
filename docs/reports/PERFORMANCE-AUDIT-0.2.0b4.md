@@ -85,15 +85,22 @@ number there, it has none.
    comparing first is equivalent; an invalid level still raises `ValueError`, now only from
    `_validate_publish_request`. *Fixed and pinned, including the invalid-level cases.*
 
-4. **Ordered effect batches built two partition lists and discarded them.**
-   `api/_effects.py:93-122`. The pump partitions SEND-first so wire order survives, but it
-   allocated both lists on every multi-effect batch even when nothing needed reordering — the shape
-   of inbound delivery, which is a batch of `MESSAGE` effects with no `SEND` among them. *Fixed:*
-   detect first, which needs no allocation, and partition only when the scan finds a `SEND` after a
-   non-`SEND`. A batch that does need reordering now pays a few extra comparisons before the same
-   partition. `benchmarks/paired_regression.py` gains `effect_batch_ordered` and
-   `effect_batch_reordered`; the existing `effect_batch_inline` is all-`SEND` and reaches neither
-   arm. **This is the one finding CI does not support**: see "What CI measured".
+4. **Ordered effect batches built two partition lists and discarded them — tried, measured,
+   REVERTED.** `api/_effects.py:93-118`. The pump partitions SEND-first so wire order survives, and
+   it allocates both lists on every multi-effect batch even when nothing needs reordering. The
+   candidate detected first, allocation-free, and partitioned only when a `SEND` followed a
+   non-`SEND`, buying two allocations on an already-ordered batch at the cost of an extra scan on
+   the batch that must actually be reordered.
+
+   **The measurement did not support the trade, so the runtime change is reverted** and
+   `collect_from_engine` is byte-for-byte the `main` implementation again. Numbers and reasoning in
+   "What CI measured". What is kept: the two corrected paired scenarios, and the ordering pins in
+   `tests/unit/test_effect_pump.py`, which pin the SEND-first invariant rather than the mechanism
+   and therefore pass against either implementation. A comment at the call site records that the
+   split was tried and rejected, so it is not proposed again from first principles.
+
+   The premise was an allocation argument. Allocation arguments are cheap to make and this one was
+   worth about nothing measurable, against a real cost on the path every pipelined PUBACK takes.
 
 5. **Every QoS 1/2 publication allocated an `asyncio.Event`.** `api/models.py:171-205`. Awaiting one
    costs two coroutine frames plus the future and waiter deque the event builds internally, and a
@@ -156,6 +163,10 @@ number there, it has none.
 
 ## Measured and rejected
 
+- **Splitting the effect-pump partition into a detect pass and a partition pass** (finding 4).
+  Measured on the corrected arms: ordered +1.86% with 4 of 11 cycles favouring base, reordered
+  −2.55% with 8 of 11 favouring base. Reverted; `collect_from_engine` is the `main` implementation
+  again, and the call site carries a comment so the idea is not re-proposed from first principles.
 - **`OutboundRecordMeta` allocated per acknowledgement** (`persistence/memory.py:231-240` →
   `protocol/outbound.py:504`), solely so the session can read `logical_size`. The type is already
   `slots=True, frozen=True`, and removing the allocation means changing the `TransitionInflightStore`
@@ -219,29 +230,48 @@ version of this section omitted:
   depth. An earlier revision cited "p50 deltas mostly negative" as supporting evidence across the
   board. That was wrong and is withdrawn; the large-payload latency cells say nothing either way.
 
-**Micro scenarios: two clear gains, the rest neutral, and one regression that is mine.**
+**Micro scenarios: two clear gains, the rest neutral, and one regression that was mine.**
 
 | Scenario | Ratio | Base CV | Reading |
 | --- | ---: | ---: | --- |
 | `compat_publish_qos0_batch` | **1.241** | 1.0% | The façade callback fix. Every pair positive. |
 | `native_publish_nowait_qos0` | **1.081** | 4.0% | Every pair positive. |
 | `async_publish_nowait_qos0` | **1.068** | 2.0% | Every pair positive. |
-| `effect_batch_ordered` / `effect_batch_reordered` | **0.979 / 0.980** | 1.1% / 1.2% | See below. |
+| `effect_batch_ordered` / `effect_batch_reordered` | 0.979 / 0.980 | 1.1% / 1.2% | Both arms measured the same branch; superseded below, and the change is reverted. |
 | `qos1_cycle_memory` / `qos1_cycle_sqlite` | 0.982 / 0.985 | 3.2% / 0.9% | Small, tight on the SQLite arm. |
 | `compat_publish_qos1` | 0.948 | **12.2%** | Baseline too noisy to interpret; no claim. |
 
-**The effect-pump arms measured the wrong branch.** Both scenarios as first written were
-`[SEND, COMPLETE, …]` interleavings, and the pump reorders as soon as a SEND follows a non-SEND — so
-*both* arms exercised the reordered path, and the ordered path that finding 4 was written to improve
-was never measured. The −2% is therefore the reordered path's extra detection scan, measured twice
-under two names, and it is real. The arms are corrected here, with a unit test pinning each to the
-branch it names, and the ordered arm's number is owed.
+**The effect-pump arms in that run measured the wrong branch.** Both scenarios as first written
+were `[SEND, COMPLETE, …]` interleavings, and the pump reorders as soon as a SEND follows a
+non-SEND, so *both* arms exercised the reordered path and the ordered path was never measured. The
+arms were corrected, with a unit test pinning each to the branch it names.
 
-Finding 4 stands for now on the aggregate rather than on its own microbenchmark: every pipelined
-PUBACK batch takes the reordered path, and the end-to-end QoS 1 numbers are positive at every window
-regardless. If the corrected ordered arm does not repay that ~2%, the change should be reverted
-rather than defended — it was justified by an allocation argument, and an allocation argument that
-does not show up in a measurement is not worth 2%.
+### The corrected effect-pump measurement, and the decision it forced
+
+Run on `43bcada`, whose runtime is identical to the final commit — the commit after it changed only
+`CHANGELOG.md` and this report. 11 rotated pairs each:
+
+| Arm | Median | Pairs favouring candidate | Spread | Base CV |
+| --- | ---: | ---: | --- | ---: |
+| `effect_batch_ordered` (the arm the change exists for) | 1.0186 | **7 / 11** | 0.9268 – 1.2064 | 4.72% |
+| `effect_batch_reordered` (the arm it taxes) | 0.9745 | **3 / 11** | 0.9039 – 1.0273 | 3.33% |
+
+The ordered arm's pairs: 0.9624, 0.9268, 0.9916, 1.0546, **1.2064**, 0.9268, 1.0018, 1.0186, 1.0949,
+1.0354, 1.0538. Four of eleven cycles favour *base*, one by 7.3%, and a single 1.2064 outlier is
+what carries the median above neutral. Issue #39 rejected the inline-callback ingress claim on
+exactly this shape — a favourable median with cycles crossing neutral. The reordered arm, by
+contrast, is consistent: eight of eleven cycles favour base, median −2.55%.
+
+So the arm that was supposed to gain is indistinguishable from noise, and the arm that pays is the
+one every pipelined PUBACK batch takes. The condition set when the arms were corrected — *if the
+ordered arm does not repay the ~2%, revert rather than defend* — is **not met**, and the runtime
+change is reverted. No claim of an effect-pump gain survives in this PR.
+
+Two things worth stating, because they are the general lesson rather than this one case. First, the
+earlier −2% reading was correct even though the scenario behind it was wrong; the fix to the
+scenario did not rescue the change, it simply measured the other half of the trade. Second, nobody
+established how often real batches are already ordered, so even a clean ordered-arm win would not
+have settled it. An optimisation whose value depends on an unmeasured frequency is not ready.
 
 ## What this cycle could not measure
 

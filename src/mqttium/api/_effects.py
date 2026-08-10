@@ -92,31 +92,29 @@ class EffectPump:
 
         if len(effects) > 1:
             self.multi_effect_batches += 1
-            # Detect before partitioning. A SEND seen after a non-SEND is
-            # exactly the condition, and answering it needs no allocation, so
-            # an already-ordered batch no longer builds two lists to discard.
-            # That is the shape of inbound delivery: a lot of MESSAGE effects
-            # with no SEND among them. A batch that does need reordering pays
-            # a few extra comparisons before the partition it would have run
-            # anyway, and the scan breaks at the first one it finds.
-            seen_other = False
+            # Partition SEND-first in one pass, and let that same pass answer
+            # whether the batch needed it: a SEND seen after a non-SEND is
+            # exactly the condition. The two-generator form this replaces walked
+            # the batch twice and always rebuilt the list, even for the common
+            # batch that was already ordered.
+            #
+            # Splitting this into a detect pass followed by a partition pass
+            # was tried and reverted: it saves two list allocations on an
+            # already-ordered batch but adds a scan to the batch that must be
+            # reordered, and the paired microbenchmark did not support the
+            # trade. See docs/reports/PERFORMANCE-AUDIT-0.2.0b4.md.
+            sends: list[EngineEffect] = []
+            others: list[EngineEffect] = []
             out_of_order = False
             for effect in effects:
                 if effect.kind is EffectKind.SEND:
-                    if seen_other:
+                    if others:
                         out_of_order = True
-                        break
+                    sends.append(effect)
                 else:
-                    seen_other = True
+                    others.append(effect)
             if out_of_order:
                 self.reordered_batches += 1
-                sends: list[EngineEffect] = []
-                others: list[EngineEffect] = []
-                for effect in effects:
-                    if effect.kind is EffectKind.SEND:
-                        sends.append(effect)
-                    else:
-                        others.append(effect)
                 effects = sends + others
         if not self.pending:
             self.pending_epoch = epoch
