@@ -55,7 +55,7 @@ and clean shutdown. They are manually dispatchable for every beta candidate.
 
 The campaign run against `main` at
 `0006198de800228c1d1b92790f56e074d791608d` is recorded in
-[`STABLE-RELEASE-EVIDENCE-2026-08-05.md`](STABLE-RELEASE-EVIDENCE-2026-08-05.md).
+[`reports/STABLE-RELEASE-EVIDENCE-2026-08-05.md`](reports/STABLE-RELEASE-EVIDENCE-2026-08-05.md).
 It retains the run URLs, workload totals and artifact digests for Linux, macOS,
 Mosquitto, EMQX and HiveMQ under MQTT 3.1.1 and MQTT 5, together with the full
 benchmark and paired-regression runs for the same final source tree.

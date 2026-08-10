@@ -97,6 +97,12 @@ class EffectPump:
             # exactly the condition. The two-generator form this replaces walked
             # the batch twice and always rebuilt the list, even for the common
             # batch that was already ordered.
+            #
+            # Splitting this into a detect pass followed by a partition pass
+            # was tried and reverted: it saves two list allocations on an
+            # already-ordered batch but adds a scan to the batch that must be
+            # reordered, and the paired microbenchmark did not support the
+            # trade. See docs/reports/PERFORMANCE-AUDIT-0.2.0b4.md.
             sends: list[EngineEffect] = []
             others: list[EngineEffect] = []
             out_of_order = False

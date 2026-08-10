@@ -58,3 +58,89 @@ async def test_discard_preserves_terminal_publish_order() -> None:
     assert list(client._pending_effects) == [complete, failed]
     assert client._pending_effect_epoch == 2
     assert client._effect_applied == 1
+
+
+def _collect(client: AsyncClient, kinds: list[EffectKind]) -> list[EffectKind]:
+    """Emit one batch through the pump and report the order it queued."""
+    for kind in kinds:
+        client._engine._emit(kind, None)
+    client._collect_effects_locked()
+    return [effect.kind for effect in client._effect_pump.pending]
+
+
+def test_ordered_batch_is_queued_untouched() -> None:
+    client = AsyncClient(client_id="effect-ordered")
+    kinds = [EffectKind.SEND, EffectKind.SEND, EffectKind.PUBLISH_COMPLETE]
+
+    assert _collect(client, kinds) == kinds
+    assert client._effect_pump.multi_effect_batches == 1
+    assert client._effect_pump.reordered_batches == 0
+
+
+def test_completion_before_send_is_reordered_send_first() -> None:
+    """The shape every pipelined PUBACK batch produces."""
+    client = AsyncClient(client_id="effect-puback")
+
+    order = _collect(client, [EffectKind.PUBLISH_COMPLETE, EffectKind.SEND])
+
+    assert order == [EffectKind.SEND, EffectKind.PUBLISH_COMPLETE]
+    assert client._effect_pump.reordered_batches == 1
+
+
+def test_interleaved_batch_keeps_relative_order_within_each_group() -> None:
+    client = AsyncClient(client_id="effect-interleaved")
+
+    order = _collect(
+        client,
+        [
+            EffectKind.SEND,
+            EffectKind.PUBLISH_COMPLETE,
+            EffectKind.SEND,
+            EffectKind.SUBACK,
+        ],
+    )
+
+    assert order == [
+        EffectKind.SEND,
+        EffectKind.SEND,
+        EffectKind.PUBLISH_COMPLETE,
+        EffectKind.SUBACK,
+    ]
+    assert client._effect_pump.reordered_batches == 1
+
+
+def test_all_send_batch_is_not_counted_as_reordered() -> None:
+    client = AsyncClient(client_id="effect-sends")
+
+    order = _collect(client, [EffectKind.SEND] * 4)
+
+    assert order == [EffectKind.SEND] * 4
+    assert client._effect_pump.multi_effect_batches == 1
+    assert client._effect_pump.reordered_batches == 0
+
+
+def test_no_send_batch_is_not_counted_as_reordered() -> None:
+    client = AsyncClient(client_id="effect-others")
+    kinds = [EffectKind.PUBLISH_COMPLETE, EffectKind.SUBACK, EffectKind.UNSUBACK]
+
+    assert _collect(client, kinds) == kinds
+    assert client._effect_pump.reordered_batches == 0
+
+
+def test_paired_benchmark_scenarios_exercise_the_branch_they_name() -> None:
+    """A benchmark arm that measures the wrong branch is worse than none.
+
+    The pump reorders as soon as a SEND follows a non-SEND, so an interleaved
+    batch is reordered too. This pins each named arm to the branch it claims.
+    """
+    ordered = [EffectKind.SEND] * 4 + [EffectKind.PUBLISH_COMPLETE] * 4
+    reordered = [EffectKind.PUBLISH_COMPLETE, EffectKind.SEND] * 4
+
+    client = AsyncClient(client_id="effect-scenario-ordered")
+    assert _collect(client, ordered) == ordered
+    assert client._effect_pump.multi_effect_batches == 1
+    assert client._effect_pump.reordered_batches == 0, "the ordered arm must not reorder"
+
+    other = AsyncClient(client_id="effect-scenario-reordered")
+    _collect(other, reordered)
+    assert other._effect_pump.reordered_batches == 1, "the reordered arm must reorder"

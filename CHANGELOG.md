@@ -6,6 +6,41 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Changed
+
+- `PublishReceipt` no longer builds an `asyncio.Event` per QoS 1/2
+  publication. Completion is a flag, and the shared future behind `wait()` is
+  created only if something actually waits, so a publication that is never
+  awaited allocates no completion primitive at all. Waiters attach through
+  `asyncio.shield`, so cancelling one `wait()` cancels only that waiter and
+  leaves the receipt and any other waiter intact — the isolation a per-waiter
+  `Event` gave implicitly. `wait()` and `is_done()` are unchanged; the private
+  `_event` field is replaced by `_future`/`_settled`.
+- The Paho façade now installs its inner `on_publish` dispatcher only while
+  the user has set `Client.on_publish`, instead of unconditionally at
+  construction. Every façade user previously paid a callback-queue hop per
+  acknowledged publication to reach a dispatcher that returned immediately,
+  and could never satisfy the native client's direct QoS 0 precondition.
+  `Client.on_publish` is now a property; reading and assigning it are
+  unchanged, including from a non-loop thread.
+- Acknowledgement frames without a reason code or properties are emitted
+  directly instead of being assembled through the generic encoder, the publish
+  encoder no longer re-converts a `QoS` its caller has already validated, topic
+  validation no longer builds an encoded form it discards, and the MQTT UTF-8
+  rules are checked with string scans rather than a loop over code points. No
+  behaviour changes: the same inputs are accepted and rejected, and the only
+  visible difference is that a string breaking several UTF-8 rules at once may
+  now cite a different one of them.
+- `FlowControlError` from the bounded writer now names the bound that refused
+  and its configured value, instead of reporting only that a limit was
+  reached. `max_outbound_bytes` (1 MiB) and `max_outbound_messages` (10 000)
+  imply about 105 bytes per queued message, so the byte bound is the one that
+  binds as payloads grow; the defaults are unchanged.
+- Documentation is now split by kind and indexed by `docs/README.md`: maintained
+  contracts stay directly under `docs/`, while dated measurements, audits and
+  campaign records moved to `docs/reports/`. Entries published before this
+  reorganisation refer to those reports by their former top-level `docs/` path.
+
 ## [0.2.0b3] - 2026-08-09
 
 ### Added

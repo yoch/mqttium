@@ -27,7 +27,6 @@ def _register_publish_handles(
     receipt = PublishReceipt(
         mid=mid,
         qos=QoS.AT_LEAST_ONCE,
-        _event=asyncio.Event(),
     )
     batch = PublishBatchReceipt()
     batch._register(mid)

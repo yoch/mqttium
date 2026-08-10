@@ -254,8 +254,18 @@ Ne jamais masquer les builtins (`TimeoutError` a été renommé).
 ## 10. Backpressure (phase 2)
 
 - File writer bornée en **octets** (`max_outbound_bytes`, défaut 1 MiB) et
-  en messages ; `publish()` async attend la place (pas d'exception par
-  défaut), mode `nowait` optionnel qui lève `FlowControlError`.
+  en messages (`max_outbound_messages`, défaut 10 000) ; `publish()` async
+  attend la place (pas d'exception par défaut), mode `nowait` optionnel qui
+  lève `FlowControlError`.
+- Les deux bornes sont indépendantes et de magnitudes délibérément
+  différentes : elles impliquent environ 105 octets par message en file, donc
+  **la borne en octets est celle qui contraint dès que les charges utiles
+  grossissent** (1 MiB admet ~16 publications de 64 KiB en vol, pas 10 000).
+  Un appelant qui dimensionne sa file en messages ne découvre la borne en
+  octets qu'au moment où les payloads grandissent : `FlowControlError` nomme
+  donc explicitement la borne qui refuse. Un item seul plus gros que
+  `max_outbound_bytes` reste admis si la file est vide, pour garantir la
+  progression.
 - `messages()` : file bornée (`max_pending_messages`, défaut 65536) ; si
   pleine, suspendre la lecture socket (backpressure TCP naturelle) plutôt
   que de jeter des messages.
