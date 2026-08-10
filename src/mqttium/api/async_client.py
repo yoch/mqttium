@@ -564,7 +564,10 @@ class AsyncClient:
         properties: Properties | None,
         nowait: bool,
     ) -> PublishReceipt | None:
-        if QoS(qos) is not QoS.AT_MOST_ONCE or not self._direct_qos0_ready():
+        # Compare before converting: every QoS 1/2 publish reaches this line and
+        # would otherwise construct an enum only to be rejected. Invalid values
+        # still raise ValueError from _validate_publish_request downstream.
+        if qos != QoS.AT_MOST_ONCE or not self._direct_qos0_ready():
             return None
         item = self._engine.outbound.prepare_qos0(
             topic,
@@ -591,7 +594,7 @@ class AsyncClient:
         if not requests or not self._direct_qos0_ready():
             return False
         for _topic, _payload, qos, _retain, _properties in requests:
-            if QoS(qos) is not QoS.AT_MOST_ONCE:
+            if qos != QoS.AT_MOST_ONCE:
                 return False
 
         items: list[WriteItem] = []
@@ -1826,9 +1829,12 @@ class AsyncClient:
                     receipt._error = reason
                 if receipt._event is not None:
                     receipt._event.set()
-            batch = self._pop_batch_receipt(mid)
-            if batch is not None:
-                batch._complete(mid, reason)
+            # Most clients never call publish_many, so skip the lookup rather
+            # than hashing every acknowledged identifier against an empty table.
+            if self._batch_receipts:
+                batch = self._pop_batch_receipt(mid)
+                if batch is not None:
+                    batch._complete(mid, reason)
         self._notify_publish_space()
 
     def _notify_publish_space(self) -> None:
@@ -2031,17 +2037,16 @@ class AsyncClient:
             self._batch_receipts[mid] = deque((current, receipt))
 
     def _pop_batch_receipt(self, mid: int) -> PublishBatchReceipt | None:
-        current = self._batch_receipts.get(mid)
+        current = self._batch_receipts.pop(mid, None)
         if current is None:
             return None
         if not isinstance(current, deque):
-            self._batch_receipts.pop(mid, None)
             return current
         receipt = current.popleft()
         if len(current) == 1:
             self._batch_receipts[mid] = current[0]
-        elif not current:
-            self._batch_receipts.pop(mid, None)
+        elif current:
+            self._batch_receipts[mid] = current
         return receipt
 
     def _fail_non_replayable(self, exc: BaseException) -> None:

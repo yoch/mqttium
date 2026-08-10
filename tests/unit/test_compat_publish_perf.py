@@ -648,3 +648,63 @@ def test_loop_stop_fails_queued_qos1_publish(monkeypatch: pytest.MonkeyPatch) ->
         release.set()
         if client._thread is not None:
             client.loop_stop()
+
+
+@pytest.mark.asyncio
+async def test_batch_receipt_settles_fifo_across_three_registrations() -> None:
+    """Reusing one mid must settle its batch receipts in submission order."""
+    client = AsyncClient()
+    mid = 21
+    batches = [PublishBatchReceipt() for _ in range(3)]
+    for batch in batches:
+        batch._register(mid)
+        client._register_batch_receipt(mid, batch)
+
+    for index, batch in enumerate(batches):
+        assert client._pop_batch_receipt(mid) is batch
+        remaining = batches[index + 1 :]
+        assert all(other.pending_count == 1 for other in remaining)
+
+    assert client._pop_batch_receipt(mid) is None
+    assert mid not in client._batch_receipts
+
+
+@pytest.mark.asyncio
+async def test_batch_and_plain_receipts_share_a_reused_mid() -> None:
+    client = AsyncClient()
+    mid = 22
+    batch = PublishBatchReceipt()
+    batch._register(mid)
+    client._register_batch_receipt(mid, batch)
+    receipt = PublishReceipt(mid=mid, qos=QoS.AT_LEAST_ONCE, _event=asyncio.Event())
+    client._register_publish_receipt(mid, receipt)
+
+    client._settle_publish(mid, None)
+
+    assert receipt.is_done()
+    assert batch.pending_count == 0
+    assert not client._batch_receipts
+    assert not client._receipts
+
+
+@pytest.mark.asyncio
+async def test_settling_skips_the_batch_table_when_no_batch_is_outstanding() -> None:
+    """A client that never calls publish_many must not hash acked mids twice."""
+    client = AsyncClient()
+    mid = 23
+    receipt = PublishReceipt(mid=mid, qos=QoS.AT_LEAST_ONCE, _event=asyncio.Event())
+    client._register_publish_receipt(mid, receipt)
+
+    lookups = 0
+    original = type(client)._pop_batch_receipt
+
+    def counted(self, value):
+        nonlocal lookups
+        lookups += 1
+        return original(self, value)
+
+    client._pop_batch_receipt = counted.__get__(client)  # type: ignore[method-assign]
+    client._settle_publish(mid, None)
+
+    assert receipt.is_done()
+    assert lookups == 0

@@ -252,3 +252,45 @@ async def test_publish_nowait_direct_path_encodes_mqtt5_properties(monkeypatch) 
     assert packet.topic == "native/mqtt5"
     assert packet.payload == b'{"value": 42}'
     assert packet.properties == properties
+
+
+@pytest.mark.parametrize("qos", [3, -1, 99])
+async def test_invalid_qos_still_raises_value_error(qos: int) -> None:
+    """Comparing before converting must not swallow an invalid level."""
+    client = AsyncClient(max_outbound_messages=8)
+    client._engine.state = ConnectionState.CONNECTED
+
+    with pytest.raises(ValueError):
+        await client.publish("native/invalid", b"x", qos=qos)
+    with pytest.raises(ValueError):
+        client.publish_nowait("native/invalid", b"x", qos=qos)
+
+
+async def test_qos1_rejection_constructs_no_qos_enum(monkeypatch) -> None:
+    """QoS 1/2 publishes reach the direct-path gate and must not pay for it."""
+    client = AsyncClient(max_outbound_messages=8)
+    client._engine.state = ConnectionState.CONNECTED
+
+    calls = 0
+    original_new = QoS.__new__
+
+    def counted_new(cls, value):
+        nonlocal calls
+        calls += 1
+        return original_new(cls, value)
+
+    monkeypatch.setattr(QoS, "__new__", counted_new)
+    client._try_direct_qos0_publish(
+        "native/qos1", b"x", qos=1, retain=False, properties=None, nowait=True
+    )
+
+    assert calls == 0
+
+
+async def test_int_and_enum_qos0_both_take_the_direct_path() -> None:
+    for level in (0, QoS.AT_MOST_ONCE):
+        client = AsyncClient(max_outbound_messages=8)
+        client._engine.state = ConnectionState.CONNECTED
+        receipt = client.publish_nowait("native/qos0", b"x", qos=level)
+        assert receipt.mid is None
+        assert client._effect_pump.enqueued == 0
