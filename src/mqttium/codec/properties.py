@@ -250,7 +250,11 @@ def _decode_value(ptype: PropType, buf: bytes | bytearray, offset: int) -> tuple
 
 
 def _validate_response_topic(value: Any, error_type: type[MQTTError]) -> None:
-    if isinstance(value, str) and ("+" in value or "#" in value):
+    if not isinstance(value, str):
+        return
+    if not value:
+        raise error_type("Property 'response_topic' must not be empty")
+    if "+" in value or "#" in value:
         raise error_type("Property 'response_topic' must not contain wildcards")
 
 
