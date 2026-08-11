@@ -11,6 +11,7 @@ from mqttium.codec.vbi import append_vbi
 from mqttium.enums import MQTTProtocolVersion, PacketType, QoS
 from mqttium.errors import MalformedPacketError, ProtocolError
 from mqttium.packets._common import _props_or_empty, _require_outbound_mid
+from mqttium.topics import validate_received_publish_topic
 from mqttium.transport.writes import SEGMENT_THRESHOLD, WriteItem
 from mqttium.types import Properties
 
@@ -127,6 +128,10 @@ class PublishPacket:
         properties: Properties | None = None
         if protocol == MQTTProtocolVersion.MQTTv5:
             properties, pos = decode_properties(remaining, pos, PUBLISH)
+            # Validate a non-empty Topic Name before the inbound session can
+            # establish a Topic Alias from it. Empty is intentionally deferred:
+            # MQTT 5 permits it only when a previously established alias is used.
+            validate_received_publish_topic(topic, utf8_validated=True)
         # The remainder is the PUBLISH payload and may be empty.
         payload = remaining[pos:]
         return cls(
