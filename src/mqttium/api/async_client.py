@@ -20,7 +20,7 @@ from itertools import islice
 from typing import Any, Literal, Never
 
 from mqttium.api._delivery import ApplicationDelivery, MessageDelivery
-from mqttium.api._effects import EffectPump
+from mqttium.api._effects import EffectPump, StaleConnectionEffect
 from mqttium.api._writer import WritePump
 from mqttium.api.models import (
     PublishBatchReceipt,
@@ -79,6 +79,9 @@ OnDisconnect = Callable[[BaseException | None], Any]
 OnPublish = Callable[[int | None, BaseException | None], Any]
 OnAuth = Callable[[AuthPacket], Any]
 PublishBackpressure = Literal["wait", "error"]
+
+_GRACEFUL_DISCONNECT_DRAIN_TIMEOUT = 5.0
+_FATAL_DISCONNECT_DRAIN_TIMEOUT = 0.25
 
 
 def _positive(name: str, value: float) -> None:
@@ -844,17 +847,34 @@ class AsyncClient:
         async with self._lifecycle_lock:
             if self._transport is None:
                 return
-            if self.is_connected:
-                packet = self._engine.begin_disconnect(reason_code)
-                await self._enqueue_outbound(packet)
-                try:
-                    # Skip the wait if the writer already died (connection lost).
-                    writer_task = self._write_pump.task
-                    if writer_task is not None and not writer_task.done():
-                        await asyncio.wait_for(self._write_pump.join(), timeout=5.0)
-                except TimeoutError:
-                    pass
-            await self._force_close()
+            # Preserve validation semantics: an invalid reason code must fail
+            # before teardown, just as it did before shutdown became bounded.
+            packet = self._engine.begin_disconnect(reason_code) if self.is_connected else None
+            try:
+                if packet is not None:
+                    # Shutdown must not wait for application traffic to free a
+                    # bounded queue. If the terminal packet cannot be admitted
+                    # immediately, close the transport instead of deadlocking.
+                    try:
+                        admitted = self._try_enqueue_outbound(
+                            packet,
+                            epoch=self._connection_epoch,
+                        )
+                    except StaleConnectionEffect:
+                        admitted = False
+                    if admitted:
+                        try:
+                            # Skip the wait if the writer already died.
+                            writer_task = self._write_pump.task
+                            if writer_task is not None and not writer_task.done():
+                                await asyncio.wait_for(
+                                    self._write_pump.join(),
+                                    timeout=_GRACEFUL_DISCONNECT_DRAIN_TIMEOUT,
+                                )
+                        except TimeoutError:
+                            pass
+            finally:
+                await self._force_close()
 
     def publish_nowait(
         self,
@@ -1223,6 +1243,11 @@ class AsyncClient:
             if not self._will_reconnect():
                 self._fail_pending(exc)
         finally:
+            clean_disconnect = (
+                self._intentional_disconnect
+                and self._engine.state is ConnectionState.DISCONNECTING
+                and self._disconnect_exc is None
+            )
             await self._invalidate_connection_epoch()
             async with self._engine_lock:
                 self._engine.notify_transport_closed()
@@ -1248,7 +1273,8 @@ class AsyncClient:
                         pass
             self._delivery.close()
             try:
-                await self._invoke(self.on_disconnect, self._disconnect_exc)
+                callback_error = None if clean_disconnect else self._disconnect_exc
+                await self._invoke(self.on_disconnect, callback_error)
             except Exception as exc:
                 self._report_callback_error(self.on_disconnect, exc)
             if not will_reconnect:
@@ -1752,7 +1778,19 @@ class AsyncClient:
         elif isinstance(exc, MalformedPacketError):
             reason = 0x81  # Malformed Packet
         try:
-            await self._transport.write(encode_disconnect(reason, MQTTProtocolVersion.MQTTv5))
+            packet = encode_disconnect(reason, MQTTProtocolVersion.MQTTv5)
+            admitted = self._try_enqueue_outbound(packet, epoch=self._connection_epoch)
+            if not admitted:
+                return
+            writer_task = self._write_pump.task
+            if writer_task is not None and not writer_task.done():
+                try:
+                    await asyncio.wait_for(
+                        self._write_pump.join(),
+                        timeout=_FATAL_DISCONNECT_DRAIN_TIMEOUT,
+                    )
+                except TimeoutError:
+                    pass
         except Exception:
             pass
 
