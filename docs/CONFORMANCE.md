@@ -50,12 +50,24 @@ Conformance is asserted three ways, in decreasing order of strength:
 
 ### Gaps found and fixed
 
-Two of the three are in what MQTTium **sends**, and that asymmetry is
+Three of the four are in what MQTTium **sends**, and that asymmetry is
 structural rather than accidental: inbound frames pass through one validating
 decoder — which refused every one of the nine malformed shapes probed — whereas
 outbound rules live at the call sites that build packets, where a rule specific
-to a direction or a protocol version has nowhere central to be enforced. The
-third is a peer-behaviour check that was simply absent.
+to a direction or a protocol version has nowhere central to be enforced. One is
+a peer-behaviour check that was simply absent.
+
+**MQTT 5 §3.14.2.2.2** — *"If the Session Expiry Interval in the CONNECT packet
+was zero, then it is a Protocol Error to set a non-zero Session Expiry Interval
+in the DISCONNECT packet sent by the Client."* (Prose, not a numbered
+statement.)
+
+`begin_disconnect` accepted and encoded it. The consequence is concrete rather
+than theoretical: the broker answers `0x82` and does not treat the DISCONNECT
+as valid, so the disconnection counts as ungraceful and **the Will Message is
+published** — the opposite of what a clean shutdown intends. An absent interval
+in CONNECT means zero (§3.1.2.11.2), so both the absent and explicit-zero cases
+are refused, while a session that really was durable can still be adjusted.
 
 **`[MQTT-3.2.2-4]` (MQTT 5.0)** — *"If the Client does not have Session State
 and receives Session Present set to 1 it MUST close the Network Connection."*
@@ -98,6 +110,12 @@ encoded. The inbound direction is unchanged and covered by its own test.
 
 | Statement | Version | Subject |
 | --- | --- | --- |
+| §3.14.2.2.2 | 5.0 | DISCONNECT cannot extend a session that was never durable |
+| `MQTT-3.14.4-1` | 5.0 | Nothing is sent after DISCONNECT |
+| `MQTT-4.3.3-6` | 5.0 | Replay sends PUBREL, never the PUBLISH again |
+| `MQTT-4.9.0-3` | 5.0 | A full send quota does not delay SUBSCRIBE or PINGREQ |
+| `MQTT-4.7.3-2` / `-3` | 5.0 | Null character and 65,535-byte limits on topics and filters |
+| `MQTT-4.8.2-2` | 5.0 | ShareName rules for `$share/` filters |
 | `MQTT-3.2.2-4` | 3.1.1, 5.0 | Session Present with no local session state closes the connection |
 | `MQTT-3.3.2-8` | 5.0 | Topic Alias 0 is refused |
 | `MQTT-3.15.1-1` | 5.0 | Reserved AUTH fixed-header bits |
@@ -156,15 +174,20 @@ The two documents contain **391 normative statements** (139 in 3.1.1, 252 in
 5.0). A crude attribution pass puts roughly **290** of them within reach of a
 client implementation; the remainder bind the Server only.
 
-Of those, the statements above are individually verified. **The rest are not
-individually audited.** Much of the protocol is exercised by the behavioural
+Of those, the statements above are individually verified — §4 (operational
+behaviour: QoS flows, ordering, flow control, topics, shared subscriptions) and
+the CONNECT properties were swept systematically and, apart from the DISCONNECT
+session-expiry rule, held throughout. **The rest are not individually
+audited.** Much of the protocol is exercised by the behavioural
 suites and by live interoperability against Mosquitto, and no counter-example is
 known — but "no known counter-example" is not the same as conformance, and this
 document does not present it as such.
 
-The honest summary: one direction-specific violation was found and fixed, the
-receiver-side validation that was probed held up without exception, and the
-remaining statements are covered by behaviour rather than by citation.
+The honest summary: four violations were found and fixed, three of them in what
+the client sends; the receiver-side validation that was probed held up without
+exception; and the remaining statements are covered by behaviour rather than by
+citation. The discovery rate is not yet zero, so no claim of full conformance is
+made.
 
 ## Extending this
 

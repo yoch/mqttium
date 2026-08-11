@@ -30,6 +30,11 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   frontier has just reached. The redundant reservation was left behind and
   counted twice, permanently inflating `len()`/`available` and blocking the
   `release()` fast path that resets the pool once every identifier is free.
+- `disconnect()` refuses a non-zero `session_expiry_interval` when CONNECT
+  declared none. MQTT 5 §3.14.2.2.2 makes it a Protocol Error, and the effect is
+  not cosmetic: the broker answers `0x82` and does not treat the DISCONNECT as
+  valid, so the shutdown counts as ungraceful and the will is published. A
+  session that really was durable can still have its expiry adjusted.
 - A CONNACK reporting Session Present after a Clean Start connection, with no
   durable record held locally, closes the connection with `0x82` instead of
   continuing. [MQTT-3.2.2-4] requires it, and resuming a session the client

@@ -388,6 +388,170 @@ def test_mqtt_4_6_0_2_pubacks_follow_the_order_the_publishes_arrived() -> None:
     assert [int.from_bytes(frame[2:4], "big") for frame in sends] == list(arrival)
 
 
+@pytest.mark.parametrize(
+    ("connect_expiry", "disconnect_expiry", "allowed"),
+    [
+        (None, 300, False),
+        (0, 300, False),
+        (None, 0, True),
+        (600, 300, True),
+        (600, 0, True),
+    ],
+)
+def test_mqtt5_disconnect_cannot_extend_a_session_that_was_never_durable(
+    connect_expiry: int | None, disconnect_expiry: int, allowed: bool
+) -> None:
+    """MQTT 5 §3.14.2.2.2 — this one is prose rather than a numbered statement:
+
+        If the Session Expiry Interval in the CONNECT packet was zero, then it
+        is a Protocol Error to set a non-zero Session Expiry Interval in the
+        DISCONNECT packet sent by the Client.
+
+    The consequence is concrete: the broker answers 0x82 and does not treat the
+    DISCONNECT as valid, so the disconnection counts as ungraceful and the Will
+    Message is published — the opposite of what a clean shutdown intends.
+    An absent interval in CONNECT means zero (§3.1.2.11.2).
+    """
+    connect_properties = None
+    if connect_expiry is not None:
+        connect_properties = Properties()
+        connect_properties.set("session_expiry_interval", connect_expiry)
+
+    engine = ProtocolEngine(
+        EngineConfig(
+            client_id="c",
+            protocol=MQTTProtocolVersion.MQTTv5,
+            connect_properties=connect_properties,
+        ),
+        MemoryInflightStore(),
+    )
+    engine.begin_connect()
+    _feed(engine, encode_frame(PacketType.CONNACK, 0, b"\x00\x00\x00"))
+    engine.take_effects()
+
+    disconnect_properties = Properties()
+    disconnect_properties.set("session_expiry_interval", disconnect_expiry)
+    if allowed:
+        assert engine.begin_disconnect(properties=disconnect_properties)
+    else:
+        with pytest.raises(ProtocolError, match="session_expiry_interval"):
+            engine.begin_disconnect(properties=disconnect_properties)
+
+
+def test_mqtt_3_14_4_1_nothing_is_sent_after_disconnect() -> None:
+    """[MQTT-3.14.4-1] MUST NOT send any more MQTT Control Packets on that
+    Network Connection.
+
+    A QoS 1 PUBLISH arriving after DISCONNECT would normally be acknowledged;
+    it must not be.
+    """
+    engine = _connected()
+    engine.begin_disconnect()
+    engine.take_effects()
+
+    _feed(
+        engine,
+        PublishPacket(
+            topic="a/b",
+            payload=b"v",
+            qos=QoS.AT_LEAST_ONCE,
+            retain=False,
+            dup=False,
+            mid=3,
+            properties=None,
+        ).encode(MQTTProtocolVersion.MQTTv5),
+    )
+    assert not [e for e in engine.take_effects() if e.kind is EffectKind.SEND]
+
+
+def test_mqtt_4_3_3_6_replay_sends_pubrel_not_publish() -> None:
+    """[MQTT-4.3.3-6] MUST NOT re-send the PUBLISH once it has sent the
+    corresponding PUBREL packet."""
+    store = MemoryInflightStore()
+    store.put_out(
+        OutboundMessage(
+            mid=4,
+            topic="t",
+            payload=b"x",
+            qos=QoS.EXACTLY_ONCE,
+            retain=False,
+            state=OutboundQoSState.WAIT_PUBCOMP,
+        )
+    )
+    engine = ProtocolEngine(
+        EngineConfig(client_id="c", protocol=MQTTProtocolVersion.MQTTv5, clean_start=False), store
+    )
+    engine.begin_connect()
+    _feed(engine, _connack_wire(session_present=True, protocol=MQTTProtocolVersion.MQTTv5))
+
+    frames = [e.data for e in engine.take_effects() if e.kind is EffectKind.SEND]
+    kinds = {(frame if isinstance(frame, bytes) else frame[0])[0] & 0xF0 for frame in frames}
+    assert PacketType.PUBREL.value in kinds
+    assert PacketType.PUBLISH.value not in kinds
+
+
+def test_mqtt_4_9_0_3_a_full_send_quota_does_not_block_other_packets() -> None:
+    """[MQTT-4.9.0-3] The Client and Server MUST continue to process and respond
+    to all other MQTT Control Packets even if the quota is zero."""
+    engine = ProtocolEngine(
+        EngineConfig(client_id="c", protocol=MQTTProtocolVersion.MQTTv5, max_outbound_inflight=1),
+        MemoryInflightStore(),
+    )
+    engine.begin_connect()
+    _feed(engine, encode_frame(PacketType.CONNACK, 0, b"\x00\x00\x00"))
+    engine.take_effects()
+
+    engine.queue_publish("t/a", b"x", qos=QoS.AT_LEAST_ONCE)
+    engine.take_effects()
+    engine.queue_publish("t/b", b"y", qos=QoS.AT_LEAST_ONCE)  # beyond the quota
+    engine.take_effects()
+    assert engine.flow.available == 0
+
+    engine.queue_subscribe("s/x")
+    assert [e for e in engine.take_effects() if e.kind is EffectKind.SEND], "SUBSCRIBE was delayed"
+    engine.queue_ping()
+    assert [e for e in engine.take_effects() if e.kind is EffectKind.SEND], "PINGREQ was delayed"
+
+
+def test_mqtt_4_7_3_2_null_character_is_refused_in_topics_and_filters() -> None:
+    """[MQTT-4.7.3-2] Topic Names and Topic Filters MUST NOT include the null
+    character (Unicode U+0000)."""
+    engine = _connected()
+    with pytest.raises(ProtocolError):
+        engine.queue_publish("a\x00b", b"x", qos=QoS.AT_MOST_ONCE)
+    with pytest.raises(ProtocolError):
+        engine.queue_subscribe("a\x00b")
+
+
+def test_mqtt_4_7_3_3_topics_longer_than_65535_bytes_are_refused() -> None:
+    """[MQTT-4.7.3-3] Topic Names and Topic Filters are UTF-8 Encoded Strings;
+    they MUST NOT encode to more than 65,535 bytes."""
+    engine = _connected()
+    with pytest.raises(ProtocolError):
+        engine.queue_publish("a" * 65_536, b"x", qos=QoS.AT_MOST_ONCE)
+
+
+@pytest.mark.parametrize(
+    ("topic_filter", "legal"),
+    [
+        ("$share/g/topic", True),
+        ("$share/a/b/t", True),
+        ("$share//topic", False),
+        ("$share/a+b/t", False),
+        ("$share/a#b/t", False),
+    ],
+)
+def test_mqtt_4_8_2_2_share_name_rules(topic_filter: str, legal: bool) -> None:
+    """[MQTT-4.8.2-2] The ShareName MUST NOT contain the characters "/", "+" or
+    "#", but MUST be followed by a "/" character."""
+    engine = _connected()
+    if legal:
+        engine.queue_subscribe(topic_filter)
+    else:
+        with pytest.raises(ProtocolError):
+            engine.queue_subscribe(topic_filter)
+
+
 # ------------------------------------------------------- the quotes themselves
 
 
@@ -442,7 +606,7 @@ def test_quoted_statements_match_the_vendored_specification() -> None:
             pytest.fail(f"{label} is misquoted\n  docstring: {quoted.strip()[:170]}\n{rendered}")
         checked += 1
 
-    assert checked >= 12, f"expected the module to cite several statements, found {checked}"
+    assert checked >= 18, f"expected the module to cite several statements, found {checked}"
 
 
 @pytest.mark.parametrize("version", ["3.1.1", "5.0"])

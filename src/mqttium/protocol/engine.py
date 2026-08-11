@@ -403,8 +403,37 @@ class ProtocolEngine:
     ) -> bytes:
         if self.state != ConnectionState.CONNECTED:
             raise NotConnectedError("disconnect requires an active connection")
+        self._check_disconnect_session_expiry(properties)
         self.state = ConnectionState.DISCONNECTING
         return encode_disconnect(reason_code, self.config.protocol, properties)
+
+    def _check_disconnect_session_expiry(self, properties: Properties | None) -> None:
+        """Refuse extending a session that was never allowed to outlive the connection.
+
+        MQTT 5 §3.14.2.2.2: "If the Session Expiry Interval in the CONNECT packet
+        was zero, then it is a Protocol Error to set a non-zero Session Expiry
+        Interval in the DISCONNECT packet sent by the Client." The consequence is
+        not abstract — the broker answers 0x82 and does not treat the DISCONNECT
+        as valid, so the disconnection counts as ungraceful and the Will Message
+        is published. Failing here is what stops a clean shutdown from firing the
+        will it was trying to avoid.
+        """
+        if self.config.protocol != MQTTProtocolVersion.MQTTv5 or properties is None:
+            return
+        requested = properties.get("session_expiry_interval")
+        if not requested:
+            return
+        connect_properties = self.config.connect_properties
+        # An absent Session Expiry Interval in CONNECT means zero (§3.1.2.11.2).
+        connected_with = (
+            connect_properties.get("session_expiry_interval") if connect_properties else None
+        )
+        if not connected_with:
+            raise ProtocolError(
+                "Cannot set a non-zero session_expiry_interval on DISCONNECT when "
+                "CONNECT declared none (MQTT 5 §3.14.2.2.2); the broker would answer "
+                "0x82 and publish the will"
+            )
 
     def notify_transport_closed(self) -> None:
         was = self.state
