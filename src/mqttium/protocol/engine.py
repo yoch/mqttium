@@ -431,6 +431,7 @@ class ProtocolEngine:
             raise NotConnectedError("disconnect requires an active connection")
         self._check_disconnect_session_expiry(properties)
         wire = encode_disconnect(reason_code, self.config.protocol, properties)
+        self._check_outbound_size(wire)
         self.state = ConnectionState.DISCONNECTING
         return wire
 
@@ -651,8 +652,10 @@ class ProtocolEngine:
         if packet_method is not None and packet_method != self._auth_method:
             self._reject_auth_method()
             return
-        if packet.reason_code == 0x19 and self.state is ConnectionState.CONNECTING:
-            raise ProtocolError("Re-authenticate AUTH is invalid before CONNACK")
+        if packet.reason_code == 0x19:
+            # MQTT 5 Table 3-11 assigns Re-authenticate to Client→Server only.
+            self._protocol_disconnect(0x82)
+            raise ProtocolError("Broker must not send Re-authenticate AUTH (0x19)")
         if not self.config.accept_auth:
             # No enhanced-auth handler configured — reject broker-initiated AUTH.
             self._send(

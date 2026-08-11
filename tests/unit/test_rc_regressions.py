@@ -175,6 +175,32 @@ def test_inbound_packet_id_collision_is_refused_without_touching_the_record(
     assert engine.state is ConnectionState.DISCONNECTED
 
 
+@pytest.mark.parametrize("protocol", [MQTTProtocolVersion.MQTTv311, MQTTProtocolVersion.MQTTv5])
+def test_auto_ack_qos1_refuses_identifier_owned_by_qos2(
+    protocol: MQTTProtocolVersion,
+) -> None:
+    engine = ProtocolEngine(
+        EngineConfig(client_id="rc-auto", protocol=protocol, manual_ack=False),
+        MemoryInflightStore(),
+    )
+    _connect(engine)
+    _inbound_publish(engine, 5, QoS.EXACTLY_ONCE, b"qos2-holder")
+    engine.take_effects()
+
+    _inbound_publish(engine, 5, QoS.AT_LEAST_ONCE, b"qos1-collision")
+    effects = engine.take_effects()
+    held = engine.store.get_in(5)
+
+    assert held is not None and held.payload == b"qos2-holder"
+    assert not any(
+        effect.kind is EffectKind.MESSAGE and effect.data.payload == b"qos1-collision"
+        for effect in effects
+    )
+    disconnects = [effect.data for effect in effects if effect.kind is EffectKind.DISCONNECTED]
+    assert disconnects and disconnects[0].reason_code == 0x82
+    assert engine.state is ConnectionState.DISCONNECTED
+
+
 def test_inbound_collision_never_reports_a_full_window_while_holding_nothing() -> None:
     """The leak used to be cumulative: with Receive Maximum 4 the client tore a
     healthy connection down reporting 0x93 while the store was empty."""

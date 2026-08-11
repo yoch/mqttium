@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from mqttium.codec.buffer import IncrementalDecoder
 from mqttium.codec.properties import encode_properties
-from mqttium.enums import MQTTProtocolVersion
+from mqttium.enums import ConnectionState, MQTTProtocolVersion
 from mqttium.errors import PacketTooLargeError, ProtocolError
 from mqttium.packets import encode_frame
 from mqttium.enums import PacketType
@@ -75,6 +75,22 @@ def test_maximum_packet_size_enforced() -> None:
     engine.take_effects()
     with pytest.raises(PacketTooLargeError):
         engine.queue_publish("t", b"x" * 100, qos=0)
+
+
+def test_maximum_packet_size_applies_to_disconnect_before_state_change() -> None:
+    engine = ProtocolEngine(EngineConfig(client_id="c", protocol=MQTTProtocolVersion.MQTTv5))
+    engine.begin_connect()
+    connack = Properties()
+    connack.set("maximum_packet_size", 10)
+    _feed(engine, _connack_v5(connack))
+    engine.take_effects()
+    disconnect = Properties()
+    disconnect.set("reason_string", "x" * 50)
+
+    with pytest.raises(PacketTooLargeError):
+        engine.begin_disconnect(properties=disconnect)
+
+    assert engine.state is ConnectionState.CONNECTED
 
 
 def test_pubrec_failure_emits_publish_failed() -> None:

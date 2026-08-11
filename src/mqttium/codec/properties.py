@@ -20,7 +20,7 @@ from mqttium.codec.primitives import (
     unpack_utf8,
 )
 from mqttium.codec.vbi import decode_vbi, encode_vbi
-from mqttium.errors import MalformedPacketError, ProtocolError
+from mqttium.errors import MQTTError, MalformedPacketError, ProtocolError
 from mqttium.types import Properties
 
 
@@ -249,6 +249,11 @@ def _decode_value(ptype: PropType, buf: bytes | bytearray, offset: int) -> tuple
     raise MalformedPacketError(f"Unknown property type {ptype}")
 
 
+def _validate_response_topic(value: Any, error_type: type[MQTTError]) -> None:
+    if isinstance(value, str) and ("+" in value or "#" in value):
+        raise error_type("Property 'response_topic' must not contain wildcards")
+
+
 def encode_properties(props: Properties | None, packet: str) -> bytes:
     """Encode a property bag for *packet* (including WILL context).
 
@@ -289,6 +294,8 @@ def encode_properties(props: Properties | None, packet: str) -> bytes:
                 raise ProtocolError(f"Property {name!r} must not be zero")
             if spec.zero_one and item not in (0, 1):
                 raise ProtocolError(f"Property {name!r} must be 0 or 1")
+            if name == "response_topic":
+                _validate_response_topic(item, ProtocolError)
             body.append(spec.id)
             body.extend(_encode_value(spec.type, item))
 
@@ -329,6 +336,8 @@ def decode_properties(
             raise MalformedPacketError(f"Property {spec.name} must not be zero")
         if spec.zero_one and value not in (0, 1):
             raise MalformedPacketError(f"Property {spec.name} must be 0 or 1")
+        if spec.name == "response_topic":
+            _validate_response_topic(value, MalformedPacketError)
 
         if spec.multiple:
             if spec.name == "subscription_identifier" and packet == SUBSCRIBE:
