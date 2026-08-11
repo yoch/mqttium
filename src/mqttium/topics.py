@@ -7,13 +7,17 @@ from mqttium.errors import MalformedPacketError, ProtocolError
 
 
 def validate_publish_topic(topic: str, *, allow_empty: bool = False) -> None:
-    """Validate a PUBLISH topic name (no wildcards).
+    """Validate an outbound PUBLISH Topic Name (no wildcards).
 
-    ``allow_empty`` is for MQTT 5 topic-alias reuse (topic string empty, alias set).
+    MQTT 5 permits an empty Topic Name only when a Topic Alias has already been
+    established on the current Network Connection. MQTTium does not currently
+    retain authoritative outbound-alias state across the engine/runtime handoff,
+    so accepting an empty name here can emit a malformed first-use alias and can
+    make durable QoS replay depend on connection-scoped state that no longer
+    exists. Until that state is modeled explicitly, outbound omission is refused
+    even when legacy callers pass ``allow_empty=True``.
     """
     if not topic:
-        if allow_empty:
-            return
         raise ProtocolError("PUBLISH topic must not be empty")
     _check_utf8_mqtt_topic(topic)
     if "+" in topic or "#" in topic:
