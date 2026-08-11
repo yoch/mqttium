@@ -50,12 +50,26 @@ Conformance is asserted three ways, in decreasing order of strength:
 
 ### Gaps found and fixed
 
-Three of the four are in what MQTTium **sends**, and that asymmetry is
+Four of the five are in what MQTTium **sends**, and that asymmetry is
 structural rather than accidental: inbound frames pass through one validating
 decoder — which refused every one of the nine malformed shapes probed — whereas
 outbound rules live at the call sites that build packets, where a rule specific
 to a direction or a protocol version has nowhere central to be enforced. One is
 a peer-behaviour check that was simply absent.
+
+**`[MQTT-3.15.2-1]` / `[MQTT-4.12.0-3]` (MQTT 5.0)** — *"The sender of the AUTH
+Packet MUST use one of the Authenticate Reason Codes"*, and *"The Client
+responds to an AUTH packet from the Server by sending a further AUTH packet.
+This packet MUST contain a Reason Code of 0x18 (Continue authentication)."*
+
+`queue_auth()` accepted any reason code the AUTH encoder considered valid,
+including `0x00` (Success) — which Table 3-11 assigns to the **Server**. Only
+`0x18` and `0x19` may come from a Client, and `queue_auth` now enforces that.
+
+This one was encoded in MQTTium's own test suite:
+`test_async_client_auth_handler_exchange` had the client's auth handler answer a
+server challenge with `0x00`, so the non-conformant flow was the one being
+asserted. The test now answers `0x18`, which is what `[MQTT-4.12.0-3]` requires.
 
 **MQTT 5 §3.14.2.2.2** — *"If the Session Expiry Interval in the CONNECT packet
 was zero, then it is a Protocol Error to set a non-zero Session Expiry Interval
@@ -110,6 +124,8 @@ encoded. The inbound direction is unchanged and covered by its own test.
 
 | Statement | Version | Subject |
 | --- | --- | --- |
+| `MQTT-3.15.2-1` | 5.0 | A Client cannot send a Server-only AUTH reason code |
+| `MQTT-4.12.0-3` | 5.0 | A Client answers a Server AUTH with 0x18 |
 | §3.14.2.2.2 | 5.0 | DISCONNECT cannot extend a session that was never durable |
 | `MQTT-3.14.4-1` | 5.0 | Nothing is sent after DISCONNECT |
 | `MQTT-4.3.3-6` | 5.0 | Replay sends PUBREL, never the PUBLISH again |
@@ -150,6 +166,11 @@ Recorded as observations, not as evidence. All were probed and held:
   zero-length topics and filters refused, `sport/#/x`, `sport#` and `sp+rt/a`
   refused while `sport/+/x`, `sport/#`, `+/tennis/#`, `#` and `+` are accepted.
 - **UNSUBSCRIBE requires at least one filter.**
+- **Acknowledgement reason codes** — every PUBACK, PUBREC, PUBREL and PUBCOMP
+  MQTTium emits carries a value defined for that packet, including the `0x92`
+  it answers an orphan PUBREC with.
+- **SUBACK reason codes** are surfaced in the order of the filters that were
+  subscribed.
 
 
 - **Packet identifier ownership.** An inbound PUBLISH whose identifier is still
@@ -183,7 +204,7 @@ suites and by live interoperability against Mosquitto, and no counter-example is
 known — but "no known counter-example" is not the same as conformance, and this
 document does not present it as such.
 
-The honest summary: four violations were found and fixed, three of them in what
+The honest summary: five violations were found and fixed, four of them in what
 the client sends; the receiver-side validation that was probed held up without
 exception; and the remaining statements are covered by behaviour rather than by
 citation. The discovery rate is not yet zero, so no claim of full conformance is

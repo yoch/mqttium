@@ -30,6 +30,11 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   frontier has just reached. The redundant reservation was left behind and
   counted twice, permanently inflating `len()`/`available` and blocking the
   `release()` fast path that resets the pool once every identifier is free.
+- `auth()` refuses a reason code a Client may not send. MQTT 5 Table 3-11
+  assigns `0x00` (Success) to the Server; only `0x18` (Continue authentication)
+  and `0x19` (Re-authenticate) may come from a Client, per [MQTT-3.15.2-1] and
+  [MQTT-4.12.0-3]. An `auth_handler` answering a server challenge with `0x00`
+  now raises instead of putting it on the wire.
 - `disconnect()` refuses a non-zero `session_expiry_interval` when CONNECT
   declared none. MQTT 5 §3.14.2.2.2 makes it a Protocol Error, and the effect is
   not cosmetic: the broker answers `0x82` and does not treat the DISCONNECT as

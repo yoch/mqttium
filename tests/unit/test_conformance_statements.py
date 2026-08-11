@@ -552,6 +552,70 @@ def test_mqtt_4_8_2_2_share_name_rules(topic_filter: str, legal: bool) -> None:
             engine.queue_subscribe(topic_filter)
 
 
+def _auth_engine(*, connected: bool) -> ProtocolEngine:
+    connect_properties = Properties()
+    connect_properties.set("authentication_method", "M")
+    engine = ProtocolEngine(
+        EngineConfig(
+            client_id="c",
+            protocol=MQTTProtocolVersion.MQTTv5,
+            connect_properties=connect_properties,
+            accept_auth=True,
+        ),
+        MemoryInflightStore(),
+    )
+    engine.begin_connect()
+    engine.take_effects()
+    if connected:
+        _feed(engine, encode_frame(PacketType.CONNACK, 0, b"\x00\x00\x00"))
+        engine.take_effects()
+    return engine
+
+
+@pytest.mark.parametrize("reason_code", [0x00, 0x7F, 0x80])
+def test_mqtt_3_15_2_1_client_cannot_send_a_server_only_auth_reason_code(
+    reason_code: int,
+) -> None:
+    """[MQTT-3.15.2-1] The sender of the AUTH Packet MUST use one of the
+    Authenticate Reason Codes.
+
+    Table 3-11 assigns each code a sender: 0x00 (Success) is the Server's, and
+    only 0x18 (Continue authentication) and 0x19 (Re-authenticate) may come from
+    a Client. 0x00 is the interesting case — it is a valid AUTH reason code, just
+    not one a Client may send.
+    """
+    engine = _auth_engine(connected=True)
+    with pytest.raises(ProtocolError):
+        engine.queue_auth(reason_code=reason_code)
+    assert engine.take_effects() == []
+
+
+def test_mqtt_4_12_0_3_client_answers_a_server_auth_with_continue() -> None:
+    """[MQTT-4.12.0-3] The Client responds to an AUTH packet from the Server by
+    sending a further AUTH packet. This packet MUST contain a Reason Code of
+    0x18 (Continue authentication).
+
+    Re-authentication (0x19) is the Client's other legal code but needs an
+    established session, so it is refused mid-handshake.
+    """
+    engine = _auth_engine(connected=False)
+    engine.queue_auth(reason_code=0x18)
+    frames = [e.data for e in engine.take_effects() if e.kind is EffectKind.SEND]
+    assert frames and frames[0][2] == 0x18
+
+    engine = _auth_engine(connected=False)
+    with pytest.raises(ProtocolError):
+        engine.queue_auth(reason_code=0x19)
+
+
+def test_reauthentication_uses_0x19_once_connected() -> None:
+    """The mirror of [MQTT-4.12.0-3]: 0x19 is legal once the session exists."""
+    engine = _auth_engine(connected=True)
+    engine.queue_auth()  # default
+    frames = [e.data for e in engine.take_effects() if e.kind is EffectKind.SEND]
+    assert frames and frames[0][2] == 0x19
+
+
 # ------------------------------------------------------- the quotes themselves
 
 
@@ -606,7 +670,7 @@ def test_quoted_statements_match_the_vendored_specification() -> None:
             pytest.fail(f"{label} is misquoted\n  docstring: {quoted.strip()[:170]}\n{rendered}")
         checked += 1
 
-    assert checked >= 18, f"expected the module to cite several statements, found {checked}"
+    assert checked >= 20, f"expected the module to cite several statements, found {checked}"
 
 
 @pytest.mark.parametrize("version", ["3.1.1", "5.0"])

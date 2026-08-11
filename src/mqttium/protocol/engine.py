@@ -64,6 +64,9 @@ from mqttium.errors import (
 )
 
 
+# MQTT 5 Table 3-11: 0x00 (Success) is sent by the Server only.
+_CLIENT_AUTH_REASON_CODES = frozenset({0x18, 0x19})
+
 _ALLOWED_PACKETS_BY_STATE: dict[ConnectionState, frozenset[PacketType]] = {
     ConnectionState.CONNECTING: frozenset(
         {
@@ -700,6 +703,15 @@ class ProtocolEngine:
             raise NotConnectedError("AUTH requires an active or pending connection")
         if self._auth_method is None:
             raise ProtocolError("AUTH requires authentication_method in CONNECT")
+        if reason_code not in _CLIENT_AUTH_REASON_CODES:
+            # MQTT 5 Table 3-11 assigns a sender to each Authenticate Reason
+            # Code: 0x00 (Success) is the Server's, and only 0x18 (Continue
+            # authentication) and 0x19 (Re-authenticate) may come from a Client.
+            # [MQTT-3.15.2-1] requires the sender to use one of them.
+            raise ProtocolError(
+                f"AUTH reason_code 0x{reason_code:02X} is not one a Client may send; "
+                "use 0x18 (Continue authentication) or 0x19 (Re-authenticate)"
+            )
         if reason_code == 0x19 and self.state is not ConnectionState.CONNECTED:
             raise ProtocolError("Re-authenticate AUTH requires a connected session")
         auth_properties = Properties(
