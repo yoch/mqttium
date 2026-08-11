@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from mqttium.api.stats import EffectStats
+from mqttium.enums import ConnectionState
 from mqttium.protocol.effects import EffectKind, EngineEffect
 
 if TYPE_CHECKING:
@@ -25,6 +26,7 @@ class StaleConnectionEffect(Exception):
 class EffectOwner(Protocol):
     _connection_epoch: int
     _engine: ProtocolEngine
+    _connack_fut: asyncio.Future[Any] | None
 
     def _apply_effect_inline(self, effect: EngineEffect, epoch: int) -> bool: ...
 
@@ -62,6 +64,7 @@ class EffectPump:
         self.progress = asyncio.Event()
         self.waiters = 0
         self.error: BaseException | None = None
+        self.error_applied: int | None = None
         self.task: asyncio.Task[None] | None = None
         self.flush_requested = False
         self.draining_inline = False
@@ -219,6 +222,14 @@ class EffectPump:
                             self.pending.popleft()
                             self._complete()
                         self.error = exc
+                        self.error_applied = self.applied
+                        connack_fut = self.owner._connack_fut
+                        if (
+                            self.owner._engine.state is ConnectionState.CONNECTING
+                            and connack_fut is not None
+                            and not connack_fut.done()
+                        ):
+                            connack_fut.set_exception(exc)
                         if self.waiters:
                             self.progress.set()
                         raise
@@ -239,17 +250,12 @@ class EffectPump:
         except asyncio.CancelledError:
             return
         except Exception as exc:
-            if not self.pending:
-                # `self.error` exists to unblock a caller whose effects the
-                # flush task failed to apply. The failing effect is popped and
-                # counted before the raise, so an empty deque means applied has
-                # caught up with enqueued: every waiter's target is already met
-                # and no future drain() can be blocked by this failure. The
-                # exception has no owner, and retaining it would hand a failure
-                # caused by the peer to the next unrelated call that suspends in
-                # drain(). A non-empty deque is the opposite case — work really
-                # is stuck, so the error stays for whoever is waiting on it.
+            if not self.pending and not self.waiters:
+                # No active drain can own this error. Dropping it here prevents
+                # an unrelated later operation from inheriting a failure from a
+                # completed background flush.
                 self.error = None
+                self.error_applied = None
             asyncio.get_running_loop().call_exception_handler(
                 {
                     "message": "mqttium scheduled effect flush failed",
@@ -264,6 +270,7 @@ class EffectPump:
             if self.pending:
                 self.schedule()
             return
+        start = self.applied
         target = self.enqueued
         if self.applied >= target:
             return
@@ -271,17 +278,28 @@ class EffectPump:
         self.apply_suspensions += 1
         try:
             while self.applied < target:
-                if self.error is not None:
-                    error = self.error
-                    self.error = None
-                    raise error
+                if (
+                    self.error is not None
+                    and self.error_applied is not None
+                    and start < self.error_applied <= target
+                ):
+                    raise self.error
                 self.progress.clear()
                 self.schedule()
                 if self.applied >= target:
                     break
                 await asyncio.shield(self.progress.wait())
+            if (
+                self.error is not None
+                and self.error_applied is not None
+                and start < self.error_applied <= target
+            ):
+                raise self.error
         finally:
             self.waiters -= 1
+            if not self.waiters and not self.pending:
+                self.error = None
+                self.error_applied = None
 
     def discard_connection_effects(self, *, settle_publish: bool = False) -> None:
         """Drop transport effects and preserve or settle terminal publishes."""
