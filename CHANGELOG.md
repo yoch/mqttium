@@ -8,6 +8,19 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- A deliberate `AsyncClient.disconnect()` now reports `None` to
+  `on_disconnect`, matching the callback's public contract, while transport and
+  protocol failures continue to report their exception.
+- `AsyncClient.disconnect()` no longer waits indefinitely to enqueue its
+  terminal packet behind a saturated bounded writer queue. The DISCONNECT is
+  admitted without blocking when capacity exists; otherwise shutdown proceeds
+  directly to closing the transport.
+- Fatal MQTT 5 DISCONNECT packets now pass through `WritePump`, preserving the
+  single-writer transport invariant. Their best-effort drain is bounded so a
+  blocked network write cannot delay teardown indefinitely.
+- `ack()` now refuses to complete a manual inbound acknowledgement while the
+  client is disconnected. This preserves the durable QoS record for session
+  replay instead of deleting it after the writer has already stopped.
 - An inbound PUBLISH whose packet identifier is still owned by an unfinished
   exchange of the other QoS no longer overwrites the stored record. The inbound
   store is keyed by identifier alone, so a QoS 1 PUBLISH reusing the identifier
