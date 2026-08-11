@@ -8,15 +8,6 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
-- PINGRESP packets with a non-zero Remaining Length are rejected instead of
-  being accepted as a successful keepalive response.
-- CONNECT validates the Will Topic as a non-empty, wildcard-free Topic Name
-  before mutating protocol state or producing wire bytes.
-- MQTT 5 shared subscriptions reject `No Local=1` before allocating a packet
-  identifier or emitting a SUBSCRIBE.
-- SUBACK and MQTT 5 UNSUBACK reason-code lists are correlated with the exact
-  request type and filter count. Mismatched acknowledgements now produce a
-  protocol error without releasing the request packet identifier.
 - An inbound PUBLISH whose packet identifier is still owned by an unfinished
   exchange of the other QoS no longer overwrites the stored record. The inbound
   store is keyed by identifier alone, so a QoS 1 PUBLISH reusing the identifier
@@ -26,9 +17,17 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   exceeded) while holding no message at all. Such a PUBLISH violates
   [MQTT-2.2.1-4] — the identifier is still in use until the broker has processed
   our acknowledgement — and is now refused with `0x82` (Protocol Error) before
-  anything is stored. Only `manual_ack=True` was ever affected: without it a
-  QoS 1 PUBLISH stores no record, so neither direction can collide. Genuine
-  QoS 2 duplicates and QoS 1 manual-ack redeliveries are unaffected.
+  anything is stored. The same collision is now checked on the default
+  auto-ACK path, which previously delivered and acknowledged the conflicting
+  QoS 1 message while leaving the QoS 2 record live. Genuine QoS 2 duplicates,
+  QoS 1 manual-ack redeliveries and a durable QoS 1 record reopened under
+  auto-ACK remain supported.
+- MQTT 5 now rejects a broker-sent AUTH with reason `0x19` (Re-authenticate),
+  which Table 3-11 assigns to Client-to-Server traffic only.
+- The broker's negotiated Maximum Packet Size is enforced for DISCONNECT before
+  the engine enters `DISCONNECTING`, not only for publication traffic.
+- MQTT 5 Response Topic properties containing `+` or `#` are rejected in both
+  outbound and inbound PUBLISH packets, as required by [MQTT-3.3.2-14].
 - `EffectPump` no longer retains the exception raised while the background
   effect-flush task applies an effect once nothing is left pending. The stored
   error was handed to whichever call next suspended in `drain()`, so a protocol
