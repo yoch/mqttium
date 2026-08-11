@@ -29,7 +29,7 @@ def test_release_version_matches_readme_and_changelog() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
 
-    assert f"> **Status:** beta (`{version}`)." in readme
+    assert f"> **Status:** release candidate (`{version}`)." in readme
     assert re.search(
         rf"^## \[{re.escape(version)}\] - \d{{4}}-\d{{2}}-\d{{2}}$",
         changelog,

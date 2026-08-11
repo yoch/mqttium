@@ -39,6 +39,38 @@ async def test_auto_callback_does_not_fill_iterator_queue() -> None:
     await client._shutdown_callback_worker(drain=False)
 
 
+async def test_unaccounted_auto_strategy_selects_current_consumer() -> None:
+    iterator_client = AsyncClient(max_pending_delivery_bytes=None)
+    await _deliver(iterator_client, b"iterator")
+    assert iterator_client._messages.get_nowait().payload == b"iterator"
+
+    callback_client = AsyncClient(max_pending_delivery_bytes=None)
+    received: list[bytes] = []
+    callback_client.on_message = lambda message: received.append(message.payload)
+    await _deliver(callback_client, b"callback")
+    await callback_client._callback_queue.join()
+    assert received == [b"callback"]
+    await callback_client._shutdown_callback_worker(drain=False)
+
+
+@pytest.mark.parametrize("mode", ["iterator", "callback", "both"])
+async def test_unaccounted_specialized_delivery_modes(mode: str) -> None:
+    client = AsyncClient(
+        message_delivery=mode,  # type: ignore[arg-type]
+        max_pending_delivery_bytes=None,
+    )
+    received: list[bytes] = []
+    client.on_message = lambda message: received.append(message.payload)
+
+    await _deliver(client, mode.encode())
+    if mode in ("callback", "both"):
+        await client._callback_queue.join()
+        assert received == [mode.encode()]
+        await client._shutdown_callback_worker(drain=False)
+    if mode in ("iterator", "both"):
+        assert client._messages.get_nowait().payload == mode.encode()
+
+
 async def test_iterator_mode_ignores_callback() -> None:
     client = AsyncClient(client_id="delivery-iterator", message_delivery="iterator")
     received: list[bytes] = []

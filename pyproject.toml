@@ -52,6 +52,11 @@ fuzz = [
 security = [
     "bandit>=1.8",
 ]
+benchmark = [
+    "gmqtt==0.7.0",
+    "paho-mqtt==2.1.0",
+    "psutil>=6",
+]
 release = [
     "build>=1.2",
     "check-wheel-contents>=0.6",

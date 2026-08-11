@@ -1,7 +1,6 @@
-# Compatibilité Paho — notes
+# Paho compatibility notes
 
-Implémentation : `mqttium.compat.paho` (VERSION2 uniquement).
+The VERSION2 compatibility implementation lives in `mqttium.compat.paho`.
 
-Politique complète (supporté / écarts / rejets) : [`docs/COMPAT.md`](../../../docs/COMPAT.md).
-
-Migration : [`docs/MIGRATION.md`](../../../docs/MIGRATION.md).
+See [`docs/COMPAT.md`](../../../docs/COMPAT.md) for the supported surface,
+intentional differences, and rejection policy.

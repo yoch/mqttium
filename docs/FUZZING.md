@@ -1,88 +1,64 @@
-# Fuzzing — mqttium (jalon E)
+# Fuzzing
 
-Fuzzer **sans dépendance**, reproductible par seed, avec oracles d’invariants.
+MQTTium uses two complementary fuzz harnesses. Both are reproducible and check
+protocol invariants rather than treating every parser exception as a failure.
 
-## Cibles
-
-| Cible | Ce qui est fuzzé | Oracle |
+| Target | Inputs | Main oracle |
 | --- | --- | --- |
-| `codec` | properties, PUBLISH, frames typées mutées | seules des `MQTTError`/`ValueError`/`struct.error` sortent |
-| `engine` | séquences protocolaires à états (CONNACK dup, ACK storms, alias, reconnect, manual_ack) | invariants : flow borné, mids cohérents, pas de compteur négatif |
-| `websocket` | headers de frames (longueurs 64-bit, contrôle, fragmentation) | bornes mémoire, `ConnectionError` sur dépassement |
+| `codec` | properties, PUBLISH packets, and mutated typed frames | only documented parse errors escape |
+| `engine` | stateful connection, acknowledgement, alias, reconnect, and manual-ack sequences | bounded flow, consistent packet identifiers, non-negative counters |
+| `websocket` | lengths, control frames, and fragmentation | bounded buffering and deterministic rejection |
 
-## Deux harness complémentaires
+`tests/fuzz/fuzz.py` is dependency-free and driven by an explicit seed.
+`tests/fuzz/test_hypothesis_fuzz.py` adds property-based generation, shrinking,
+and a persistent example database.
 
-| Harness | Fichier | Force |
-| --- | --- | --- |
-| Seedé, sans dépendance | `tests/fuzz/fuzz.py` | Reproductible (`--seed`), CI simple, invariants custom |
-| Hypothesis (guidé + shrinking) | `tests/fuzz/test_hypothesis_fuzz.py` | Génération property-based, shrinking auto des cas d’échec |
-
-## Lancer
+## Run locally
 
 ```bash
-cd /workspace
-# Smoke (dans la suite pytest)
-PYTHONPATH=mqttium/src python3 -m pytest mqttium/tests/unit/test_fuzz_smoke.py -q
+# Fast smoke included in the unit suite
+python -m pytest tests/unit/test_fuzz_smoke.py -q
 
-# Seedé, borné
-PYTHONPATH=mqttium/src python3 mqttium/tests/fuzz/fuzz.py --seed 1 --iterations 20000
+# Deterministic campaign
+python tests/fuzz/fuzz.py --seed 1 --iterations 20000
 
-# Hypothesis (profil CI par défaut)
-pip install -e "mqttium[fuzz]"
-PYTHONPATH=mqttium/src python3 -m pytest mqttium/tests/fuzz/test_hypothesis_fuzz.py -q
+# Hypothesis with the default profile
+python -m pytest tests/fuzz/test_hypothesis_fuzz.py -q
 
-# Hypothesis agressif (3000 exemples / test)
-cd mqttium && HYPOTHESIS_PROFILE=aggressive python3 -m pytest tests/fuzz/test_hypothesis_fuzz.py -q
+# More aggressive local search
+HYPOTHESIS_PROFILE=aggressive \
+  python -m pytest tests/fuzz/test_hypothesis_fuzz.py -q
 ```
 
-## CI
+The local release runner can orchestrate multiple deterministic shards:
 
-Le job `fuzz` de `.github/workflows/ci.yml` exécute le fuzzer seedé (3×20k) et
-Hypothesis (profil `ci`) sur chaque changement. Le workflow
-`.github/workflows/fuzz-campaign.yml` ajoute trois niveaux bornés :
-
-- une minute sur les PR qui touchent les cibles ou le harness ;
-- trois shards de 20 minutes chaque nuit ;
-- sur déclenchement manuel, une campagne de release candidate de cinq shards
-  de 288 minutes, soit 1 440 minutes (24 CPU-heures) de fuzzing mono-processus.
-
-La limite de chaque job RC est de 300 minutes : les douze minutes restantes
-sont réservées à l'installation et à l'upload. La durée de 288 minutes inclut
-le passage Hypothesis agressif, puis des lots seedés qui alternent `codec`,
-`engine` et `websocket` jusqu'à l'échéance.
-
-## Reproductibilité
-
-- Seedé : `--seed N` reproduit exactement la séquence.
-- Hypothesis : tout échec est **shrinké** automatiquement et rejouable via la
-  base d'exemples (`.hypothesis/`) ou `@reproduce_failure`.
-- Campagnes longues : le seed du shard et chaque seed de lot figurent dans
-  `metadata.json` et `campaign.log`. La quantité de lots achevés dépend de la
-  vitesse du runner, mais chaque lot reste exactement rejouable. Le corpus
-  Hypothesis, les inputs fautifs et les logs sont uploadés même après un échec.
-
-## Logging temps réel & rejouabilité
-
-Le fuzzer seedé logue sur **stderr** (flush immédiat, parseable) :
-
+```bash
+python benchmarks/fuzz_campaign.py \
+  --shards 5 \
+  --duration-minutes 288 \
+  --output-dir /tmp/mqttium-fuzz
 ```
+
+The seed for every shard and batch is written to `metadata.json` and
+`campaign.log`. Failure inputs are stored as binary artefacts, so a failure can
+be replayed without relying on the original machine.
+
+## Failure output
+
+The deterministic fuzzer writes parseable progress to standard error:
+
+```text
 [START] target=engine seed=1 iterations=20000
-[PROGRESS] target=engine iter=2001/20000 rate=87,590/s elapsed=0.0s
+[PROGRESS] target=engine iter=2001/20000 rate=87590/s elapsed=0.0s
 [FAIL] target=engine iter=50 kind=crash seed=7 elapsed=0.00s
-[ARTIFACT] mqttium/tests/fuzz/artifacts/engine-seed7-iter50.bin
-[DONE] target=engine status=FAIL iters=20000 crashes=1 ... elapsed=0.1s
+[ARTIFACT] tests/fuzz/artifacts/engine-seed7-iter50.bin
+[DONE] target=engine status=FAIL iters=20000 crashes=1 elapsed=0.1s
 ```
 
-- `--progress-every N` : cadence des lignes de progression (débit + elapsed).
-- `--artifacts-dir DIR` : chaque input fautif est écrit pour replay.
-- `--quiet` : coupe les logs temps réel (résumé final conservé).
-- Exit code `1` dès qu’une cible a un crash ou une violation d’invariant.
+Use `--progress-every` to change reporting frequency, `--artifacts-dir` to
+choose where failing inputs are written, and `--quiet` to suppress live progress.
+An invariant violation or crash returns exit code 1.
 
-Rejouer un cas : `--seed N` reproduit la séquence ; l’artefact `.bin` est
-l’input exact à renvoyer dans la cible.
-
-## Conservation
-
-Les artefacts nightly sont conservés 30 jours. Les cinq artefacts d'une
-campagne RC sont conservés 90 jours et contiennent le SHA, le profil, les
-seeds, le corpus Hypothesis, les inputs fautifs et le log complet.
+Long campaigns are release evidence, not a requirement for every development
+iteration. Their outputs belong under `/tmp` or another external artefact
+directory and must not be committed to the source tree.

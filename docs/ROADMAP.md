@@ -18,10 +18,11 @@ finalisation architecture pass.
 
 ## Stable-release campaign
 
-Automation is implemented in `.github/workflows/finalization.yml`; successful
-workflow definitions are not counted as evidence until their run artefacts are
-retained and reviewed. Extended macOS and multi-broker campaigns are launched
-manually. See [`STABILITY.md`](STABILITY.md) and the retained
+Performance and source validation run locally through
+`benchmarks/local_release.py`. A final GitHub matrix supplies the Python-version
+and independent-broker environments that are intentionally not reproduced
+locally.
+See [`STABILITY.md`](STABILITY.md) and the retained historical
 [2026-08-05 campaign record](reports/STABLE-RELEASE-EVIDENCE-2026-08-05.md).
 
 - [x] Retain successful reconnect, session and backpressure soak runs on Linux
@@ -30,8 +31,12 @@ manually. See [`STABILITY.md`](STABILITY.md) and the retained
       Community Edition.
 - [x] Publish reproducible release benchmark artefacts from pinned runner
       profiles.
-- [ ] Review the evidence and promote the API candidate to the first non-alpha
-      release.
+- [ ] Complete and review the local `rc` manifest, then promote the candidate
+      from `1.0.0rc1` to `1.0.0`.
+- [ ] After the source is clean, run one Python 3.11–3.14 and EMQX/HiveMQ
+      GitHub matrix for the first RC.
+- [ ] Run the multi-hour fuzz and soak campaign after the first RC, before a
+      later candidate or final `1.0.0` promotion.
 
 ## Remaining memory and performance work
 
@@ -61,9 +66,8 @@ which records what already shipped.
 
 ## Optional extensions
 
-- [ ] Extract inbound application delivery into a dedicated controller only if
-      soak results or future delivery policies show a concrete ownership or
-      maintenance benefit.
+- [x] Extract inbound application delivery into a dedicated controller with
+      measured mode-specialised admission and unchanged Stable API semantics.
 - [ ] Concrete enhanced-authentication plugins such as SCRAM where broker demand
       justifies them.
 - [ ] Additional Paho compatibility surface only when backed by behavioural tests.
@@ -73,7 +77,7 @@ which records what already shipped.
 
 - Python 3.11, 3.12, 3.13 and 3.14 unit and Mosquitto integration tests;
 - Ruff formatting/linting and mypy;
-- at least 80% source coverage;
+- at least 87.36% source coverage;
 - deterministic plus Hypothesis fuzzing;
 - wheel, sdist and isolated-install validation;
 - subscriber-confirmed TCP, TLS and controlled WAN-profile benchmarks;
