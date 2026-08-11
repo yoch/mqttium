@@ -127,9 +127,7 @@ def test_matching_subscription_ack_consumes_request_shape() -> None:
 
 
 def test_empty_client_id_requires_assigned_identifier_in_success_connack() -> None:
-    engine = ProtocolEngine(
-        EngineConfig(client_id="", protocol=MQTTProtocolVersion.MQTTv5)
-    )
+    engine = ProtocolEngine(EngineConfig(client_id="", protocol=MQTTProtocolVersion.MQTTv5))
     engine.begin_connect()
 
     _feed(engine, _connack_v5())
@@ -141,9 +139,7 @@ def test_empty_client_id_requires_assigned_identifier_in_success_connack() -> No
 
 
 def test_empty_client_id_accepts_nonempty_assigned_identifier() -> None:
-    engine = ProtocolEngine(
-        EngineConfig(client_id="", protocol=MQTTProtocolVersion.MQTTv5)
-    )
+    engine = ProtocolEngine(EngineConfig(client_id="", protocol=MQTTProtocolVersion.MQTTv5))
     engine.begin_connect()
     properties = Properties()
     properties.set("assigned_client_identifier", "server-assigned")
