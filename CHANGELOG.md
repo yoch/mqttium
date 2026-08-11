@@ -30,6 +30,11 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   frontier has just reached. The redundant reservation was left behind and
   counted twice, permanently inflating `len()`/`available` and blocking the
   `release()` fast path that resets the pool once every identifier is free.
+- Connecting over MQTT 3.1.1 with a password but no username is refused instead
+  of sending a CONNECT whose password flag is set while the username flag is
+  clear, which [MQTT-3.1.2-22] forbids and a broker may reject or misparse.
+  MQTT 5 lifted the restriction, so the check is version-specific and the same
+  configuration still works there.
 - `publish()` rejects `subscription_identifier` in MQTT 5 properties instead of
   putting it on the wire. [MQTT-3.3.4-6] forbids a Subscription Identifier on a
   PUBLISH sent from a Client to a Server; the property table validates per

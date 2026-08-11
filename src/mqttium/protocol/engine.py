@@ -233,6 +233,18 @@ class ProtocolEngine:
         configured_auth_method = None
         if self.config.connect_properties is not None:
             configured_auth_method = self.config.connect_properties.get("authentication_method")
+        if (
+            self.config.protocol == MQTTProtocolVersion.MQTTv311
+            and self.config.password is not None
+            and self.config.username is None
+        ):
+            # [MQTT-3.1.2-22]: under MQTT 3.1.1, if the User Name Flag is 0 the
+            # Password Flag MUST be 0. MQTT 5 lifted the restriction, so this is
+            # deliberately version-specific rather than a general rule.
+            raise ProtocolError(
+                "MQTT 3.1.1 does not allow a password without a username "
+                "[MQTT-3.1.2-22]; connect with MQTT 5 or supply a username"
+            )
         if self.config.accept_auth:
             if self.config.protocol != MQTTProtocolVersion.MQTTv5:
                 raise ProtocolError("Enhanced authentication requires MQTT 5")

@@ -48,7 +48,22 @@ Conformance is asserted three ways, in decreasing order of strength:
 
 ## Result
 
-### Gap found and fixed
+### Gaps found and fixed
+
+Both were in what MQTTium **sends**. Receiver-side validation, probed across
+nine malformed-frame shapes, refused every one — the asymmetry is structural
+and worth naming: inbound frames pass through one validating decoder, whereas
+outbound rules are spread across the call sites that build packets.
+
+**`[MQTT-3.1.2-22]` (MQTT 3.1.1)** — *"If the User Name Flag is set to 0, the
+Password Flag MUST be set to 0."*
+
+MQTTium sent a CONNECT with the password flag set and the username flag clear
+whenever a password was configured without a username, which a 3.1.1 broker may
+reject or misparse. MQTT 5 lifted the restriction, so `begin_connect` now
+refuses the combination for 3.1.1 only rather than degrading silently. Note the
+label means something entirely different in the 5.0 document — see the
+version-ambiguity warning above.
 
 **`[MQTT-3.3.4-6]` (MQTT 5.0)** — *"A PUBLISH packet sent from a Client to a
 Server MUST NOT contain a Subscription Identifier."*
@@ -66,6 +81,9 @@ encoded. The inbound direction is unchanged and covered by its own test.
 
 | Statement | Version | Subject |
 | --- | --- | --- |
+| `MQTT-3.1.2-22` | 3.1.1 | No password flag without a username flag (and MQTT 5 still allows it) |
+| `MQTT-3.1.2-21` | 5.0 | Server Keep Alive replaces the requested value |
+| `MQTT-3.3.2-2` | 5.0 | No wildcard in a PUBLISH topic name |
 | `MQTT-3.3.4-6` | 5.0 | No Subscription Identifier on an outbound PUBLISH |
 | `MQTT-3.8.3-2` | 5.0 | SUBSCRIBE carries at least one filter |
 | `MQTT-3.3.1-4` | 3.1.1, 5.0 | PUBLISH must not set both QoS bits |
@@ -80,7 +98,20 @@ silent accept.
 
 ### Surveyed by reading, no dedicated statement test
 
-Recorded as observations, not as evidence:
+Recorded as observations, not as evidence. All were probed and held:
+
+- **CONNECT construction** — Will Flag 0 forces Will QoS and Will Retain to 0
+  and omits the will payload; a configured will encodes its QoS and retain
+  faithfully; credential flags always describe the payload that follows them.
+- **Nothing but AUTH or DISCONNECT reaches the wire before CONNACK**
+  (`[MQTT-3.1.2-30]`). A QoS 1 publish issued while connecting is admitted to
+  the offline queue but emits no frame until the session is established; QoS 0,
+  SUBSCRIBE and PINGREQ are refused outright.
+- **Topic and filter validation** — wildcards refused in a publish topic,
+  zero-length topics and filters refused, `sport/#/x`, `sport#` and `sp+rt/a`
+  refused while `sport/+/x`, `sport/#`, `+/tennis/#`, `#` and `+` are accepted.
+- **UNSUBSCRIBE requires at least one filter.**
+
 
 - **Packet identifier ownership.** An inbound PUBLISH whose identifier is still
   held by an unfinished exchange of the other QoS is refused with `0x82`

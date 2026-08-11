@@ -122,6 +122,100 @@ def test_mqtt_3_8_3_2_subscribe_requires_at_least_one_filter() -> None:
     assert engine.take_effects() == []
 
 
+def test_mqtt_3_1_2_22_mqtt311_rejects_a_password_without_a_username() -> None:
+    """[MQTT-3.1.2-22] If the User Name Flag is set to 0, the Password Flag MUST
+    be set to 0.
+
+    This is an MQTT 3.1.1 rule that MQTT 5 lifted, so the check is deliberately
+    version-specific: the same configuration is legal over MQTT 5. Note that
+    this label means something entirely different in the 5.0 document — 119
+    labels appear in both and 112 of them disagree.
+    """
+    engine = ProtocolEngine(
+        EngineConfig(
+            client_id="c",
+            protocol=MQTTProtocolVersion.MQTTv311,
+            username=None,
+            password=b"secret",
+        ),
+        MemoryInflightStore(),
+    )
+    with pytest.raises(ProtocolError, match="MQTT-3.1.2-22"):
+        engine.begin_connect()
+
+
+@pytest.mark.parametrize(
+    ("username", "password", "expect_user_flag", "expect_password_flag"),
+    [
+        ("u", b"secret", True, True),
+        ("u", None, True, False),
+        (None, None, False, False),
+    ],
+)
+def test_mqtt311_connect_flags_match_the_credentials_present(
+    username: str | None,
+    password: bytes | None,
+    expect_user_flag: bool,
+    expect_password_flag: bool,
+) -> None:
+    """The credential flags must describe the payload that follows them."""
+    engine = ProtocolEngine(
+        EngineConfig(
+            client_id="c",
+            protocol=MQTTProtocolVersion.MQTTv311,
+            username=username,
+            password=password,
+        ),
+        MemoryInflightStore(),
+    )
+    wire = engine.begin_connect()
+    flags = wire[wire.index(b"MQTT") + 5]
+    assert bool(flags & 0x80) is expect_user_flag
+    assert bool(flags & 0x40) is expect_password_flag
+
+
+def test_mqtt5_allows_a_password_without_a_username() -> None:
+    """MQTT 5 removed the pairing rule; refusing it there would be wrong."""
+    engine = ProtocolEngine(
+        EngineConfig(
+            client_id="c",
+            protocol=MQTTProtocolVersion.MQTTv5,
+            username=None,
+            password=b"secret",
+        ),
+        MemoryInflightStore(),
+    )
+    wire = engine.begin_connect()
+    flags = wire[wire.index(b"MQTT") + 5]
+    assert flags & 0x40, "the password flag must be set"
+    assert not flags & 0x80, "no username flag is expected"
+
+
+def test_mqtt_3_3_2_2_publish_topic_must_not_contain_wildcards() -> None:
+    """[MQTT-3.3.2-2] The Topic Name in the PUBLISH packet MUST NOT contain
+    wildcard characters."""
+    engine = _connected()
+    for topic in ("a/+/b", "a/#", "+", "#"):
+        with pytest.raises(ProtocolError):
+            engine.queue_publish(topic, b"x", qos=QoS.AT_MOST_ONCE)
+    assert engine.take_effects() == []
+
+
+def test_mqtt_3_1_2_21_server_keep_alive_replaces_the_requested_value() -> None:
+    """[MQTT-3.1.2-21] If the Server returns a Server Keep Alive on the CONNACK
+    packet, the Client MUST use that value instead of the value it sent as the
+    Keep Alive."""
+    engine = ProtocolEngine(
+        EngineConfig(client_id="c", protocol=MQTTProtocolVersion.MQTTv5, keepalive=60),
+        MemoryInflightStore(),
+    )
+    engine.begin_connect()
+    _feed(engine, encode_frame(PacketType.CONNACK, 0, b"\x00\x00\x03\x13\x00\x1e"))
+    engine.take_effects()
+    assert engine.negotiated.server_keep_alive == 30
+    assert engine.negotiated.effective_keepalive == 30
+
+
 # ------------------------------------------------------------------- receiving
 
 
@@ -224,7 +318,7 @@ def test_quoted_statements_match_the_vendored_specification() -> None:
             pytest.fail(f"{label} is misquoted\n  docstring: {quoted.strip()[:170]}\n{rendered}")
         checked += 1
 
-    assert checked >= 5, f"expected the module to cite several statements, found {checked}"
+    assert checked >= 8, f"expected the module to cite several statements, found {checked}"
 
 
 @pytest.mark.parametrize("version", ["3.1.1", "5.0"])
