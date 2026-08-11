@@ -239,6 +239,17 @@ class EffectPump:
         except asyncio.CancelledError:
             return
         except Exception as exc:
+            if not self.pending:
+                # `self.error` exists to unblock a caller whose effects the
+                # flush task failed to apply. The failing effect is popped and
+                # counted before the raise, so an empty deque means applied has
+                # caught up with enqueued: every waiter's target is already met
+                # and no future drain() can be blocked by this failure. The
+                # exception has no owner, and retaining it would hand a failure
+                # caused by the peer to the next unrelated call that suspends in
+                # drain(). A non-empty deque is the opposite case — work really
+                # is stuck, so the error stays for whoever is waiting on it.
+                self.error = None
             asyncio.get_running_loop().call_exception_handler(
                 {
                     "message": "mqttium scheduled effect flush failed",

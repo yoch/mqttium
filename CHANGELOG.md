@@ -6,6 +6,41 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- An inbound PUBLISH whose packet identifier is still owned by an unfinished
+  exchange of the other QoS no longer overwrites the stored record. The inbound
+  store is keyed by identifier alone, so a QoS 1 PUBLISH reusing the identifier
+  of a live QoS 2 exchange (or the reverse) replaced it and stranded its Receive
+  Maximum slot and byte reservation permanently. The leak was cumulative and
+  ended in the client disconnecting itself with `0x93` (Receive Maximum
+  exceeded) while holding no message at all. Such a PUBLISH violates
+  [MQTT-2.2.1-3] and is now refused with `0x82` (Protocol Error) before anything
+  is stored. Genuine QoS 2 duplicates and QoS 1 manual-ack redeliveries are
+  unaffected.
+- `EffectPump` no longer retains the exception raised while the background
+  effect-flush task applies an effect once nothing is left pending. The stored
+  error was handed to whichever call next suspended in `drain()`, so a protocol
+  error caused by the broker surfaced against an unrelated later `publish()` on
+  a healthy connection. A failure that genuinely blocks pending effects is still
+  reported to whoever waits on it.
+- `PacketIdPool.reserve()` is now idempotent for an identifier the allocation
+  frontier has just reached. The redundant reservation was left behind and
+  counted twice, permanently inflating `len()`/`available` and blocking the
+  `release()` fast path that resets the pool once every identifier is free.
+### Documentation
+
+- `InflightStore.update_out()` / `update_in()` now state what they actually
+  guarantee: the mutable state fields only (`state`/`dup`, and
+  `state`/`delivered`/`user_acked`), plus retransmission order.
+  `SqliteInflightStore` deliberately narrows the write to those columns so a
+  retransmission does not rewrite the payload BLOB, while `MemoryInflightStore`
+  replaces the record — the protocol was silent on which was correct. The
+  corollary is now spelled out: the phase-two compaction `on_pubrec` applies
+  through `update_out()` is best-effort for a store without
+  `TransitionInflightStore`. Both built-in stores implement that extension and
+  compact through `transition_out(compact=True)` instead.
+
 ## [1.0.0rc1] - 2026-08-11
 
 ### Added

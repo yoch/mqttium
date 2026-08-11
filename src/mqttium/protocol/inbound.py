@@ -9,7 +9,7 @@ stream; handlers emit through it so observable effect ordering does not change.
 from __future__ import annotations
 
 from collections.abc import Iterator
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NoReturn
 
 from mqttium.codec.buffer import RawPacket
 from mqttium.codec.packet_validation import require_nonzero_mid
@@ -274,14 +274,22 @@ class InboundSession:
         assert packet.mid is not None
         if packet.qos == QoS.EXACTLY_ONCE:
             transitions = self._transitions
-            # Only existence matters here; re-reading the stored payload to
-            # answer a duplicate PUBLISH was pure waste.
-            duplicate = (
-                transitions.contains_in(packet.mid)
-                if transitions is not None
-                else store.get_in(packet.mid) is not None
-            )
-            if duplicate:
+            # Existence is the common question and the cheapest to answer, so it
+            # stays first: a fresh PUBLISH finds nothing and pays exactly one
+            # lookup. Only once a record turns up does the state matter, and it
+            # has to, because the inbound store is keyed by identifier alone —
+            # a record under this mid is a QoS 2 duplicate only if it is in a
+            # QoS 2 phase. Reading it back costs a second metadata query on the
+            # rare duplicate path rather than on every inbound QoS 2 PUBLISH.
+            existing: InboundMessage | InboundRecordMeta | None = None
+            if transitions is not None:
+                if transitions.contains_in(packet.mid):
+                    existing = transitions.in_meta(packet.mid)
+            else:
+                existing = store.get_in(packet.mid)
+            if existing is not None:
+                if existing.state is InboundQoSState.WAIT_PUBACK:
+                    self._reject_packet_id_collision(packet.mid, "QoS 2", "QoS 1")
                 engine._send(PubRecPacket(mid=packet.mid).encode(config.protocol))
                 return
 
@@ -345,9 +353,14 @@ class InboundSession:
             # but is surfaced again so an application can complete manual ACK
             # after a reconnect or callback cancellation.
             existing = store.get_in(mid)
-            if existing is not None and existing.state is InboundQoSState.WAIT_PUBACK:
-                self._emit_message(existing, dup=True)
-                return
+            if existing is not None:
+                if existing.state is InboundQoSState.WAIT_PUBACK:
+                    self._emit_message(existing, dup=True)
+                    return
+                # The record belongs to an unfinished QoS 2 exchange. Storing
+                # this one would overwrite it and strand its Receive Maximum
+                # slot and byte reservation for the lifetime of the session.
+                self._reject_packet_id_collision(mid, "QoS 1", "QoS 2")
 
         logical_size = self.logical_size(topic, payload, properties) if config.manual_ack else None
         self._acquire_slot(logical_size)
@@ -712,6 +725,23 @@ class InboundSession:
                 f"release={logical_size}, pending={self._pending_bytes}"
             )
         self._pending_bytes -= logical_size
+
+    def _reject_packet_id_collision(self, mid: int, arriving: str, held: str) -> NoReturn:
+        """Refuse a PUBLISH whose identifier is still owned by another exchange.
+
+        [MQTT-2.2.1-3] forbids reusing a packet identifier while its exchange is
+        unfinished. The inbound store is keyed by identifier alone, so honouring
+        such a PUBLISH would replace the live record and leak the Receive
+        Maximum slot and byte reservation it still owns — permanently, and
+        cumulatively until the client disconnects itself reporting a full
+        receive window while holding nothing.
+        """
+        # MQTT 5 §3.14.2.1: DISCONNECT 0x82 (Protocol Error).
+        self._protocol_disconnect(0x82)
+        raise ProtocolError(
+            f"Inbound {arriving} PUBLISH reuses mid={mid}, still held by an "
+            f"unfinished {held} exchange"
+        )
 
     def _protocol_disconnect(self, reason_code: int) -> None:
         """Emit a normative DISCONNECT before the transport is torn down."""

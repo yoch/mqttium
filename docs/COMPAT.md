@@ -163,5 +163,5 @@ under concurrent publishers.
 - `tests/unit/test_compat_lib_subset.py` — behavioral compatibility subset
 - `tests/unit/test_compat_publish_perf.py` — effect ordering, MID reuse, mixed-QoS coalescing, cancellation, loop shutdown, and concurrent QoS 1 admission
 - `tests/unit/test_compat_publish_edges.py` — oversized drain handling and complete QoS 2 publish handshake
-- `tests/integration/test_compat_publish_perf.py` — end-to-end QoS 0 and concurrent QoS 1 callbacks and delivery
+- `tests/integration/test_compat_publish_live.py` — end-to-end QoS 0 and concurrent QoS 1 callbacks and delivery
 - `benchmarks/compat_qosn_submit_ab.py` — coroutine, callback, and coalesced QoS 1 submit-rate/latency comparison

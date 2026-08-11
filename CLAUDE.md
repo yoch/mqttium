@@ -198,7 +198,7 @@ not `AsyncClient` must pump `continue_inbound_replay()` itself while `inbound.re
     recomputed once at hydration and written back.
 
   `SqliteInflightStore` versions its schema in `PRAGMA user_version` (`SQLITE_SCHEMA_VERSION`,
-  currently 2). Migrations run in one transaction, so an interrupted upgrade reopens at the
+  currently 4). Migrations run in one transaction, so an interrupted upgrade reopens at the
   starting version; a newer schema is refused. `batch()` is lazy — `BEGIN IMMEDIATE` is deferred to
   the first mutation, so a read-only ingress lot takes no write lock. Two storage decisions are
   load-bearing and measured, not cosmetic: **`payload` is declared last** (SQLite walks the columns
