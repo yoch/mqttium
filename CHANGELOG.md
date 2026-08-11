@@ -6,6 +6,26 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Changed
+
+- `SEGMENT_THRESHOLD` for segmented PUBLISH writes is **128 KiB** (was 1 MiB).
+  Contiguous encode of mid-size payloads sat on a measured copy cliff around
+  256 KiB; lowering the cut also retains more QoS 1/2 frames in the cheap
+  `(header, payload)` form used by the existing frame-retention policy.
+- MQTT 5 QoS ≥ 1 `queue_publish` reuses the property table bytes produced by
+  admission sizing when launching the PUBLISH, so `encode_properties` runs once
+  per publication instead of twice.
+- MQTT 5 QoS 0 ingress decodes directly into a `Message` (properties and topic
+  aliases included) without building an intermediate `PublishPacket`. QoS 1/2
+  still use the generic packet path.
+- `TopicMatcher` short-circuits exact-only registries to a dict lookup; mixed
+  exact/wildcard sets keep insertion order.
+- `Properties` memoises the last encoded table per packet name until mutated
+  through `set` / `add_user_property`, so delivery/inbound `logical_size` does
+  not re-encode a bag already sized on the hot path.
+- Outbound encode after `validate_publish_topic` skips a second MQTT-UTF-8
+  validation pass (`topic_validated=True` on `encode_publish_item`).
+
 ### Fixed
 
 - An inbound PUBLISH whose packet identifier is still owned by an unfinished
@@ -74,6 +94,9 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Documentation
 
+- Independent hot-path audit at `1.0.0rc1` /
+  `docs/reports/PERFORMANCE-AUDIT-1.0.0rc1-INDEPENDENT.md`, with dispositions
+  against prior reports and follow-up fixes for issues #99–#106 / index #108.
 - `InflightStore.update_out()` / `update_in()` now state what they actually
   guarantee: the mutable state fields only (`state`/`dup`, and
   `state`/`delivered`/`user_acked`), plus retransmission order.

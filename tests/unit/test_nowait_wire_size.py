@@ -57,18 +57,17 @@ def test_publish_wire_size_matches_encoded_frame(
 
 
 async def test_publish_nowait_encodes_only_the_real_frame(monkeypatch) -> None:
-    calls = 0
-    original = PublishPacket.encode_write_item
+    import mqttium.protocol.outbound as outbound_module
+    from mqttium.packets.publish import encode_publish_item as original
 
-    def counted(
-        self: PublishPacket,
-        protocol: MQTTProtocolVersion = MQTTProtocolVersion.MQTTv311,
-    ):
+    calls = 0
+
+    def counted(*args, **kwargs):
         nonlocal calls
         calls += 1
-        return original(self, protocol)
+        return original(*args, **kwargs)
 
-    monkeypatch.setattr(PublishPacket, "encode_write_item", counted)
+    monkeypatch.setattr(outbound_module, "encode_publish_item", counted)
     client = AsyncClient(max_outbound_messages=8)
     client._engine.state = ConnectionState.CONNECTED
 

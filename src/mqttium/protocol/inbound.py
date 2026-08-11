@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, NoReturn
 from mqttium.codec.buffer import RawPacket
 from mqttium.codec.packet_validation import require_nonzero_mid
 from mqttium.codec.primitives import unpack_u16, unpack_utf8
-from mqttium.codec.properties import PUBLISH, encode_properties
+from mqttium.codec.properties import PUBLISH, decode_properties, encode_properties
 from mqttium.enums import ConnectionState, InboundQoSState, MQTTProtocolVersion, QoS
 from mqttium.errors import MalformedPacketError, ProtocolError
 from mqttium.persistence.memory import (
@@ -109,6 +109,18 @@ def _decode_v311_qos1_fields(
     mid, pos = unpack_u16(raw.remaining, pos)
     require_nonzero_mid(mid, "PUBLISH")
     return topic, raw.remaining[pos:], mid, bool(raw.flags & 0x01), bool(raw.flags & 0x08)
+
+
+def _decode_v5_qos0_fields(
+    raw: RawPacket,
+) -> tuple[str, bytes, bool, Properties | None]:
+    """Decode MQTT 5 QoS 0 PUBLISH fields without building a PublishPacket."""
+
+    if raw.flags & 0x08:
+        raise MalformedPacketError("QoS 0 PUBLISH must not set DUP")
+    topic, pos = unpack_utf8(raw.remaining)
+    properties, pos = decode_properties(raw.remaining, pos, PUBLISH)
+    return topic, raw.remaining[pos:], bool(raw.flags & 0x01), properties
 
 
 class InboundSession:
@@ -250,6 +262,25 @@ class InboundSession:
                     retain=retain,
                     dup=dup,
                     properties=None,
+                )
+                return
+        elif config.protocol is MQTTProtocolVersion.MQTTv5:
+            qos = (raw.flags >> 1) & 0x03
+            if qos == int(QoS.AT_MOST_ONCE):
+                topic, payload, retain, properties = _decode_v5_qos0_fields(raw)
+                topic = self._resolve_topic_fields(topic, properties)
+                validate_received_publish_topic(topic, utf8_validated=True)
+                engine._emit(
+                    EffectKind.MESSAGE,
+                    Message(
+                        topic=topic,
+                        payload=payload,
+                        qos=QoS.AT_MOST_ONCE,
+                        retain=retain,
+                        dup=False,
+                        mid=None,
+                        properties=properties,
+                    ),
                 )
                 return
         packet = PublishPacket.decode(raw.flags, raw.remaining, config.protocol)
@@ -643,14 +674,16 @@ class InboundSession:
     # --- aliases and Receive Maximum --------------------------------------
 
     def _resolve_topic(self, packet: PublishPacket) -> str:
+        return self._resolve_topic_fields(packet.topic, packet.properties)
+
+    def _resolve_topic_fields(self, topic: str, props: Properties | None) -> str:
         if self.config.protocol != MQTTProtocolVersion.MQTTv5:
-            return packet.topic
-        props = packet.properties
+            return topic
         alias = props.get("topic_alias") if props else None
         if alias is None:
-            if not packet.topic:
+            if not topic:
                 raise ProtocolError("PUBLISH with empty topic and no topic alias")
-            return packet.topic
+            return topic
         alias = int(alias)
         max_alias = self.config.topic_alias_maximum
         # max_alias == 0 means inbound aliases are not accepted.
@@ -658,9 +691,9 @@ class InboundSession:
             # MQTT 5 §3.3.2.3.5: DISCONNECT 0x94 (Topic Alias invalid).
             self._protocol_disconnect(0x94)
             raise ProtocolError(f"Invalid topic alias {alias}")
-        if packet.topic:
-            self._aliases[alias] = packet.topic
-            return packet.topic
+        if topic:
+            self._aliases[alias] = topic
+            return topic
         if alias not in self._aliases:
             self._protocol_disconnect(0x94)
             raise ProtocolError(f"Unknown topic alias {alias}")

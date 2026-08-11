@@ -25,8 +25,15 @@ def encode_publish_item(
     mid: int | None,
     properties: Properties | None,
     protocol: MQTTProtocolVersion = MQTTProtocolVersion.MQTTv311,
+    property_wire: bytes | None = None,
+    topic_validated: bool = False,
 ) -> WriteItem:
-    """Validate and encode one outbound PUBLISH exactly once."""
+    """Validate and encode one outbound PUBLISH exactly once.
+
+    ``property_wire`` reuses a table already produced by admission sizing.
+    ``topic_validated`` skips a second MQTT-UTF-8 pass when the caller has
+    already run ``validate_publish_topic``.
+    """
 
     # Every internal caller has already validated and converted, so the common
     # case is an exact QoS member. Re-running the enum call on it costs about
@@ -48,9 +55,17 @@ def encode_publish_item(
         _require_outbound_mid(mid, PUBLISH)
 
     flags = (int(level) << 1) | (0x01 if retain else 0) | (0x08 if dup else 0)
-    topic_bytes = encode_utf8(topic)
+    if topic_validated:
+        topic_bytes = topic.encode("ascii") if topic.isascii() else topic.encode("utf-8")
+        if len(topic_bytes) > 65535:
+            raise ProtocolError("UTF-8 string too long for MQTT")
+    else:
+        topic_bytes = encode_utf8(topic)
     topic_size = len(topic_bytes)
-    props = _props_or_empty(properties, PUBLISH, protocol)
+    if property_wire is not None:
+        props = property_wire
+    else:
+        props = _props_or_empty(properties, PUBLISH, protocol)
     payload_size = len(payload)
     remaining_length = 2 + topic_size + (2 if level else 0) + len(props) + payload_size
 

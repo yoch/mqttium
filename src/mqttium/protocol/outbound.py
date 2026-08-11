@@ -36,7 +36,6 @@ from mqttium.errors import (
 from mqttium.packets import (
     PubAckPacket,
     PubCompPacket,
-    PublishPacket,
     PubRecPacket,
     PubRelPacket,
 )
@@ -346,6 +345,7 @@ class OutboundSession:
             mid=None,
             properties=properties,
             protocol=self.config.protocol,
+            topic_validated=True,
         )
         self._engine._check_outbound_size(item)
         return item
@@ -393,11 +393,10 @@ class OutboundSession:
             self._emit(EffectKind.PUBLISH_COMPLETE, None)
             return PublishHandle(mid=None, qos=qos)
 
-        # One property encode and one topic measurement feed both the wire-size
-        # check and the logical budget.
-        topic_bytes, wire_property_bytes, logical_property_bytes = self.size_parts(
-            topic, properties
-        )
+        # One property encode feeds the wire-size check, the logical budget, and
+        # (via OutboundMessage.property_wire) the eventual PUBLISH frame.
+        topic_bytes, property_wire, logical_property_bytes = self.size_parts(topic, properties)
+        wire_property_bytes = len(property_wire)
         # Validate packet size before reserving local memory or a packet id.
         self._check_publish_wire_size(topic_bytes, wire_property_bytes, len(payload), qos)
         logical_size = len(payload) + topic_bytes + logical_property_bytes
@@ -421,6 +420,7 @@ class OutboundSession:
                 state=OutboundQoSState.QUEUED,
                 properties=properties,
                 logical_size=logical_size,
+                property_wire=property_wire or None,
             )
 
             # Defer wire encode until launch: avoids double work when messages sit
@@ -616,15 +616,20 @@ class OutboundSession:
     def _launch(self, msg: OutboundMessage) -> None:
         wire = msg.encoded_publish
         if wire is None:
-            wire = PublishPacket(
-                topic=msg.topic,
-                payload=msg.payload,
+            property_wire = msg.property_wire
+            wire = encode_publish_item(
+                msg.topic,
+                msg.payload,
                 qos=msg.qos,
                 retain=msg.retain,
                 dup=msg.dup,
                 mid=msg.mid,
                 properties=msg.properties,
-            ).encode_write_item(self.config.protocol)
+                protocol=self.config.protocol,
+                property_wire=property_wire,
+                topic_validated=True,
+            )
+            msg.property_wire = None
         self._engine._check_outbound_size(wire)
         if msg.qos == QoS.AT_LEAST_ONCE:
             msg.state = OutboundQoSState.WAIT_PUBACK
@@ -655,15 +660,19 @@ class OutboundSession:
             msg.dup = True
             retained = msg.encoded_publish
             if retained is None:
-                wire = PublishPacket(
-                    topic=msg.topic,
-                    payload=msg.payload,
+                wire = encode_publish_item(
+                    msg.topic,
+                    msg.payload,
                     qos=msg.qos,
                     retain=msg.retain,
                     dup=True,
                     mid=msg.mid,
                     properties=msg.properties,
-                ).encode_write_item(self.config.protocol)
+                    protocol=self.config.protocol,
+                    property_wire=msg.property_wire,
+                    topic_validated=True,
+                )
+                msg.property_wire = None
             else:
                 # Segmented frames share the original payload. The first replay
                 # replaces only their small header; later replays reuse the
@@ -786,24 +795,21 @@ class OutboundSession:
         self,
         topic: str,
         properties: Properties | None,
-    ) -> tuple[int, int, int]:
-        """Topic bytes, wire property bytes, logical property bytes — one encode.
+    ) -> tuple[int, bytes, int]:
+        """Topic byte count, property wire bytes, logical property byte count.
 
-        The wire size must count MQTT 5's mandatory property-length byte even
-        when there are no properties; the logical budget accounts for
-        application data only, so it does not.
+        Encodes the MQTT 5 property table at most once. Callers that also build
+        the PUBLISH frame should pass the returned wire bytes through so launch
+        does not encode again.
         """
         topic_bytes = len(topic) if topic.isascii() else len(topic.encode("utf-8"))
         if self.config.protocol != MQTTProtocolVersion.MQTTv5:
-            return topic_bytes, 0, 0
+            return topic_bytes, b"", 0
         if properties is None or not properties.values:
             # An empty property table encodes to the single length byte 0x00.
-            return topic_bytes, 1, 0
-        wire_property_bytes = len(encode_properties(properties, PUBLISH))
-        logical_property_bytes = (
-            wire_property_bytes if properties is not None and properties.values else 0
-        )
-        return topic_bytes, wire_property_bytes, logical_property_bytes
+            return topic_bytes, b"\x00", 0
+        wire = encode_properties(properties, PUBLISH)
+        return topic_bytes, wire, len(wire)
 
     @staticmethod
     def _publish_wire_size_from_parts(
@@ -823,9 +829,9 @@ class OutboundSession:
         properties: Properties | None,
     ) -> int:
         level = QoS(qos)
-        topic_bytes, wire_property_bytes, _ = self.size_parts(topic, properties)
+        topic_bytes, property_wire, _ = self.size_parts(topic, properties)
         return self._publish_wire_size_from_parts(
-            topic_bytes, wire_property_bytes, payload_size, level
+            topic_bytes, len(property_wire), payload_size, level
         )
 
     def _check_publish_wire_size(
@@ -854,8 +860,8 @@ class OutboundSession:
         qos: QoS,
         properties: Properties | None,
     ) -> None:
-        topic_bytes, wire_property_bytes, _ = self.size_parts(topic, properties)
-        self._check_publish_wire_size(topic_bytes, wire_property_bytes, payload_size, qos)
+        topic_bytes, property_wire, _ = self.size_parts(topic, properties)
+        self._check_publish_wire_size(topic_bytes, len(property_wire), payload_size, qos)
 
     # --- hydration and replay -------------------------------------------------
 

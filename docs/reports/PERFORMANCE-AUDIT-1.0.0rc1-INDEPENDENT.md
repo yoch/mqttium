@@ -171,6 +171,31 @@ of tens of calls.
   returning a MID synchronously from another thread — architectural cost, not a
   defect to “fix” without an API change.
 
+## Follow-up (same branch): comparison with prior work and fixes
+
+### Disposition vs prior justifications
+
+| # | Issue | Prior status | Justification already on record | Action taken |
+| --- | --- | --- | --- | --- |
+| 1 | #99 | **NEW** — segmented writes existed at 1 MiB; cliff not previously quantified as a threshold choice | `writes.py` / `QOS1-FRAME-POLICY.md` use the threshold as the retain boundary, they do not defend 1 MiB specifically | **Fixed:** `SEGMENT_THRESHOLD = 128 KiB` (below the ~256 KiB contiguous-copy cliff measured here) |
+| 2 | #100 | **PARTIAL** — `size_parts` already shared one encode between wire size and budget; empty-queue nowait skip; threading sized parts into `queue_publish` was declined in the 0.2.0b4 audit as widening the hottest signature | `NOWAIT-WIRE-SIZE.md`, `PERFORMANCE-AUDIT-0.2.0b4.md` finding 6 | **Fixed:** `OutboundMessage.property_wire` carries the sized table into `_launch` / `encode_publish_item` (one encode per QoS≥1 publish) |
+| 3 | #101 | **DEFERRED** — v3.1.1 QoS 0/1 direct paths shipped; MQTT 5 kept the generic decoder for properties/aliases | `QOS0-V311-DECODE.md`, `QOS1-V311-DECODE.md` | **Fixed:** MQTT 5 QoS 0 direct `Message` path with properties + alias resolve; QoS 1/2 unchanged |
+| 4 | #102 | **PARTIAL** — `queue_publish_many` and ingress `store.batch()` already coalesce; lazy `BEGIN IMMEDIATE` | `sqlite.py` `batch()` docstring; CHANGELOG | **Documented, not coalesced across singles:** one `COMMIT` per single `queue_publish` preserves per-call durability; bulk callers should use `publish_many` / `queue_publish_many`. Cross-call deferred commit would change crash semantics |
+| 5 | #103 | **NEW** — matcher intentionally compact and separate from the engine | `matcher.py` module docstring | **Fixed:** exact-only registries are O(1); mixed sets keep insertion order |
+| 6 | #104 | **NEW** as a delivery hot-path cost | (none) | **Fixed:** `Properties` memoises encoded tables until `set` / `add_user_property` |
+| 7 | #105 | **DELIBERATELY REJECTED** | `QOS1-FRAME-POLICY.md`: contiguous frames duplicate the payload and were already re-encoded for DUP; segmented retain only | **No change** (policy stands). Lowering #99’s threshold retains more messages in segmented form as a side effect |
+| 8 | #106 | **PARTIAL** — `validate_utf8` no longer encodes-and-discards (0.2.0b4); residual dual pass remained | `primitives.validate_utf8` docstring; 0.2.0b4 UTF-8 note | **Fixed:** `encode_publish_item(..., topic_validated=True)` on the outbound hot path |
+
+### Verification (this worktree)
+
+- `python -m pytest -q tests/unit` → **808 passed**
+- QoS 1 MQTT 5 launch: `encode_properties` call count **1** (was 2)
+- MQTT 5 QoS 0 ingress: `PublishPacket.decode` call count **0**
+- 256 KiB encode: **segmented** under the new threshold
+- Exact-only `TopicMatcher` with 1000 filters: ~**211 ns**/match (was ~194 µs linear)
+
+Runtime changes ship in this PR together with the audit report.
+
 ## Reproduction
 
 Artefacts were written under `/tmp/mqttium-perf-audit/` on the audit host

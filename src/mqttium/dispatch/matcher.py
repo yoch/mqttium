@@ -11,14 +11,26 @@ from collections.abc import Iterator
 from typing import Any
 
 
+def _filter_is_wildcard(topic_filter: str) -> bool:
+    return "+" in topic_filter or "#" in topic_filter
+
+
 class TopicMatcher:
     """Map MQTT topic filters to values and iterate matches for a topic."""
 
     def __init__(self) -> None:
-        self._entries: dict[str, tuple[tuple[str, ...], Any]] = {}
+        # Insertion-ordered filter → (levels, value, is_wildcard).
+        self._entries: dict[str, tuple[tuple[str, ...], Any, bool]] = {}
+        self._wildcard_count = 0
 
     def __setitem__(self, topic_filter: str, value: Any) -> None:
-        self._entries[topic_filter] = (tuple(topic_filter.split("/")), value)
+        wildcard = _filter_is_wildcard(topic_filter)
+        previous = self._entries.get(topic_filter)
+        if previous is not None and previous[2]:
+            self._wildcard_count -= 1
+        self._entries[topic_filter] = (tuple(topic_filter.split("/")), value, wildcard)
+        if wildcard:
+            self._wildcard_count += 1
 
     def __getitem__(self, topic_filter: str) -> Any:
         try:
@@ -28,16 +40,30 @@ class TopicMatcher:
 
     def __delitem__(self, topic_filter: str) -> None:
         try:
-            del self._entries[topic_filter]
+            _levels, _value, wildcard = self._entries.pop(topic_filter)
         except KeyError as exc:
             raise KeyError(topic_filter) from exc
+        if wildcard:
+            self._wildcard_count -= 1
 
     def iter_match(self, topic: str) -> Iterator[Any]:
         """Yield values whose MQTT filters match ``topic`` in insertion order."""
 
+        # Exact-only registries are the common Paho `message_callback_add` case:
+        # skip the linear scan entirely.
+        if self._wildcard_count == 0:
+            entry = self._entries.get(topic)
+            if entry is not None:
+                yield entry[1]
+            return
+
         topic_levels = tuple(topic.split("/"))
         is_system_topic = topic.startswith("$")
-        for filter_levels, value in self._entries.values():
+        for filter_key, (filter_levels, value, wildcard) in self._entries.items():
+            if not wildcard:
+                if filter_key == topic:
+                    yield value
+                continue
             if self._matches(filter_levels, topic_levels, is_system_topic):
                 yield value
 

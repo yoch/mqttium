@@ -5,7 +5,7 @@ import pytest
 
 import mqttium.protocol.outbound as outbound_module
 from mqttium.api.async_client import AsyncClient
-from mqttium.enums import MQTTProtocolVersion
+from mqttium.enums import ConnectionState, MQTTProtocolVersion
 from mqttium.protocol.engine import EngineConfig, ProtocolEngine
 from mqttium.types import Properties
 
@@ -45,12 +45,14 @@ def test_realworld_benchmark_confirms_payload_identity() -> None:
 
 
 def test_publish_admission_encodes_properties_once(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The wire-size check and the logical budget share one property encode.
+    """Admission sizing and launch share one property encode.
 
     Both need the same topic and property measurements; computing them twice was
     pure duplicated allocation on the QoS 1/2 publish path whenever the broker
     advertised a maximum packet size.
     """
+    import mqttium.packets._common as common_module
+
     calls = 0
     original = outbound_module.encode_properties
 
@@ -60,12 +62,14 @@ def test_publish_admission_encodes_properties_once(monkeypatch: pytest.MonkeyPat
         return original(properties, packet_type)
 
     monkeypatch.setattr(outbound_module, "encode_properties", counting)
+    monkeypatch.setattr(common_module, "encode_properties", counting)
 
     properties = Properties()
     properties.add_user_property("source", "contract")
     engine = ProtocolEngine(
         EngineConfig(protocol=MQTTProtocolVersion.MQTTv5, max_pending_outbound_bytes=None)
     )
+    engine.state = ConnectionState.CONNECTED
     engine.negotiated = replace(engine.negotiated, maximum_packet_size=1_000_000)
 
     engine.queue_publish("contract/topic", b"payload", qos=1, properties=properties)

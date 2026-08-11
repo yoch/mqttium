@@ -18,16 +18,21 @@ class Properties:
     """
 
     values: dict[str, Any] = field(default_factory=dict)
+    # Packet-name → last encoded table. Cleared on mutation through set/add.
+    # compare=False so equality stays value-based; not part of the public surface.
+    _encoded: dict[str, bytes] = field(default_factory=dict, repr=False, compare=False)
 
     def get(self, name: str, default: Any = None) -> Any:
         return self.values.get(name, default)
 
     def set(self, name: str, value: Any) -> None:
         self.values[name] = value
+        self._encoded.clear()
 
     def add_user_property(self, key: str, value: str) -> None:
         items = self.values.setdefault("user_property", [])
         items.append((key, value))
+        self._encoded.clear()
 
     def __bool__(self) -> bool:
         return bool(self.values)
@@ -57,6 +62,8 @@ class OutboundMessage:
     encoded_publish: bytes | tuple[bytes, bytes] | None = None
     encoded_pubrel: bytes | None = None
     logical_size: int = 0
+    # Ephemeral admit→launch cache of the MQTT 5 property table. Not persisted.
+    property_wire: bytes | None = None
 
 
 @dataclass(slots=True, frozen=True)

@@ -253,9 +253,15 @@ def encode_properties(props: Properties | None, packet: str) -> bytes:
     """Encode a property bag for *packet* (including WILL context).
 
     Empty / None → single ``0x00`` length byte (fast path).
+    Non-empty results are memoised on ``props._encoded[packet]`` until the bag
+    is mutated through ``set`` / ``add_user_property``.
     """
     if not props or not props.values:
         return b"\x00"
+
+    cached = props._encoded.get(packet)
+    if cached is not None:
+        return cached
 
     body = bytearray()
     for name, value in props.values.items():
@@ -292,7 +298,9 @@ def encode_properties(props: Properties | None, packet: str) -> bytes:
             body.append(spec.id)
             body.extend(_encode_value(spec.type, item))
 
-    return encode_vbi(len(body)) + bytes(body)
+    encoded = encode_vbi(len(body)) + bytes(body)
+    props._encoded[packet] = encoded
+    return encoded
 
 
 def decode_properties(
