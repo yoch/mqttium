@@ -14,6 +14,7 @@ descriptions of current behaviour are the contracts in
 
 | Date | Report | Records |
 | --- | --- | --- |
+| 2026-08-11 | [`PERFORMANCE-AUDIT-POST-FIX-RESIDUALS.md`](PERFORMANCE-AUDIT-POST-FIX-RESIDUALS.md) | Fresh scan of `61005c1` after #99–#106 fixes: twelve new residual candidates (MQTT 5 QoS 1/2 `PublishPacket`, effect reorder, WS framing, SQLite launch rewrite, …). |
 | 2026-08-11 | [`PERFORMANCE-AUDIT-1.0.0rc1-INDEPENDENT.md`](PERFORMANCE-AUDIT-1.0.0rc1-INDEPENDENT.md) | Fresh hot-path audit of `1.0.0rc1` @ `6f72296`: eight measured findings filed as #99–#106 (index #108). |
 | 2026-08-10 | [`PERFORMANCE-AUDIT-0.2.0b4.md`](PERFORMANCE-AUDIT-0.2.0b4.md) | Re-reads the cross-client record against `4bdcdb3`, and records the per-message work removed before the `0.2.0b4` tag — with the reasons no throughput figure is attached to it. |
 | 2026-08-10 | [`QUALITY-AUDIT-0.2.0b4.md`](QUALITY-AUDIT-0.2.0b4.md) | Frozen quality inventory for the `0.2.0b4` work — module sizes, complexity signals, coverage — at commit `dc13866`. |
