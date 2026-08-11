@@ -348,19 +348,44 @@ class InboundSession:
     ) -> None:
         config = self.config
         store = self.store
-        if config.manual_ack:
+        transitions = self._transitions
+        existing: InboundMessage | InboundRecordMeta | None = (
+            transitions.in_meta(mid) if transitions is not None else store.get_in(mid)
+        )
+        if existing is not None:
             # A duplicate QoS1 publish reuses the existing Receive Maximum slot,
             # but is surfaced again so an application can complete manual ACK
             # after a reconnect or callback cancellation.
-            existing = store.get_in(mid)
-            if existing is not None:
-                if existing.state is InboundQoSState.WAIT_PUBACK:
-                    self._emit_message(existing, dup=True)
+            if existing.state is InboundQoSState.WAIT_PUBACK:
+                if config.manual_ack:
+                    message = (
+                        existing if isinstance(existing, InboundMessage) else store.get_in(mid)
+                    )
+                    if message is None:
+                        raise ProtocolError(f"Inbound mid={mid} disappeared while redelivering")
+                    self._emit_message(message, dup=True)
                     return
-                # The record belongs to an unfinished QoS 2 exchange. Storing
-                # this one would overwrite it and strand its Receive Maximum
-                # slot and byte reservation for the lifetime of the session.
-                self._reject_packet_id_collision(mid, "QoS 1", "QoS 2")
+                # A durable session may have been reopened without manual ACK.
+                # Complete the old QoS 1 record rather than leaking it after the
+                # automatic PUBACK sent for this retransmission.
+                if isinstance(existing, InboundMessage):
+                    completed = store.pop_in(mid)
+                    if completed is None:
+                        raise ProtocolError(f"Inbound mid={mid} disappeared while acknowledging")
+                    recovered_logical_size = self.stored_logical_size(completed)
+                else:
+                    assert transitions is not None
+                    completed_meta = transitions.complete_in(mid, InboundQoSState.WAIT_PUBACK)
+                    if completed_meta is None:
+                        raise ProtocolError(f"Inbound mid={mid} changed while acknowledging")
+                    recovered_logical_size = completed_meta.logical_size
+                self._engine._send(PubAckPacket(mid=mid).encode(config.protocol))
+                self._release_slot(recovered_logical_size)
+                return
+            # The record belongs to an unfinished QoS 2 exchange. Accepting the
+            # QoS 1 PUBLISH would acknowledge an identifier the broker still
+            # owns while leaving the QoS 2 record live.
+            self._reject_packet_id_collision(mid, "QoS 1", "QoS 2")
 
         logical_size = self.logical_size(topic, payload, properties) if config.manual_ack else None
         self._acquire_slot(logical_size)

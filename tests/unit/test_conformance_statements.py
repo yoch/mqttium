@@ -201,6 +201,26 @@ def test_mqtt_3_3_2_2_publish_topic_must_not_contain_wildcards() -> None:
     assert engine.take_effects() == []
 
 
+def test_mqtt_3_3_2_14_response_topic_must_not_contain_wildcards() -> None:
+    """[MQTT-3.3.2-14] The Response Topic MUST NOT contain wildcard characters."""
+    properties = Properties({"response_topic": "reply/#"})
+    engine = _connected()
+    with pytest.raises(ProtocolError, match="response_topic.*wildcards"):
+        engine.queue_publish("request", b"outbound", properties=properties)
+    assert engine.take_effects() == []
+
+    inbound = PublishPacket(
+        topic="request",
+        payload=b"inbound",
+        qos=QoS.AT_MOST_ONCE,
+        retain=False,
+        dup=False,
+        properties=Properties({"response_topic": "reply/x"}),
+    ).encode(MQTTProtocolVersion.MQTTv5)
+    inbound = inbound.replace(b"reply/x", b"reply/+")
+    assert _rejects(engine, inbound)
+
+
 def test_mqtt_3_1_2_21_server_keep_alive_replaces_the_requested_value() -> None:
     """[MQTT-3.1.2-21] If the Server returns a Server Keep Alive on the CONNACK
     packet, the Client MUST use that value instead of the value it sent as the

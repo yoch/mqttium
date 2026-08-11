@@ -104,3 +104,26 @@ def test_reauthenticate_requires_connected_state() -> None:
     engine.begin_connect()
     with pytest.raises(ProtocolError, match="connected session"):
         engine.queue_auth(reason_code=0x19)
+
+
+def test_broker_cannot_send_reauthenticate_reason_after_connack() -> None:
+    engine = ProtocolEngine(
+        EngineConfig(
+            client_id="auth-direction",
+            protocol=MQTTProtocolVersion.MQTTv5,
+            accept_auth=True,
+            connect_properties=_props(),
+        )
+    )
+    engine.begin_connect()
+    engine.handle_raw(RawPacket(PacketType.CONNACK, 0, b"\x00\x00\x00"))
+    engine.take_effects()
+
+    engine.handle_raw(_raw_auth(0x19, "demo"))
+    effects = engine.take_effects()
+
+    assert engine.state is ConnectionState.DISCONNECTED
+    assert not any(effect.kind is EffectKind.AUTH for effect in effects)
+    disconnected = next(effect.data for effect in effects if effect.kind is EffectKind.DISCONNECTED)
+    assert disconnected.reason_code == 0x82
+    assert any(effect.kind is EffectKind.SEND for effect in effects)
