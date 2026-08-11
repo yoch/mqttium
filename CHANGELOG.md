@@ -30,6 +30,23 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   frontier has just reached. The redundant reservation was left behind and
   counted twice, permanently inflating `len()`/`available` and blocking the
   `release()` fast path that resets the pool once every identifier is free.
+- `publish()` rejects `subscription_identifier` in MQTT 5 properties instead of
+  putting it on the wire. [MQTT-3.3.4-6] forbids a Subscription Identifier on a
+  PUBLISH sent from a Client to a Server; the property table validates per
+  packet type and cannot express a restriction that applies to one direction
+  only, since the same property is legal on the PUBLISH a broker sends. The
+  inbound direction is unchanged.
+
+### Added
+
+- `docs/spec/` vendors every normative statement of MQTT 3.1.1 and 5.0,
+  extracted verbatim from the OASIS documents with provenance, checksum and
+  regeneration tooling (`tools/extract_spec_statements.py`), and
+  `docs/CONFORMANCE.md` records what is verified against them and what is not.
+  `tests/unit/test_conformance_statements.py` turns a first set of statements
+  into executable checks and verifies its own quotations against the index, so
+  a test cannot claim to enforce a statement it misquotes.
+
 ### Documentation
 
 - `InflightStore.update_out()` / `update_in()` now state what they actually
