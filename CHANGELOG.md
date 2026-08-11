@@ -6,6 +6,85 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- An inbound PUBLISH whose packet identifier is still owned by an unfinished
+  exchange of the other QoS no longer overwrites the stored record. The inbound
+  store is keyed by identifier alone, so a QoS 1 PUBLISH reusing the identifier
+  of a live QoS 2 exchange (or the reverse) replaced it and stranded its Receive
+  Maximum slot and byte reservation permanently. The leak was cumulative and
+  ended in the client disconnecting itself with `0x93` (Receive Maximum
+  exceeded) while holding no message at all. Such a PUBLISH violates
+  [MQTT-2.2.1-4] — the identifier is still in use until the broker has processed
+  our acknowledgement — and is now refused with `0x82` (Protocol Error) before
+  anything is stored. Only `manual_ack=True` was ever affected: without it a
+  QoS 1 PUBLISH stores no record, so neither direction can collide. Genuine
+  QoS 2 duplicates and QoS 1 manual-ack redeliveries are unaffected.
+- `EffectPump` no longer retains the exception raised while the background
+  effect-flush task applies an effect once nothing is left pending. The stored
+  error was handed to whichever call next suspended in `drain()`, so a protocol
+  error caused by the broker surfaced against an unrelated later `publish()` on
+  a healthy connection. A failure that genuinely blocks pending effects is still
+  reported to whoever waits on it.
+- `PacketIdPool.reserve()` is now idempotent for an identifier the allocation
+  frontier has just reached. The redundant reservation was left behind and
+  counted twice, permanently inflating `len()`/`available` and blocking the
+  `release()` fast path that resets the pool once every identifier is free.
+- Connecting over MQTT 3.1.1 with an empty `client_id` and `clean_start=False`
+  is refused. [MQTT-3.1.3-7] requires a clean session with a zero-byte ClientId,
+  and the broker must answer `0x02` (Identifier rejected) and close, so the
+  connection could never succeed. The check uses the effective Clean Start, so a
+  resumed session — which rewrites it to 0 — is caught too. MQTT 5 allows the
+  pairing and assigns an identifier.
+- `auth()` refuses a reason code a Client may not send. MQTT 5 Table 3-11
+  assigns `0x00` (Success) to the Server; only `0x18` (Continue authentication)
+  and `0x19` (Re-authenticate) may come from a Client, per [MQTT-3.15.2-1] and
+  [MQTT-4.12.0-3]. An `auth_handler` answering a server challenge with `0x00`
+  now raises instead of putting it on the wire.
+- `disconnect()` refuses a non-zero `session_expiry_interval` when CONNECT
+  declared none. MQTT 5 §3.14.2.2.2 makes it a Protocol Error; a broker can
+  treat the invalid DISCONNECT as ungraceful and may publish a configured Will.
+  The check uses the expiry actually encoded in CONNECT, so later mutation of
+  the application-owned properties cannot rewrite connection history.
+- A CONNACK reporting Session Present after a Clean Start connection closes the
+  connection with `0x82` instead of continuing. MQTT 3.1.1 [MQTT-3.2.2-1] and
+  MQTT 5 [MQTT-3.2.2-2] require Session Present 0 in this case. Local inflight
+  records do not override the clean session requested on the wire.
+- Connecting over MQTT 3.1.1 with a password but no username is refused instead
+  of sending a CONNECT whose password flag is set while the username flag is
+  clear, which [MQTT-3.1.2-22] forbids and a broker may reject or misparse.
+  MQTT 5 lifted the restriction, so the check is version-specific and the same
+  configuration still works there.
+- `publish()` rejects `subscription_identifier` in MQTT 5 properties instead of
+  putting it on the wire. [MQTT-3.3.4-6] forbids a Subscription Identifier on a
+  PUBLISH sent from a Client to a Server; the property table validates per
+  packet type and cannot express a restriction that applies to one direction
+  only, since the same property is legal on the PUBLISH a broker sends. The
+  inbound direction is unchanged.
+
+### Added
+
+- `docs/spec/` vendors the numbered conformance statements of MQTT 3.1.1 and
+  5.0, extracted from reproducible official OASIS archives with provenance,
+  checksums and regeneration tooling (`tools/extract_spec_statements.py`), and
+  `docs/CONFORMANCE.md` records what is verified against them and what is not.
+  `tests/unit/test_conformance_statements.py` turns a first set of statements
+  into executable checks and verifies its own quotations against the index, so
+  a test cannot claim to enforce a statement it misquotes.
+
+### Documentation
+
+- `InflightStore.update_out()` / `update_in()` now state what they actually
+  guarantee: the mutable state fields only (`state`/`dup`, and
+  `state`/`delivered`/`user_acked`), plus retransmission order.
+  `SqliteInflightStore` deliberately narrows the write to those columns so a
+  retransmission does not rewrite the payload BLOB, while `MemoryInflightStore`
+  replaces the record — the protocol was silent on which was correct. The
+  corollary is now spelled out: the phase-two compaction `on_pubrec` applies
+  through `update_out()` is best-effort for a store without
+  `TransitionInflightStore`. Both built-in stores implement that extension and
+  compact through `transition_out(compact=True)` instead.
+
 ## [1.0.0rc1] - 2026-08-11
 
 ### Added

@@ -64,6 +64,9 @@ from mqttium.errors import (
 )
 
 
+# MQTT 5 Table 3-11: 0x00 (Success) is sent by the Server only.
+_CLIENT_AUTH_REASON_CODES = frozenset({0x18, 0x19})
+
 _ALLOWED_PACKETS_BY_STATE: dict[ConnectionState, frozenset[PacketType]] = {
     ConnectionState.CONNECTING: frozenset(
         {
@@ -110,6 +113,8 @@ class ProtocolEngine:
         self.inbound = InboundSession(self)
         # After a durable session is established, next CONNECT uses Clean Start 0.
         self._prefer_session_resume = False
+        self._sent_clean_start = False
+        self._sent_session_expiry_interval: int | None = None
         self._auth_method: str | None = None
         self._handlers = {
             PacketType.CONNACK: self._on_connack,
@@ -230,9 +235,25 @@ class ProtocolEngine:
     def begin_connect(self) -> bytes:
         if self.state in (ConnectionState.CONNECTED, ConnectionState.CONNECTING):
             raise ProtocolError("Already connected or connecting")
+
+        clean_start = self.config.clean_start
+        if self._prefer_session_resume:
+            clean_start = False
         configured_auth_method = None
         if self.config.connect_properties is not None:
             configured_auth_method = self.config.connect_properties.get("authentication_method")
+        if (
+            self.config.protocol == MQTTProtocolVersion.MQTTv311
+            and self.config.password is not None
+            and self.config.username is None
+        ):
+            # [MQTT-3.1.2-22]: under MQTT 3.1.1, if the User Name Flag is 0 the
+            # Password Flag MUST be 0. MQTT 5 lifted the restriction, so this is
+            # deliberately version-specific rather than a general rule.
+            raise ProtocolError(
+                "MQTT 3.1.1 does not allow a password without a username "
+                "[MQTT-3.1.2-22]; connect with MQTT 5 or supply a username"
+            )
         if self.config.accept_auth:
             if self.config.protocol != MQTTProtocolVersion.MQTTv5:
                 raise ProtocolError("Enhanced authentication requires MQTT 5")
@@ -240,19 +261,22 @@ class ProtocolEngine:
                 raise ProtocolError(
                     "auth_handler requires authentication_method in CONNECT properties"
                 )
-        self._auth_method = (
-            str(configured_auth_method) if configured_auth_method is not None else None
-        )
-        self.state = ConnectionState.CONNECTING
-        self._pending_connect = True
-        self.inbound.start_connection()
-        # Negotiated capabilities are connection-scoped. Queued messages are
-        # validated against the new values only after the next CONNACK.
-        self.negotiated = NegotiatedSettings()
-
-        clean_start = self.config.clean_start
-        if self._prefer_session_resume:
-            clean_start = False
+        if (
+            self.config.protocol == MQTTProtocolVersion.MQTTv311
+            and not self.config.client_id
+            and not clean_start
+        ):
+            # [MQTT-3.1.3-7]: a zero-byte ClientId requires CleanSession 1. The
+            # broker is required to answer 0x02 (Identifier rejected) and close
+            # ([MQTT-3.1.3-8]), so this connection cannot succeed — failing here
+            # says why instead of surfacing a bare rejection. MQTT 5 allows the
+            # combination and assigns an identifier, hence the version check.
+            # `clean_start` is the effective value: a resumed session forces it
+            # to 0, which is exactly when this would otherwise slip through.
+            raise ProtocolError(
+                "MQTT 3.1.1 requires clean_start=True with an empty client_id "
+                "[MQTT-3.1.3-7]; set a client_id or connect with MQTT 5"
+            )
 
         connect_props = self.config.connect_properties
         if self.config.protocol == MQTTProtocolVersion.MQTTv5:
@@ -285,7 +309,25 @@ class ProtocolEngine:
             protocol=self.config.protocol,
             properties=connect_props,
         )
-        return packet.encode()
+        wire = packet.encode()
+
+        # Commit connection state only after every validation and the encoding
+        # have succeeded. A synchronous configuration error must leave the
+        # engine reusable rather than stranded in CONNECTING.
+        self._auth_method = (
+            str(configured_auth_method) if configured_auth_method is not None else None
+        )
+        self._sent_clean_start = clean_start
+        self._sent_session_expiry_interval = (
+            connect_props.get("session_expiry_interval") if connect_props is not None else None
+        )
+        self.state = ConnectionState.CONNECTING
+        self._pending_connect = True
+        self.inbound.start_connection()
+        # Negotiated capabilities are connection-scoped. Queued messages are
+        # validated against the new values only after the next CONNACK.
+        self.negotiated = NegotiatedSettings()
+        return wire
 
     def queue_publish(
         self,
@@ -387,8 +429,34 @@ class ProtocolEngine:
     ) -> bytes:
         if self.state != ConnectionState.CONNECTED:
             raise NotConnectedError("disconnect requires an active connection")
+        self._check_disconnect_session_expiry(properties)
+        wire = encode_disconnect(reason_code, self.config.protocol, properties)
         self.state = ConnectionState.DISCONNECTING
-        return encode_disconnect(reason_code, self.config.protocol, properties)
+        return wire
+
+    def _check_disconnect_session_expiry(self, properties: Properties | None) -> None:
+        """Refuse extending a session that was never allowed to outlive the connection.
+
+        MQTT 5 §3.14.2.2.2: "If the Session Expiry Interval in the CONNECT packet
+        was zero, then it is a Protocol Error to set a non-zero Session Expiry
+        Interval in the DISCONNECT packet sent by the Client." A broker can treat
+        that as an ungraceful disconnect, which may publish a configured Will.
+        Failing locally preserves the semantics requested by clean shutdown.
+        """
+        if self.config.protocol != MQTTProtocolVersion.MQTTv5 or properties is None:
+            return
+        requested = properties.get("session_expiry_interval")
+        if not requested:
+            return
+        # An absent Session Expiry Interval in CONNECT means zero (§3.1.2.11.2).
+        # Use the value encoded on the wire, not the application-owned mutable
+        # Properties object retained in EngineConfig.
+        if not self._sent_session_expiry_interval:
+            raise ProtocolError(
+                "Cannot set a non-zero session_expiry_interval on DISCONNECT when "
+                "CONNECT declared none (MQTT 5 §3.14.2.2.2); this can make the "
+                "shutdown ungraceful and publish a configured Will"
+            )
 
     def notify_transport_closed(self) -> None:
         was = self.state
@@ -463,13 +531,21 @@ class ProtocolEngine:
             )
             return
 
-        requested_expiry = None
-        if self.config.connect_properties:
-            requested_expiry = self.config.connect_properties.get("session_expiry_interval")
+        if connack.session_present and self._sent_clean_start:
+            # The Server MUST report Session Present 0 after accepting Clean
+            # Start/CleanSession 1: MQTT 5 [MQTT-3.2.2-2], MQTT 3.1.1
+            # [MQTT-3.2.2-1]. Local inflight records do not make a stale session
+            # valid: replaying them would contradict the clean session the
+            # Client explicitly requested.
+            self._protocol_disconnect(0x82)
+            raise ProtocolError(
+                "CONNACK reports Session Present after Clean Start [MQTT-3.2.2-1/-2]"
+            )
+
         self.negotiated = NegotiatedSettings.from_connack(
             connack.properties,
             requested_keepalive=self.config.keepalive,
-            requested_session_expiry=requested_expiry,
+            requested_session_expiry=self._sent_session_expiry_interval,
             local_client_id=self.config.client_id,
         )
         self.outbound.flow.apply_broker_receive_maximum(
@@ -593,6 +669,18 @@ class ProtocolEngine:
             return
         self._emit(EffectKind.AUTH, packet)
 
+    def _protocol_disconnect(self, reason_code: int) -> None:
+        """Tear the connection down, announcing why when the version allows it."""
+        if self.config.protocol == MQTTProtocolVersion.MQTTv5:
+            # MQTT 3.1.1 DISCONNECT carries no reason code, so there is nothing
+            # useful to send: the peer only learns from the close itself.
+            self._send(encode_disconnect(reason_code, self.config.protocol))
+        self.state = ConnectionState.DISCONNECTED
+        self._emit(
+            EffectKind.DISCONNECTED,
+            DisconnectInfo(reason_code=reason_code, from_broker=False),
+        )
+
     def _reject_auth_method(self) -> None:
         self._send(encode_disconnect(0x8C, self.config.protocol))
         self.state = ConnectionState.DISCONNECTED
@@ -613,6 +701,15 @@ class ProtocolEngine:
             raise NotConnectedError("AUTH requires an active or pending connection")
         if self._auth_method is None:
             raise ProtocolError("AUTH requires authentication_method in CONNECT")
+        if reason_code not in _CLIENT_AUTH_REASON_CODES:
+            # MQTT 5 Table 3-11 assigns a sender to each Authenticate Reason
+            # Code: 0x00 (Success) is the Server's, and only 0x18 (Continue
+            # authentication) and 0x19 (Re-authenticate) may come from a Client.
+            # [MQTT-3.15.2-1] requires the sender to use one of them.
+            raise ProtocolError(
+                f"AUTH reason_code 0x{reason_code:02X} is not one a Client may send; "
+                "use 0x18 (Continue authentication) or 0x19 (Re-authenticate)"
+            )
         if reason_code == 0x19 and self.state is not ConnectionState.CONNECTED:
             raise ProtocolError("Re-authenticate AUTH requires a connected session")
         auth_properties = Properties(

@@ -9,7 +9,7 @@ stream; handlers emit through it so observable effect ordering does not change.
 from __future__ import annotations
 
 from collections.abc import Iterator
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NoReturn
 
 from mqttium.codec.buffer import RawPacket
 from mqttium.codec.packet_validation import require_nonzero_mid
@@ -274,14 +274,22 @@ class InboundSession:
         assert packet.mid is not None
         if packet.qos == QoS.EXACTLY_ONCE:
             transitions = self._transitions
-            # Only existence matters here; re-reading the stored payload to
-            # answer a duplicate PUBLISH was pure waste.
-            duplicate = (
-                transitions.contains_in(packet.mid)
-                if transitions is not None
-                else store.get_in(packet.mid) is not None
-            )
-            if duplicate:
+            # Existence is the common question and the cheapest to answer, so it
+            # stays first: a fresh PUBLISH finds nothing and pays exactly one
+            # lookup. Only once a record turns up does the state matter, and it
+            # has to, because the inbound store is keyed by identifier alone —
+            # a record under this mid is a QoS 2 duplicate only if it is in a
+            # QoS 2 phase. Reading it back costs a second metadata query on the
+            # rare duplicate path rather than on every inbound QoS 2 PUBLISH.
+            existing: InboundMessage | InboundRecordMeta | None = None
+            if transitions is not None:
+                if transitions.contains_in(packet.mid):
+                    existing = transitions.in_meta(packet.mid)
+            else:
+                existing = store.get_in(packet.mid)
+            if existing is not None:
+                if existing.state is InboundQoSState.WAIT_PUBACK:
+                    self._reject_packet_id_collision(packet.mid, "QoS 2", "QoS 1")
                 engine._send(PubRecPacket(mid=packet.mid).encode(config.protocol))
                 return
 
@@ -345,9 +353,14 @@ class InboundSession:
             # but is surfaced again so an application can complete manual ACK
             # after a reconnect or callback cancellation.
             existing = store.get_in(mid)
-            if existing is not None and existing.state is InboundQoSState.WAIT_PUBACK:
-                self._emit_message(existing, dup=True)
-                return
+            if existing is not None:
+                if existing.state is InboundQoSState.WAIT_PUBACK:
+                    self._emit_message(existing, dup=True)
+                    return
+                # The record belongs to an unfinished QoS 2 exchange. Storing
+                # this one would overwrite it and strand its Receive Maximum
+                # slot and byte reservation for the lifetime of the session.
+                self._reject_packet_id_collision(mid, "QoS 1", "QoS 2")
 
         logical_size = self.logical_size(topic, payload, properties) if config.manual_ack else None
         self._acquire_slot(logical_size)
@@ -712,6 +725,32 @@ class InboundSession:
                 f"release={logical_size}, pending={self._pending_bytes}"
             )
         self._pending_bytes -= logical_size
+
+    def _reject_packet_id_collision(self, mid: int, arriving: str, held: str) -> NoReturn:
+        """Refuse a PUBLISH whose identifier is still owned by another exchange.
+
+        MQTT 5 [MQTT-2.2.1-4] and MQTT 3.1.1 [MQTT-2.3.1-4] require the Server
+        to assign every new QoS > 0 PUBLISH a Packet Identifier that is
+        *currently unused*, and an identifier stays in use until its sender has
+        processed the corresponding acknowledgement — for QoS 2, our PUBCOMP.
+        A record in WAIT_PUBREL or WAIT_USER_ACK proves the broker has not
+        received one, so the identifier is provably still its own and the reuse
+        is a protocol violation, not a race.
+
+        There is no consistent way to continue: honouring the PUBLISH replaces
+        the live record and leaks the Receive Maximum slot and byte reservation
+        it still owns, while dropping it silently discards a message the broker
+        believes is in flight and will retransmit. Refusing the connection is
+        the only answer that neither corrupts local accounting nor loses a
+        message without telling anyone.
+        """
+        # 0x82 Protocol Error, the same tear-down the receive-window and topic
+        # alias violations above use.
+        self._protocol_disconnect(0x82)
+        raise ProtocolError(
+            f"Inbound {arriving} PUBLISH reuses mid={mid}, still held by an "
+            f"unfinished {held} exchange"
+        )
 
     def _protocol_disconnect(self, reason_code: int) -> None:
         """Emit a normative DISCONNECT before the transport is torn down."""

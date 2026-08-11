@@ -119,7 +119,10 @@ async def test_async_client_auth_handler_exchange() -> None:
         props = Properties()
         props.set("authentication_method", "demo")
         props.set("authentication_data", b"token")
-        return AuthPacket(reason_code=0x00, properties=props)
+        # [MQTT-4.12.0-3]: a Client answering a Server AUTH must use 0x18. Table
+        # 3-11 reserves 0x00 (Success) for the Server, which concludes the
+        # exchange with CONNACK rather than with an AUTH of its own.
+        return AuthPacket(reason_code=0x18, properties=props)
 
     connect_props = Properties()
     connect_props.set("authentication_method", "demo")

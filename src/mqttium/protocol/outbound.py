@@ -295,6 +295,19 @@ class OutboundSession:
         )
         validate_publish_topic(topic, allow_empty=allow_empty)
 
+        if (
+            properties is not None
+            and self.config.protocol == MQTTProtocolVersion.MQTTv5
+            and properties.get("subscription_identifier") is not None
+        ):
+            # [MQTT-3.3.4-6]: a PUBLISH sent from a Client to a Server MUST NOT
+            # contain a Subscription Identifier. The property table cannot catch
+            # this, because it is legal on the inbound PUBLISH the broker sends
+            # us — the restriction is on the direction, not on the packet type.
+            raise ProtocolError(
+                "subscription_identifier is not allowed on an outbound PUBLISH [MQTT-3.3.4-6]"
+            )
+
         engine = self._engine
         if engine.state == ConnectionState.CONNECTED:
             negotiated = engine.negotiated

@@ -117,6 +117,12 @@ class PacketIdPool:
             frontier += 1
             reserved = self._reserved
             if reserved is not None:
+                # The frontier has just absorbed `mid`, so an out-of-order
+                # reservation recorded for it earlier is now redundant. Leaving
+                # it behind would count the identifier twice — once below the
+                # frontier and once in `_reserved` — which permanently inflates
+                # __len__/available and blocks the release() reset fast path.
+                reserved.discard(mid)
                 while frontier in reserved:
                     reserved.remove(frontier)
                     frontier += 1
