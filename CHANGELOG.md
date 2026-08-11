@@ -8,6 +8,10 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Topic-specific Paho callbacks registered with a shared-subscription filter
+  now match the Topic Name delivered by the broker after its
+  `$share/{ShareName}/` prefix is stripped. Lookup/removal still use the
+  original filter, and a shared `#` does not capture `$` system topics.
 - An inbound PUBLISH whose packet identifier is still owned by an unfinished
   exchange of the other QoS no longer overwrites the stored record. The inbound
   store is keyed by identifier alone, so a QoS 1 PUBLISH reusing the identifier

@@ -18,7 +18,7 @@ class TopicMatcher:
         self._entries: dict[str, tuple[tuple[str, ...], Any]] = {}
 
     def __setitem__(self, topic_filter: str, value: Any) -> None:
-        self._entries[topic_filter] = (tuple(topic_filter.split("/")), value)
+        self._entries[topic_filter] = (self._match_levels(topic_filter), value)
 
     def __getitem__(self, topic_filter: str) -> Any:
         try:
@@ -40,6 +40,27 @@ class TopicMatcher:
         for filter_levels, value in self._entries.values():
             if self._matches(filter_levels, topic_levels, is_system_topic):
                 yield value
+
+    @staticmethod
+    def _match_levels(topic_filter: str) -> tuple[str, ...]:
+        """Return the filter levels present in broker-delivered Topic Names.
+
+        A broker strips ``$share/{ShareName}/`` before delivering a shared
+        publication. Keep the original filter as the mapping key, but match its
+        underlying filter so callback lookup and deletion remain symmetric.
+        Invalid shared-filter shapes are left literal; subscription validation
+        remains the protocol layer's responsibility.
+        """
+        if topic_filter.startswith("$share/"):
+            group, separator, shared_filter = topic_filter[7:].partition("/")
+            if (
+                separator
+                and group
+                and shared_filter
+                and not any(character in group for character in "+#")
+            ):
+                topic_filter = shared_filter
+        return tuple(topic_filter.split("/"))
 
     @staticmethod
     def _matches(
