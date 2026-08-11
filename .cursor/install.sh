@@ -42,7 +42,16 @@ if command -v sudo >/dev/null 2>&1; then
     sudo ln -sf "$(readlink -f "$uv")" /usr/local/bin/uv
     uv=/usr/local/bin/uv
 fi
+# Do not let uv drop `python3.x` shims into ~/.local/bin: that directory precedes
+# /usr/local/bin on the agent's PATH and would shadow the venv wrappers below
+# with bare interpreters that lack mqttium.
+export UV_PYTHON_INSTALL_BIN=0
 "$uv" python install "$primary_version" "${matrix_versions[@]}"
+rm -f "$HOME/.local/bin/python" "$HOME/.local/bin/python3" \
+    "$HOME/.local/bin/python$primary_version"
+for version in "${matrix_versions[@]}"; do
+    rm -f "$HOME/.local/bin/python$version"
+done
 
 # --- Virtual environments --------------------------------------------------
 # Primary 3.12 environment carries every development extra.
