@@ -8,19 +8,6 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
-- A deliberate `AsyncClient.disconnect()` now reports `None` to
-  `on_disconnect`, matching the callback's public contract, while transport and
-  protocol failures continue to report their exception.
-- `AsyncClient.disconnect()` no longer waits indefinitely to enqueue its
-  terminal packet behind a saturated bounded writer queue. The DISCONNECT is
-  admitted without blocking when capacity exists; otherwise shutdown proceeds
-  directly to closing the transport.
-- Fatal MQTT 5 DISCONNECT packets now pass through `WritePump`, preserving the
-  single-writer transport invariant. Their best-effort drain is bounded so a
-  blocked network write cannot delay teardown indefinitely.
-- `ack()` now refuses to complete a manual inbound acknowledgement while the
-  client is disconnected. This preserves the durable QoS record for session
-  replay instead of deleting it after the writer has already stopped.
 - An inbound PUBLISH whose packet identifier is still owned by an unfinished
   exchange of the other QoS no longer overwrites the stored record. The inbound
   store is keyed by identifier alone, so a QoS 1 PUBLISH reusing the identifier
@@ -30,9 +17,17 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   exceeded) while holding no message at all. Such a PUBLISH violates
   [MQTT-2.2.1-4] — the identifier is still in use until the broker has processed
   our acknowledgement — and is now refused with `0x82` (Protocol Error) before
-  anything is stored. Only `manual_ack=True` was ever affected: without it a
-  QoS 1 PUBLISH stores no record, so neither direction can collide. Genuine
-  QoS 2 duplicates and QoS 1 manual-ack redeliveries are unaffected.
+  anything is stored. The same collision is now checked on the default
+  auto-ACK path, which previously delivered and acknowledged the conflicting
+  QoS 1 message while leaving the QoS 2 record live. Genuine QoS 2 duplicates,
+  QoS 1 manual-ack redeliveries and a durable QoS 1 record reopened under
+  auto-ACK remain supported.
+- MQTT 5 now rejects a broker-sent AUTH with reason `0x19` (Re-authenticate),
+  which Table 3-11 assigns to Client-to-Server traffic only.
+- The broker's negotiated Maximum Packet Size is enforced for DISCONNECT before
+  the engine enters `DISCONNECTING`, not only for publication traffic.
+- MQTT 5 Response Topic properties containing `+` or `#` are rejected in both
+  outbound and inbound PUBLISH packets, as required by [MQTT-3.3.2-14].
 - `EffectPump` no longer retains the exception raised while the background
   effect-flush task applies an effect once nothing is left pending. The stored
   error was handed to whichever call next suspended in `drain()`, so a protocol
