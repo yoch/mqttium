@@ -49,7 +49,7 @@ from mqttium.protocol.inbound import InboundSession
 from mqttium.protocol.negotiated import NegotiatedSettings
 from mqttium.protocol.outbound import OutboundSession
 from mqttium.protocol.packet_ids import PacketIdPool
-from mqttium.topics import validate_subscribe_filter
+from mqttium.topics import validate_publish_topic, validate_subscribe_filter
 from mqttium.transport.writes import WriteItem, item_size
 from mqttium.types import (
     OutboundMessage,
@@ -134,6 +134,10 @@ class ProtocolEngine:
         self.outbound.hydrate()
         # MIDs of in-flight SUBSCRIBE/UNSUBSCRIBE (never collide with PUBLISH).
         self._pending_sub_mids: set[int] = set()
+        # Correlate each acknowledgement with both the request kind and the
+        # number of filters it must answer. The set above remains the compact
+        # compatibility/invariant view used by diagnostics and fuzzers.
+        self._pending_sub_requests: dict[int, tuple[PacketType, int]] = {}
 
     def take_effects(self) -> list[EngineEffect]:
         effects = self._effects
@@ -295,6 +299,10 @@ class ProtocolEngine:
                 connect_props.set("topic_alias_maximum", self.config.topic_alias_maximum)
 
         will = self.config.will
+        if will is not None:
+            # A Will Topic is a Topic Name and follows the same non-empty,
+            # no-wildcard rules as an outbound PUBLISH topic.
+            validate_publish_topic(will.topic)
         packet = ConnectPacket(
             client_id=self.config.client_id,
             clean_start=clean_start,
@@ -360,9 +368,10 @@ class ProtocolEngine:
 
         subscriptions: list[Subscription] = []
         if isinstance(topics, str):
+            options = SubscribeOptions(qos=QoS(qos))
             validate_subscribe_filter(topics)
-            self._check_subscribe_capabilities(topics, properties)
-            subscriptions.append(Subscription(topic=topics, options=SubscribeOptions(qos=QoS(qos))))
+            self._check_subscribe_capabilities(topics, options, properties)
+            subscriptions.append(Subscription(topic=topics, options=options))
         else:
             for item in topics:
                 if isinstance(item, str):
@@ -374,7 +383,7 @@ class ProtocolEngine:
                     else:
                         options = SubscribeOptions(qos=QoS(opt))
                 validate_subscribe_filter(topic)
-                self._check_subscribe_capabilities(topic, properties)
+                self._check_subscribe_capabilities(topic, options, properties)
                 subscriptions.append(Subscription(topic=topic, options=options))
 
         mid = self.outbound.packet_ids.allocate()
@@ -390,6 +399,7 @@ class ProtocolEngine:
             self.outbound.packet_ids.release(mid)
             raise
         self._pending_sub_mids.add(mid)
+        self._pending_sub_requests[mid] = (PacketType.SUBACK, len(subscriptions))
         self._send(wire)
         return mid
 
@@ -414,6 +424,7 @@ class ProtocolEngine:
             self.outbound.packet_ids.release(mid)
             raise
         self._pending_sub_mids.add(mid)
+        self._pending_sub_requests[mid] = (PacketType.UNSUBACK, len(topic_list))
         self._send(wire)
         return mid
 
@@ -472,6 +483,7 @@ class ProtocolEngine:
                 for mid in self._pending_sub_mids:
                     self.outbound.packet_ids.release(mid)
             self._pending_sub_mids.clear()
+            self._pending_sub_requests.clear()
         if was != ConnectionState.DISCONNECTED:
             self._emit(EffectKind.DISCONNECTED, DisconnectInfo(from_broker=False))
 
@@ -594,25 +606,53 @@ class ProtocolEngine:
 
     def _on_suback(self, raw: RawPacket) -> None:
         ack = SubAckPacket.decode(raw.remaining, self.config.protocol)
-        if ack.mid not in self._pending_sub_mids:
-            # Orphan / cross-mid SUBACK: do not release a foreign packet id.
-            self._emit(EffectKind.PROTOCOL_ERROR, f"SUBACK for unknown mid {ack.mid}")
-            return
-        self._pending_sub_mids.discard(ack.mid)
-        self.outbound.packet_ids.release(ack.mid)
+        self._complete_subscription_request(
+            ack.mid,
+            PacketType.SUBACK,
+            len(ack.reason_codes),
+        )
         self._emit(EffectKind.SUBACK, ack)
 
     def _on_unsuback(self, raw: RawPacket) -> None:
         ack = UnsubAckPacket.decode(raw.remaining, self.config.protocol)
-        if ack.mid not in self._pending_sub_mids:
-            self._emit(EffectKind.PROTOCOL_ERROR, f"UNSUBACK for unknown mid {ack.mid}")
-            return
-        self._pending_sub_mids.discard(ack.mid)
-        self.outbound.packet_ids.release(ack.mid)
+        reason_count = (
+            len(ack.reason_codes) if self.config.protocol is MQTTProtocolVersion.MQTTv5 else None
+        )
+        self._complete_subscription_request(
+            ack.mid,
+            PacketType.UNSUBACK,
+            reason_count,
+        )
         self._emit(EffectKind.UNSUBACK, ack)
 
     def _on_pingresp(self, raw: RawPacket) -> None:
+        if raw.remaining:
+            raise MalformedPacketError("PINGRESP remaining length must be 0")
         self._emit(EffectKind.PINGRESP)
+
+    def _complete_subscription_request(
+        self,
+        mid: int,
+        ack_type: PacketType,
+        reason_count: int | None,
+    ) -> None:
+        expected = self._pending_sub_requests.get(mid)
+        if mid not in self._pending_sub_mids or expected is None:
+            # Orphan / cross-mid ACK: do not release a foreign packet id.
+            raise ProtocolError(f"{ack_type.name} for unknown mid {mid}")
+        expected_type, expected_count = expected
+        if ack_type is not expected_type:
+            raise ProtocolError(
+                f"Expected {expected_type.name} for mid {mid}, received {ack_type.name}"
+            )
+        if reason_count is not None and reason_count != expected_count:
+            raise ProtocolError(
+                f"{ack_type.name} for mid {mid} has {reason_count} reason codes; "
+                f"expected {expected_count}"
+            )
+        self._pending_sub_mids.discard(mid)
+        self._pending_sub_requests.pop(mid, None)
+        self.outbound.packet_ids.release(mid)
 
     def _on_pingreq(self, raw: RawPacket) -> None:
         # Brokers must not send PINGREQ to clients.
@@ -738,8 +778,11 @@ class ProtocolEngine:
     def _check_subscribe_capabilities(
         self,
         topic: str,
+        options: SubscribeOptions,
         properties: Properties | None,
     ) -> None:
+        if topic.startswith("$share/") and options.no_local:
+            raise ProtocolError("No Local must be 0 for a shared subscription")
         if topic.startswith("$share/") and not self.negotiated.shared_subscription_available:
             raise ProtocolError("Broker does not support shared subscriptions")
         if ("+" in topic or "#" in topic) and not self.negotiated.wildcard_subscription_available:

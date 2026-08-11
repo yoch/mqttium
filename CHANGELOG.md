@@ -8,6 +8,15 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- PINGRESP packets with a non-zero Remaining Length are rejected instead of
+  being accepted as a successful keepalive response.
+- CONNECT validates the Will Topic as a non-empty, wildcard-free Topic Name
+  before mutating protocol state or producing wire bytes.
+- MQTT 5 shared subscriptions reject `No Local=1` before allocating a packet
+  identifier or emitting a SUBSCRIBE.
+- SUBACK and MQTT 5 UNSUBACK reason-code lists are correlated with the exact
+  request type and filter count. Mismatched acknowledgements now produce a
+  protocol error without releasing the request packet identifier.
 - An inbound PUBLISH whose packet identifier is still owned by an unfinished
   exchange of the other QoS no longer overwrites the stored record. The inbound
   store is keyed by identifier alone, so a QoS 1 PUBLISH reusing the identifier
