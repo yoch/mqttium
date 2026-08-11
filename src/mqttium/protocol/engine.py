@@ -23,6 +23,7 @@ from mqttium.packets import (
     ConnAckPacket,
     ConnectPacket,
     DisconnectPacket,
+    PublishPacket,
     SubAckPacket,
     SubscribeOptions,
     SubscribePacket,
@@ -137,10 +138,21 @@ class ProtocolEngine:
         # Keep the exact request shape so an acknowledgement cannot complete a
         # request merely because it happens to reuse the same packet identifier.
         self._pending_sub_requests: dict[int, tuple[PacketType, int]] = {}
+        # Auto-ACK QoS1 exchanges whose PUBACK effect has been emitted but not
+        # handed off from the synchronous engine yet. While these remain in the
+        # current effect batch, a broker has necessarily pipelined any following
+        # PUBLISH before that acknowledgement could leave the engine/runtime
+        # boundary, so they still consume the advertised Receive Maximum.
+        self._pending_auto_qos1_mids: set[int] = set()
 
     def take_effects(self) -> list[EngineEffect]:
         effects = self._effects
         self._effects = []
+        if effects:
+            # Handing the complete effect batch to the runtime is the first
+            # boundary at which an auto-PUBACK can make progress toward the
+            # transport. Do not keep it counted against a later engine batch.
+            self._pending_auto_qos1_mids.clear()
         return effects
 
     @property
@@ -326,6 +338,7 @@ class ProtocolEngine:
         self._sent_session_expiry_interval = (
             connect_props.get("session_expiry_interval") if connect_props is not None else None
         )
+        self._pending_auto_qos1_mids.clear()
         self.state = ConnectionState.CONNECTING
         self._pending_connect = True
         self.inbound.start_connection()
@@ -478,6 +491,7 @@ class ProtocolEngine:
         self.state = ConnectionState.DISCONNECTED
         self.inbound.transport_closed()
         self._pending_connect = False
+        self._pending_auto_qos1_mids.clear()
         # Release sub/unsub MIDs still in flight — no ACK will arrive now.
         if self._pending_sub_mids:
             if self.outbound.pending_messages == 0:
@@ -507,9 +521,11 @@ class ProtocolEngine:
             handler = self._handlers.get(raw.packet_type)
             if handler is None:
                 raise ProtocolError(f"Unhandled packet {raw.packet_type!r}")
+            self._check_pending_auto_qos1_receive_maximum(raw)
             effect_start = len(self._effects)
             handler(raw)
             self._validate_new_outbound_effects(effect_start)
+            self._track_pending_auto_qos1(effect_start)
         except (ProtocolError, MalformedPacketError, PacketTooLargeError) as exc:
             self._emit(EffectKind.PROTOCOL_ERROR, str(exc))
         except Exception as exc:
@@ -826,6 +842,49 @@ class ProtocolEngine:
         except PacketTooLargeError:
             del self._effects[start:]
             raise
+
+    def _check_pending_auto_qos1_receive_maximum(self, raw: RawPacket) -> None:
+        """Count auto-PUBACKs that have not left the current engine batch yet."""
+        pending = self._pending_auto_qos1_mids
+        if (
+            not pending
+            or self.config.manual_ack
+            or raw.packet_type is not PacketType.PUBLISH
+            or ((raw.flags >> 1) & 0x03) == int(QoS.AT_MOST_ONCE)
+        ):
+            return
+
+        packet = PublishPacket.decode(raw.flags, raw.remaining, self.config.protocol)
+        mid = packet.mid
+        if mid is None:
+            return
+        # A retransmitted QoS1 with the same identifier is the same exchange and
+        # does not consume another Receive Maximum slot. QoS2 has durable state
+        # in InboundSession and is left to that state machine.
+        if packet.qos is QoS.AT_LEAST_ONCE and mid in pending:
+            return
+        if packet.qos is not QoS.AT_LEAST_ONCE:
+            return
+
+        if self.inbound._inflight + len(pending) >= self.config.local_receive_maximum:
+            self._protocol_disconnect(0x93)
+            raise ProtocolError(
+                "Receive Maximum exceeded by QoS1 PUBLISH received before pending PUBACK handoff"
+            )
+
+    def _track_pending_auto_qos1(self, start: int) -> None:
+        """Remember auto-PUBACK packet ids until the effect batch is handed off."""
+        if self.config.manual_ack:
+            return
+        for effect in self._effects[start:]:
+            if effect.kind is not EffectKind.SEND:
+                continue
+            wire = effect.data
+            if not isinstance(wire, bytes) or len(wire) < 4:
+                continue
+            if wire[0] & 0xF0 != int(PacketType.PUBACK):
+                continue
+            self._pending_auto_qos1_mids.add((wire[2] << 8) | wire[3])
 
     def _check_subscribe_capabilities(
         self,
