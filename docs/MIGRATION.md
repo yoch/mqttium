@@ -5,6 +5,19 @@ applications can start with `mqttium.compat.paho.Client` and move to the native
 API later. One-shot scripts can use `mqttium.helpers.publish` and
 `mqttium.helpers.subscribe`.
 
+## Choose the adoption path
+
+| Existing code | Start with | Move toward |
+| --- | --- | --- |
+| Paho VERSION2 callbacks and synchronous callers | `mqttium.compat.paho.Client` | Replace one service boundary at a time with `AsyncClient` |
+| Native asyncio code | `mqttium.api.AsyncClient` | Keep protocol completion and backpressure explicit |
+| `paho.mqtt.publish` / `subscribe` scripts | `mqttium.helpers` | Use a long-lived `AsyncClient` if operations become frequent |
+| gmqtt application | `mqttium.api.AsyncClient` | Review completion, QoS 2 and bounded-queue differences |
+
+The compatibility facade is useful when changing event-loop ownership and API
+shape at the same time would make a migration too risky. It is not required for
+new async code.
+
 ## From Paho
 
 The compatibility layer keeps the familiar loop and callback shape:
@@ -14,10 +27,14 @@ from mqttium.compat.paho import CallbackAPIVersion, Client
 
 
 client = Client(CallbackAPIVersion.VERSION2, "client-id")
-client.connect("localhost")
 client.loop_start()
-info = client.publish("events", b"ready", qos=1)
-info.wait_for_publish()
+try:
+    client.connect("localhost")
+    info = client.publish("events", b"ready", qos=1)
+    info.wait_for_publish(timeout=5)
+finally:
+    client.disconnect()
+    client.loop_stop()
 ```
 
 The native API removes the background thread and makes completion explicit:
@@ -43,6 +60,20 @@ Important compatibility differences:
 - WebSocket connections are native: `await client.connect_ws(url)`;
 - MQTT 5 enhanced authentication uses `auth_handler` or `await client.auth()`;
 - durable inflight state is configured with `SqliteInflightStore`.
+
+A practical staged migration is:
+
+1. change the import and require `CallbackAPIVersion.VERSION2` while preserving
+   existing callbacks and caller threads;
+2. configure queue and byte limits, then handle `MQTT_ERR_QUEUE_SIZE` as an
+   explicit overload result;
+3. move new publishing or consuming paths to `AsyncClient`, replacing
+   `wait_for_publish()` with `await receipt.wait()`;
+4. remove the compatibility loop after the final synchronous boundary is gone.
+
+Do not call blocking `Client` methods from its network-thread callbacks. Move
+that operation to another thread or convert the callback path to the native
+client.
 
 See [`COMPAT.md`](COMPAT.md) for the complete supported surface.
 
@@ -98,13 +129,25 @@ message count.
 ## Durable sessions
 
 ```python
-from mqttium.api import AsyncClient
-from mqttium.persistence.sqlite import SqliteInflightStore
+from mqttium import MQTTProtocolVersion
+from mqttium.api import AsyncClient, Properties, ReconnectPolicy
+from mqttium.persistence import SqliteInflightStore
 
 
 store = SqliteInflightStore("session.sqlite")
-client = AsyncClient("durable-client", store=store)
+client = AsyncClient(
+    "durable-client",
+    protocol=MQTTProtocolVersion.MQTTv5,
+    clean_start=False,
+    connect_properties=Properties({"session_expiry_interval": 86_400}),
+    reconnect=ReconnectPolicy(),
+    store=store,
+)
 ```
+
+SQLite and broker-session retention are separate requirements. See
+[`SESSIONS-AND-PERSISTENCE.md`](SESSIONS-AND-PERSISTENCE.md) before relying on
+restart recovery.
 
 Historical SQLite rows are accounted for when they are first reopened. A store
 already above a new limit may drain existing work but cannot admit more until it
@@ -129,13 +172,26 @@ replaced with `max_pending_outbound_messages` and
 
 ## One-shot helpers
 
+Subscriber process:
+
 ```python
-from mqttium.helpers import publish, subscribe
+from mqttium.helpers import subscribe
 
 
-await publish.single("events", b"ready", qos=1, hostname="127.0.0.1")
 message = await subscribe.simple("events/#", hostname="127.0.0.1")
 ```
+
+Publisher process:
+
+```python
+from mqttium.helpers import publish
+
+
+await publish.single("events/ready", b"ready", qos=1, hostname="127.0.0.1")
+```
+
+Start the subscriber first. For repeated operations, keep one `AsyncClient`
+connected instead of reconnecting per call.
 
 MQTTium is original Apache-2.0 code. Paho and gmqtt are referenced for API and
 behavioural comparison; their protocol engines are not copied.

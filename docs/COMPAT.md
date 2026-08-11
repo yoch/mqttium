@@ -4,12 +4,31 @@ This document defines the policy of `mqttium.compat.paho` and explains which
 behaviors are intentionally **not supported**. The compatibility façade is an
 **additive** layer: the core remains `AsyncClient` / `ProtocolEngine`.
 
+Use this facade when an existing application depends on Paho VERSION2 callback
+shape, synchronous lifecycle calls or producers outside the network thread. New
+async code should use `mqttium.api.AsyncClient` directly.
+
 ## Goal
 
 Provide the best practical compatibility with Paho
 `CallbackAPIVersion.VERSION2` for migration purposes, without reproducing the
 monolithic design, historical quirks, and technical debt of the original
 client.
+
+## Adoption path
+
+1. Replace the client import and construct
+   `Client(CallbackAPIVersion.VERSION2, ...)`.
+2. Keep existing VERSION2 callbacks, `loop_start()`, publish/subscribe calls and
+   producer threads.
+3. Configure bounded request, message and byte limits and handle
+   `MQTT_ERR_QUEUE_SIZE`.
+4. Move individual service boundaries to `AsyncClient`; remove the facade after
+   the final synchronous caller is gone.
+
+The runnable [`examples/paho_compat.py`](../examples/paho_compat.py) demonstrates
+the complete connect, subscribe, publish, callback and shutdown lifecycle. See
+[`MIGRATION.md`](MIGRATION.md) for native equivalents.
 
 ## Supported surface (VERSION2)
 
@@ -131,7 +150,7 @@ the coalesced queue. The callback alternative is useful as a low-contention
 reference; the coalesced path reduces cross-thread wakeups and tail latency
 under concurrent publishers.
 
-## Recommended migration path
+## Entry-point summary
 
 1. New code → `mqttium.api.AsyncClient`
 2. Legacy synchronous VERSION2 code → `mqttium.compat.paho.Client`
