@@ -21,9 +21,7 @@ def _feed(engine: ProtocolEngine, wire: bytes) -> None:
 
 
 def _connected_engine(maximum_packet_size: int) -> ProtocolEngine:
-    engine = ProtocolEngine(
-        EngineConfig(client_id="ack-size", protocol=MQTTProtocolVersion.MQTTv5)
-    )
+    engine = ProtocolEngine(EngineConfig(client_id="ack-size", protocol=MQTTProtocolVersion.MQTTv5))
     engine.begin_connect()
     properties = Properties()
     properties.set("maximum_packet_size", maximum_packet_size)
