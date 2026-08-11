@@ -43,3 +43,10 @@ def test_unreleased_link_starts_at_current_version() -> None:
     version = _package_version()
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
     assert f"[Unreleased]: https://github.com/yoch/mqttium/compare/v{version}...HEAD" in changelog
+
+
+def test_finalization_soaks_install_resource_sampling_dependencies() -> None:
+    workflow = (ROOT / ".github/workflows/finalization.yml").read_text(encoding="utf-8")
+
+    assert workflow.count('python -m pip install -e ".[benchmark]"') == 3
+    assert 'python -m pip install -e "."' not in workflow
