@@ -49,7 +49,7 @@ from mqttium.protocol.inbound import InboundSession
 from mqttium.protocol.negotiated import NegotiatedSettings
 from mqttium.protocol.outbound import OutboundSession
 from mqttium.protocol.packet_ids import PacketIdPool
-from mqttium.topics import validate_subscribe_filter
+from mqttium.topics import validate_publish_topic, validate_subscribe_filter
 from mqttium.transport.writes import WriteItem, item_size
 from mqttium.types import (
     OutboundMessage,
@@ -134,6 +134,9 @@ class ProtocolEngine:
         self.outbound.hydrate()
         # MIDs of in-flight SUBSCRIBE/UNSUBSCRIBE (never collide with PUBLISH).
         self._pending_sub_mids: set[int] = set()
+        # Keep the exact request shape so an acknowledgement cannot complete a
+        # request merely because it happens to reuse the same packet identifier.
+        self._pending_sub_requests: dict[int, tuple[PacketType, int]] = {}
 
     def take_effects(self) -> list[EngineEffect]:
         effects = self._effects
@@ -295,6 +298,8 @@ class ProtocolEngine:
                 connect_props.set("topic_alias_maximum", self.config.topic_alias_maximum)
 
         will = self.config.will
+        if will is not None:
+            validate_publish_topic(will.topic)
         packet = ConnectPacket(
             client_id=self.config.client_id,
             clean_start=clean_start,
@@ -360,9 +365,10 @@ class ProtocolEngine:
 
         subscriptions: list[Subscription] = []
         if isinstance(topics, str):
+            options = SubscribeOptions(qos=QoS(qos))
             validate_subscribe_filter(topics)
-            self._check_subscribe_capabilities(topics, properties)
-            subscriptions.append(Subscription(topic=topics, options=SubscribeOptions(qos=QoS(qos))))
+            self._check_subscribe_capabilities(topics, options, properties)
+            subscriptions.append(Subscription(topic=topics, options=options))
         else:
             for item in topics:
                 if isinstance(item, str):
@@ -374,7 +380,7 @@ class ProtocolEngine:
                     else:
                         options = SubscribeOptions(qos=QoS(opt))
                 validate_subscribe_filter(topic)
-                self._check_subscribe_capabilities(topic, properties)
+                self._check_subscribe_capabilities(topic, options, properties)
                 subscriptions.append(Subscription(topic=topic, options=options))
 
         mid = self.outbound.packet_ids.allocate()
@@ -390,6 +396,7 @@ class ProtocolEngine:
             self.outbound.packet_ids.release(mid)
             raise
         self._pending_sub_mids.add(mid)
+        self._pending_sub_requests[mid] = (PacketType.SUBACK, len(subscriptions))
         self._send(wire)
         return mid
 
@@ -414,13 +421,16 @@ class ProtocolEngine:
             self.outbound.packet_ids.release(mid)
             raise
         self._pending_sub_mids.add(mid)
+        self._pending_sub_requests[mid] = (PacketType.UNSUBACK, len(topic_list))
         self._send(wire)
         return mid
 
     def queue_ping(self) -> None:
         if self.state != ConnectionState.CONNECTED:
             raise NotConnectedError("PINGREQ requires an active connection")
-        self._send(encode_pingreq())
+        wire = encode_pingreq()
+        self._check_outbound_size(wire)
+        self._send(wire)
 
     def begin_disconnect(
         self,
@@ -473,6 +483,7 @@ class ProtocolEngine:
                 for mid in self._pending_sub_mids:
                     self.outbound.packet_ids.release(mid)
             self._pending_sub_mids.clear()
+        self._pending_sub_requests.clear()
         if was != ConnectionState.DISCONNECTED:
             self._emit(EffectKind.DISCONNECTED, DisconnectInfo(from_broker=False))
 
@@ -531,6 +542,19 @@ class ProtocolEngine:
                 ),
             )
             return
+
+        if self.config.protocol == MQTTProtocolVersion.MQTTv5 and not self.config.client_id:
+            assigned_client_id = (
+                connack.properties.get("assigned_client_identifier")
+                if connack.properties is not None
+                else None
+            )
+            if not assigned_client_id:
+                self._protocol_disconnect(0x82)
+                raise ProtocolError(
+                    "Successful CONNACK for an empty ClientID requires a non-empty "
+                    "Assigned Client Identifier [MQTT-3.2.2-16]"
+                )
 
         if connack.session_present and self._sent_clean_start:
             # The Server MUST report Session Present 0 after accepting Clean
@@ -591,28 +615,57 @@ class ProtocolEngine:
 
     def ack(self, mid: int) -> None:
         """Complete a deferred inbound ACK in manual-ack mode."""
+        if self.state is not ConnectionState.CONNECTED:
+            raise NotConnectedError("ack requires an active connection")
         self.inbound.ack(mid)
 
     def _on_suback(self, raw: RawPacket) -> None:
         ack = SubAckPacket.decode(raw.remaining, self.config.protocol)
-        if ack.mid not in self._pending_sub_mids:
-            # Orphan / cross-mid SUBACK: do not release a foreign packet id.
-            self._emit(EffectKind.PROTOCOL_ERROR, f"SUBACK for unknown mid {ack.mid}")
-            return
-        self._pending_sub_mids.discard(ack.mid)
-        self.outbound.packet_ids.release(ack.mid)
+        self._complete_subscription_request(
+            ack.mid,
+            PacketType.SUBACK,
+            len(ack.reason_codes),
+        )
         self._emit(EffectKind.SUBACK, ack)
 
     def _on_unsuback(self, raw: RawPacket) -> None:
         ack = UnsubAckPacket.decode(raw.remaining, self.config.protocol)
-        if ack.mid not in self._pending_sub_mids:
-            self._emit(EffectKind.PROTOCOL_ERROR, f"UNSUBACK for unknown mid {ack.mid}")
-            return
-        self._pending_sub_mids.discard(ack.mid)
-        self.outbound.packet_ids.release(ack.mid)
+        reason_count = (
+            len(ack.reason_codes) if self.config.protocol is MQTTProtocolVersion.MQTTv5 else None
+        )
+        self._complete_subscription_request(
+            ack.mid,
+            PacketType.UNSUBACK,
+            reason_count,
+        )
         self._emit(EffectKind.UNSUBACK, ack)
 
+    def _complete_subscription_request(
+        self,
+        mid: int,
+        ack_type: PacketType,
+        reason_count: int | None,
+    ) -> None:
+        expected = self._pending_sub_requests.get(mid)
+        if mid not in self._pending_sub_mids or expected is None:
+            raise ProtocolError(f"{ack_type.name} for unknown mid {mid}")
+        expected_type, expected_count = expected
+        if ack_type is not expected_type:
+            raise ProtocolError(
+                f"Expected {expected_type.name} for mid {mid}, received {ack_type.name}"
+            )
+        if reason_count is not None and reason_count != expected_count:
+            raise ProtocolError(
+                f"{ack_type.name} for mid {mid} has {reason_count} reason codes; "
+                f"expected {expected_count}"
+            )
+        self._pending_sub_mids.discard(mid)
+        self._pending_sub_requests.pop(mid, None)
+        self.outbound.packet_ids.release(mid)
+
     def _on_pingresp(self, raw: RawPacket) -> None:
+        if raw.remaining:
+            raise MalformedPacketError("PINGRESP remaining length must be 0")
         self._emit(EffectKind.PINGRESP)
 
     def _on_pingreq(self, raw: RawPacket) -> None:
@@ -621,6 +674,24 @@ class ProtocolEngine:
 
     def _on_disconnect(self, raw: RawPacket) -> None:
         packet = DisconnectPacket.decode(raw.remaining, self.config.protocol)
+        if (
+            self.config.protocol is MQTTProtocolVersion.MQTTv5
+            and packet.properties is not None
+            and packet.properties.get("session_expiry_interval") is not None
+        ):
+            self.state = ConnectionState.DISCONNECTED
+            self._emit(
+                EffectKind.DISCONNECTED,
+                DisconnectInfo(
+                    reason_code=packet.reason_code,
+                    properties=packet.properties,
+                    from_broker=True,
+                ),
+            )
+            raise ProtocolError(
+                "Server must not send Session Expiry Interval in DISCONNECT "
+                "[MQTT-3.14.2-2]"
+            )
         self.state = ConnectionState.DISCONNECTED
         self._emit(
             EffectKind.DISCONNECTED,
@@ -633,13 +704,8 @@ class ProtocolEngine:
 
     def _on_auth(self, raw: RawPacket) -> None:
         if self.config.protocol != MQTTProtocolVersion.MQTTv5:
-            self._send(encode_disconnect(0x82, self.config.protocol))
-            self.state = ConnectionState.DISCONNECTED
-            self._emit(
-                EffectKind.DISCONNECTED,
-                DisconnectInfo(reason_code=0x82, from_broker=False),
-            )
-            return
+            self._protocol_disconnect(0x82)
+            raise ProtocolError("AUTH is not valid in MQTT 3.1.1")
         packet = AuthPacket.decode(raw.remaining, self.config.protocol)
         if self._auth_method is None:
             self._reject_auth_method()
@@ -741,8 +807,11 @@ class ProtocolEngine:
     def _check_subscribe_capabilities(
         self,
         topic: str,
+        options: SubscribeOptions,
         properties: Properties | None,
     ) -> None:
+        if topic.startswith("$share/") and options.no_local:
+            raise ProtocolError("No Local must be 0 for a shared subscription")
         if topic.startswith("$share/") and not self.negotiated.shared_subscription_available:
             raise ProtocolError("Broker does not support shared subscriptions")
         if ("+" in topic or "#" in topic) and not self.negotiated.wildcard_subscription_available:
