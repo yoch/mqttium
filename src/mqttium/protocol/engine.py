@@ -343,6 +343,8 @@ class ProtocolEngine:
         retain: bool = False,
         properties: Properties | None = None,
     ) -> PublishHandle:
+        if self.state is ConnectionState.DISCONNECTING:
+            raise NotConnectedError("publish is not allowed while disconnecting")
         return self.outbound.queue_publish(
             topic, payload, qos=qos, retain=retain, properties=properties
         )
@@ -351,6 +353,8 @@ class ProtocolEngine:
         self,
         messages: Iterable[tuple[str, bytes, QoS | int, bool, Properties | None]],
     ) -> list[PublishHandle]:
+        if self.state is ConnectionState.DISCONNECTING:
+            raise NotConnectedError("publish is not allowed while disconnecting")
         return self.outbound.queue_publish_many(messages)
 
     def queue_subscribe(
@@ -689,8 +693,7 @@ class ProtocolEngine:
                 ),
             )
             raise ProtocolError(
-                "Server must not send Session Expiry Interval in DISCONNECT "
-                "[MQTT-3.14.2-2]"
+                "Server must not send Session Expiry Interval in DISCONNECT [MQTT-3.14.2-2]"
             )
         self.state = ConnectionState.DISCONNECTED
         self._emit(
