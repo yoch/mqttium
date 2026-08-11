@@ -1,38 +1,52 @@
 # MQTTium
 
-**A dependable, async-native MQTT client for Python.**
+**A dependable, efficient, async-native MQTT client for Python.**
 
 MQTT looks simple until a connection drops halfway through a QoS exchange, a
 consumer slows down, or a process restarts with work still in flight. MQTTium
-is built for those moments. It keeps protocol state explicit, places hard
-limits around memory growth, and tells the application when a publication has
-actually completed.
+is built for those moments. It keeps protocol state explicit, bounds the work
+that can accumulate in memory, and tells the application when a publication
+has actually completed.
 
-MQTTium supports MQTT 3.1.1 and MQTT 5, QoS 0/1/2, TCP, TLS, WebSocket and Unix
-sockets. Its primary API is native `asyncio`; a Paho-compatible VERSION2 facade
-is available for gradual migrations.
+MQTTium is a good fit for services, gateways and devices where reconnects,
+sustained traffic, delivery confirmation or controlled resource use matter. If
+an application only sends an occasional QoS 0 message, a smaller client may be
+all it needs.
 
 > **Status:** release candidate (`1.0.0rc1`). The native Stable API is frozen
 > for 1.0. Provisional extension points may still evolve under their documented
 > compatibility policy.
 
-## Design philosophy
+## Why MQTTium?
 
-MQTTium treats reliability as an API property, not an implementation detail:
+Reliability is an API property here, not an implementation detail:
 
 - **One owner for protocol state.** Packet identifiers, QoS transitions,
-  reconnects and session replay are managed by explicit state machines. This
-  makes failures predictable and the implementation easier to audit.
-- **Bounded work by default.** Producer, writer and consumer queues have message
-  and byte limits. Overload becomes waiting or an explicit error, not
-  unbounded memory growth.
+  reconnects and session replay are managed by explicit state machines.
+- **Bounded work by default.** Producer, writer and delivery queues have message
+  and byte limits. Overload becomes waiting or an explicit error, not runaway
+  memory use.
 - **Observable completion.** A publish receipt distinguishes local admission
-  from broker acknowledgement. Runtime snapshots expose pressure and inflight
-  state without requiring per-message logging.
+  from broker acknowledgement. Runtime snapshots expose pressure without
+  requiring per-message logging.
+- **Performance with guardrails.** Optimisations must preserve MQTT semantics,
+  backpressure, memory bounds and event-loop fairness, and must be supported by
+  reproducible measurements.
 
-Those choices are most useful in services, gateways and devices where
-reconnects, sustained traffic or delivery confirmation matter. For a script
-that occasionally sends a QoS 0 message, a smaller client may be all you need.
+## At a glance
+
+| Need | MQTTium provides |
+| --- | --- |
+| Protocol coverage | MQTT 3.1.1 and MQTT 5, QoS 0/1/2, typed properties, Last Will and enhanced authentication |
+| Completion | Per-message and aggregate publish receipts that follow the relevant MQTT acknowledgement exchange |
+| Controlled load | Message and byte budgets, wait-or-refuse backpressure, bounded ingress and delivery |
+| Session continuity | Jittered reconnect policy plus in-memory or SQLite-backed inflight state with incremental replay |
+| Application delivery | Async iterator, sync or async callbacks, optional dual delivery and manual acknowledgement |
+| Transports | TCP, TLS, WebSocket and Unix-domain sockets |
+| Operations | Immutable statistics, queue high-water marks and broker-negotiated limits without a background sampler |
+| Throughput-oriented APIs | Bounded `publish_many()`, loop-bound `publish_nowait()` and one-shot helpers |
+| Migration | A Paho-shaped `CallbackAPIVersion.VERSION2` facade with bounded cross-thread producers |
+| Packaging | A typed Python 3.11–3.14 package with no runtime dependencies |
 
 ## Install
 
@@ -40,9 +54,8 @@ that occasionally sends a QoS 0 message, a smaller client may be all you need.
 python -m pip install mqttium
 ```
 
-Python 3.11 through 3.14 is supported. MQTTium is licensed under Apache-2.0.
-
-To evaluate the current release candidate directly from source:
+MQTTium is licensed under Apache-2.0. To evaluate the current release-candidate
+source tree directly:
 
 ```bash
 git clone https://github.com/yoch/mqttium.git
@@ -50,10 +63,10 @@ cd mqttium
 python -m pip install -e .
 ```
 
-## Quick start
+## First round trip
 
-This client subscribes, publishes with QoS 1, waits for the broker's PUBACK and
-then consumes the message:
+The example below subscribes, publishes with QoS 1, waits for the broker's
+PUBACK and consumes the message:
 
 ```python
 import asyncio
@@ -86,37 +99,14 @@ asyncio.run(main())
 
 For QoS 0, a receipt is complete once the message has been admitted for
 writing. For QoS 1 and 2, `receipt.wait()` follows the MQTT acknowledgement
-exchange.
+exchange. See the [Getting Started guide](docs/GETTING-STARTED.md) for callback
+delivery, errors and lifecycle details, or run
+[`examples/pubsub.py`](examples/pubsub.py) against a local broker.
 
-## Receiving messages
+## Publishing under load
 
-Use the async iterator when message processing naturally belongs in a task:
-
-```python
-async for message in client.messages():
-    await handle(message.topic, message.payload)
-```
-
-Or assign a callback when an existing application is callback-oriented:
-
-```python
-def on_message(message) -> None:
-    print(message.topic, message.payload)
-
-
-client.on_message = on_message
-```
-
-Delivery mode, callback concurrency, queue depth and retained payload bytes are
-bounded independently. Slow application code therefore applies visible
-backpressure instead of quietly consuming the process's memory. Applications
-that need control of acknowledgement timing can enable `manual_ack` and call
-`await client.ack(message)` after processing.
-
-## Publishing and overload
-
-`publish()` waits for capacity by default. Applications that must shed load
-instead can request immediate refusal:
+`publish()` waits for capacity by default. Applications that need to shed load
+can request immediate refusal:
 
 ```python
 from mqttium import FlowControlError
@@ -131,7 +121,7 @@ except FlowControlError:
     ...
 ```
 
-For high-volume producers, `publish_many()` consumes an iterable in bounded
+For sustained producers, `publish_many()` consumes an iterable in bounded
 chunks and uses one aggregate receipt:
 
 ```python
@@ -144,50 +134,124 @@ await batch.wait()
 ```
 
 `publish_nowait()` is the synchronous, non-suspending option for code already
-running on the client's event-loop thread. It raises `FlowControlError` as soon
-as either the protocol or writer budget is full. These entry points share the
-same admission and completion rules; choosing one changes waiting and batching,
-not delivery semantics.
+running on the client's event-loop thread. It raises `FlowControlError` when a
+protocol or writer budget is full. All three entry points share the same
+admission and completion rules; choosing one changes waiting and batching, not
+delivery semantics.
 
-## Reconnection and durable inflight state
+## Receiving and acknowledging messages
 
-Automatic reconnect is opt-in on the native client:
+Use the async iterator when processing naturally belongs in a task:
 
 ```python
-from mqttium.api import AsyncClient, ReconnectPolicy
+async for message in client.messages():
+    await handle(message.topic, message.payload)
+```
 
+Or assign a synchronous or asynchronous callback:
+
+```python
+async def on_message(message) -> None:
+    await handle(message.topic, message.payload)
+
+
+client.on_message = on_message
+```
+
+Delivery mode, callback queue, iterator queue and retained payload bytes are
+bounded independently. Slow application code therefore creates visible
+backpressure instead of silently consuming the process's memory. Applications
+that need control of inbound QoS acknowledgement timing can set
+`manual_ack=True` and call `await client.ack(message)` after processing.
+
+## Surviving disconnects and process restarts
+
+Automatic reconnect is opt-in. `ReconnectPolicy` uses jittered exponential
+backoff and stops retrying terminal authentication, authorisation and protocol
+errors.
+
+For MQTT 5, a durable broker session and durable client inflight state are two
+separate pieces. Configure both explicitly:
+
+```python
+from mqttium import MQTTProtocolVersion
+from mqttium.api import AsyncClient, Properties, ReconnectPolicy
+from mqttium.persistence import SqliteInflightStore
+
+store = SqliteInflightStore("mqtt-session.sqlite")
 client = AsyncClient(
     "gateway",
+    protocol=MQTTProtocolVersion.MQTTv5,
     clean_start=False,
+    connect_properties=Properties({"session_expiry_interval": 86_400}),
     reconnect=ReconnectPolicy(
         initial_delay=0.5,
         max_delay=30.0,
         max_retries=None,
     ),
+    store=store,
 )
+
+try:
+    await client.connect("broker.example", 1883)
+    # Publish and subscribe normally.
+finally:
+    await client.disconnect()
+    store.close()
 ```
 
-Reconnect delays use jittered exponential backoff. Terminal broker rejections
-are not retried indefinitely, and interrupted QoS exchanges keep their protocol
-phase.
+With MQTT 3.1.1, `clean_start=False` requests the corresponding persistent
+broker session; there is no MQTT 5 session-expiry property.
 
-When inflight work must survive a process restart, provide a SQLite store:
+`SqliteInflightStore` persists unfinished outbound QoS 1/2 exchanges and
+inbound QoS 2 protocol state. It does not persist arbitrary application work,
+delivered iterator/callback queues or subscription intent on its own. The
+broker must also retain the MQTT session for an interrupted exchange to resume.
+The application owns and closes the synchronous store. Its schema is versioned,
+and replay is paged so reopening a large session does not require loading every
+payload at once.
+
+The [Sessions and Persistence guide](docs/SESSIONS-AND-PERSISTENCE.md) covers
+restart behaviour, clean-session rules, sizing and recovery boundaries. A
+runnable configuration is available in
+[`examples/durable_session.py`](examples/durable_session.py).
+
+## Moving from Paho without a rewrite
+
+Existing synchronous Paho VERSION2 applications can adopt MQTTium one boundary
+at a time. Start with the compatibility facade and move new or performance-
+sensitive code to `AsyncClient` when convenient:
 
 ```python
-from mqttium.api import AsyncClient
-from mqttium.persistence import SqliteInflightStore
+from mqttium.compat.paho import CallbackAPIVersion, Client
 
-store = SqliteInflightStore("mqtt-session.sqlite")
-client = AsyncClient("gateway", clean_start=False, store=store)
+client = Client(CallbackAPIVersion.VERSION2, client_id="legacy-service")
+client.loop_start()
+try:
+    client.connect("127.0.0.1", 1883)
+    info = client.publish("events", b"ready", qos=1)
+    info.wait_for_publish(timeout=5)
+finally:
+    client.disconnect()
+    client.loop_stop()
 ```
 
-The store is synchronous and intentionally owned by the application; close it
-during application shutdown. Replay is incremental, so restoring a large
-session does not require loading every payload into memory at once.
+The facade supports the common VERSION2 lifecycle, publish/subscribe methods,
+filtered message callbacks, credentials, wills, queue controls and producers
+running outside the network thread. Its cross-thread handoff is bounded by
+message and byte limits.
 
-## Transports and MQTT versions
+It is intentionally not a bug-for-bug clone. VERSION1 callbacks, blocking
+re-entry from the network callback thread and behaviours that conflict with
+MQTT correctness or bounded resources are rejected explicitly. Consult the
+[migration guide](docs/MIGRATION.md) for the staged path and the
+[compatibility matrix](docs/COMPAT.md) for the exact supported surface. The
+complete callback lifecycle is runnable as
+[`examples/paho_compat.py`](examples/paho_compat.py).
 
-TCP is the default. TLS uses a normal Python `SSLContext`, while WebSocket and
+## Transports and MQTT 5
+
+TCP is the default. TLS uses a normal Python `SSLContext`; WebSocket and
 Unix-domain connections have explicit entry points:
 
 ```python
@@ -196,55 +260,63 @@ await client.connect_ws("wss://broker.example/mqtt", ssl=tls_context)
 await client.connect_unix("/run/mosquitto/mosquitto.sock")
 ```
 
-Select MQTT 5 when constructing the client:
+MQTT 5 properties remain explicit. MQTTium supports CONNECT, publish,
+subscription, Will and AUTH properties, enhanced-authentication handlers and
+client-initiated re-authentication. It exposes the broker's negotiated Receive
+Maximum, maximum packet size, maximum QoS, feature availability, keepalive and
+assigned client identifier through `client.negotiated`. Unsupported broker
+capabilities are rejected rather than silently downgraded. Topic aliases are
+deliberately explicit and reset with each network connection.
+
+## Observing a running client
+
+`client.stats()` returns an immutable point-in-time tree maintained by the
+components that own each queue or protocol state:
 
 ```python
-from mqttium import MQTTProtocolVersion
-from mqttium.api import AsyncClient
+snapshot = client.stats()
 
-client = AsyncClient("mqtt5-client", protocol=MQTTProtocolVersion.MQTTv5)
+print(snapshot.state)
+print(snapshot.outbound.pending_messages, snapshot.outbound.pending_bytes)
+print(snapshot.writer.queued_bytes, snapshot.delivery.pending_bytes)
+print(client.negotiated.receive_maximum, client.effective_client_id)
 ```
 
-The same client API is used for MQTT 3.1.1 and MQTT 5; version-specific
-properties remain explicit rather than being silently emulated.
+The snapshot includes tasks, protocol flow, packet identifiers, ingress,
+effects, writer pressure, delivery queues, receipts and transport buffers.
+Calling it starts no sampler and emits no logs. MQTTium leaves logging, metrics,
+sampling and redaction policy to the application. See the
+[Operations guide](docs/OPERATIONS.md) for sizing and diagnosis, and
+[`examples/runtime_stats.py`](examples/runtime_stats.py) for a JSON snapshot.
 
-## Moving from Paho
+## Efficiency under sustained load
 
-Projects can start with the Paho-compatible facade and migrate one boundary at
-a time:
+Performance is a design constraint, not a promise to bypass protocol work.
+MQTTium batches work that is already ready, bounds each event-loop turn and
+avoids background threads in the native client. Batch publishing avoids a task
+or completion object per message where possible, while optional features stay
+off inactive hot paths. The package itself has no runtime dependencies.
 
-```python
-from mqttium.compat.paho import CallbackAPIVersion, Client
+Performance changes are accepted only with reproducible local evidence and
+guardrails for memory, latency, fairness and non-targeted workloads. The
+[benchmarking contract](docs/BENCHMARKING.md) explains how measurements are
+made; the [RC performance report](docs/reports/PERFORMANCE-1.0.0rc1.md) records
+current decisions. A user-facing benchmark section will follow when the
+cross-client results are stable enough to publish without overclaiming.
 
-client = Client(CallbackAPIVersion.VERSION2)
-```
-
-The facade covers the commonly used VERSION2 surface, including filtered
-callbacks and threaded producers. It does not reproduce Paho behaviours that
-conflict with MQTT correctness or bounded resource use. The exact differences
-and native equivalents are documented in
-[`docs/COMPAT.md`](docs/COMPAT.md) and [`docs/MIGRATION.md`](docs/MIGRATION.md).
-
-## Stability and evidence
+## Stability, documentation and trust
 
 The public contract is divided into Stable, Provisional and Internal surfaces.
-The complete boundary and default-value commitments are in
-[`docs/API-STABILITY.md`](docs/API-STABILITY.md).
+The exact boundary and default-value commitments are documented in the
+[API stability policy](docs/API-STABILITY.md).
 
 Protocol behaviour is checked with unit, integration, property, fuzz, memory
-and broker tests. Performance claims require paired local runs on an eligible
-machine; hosted-runner measurements are advisory. Generated measurements stay
-outside the source tree so a checkout remains reproducible and clean.
+and multi-broker tests. Wheel and source distributions are installed in
+isolated environments and exercised over TCP, TLS, WebSocket and Unix sockets,
+including SQLite restart, Paho VERSION2 and clean shutdown paths.
 
-Continue with:
-
-- [`docs/README.md`](docs/README.md) for the documentation map;
-- [`docs/DESIGN.md`](docs/DESIGN.md) for architecture and ownership rules;
-- [`docs/IMPLEMENTATION-GUIDE.md`](docs/IMPLEMENTATION-GUIDE.md) for operational
-  details and configuration;
-- [`docs/BENCHMARKING.md`](docs/BENCHMARKING.md) for measurement validity;
-- [`docs/STABILITY.md`](docs/STABILITY.md) for release evidence.
-
-Contributions and reproducible bug reports are welcome. See
-[`CONTRIBUTING.md`](CONTRIBUTING.md), and report security issues through the
-private process in [`SECURITY.md`](SECURITY.md).
+Continue with the [documentation home](docs/README.md), which separates current
+user guides, technical contracts, maintainer evidence and planned material.
+Contributions and reproducible bug reports are welcome; see
+[CONTRIBUTING.md](CONTRIBUTING.md). Report security issues through the private
+process in [SECURITY.md](SECURITY.md).
