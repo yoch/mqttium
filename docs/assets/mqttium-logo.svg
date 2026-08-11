@@ -17,7 +17,7 @@
     </style>
   </defs>
 
-  <!-- ==================== CARTOUCHE / ICONE ==================== -->
+  <!-- ==================== EMBLEM / ICON ==================== -->
   <rect x="165" y="88" width="564" height="565" rx="69" ry="69" fill="#202629"/>
   <path fill="#FFFFFF" d="M253,190 L366,320 L479,190 L479,444 L445,444 L445,286
                           L366,376 L287,286 L287,444 L253,444 Z"/>
@@ -27,7 +27,7 @@
   <rect x="561" y="539" width="33" height="34" rx="9" fill="#92AAC1"/>
   <rect x="622" y="539" width="34" height="34" rx="9" fill="#FFFFFF"/>
 
-  <!-- ==================== WORDMARK (police embarquee, centree) ==================== -->
+  <!-- ==================== WORDMARK (embedded font, centred) ==================== -->
   <text class="word" x="447" y="806" text-anchor="middle">
     <tspan fill="#202629">MOTT</tspan><tspan fill="#0099A2">ium</tspan>
   </text>

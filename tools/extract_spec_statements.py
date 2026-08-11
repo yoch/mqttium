@@ -1,123 +1,145 @@
 #!/usr/bin/env python3
-"""Rebuild the vendored MQTT conformance-statement index from the OASIS sources.
+"""Rebuild the MQTT conformance index from reproducible OASIS archives.
 
-The OASIS HTML is a Word export with a consistent convention: the text of every
-normative statement is highlighted (``background:yellow``) and immediately
-followed by its label in red (``[MQTT-x.y.z-n]``). That makes the statements
-machine-extractable verbatim, which is the whole point — an index paraphrased by
-hand or by a model is worse than none, because it would be trusted.
+The numbered statements are read from the highlighted normative prose in the
+official HTML.  The conformance appendix is parsed independently: it fills the
+few labels omitted from the body and exposes source disagreements for review.
 
 Usage::
 
-    python tools/extract_spec_statements.py            # download and rebuild
-    python tools/extract_spec_statements.py --check    # verify the index is current
+    python tools/extract_spec_statements.py
+    python tools/extract_spec_statements.py --check
+    python tools/extract_spec_statements.py --from-archive V311_ZIP V5_ZIP
 
-Writes ``docs/spec/mqtt-v*-statements.json``. Only the extracted statements are
-vendored; the full specifications are not redistributed here.
+Only the generated statement indexes are vendored; the specifications and
+their archives remain at OASIS.
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
-import html
+import io
 import json
 import re
 import sys
 import urllib.request
+import zipfile
 from datetime import date
+from html.parser import HTMLParser
 from pathlib import Path
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 OUTPUT_DIR = REPO_ROOT / "docs" / "spec"
+SOURCE_ENCODING = "cp1252"  # Alias of the declared windows-1252 charset.
 
-SOURCES = {
+SOURCES: dict[str, dict[str, str]] = {
     "3.1.1": {
-        "title": "MQTT Version 3.1.1 Plus Errata 01, OASIS Standard Incorporating "
-        "Approved Errata 01",
-        "url": "https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html",
+        "title": (
+            "MQTT Version 3.1.1 Plus Errata 01, OASIS Standard Incorporating Approved Errata 01"
+        ),
+        "url": (
+            "https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/errata01/os/"
+            "mqtt-v3.1.1-errata01-os-complete.html"
+        ),
+        "archive_url": (
+            "https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/errata01/os/mqtt-v3.1.1-errata01-os.zip"
+        ),
+        "archive_member": "mqtt-v3.1.1-errata01-os-complete.html",
         "published": "2015-12-10",
     },
     "5.0": {
         "title": "MQTT Version 5.0, OASIS Standard",
         "url": "https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html",
+        "archive_url": "https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.zip",
+        "archive_member": "mqtt-v5.0-os.html",
         "published": "2019-03-07",
     },
 }
 
-_HIGHLIGHT_OPEN = re.compile(r"<span[^>]*background:\s*yellow[^>]*>", re.IGNORECASE)
-_SPAN_CLOSE = re.compile(r"</span>", re.IGNORECASE)
-_TAG = re.compile(r"<[^>]+>")
 _LABEL = re.compile(r"\[(MQTT-\d+(?:\.\d+)*-\d+)\]")
-_HEADING = re.compile(
-    r"<h[1-6][^>]*>(.*?)</h[1-6]>",
-    re.IGNORECASE | re.DOTALL,
-)
-_CELL = re.compile(r"</?t[dh][^>]*>", re.IGNORECASE)
+_YELLOW = re.compile(r"background(?:-color)?\s*:\s*yellow", re.IGNORECASE)
 _WS = re.compile(r"\s+")
-
-# Sentinels survive tag stripping and cannot appear in the source text.
-_MARK_START = "\x01"
-_MARK_END = "\x02"
-_HEAD_START = "\x03"
-_HEAD_END = "\x04"
-_CELL_MARK = "\x05"
 
 
 def _clean(text: str) -> str:
-    return _WS.sub(" ", html.unescape(_TAG.sub("", text))).strip()
+    return _WS.sub(" ", text).strip()
 
 
-def _segments(raw_html: str) -> list[tuple[str, str]]:
-    """Flatten the document into ``(kind, text)`` runs.
+class _BodyParser(HTMLParser):
+    """Emit body text runs while respecting nested highlighted spans.
 
-    ``kind`` is ``highlight`` for the yellow-marked statement text, ``cell`` for
-    a table-cell boundary and ``plain`` otherwise. Working in runs rather than
-    on one flat string is what lets a statement interrupted by an inline link be
-    put back together without swallowing the prose around it.
+    Regex substitution is unsafe for the OASIS Word export: highlighted text
+    can contain nested spans, so the first closing ``</span>`` is not
+    necessarily the end of the statement.  Tracking the actual element stack
+    prevents short fragments such as ``(0x00)`` from replacing a full rule.
     """
-    marked = _HIGHLIGHT_OPEN.sub(_MARK_START, raw_html)
-    marked = _SPAN_CLOSE.sub(_MARK_END, marked)
-    marked = _CELL.sub(_CELL_MARK, marked)
-    marked = _HEADING.sub(lambda m: f"{_HEAD_START}{m.group(1)}{_HEAD_END}", marked)
-    flat = html.unescape(_TAG.sub("", marked))
 
-    runs: list[tuple[str, str]] = []
-    index = 0
-    length = len(flat)
-    while index < length:
-        char = flat[index]
-        if char == _MARK_START:
-            end = flat.find(_MARK_END, index + 1)
-            if end == -1:
-                end = length
-            runs.append(("highlight", flat[index + 1 : end]))
-            index = end + 1
-            continue
-        if char == _CELL_MARK:
-            runs.append(("cell", ""))
-            index += 1
-            continue
-        next_special = min(
-            (
-                pos
-                for pos in (flat.find(_MARK_START, index), flat.find(_CELL_MARK, index))
-                if pos != -1
-            ),
-            default=length,
-        )
-        runs.append(("plain", flat[index:next_special]))
-        index = next_special
-    return runs
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.runs: list[tuple[str, str]] = []
+        self._span_highlights: list[bool] = []
+        self._highlight_depth = 0
+
+    def _append(self, kind: str, text: str = "") -> None:
+        if text and self.runs and self.runs[-1][0] == kind:
+            previous_kind, previous_text = self.runs[-1]
+            self.runs[-1] = (previous_kind, previous_text + text)
+        else:
+            self.runs.append((kind, text))
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "span":
+            style = dict(attrs).get("style") or ""
+            highlighted = _YELLOW.search(style) is not None
+            self._span_highlights.append(highlighted)
+            self._highlight_depth += int(highlighted)
+        if tag in {"td", "th"}:
+            self._append("cell")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "span" and self._span_highlights:
+            self._highlight_depth -= int(self._span_highlights.pop())
+        if tag in {"td", "th"}:
+            self._append("cell")
+
+    def handle_data(self, data: str) -> None:
+        self._append("highlight" if self._highlight_depth else "plain", data)
+
+
+class _AppendixParser(HTMLParser):
+    """Parse conformance-table rows without depending on Word's tag layout."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.rows: list[list[str]] = []
+        self._row: list[str] | None = None
+        self._cell: list[str] | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        del attrs
+        if tag == "tr":
+            self._row = []
+        elif tag in {"td", "th"} and self._row is not None:
+            self._cell = []
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"td", "th"} and self._row is not None and self._cell is not None:
+            self._row.append(_clean("".join(self._cell)))
+            self._cell = None
+        elif tag == "tr" and self._row is not None:
+            self.rows.append(self._row)
+            self._row = None
+            self._cell = None
+
+    def handle_data(self, data: str) -> None:
+        if self._cell is not None:
+            self._cell.append(data)
 
 
 def _highlighted_text(runs: list[tuple[str, str]], upto: int) -> str:
-    """Recover the highlighted statement text preceding ``runs[upto]``.
-
-    Consecutive highlighted runs are merged across separators that carry no
-    prose of their own, which is how a statement broken by an inline
-    cross-reference link is reassembled.
-    """
+    """Reassemble highlighted text immediately preceding a statement label."""
     collected: list[str] = []
     index = upto - 1
     while index >= 0:
@@ -128,78 +150,46 @@ def _highlighted_text(runs: list[tuple[str, str]], upto: int) -> str:
                 collected.insert(0, cleaned)
             index -= 1
             continue
-        if kind == "plain" and not _clean(text.replace(_HEAD_START, "").replace(_HEAD_END, "")):
+        if kind == "plain" and not _clean(text):
             index -= 1
             continue
         break
     return _clean(" ".join(collected))
 
 
-def _appendix_rows(raw_html: str) -> dict[str, str]:
-    """Read the conformance-clause tables, where the label *precedes* its text.
+def _body_statements(raw_html: str) -> dict[str, str]:
+    parser = _BodyParser()
+    parser.feed(raw_html)
+    statements: dict[str, str] = {}
+    for position, (kind, text) in enumerate(parser.runs):
+        if kind != "plain":
+            continue
+        for match in _LABEL.finditer(text):
+            statement = _highlighted_text(parser.runs, position)
+            if statement:
+                statements.setdefault(match.group(1), statement)
+    return statements
 
-    The layout is ``<tr><td>[MQTT-x-n]</td><td>statement</td></tr>``. Searching
-    backwards from the label — the intuitive direction, and the one the
-    highlighted body form needs — silently attaches the previous row's text, so
-    this walks rows explicitly instead.
-    """
-    texts: dict[str, str] = {}
-    for row in re.findall(r"<tr[^>]*>(.*?)</tr>", raw_html, re.IGNORECASE | re.DOTALL):
-        cells = re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", row, re.IGNORECASE | re.DOTALL)
+
+def _appendix_rows(raw_html: str) -> dict[str, str]:
+    parser = _AppendixParser()
+    parser.feed(raw_html)
+    statements: dict[str, str] = {}
+    for cells in parser.rows:
         if len(cells) < 2:
             continue
-        label_match = _LABEL.search(_clean(cells[0]))
-        if label_match is None:
-            continue
-        text = _clean(cells[1])
-        if text:
-            texts.setdefault(label_match.group(1), text)
-    return texts
+        match = _LABEL.search(cells[0])
+        if match is not None and cells[1]:
+            statements.setdefault(match.group(1), cells[1])
+    return statements
 
 
-def extract(raw_html: str) -> list[dict[str, str]]:
-    """Return every ``[MQTT-…]`` statement with its verbatim text and section.
-
-    The highlighted body text is authoritative. The conformance-clause tables in
-    the appendix repeat many statements and are used only to fill the ones the
-    body does not highlight; where both exist they are cross-checked, because a
-    disagreement means this parser has drifted from the document's conventions.
-    """
-    runs = _segments(raw_html)
-    appendix = _appendix_rows(raw_html)
-
-    body: dict[str, dict[str, str]] = {}
-    section = ""
-    for position, (_kind, text) in enumerate(runs):
-        for heading in re.finditer(f"{_HEAD_START}(.*?){_HEAD_END}", text, re.DOTALL):
-            candidate = _clean(heading.group(1))
-            if candidate:
-                section = candidate
-        for match in _LABEL.finditer(text):
-            label = match.group(1)
-            statement_text = _highlighted_text(runs, position)
-            if not statement_text:
-                # A label cited in prose ("see [MQTT-3.1.4-4]") or sitting in an
-                # appendix cell highlights nothing of its own.
-                continue
-            body.setdefault(
-                label, {"id": label, "section": section, "text": statement_text, "origin": "body"}
-            )
-
-    statements = dict(body)
-    for label, text in appendix.items():
-        if label not in statements:
-            statements[label] = {
-                "id": label,
-                "section": "conformance clause (appendix)",
-                "text": text,
-                "origin": "appendix",
-            }
-    return sorted(statements.values(), key=lambda s: _sort_key(s["id"]))
+def _section(label: str) -> str:
+    """Return the stable numeric section encoded in the statement identifier."""
+    return label.removeprefix("MQTT-").rsplit("-", 1)[0]
 
 
 def _normalise(text: str) -> str:
-    """Compare on words alone: the two renderings differ in punctuation only."""
     return " ".join(re.findall(r"[a-z0-9]+", text.lower()))
 
 
@@ -207,26 +197,67 @@ def _sort_key(label: str) -> tuple[int, ...]:
     return tuple(int(part) for part in re.findall(r"\d+", label))
 
 
-def build(version: str, *, raw_bytes: bytes) -> dict[str, object]:
-    source = SOURCES[version]
-    raw_html = raw_bytes.decode(SOURCE_ENCODING)
-    statements = extract(raw_html)
-    # The body prose and the appendix summary occasionally word a statement
-    # differently (a highlighted list lead-in, an expanded pronoun). That is a
-    # property of the source, not a parsing error, so both readings are kept
-    # rather than silently choosing one.
+def _without_trailing_section_zero(label: str) -> str:
+    """Normalise the one known appendix-only label typo without hiding it."""
+    return re.sub(r"\.0(?=-\d+$)", "", label)
+
+
+def extract(raw_html: str) -> list[dict[str, str]]:
+    """Return the numbered statements and independently audited renderings."""
+    body = _body_statements(raw_html)
     appendix = _appendix_rows(raw_html)
-    divergences = 0
-    for statement in statements:
-        if statement.get("origin") != "body":
+    aliases: dict[str, str] = {}
+    for appendix_label, row_text in list(appendix.items()):
+        if appendix_label in body:
             continue
-        other = appendix.get(statement["id"])
-        if other is not None and _normalise(other) != _normalise(statement["text"]):
-            statement["appendix_text"] = other
-            divergences += 1
+        matching_body_label = _without_trailing_section_zero(appendix_label)
+        body_text = body.get(matching_body_label)
+        if body_text is not None and _normalise(body_text) == _normalise(row_text):
+            # MQTT 5's body labels the network-connection rule MQTT-4.2-1 while
+            # its appendix says MQTT-4.2.0-1. Preserve the discrepancy as
+            # provenance instead of inflating the statement count with a
+            # duplicate or silently rewriting either source.
+            aliases[matching_body_label] = appendix_label
+            del appendix[appendix_label]
+
+    statements: list[dict[str, str]] = []
+    for label in sorted(body.keys() | appendix.keys(), key=_sort_key):
+        body_text = body.get(label)
+        appendix_text = appendix.get(label)
+        item = {
+            "id": label,
+            "section": _section(label),
+            "text": body_text or appendix_text or "",
+            "origin": "body" if body_text else "appendix",
+        }
+        if (
+            body_text is not None
+            and appendix_text is not None
+            and _normalise(body_text) != _normalise(appendix_text)
+        ):
+            item["appendix_text"] = appendix_text
+        if label in aliases:
+            item["appendix_id"] = aliases[label]
+        statements.append(item)
+    return statements
+
+
+def _html_from_archive(version: str, archive_bytes: bytes) -> bytes:
+    member = SOURCES[version]["archive_member"]
+    with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
+        try:
+            return archive.read(member)
+        except KeyError as exc:
+            raise ValueError(f"OASIS archive does not contain {member!r}") from exc
+
+
+def build(version: str, *, archive_bytes: bytes) -> dict[str, object]:
+    source = SOURCES[version]
+    raw_bytes = _html_from_archive(version, archive_bytes)
+    statements = extract(raw_bytes.decode(SOURCE_ENCODING))
     return {
         "_comment": (
-            "Verbatim conformance statements extracted from the OASIS specification "
+            "Numbered conformance statements extracted from the OASIS specification "
             "named in `source`. Regenerate with tools/extract_spec_statements.py; "
             "do not edit by hand."
         ),
@@ -234,16 +265,11 @@ def build(version: str, *, raw_bytes: bytes) -> dict[str, object]:
         "source": source,
         "retrieved": date.today().isoformat(),
         "source_encoding": SOURCE_ENCODING,
+        "archive_sha256": hashlib.sha256(archive_bytes).hexdigest(),
         "source_sha256": hashlib.sha256(raw_bytes).hexdigest(),
         "statement_count": len(statements),
         "statements": statements,
     }
-
-
-# The OASIS HTML is a Word export that declares no charset and is not UTF-8
-# (0x96 en-dash, 0xb7 middle dot). Decoding it as UTF-8 silently replaces those
-# characters, which corrupts the very text this index exists to quote exactly.
-SOURCE_ENCODING = "cp1252"
 
 
 def fetch(url: str) -> bytes:
@@ -251,34 +277,40 @@ def fetch(url: str) -> bytes:
         return response.read()
 
 
+def _stable_content(index: dict[str, Any]) -> dict[str, Any]:
+    stable = dict(index)
+    stable.pop("retrieved", None)
+    return stable
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--check",
         action="store_true",
-        help="fail if the vendored index differs from a fresh extraction",
+        help="fail if statements or reproducible provenance differ",
     )
     parser.add_argument(
-        "--from-file",
+        "--from-archive",
         type=Path,
         nargs=2,
-        metavar=("V311_HTML", "V5_HTML"),
-        help="use already-downloaded HTML instead of fetching",
+        metavar=("V311_ZIP", "V5_ZIP"),
+        help="use already-downloaded official ZIP archives instead of fetching",
     )
     args = parser.parse_args()
 
-    local = {}
-    if args.from_file:
+    local: dict[str, bytes] = {}
+    if args.from_archive:
         local = {
-            "3.1.1": args.from_file[0].read_bytes(),
-            "5.0": args.from_file[1].read_bytes(),
+            "3.1.1": args.from_archive[0].read_bytes(),
+            "5.0": args.from_archive[1].read_bytes(),
         }
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     failed = False
     for version, source in SOURCES.items():
-        raw_bytes = local.get(version) or fetch(source["url"])
-        index = build(version, raw_bytes=raw_bytes)
+        archive_bytes = local.get(version) or fetch(source["archive_url"])
+        index = build(version, archive_bytes=archive_bytes)
         path = OUTPUT_DIR / f"mqtt-v{version}-statements.json"
         rendered = json.dumps(index, indent=2, ensure_ascii=False) + "\n"
 
@@ -288,21 +320,21 @@ def main() -> int:
                 failed = True
                 continue
             current = json.loads(path.read_text(encoding="utf-8"))
-            if current["statements"] != index["statements"]:
-                print(f"STALE {path}: statements differ from the published source")
+            if _stable_content(current) != _stable_content(index):
+                print(f"STALE {path}: content or provenance differs from OASIS")
                 failed = True
             else:
                 print(f"ok {path.name}: {index['statement_count']} statements match")
             continue
 
         path.write_text(rendered, encoding="utf-8")
-        empty = sum(1 for s in index["statements"] if not s["text"])
-        both = sum(1 for s in index["statements"] if "appendix_text" in s)
-        from_appendix = sum(1 for s in index["statements"] if s["origin"] == "appendix")
+        items = index["statements"]
+        assert isinstance(items, list)
+        appendix_only = sum(item["origin"] == "appendix" for item in items)
+        divergences = sum("appendix_text" in item for item in items)
         print(
             f"wrote {path.name}: {index['statement_count']} statements "
-            f"({empty} without text, {from_appendix} appendix-only, "
-            f"{both} worded differently in the appendix)"
+            f"({appendix_only} appendix-only, {divergences} source divergences)"
         )
 
     return 1 if failed else 0

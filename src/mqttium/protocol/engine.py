@@ -114,6 +114,7 @@ class ProtocolEngine:
         # After a durable session is established, next CONNECT uses Clean Start 0.
         self._prefer_session_resume = False
         self._sent_clean_start = False
+        self._sent_session_expiry_interval: int | None = None
         self._auth_method: str | None = None
         self._handlers = {
             PacketType.CONNACK: self._on_connack,
@@ -234,6 +235,10 @@ class ProtocolEngine:
     def begin_connect(self) -> bytes:
         if self.state in (ConnectionState.CONNECTED, ConnectionState.CONNECTING):
             raise ProtocolError("Already connected or connecting")
+
+        clean_start = self.config.clean_start
+        if self._prefer_session_resume:
+            clean_start = False
         configured_auth_method = None
         if self.config.connect_properties is not None:
             configured_auth_method = self.config.connect_properties.get("authentication_method")
@@ -256,23 +261,6 @@ class ProtocolEngine:
                 raise ProtocolError(
                     "auth_handler requires authentication_method in CONNECT properties"
                 )
-        self._auth_method = (
-            str(configured_auth_method) if configured_auth_method is not None else None
-        )
-        self.state = ConnectionState.CONNECTING
-        self._pending_connect = True
-        self.inbound.start_connection()
-        # Negotiated capabilities are connection-scoped. Queued messages are
-        # validated against the new values only after the next CONNACK.
-        self.negotiated = NegotiatedSettings()
-
-        clean_start = self.config.clean_start
-        if self._prefer_session_resume:
-            clean_start = False
-        # Remembered because CONNACK is validated against what was actually
-        # sent, which is not always what the configuration says.
-        self._sent_clean_start = clean_start
-
         if (
             self.config.protocol == MQTTProtocolVersion.MQTTv311
             and not self.config.client_id
@@ -321,7 +309,25 @@ class ProtocolEngine:
             protocol=self.config.protocol,
             properties=connect_props,
         )
-        return packet.encode()
+        wire = packet.encode()
+
+        # Commit connection state only after every validation and the encoding
+        # have succeeded. A synchronous configuration error must leave the
+        # engine reusable rather than stranded in CONNECTING.
+        self._auth_method = (
+            str(configured_auth_method) if configured_auth_method is not None else None
+        )
+        self._sent_clean_start = clean_start
+        self._sent_session_expiry_interval = (
+            connect_props.get("session_expiry_interval") if connect_props is not None else None
+        )
+        self.state = ConnectionState.CONNECTING
+        self._pending_connect = True
+        self.inbound.start_connection()
+        # Negotiated capabilities are connection-scoped. Queued messages are
+        # validated against the new values only after the next CONNACK.
+        self.negotiated = NegotiatedSettings()
+        return wire
 
     def queue_publish(
         self,
@@ -424,35 +430,32 @@ class ProtocolEngine:
         if self.state != ConnectionState.CONNECTED:
             raise NotConnectedError("disconnect requires an active connection")
         self._check_disconnect_session_expiry(properties)
+        wire = encode_disconnect(reason_code, self.config.protocol, properties)
         self.state = ConnectionState.DISCONNECTING
-        return encode_disconnect(reason_code, self.config.protocol, properties)
+        return wire
 
     def _check_disconnect_session_expiry(self, properties: Properties | None) -> None:
         """Refuse extending a session that was never allowed to outlive the connection.
 
         MQTT 5 §3.14.2.2.2: "If the Session Expiry Interval in the CONNECT packet
         was zero, then it is a Protocol Error to set a non-zero Session Expiry
-        Interval in the DISCONNECT packet sent by the Client." The consequence is
-        not abstract — the broker answers 0x82 and does not treat the DISCONNECT
-        as valid, so the disconnection counts as ungraceful and the Will Message
-        is published. Failing here is what stops a clean shutdown from firing the
-        will it was trying to avoid.
+        Interval in the DISCONNECT packet sent by the Client." A broker can treat
+        that as an ungraceful disconnect, which may publish a configured Will.
+        Failing locally preserves the semantics requested by clean shutdown.
         """
         if self.config.protocol != MQTTProtocolVersion.MQTTv5 or properties is None:
             return
         requested = properties.get("session_expiry_interval")
         if not requested:
             return
-        connect_properties = self.config.connect_properties
         # An absent Session Expiry Interval in CONNECT means zero (§3.1.2.11.2).
-        connected_with = (
-            connect_properties.get("session_expiry_interval") if connect_properties else None
-        )
-        if not connected_with:
+        # Use the value encoded on the wire, not the application-owned mutable
+        # Properties object retained in EngineConfig.
+        if not self._sent_session_expiry_interval:
             raise ProtocolError(
                 "Cannot set a non-zero session_expiry_interval on DISCONNECT when "
-                "CONNECT declared none (MQTT 5 §3.14.2.2.2); the broker would answer "
-                "0x82 and publish the will"
+                "CONNECT declared none (MQTT 5 §3.14.2.2.2); this can make the "
+                "shutdown ungraceful and publish a configured Will"
             )
 
     def notify_transport_closed(self) -> None:
@@ -528,32 +531,21 @@ class ProtocolEngine:
             )
             return
 
-        if connack.session_present and self._sent_clean_start and not self._has_session_state():
-            # [MQTT-3.2.2-4] (MQTT 5): a Client with *no* Session State that
-            # receives Session Present 1 MUST close the Network Connection.
-            # Having asked for a clean start, the broker was required to answer
-            # 0 ([MQTT-3.2.2-2]); resuming a session we hold nothing for would
-            # leave the two sides disagreeing about what exists.
-            #
-            # Both halves of the condition matter. A client that still holds
-            # durable records is outside this statement even when it asked for
-            # a clean start, and replaying them is the useful behaviour, so the
-            # session-state check is not redundant with the clean-start one.
-            # MQTT 3.1.1 numbers only the server-side half, but the violation
-            # and the remedy are identical.
+        if connack.session_present and self._sent_clean_start:
+            # The Server MUST report Session Present 0 after accepting Clean
+            # Start/CleanSession 1: MQTT 5 [MQTT-3.2.2-2], MQTT 3.1.1
+            # [MQTT-3.2.2-1]. Local inflight records do not make a stale session
+            # valid: replaying them would contradict the clean session the
+            # Client explicitly requested.
             self._protocol_disconnect(0x82)
             raise ProtocolError(
-                "CONNACK reports Session Present after Clean Start with no local "
-                "session state [MQTT-3.2.2-4]"
+                "CONNACK reports Session Present after Clean Start [MQTT-3.2.2-1/-2]"
             )
 
-        requested_expiry = None
-        if self.config.connect_properties:
-            requested_expiry = self.config.connect_properties.get("session_expiry_interval")
         self.negotiated = NegotiatedSettings.from_connack(
             connack.properties,
             requested_keepalive=self.config.keepalive,
-            requested_session_expiry=requested_expiry,
+            requested_session_expiry=self._sent_session_expiry_interval,
             local_client_id=self.config.client_id,
         )
         self.outbound.flow.apply_broker_receive_maximum(
@@ -676,17 +668,6 @@ class ProtocolEngine:
             )
             return
         self._emit(EffectKind.AUTH, packet)
-
-    def _has_session_state(self) -> bool:
-        """Whether anything survives from a previous session.
-
-        Durable publication records are what MQTTium actually retains, so they
-        are what "Session State" means here. Runs once per CONNACK, and only on
-        the path that is about to refuse the connection.
-        """
-        if self.outbound.pending_messages:
-            return True
-        return next(iter(self.store.in_items()), None) is not None
 
     def _protocol_disconnect(self, reason_code: int) -> None:
         """Tear the connection down, announcing why when the version allows it."""

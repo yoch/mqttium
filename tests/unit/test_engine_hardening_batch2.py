@@ -131,6 +131,8 @@ def test_qos2_replay_never_exceeds_local_window() -> None:
 
     engine = ProtocolEngine(
         config=EngineConfig(
+            client_id="qos2-replay",
+            clean_start=False,
             protocol=MQTTProtocolVersion.MQTTv311,
             max_outbound_inflight=1,
         ),

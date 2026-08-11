@@ -1,5 +1,5 @@
 <h1 align="center">
-  <img src="docs/assets/mqttium-logo.svg" alt="MQTTium" width="220">
+  <img src="https://raw.githubusercontent.com/yoch/mqttium/main/docs/assets/mqttium-logo-900.png" alt="MQTTium" width="220">
 </h1>
 
 <p align="center"><strong>A dependable, efficient, async-native MQTT client for Python.</strong></p>

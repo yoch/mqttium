@@ -43,9 +43,8 @@ must update the contract in the same change.
 | [`API-STABILITY.md`](API-STABILITY.md) | Stable, Provisional and Internal tiers; canonical imports; defaults and deprecation policy. |
 | [`IMPLEMENTATION-GUIDE.md`](IMPLEMENTATION-GUIDE.md) | MQTT properties, negotiation, keepalive, reconnect, QoS, backpressure, delivery and persistence contracts. |
 | [`DESIGN.md`](DESIGN.md) | Architecture, ownership boundaries, receipts, persistence, observability and performance rules. |
-
 | [`CONFORMANCE.md`](CONFORMANCE.md) | What is verified against the numbered MQTT statements, how, and what is not. |
-| [`spec/`](spec/README.md) | The statements themselves, extracted verbatim from the OASIS documents, with provenance. |
+| [`spec/`](spec/README.md) | The numbered statements themselves, extracted from reproducible OASIS archives with provenance. |
 
 For protocol behaviour, conflicts resolve in this order:
 

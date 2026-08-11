@@ -729,12 +729,13 @@ class InboundSession:
     def _reject_packet_id_collision(self, mid: int, arriving: str, held: str) -> NoReturn:
         """Refuse a PUBLISH whose identifier is still owned by another exchange.
 
-        [MQTT-2.2.1-4] requires the Server to assign every new QoS > 0 PUBLISH a
-        Packet Identifier that is *currently unused*, and an identifier stays in
-        use until its sender has processed the corresponding acknowledgement —
-        for QoS 2, our PUBCOMP. A record in WAIT_PUBREL or WAIT_USER_ACK proves
-        the broker has not received one, so the identifier is provably still
-        its own and the reuse is a protocol violation, not a race.
+        MQTT 5 [MQTT-2.2.1-4] and MQTT 3.1.1 [MQTT-2.3.1-4] require the Server
+        to assign every new QoS > 0 PUBLISH a Packet Identifier that is
+        *currently unused*, and an identifier stays in use until its sender has
+        processed the corresponding acknowledgement — for QoS 2, our PUBCOMP.
+        A record in WAIT_PUBREL or WAIT_USER_ACK proves the broker has not
+        received one, so the identifier is provably still its own and the reuse
+        is a protocol violation, not a race.
 
         There is no consistent way to continue: honouring the PUBLISH replaces
         the live record and leaks the Receive Maximum slot and byte reservation

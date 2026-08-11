@@ -1,8 +1,8 @@
 """Executable conformance checks, each tied to a numbered MQTT statement.
 
 Every test here names the normative statement it exercises and quotes it from
-``docs/spec/mqtt-v*-statements.json``, which is extracted verbatim from the
-OASIS documents. ``test_quoted_statements_match_the_vendored_specification``
+``docs/spec/mqtt-v*-statements.json``, which is extracted from reproducible
+official OASIS archives. ``test_quoted_statements_match_the_vendored_specification``
 then verifies those quotes are still accurate, so a docstring cannot drift away
 from the text it claims to enforce.
 
@@ -272,14 +272,13 @@ def _connack_wire(*, session_present: bool, protocol: MQTTProtocolVersion) -> by
 
 
 @pytest.mark.parametrize("protocol", [MQTTProtocolVersion.MQTTv311, MQTTProtocolVersion.MQTTv5])
-def test_mqtt_3_2_2_4_session_present_without_session_state_closes(
+def test_session_present_after_clean_start_always_closes(
     protocol: MQTTProtocolVersion,
 ) -> None:
-    """[MQTT-3.2.2-4] If the Client does not have Session State and receives
-    Session Present set to 1 it MUST close the Network Connection.
+    """A successful clean connection can never report a previous session.
 
-    MQTT 3.1.1 numbers only the server-side half of this, but the violation and
-    the remedy are identical, so both versions are checked.
+    MQTT 3.1.1 [MQTT-3.2.2-1] and MQTT 5 [MQTT-3.2.2-2] both require the
+    Server to set Session Present to 0 in this case.
     """
     engine = ProtocolEngine(
         EngineConfig(client_id="c", protocol=protocol, clean_start=True), MemoryInflightStore()
@@ -295,10 +294,8 @@ def test_mqtt_3_2_2_4_session_present_without_session_state_closes(
         assert any(e.kind is EffectKind.SEND for e in effects), "MQTT 5 announces the reason"
 
 
-def test_session_present_with_local_session_state_is_honoured() -> None:
-    """The other half of [MQTT-3.2.2-4]: a client that *does* hold durable
-    records is outside the statement, and replaying them is the useful
-    behaviour even though a clean start was requested."""
+def test_clean_start_does_not_replay_stale_local_session_state() -> None:
+    """Local records cannot override the clean session requested on the wire."""
     store = MemoryInflightStore()
     store.put_out(
         OutboundMessage(
@@ -315,8 +312,10 @@ def test_session_present_with_local_session_state_is_honoured() -> None:
     )
     engine.begin_connect()
     _feed(engine, _connack_wire(session_present=True, protocol=MQTTProtocolVersion.MQTTv5))
-    engine.take_effects()
-    assert engine.state is ConnectionState.CONNECTED
+    effects = engine.take_effects()
+    assert engine.state is ConnectionState.DISCONNECTED
+    assert store.get_out(1) is not None, "the rejected CONNACK must not mutate durable state"
+    assert not any(e.kind is EffectKind.PUBLISH_COMPLETE for e in effects)
 
 
 @pytest.mark.parametrize("session_present", [True, False])
@@ -407,9 +406,8 @@ def test_mqtt5_disconnect_cannot_extend_a_session_that_was_never_durable(
         is a Protocol Error to set a non-zero Session Expiry Interval in the
         DISCONNECT packet sent by the Client.
 
-    The consequence is concrete: the broker answers 0x82 and does not treat the
-    DISCONNECT as valid, so the disconnection counts as ungraceful and the Will
-    Message is published — the opposite of what a clean shutdown intends.
+    A broker can treat the invalid DISCONNECT as ungraceful, which may publish a
+    configured Will — the opposite of what a clean shutdown intends.
     An absent interval in CONNECT means zero (§3.1.2.11.2).
     """
     connect_properties = None
@@ -431,6 +429,36 @@ def test_mqtt5_disconnect_cannot_extend_a_session_that_was_never_durable(
 
     disconnect_properties = Properties()
     disconnect_properties.set("session_expiry_interval", disconnect_expiry)
+    if allowed:
+        assert engine.begin_disconnect(properties=disconnect_properties)
+    else:
+        with pytest.raises(ProtocolError, match="session_expiry_interval"):
+            engine.begin_disconnect(properties=disconnect_properties)
+
+
+@pytest.mark.parametrize(
+    ("sent_expiry", "mutated_expiry", "allowed"),
+    [(0, 600, False), (600, 0, True)],
+)
+def test_disconnect_uses_the_session_expiry_actually_sent_on_connect(
+    sent_expiry: int, mutated_expiry: int, allowed: bool
+) -> None:
+    """Application mutation after CONNECT cannot rewrite wire history."""
+    connect_properties = Properties({"session_expiry_interval": sent_expiry})
+    engine = ProtocolEngine(
+        EngineConfig(
+            client_id="c",
+            protocol=MQTTProtocolVersion.MQTTv5,
+            connect_properties=connect_properties,
+        ),
+        MemoryInflightStore(),
+    )
+    engine.begin_connect()
+    connect_properties.set("session_expiry_interval", mutated_expiry)
+    _feed(engine, encode_frame(PacketType.CONNACK, 0, b"\x00\x00\x00"))
+    engine.take_effects()
+
+    disconnect_properties = Properties({"session_expiry_interval": 300})
     if allowed:
         assert engine.begin_disconnect(properties=disconnect_properties)
     else:
@@ -645,6 +673,8 @@ def test_mqtt_3_1_3_7_empty_client_id_requires_a_clean_session(
     else:
         with pytest.raises(ProtocolError, match="MQTT-3.1.3-7"):
             engine.begin_connect()
+        assert engine.state is ConnectionState.NEW
+        assert not engine._pending_connect
 
 
 def test_empty_client_id_is_caught_when_a_resumed_session_forces_clean_start() -> None:
@@ -657,6 +687,8 @@ def test_empty_client_id_is_caught_when_a_resumed_session_forces_clean_start() -
     engine._prefer_session_resume = True
     with pytest.raises(ProtocolError, match="MQTT-3.1.3-7"):
         engine.begin_connect()
+    assert engine.state is ConnectionState.NEW
+    assert not engine._pending_connect
 
 
 @pytest.mark.parametrize(
@@ -769,17 +801,46 @@ def test_vendored_statement_index_is_well_formed(version: str) -> None:
     data = json.loads((SPEC_DIR / f"mqtt-v{version}-statements.json").read_text(encoding="utf-8"))
 
     assert data["mqtt_version"] == version
-    assert data["source"]["url"].startswith("https://docs.oasis-open.org/mqtt/")
+    expected = {
+        "3.1.1": {
+            "count": 139,
+            "archive": "7c3932da425b6a20ca1732a18b358f17944c0bad6305e923de4735aa5508516e",
+            "html": "df463403cdbe7e399e5247a467a7bf1a6795aed4338158eed2f638c0265651f5",
+            "url_suffix": "errata01/os/mqtt-v3.1.1-errata01-os-complete.html",
+        },
+        "5.0": {
+            "count": 251,
+            "archive": "948793b3db21fb198345f11d49434de5300655b132d479561ffa9fe950a5931e",
+            "html": "4326d27913c2ad12030aaff1ab50a86a190917c2f7e44af73300197bb7635c67",
+            "url_suffix": "v5.0/os/mqtt-v5.0-os.html",
+        },
+    }[version]
+    source = data["source"]
+    assert source["url"].startswith("https://docs.oasis-open.org/mqtt/")
+    assert source["url"].endswith(expected["url_suffix"])
+    assert source["archive_url"].endswith("-os.zip")
+    assert source["archive_member"].endswith(".html")
+    assert data["archive_sha256"] == expected["archive"]
+    assert data["source_sha256"] == expected["html"]
     assert re.fullmatch(r"[0-9a-f]{64}", data["source_sha256"])
     assert data["source_encoding"] == "cp1252"
 
     items = data["statements"]
+    assert data["statement_count"] == expected["count"]
     assert data["statement_count"] == len(items)
     assert len({item["id"] for item in items}) == len(items), "duplicate statement ids"
     for item in items:
         assert re.fullmatch(r"MQTT-\d+(\.\d+)*-\d+", item["id"])
-        assert item["text"].strip(), f"{item['id']} has no text"
+        assert len(item["text"].strip()) >= 20, f"{item['id']} looks truncated"
+        assert item["section"] == item["id"].removeprefix("MQTT-").rsplit("-", 1)[0]
         assert item["origin"] in {"body", "appendix"}
+        assert not any(ord(char) < 32 for char in item["section"])
         assert "\x01" not in item["text"] and "�" not in item["text"], (
             f"{item['id']} carries an extraction sentinel or a decoding failure"
         )
+
+    by_id = {item["id"]: item for item in items}
+    assert by_id["MQTT-3.1.2-11"]["text"] != "(0x00)"
+    if version == "5.0":
+        assert by_id["MQTT-4.2-1"]["appendix_id"] == "MQTT-4.2.0-1"
+        assert "MQTT-4.2.0-1" not in by_id

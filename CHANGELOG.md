@@ -42,16 +42,14 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   [MQTT-4.12.0-3]. An `auth_handler` answering a server challenge with `0x00`
   now raises instead of putting it on the wire.
 - `disconnect()` refuses a non-zero `session_expiry_interval` when CONNECT
-  declared none. MQTT 5 §3.14.2.2.2 makes it a Protocol Error, and the effect is
-  not cosmetic: the broker answers `0x82` and does not treat the DISCONNECT as
-  valid, so the shutdown counts as ungraceful and the will is published. A
-  session that really was durable can still have its expiry adjusted.
-- A CONNACK reporting Session Present after a Clean Start connection, with no
-  durable record held locally, closes the connection with `0x82` instead of
-  continuing. [MQTT-3.2.2-4] requires it, and resuming a session the client
-  holds nothing for leaves the two sides disagreeing about what exists. A
-  client that still holds durable records is outside the statement and keeps
-  replaying them, so a clean start alone does not trigger this.
+  declared none. MQTT 5 §3.14.2.2.2 makes it a Protocol Error; a broker can
+  treat the invalid DISCONNECT as ungraceful and may publish a configured Will.
+  The check uses the expiry actually encoded in CONNECT, so later mutation of
+  the application-owned properties cannot rewrite connection history.
+- A CONNACK reporting Session Present after a Clean Start connection closes the
+  connection with `0x82` instead of continuing. MQTT 3.1.1 [MQTT-3.2.2-1] and
+  MQTT 5 [MQTT-3.2.2-2] require Session Present 0 in this case. Local inflight
+  records do not override the clean session requested on the wire.
 - Connecting over MQTT 3.1.1 with a password but no username is refused instead
   of sending a CONNECT whose password flag is set while the username flag is
   clear, which [MQTT-3.1.2-22] forbids and a broker may reject or misparse.
@@ -66,9 +64,9 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Added
 
-- `docs/spec/` vendors every normative statement of MQTT 3.1.1 and 5.0,
-  extracted verbatim from the OASIS documents with provenance, checksum and
-  regeneration tooling (`tools/extract_spec_statements.py`), and
+- `docs/spec/` vendors the numbered conformance statements of MQTT 3.1.1 and
+  5.0, extracted from reproducible official OASIS archives with provenance,
+  checksums and regeneration tooling (`tools/extract_spec_statements.py`), and
   `docs/CONFORMANCE.md` records what is verified against them and what is not.
   `tests/unit/test_conformance_statements.py` turns a first set of statements
   into executable checks and verifies its own quotations against the index, so

@@ -1,13 +1,13 @@
 # Vendored MQTT conformance statements
 
-Machine-readable indexes of every normative statement in the two MQTT
+Machine-readable indexes of the numbered conformance statements in the two MQTT
 specifications MQTTium implements, so a conformance claim can cite an exact
-label and quote instead of a recollection.
+version, label and quote instead of a recollection.
 
 | File | Statements |
 | --- | --- |
 | [`mqtt-v3.1.1-statements.json`](mqtt-v3.1.1-statements.json) | 139 |
-| [`mqtt-v5.0-statements.json`](mqtt-v5.0-statements.json) | 252 |
+| [`mqtt-v5.0-statements.json`](mqtt-v5.0-statements.json) | 251 |
 
 `docs/CONFORMANCE.md` is the audit that maps these onto the implementation.
 This directory is only the source material.
@@ -18,45 +18,55 @@ This directory is only the source material.
 | --- | --- | --- |
 | Title | MQTT Version 3.1.1 Plus Errata 01, OASIS Standard Incorporating Approved Errata 01 | MQTT Version 5.0, OASIS Standard |
 | Published | 2015-12-10 | 2019-03-07 |
-| Source | [`mqtt-v3.1.1-os.html`](https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html) | [`mqtt-v5.0-os.html`](https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html) |
+| Source | [`mqtt-v3.1.1-errata01-os-complete.html`](https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/errata01/os/mqtt-v3.1.1-errata01-os-complete.html) | [`mqtt-v5.0-os.html`](https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html) |
+| Archive | [`mqtt-v3.1.1-errata01-os.zip`](https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/errata01/os/mqtt-v3.1.1-errata01-os.zip) | [`mqtt-v5.0-os.zip`](https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.zip) |
 | Retrieved | 2026-08-11 | 2026-08-11 |
-| SHA-256 | `547c9b35…4c15d` | `fe4fd387…1d8965` |
+| Archive SHA-256 | `7c3932da…508516e` | `948793b3…a5931e` |
+| HTML SHA-256 | `df463403…5651f5` | `4326d279…35c67` |
 
-The full SHA-256 of the retrieved bytes is recorded in each JSON file, so a
-future run can prove whether OASIS republished the document underneath us.
+The generator downloads the official ZIP archives, not the live HTML URLs.
+Those archives are byte-stable; the live pages are served through a layer that
+rewrites email-obfuscation tokens and therefore changes their hash without a
+specification change. Both the archive and the selected HTML member hashes are
+recorded in each JSON file.
 
 ## How the extraction works
 
-The OASIS HTML is a Word export with a consistent convention: the text of a
-normative statement is highlighted (`background:yellow`) and immediately
-followed by its label in red (`[MQTT-x.y.z-n]`). `tools/extract_spec_statements.py`
-reads that structure directly, so every quoted string is verbatim — nothing is
-summarised, retyped, or passed through a language model. Three details are
-load-bearing and were each found by a wrong result:
+The OASIS HTML is a Word export with a useful convention: numbered normative
+text is highlighted (`background:yellow`) and followed by a label
+(`[MQTT-x.y.z-n]`). `tools/extract_spec_statements.py` parses that structure with
+the standard-library HTML parser; nothing is summarised, retyped or passed
+through a language model. The appendix conformance table is parsed independently
+and used for the few statements absent from the highlighted body.
 
-- **The source is `cp1252`, and declares no charset.** Decoding it as UTF-8
-  replaces the en-dashes and middle dots, corrupting the very text the index
-  exists to quote exactly.
-- **A statement can be split across several highlighted runs** when an inline
-  cross-reference link interrupts it. Adjacent runs are merged, so
-  `MQTT-3.14.1-1` reads as one sentence rather than a trailing space.
-- **In the appendix conformance tables the label *precedes* its text**
-  (`<tr><td>[MQTT-x-n]</td><td>statement</td></tr>`). Searching backwards there
-  — the direction the highlighted body form needs — silently attaches the
-  *previous* row's statement, which is how `MQTT-3.8.4-3` first came out
-  carrying `MQTT-3.8.4-2`'s text.
+Three details are deliberately tested:
+
+- Both HTML files declare `windows-1252` (`cp1252` in Python). Decoding as UTF-8
+  corrupts punctuation.
+- Highlighted text can contain nested spans and links. Element-stack tracking
+  is required; matching the first closing `</span>` reduced
+  `MQTT-3.1.2-11` to the fragment `(0x00)` in the first implementation.
+- In appendix rows the label precedes its text. Rows are parsed as cells instead
+  of searching backwards through flattened markup.
 
 `origin` records where each statement was read: `body` for the highlighted
 prose, `appendix` for the handful the body does not highlight. Where the two
-renderings differ in wording — a highlighted list lead-in, an expanded pronoun —
-both are kept, the appendix one under `appendix_text`. That is a property of the
-source document, not a parsing artefact.
+renderings differ, both are kept, with the appendix rendering under
+`appendix_text`.
+
+The MQTT 5 body labels its network-connection rule `MQTT-4.2-1`; the appendix
+labels the same text `MQTT-4.2.0-1`. The index preserves the latter as
+`appendix_id` on the body statement rather than pretending these are two rules.
+This is why the MQTT 5 index contains 251 statements, not the naïve union of 252
+labels.
 
 ## Regenerating
 
 ```bash
 python tools/extract_spec_statements.py           # re-download and rewrite
 python tools/extract_spec_statements.py --check   # fail if the index has drifted
+# or use already downloaded official archives:
+python tools/extract_spec_statements.py --from-archive V311_ZIP V5_ZIP
 ```
 
 The indexes are generated. Fix `tools/extract_spec_statements.py` and re-run
@@ -97,5 +107,6 @@ notice is included:
 > INFRINGE ANY OWNERSHIP RIGHTS OR ANY IMPLIED WARRANTIES OF MERCHANTABILITY OR
 > FITNESS FOR A PARTICULAR PURPOSE.
 
-The corresponding notice for MQTT 3.1.1 is `Copyright © OASIS Open 2014. All
+The corresponding notice for MQTT 3.1.1 Plus Errata 01 is
+`Copyright © OASIS Open 2015. All
 Rights Reserved.` under identical terms.

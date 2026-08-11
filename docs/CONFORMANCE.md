@@ -2,8 +2,8 @@
 
 What MQTTium has been *verified* to satisfy in MQTT 3.1.1 and 5.0, how it was
 verified, and what has not been checked. The source material is the vendored
-statement index in [`docs/spec/`](spec/README.md), extracted verbatim from the
-OASIS documents.
+statement index in [`docs/spec/`](spec/README.md), extracted from the numbered
+OASIS conformance statements with reproducible archive provenance.
 
 This is a contract in the sense of `docs/README.md`: it describes current
 behaviour and must be updated by any change that contradicts it. It is **not** a
@@ -89,27 +89,27 @@ was zero, then it is a Protocol Error to set a non-zero Session Expiry Interval
 in the DISCONNECT packet sent by the Client."* (Prose, not a numbered
 statement.)
 
-`begin_disconnect` accepted and encoded it. The consequence is concrete rather
-than theoretical: the broker answers `0x82` and does not treat the DISCONNECT
-as valid, so the disconnection counts as ungraceful and **the Will Message is
-published** — the opposite of what a clean shutdown intends. An absent interval
-in CONNECT means zero (§3.1.2.11.2), so both the absent and explicit-zero cases
-are refused, while a session that really was durable can still be adjusted.
+`begin_disconnect` accepted and encoded it. A broker can treat the invalid
+DISCONNECT as ungraceful, which may publish a configured Will — the opposite of
+what a clean shutdown intends. An absent interval in CONNECT means zero
+(§3.1.2.11.2), so both the absent and explicit-zero cases are refused, while a
+session that really was durable can still have its expiry adjusted. Validation
+uses the value actually encoded in CONNECT, not an application-owned
+`Properties` object that may have been mutated since.
 
-**`[MQTT-3.2.2-4]` (MQTT 5.0)** — *"If the Client does not have Session State
-and receives Session Present set to 1 it MUST close the Network Connection."*
+**`[MQTT-3.2.2-1]` (MQTT 3.1.1) / `[MQTT-3.2.2-2]` (MQTT 5.0)** — after
+accepting CleanSession/Clean Start 1, the Server must set Session Present to 0.
 
 A broker answering `session_present=1` to a Clean Start connection was accepted
 and the session continued, leaving the two sides disagreeing about what state
 exists. `_on_connack` now tears the connection down with `0x82`.
 
-Both halves of the condition are load-bearing, and the first attempt got this
-wrong by keying only on Clean Start: a client that still holds durable records
-is *outside* this statement even when it requested a clean start, and replaying
-them is the useful behaviour. An existing test
-(`test_qos2_replay_never_exceeds_local_window`) caught the over-broad version.
-MQTT 3.1.1 numbers only the server-side half, but the violation and the remedy
-are identical, so both versions close.
+This applies even if SQLite still contains inflight records. Local stale state
+cannot turn a clean connection into a resumed one; replaying it would contradict
+the flag the Client sent. The previous implementation inferred the MQTT Session
+State concept from publication rows alone, although broker-side subscriptions
+are also Session State and cannot be discovered through that store. Resume tests
+now request a non-clean connection explicitly.
 
 **`[MQTT-3.1.2-22]` (MQTT 3.1.1)** — *"If the User Name Flag is set to 0, the
 Password Flag MUST be set to 0."*
@@ -148,7 +148,7 @@ encoded. The inbound direction is unchanged and covered by its own test.
 | `MQTT-4.9.0-3` | 5.0 | A full send quota does not delay SUBSCRIBE or PINGREQ |
 | `MQTT-4.7.3-2` / `-3` | 5.0 | Null character and 65,535-byte limits on topics and filters |
 | `MQTT-4.8.2-2` | 5.0 | ShareName rules for `$share/` filters |
-| `MQTT-3.2.2-4` | 3.1.1, 5.0 | Session Present with no local session state closes the connection |
+| `MQTT-3.2.2-1` / `-2` | 3.1.1, 5.0 | Session Present after a clean connection closes the connection |
 | `MQTT-3.3.2-8` | 5.0 | Topic Alias 0 is refused |
 | `MQTT-3.15.1-1` | 5.0 | Reserved AUTH fixed-header bits |
 | `MQTT-4.6.0-2` | 5.0 | PUBACK order follows PUBLISH arrival order |
@@ -187,8 +187,6 @@ Recorded as observations, not as evidence. All were probed and held:
   it answers an orphan PUBREC with.
 - **SUBACK reason codes** are surfaced in the order of the filters that were
   subscribed.
-
-
 - **Packet identifier ownership.** An inbound PUBLISH whose identifier is still
   held by an unfinished exchange of the other QoS is refused with `0x82`
   (`protocol/inbound.py`). The identifier is provably still the broker's:
@@ -207,9 +205,11 @@ Recorded as observations, not as evidence. All were probed and held:
 
 ## Coverage
 
-The two documents contain **391 normative statements** (139 in 3.1.1, 252 in
-5.0). A crude attribution pass puts roughly **290** of them within reach of a
-client implementation; the remainder bind the Server only.
+The two documents contain **390 numbered conformance statements** (139 in 3.1.1,
+251 in 5.0). The MQTT 5 appendix typo documented in [`spec/`](spec/README.md)
+does not create a second rule. A crude attribution pass puts roughly **290** of
+them within reach of a client implementation; the remainder bind the Server
+only.
 
 Of those, the statements above are individually verified — §4 (operational
 behaviour: QoS flows, ordering, flow control, topics, shared subscriptions) and
@@ -233,4 +233,4 @@ with the statement label followed by its verbatim text; the self-check will
 verify the quote and reject a label that does not exist. Then add a row above.
 
 Regenerate the index with `python tools/extract_spec_statements.py` when OASIS
-republishes a document, and re-read this file against the new statement set.
+publishes a new archive, and re-read this file against the new statement set.
