@@ -507,8 +507,10 @@ class ProtocolEngine:
             handler = self._handlers.get(raw.packet_type)
             if handler is None:
                 raise ProtocolError(f"Unhandled packet {raw.packet_type!r}")
+            effect_start = len(self._effects)
             handler(raw)
-        except (ProtocolError, MalformedPacketError) as exc:
+            self._validate_new_outbound_effects(effect_start)
+        except (ProtocolError, MalformedPacketError, PacketTooLargeError) as exc:
             self._emit(EffectKind.PROTOCOL_ERROR, str(exc))
         except Exception as exc:
             # Isolate store/persistence errors: surface as protocol error rather
@@ -792,12 +794,12 @@ class ProtocolEngine:
             raise ProtocolError("AUTH authentication_method does not match CONNECT")
         if method is None:
             auth_properties.set("authentication_method", self._auth_method)
-        self._send(
-            AuthPacket(
-                reason_code=reason_code,
-                properties=auth_properties,
-            ).encode(self.config.protocol)
-        )
+        wire = AuthPacket(
+            reason_code=reason_code,
+            properties=auth_properties,
+        ).encode(self.config.protocol)
+        self._check_outbound_size(wire)
+        self._send(wire)
 
     def _check_outbound_size(self, wire: WriteItem) -> None:
         limit = self.negotiated.maximum_packet_size
@@ -806,6 +808,24 @@ class ProtocolEngine:
             raise PacketTooLargeError(
                 f"Encoded packet size {size} exceeds broker maximum_packet_size {limit}"
             )
+
+    def _validate_new_outbound_effects(self, start: int) -> None:
+        """Refuse a handler batch if any SEND violates the broker's packet limit.
+
+        Inbound automatic acknowledgements are emitted as effects rather than
+        returned from a public queue_* method. Validate the whole newly-produced
+        batch before exposing any of it so an oversized PUBACK/PUBREC/PUBCOMP
+        cannot escape while its paired MESSAGE remains application-visible.
+        """
+        if self.negotiated.maximum_packet_size is None:
+            return
+        try:
+            for effect in self._effects[start:]:
+                if effect.kind is EffectKind.SEND:
+                    self._check_outbound_size(effect.data)
+        except PacketTooLargeError:
+            del self._effects[start:]
+            raise
 
     def _check_subscribe_capabilities(
         self,
