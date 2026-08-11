@@ -24,9 +24,17 @@ fi
 
 # Expose the venv interpreter and dev tools on PATH so the documented commands
 # (python -m pytest, ruff, mypy, bandit, ...) work verbatim in fresh shells.
+#
+# These are exec wrappers, not symlinks: symlinking the venv's own "python"
+# (itself a symlink to python3) into /usr/local/bin makes CPython canonicalize
+# the whole chain to the system interpreter and lose the venv, so a bare
+# "python" would import against system site-packages. Invoking the venv
+# interpreter by its own path keeps venv detection working.
 if command -v sudo >/dev/null 2>&1; then
     for tool in python ruff mypy pytest bandit; do
-        sudo ln -sf "$repo_root/.venv/bin/$tool" "/usr/local/bin/$tool"
+        printf '#!/bin/sh\nexec "%s/.venv/bin/%s" "$@"\n' "$repo_root" "$tool" |
+            sudo tee "/usr/local/bin/$tool" >/dev/null
+        sudo chmod +x "/usr/local/bin/$tool"
     done
 fi
 
