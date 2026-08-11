@@ -13,21 +13,13 @@ on:
         required: true
         default: main
         type: string
-  pull_request:
-    paths:
-      - benchmarks/**
-      - src/mqttium/api/**
-      - src/mqttium/codec/**
-      - src/mqttium/protocol/**
-      - src/mqttium/transport/**
-      - .github/workflows/paired-regression.yml
 
 permissions:
   contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: false
 
 jobs:
   paired:
@@ -45,12 +37,12 @@ jobs:
       - name: Check out candidate
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_ref || github.sha }}
+          ref: ${{ inputs.candidate_ref }}
           path: candidate
       - name: Check out base
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.base_ref || github.event.pull_request.base.sha }}
+          ref: ${{ inputs.base_ref }}
           path: base
       - uses: actions/setup-python@v7
         with:

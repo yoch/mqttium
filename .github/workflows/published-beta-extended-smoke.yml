@@ -1,11 +1,6 @@
 name: Published beta extended smoke
 
 on:
-  pull_request:
-    paths:
-      - .github/workflows/published-beta-extended-smoke.yml
-      - tests/installed_distribution_extended_smoke.py
-      - tests/unit/test_public_api_surface.py
   workflow_dispatch:
     inputs:
       version:
@@ -21,7 +16,7 @@ permissions:
 
 concurrency:
   group: published-beta-extended-${{ github.event.inputs.version || '1.0.0rc1' }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: false
 
 jobs:
   transports-compat-shutdown:

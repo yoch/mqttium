@@ -1,10 +1,6 @@
 name: Published beta resilience smoke
 
 on:
-  pull_request:
-    paths:
-      - .github/workflows/published-beta-resilience-smoke.yml
-      - tests/installed_distribution_resilience_smoke.py
   workflow_dispatch:
     inputs:
       version:
@@ -20,7 +16,7 @@ permissions:
 
 concurrency:
   group: published-beta-resilience-${{ github.event.inputs.version || '1.0.0rc1' }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: false
 
 jobs:
   tls-and-sqlite:
