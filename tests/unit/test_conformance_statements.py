@@ -19,14 +19,14 @@ from pathlib import Path
 import pytest
 
 from mqttium.codec.buffer import IncrementalDecoder
-from mqttium.enums import MQTTProtocolVersion, PacketType, QoS
+from mqttium.enums import ConnectionState, MQTTProtocolVersion, OutboundQoSState, PacketType, QoS
 from mqttium.errors import ProtocolError
 from mqttium.packets import PublishPacket, encode_frame
 from mqttium.persistence.memory import MemoryInflightStore
 from mqttium.protocol.config import EngineConfig
 from mqttium.protocol.effects import EffectKind
 from mqttium.protocol.engine import ProtocolEngine
-from mqttium.types import Properties
+from mqttium.types import OutboundMessage, Properties
 
 SPEC_DIR = Path(__file__).resolve().parents[2] / "docs" / "spec"
 
@@ -264,6 +264,130 @@ def test_mqtt_2_1_3_1_reserved_fixed_header_flags_are_validated(
     assert _rejects(engine, encode_frame(packet_type, flags, body)), f"{name} accepted bad flags"
 
 
+def _connack_wire(*, session_present: bool, protocol: MQTTProtocolVersion) -> bytes:
+    remaining = bytes((1 if session_present else 0, 0))
+    if protocol is MQTTProtocolVersion.MQTTv5:
+        remaining += b"\x00"
+    return encode_frame(PacketType.CONNACK, 0, remaining)
+
+
+@pytest.mark.parametrize("protocol", [MQTTProtocolVersion.MQTTv311, MQTTProtocolVersion.MQTTv5])
+def test_mqtt_3_2_2_4_session_present_without_session_state_closes(
+    protocol: MQTTProtocolVersion,
+) -> None:
+    """[MQTT-3.2.2-4] If the Client does not have Session State and receives
+    Session Present set to 1 it MUST close the Network Connection.
+
+    MQTT 3.1.1 numbers only the server-side half of this, but the violation and
+    the remedy are identical, so both versions are checked.
+    """
+    engine = ProtocolEngine(
+        EngineConfig(client_id="c", protocol=protocol, clean_start=True), MemoryInflightStore()
+    )
+    engine.begin_connect()
+    _feed(engine, _connack_wire(session_present=True, protocol=protocol))
+    effects = engine.take_effects()
+
+    assert engine.state is ConnectionState.DISCONNECTED
+    disconnects = [e.data for e in effects if e.kind is EffectKind.DISCONNECTED]
+    assert disconnects and disconnects[0].reason_code == 0x82
+    if protocol is MQTTProtocolVersion.MQTTv5:
+        assert any(e.kind is EffectKind.SEND for e in effects), "MQTT 5 announces the reason"
+
+
+def test_session_present_with_local_session_state_is_honoured() -> None:
+    """The other half of [MQTT-3.2.2-4]: a client that *does* hold durable
+    records is outside the statement, and replaying them is the useful
+    behaviour even though a clean start was requested."""
+    store = MemoryInflightStore()
+    store.put_out(
+        OutboundMessage(
+            mid=1,
+            topic="t",
+            payload=b"x",
+            qos=QoS.EXACTLY_ONCE,
+            retain=False,
+            state=OutboundQoSState.WAIT_PUBCOMP,
+        )
+    )
+    engine = ProtocolEngine(
+        EngineConfig(client_id="c", protocol=MQTTProtocolVersion.MQTTv5, clean_start=True), store
+    )
+    engine.begin_connect()
+    _feed(engine, _connack_wire(session_present=True, protocol=MQTTProtocolVersion.MQTTv5))
+    engine.take_effects()
+    assert engine.state is ConnectionState.CONNECTED
+
+
+@pytest.mark.parametrize("session_present", [True, False])
+def test_session_present_is_accepted_when_no_clean_start_was_requested(
+    session_present: bool,
+) -> None:
+    """Only the combination the specification forbids may close the connection."""
+    engine = ProtocolEngine(
+        EngineConfig(client_id="c", protocol=MQTTProtocolVersion.MQTTv5, clean_start=False),
+        MemoryInflightStore(),
+    )
+    engine.begin_connect()
+    _feed(
+        engine, _connack_wire(session_present=session_present, protocol=MQTTProtocolVersion.MQTTv5)
+    )
+    engine.take_effects()
+    assert engine.state is ConnectionState.CONNECTED
+
+
+def test_mqtt_3_3_2_8_topic_alias_zero_is_refused() -> None:
+    """[MQTT-3.3.2-8] A sender MUST NOT send a PUBLISH packet containing a Topic
+    Alias which has the value 0."""
+    engine = _connected()
+    properties = Properties()
+    properties.set("topic_alias", 0)
+    with pytest.raises(ProtocolError):
+        engine.queue_publish("t/x", b"v", qos=QoS.AT_MOST_ONCE, properties=properties)
+
+
+def test_mqtt_3_15_1_1_auth_reserved_flags_are_validated() -> None:
+    """[MQTT-3.15.1-1] Bits 3,2,1 and 0 of the Fixed Header of the AUTH packet
+    are reserved and MUST all be set to 0."""
+    properties = Properties()
+    properties.set("authentication_method", "M")
+    engine = ProtocolEngine(
+        EngineConfig(
+            client_id="c",
+            protocol=MQTTProtocolVersion.MQTTv5,
+            connect_properties=properties,
+            accept_auth=True,
+        ),
+        MemoryInflightStore(),
+    )
+    engine.begin_connect()
+    _feed(engine, encode_frame(PacketType.CONNACK, 0, b"\x00\x00\x00"))
+    engine.take_effects()
+    assert _rejects(engine, encode_frame(PacketType.AUTH, 0b0001, b"\x18\x00"))
+
+
+def test_mqtt_4_6_0_2_pubacks_follow_the_order_the_publishes_arrived() -> None:
+    """[MQTT-4.6.0-2] The Client MUST send PUBACK packets in the order in which
+    the corresponding PUBLISH packets were received (QoS 1 messages)."""
+    engine = _connected()
+    arrival = (5, 3, 9, 1)
+    for mid in arrival:
+        _feed(
+            engine,
+            PublishPacket(
+                topic="a/b",
+                payload=b"v",
+                qos=QoS.AT_LEAST_ONCE,
+                retain=False,
+                dup=False,
+                mid=mid,
+                properties=None,
+            ).encode(MQTTProtocolVersion.MQTTv5),
+        )
+    sends = [e.data for e in engine.take_effects() if e.kind is EffectKind.SEND]
+    assert [int.from_bytes(frame[2:4], "big") for frame in sends] == list(arrival)
+
+
 # ------------------------------------------------------- the quotes themselves
 
 
@@ -318,7 +442,7 @@ def test_quoted_statements_match_the_vendored_specification() -> None:
             pytest.fail(f"{label} is misquoted\n  docstring: {quoted.strip()[:170]}\n{rendered}")
         checked += 1
 
-    assert checked >= 8, f"expected the module to cite several statements, found {checked}"
+    assert checked >= 12, f"expected the module to cite several statements, found {checked}"
 
 
 @pytest.mark.parametrize("version", ["3.1.1", "5.0"])

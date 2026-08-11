@@ -110,6 +110,7 @@ class ProtocolEngine:
         self.inbound = InboundSession(self)
         # After a durable session is established, next CONNECT uses Clean Start 0.
         self._prefer_session_resume = False
+        self._sent_clean_start = False
         self._auth_method: str | None = None
         self._handlers = {
             PacketType.CONNACK: self._on_connack,
@@ -265,6 +266,9 @@ class ProtocolEngine:
         clean_start = self.config.clean_start
         if self._prefer_session_resume:
             clean_start = False
+        # Remembered because CONNACK is validated against what was actually
+        # sent, which is not always what the configuration says.
+        self._sent_clean_start = clean_start
 
         connect_props = self.config.connect_properties
         if self.config.protocol == MQTTProtocolVersion.MQTTv5:
@@ -475,6 +479,25 @@ class ProtocolEngine:
             )
             return
 
+        if connack.session_present and self._sent_clean_start and not self._has_session_state():
+            # [MQTT-3.2.2-4] (MQTT 5): a Client with *no* Session State that
+            # receives Session Present 1 MUST close the Network Connection.
+            # Having asked for a clean start, the broker was required to answer
+            # 0 ([MQTT-3.2.2-2]); resuming a session we hold nothing for would
+            # leave the two sides disagreeing about what exists.
+            #
+            # Both halves of the condition matter. A client that still holds
+            # durable records is outside this statement even when it asked for
+            # a clean start, and replaying them is the useful behaviour, so the
+            # session-state check is not redundant with the clean-start one.
+            # MQTT 3.1.1 numbers only the server-side half, but the violation
+            # and the remedy are identical.
+            self._protocol_disconnect(0x82)
+            raise ProtocolError(
+                "CONNACK reports Session Present after Clean Start with no local "
+                "session state [MQTT-3.2.2-4]"
+            )
+
         requested_expiry = None
         if self.config.connect_properties:
             requested_expiry = self.config.connect_properties.get("session_expiry_interval")
@@ -604,6 +627,29 @@ class ProtocolEngine:
             )
             return
         self._emit(EffectKind.AUTH, packet)
+
+    def _has_session_state(self) -> bool:
+        """Whether anything survives from a previous session.
+
+        Durable publication records are what MQTTium actually retains, so they
+        are what "Session State" means here. Runs once per CONNACK, and only on
+        the path that is about to refuse the connection.
+        """
+        if self.outbound.pending_messages:
+            return True
+        return next(iter(self.store.in_items()), None) is not None
+
+    def _protocol_disconnect(self, reason_code: int) -> None:
+        """Tear the connection down, announcing why when the version allows it."""
+        if self.config.protocol == MQTTProtocolVersion.MQTTv5:
+            # MQTT 3.1.1 DISCONNECT carries no reason code, so there is nothing
+            # useful to send: the peer only learns from the close itself.
+            self._send(encode_disconnect(reason_code, self.config.protocol))
+        self.state = ConnectionState.DISCONNECTED
+        self._emit(
+            EffectKind.DISCONNECTED,
+            DisconnectInfo(reason_code=reason_code, from_broker=False),
+        )
 
     def _reject_auth_method(self) -> None:
         self._send(encode_disconnect(0x8C, self.config.protocol))

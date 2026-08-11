@@ -30,6 +30,12 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   frontier has just reached. The redundant reservation was left behind and
   counted twice, permanently inflating `len()`/`available` and blocking the
   `release()` fast path that resets the pool once every identifier is free.
+- A CONNACK reporting Session Present after a Clean Start connection, with no
+  durable record held locally, closes the connection with `0x82` instead of
+  continuing. [MQTT-3.2.2-4] requires it, and resuming a session the client
+  holds nothing for leaves the two sides disagreeing about what exists. A
+  client that still holds durable records is outside the statement and keeps
+  replaying them, so a clean start alone does not trigger this.
 - Connecting over MQTT 3.1.1 with a password but no username is refused instead
   of sending a CONNECT whose password flag is set while the username flag is
   clear, which [MQTT-3.1.2-22] forbids and a broker may reject or misparse.

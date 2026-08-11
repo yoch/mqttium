@@ -50,10 +50,27 @@ Conformance is asserted three ways, in decreasing order of strength:
 
 ### Gaps found and fixed
 
-Both were in what MQTTium **sends**. Receiver-side validation, probed across
-nine malformed-frame shapes, refused every one — the asymmetry is structural
-and worth naming: inbound frames pass through one validating decoder, whereas
-outbound rules are spread across the call sites that build packets.
+Two of the three are in what MQTTium **sends**, and that asymmetry is
+structural rather than accidental: inbound frames pass through one validating
+decoder — which refused every one of the nine malformed shapes probed — whereas
+outbound rules live at the call sites that build packets, where a rule specific
+to a direction or a protocol version has nowhere central to be enforced. The
+third is a peer-behaviour check that was simply absent.
+
+**`[MQTT-3.2.2-4]` (MQTT 5.0)** — *"If the Client does not have Session State
+and receives Session Present set to 1 it MUST close the Network Connection."*
+
+A broker answering `session_present=1` to a Clean Start connection was accepted
+and the session continued, leaving the two sides disagreeing about what state
+exists. `_on_connack` now tears the connection down with `0x82`.
+
+Both halves of the condition are load-bearing, and the first attempt got this
+wrong by keying only on Clean Start: a client that still holds durable records
+is *outside* this statement even when it requested a clean start, and replaying
+them is the useful behaviour. An existing test
+(`test_qos2_replay_never_exceeds_local_window`) caught the over-broad version.
+MQTT 3.1.1 numbers only the server-side half, but the violation and the remedy
+are identical, so both versions close.
 
 **`[MQTT-3.1.2-22]` (MQTT 3.1.1)** — *"If the User Name Flag is set to 0, the
 Password Flag MUST be set to 0."*
@@ -81,6 +98,10 @@ encoded. The inbound direction is unchanged and covered by its own test.
 
 | Statement | Version | Subject |
 | --- | --- | --- |
+| `MQTT-3.2.2-4` | 3.1.1, 5.0 | Session Present with no local session state closes the connection |
+| `MQTT-3.3.2-8` | 5.0 | Topic Alias 0 is refused |
+| `MQTT-3.15.1-1` | 5.0 | Reserved AUTH fixed-header bits |
+| `MQTT-4.6.0-2` | 5.0 | PUBACK order follows PUBLISH arrival order |
 | `MQTT-3.1.2-22` | 3.1.1 | No password flag without a username flag (and MQTT 5 still allows it) |
 | `MQTT-3.1.2-21` | 5.0 | Server Keep Alive replaces the requested value |
 | `MQTT-3.3.2-2` | 5.0 | No wildcard in a PUBLISH topic name |
