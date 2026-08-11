@@ -50,12 +50,25 @@ Conformance is asserted three ways, in decreasing order of strength:
 
 ### Gaps found and fixed
 
-Four of the five are in what MQTTium **sends**, and that asymmetry is
+Five of the six are in what MQTTium **sends**, and that asymmetry is
 structural rather than accidental: inbound frames pass through one validating
 decoder — which refused every one of the nine malformed shapes probed — whereas
 outbound rules live at the call sites that build packets, where a rule specific
 to a direction or a protocol version has nowhere central to be enforced. One is
 a peer-behaviour check that was simply absent.
+
+**`[MQTT-3.1.3-7]` (MQTT 3.1.1)** — *"If the Client supplies a zero-byte
+ClientId, the Client MUST also set CleanSession to 1."*
+
+MQTTium sent that combination. The broker is required to answer `0x02`
+(Identifier rejected) and close ([MQTT-3.1.3-8]), so the connection could never
+succeed — a durable session is keyed by the client identifier, which an empty
+one cannot provide. `begin_connect` refuses it, checking the *effective* Clean
+Start: resuming a session rewrites it to 0, which is exactly when this would
+otherwise slip through. MQTT 5 allows the pairing and assigns an identifier.
+
+Four persistence tests were constructing this impossible configuration and had
+to be given a client identifier, which is the more realistic setup anyway.
 
 **`[MQTT-3.15.2-1]` / `[MQTT-4.12.0-3]` (MQTT 5.0)** — *"The sender of the AUTH
 Packet MUST use one of the Authenticate Reason Codes"*, and *"The Client
@@ -124,6 +137,9 @@ encoded. The inbound direction is unchanged and covered by its own test.
 
 | Statement | Version | Subject |
 | --- | --- | --- |
+| `MQTT-3.1.3-7` | 3.1.1 | An empty ClientId requires a clean session |
+| `MQTT-1.5.3-1` / `-2` | 3.1.1 | CONNECT strings reject U+0000 and ill-formed UTF-8 |
+| `MQTT-3.1.3-1` | 3.1.1 | CONNECT payload field order |
 | `MQTT-3.15.2-1` | 5.0 | A Client cannot send a Server-only AUTH reason code |
 | `MQTT-4.12.0-3` | 5.0 | A Client answers a Server AUTH with 0x18 |
 | §3.14.2.2.2 | 5.0 | DISCONNECT cannot extend a session that was never durable |
@@ -204,7 +220,7 @@ suites and by live interoperability against Mosquitto, and no counter-example is
 known — but "no known counter-example" is not the same as conformance, and this
 document does not present it as such.
 
-The honest summary: five violations were found and fixed, four of them in what
+The honest summary: six violations were found and fixed, five of them in what
 the client sends; the receiver-side validation that was probed held up without
 exception; and the remaining statements are covered by behaviour rather than by
 citation. The discovery rate is not yet zero, so no claim of full conformance is

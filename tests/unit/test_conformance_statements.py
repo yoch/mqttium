@@ -616,6 +616,92 @@ def test_reauthentication_uses_0x19_once_connected() -> None:
     assert frames and frames[0][2] == 0x19
 
 
+@pytest.mark.parametrize(
+    ("protocol", "clean_start", "allowed"),
+    [
+        (MQTTProtocolVersion.MQTTv311, True, True),
+        (MQTTProtocolVersion.MQTTv311, False, False),
+        (MQTTProtocolVersion.MQTTv5, True, True),
+        (MQTTProtocolVersion.MQTTv5, False, True),
+    ],
+)
+def test_mqtt_3_1_3_7_empty_client_id_requires_a_clean_session(
+    protocol: MQTTProtocolVersion, clean_start: bool, allowed: bool
+) -> None:
+    """[MQTT-3.1.3-7] If the Client supplies a zero-byte ClientId, the Client
+    MUST also set CleanSession to 1.
+
+    The broker is required to answer 0x02 (Identifier rejected) and close, so
+    the connection cannot succeed — a durable session is keyed by the client
+    identifier, which an empty one cannot provide. MQTT 5 allows the pairing and
+    assigns an identifier instead, so the rule is version-specific.
+    """
+    engine = ProtocolEngine(
+        EngineConfig(client_id="", protocol=protocol, clean_start=clean_start),
+        MemoryInflightStore(),
+    )
+    if allowed:
+        assert engine.begin_connect()
+    else:
+        with pytest.raises(ProtocolError, match="MQTT-3.1.3-7"):
+            engine.begin_connect()
+
+
+def test_empty_client_id_is_caught_when_a_resumed_session_forces_clean_start() -> None:
+    """The effective Clean Start is what counts: resuming a durable session
+    rewrites it to 0, which is exactly when this would otherwise slip through."""
+    engine = ProtocolEngine(
+        EngineConfig(client_id="", protocol=MQTTProtocolVersion.MQTTv311, clean_start=True),
+        MemoryInflightStore(),
+    )
+    engine._prefer_session_resume = True
+    with pytest.raises(ProtocolError, match="MQTT-3.1.3-7"):
+        engine.begin_connect()
+
+
+@pytest.mark.parametrize(
+    ("field", "config"),
+    [
+        ("client_id", {"client_id": "a\x00b"}),
+        ("username", {"client_id": "c", "username": "u\x00v"}),
+        ("client_id surrogate", {"client_id": "a\ud800b"}),
+    ],
+)
+def test_mqtt_1_5_3_2_connect_strings_reject_ill_formed_utf8(field: str, config: dict) -> None:
+    """[MQTT-1.5.3-2] A UTF-8 encoded string MUST NOT include an encoding of the
+    null character U+0000.
+
+    [MQTT-1.5.3-1] additionally requires well-formed UTF-8, which is why the
+    lone surrogate is here too.
+    """
+    engine = ProtocolEngine(
+        EngineConfig(protocol=MQTTProtocolVersion.MQTTv311, **config), MemoryInflightStore()
+    )
+    with pytest.raises(ProtocolError):
+        engine.begin_connect()
+
+
+def test_mqtt_3_1_3_1_connect_payload_field_order() -> None:
+    """[MQTT-3.1.3-1] These fields, if present, MUST appear in the order Client
+    Identifier, Will Topic, Will Message, User Name, Password."""
+    from mqttium.types import Message
+
+    engine = ProtocolEngine(
+        EngineConfig(
+            client_id="CID",
+            protocol=MQTTProtocolVersion.MQTTv311,
+            username="USR",
+            password=b"PWD",
+            will=Message(topic="WT", payload=b"WM"),
+        ),
+        MemoryInflightStore(),
+    )
+    wire = engine.begin_connect()
+    offsets = [wire.find(part) for part in (b"CID", b"WT", b"WM", b"USR", b"PWD")]
+    assert -1 not in offsets
+    assert offsets == sorted(offsets)
+
+
 # ------------------------------------------------------- the quotes themselves
 
 
@@ -670,7 +756,10 @@ def test_quoted_statements_match_the_vendored_specification() -> None:
             pytest.fail(f"{label} is misquoted\n  docstring: {quoted.strip()[:170]}\n{rendered}")
         checked += 1
 
-    assert checked >= 20, f"expected the module to cite several statements, found {checked}"
+    # A floor, not a coverage target: it exists so a broken _QUOTATION regex
+    # cannot make this test pass by matching nothing. Adding tests need not
+    # move it.
+    assert checked >= 15, f"the quotation regex matched only {checked} docstrings"
 
 
 @pytest.mark.parametrize("version", ["3.1.1", "5.0"])

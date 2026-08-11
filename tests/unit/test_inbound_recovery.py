@@ -61,7 +61,7 @@ def test_session_resume_restores_receive_window_count() -> None:
     store.put_in(_inbound(1))
     store.put_in(_inbound(2))
     engine = ProtocolEngine(
-        EngineConfig(clean_start=False, local_receive_maximum=2),
+        EngineConfig(client_id="recovery", clean_start=False, local_receive_maximum=2),
         store=store,
     )
 
@@ -74,7 +74,7 @@ def test_session_resume_restores_receive_window_count() -> None:
 def test_undelivered_qos2_is_replayed_once_after_restart() -> None:
     store = MemoryInflightStore()
     store.put_in(_inbound(7, delivered=False))
-    engine = ProtocolEngine(EngineConfig(clean_start=False), store=store)
+    engine = ProtocolEngine(EngineConfig(client_id="recovery", clean_start=False), store=store)
 
     effects = _resume(engine)
     messages = [effect.data for effect in effects if effect.kind is EffectKind.MESSAGE]
@@ -96,7 +96,7 @@ def test_recovered_manual_ack_is_redelivered_even_if_previously_delivered() -> N
         )
     )
     engine = ProtocolEngine(
-        EngineConfig(clean_start=False, manual_ack=True),
+        EngineConfig(client_id="recovery", clean_start=False, manual_ack=True),
         store=store,
     )
 

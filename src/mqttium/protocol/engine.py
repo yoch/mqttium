@@ -273,6 +273,23 @@ class ProtocolEngine:
         # sent, which is not always what the configuration says.
         self._sent_clean_start = clean_start
 
+        if (
+            self.config.protocol == MQTTProtocolVersion.MQTTv311
+            and not self.config.client_id
+            and not clean_start
+        ):
+            # [MQTT-3.1.3-7]: a zero-byte ClientId requires CleanSession 1. The
+            # broker is required to answer 0x02 (Identifier rejected) and close
+            # ([MQTT-3.1.3-8]), so this connection cannot succeed — failing here
+            # says why instead of surfacing a bare rejection. MQTT 5 allows the
+            # combination and assigns an identifier, hence the version check.
+            # `clean_start` is the effective value: a resumed session forces it
+            # to 0, which is exactly when this would otherwise slip through.
+            raise ProtocolError(
+                "MQTT 3.1.1 requires clean_start=True with an empty client_id "
+                "[MQTT-3.1.3-7]; set a client_id or connect with MQTT 5"
+            )
+
         connect_props = self.config.connect_properties
         if self.config.protocol == MQTTProtocolVersion.MQTTv5:
             connect_props = Properties(values=dict(connect_props.values) if connect_props else {})

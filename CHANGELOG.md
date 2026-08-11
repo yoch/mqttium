@@ -30,6 +30,12 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   frontier has just reached. The redundant reservation was left behind and
   counted twice, permanently inflating `len()`/`available` and blocking the
   `release()` fast path that resets the pool once every identifier is free.
+- Connecting over MQTT 3.1.1 with an empty `client_id` and `clean_start=False`
+  is refused. [MQTT-3.1.3-7] requires a clean session with a zero-byte ClientId,
+  and the broker must answer `0x02` (Identifier rejected) and close, so the
+  connection could never succeed. The check uses the effective Clean Start, so a
+  resumed session — which rewrites it to 0 — is caught too. MQTT 5 allows the
+  pairing and assigns an identifier.
 - `auth()` refuses a reason code a Client may not send. MQTT 5 Table 3-11
   assigns `0x00` (Success) to the Server; only `0x18` (Continue authentication)
   and `0x19` (Re-authenticate) may come from a Client, per [MQTT-3.15.2-1] and

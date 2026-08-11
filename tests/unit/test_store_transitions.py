@@ -314,7 +314,9 @@ def test_hydration_backfills_a_legacy_logical_size(tmp_path: Path) -> None:
     store.close()
 
     reopened = SqliteInflightStore(path)
-    engine = ProtocolEngine(EngineConfig(clean_start=False), store=reopened)
+    engine = ProtocolEngine(
+        EngineConfig(client_id="transitions", clean_start=False), store=reopened
+    )
     expected = 100 + len("a/b")
     assert engine.pending_outbound_bytes == expected
 
