@@ -52,6 +52,7 @@ class Recorder:
             "mypy",
             "paho-mqtt",
             "psutil",
+            "py-spy",
             "pytest",
             "pytest-cov",
             "ruff",

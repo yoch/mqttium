@@ -64,6 +64,11 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Added
 
+- A profile-first optimisation research runner with realistic common and rare
+  MQTT workloads, clean ABBA comparisons, exact delivery/order checks,
+  controlled-network profiles, and diagnostic `cProfile`, `py-spy`, `perf` and
+  `strace` captures. `py-spy==0.4.2` is available through the benchmark extra;
+  no profiler is imported by the installed library.
 - `docs/spec/` vendors the numbered conformance statements of MQTT 3.1.1 and
   5.0, extracted from reproducible official OASIS archives with provenance,
   checksums and regeneration tooling (`tools/extract_spec_statements.py`), and

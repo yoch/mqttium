@@ -6,6 +6,13 @@ be committed.
 
 ## What each benchmark answers
 
+- `research_campaign.py discover` runs the short profile-first funnel over
+  realistic common and rare workloads. `compare` screens one selected workload
+  in fresh alternating processes before the stricter paired harnesses are used.
+- `research_scenarios.py` owns those usage workers and verifies exact delivery
+  and ordering. One-way TCP/TLS workloads timestamp `mosquitto_sub` output in a
+  separate process; duplex and slow-consumer scenarios deliberately keep the
+  application work in the measured process because that is the workload.
 - `hotpath_profile.py` counts calls, primitive calls, and allocations. These
   exact measurements are the first place to look for redundant work.
 - `paired_regression.py` compares isolated implementation paths in fresh
@@ -36,6 +43,46 @@ diagnostic, regardless of whether it exposes a strict exit mode for experiments.
 
 Hosted GitHub runners are useful for functional coverage and advisory numbers.
 They are not authoritative for latency or small throughput changes.
+
+## Short research campaigns
+
+Install the benchmark tooling and run discovery on a local broker managed by
+the orchestrator:
+
+```bash
+python -m pip install -e ".[benchmark]"
+python benchmarks/research_campaign.py discover --cpu 3
+```
+
+Raw JSON, cProfile data and Speedscope profiles default to
+`/tmp/mqttium-research/<revision>/discover`. `py-spy`, `perf`, `strace` and
+`cProfile` runs are recorded as `diagnostic-instrumented`; their timings are
+never comparison evidence. `--skip-samplers` retains the clean usage, memory,
+stress and reconnect measurements without profiler artefacts.
+
+Screen one candidate against an immutable source root with a complete ABBA
+cycle:
+
+```bash
+python benchmarks/research_campaign.py compare \
+  --base-root /path/to/base --candidate-root . \
+  --scenario reliable --repeat 4 --cpu 3
+```
+
+Compare mode requires at least four repetitions and rejects odd counts. A new
+harness must first compare one source tree with itself; an A/A median outside
+`1.00 ± 0.02` or baseline CV above 5% marks the result invalid. Instrumented
+runs, quick screens and single-load comparisons cannot retain an optimisation.
+For this campaign, distinct-tree comparisons also require the base root to be
+clean and exactly at `6f72296c579a26b421bdb793d3ab58a3be75c47f`; both source
+revisions and worktree states are recorded in the manifest. A future campaign
+may select its own immutable reference with `--expected-base-revision`.
+
+`--network-profile wan|degraded --allow-netem` is an explicit request to apply
+a temporary loopback qdisc. The runner refuses to replace an existing qdisc and
+always attempts to remove the qdisc it created. Root or passwordless `sudo` is
+required. `--managed-tls` creates a one-day local certificate and private key
+under the external artefact directory; the key keeps its owner-only mode.
 
 ## Keeping the harness out of the result
 
