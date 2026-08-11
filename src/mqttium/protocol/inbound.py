@@ -729,14 +729,22 @@ class InboundSession:
     def _reject_packet_id_collision(self, mid: int, arriving: str, held: str) -> NoReturn:
         """Refuse a PUBLISH whose identifier is still owned by another exchange.
 
-        [MQTT-2.2.1-3] forbids reusing a packet identifier while its exchange is
-        unfinished. The inbound store is keyed by identifier alone, so honouring
-        such a PUBLISH would replace the live record and leak the Receive
-        Maximum slot and byte reservation it still owns — permanently, and
-        cumulatively until the client disconnects itself reporting a full
-        receive window while holding nothing.
+        [MQTT-2.2.1-4] requires the Server to assign every new QoS > 0 PUBLISH a
+        Packet Identifier that is *currently unused*, and an identifier stays in
+        use until its sender has processed the corresponding acknowledgement —
+        for QoS 2, our PUBCOMP. A record in WAIT_PUBREL or WAIT_USER_ACK proves
+        the broker has not received one, so the identifier is provably still
+        its own and the reuse is a protocol violation, not a race.
+
+        There is no consistent way to continue: honouring the PUBLISH replaces
+        the live record and leaks the Receive Maximum slot and byte reservation
+        it still owns, while dropping it silently discards a message the broker
+        believes is in flight and will retransmit. Refusing the connection is
+        the only answer that neither corrupts local accounting nor loses a
+        message without telling anyone.
         """
-        # MQTT 5 §3.14.2.1: DISCONNECT 0x82 (Protocol Error).
+        # 0x82 Protocol Error, the same tear-down the receive-window and topic
+        # alias violations above use.
         self._protocol_disconnect(0x82)
         raise ProtocolError(
             f"Inbound {arriving} PUBLISH reuses mid={mid}, still held by an "

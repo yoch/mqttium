@@ -1,6 +1,8 @@
-# MQTTium
+<h1 align="center">
+  <img src="docs/assets/mqttium-logo.svg" alt="MQTTium" width="220">
+</h1>
 
-**A dependable, efficient, async-native MQTT client for Python.**
+<p align="center"><strong>A dependable, efficient, async-native MQTT client for Python.</strong></p>
 
 MQTT looks simple until a connection drops halfway through a QoS exchange, a
 consumer slows down, or a process restarts with work still in flight. MQTTium

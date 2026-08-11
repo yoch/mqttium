@@ -15,9 +15,11 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   Maximum slot and byte reservation permanently. The leak was cumulative and
   ended in the client disconnecting itself with `0x93` (Receive Maximum
   exceeded) while holding no message at all. Such a PUBLISH violates
-  [MQTT-2.2.1-3] and is now refused with `0x82` (Protocol Error) before anything
-  is stored. Genuine QoS 2 duplicates and QoS 1 manual-ack redeliveries are
-  unaffected.
+  [MQTT-2.2.1-4] — the identifier is still in use until the broker has processed
+  our acknowledgement — and is now refused with `0x82` (Protocol Error) before
+  anything is stored. Only `manual_ack=True` was ever affected: without it a
+  QoS 1 PUBLISH stores no record, so neither direction can collide. Genuine
+  QoS 2 duplicates and QoS 1 manual-ack redeliveries are unaffected.
 - `EffectPump` no longer retains the exception raised while the background
   effect-flush task applies an effect once nothing is left pending. The stored
   error was handed to whichever call next suspended in `drain()`, so a protocol

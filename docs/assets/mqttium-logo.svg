@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 920" width="900" height="920">
+  <title>MQTTium</title>
+  <defs>
+    <style>
+      @font-face {
+        font-family: 'MQTTiumWord';
+        src: url(data:font/woff2;base64,d09GMgABAAAAAAM8AAwAAAAABewAAALsAAQBBgAAAAAAAAAAAAAAAAAAAAAAAAAAGyAcMAZgAFwKgzSCagE2AiQDGAsOAAQgBYMaByAbwQQAPgyYcps6KEIkgi6ctlzBmM0hlyLGevXbmgiisf/N3t1XTaLRgKzeSO7NrIpJxpNoyGKd0Ki8k7F2r66oeGhUIkRGpNo60aJKFW+fKqw0Ojic8Ah6FmDpGBOs0FL7HwB3dvbnK6QbcXv+1+5MnaoZGyiee5KQRmTM7gyQNGAdm/JY1T2oF7JqN26uYKE2GQ5ojDJcfucKKrZAvR5SiLnzCysBr0BFgBFGWaEK2Zu6pp2QOtIG41HTS66IdaginUIGLPE/JtZwxkJAFQABAIuWZ0vg0DJTRfj/kU1lJE0AAWkkvQEGoJGQ0Qkl0AltIdCsVlJtmRKV+gyZqoh2D/PSU7dcd6EQuGrxGlGLY8BzQAEhjZHRRG/FN6LVXQtoIqaxvrkvRWpae/n9e5w8+9Fw+uSbE1+/1v9osibrTv2p3HFCzzfsRIQDIuL8w2YfkAV7TryrV01814SpHrVGR5IQQ4JnKzqT/6zbX4iIneP6U3sQmYRs8q2lziI70uvdlejbPPNvqWp4veG/WE9Xfb++cWtLd5evnbZ24xs2t/bINqw9t3gylVyqqEwuTqTy8002p7JCk/XhefD5xft7G0YOFkPbEReFkyNQja+qBKZatdRwpvGN7uwrTNV7t7Q6k1NRX21NZepwVLK9wuKZvsjdF2twDqsbyjZWWSPe5a6+wkS9Z8qqc/Iq6qotAAiUwI5+OaGFFv5Xm1EP8PPJD/Cn246satAGoEYCwf/h1L0SzOBf8VdV5yZFmcmUeim9RamGZWkVFkKg2lWN9sHW7pYl1FgBJQoBeEQOQrNHaCKfg2yqfVD0+QJV6oO/X7W+GJIyYtSccX169Jok52Sf5cOppKJdqVKydFSfYRNa67gR/bp0VBUmTJnUq6fGmZR+tUmTRk0IsrHp0eedp7Sz6jBiiE2/VbcRU4Z1GjfH9rx2Bu3RynXpMWVQm3F5KmWVCL1nlNao43GzsrNza+evsXgYK2bxUYJU5aYAAAAA) format('woff2');
+        font-weight: 400;
+        font-style: normal;
+      }
+      .word {
+        font-family: 'MQTTiumWord', 'Poppins', sans-serif;
+        font-weight: 400;
+        font-size: 114.78px;
+        letter-spacing: -3px;
+      }
+    </style>
+  </defs>
+
+  <!-- ==================== CARTOUCHE / ICONE ==================== -->
+  <rect x="165" y="88" width="564" height="565" rx="69" ry="69" fill="#202629"/>
+  <path fill="#FFFFFF" d="M253,190 L366,320 L479,190 L479,444 L445,444 L445,286
+                          L366,376 L287,286 L287,444 L253,444 Z"/>
+  <circle cx="577.5" cy="367.5" r="61.5" fill="none" stroke="#FFFFFF" stroke-width="34"/>
+  <rect x="622" y="367.5" width="34" height="136.5" fill="#FFFFFF"/>
+  <rect x="501" y="539" width="33" height="34" rx="9" fill="#0099A2"/>
+  <rect x="561" y="539" width="33" height="34" rx="9" fill="#92AAC1"/>
+  <rect x="622" y="539" width="34" height="34" rx="9" fill="#FFFFFF"/>
+
+  <!-- ==================== WORDMARK (police embarquee, centree) ==================== -->
+  <text class="word" x="447" y="806" text-anchor="middle">
+    <tspan fill="#202629">MOTT</tspan><tspan fill="#0099A2">ium</tspan>
+  </text>
+  <path d="M345.7,793 L371.5,823" stroke="#202629" stroke-width="11" fill="none"/>
+</svg>
