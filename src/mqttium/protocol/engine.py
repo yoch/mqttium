@@ -591,6 +591,8 @@ class ProtocolEngine:
 
     def ack(self, mid: int) -> None:
         """Complete a deferred inbound ACK in manual-ack mode."""
+        if self.state is not ConnectionState.CONNECTED:
+            raise NotConnectedError("ack requires an active connection")
         self.inbound.ack(mid)
 
     def _on_suback(self, raw: RawPacket) -> None:
