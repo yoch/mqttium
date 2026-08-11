@@ -228,3 +228,32 @@ path. Do not revive detect-then-partition without beating the 0.2.0b4 A/B.
 2. Emit `SEND` before `MESSAGE` on inbound auto-ack (candidate 2) — tiny code change, counter-falsifiable.
 3. WS frame coalesce (candidate 3) if WebSocket is a product path.
 4. SQLite launch `update_out` when row exists (candidate 4) under flow-limited QoS 1.
+
+## Independent re-verification (same host, later pass)
+
+Re-ran the high/medium probes without relying on the first pass’s notebook:
+
+| Candidate | Re-check | Notes |
+| --- | --- | --- |
+| 1 MQTT 5 QoS 1 handler | **1.52×** vs v3.1.1 (5612 / 3703 ns); with props **2.08×**; `PublishPacket.decode` called once; field-only path **1.74×** cheaper than packet→`Message` | Confirmed — file issue |
+| 2 Effect order | Effects are `MESSAGE`, `SEND` → SEND-first reorder required | Confirmed — file issue |
+| 3 WS mask coalesce | 32×50 B frames **58.3 µs** vs one 1600 B frame **3.7 µs** (**~16×**) | Confirmed — file issue |
+| 4 SQLite launch rewrite | Isolated `put_out` after `get_out` vs `update_out` on 256 KiB: **~1.30×**; without `get_out` the ratio flipped on this host | **Qualified** — real for “reload then upsert BLOB”, but not a universal 2×; still worth a targeted A/B under `Receive Maximum=1` |
+| 6 PubAck encode | **674 ns** vs fixed 4-byte **105 ns** (**6.5×**) | Confirmed |
+| 7 PubAck decode | **741 ns** vs mid unpack **93 ns** (**8.0×**) | Confirmed |
+| 8 Empty `Properties()` | **126 ns** alloc vs `None` path ~10 ns | Confirmed (lower severity) |
+
+## Issues
+
+| Candidate | Severity | Issue |
+| --- | --- | --- |
+| 1 | High | #144 — MQTT 5 QoS 1/2 `PublishPacket` ingress |
+| 2 | High | #145 — inbound MESSAGE-before-SEND forces EffectPump reorder |
+| 3 | High (WS) | #146 — WebSocket one masked frame per MQTT part |
+| 4 | Medium | #147 — SQLite `_launch` full `put_out` after `QUEUED` |
+| 5 | Medium | #148 — delivery small-message gate |
+| 6 | Medium | #149 — inbound PUBACK via packet wrapper |
+| 7 | Medium | #150 — outbound PUBACK full decode on v3.1.1 |
+| 8–12 | Low–Medium / Low | listed in index #151 only (avoid duplicate noise with #106 / #103 / #39) |
+
+Index: #152 (complete); #151 is an incomplete duplicate from the same filing batch. Not a substitute for #108 / #99–#106.
