@@ -4,23 +4,13 @@ on:
   workflow_dispatch:
   schedule:
     - cron: "17 2 * * 0"
-  pull_request:
-    paths:
-      - benchmarks/**
-      - src/mqttium/api/**
-      - src/mqttium/codec/**
-      - src/mqttium/compat/**
-      - src/mqttium/persistence/**
-      - src/mqttium/protocol/**
-      - src/mqttium/transport/**
-      - .github/workflows/benchmarks.yml
 
 permissions:
   contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: false
 
 jobs:
   benchmark:

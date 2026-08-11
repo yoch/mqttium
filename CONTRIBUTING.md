@@ -1,7 +1,7 @@
 # Contributing
 
-Contributions and reproducible feedback are welcome during the MQTTium beta.
-Incorrect behaviour in a published beta should use the structured bug form and
+Contributions and reproducible feedback are welcome during the MQTTium release-candidate period.
+Incorrect behaviour in a published pre-release should use the structured bug form and
 the evidence checklist in [`docs/BETA-REPORTING.md`](docs/BETA-REPORTING.md).
 Security vulnerabilities must follow the private process in [`SECURITY.md`](SECURITY.md).
 
@@ -36,7 +36,7 @@ if any cache or build artefact is tracked by git.
 
 ## Bug reports
 
-Prefer a minimal complete reproducer against a published beta installed in a
+Prefer a minimal complete reproducer against the latest published pre-release in a
 clean virtual environment. Include the MQTTium, Python, broker and operating-
 system versions, protocol, transport, relevant client options, complete
 traceback and a `ClientStats` snapshot when the owning event loop is responsive.

@@ -19,6 +19,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from itertools import islice
 from typing import Any, Literal, Never
 
+from mqttium.api._delivery import ApplicationDelivery, MessageDelivery
 from mqttium.api._effects import EffectPump
 from mqttium.api._writer import WritePump
 from mqttium.api.models import (
@@ -31,14 +32,12 @@ from mqttium.api.models import (
 from mqttium.api.stats import (
     ClientStats,
     DecoderStats,
-    DeliveryStats,
     ProtocolStats,
     ReceiptStats,
     TaskStats,
     TransportStats,
 )
 from mqttium.codec.buffer import DEFAULT_MAX_PACKET_SIZE, IncrementalDecoder
-from mqttium.codec.properties import PUBLISH, encode_properties
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, QoS
 from mqttium.errors import (
     FlowControlError,
@@ -79,39 +78,50 @@ OnConnect = Callable[[ConnAckPacket], Any]
 OnDisconnect = Callable[[BaseException | None], Any]
 OnPublish = Callable[[int | None, BaseException | None], Any]
 OnAuth = Callable[[AuthPacket], Any]
-MessageDelivery = Literal["auto", "iterator", "callback", "both"]
 PublishBackpressure = Literal["wait", "error"]
 
 
-class _SharedDeliveryReservation:
-    """One exact byte reservation shared by callback and iterator delivery."""
-
-    __slots__ = ("logical_bytes", "remaining")
-
-    def __init__(self, logical_bytes: int) -> None:
-        self.logical_bytes = logical_bytes
-        self.remaining = 2
+def _positive(name: str, value: float) -> None:
+    if value <= 0:
+        raise ValueError(f"{name} must be greater than 0")
 
 
-AccountedDeliveryToken = int | _SharedDeliveryReservation
-DeliveryToken = AccountedDeliveryToken | None
-CallbackJob = tuple[Callable[..., Any], tuple[Any, ...], DeliveryToken]
-TrackedIteratorMessage = tuple[Message, AccountedDeliveryToken]
-IteratorQueueItem = Message | TrackedIteratorMessage
+def _non_negative_optional(name: str, value: int | None) -> None:
+    if value is not None and value < 0:
+        raise ValueError(f"{name} must be non-negative or None")
 
 
-class _DeliveryQueue(asyncio.Queue[IteratorQueueItem]):
-    """Queue for stream delivery without unused ``join()`` bookkeeping."""
-
-    def put_nowait(self, item: IteratorQueueItem) -> None:
-        if self.full():
-            raise asyncio.QueueFull
-        self._put(item)
-        self._wakeup_next(self._getters)  # type: ignore[attr-defined]
+def _validate_client_arguments(
+    *,
+    client_id: object,
+    username: object,
+    password: object,
+    message_delivery: str,
+    publish_backpressure: str,
+    optional_bounds: tuple[tuple[str, int | None], ...],
+    positive_bounds: tuple[tuple[str, float], ...],
+    ping_timeout: float | None,
+) -> None:
+    if message_delivery not in ("auto", "iterator", "callback", "both"):
+        raise ValueError("message_delivery must be 'auto', 'iterator', 'callback', or 'both'")
+    if publish_backpressure not in ("wait", "error"):
+        raise ValueError("publish_backpressure must be 'wait' or 'error'")
+    for name, optional_value in optional_bounds:
+        _non_negative_optional(name, optional_value)
+    for name, positive_value in positive_bounds:
+        _positive(name, positive_value)
+    if ping_timeout is not None:
+        _positive("ping_timeout", ping_timeout)
+    if not isinstance(client_id, str):
+        raise ValueError("client_id must be a string")
+    if username is not None and not isinstance(username, str):
+        raise ValueError("username must be a string or None")
+    if password is not None and not isinstance(password, (bytes, str)):
+        raise ValueError("password must be bytes, str, or None")
 
 
 class AsyncClient:
-    def __init__(  # noqa: C901
+    def __init__(
         self,
         client_id: str = "",
         *,
@@ -147,51 +157,31 @@ class AsyncClient:
         store: InflightStore | None = None,
         auth_handler: OnAuth | None = None,
     ) -> None:
-        if message_delivery not in ("auto", "iterator", "callback", "both"):
-            raise ValueError("message_delivery must be 'auto', 'iterator', 'callback', or 'both'")
-        if publish_backpressure not in ("wait", "error"):
-            raise ValueError("publish_backpressure must be 'wait' or 'error'")
-        if max_pending_outbound_messages is not None and max_pending_outbound_messages < 0:
-            raise ValueError("max_pending_outbound_messages must be non-negative or None")
-        if max_pending_outbound_bytes is not None and max_pending_outbound_bytes < 0:
-            raise ValueError("max_pending_outbound_bytes must be non-negative or None")
-        if max_pending_inbound_bytes is not None and max_pending_inbound_bytes < 0:
-            raise ValueError("max_pending_inbound_bytes must be non-negative or None")
-        if max_pending_messages <= 0:
-            raise ValueError("max_pending_messages must be greater than 0")
-        if max_pending_callbacks <= 0:
-            raise ValueError("max_pending_callbacks must be greater than 0")
-        if max_pending_delivery_bytes is not None and max_pending_delivery_bytes < 0:
-            raise ValueError("max_pending_delivery_bytes must be non-negative or None")
-        if delivery_timeout <= 0:
-            raise ValueError("delivery_timeout must be greater than 0")
-        if callback_shutdown_timeout <= 0:
-            raise ValueError("callback_shutdown_timeout must be greater than 0")
-        if max_outbound_messages <= 0:
-            raise ValueError("max_outbound_messages must be greater than 0")
-        if max_outbound_bytes <= 0:
-            raise ValueError("max_outbound_bytes must be greater than 0")
-        if max_ingress_batch_bytes <= 0:
-            raise ValueError("max_ingress_batch_bytes must be greater than 0")
-        if ack_timeout <= 0:
-            raise ValueError("ack_timeout must be greater than 0")
-        if ping_timeout is not None and ping_timeout <= 0:
-            raise ValueError("ping_timeout must be greater than 0")
-        if not isinstance(client_id, str):
-            raise ValueError("client_id must be a string")
-        if username is not None and not isinstance(username, str):
-            raise ValueError("username must be a string or None")
-        if password is not None and not isinstance(password, (bytes, str)):
-            raise ValueError("password must be bytes, str, or None")
-        self._message_delivery = message_delivery
+        _validate_client_arguments(
+            client_id=client_id,
+            username=username,
+            password=password,
+            message_delivery=message_delivery,
+            publish_backpressure=publish_backpressure,
+            optional_bounds=(
+                ("max_pending_outbound_messages", max_pending_outbound_messages),
+                ("max_pending_outbound_bytes", max_pending_outbound_bytes),
+                ("max_pending_inbound_bytes", max_pending_inbound_bytes),
+                ("max_pending_delivery_bytes", max_pending_delivery_bytes),
+            ),
+            positive_bounds=(
+                ("max_pending_messages", max_pending_messages),
+                ("max_pending_callbacks", max_pending_callbacks),
+                ("delivery_timeout", delivery_timeout),
+                ("callback_shutdown_timeout", callback_shutdown_timeout),
+                ("max_outbound_messages", max_outbound_messages),
+                ("max_outbound_bytes", max_outbound_bytes),
+                ("max_ingress_batch_bytes", max_ingress_batch_bytes),
+                ("ack_timeout", ack_timeout),
+            ),
+            ping_timeout=ping_timeout,
+        )
         self._publish_backpressure = publish_backpressure
-        self._max_pending_messages = max_pending_messages
-        self._max_pending_delivery_bytes = max_pending_delivery_bytes
-        self._pending_delivery_bytes = 0
-        self._pending_delivery_high_water_bytes = 0
-        self._delivery_space = asyncio.Event()
-        self._delivery_space.set()
-        self._delivery_waiters = 0
         effective_max_packet_size = (
             maximum_packet_size if maximum_packet_size is not None else DEFAULT_MAX_PACKET_SIZE
         )
@@ -249,58 +239,38 @@ class AsyncClient:
         self._try_enqueue_outbound = self._write_pump.try_enqueue
         self._try_enqueue_outbound_many = self._write_pump.try_enqueue_many
         self._enqueue_outbound = self._write_pump.enqueue
-        self._callback_queue: asyncio.Queue[CallbackJob] = asyncio.Queue(
-            maxsize=max_pending_callbacks
+        self._delivery = ApplicationDelivery(
+            mode=message_delivery,
+            protocol=protocol,
+            max_pending_messages=max_pending_messages,
+            max_pending_callbacks=max_pending_callbacks,
+            max_pending_delivery_bytes=max_pending_delivery_bytes,
+            maximum_packet_size=effective_max_packet_size,
+            delivery_timeout=delivery_timeout,
+            callback_shutdown_timeout=callback_shutdown_timeout,
         )
-        if max_pending_delivery_bytes is None:
-            self._delivery_small_budget_bytes = 0
-            self._delivery_small_message_limit = None
-            self._delivery_accounted_limit = None
-        else:
-            if message_delivery == "callback":
-                maximum_small_messages = max_pending_callbacks + 2
-            elif message_delivery == "iterator":
-                maximum_small_messages = max_pending_messages + 1
-            else:
-                maximum_small_messages = max_pending_messages + max_pending_callbacks + 2
-            candidate_small_budget = max_pending_delivery_bytes // 8
-            candidate_small_limit = (
-                candidate_small_budget // maximum_small_messages if maximum_small_messages else 0
-            )
-            candidate_accounted_limit = max_pending_delivery_bytes - candidate_small_budget
-            # Partition only when it preserves the capacity of every packet that
-            # could otherwise fit both the configured delivery budget and the
-            # decoder's maximum packet size. Tiny/custom budgets therefore keep
-            # exact accounting across their full range.
-            minimum_single_message_capacity = min(
-                max_pending_delivery_bytes, effective_max_packet_size
-            )
-            if (
-                candidate_small_limit <= 0
-                or candidate_accounted_limit < minimum_single_message_capacity
-            ):
-                self._delivery_small_budget_bytes = 0
-                self._delivery_small_message_limit = 0
-                self._delivery_accounted_limit = max_pending_delivery_bytes
-            else:
-                self._delivery_small_budget_bytes = candidate_small_budget
-                self._delivery_small_message_limit = candidate_small_limit
-                self._delivery_accounted_limit = candidate_accounted_limit
-        self._callback_worker_task: asyncio.Task[None] | None = None
+        # Keep established private test/compatibility seams as direct bound
+        # operations while the controller remains the sole state owner.
+        self._try_reserve_delivery = self._delivery.try_reserve
+        self._reserve_delivery_slow = self._delivery.reserve_slow
+        self._release_delivery_reference_nowait = self._delivery.release_nowait
+        self._release_delivery_reference = self._delivery.release
+        self._delivery_logical_size = self._delivery.logical_size
+        self._put_message = self._delivery.put_message
+        self._accept_message = self._delivery.acceptor()
+        self._ensure_callback_worker = self._delivery.ensure_callback_worker
+        self._spawn_callback = self._delivery.spawn_callback
+        self._enqueue_callback = self._delivery.enqueue_callback
+        self._report_callback_error = self._delivery.report_callback_error
+        self._shutdown_callback_worker = self._delivery.shutdown_callbacks
+        self._invoke = self._delivery.invoke
         self._publish_waiters = 0
-        self._delivery_timeout = delivery_timeout
-        self._callback_shutdown_timeout = callback_shutdown_timeout
         self._publish_space = asyncio.Event()
         self._connack_fut: asyncio.Future[ConnAckPacket] | None = None
         self._receipts: dict[int, PublishReceipt | deque[PublishReceipt]] = {}
         self._batch_receipts: dict[int, PublishBatchReceipt | deque[PublishBatchReceipt]] = {}
         self._sub_futs: dict[int, asyncio.Future[SubscribeResult]] = {}
         self._unsub_futs: dict[int, asyncio.Future[UnsubscribeResult]] = {}
-        self._messages: asyncio.Queue[IteratorQueueItem] = _DeliveryQueue(
-            maxsize=self._max_pending_messages
-        )
-        self._message_ready = asyncio.Event()
-        self._closed = asyncio.Event()
         self._disconnect_exc: BaseException | None = None
         # Set once a connection is torn down, cleared by the next connect. Read
         # by _publish_wait_failure(); _closed is set too late in teardown to use.
@@ -348,6 +318,52 @@ class AsyncClient:
     @property
     def _effect_flush_task(self) -> asyncio.Task[None] | None:
         return self._effect_pump.task
+
+    # Historical private delivery views. ApplicationDelivery owns the mutable
+    # values; these properties preserve focused tests without duplicating state.
+    @property
+    def _callback_worker_task(self) -> asyncio.Task[None] | None:
+        return self._delivery.callback_task
+
+    @property
+    def _messages(self) -> asyncio.Queue[Any]:
+        return self._delivery.messages_queue
+
+    @property
+    def _callback_queue(self) -> asyncio.Queue[Any]:
+        return self._delivery.callback_queue
+
+    @property
+    def _message_ready(self) -> asyncio.Event:
+        return self._delivery.message_ready
+
+    @property
+    def _closed(self) -> asyncio.Event:
+        return self._delivery.closed
+
+    @property
+    def _pending_delivery_bytes(self) -> int:
+        return self._delivery.pending_bytes
+
+    @property
+    def _pending_delivery_high_water_bytes(self) -> int:
+        return self._delivery.pending_high_water_bytes
+
+    @property
+    def _delivery_waiters(self) -> int:
+        return self._delivery.waiters
+
+    @property
+    def _delivery_accounted_limit(self) -> int | None:
+        return self._delivery.accounted_limit
+
+    @property
+    def _delivery_small_budget_bytes(self) -> int:
+        return self._delivery.small_budget_bytes
+
+    @property
+    def _delivery_small_message_limit(self) -> int | None:
+        return self._delivery.small_message_limit
 
     # Historical private writer views remain for tests and instrumentation.
     # WritePump is the sole state owner; runtime code does not use these views.
@@ -460,18 +476,7 @@ class AsyncClient:
                 max_packet_size=self._decoder.max_packet_size,
                 ingress_batch_limit_bytes=self._max_ingress_batch_bytes,
             ),
-            delivery=DeliveryStats(
-                iterator_queued=self._messages.qsize(),
-                iterator_limit=self._messages.maxsize,
-                callback_queued=self._callback_queue.qsize(),
-                callback_limit=self._callback_queue.maxsize,
-                pending_bytes=self._pending_delivery_bytes,
-                pending_high_water_bytes=self._pending_delivery_high_water_bytes,
-                accounted_limit=self._delivery_accounted_limit,
-                small_budget_bytes=self._delivery_small_budget_bytes,
-                small_message_limit=self._delivery_small_message_limit,
-                waiters=self._delivery_waiters,
-            ),
+            delivery=self._delivery.stats(),
             receipts=ReceiptStats(
                 publish=publish_receipts,
                 publish_batches=len(batch_ids),
@@ -786,7 +791,7 @@ class AsyncClient:
             except TimeoutError as exc:
                 raise MQTTTimeoutError("Transport connection timed out") from exc
             self._transport = transport
-            self._closed.clear()
+            self._delivery.reopen()
             self._disconnect_exc = None
             self._teardown_final = False
             self._last_disconnect = None
@@ -1159,26 +1164,8 @@ class AsyncClient:
             raise MQTTTimeoutError(f"UNSUBACK timed out for mid={mid}") from exc
 
     async def messages(self) -> AsyncIterator[Message]:
-        # Fast-path get_nowait avoids allocating two tasks per delivered
-        # message. The event is only a wake-up signal; the queue remains the
-        # source of truth and is drained before the stream terminates.
-        while True:
-            try:
-                item = self._messages.get_nowait()
-                if isinstance(item, tuple):
-                    message, delivery_token = item
-                    self._release_delivery_reference_nowait(delivery_token)
-                    yield message
-                else:
-                    yield item
-                continue
-            except asyncio.QueueEmpty:
-                if self._closed.is_set():
-                    return
-            self._message_ready.clear()
-            if not self._messages.empty() or self._closed.is_set():
-                continue
-            await self._message_ready.wait()
+        async for message in self._delivery.messages():
+            yield message
 
     async def ack(self, message: Message) -> None:
         """Acknowledge an inbound QoS>0 message when ``manual_ack=True``.
@@ -1259,8 +1246,7 @@ class AsyncClient:
                         await self._transport.close()
                     except Exception:
                         pass
-            self._closed.set()
-            self._message_ready.set()
+            self._delivery.close()
             try:
                 await self._invoke(self.on_disconnect, self._disconnect_exc)
             except Exception as exc:
@@ -1292,7 +1278,7 @@ class AsyncClient:
             self._engine.notify_transport_closed()
             self._collect_effects_locked()
         await self._drain_effects()
-        self._closed.set()
+        self._delivery.close()
         # Close transport so the reader unblocks and runs shared cleanup.
         if self._transport is not None:
             await self._transport.close()
@@ -1486,54 +1472,9 @@ class AsyncClient:
         effects: deque[EngineEffect],
         epoch: int,
     ) -> int:
-        if epoch != self._connection_epoch or len(effects) < 2:
+        if epoch != self._connection_epoch:
             return 0
-        first: Message = effects[0].data
-        if first.qos != QoS.AT_MOST_ONCE:
-            return 0
-        callback = self.on_message
-        callback_delivery = callback is not None and self._message_delivery in (
-            "auto",
-            "callback",
-            "both",
-        )
-        iterator_delivery = self._message_delivery in ("iterator", "both") or (
-            self._message_delivery == "auto" and callback is None
-        )
-        if not callback_delivery and not iterator_delivery:
-            return 0
-        small_limit = self._delivery_small_message_limit
-        callback_worker_ready = False
-        applied = 0
-        for effect in effects:
-            if effect.kind is not EffectKind.MESSAGE:
-                break
-            msg: Message = effect.data
-            if msg.qos != QoS.AT_MOST_ONCE:
-                break
-            if small_limit is not None:
-                if (
-                    small_limit <= 0
-                    or msg.properties
-                    or len(msg.payload) + 4 * len(msg.topic) > small_limit
-                ):
-                    break
-            if iterator_delivery and self._messages.full():
-                break
-            if callback_delivery and self._callback_queue.full():
-                break
-            if iterator_delivery:
-                self._messages.put_nowait(msg)
-            if callback_delivery:
-                assert callback is not None
-                if not callback_worker_ready:
-                    self._ensure_callback_worker()
-                    callback_worker_ready = True
-                self._callback_queue.put_nowait((callback, (msg,), None))
-            applied += 1
-        if applied and iterator_delivery:
-            self._message_ready.set()
-        return applied
+        return self._delivery.deliver_batch_inline(effects, self.on_message)
 
     async def _flush_effects(self, *, nowait: bool = False) -> None:
         async with self._engine_lock:
@@ -1543,7 +1484,7 @@ class AsyncClient:
             return
         await self._drain_effects()
 
-    async def _apply_effect(  # noqa: C901
+    async def _apply_effect(  # noqa: C901 -- reduced from 44; remaining branches own lifecycle
         self,
         effect: EngineEffect,
         *,
@@ -1579,94 +1520,13 @@ class AsyncClient:
                     )
                     self._collect_effects_locked()
         elif kind is EffectKind.MESSAGE:
-            msg: Message = effect.data
-            callback_delivery = self.on_message is not None and self._message_delivery in (
-                "auto",
-                "callback",
-                "both",
-            )
-            iterator_delivery = self._message_delivery in ("iterator", "both") or (
-                self._message_delivery == "auto" and self.on_message is None
-            )
-            references = int(iterator_delivery) + int(callback_delivery)
-            small_limit = self._delivery_small_message_limit
-            small_delivery = references and (
-                small_limit is None
-                or (
-                    small_limit > 0
-                    # An MQTT 5 PUBLISH without properties decodes to an empty
-                    # `Properties`, not to None: testing truthiness rather than
-                    # identity is what keeps those messages on the fast path.
-                    # An empty table contributes no logical bytes, so the bound
-                    # below stays a valid upper bound of _delivery_logical_size.
-                    and not msg.properties
-                    and len(msg.payload) + 4 * len(msg.topic) <= small_limit
-                )
-            )
-            if small_delivery:
-                if iterator_delivery:
-                    try:
-                        self._messages.put_nowait(msg)
-                    except asyncio.QueueFull:
-                        await self._put_message_slow(msg)
-                    else:
-                        self._message_ready.set()
-                if callback_delivery:
-                    assert self.on_message is not None
-                    self._ensure_callback_worker()
-                    job: CallbackJob = (self.on_message, (msg,), None)
-                    try:
-                        self._callback_queue.put_nowait(job)
-                    except asyncio.QueueFull:
-                        await self._enqueue_callback_slow(job)
-                if msg.mid is not None:
-                    async with self._engine_lock:
-                        self._engine.mark_inbound_delivered(msg.mid)
-                return
-
-            delivery_token: DeliveryToken = None
-            iterator_enqueued = False
-            callback_enqueued = False
-            if references:
-                logical_bytes = self._delivery_logical_size(msg)
-                limit = self._delivery_accounted_limit
-                if limit is not None and logical_bytes > limit:
-                    raise MessageDeliveryError(
-                        f"Message requires {logical_bytes} delivery bytes, exceeding limit {limit}"
-                    )
-                delivery_token = self._try_reserve_delivery(logical_bytes, references)
-                if delivery_token is None:
-                    delivery_token = await self._reserve_delivery_slow(logical_bytes, references)
-            try:
-                if iterator_delivery:
-                    iterator_item: IteratorQueueItem = (
-                        (msg, delivery_token) if delivery_token is not None else msg
-                    )
-                    try:
-                        self._messages.put_nowait(iterator_item)
-                    except asyncio.QueueFull:
-                        await self._put_message_slow(iterator_item)
-                    else:
-                        self._message_ready.set()
-                    iterator_enqueued = True
-                if callback_delivery:
-                    assert self.on_message is not None
-                    self._ensure_callback_worker()
-                    job = (self.on_message, (msg,), delivery_token)
-                    try:
-                        self._callback_queue.put_nowait(job)
-                    except asyncio.QueueFull:
-                        await self._enqueue_callback_slow(job)
-                    callback_enqueued = True
-            except BaseException:
-                if delivery_token is not None:
-                    unqueued = references - int(iterator_enqueued) - int(callback_enqueued)
-                    for _ in range(unqueued):
-                        self._release_delivery_reference_nowait(delivery_token)
-                raise
-            if msg.mid is not None:
+            message: Message = effect.data
+            pending_delivery = self._accept_message(message, self.on_message)
+            if pending_delivery is not None:
+                await pending_delivery
+            if message.mid is not None:
                 async with self._engine_lock:
-                    self._engine.mark_inbound_delivered(msg.mid)
+                    self._engine.mark_inbound_delivered(message.mid)
         elif kind is EffectKind.PUBLISH_COMPLETE:
             mid: int | None = effect.data
             self._settle_publish(mid, None)
@@ -1739,79 +1599,6 @@ class AsyncClient:
         """Maximum logical size eligible for the zero-accounting fast path."""
         return self._delivery_small_message_limit
 
-    def _try_reserve_delivery(self, logical_bytes: int, references: int) -> DeliveryToken:
-        limit = self._delivery_accounted_limit
-        if limit is not None and self._pending_delivery_bytes + logical_bytes > limit:
-            return None
-        self._pending_delivery_bytes += logical_bytes
-        if self._pending_delivery_bytes > self._pending_delivery_high_water_bytes:
-            self._pending_delivery_high_water_bytes = self._pending_delivery_bytes
-        if references == 1:
-            return logical_bytes
-        # `references` is derived from callback_delivery + iterator_delivery,
-        # so the only remaining runtime case is exactly two consumers.
-        return _SharedDeliveryReservation(logical_bytes)
-
-    async def _reserve_delivery(self, message: Message, references: int) -> DeliveryToken:
-        logical_bytes = self._delivery_logical_size(message)
-        limit = self._delivery_accounted_limit
-        if limit is not None and logical_bytes > limit:
-            raise MessageDeliveryError(
-                f"Message requires {logical_bytes} delivery bytes, exceeding limit {limit}"
-            )
-        token = self._try_reserve_delivery(logical_bytes, references)
-        if token is not None:
-            return token
-        return await self._reserve_delivery_slow(logical_bytes, references)
-
-    async def _reserve_delivery_slow(self, logical_bytes: int, references: int) -> DeliveryToken:
-        while True:
-            self._delivery_waiters += 1
-            try:
-                self._delivery_space.clear()
-                token = self._try_reserve_delivery(logical_bytes, references)
-                if token is not None:
-                    return token
-                await self._delivery_space.wait()
-            finally:
-                self._delivery_waiters -= 1
-            token = self._try_reserve_delivery(logical_bytes, references)
-            if token is not None:
-                return token
-
-    def _release_delivery_reference_nowait(self, token: AccountedDeliveryToken) -> None:
-        if isinstance(token, int):
-            self._pending_delivery_bytes -= token
-        else:
-            remaining = token.remaining
-            if remaining <= 0:
-                return
-            remaining -= 1
-            token.remaining = remaining
-            if remaining:
-                return
-            logical_bytes = token.logical_bytes
-            token.logical_bytes = 0
-            self._pending_delivery_bytes -= logical_bytes
-        if self._delivery_waiters:
-            self._delivery_space.set()
-
-    async def _release_delivery_reference(self, token: AccountedDeliveryToken) -> None:
-        self._release_delivery_reference_nowait(token)
-
-    def _delivery_logical_size(self, message: Message) -> int:
-        property_bytes = 0
-        if (
-            self._engine.config.protocol == MQTTProtocolVersion.MQTTv5
-            and message.properties is not None
-            and message.properties.values
-        ):
-            property_bytes = len(encode_properties(message.properties, PUBLISH))
-        topic_bytes = (
-            len(message.topic) if message.topic.isascii() else len(message.topic.encode("utf-8"))
-        )
-        return len(message.payload) + topic_bytes + property_bytes
-
     def _settle_publish(self, mid: int | None, reason: BaseException | None) -> None:
         """Retire the receipt and batch entry for one publication.
 
@@ -1852,137 +1639,7 @@ class AsyncClient:
         return self._disconnect_exc or MQTTError("Connection closed")
 
     async def _reset_message_stream(self) -> None:
-        if not self._closed.is_set():
-            return
-        while True:
-            try:
-                item = self._messages.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            else:
-                if isinstance(item, tuple):
-                    _message, delivery_token = item
-                    self._release_delivery_reference_nowait(delivery_token)
-        self._messages = _DeliveryQueue(maxsize=self._max_pending_messages)
-        self._message_ready = asyncio.Event()
-        self._closed.clear()
-
-    async def _put_message(self, item: IteratorQueueItem) -> None:
-        try:
-            self._messages.put_nowait(item)
-        except asyncio.QueueFull:
-            await self._put_message_slow(item)
-        else:
-            self._message_ready.set()
-
-    async def _put_message_slow(self, item: IteratorQueueItem) -> None:
-        try:
-            await asyncio.wait_for(
-                self._messages.put(item),
-                timeout=self._delivery_timeout,
-            )
-        except TimeoutError as exc:
-            raise MessageDeliveryError(
-                f"Iterator delivery queue remained full for {self._delivery_timeout:.3f}s"
-            ) from exc
-        self._message_ready.set()
-
-    def _ensure_callback_worker(self) -> None:
-        if self._callback_worker_task is None or self._callback_worker_task.done():
-            self._callback_worker_task = asyncio.create_task(
-                self._callback_worker(), name="mqttium-callback-worker"
-            )
-
-    def _spawn_callback(self, callback: Callable[..., Any], *args: Any) -> None:
-        """Compatibility entry point for loop-thread callback producers."""
-        self._ensure_callback_worker()
-        try:
-            self._callback_queue.put_nowait((callback, args, None))
-        except asyncio.QueueFull as exc:
-            raise MessageDeliveryError("Callback delivery queue is full") from exc
-
-    async def _enqueue_callback(
-        self,
-        callback: Callable[..., Any],
-        *args: Any,
-        delivery_token: DeliveryToken = None,
-    ) -> None:
-        self._ensure_callback_worker()
-        job = (callback, args, delivery_token)
-        try:
-            self._callback_queue.put_nowait(job)
-        except asyncio.QueueFull:
-            await self._enqueue_callback_slow(job)
-
-    async def _enqueue_callback_slow(self, job: CallbackJob) -> None:
-        try:
-            await asyncio.wait_for(
-                self._callback_queue.put(job),
-                timeout=self._delivery_timeout,
-            )
-        except TimeoutError as exc:
-            raise MessageDeliveryError(
-                f"Callback delivery queue remained full for {self._delivery_timeout:.3f}s"
-            ) from exc
-
-    async def _callback_worker(self) -> None:
-        try:
-            while True:
-                callback, args, delivery_token = await self._callback_queue.get()
-                try:
-                    await self._invoke(callback, *args)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    self._report_callback_error(callback, exc)
-                finally:
-                    if delivery_token is not None:
-                        self._release_delivery_reference_nowait(delivery_token)
-                    self._callback_queue.task_done()
-        except asyncio.CancelledError:
-            raise
-
-    def _report_callback_error(
-        self,
-        callback: Callable[..., Any] | None,
-        exc: BaseException,
-    ) -> None:
-        asyncio.get_running_loop().call_exception_handler(
-            {
-                "message": "mqttium user callback failed",
-                "exception": exc,
-                "callback": callback,
-            }
-        )
-
-    async def _shutdown_callback_worker(self, *, drain: bool) -> None:
-        task = self._callback_worker_task
-        if task is None:
-            return
-        if drain and not task.done():
-            try:
-                await asyncio.wait_for(
-                    self._callback_queue.join(),
-                    timeout=self._callback_shutdown_timeout,
-                )
-            except TimeoutError:
-                pass
-        if not task.done():
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-        self._callback_worker_task = None
-        while True:
-            try:
-                _callback, _args, delivery_token = self._callback_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            else:
-                if delivery_token is not None:
-                    self._release_delivery_reference_nowait(delivery_token)
-                self._callback_queue.task_done()
+        await self._delivery.reset_stream()
 
     async def _invalidate_connection_epoch(self) -> None:
         self._connection_epoch += 1
@@ -2099,14 +1756,6 @@ class AsyncClient:
         except Exception:
             pass
 
-    async def _invoke(self, callback: Callable[..., Any] | None, *args: Any) -> Any:
-        if callback is None:
-            return None
-        result = callback(*args)
-        if isinstance(result, Awaitable):
-            return await result
-        return result
-
     async def _force_close(self, *, preserve_reconnect: bool = False) -> None:
         await self._invalidate_connection_epoch()
         current = asyncio.current_task()
@@ -2149,5 +1798,4 @@ class AsyncClient:
             self._transport = None
         if not preserve_reconnect:
             await self._shutdown_callback_worker(drain=True)
-        self._closed.set()
-        self._message_ready.set()
+        self._delivery.close()

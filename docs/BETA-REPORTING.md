@@ -1,6 +1,6 @@
-# Beta issue reporting and triage
+# Pre-release issue reporting and triage
 
-MQTTium beta reports should make it possible to reproduce, classify and test a
+MQTTium pre-release reports should make it possible to reproduce, classify and test a
 fix without first reconstructing the reporter's environment. Use the structured
 GitHub bug form for incorrect behaviour. Security vulnerabilities must use the
 private process in [`SECURITY.md`](../SECURITY.md), not a public issue.
@@ -20,7 +20,7 @@ print("loaded from:", mqttium.__file__)
 PY
 ```
 
-Try the latest published beta in a clean virtual environment. A report from an
+Try the latest published pre-release in a clean virtual environment. A report from an
 editable checkout is still useful when it concerns unreleased development, but
 state that explicitly and include the commit SHA.
 
@@ -97,7 +97,7 @@ application data.
 
 ## Maintainer triage
 
-A beta issue is ready for implementation when it has:
+A pre-release issue is ready for implementation when it has:
 
 1. a published version or exact commit;
 2. a minimal reproducer or a retained failing test artifact;

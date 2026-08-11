@@ -11,12 +11,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import os
 import statistics
 import subprocess
 import sys
-import threading
 import time
+from collections import deque
 from dataclasses import asdict, dataclass
 from itertools import product
 from pathlib import Path
@@ -32,6 +33,9 @@ class WorkerResult:
     payload_bytes: int
     count: int
     window: int
+    observer_qos: int
+    publisher_ack_seconds: float
+    delivery_seconds: float
     publisher_ack_msg_s: float
     delivered_msg_s: float
     latency_p50_ms: float
@@ -46,6 +50,10 @@ class WorkerResult:
     effect_suspensions: int
 
 
+class InvalidMeasurement(RuntimeError):
+    """A worker could not produce a trustworthy sample."""
+
+
 def percentile(values: list[float], fraction: float) -> float:
     ordered = sorted(values)
     index = min(len(ordered) - 1, round((len(ordered) - 1) * fraction))
@@ -57,7 +65,65 @@ def make_payload(sequence: int, size: int) -> bytes:
     return header + b"x" * max(0, size - len(header))
 
 
-def start_subscriber(host: str, port: int, topic: str, count: int):
+@dataclass
+class SubscriberProbe:
+    client: subprocess.Popen[bytes]
+    observer: subprocess.Popen[bytes]
+
+    def abort(self) -> None:
+        for process in (self.observer, self.client):
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+
+    def finish(self, timeout: float) -> tuple[list[float], list[int]]:
+        try:
+            output, observer_error = self.observer.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            self.observer.kill()
+            self.client.kill()
+            self.observer.wait()
+            self.client.wait()
+            raise TimeoutError("subscriber observer timed out") from exc
+        try:
+            self.client.wait(timeout=2.0)
+        except subprocess.TimeoutExpired as exc:
+            self.client.kill()
+            self.client.wait()
+            raise TimeoutError("mosquitto_sub did not stop after observation") from exc
+        client_error = b""
+        if self.client.stderr is not None:
+            client_error = self.client.stderr.read()
+        if self.client.returncode or self.observer.returncode:
+            diagnostic = (observer_error or client_error or b"no diagnostic").decode(
+                errors="replace"
+            )
+            raise RuntimeError(f"subscriber probe failed: {diagnostic.strip()}")
+        try:
+            raw = json.loads(output)
+            latencies = [float(value) for value in raw["latencies_ms"]]
+            sequences = [int(value) for value in raw["sequences"]]
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError("subscriber observer returned malformed output") from exc
+        return latencies, sequences
+
+
+def observe_subscriber() -> None:
+    """Timestamp subscriber output outside the measured publisher process."""
+    latencies: list[float] = []
+    sequences: list[int] = []
+    for line in sys.stdin.buffer:
+        arrived_ns = time.monotonic_ns()
+        try:
+            sequences.append(int(line[:16], 16))
+            sent_ns = int(line[16:HEADER_HEX_BYTES], 16)
+        except ValueError as exc:
+            raise RuntimeError("subscriber emitted a malformed payload header") from exc
+        latencies.append((arrived_ns - sent_ns) / 1_000_000)
+    print(json.dumps({"latencies_ms": latencies, "sequences": sequences}))
+
+
+def start_subscriber(host: str, port: int, topic: str, count: int) -> SubscriberProbe:
     command = [
         "mosquitto_sub",
         "-h",
@@ -67,31 +133,30 @@ def start_subscriber(host: str, port: int, topic: str, count: int):
         "-t",
         topic,
         "-q",
-        "1",
+        # The observer verifies delivery; it must not add a second PUBACK path
+        # to the publisher-throughput measurement.
+        "0",
         "-C",
         str(count),
         "-F",
         "%p",
     ]
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    latencies: list[float] = []
-    sequences: list[int] = []
-
-    def read() -> None:
-        assert process.stdout is not None
-        for line in process.stdout:
-            arrived_ns = time.monotonic_ns()
-            sequences.append(int(line[:16], 16))
-            sent_ns = int(line[16:HEADER_HEX_BYTES], 16)
-            latencies.append((arrived_ns - sent_ns) / 1_000_000)
-
-    thread = threading.Thread(target=read, daemon=True)
-    thread.start()
+    assert process.stdout is not None
+    observer = subprocess.Popen(
+        [sys.executable, str(Path(__file__).resolve()), "--observer-worker"],
+        stdin=process.stdout,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    process.stdout.close()
     time.sleep(0.2)
     if process.poll() is not None:
+        observer.kill()
+        observer.wait()
         assert process.stderr is not None
         raise RuntimeError(process.stderr.read().decode(errors="replace"))
-    return process, latencies, sequences, thread
+    return SubscriberProbe(process, observer)
 
 
 async def publish(
@@ -104,7 +169,7 @@ async def publish(
     protocol: str,
     completion: str,
 ) -> tuple[float, dict[str, int], list[float]]:
-    from mqttium.api import AsyncClient
+    from mqttium.api import AsyncClient, PublishReceipt
     from mqttium.enums import MQTTProtocolVersion
     from mqttium.protocol.reconnect import ReconnectPolicy
 
@@ -115,7 +180,7 @@ async def publish(
         reconnect=ReconnectPolicy(enabled=False),
     )
     await client.connect(host, port, timeout=10.0)
-    pending = []
+    pending: deque[tuple[PublishReceipt, int]] = deque()
     completed: asyncio.Queue[tuple[int, int]] = asyncio.Queue()
     publish_started: dict[int, int] = {}
     early_completion: dict[int, int] = {}
@@ -139,7 +204,7 @@ async def publish(
         if completion == "receipt":
             pending.append((receipt, published_ns))
             if len(pending) >= window:
-                oldest, sent_ns = pending.pop(0)
+                oldest, sent_ns = pending.popleft()
                 await oldest.wait()
                 ack_latencies.append((time.monotonic_ns() - sent_ns) / 1_000_000)
         else:
@@ -176,33 +241,34 @@ async def publish(
 
 def worker(args: argparse.Namespace) -> None:
     topic = f"bench/paired/{os.getpid()}/{time.time_ns()}"
-    process, latencies, sequences, thread = start_subscriber(
-        args.host, args.port, topic, args.count
-    )
+    subscriber = start_subscriber(args.host, args.port, topic, args.count)
+    if args.cpu is not None:
+        try:
+            os.sched_setaffinity(0, {args.cpu})
+        except (AttributeError, OSError) as exc:
+            subscriber.abort()
+            raise RuntimeError(f"cannot pin publisher worker to CPU {args.cpu}") from exc
     delivery_started = time.perf_counter()
     cpu_started = time.process_time()
-    ack_seconds, effects, ack_latencies = asyncio.run(
-        publish(
-            args.host,
-            args.port,
-            topic,
-            args.count,
-            args.payload_bytes,
-            args.window,
-            args.protocol,
-            args.completion,
-        )
-    )
     try:
-        process.wait(timeout=args.timeout)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait()
-    thread.join(timeout=2.0)
+        ack_seconds, effects, ack_latencies = asyncio.run(
+            publish(
+                args.host,
+                args.port,
+                topic,
+                args.count,
+                args.payload_bytes,
+                args.window,
+                args.protocol,
+                args.completion,
+            )
+        )
+    except BaseException:
+        subscriber.abort()
+        raise
+    latencies, sequences = subscriber.finish(args.timeout)
     if len(latencies) != args.count:
-        assert process.stderr is not None
-        detail = process.stderr.read().decode(errors="replace")
-        raise TimeoutError(f"subscriber incomplete {len(latencies)}/{args.count}: {detail}")
+        raise TimeoutError(f"subscriber incomplete {len(latencies)}/{args.count}")
 
     if sorted(sequences) != list(range(args.count)):
         raise RuntimeError("subscriber payload sequence mismatch")
@@ -214,6 +280,9 @@ def worker(args: argparse.Namespace) -> None:
         payload_bytes=args.payload_bytes,
         count=args.count,
         window=args.window,
+        observer_qos=0,
+        publisher_ack_seconds=ack_seconds,
+        delivery_seconds=delivery_seconds,
         publisher_ack_msg_s=args.count / ack_seconds,
         delivered_msg_s=args.count / delivery_seconds,
         latency_p50_ms=statistics.median(latencies),
@@ -264,16 +333,32 @@ def run_worker(
         "--timeout",
         str(args.timeout),
     ]
-    completed = subprocess.run(
-        command,
-        check=True,
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=args.timeout + 30,
-    )
+    cpu = getattr(args, "cpu", None)
+    if cpu is not None:
+        command.extend(("--cpu", str(cpu)))
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=args.timeout + 30,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise InvalidMeasurement(
+            f"worker timed out after {args.timeout + 30:.1f}s: {' '.join(command)}"
+        ) from exc
+    if completed.returncode:
+        diagnostic = (completed.stderr or completed.stdout or "no worker output").strip()
+        raise InvalidMeasurement(f"worker exited {completed.returncode}: {diagnostic[-2000:]}")
     lines = [line for line in completed.stdout.splitlines() if line.strip()]
-    return WorkerResult(**json.loads(lines[-1]))
+    try:
+        return WorkerResult(**json.loads(lines[-1]))
+    except (IndexError, TypeError, json.JSONDecodeError) as exc:
+        raise InvalidMeasurement(
+            f"worker returned malformed output: {completed.stdout[-2000:]!r}"
+        ) from exc
 
 
 def median(values: list[float]) -> float:
@@ -285,7 +370,98 @@ def coefficient_of_variation(values: list[float]) -> float:
     return statistics.stdev(values) / mean if len(values) > 1 and mean else 0.0
 
 
-def parent(args: argparse.Namespace) -> None:
+def calibrated_sample_count(
+    requested: int, rates: list[float], minimum_seconds: float, maximum: int
+) -> int:
+    """Choose one bounded count that gives both variants a meaningful sample."""
+    return min(maximum, max(requested, math.ceil(max(rates) * minimum_seconds)))
+
+
+def _eligibility(path: Path | None) -> dict[str, object]:
+    if path is None:
+        return {
+            "checked": False,
+            "eligible": None,
+            "failures": ["runner preflight was not provided"],
+        }
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {
+            "checked": True,
+            "eligible": False,
+            "failures": [f"cannot read runner preflight: {exc}"],
+        }
+    eligible = report.get("eligible") is True
+    raw_failures = report.get("failures", [])
+    failures = (
+        [str(failure) for failure in raw_failures]
+        if isinstance(raw_failures, list)
+        else ["runner preflight has an invalid failures field"]
+    )
+    return {
+        "checked": True,
+        "eligible": eligible,
+        "failures": failures,
+        "report": report,
+    }
+
+
+def _evaluation(
+    *,
+    policy: str,
+    eligibility: dict[str, object],
+    failures: list[str],
+    invalid: bool = False,
+) -> tuple[str, int]:
+    if eligibility["eligible"] is not True or invalid:
+        return "invalid", 2 if policy == "strict" else 0
+    if failures:
+        return "failed", 1 if policy == "strict" else 0
+    return "passed", 0
+
+
+def _markdown_summary(payload: dict[str, object]) -> str:
+    status = str(payload["status"])
+    eligibility = payload["eligibility"]
+    assert isinstance(eligibility, dict)
+    failures = payload["failures"]
+    assert isinstance(failures, list)
+    lines = [
+        "# Paired network evaluation",
+        "",
+        f"- Policy: `{payload['policy']}`",
+        f"- Status: **{status}**",
+        f"- Runner eligible: `{eligibility.get('eligible')}`",
+        f"- Scenarios: `{len(payload['scenarios'])}`",  # type: ignore[arg-type]
+        "",
+    ]
+    if failures:
+        lines.extend(("## Failures", ""))
+        lines.extend(f"- {failure}" for failure in failures)
+        lines.append("")
+    else:
+        lines.extend(("No threshold failure was detected.", ""))
+    if status in ("failed", "invalid") and payload["policy"] == "advisory":
+        lines.extend(
+            (
+                "> [!WARNING]",
+                f"> The advisory measurement is {status}; it is not release evidence.",
+                "",
+            )
+        )
+    return "\n".join(lines)
+
+
+def _write_evaluation(args: argparse.Namespace, payload: dict[str, object]) -> None:
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    summary_output = args.summary_output or args.output.with_suffix(".md")
+    summary_output.parent.mkdir(parents=True, exist_ok=True)
+    summary_output.write_text(_markdown_summary(payload), encoding="utf-8")
+
+
+def parent(args: argparse.Namespace) -> int:
     script = Path(__file__).resolve()
     base = args.base_root.resolve()
     candidate = args.candidate_root.resolve()
@@ -301,13 +477,73 @@ def parent(args: argparse.Namespace) -> None:
         "payloads": payloads,
         "protocols": protocols,
         "completions": completions,
+        "policy": args.policy,
+        "thresholds": {
+            "max_baseline_cv": args.max_baseline_cv,
+            "min_ack_ratio": args.min_ack_ratio,
+        },
+        "harness": {
+            "subscriber_reader": "separate_process",
+            "observer_qos": 0,
+            "target_sample_seconds": args.target_sample_seconds,
+            "maximum_count": args.max_count,
+            "publisher_cpu": args.cpu,
+        },
+        "eligibility": _eligibility(args.preflight_report),
+        "status": "running",
+        "failures": [],
+        "invalidations": [],
+        "regressions": [],
         "scenarios": [],
     }
 
+    eligibility = payload["eligibility"]
+    assert isinstance(eligibility, dict)
+    if args.policy == "strict" and eligibility["eligible"] is not True:
+        payload["status"] = "invalid"
+        eligibility_failures = list(eligibility["failures"])  # type: ignore[arg-type]
+        payload["failures"] = eligibility_failures
+        payload["invalidations"] = eligibility_failures
+        _write_evaluation(args, payload)
+        return 2
+
     failures: list[str] = []
+    invalidations: list[str] = []
+    regressions: list[str] = []
     for protocol, payload_bytes, completion in product(protocols, payloads, completions):
-        count = args.count_small if payload_bytes <= 256 else args.count_large
+        requested_count = args.count_small if payload_bytes <= 256 else args.count_large
         for window in windows:
+            calibration: dict[str, WorkerResult] = {}
+            for variant, root in (("base", base), ("candidate", candidate)):
+                try:
+                    calibration[variant] = run_worker(
+                        script,
+                        root,
+                        args,
+                        payload_bytes=payload_bytes,
+                        count=requested_count,
+                        window=window,
+                        protocol=protocol,
+                        completion=completion,
+                    )
+                except InvalidMeasurement as exc:
+                    label = (
+                        f"protocol={protocol} completion={completion} "
+                        f"payload={payload_bytes} window={window} calibration={variant}"
+                    )
+                    failures.append(f"{label}: {exc}")
+                    payload["status"] = "invalid"
+                    payload["failures"] = failures
+                    payload["invalidations"] = failures
+                    _write_evaluation(args, payload)
+                    print(f"paired network measurement invalid: {failures[-1]}", file=sys.stderr)
+                    return 2 if args.policy == "strict" else 0
+            count = calibrated_sample_count(
+                requested_count,
+                [result.publisher_ack_msg_s for result in calibration.values()],
+                args.target_sample_seconds,
+                args.max_count,
+            )
             pairs: list[dict[str, object]] = []
             ack_ratios: list[float] = []
             base_ack_rates: list[float] = []
@@ -323,16 +559,32 @@ def parent(args: argparse.Namespace) -> None:
                 measured: dict[str, WorkerResult] = {}
                 for variant in order:
                     root = base if variant == "base" else candidate
-                    measured[variant] = run_worker(
-                        script,
-                        root,
-                        args,
-                        payload_bytes=payload_bytes,
-                        count=count,
-                        window=window,
-                        protocol=protocol,
-                        completion=completion,
-                    )
+                    try:
+                        measured[variant] = run_worker(
+                            script,
+                            root,
+                            args,
+                            payload_bytes=payload_bytes,
+                            count=count,
+                            window=window,
+                            protocol=protocol,
+                            completion=completion,
+                        )
+                    except InvalidMeasurement as exc:
+                        label = (
+                            f"protocol={protocol} completion={completion} "
+                            f"payload={payload_bytes} window={window} pair={index + 1} "
+                            f"variant={variant}"
+                        )
+                        failures.append(f"{label}: {exc}")
+                        payload["status"] = "invalid"
+                        payload["failures"] = failures
+                        payload["invalidations"] = failures
+                        _write_evaluation(args, payload)
+                        print(
+                            f"paired network measurement invalid: {failures[-1]}", file=sys.stderr
+                        )
+                        return 2 if args.policy == "strict" else 0
                 base_result = measured["base"]
                 candidate_result = measured["candidate"]
                 ack_ratio = candidate_result.publisher_ack_msg_s / base_result.publisher_ack_msg_s
@@ -364,8 +616,11 @@ def parent(args: argparse.Namespace) -> None:
                 "protocol": protocol,
                 "completion": completion,
                 "payload_bytes": payload_bytes,
+                "requested_count": requested_count,
                 "count": count,
                 "window": window,
+                "target_sample_seconds": args.target_sample_seconds,
+                "calibration": {variant: asdict(result) for variant, result in calibration.items()},
                 "median_candidate_over_base_ack": ratio,
                 "base_ack_cv": baseline_cv,
                 "candidate_ack_cv": coefficient_of_variation(candidate_ack_rates),
@@ -385,9 +640,9 @@ def parent(args: argparse.Namespace) -> None:
                 f"payload={payload_bytes} window={window}"
             )
             if baseline_cv > args.max_baseline_cv:
-                failures.append(f"{label}: baseline CV {baseline_cv:.2%}")
+                invalidations.append(f"{label}: baseline CV {baseline_cv:.2%}")
             if ratio < args.min_ack_ratio:
-                failures.append(f"{label}: candidate/base {ratio:.4f}")
+                regressions.append(f"{label}: candidate/base {ratio:.4f}")
             print(
                 f"protocol={protocol:3s} completion={completion:8s} "
                 f"payload={payload_bytes:4d} window={window:3d} "
@@ -397,15 +652,29 @@ def parent(args: argparse.Namespace) -> None:
                 f"delta={median(p50_deltas):+7.2f}ms"
             )
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(payload, indent=2) + "\n")
+    failures = invalidations + regressions
+    status, exit_code = _evaluation(
+        policy=args.policy,
+        eligibility=eligibility,
+        failures=failures,
+        invalid=bool(invalidations),
+    )
+    payload["status"] = status
+    payload["failures"] = failures
+    payload["invalidations"] = invalidations
+    payload["regressions"] = regressions
+    _write_evaluation(args, payload)
     if failures:
-        raise SystemExit("paired network gate failed:\n" + "\n".join(failures))
+        message = "paired network thresholds failed:\n" + "\n".join(failures)
+        stream = sys.stderr if args.policy == "strict" else sys.stdout
+        print(message, file=stream)
+    return exit_code
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--worker", action="store_true")
+    parser.add_argument("--observer-worker", action="store_true")
     parser.add_argument("--base-root", type=Path)
     parser.add_argument("--candidate-root", type=Path)
     parser.add_argument("--host", default="127.0.0.1")
@@ -416,6 +685,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--protocol", choices=("311", "5"), default="311")
     parser.add_argument("--completion", choices=("receipt", "callback"), default="receipt")
     parser.add_argument("--timeout", type=float, default=120.0)
+    parser.add_argument("--cpu", type=int)
     parser.add_argument("--repeat", type=int, default=8, help="even count forming ABBA cycles")
     parser.add_argument("--windows", default="1,8,32,64,128")
     parser.add_argument("--protocols", default="311,5")
@@ -423,22 +693,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--payloads", default="64,4096")
     parser.add_argument("--count-small", type=int, default=1_500)
     parser.add_argument("--count-large", type=int, default=750)
+    parser.add_argument("--target-sample-seconds", type=float, default=1.5)
+    parser.add_argument("--max-count", type=int, default=50_000)
     parser.add_argument("--max-baseline-cv", type=float, default=0.05)
     parser.add_argument("--min-ack-ratio", type=float, default=0.95)
+    parser.add_argument("--policy", choices=("advisory", "strict"), default="advisory")
+    parser.add_argument("--preflight-report", type=Path)
     parser.add_argument("--output", type=Path, default=Path("/tmp/paired-network.json"))
+    parser.add_argument("--summary-output", type=Path)
     args = parser.parse_args()
-    if not args.worker and (args.base_root is None or args.candidate_root is None):
+    if not (args.worker or args.observer_worker) and (
+        args.base_root is None or args.candidate_root is None
+    ):
         parser.error("--base-root and --candidate-root are required")
-    if not args.worker and (args.repeat <= 0 or args.repeat % 2):
+    if not (args.worker or args.observer_worker) and (args.repeat <= 0 or args.repeat % 2):
         parser.error("--repeat must be a positive even count (complete ABBA cycles)")
     if any(value not in ("receipt", "callback") for value in args.completions.split(",")):
         parser.error("--completions accepts receipt,callback")
+    if args.target_sample_seconds <= 0:
+        parser.error("--target-sample-seconds must be positive")
+    if args.max_count <= 0:
+        parser.error("--max-count must be positive")
     return args
 
 
 if __name__ == "__main__":
     arguments = parse_args()
-    if arguments.worker:
+    if arguments.observer_worker:
+        observe_subscriber()
+    elif arguments.worker:
         worker(arguments)
     else:
-        parent(arguments)
+        raise SystemExit(parent(arguments))

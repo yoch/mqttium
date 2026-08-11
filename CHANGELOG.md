@@ -6,6 +6,46 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [1.0.0rc1] - 2026-08-11
+
+### Added
+
+- A single local release runner with `quick`, `performance`, and `rc` profiles,
+  durable manifests under `/tmp`, mandatory broker integration, local quality,
+  performance and resource gates, short reconnect soaks, and isolated-artifact
+  transport smokes. Cross-version and independent-broker validation remains a
+  final GitHub matrix; multi-hour campaigns are available separately after the
+  first RC.
+- An open-loop A/B harness covering calibrated 50/75/90/100% load, MQTT 3.1.1
+  and 5, 64-byte and 4 KiB payloads, receipt and callback completion, ABBA
+  ordering, latency, CPU, loop-lag, completeness, and EffectPump counters.
+- Exact call-count/allocation profiling for the retained micro-scenario
+  registry and resource-aware soak snapshots.
+
+### Changed
+
+- Application delivery is owned by the internal `ApplicationDelivery`
+  controller. `AsyncClient` delegates iterator/callback queues, byte
+  reservations, callback workers, reset/shutdown, and delivery statistics while
+  preserving public signatures, defaults, ordering, backpressure, and callback
+  exception isolation. Mode-specialised admission removes repeated hot-path
+  branches.
+- Paired network evaluation now always persists eligibility, policy, thresholds,
+  status, failures, and Markdown before exiting. Advisory runs remain visible
+  and non-blocking; strict runs return 1 for a measured regression and 2 for an
+  invalid runner or worker sample. Subscriber timestamps are collected in a
+  separate process, the observer no longer adds a second PUBACK stream, and
+  every cell records calibrated and actual sample duration. A final A/A control
+  exceeded the noise budget, so closed-loop network results are advisory rather
+  than release gates.
+- Paired micro workers use a scenario registry instead of one complex dispatch
+  function. Benchmark-only dependencies are available through the `benchmark`
+  extra, and accidental tracked `.patch`/`.diff` files are rejected.
+
+### Removed
+
+- The obsolete tracked `network-hotpaths-remaining.patch` review artefact.
+
 ## [0.2.0b4] - 2026-08-11
 
 ### Changed
@@ -342,7 +382,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - Pre-spin-out comparative analysis and generated coverage data from the
   published source tree.
 
-[Unreleased]: https://github.com/yoch/mqttium/compare/v0.2.0b4...HEAD
+[Unreleased]: https://github.com/yoch/mqttium/compare/v1.0.0rc1...HEAD
+[1.0.0rc1]: https://github.com/yoch/mqttium/compare/v0.2.0b4...v1.0.0rc1
 [0.2.0b4]: https://github.com/yoch/mqttium/compare/v0.2.0b3...v0.2.0b4
 [0.2.0b3]: https://github.com/yoch/mqttium/compare/v0.2.0b2...v0.2.0b3
 [0.2.0b2]: https://github.com/yoch/mqttium/compare/v0.2.0b1...v0.2.0b2

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import socket
 
 import pytest
@@ -19,7 +20,11 @@ def _broker_up() -> bool:
         return False
 
 
-pytestmark = pytest.mark.skipif(not _broker_up(), reason="Mosquitto not on :11883")
+_BROKER_AVAILABLE = _broker_up()
+if os.environ.get("MQTTIUM_REQUIRE_BROKER") == "1" and not _BROKER_AVAILABLE:
+    raise RuntimeError("MQTTIUM_REQUIRE_BROKER=1 but Mosquitto is not listening on :11883")
+
+pytestmark = pytest.mark.skipif(not _BROKER_AVAILABLE, reason="Mosquitto not on :11883")
 
 
 @pytest.mark.parametrize("protocol", [MQTTProtocolVersion.MQTTv311, MQTTProtocolVersion.MQTTv5])

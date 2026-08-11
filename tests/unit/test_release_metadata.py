@@ -29,7 +29,7 @@ def test_release_version_matches_readme_and_changelog() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
 
-    assert f"> **Status:** beta (`{version}`)." in readme
+    assert f"> **Status:** release candidate (`{version}`)." in readme
     assert re.search(
         rf"^## \[{re.escape(version)}\] - \d{{4}}-\d{{2}}-\d{{2}}$",
         changelog,
@@ -43,3 +43,10 @@ def test_unreleased_link_starts_at_current_version() -> None:
     version = _package_version()
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
     assert f"[Unreleased]: https://github.com/yoch/mqttium/compare/v{version}...HEAD" in changelog
+
+
+def test_finalization_soaks_install_resource_sampling_dependencies() -> None:
+    workflow = (ROOT / ".github/workflows/finalization.yml").read_text(encoding="utf-8")
+
+    assert workflow.count('python -m pip install -e ".[benchmark]"') == 3
+    assert 'python -m pip install -e "."' not in workflow

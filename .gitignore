@@ -20,3 +20,7 @@ coverage.xml
 htmlcov/
 tests/fuzz/artifacts/
 benchmarks/results/
+
+# Review patches are transient artefacts, never release sources
+*.patch
+*.diff

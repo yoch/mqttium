@@ -1,8 +1,8 @@
 # Public API stability policy
 
-MQTTium is currently a beta release. This document defines the supported beta
-API contract and separates that contract from implementation objects that remain
-importable in Python.
+MQTTium is at `1.0.0rc1`. This document defines the frozen Stable API candidate
+and separates that contract from implementation objects that remain importable
+in Python.
 
 ## Support tiers
 
@@ -81,8 +81,14 @@ The stable `AsyncClient` surface is:
 cross-thread APIs. Threaded migration code should use `mqttium.compat.Client`.
 
 Constructor keyword arguments are part of the native contract. New optional
-keywords may be added compatibly. Existing stable defaults will not change after
-the first stable release without a documented migration path.
+keywords may be added compatibly. Existing Stable defaults are frozen for 1.0
+and will not change without the SemVer and deprecation process below.
+
+`EngineConfig.local_receive_maximum` intentionally defaults to `65535`, while
+`AsyncClient.local_receive_maximum` defaults to `100`. The engine default is the
+protocol maximum for advanced direct-engine consumers; the client default is a
+bounded application-facing inbound concurrency window. Aligning them would
+silently change memory and backpressure behaviour, so the RC preserves both.
 
 `tests/unit/test_public_api_surface.py` is the executable contract for the
 canonical Stable exports, the retained alpha `PacketType` root import, all
@@ -148,7 +154,7 @@ Internal names have no deprecation guarantee.
 
 ## Release gate
 
-This classification is the beta contract starting with `0.2.0b1`. A stable
-`1.0` additionally requires retained reconnect, backpressure and
-broker-interoperability evidence as described in [`STABILITY.md`](STABILITY.md),
+This classification is the frozen `1.0.0rc1` contract. Promotion to `1.0.0`
+requires the complete local reconnect, backpressure, memory and
+broker-interoperability evidence described in [`STABILITY.md`](STABILITY.md),
 plus evidence that no major public redesign is expected.

@@ -18,8 +18,12 @@ cycle:
    the next cycle.
 
 The harness writes a JSON result containing workload totals, elapsed time,
-forced reconnect count and high-water statistics. A single command can be used
-against any externally managed broker:
+forced reconnect count, RSS/USS/PSS and tracemalloc samples, tasks, threads,
+descriptors, delivery queues, high-water statistics and the final drained
+state. Discrete resource growth, loss/duplication, missed reconnect or a
+non-drained counter fails the run; RSS trends remain diagnostic while the
+versioned tracemalloc thresholds are the memory gate. A single command can be
+used against any externally managed broker:
 
 ```bash
 PYTHONPATH=src python benchmarks/soak.py \
@@ -31,25 +35,33 @@ PYTHONPATH=src python benchmarks/soak.py \
   --output /tmp/mqttium-soak.json
 ```
 
-## Workflow coverage
+## First-RC coverage
 
-`.github/workflows/finalization.yml` provides:
+`python benchmarks/local_release.py rc --base-ref fbf1887` provides:
 
-- a short Mosquitto run on pull requests for MQTT 3.1.1 and MQTT 5;
-- manually configurable Mosquitto runs on Ubuntu and macOS;
-- manually triggered interoperability runs against pinned EMQX and HiveMQ
-  Community Edition images;
-- retained JSON artefacts and broker logs.
+- memory, application stress and exact hot-path call/allocation profiles;
+- local unit, type, lint, security and mandatory broker integration gates;
+- short resource-aware reconnect soaks for MQTT 3.1.1 and MQTT 5;
+- strict local micro/open-loop performance gates on an eligible machine, plus
+  an advisory closed-loop network diagnostic;
+- isolated wheel TCP, TLS, WebSocket, Unix, SQLite, Paho VERSION2 and shutdown
+  smokes;
+- manifests, JSON artefacts and broker logs retained outside the repository.
 
-The workflow is intentionally separate from normal CI so the permanent unit,
-integration, packaging and fuzzing gates remain fast. Extended macOS and
-multi-broker campaigns run only through `workflow_dispatch`.
+After the source tree and local manifest are final, one GitHub matrix validates
+Python 3.11–3.14 and interoperability with EMQX and HiveMQ. Those environment-
+specific checks are release evidence for portability, but GitHub performance
+numbers remain advisory.
 
-The published-beta workflows separately install the exact PyPI artifact rather
+The published-RC workflows separately install the exact PyPI artifact rather
 than the checkout. Their retained matrix covers wheel/sdist metadata and Stable
 imports on Python 3.11–3.14, TCP and TLS broker round trips, SQLite restart,
 WebSocket and Unix transports, the Paho VERSION2 migration subset, cancellation
-and clean shutdown. They are manually dispatchable for every beta candidate.
+and clean shutdown. They are manually dispatchable for every candidate.
+
+Multi-hour deterministic fuzz and soak campaigns are intentionally deferred
+until after the first RC. They are required before promotion to later release
+candidates or `1.0.0`, not before publishing `1.0.0rc1`.
 
 ## Retained evidence
 
@@ -62,20 +74,19 @@ benchmark and paired-regression runs for the same final source tree.
 
 ## Acceptance criteria
 
-A stable-release candidate requires retained successful runs showing:
+The first RC requires retained successful runs showing:
 
 - no lost subscriber-confirmed message in the configured workload;
 - automatic reconnect after every forced transport closure;
 - zero pending protocol messages/bytes, flow slots, writer entries, effects and
   receipts after each cycle drains;
 - no task, descriptor or queue growth across cycles;
-- success for MQTT 3.1.1 and MQTT 5 on Linux and macOS;
-- success against Mosquitto and at least two independent broker
-  implementations;
+- success for MQTT 3.1.1 and MQTT 5 locally, followed by the GitHub version and
+  broker interoperability matrix;
 - no material regression in the paired micro and network benchmarks.
 
-A workflow definition is not itself evidence. The successful run URLs and
-artefact digests should be recorded in the release issue or release notes.
+A runner definition is not itself evidence. The successful local manifest and
+artefact digests must be recorded in the RC report.
 
 ## Failure triage
 

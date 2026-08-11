@@ -1,168 +1,141 @@
-# Migration Paho / gmqtt → mqttium
+# Migrating to MQTTium
 
-Ce document décrit comment migrer vers l’API native async et, le cas échéant,
-vers la façade de compatibilité Paho.
+New async code should use `mqttium.api.AsyncClient`. Existing Paho VERSION2
+applications can start with `mqttium.compat.paho.Client` and move to the native
+API later. One-shot scripts can use `mqttium.helpers.publish` and
+`mqttium.helpers.subscribe`.
 
-## Choix d’API
+## From Paho
 
-| Besoin | API |
-| --- | --- |
-| Nouveau code / asyncio | `mqttium.api.AsyncClient` (recommandé) |
-| Legacy sync style Paho VERSION2 | `mqttium.compat.paho.Client` |
-| One-shot pub/sub | `mqttium.helpers.publish` / `mqttium.helpers.subscribe` |
-
-## Depuis Paho
+The compatibility layer keeps the familiar loop and callback shape:
 
 ```python
-# Avant (Paho)
-from paho.mqtt.client import Client, CallbackAPIVersion
-c = Client(CallbackAPIVersion.VERSION2, "id")
-c.connect("localhost")
-c.loop_start()
-c.publish("t", b"x", qos=1)
+from mqttium.compat.paho import CallbackAPIVersion, Client
 
-# Après — façade compat (changements minimaux)
-from mqttium.compat.paho import Client, CallbackAPIVersion
-c = Client(CallbackAPIVersion.VERSION2, "id")
-c.connect("localhost")
-c.loop_start()
-c.publish("t", b"x", qos=1)
 
-# Après — natif async (recommandé)
+client = Client(CallbackAPIVersion.VERSION2, "client-id")
+client.connect("localhost")
+client.loop_start()
+info = client.publish("events", b"ready", qos=1)
+info.wait_for_publish()
+```
+
+The native API removes the background thread and makes completion explicit:
+
+```python
 from mqttium.api import AsyncClient
-client = AsyncClient("id")
+
+
+client = AsyncClient("client-id")
 await client.connect("localhost")
-receipt = await client.publish("t", b"x", qos=1)
+receipt = await client.publish("events", b"ready", qos=1)
 await receipt.wait()
+await client.disconnect()
 ```
 
-### Écarts volontaires
+Important compatibility differences:
 
-- Seul `CallbackAPIVersion.VERSION2` est supporté.
-- Pas de republication QoS>0 non conforme sur session clean.
-- `connect_async` historique n’existe pas ; utiliser `await connect()` ou la
-  façade sync.
-- Persistence : passer `store=SqliteInflightStore(path)` à `AsyncClient`.
-- WebSocket : `await client.connect_ws("ws://host:9001/mqtt")` (pas via la façade sync).
-- AUTH MQTT 5 : `AsyncClient(..., auth_handler=...)` ou `await client.auth(...)`.
+- only `CallbackAPIVersion.VERSION2` is supported;
+- MQTTium does not reproduce non-compliant QoS republishing after a clean
+  session;
+- use native `await client.connect()` instead of Paho's historical
+  `connect_async` behaviour;
+- WebSocket connections are native: `await client.connect_ws(url)`;
+- MQTT 5 enhanced authentication uses `auth_handler` or `await client.auth()`;
+- durable inflight state is configured with `SqliteInflightStore`.
 
-## Depuis gmqtt
+See [`COMPAT.md`](COMPAT.md) for the complete supported surface.
+
+## From gmqtt
 
 ```python
-# gmqtt
-client = gmqtt.Client("id")
-client.set_auth_credentials(user, password)
-await client.connect("localhost")
-client.publish("t", b"x", qos=1)
-await client.disconnect()
+from mqttium.api import AsyncClient
 
-# mqttium
-client = AsyncClient("id", username=user, password=password)
+
+client = AsyncClient("client-id", username=user, password=password)
 await client.connect("localhost")
-receipt = await client.publish("t", b"x", qos=1)
+receipt = await client.publish("events", b"ready", qos=1)
 await receipt.wait()
 await client.disconnect()
 ```
 
-Points protocolaires corrigés vs gmqtt :
+MQTTium deliberately keeps a packet identifier until PUBCOMP for QoS 2,
+separates Receive Maximum from the packet-identifier space, and uses a bounded
+incremental decoder.
 
-- MID conservé jusqu’au PUBCOMP (QoS 2)
-- `Receive Maximum` ≠ espace de packet identifiers
-- Parser incrémental non allocateur par octet
+## Bounded queues are the default
 
-## Limites d’admission bornées par défaut
-
-Depuis la série non publiée, toutes les files qui croissent avec la charge
-applicative sont bornées par défaut. Auparavant un producteur QoS 1/2 pouvait
-empiler jusqu’à épuisement de l’espace des 65 535 identifiants de paquet.
+Queues that grow with application load have finite defaults. A publisher that
+outruns its broker waits for capacity instead of consuming memory indefinitely.
 
 ```python
 client = AsyncClient(
-    max_pending_outbound_messages=10_000,      # publications QoS 1/2 non terminées
-    max_pending_outbound_bytes=64 * 1024**2,   # leur taille logique topic+payload+propriétés
-    max_pending_inbound_bytes=64 * 1024**2,    # QoS entrants conservés dans la session
-    max_pending_delivery_bytes=64 * 1024**2,   # messages entrants en attente de consommateur
-    publish_backpressure="wait",               # ou "error" pour refuser immédiatement
+    max_pending_outbound_messages=10_000,
+    max_pending_outbound_bytes=64 * 1024**2,
+    max_pending_inbound_bytes=64 * 1024**2,
+    max_pending_delivery_bytes=64 * 1024**2,
+    publish_backpressure="wait",
 )
 ```
 
-Conséquences pour le code existant :
+Existing applications should account for these rules:
 
-- `publish()` attend la capacité par défaut. Sous `publish_backpressure="error"`
-  ou avec `nowait=True`, il lève `FlowControlError`. Le refus est atomique :
-  ni identifiant de paquet alloué, ni enregistrement de store écrit.
-- Un `publish()` garé sur la capacité échoue si la connexion est définitivement
-  perdue ; il continue d’attendre pendant une reconnexion en cours.
-- `publish_many()` ne retient au plus que `max_failure_details` (128) détails
-  d’échec. Les totaux restent exacts via `PublishBatchError.failure_count` et
-  `failure_counts` ; utiliser `failure_sink=` pour tout capturer.
-- Passer `None` sur une limite restaure le comportement non borné d’avant.
-- `max_pending_inbound_bytes` borne séparément les QoS 2 entrants et les QoS 1
-  en acquittement manuel qui restent dans le store. Les sessions SQLite
-  historiques sont comptabilisées à leur première réouverture; si elles
-  dépassent déjà la nouvelle limite, elles peuvent se vider mais aucun nouvel
-  enregistrement n’est accepté avant le retour sous la limite.
-- Façade Paho : la saturation renvoie `MQTT_ERR_QUEUE_SIZE` (15), et
-  `max_queued_messages_set()` / `max_queued_bytes_set()` ajustent ces limites.
+- `publish()` waits by default. With `publish_backpressure="error"` or
+  `nowait=True`, saturation raises `FlowControlError` without allocating a
+  packet identifier or writing store state.
+- A publisher waiting for capacity survives a reconnect attempt, but fails when
+  the connection becomes terminal.
+- Passing `None` disables an individual limit.
+- `publish_many()` retains at most `max_failure_details` individual errors while
+  keeping exact aggregate counts. Use `failure_sink` when every detail matters.
+- The Paho façade maps saturation to `MQTT_ERR_QUEUE_SIZE`; its message and byte
+  limits can be adjusted independently.
 
-## Implémentations tierces d’`InflightStore`
+The writer has its own byte and message limits. Applications sending large
+payloads should size the byte budget explicitly rather than relying only on a
+message count.
 
-`InflightStore` est inchangé. La pagination est une **extension optionnelle**,
-`PagedInflightStore`, qui ajoute `out_pages()`, `out_summary_pages()` et
-`in_pages()`. Elles servent à réhydrater une session persistante sans
-matérialiser tous les payloads en même temps — `out_summary_pages()` en
-particulier ne sélectionne jamais la colonne payload.
-
-Un store tiers qui ne l’implémente pas **continue de fonctionner** : le moteur
-détecte l’absence (`isinstance`, une seule fois à la construction) et retombe
-sur le chemin eager (`out_items()` intégral). Sur un jeu de 6 000 messages de
-4 KiB, c’est la différence entre ~4,5 MiB et ~50 MiB de pic alloué à la
-reconnexion. Implémenter les trois méthodes en suivant `SqliteInflightStore`
-(pagination par clé `WHERE seq > ? ORDER BY seq LIMIT ?`) si la volumétrie le
-justifie :
+## Durable sessions
 
 ```python
-from mqttium.persistence.memory import PagedInflightStore
+from mqttium.api import AsyncClient
+from mqttium.persistence.sqlite import SqliteInflightStore
 
-class MonStore:
-    ...
 
-assert isinstance(MonStore(), PagedInflightStore)  # sinon : chemin eager
+store = SqliteInflightStore("session.sqlite")
+client = AsyncClient("durable-client", store=store)
 ```
 
-## Mutation d’`EngineConfig`
+Historical SQLite rows are accounted for when they are first reopened. A store
+already above a new limit may drain existing work but cannot admit more until it
+falls below that limit.
 
-Les limites se modifient via `config.update(max_pending_outbound_bytes=...)` ou
-`config.update(max_pending_inbound_bytes=...)`.
-La méthode valide d’abord une copie : une valeur rejetée, y compris pour une
-erreur de type, ne laisse donc aucune mutation partielle.
+Third-party `InflightStore` implementations remain supported. Implementing the
+optional `PagedInflightStore` protocol enables incremental replay without
+materialising every payload at once. The fallback eager path is correct but can
+use substantially more memory for large sessions.
 
-Une fois la configuration attachée à un `ProtocolEngine`, `update()` accepte
-uniquement les réglages qui n’ont pas d’état dérivé dans le moteur : keepalive,
-credentials, will, limites d’admission et authentification. Changer le protocole,
-`local_receive_maximum` ou `maximum_packet_size` exige de construire un nouveau
-moteur/client.
+## Updating `EngineConfig`
 
-## Suppression d’`EngineConfig.max_queued`
+`EngineConfig.update()` validates a copy before changing the live object, so an
+invalid value cannot leave a partial update. Once attached to a protocol engine,
+only settings without derived connection state can change in place, including
+credentials, keepalive, authentication, wills, and admission limits.
 
-Le champ public historique `max_queued` est supprimé. Son `0` signifiait
-« illimité », contrairement aux nouvelles limites où `0` refuse toute
-publication QoS 1/2.
+Changing the MQTT version, `local_receive_maximum`, or `maximum_packet_size`
+requires a new engine or client. The removed `max_queued` field should be
+replaced with `max_pending_outbound_messages` and
+`max_pending_outbound_bytes`; `None`, rather than zero, means unlimited.
 
-Utiliser `max_pending_outbound_messages` pour une limite en nombre et
-`max_pending_outbound_bytes` pour une limite mémoire. `None` désactive la limite
-correspondante.
-
-## Helpers one-shot
+## One-shot helpers
 
 ```python
 from mqttium.helpers import publish, subscribe
 
-await publish.single("t", b"hello", qos=1, hostname="127.0.0.1")
-msg = await subscribe.simple("t/#", hostname="127.0.0.1")
+
+await publish.single("events", b"ready", qos=1, hostname="127.0.0.1")
+message = await subscribe.simple("events/#", hostname="127.0.0.1")
 ```
 
-## Licence
-
-Code from-scratch : **Apache License 2.0** (voir `LICENSE`). Les analyses
-documentaires citent Paho/gmqtt sans en copier le moteur.
+MQTTium is original Apache-2.0 code. Paho and gmqtt are referenced for API and
+behavioural comparison; their protocol engines are not copied.

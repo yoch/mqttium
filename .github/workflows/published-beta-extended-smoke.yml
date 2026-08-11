@@ -1,17 +1,12 @@
 name: Published beta extended smoke
 
 on:
-  pull_request:
-    paths:
-      - .github/workflows/published-beta-extended-smoke.yml
-      - tests/installed_distribution_extended_smoke.py
-      - tests/unit/test_public_api_surface.py
   workflow_dispatch:
     inputs:
       version:
         description: Published MQTTium version to validate
         required: true
-        default: 0.2.0b3
+        default: 1.0.0rc1
         type: string
   schedule:
     - cron: "43 5 1 * *"
@@ -20,14 +15,14 @@ permissions:
   contents: read
 
 concurrency:
-  group: published-beta-extended-${{ github.event.inputs.version || '0.2.0b3' }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: published-beta-extended-${{ github.event.inputs.version || '1.0.0rc1' }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   transports-compat-shutdown:
     runs-on: ubuntu-24.04
     env:
-      MQTTIUM_VERSION: ${{ github.event.inputs.version || '0.2.0b3' }}
+      MQTTIUM_VERSION: ${{ github.event.inputs.version || '1.0.0rc1' }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7

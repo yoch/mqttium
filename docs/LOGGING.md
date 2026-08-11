@@ -1,89 +1,82 @@
-# Logging & observabilité — décision
+# Logging and observability
 
-## Décision : pas de logging dans la bibliothèque
+## Decision: no logging inside the library
 
-`mqttium` n’émet **aucun** log (`logging` stdlib absent de `src/`). C’est
-volontaire et mesuré.
+MQTTium does not emit logs, and the standard `logging` module is absent from
+`src/`. This is deliberate.
 
-### Pourquoi
+Useful MQTT logs tend to sit on the publish, message, and acknowledgement paths.
+Even a disabled `isEnabledFor(DEBUG)` guard measured about 1.65% per publication
+in the retained paired microbenchmark, and every additional log point compounds
+that cost. Enabled per-message logging is much more expensive and can expose
+topics, payloads, credentials, or other application data.
 
-1. **Le logging utile serait sur le hot path** (publish / message / ACK), pas
-   sur les événements rares. Or même **désactivé**, un guard
-   `log.isEnabledFor(DEBUG)` coûte ~**1.6 %** (médiane, 0.5–3 %) par publish —
-   et ça se cumule par point de log. **Activé**, formater + émettre par message
-   détruit le débit et peut **fuiter des données** (payloads, topics, secrets).
-2. La bibliothèque est **déjà observable sans logging** (voir ci-dessous).
-3. Moins de surface = moins de bugs, moins de config, pas de handler global
-   imposé à l’application.
+Keeping logging outside the library also avoids global handler configuration and
+leaves each application in control of its own privacy and sampling policy.
 
-Mesuré (ABBA, loop unique, 15 rounds, QoS0 publish) : overhead médian d’un
-guard désactivé ≈ 1.65 %. Référence : `benchmarks/perf_sprint.py`.
+## Observability without background work
 
-## Comment observer sans logging
+MQTTium exposes state when the application asks for it. Unused observability has
+no sampler, logging, or formatting cost.
 
-La lib expose déjà tout ce qu’il faut — **coût nul quand inutilisé** :
-
-| Besoin | Mécanisme existant |
+| Need | API |
 | --- | --- |
-| Completion / erreur d’un publish | `await receipt.wait()` / `receipt.is_done()` |
-| Cycle de vie connexion | callbacks `on_connect` / `on_disconnect(exc)` |
-| Messages entrants | `on_message` / `async for msg in client.messages()` |
-| État courant | `client.is_connected`, `client.state`, `client.negotiated` |
-| Erreurs protocolaires | exceptions typées (`ProtocolError`, `MQTTTimeoutError`, …) |
-| Comportement broker | `DisconnectInfo` (reason_code, properties, from_broker) |
+| Publish completion or failure | `await receipt.wait()` and `receipt.is_done()` |
+| Connection lifecycle | `on_connect` and `on_disconnect` |
+| Incoming messages | `on_message` or `async for message in client.messages()` |
+| Current state | `client.is_connected`, `client.state`, `client.negotiated` |
+| Protocol failures | typed exceptions such as `ProtocolError` and `MQTTTimeoutError` |
+| Broker disconnect details | `DisconnectInfo` |
+| Queue and resource pressure | `client.stats()` |
 
-### Recette : instrumentation par l’application (recommandé)
+## Add application-level instrumentation
 
-Wrapper fin côté app — aucune modification de la lib, aucun coût pour les
-autres utilisateurs :
+A small wrapper can add the metrics and logs an application actually needs:
 
 ```python
-import logging, time
+import logging
+import time
+
 from mqttium.api import AsyncClient
+
 
 log = logging.getLogger("myapp.mqtt")
 
+
 class ObservedClient:
     def __init__(self, client: AsyncClient) -> None:
-        self._c = client
+        self._client = client
         self.published = 0
         self.errors = 0
-        client.on_disconnect = self._on_disc
+        self.last_publish_latency = 0.0
+        client.on_disconnect = self._on_disconnect
 
-    async def publish(self, topic, payload, **kw):
-        t0 = time.monotonic()
+    async def publish(self, topic, payload, **kwargs):
+        started = time.monotonic()
         try:
-            r = await self._c.publish(topic, payload, **kw)
+            receipt = await self._client.publish(topic, payload, **kwargs)
             self.published += 1
-            return r
+            return receipt
         except Exception:
             self.errors += 1
-            log.warning("publish failed topic=%s", topic)
+            log.warning("MQTT publish failed for topic=%s", topic)
             raise
         finally:
-            # métrique timing si besoin
-            _ = time.monotonic() - t0
+            self.last_publish_latency = time.monotonic() - started
 
-    def _on_disc(self, exc):
-        log.info("mqtt disconnected: %r", exc)
+    def _on_disconnect(self, error) -> None:
+        log.info("MQTT disconnected: %r", error)
 
-    def __getattr__(self, name):  # délègue le reste
-        return getattr(self._c, name)
+    def __getattr__(self, name):
+        return getattr(self._client, name)
 ```
 
-Points clés :
-- **Compteurs** (`published`, `errors`) plutôt que des strings par message.
-- Logs **uniquement** sur les transitions/erreurs que *l’app* juge utiles.
-- Le hot path de la lib reste intact (aucun guard ajouté côté mqttium).
+Prefer counters and sampled timings over one formatted string per message. Log
+state transitions and failures that are meaningful to the application, and
+redact topic or payload data where required.
 
-### Si un jour la lib doit s’instrumenter
+## Future instrumentation
 
-Le seul mécanisme acceptable (coût strictement nul quand inactif) serait un
-**hook optionnel** dans l’esprit des callbacks existants :
-
-```python
-client.on_event = my_probe   # None par défaut → un seul `if hook is None`
-```
-
-Jamais de `logging` global, jamais de formatage par message. À réévaluer
-uniquement avec un microbench prouvant < 0.5 % d’overhead désactivé.
+If the library ever needs an event hook, it must remain optional, avoid global
+logging, and add no formatting on the inactive path. Any proposal must include
+a paired benchmark demonstrating less than 0.5% disabled overhead.

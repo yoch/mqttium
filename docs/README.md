@@ -36,6 +36,8 @@ are not updated when the code moves on.
 | --- | --- |
 | [`BENCHMARKING.md`](BENCHMARKING.md) | Validity contract for every benchmark: paired A/B, medians, rotated order, `N/A` over a manufactured comparison. |
 | [`MEMORY-BENCHMARK.md`](MEMORY-BENCHMARK.md) | Methodology and harness contract behind `benchmarks/memory_profile.py` and its threshold file. |
+| [`reports/RELEASE-CANDIDATE-1.0.0rc1.md`](reports/RELEASE-CANDIDATE-1.0.0rc1.md) | Current local evidence and explicit go/no-go status for the 1.0 release candidate. |
+| [`reports/PERFORMANCE-1.0.0rc1.md`](reports/PERFORMANCE-1.0.0rc1.md) | Local A/B gains, invalid measurements, rejected designs and open-loop evidence for the RC. |
 | [`FUZZING.md`](FUZZING.md) 🇫🇷 | Fuzzing strategy, seeded corpus and Hypothesis profiles. |
 | [`STABILITY.md`](STABILITY.md) | Soak and multi-broker interoperability campaign, with its acceptance criteria. |
 
@@ -45,7 +47,7 @@ are not updated when the code moves on.
 | --- | --- |
 | [`RELEASING.md`](RELEASING.md) | Tag, rehearsal, publication and failure handling. Authoritative for the release procedure. |
 | [`ROADMAP.md`](ROADMAP.md) | Remaining work before a stable release. |
-| [`BETA-REPORTING.md`](BETA-REPORTING.md) | What a usable beta bug report contains, and how reports are triaged. |
+| [`BETA-REPORTING.md`](BETA-REPORTING.md) | What a usable pre-release bug report contains, and how reports are triaged. |
 | [`CHATGPT-USAGE.md`](CHATGPT-USAGE.md) | Atomic multi-file commit procedure for agents working on this repository through the GitHub API. |
 
 🇫🇷 marks documents written in French. The rest of the repository is English.

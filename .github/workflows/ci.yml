@@ -23,7 +23,7 @@ jobs:
       - name: Repository hygiene
         run: |
           set -euo pipefail
-          test -z "$(git ls-files | grep -E '(^|/)(__pycache__|\.pytest_cache|\.mypy_cache|\.ruff_cache|dist|build|.*\.egg-info)(/|$)|(^|/)\.coverage($|\.)|\.py[co]$' || true)"
+          test -z "$(git ls-files | grep -E '(^|/)(__pycache__|\.pytest_cache|\.mypy_cache|\.ruff_cache|dist|build|.*\.egg-info)(/|$)|(^|/)\.coverage($|\.)|\.py[co]$|\.(patch|diff)$' || true)"
           test -z "$(grep -RIl --exclude-dir=.git -E 'mqttnext|MQTTNext|MQTTNEXT' src tests examples benchmarks || true)"
       - run: ruff format --check src tests benchmarks
       - run: ruff check src tests benchmarks

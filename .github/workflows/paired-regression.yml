@@ -13,21 +13,13 @@ on:
         required: true
         default: main
         type: string
-  pull_request:
-    paths:
-      - benchmarks/**
-      - src/mqttium/api/**
-      - src/mqttium/codec/**
-      - src/mqttium/protocol/**
-      - src/mqttium/transport/**
-      - .github/workflows/paired-regression.yml
 
 permissions:
   contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: false
 
 jobs:
   paired:
@@ -45,12 +37,12 @@ jobs:
       - name: Check out candidate
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_ref || github.sha }}
+          ref: ${{ inputs.candidate_ref }}
           path: candidate
       - name: Check out base
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.base_ref || github.event.pull_request.base.sha }}
+          ref: ${{ inputs.base_ref }}
           path: base
       - uses: actions/setup-python@v7
         with:
@@ -85,12 +77,17 @@ jobs:
             --candidate-root candidate \
             --repeat 11 \
             --output /tmp/mqttium-paired/micro.json
-      - name: Paired network and latency sweep
-        continue-on-error: ${{ github.event_name == 'pull_request' }}
+      - name: Record hosted-runner eligibility
+        run: |
+          python harness/benchmarks/runner_probe.py \
+            --output /tmp/mqttium-paired/runner.json
+      - name: Advisory paired network and latency sweep
         run: |
           python harness/benchmarks/paired_network.py \
             --base-root base \
             --candidate-root candidate \
+            --policy advisory \
+            --preflight-report /tmp/mqttium-paired/runner.json \
             --repeat 8 \
             --windows 1,8,32,64,128 \
             --protocols 311,5 \
@@ -98,11 +95,12 @@ jobs:
             --count-small 20000 \
             --count-large 8000 \
             --output /tmp/mqttium-paired/network.json
-      - name: Native QoS 1 receipt/callback diagnostic
-        continue-on-error: true
+      - name: Advisory native QoS 1 receipt/callback diagnostic
         run: |
           python harness/benchmarks/paired_network.py \
             --base-root base --candidate-root candidate \
+            --policy advisory \
+            --preflight-report /tmp/mqttium-paired/runner.json \
             --repeat 4 --windows 64 --protocols 311 \
             --payloads 64 --completions receipt,callback \
             --count-small 5000 \
@@ -114,6 +112,7 @@ jobs:
           name: paired-regression-${{ github.run_id }}
           path: |
             /tmp/mqttium-paired/*.json
+            /tmp/mqttium-paired/*.md
             /tmp/mqttium-paired/mosquitto.log
           if-no-files-found: warn
           retention-days: 30

@@ -46,7 +46,7 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - run: python -m pip install -e "."
+      - run: python -m pip install -e ".[benchmark]"
       - name: Start Mosquitto
         run: |
           sudo apt-get update -qq
@@ -87,7 +87,7 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - run: python -m pip install -e "."
+      - run: python -m pip install -e ".[benchmark]"
       - name: Start Mosquitto
         run: |
           brew install mosquitto
@@ -133,7 +133,7 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - run: python -m pip install -e "."
+      - run: python -m pip install -e ".[benchmark]"
       - name: Start broker container
         run: |
           docker run -d --name mqttium-broker -p 11883:1883 "${{ matrix.image }}"
