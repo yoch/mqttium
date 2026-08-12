@@ -50,9 +50,7 @@ def test_success_puback_settle_skips_full_decoder(monkeypatch) -> None:
     assert handle.mid is not None
     engine.take_effects()
 
-    engine.handle_raw(
-        RawPacket(PacketType.PUBACK, 0x00, pack_u16(handle.mid))
-    )
+    engine.handle_raw(RawPacket(PacketType.PUBACK, 0x00, pack_u16(handle.mid)))
     effects = engine.take_effects()
 
     assert calls == 0
@@ -75,9 +73,7 @@ def test_reason_bearing_puback_keeps_full_decoder(monkeypatch) -> None:
     assert handle.mid is not None
     engine.take_effects()
 
-    engine.handle_raw(
-        RawPacket(PacketType.PUBACK, 0x00, pack_u16(handle.mid) + b"\x10")
-    )
+    engine.handle_raw(RawPacket(PacketType.PUBACK, 0x00, pack_u16(handle.mid) + b"\x10"))
     effects = engine.take_effects()
 
     assert calls == 1
