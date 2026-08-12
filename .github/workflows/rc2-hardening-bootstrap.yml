@@ -1,0 +1,31 @@
+name: RC2 hardening bootstrap
+
+on:
+  push:
+    branches: [fix/rc2-hardening]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: fix/rc2-hardening
+      - name: Apply staged patch
+        run: |
+          set -euo pipefail
+          git apply --check --whitespace=error-all .rc2-mps.patch
+          git apply --index --whitespace=error-all .rc2-mps.patch
+          python -m compileall -q src/mqttium
+      - name: Remove bootstrap files and push result
+        run: |
+          set -euo pipefail
+          git rm .rc2-mps.patch .github/workflows/rc2-hardening-bootstrap.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Complete RC2 maximum packet size hardening'
+          git push origin HEAD:fix/rc2-hardening
