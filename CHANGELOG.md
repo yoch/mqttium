@@ -6,6 +6,21 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- Local MQTT protocol failures now complete teardown even when the negotiated
+  Maximum Packet Size prevents sending the normative DISCONNECT, close the
+  runtime transport, and surface CONNACK validation failures to `connect()`
+  instead of timing out.
+- MQTT 5 client-side DISCONNECT encoding enforces direction-specific reason
+  codes and rejects Server Reference; CONNECT rejects Authentication Data
+  without Authentication Method.
+- Request Problem Information is enforced on inbound acknowledgement and AUTH
+  packets before QoS/subscription state mutates.
+- Automatic reconnect stops on permanent MQTT 5 connection refusals such as
+  Banned and protocol/configuration errors, while transient capacity failures
+  such as Connection rate exceeded remain eligible for backoff and retry.
+
 ## [1.0.0rc2] - 2026-08-12
 
 ### Fixed

@@ -15,7 +15,7 @@ from mqttium.codec.buffer import RawPacket
 from mqttium.codec.packet_validation import require_nonzero_mid
 from mqttium.codec.primitives import unpack_u16, unpack_utf8
 from mqttium.codec.properties import PUBLISH, decode_properties, encode_properties
-from mqttium.enums import ConnectionState, InboundQoSState, MQTTProtocolVersion, QoS
+from mqttium.enums import InboundQoSState, MQTTProtocolVersion, PacketType, QoS
 from mqttium.errors import MalformedPacketError, ProtocolError
 from mqttium.persistence.memory import (
     BoundedInboundReplayStore,
@@ -28,9 +28,8 @@ from mqttium.packets import (
     PublishPacket,
     PubRecPacket,
     PubRelPacket,
-    encode_disconnect,
 )
-from mqttium.protocol.effects import DisconnectInfo, EffectKind
+from mqttium.protocol.effects import EffectKind
 from mqttium.protocol.stats import InboundStats
 from mqttium.topics import validate_received_publish_topic
 from mqttium.types import InboundMessage, InboundRecordMeta, Message, Properties
@@ -528,6 +527,7 @@ class InboundSession:
         config = self.config
         store = self.store
         rel = PubRelPacket.decode(raw.remaining, config.protocol)
+        engine._validate_inbound_problem_information(PacketType.PUBREL, rel.properties)
         transitions = self._transitions
         if transitions is not None:
             meta = transitions.in_meta(rel.mid)
@@ -883,12 +883,5 @@ class InboundSession:
         )
 
     def _protocol_disconnect(self, reason_code: int) -> None:
-        """Emit a normative DISCONNECT before the transport is torn down."""
-        engine = self._engine
-        if self.config.protocol == MQTTProtocolVersion.MQTTv5:
-            engine._send(encode_disconnect(reason_code, self.config.protocol))
-        engine.state = ConnectionState.DISCONNECTED
-        engine._emit(
-            EffectKind.DISCONNECTED,
-            DisconnectInfo(reason_code=reason_code, from_broker=False),
-        )
+        """Delegate local fatal teardown to the engine's single implementation."""
+        self._engine._protocol_disconnect(reason_code)

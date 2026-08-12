@@ -80,6 +80,13 @@ class ConnectPacket:
             raise ProtocolError("Password exceeds MQTT binary-data limit")
         if len(self.will_payload) > 65535:
             raise ProtocolError("Will payload exceeds MQTT binary-data limit")
+        if (
+            self.protocol == MQTTProtocolVersion.MQTTv5
+            and self.properties is not None
+            and self.properties.get("authentication_data") is not None
+            and self.properties.get("authentication_method") is None
+        ):
+            raise ProtocolError("CONNECT authentication_data requires authentication_method")
 
         flags = 0
         if self.clean_start:

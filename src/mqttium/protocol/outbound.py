@@ -25,6 +25,7 @@ from mqttium.enums import (
     ConnectionState,
     MQTTProtocolVersion,
     OutboundQoSState,
+    PacketType,
     QoS,
 )
 from mqttium.errors import (
@@ -548,6 +549,7 @@ class OutboundSession:
             reason_code = 0
         else:
             ack = PubAckPacket.decode(remaining, self.config.protocol)
+            self._engine._validate_inbound_problem_information(PacketType.PUBACK, ack.properties)
             mid = ack.mid
             reason_code = ack.reason_code
         if not self._settle(mid, OutboundQoSState.WAIT_PUBACK):
@@ -564,6 +566,7 @@ class OutboundSession:
 
     def on_pubrec(self, raw: RawPacket) -> None:
         rec = PubRecPacket.decode(raw.remaining, self.config.protocol)
+        self._engine._validate_inbound_problem_information(PacketType.PUBREC, rec.properties)
         transitions = self._transitions
         if transitions is not None:
             if rec.reason_code >= 128:
@@ -627,6 +630,7 @@ class OutboundSession:
 
     def on_pubcomp(self, raw: RawPacket) -> None:
         comp = PubCompPacket.decode(raw.remaining, self.config.protocol)
+        self._engine._validate_inbound_problem_information(PacketType.PUBCOMP, comp.properties)
         if not self._settle(comp.mid, OutboundQoSState.WAIT_PUBCOMP):
             return
         self.flow.release()
