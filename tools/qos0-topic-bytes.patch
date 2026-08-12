@@ -1,0 +1,211 @@
+--- a/src/mqttium/topics.py
++++ b/src/mqttium/topics.py
+@@ -2,7 +2,7 @@
+ 
+ from __future__ import annotations
+ 
+-from mqttium.codec.primitives import validate_utf8
++from mqttium.codec.primitives import encode_utf8, validate_utf8
+ from mqttium.errors import MalformedPacketError, ProtocolError
+ 
+ 
+@@ -20,6 +20,24 @@
+         raise ProtocolError("PUBLISH topic must not contain wildcards")
+ 
+ 
++def encode_validated_publish_topic(topic: str) -> bytes:
++    """Validate an outbound PUBLISH topic and return its MQTT UTF-8 bytes.
++
++    This is the QoS 0 hot-path companion to :func:`validate_publish_topic`: the
++    caller is about to encode the packet immediately, so retaining the validated
++    bytes avoids scanning/encoding the Topic Name a second time.
++    """
++    if not topic:
++        raise ProtocolError("PUBLISH topic must not be empty")
++    try:
++        encoded = encode_utf8(topic)
++    except ProtocolError as exc:
++        raise ProtocolError(f"Invalid MQTT topic: {exc}") from exc
++    if "+" in topic or "#" in topic:
++        raise ProtocolError("PUBLISH topic must not contain wildcards")
++    return encoded
++
++
+ def validate_received_publish_topic(
+     topic: str,
+     *,
+--- a/src/mqttium/packets/publish.py
++++ b/src/mqttium/packets/publish.py
+@@ -26,6 +26,7 @@
+     mid: int | None,
+     properties: Properties | None,
+     protocol: MQTTProtocolVersion = MQTTProtocolVersion.MQTTv311,
++    _topic_bytes: bytes | None = None,
+ ) -> WriteItem:
+     """Validate and encode one outbound PUBLISH exactly once."""
+ 
+@@ -49,7 +50,7 @@
+         _require_outbound_mid(mid, PUBLISH)
+ 
+     flags = (int(level) << 1) | (0x01 if retain else 0) | (0x08 if dup else 0)
+-    topic_bytes = encode_utf8(topic)
++    topic_bytes = encode_utf8(topic) if _topic_bytes is None else _topic_bytes
+     topic_size = len(topic_bytes)
+     props = _props_or_empty(properties, PUBLISH, protocol)
+     payload_size = len(payload)
+--- a/src/mqttium/protocol/outbound.py
++++ b/src/mqttium/protocol/outbound.py
+@@ -47,7 +47,7 @@
+ from mqttium.protocol.flow_control import FlowControl
+ from mqttium.protocol.packet_ids import PacketIdPool
+ from mqttium.protocol.stats import OutboundStats
+-from mqttium.topics import validate_publish_topic
++from mqttium.topics import encode_validated_publish_topic, validate_publish_topic
+ from mqttium.transport.writes import WriteItem
+ from mqttium.types import OutboundMessage, OutboundMessageSummary, Properties
+ 
+@@ -285,8 +285,8 @@
+         qos: QoS | int,
+         retain: bool,
+         properties: Properties | None,
+-    ) -> QoS:
+-        """Validate one outbound PUBLISH against local and negotiated rules."""
++    ) -> tuple[QoS, bytes | None]:
++        """Validate one outbound PUBLISH and retain QoS 0 Topic Name bytes."""
+ 
+         level = QoS(qos)
+         # An empty Topic Name is legal only after this client has established
+@@ -297,7 +297,12 @@
+         # Keep the generic validator's allow_empty primitive for a future
+         # stateful alias implementation, but do not use it from outbound API
+         # admission until that state exists.
+-        validate_publish_topic(topic)
++        topic_bytes: bytes | None
++        if level is QoS.AT_MOST_ONCE:
++            topic_bytes = encode_validated_publish_topic(topic)
++        else:
++            validate_publish_topic(topic)
++            topic_bytes = None
+ 
+         if (
+             properties is not None
+@@ -331,7 +336,7 @@
+ 
+         if engine.state != ConnectionState.CONNECTED and level == QoS.AT_MOST_ONCE:
+             raise NotConnectedError("Cannot publish QoS 0 while disconnected")
+-        return level
++        return level, topic_bytes
+ 
+     def _prepare_qos0_validated(
+         self,
+@@ -340,6 +345,7 @@
+         *,
+         retain: bool,
+         properties: Properties | None,
++        topic_bytes: bytes,
+     ) -> WriteItem:
+         item = encode_publish_item(
+             topic,
+@@ -350,6 +356,7 @@
+             mid=None,
+             properties=properties,
+             protocol=self.config.protocol,
++            _topic_bytes=topic_bytes,
+         )
+         self._engine._check_outbound_size(item)
+         return item
+@@ -364,12 +371,16 @@
+     ) -> WriteItem:
+         """Prepare a mutation-free QoS 0 publication for the native runtime."""
+ 
+-        self._validate_publish_request(topic, QoS.AT_MOST_ONCE, retain, properties)
++        _qos, topic_bytes = self._validate_publish_request(
++            topic, QoS.AT_MOST_ONCE, retain, properties
++        )
++        assert topic_bytes is not None
+         return self._prepare_qos0_validated(
+             topic,
+             payload,
+             retain=retain,
+             properties=properties,
++            topic_bytes=topic_bytes,
+         )
+ 
+     def queue_publish(
+@@ -382,14 +393,16 @@
+         properties: Properties | None = None,
+     ) -> PublishHandle:
+         engine = self._engine
+-        qos = self._validate_publish_request(topic, qos, retain, properties)
++        qos, topic_bytes = self._validate_publish_request(topic, qos, retain, properties)
+ 
+         if qos == QoS.AT_MOST_ONCE:
++            assert topic_bytes is not None
+             item = self._prepare_qos0_validated(
+                 topic,
+                 payload,
+                 retain=retain,
+                 properties=properties,
++                topic_bytes=topic_bytes,
+             )
+             self._send(item)
+             # Completion follows SEND so compatibility on_publish cannot run
+--- /dev/null
++++ b/tests/unit/test_topic_bytes_handoff.py
+@@ -0,0 +1,51 @@
++"""QoS 0 reuses the Topic Name bytes produced by outbound validation."""
++
++from __future__ import annotations
++
++import mqttium.packets.publish as publish_module
++import mqttium.protocol.outbound as outbound_module
++import mqttium.topics as topics_module
++
++from mqttium.enums import ConnectionState, MQTTProtocolVersion
++from mqttium.protocol.config import EngineConfig
++from mqttium.protocol.engine import ProtocolEngine
++
++
++def _connected_engine() -> ProtocolEngine:
++    engine = ProtocolEngine(EngineConfig(protocol=MQTTProtocolVersion.MQTTv5))
++    engine.state = ConnectionState.CONNECTED
++    return engine
++
++
++def test_qos0_validation_hands_topic_bytes_to_encoder(monkeypatch) -> None:
++    validation_calls = 0
++    encoder_calls = 0
++    original_validation_encode = topics_module.encode_utf8
++    original_packet_encode = publish_module.encode_utf8
++
++    def validation_encode(topic: str) -> bytes:
++        nonlocal validation_calls
++        validation_calls += 1
++        return original_validation_encode(topic)
++
++    def packet_encode(topic: str) -> bytes:
++        nonlocal encoder_calls
++        encoder_calls += 1
++        return original_packet_encode(topic)
++
++    monkeypatch.setattr(topics_module, "encode_utf8", validation_encode)
++    monkeypatch.setattr(publish_module, "encode_utf8", packet_encode)
++
++    engine = _connected_engine()
++    item = engine.outbound.prepare_qos0("capteurs/été/température", b"payload")
++
++    assert item
++    assert validation_calls == 1
++    assert encoder_calls == 0
++
++
++def test_qos1_validation_does_not_preencode_topic(monkeypatch) -> None:
++    def unexpected_preencode(_topic: str) -> bytes:
++        raise AssertionError("QoS 1 validation must not allocate Topic Name bytes")
++
++    monkeypatch.setattr(outbound_module, "encode_validated_publish_topic", unexpected_preencode)
++    engine = _connected_engine()
++
++    handle = engine.queue_publish("queued/topic", b"payload", qos=1)
++
++    assert handle.mid is not None
