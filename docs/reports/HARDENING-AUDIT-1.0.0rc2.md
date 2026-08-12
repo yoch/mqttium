@@ -109,6 +109,28 @@ distinct user-visible failure mode on the connect path.
 - Incremental decoder default max packet size enforcement.
 - `SEGMENT_THRESHOLD` (128 KiB) present as documented for RC2.
 
+## Phase-2 surface matrix
+
+Status per planned sweep area (`clean` = no new defect beyond F1–F3;
+`bug→#N` = filed; `intentional` = documented non-bug behaviour).
+
+| # | Surface | Status |
+| --- | --- | --- |
+| 2.1 | `_protocol_disconnect` / MPS / size validation | **bug→#186**, **bug→#187**, **bug→#188** |
+| 2.2 | Fast-path MQTT 5 decode vs 3.1.1 fallback | **clean** — wildcard / empty / DUP QoS 0 refused on both paths |
+| 2.3 | Property encoding cache / mutation | **clean** — in-place `bytearray` snapshot held |
+| 2.4 | Persistence transitions / SQLite | **clean** — external `complete_out` + orphan PUBACK stable |
+| 2.5 | WebSocket coalesce | **clean** — bounds/masking contract held on read |
+| 2.6 | Compat Paho confinement | **clean** — protocol layer does not import compat |
+| 2.7 | Decoder / delivery budgets | **clean** — oversized VBI → `PacketTooLargeError`; delivery controller present |
+| 2.8 | Reconnect / connection epoch | **clean** — epoch bump works; covered by `test_reconnect_stale_effects` / `test_reconnect_receipts` (no new counter-example) |
+| 2.9 | CONFORMANCE statement gaps | **clean for sampled high-impact rules**; residual uncited statements remain a known coverage gap (see Limits) — no new executable counter-example filed |
+| 2.10 | Hostile-broker liveness | **intentional / existing suite** — `test_hostile_broker.py` not extended; focused harnesses used instead; no new hang found beyond F2 |
+
+Manual ACK + MPS was re-checked as part of 2.1 (already covered by RC2
+`test_inbound_ack_packet_size` / `test_control_packet_size_lifecycle` for the
+paths `#181` fixed; residual gap is only `_protocol_disconnect`).
+
 ## Limits of this audit
 
 - Not a full walk of all ~290 client-reachable numbered statements in
