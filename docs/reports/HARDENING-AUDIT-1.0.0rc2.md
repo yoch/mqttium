@@ -109,6 +109,18 @@ Client-encodable — e.g. `begin_disconnect(0x8E)` yields `e0028e00`.
 property table is packet-typed, not direction-typed (same structural gap as
 outbound `subscription_identifier` / Client AUTH Success before those fixes).
 
+### F6 — Request Problem Information 0 not enforced (#192)
+
+CONNECT encodes `request_problem_information=0`, but the engine never snapshots
+that value. Inbound PUBACK/PUBREC/SUBACK with `reason_string` / `user_property`
+complete normally, missing the peer check in `[MQTT-3.1.2-29]`.
+
+### F7 — Reconnect retries Banned (#193)
+
+`_V5_TERMINAL` omits CONNACK `0x8A` (Banned). After `Connection refused:
+reason_code=138`, reconnect keeps retrying, against IMPLEMENTATION-GUIDE §5
+permanent-authorisation policy. `0x88`/`0x89` stay correctly retryable.
+
 ## Round 4 expert sweep
 
 Confirmed **#192** (RPI=0) and **#193** (Banned reconnect). Additional probes without new filings:
@@ -229,6 +241,9 @@ Fix order suggested by coupling (not implemented in this audit pass):
    (#190).
 5. Split Client vs Server DISCONNECT reason allowlists and reject Client
    `server_reference` on outbound DISCONNECT (#191).
+6. Snapshot Request Problem Information from CONNECT; reject forbidden inbound
+   Reason String / User Properties when RPI was 0 (#192).
+7. Add CONNACK `0x8A` Banned to `_V5_TERMINAL` (#193).
 
 ### Suggested fix approaches (for issue assignees)
 
