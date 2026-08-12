@@ -1,8 +1,8 @@
 """Topic-filter matching for callback dispatch.
 
-Exact filters are indexed by delivered Topic Name; wildcard filters retain the
-small linear matcher. Matching candidates carry their original insertion
-sequence so combining both paths preserves Paho callback order exactly.
+Exact filters are indexed by Topic Name; wildcard filters retain the small
+linear matcher. Matching candidates carry their original insertion sequence so
+combining both paths preserves callback order without changing filter semantics.
 """
 
 from __future__ import annotations
@@ -17,10 +17,11 @@ class TopicMatcher:
     def __init__(self) -> None:
         # literal filter -> (insertion sequence, compiled levels, value, exact topic)
         self._entries: dict[str, tuple[int, tuple[str, ...], Any, str | None]] = {}
-        # delivered exact topic -> literal filters compiling to that topic. More
-        # than one is possible because several $share groups can use the same
-        # underlying exact Topic Filter.
-        self._exact: dict[str, dict[str, None]] = {}
+        # Exact Topic Name -> literal filter. Shared-subscription prefixes are
+        # intentionally not rewritten here: Paho stores and matches the filter
+        # literally, and broker-side $share stripping belongs to subscription
+        # delivery semantics rather than callback registration semantics.
+        self._exact: dict[str, str] = {}
         # Literal wildcard filters only; dict preserves their insertion order.
         self._wildcards: dict[str, None] = {}
         self._next_sequence = 0
@@ -28,15 +29,9 @@ class TopicMatcher:
     @staticmethod
     def _compile(topic_filter: str) -> tuple[tuple[str, ...], str | None]:
         levels = tuple(topic_filter.split("/"))
-        # A broker removes "$share/{ShareName}/" before delivering a shared
-        # subscription message. Keep the literal filter as the dictionary key
-        # for Paho-compatible get/delete semantics, but compile the match side
-        # against the Topic Filter that follows the ShareName.
-        if len(levels) >= 3 and levels[0] == "$share" and levels[1]:
-            levels = levels[2:]
         if any(level in {"+", "#"} for level in levels):
             return levels, None
-        return levels, "/".join(levels)
+        return levels, topic_filter
 
     def __setitem__(self, topic_filter: str, value: Any) -> None:
         current = self._entries.get(topic_filter)
@@ -54,7 +49,7 @@ class TopicMatcher:
         if exact_topic is None:
             self._wildcards[topic_filter] = None
         else:
-            self._exact.setdefault(exact_topic, {})[topic_filter] = None
+            self._exact[exact_topic] = topic_filter
 
     def __getitem__(self, topic_filter: str) -> Any:
         try:
@@ -69,21 +64,17 @@ class TopicMatcher:
             raise KeyError(topic_filter) from exc
         if exact_topic is None:
             self._wildcards.pop(topic_filter, None)
-            return
-        bucket = self._exact[exact_topic]
-        bucket.pop(topic_filter, None)
-        if not bucket:
-            del self._exact[exact_topic]
+        else:
+            self._exact.pop(exact_topic, None)
 
     def iter_match(self, topic: str) -> Iterator[Any]:
         """Yield values whose MQTT filters match ``topic`` in insertion order."""
 
         candidates: list[tuple[int, Any]] = []
-        exact = self._exact.get(topic)
-        if exact is not None:
-            for topic_filter in exact:
-                sequence, _levels, value, _exact_topic = self._entries[topic_filter]
-                candidates.append((sequence, value))
+        exact_filter = self._exact.get(topic)
+        if exact_filter is not None:
+            sequence, _levels, value, _exact_topic = self._entries[exact_filter]
+            candidates.append((sequence, value))
 
         if self._wildcards:
             topic_levels = tuple(topic.split("/"))
