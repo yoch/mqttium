@@ -15,15 +15,163 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: fix/rc2-hardening
-      - name: Apply staged patch
+      - name: Apply exact RC2 hardening edits
         run: |
           set -euo pipefail
-          git apply --check --whitespace=error-all .rc2-mps.patch
-          git apply --index --whitespace=error-all .rc2-mps.patch
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace_one(path: str, old: str, new: str) -> None:
+              target = Path(path)
+              text = target.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one match, found {count}")
+              target.write_text(text.replace(old, new))
+
+          replace_one(
+              "src/mqttium/protocol/inbound.py",
+              '''        if state not in (InboundQoSState.WAIT_PUBACK, InboundQoSState.WAIT_USER_ACK):
+              raise ProtocolError(f"Inbound mid={mid} is not awaiting ack (state={state!r})")
+
+          if isinstance(record, InboundMessage):
+          ''',
+              '''        if state not in (InboundQoSState.WAIT_PUBACK, InboundQoSState.WAIT_USER_ACK):
+              raise ProtocolError(f"Inbound mid={mid} is not awaiting ack (state={state!r})")
+
+          packet = (
+              PubAckPacket(mid=mid)
+              if state is InboundQoSState.WAIT_PUBACK
+              else PubCompPacket(mid=mid)
+          )
+          wire = packet.encode(config.protocol)
+          self._engine._check_outbound_size(wire)
+
+          if isinstance(record, InboundMessage):
+          ''',
+          )
+          replace_one(
+              "src/mqttium/protocol/inbound.py",
+              '''        packet = (
+              PubAckPacket(mid=mid)
+              if state is InboundQoSState.WAIT_PUBACK
+              else PubCompPacket(mid=mid)
+          )
+          self._engine._send(packet.encode(config.protocol))
+          self._release_slot(logical_size)
+          ''',
+              '''        self._engine._send(wire)
+          self._release_slot(logical_size)
+          ''',
+          )
+
+          replace_one(
+              "src/mqttium/api/async_client.py",
+              '''            packet = self._engine.begin_disconnect(reason_code) if self.is_connected else None
+          try:
+          ''',
+              '''            try:
+              packet = (
+                  self._engine.begin_disconnect(reason_code)
+                  if self.is_connected
+                  else None
+              )
+          except PacketTooLargeError:
+              # The peer's packet limit makes a legal DISCONNECT impossible.
+              # Closing the transport is the only conforming shutdown left.
+              await self._force_close()
+              return
+          try:
+          ''',
+          )
+          replace_one(
+              "src/mqttium/api/async_client.py",
+              '''        async with self._engine_lock:
+              self._engine.ack(message.mid)
+              self._collect_effects_locked()
+          await self._drain_effects()
+          ''',
+              '''        try:
+              async with self._engine_lock:
+                  self._engine.ack(message.mid)
+                  self._collect_effects_locked()
+          except PacketTooLargeError as exc:
+              # A broker limit below the mandatory ACK size makes this QoS
+              # exchange impossible to complete without violating negotiation.
+              self._disconnect_exc = exc
+              self._intentional_disconnect = True
+              await self._force_close()
+              raise
+          await self._drain_effects()
+          ''',
+          )
+          replace_one(
+              "src/mqttium/api/async_client.py",
+              '''                if now >= due:
+                  async with self._engine_lock:
+                      self._engine.queue_ping()
+                      self._collect_effects_locked()
+                  # A lost PINGREQ beats a wedged keepalive under backpressure.
+          ''',
+              '''                if now >= due:
+                  try:
+                      async with self._engine_lock:
+                          self._engine.queue_ping()
+                          self._collect_effects_locked()
+                  except PacketTooLargeError as exc:
+                      # A broker limit below the two-byte PINGREQ leaves no
+                      # conforming keepalive packet to send.
+                      self._disconnect_exc = exc
+                      self._intentional_disconnect = True
+                      await self._force_close()
+                      return
+                  # A lost PINGREQ beats a wedged keepalive under backpressure.
+          ''',
+          )
+          replace_one(
+              "src/mqttium/api/async_client.py",
+              '''        elif kind is EffectKind.AUTH:
+              challenge: AuthPacket = effect.data
+              if self.auth_handler is None:
+                  await self._enqueue_outbound(
+                      encode_disconnect(0x8C, self._engine.config.protocol),
+                      nowait=nowait,
+                      epoch=epoch,
+                  )
+                  return
+          ''',
+              '''        elif kind is EffectKind.AUTH:
+              challenge: AuthPacket = effect.data
+              if self.auth_handler is None:
+                  packet = encode_disconnect(0x8C, self._engine.config.protocol)
+                  self._engine._check_outbound_size(packet)
+                  await self._enqueue_outbound(
+                      packet,
+                      nowait=nowait,
+                      epoch=epoch,
+                  )
+                  return
+          ''',
+          )
+          replace_one(
+              "src/mqttium/api/async_client.py",
+              '''        try:
+              packet = encode_disconnect(reason, MQTTProtocolVersion.MQTTv5)
+              admitted = self._try_enqueue_outbound(packet, epoch=self._connection_epoch)
+          ''',
+              '''        try:
+              packet = encode_disconnect(reason, MQTTProtocolVersion.MQTTv5)
+              self._engine._check_outbound_size(packet)
+              admitted = self._try_enqueue_outbound(packet, epoch=self._connection_epoch)
+          ''',
+          )
+          PY
           python -m compileall -q src/mqttium
+          git diff --check
       - name: Remove bootstrap files and push result
         run: |
           set -euo pipefail
+          git add src/mqttium/protocol/inbound.py src/mqttium/api/async_client.py
           git rm .rc2-mps.patch .github/workflows/rc2-hardening-bootstrap.yml
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
