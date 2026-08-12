@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from mqttium.codec.primitives import validate_utf8
+from mqttium.codec.primitives import encode_utf8, validate_utf8
 from mqttium.errors import MalformedPacketError, ProtocolError
 
 
@@ -18,6 +18,24 @@ def validate_publish_topic(topic: str, *, allow_empty: bool = False) -> None:
     _check_utf8_mqtt_topic(topic)
     if "+" in topic or "#" in topic:
         raise ProtocolError("PUBLISH topic must not contain wildcards")
+
+
+def encode_validated_publish_topic(topic: str) -> bytes:
+    """Validate an outbound PUBLISH topic and return its MQTT UTF-8 bytes.
+
+    This is the QoS 0 hot-path companion to :func:`validate_publish_topic`: the
+    caller is about to encode the packet immediately, so retaining the validated
+    bytes avoids scanning/encoding the Topic Name a second time.
+    """
+    if not topic:
+        raise ProtocolError("PUBLISH topic must not be empty")
+    try:
+        encoded = encode_utf8(topic)
+    except ProtocolError as exc:
+        raise ProtocolError(f"Invalid MQTT topic: {exc}") from exc
+    if "+" in topic or "#" in topic:
+        raise ProtocolError("PUBLISH topic must not contain wildcards")
+    return encoded
 
 
 def validate_received_publish_topic(
