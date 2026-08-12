@@ -858,7 +858,7 @@ class AsyncClient:
             except PacketTooLargeError:
                 # The peer's packet limit makes a legal DISCONNECT impossible.
                 # Closing the transport is the only conforming shutdown left.
-                await self._force_close()
+                await self._force_close_after_local_packet_failure()
                 return
             try:
                 if packet is not None:
@@ -1213,7 +1213,7 @@ class AsyncClient:
             # exchange impossible to complete without violating negotiation.
             self._disconnect_exc = exc
             self._intentional_disconnect = True
-            await self._force_close()
+            await self._force_close_after_local_packet_failure()
             raise
         await self._drain_effects()
 
@@ -1417,7 +1417,7 @@ class AsyncClient:
                         # conforming keepalive packet to send.
                         self._disconnect_exc = exc
                         self._intentional_disconnect = True
-                        await self._force_close()
+                        await self._force_close_after_local_packet_failure()
                         return
                     # A lost PINGREQ beats a wedged keepalive under backpressure.
                     try:
@@ -1822,6 +1822,17 @@ class AsyncClient:
                     pass
         except Exception:
             pass
+
+    async def _force_close_after_local_packet_failure(self) -> None:
+        """Close transport and finalize engine state for local packet-size failures."""
+        await self._force_close()
+        async with self._engine_lock:
+            if self._engine.state not in (
+                ConnectionState.NEW,
+                ConnectionState.DISCONNECTED,
+            ):
+                self._engine.notify_transport_closed()
+                self._engine.take_effects()
 
     async def _force_close(self, *, preserve_reconnect: bool = False) -> None:
         await self._invalidate_connection_epoch()
