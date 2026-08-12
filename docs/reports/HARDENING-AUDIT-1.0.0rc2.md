@@ -32,6 +32,7 @@ in-process fake transports. Python 3.12.3 on Linux x86_64; `PYTHONPATH=src`.
 | F1 | [#186](https://github.com/yoch/mqttium/issues/186) | `_protocol_disconnect` emits a DISCONNECT larger than negotiated Maximum Packet Size |
 | F2 | [#187](https://github.com/yoch/mqttium/issues/187) | Local `_protocol_disconnect` leaves `AsyncClient` transport / reader alive (zombie) |
 | F3 | [#188](https://github.com/yoch/mqttium/issues/188) | CONNACK protocol violations during `connect()` surface as `MQTTTimeoutError` |
+| F4 | [#190](https://github.com/yoch/mqttium/issues/190) | CONNACK auth-property validation leaves `ProtocolEngine` stuck in `CONNECTING` |
 
 ### F1 — oversized DISCONNECT from `_protocol_disconnect` (#186)
 
@@ -78,6 +79,23 @@ the CONNACK timeout (`MQTTTimeoutError`).
 Related to #187 (same `_protocol_disconnect` + effect-pump interaction) but a
 distinct user-visible failure mode on the connect path.
 
+### F4 — CONNACK auth validation leaves engine `CONNECTING` (#190)
+
+When `_on_connack` rejects a successful-looking CONNACK for auth-property
+rules (`authentication_method` mismatch, or `authentication_data` without a
+CONNECT method), it raises `ProtocolError` **without** leaving `CONNECTING`.
+`_pending_connect` is already cleared, so `begin_connect()` then fails with
+“Already connected or connecting”. Recovery needs an explicit
+`notify_transport_closed()`.
+
+Unsuccessful CONNACK reason codes correctly emit `DISCONNECTED`. Empty ClientID
+without ACI and Clean Start + Session Present use `_protocol_disconnect`. These
+auth-property checks should follow the same teardown pattern.
+
+`AsyncClient.connect()` still fails promptly (state is still `CONNECTING`, so
+EffectPump can fail `_connack_fut`). The defect is the engine state machine /
+direct `ProtocolEngine` consumers. Distinct from #188.
+
 ## Candidates examined and rejected
 
 | Candidate | Verdict |
@@ -99,6 +117,11 @@ distinct user-visible failure mode on the connect path.
 | WebSocket coalesce bounds / masking | **No defect found** in read + contract comments (`_MAX_COALESCED_PAYLOAD`, frame/batch caps) |
 | Compat import confinement from protocol | **Clean** |
 | Unsolicited AUTH Success (`0x00`) while CONNECTED | **Inconclusive / likely intentional** — delivered as `AUTH` for the handler; not filed |
+| Outbound publish with `receive_maximum=1` admitting a second QoS1 | **Intentional** — second message enters `QUEUED`, no extra SEND until flow frees |
+| MQTT 5 SUBACK with reason byte but no property length | **False positive** — malformed framing; correct `mid + 0x00 + reason` works and releases the MID |
+| CONNACK `Assigned Client Identifier` while local ClientID non-empty | **Inconclusive** — numbered statements only MUST ACI for zero-length ClientID; no clear MUST NOT filed |
+| PUBACK / PUBREC failure reason codes (`0x80`/`0x87`/`0x97`) | **Clean** — `PUBLISH_FAILED`, store cleared, MID released |
+| `0x10` No matching subscribers on PUBACK | **Clean** — treated as `PUBLISH_COMPLETE` |
 
 ## Surfaces surveyed without a confirmed new defect
 
@@ -116,7 +139,7 @@ Status per planned sweep area (`clean` = no new defect beyond F1–F3;
 
 | # | Surface | Status |
 | --- | --- | --- |
-| 2.1 | `_protocol_disconnect` / MPS / size validation | **bug→#186**, **bug→#187**, **bug→#188** |
+| 2.1 | `_protocol_disconnect` / MPS / CONNACK handshake teardown | **bug→#186**, **bug→#187**, **bug→#188**, **bug→#190** |
 | 2.2 | Fast-path MQTT 5 decode vs 3.1.1 fallback | **clean** — wildcard / empty / DUP QoS 0 refused on both paths |
 | 2.3 | Property encoding cache / mutation | **clean** — in-place `bytearray` snapshot held |
 | 2.4 | Persistence transitions / SQLite | **clean** — external `complete_out` + orphan PUBACK stable |
@@ -145,7 +168,7 @@ paths `#181` fixed; residual gap is only `_protocol_disconnect`).
 
 ## Follow-up
 
-Fix order suggested by coupling:
+Fix order suggested by coupling (not implemented in this audit pass):
 
 1. Teach `_protocol_disconnect` (engine + inbound) to honour Maximum Packet Size
    the same way intentional disconnect / AUTH fallback already do (#186).
@@ -154,3 +177,27 @@ Fix order suggested by coupling:
 3. Fail `_connack_fut` on connect-path protocol disconnects even after state is
    `DISCONNECTED` (#188) — likely falls out of (2) if the error is preserved for
    the waiter.
+4. On CONNACK auth-property validation failures, leave `CONNECTING` via
+   `_protocol_disconnect` / `DISCONNECTED` rather than a bare `PROTOCOL_ERROR`
+   (#190).
+
+### Suggested fix approaches (for issue assignees)
+
+Issue comments could not be posted with the audit token (403). The approaches
+below are also mirrored on PR #189.
+
+**#186** — Before `_send` in `_protocol_disconnect`, `encode_disconnect` +
+`_check_outbound_size`. On `PacketTooLargeError`, omit the SEND but still
+transition to `DISCONNECTED`. Optionally align `_reject_auth_method`.
+
+**#187** — Close the transport on any `DISCONNECTED` while it is still open.
+Optionally set `_disconnect_exc` from `PROTOCOL_ERROR` only when
+`engine.state is DISCONNECTED`, preserving the intentional non-fatal rude
+CONNACK policy when the engine stays `CONNECTED`.
+
+**#188** — In `EffectPump`, if `_connack_fut` is pending and not done,
+`set_exception(exc)` without requiring `state is CONNECTING`.
+
+**#190** — In `_on_connack`, on auth-method / auth-data validation failure, use
+the same teardown pattern as empty ClientID without ACI (`_protocol_disconnect`
+then raise), instead of raising alone while left in `CONNECTING`.
