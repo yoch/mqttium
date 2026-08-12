@@ -8,6 +8,12 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Inbound MQTT 3.1 PUBLISH decoding no longer enters the MQTT 5 direct path.
+  After #174, `on_publish` gated the fast decoder with a bare `else` on
+  non-`MQTTv311`, so `MQTTv31` read a property section that 3.1 packets do not
+  have: a leading `0x00` payload byte was dropped silently, and other leading
+  bytes raised a spurious protocol error. The direct decoder is gated on
+  `MQTTv5` again; MQTT 3.1 keeps `PublishPacket.decode`.
 - An inbound PUBLISH whose packet identifier is still owned by an unfinished
   exchange of the other QoS no longer overwrites the stored record. The inbound
   store is keyed by identifier alone, so a QoS 1 PUBLISH reusing the identifier

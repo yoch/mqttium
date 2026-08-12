@@ -183,3 +183,54 @@ def test_v311_qos2_remains_generic(monkeypatch) -> None:
         )
     )
     assert calls == 1
+
+
+@pytest.mark.parametrize(
+    ("flags", "remaining", "expected_payload", "expected_mid"),
+    [
+        # Leading 0x00 looks like an empty MQTT 5 property length; must stay payload.
+        (0x00, pack_utf8("v31/qos0") + b"\x00HELLO", b"\x00HELLO", None),
+        # Leading 0x01 is not a valid property section for MQTT 3.1 either.
+        (0x00, pack_utf8("v31/qos0") + b"\x01HELLO", b"\x01HELLO", None),
+        (
+            0x02,
+            pack_utf8("v31/qos1") + pack_u16(11) + b"\x00HELLO",
+            b"\x00HELLO",
+            11,
+        ),
+        (
+            0x04,
+            pack_utf8("v31/qos2") + pack_u16(12) + b"\x01HELLO",
+            b"\x01HELLO",
+            12,
+        ),
+    ],
+)
+def test_mqtt31_publish_keeps_generic_decoder_without_properties(
+    flags: int,
+    remaining: bytes,
+    expected_payload: bytes,
+    expected_mid: int | None,
+    monkeypatch,
+) -> None:
+    """MQTT 3.1 must not enter the MQTT 5 direct decoder (#174 bare else)."""
+    calls = 0
+    original = PublishPacket.decode
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(PublishPacket, "decode", counted)
+    engine = ProtocolEngine(EngineConfig(protocol=MQTTProtocolVersion.MQTTv31))
+    engine.state = ConnectionState.CONNECTED
+    engine.handle_raw(RawPacket(PacketType.PUBLISH, flags, remaining))
+    effects = engine.take_effects()
+    messages = [effect for effect in effects if effect.kind is EffectKind.MESSAGE]
+    assert len(messages) == 1
+    message = messages[0].data
+    assert message.payload == expected_payload
+    assert message.mid == expected_mid
+    assert message.properties is None
+    assert calls == 1

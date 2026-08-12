@@ -284,7 +284,10 @@ class InboundSession:
                     properties=None,
                 )
                 return
-        else:
+        elif config.protocol is MQTTProtocolVersion.MQTTv5:
+            # Gate on MQTTv5 only: MQTT 3.1 PUBLISH has no property section, so
+            # the bare else that shipped with #174 would treat the first payload
+            # byte as a property length (silent drop or spurious PROTOCOL_ERROR).
             if qos_raw == 3:
                 raise MalformedPacketError("Invalid PUBLISH QoS 3")
             qos = QoS(qos_raw)
@@ -327,11 +330,35 @@ class InboundSession:
             )
             return
 
-        # MQTT 3.1.1 QoS 2 retains the generic decoder; #144 is MQTT 5 only.
+        # MQTT 3.1 (all QoS) and MQTT 3.1.1 QoS 2 keep the generic decoder.
         packet = PublishPacket.decode(raw.flags, raw.remaining, config.protocol)
         topic = self._resolve_topic(packet)
         validate_received_publish_topic(topic, utf8_validated=True)
+        if packet.qos is QoS.AT_MOST_ONCE:
+            engine._emit(
+                EffectKind.MESSAGE,
+                Message(
+                    topic=topic,
+                    payload=packet.payload,
+                    qos=packet.qos,
+                    retain=packet.retain,
+                    dup=packet.dup,
+                    mid=None,
+                    properties=packet.properties,
+                ),
+            )
+            return
         assert packet.mid is not None
+        if packet.qos is QoS.AT_LEAST_ONCE:
+            self._on_qos1(
+                topic=topic,
+                payload=packet.payload,
+                mid=packet.mid,
+                retain=packet.retain,
+                dup=packet.dup,
+                properties=packet.properties,
+            )
+            return
         self._on_qos2(
             topic=topic,
             payload=packet.payload,
