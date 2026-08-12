@@ -21,9 +21,7 @@ def _engine() -> ProtocolEngine:
 @pytest.mark.parametrize("payload", [b"\x00body", b"\x05body"])
 def test_v31_qos0_preserves_payload_prefix(payload: bytes) -> None:
     engine = _engine()
-    engine.handle_raw(
-        RawPacket(PacketType.PUBLISH, 0x00, pack_utf8("v31/qos0") + payload)
-    )
+    engine.handle_raw(RawPacket(PacketType.PUBLISH, 0x00, pack_utf8("v31/qos0") + payload))
 
     effects = engine.take_effects()
     messages = [effect.data for effect in effects if effect.kind is EffectKind.MESSAGE]
