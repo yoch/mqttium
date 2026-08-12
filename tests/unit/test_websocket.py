@@ -40,6 +40,14 @@ def _server_frame(
     return bytes(header) + payload
 
 
+def _decode_client_batch(batch: list[bytes], max_frame_size: int = 1 << 20) -> bytes:
+    frame = bytearray(b"".join(batch))
+    parsed = _parse_frame(frame, max_frame_size, expect_masked=True)
+    assert parsed is not None
+    assert frame == b""
+    return parsed[2]
+
+
 @pytest.mark.asyncio
 async def test_websocket_binary_roundtrip_and_immediate_pong() -> None:
     loop = asyncio.get_running_loop()
@@ -243,7 +251,7 @@ class _BatchWriter:
         return None
 
 
-async def test_write_many_bounds_masked_frame_batches_by_bytes() -> None:
+async def test_write_many_bounds_masked_frames_by_bytes() -> None:
     writer = _BatchWriter()
     transport = WebSocketTransport(
         None,  # type: ignore[arg-type]
@@ -256,17 +264,13 @@ async def test_write_many_bounds_masked_frame_batches_by_bytes() -> None:
 
     assert len(writer.batches) == 2
     assert all(sum(map(len, batch)) <= 160 for batch in writer.batches)
-    decoded = []
-    for batch in writer.batches:
-        for encoded in batch:
-            frame = bytearray(encoded)
-            parsed = _parse_frame(frame, 1024, expect_masked=True)
-            assert parsed is not None
-            decoded.append(parsed[2])
-    assert decoded == parts
+    assert [_decode_client_batch(batch) for batch in writer.batches] == [
+        parts[0],
+        parts[1] + parts[2],
+    ]
 
 
-async def test_write_many_groups_frames_within_byte_budget() -> None:
+async def test_write_many_coalesces_mqtt_packets_into_one_websocket_message() -> None:
     writer = _BatchWriter()
     transport = WebSocketTransport(
         None,  # type: ignore[arg-type]
@@ -278,9 +282,43 @@ async def test_write_many_groups_frames_within_byte_budget() -> None:
     await transport.write_many(parts)
 
     assert len(writer.batches) == 2
-    assert len(writer.batches[0]) == 3
-    assert len(writer.batches[1]) == 1
-    assert sum(map(len, writer.batches[0])) <= 256
+    assert _decode_client_batch(writer.batches[0]) == b"".join(parts[:3])
+    assert _decode_client_batch(writer.batches[1]) == parts[3]
+    assert all(sum(map(len, batch)) <= 256 for batch in writer.batches)
+
+
+async def test_write_many_does_not_coalesce_beyond_max_frame_size() -> None:
+    writer = _BatchWriter()
+    transport = WebSocketTransport(
+        None,  # type: ignore[arg-type]
+        writer,  # type: ignore[arg-type]
+        max_frame_size=100,
+        max_write_batch_bytes=512,
+    )
+    parts = [b"a" * 60, b"b" * 60, b"c" * 20]
+
+    await transport.write_many(parts)
+
+    assert [_decode_client_batch(batch) for batch in writer.batches] == [
+        parts[0],
+        parts[1] + parts[2],
+    ]
+
+
+async def test_write_many_emits_one_oversized_mqtt_packet_alone() -> None:
+    writer = _BatchWriter()
+    transport = WebSocketTransport(
+        None,  # type: ignore[arg-type]
+        writer,  # type: ignore[arg-type]
+        max_frame_size=64,
+        max_write_batch_bytes=64,
+    )
+    part = b"x" * 100
+
+    await transport.write_many([part])
+
+    assert len(writer.batches) == 1
+    assert _decode_client_batch(writer.batches[0]) == part
 
 
 @pytest.mark.parametrize("payload_size", [0, 1, 2, 3, 4, 5, 125, 126, 127, 65_535, 65_536])

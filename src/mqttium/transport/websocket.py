@@ -17,6 +17,7 @@ from mqttium.transport.stats import TransportStats
 _MAX_HANDSHAKE_BYTES = 64 * 1024
 _MAX_CONTROL_PAYLOAD = 125
 _MAX_PENDING_CONTROL = 16
+_MAX_COALESCED_PAYLOAD = 256 * 1024
 _XOR_TABLES: tuple[bytes, ...] | None = None
 
 
@@ -102,27 +103,48 @@ class WebSocketTransport:
         if not parts:
             return
         await self._flush_control()
-        # Bound temporary masked-frame retention by bytes, not only by the
-        # writer's item count. One oversized MQTT item is emitted alone.
-        frames: list[bytes] = []
-        batch_bytes = 0
+        # A WebSocket binary message may contain several consecutive MQTT
+        # Control Packets. Coalesce them before framing so one batch pays for
+        # one random mask and one RFC 6455 header, while retaining scatter/gather
+        # writes for the already-owned MQTT byte strings.
+        batch: list[bytes] = []
+        payload_bytes = 0
         for part in parts:
-            frame = _mask_client_frame(0x2, part)
-            frame_size = len(frame)
-            if frames and batch_bytes + frame_size > self._max_write_batch_bytes:
-                await self._write_frame_batch(frames)
-                batch_bytes = 0
-            frames.append(frame)
-            batch_bytes += frame_size
-            if batch_bytes >= self._max_write_batch_bytes:
-                await self._write_frame_batch(frames)
-                batch_bytes = 0
-        if frames:
-            await self._write_frame_batch(frames)
+            projected = payload_bytes + len(part)
+            if batch and (
+                _masked_frame_size(projected) > self._max_write_batch_bytes
+                or projected > self._max_frame_size
+                or projected > _MAX_COALESCED_PAYLOAD
+            ):
+                await self._write_payload_batch(batch, payload_bytes)
+                payload_bytes = 0
+                projected = len(part)
+            batch.append(part)
+            payload_bytes = projected
+            # One MQTT packet larger than a configured batch/frame bound is
+            # still emitted alone, matching the previous write_many contract.
+            if (
+                _masked_frame_size(payload_bytes) >= self._max_write_batch_bytes
+                or payload_bytes >= self._max_frame_size
+                or payload_bytes >= _MAX_COALESCED_PAYLOAD
+            ):
+                await self._write_payload_batch(batch, payload_bytes)
+                payload_bytes = 0
+        if batch:
+            await self._write_payload_batch(batch, payload_bytes)
 
-    async def _write_frame_batch(self, frames: list[bytes]) -> None:
-        self._writer.writelines(frames)
-        frames.clear()
+    async def _write_payload_batch(self, parts: list[bytes], payload_bytes: int) -> None:
+        payload = parts[0] if len(parts) == 1 else b"".join(parts)
+        mask = os.urandom(4)
+        # Header and masked payload are separate TCP write segments but together
+        # form one RFC 6455 binary frame. This avoids a final header+payload copy.
+        self._writer.writelines(
+            [
+                _client_frame_header(0x2, payload_bytes, mask),
+                _mask_payload(payload, mask),
+            ]
+        )
+        parts.clear()
         if write_buffer_needs_drain(self._writer):
             await self._writer.drain()
 
@@ -366,6 +388,29 @@ def _mask_payload(payload: bytes, mask: bytes) -> bytes:
     return bytes(masked)
 
 
+def _masked_frame_size(payload_size: int) -> int:
+    if payload_size < 126:
+        return payload_size + 6
+    if payload_size < 65536:
+        return payload_size + 8
+    return payload_size + 14
+
+
+def _client_frame_header(opcode: int, payload_size: int, mask: bytes) -> bytes:
+    header = bytearray()
+    header.append(0x80 | (opcode & 0x0F))
+    if payload_size < 126:
+        header.append(0x80 | payload_size)
+    elif payload_size < 65536:
+        header.append(0x80 | 126)
+        header.extend(struct.pack("!H", payload_size))
+    else:
+        header.append(0x80 | 127)
+        header.extend(struct.pack("!Q", payload_size))
+    header.extend(mask)
+    return bytes(header)
+
+
 def _mask_client_frame(
     opcode: int,
     payload: bytes,
@@ -376,19 +421,7 @@ def _mask_client_frame(
         mask = os.urandom(4)
     elif len(mask) != 4:
         raise ValueError("WebSocket mask must contain exactly four bytes")
-    header = bytearray()
-    header.append(0x80 | (opcode & 0x0F))
-    ln = len(payload)
-    if ln < 126:
-        header.append(0x80 | ln)
-    elif ln < 65536:
-        header.append(0x80 | 126)
-        header.extend(struct.pack("!H", ln))
-    else:
-        header.append(0x80 | 127)
-        header.extend(struct.pack("!Q", ln))
-    header.extend(mask)
-    return bytes(header) + _mask_payload(payload, mask)
+    return _client_frame_header(opcode, len(payload), mask) + _mask_payload(payload, mask)
 
 
 def _parse_frame(  # noqa: C901
