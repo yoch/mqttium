@@ -33,6 +33,25 @@ def test_system_topic_wildcard_guard() -> None:
     assert list(matcher.iter_match("foo/bar")) == ["all"]
 
 
+def test_shared_filter_matches_broker_delivered_topic() -> None:
+    matcher = TopicMatcher()
+    matcher["$share/group/sensors/#"] = "shared"
+    matcher["sensors/#"] = "normal"
+
+    assert list(matcher.iter_match("sensors/temp")) == ["shared", "normal"]
+    assert list(matcher.iter_match("$share/group/sensors/temp")) == []
+    assert matcher["$share/group/sensors/#"] == "shared"
+
+
+def test_shared_system_filter_keeps_system_topic_wildcard_guard() -> None:
+    matcher = TopicMatcher()
+    matcher["$share/group/#"] = "shared-all"
+    matcher["$share/group/$SYS/#"] = "shared-sys"
+
+    assert list(matcher.iter_match("$SYS/broker/version")) == ["shared-sys"]
+    assert list(matcher.iter_match("regular/topic")) == ["shared-all"]
+
+
 def test_values_may_be_none_and_deletion_is_explicit() -> None:
     matcher = TopicMatcher()
     matcher["nullable/topic"] = None

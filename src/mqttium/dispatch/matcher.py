@@ -18,7 +18,14 @@ class TopicMatcher:
         self._entries: dict[str, tuple[tuple[str, ...], Any]] = {}
 
     def __setitem__(self, topic_filter: str, value: Any) -> None:
-        self._entries[topic_filter] = (tuple(topic_filter.split("/")), value)
+        levels = tuple(topic_filter.split("/"))
+        # A broker removes "$share/{ShareName}/" before delivering a shared
+        # subscription message. Keep the literal filter as the dictionary key
+        # for Paho-compatible get/delete semantics, but compile the match side
+        # against the Topic Filter that follows the ShareName.
+        if len(levels) >= 3 and levels[0] == "$share" and levels[1]:
+            levels = levels[2:]
+        self._entries[topic_filter] = (levels, value)
 
     def __getitem__(self, topic_filter: str) -> Any:
         try:
