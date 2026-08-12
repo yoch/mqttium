@@ -36,6 +36,7 @@ in-process fake transports. Python 3.12.3 on Linux x86_64; `PYTHONPATH=src`.
 | F5 | [#191](https://github.com/yoch/mqttium/issues/191) | Client DISCONNECT accepts Server-only reason codes and Server Reference |
 | F6 | [#192](https://github.com/yoch/mqttium/issues/192) | Request Problem Information 0 is not enforced on inbound packets |
 | F7 | [#193](https://github.com/yoch/mqttium/issues/193) | ReconnectPolicy retries CONNACK Banned (`0x8A`) |
+| F8 | [#194](https://github.com/yoch/mqttium/issues/194) | CONNECT accepts Authentication Data without Authentication Method |
 
 ### F1 — oversized DISCONNECT from `_protocol_disconnect` (#186)
 
@@ -121,6 +122,22 @@ complete normally, missing the peer check in `[MQTT-3.1.2-29]`.
 reason_code=138`, reconnect keeps retrying, against IMPLEMENTATION-GUIDE §5
 permanent-authorisation policy. `0x88`/`0x89` stay correctly retryable.
 
+### F8 — CONNECT Authentication Data without Method (#194)
+
+`begin_connect()` accepts `connect_properties` with `authentication_data` and no
+`authentication_method`, and emits CONNECT containing property `0x16` without
+`0x15`. MQTT 5 §3.1.2.11.10: *It is a Protocol Error to include Authentication
+Data if there is no Authentication Method.*
+
+## Round 5 continued hunting
+
+Confirmed **#194** (CONNECT Authentication Data without Method). Also noted for
+#193 follow-up: CONNACK `0x90` / `0x9B` / `0x9F` are valid refusal codes but not
+in `_V5_TERMINAL` (permanent-ish; Banned already filed). Message Expiry Interval
+`0` is **not** a Protocol Error (OASIS). Empty user-property keys left unfiled.
+ProtocolEngine alone does not size-check ingress against `config.maximum_packet_size`
+(AsyncClient decoder does) — layered by design, not filed.
+
 ## Round 4 expert sweep
 
 Confirmed **#192** (RPI=0) and **#193** (Banned reconnect). Additional probes without new filings:
@@ -198,7 +215,7 @@ Status per planned sweep area (`clean` = no new defect beyond F1–F3;
 
 | # | Surface | Status |
 | --- | --- | --- |
-| 2.1 | `_protocol_disconnect` / MPS / CONNACK / DISCONNECT direction | **bug→#186–#188**, **bug→#190–#193** |
+| 2.1 | `_protocol_disconnect` / MPS / CONNACK / DISCONNECT direction | **bug→#186–#188**, **bug→#190–#194** |
 | 2.2 | Fast-path MQTT 5 decode vs 3.1.1 fallback | **clean** — wildcard / empty / DUP QoS 0 refused on both paths |
 | 2.3 | Property encoding cache / mutation | **clean** — in-place `bytearray` snapshot held |
 | 2.4 | Persistence transitions / SQLite | **clean** — external `complete_out` + orphan PUBACK stable |
@@ -243,7 +260,8 @@ Fix order suggested by coupling (not implemented in this audit pass):
    `server_reference` on outbound DISCONNECT (#191).
 6. Snapshot Request Problem Information from CONNECT; reject forbidden inbound
    Reason String / User Properties when RPI was 0 (#192).
-7. Add CONNACK `0x8A` Banned to `_V5_TERMINAL` (#193).
+7. Add CONNACK `0x8A` Banned to `_V5_TERMINAL` (#193); consider `0x90`/`0x9B`/`0x9F`.
+8. Reject CONNECT `authentication_data` without `authentication_method` (#194).
 
 ### Suggested fix approaches (for issue assignees)
 
