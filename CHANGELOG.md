@@ -6,6 +6,12 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Changed
+
+- Outbound admission reuses an already-converted `QoS` member instead of
+  constructing a new enum on every `prepare_qos0` / `queue_publish`. Invalid
+  integer levels still raise `ValueError`.
+
 ## [1.0.0rc2] - 2026-08-12
 
 ### Fixed

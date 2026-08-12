@@ -55,6 +55,19 @@ if TYPE_CHECKING:
     from mqttium.protocol.engine import ProtocolEngine
 
 
+def _as_qos(qos: QoS | int) -> QoS:
+    """Reuse an already-converted QoS member; invalid ints still raise ValueError.
+
+    ``encode_publish_item`` already does this because re-running ``QoS()`` on a
+    member cost about 0.17 µs here — the same conversion ``_validate_publish_request``
+    still paid on every publication, including QoS 0 ``prepare_qos0`` which always
+    passes ``QoS.AT_MOST_ONCE``.
+    """
+    if type(qos) is QoS:
+        return qos
+    return QoS(qos)
+
+
 def _retain_publish_item(item: WriteItem) -> WriteItem | None:
     """Keep only a segmented frame, whose payload is already shared."""
     return item if not isinstance(item, bytes) else None
@@ -147,7 +160,7 @@ class OutboundSession:
         qos: QoS | int,
         properties: Properties | None = None,
     ) -> bool:
-        if QoS(qos) == QoS.AT_MOST_ONCE:
+        if _as_qos(qos) == QoS.AT_MOST_ONCE:
             return True
         message_limit = self.config.max_pending_outbound_messages
         if message_limit is not None and message_limit < 1:
@@ -163,7 +176,7 @@ class OutboundSession:
         pending_count = 0
         pending_bytes = 0
         for topic, payload, qos, _retain, properties in messages:
-            if QoS(qos) == QoS.AT_MOST_ONCE:
+            if _as_qos(qos) == QoS.AT_MOST_ONCE:
                 continue
             pending_count += 1
             pending_bytes += self.logical_size(topic, payload, properties)
@@ -288,7 +301,7 @@ class OutboundSession:
     ) -> tuple[QoS, bytes | None]:
         """Validate one outbound PUBLISH and retain QoS 0 Topic Name bytes."""
 
-        level = QoS(qos)
+        level = _as_qos(qos)
         # An empty Topic Name is legal only after this client has established
         # the Topic Alias on the current Network Connection. OutboundSession
         # does not yet own authoritative alias-establishment state across all
@@ -877,7 +890,7 @@ class OutboundSession:
         qos: QoS | int,
         properties: Properties | None,
     ) -> int:
-        level = QoS(qos)
+        level = _as_qos(qos)
         topic_bytes, wire_property_bytes, _ = self.size_parts(topic, properties)
         return self._publish_wire_size_from_parts(
             topic_bytes, wire_property_bytes, payload_size, level

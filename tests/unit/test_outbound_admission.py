@@ -8,7 +8,7 @@ import pytest
 
 from mqttium.codec.buffer import IncrementalDecoder
 from mqttium.codec.properties import PUBLISH, encode_properties
-from mqttium.enums import MQTTProtocolVersion, OutboundQoSState, PacketType, QoS
+from mqttium.enums import ConnectionState, MQTTProtocolVersion, OutboundQoSState, PacketType, QoS
 from mqttium.errors import FlowControlError, MQTTError
 from mqttium.packets import PubAckPacket, PubCompPacket, PubRecPacket, encode_frame
 from mqttium.persistence.memory import MemoryInflightStore
@@ -284,3 +284,27 @@ def test_sustained_qos1_load_returns_admission_counters_to_zero() -> None:
 
     assert engine.outbound.pending_high_water_messages == 50
     assert engine.outbound.pending_high_water_bytes > 0
+
+
+def test_prepare_qos0_does_not_reconstruct_qos_enum(monkeypatch) -> None:
+    engine = ProtocolEngine(EngineConfig(client_id="qos-enum"))
+    engine.state = ConnectionState.CONNECTED
+    calls = 0
+    original_new = QoS.__new__
+
+    def counted_new(cls, value):
+        nonlocal calls
+        calls += 1
+        return original_new(cls, value)
+
+    monkeypatch.setattr(QoS, "__new__", counted_new)
+    engine.outbound.prepare_qos0("bench/qos", b"x")
+    engine.outbound.queue_publish("bench/qos1", b"x", qos=QoS.AT_LEAST_ONCE)
+    assert calls == 0
+
+
+@pytest.mark.parametrize("qos", [3, -1, 99])
+def test_invalid_qos_still_raises_value_error_at_admission(qos: int) -> None:
+    engine = ProtocolEngine(EngineConfig(client_id="qos-enum"))
+    with pytest.raises(ValueError):
+        engine.outbound.queue_publish("bench/invalid", b"x", qos=qos)
