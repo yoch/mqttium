@@ -1,0 +1,50 @@
+name: Apply QoS0 mypy fix
+
+on:
+  push:
+    branches:
+      - perf/qos0-topic-bytes-handoff
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: perf/qos0-topic-bytes-handoff
+      - name: Rename size variable and self-clean
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('src/mqttium/protocol/outbound.py')
+          text = path.read_text()
+          old = '''        topic_bytes, wire_property_bytes, logical_property_bytes = self.size_parts(
+              topic, properties
+          )
+          # Validate packet size before reserving local memory or a packet id.
+          self._check_publish_wire_size(topic_bytes, wire_property_bytes, len(payload), qos)
+          logical_size = len(payload) + topic_bytes + logical_property_bytes
+          '''
+          new = '''        topic_size, wire_property_bytes, logical_property_bytes = self.size_parts(
+              topic, properties
+          )
+          # Validate packet size before reserving local memory or a packet id.
+          self._check_publish_wire_size(topic_size, wire_property_bytes, len(payload), qos)
+          logical_size = len(payload) + topic_size + logical_property_bytes
+          '''
+          if old not in text:
+              raise SystemExit('expected queue_publish size block not found')
+          path.write_text(text.replace(old, new, 1))
+          PY
+          rm .github/workflows/apply-qos0-mypy-fix.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'Fix QoS0 topic-byte handoff typing'
+          git push origin HEAD:perf/qos0-topic-bytes-handoff
