@@ -26,144 +26,130 @@ jobs:
               text = target.read_text()
               count = text.count(old)
               if count != 1:
-                  raise SystemExit(f"{path}: expected one match, found {count}")
+                  raise SystemExit(f"{path}: expected one match, found {count}: {old!r}")
               target.write_text(text.replace(old, new))
 
           replace_one(
               "src/mqttium/protocol/inbound.py",
-              '''        if state not in (InboundQoSState.WAIT_PUBACK, InboundQoSState.WAIT_USER_ACK):
-              raise ProtocolError(f"Inbound mid={mid} is not awaiting ack (state={state!r})")
-
-          if isinstance(record, InboundMessage):
-          ''',
-              '''        if state not in (InboundQoSState.WAIT_PUBACK, InboundQoSState.WAIT_USER_ACK):
-              raise ProtocolError(f"Inbound mid={mid} is not awaiting ack (state={state!r})")
-
-          packet = (
-              PubAckPacket(mid=mid)
-              if state is InboundQoSState.WAIT_PUBACK
-              else PubCompPacket(mid=mid)
-          )
-          wire = packet.encode(config.protocol)
-          self._engine._check_outbound_size(wire)
-
-          if isinstance(record, InboundMessage):
-          ''',
+              "        if state not in (InboundQoSState.WAIT_PUBACK, InboundQoSState.WAIT_USER_ACK):\n"
+              "            raise ProtocolError(f\"Inbound mid={mid} is not awaiting ack (state={state!r})\")\n"
+              "\n"
+              "        if isinstance(record, InboundMessage):\n",
+              "        if state not in (InboundQoSState.WAIT_PUBACK, InboundQoSState.WAIT_USER_ACK):\n"
+              "            raise ProtocolError(f\"Inbound mid={mid} is not awaiting ack (state={state!r})\")\n"
+              "\n"
+              "        packet = (\n"
+              "            PubAckPacket(mid=mid)\n"
+              "            if state is InboundQoSState.WAIT_PUBACK\n"
+              "            else PubCompPacket(mid=mid)\n"
+              "        )\n"
+              "        wire = packet.encode(config.protocol)\n"
+              "        self._engine._check_outbound_size(wire)\n"
+              "\n"
+              "        if isinstance(record, InboundMessage):\n",
           )
           replace_one(
               "src/mqttium/protocol/inbound.py",
-              '''        packet = (
-              PubAckPacket(mid=mid)
-              if state is InboundQoSState.WAIT_PUBACK
-              else PubCompPacket(mid=mid)
-          )
-          self._engine._send(packet.encode(config.protocol))
-          self._release_slot(logical_size)
-          ''',
-              '''        self._engine._send(wire)
-          self._release_slot(logical_size)
-          ''',
+              "        packet = (\n"
+              "            PubAckPacket(mid=mid)\n"
+              "            if state is InboundQoSState.WAIT_PUBACK\n"
+              "            else PubCompPacket(mid=mid)\n"
+              "        )\n"
+              "        self._engine._send(packet.encode(config.protocol))\n"
+              "        self._release_slot(logical_size)\n",
+              "        self._engine._send(wire)\n"
+              "        self._release_slot(logical_size)\n",
           )
 
           replace_one(
               "src/mqttium/api/async_client.py",
-              '''            packet = self._engine.begin_disconnect(reason_code) if self.is_connected else None
-          try:
-          ''',
-              '''            try:
-              packet = (
-                  self._engine.begin_disconnect(reason_code)
-                  if self.is_connected
-                  else None
-              )
-          except PacketTooLargeError:
-              # The peer's packet limit makes a legal DISCONNECT impossible.
-              # Closing the transport is the only conforming shutdown left.
-              await self._force_close()
-              return
-          try:
-          ''',
+              "            packet = self._engine.begin_disconnect(reason_code) if self.is_connected else None\n"
+              "            try:\n",
+              "            try:\n"
+              "                packet = (\n"
+              "                    self._engine.begin_disconnect(reason_code)\n"
+              "                    if self.is_connected\n"
+              "                    else None\n"
+              "                )\n"
+              "            except PacketTooLargeError:\n"
+              "                # The peer's packet limit makes a legal DISCONNECT impossible.\n"
+              "                # Closing the transport is the only conforming shutdown left.\n"
+              "                await self._force_close()\n"
+              "                return\n"
+              "            try:\n",
           )
           replace_one(
               "src/mqttium/api/async_client.py",
-              '''        async with self._engine_lock:
-              self._engine.ack(message.mid)
-              self._collect_effects_locked()
-          await self._drain_effects()
-          ''',
-              '''        try:
-              async with self._engine_lock:
-                  self._engine.ack(message.mid)
-                  self._collect_effects_locked()
-          except PacketTooLargeError as exc:
-              # A broker limit below the mandatory ACK size makes this QoS
-              # exchange impossible to complete without violating negotiation.
-              self._disconnect_exc = exc
-              self._intentional_disconnect = True
-              await self._force_close()
-              raise
-          await self._drain_effects()
-          ''',
+              "        async with self._engine_lock:\n"
+              "            self._engine.ack(message.mid)\n"
+              "            self._collect_effects_locked()\n"
+              "        await self._drain_effects()\n",
+              "        try:\n"
+              "            async with self._engine_lock:\n"
+              "                self._engine.ack(message.mid)\n"
+              "                self._collect_effects_locked()\n"
+              "        except PacketTooLargeError as exc:\n"
+              "            # A broker limit below the mandatory ACK size makes this QoS\n"
+              "            # exchange impossible to complete without violating negotiation.\n"
+              "            self._disconnect_exc = exc\n"
+              "            self._intentional_disconnect = True\n"
+              "            await self._force_close()\n"
+              "            raise\n"
+              "        await self._drain_effects()\n",
           )
           replace_one(
               "src/mqttium/api/async_client.py",
-              '''                if now >= due:
-                  async with self._engine_lock:
-                      self._engine.queue_ping()
-                      self._collect_effects_locked()
-                  # A lost PINGREQ beats a wedged keepalive under backpressure.
-          ''',
-              '''                if now >= due:
-                  try:
-                      async with self._engine_lock:
-                          self._engine.queue_ping()
-                          self._collect_effects_locked()
-                  except PacketTooLargeError as exc:
-                      # A broker limit below the two-byte PINGREQ leaves no
-                      # conforming keepalive packet to send.
-                      self._disconnect_exc = exc
-                      self._intentional_disconnect = True
-                      await self._force_close()
-                      return
-                  # A lost PINGREQ beats a wedged keepalive under backpressure.
-          ''',
+              "                if now >= due:\n"
+              "                    async with self._engine_lock:\n"
+              "                        self._engine.queue_ping()\n"
+              "                        self._collect_effects_locked()\n"
+              "                    # A lost PINGREQ beats a wedged keepalive under backpressure.\n",
+              "                if now >= due:\n"
+              "                    try:\n"
+              "                        async with self._engine_lock:\n"
+              "                            self._engine.queue_ping()\n"
+              "                            self._collect_effects_locked()\n"
+              "                    except PacketTooLargeError as exc:\n"
+              "                        # A broker limit below the two-byte PINGREQ leaves no\n"
+              "                        # conforming keepalive packet to send.\n"
+              "                        self._disconnect_exc = exc\n"
+              "                        self._intentional_disconnect = True\n"
+              "                        await self._force_close()\n"
+              "                        return\n"
+              "                    # A lost PINGREQ beats a wedged keepalive under backpressure.\n",
           )
           replace_one(
               "src/mqttium/api/async_client.py",
-              '''        elif kind is EffectKind.AUTH:
-              challenge: AuthPacket = effect.data
-              if self.auth_handler is None:
-                  await self._enqueue_outbound(
-                      encode_disconnect(0x8C, self._engine.config.protocol),
-                      nowait=nowait,
-                      epoch=epoch,
-                  )
-                  return
-          ''',
-              '''        elif kind is EffectKind.AUTH:
-              challenge: AuthPacket = effect.data
-              if self.auth_handler is None:
-                  packet = encode_disconnect(0x8C, self._engine.config.protocol)
-                  self._engine._check_outbound_size(packet)
-                  await self._enqueue_outbound(
-                      packet,
-                      nowait=nowait,
-                      epoch=epoch,
-                  )
-                  return
-          ''',
+              "        elif kind is EffectKind.AUTH:\n"
+              "            challenge: AuthPacket = effect.data\n"
+              "            if self.auth_handler is None:\n"
+              "                await self._enqueue_outbound(\n"
+              "                    encode_disconnect(0x8C, self._engine.config.protocol),\n"
+              "                    nowait=nowait,\n"
+              "                    epoch=epoch,\n"
+              "                )\n"
+              "                return\n",
+              "        elif kind is EffectKind.AUTH:\n"
+              "            challenge: AuthPacket = effect.data\n"
+              "            if self.auth_handler is None:\n"
+              "                packet = encode_disconnect(0x8C, self._engine.config.protocol)\n"
+              "                self._engine._check_outbound_size(packet)\n"
+              "                await self._enqueue_outbound(\n"
+              "                    packet,\n"
+              "                    nowait=nowait,\n"
+              "                    epoch=epoch,\n"
+              "                )\n"
+              "                return\n",
           )
           replace_one(
               "src/mqttium/api/async_client.py",
-              '''        try:
-              packet = encode_disconnect(reason, MQTTProtocolVersion.MQTTv5)
-              admitted = self._try_enqueue_outbound(packet, epoch=self._connection_epoch)
-          ''',
-              '''        try:
-              packet = encode_disconnect(reason, MQTTProtocolVersion.MQTTv5)
-              self._engine._check_outbound_size(packet)
-              admitted = self._try_enqueue_outbound(packet, epoch=self._connection_epoch)
-          ''',
+              "        try:\n"
+              "            packet = encode_disconnect(reason, MQTTProtocolVersion.MQTTv5)\n"
+              "            admitted = self._try_enqueue_outbound(packet, epoch=self._connection_epoch)\n",
+              "        try:\n"
+              "            packet = encode_disconnect(reason, MQTTProtocolVersion.MQTTv5)\n"
+              "            self._engine._check_outbound_size(packet)\n"
+              "            admitted = self._try_enqueue_outbound(packet, epoch=self._connection_epoch)\n",
           )
           PY
           python -m compileall -q src/mqttium
