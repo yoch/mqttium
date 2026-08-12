@@ -49,3 +49,8 @@ def test_qos1_validation_does_not_preencode_topic(monkeypatch) -> None:
         raise AssertionError("QoS 1 validation must not allocate Topic Name bytes")
 
     monkeypatch.setattr(outbound_module, "encode_validated_publish_topic", unexpected_preencode)
+
+    engine = _connected_engine()
+    handle = engine.queue_publish("capteurs/qos1", b"payload", qos=1)
+
+    assert handle.mid is not None
