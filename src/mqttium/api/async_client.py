@@ -1551,11 +1551,11 @@ class AsyncClient:
         elif kind is EffectKind.AUTH:
             challenge: AuthPacket = effect.data
             if self.auth_handler is None:
-                packet = encode_disconnect(0x8C, self._engine.config.protocol)
+                packet = encode_disconnect(0x82, self._engine.config.protocol)
                 try:
                     self._engine._check_outbound_size(packet)
                 except PacketTooLargeError as exc:
-                    # The broker limit makes the required AUTH rejection
+                    # The broker limit makes the protocol-error DISCONNECT
                     # impossible to send. Close the transport so the connection
                     # cannot remain active after this terminal condition.
                     self._disconnect_exc = exc
@@ -1616,7 +1616,15 @@ class AsyncClient:
             info = effect.data
             if isinstance(info, DisconnectInfo):
                 self._last_disconnect = info
-                if info.from_broker and self._transport is not None:
+                if self._transport is not None and not self._transport.is_closing():
+                    if not info.from_broker:
+                        try:
+                            await asyncio.wait_for(
+                                self._write_pump.join(),
+                                timeout=_FATAL_DISCONNECT_DRAIN_TIMEOUT,
+                            )
+                        except TimeoutError:
+                            pass
                     try:
                         await self._transport.close()
                     except Exception:
@@ -1632,7 +1640,10 @@ class AsyncClient:
                 self._engine.continue_inbound_replay()
                 self._collect_effects_locked()
         elif kind is EffectKind.PROTOCOL_ERROR:
-            raise ProtocolError(str(effect.data))
+            error = ProtocolError(str(effect.data))
+            if self._engine.state is ConnectionState.DISCONNECTED:
+                self._disconnect_exc = error
+            raise error
         else:
             never: Never = kind
             raise MQTTError(f"Unhandled effect {never!r}")

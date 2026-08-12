@@ -117,6 +117,7 @@ class ProtocolEngine:
         self._prefer_session_resume = False
         self._sent_clean_start = False
         self._sent_session_expiry_interval: int | None = None
+        self._sent_request_problem_information = 1
         self._auth_method: str | None = None
         self._handlers = {
             PacketType.CONNACK: self._on_connack,
@@ -339,6 +340,12 @@ class ProtocolEngine:
         self._sent_session_expiry_interval = (
             connect_props.get("session_expiry_interval") if connect_props is not None else None
         )
+        request_problem_information = (
+            connect_props.get("request_problem_information") if connect_props is not None else None
+        )
+        self._sent_request_problem_information = (
+            1 if request_problem_information is None else int(request_problem_information)
+        )
         self._pending_auto_qos1_mids.clear()
         self.state = ConnectionState.CONNECTING
         self._pending_connect = True
@@ -546,12 +553,14 @@ class ProtocolEngine:
                 else None
             )
             if connack_method is not None and connack_method != self._auth_method:
+                self._protocol_disconnect(0x82)
                 raise ProtocolError("CONNACK authentication_method does not match CONNECT")
             if (
                 connack.properties is not None
                 and connack.properties.get("authentication_data") is not None
                 and self._auth_method is None
             ):
+                self._protocol_disconnect(0x82)
                 raise ProtocolError("CONNACK authentication_data requires authentication_method")
         if connack.reason_code != 0:
             self.state = ConnectionState.DISCONNECTED
@@ -644,6 +653,7 @@ class ProtocolEngine:
 
     def _on_suback(self, raw: RawPacket) -> None:
         ack = SubAckPacket.decode(raw.remaining, self.config.protocol)
+        self._validate_inbound_problem_information(PacketType.SUBACK, ack.properties)
         self._complete_subscription_request(
             ack.mid,
             PacketType.SUBACK,
@@ -653,6 +663,7 @@ class ProtocolEngine:
 
     def _on_unsuback(self, raw: RawPacket) -> None:
         ack = UnsubAckPacket.decode(raw.remaining, self.config.protocol)
+        self._validate_inbound_problem_information(PacketType.UNSUBACK, ack.properties)
         reason_count = (
             len(ack.reason_codes) if self.config.protocol is MQTTProtocolVersion.MQTTv5 else None
         )
@@ -695,6 +706,26 @@ class ProtocolEngine:
         # Brokers must not send PINGREQ to clients.
         raise ProtocolError("Unexpected PINGREQ from broker")
 
+    def _validate_inbound_problem_information(
+        self,
+        packet_type: PacketType,
+        properties: Properties | None,
+    ) -> None:
+        """Enforce the Request Problem Information obligation negotiated in CONNECT."""
+        if (
+            self.config.protocol != MQTTProtocolVersion.MQTTv5
+            or self._sent_request_problem_information != 0
+            or packet_type in (PacketType.PUBLISH, PacketType.CONNACK, PacketType.DISCONNECT)
+            or properties is None
+        ):
+            return
+        if properties.get("reason_string") is None and properties.get("user_property") is None:
+            return
+        self._protocol_disconnect(0x82)
+        raise ProtocolError(
+            f"{packet_type.name} includes problem information after Request Problem Information=0"
+        )
+
     def _on_disconnect(self, raw: RawPacket) -> None:
         packet = DisconnectPacket.decode(raw.remaining, self.config.protocol)
         if (
@@ -729,6 +760,7 @@ class ProtocolEngine:
             self._protocol_disconnect(0x82)
             raise ProtocolError("AUTH is not valid in MQTT 3.1.1")
         packet = AuthPacket.decode(raw.remaining, self.config.protocol)
+        self._validate_inbound_problem_information(PacketType.AUTH, packet.properties)
         if self._auth_method is None:
             self._reject_auth_method()
             return
@@ -745,27 +777,26 @@ class ProtocolEngine:
             self._protocol_disconnect(0x82)
             raise ProtocolError("Broker must not send Re-authenticate AUTH (0x19)")
         if not self.config.accept_auth:
-            # No enhanced-auth handler configured — reject broker-initiated AUTH.
-            self._send(
-                encode_disconnect(
-                    0x8C,
-                    self.config.protocol,
-                )
-            )
-            self.state = ConnectionState.DISCONNECTED
-            self._emit(
-                EffectKind.DISCONNECTED,
-                DisconnectInfo(reason_code=0x8C, from_broker=False),
-            )
+            # The peer continued an exchange the runtime cannot service. This is
+            # a protocol failure on the active connection, not a CONNACK refusal.
+            self._protocol_disconnect(0x82)
             return
         self._emit(EffectKind.AUTH, packet)
 
     def _protocol_disconnect(self, reason_code: int) -> None:
         """Tear the connection down, announcing why when the version allows it."""
         if self.config.protocol == MQTTProtocolVersion.MQTTv5:
-            # MQTT 3.1.1 DISCONNECT carries no reason code, so there is nothing
-            # useful to send: the peer only learns from the close itself.
-            self._send(encode_disconnect(reason_code, self.config.protocol))
+            # MQTT 3.1.1 DISCONNECT carries no reason code. MQTT 5 does, but a
+            # negotiated Maximum Packet Size can make even the normative error
+            # packet impossible to send. Connection state must still become
+            # terminal in that case.
+            packet = encode_disconnect(reason_code, self.config.protocol)
+            try:
+                self._check_outbound_size(packet)
+            except PacketTooLargeError:
+                pass
+            else:
+                self._send(packet)
         self.state = ConnectionState.DISCONNECTED
         self._emit(
             EffectKind.DISCONNECTED,
@@ -773,12 +804,7 @@ class ProtocolEngine:
         )
 
     def _reject_auth_method(self) -> None:
-        self._send(encode_disconnect(0x8C, self.config.protocol))
-        self.state = ConnectionState.DISCONNECTED
-        self._emit(
-            EffectKind.DISCONNECTED,
-            DisconnectInfo(reason_code=0x8C, from_broker=False),
-        )
+        self._protocol_disconnect(0x82)
 
     def queue_auth(
         self,

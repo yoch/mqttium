@@ -45,6 +45,27 @@ _DISCONNECT_V5_REASONS = frozenset(
         0xA2,
     }
 )
+# MQTT 5 Table 3-10 is directional. The decoder accepts every DISCONNECT
+# reason a Server may legally send; the Client encoder is restricted to values
+# whose "Sent by" column includes Client.
+_CLIENT_DISCONNECT_V5_REASONS = frozenset(
+    {
+        0x00,
+        0x04,
+        0x80,
+        0x81,
+        0x82,
+        0x83,
+        0x90,
+        0x93,
+        0x94,
+        0x95,
+        0x96,
+        0x97,
+        0x98,
+        0x99,
+    }
+)
 _AUTH_REASONS = frozenset({0x00, 0x18, 0x19})
 
 
@@ -125,7 +146,11 @@ def encode_disconnect(
     properties: Properties | None = None,
 ) -> bytes:
     if protocol == MQTTProtocolVersion.MQTTv5:
-        _require_outbound_reason(reason_code, _DISCONNECT_V5_REASONS, DISCONNECT)
+        _require_outbound_reason(reason_code, _CLIENT_DISCONNECT_V5_REASONS, DISCONNECT)
+        if properties is not None and properties.get("server_reference") is not None:
+            raise ProtocolError(
+                "DISCONNECT server_reference is Server-only and cannot be sent by a Client"
+            )
         if reason_code == 0 and not (properties and properties.values):
             return encode_frame(PacketType.DISCONNECT, 0, b"")
         body = bytearray()

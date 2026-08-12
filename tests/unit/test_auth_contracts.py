@@ -40,7 +40,7 @@ def test_auth_handler_requires_method_in_connect() -> None:
     assert engine.state is ConnectionState.NEW
 
 
-def test_inbound_auth_method_mismatch_disconnects_with_bad_method() -> None:
+def test_inbound_auth_method_mismatch_disconnects_with_protocol_error() -> None:
     engine = ProtocolEngine(
         EngineConfig(
             protocol=MQTTProtocolVersion.MQTTv5,
@@ -55,7 +55,7 @@ def test_inbound_auth_method_mismatch_disconnects_with_bad_method() -> None:
     assert engine.state is ConnectionState.DISCONNECTED
     assert any(effect.kind is EffectKind.SEND for effect in effects)
     disconnected = next(effect.data for effect in effects if effect.kind is EffectKind.DISCONNECTED)
-    assert disconnected.reason_code == 0x8C
+    assert disconnected.reason_code == 0x82
 
 
 def test_outbound_auth_injects_configured_method() -> None:

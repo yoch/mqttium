@@ -11,13 +11,21 @@ from mqttium.enums import MQTTProtocolVersion
 _V311_TERMINAL = frozenset({1, 2, 4, 5})
 _V5_TERMINAL = frozenset(
     {
-        0x84,
-        0x85,
-        0x86,
-        0x87,
-        0x8C,
-        0x9D,
-        0x9C,
+        0x81,  # Malformed Packet
+        0x82,  # Protocol Error
+        0x84,  # Unsupported Protocol Version
+        0x85,  # Client Identifier not valid
+        0x86,  # Bad User Name or Password
+        0x87,  # Not authorized
+        0x8A,  # Banned
+        0x8C,  # Bad authentication method
+        0x90,  # Topic Name invalid (Will Topic on CONNACK)
+        0x95,  # Packet too large (CONNECT)
+        0x99,  # Payload format invalid (Will Payload)
+        0x9A,  # Retain not supported
+        0x9B,  # QoS not supported
+        0x9C,  # Use another server (unless following Server Reference)
+        0x9D,  # Server moved
     }
 )
 

@@ -12,7 +12,6 @@ from collections import deque
 from typing import TYPE_CHECKING, Protocol
 
 from mqttium.api.stats import EffectStats
-from mqttium.enums import ConnectionState
 from mqttium.protocol.effects import EffectKind, EngineEffect
 
 if TYPE_CHECKING:
@@ -220,10 +219,9 @@ class EffectPump:
                             self.pending.popleft()
                             self._complete()
                         self.error = exc
-                        if self.owner._engine.state is ConnectionState.CONNECTING:
-                            connack_fut = getattr(self.owner, "_connack_fut", None)
-                            if connack_fut is not None and not connack_fut.done():
-                                connack_fut.set_exception(exc)
+                        connack_fut = getattr(self.owner, "_connack_fut", None)
+                        if connack_fut is not None and not connack_fut.done():
+                            connack_fut.set_exception(exc)
                         if self.waiters:
                             self.progress.set()
                         raise
