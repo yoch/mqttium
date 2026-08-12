@@ -76,6 +76,31 @@ def test_publish_admission_encodes_properties_once(monkeypatch: pytest.MonkeyPat
     assert calls == 0, "an empty property table needs no encode"
 
 
+def test_connected_qos1_launch_reuses_cached_property_body(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Sizing and the actual MQTT 5 frame encode walk each property only once."""
+    import mqttium.codec.properties as properties_module
+    from mqttium.enums import ConnectionState
+
+    calls = 0
+    original = properties_module._encode_value
+
+    def counting(prop_type: object, value: object) -> bytes:
+        nonlocal calls
+        calls += 1
+        return original(prop_type, value)
+
+    monkeypatch.setattr(properties_module, "_encode_value", counting)
+    properties = Properties()
+    properties.add_user_property("source", "contract")
+    properties.set("content_type", "application/octet-stream")
+    engine = ProtocolEngine(EngineConfig(protocol=MQTTProtocolVersion.MQTTv5))
+    engine.state = ConnectionState.CONNECTED
+
+    engine.queue_publish("contract/topic", b"payload", qos=1, properties=properties)
+
+    assert calls == 2
+
+
 async def test_nowait_publish_encodes_properties_once(monkeypatch) -> None:
     """Admission must not re-encode a property table queue_publish will encode."""
     import mqttium.protocol.outbound as outbound_module
