@@ -34,6 +34,8 @@ in-process fake transports. Python 3.12.3 on Linux x86_64; `PYTHONPATH=src`.
 | F3 | [#188](https://github.com/yoch/mqttium/issues/188) | CONNACK protocol violations during `connect()` surface as `MQTTTimeoutError` |
 | F4 | [#190](https://github.com/yoch/mqttium/issues/190) | CONNACK auth-property validation leaves `ProtocolEngine` stuck in `CONNECTING` |
 | F5 | [#191](https://github.com/yoch/mqttium/issues/191) | Client DISCONNECT accepts Server-only reason codes and Server Reference |
+| F6 | [#192](https://github.com/yoch/mqttium/issues/192) | Request Problem Information 0 is not enforced on inbound packets |
+| F7 | [#193](https://github.com/yoch/mqttium/issues/193) | ReconnectPolicy retries CONNACK Banned (`0x8A`) |
 
 ### F1 — oversized DISCONNECT from `_protocol_disconnect` (#186)
 
@@ -107,6 +109,17 @@ Client-encodable — e.g. `begin_disconnect(0x8E)` yields `e0028e00`.
 property table is packet-typed, not direction-typed (same structural gap as
 outbound `subscription_identifier` / Client AUTH Success before those fixes).
 
+## Round 4 expert sweep
+
+Confirmed **#192** (RPI=0) and **#193** (Banned reconnect). Additional probes without new filings:
+
+- `$` / `#` TopicMatcher rules (`#` does not match `$SYS/…`)
+- SUBSCRIBE duplicate `subscription_identifier` refused
+- Callback re-entrancy into `publish()` succeeds (invariant 6)
+- Packet-ID pool exhausts 1..65535 cleanly
+- Direct `EngineConfig` field assignment bypasses `update()` allowlist — API footgun, not filed (use `config.update()`)
+- Session taken over (`0x8E`) remains retryable — treated as intentional vs Banned
+
 ## Round 3 expert sweep (additional)
 
 Surfaces probed beyond F1–F5 without a new confirmed bug (sample):
@@ -173,7 +186,7 @@ Status per planned sweep area (`clean` = no new defect beyond F1–F3;
 
 | # | Surface | Status |
 | --- | --- | --- |
-| 2.1 | `_protocol_disconnect` / MPS / CONNACK / DISCONNECT direction | **bug→#186**, **bug→#187**, **bug→#188**, **bug→#190**, **bug→#191** |
+| 2.1 | `_protocol_disconnect` / MPS / CONNACK / DISCONNECT direction | **bug→#186–#188**, **bug→#190–#193** |
 | 2.2 | Fast-path MQTT 5 decode vs 3.1.1 fallback | **clean** — wildcard / empty / DUP QoS 0 refused on both paths |
 | 2.3 | Property encoding cache / mutation | **clean** — in-place `bytearray` snapshot held |
 | 2.4 | Persistence transitions / SQLite | **clean** — external `complete_out` + orphan PUBACK stable |
@@ -240,3 +253,10 @@ then raise), instead of raising alone while left in `CONNECTING`.
 **#191** — Split outbound Client vs inbound DISCONNECT reason allowlists; reject
 `server_reference` on Client-originated DISCONNECT (directional check outside
 the packet-type property table).
+
+**#192** — Snapshot effective Request Problem Information at `begin_connect`
+(absent ⇒ 1). When RPI is 0, reject inbound Reason String / User Properties on
+packets other than PUBLISH/CONNACK/DISCONNECT with Protocol Error.
+
+**#193** — Add `0x8A` to `_V5_TERMINAL`; audit other permanent CONNACK refusals.
+Keep `0x88`/`0x89` retryable.
