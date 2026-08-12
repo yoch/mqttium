@@ -18,6 +18,17 @@ class Properties:
     """
 
     values: dict[str, Any] = field(default_factory=dict)
+    # packet context -> (structural signature, encoded property table).
+    # The signature is recomputed on reads so direct `values` mutations remain safe.
+    _encoded: dict[str, tuple[tuple[tuple[str, Any], ...], bytes]] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
+
+    def _signature(self) -> tuple[tuple[str, Any], ...]:
+        return tuple(
+            (name, tuple(value) if isinstance(value, list) else value)
+            for name, value in self.values.items()
+        )
 
     def get(self, name: str, default: Any = None) -> Any:
         return self.values.get(name, default)

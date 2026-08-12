@@ -167,3 +167,38 @@ def test_user_property_rejects_malformed_pairs(value: object) -> None:
 
     with pytest.raises(ProtocolError, match="UTF-8|string-pair"):
         encode_properties(props, PUBLISH)
+
+
+def test_encode_properties_reuses_unchanged_table_bytes() -> None:
+    props = Properties()
+    props.add_user_property("source", "cache")
+    first = encode_properties(props, PUBLISH)
+    second = encode_properties(props, PUBLISH)
+
+    assert second is first
+
+
+def test_encode_properties_cache_tracks_direct_value_mutation() -> None:
+    props = Properties()
+    props.set("content_type", "text/plain")
+    first = encode_properties(props, PUBLISH)
+
+    props.values["content_type"] = "application/json"
+    second = encode_properties(props, PUBLISH)
+
+    assert second != first
+    decoded, _ = decode_properties(second, 0, PUBLISH)
+    assert decoded.get("content_type") == "application/json"
+
+
+def test_encode_properties_cache_tracks_repeatable_list_mutation() -> None:
+    props = Properties()
+    props.add_user_property("first", "one")
+    first = encode_properties(props, PUBLISH)
+
+    props.values["user_property"].append(("second", "two"))
+    second = encode_properties(props, PUBLISH)
+
+    assert second != first
+    decoded, _ = decode_properties(second, 0, PUBLISH)
+    assert decoded.get("user_property") == [("first", "one"), ("second", "two")]

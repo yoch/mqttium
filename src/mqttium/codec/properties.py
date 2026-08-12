@@ -258,14 +258,7 @@ def _validate_response_topic(value: Any, error_type: type[MQTTError]) -> None:
         raise error_type("Property 'response_topic' must not contain wildcards")
 
 
-def encode_properties(props: Properties | None, packet: str) -> bytes:
-    """Encode a property bag for *packet* (including WILL context).
-
-    Empty / None → single ``0x00`` length byte (fast path).
-    """
-    if not props or not props.values:
-        return b"\x00"
-
+def _encode_properties_uncached(props: Properties, packet: str) -> bytes:
     body = bytearray()
     for name, value in props.values.items():
         spec = BY_NAME.get(name)
@@ -304,6 +297,27 @@ def encode_properties(props: Properties | None, packet: str) -> bytes:
             body.extend(_encode_value(spec.type, item))
 
     return encode_vbi(len(body)) + bytes(body)
+
+
+def encode_properties(props: Properties | None, packet: str) -> bytes:
+    """Encode a property bag for *packet* (including WILL context).
+
+    Empty / None → single ``0x00`` length byte (fast path). Non-empty results
+    are cached by packet context and a structural value signature, so repeated
+    sizing/encoding reuses bytes even when callers mutate ``props.values``
+    directly between calls.
+    """
+    if not props or not props.values:
+        return b"\x00"
+
+    signature = props._signature()
+    cached = props._encoded.get(packet)
+    if cached is not None and cached[0] == signature:
+        return cached[1]
+
+    encoded = _encode_properties_uncached(props, packet)
+    props._encoded[packet] = (signature, encoded)
+    return encoded
 
 
 def decode_properties(
