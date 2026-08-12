@@ -412,12 +412,12 @@ class OutboundSession:
 
         # One property encode and one topic measurement feed both the wire-size
         # check and the logical budget.
-        topic_bytes, wire_property_bytes, logical_property_bytes = self.size_parts(
+        topic_size, wire_property_bytes, logical_property_bytes = self.size_parts(
             topic, properties
         )
         # Validate packet size before reserving local memory or a packet id.
-        self._check_publish_wire_size(topic_bytes, wire_property_bytes, len(payload), qos)
-        logical_size = len(payload) + topic_bytes + logical_property_bytes
+        self._check_publish_wire_size(topic_size, wire_property_bytes, len(payload), qos)
+        logical_size = len(payload) + topic_size + logical_property_bytes
         # Snapshot before the first acquisition. Three local reads is all the
         # success path pays for a shared rollback; _rollback itself is a call
         # only taken on failure. This path is the hottest in the library and
