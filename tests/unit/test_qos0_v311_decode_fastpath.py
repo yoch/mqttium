@@ -134,7 +134,7 @@ def test_mqtt5_qos2_emits_pubrec_before_message() -> None:
     assert effects[1].data.qos is QoS.EXACTLY_ONCE
 
 
-def test_mqtt5_qos0_keeps_property_aware_path(monkeypatch) -> None:
+def test_mqtt5_qos0_uses_direct_property_aware_path(monkeypatch) -> None:
     calls = 0
     original = PublishPacket.decode
 
@@ -157,4 +157,60 @@ def test_mqtt5_qos0_keeps_property_aware_path(monkeypatch) -> None:
     assert [effect.kind for effect in effects] == [EffectKind.MESSAGE]
     assert effects[0].data.topic == "bench/v5"
     assert effects[0].data.payload == b"payload"
+    assert calls == 0
+
+
+def test_mqtt5_qos0_direct_path_preserves_properties(monkeypatch) -> None:
+    from mqttium.codec.properties import PUBLISH, encode_properties
+    from mqttium.types import Properties
+
+    calls = 0
+    original = PublishPacket.decode
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(PublishPacket, "decode", counted)
+    props = Properties()
+    props.set("content_type", "text/plain")
+    wire_props = encode_properties(props, PUBLISH)
+    engine = _connected(MQTTProtocolVersion.MQTTv5)
+    engine.handle_raw(
+        RawPacket(
+            PacketType.PUBLISH,
+            0x00,
+            pack_utf8("bench/v5/props") + wire_props + b"body",
+        )
+    )
+
+    effects = engine.take_effects()
+    assert effects[0].data.properties is not None
+    assert effects[0].data.properties.get("content_type") == "text/plain"
+    assert effects[0].data.payload == b"body"
+    assert calls == 0
+
+
+def test_mqtt5_qos1_still_uses_generic_packet_path(monkeypatch) -> None:
+    calls = 0
+    original = PublishPacket.decode
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(PublishPacket, "decode", counted)
+    engine = _connected(MQTTProtocolVersion.MQTTv5)
+    engine.handle_raw(
+        RawPacket(
+            PacketType.PUBLISH,
+            0x02,
+            pack_utf8("bench/v5/qos1") + pack_u16(9) + b"\x00" + b"payload",
+        )
+    )
+
+    effects = engine.take_effects()
+    assert effects[1].data.qos is QoS.AT_LEAST_ONCE
     assert calls == 1
