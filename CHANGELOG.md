@@ -31,7 +31,9 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   paths, including graceful/fatal DISCONNECT, PINGREQ, manual PUBACK/PUBCOMP and
   authentication fallbacks. Manual ACK validates before durable mutation; if a
   mandatory control packet cannot fit, the transport is closed rather than
-  emitting an illegal packet.
+  emitting an illegal packet. An intentional `disconnect()` fallback still reports
+  a clean `on_disconnect(None)`, while an AUTH rejection that cannot fit closes the
+  active connection instead of leaving it open.
 - Graceful and fatal shutdown preserve the single-writer invariant, bound
   terminal enqueue/drain, reject new publication while disconnecting, and leave
   transport and protocol state consistently closed even when no DISCONNECT can

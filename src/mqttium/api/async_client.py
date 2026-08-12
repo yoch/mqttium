@@ -1259,7 +1259,7 @@ class AsyncClient:
         finally:
             clean_disconnect = (
                 self._intentional_disconnect
-                and self._engine.state is ConnectionState.DISCONNECTING
+                and self._engine.state in (ConnectionState.CONNECTED, ConnectionState.DISCONNECTING)
                 and self._disconnect_exc is None
             )
             await self._invalidate_connection_epoch()
@@ -1552,7 +1552,20 @@ class AsyncClient:
             challenge: AuthPacket = effect.data
             if self.auth_handler is None:
                 packet = encode_disconnect(0x8C, self._engine.config.protocol)
-                self._engine._check_outbound_size(packet)
+                try:
+                    self._engine._check_outbound_size(packet)
+                except PacketTooLargeError as exc:
+                    # The broker limit makes the required AUTH rejection
+                    # impossible to send. Close the transport so the connection
+                    # cannot remain active after this terminal condition.
+                    self._disconnect_exc = exc
+                    self._intentional_disconnect = True
+                    if self._transport is not None:
+                        try:
+                            await self._transport.close()
+                        except Exception:
+                            pass
+                    return
                 await self._enqueue_outbound(
                     packet,
                     nowait=nowait,
