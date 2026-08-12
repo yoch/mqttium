@@ -36,11 +36,16 @@ def _engine(receive_maximum: int = 1) -> ProtocolEngine:
     return engine
 
 
-def _publish(mid: int, *, dup: bool = False) -> bytes:
+def _publish(
+    mid: int,
+    *,
+    qos: QoS = QoS.AT_LEAST_ONCE,
+    dup: bool = False,
+) -> bytes:
     return PublishPacket(
         topic="receive/window",
         payload=bytes((mid,)),
-        qos=QoS.AT_LEAST_ONCE,
+        qos=qos,
         retain=False,
         dup=dup,
         mid=mid,
@@ -59,6 +64,48 @@ def test_pipelined_qos1_exceeding_receive_maximum_is_refused_before_delivery() -
     assert engine.state is ConnectionState.DISCONNECTED
     assert any(effect.kind is EffectKind.DISCONNECTED for effect in effects)
     assert any(effect.kind is EffectKind.PROTOCOL_ERROR for effect in effects)
+
+
+def test_pending_qos1_puback_counts_against_fresh_qos2() -> None:
+    engine = _engine(receive_maximum=1)
+
+    _feed(engine, _publish(1))
+    _feed(engine, _publish(2, qos=QoS.EXACTLY_ONCE))
+    effects = engine.take_effects()
+
+    messages = [effect.data.payload for effect in effects if effect.kind is EffectKind.MESSAGE]
+    assert messages == [b"\x01"]
+    assert engine.state is ConnectionState.DISCONNECTED
+    error = next(effect.data for effect in effects if effect.kind is EffectKind.PROTOCOL_ERROR)
+    assert "Receive Maximum exceeded by QoS 2" in error
+
+
+def test_cross_qos_reuse_of_pending_autoack_mid_is_protocol_error() -> None:
+    engine = _engine(receive_maximum=2)
+
+    _feed(engine, _publish(7))
+    _feed(engine, _publish(7, qos=QoS.EXACTLY_ONCE))
+    effects = engine.take_effects()
+
+    assert engine.state is ConnectionState.DISCONNECTED
+    messages = [effect.data.payload for effect in effects if effect.kind is EffectKind.MESSAGE]
+    assert messages == [b"\x07"]
+    error = next(effect.data for effect in effects if effect.kind is EffectKind.PROTOCOL_ERROR)
+    assert "reused by QoS 2 while QoS 1 PUBACK is pending" in error
+
+
+def test_qos2_duplicate_does_not_double_charge_pending_autoack_window() -> None:
+    engine = _engine(receive_maximum=2)
+
+    _feed(engine, _publish(10, qos=QoS.EXACTLY_ONCE))
+    _feed(engine, _publish(11))
+    _feed(engine, _publish(10, qos=QoS.EXACTLY_ONCE, dup=True))
+    effects = engine.take_effects()
+
+    assert engine.state is ConnectionState.CONNECTED
+    messages = [effect.data.payload for effect in effects if effect.kind is EffectKind.MESSAGE]
+    assert messages == [b"\x0a", b"\x0b"]
+    assert not any(effect.kind is EffectKind.PROTOCOL_ERROR for effect in effects)
 
 
 def test_effect_handoff_releases_autoack_receive_maximum_slot() -> None:
