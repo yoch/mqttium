@@ -18,6 +18,7 @@ from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 from mqttium.codec.buffer import RawPacket
+from mqttium.codec.packet_validation import require_nonzero_mid
 from mqttium.codec.properties import PUBLISH, encode_properties
 from mqttium.codec.vbi import vbi_len
 from mqttium.enums import (
@@ -526,17 +527,28 @@ class OutboundSession:
         return True
 
     def on_puback(self, raw: RawPacket) -> None:
-        ack = PubAckPacket.decode(raw.remaining, self.config.protocol)
-        if not self._settle(ack.mid, OutboundQoSState.WAIT_PUBACK):
+        remaining = raw.remaining
+        if len(remaining) == 2:
+            # Success/no-properties is by far the common PUBACK shape in both
+            # MQTT versions. Avoid constructing a PubAckPacket only to recover
+            # its MID and the implicit zero reason code.
+            mid = (remaining[0] << 8) | remaining[1]
+            require_nonzero_mid(mid, "PUBACK")
+            reason_code = 0
+        else:
+            ack = PubAckPacket.decode(remaining, self.config.protocol)
+            mid = ack.mid
+            reason_code = ack.reason_code
+        if not self._settle(mid, OutboundQoSState.WAIT_PUBACK):
             return
         self.flow.release()
         # Emit before freeing the packet id so FIFO receipt settlement remains
         # ordered even if a concurrent publish reuses the mid immediately.
-        if ack.reason_code >= 128:
-            self._fail(ack.mid, ProtocolError(f"PUBACK reason_code={ack.reason_code}"))
+        if reason_code >= 128:
+            self._fail(mid, ProtocolError(f"PUBACK reason_code={reason_code}"))
         else:
-            self._emit(EffectKind.PUBLISH_COMPLETE, ack.mid)
-        self.packet_ids.release(ack.mid)
+            self._emit(EffectKind.PUBLISH_COMPLETE, mid)
+        self.packet_ids.release(mid)
         self.drain()
 
     def on_pubrec(self, raw: RawPacket) -> None:

@@ -49,6 +49,11 @@ REPLAY_BATCH_MESSAGES = 64
 REPLAY_BATCH_BYTES = 1 << 20
 
 
+def _encode_puback_success(mid: int) -> bytes:
+    """Encode the fixed success/no-properties PUBACK for an already-validated MID."""
+    return bytes((0x40, 0x02, mid >> 8, mid & 0xFF))
+
+
 class InboundReplayCursor:
     """Position inside a paged inbound replay.
 
@@ -446,7 +451,7 @@ class InboundSession:
                     if completed_meta is None:
                         raise ProtocolError(f"Inbound mid={mid} changed while acknowledging")
                     recovered_logical_size = completed_meta.logical_size
-                self._engine._send(PubAckPacket(mid=mid).encode(config.protocol))
+                self._engine._send(_encode_puback_success(mid))
                 self._release_slot(recovered_logical_size)
                 return
             # The record belongs to an unfinished QoS 2 exchange. Accepting the
@@ -477,7 +482,7 @@ class InboundSession:
         if not config.manual_ack:
             # Match the runtime's mandatory SEND-before-application order at the
             # producer, avoiding an EffectPump repartition on every auto-ACK.
-            self._engine._send(PubAckPacket(mid=mid).encode(config.protocol))
+            self._engine._send(_encode_puback_success(mid))
         self._engine._emit(
             EffectKind.MESSAGE,
             Message(
