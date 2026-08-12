@@ -616,7 +616,7 @@ class OutboundSession:
 
     # --- launching and retransmission ---------------------------------------
 
-    def _launch(self, msg: OutboundMessage) -> None:
+    def _launch(self, msg: OutboundMessage, *, persisted: bool = False) -> None:
         wire = msg.encoded_publish
         if wire is None:
             wire = PublishPacket(
@@ -629,15 +629,44 @@ class OutboundSession:
                 properties=msg.properties,
             ).encode_write_item(self.config.protocol)
         self._engine._check_outbound_size(wire)
-        if msg.qos == QoS.AT_LEAST_ONCE:
-            msg.state = OutboundQoSState.WAIT_PUBACK
-        else:
-            msg.state = OutboundQoSState.WAIT_PUBREC
+        target_state = (
+            OutboundQoSState.WAIT_PUBACK
+            if msg.qos == QoS.AT_LEAST_ONCE
+            else OutboundQoSState.WAIT_PUBREC
+        )
         # A contiguous frame owns another payload-sized bytes object and replay
         # re-encodes it anyway. A segmented item owns only its small header; its
         # payload is the application bytes already retained by the record.
-        msg.encoded_publish = _retain_publish_item(wire)
-        self.store.put_out(msg)
+        retained = _retain_publish_item(wire)
+        if persisted:
+            transitions = self._transitions
+            if transitions is not None:
+                changed = transitions.transition_out(
+                    msg.mid,
+                    OutboundQoSState.QUEUED,
+                    target_state,
+                )
+                if changed is None:
+                    raise ProtocolError(
+                        f"Outbound mid={msg.mid} changed while launching queued publish"
+                    )
+                # MemoryInflightStore transitions the same object; SQLite only
+                # updates durable metadata. Keep the materialised object aligned
+                # in either case without rewriting its payload to the store.
+                msg.state = target_state
+                msg.encoded_publish = retained
+            else:
+                # Third-party stores keep working through the base interface.
+                # update_out guarantees state/dup persistence and may implement
+                # the same payload-free optimization as the built-in SQLite store.
+                msg.state = target_state
+                msg.encoded_publish = retained
+                self.store.update_out(msg)
+        else:
+            # First launch: no durable row exists yet, so persist the full record.
+            msg.state = target_state
+            msg.encoded_publish = retained
+            self.store.put_out(msg)
         self._send(wire)
 
     def _try_launch(self, msg: OutboundMessage) -> bool:
@@ -695,7 +724,7 @@ class OutboundSession:
             try:
                 msg = self.materialize(stored)
                 if msg.state is OutboundQoSState.QUEUED:
-                    self._launch(msg)
+                    self._launch(msg, persisted=True)
                 else:
                     self._retransmit(msg)
             except Exception as exc:

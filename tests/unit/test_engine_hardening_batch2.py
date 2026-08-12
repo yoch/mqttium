@@ -15,7 +15,7 @@ from mqttium.enums import (
 from mqttium.packets import PubAckPacket, PubCompPacket, PublishPacket
 from mqttium.persistence.memory import MemoryInflightStore
 from mqttium.protocol.engine import EffectKind, EngineConfig, ProtocolEngine
-from mqttium.types import OutboundMessage
+from mqttium.types import OutboundMessage, OutboundRecordMeta
 
 
 def _raw(wire: bytes) -> RawPacket:
@@ -79,12 +79,19 @@ def test_direct_launch_rolls_back_mid_and_flow_on_store_failure() -> None:
 
 
 class _FailOnTransitionStore(MemoryInflightStore):
-    fail_put = False
+    fail_transition = False
 
-    def put_out(self, msg: OutboundMessage) -> None:
-        if self.fail_put and msg.state is not OutboundQoSState.QUEUED:
+    def transition_out(
+        self,
+        mid: int,
+        expected_state: OutboundQoSState,
+        new_state: OutboundQoSState,
+        *,
+        compact: bool = False,
+    ) -> OutboundRecordMeta | None:
+        if self.fail_transition and expected_state is OutboundQoSState.QUEUED:
             raise RuntimeError("transition write failed")
-        super().put_out(msg)
+        return super().transition_out(mid, expected_state, new_state, compact=compact)
 
 
 def test_queued_launch_failure_releases_resources_and_emits_failure() -> None:
@@ -102,7 +109,7 @@ def test_queued_launch_failure_releases_resources_and_emits_failure() -> None:
     assert engine.flow.inflight == 1
     engine.take_effects()
 
-    store.fail_put = True
+    store.fail_transition = True
     engine.handle_raw(_raw(PubAckPacket(mid=first.mid).encode()))
     effects = engine.take_effects()
 
