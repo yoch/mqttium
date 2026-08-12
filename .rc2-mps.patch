@@ -90,11 +90,7 @@ diff --git a/src/mqttium/api/async_client.py b/src/mqttium/api/async_client.py
                      # A lost PINGREQ beats a wedged keepalive under backpressure.
                      try:
                          await self._drain_effects(nowait=True)
-@@ -1497,10 +1516,12 @@ class AsyncClient:
-         if kind is EffectKind.SEND:
-             await self._enqueue_outbound(effect.data, nowait=nowait, epoch=epoch)
-         elif kind is EffectKind.CONNACK:
-@@ -1511,10 +1532,12 @@ class AsyncClient:
+@@ -1511,10 +1530,12 @@ class AsyncClient:
          elif kind is EffectKind.AUTH:
              challenge: AuthPacket = effect.data
              if self.auth_handler is None:
@@ -106,7 +102,7 @@ diff --git a/src/mqttium/api/async_client.py b/src/mqttium/api/async_client.py
                      nowait=nowait,
                      epoch=epoch,
                  )
-@@ -1781,6 +1804,7 @@ class AsyncClient:
+@@ -1781,6 +1802,7 @@ class AsyncClient:
              reason = 0x81  # Malformed Packet
          try:
              packet = encode_disconnect(reason, MQTTProtocolVersion.MQTTv5)
