@@ -1,0 +1,352 @@
+--- a/src/mqttium/protocol/inbound.py
++++ b/src/mqttium/protocol/inbound.py
+@@ -111,19 +111,32 @@
+     return topic, raw.remaining[pos:], mid, bool(raw.flags & 0x01), bool(raw.flags & 0x08)
+ 
+ 
+-def _decode_v5_qos0_fields(
++def _decode_v5_publish_fields(
+     raw: RawPacket,
+-) -> tuple[str, bytes, bool, Properties | None]:
+-    """Decode MQTT 5 QoS 0 fields without constructing a PublishPacket."""
+-
+-    if raw.flags & 0x08:
++    qos: QoS,
++) -> tuple[str, bytes, int | None, bool, bool, Properties]:
++    """Decode MQTT 5 PUBLISH fields without constructing a PublishPacket."""
++
++    dup = bool(raw.flags & 0x08)
++    if qos is QoS.AT_MOST_ONCE and dup:
+         raise MalformedPacketError("QoS 0 PUBLISH must not set DUP")
+     topic, pos = unpack_utf8(raw.remaining)
++    mid: int | None = None
++    if qos:
++        mid, pos = unpack_u16(raw.remaining, pos)
++        require_nonzero_mid(mid, "PUBLISH")
+     properties, pos = decode_properties(raw.remaining, pos, PUBLISH)
+     # Preserve #128: a non-empty Topic Name must be validated before it can
+     # establish or replace a connection-scoped Topic Alias.
+     validate_received_publish_topic(topic, utf8_validated=True)
+-    return topic, raw.remaining[pos:], bool(raw.flags & 0x01), properties
++    return (
++        topic,
++        raw.remaining[pos:],
++        mid,
++        bool(raw.flags & 0x01),
++        dup,
++        properties,
++    )
+ 
+ 
+ class InboundSession:
+@@ -250,13 +263,12 @@
+         """Handle one inbound PUBLISH without adding an engine wrapper frame."""
+         engine = self._engine
+         config = self.config
+-        store = self.store
+-        qos = (raw.flags >> 1) & 0x03
++        qos_raw = (raw.flags >> 1) & 0x03
+         if config.protocol is MQTTProtocolVersion.MQTTv311:
+-            if qos == int(QoS.AT_MOST_ONCE):
++            if qos_raw == int(QoS.AT_MOST_ONCE):
+                 engine._emit(EffectKind.MESSAGE, _decode_v311_qos0_message(raw))
+                 return
+-            if qos == int(QoS.AT_LEAST_ONCE):
++            if qos_raw == int(QoS.AT_LEAST_ONCE):
+                 topic, payload, mid, retain, dup = _decode_v311_qos1_fields(raw)
+                 self._on_qos1(
+                     topic=topic,
+@@ -267,85 +279,105 @@
+                     properties=None,
+                 )
+                 return
+-        elif config.protocol is MQTTProtocolVersion.MQTTv5 and qos == int(QoS.AT_MOST_ONCE):
+-            topic, payload, retain, properties = _decode_v5_qos0_fields(raw)
++        else:
++            if qos_raw == 3:
++                raise MalformedPacketError("Invalid PUBLISH QoS 3")
++            qos = QoS(qos_raw)
++            topic, payload, mid, retain, dup, properties = _decode_v5_publish_fields(raw, qos)
+             topic = self._resolve_topic_fields(topic, properties)
+-            engine._emit(
+-                EffectKind.MESSAGE,
+-                Message(
++            if qos is QoS.AT_MOST_ONCE:
++                engine._emit(
++                    EffectKind.MESSAGE,
++                    Message(
++                        topic=topic,
++                        payload=payload,
++                        qos=qos,
++                        retain=retain,
++                        dup=False,
++                        mid=None,
++                        properties=properties,
++                    ),
++                )
++                return
++            assert mid is not None
++            if qos is QoS.AT_LEAST_ONCE:
++                self._on_qos1(
+                     topic=topic,
+                     payload=payload,
+-                    qos=QoS.AT_MOST_ONCE,
++                    mid=mid,
+                     retain=retain,
+-                    dup=False,
+-                    mid=None,
++                    dup=dup,
+                     properties=properties,
+-                ),
++                )
++                return
++            self._on_qos2(
++                topic=topic,
++                payload=payload,
++                mid=mid,
++                retain=retain,
++                dup=dup,
++                properties=properties,
+             )
+             return
++
++        # MQTT 3.1.1 QoS 2 retains the generic decoder; #144 is MQTT 5 only.
+         packet = PublishPacket.decode(raw.flags, raw.remaining, config.protocol)
+         topic = self._resolve_topic(packet)
+         validate_received_publish_topic(topic, utf8_validated=True)
+-
+-        if packet.qos == QoS.AT_MOST_ONCE:
+-            engine._emit(
+-                EffectKind.MESSAGE,
+-                Message(
+-                    topic=topic,
+-                    payload=packet.payload,
+-                    qos=packet.qos,
+-                    retain=packet.retain,
+-                    dup=packet.dup,
+-                    mid=None,
+-                    properties=packet.properties,
+-                ),
+-            )
+-            return
+-
+         assert packet.mid is not None
+-        if packet.qos == QoS.EXACTLY_ONCE:
+-            transitions = self._transitions
+-            # Existence is the common question and the cheapest to answer, so it
+-            # stays first: a fresh PUBLISH finds nothing and pays exactly one
+-            # lookup. Only once a record turns up does the state matter, and it
+-            # has to, because the inbound store is keyed by identifier alone —
+-            # a record under this mid is a QoS 2 duplicate only if it is in a
+-            # QoS 2 phase. Reading it back costs a second metadata query on the
+-            # rare duplicate path rather than on every inbound QoS 2 PUBLISH.
+-            existing: InboundMessage | InboundRecordMeta | None = None
+-            if transitions is not None:
+-                if transitions.contains_in(packet.mid):
+-                    existing = transitions.in_meta(packet.mid)
+-            else:
+-                existing = store.get_in(packet.mid)
+-            if existing is not None:
+-                if existing.state is InboundQoSState.WAIT_PUBACK:
+-                    self._reject_packet_id_collision(packet.mid, "QoS 2", "QoS 1")
+-                engine._send(PubRecPacket(mid=packet.mid).encode(config.protocol))
+-                return
+-
+-        if packet.qos == QoS.AT_LEAST_ONCE:
+-            self._on_qos1(
+-                topic=topic,
+-                payload=packet.payload,
+-                mid=packet.mid,
+-                retain=packet.retain,
+-                dup=packet.dup,
+-                properties=packet.properties,
+-            )
+-            return
+-
+-        logical_size = self.logical_size(topic, packet.payload, packet.properties)
++        self._on_qos2(
++            topic=topic,
++            payload=packet.payload,
++            mid=packet.mid,
++            retain=packet.retain,
++            dup=packet.dup,
++            properties=packet.properties,
++        )
++
++    def _on_qos2(
++        self,
++        *,
++        topic: str,
++        payload: bytes,
++        mid: int,
++        retain: bool,
++        dup: bool,
++        properties: Properties | None,
++    ) -> None:
++        engine = self._engine
++        config = self.config
++        store = self.store
++        transitions = self._transitions
++        # Existence is the common question and the cheapest to answer, so it
++        # stays first: a fresh PUBLISH finds nothing and pays exactly one
++        # lookup. Only once a record turns up does the state matter, and it
++        # has to, because the inbound store is keyed by identifier alone —
++        # a record under this mid is a QoS 2 duplicate only if it is in a
++        # QoS 2 phase. Reading it back costs a second metadata query on the
++        # rare duplicate path rather than on every inbound QoS 2 PUBLISH.
++        existing: InboundMessage | InboundRecordMeta | None = None
++        if transitions is not None:
++            if transitions.contains_in(mid):
++                existing = transitions.in_meta(mid)
++        else:
++            existing = store.get_in(mid)
++        if existing is not None:
++            if existing.state is InboundQoSState.WAIT_PUBACK:
++                self._reject_packet_id_collision(mid, "QoS 2", "QoS 1")
++            engine._send(PubRecPacket(mid=mid).encode(config.protocol))
++            return
++
++        logical_size = self.logical_size(topic, payload, properties)
+         self._acquire_slot(logical_size)
+         inbound = InboundMessage(
+-            mid=packet.mid,
++            mid=mid,
+             topic=topic,
+-            payload=packet.payload,
+-            qos=packet.qos,
+-            retain=packet.retain,
++            payload=payload,
++            qos=QoS.EXACTLY_ONCE,
++            retain=retain,
+             state=InboundQoSState.WAIT_PUBREL,
+             delivered=False,
+-            properties=packet.properties,
++            properties=properties,
+             logical_size=logical_size,
+         )
+         try:
+@@ -355,17 +387,17 @@
+             raise
+         # Runtime effect application is SEND-first. Produce the protocol ACK in
+         # that order here so every QoS2 delivery avoids EffectPump repartition.
+-        engine._send(PubRecPacket(mid=packet.mid).encode(config.protocol))
++        engine._send(PubRecPacket(mid=mid).encode(config.protocol))
+         engine._emit(
+             EffectKind.MESSAGE,
+             Message(
+                 topic=topic,
+-                payload=packet.payload,
+-                qos=packet.qos,
+-                retain=packet.retain,
+-                dup=packet.dup,
+-                mid=packet.mid,
+-                properties=packet.properties,
++                payload=payload,
++                qos=QoS.EXACTLY_ONCE,
++                retain=retain,
++                dup=dup,
++                mid=mid,
++                properties=properties,
+             ),
+         )
+ 
+--- a/tests/unit/test_qos0_v311_decode_fastpath.py
++++ b/tests/unit/test_qos0_v311_decode_fastpath.py
+@@ -192,7 +192,7 @@
+     assert calls == 0
+ 
+ 
+-def test_mqtt5_qos1_still_uses_generic_packet_path(monkeypatch) -> None:
++def test_mqtt5_qos1_uses_direct_property_aware_path(monkeypatch) -> None:
+     calls = 0
+     original = PublishPacket.decode
+ 
+@@ -213,4 +213,4 @@
+ 
+     effects = engine.take_effects()
+     assert effects[1].data.qos is QoS.AT_LEAST_ONCE
+-    assert calls == 1
++    assert calls == 0
+--- a/tests/unit/test_qos1_v311_decode_fastpath.py
++++ b/tests/unit/test_qos1_v311_decode_fastpath.py
+@@ -127,27 +127,7 @@
+     assert duplicate_effects[0].data.dup is True
+ 
+ 
+-@pytest.mark.parametrize(
+-    ("protocol", "flags", "remaining"),
+-    [
+-        (
+-            MQTTProtocolVersion.MQTTv5,
+-            0x02,
+-            pack_utf8("bench/v5") + pack_u16(3) + b"\x00payload",
+-        ),
+-        (
+-            MQTTProtocolVersion.MQTTv311,
+-            0x04,
+-            pack_utf8("bench/qos2") + pack_u16(3) + b"payload",
+-        ),
+-    ],
+-)
+-def test_mqtt5_and_qos2_remain_generic(
+-    monkeypatch,
+-    protocol: MQTTProtocolVersion,
+-    flags: int,
+-    remaining: bytes,
+-) -> None:
++def test_mqtt5_qos1_and_qos2_use_direct_fields(monkeypatch) -> None:
+     calls = 0
+     original = PublishPacket.decode
+ 
+@@ -157,7 +137,49 @@
+         return original(*args, **kwargs)
+ 
+     monkeypatch.setattr(PublishPacket, "decode", counted)
+-    engine = ProtocolEngine(EngineConfig(protocol=protocol))
++    engine = ProtocolEngine(EngineConfig(protocol=MQTTProtocolVersion.MQTTv5))
+     engine.state = ConnectionState.CONNECTED
+-    engine.handle_raw(RawPacket(PacketType.PUBLISH, flags, remaining))
++    engine.handle_raw(
++        RawPacket(
++            PacketType.PUBLISH,
++            0x02,
++            pack_utf8("bench/v5/qos1") + pack_u16(3) + b"\x00payload",
++        )
++    )
++    assert calls == 0
++
++    # A fresh engine keeps this test focused on on_publish: otherwise the
++    # Receive-Maximum preflight intentionally decodes a second PUBLISH while
++    # the first auto-PUBACK is still pending in the current effect batch.
++    engine = ProtocolEngine(EngineConfig(protocol=MQTTProtocolVersion.MQTTv5))
++    engine.state = ConnectionState.CONNECTED
++    engine.handle_raw(
++        RawPacket(
++            PacketType.PUBLISH,
++            0x04,
++            pack_utf8("bench/v5/qos2") + pack_u16(4) + b"\x00payload",
++        )
++    )
++    assert calls == 0
++
++
++def test_v311_qos2_remains_generic(monkeypatch) -> None:
++    calls = 0
++    original = PublishPacket.decode
++
++    def counted(*args, **kwargs):
++        nonlocal calls
++        calls += 1
++        return original(*args, **kwargs)
++
++    monkeypatch.setattr(PublishPacket, "decode", counted)
++    engine = ProtocolEngine(EngineConfig(protocol=MQTTProtocolVersion.MQTTv311))
++    engine.state = ConnectionState.CONNECTED
++    engine.handle_raw(
++        RawPacket(
++            PacketType.PUBLISH,
++            0x04,
++            pack_utf8("bench/qos2") + pack_u16(3) + b"payload",
++        )
++    )
+     assert calls == 1
