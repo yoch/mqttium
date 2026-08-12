@@ -1,0 +1,30 @@
+name: Apply QoS1/2 typing fix
+
+on:
+  push:
+    branches:
+      - perf/mqtt5-qos12-direct-decode
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: perf/mqtt5-qos12-direct-decode
+      - name: Apply typing patch and remove bootstrap files
+        shell: bash
+        run: |
+          set -euo pipefail
+          git apply --check tools/qos12-mypy.patch
+          git apply tools/qos12-mypy.patch
+          rm tools/qos12-mypy.patch .github/workflows/apply-qos12-mypy.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'Fix MQTT 5 direct decoder MID typing'
+          git push origin HEAD:perf/mqtt5-qos12-direct-decode
