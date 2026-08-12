@@ -33,6 +33,7 @@ in-process fake transports. Python 3.12.3 on Linux x86_64; `PYTHONPATH=src`.
 | F2 | [#187](https://github.com/yoch/mqttium/issues/187) | Local `_protocol_disconnect` leaves `AsyncClient` transport / reader alive (zombie) |
 | F3 | [#188](https://github.com/yoch/mqttium/issues/188) | CONNACK protocol violations during `connect()` surface as `MQTTTimeoutError` |
 | F4 | [#190](https://github.com/yoch/mqttium/issues/190) | CONNACK auth-property validation leaves `ProtocolEngine` stuck in `CONNECTING` |
+| F5 | [#191](https://github.com/yoch/mqttium/issues/191) | Client DISCONNECT accepts Server-only reason codes and Server Reference |
 
 ### F1 — oversized DISCONNECT from `_protocol_disconnect` (#186)
 
@@ -96,6 +97,39 @@ auth-property checks should follow the same teardown pattern.
 EffectPump can fail `_connack_fut`). The defect is the engine state machine /
 direct `ProtocolEngine` consumers. Distinct from #188.
 
+### F5 — Client DISCONNECT accepts Server-only reasons / Server Reference (#191)
+
+`encode_disconnect` / `begin_disconnect` share one `_DISCONNECT_V5_REASONS`
+allowlist for inbound and outbound. Server-only Table 3-28 codes (`0x89`,
+`0x8B`, `0x8D`, `0x8E`, `0x9C`, `0x9D`, `0x9F`, `0xA0`) are therefore
+Client-encodable — e.g. `begin_disconnect(0x8E)` yields `e0028e00`.
+`server_reference` is likewise attachable on a Client DISCONNECT because the
+property table is packet-typed, not direction-typed (same structural gap as
+outbound `subscription_identifier` / Client AUTH Success before those fixes).
+
+## Round 3 expert sweep (additional)
+
+Surfaces probed beyond F1–F5 without a new confirmed bug (sample):
+
+- QoS 2 redelivery before PUBREL (PUBREC only, no second MESSAGE)
+- Manual-ack PUBREL→WAIT_USER_ACK→ack ordering
+- SQLite `logical_size` recompute on hydration; CAS `transition_out`; newer schema refuse
+- Session resume PUBREL replay; `session_present=0` purge
+- Fragmented / coalesced decoder feeds; UTF-8 overlong / surrogates rejected
+- Alias remap; alias not stored after wildcard Topic Name rejection
+- Auto-ack SEND-before-MESSAGE order; flow queue under `receive_maximum`
+- Publish-while-disconnecting refused; receipt cancel isolation; masked WS server frames API
+- Compat confinement / ingress-bound tests present
+
+### Round 3 rejected / inconclusive
+
+| Candidate | Verdict |
+| --- | --- |
+| Publish Topic Name `$share/...` | **Inconclusive** — MQTT SHOULD refuse `$` PUBLISH Topic Names; not a MUST |
+| Inbound DISCONNECT `0x04` (Client-only) from broker | **Low severity / broker misbehavior** — noted under #191 outbound focus |
+| Invalid CONNACK reason leaving `pending_connect=True` | **Recoverable** — a later valid CONNACK still connects; distinct from #190 |
+| Keepalive + MPS=1 without keepalive task started | **Inconclusive harness** — `queue_ping` raises `PacketTooLargeError`; production `_keepalive_loop` already force-closes |
+
 ## Candidates examined and rejected
 
 | Candidate | Verdict |
@@ -139,7 +173,7 @@ Status per planned sweep area (`clean` = no new defect beyond F1–F3;
 
 | # | Surface | Status |
 | --- | --- | --- |
-| 2.1 | `_protocol_disconnect` / MPS / CONNACK handshake teardown | **bug→#186**, **bug→#187**, **bug→#188**, **bug→#190** |
+| 2.1 | `_protocol_disconnect` / MPS / CONNACK / DISCONNECT direction | **bug→#186**, **bug→#187**, **bug→#188**, **bug→#190**, **bug→#191** |
 | 2.2 | Fast-path MQTT 5 decode vs 3.1.1 fallback | **clean** — wildcard / empty / DUP QoS 0 refused on both paths |
 | 2.3 | Property encoding cache / mutation | **clean** — in-place `bytearray` snapshot held |
 | 2.4 | Persistence transitions / SQLite | **clean** — external `complete_out` + orphan PUBACK stable |
@@ -180,6 +214,8 @@ Fix order suggested by coupling (not implemented in this audit pass):
 4. On CONNACK auth-property validation failures, leave `CONNECTING` via
    `_protocol_disconnect` / `DISCONNECTED` rather than a bare `PROTOCOL_ERROR`
    (#190).
+5. Split Client vs Server DISCONNECT reason allowlists and reject Client
+   `server_reference` on outbound DISCONNECT (#191).
 
 ### Suggested fix approaches (for issue assignees)
 
@@ -201,3 +237,6 @@ CONNACK policy when the engine stays `CONNECTED`.
 **#190** — In `_on_connack`, on auth-method / auth-data validation failure, use
 the same teardown pattern as empty ClientID without ACI (`_protocol_disconnect`
 then raise), instead of raising alone while left in `CONNECTING`.
+**#191** — Split outbound Client vs inbound DISCONNECT reason allowlists; reject
+`server_reference` on Client-originated DISCONNECT (directional check outside
+the packet-type property table).
