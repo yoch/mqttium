@@ -850,11 +850,7 @@ class AsyncClient:
             # Preserve validation semantics: an invalid reason code must fail
             # before teardown, just as it did before shutdown became bounded.
             try:
-                packet = (
-                    self._engine.begin_disconnect(reason_code)
-                    if self.is_connected
-                    else None
-                )
+                packet = self._engine.begin_disconnect(reason_code) if self.is_connected else None
             except PacketTooLargeError:
                 # The peer's packet limit makes a legal DISCONNECT impossible.
                 # Closing the transport is the only conforming shutdown left.
