@@ -1,0 +1,44 @@
+name: Apply QoS0 format fix
+
+on:
+  push:
+    branches:
+      - perf/qos0-topic-bytes-handoff
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: perf/qos0-topic-bytes-handoff
+      - name: Format size-parts line and self-clean
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('src/mqttium/protocol/outbound.py')
+          text = path.read_text()
+          old = '''        topic_size, wire_property_bytes, logical_property_bytes = self.size_parts(
+              topic, properties
+          )
+          '''
+          new = '''        topic_size, wire_property_bytes, logical_property_bytes = self.size_parts(topic, properties)
+          '''
+          count = text.count(old)
+          if count != 1:
+              raise SystemExit(f'expected exactly one format block, found {count}')
+          path.write_text(text.replace(old, new, 1))
+          PY
+          rm .github/workflows/apply-qos0-format-fix.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'Format QoS0 topic-byte handoff'
+          git push origin HEAD:perf/qos0-topic-bytes-handoff
