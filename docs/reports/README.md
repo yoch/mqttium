@@ -29,7 +29,54 @@ Read the audit's verdict table before quoting the record. One of its conclusions
 experiment behind it varied the benchmark adapter's completion discipline at the same time, so it
 cannot attribute anything to that branch, and its author agrees. The record is left as written
 because a report states what was believed on its date; the correction lives in the audit. Its QoS 1
-latency measurement, by contrast, is unverified here rather than unsupported.
+latency measurement, by contrast, is **retracted by its author**, and the retraction is the more
+useful of the two corrections.
+
+The record framed MQTTium's PUBACK latency as a fixed floor, 2.95x gmqtt at a matched offered rate.
+Its author re-tested that on 2026-08-12 and it does not hold. Driving both clients at the *same
+absolute* rate rather than at the same fraction of each one's own capacity:
+
+| offered | MQTTium | gmqtt | ratio |
+| --- | --- | --- | --- |
+| 2,105 msgs/s | 0.318 ms | 0.256 ms | 1.24x |
+| 6,246 msgs/s | 1.32 ms | 0.45 ms | 2.94x |
+
+Latency falls fourfold when the offered rate falls threefold, so it is load-dependent queueing and
+not a constant delay — the opposite of what the record claimed.
+
+The root cause is a method error, not a defect on either side. That harness paced each client at a
+fraction of its *own* calibrated capacity, so a faster client was offered a higher absolute rate and
+sat further along its own latency-versus-load curve. Reading the resulting table across clients
+penalises whichever client has the most headroom, which was MQTTium. Its author has since added a
+fixed-rate scenario for cross-client comparison and marked the fraction-paced one as unsuitable for
+it.
+
+One contributing cause is quantified: that harness suspends a coroutine for the whole round trip on
+MQTTium while returning immediately and correlating the ack in a callback on gmqtt. Driving MQTTium
+the second way is worth 11-34%, growing with load. It has been reverted there rather than kept,
+because it would trade one asymmetry for another.
+
+Measured in this repository against the same containerised broker, publisher pinned to one physical
+core as that harness pins it, MQTTium is 1.18x gmqtt at 6,246 msgs/s (1.13x unpinned), with a
+four-point breakdown putting 71 us of library — 45 us to the wire, 26 us to settle — inside a 207 us
+round trip. The same figures hold on the `v1.0.0rc1` tag that was measured externally, so nothing
+here was fixed after the fact.
+
+Two hypotheses were tested here and did **not** hold, and are recorded so they are not re-run:
+single-physical-core pinning does not amplify MQTTium's scheduling hops (1.18x pinned against 1.13x
+unpinned, breakdown unchanged), and the knee that harness later reported between 2,500 and 5,000
+msgs/s does not reproduce (0.270-0.284 ms against 0.251-0.301 ms over six alternated samples per
+point, on both the awaited and `publish_nowait` paths).
+
+One question is open rather than answered. That harness calibrates MQTTium's ceiling at 12,492
+msgs/s; a tight in-process loop here reaches about 17,960 under that harness's own broker and
+publisher pinning, so the environment accounts for none of the difference. That does not establish
+how much of it is adapter overhead, because a ceiling measured without a pacer or per-message
+bookkeeping is not like-for-like with a calibrator's discipline. It matters because that calibration
+sets the offered rate for every open-loop point.
+
+Do not treat the cross-client latency column as a statement about MQTTium until that harness can
+defend it.
 
 ## Memory campaign
 
