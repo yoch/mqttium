@@ -283,7 +283,9 @@ class InboundSession:
             if qos_raw == 3:
                 raise MalformedPacketError("Invalid PUBLISH QoS 3")
             qos = QoS(qos_raw)
-            topic, payload, mid, retain, dup, properties = _decode_v5_publish_fields(raw, qos)
+            topic, payload, decoded_mid, retain, dup, properties = _decode_v5_publish_fields(
+                raw, qos
+            )
             topic = self._resolve_topic_fields(topic, properties)
             if qos is QoS.AT_MOST_ONCE:
                 engine._emit(
@@ -299,12 +301,12 @@ class InboundSession:
                     ),
                 )
                 return
-            assert mid is not None
+            assert decoded_mid is not None
             if qos is QoS.AT_LEAST_ONCE:
                 self._on_qos1(
                     topic=topic,
                     payload=payload,
-                    mid=mid,
+                    mid=decoded_mid,
                     retain=retain,
                     dup=dup,
                     properties=properties,
@@ -313,7 +315,7 @@ class InboundSession:
             self._on_qos2(
                 topic=topic,
                 payload=payload,
-                mid=mid,
+                mid=decoded_mid,
                 retain=retain,
                 dup=dup,
                 properties=properties,
