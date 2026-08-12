@@ -22,19 +22,26 @@ jobs:
           set -euo pipefail
           python - <<'PY'
           from pathlib import Path
+          import re
 
           path = Path('src/mqttium/protocol/outbound.py')
           text = path.read_text()
-          old = '''        topic_size, wire_property_bytes, logical_property_bytes = self.size_parts(
-              topic, properties
+          pattern = re.compile(
+              r'(?m)^(?P<indent>\s*)topic_size, wire_property_bytes, logical_property_bytes = self\.size_parts\(\n'
+              r'\s*topic, properties\n\s*\)$'
           )
-          '''
-          new = '''        topic_size, wire_property_bytes, logical_property_bytes = self.size_parts(topic, properties)
-          '''
-          count = text.count(old)
+          match = pattern.search(text)
+          if match is None:
+              raise SystemExit('expected size_parts format block not found')
+          indent = match.group('indent')
+          replacement = (
+              f'{indent}topic_size, wire_property_bytes, logical_property_bytes = '
+              'self.size_parts(topic, properties)'
+          )
+          text, count = pattern.subn(replacement, text, count=1)
           if count != 1:
-              raise SystemExit(f'expected exactly one format block, found {count}')
-          path.write_text(text.replace(old, new, 1))
+              raise SystemExit(f'expected one replacement, got {count}')
+          path.write_text(text)
           PY
           rm .github/workflows/apply-qos0-format-fix.yml
           git config user.name 'github-actions[bot]'
