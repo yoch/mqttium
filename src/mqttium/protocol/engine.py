@@ -14,6 +14,7 @@ from mqttium.codec.buffer import RawPacket
 from mqttium.codec.packet_validation import validate_raw_packet
 from mqttium.enums import (
     ConnectionState,
+    InboundQoSState,
     MQTTProtocolVersion,
     PacketType,
     QoS,
@@ -846,11 +847,12 @@ class ProtocolEngine:
     def _check_pending_auto_qos1_receive_maximum(self, raw: RawPacket) -> None:
         """Count auto-PUBACKs that have not left the current engine batch yet."""
         pending = self._pending_auto_qos1_mids
+        qos_raw = (raw.flags >> 1) & 0x03 if raw.packet_type is PacketType.PUBLISH else 0
         if (
             not pending
             or self.config.manual_ack
             or raw.packet_type is not PacketType.PUBLISH
-            or ((raw.flags >> 1) & 0x03) == int(QoS.AT_MOST_ONCE)
+            or qos_raw not in (int(QoS.AT_LEAST_ONCE), int(QoS.EXACTLY_ONCE))
         ):
             return
 
@@ -858,18 +860,40 @@ class ProtocolEngine:
         mid = packet.mid
         if mid is None:
             return
-        # A retransmitted QoS1 with the same identifier is the same exchange and
-        # does not consume another Receive Maximum slot. QoS2 has durable state
-        # in InboundSession and is left to that state machine.
-        if packet.qos is QoS.AT_LEAST_ONCE and mid in pending:
-            return
-        if packet.qos is not QoS.AT_LEAST_ONCE:
+
+        if mid in pending:
+            if packet.qos is QoS.AT_LEAST_ONCE:
+                # Same QoS1 exchange: retransmission does not consume a second
+                # Receive Maximum slot before the pending PUBACK is handed off.
+                return
+            # The same identifier cannot start a QoS2 exchange while the QoS1
+            # exchange is still outstanding from the broker's point of view.
+            self._protocol_disconnect(0x82)
+            raise ProtocolError(
+                f"Inbound packet identifier {mid} reused by QoS 2 while QoS 1 PUBACK is pending"
+            )
+
+        transitions = self.inbound._transitions
+        existing = transitions.in_meta(mid) if transitions is not None else self.store.get_in(mid)
+        if existing is not None:
+            state = existing.state
+            if packet.qos is QoS.AT_LEAST_ONCE and state is InboundQoSState.WAIT_PUBACK:
+                return
+            if packet.qos is QoS.EXACTLY_ONCE and state in (
+                InboundQoSState.WAIT_PUBREL,
+                InboundQoSState.WAIT_USER_ACK,
+            ):
+                return
+            # Any other existing state is a cross-QoS packet-identifier
+            # collision. Let InboundSession report that protocol error rather
+            # than misclassifying it as Receive Maximum exhaustion.
             return
 
         if self.inbound._inflight + len(pending) >= self.config.local_receive_maximum:
             self._protocol_disconnect(0x93)
             raise ProtocolError(
-                "Receive Maximum exceeded by QoS1 PUBLISH received before pending PUBACK handoff"
+                f"Receive Maximum exceeded by QoS {int(packet.qos)} PUBLISH received "
+                "before pending PUBACK handoff"
             )
 
     def _track_pending_auto_qos1(self, start: int) -> None:
