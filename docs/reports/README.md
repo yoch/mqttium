@@ -14,6 +14,7 @@ descriptions of current behaviour are the contracts in
 
 | Date | Report | Records |
 | --- | --- | --- |
+| 2026-08-12 | [`HARDENING-AUDIT-1.0.0rc2.md`](HARDENING-AUDIT-1.0.0rc2.md) | Hardening pass over `1.0.0rc2` (`c34a949`): three confirmed lifecycle/MPS defects filed as #186–#188, plus the intentional behaviours and clean surfaces rejected as false positives. |
 | 2026-08-10 | [`PERFORMANCE-AUDIT-0.2.0b4.md`](PERFORMANCE-AUDIT-0.2.0b4.md) | Re-reads the cross-client record against `4bdcdb3`, and records the per-message work removed before the `0.2.0b4` tag — with the reasons no throughput figure is attached to it. |
 | 2026-08-10 | [`QUALITY-AUDIT-0.2.0b4.md`](QUALITY-AUDIT-0.2.0b4.md) | Frozen quality inventory for the `0.2.0b4` work — module sizes, complexity signals, coverage — at commit `dc13866`. |
 | 2026-08-09 | [`CROSS-CLIENT-BENCHMARK-2026-08-09.md`](CROSS-CLIENT-BENCHMARK-2026-08-09.md) | MQTTium `0.2.0b2` against seven other Python MQTT clients, measured by an external harness on a pinned host: fastest at QoS 0 in both identities, mid-pack at QoS 1. |
