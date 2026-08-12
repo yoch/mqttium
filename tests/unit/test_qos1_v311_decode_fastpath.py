@@ -127,27 +127,7 @@ def test_v311_qos1_manual_ack_preserves_duplicate_state() -> None:
     assert duplicate_effects[0].data.dup is True
 
 
-@pytest.mark.parametrize(
-    ("protocol", "flags", "remaining"),
-    [
-        (
-            MQTTProtocolVersion.MQTTv5,
-            0x02,
-            pack_utf8("bench/v5") + pack_u16(3) + b"\x00payload",
-        ),
-        (
-            MQTTProtocolVersion.MQTTv311,
-            0x04,
-            pack_utf8("bench/qos2") + pack_u16(3) + b"payload",
-        ),
-    ],
-)
-def test_mqtt5_and_qos2_remain_generic(
-    monkeypatch,
-    protocol: MQTTProtocolVersion,
-    flags: int,
-    remaining: bytes,
-) -> None:
+def test_mqtt5_qos1_and_qos2_use_direct_fields(monkeypatch) -> None:
     calls = 0
     original = PublishPacket.decode
 
@@ -157,7 +137,49 @@ def test_mqtt5_and_qos2_remain_generic(
         return original(*args, **kwargs)
 
     monkeypatch.setattr(PublishPacket, "decode", counted)
-    engine = ProtocolEngine(EngineConfig(protocol=protocol))
+    engine = ProtocolEngine(EngineConfig(protocol=MQTTProtocolVersion.MQTTv5))
     engine.state = ConnectionState.CONNECTED
-    engine.handle_raw(RawPacket(PacketType.PUBLISH, flags, remaining))
+    engine.handle_raw(
+        RawPacket(
+            PacketType.PUBLISH,
+            0x02,
+            pack_utf8("bench/v5/qos1") + pack_u16(3) + b"\x00payload",
+        )
+    )
+    assert calls == 0
+
+    # A fresh engine keeps this test focused on on_publish: otherwise the
+    # Receive-Maximum preflight intentionally decodes a second PUBLISH while
+    # the first auto-PUBACK is still pending in the current effect batch.
+    engine = ProtocolEngine(EngineConfig(protocol=MQTTProtocolVersion.MQTTv5))
+    engine.state = ConnectionState.CONNECTED
+    engine.handle_raw(
+        RawPacket(
+            PacketType.PUBLISH,
+            0x04,
+            pack_utf8("bench/v5/qos2") + pack_u16(4) + b"\x00payload",
+        )
+    )
+    assert calls == 0
+
+
+def test_v311_qos2_remains_generic(monkeypatch) -> None:
+    calls = 0
+    original = PublishPacket.decode
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(PublishPacket, "decode", counted)
+    engine = ProtocolEngine(EngineConfig(protocol=MQTTProtocolVersion.MQTTv311))
+    engine.state = ConnectionState.CONNECTED
+    engine.handle_raw(
+        RawPacket(
+            PacketType.PUBLISH,
+            0x04,
+            pack_utf8("bench/qos2") + pack_u16(3) + b"payload",
+        )
+    )
     assert calls == 1
