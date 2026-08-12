@@ -641,6 +641,14 @@ class InboundSession:
         if state not in (InboundQoSState.WAIT_PUBACK, InboundQoSState.WAIT_USER_ACK):
             raise ProtocolError(f"Inbound mid={mid} is not awaiting ack (state={state!r})")
 
+        packet = (
+            PubAckPacket(mid=mid)
+            if state is InboundQoSState.WAIT_PUBACK
+            else PubCompPacket(mid=mid)
+        )
+        wire = packet.encode(config.protocol)
+        self._engine._check_outbound_size(wire)
+
         if isinstance(record, InboundMessage):
             popped = store.pop_in(mid)
             if popped is None:
@@ -652,12 +660,7 @@ class InboundSession:
             if completed is None:
                 raise ProtocolError(f"Inbound mid={mid} changed while acknowledging")
             logical_size = completed.logical_size
-        packet = (
-            PubAckPacket(mid=mid)
-            if state is InboundQoSState.WAIT_PUBACK
-            else PubCompPacket(mid=mid)
-        )
-        self._engine._send(packet.encode(config.protocol))
+        self._engine._send(wire)
         self._release_slot(logical_size)
 
     def replay_session(self) -> None:

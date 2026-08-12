@@ -1,10 +1,13 @@
-"""Regression coverage for broker Maximum Packet Size on automatic ACKs."""
+"""Regression coverage for broker Maximum Packet Size on automatic and manual ACKs."""
 
 from __future__ import annotations
+
+import pytest
 
 from mqttium.codec.buffer import IncrementalDecoder
 from mqttium.codec.properties import CONNACK, encode_properties
 from mqttium.enums import MQTTProtocolVersion, PacketType, QoS
+from mqttium.errors import PacketTooLargeError
 from mqttium.packets import PublishPacket, encode_frame
 from mqttium.protocol.config import EngineConfig
 from mqttium.protocol.effects import EffectKind
@@ -20,8 +23,18 @@ def _feed(engine: ProtocolEngine, wire: bytes) -> None:
     engine.handle_raw(raw)
 
 
-def _connected_engine(maximum_packet_size: int) -> ProtocolEngine:
-    engine = ProtocolEngine(EngineConfig(client_id="ack-size", protocol=MQTTProtocolVersion.MQTTv5))
+def _connected_engine(
+    maximum_packet_size: int,
+    *,
+    manual_ack: bool = False,
+) -> ProtocolEngine:
+    engine = ProtocolEngine(
+        EngineConfig(
+            client_id="ack-size",
+            protocol=MQTTProtocolVersion.MQTTv5,
+            manual_ack=manual_ack,
+        )
+    )
     engine.begin_connect()
     properties = Properties()
     properties.set("maximum_packet_size", maximum_packet_size)
@@ -65,3 +78,35 @@ def test_automatic_puback_at_exact_broker_packet_limit_is_emitted() -> None:
     assert sent == [b"\x40\x02\x00\x07"]
     assert any(effect.kind is EffectKind.MESSAGE for effect in effects)
     assert not any(effect.kind is EffectKind.PROTOCOL_ERROR for effect in effects)
+
+
+def test_manual_puback_size_failure_preserves_durable_record() -> None:
+    engine = _connected_engine(maximum_packet_size=3, manual_ack=True)
+
+    _feed(engine, _qos1_publish())
+    effects = engine.take_effects()
+    assert any(effect.kind is EffectKind.MESSAGE for effect in effects)
+    assert engine.store.get_in(7) is not None
+    assert engine.inbound._inflight == 1
+
+    with pytest.raises(PacketTooLargeError, match="maximum_packet_size 3"):
+        engine.ack(7)
+
+    assert engine.store.get_in(7) is not None
+    assert engine.inbound._inflight == 1
+    assert not any(effect.kind is EffectKind.SEND for effect in engine.take_effects())
+
+
+def test_manual_puback_at_exact_limit_completes_record() -> None:
+    engine = _connected_engine(maximum_packet_size=4, manual_ack=True)
+
+    _feed(engine, _qos1_publish())
+    engine.take_effects()
+    engine.ack(7)
+    effects = engine.take_effects()
+
+    assert [effect.data for effect in effects if effect.kind is EffectKind.SEND] == [
+        b"\x40\x02\x00\x07"
+    ]
+    assert engine.store.get_in(7) is None
+    assert engine.inbound._inflight == 0

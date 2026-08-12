@@ -8,6 +8,17 @@ from typing import Any
 from mqttium.enums import InboundQoSState, OutboundQoSState, QoS
 
 
+def _freeze_property_signature(value: Any) -> Any:
+    """Snapshot mutable property values before using them as a cache signature."""
+    if isinstance(value, bytearray):
+        return bytes(value)
+    if isinstance(value, list):
+        return tuple(_freeze_property_signature(item) for item in value)
+    if isinstance(value, tuple):
+        return tuple(_freeze_property_signature(item) for item in value)
+    return value
+
+
 @dataclass(slots=True)
 class Properties:
     """Minimal MQTT 5 property bag.
@@ -19,15 +30,14 @@ class Properties:
 
     values: dict[str, Any] = field(default_factory=dict)
     # packet context -> (structural signature, encoded property table).
-    # The signature is recomputed on reads so direct `values` mutations remain safe.
+    # The signature snapshots mutable values, so direct/in-place mutations remain safe.
     _encoded: dict[str, tuple[tuple[tuple[str, Any], ...], bytes]] = field(
         default_factory=dict, init=False, repr=False, compare=False
     )
 
     def _signature(self) -> tuple[tuple[str, Any], ...]:
         return tuple(
-            (name, tuple(value) if isinstance(value, list) else value)
-            for name, value in self.values.items()
+            (name, _freeze_property_signature(value)) for name, value in self.values.items()
         )
 
     def get(self, name: str, default: Any = None) -> Any:

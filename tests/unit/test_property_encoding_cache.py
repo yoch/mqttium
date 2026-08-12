@@ -5,6 +5,7 @@ from __future__ import annotations
 import mqttium.codec.properties as properties_module
 
 from mqttium.api.async_client import AsyncClient
+from mqttium.codec.properties import PUBLISH, decode_properties, encode_properties
 from mqttium.enums import MQTTProtocolVersion
 from mqttium.types import Message, Properties
 
@@ -29,3 +30,18 @@ def test_delivery_logical_size_reuses_cached_mqtt5_property_body(monkeypatch) ->
 
     assert first == second
     assert calls == 1
+
+
+def test_binary_property_cache_detects_in_place_bytearray_mutation() -> None:
+    data = bytearray(b"before")
+    properties = Properties()
+    properties.set("correlation_data", data)
+
+    first = encode_properties(properties, PUBLISH)
+    data[:] = b"after"
+    second = encode_properties(properties, PUBLISH)
+
+    assert first != second
+    decoded, pos = decode_properties(second, 0, PUBLISH)
+    assert pos == len(second)
+    assert decoded.get("correlation_data") == b"after"

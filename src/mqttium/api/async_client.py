@@ -849,7 +849,13 @@ class AsyncClient:
                 return
             # Preserve validation semantics: an invalid reason code must fail
             # before teardown, just as it did before shutdown became bounded.
-            packet = self._engine.begin_disconnect(reason_code) if self.is_connected else None
+            try:
+                packet = self._engine.begin_disconnect(reason_code) if self.is_connected else None
+            except PacketTooLargeError:
+                # The peer's packet limit makes a legal DISCONNECT impossible.
+                # Closing the transport is the only conforming shutdown left.
+                await self._force_close_after_local_packet_failure()
+                return
             try:
                 if packet is not None:
                     # Shutdown must not wait for application traffic to free a
@@ -1194,9 +1200,17 @@ class AsyncClient:
         """
         if message.mid is None:
             return
-        async with self._engine_lock:
-            self._engine.ack(message.mid)
-            self._collect_effects_locked()
+        try:
+            async with self._engine_lock:
+                self._engine.ack(message.mid)
+                self._collect_effects_locked()
+        except PacketTooLargeError as exc:
+            # A broker limit below the mandatory ACK size makes this QoS
+            # exchange impossible to complete without violating negotiation.
+            self._disconnect_exc = exc
+            self._intentional_disconnect = True
+            await self._force_close_after_local_packet_failure()
+            raise
         await self._drain_effects()
 
     async def _read_loop(self) -> None:  # noqa: C901
@@ -1390,9 +1404,17 @@ class AsyncClient:
                     continue
                 due = self._write_pump.last_outbound + k
                 if now >= due:
-                    async with self._engine_lock:
-                        self._engine.queue_ping()
-                        self._collect_effects_locked()
+                    try:
+                        async with self._engine_lock:
+                            self._engine.queue_ping()
+                            self._collect_effects_locked()
+                    except PacketTooLargeError as exc:
+                        # A broker limit below the two-byte PINGREQ leaves no
+                        # conforming keepalive packet to send.
+                        self._disconnect_exc = exc
+                        self._intentional_disconnect = True
+                        await self._force_close_after_local_packet_failure()
+                        return
                     # A lost PINGREQ beats a wedged keepalive under backpressure.
                     try:
                         await self._drain_effects(nowait=True)
@@ -1529,8 +1551,10 @@ class AsyncClient:
         elif kind is EffectKind.AUTH:
             challenge: AuthPacket = effect.data
             if self.auth_handler is None:
+                packet = encode_disconnect(0x8C, self._engine.config.protocol)
+                self._engine._check_outbound_size(packet)
                 await self._enqueue_outbound(
-                    encode_disconnect(0x8C, self._engine.config.protocol),
+                    packet,
                     nowait=nowait,
                     epoch=epoch,
                 )
@@ -1779,6 +1803,7 @@ class AsyncClient:
             reason = 0x81  # Malformed Packet
         try:
             packet = encode_disconnect(reason, MQTTProtocolVersion.MQTTv5)
+            self._engine._check_outbound_size(packet)
             admitted = self._try_enqueue_outbound(packet, epoch=self._connection_epoch)
             if not admitted:
                 return
@@ -1793,6 +1818,17 @@ class AsyncClient:
                     pass
         except Exception:
             pass
+
+    async def _force_close_after_local_packet_failure(self) -> None:
+        """Close transport and finalize engine state for local packet-size failures."""
+        await self._force_close()
+        async with self._engine_lock:
+            if self._engine.state not in (
+                ConnectionState.NEW,
+                ConnectionState.DISCONNECTED,
+            ):
+                self._engine.notify_transport_closed()
+                self._engine.take_effects()
 
     async def _force_close(self, *, preserve_reconnect: bool = False) -> None:
         await self._invalidate_connection_epoch()

@@ -46,32 +46,25 @@ def test_system_topic_wildcard_guard() -> None:
     assert list(matcher.iter_match("foo/bar")) == ["all"]
 
 
-def test_shared_filter_matches_broker_delivered_topic() -> None:
+def test_shared_subscription_filter_is_matched_literally_like_paho() -> None:
     matcher = TopicMatcher()
     matcher["$share/group/sensors/#"] = "shared"
     matcher["sensors/#"] = "normal"
 
-    assert list(matcher.iter_match("sensors/temp")) == ["shared", "normal"]
-    assert list(matcher.iter_match("$share/group/sensors/temp")) == []
+    # Paho registers the callback filter literally; broker-side removal of the
+    # shared-subscription prefix is not emulated by the callback matcher.
+    assert list(matcher.iter_match("sensors/temp")) == ["normal"]
+    assert list(matcher.iter_match("$share/group/sensors/temp")) == ["shared"]
     assert matcher["$share/group/sensors/#"] == "shared"
 
 
-def test_multiple_shared_exact_filters_can_match_same_delivered_topic() -> None:
+def test_shared_exact_filter_does_not_alias_underlying_topic() -> None:
     matcher = TopicMatcher()
-    matcher["$share/first/sensors/temp"] = "first"
+    matcher["$share/first/sensors/temp"] = "shared"
     matcher["sensors/temp"] = "normal"
-    matcher["$share/second/sensors/temp"] = "second"
 
-    assert list(matcher.iter_match("sensors/temp")) == ["first", "normal", "second"]
-
-
-def test_shared_system_filter_keeps_system_topic_wildcard_guard() -> None:
-    matcher = TopicMatcher()
-    matcher["$share/group/#"] = "shared-all"
-    matcher["$share/group/$SYS/#"] = "shared-sys"
-
-    assert list(matcher.iter_match("$SYS/broker/version")) == ["shared-sys"]
-    assert list(matcher.iter_match("regular/topic")) == ["shared-all"]
+    assert list(matcher.iter_match("sensors/temp")) == ["normal"]
+    assert list(matcher.iter_match("$share/first/sensors/temp")) == ["shared"]
 
 
 def test_replacing_value_preserves_insertion_order() -> None:
