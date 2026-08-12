@@ -1,0 +1,31 @@
+name: Update QoS0 branch from main
+
+on:
+  push:
+    branches:
+      - perf/qos0-topic-bytes-handoff
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: perf/qos0-topic-bytes-handoff
+          fetch-depth: 0
+      - name: Merge current main and self-clean
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git merge --no-commit --no-ff origin/main
+          rm .github/workflows/update-qos0-from-main.yml
+          git add -A
+          git commit -m 'Merge current main into QoS0 optimization branch'
+          git push origin HEAD:perf/qos0-topic-bytes-handoff
