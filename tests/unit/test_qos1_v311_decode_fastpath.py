@@ -92,12 +92,12 @@ def test_v311_qos0_and_qos1_both_avoid_generic_packet(monkeypatch) -> None:
     effects = engine.take_effects()
     assert [effect.kind for effect in effects] == [
         EffectKind.MESSAGE,
-        EffectKind.MESSAGE,
         EffectKind.SEND,
+        EffectKind.MESSAGE,
     ]
     assert effects[0].data.qos is QoS.AT_MOST_ONCE
-    assert effects[1].data.qos is QoS.AT_LEAST_ONCE
-    assert effects[1].data.mid == 7
+    assert effects[2].data.qos is QoS.AT_LEAST_ONCE
+    assert effects[2].data.mid == 7
     assert calls == 0
 
 

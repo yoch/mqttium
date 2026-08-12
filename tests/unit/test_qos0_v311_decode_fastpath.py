@@ -112,10 +112,26 @@ def test_qos1_uses_direct_acknowledged_path_after_composition(monkeypatch) -> No
     )
 
     effects = engine.take_effects()
-    assert [effect.kind for effect in effects] == [EffectKind.MESSAGE, EffectKind.SEND]
-    assert effects[0].data.mid == 7
-    assert effects[0].data.qos is QoS.AT_LEAST_ONCE
+    assert [effect.kind for effect in effects] == [EffectKind.SEND, EffectKind.MESSAGE]
+    assert effects[1].data.mid == 7
+    assert effects[1].data.qos is QoS.AT_LEAST_ONCE
     assert calls == 0
+
+
+def test_mqtt5_qos2_emits_pubrec_before_message() -> None:
+    engine = _connected(MQTTProtocolVersion.MQTTv5)
+    engine.handle_raw(
+        RawPacket(
+            PacketType.PUBLISH,
+            0x04,
+            pack_utf8("bench/qos2") + pack_u16(8) + b"\x00payload",
+        )
+    )
+
+    effects = engine.take_effects()
+    assert [effect.kind for effect in effects] == [EffectKind.SEND, EffectKind.MESSAGE]
+    assert effects[1].data.mid == 8
+    assert effects[1].data.qos is QoS.EXACTLY_ONCE
 
 
 def test_mqtt5_qos0_keeps_property_aware_path(monkeypatch) -> None:

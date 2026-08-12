@@ -322,6 +322,9 @@ class InboundSession:
         except Exception:
             self._release_slot(logical_size)
             raise
+        # Runtime effect application is SEND-first. Produce the protocol ACK in
+        # that order here so every QoS2 delivery avoids EffectPump repartition.
+        engine._send(PubRecPacket(mid=packet.mid).encode(config.protocol))
         engine._emit(
             EffectKind.MESSAGE,
             Message(
@@ -334,7 +337,6 @@ class InboundSession:
                 properties=packet.properties,
             ),
         )
-        engine._send(PubRecPacket(mid=packet.mid).encode(config.protocol))
 
     def _on_qos1(
         self,
@@ -407,6 +409,10 @@ class InboundSession:
             except Exception:
                 self._release_slot(logical_size)
                 raise
+        if not config.manual_ack:
+            # Match the runtime's mandatory SEND-before-application order at the
+            # producer, avoiding an EffectPump repartition on every auto-ACK.
+            self._engine._send(PubAckPacket(mid=mid).encode(config.protocol))
         self._engine._emit(
             EffectKind.MESSAGE,
             Message(
@@ -420,7 +426,6 @@ class InboundSession:
             ),
         )
         if not config.manual_ack:
-            self._engine._send(PubAckPacket(mid=mid).encode(config.protocol))
             self._release_slot()
 
     def on_pubrel(self, raw: RawPacket) -> None:  # noqa: C901
