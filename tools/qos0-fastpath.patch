@@ -1,0 +1,172 @@
+--- a/src/mqttium/protocol/inbound.py
++++ b/src/mqttium/protocol/inbound.py
+@@ -14,7 +14,7 @@
+ from mqttium.codec.buffer import RawPacket
+ from mqttium.codec.packet_validation import require_nonzero_mid
+ from mqttium.codec.primitives import unpack_u16, unpack_utf8
+-from mqttium.codec.properties import PUBLISH, encode_properties
++from mqttium.codec.properties import PUBLISH, decode_properties, encode_properties
+ from mqttium.enums import ConnectionState, InboundQoSState, MQTTProtocolVersion, QoS
+ from mqttium.errors import MalformedPacketError, ProtocolError
+ from mqttium.persistence.memory import (
+@@ -109,6 +109,21 @@
+     mid, pos = unpack_u16(raw.remaining, pos)
+     require_nonzero_mid(mid, "PUBLISH")
+     return topic, raw.remaining[pos:], mid, bool(raw.flags & 0x01), bool(raw.flags & 0x08)
++
++
++def _decode_v5_qos0_fields(
++    raw: RawPacket,
++) -> tuple[str, bytes, bool, Properties | None]:
++    """Decode MQTT 5 QoS 0 fields without constructing a PublishPacket."""
++
++    if raw.flags & 0x08:
++        raise MalformedPacketError("QoS 0 PUBLISH must not set DUP")
++    topic, pos = unpack_utf8(raw.remaining)
++    properties, pos = decode_properties(raw.remaining, pos, PUBLISH)
++    # Preserve #128: a non-empty Topic Name must be validated before it can
++    # establish or replace a connection-scoped Topic Alias.
++    validate_received_publish_topic(topic, utf8_validated=True)
++    return topic, raw.remaining[pos:], bool(raw.flags & 0x01), properties
+ 
+ 
+ class InboundSession:
+@@ -236,8 +251,8 @@
+         engine = self._engine
+         config = self.config
+         store = self.store
++        qos = (raw.flags >> 1) & 0x03
+         if config.protocol is MQTTProtocolVersion.MQTTv311:
+-            qos = (raw.flags >> 1) & 0x03
+             if qos == int(QoS.AT_MOST_ONCE):
+                 engine._emit(EffectKind.MESSAGE, _decode_v311_qos0_message(raw))
+                 return
+@@ -252,6 +267,22 @@
+                     properties=None,
+                 )
+                 return
++        elif config.protocol is MQTTProtocolVersion.MQTTv5 and qos == int(QoS.AT_MOST_ONCE):
++            topic, payload, retain, properties = _decode_v5_qos0_fields(raw)
++            topic = self._resolve_topic_fields(topic, properties)
++            engine._emit(
++                EffectKind.MESSAGE,
++                Message(
++                    topic=topic,
++                    payload=payload,
++                    qos=QoS.AT_MOST_ONCE,
++                    retain=retain,
++                    dup=False,
++                    mid=None,
++                    properties=properties,
++                ),
++            )
++            return
+         packet = PublishPacket.decode(raw.flags, raw.remaining, config.protocol)
+         topic = self._resolve_topic(packet)
+         validate_received_publish_topic(topic, utf8_validated=True)
+@@ -673,14 +704,16 @@
+     # --- aliases and Receive Maximum --------------------------------------
+ 
+     def _resolve_topic(self, packet: PublishPacket) -> str:
++        return self._resolve_topic_fields(packet.topic, packet.properties)
++
++    def _resolve_topic_fields(self, topic: str, props: Properties | None) -> str:
+         if self.config.protocol != MQTTProtocolVersion.MQTTv5:
+-            return packet.topic
+-        props = packet.properties
++            return topic
+         alias = props.get("topic_alias") if props else None
+         if alias is None:
+-            if not packet.topic:
++            if not topic:
+                 raise ProtocolError("PUBLISH with empty topic and no topic alias")
+-            return packet.topic
++            return topic
+         alias = int(alias)
+         max_alias = self.config.topic_alias_maximum
+         # max_alias == 0 means inbound aliases are not accepted.
+@@ -688,9 +721,9 @@
+             # MQTT 5 §3.3.2.3.5: DISCONNECT 0x94 (Topic Alias invalid).
+             self._protocol_disconnect(0x94)
+             raise ProtocolError(f"Invalid topic alias {alias}")
+-        if packet.topic:
+-            self._aliases[alias] = packet.topic
+-            return packet.topic
++        if topic:
++            self._aliases[alias] = topic
++            return topic
+         if alias not in self._aliases:
+             self._protocol_disconnect(0x94)
+             raise ProtocolError(f"Unknown topic alias {alias}")
+--- a/tests/unit/test_qos0_v311_decode_fastpath.py
++++ b/tests/unit/test_qos0_v311_decode_fastpath.py
+@@ -134,7 +134,7 @@
+     assert effects[1].data.qos is QoS.EXACTLY_ONCE
+ 
+ 
+-def test_mqtt5_qos0_keeps_property_aware_path(monkeypatch) -> None:
++def test_mqtt5_qos0_uses_direct_property_aware_path(monkeypatch) -> None:
+     calls = 0
+     original = PublishPacket.decode
+ 
+@@ -157,4 +157,60 @@
+     assert [effect.kind for effect in effects] == [EffectKind.MESSAGE]
+     assert effects[0].data.topic == "bench/v5"
+     assert effects[0].data.payload == b"payload"
++    assert calls == 0
++
++
++def test_mqtt5_qos0_direct_path_preserves_properties(monkeypatch) -> None:
++    from mqttium.codec.properties import PUBLISH, encode_properties
++    from mqttium.types import Properties
++
++    calls = 0
++    original = PublishPacket.decode
++
++    def counted(*args, **kwargs):
++        nonlocal calls
++        calls += 1
++        return original(*args, **kwargs)
++
++    monkeypatch.setattr(PublishPacket, "decode", counted)
++    props = Properties()
++    props.set("content_type", "text/plain")
++    wire_props = encode_properties(props, PUBLISH)
++    engine = _connected(MQTTProtocolVersion.MQTTv5)
++    engine.handle_raw(
++        RawPacket(
++            PacketType.PUBLISH,
++            0x00,
++            pack_utf8("bench/v5/props") + wire_props + b"body",
++        )
++    )
++
++    effects = engine.take_effects()
++    assert effects[0].data.properties is not None
++    assert effects[0].data.properties.get("content_type") == "text/plain"
++    assert effects[0].data.payload == b"body"
++    assert calls == 0
++
++
++def test_mqtt5_qos1_still_uses_generic_packet_path(monkeypatch) -> None:
++    calls = 0
++    original = PublishPacket.decode
++
++    def counted(*args, **kwargs):
++        nonlocal calls
++        calls += 1
++        return original(*args, **kwargs)
++
++    monkeypatch.setattr(PublishPacket, "decode", counted)
++    engine = _connected(MQTTProtocolVersion.MQTTv5)
++    engine.handle_raw(
++        RawPacket(
++            PacketType.PUBLISH,
++            0x02,
++            pack_utf8("bench/v5/qos1") + pack_u16(9) + b"\x00" + b"payload",
++        )
++    )
++
++    effects = engine.take_effects()
++    assert effects[1].data.qos is QoS.AT_LEAST_ONCE
+     assert calls == 1
