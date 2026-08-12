@@ -1,154 +1,27 @@
 name: RC2 release notes bootstrap
-
 on:
   push:
-    branches: [release/v1.0.0rc2]
-
+    branches:
+      - release/v1.0.0rc2
 permissions:
   contents: write
-
 jobs:
   prepare:
-    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
         with:
           ref: release/v1.0.0rc2
-      - name: Finalize RC2 changelog
+      - name: Finalize changelog
+        env:
+          SCRIPT_B64: ZnJvbSBwYXRobGliIGltcG9ydCBQYXRoCgpwYXRoID0gUGF0aCgiQ0hBTkdFTE9HLm1kIikKdGV4dCA9IHBhdGgucmVhZF90ZXh0KCkKCm9sZCA9ICIjIyBbVW5yZWxlYXNlZF1cblxuIyMjIEZpeGVkXG4iCm5ldyA9ICIjIyBbVW5yZWxlYXNlZF1cblxuIyMgWzEuMC4wcmMyXSAtIDIwMjYtMDgtMTJcblxuIyMjIEZpeGVkXG4iCmlmIHRleHQuY291bnQob2xkKSAhPSAxOgogICAgcmFpc2UgU3lzdGVtRXhpdChmInJlbGVhc2UgaGVhZGluZyBtYXJrZXIgY291bnQ9e3RleHQuY291bnQob2xkKX0iKQp0ZXh0ID0gdGV4dC5yZXBsYWNlKG9sZCwgbmV3LCAxKQoKc3RhbGVfc2hhcmVkID0gIiIiLSBUb3BpYy1zcGVjaWZpYyBQYWhvIGNhbGxiYWNrcyByZWdpc3RlcmVkIHdpdGggYSBzaGFyZWQtc3Vic2NyaXB0aW9uIGZpbHRlcgogIG5vdyBtYXRjaCB0aGUgVG9waWMgTmFtZSB0aGUgYnJva2VyIGRlbGl2ZXJzLCB3aGljaCBoYXMgdGhlCiAgYCRzaGFyZS97U2hhcmVOYW1lfS9gIHByZWZpeCBzdHJpcHBlZDsgcHJldmlvdXNseSB0aGV5IG5ldmVyIGZpcmVkLiBMb29rdXAgYW5kCiAgcmVtb3ZhbCBzdGlsbCB1c2UgdGhlIG9yaWdpbmFsIGZpbHRlciwgc2V2ZXJhbCBgJHNoYXJlYCBncm91cHMgbWF5IHNoYXJlIG9uZQogIHVuZGVybHlpbmcgZmlsdGVyLCBhbmQgYSBzaGFyZWQgYCNXIHN0aWxsIGRvZXMgbm90IGNhcHR1cmUgYCRgIHN5c3RlbSB0b3BpY3MuCiIiIgppZiB0ZXh0LmNvdW50KHN0YWxlX3NoYXJlZCkgIT0gMToKICAgIHJhaXNlIFN5c3RlbUV4aXQoZiJzaGFyZWQgYnVsbGV0IGNvdW50PXt0ZXh0LmNvdW50KHN0YWxlX3NoYXJlZCl9IikKdGV4dCA9IHRleHQucmVwbGFjZShzdGFsZV9zaGFyZWQsICIiLCAxKQoKb2xkX21wcyA9ICIiIi0gVGhlIGJyb2tlcidzIG5lZ290aWF0ZWQgTWF4aW11bSBQYWNrZXQgU2l6ZSBpcyBlbmZvcmNlZCBmb3IgRElTQ09OTkVDVCBiZWZvcmUKICB0aGUgZW5naW5lIGVudGVycyBgRElTQ09OTkVDVElOR2AsIG5vdCBvbmx5IGZvciBwdWJsaWNhdGlvbiB0cmFmZmljLgoiIiIKbmV3X21wcyA9ICIiIi0gVGhlIGJyb2tlcidzIG5lZ290aWF0ZWQgTWF4aW11bSBQYWNrZXQgU2l6ZSBpcyBlbmZvcmNlZCBhY3Jvc3MgY29udHJvbC1wYWNrZXQKICBwYXRocyBhcyB3ZWxsIGFzIHB1YmxpY2F0aW9uIHRyYWZmaWM6IGdyYWNlZnVsIGFuZCBmYXRhbCBESVNDT05ORUNULCBQSU5HUkVRLAogIG1hbnVhbCBQVUJBQ0svUFVCQ09NUCBhbmQgYXV0aGVudGljYXRpb24gZmFsbGJhY2tzIGNhbm5vdCBieXBhc3MgdGhlIG5lZ290aWF0ZWQKICBsaW1pdC4gTWFudWFsIGFja25vd2xlZGdlbWVudCB2YWxpZGF0ZXMgYmVmb3JlIG11dGF0aW5nIGR1cmFibGUgc3RhdGUsIGFuZCB3aGVuIGEKICBtYW5kYXRvcnkgY29udHJvbCBwYWNrZXQgY2Fubm90IGZpdCB0aGUgY2xpZW50IGNsb3NlcyB0aGUgdHJhbnNwb3J0IHJhdGhlciB0aGFuCiAgcHV0dGluZyBhbiBpbGxlZ2FsIHBhY2tldCBvbiB0aGUgd2lyZS4KIiIiCmlmIHRleHQuY291bnQob2xkX21wcykgIT0gMToKICAgIHJhaXNlIFN5c3RlbUV4aXQoZiJNUFMgYnVsbGV0IGNvdW50PXt0ZXh0LmNvdW50KG9sZF9tcHMpfSIpCnRleHQgPSB0ZXh0LnJlcGxhY2Uob2xkX21wcywgbmV3X21wcywgMSkKCnJlc3BvbnNlX3RvcGljID0gIiIiLSBNUVRUIDUgUmVzcG9uc2UgVG9waWMgcHJvcGVydGllcyBjb250YWluaW5nIGArYCBvciBgI2AgYXJlIHJlamVjdGVkIGluIGJvdGgKICBvdXRib3VuZCBhbmQgaW5ib3VuZCBQVUJMSVNIIHBhY2tldHMsIGFzIHJlcXVpcmVkIGJ5IFtNUVRULTMuMy4yLTE0XS4KIiIiCnJlc3BvbnNlX3RvcGljX25ldyA9ICIiIi0gTVFUVDUgdG9waWMvcHJvcGVydHkgdmFsaWRhdGlvbiBpcyBhcHBsaWVkIGJlZm9yZSBjb25uZWN0aW9uLXNjb3BlZCBhbGlhcwogIHN0YXRlIGNhbiBtdXRhdGUuIFJlc3BvbnNlIFRvcGljIHJlamVjdHMgZW1wdHkgdmFsdWVzIGFuZCB3aWxkY2FyZHMgZm9yIGJvdGgKICBQVUJMSVNIIChpbmNsLiBXaWxsKSBwcm9wZXJ0aWVzLCBpbnZhbGlkIFdpbGwgVG9waWNzIGFyZSByZWZ1c2VkLCBhbmQgb3V0Ym91bmQgZW1wdHkKICBUb3BpYyBOYW1lcyBhcmUgbm90IGFjY2VwdGVkIHVudGlsIGEgc3RhdGVmdWwgb3V0Ym91bmQgVG9waWMgQWxpYXMgaGFzIGFjdHVhbGx5CiAgYmVlbiBlc3RhYmxpc2hlZC4KIiIiCmlmIHRleHQuY291bnQocmVzcG9uc2VfdG9waWMpICE9IDE6CiAgICByYWlzZSBTeXN0ZW1FeGl0KGYiUmVzcG9uc2UgVG9waWMgYnVsbGV0IGNvdW50PXt0ZXh0LmNvdW50KHJlc3BvbnNlX3RvcGljKX0iKQp0ZXh0ID0gdGV4dC5yZXBsYWNlKHJlc3BvbnNlX3RvcGljLCByZXNwb25zZV90b3BpY19uZXcsIDEpCgplZmZlY3RfbWFya2VyID0gIiIiLSBgRWZmZWN0UHVtcGAgbm8gbG9uZ2VyIHJldGFpbnMgdGhlIGV4Y2VwdGlvbiByYWlzZWQgd2hpbGUgdGhlIGJhY2tncm91bmQKICBlZmZlY3QtZmx1c2ggdGFzayBhcHBsaWVzIGFuIGVmZmVjdCBvbmNlIG5vdGhpbmcgaXMgbGVmdCBwZW5kaW5nLiBUaGUgc3RvcmVkCiAgZXJyb3Igd2FzIGhhbmRlZCB0byB3aGljaGV2ZXIgY2FsbCBuZXh0IHN1c3BlbmRlZCBpbiBgZHJhaW4oKWAsIHNvIGEgcHJvdG9jb2wKICBlcnJvciBjYXVzZWQgYnkgdGhlIGJyb2tlciBzdXJmYWNlZCBhZ2FpbnN0IGFuIHVucmVsYXRlZCBsYXRlciBgcHVibGlzaCgpYCBvbgogIGEgaGVhbHRoeSBjb25uZWN0aW9uLiBBIGZhaWx1cmUgdGhhdCBnZW51aW5lbHkgYmxvY2tzIHBlbmRpbmcgZWZmZWN0cyBpcyBzdGlsbAogIHJlcG9ydGVkIHRvIHdob2V2ZXIgd2FpdHMgb24gaXQuCiIiIgpleHRyYV9maXhlZCA9IGVmZmVjdF9tYXJrZXIgKyAiIiItIENhY2hlZCBNUVRUIDUgcHJvcGVydHkgZW5jb2Rpbmcgbm93IHNuYXBzaG90cyBtdXRhYmxlIGJpbmFyeSB2YWx1ZXMuIEFuCiAgaW4tcGxhY2UgYGJ5dGVhcnJheWAgbXV0YXRpb24gY2FuIG5vIGxvbmdlciBsZWF2ZSBhIHN0YWxlIGVuY29kZWQgcHJvcGVydHkgdGFibGUKICBiZWhpbmQgd2hpbGUgdGhlIGNhY2hlIHNpZ25hdHVyZSBhcHBlYXJzIHVuY2hhbmdlZC4KLSBTVUJBQ0sgYW5kIFVOU1VCQUNLIGFyZSBjb3JyZWxhdGVkIHdpdGggdGhlIHJlcXVlc3QgdHlwZSBhbmQgZXhwZWN0ZWQgcmVzdWx0IGNvdW50CiAgYmVmb3JlIHRoZWlyIHBhY2tldCBpZGVudGlmaWVyIGlzIHJlbGVhc2VkLiBNYWxmb3JtZWQgUElOR1JFU1AgcGFja2V0cywgaW52YWxpZAogIHNlcnZlciBESVNDT05ORUNUIFNlc3Npb24gRXhwaXJ5LCBhbmQgc3VjY2Vzc2Z1bCBlbXB0eS1jbGllbnQtaWQgQ09OTkFDSyBwYWNrZXRzCiAgd2l0aG91dCBhbiBBc3NpZ25lZCBDbGllbnQgSWRlbnRpZmllciBhcmUgYWxzbyByZWplY3RlZCBpbnN0ZWFkIG9mIGFkdmFuY2luZwogIHN0YXRlLgotIFJlY2VpdmUgTWF4aW11bSBhY2NvdW50aW5nIG5vdyBjb3ZlcnMgdGhlIGhhbmRvZmYgb2YgYXV0b21hdGljIGFja25vd2xlZGdlbWVudHMKICB0byB0aGUgcnVudGltZSwgaW5jbHVkaW5nIG1peGVkIFFvUyAxL1FvUyAyIHRyYWZmaWMsIHNvIGEgYnJva2VyIGNhbm5vdCBleGNlZWQgdGhlCiAgbmVnb3RpYXRlZCBpbmJvdW5kIHdpbmRvdyBpbnNpZGUgb25lIGRlY29kZWQgYmF0Y2guCiIiIgppZiB0ZXh0LmNvdW50KGVmZmVjdF9tYXJrZXIpICE9IDE6CiAgICByYWlzZSBTeXN0ZW1FeGl0KGYiRWZmZWN0UHVtcCBtYXJrZXIgY291bnQ9e3RleHQuY291bnQoZWZmZWN0X21hcmtlcil9IikKdGV4dCA9IHRleHQucmVwbGFjZShlZmZlY3RfbWFya2VyLCBleHRyYV9maXhlZCwgMSkKCmFkZGVkX21hcmtlciA9ICJcbiMjIyBBZGRlZFxuIgpjaGFuZ2VkID0gIiIiCiMjIyBDaGFuZ2VkCgotIE1RVFQgNSBpbmJvdW5kIFFvUyAwLzEvMiBQVUJMSVNIIGhhbmRsaW5nIGRlY29kZXMgZGlyZWN0bHkgaW50byB0aGUgZXhpc3RpbmcKICBkZWxpdmVyeS9Rb1Mgc3RhdGUgbWFjaGluZXMgaW5zdGVhZCBvZiBjb25zdHJ1Y3RpbmcgYSBzaG9ydC1saXZlZAogIGBQdWJsaXNoUGFja2V0YC4gTVFUVDMuMS8zLjEuMSByZXRhaW4gdGhlaXIgcHJvdG9jb2wtc3BlY2lmaWMgcGF0aHMsIHdpdGgKICByZWdyZXNzaW9uIGNvdmVyYWdlIGZvciBwYXlsb2FkcyB0aGF0IHJlc2VtYmxlIE1RVFQgNSBwcm9wZXJ0eSBsZW5ndGhzLgotIENvbW1vbiBhY2tub3dsZWRnZW1lbnQgYW5kIHB1YmxpY2F0aW9uIGhvdCBwYXRocyBhdm9pZCByZWR1bmRhbnQgZ2VuZXJpYyBjb2RlYwogIHdvcms6IHN1Y2Nlc3MgUFVCQUNLIGVuY29kZS9kZWNvZGUgdXNlcyB0aGUgZml4ZWQgZm9ybSwgdmFsaWRhdGVkIFFvUyAwIFRvcGljCiAgTmFtZSBieXRlcyBhcmUgcmV1c2VkIGJ5IHRoZSBlbmNvZGVyLCBhbmQgTVFUVDUgcHJvcGVydHkgYm9kaWVzIGFyZSByZXVzZWQKICBhY3Jvc3Mgc2l6aW5nIGFuZCB3aXJlIGVuY29kaW5nIHdoaWxlIHByZXNlcnZpbmcgbXV0YXRpb24gc2FmZXR5LgotIEV4YWN0IHRvcGljIGNhbGxiYWNrcyByZXRhaW4gTygxKSBsb29rdXAgd2hpbGUgd2lsZGNhcmQgZmlsdGVycyBrZWVwIHRoZSBzbWFsbAogIG9yZGVyZWQgc2Nhbi4gRmlsdGVycyBhcmUgbWF0Y2hlZCBsaXRlcmFsbHksIGluY2x1ZGluZyBgJHNoYXJlL3tncm91cH0vLi4uYCwKICBwcmVzZXJ2aW5nIFBhaG8gY2FsbGJhY2sgc2VtYW50aWNzIGluc3RlYWQgb2YgYWRkaW5nIGJyb2tlci1zaWRlCiAgc2hhcmVkLXN1YnNjcmlwdGlvbiByZXdyaXRpbmcgdG8gdGhlIG1hdGNoZXIuCi0gQXV0b21hdGljIGFja25vd2xlZGdlbWVudCBlZmZlY3RzIGFyZSBwcm9kdWNlZCBTRU5ELWZpcnN0LCBxdWV1ZWQgU1FMaXRlCiAgbGF1bmNoZXMgdXNlIHN0YXRlLW9ubHkgdHJhbnNpdGlvbnMgaW5zdGVhZCBvZiByZXdyaXRpbmcgcGF5bG9hZCBCTE9CcywKICBzZWdtZW50ZWQgd3JpdGVzIHVzZSB0aGUgbWVhc3VyZWQgMTI4IEtpQiB0aHJlc2hvbGQsIGFuZCBXZWJTb2NrZXQgd3JpdGVzCiAgY29hbGVzY2UgYm91bmRlZCBNUVRUIGl0ZW1zIGludG8gZmV3ZXIgbWFza2VkIGZyYW1lcyB3aXRob3V0IGNoYW5naW5nIHBhY2tldAogIG9yZGVyaW5nIG9yIHdyaXRlciBib3VuZHMuCgojIyMgQWRkZWQKIiIiCmlmIHRleHQuY291bnQoYWRkZWRfbWFya2VyKSA8IDE6CiAgICByYWlzZSBTeXN0ZW1FeGl0KCJBZGRlZCBtYXJrZXIgbWlzc2luZyIpCnRleHQgPSB0ZXh0LnJlcGxhY2UoYWRkZWRfbWFya2VyLCBjaGFuZ2VkLCAxKQoKZG9jdW1lbnRhdGlvbl9tYXJrZXIgPSAiIyMjIERvY3VtZW50YXRpb25cblxuIgpkb2N1bWVudGF0aW9uX2FkZCA9ICIiIiMjIyBEb2N1bWVudGF0aW9uCgotIFRoZSBjcm9zcy1jbGllbnQgUW9TIDEgbGF0ZW5jeSBjbGFpbSBmcm9tIHRoZSAyMDI2LTA4LTA5IGV4dGVybmFsIGJlbmNobWFyayBpcwogIHJldHJhY3RlZCBpbiB0aGUgcmVwb3J0cyBpbmRleC4gVGhlIGFwcGFyZW50IDIuOTV4IGdhcCBjYW1lIGZyb20gcGFjaW5nIGVhY2gKICBjbGllbnQgYXQgYSBmcmFjdGlvbiBvZiBpdHMgb3duIGNhbGlicmF0ZWQgY2FwYWNpdHkgcmF0aGVyIHRoYW4gY29tcGFyaW5nCiAgbWF0Y2hlZCBhYnNvbHV0ZSBsb2FkOyB0aGUgZGF0ZWQgc291cmNlIHJlcG9ydCByZW1haW5zIHVuY2hhbmdlZCBhcyBhCiAgaGlzdG9yaWNhbCByZWNvcmQuCiIiIgppZiB0ZXh0LmNvdW50KGRvY3VtZW50YXRpb25fbWFya2VyKSA8IDE6CiAgICByYWlzZSBTeXN0ZW1FeGl0KCJEb2N1bWVudGF0aW9uIG1hcmtlciBtaXNzaW5nIikKdGV4dCA9IHRleHQucmVwbGFjZShkb2N1bWVudGF0aW9uX21hcmtlciwgZG9jdW1lbnRhdGlvbl9hZGQsIDEpCgpvbGRfbGluayA9ICJbVW5yZWxlYXNlZF06IGh0dHBzOi8vZ2l0aHViLmNvbS95b2NoL21xdHRpdW0vY29tcGFyZS92MS4wLjByYzEuLi5IRUFEXG4iCm5ld19saW5rcyA9ICgKICAgICJbVW5yZWxlYXNlZF06IGh0dHBzOi8vZ2l0aHViLmNvbS95b2NoL21xdHRpdW0vY29tcGFyZS92MS4wLjByYzIuLi5IRUFEXG4iCiAgICAiWzEuMC4wcmMyXTogaHR0cHM6Ly9naXRodWIuY29tL3lvY2gvbXF0dGl1bS9jb21wYXJlL3YxLjAuMHJjMS4uLnYxLjAuMHJjMlxuIgopCmlmIHRleHQuY291bnQob2xkX2xpbmspICE9IDE6CiAgICByYWlzZSBTeXN0ZW1FeGl0KGYiVW5yZWxlYXNlZCBsaW5rIGNvdW50PXt0ZXh0LmNvdW50KG9sZF9saW5rKX0iKQp0ZXh0ID0gdGV4dC5yZXBsYWNlKG9sZF9saW5rLCBuZXdfbGlua3MsIDEpCgpwYXRoLndyaXRlX3RleHQodGV4dCkK
         run: |
-          set -euo pipefail
-          python - <<'PY'
-          from pathlib import Path
-
-          path = Path('CHANGELOG.md')
-          text = path.read_text()
-
-          text = text.replace(
-              '## [Unreleased]\n\n### Fixed\n',
-              '## [Unreleased]\n\n## [1.0.0rc2] - 2026-08-12\n\n### Fixed\n',
-              1,
-          )
-
-          stale_shared = '''- Topic-specific Paho callbacks registered with a shared-subscription filter
-          now match the Topic Name the broker delivers, which has the
-          `$share/{ShareName}/` prefix stripped; previously they never fired. Lookup and
-          removal still use the original filter, several `$share` groups may share one
-          underlying filter, and a shared `#` still does not capture `$` system topics.
-          '''
-          if text.count(stale_shared) != 1:
-              raise SystemExit('stale shared-subscription changelog bullet not found exactly once')
-          text = text.replace(stale_shared, '', 1)
-
-          old_mps = '''- The broker's negotiated Maximum Packet Size is enforced for DISCONNECT before
-          the engine enters `DISCONNECTING`, not only for publication traffic.
-          '''
-          new_mps = '''- The broker's negotiated Maximum Packet Size is enforced across control-packet
-          paths as well as publication traffic: graceful and fatal DISCONNECT, PINGREQ,
-          manual PUBACK/PUBCOMP and authentication fallbacks cannot bypass the negotiated
-          limit. Manual acknowledgement validates before mutating durable state, and when a
-          mandatory control packet cannot fit the client closes the transport rather than
-          putting an illegal packet on the wire.
-          '''
-          if text.count(old_mps) != 1:
-              raise SystemExit('old Maximum Packet Size bullet not found exactly once')
-          text = text.replace(old_mps, new_mps, 1)
-
-          response_topic = '''- MQTT 5 Response Topic properties containing `+` or `#` are rejected in both
-          outbound and inbound PUBLISH packets, as required by [MQTT-3.3.2-14].
-          '''
-          response_topic_new = '''- MQTT 5 topic/property validation is applied before connection-scoped alias
-          state can mutate. Response Topic rejects empty values and wildcards for both
-          PUBLISH and Will properties, invalid Will Topics are refused, and outbound empty
-          Topic Names are not accepted until a stateful outbound Topic Alias has actually
-          been established.
-          '''
-          if text.count(response_topic) != 1:
-              raise SystemExit('Response Topic changelog bullet not found exactly once')
-          text = text.replace(response_topic, response_topic_new, 1)
-
-          effect_marker = '''- `EffectPump` no longer retains the exception raised while the background
-          effect-flush task applies an effect once nothing is left pending. The stored
-          error was handed to whichever call next suspended in `drain()`, so a protocol
-          error caused by the broker surfaced against an unrelated later `publish()` on
-          a healthy connection. A failure that genuinely blocks pending effects is still
-          reported to whoever waits on it.
-          '''
-          additions = effect_marker + '''- Cached MQTT 5 property encoding now snapshots mutable binary values. An
-          in-place `bytearray` mutation can no longer leave a stale encoded property table
-          behind while the cache signature appears unchanged.
-- SUBACK and UNSUBACK are correlated with the request type and expected result count
-          before their packet identifier is released. Malformed PINGRESP packets, invalid
-          server DISCONNECT Session Expiry, and successful empty-client-id CONNACK packets
-          without an Assigned Client Identifier are also rejected instead of advancing
-          state.
-- Receive Maximum accounting now covers the handoff of automatic acknowledgements to
-          the runtime, including mixed QoS 1/QoS 2 traffic, so a broker cannot exceed the
-          negotiated inbound window inside one decoded batch.
-          '''
-          if text.count(effect_marker) != 1:
-              raise SystemExit('EffectPump changelog marker not found exactly once')
-          text = text.replace(effect_marker, additions, 1)
-
-          added_marker = '\n### Added\n'
-          changed = '''
-### Changed
-
-- MQTT 5 inbound QoS 0/1/2 PUBLISH handling decodes directly into the existing
-  delivery/QoS state machines instead of constructing a short-lived `PublishPacket`.
-  MQTT 3.1/3.1.1 retain their protocol-specific paths, with regression coverage for
-  payloads that resemble MQTT 5 property lengths.
-- Common acknowledgement and publication hot paths avoid redundant generic codec work:
-  success PUBACK encode/decode uses the fixed form, validated QoS 0 Topic Name bytes are
-  reused by the encoder, and MQTT 5 property bodies are reused across sizing and wire
-  encoding while preserving mutation safety.
-- Exact topic callbacks retain O(1) lookup while wildcard filters keep the small ordered
-  scan. Filters are matched literally, including `$share/{group}/...`, preserving Paho
-  callback semantics instead of adding broker-side shared-subscription rewriting to the
-  matcher.
-- Automatic acknowledgement effects are produced SEND-first, queued SQLite launches use
-  state-only transitions instead of rewriting payload BLOBs, segmented writes use the
-  measured 128 KiB threshold, and WebSocket writes coalesce bounded MQTT items into fewer
-  masked frames without changing packet ordering or writer bounds.
-
-### Added
-'''
-          if text.count(added_marker) < 1:
-              raise SystemExit('Added section marker not found')
-          text = text.replace(added_marker, changed, 1)
-
-          documentation_marker = '''### Documentation
-
-'''
-          documentation_add = '''### Documentation
-
-- The cross-client QoS 1 latency claim from the 2026-08-09 external benchmark is
-  retracted in the reports index. The apparent 2.95x gap came from pacing each client at
-  a fraction of its own calibrated capacity rather than comparing matched absolute load;
-  the dated source report remains unchanged as a historical record.
-'''
-          if text.count(documentation_marker) < 1:
-              raise SystemExit('Documentation section marker not found')
-          text = text.replace(documentation_marker, documentation_add, 1)
-
-          old_link = '[Unreleased]: https://github.com/yoch/mqttium/compare/v1.0.0rc1...HEAD\n'
-          new_links = (
-              '[Unreleased]: https://github.com/yoch/mqttium/compare/v1.0.0rc2...HEAD\n'
-              '[1.0.0rc2]: https://github.com/yoch/mqttium/compare/v1.0.0rc1...v1.0.0rc2\n'
-          )
-          if text.count(old_link) != 1:
-              raise SystemExit('Unreleased comparison link not found exactly once')
-          text = text.replace(old_link, new_links, 1)
-
-          path.write_text(text)
-          PY
+          echo "$SCRIPT_B64" | base64 -d > /tmp/rc2_changelog.py
+          python /tmp/rc2_changelog.py
           git diff --check
-      - name: Remove bootstrap and push result
-        run: |
-          set -euo pipefail
           git add CHANGELOG.md
           git rm .github/workflows/rc2-release-notes-bootstrap.yml
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git commit -m 'Finalize 1.0.0rc2 changelog'
           git push origin HEAD:release/v1.0.0rc2
