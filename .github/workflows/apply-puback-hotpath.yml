@@ -1,0 +1,30 @@
+name: Apply PUBACK hot-path patch
+
+on:
+  push:
+    branches:
+      - perf/puback-success-hotpath
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: perf/puback-success-hotpath
+      - name: Apply validated patch and remove bootstrap files
+        shell: bash
+        run: |
+          set -euo pipefail
+          git apply --check tools/puback-hotpath.patch
+          git apply tools/puback-hotpath.patch
+          rm tools/puback-hotpath.patch .github/workflows/apply-puback-hotpath.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'Fast-path success PUBACK handling'
+          git push origin HEAD:perf/puback-success-hotpath
