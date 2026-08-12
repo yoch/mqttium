@@ -47,7 +47,7 @@ from mqttium.protocol.effects import EffectKind, PublishFailure, PublishHandle
 from mqttium.protocol.flow_control import FlowControl
 from mqttium.protocol.packet_ids import PacketIdPool
 from mqttium.protocol.stats import OutboundStats
-from mqttium.topics import validate_publish_topic
+from mqttium.topics import encode_validated_publish_topic, validate_publish_topic
 from mqttium.transport.writes import WriteItem
 from mqttium.types import OutboundMessage, OutboundMessageSummary, Properties
 
@@ -285,8 +285,8 @@ class OutboundSession:
         qos: QoS | int,
         retain: bool,
         properties: Properties | None,
-    ) -> QoS:
-        """Validate one outbound PUBLISH against local and negotiated rules."""
+    ) -> tuple[QoS, bytes | None]:
+        """Validate one outbound PUBLISH and retain QoS 0 Topic Name bytes."""
 
         level = QoS(qos)
         # An empty Topic Name is legal only after this client has established
@@ -297,7 +297,12 @@ class OutboundSession:
         # Keep the generic validator's allow_empty primitive for a future
         # stateful alias implementation, but do not use it from outbound API
         # admission until that state exists.
-        validate_publish_topic(topic)
+        topic_bytes: bytes | None
+        if level is QoS.AT_MOST_ONCE:
+            topic_bytes = encode_validated_publish_topic(topic)
+        else:
+            validate_publish_topic(topic)
+            topic_bytes = None
 
         if (
             properties is not None
@@ -331,7 +336,7 @@ class OutboundSession:
 
         if engine.state != ConnectionState.CONNECTED and level == QoS.AT_MOST_ONCE:
             raise NotConnectedError("Cannot publish QoS 0 while disconnected")
-        return level
+        return level, topic_bytes
 
     def _prepare_qos0_validated(
         self,
@@ -340,6 +345,7 @@ class OutboundSession:
         *,
         retain: bool,
         properties: Properties | None,
+        topic_bytes: bytes,
     ) -> WriteItem:
         item = encode_publish_item(
             topic,
@@ -350,6 +356,7 @@ class OutboundSession:
             mid=None,
             properties=properties,
             protocol=self.config.protocol,
+            _topic_bytes=topic_bytes,
         )
         self._engine._check_outbound_size(item)
         return item
@@ -364,12 +371,16 @@ class OutboundSession:
     ) -> WriteItem:
         """Prepare a mutation-free QoS 0 publication for the native runtime."""
 
-        self._validate_publish_request(topic, QoS.AT_MOST_ONCE, retain, properties)
+        _qos, topic_bytes = self._validate_publish_request(
+            topic, QoS.AT_MOST_ONCE, retain, properties
+        )
+        assert topic_bytes is not None
         return self._prepare_qos0_validated(
             topic,
             payload,
             retain=retain,
             properties=properties,
+            topic_bytes=topic_bytes,
         )
 
     def queue_publish(
@@ -382,14 +393,16 @@ class OutboundSession:
         properties: Properties | None = None,
     ) -> PublishHandle:
         engine = self._engine
-        qos = self._validate_publish_request(topic, qos, retain, properties)
+        qos, topic_bytes = self._validate_publish_request(topic, qos, retain, properties)
 
         if qos == QoS.AT_MOST_ONCE:
+            assert topic_bytes is not None
             item = self._prepare_qos0_validated(
                 topic,
                 payload,
                 retain=retain,
                 properties=properties,
+                topic_bytes=topic_bytes,
             )
             self._send(item)
             # Completion follows SEND so compatibility on_publish cannot run

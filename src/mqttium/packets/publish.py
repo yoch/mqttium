@@ -26,6 +26,7 @@ def encode_publish_item(
     mid: int | None,
     properties: Properties | None,
     protocol: MQTTProtocolVersion = MQTTProtocolVersion.MQTTv311,
+    _topic_bytes: bytes | None = None,
 ) -> WriteItem:
     """Validate and encode one outbound PUBLISH exactly once."""
 
@@ -49,7 +50,7 @@ def encode_publish_item(
         _require_outbound_mid(mid, PUBLISH)
 
     flags = (int(level) << 1) | (0x01 if retain else 0) | (0x08 if dup else 0)
-    topic_bytes = encode_utf8(topic)
+    topic_bytes = encode_utf8(topic) if _topic_bytes is None else _topic_bytes
     topic_size = len(topic_bytes)
     props = _props_or_empty(properties, PUBLISH, protocol)
     payload_size = len(payload)
