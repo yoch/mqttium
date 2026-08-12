@@ -1,0 +1,154 @@
+name: RC2 release notes bootstrap
+
+on:
+  push:
+    branches: [release/v1.0.0rc2]
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: release/v1.0.0rc2
+      - name: Finalize RC2 changelog
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('CHANGELOG.md')
+          text = path.read_text()
+
+          text = text.replace(
+              '## [Unreleased]\n\n### Fixed\n',
+              '## [Unreleased]\n\n## [1.0.0rc2] - 2026-08-12\n\n### Fixed\n',
+              1,
+          )
+
+          stale_shared = '''- Topic-specific Paho callbacks registered with a shared-subscription filter
+          now match the Topic Name the broker delivers, which has the
+          `$share/{ShareName}/` prefix stripped; previously they never fired. Lookup and
+          removal still use the original filter, several `$share` groups may share one
+          underlying filter, and a shared `#` still does not capture `$` system topics.
+          '''
+          if text.count(stale_shared) != 1:
+              raise SystemExit('stale shared-subscription changelog bullet not found exactly once')
+          text = text.replace(stale_shared, '', 1)
+
+          old_mps = '''- The broker's negotiated Maximum Packet Size is enforced for DISCONNECT before
+          the engine enters `DISCONNECTING`, not only for publication traffic.
+          '''
+          new_mps = '''- The broker's negotiated Maximum Packet Size is enforced across control-packet
+          paths as well as publication traffic: graceful and fatal DISCONNECT, PINGREQ,
+          manual PUBACK/PUBCOMP and authentication fallbacks cannot bypass the negotiated
+          limit. Manual acknowledgement validates before mutating durable state, and when a
+          mandatory control packet cannot fit the client closes the transport rather than
+          putting an illegal packet on the wire.
+          '''
+          if text.count(old_mps) != 1:
+              raise SystemExit('old Maximum Packet Size bullet not found exactly once')
+          text = text.replace(old_mps, new_mps, 1)
+
+          response_topic = '''- MQTT 5 Response Topic properties containing `+` or `#` are rejected in both
+          outbound and inbound PUBLISH packets, as required by [MQTT-3.3.2-14].
+          '''
+          response_topic_new = '''- MQTT 5 topic/property validation is applied before connection-scoped alias
+          state can mutate. Response Topic rejects empty values and wildcards for both
+          PUBLISH and Will properties, invalid Will Topics are refused, and outbound empty
+          Topic Names are not accepted until a stateful outbound Topic Alias has actually
+          been established.
+          '''
+          if text.count(response_topic) != 1:
+              raise SystemExit('Response Topic changelog bullet not found exactly once')
+          text = text.replace(response_topic, response_topic_new, 1)
+
+          effect_marker = '''- `EffectPump` no longer retains the exception raised while the background
+          effect-flush task applies an effect once nothing is left pending. The stored
+          error was handed to whichever call next suspended in `drain()`, so a protocol
+          error caused by the broker surfaced against an unrelated later `publish()` on
+          a healthy connection. A failure that genuinely blocks pending effects is still
+          reported to whoever waits on it.
+          '''
+          additions = effect_marker + '''- Cached MQTT 5 property encoding now snapshots mutable binary values. An
+          in-place `bytearray` mutation can no longer leave a stale encoded property table
+          behind while the cache signature appears unchanged.
+- SUBACK and UNSUBACK are correlated with the request type and expected result count
+          before their packet identifier is released. Malformed PINGRESP packets, invalid
+          server DISCONNECT Session Expiry, and successful empty-client-id CONNACK packets
+          without an Assigned Client Identifier are also rejected instead of advancing
+          state.
+- Receive Maximum accounting now covers the handoff of automatic acknowledgements to
+          the runtime, including mixed QoS 1/QoS 2 traffic, so a broker cannot exceed the
+          negotiated inbound window inside one decoded batch.
+          '''
+          if text.count(effect_marker) != 1:
+              raise SystemExit('EffectPump changelog marker not found exactly once')
+          text = text.replace(effect_marker, additions, 1)
+
+          added_marker = '\n### Added\n'
+          changed = '''
+### Changed
+
+- MQTT 5 inbound QoS 0/1/2 PUBLISH handling decodes directly into the existing
+  delivery/QoS state machines instead of constructing a short-lived `PublishPacket`.
+  MQTT 3.1/3.1.1 retain their protocol-specific paths, with regression coverage for
+  payloads that resemble MQTT 5 property lengths.
+- Common acknowledgement and publication hot paths avoid redundant generic codec work:
+  success PUBACK encode/decode uses the fixed form, validated QoS 0 Topic Name bytes are
+  reused by the encoder, and MQTT 5 property bodies are reused across sizing and wire
+  encoding while preserving mutation safety.
+- Exact topic callbacks retain O(1) lookup while wildcard filters keep the small ordered
+  scan. Filters are matched literally, including `$share/{group}/...`, preserving Paho
+  callback semantics instead of adding broker-side shared-subscription rewriting to the
+  matcher.
+- Automatic acknowledgement effects are produced SEND-first, queued SQLite launches use
+  state-only transitions instead of rewriting payload BLOBs, segmented writes use the
+  measured 128 KiB threshold, and WebSocket writes coalesce bounded MQTT items into fewer
+  masked frames without changing packet ordering or writer bounds.
+
+### Added
+'''
+          if text.count(added_marker) < 1:
+              raise SystemExit('Added section marker not found')
+          text = text.replace(added_marker, changed, 1)
+
+          documentation_marker = '''### Documentation
+
+'''
+          documentation_add = '''### Documentation
+
+- The cross-client QoS 1 latency claim from the 2026-08-09 external benchmark is
+  retracted in the reports index. The apparent 2.95x gap came from pacing each client at
+  a fraction of its own calibrated capacity rather than comparing matched absolute load;
+  the dated source report remains unchanged as a historical record.
+'''
+          if text.count(documentation_marker) < 1:
+              raise SystemExit('Documentation section marker not found')
+          text = text.replace(documentation_marker, documentation_add, 1)
+
+          old_link = '[Unreleased]: https://github.com/yoch/mqttium/compare/v1.0.0rc1...HEAD\n'
+          new_links = (
+              '[Unreleased]: https://github.com/yoch/mqttium/compare/v1.0.0rc2...HEAD\n'
+              '[1.0.0rc2]: https://github.com/yoch/mqttium/compare/v1.0.0rc1...v1.0.0rc2\n'
+          )
+          if text.count(old_link) != 1:
+              raise SystemExit('Unreleased comparison link not found exactly once')
+          text = text.replace(old_link, new_links, 1)
+
+          path.write_text(text)
+          PY
+          git diff --check
+      - name: Remove bootstrap and push result
+        run: |
+          set -euo pipefail
+          git add CHANGELOG.md
+          git rm .github/workflows/rc2-release-notes-bootstrap.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Finalize 1.0.0rc2 changelog'
+          git push origin HEAD:release/v1.0.0rc2
