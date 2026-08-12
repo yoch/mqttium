@@ -288,12 +288,15 @@ class OutboundSession:
         """Validate one outbound PUBLISH against local and negotiated rules."""
 
         level = QoS(qos)
-        allow_empty = bool(
-            properties
-            and properties.get("topic_alias")
-            and self.config.protocol == MQTTProtocolVersion.MQTTv5
-        )
-        validate_publish_topic(topic, allow_empty=allow_empty)
+        # An empty Topic Name is legal only after this client has established
+        # the Topic Alias on the current Network Connection. OutboundSession
+        # does not yet own authoritative alias-establishment state across all
+        # send paths, so accepting omission here would guess at connection state
+        # and can make durable QoS replay depend on an alias lost at reconnect.
+        # Keep the generic validator's allow_empty primitive for a future
+        # stateful alias implementation, but do not use it from outbound API
+        # admission until that state exists.
+        validate_publish_topic(topic)
 
         if (
             properties is not None
