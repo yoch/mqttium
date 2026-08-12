@@ -192,7 +192,7 @@ def test_mqtt5_qos0_direct_path_preserves_properties(monkeypatch) -> None:
     assert calls == 0
 
 
-def test_mqtt5_qos1_still_uses_generic_packet_path(monkeypatch) -> None:
+def test_mqtt5_qos1_uses_direct_property_aware_path(monkeypatch) -> None:
     calls = 0
     original = PublishPacket.decode
 
@@ -213,4 +213,4 @@ def test_mqtt5_qos1_still_uses_generic_packet_path(monkeypatch) -> None:
 
     effects = engine.take_effects()
     assert effects[1].data.qos is QoS.AT_LEAST_ONCE
-    assert calls == 1
+    assert calls == 0
