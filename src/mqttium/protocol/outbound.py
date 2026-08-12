@@ -412,9 +412,7 @@ class OutboundSession:
 
         # One property encode and one topic measurement feed both the wire-size
         # check and the logical budget.
-        topic_size, wire_property_bytes, logical_property_bytes = self.size_parts(
-            topic, properties
-        )
+        topic_size, wire_property_bytes, logical_property_bytes = self.size_parts(topic, properties)
         # Validate packet size before reserving local memory or a packet id.
         self._check_publish_wire_size(topic_size, wire_property_bytes, len(payload), qos)
         logical_size = len(payload) + topic_size + logical_property_bytes
