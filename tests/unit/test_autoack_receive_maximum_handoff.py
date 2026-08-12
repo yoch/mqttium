@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from mqttium.codec.buffer import IncrementalDecoder
+from mqttium.codec.buffer import IncrementalDecoder, RawPacket
+from mqttium.codec.primitives import pack_u16
 from mqttium.codec.properties import CONNACK, encode_properties
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, PacketType, QoS
 from mqttium.packets import PublishPacket, encode_frame
@@ -138,3 +139,26 @@ def test_duplicate_qos1_before_puback_handoff_does_not_consume_second_slot() -> 
     assert len([effect for effect in effects if effect.kind is EffectKind.MESSAGE]) == 2
     assert len([effect for effect in effects if effect.kind is EffectKind.SEND]) == 2
     assert not any(effect.kind is EffectKind.PROTOCOL_ERROR for effect in effects)
+
+
+def test_malformed_pipelined_publish_is_not_receive_maximum_disconnect() -> None:
+    """A truncated/malformed follow-up PUBLISH must not become 0x93.
+
+    The preflight locates the MID without constructing a PublishPacket. If that
+    parse fails, Receive Maximum accounting is skipped and the inbound handler
+    reports the malformation.
+    """
+    engine = _engine(receive_maximum=1)
+    _feed(engine, _publish(1))
+    engine.handle_raw(
+        RawPacket(
+            PacketType.PUBLISH,
+            0x02,
+            b"\x00\x01\xff" + pack_u16(2) + b"\x00x",
+        )
+    )
+    effects = engine.take_effects()
+    assert engine.state is ConnectionState.CONNECTED
+    error = next(effect.data for effect in effects if effect.kind is EffectKind.PROTOCOL_ERROR)
+    assert "Receive Maximum" not in error
+    assert "UTF-8" in error or "Invalid" in error

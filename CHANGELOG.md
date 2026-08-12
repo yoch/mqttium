@@ -6,6 +6,13 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Changed
+
+- The Receive Maximum preflight locates a QoS 1/2 PUBLISH packet identifier
+  without constructing a `PublishPacket`, so a pipelined ingress batch no longer
+  decodes each payload twice. Accounting, duplicate-MID and handoff rules are
+  unchanged.
+
 ## [1.0.0rc2] - 2026-08-12
 
 ### Fixed
