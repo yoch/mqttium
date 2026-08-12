@@ -1,0 +1,182 @@
+name: Review Cursor performance batch
+
+on:
+  push:
+    branches: [review/perf-cursor-batch]
+
+permissions:
+  contents: read
+
+jobs:
+  candidate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - pr: 197
+            ref: cursor/rm-preflight-mid-6aff
+            scenario: ingress_publish_qos1
+          - pr: 198
+            ref: cursor/v311-qos2-decode-6aff
+            scenario: ingress_publish_qos1
+          - pr: 199
+            ref: cursor/ack-success-fastpath-6aff
+            scenario: qos2_cycle_sqlite
+          - pr: 200
+            ref: cursor/qos-enum-admission-6aff
+            scenario: native_publish_nowait_qos0
+          - pr: 201
+            ref: cursor/launch-encode-item-6aff
+            scenario: qos1_cycle_memory
+    steps:
+      - name: Check out current main baseline
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+          path: base
+      - name: Check out candidate
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ matrix.ref }}
+          fetch-depth: 0
+          path: candidate
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - name: Rebase candidate onto current main
+        working-directory: candidate
+        run: |
+          git config user.name review-bot
+          git config user.email review-bot@users.noreply.github.com
+          git fetch origin main
+          git rebase origin/main
+      - name: Install candidate tooling
+        run: python -m pip install -e './candidate[dev,security]'
+      - name: Static validation
+        working-directory: candidate
+        run: |
+          ruff format --check src tests benchmarks
+          ruff check src tests benchmarks
+          mypy src/mqttium
+          bandit -q -ll -r src
+      - name: Full unit suite
+        working-directory: candidate
+        run: python -m pytest -q tests/unit
+      - name: Paired targeted microbenchmark
+        run: |
+          python base/benchmarks/paired_regression.py \
+            --base-root base \
+            --candidate-root candidate \
+            --scenario '${{ matrix.scenario }}' \
+            --repeat 11 \
+            --output /tmp/paired-${{ matrix.pr }}.json
+          cat /tmp/paired-${{ matrix.pr }}.json
+      - name: PR 197 pipelined ingress shape
+        if: matrix.pr == 197
+        run: |
+          cat > /tmp/batch_ingress.py <<'PY'
+          import json, os, statistics, subprocess, sys, textwrap
+          from pathlib import Path
+
+          worker = r'''
+          import json, os, statistics, time
+          from mqttium.codec.buffer import RawPacket
+          from mqttium.codec.primitives import pack_u16, pack_utf8
+          from mqttium.enums import ConnectionState, MQTTProtocolVersion, PacketType
+          from mqttium.protocol.config import EngineConfig
+          from mqttium.protocol.engine import ProtocolEngine
+
+          raws = [RawPacket(PacketType.PUBLISH, 0x02, pack_utf8('bench/pipeline') + pack_u16(i) + b'x'*64) for i in range(1,65)]
+          samples=[]
+          for rep in range(13):
+              engine=ProtocolEngine(EngineConfig(protocol=MQTTProtocolVersion.MQTTv311, local_receive_maximum=65535))
+              engine.state=ConnectionState.CONNECTED
+              start=time.perf_counter_ns()
+              for _ in range(250):
+                  for raw in raws:
+                      engine.handle_raw(raw)
+                  engine.take_effects()
+              elapsed=time.perf_counter_ns()-start
+              if rep>=2: samples.append(16_000_000_000/elapsed)
+          print(json.dumps(samples))
+          '''
+          def run(root):
+              env=os.environ.copy(); env['PYTHONPATH']=str(Path(root).resolve()/'src')
+              out=subprocess.check_output([sys.executable,'-c',worker],env=env,text=True)
+              return json.loads(out)
+          base=run('base'); cand=run('candidate')
+          ratios=[c/b for b,c in zip(base,cand)]
+          print(json.dumps({'base':base,'candidate':cand,'ratios':ratios,'median_ratio':statistics.median(ratios)},indent=2))
+          PY
+          python /tmp/batch_ingress.py
+      - name: PR 198 inbound QoS2 cycle shape
+        if: matrix.pr == 198
+        run: |
+          cat > /tmp/qos2_ingress.py <<'PY'
+          import json, os, statistics, subprocess, sys
+          from pathlib import Path
+          worker = r'''
+          import json, time
+          from mqttium.codec.buffer import RawPacket
+          from mqttium.codec.primitives import pack_u16, pack_utf8
+          from mqttium.enums import ConnectionState, MQTTProtocolVersion, PacketType
+          from mqttium.protocol.config import EngineConfig
+          from mqttium.protocol.engine import ProtocolEngine
+          samples=[]
+          for rep in range(13):
+              engine=ProtocolEngine(EngineConfig(protocol=MQTTProtocolVersion.MQTTv311, local_receive_maximum=65535))
+              engine.state=ConnectionState.CONNECTED
+              start=time.perf_counter_ns()
+              for i in range(1,12001):
+                  mid=((i-1)%65535)+1
+                  engine.handle_raw(RawPacket(PacketType.PUBLISH,0x04,pack_utf8('bench/qos2')+pack_u16(mid)+b'x'*64))
+                  engine.take_effects()
+                  engine.handle_raw(RawPacket(PacketType.PUBREL,0x02,pack_u16(mid)))
+                  engine.take_effects()
+              elapsed=time.perf_counter_ns()-start
+              if rep>=2: samples.append(12_000_000_000/elapsed)
+          print(json.dumps(samples))
+          '''
+          def run(root):
+              env=os.environ.copy(); env['PYTHONPATH']=str(Path(root).resolve()/'src')
+              return json.loads(subprocess.check_output([sys.executable,'-c',worker],env=env,text=True))
+          base=run('base'); cand=run('candidate'); ratios=[c/b for b,c in zip(base,cand)]
+          print(json.dumps({'base':base,'candidate':cand,'ratios':ratios,'median_ratio':statistics.median(ratios)},indent=2))
+          PY
+          python /tmp/qos2_ingress.py
+      - name: Start broker for QoS1 network candidates
+        if: matrix.pr == 200 || matrix.pr == 201
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mosquitto mosquitto-clients
+          mkdir -p /tmp/mqttium-review
+          cat > /tmp/mqttium-review/mosquitto.conf <<'MOSQ'
+          persistence false
+          allow_anonymous true
+          max_inflight_messages 1000
+          max_queued_messages 100000
+          max_queued_bytes 0
+          connection_messages false
+          log_type error
+          listener 11883 127.0.0.1
+          MOSQ
+          mosquitto -c /tmp/mqttium-review/mosquitto.conf >/tmp/mqttium-review/mosquitto.log 2>&1 &
+          for i in $(seq 1 50); do
+            (echo >/dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            sleep 0.2
+          done
+          cat /tmp/mqttium-review/mosquitto.log
+          exit 1
+      - name: Paired real-network QoS1 point
+        if: matrix.pr == 200 || matrix.pr == 201
+        run: |
+          python base/benchmarks/paired_network.py \
+            --base-root base --candidate-root candidate \
+            --policy advisory --repeat 6 --windows 32 \
+            --protocols 311,5 --payloads 64 \
+            --count-small 10000 --count-large 10000 \
+            --output /tmp/network-${{ matrix.pr }}.json
+          cat /tmp/network-${{ matrix.pr }}.json
