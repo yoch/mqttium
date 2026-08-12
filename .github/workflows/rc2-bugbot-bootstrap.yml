@@ -1,0 +1,118 @@
+name: RC2 Bugbot follow-up bootstrap
+
+on:
+  push:
+    branches:
+      - fix/rc2-bugbot-followups
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: fix/rc2-bugbot-followups
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Apply exact fixes and targeted regressions
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('src/mqttium/api/async_client.py')
+          text = path.read_text()
+
+          old = '''            clean_disconnect = (
+              self._intentional_disconnect
+              and self._engine.state is ConnectionState.DISCONNECTING
+              and self._disconnect_exc is None
+          )
+          '''
+          new = '''            clean_disconnect = (
+              self._intentional_disconnect
+              and self._engine.state
+              in (ConnectionState.CONNECTED, ConnectionState.DISCONNECTING)
+              and self._disconnect_exc is None
+          )
+          '''
+          if text.count(old) != 1:
+              raise SystemExit(f'clean_disconnect match count={text.count(old)}')
+          text = text.replace(old, new, 1)
+
+          old = '''            if self.auth_handler is None:
+              packet = encode_disconnect(0x8C, self._engine.config.protocol)
+              self._engine._check_outbound_size(packet)
+              await self._enqueue_outbound(
+                  packet,
+                  nowait=nowait,
+                  epoch=epoch,
+              )
+              return
+          '''
+          new = '''            if self.auth_handler is None:
+              packet = encode_disconnect(0x8C, self._engine.config.protocol)
+              try:
+                  self._engine._check_outbound_size(packet)
+              except PacketTooLargeError as exc:
+                  # The broker limit makes the required AUTH rejection
+                  # impossible to send. Close the transport so the connection
+                  # cannot remain active after this terminal condition.
+                  self._disconnect_exc = exc
+                  self._intentional_disconnect = True
+                  if self._transport is not None:
+                      try:
+                          await self._transport.close()
+                      except Exception:
+                          pass
+                  return
+              await self._enqueue_outbound(
+                  packet,
+                  nowait=nowait,
+                  epoch=epoch,
+              )
+              return
+          '''
+          if text.count(old) != 1:
+              raise SystemExit(f'AUTH fallback match count={text.count(old)}')
+          path.write_text(text.replace(old, new, 1))
+
+          changelog = Path('CHANGELOG.md')
+          text = changelog.read_text()
+          old = '''- The broker's Maximum Packet Size is enforced on publication and control-packet
+          paths, including graceful/fatal DISCONNECT, PINGREQ, manual PUBACK/PUBCOMP and
+          authentication fallbacks. Manual ACK validates before durable mutation; if a
+          mandatory control packet cannot fit, the transport is closed rather than
+          emitting an illegal packet.
+          '''
+          new = '''- The broker's Maximum Packet Size is enforced on publication and control-packet
+          paths, including graceful/fatal DISCONNECT, PINGREQ, manual PUBACK/PUBCOMP and
+          authentication fallbacks. Manual ACK validates before durable mutation; if a
+          mandatory control packet cannot fit, the transport is closed rather than
+          emitting an illegal packet. An intentional `disconnect()` fallback still reports
+          a clean `on_disconnect(None)`, while an AUTH rejection that cannot fit closes the
+          active connection instead of leaving it open.
+          '''
+          if text.count(old) != 1:
+              raise SystemExit(f'changelog MPS match count={text.count(old)}')
+          changelog.write_text(text.replace(old, new, 1))
+          PY
+          python -m pip install -e '.[dev]'
+          ruff format src tests
+          ruff check src tests
+          python -m pytest -q tests/unit/test_control_packet_size_lifecycle.py tests/unit/test_async_lifecycle.py
+          git diff --check
+      - name: Commit and remove bootstrap
+        run: |
+          set -euo pipefail
+          git add src/mqttium/api/async_client.py tests/unit/test_control_packet_size_lifecycle.py CHANGELOG.md
+          git rm .github/workflows/rc2-bugbot-bootstrap.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Fix Bugbot RC2 lifecycle findings'
+          git push origin HEAD:fix/rc2-bugbot-followups
