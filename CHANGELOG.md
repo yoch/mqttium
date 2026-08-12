@@ -22,6 +22,11 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   QoS 1 message while leaving the QoS 2 record live. Genuine QoS 2 duplicates,
   QoS 1 manual-ack redeliveries and a durable QoS 1 record reopened under
   auto-ACK remain supported.
+- Topic-specific Paho callbacks registered with a shared-subscription filter
+  now match the Topic Name the broker delivers, which has the
+  `$share/{ShareName}/` prefix stripped; previously they never fired. Lookup and
+  removal still use the original filter, several `$share` groups may share one
+  underlying filter, and a shared `#` still does not capture `$` system topics.
 - MQTT 5 now rejects a broker-sent AUTH with reason `0x19` (Re-authenticate),
   which Table 3-11 assigns to Client-to-Server traffic only.
 - The broker's negotiated Maximum Packet Size is enforced for DISCONNECT before
