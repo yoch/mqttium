@@ -37,22 +37,22 @@ jobs:
           ref: main
           fetch-depth: 0
           path: base
-      - name: Check out candidate
+      - name: Check out current main candidate worktree
         uses: actions/checkout@v7
         with:
-          ref: ${{ matrix.ref }}
+          ref: main
           fetch-depth: 0
           path: candidate
       - uses: actions/setup-python@v7
         with:
           python-version: '3.13'
-      - name: Rebase candidate onto current main
+      - name: Apply candidate source/test diff onto current main
         working-directory: candidate
         run: |
-          git config user.name review-bot
-          git config user.email review-bot@users.noreply.github.com
-          git fetch origin main
-          git rebase origin/main
+          git diff c34a9499ed2723054c2e0d3b730248f176be0856..origin/${{ matrix.ref }} -- src tests benchmarks > /tmp/candidate-${{ matrix.pr }}.patch
+          test -s /tmp/candidate-${{ matrix.pr }}.patch
+          git apply --3way --whitespace=error-all /tmp/candidate-${{ matrix.pr }}.patch
+          git diff --check
       - name: Install candidate tooling
         run: python -m pip install -e './candidate[dev,security]'
       - name: Static validation
@@ -78,11 +78,11 @@ jobs:
         if: matrix.pr == 197
         run: |
           cat > /tmp/batch_ingress.py <<'PY'
-          import json, os, statistics, subprocess, sys, textwrap
+          import json, os, statistics, subprocess, sys
           from pathlib import Path
 
           worker = r'''
-          import json, os, statistics, time
+          import json, time
           from mqttium.codec.buffer import RawPacket
           from mqttium.codec.primitives import pack_u16, pack_utf8
           from mqttium.enums import ConnectionState, MQTTProtocolVersion, PacketType
@@ -91,6 +91,7 @@ jobs:
 
           raws = [RawPacket(PacketType.PUBLISH, 0x02, pack_utf8('bench/pipeline') + pack_u16(i) + b'x'*64) for i in range(1,65)]
           samples=[]
+          operations=64*250
           for rep in range(13):
               engine=ProtocolEngine(EngineConfig(protocol=MQTTProtocolVersion.MQTTv311, local_receive_maximum=65535))
               engine.state=ConnectionState.CONNECTED
@@ -100,7 +101,7 @@ jobs:
                       engine.handle_raw(raw)
                   engine.take_effects()
               elapsed=time.perf_counter_ns()-start
-              if rep>=2: samples.append(16_000_000_000/elapsed)
+              if rep>=2: samples.append(operations*1_000_000_000/elapsed)
           print(json.dumps(samples))
           '''
           def run(root):
@@ -126,18 +127,19 @@ jobs:
           from mqttium.protocol.config import EngineConfig
           from mqttium.protocol.engine import ProtocolEngine
           samples=[]
+          operations=12000
           for rep in range(13):
               engine=ProtocolEngine(EngineConfig(protocol=MQTTProtocolVersion.MQTTv311, local_receive_maximum=65535))
               engine.state=ConnectionState.CONNECTED
               start=time.perf_counter_ns()
-              for i in range(1,12001):
+              for i in range(1,operations+1):
                   mid=((i-1)%65535)+1
                   engine.handle_raw(RawPacket(PacketType.PUBLISH,0x04,pack_utf8('bench/qos2')+pack_u16(mid)+b'x'*64))
                   engine.take_effects()
                   engine.handle_raw(RawPacket(PacketType.PUBREL,0x02,pack_u16(mid)))
                   engine.take_effects()
               elapsed=time.perf_counter_ns()-start
-              if rep>=2: samples.append(12_000_000_000/elapsed)
+              if rep>=2: samples.append(operations*1_000_000_000/elapsed)
           print(json.dumps(samples))
           '''
           def run(root):
