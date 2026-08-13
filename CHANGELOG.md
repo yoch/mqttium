@@ -44,6 +44,12 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   the configured retry policy can reach later attempts and terminal exhaustion
   settles pending receipts; carry refused CONNACK reason codes structurally
   instead of recovering them from exception text.
+- Tighten low-risk lifecycle and persistence edges: remove the unused opposite-
+  direction `FlowControl` argument, make delivery stream reset synchronous, pin
+  SQLite's existing five-second busy timeout explicitly, close SQLite handles
+  on constructor failures, reject version-current databases missing required
+  tables, validate `helpers.subscribe.simple(msg_count)` as positive, and refresh
+  RC2 API-stability/roadmap status.
 - Local MQTT protocol failures now complete teardown even when the negotiated
   Maximum Packet Size prevents sending the normative DISCONNECT, close the
   runtime transport, and surface CONNACK validation failures to `connect()`

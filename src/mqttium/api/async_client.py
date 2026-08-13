@@ -1728,7 +1728,7 @@ class AsyncClient:
         return self._disconnect_exc or MQTTError("Connection closed")
 
     async def _reset_message_stream(self) -> None:
-        await self._delivery.reset_stream()
+        self._delivery.reset_stream()
 
     async def _invalidate_connection_epoch(self) -> None:
         self._connection_epoch += 1

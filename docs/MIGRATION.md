@@ -87,6 +87,14 @@ the shortest two-byte body: `properties is None`. Code that inspected an empty
 `Properties()` object to distinguish those wire spellings should stop relying
 on that representation detail.
 
+## Provisional FlowControl cleanup
+
+Post-RC2 builds remove the unused `local_max` argument from
+`FlowControl.apply_broker_receive_maximum()`. Advanced integrations calling the
+Provisional method directly should pass only the broker Receive Maximum and,
+optionally, the local outbound cap. The removed value was the client receive
+maximum for the opposite traffic direction and never affected the result.
+
 ## From gmqtt
 
 ```python

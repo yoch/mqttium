@@ -873,9 +873,7 @@ class OutboundSession:
             # An empty property table encodes to the single length byte 0x00.
             return topic_bytes, 1, 0
         wire_property_bytes = len(encode_properties(properties, PUBLISH))
-        logical_property_bytes = (
-            wire_property_bytes if properties is not None and properties.values else 0
-        )
+        logical_property_bytes = wire_property_bytes
         return topic_bytes, wire_property_bytes, logical_property_bytes
 
     @staticmethod
@@ -999,7 +997,6 @@ class OutboundSession:
         self.flow.reset()
         self.flow.apply_broker_receive_maximum(
             engine.negotiated.receive_maximum,
-            self.config.local_receive_maximum,
             self.config.max_outbound_inflight,
         )
         self._queued.clear()
