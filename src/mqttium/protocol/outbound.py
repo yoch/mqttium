@@ -41,6 +41,7 @@ from mqttium.packets import (
     PubRecPacket,
     PubRelPacket,
 )
+from mqttium.packets.acks import encode_success_ack
 from mqttium.packets.publish import encode_publish_item
 from mqttium.persistence.memory import PagedInflightStore, TransitionInflightStore
 from mqttium.protocol.effects import EffectKind, PublishFailure, PublishHandle
@@ -589,53 +590,50 @@ class OutboundSession:
         self.drain()
 
     def on_pubrec(self, raw: RawPacket) -> None:
-        rec = PubRecPacket.decode(raw.remaining, self.config.protocol)
-        self._engine._validate_inbound_problem_information(PacketType.PUBREC, rec.properties)
+        remaining = raw.remaining
+        if len(remaining) == 2:
+            mid = (remaining[0] << 8) | remaining[1]
+            require_nonzero_mid(mid, "PUBREC")
+            reason_code = 0
+        else:
+            rec = PubRecPacket.decode(remaining, self.config.protocol)
+            self._engine._validate_inbound_problem_information(PacketType.PUBREC, rec.properties)
+            mid = rec.mid
+            reason_code = rec.reason_code
         transitions = self._transitions
         if transitions is not None:
-            if rec.reason_code >= 128:
-                self._fail_after_pubrec(rec.mid, rec.reason_code)
+            if reason_code >= 128:
+                self._fail_after_pubrec(mid, reason_code)
                 return
-            # The transition itself is the authoritative state check. On the
-            # successful path this is one metadata read plus one conditional
-            # UPDATE; the result must be observed before PUBREL is emitted.
             changed = transitions.transition_out(
-                rec.mid,
+                mid,
                 OutboundQoSState.WAIT_PUBREC,
                 OutboundQoSState.WAIT_PUBCOMP,
                 compact=True,
             )
             if changed is not None:
-                # Keep the local flow slot until PUBCOMP. MQTT 5 allows releasing
-                # at PUBREC, but freeing early lets WAIT_PUBCOMP accumulate without
-                # bound and has caused intermittent multi-second stalls under load.
-                self._send(PubRelPacket(mid=rec.mid).encode(self.config.protocol))
+                self._send(encode_success_ack(PacketType.PUBREL, mid, flags=0x02))
                 return
-            # A failed transition can mean either an orphan or a duplicate/stale
-            # PUBREC. Only the true orphan receives the normative PUBREL answer;
-            # an existing record in another phase is left untouched.
-            if transitions.out_meta(rec.mid) is None:
-                self._send_orphan_pubrel(rec.mid)
+            if transitions.out_meta(mid) is None:
+                self._send_orphan_pubrel(mid)
             return
 
-        msg = self.store.get_out(rec.mid)
+        msg = self.store.get_out(mid)
         if msg is None:
-            self._send_orphan_pubrel(rec.mid)
+            self._send_orphan_pubrel(mid)
             return
         if msg.state is not OutboundQoSState.WAIT_PUBREC:
             return
-        if rec.reason_code >= 128:
-            self._fail_after_pubrec(rec.mid, rec.reason_code)
+        if reason_code >= 128:
+            self._fail_after_pubrec(mid, reason_code)
             return
         msg.state = OutboundQoSState.WAIT_PUBCOMP
-        # Third-party stores without the transition extension still receive
-        # the same phase-two compaction as the built-in stores.
         msg.topic = ""
         msg.payload = b""
         msg.properties = None
         msg.encoded_publish = None
         if msg.encoded_pubrel is None:
-            msg.encoded_pubrel = PubRelPacket(mid=rec.mid).encode(self.config.protocol)
+            msg.encoded_pubrel = encode_success_ack(PacketType.PUBREL, mid, flags=0x02)
         self.store.update_out(msg)
         self._send(msg.encoded_pubrel)
 
@@ -653,16 +651,24 @@ class OutboundSession:
         self.drain()
 
     def on_pubcomp(self, raw: RawPacket) -> None:
-        comp = PubCompPacket.decode(raw.remaining, self.config.protocol)
-        self._engine._validate_inbound_problem_information(PacketType.PUBCOMP, comp.properties)
-        if not self._settle(comp.mid, OutboundQoSState.WAIT_PUBCOMP):
+        remaining = raw.remaining
+        if len(remaining) == 2:
+            mid = (remaining[0] << 8) | remaining[1]
+            require_nonzero_mid(mid, "PUBCOMP")
+            reason_code = 0
+        else:
+            comp = PubCompPacket.decode(remaining, self.config.protocol)
+            self._engine._validate_inbound_problem_information(PacketType.PUBCOMP, comp.properties)
+            mid = comp.mid
+            reason_code = comp.reason_code
+        if not self._settle(mid, OutboundQoSState.WAIT_PUBCOMP):
             return
         self.flow.release()
-        if comp.reason_code >= 128:
-            self._fail(comp.mid, ProtocolError(f"PUBCOMP reason_code={comp.reason_code}"))
+        if reason_code >= 128:
+            self._fail(mid, ProtocolError(f"PUBCOMP reason_code={reason_code}"))
         else:
-            self._emit(EffectKind.PUBLISH_COMPLETE, comp.mid)
-        self.packet_ids.release(comp.mid)
+            self._emit(EffectKind.PUBLISH_COMPLETE, mid)
+        self.packet_ids.release(mid)
         self.drain()
 
     # --- launching and retransmission ---------------------------------------

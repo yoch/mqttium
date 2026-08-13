@@ -6,6 +6,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- Fast-path common success/no-properties PUBREC, PUBREL and PUBCOMP frames without transient packet objects while retaining full MQTT 5 property/RPI validation for longer acknowledgement forms.
+
 - Avoid transient `PublishPacket` allocation when launching or re-encoding stored QoS 1/2 outbound messages; call the shared functional PUBLISH encoder directly while preserving byte output and replay semantics.
 
 - Optimize MQTT 3.1.1 inbound QoS 2 PUBLISH decoding by reusing the specialized QoS 1/2 field parser, avoiding a transient `PublishPacket` without changing QoS 2 state semantics.

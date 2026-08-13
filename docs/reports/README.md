@@ -98,6 +98,7 @@ implemented — the report exists so the choice stays falsifiable.
 | Date | Report | Question answered |
 | --- | --- | --- |
 | 2026-08-12 | [`QOS2-V311-DECODE.md`](QOS2-V311-DECODE.md) | Should inbound MQTT 3.1.1 QoS 2 PUBLISH use the same field decoder as QoS 1? |
+| 2026-08-12 | [`ACK-SUCCESS-FASTPATH.md`](ACK-SUCCESS-FASTPATH.md) | Can common success/no-properties acknowledgement frames bypass transient packet objects without weakening long-form MQTT 5 validation? |
 | 2026-08-12 | [`QOS12-LAUNCH-ENCODE.md`](QOS12-LAUNCH-ENCODE.md) | Should stored outbound QoS 1/2 launches call the functional PUBLISH encoder directly instead of constructing a transient packet object? |
 | 2026-08-06 | [`QOS0-V311-DECODE.md`](QOS0-V311-DECODE.md) | Should inbound MQTT 3.1.1 QoS 0 PUBLISH decode straight into the delivered `Message`? |
 | 2026-08-06 | [`QOS1-V311-DECODE.md`](QOS1-V311-DECODE.md) | Same question for MQTT 3.1.1 QoS 1, ahead of the acknowledgement state machine. |

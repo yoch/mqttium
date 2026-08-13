@@ -43,6 +43,16 @@ _ACK_REASONS = {
 }
 
 
+def encode_success_ack(packet_type: PacketType, mid: int, *, flags: int = 0) -> bytes:
+    """Fixed four-byte success/no-properties acknowledgement.
+
+    MQTT 5 omits a zero reason code when nothing follows it, so the frame is
+    identical in both protocol versions. Reason code 0 is in every ack's allowed
+    set. This is the common case on both QoS legs.
+    """
+    return bytes((int(packet_type) | (flags & 0x0F), 2, mid >> 8, mid & 0xFF))
+
+
 def _decode_ack_with_reason(
     remaining: bytes,
     protocol: MQTTProtocolVersion,
@@ -90,7 +100,7 @@ def _encode_ack_with_reason(
         # sends, and every PUBREC/PUBREL/PUBCOMP of an uncontested QoS 2
         # handshake -- and building it through the generic encoder measured
         # about 1.15 us against 0.11 us for the frame itself.
-        return bytes((int(packet_type) | (flags & 0x0F), 2, mid >> 8, mid & 0xFF))
+        return encode_success_ack(packet_type, mid, flags=flags)
     body = bytearray(pack_u16(mid))
     if protocol == MQTTProtocolVersion.MQTTv5:
         _require_outbound_reason(reason_code, _ACK_REASONS[packet_name], packet_name)

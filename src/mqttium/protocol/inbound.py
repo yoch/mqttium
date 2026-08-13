@@ -23,12 +23,10 @@ from mqttium.persistence.memory import (
     TransitionInflightStore,
 )
 from mqttium.packets import (
-    PubAckPacket,
-    PubCompPacket,
     PublishPacket,
-    PubRecPacket,
     PubRelPacket,
 )
+from mqttium.packets.acks import encode_success_ack
 from mqttium.protocol.effects import EffectKind
 from mqttium.protocol.stats import InboundStats
 from mqttium.topics import validate_received_publish_topic
@@ -50,7 +48,7 @@ REPLAY_BATCH_BYTES = 1 << 20
 
 def _encode_puback_success(mid: int) -> bytes:
     """Encode the fixed success/no-properties PUBACK for an already-validated MID."""
-    return bytes((0x40, 0x02, mid >> 8, mid & 0xFF))
+    return encode_success_ack(PacketType.PUBACK, mid)
 
 
 class InboundReplayCursor:
@@ -389,7 +387,6 @@ class InboundSession:
         properties: Properties | None,
     ) -> None:
         engine = self._engine
-        config = self.config
         store = self.store
         transitions = self._transitions
         # Existence is the common question and the cheapest to answer, so it
@@ -408,7 +405,7 @@ class InboundSession:
         if existing is not None:
             if existing.state is InboundQoSState.WAIT_PUBACK:
                 self._reject_packet_id_collision(mid, "QoS 2", "QoS 1")
-            engine._send(PubRecPacket(mid=mid).encode(config.protocol))
+            engine._send(encode_success_ack(PacketType.PUBREC, mid))
             return
 
         logical_size = self.logical_size(topic, payload, properties)
@@ -431,7 +428,7 @@ class InboundSession:
             raise
         # Runtime effect application is SEND-first. Produce the protocol ACK in
         # that order here so every QoS2 delivery avoids EffectPump repartition.
-        engine._send(PubRecPacket(mid=mid).encode(config.protocol))
+        engine._send(encode_success_ack(PacketType.PUBREC, mid))
         engine._emit(
             EffectKind.MESSAGE,
             Message(
@@ -539,77 +536,70 @@ class InboundSession:
         engine = self._engine
         config = self.config
         store = self.store
-        rel = PubRelPacket.decode(raw.remaining, config.protocol)
-        engine._validate_inbound_problem_information(PacketType.PUBREL, rel.properties)
+        remaining = raw.remaining
+        if len(remaining) == 2:
+            mid = (remaining[0] << 8) | remaining[1]
+            require_nonzero_mid(mid, "PUBREL")
+        else:
+            rel = PubRelPacket.decode(remaining, config.protocol)
+            engine._validate_inbound_problem_information(PacketType.PUBREL, rel.properties)
+            mid = rel.mid
         transitions = self._transitions
         if transitions is not None:
-            meta = transitions.in_meta(rel.mid)
+            meta = transitions.in_meta(mid)
             if meta is None:
-                # An already-completed QoS 2 exchange answers duplicate PUBREL
-                # idempotently. MQTT 5 permits 0x92 but success is interoperable
-                # with brokers that retry across reconnects.
-                engine._send(PubCompPacket(mid=rel.mid).encode(config.protocol))
+                engine._send(encode_success_ack(PacketType.PUBCOMP, mid))
                 return
             if meta.state is InboundQoSState.WAIT_USER_ACK:
                 if config.manual_ack:
-                    # Duplicate PUBREL while application acknowledgement is
-                    # pending: retain the record and keep PUBCOMP deferred.
                     return
-                # The persisted session may have been reopened with manual ACK
-                # disabled. Complete the already-received QoS 2 handshake rather
-                # than leaving WAIT_USER_ACK permanently stuck.
-                completed = transitions.complete_in(rel.mid, InboundQoSState.WAIT_USER_ACK)
+                completed = transitions.complete_in(mid, InboundQoSState.WAIT_USER_ACK)
                 if completed is None:
-                    raise ProtocolError(f"Inbound mid={rel.mid} changed while completing PUBREL")
-                engine._send(PubCompPacket(mid=rel.mid).encode(config.protocol))
+                    raise ProtocolError(f"Inbound mid={mid} changed while completing PUBREL")
+                engine._send(encode_success_ack(PacketType.PUBCOMP, mid))
                 self._release_slot(completed.logical_size)
                 return
             if meta.state is not InboundQoSState.WAIT_PUBREL:
-                raise ProtocolError(
-                    f"PUBREL for inbound mid={rel.mid} in invalid state {meta.state!r}"
-                )
+                raise ProtocolError(f"PUBREL for inbound mid={mid} in invalid state {meta.state!r}")
             if config.manual_ack and not meta.user_acked:
                 changed = transitions.transition_in(
-                    rel.mid,
+                    mid,
                     InboundQoSState.WAIT_PUBREL,
                     InboundQoSState.WAIT_USER_ACK,
                 )
                 if changed is None:
-                    raise ProtocolError(f"Inbound mid={rel.mid} changed while processing PUBREL")
+                    raise ProtocolError(f"Inbound mid={mid} changed while processing PUBREL")
                 return
-            completed = transitions.complete_in(rel.mid, InboundQoSState.WAIT_PUBREL)
+            completed = transitions.complete_in(mid, InboundQoSState.WAIT_PUBREL)
             if completed is None:
-                raise ProtocolError(f"Inbound mid={rel.mid} changed while completing PUBREL")
-            engine._send(PubCompPacket(mid=rel.mid).encode(config.protocol))
+                raise ProtocolError(f"Inbound mid={mid} changed while completing PUBREL")
+            engine._send(encode_success_ack(PacketType.PUBCOMP, mid))
             self._release_slot(completed.logical_size)
             return
 
-        inbound = store.get_in(rel.mid)
+        inbound = store.get_in(mid)
         if inbound is None:
-            # Orphan PUBREL: idempotent PUBCOMP.
-            engine._send(PubCompPacket(mid=rel.mid).encode(config.protocol))
+            engine._send(encode_success_ack(PacketType.PUBCOMP, mid))
             return
         if inbound.state is InboundQoSState.WAIT_USER_ACK:
             if config.manual_ack:
                 return
-            popped = store.pop_in(rel.mid)
+            popped = store.pop_in(mid)
             if popped is None:
-                raise ProtocolError(f"Inbound mid={rel.mid} disappeared while completing PUBREL")
-            engine._send(PubCompPacket(mid=rel.mid).encode(config.protocol))
+                raise ProtocolError(f"Inbound mid={mid} disappeared while completing PUBREL")
+            engine._send(encode_success_ack(PacketType.PUBCOMP, mid))
             self._release_slot(self.stored_logical_size(popped))
             return
         if inbound.state is not InboundQoSState.WAIT_PUBREL:
-            raise ProtocolError(
-                f"PUBREL for inbound mid={rel.mid} in invalid state {inbound.state!r}"
-            )
+            raise ProtocolError(f"PUBREL for inbound mid={mid} in invalid state {inbound.state!r}")
         if config.manual_ack and not inbound.user_acked:
             inbound.state = InboundQoSState.WAIT_USER_ACK
             store.update_in(inbound)
             return
-        popped = store.pop_in(rel.mid)
+        popped = store.pop_in(mid)
         if popped is None:
-            raise ProtocolError(f"Inbound mid={rel.mid} disappeared while completing PUBREL")
-        engine._send(PubCompPacket(mid=rel.mid).encode(config.protocol))
+            raise ProtocolError(f"Inbound mid={mid} disappeared while completing PUBREL")
+        engine._send(encode_success_ack(PacketType.PUBCOMP, mid))
         self._release_slot(self.stored_logical_size(popped))
 
     # --- application acknowledgement and replay ---------------------------
@@ -654,12 +644,10 @@ class InboundSession:
         if state not in (InboundQoSState.WAIT_PUBACK, InboundQoSState.WAIT_USER_ACK):
             raise ProtocolError(f"Inbound mid={mid} is not awaiting ack (state={state!r})")
 
-        packet = (
-            PubAckPacket(mid=mid)
-            if state is InboundQoSState.WAIT_PUBACK
-            else PubCompPacket(mid=mid)
+        wire = encode_success_ack(
+            PacketType.PUBACK if state is InboundQoSState.WAIT_PUBACK else PacketType.PUBCOMP,
+            mid,
         )
-        wire = packet.encode(config.protocol)
         self._engine._check_outbound_size(wire)
 
         if isinstance(record, InboundMessage):
