@@ -21,6 +21,11 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Harden the Paho VERSION2 façade: serialize `loop_start()` ownership, reject
+  blocking publish waits and disconnects from the network thread, propagate
+  QoS 0 admission failures through `MQTTMessageInfo`, restore Paho's
+  `is_connected()` method shape and `ConnectFlags`, accept `payload=None` as a
+  zero-length publish, and validate per-topic callback filters.
 - Local MQTT protocol failures now complete teardown even when the negotiated
   Maximum Packet Size prevents sending the normative DISCONNECT, close the
   runtime transport, and surface CONNACK validation failures to `connect()`
