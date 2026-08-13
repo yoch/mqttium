@@ -14,10 +14,14 @@ from mqttium.protocol.engine import ProtocolEngine
 
 
 def test_auto_qos1_puback_skips_packet_dataclass(monkeypatch) -> None:
-    def fail_packet(*args, **kwargs):
-        raise AssertionError("auto-PUBACK must use the fixed frame helper")
+    calls: list[PacketType] = []
+    original = inbound_module.encode_success_ack
 
-    monkeypatch.setattr(inbound_module, "PubAckPacket", fail_packet)
+    def counted(packet_type, mid, **kwargs):
+        calls.append(packet_type)
+        return original(packet_type, mid, **kwargs)
+
+    monkeypatch.setattr(inbound_module, "encode_success_ack", counted)
     engine = ProtocolEngine(EngineConfig(protocol=MQTTProtocolVersion.MQTTv311))
     engine.state = ConnectionState.CONNECTED
 
@@ -30,6 +34,7 @@ def test_auto_qos1_puback_skips_packet_dataclass(monkeypatch) -> None:
     )
     effects = engine.take_effects()
 
+    assert calls == [PacketType.PUBACK]
     assert [effect.kind for effect in effects] == [EffectKind.SEND, EffectKind.MESSAGE]
     assert effects[0].data == b"\x40\x02\x00\x07"
 
@@ -55,6 +60,131 @@ def test_success_puback_settle_skips_full_decoder(monkeypatch) -> None:
 
     assert calls == 0
     assert any(effect.kind is EffectKind.PUBLISH_COMPLETE for effect in effects)
+
+
+def test_auto_qos2_pubrec_skips_packet_dataclass(monkeypatch) -> None:
+    calls: list[PacketType] = []
+    original = inbound_module.encode_success_ack
+
+    def counted(packet_type, mid, **kwargs):
+        calls.append(packet_type)
+        return original(packet_type, mid, **kwargs)
+
+    monkeypatch.setattr(inbound_module, "encode_success_ack", counted)
+    engine = ProtocolEngine(EngineConfig(protocol=MQTTProtocolVersion.MQTTv311))
+    engine.state = ConnectionState.CONNECTED
+
+    engine.handle_raw(
+        RawPacket(
+            PacketType.PUBLISH,
+            0x04,
+            pack_utf8("ack/hot") + pack_u16(7) + b"payload",
+        )
+    )
+    effects = engine.take_effects()
+
+    assert calls == [PacketType.PUBREC]
+    assert [effect.kind for effect in effects] == [EffectKind.SEND, EffectKind.MESSAGE]
+    assert effects[0].data == b"\x50\x02\x00\x07"
+
+
+def test_success_pubrec_settle_skips_full_decoder(monkeypatch) -> None:
+    calls = 0
+    original = outbound_module.PubRecPacket.decode
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(outbound_module.PubRecPacket, "decode", counted)
+    engine = ProtocolEngine(EngineConfig(protocol=MQTTProtocolVersion.MQTTv5))
+    engine.state = ConnectionState.CONNECTED
+    handle = engine.queue_publish("ack/hot", b"payload", qos=2)
+    assert handle.mid is not None
+    engine.take_effects()
+
+    engine.handle_raw(RawPacket(PacketType.PUBREC, 0x00, pack_u16(handle.mid)))
+    effects = engine.take_effects()
+
+    assert calls == 0
+    assert any(effect.kind is EffectKind.SEND for effect in effects)
+    assert any(effect.data == b"\x62\x02" + pack_u16(handle.mid) for effect in effects)
+
+
+def test_success_pubcomp_settle_skips_full_decoder(monkeypatch) -> None:
+    calls = 0
+    original = outbound_module.PubCompPacket.decode
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(outbound_module.PubCompPacket, "decode", counted)
+    engine = ProtocolEngine(EngineConfig(protocol=MQTTProtocolVersion.MQTTv5))
+    engine.state = ConnectionState.CONNECTED
+    handle = engine.queue_publish("ack/hot", b"payload", qos=2)
+    assert handle.mid is not None
+    engine.take_effects()
+    engine.handle_raw(RawPacket(PacketType.PUBREC, 0x00, pack_u16(handle.mid)))
+    engine.take_effects()
+
+    engine.handle_raw(RawPacket(PacketType.PUBCOMP, 0x00, pack_u16(handle.mid)))
+    effects = engine.take_effects()
+
+    assert calls == 0
+    assert any(effect.kind is EffectKind.PUBLISH_COMPLETE for effect in effects)
+
+
+def test_success_pubrel_skips_full_decoder(monkeypatch) -> None:
+    calls = 0
+    original = inbound_module.PubRelPacket.decode
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(inbound_module.PubRelPacket, "decode", counted)
+    engine = ProtocolEngine(EngineConfig(protocol=MQTTProtocolVersion.MQTTv311))
+    engine.state = ConnectionState.CONNECTED
+    engine.handle_raw(
+        RawPacket(
+            PacketType.PUBLISH,
+            0x04,
+            pack_utf8("ack/hot") + pack_u16(9) + b"payload",
+        )
+    )
+    engine.take_effects()
+
+    engine.handle_raw(RawPacket(PacketType.PUBREL, 0x02, pack_u16(9)))
+    effects = engine.take_effects()
+
+    assert calls == 0
+    assert any(effect.data == b"\x70\x02\x00\x09" for effect in effects)
+
+
+def test_reason_bearing_pubrec_keeps_full_decoder(monkeypatch) -> None:
+    calls = 0
+    original = outbound_module.PubRecPacket.decode
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(outbound_module.PubRecPacket, "decode", counted)
+    engine = ProtocolEngine(EngineConfig(protocol=MQTTProtocolVersion.MQTTv5))
+    engine.state = ConnectionState.CONNECTED
+    handle = engine.queue_publish("ack/hot", b"payload", qos=2)
+    assert handle.mid is not None
+    engine.take_effects()
+
+    engine.handle_raw(RawPacket(PacketType.PUBREC, 0x00, pack_u16(handle.mid) + b"\x10"))
+    engine.take_effects()
+
+    assert calls == 1
 
 
 def test_reason_bearing_puback_keeps_full_decoder(monkeypatch) -> None:
