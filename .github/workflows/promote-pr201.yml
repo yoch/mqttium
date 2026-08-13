@@ -17,8 +17,9 @@ jobs:
           python-version: '3.13'
       - name: Apply reviewed PR201 delta
         run: |
-          git diff c34a9499ed2723054c2e0d3b730248f176be0856..origin/cursor/launch-encode-item-6aff -- src tests docs > /tmp/pr201.patch
+          git diff c34a9499ed2723054c2e0d3b730248f176be0856..origin/cursor/launch-encode-item-6aff -- src tests > /tmp/pr201.patch
           git apply --3way --whitespace=error-all /tmp/pr201.patch
+          git show origin/cursor/launch-encode-item-6aff:docs/reports/QOS12-LAUNCH-ENCODE.md > docs/reports/QOS12-LAUNCH-ENCODE.md
           python - <<'PY'
           from pathlib import Path
           p=Path('CHANGELOG.md')
@@ -27,6 +28,14 @@ jobs:
           note='\n- Avoid transient `PublishPacket` allocation when launching or re-encoding stored QoS 1/2 outbound messages; call the shared functional PUBLISH encoder directly while preserving byte output and replay semantics.\n'
           if note.strip() not in text:
               text=text.replace(marker, marker+note, 1)
+              p.write_text(text)
+
+          p=Path('docs/reports/README.md')
+          text=p.read_text()
+          row='| 2026-08-12 | [`QOS12-LAUNCH-ENCODE.md`](QOS12-LAUNCH-ENCODE.md) | Should stored outbound QoS 1/2 launches call the functional PUBLISH encoder directly instead of constructing a transient packet object? |\n'
+          anchor='| 2026-08-12 | [`QOS2-V311-DECODE.md`](QOS2-V311-DECODE.md) | Should inbound MQTT 3.1.1 QoS 2 PUBLISH use the same field decoder as QoS 1? |\n'
+          if row not in text:
+              text=text.replace(anchor, anchor+row, 1)
               p.write_text(text)
           PY
           git diff --check
