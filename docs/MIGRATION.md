@@ -53,6 +53,8 @@ await client.disconnect()
 Important compatibility differences:
 
 - only `CallbackAPIVersion.VERSION2` is supported;
+- call `client.is_connected()` as a method, matching Paho. Builds before the
+  post-RC2 compatibility fix accidentally exposed it as a boolean property;
 - MQTTium does not reproduce non-compliant QoS republishing after a clean
   session;
 - use native `await client.connect()` instead of Paho's historical

@@ -22,6 +22,7 @@ from mqttium.dispatch.matcher import TopicMatcher
 from mqttium.enums import MQTTProtocolVersion, QoS
 from mqttium.errors import FlowControlError
 from mqttium.packets import ConnAckPacket
+from mqttium.topics import validate_subscribe_filter
 from mqttium.types import Message, Properties
 
 
@@ -39,6 +40,13 @@ _PUBLISH_BATCH_MAX_BYTES = 1 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
+class ConnectFlags:
+    """VERSION2 connect flags (Paho-compatible subset)."""
+
+    session_present: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class DisconnectFlags:
     """VERSION2 disconnect flags (Paho-compatible subset)."""
 
@@ -52,6 +60,7 @@ class MQTTMessageInfo:
     mid: int | None
     _receipt: PublishReceipt | None = field(default=None, repr=False)
     _loop: asyncio.AbstractEventLoop | None = field(default=None, repr=False)
+    _handoff: Future[None] | None = field(default=None, repr=False)
     rc: int = 0
 
     def wait_for_publish(self, timeout: float | None = None) -> None:
@@ -60,6 +69,14 @@ class MQTTMessageInfo:
             raise ValueError("Message is not queued due to ERR_QUEUE_SIZE")
         if self.rc != MQTT_ERR_SUCCESS:
             raise RuntimeError(f"Message publish failed with rc={self.rc}")
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if self._loop is not None and running_loop is self._loop:
+            raise RuntimeError("wait_for_publish() cannot block the network event loop")
+        if self._handoff is not None:
+            self._handoff.result(timeout)
         if self._receipt is None or self._receipt.is_done():
             if self._receipt is not None and self._receipt._error is not None:
                 raise self._receipt._error
@@ -74,13 +91,25 @@ class MQTTMessageInfo:
             raise ValueError("Message is not queued due to ERR_QUEUE_SIZE")
         if self.rc != MQTT_ERR_SUCCESS:
             raise RuntimeError(f"Message publish failed with rc={self.rc}")
+        if self._handoff is not None:
+            if not self._handoff.done():
+                return False
+            self._handoff.result()
         return self._receipt is None or self._receipt.is_done()
 
 
 class _PendingPublish:
     """One cross-thread publish waiting for loop-side admission."""
 
-    __slots__ = ("topic", "payload", "retain", "qos", "future", "logical_size")
+    __slots__ = (
+        "topic",
+        "payload",
+        "retain",
+        "qos",
+        "future",
+        "completion",
+        "logical_size",
+    )
 
     def __init__(
         self,
@@ -89,12 +118,14 @@ class _PendingPublish:
         retain: bool,
         qos: QoS,
         future: Future[MQTTMessageInfo] | None,
+        completion: Future[None] | None = None,
     ) -> None:
         self.topic = topic
         self.payload: bytes | None = payload
         self.retain = retain
         self.qos = qos
         self.future = future
+        self.completion = completion
         topic_size = len(topic) if topic.isascii() else len(topic.encode("utf-8"))
         self.logical_size = topic_size + len(payload)
 
@@ -173,6 +204,7 @@ class Client:
         self._publish_pending: SimpleQueue[_PendingPublish] = SimpleQueue()
         self._publish_spillover: _PendingPublish | None = None
         self._publish_schedule_lock = threading.Lock()
+        self._loop_state_lock = threading.Lock()
         self._max_pending_publish_requests = max_pending_publish_requests
         self._max_pending_publish_bytes = max_pending_publish_bytes
         self._pending_publish_requests = 0
@@ -254,6 +286,7 @@ class Client:
         self._run_loop_mutation(lambda: self._async._reconfigure(will=message))
 
     def message_callback_add(self, sub: str, callback: Callable[..., Any]) -> None:
+        validate_subscribe_filter(sub)
         self._run_loop_mutation(lambda: self._topic_callbacks.__setitem__(sub, callback))
 
     def message_callback_remove(self, sub: str) -> None:
@@ -263,20 +296,44 @@ class Client:
 
         self._run_loop_mutation(_remove)
 
-    @property
     def is_connected(self) -> bool:
         return bool(self._run_loop_mutation(lambda: self._async.is_connected))
 
     def loop_start(self) -> None:
-        if self._thread is not None and self._thread.is_alive():
-            return
-        self._started.clear()
-        self._stopping.clear()
-        self._thread = threading.Thread(
-            target=self._run_loop, name="mqttium-paho-loop", daemon=True
-        )
-        self._thread.start()
-        if not self._started.wait(timeout=5.0):
+        while True:
+            stopping_thread: threading.Thread | None = None
+            with self._loop_state_lock:
+                thread = self._thread
+                if thread is not None and thread.is_alive():
+                    if self._stopping.is_set():
+                        stopping_thread = thread
+                    else:
+                        started = self._started
+                        break
+                else:
+                    self._started.clear()
+                    self._stopping.clear()
+                    thread = threading.Thread(
+                        target=self._run_loop, name="mqttium-paho-loop", daemon=True
+                    )
+                    self._thread = thread
+                    try:
+                        thread.start()
+                    except BaseException:
+                        if self._thread is thread:
+                            self._thread = None
+                        raise
+                    started = self._started
+                    break
+
+            assert stopping_thread is not None
+            if stopping_thread is threading.current_thread():
+                raise RuntimeError("Cannot restart a stopping network loop from its own thread")
+            stopping_thread.join(timeout=5.0)
+            if stopping_thread.is_alive():
+                raise RuntimeError("Previous background loop did not stop")
+
+        if not started.wait(timeout=5.0):
             raise RuntimeError("Failed to start background loop")
 
     def loop_stop(self) -> None:
@@ -284,13 +341,23 @@ class Client:
         self._fail_pending_publish_requests(
             RuntimeError("network loop stopped before publish admission")
         )
+        with self._loop_state_lock:
+            thread = self._thread
+        if thread is not None and thread.is_alive() and not self._started.is_set():
+            self._started.wait(timeout=5.0)
         loop = self._loop
         if loop is not None and loop.is_running():
+            if self._on_network_thread():
+                loop.stop()
+                return
             loop.call_soon_threadsafe(loop.stop)
-        if self._thread is not None:
-            self._thread.join(timeout=5.0)
-            self._thread = None
-        self._loop = None
+        if thread is not None:
+            thread.join(timeout=5.0)
+        with self._loop_state_lock:
+            if self._thread is thread:
+                self._thread = None
+            if self._loop is loop:
+                self._loop = None
 
     def _run_loop(self) -> None:
         loop = asyncio.new_event_loop()
@@ -310,6 +377,11 @@ class Client:
             if pending:
                 loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
             loop.close()
+            with self._loop_state_lock:
+                if self._loop is loop:
+                    self._loop = None
+                if self._thread is threading.current_thread():
+                    self._thread = None
 
     def _submit(
         self,
@@ -415,6 +487,8 @@ class Client:
         return self.connect(host, port, keepalive=keepalive)
 
     def disconnect(self) -> int:
+        if self._on_network_thread():
+            raise RuntimeError("disconnect() cannot block the network event loop")
         try:
             self._submit(self._async.disconnect(), timeout=10.0)
         except Exception:
@@ -512,6 +586,9 @@ class Client:
             future = request.future
             if future is not None and not future.done():
                 future.set_exception(error)
+            completion = request.completion
+            if completion is not None and not completion.done():
+                completion.set_exception(error)
 
     def _report_qos0_publish_error(self, error: BaseException) -> None:
         try:
@@ -545,16 +622,19 @@ class Client:
         results: list[
             tuple[Future[MQTTMessageInfo], MQTTMessageInfo | None, BaseException | None]
         ] = []
+        qos0_completions: list[Future[None]] = []
         committed = False
 
         try:
             for request in batch:
                 future = request.future
+                completion = request.completion
                 if self._stopping.is_set():
+                    stop_error = RuntimeError("network loop stopped before publish admission")
                     if future is not None and not future.done():
-                        future.set_exception(
-                            RuntimeError("network loop stopped before publish admission")
-                        )
+                        future.set_exception(stop_error)
+                    if completion is not None and not completion.done():
+                        completion.set_exception(stop_error)
                     continue
                 if future is not None and not future.set_running_or_notify_cancel():
                     continue
@@ -566,6 +646,8 @@ class Client:
                             retain=request.retain,
                         )
                         committed = True
+                        if completion is not None:
+                            qos0_completions.append(completion)
                     else:
                         info = self._commit_qosn_publish_on_loop(request)
                         committed = True
@@ -573,6 +655,8 @@ class Client:
                         results.append((future, info, None))
                 except FlowControlError as exc:
                     if future is None:
+                        if completion is not None and not completion.done():
+                            completion.set_exception(exc)
                         self._report_qos0_publish_error(exc)
                     else:
                         results.append(
@@ -584,6 +668,8 @@ class Client:
                         )
                 except BaseException as exc:
                     if future is None:
+                        if completion is not None and not completion.done():
+                            completion.set_exception(exc)
                         self._report_qos0_publish_error(exc)
                     else:
                         results.append((future, None, exc))
@@ -592,10 +678,12 @@ class Client:
                 request.discard_payload()
             self._release_publish_requests(batch)
 
+        finalize_error: BaseException | None = None
         if committed:
             try:
                 self._finalize_publish_effects()
             except BaseException as exc:
+                finalize_error = exc
                 loop = self._loop
                 if loop is not None:
                     loop.call_exception_handler(
@@ -604,6 +692,15 @@ class Client:
                             "exception": exc,
                         }
                     )
+
+        for completion in qos0_completions:
+            if completion.done():
+                continue
+            if finalize_error is None:
+                completion.set_result(None)
+            else:
+                completion.set_exception(finalize_error)
+                self._report_qos0_publish_error(finalize_error)
 
         for future, result_info, error in results:
             if error is not None:
@@ -643,7 +740,7 @@ class Client:
     def publish(
         self,
         topic: str,
-        payload: bytes | str = b"",
+        payload: bytes | str | None = None,
         qos: int = 0,
         retain: bool = False,
     ) -> MQTTMessageInfo:
@@ -653,7 +750,12 @@ class Client:
         allocation and receipt registration; admission failures return
         ``MQTT_ERR_QUEUE_SIZE``.
         """
-        data = payload.encode("utf-8") if isinstance(payload, str) else payload
+        if payload is None:
+            data = b""
+        elif isinstance(payload, str):
+            data = payload.encode("utf-8")
+        else:
+            data = payload
         requested_qos = QoS(qos)
         if self._loop is None:
             self.loop_start()
@@ -686,12 +788,11 @@ class Client:
             return info
 
         if requested_qos is QoS.AT_MOST_ONCE:
-            info = MQTTMessageInfo(
-                mid=None,
-                _receipt=PublishReceipt(mid=None, qos=requested_qos),
-                _loop=self._loop,
+            completion: Future[None] = Future()
+            info = MQTTMessageInfo(mid=None, _loop=self._loop, _handoff=completion)
+            request = _PendingPublish(
+                topic, data, retain, requested_qos, None, completion=completion
             )
-            request = _PendingPublish(topic, data, retain, requested_qos, None)
             if not self._enqueue_publish_request(request):
                 request.discard_payload()
                 return MQTTMessageInfo(mid=None, rc=MQTT_ERR_QUEUE_SIZE)
@@ -768,7 +869,7 @@ class Client:
         cb = self.on_connect
         if cb is None:
             return
-        flags = {"session present": bool(connack.session_present)}
+        flags = ConnectFlags(session_present=bool(connack.session_present))
         props = connack.properties or Properties()
         self._safe_callback(cb, self, self._userdata, flags, connack.reason_code, props)
 
