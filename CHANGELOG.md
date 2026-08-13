@@ -21,6 +21,10 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Harden MQTT-over-WebSocket teardown and handshake handling: close the TCP
+  stream before any cancellable close wait, bracket IPv6 literals in the HTTP
+  `Host` header, and enforce the configured handshake timeout as one total
+  deadline instead of resetting it for each received chunk.
 - Correct MQTT string and PUBLISH conformance: preserve legal U+FEFF text,
   reject empty MQTT 3.1.1 inbound Topic Names at the packet boundary, surface
   PUBLISH wire-limit overflow as `PacketTooLargeError`, reject semantic Will

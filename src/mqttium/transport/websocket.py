@@ -171,9 +171,12 @@ class WebSocketTransport:
     async def close(self) -> None:
         self._closing = True
         try:
+            # Queue the close frame, then close the stream before the first
+            # cancellation point. asyncio transports flush already-buffered
+            # bytes while closing; cancellation must never leave the TCP stream
+            # open merely because drain()/wait_closed() was interrupted.
             with suppress(Exception):
                 self._writer.write(_mask_client_frame(0x8, b""))
-                await self._writer.drain()
             await _close_stream_writer(self._writer)
         finally:
             # No buffered frame can be reused after the underlying stream is
@@ -293,9 +296,10 @@ def _build_handshake_request(
     key: str,
     extra_headers: dict[str, str] | None,
 ) -> bytes:
+    host_header = f"[{host}]" if ":" in host and not host.startswith("[") else host
     headers = [
         f"GET {path} HTTP/1.1",
-        f"Host: {host}:{port}",
+        f"Host: {host_header}:{port}",
         "Upgrade: websocket",
         "Connection: Upgrade",
         f"Sec-WebSocket-Key: {key}",
@@ -315,13 +319,14 @@ async def _read_handshake_response(
 ) -> tuple[bytes, bytes]:
     buffer = bytearray()
     delimiter = b"\r\n\r\n"
-    while delimiter not in buffer:
-        chunk = await asyncio.wait_for(reader.read(4096), timeout=timeout)
-        if not chunk:
-            raise ConnectionError("WebSocket handshake closed early")
-        buffer.extend(chunk)
-        if len(buffer) > _MAX_HANDSHAKE_BYTES:
-            raise ConnectionError("WebSocket handshake headers too large")
+    async with asyncio.timeout(timeout):
+        while delimiter not in buffer:
+            chunk = await reader.read(4096)
+            if not chunk:
+                raise ConnectionError("WebSocket handshake closed early")
+            buffer.extend(chunk)
+            if len(buffer) > _MAX_HANDSHAKE_BYTES:
+                raise ConnectionError("WebSocket handshake headers too large")
     head, _, leftover = bytes(buffer).partition(delimiter)
     return head, leftover
 
