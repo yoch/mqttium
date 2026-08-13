@@ -6,7 +6,7 @@ import pytest
 
 from mqttium.codec.buffer import _VIEW_COPY_THRESHOLD, IncrementalDecoder
 from mqttium.codec.vbi import decode_vbi, encode_vbi, vbi_len
-from mqttium.enums import PacketType, QoS
+from mqttium.enums import MQTTProtocolVersion, PacketType, QoS
 from mqttium.errors import MalformedPacketError, PacketTooLargeError, ProtocolError
 from mqttium.packets import PublishPacket, encode_frame
 
@@ -338,3 +338,22 @@ def test_a_strict_decode_cannot_produce_a_surrogate() -> None:
                 except UnicodeDecodeError:
                     continue
                 assert not any(0xD800 <= ord(c) <= 0xDFFF for c in text)
+
+
+def test_decode_publish_envelope_matches_packet_without_payload_copy() -> None:
+    from mqttium.codec.primitives import pack_u16, pack_utf8
+    from mqttium.packets.publish import decode_publish_envelope
+
+    remaining = pack_utf8("bench/envelope") + pack_u16(9) + b"\x00" + (b"x" * 64)
+    packet = PublishPacket.decode(0x02, remaining, MQTTProtocolVersion.MQTTv5)
+    qos, topic, mid, retain, dup, properties, pos = decode_publish_envelope(
+        0x02, remaining, MQTTProtocolVersion.MQTTv5
+    )
+    assert qos is packet.qos is QoS.AT_LEAST_ONCE
+    assert topic == packet.topic == "bench/envelope"
+    assert mid == packet.mid == 9
+    assert retain is packet.retain is False
+    assert dup is packet.dup is False
+    assert remaining[pos:] == packet.payload == b"x" * 64
+    assert properties is not None and packet.properties is not None
+    assert not properties.values and not packet.properties.values

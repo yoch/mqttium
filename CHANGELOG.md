@@ -6,8 +6,12 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- The Receive Maximum preflight recovers a pipelined PUBLISH packet identifier
+  without constructing a `PublishPacket` or copying the payload, while still
+  running the same MQTT 5 property-table and received-topic validation as
+  `PublishPacket.decode`. A wildcard or malformed property table cannot become
+  DISCONNECT 0x93.
 - Avoid transient `PublishPacket` allocation when launching or re-encoding stored QoS 1/2 outbound messages; call the shared functional PUBLISH encoder directly while preserving byte output and replay semantics.
-
 - Optimize MQTT 3.1.1 inbound QoS 2 PUBLISH decoding by reusing the specialized QoS 1/2 field parser, avoiding a transient `PublishPacket` without changing QoS 2 state semantics.
 
 ### Fixed

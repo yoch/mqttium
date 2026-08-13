@@ -74,6 +74,42 @@ def encode_publish_item(
     return bytes(header)
 
 
+def decode_publish_envelope(
+    flags: int,
+    remaining: bytes,
+    protocol: MQTTProtocolVersion = MQTTProtocolVersion.MQTTv311,
+) -> tuple[QoS, str, int | None, bool, bool, Properties | None, int]:
+    """Validate a PUBLISH variable header; return the payload start offset.
+
+    This is the check ``PublishPacket.decode`` runs before it copies the
+    payload. The Receive Maximum preflight needs the identifier after those
+    same checks — MQTT 5 property table, received Topic Name, nonzero MID —
+    without constructing a packet or copying application bytes.
+    """
+    dup = bool(flags & 0x08)
+    qos_raw = (flags >> 1) & 0x03
+    if qos_raw == 3:
+        raise MalformedPacketError("Invalid PUBLISH QoS 3")
+    qos = QoS(qos_raw)
+    if qos == QoS.AT_MOST_ONCE and dup:
+        raise MalformedPacketError("QoS 0 PUBLISH must not set DUP")
+    retain = bool(flags & 0x01)
+
+    topic, pos = unpack_utf8(remaining, 0)
+    mid: int | None = None
+    if qos:
+        mid, pos = unpack_u16(remaining, pos)
+        require_nonzero_mid(mid, PUBLISH)
+    properties: Properties | None = None
+    if protocol == MQTTProtocolVersion.MQTTv5:
+        properties, pos = decode_properties(remaining, pos, PUBLISH)
+        # Validate a non-empty Topic Name before the inbound session can
+        # establish a Topic Alias from it. Empty is intentionally deferred:
+        # MQTT 5 permits it only when a previously established alias is used.
+        validate_received_publish_topic(topic, utf8_validated=True)
+    return qos, topic, mid, retain, dup, properties, pos
+
+
 @dataclass(slots=True, frozen=True)
 class PublishPacket:
     topic: str
@@ -112,32 +148,13 @@ class PublishPacket:
         remaining: bytes,
         protocol: MQTTProtocolVersion = MQTTProtocolVersion.MQTTv311,
     ) -> PublishPacket:
-        dup = bool(flags & 0x08)
-        qos_raw = (flags >> 1) & 0x03
-        if qos_raw == 3:
-            raise MalformedPacketError("Invalid PUBLISH QoS 3")
-        qos = QoS(qos_raw)
-        if qos == QoS.AT_MOST_ONCE and dup:
-            raise MalformedPacketError("QoS 0 PUBLISH must not set DUP")
-        retain = bool(flags & 0x01)
-
-        topic, pos = unpack_utf8(remaining, 0)
-        mid: int | None = None
-        if qos:
-            mid, pos = unpack_u16(remaining, pos)
-            require_nonzero_mid(mid, PUBLISH)
-        properties: Properties | None = None
-        if protocol == MQTTProtocolVersion.MQTTv5:
-            properties, pos = decode_properties(remaining, pos, PUBLISH)
-            # Validate a non-empty Topic Name before the inbound session can
-            # establish a Topic Alias from it. Empty is intentionally deferred:
-            # MQTT 5 permits it only when a previously established alias is used.
-            validate_received_publish_topic(topic, utf8_validated=True)
+        qos, topic, mid, retain, dup, properties, pos = decode_publish_envelope(
+            flags, remaining, protocol
+        )
         # The remainder is the PUBLISH payload and may be empty.
-        payload = remaining[pos:]
         return cls(
             topic=topic,
-            payload=payload,
+            payload=remaining[pos:],
             qos=qos,
             retain=retain,
             dup=dup,

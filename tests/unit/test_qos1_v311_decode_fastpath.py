@@ -104,6 +104,32 @@ def test_v311_qos0_and_qos1_both_avoid_generic_packet(monkeypatch) -> None:
     assert calls == 0
 
 
+def test_pipelined_qos1_batch_avoids_generic_packet(monkeypatch) -> None:
+    """The Receive Maximum preflight must not re-decode a pipelined PUBLISH."""
+    calls = 0
+    original = PublishPacket.decode
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(PublishPacket, "decode", counted)
+    engine = _connected()
+    for mid in range(1, 9):
+        engine.handle_raw(
+            RawPacket(
+                PacketType.PUBLISH,
+                0x02,
+                pack_utf8("bench/pipeline") + pack_u16(mid) + b"one",
+            )
+        )
+    effects = engine.take_effects()
+    assert calls == 0
+    assert sum(1 for effect in effects if effect.kind is EffectKind.MESSAGE) == 8
+    assert sum(1 for effect in effects if effect.kind is EffectKind.SEND) == 8
+
+
 def test_v311_qos1_manual_ack_preserves_duplicate_state() -> None:
     engine = _connected(manual_ack=True)
     first = RawPacket(
@@ -151,11 +177,6 @@ def test_mqtt5_qos1_and_qos2_use_direct_fields(monkeypatch) -> None:
     )
     assert calls == 0
 
-    # A fresh engine keeps this test focused on on_publish: otherwise the
-    # Receive-Maximum preflight intentionally decodes a second PUBLISH while
-    # the first auto-PUBACK is still pending in the current effect batch.
-    engine = ProtocolEngine(EngineConfig(protocol=MQTTProtocolVersion.MQTTv5))
-    engine.state = ConnectionState.CONNECTED
     engine.handle_raw(
         RawPacket(
             PacketType.PUBLISH,

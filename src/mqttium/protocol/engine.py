@@ -24,7 +24,6 @@ from mqttium.packets import (
     ConnAckPacket,
     ConnectPacket,
     DisconnectPacket,
-    PublishPacket,
     SubAckPacket,
     SubscribeOptions,
     SubscribePacket,
@@ -34,6 +33,7 @@ from mqttium.packets import (
     encode_disconnect,
     encode_pingreq,
 )
+from mqttium.packets.publish import decode_publish_envelope
 from mqttium.persistence.memory import (
     InflightStore,
     MemoryInflightStore,
@@ -68,6 +68,21 @@ from mqttium.errors import (
 
 # MQTT 5 Table 3-11: 0x00 (Success) is sent by the Server only.
 _CLIENT_AUTH_REASON_CODES = frozenset({0x18, 0x19})
+
+
+def _qos_publish_mid(raw: RawPacket, protocol: MQTTProtocolVersion) -> int | None:
+    """Packet identifier of a QoS 1/2 PUBLISH after decode's header checks.
+
+    Does not copy the payload or construct a ``PublishPacket``. Header
+    validation — MQTT 5 property table, received Topic Name, nonzero MID — is
+    the same function ``PublishPacket.decode`` uses, so a wildcard or malformed
+    property table cannot be classified as Receive Maximum exceeded.
+    """
+    _qos, _topic, mid, _retain, _dup, _properties, _pos = decode_publish_envelope(
+        raw.flags, raw.remaining, protocol
+    )
+    return mid
+
 
 _ALLOWED_PACKETS_BY_STATE: dict[ConnectionState, frozenset[PacketType]] = {
     ConnectionState.CONNECTING: frozenset(
@@ -882,13 +897,13 @@ class ProtocolEngine:
         ):
             return
 
-        packet = PublishPacket.decode(raw.flags, raw.remaining, self.config.protocol)
-        mid = packet.mid
+        mid = _qos_publish_mid(raw, self.config.protocol)
         if mid is None:
             return
 
+        qos1 = qos_raw == int(QoS.AT_LEAST_ONCE)
         if mid in pending:
-            if packet.qos is QoS.AT_LEAST_ONCE:
+            if qos1:
                 # Same QoS1 exchange: retransmission does not consume a second
                 # Receive Maximum slot before the pending PUBACK is handed off.
                 return
@@ -903,9 +918,9 @@ class ProtocolEngine:
         existing = transitions.in_meta(mid) if transitions is not None else self.store.get_in(mid)
         if existing is not None:
             state = existing.state
-            if packet.qos is QoS.AT_LEAST_ONCE and state is InboundQoSState.WAIT_PUBACK:
+            if qos1 and state is InboundQoSState.WAIT_PUBACK:
                 return
-            if packet.qos is QoS.EXACTLY_ONCE and state in (
+            if not qos1 and state in (
                 InboundQoSState.WAIT_PUBREL,
                 InboundQoSState.WAIT_USER_ACK,
             ):
@@ -918,7 +933,7 @@ class ProtocolEngine:
         if self.inbound._inflight + len(pending) >= self.config.local_receive_maximum:
             self._protocol_disconnect(0x93)
             raise ProtocolError(
-                f"Receive Maximum exceeded by QoS {int(packet.qos)} PUBLISH received "
+                f"Receive Maximum exceeded by QoS {qos_raw} PUBLISH received "
                 "before pending PUBACK handoff"
             )
 

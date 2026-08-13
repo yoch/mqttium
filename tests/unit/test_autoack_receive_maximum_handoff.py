@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from mqttium.codec.buffer import IncrementalDecoder
+from mqttium.codec.buffer import IncrementalDecoder, RawPacket
+from mqttium.codec.primitives import pack_u16, pack_utf8
 from mqttium.codec.properties import CONNACK, encode_properties
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, PacketType, QoS
 from mqttium.packets import PublishPacket, encode_frame
@@ -138,3 +139,66 @@ def test_duplicate_qos1_before_puback_handoff_does_not_consume_second_slot() -> 
     assert len([effect for effect in effects if effect.kind is EffectKind.MESSAGE]) == 2
     assert len([effect for effect in effects if effect.kind is EffectKind.SEND]) == 2
     assert not any(effect.kind is EffectKind.PROTOCOL_ERROR for effect in effects)
+
+
+def test_malformed_pipelined_publish_is_not_receive_maximum_disconnect() -> None:
+    """A truncated follow-up PUBLISH must not become DISCONNECT 0x93."""
+    engine = _engine(receive_maximum=1)
+    _feed(engine, _publish(1))
+    engine.handle_raw(
+        RawPacket(
+            PacketType.PUBLISH,
+            0x02,
+            b"\x00\x01\xff" + pack_u16(2) + b"\x00x",
+        )
+    )
+    effects = engine.take_effects()
+    assert engine.state is ConnectionState.CONNECTED
+    error = next(effect.data for effect in effects if effect.kind is EffectKind.PROTOCOL_ERROR)
+    assert "Receive Maximum" not in error
+    assert "UTF-8" in error or "Invalid" in error
+    assert not any(effect.kind is EffectKind.DISCONNECTED for effect in effects)
+
+
+def test_mqtt5_wildcard_pipelined_publish_is_not_receive_maximum_disconnect() -> None:
+    """MQTT 5 received-topic validation must win over pending-handoff RM.
+
+    This is the differential that rejected #197: a wildcard Topic Name is valid
+    MQTT UTF-8, so a MID-only preflight classified it as Receive Maximum
+    exceeded (DISCONNECT 0x93). ``PublishPacket.decode`` validates the topic
+    after the property table, so the packet stays CONNECTED with PROTOCOL_ERROR.
+    """
+    engine = _engine(receive_maximum=1)
+    _feed(engine, _publish(1))
+    engine.handle_raw(
+        RawPacket(
+            PacketType.PUBLISH,
+            0x02,
+            pack_utf8("sensors/+/temp") + pack_u16(2) + b"\x00payload",
+        )
+    )
+    effects = engine.take_effects()
+    assert engine.state is ConnectionState.CONNECTED
+    assert not any(effect.kind is EffectKind.DISCONNECTED for effect in effects)
+    error = next(effect.data for effect in effects if effect.kind is EffectKind.PROTOCOL_ERROR)
+    assert "wildcards" in error
+    assert "Receive Maximum" not in error
+
+
+def test_mqtt5_malformed_properties_are_not_receive_maximum_disconnect() -> None:
+    """MQTT 5 property-table errors must also win over pending-handoff RM."""
+    engine = _engine(receive_maximum=1)
+    _feed(engine, _publish(1))
+    engine.handle_raw(
+        RawPacket(
+            PacketType.PUBLISH,
+            0x02,
+            pack_utf8("sensors/temp") + pack_u16(2) + b"\x01\xff",
+        )
+    )
+    effects = engine.take_effects()
+    assert engine.state is ConnectionState.CONNECTED
+    assert not any(effect.kind is EffectKind.DISCONNECTED for effect in effects)
+    error = next(effect.data for effect in effects if effect.kind is EffectKind.PROTOCOL_ERROR)
+    assert "Receive Maximum" not in error
+    assert "Unknown property" in error or "property" in error.lower()
