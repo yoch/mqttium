@@ -37,10 +37,10 @@ class EffectKind(Enum):
 class EngineEffect:
     kind: EffectKind
     data: Any = None
-    # MESSAGE only: True when application acceptance must mark a persisted
-    # inbound record delivered. Keeping this on the effect avoids inferring
-    # persistence from the current manual_ack setting during restart replay.
-    requires_delivery_mark: bool = False
+    # MESSAGE only: False explicitly means no persisted delivery mark is
+    # required, True means one is required, and None preserves the conservative
+    # legacy behavior for unclassified/internal effects constructed directly.
+    requires_delivery_mark: bool | None = None
 
 
 @dataclass(slots=True)

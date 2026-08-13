@@ -1587,8 +1587,7 @@ class AsyncClient:
             pending_delivery = self._accept_message(message, self.on_message)
             if pending_delivery is not None:
                 await pending_delivery
-            if effect.requires_delivery_mark:
-                assert message.mid is not None
+            if effect.requires_delivery_mark is not False and message.mid is not None:
                 async with self._engine_lock:
                     self._engine.mark_inbound_delivered(message.mid)
         elif kind is EffectKind.PUBLISH_COMPLETE:

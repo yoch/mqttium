@@ -44,6 +44,12 @@ must mark a persisted inbound row. The runtime consumes that fact directly:
 This makes persistence ownership explicit at the protocol/runtime boundary
 instead of reconstructing it from current configuration.
 
+For safety and compatibility, an `EngineEffect(MESSAGE, ...)` constructed without
+classification keeps `requires_delivery_mark=None`. Such an unclassified effect
+is never batch-eligible; if it has a packet identifier, the runtime preserves the
+legacy delivery-mark behavior. Only an authoritative producer setting explicit
+`False` opts a MESSAGE into the non-persisted fast path.
+
 ## Correctness validation
 
 Focused tests pin batching for QoS 0 and fresh auto-QoS1, persisted-message

@@ -391,7 +391,7 @@ class ApplicationDelivery:
             if effect.kind is not EffectKind.MESSAGE:
                 break
             message: Message = effect.data
-            if effect.requires_delivery_mark or not self._is_small(message, 1):
+            if effect.requires_delivery_mark is not False or not self._is_small(message, 1):
                 break
             if iterator_delivery and self.messages_queue.full():
                 break

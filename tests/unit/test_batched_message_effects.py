@@ -102,6 +102,28 @@ def test_batch_stops_before_half_delivering_both_mode() -> None:
     client._callback_queue.task_done()
 
 
+def test_unclassified_identified_message_is_not_batched() -> None:
+    client = AsyncClient(message_delivery="iterator")
+    unknown = EngineEffect(
+        kind=EffectKind.MESSAGE,
+        data=Message(
+            topic="hot/path",
+            payload=b"payload",
+            qos=QoS.AT_LEAST_ONCE,
+            mid=7,
+        ),
+    )
+
+    applied = client._apply_message_effect_batch_inline(
+        deque([unknown, _effect()]),
+        client._connection_epoch,
+    )
+
+    assert unknown.requires_delivery_mark is None
+    assert applied == 0
+    assert client._messages.empty()
+
+
 @pytest.mark.parametrize("qos", [QoS.AT_LEAST_ONCE, QoS.EXACTLY_ONCE])
 def test_batch_defers_persisted_acknowledged_messages(qos: QoS) -> None:
     client = AsyncClient(message_delivery="callback")
