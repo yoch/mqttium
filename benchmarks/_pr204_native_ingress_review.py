@@ -28,7 +28,7 @@ def _publish(host: str, port: int, topic: str, count: int, payload: bytes, proto
     client.max_queued_messages_set(0)
 
     def on_connect(_client, _userdata, _flags, reason_code, _properties=None):
-        if int(reason_code) != 0:
+        if reason_code.is_failure:
             raise RuntimeError(f"publisher connection refused: {reason_code}")
         connected.set()
 
