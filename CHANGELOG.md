@@ -6,6 +6,11 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- Fast-path MQTT 5 acknowledgement bodies that carry an explicit reason code
+  and no property table (three bytes), so common broker shapes such as Mosquitto
+  PUBACK/PUBREC `0x10` no longer fall through to the full packet decoder on the
+  QoS 1/2 hot path.
+
 - Batch consecutive small non-persisted MESSAGE effects (QoS 0 and fresh automatic QoS 1) directly during the inline effect drain, and skip the absent-row delivery mark for automatic QoS 1 while retaining marks for persisted replay/manual/QoS 2 records.
 
 - Hold the inbound Receive Maximum slot for an automatic QoS 1 PUBACK until

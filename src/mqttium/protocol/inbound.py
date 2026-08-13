@@ -12,7 +12,7 @@ from collections.abc import Iterator
 from typing import TYPE_CHECKING, NoReturn
 
 from mqttium.codec.buffer import RawPacket
-from mqttium.codec.packet_validation import require_nonzero_mid
+from mqttium.codec.packet_validation import require_nonzero_mid, require_reason_code
 from mqttium.codec.primitives import unpack_u16, unpack_utf8
 from mqttium.codec.properties import PUBLISH, decode_properties, encode_properties
 from mqttium.enums import InboundQoSState, MQTTProtocolVersion, PacketType, QoS
@@ -26,7 +26,7 @@ from mqttium.packets import (
     PublishPacket,
     PubRelPacket,
 )
-from mqttium.packets.acks import encode_success_ack
+from mqttium.packets.acks import _PUBREL_REASONS, encode_success_ack
 from mqttium.protocol.effects import EffectKind
 from mqttium.protocol.stats import InboundStats
 from mqttium.topics import validate_received_publish_topic
@@ -591,9 +591,18 @@ class InboundSession:
         config = self.config
         store = self.store
         remaining = raw.remaining
-        if len(remaining) == 2:
+        size = len(remaining)
+        if size == 2:
             mid = (remaining[0] << 8) | remaining[1]
             require_nonzero_mid(mid, "PUBREL")
+        elif size == 3 and config.protocol is MQTTProtocolVersion.MQTTv5:
+            # MQTT 5 may send an explicit reason code with no property table
+            # (three bytes). PUBREL reasons are only 0x00/0x92; anything else
+            # fails require_reason_code. Only MQTT 5 may take this branch:
+            # three bytes is malformed under 3.1.1.
+            mid = (remaining[0] << 8) | remaining[1]
+            require_nonzero_mid(mid, "PUBREL")
+            require_reason_code(remaining[2], _PUBREL_REASONS, "PUBREL")
         else:
             rel = PubRelPacket.decode(remaining, config.protocol)
             engine._validate_inbound_problem_information(PacketType.PUBREL, rel.properties)

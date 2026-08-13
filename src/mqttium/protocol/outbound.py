@@ -18,7 +18,7 @@ from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 from mqttium.codec.buffer import RawPacket
-from mqttium.codec.packet_validation import require_nonzero_mid
+from mqttium.codec.packet_validation import require_nonzero_mid, require_reason_code
 from mqttium.codec.properties import PUBLISH, encode_properties
 from mqttium.codec.vbi import vbi_len
 from mqttium.enums import (
@@ -42,6 +42,7 @@ from mqttium.packets import (
     PubRelPacket,
 )
 from mqttium.packets.acks import encode_success_ack
+from mqttium.packets.acks import _PUBACK_REASONS, _PUBCOMP_REASONS, _PUBREC_REASONS
 from mqttium.packets.publish import encode_publish_item
 from mqttium.persistence.memory import PagedInflightStore, TransitionInflightStore
 from mqttium.protocol.effects import EffectKind, PublishFailure, PublishHandle
@@ -565,13 +566,27 @@ class OutboundSession:
 
     def on_puback(self, raw: RawPacket) -> None:
         remaining = raw.remaining
-        if len(remaining) == 2:
-            # Success/no-properties is by far the common PUBACK shape in both
-            # MQTT versions. Avoid constructing a PubAckPacket only to recover
-            # its MID and the implicit zero reason code.
+        size = len(remaining)
+        if size == 2:
+            # Success/no-properties is the common PUBACK shape under 3.1.1, and
+            # under MQTT 5 whenever the broker omits a zero reason code. Avoid
+            # constructing a PubAckPacket only to recover its MID and the
+            # implicit zero reason code.
             mid = (remaining[0] << 8) | remaining[1]
             require_nonzero_mid(mid, "PUBACK")
             reason_code = 0
+        elif size == 3 and self.config.protocol is MQTTProtocolVersion.MQTTv5:
+            # MQTT 5 brokers routinely answer with an explicit reason code and
+            # no property table, which is three bytes rather than two. Mosquitto
+            # does exactly that, returning 0x10 (No matching subscribers)
+            # whenever nothing is subscribed to the topic, so the two-byte shape
+            # above never fired under MQTT 5 and every acknowledgement paid a
+            # full decode. Only MQTT 5 may take this branch: three bytes is
+            # malformed under 3.1.1 and must still reach the generic path.
+            mid = (remaining[0] << 8) | remaining[1]
+            require_nonzero_mid(mid, "PUBACK")
+            reason_code = remaining[2]
+            require_reason_code(reason_code, _PUBACK_REASONS, "PUBACK")
         else:
             ack = PubAckPacket.decode(remaining, self.config.protocol)
             self._engine._validate_inbound_problem_information(PacketType.PUBACK, ack.properties)
@@ -591,10 +606,23 @@ class OutboundSession:
 
     def on_pubrec(self, raw: RawPacket) -> None:
         remaining = raw.remaining
-        if len(remaining) == 2:
+        size = len(remaining)
+        if size == 2:
             mid = (remaining[0] << 8) | remaining[1]
             require_nonzero_mid(mid, "PUBREC")
             reason_code = 0
+        elif size == 3 and self.config.protocol is MQTTProtocolVersion.MQTTv5:
+            # MQTT 5 brokers routinely answer with an explicit reason code and
+            # no property table, which is three bytes rather than two. Mosquitto
+            # does exactly that, returning 0x10 (No matching subscribers)
+            # whenever nothing is subscribed to the topic, so the two-byte shape
+            # above never fired under MQTT 5 and every acknowledgement paid a
+            # full decode. Only MQTT 5 may take this branch: three bytes is
+            # malformed under 3.1.1 and must still reach the generic path.
+            mid = (remaining[0] << 8) | remaining[1]
+            require_nonzero_mid(mid, "PUBREC")
+            reason_code = remaining[2]
+            require_reason_code(reason_code, _PUBREC_REASONS, "PUBREC")
         else:
             rec = PubRecPacket.decode(remaining, self.config.protocol)
             self._engine._validate_inbound_problem_information(PacketType.PUBREC, rec.properties)
@@ -652,10 +680,20 @@ class OutboundSession:
 
     def on_pubcomp(self, raw: RawPacket) -> None:
         remaining = raw.remaining
-        if len(remaining) == 2:
+        size = len(remaining)
+        if size == 2:
             mid = (remaining[0] << 8) | remaining[1]
             require_nonzero_mid(mid, "PUBCOMP")
             reason_code = 0
+        elif size == 3 and self.config.protocol is MQTTProtocolVersion.MQTTv5:
+            # MQTT 5 may send an explicit reason code with no property table
+            # (three bytes). PUBCOMP reasons are only 0x00/0x92; anything else
+            # fails require_reason_code. Only MQTT 5 may take this branch:
+            # three bytes is malformed under 3.1.1.
+            mid = (remaining[0] << 8) | remaining[1]
+            require_nonzero_mid(mid, "PUBCOMP")
+            reason_code = remaining[2]
+            require_reason_code(reason_code, _PUBCOMP_REASONS, "PUBCOMP")
         else:
             comp = PubCompPacket.decode(remaining, self.config.protocol)
             self._engine._validate_inbound_problem_information(PacketType.PUBCOMP, comp.properties)
