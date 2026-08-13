@@ -39,15 +39,17 @@ the complete connect, subscribe, publish, callback and shutdown lifecycle. See
 | `connect` / `disconnect` / `reconnect` | Supported | Synchronous and blocking |
 | `publish` → `MQTTMessageInfo` | Supported | `wait_for_publish` propagates errors |
 | `subscribe` / `unsubscribe` | Supported | Simple `(rc, mid)` form |
-| `on_connect(client, userdata, flags, reason_code, properties)` | Supported | |
+| `on_connect(client, userdata, flags, reason_code, properties)` | Partial | Uses `ConnectFlags.session_present`; reason code remains an integer rather than Paho's `ReasonCode` object |
 | `on_disconnect(client, userdata, flags, reason_code, properties)` | Supported | Uses `DisconnectFlags` |
-| `on_message` / `message_callback_add` | Supported | Topic is a **str**; specific callbacks take precedence as in Paho |
+| `on_message` / `message_callback_add` | Supported | Topic is a **str**; specific callbacks take precedence as in Paho; callback filters are validated |
 | `on_publish(…, mid, reason_code, properties)` | Partial | Simplified reason code and properties |
 | `username_pw_set` / `will_set` / `user_data_set` | Supported | Configure before `connect` |
-| `is_connected` | Supported | |
+| `is_connected()` | Supported | Method, matching Paho |
 | `max_queued_messages_set(n)` | Supported | Bounds unfinished QoS 1/2 publications; `0` means unlimited, as in Paho |
 | `max_queued_bytes_set(n)` | **Additive** | No Paho equivalent; bounds unfinished native publications by logical bytes |
 | `max_pending_publish_requests` / `max_pending_publish_bytes` | **Additive constructor limits** | Hard bounds for requests retained in the cross-thread handoff before loop-side admission |
+
+Shared-subscription callback filters are matched literally, as in Paho: a callback registered for `$share/group/filter` does not match a delivered message whose Topic Name is `filter`.
 
 For one-shot helpers, prefer the async-native `mqttium.helpers` API instead of
 `paho.mqtt.publish` or `paho.mqtt.subscribe`.

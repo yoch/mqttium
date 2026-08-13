@@ -21,6 +21,11 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Harden the Paho VERSION2 façade: serialize `loop_start()` ownership, reject
+  blocking publish waits and disconnects from the network thread, propagate
+  QoS 0 admission failures through `MQTTMessageInfo`, restore Paho's
+  `is_connected()` method shape and `ConnectFlags`, accept `payload=None` as a
+  zero-length publish, and validate per-topic callback filters.
 - Keep automatic reconnect eligible after failed transport/CONNACK attempts, so
   the configured retry policy can reach later attempts and terminal exhaustion
   settles pending receipts; carry refused CONNACK reason codes structurally
