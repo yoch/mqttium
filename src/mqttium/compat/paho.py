@@ -343,9 +343,16 @@ class Client:
         )
         with self._loop_state_lock:
             thread = self._thread
-        if thread is not None and thread.is_alive() and not self._started.is_set():
-            self._started.wait(timeout=5.0)
-        loop = self._loop
+            started = self._started
+        if thread is not None and thread.is_alive() and not started.is_set():
+            started.wait(timeout=5.0)
+        with self._loop_state_lock:
+            # A concurrent restart may have installed another loop generation
+            # while this stop waited for the old thread to publish readiness.
+            # Never stop or clear state owned by that replacement.
+            if self._thread is not thread:
+                return
+            loop = self._loop
         if loop is not None and loop.is_running():
             if self._on_network_thread():
                 loop.stop()

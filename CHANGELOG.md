@@ -24,6 +24,9 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - Preserve the broker's terminal CONNACK refusal error when reconnect gives up,
   so pending publish receipts and admission waiters no longer receive a generic
   `Connection closed` failure during reader teardown.
+- Keep Paho `loop_stop()` scoped to the network-loop generation it observed,
+  so a concurrent restart cannot have its replacement loop stopped or cleared
+  by an older stop operation.
 - Harden MQTT-over-WebSocket teardown and handshake handling: close the TCP
   stream before any cancellable close wait, bracket IPv6 literals in the HTTP
   `Host` header, and enforce the configured handshake timeout as one total
