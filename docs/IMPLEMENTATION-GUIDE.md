@@ -34,6 +34,14 @@ The contiguous fast path may decode directly from the current input chunk. A
 packet spanning chunks falls back to the incremental buffer. Either path must
 produce the same owned packet values and errors.
 
+Codec primitives are specialized per MQTT version and bound once through
+``packets._bindings.bind_codec`` when ``ProtocolEngine`` is constructed.
+Directional sessions and engine handlers call those bound functions; they do
+not re-test ``config.protocol`` on each packet. Acknowledgement bodies treat
+the two-byte success form and the MQTT 5 three-byte explicit-reason form as
+the primary path; absent properties are ``None``. Provisional
+``mqttium.packets`` dataclasses remain factories over the same primitives.
+
 MQTT UTF-8 validation applies on both encode and decode. Topics reject wildcards
 and U+0000. Filters validate `+` and `#` placement, shared-subscription prefixes,
 and empty group names before mutating engine state.

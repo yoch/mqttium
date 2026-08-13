@@ -1,0 +1,125 @@
+"""Version-bound codec primitive table.
+
+Constructed once from ``MQTTProtocolVersion`` so sessions and the engine never
+branch on protocol per packet. Internal only — not part of ``packets.__all__``.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass
+
+from mqttium.codec.buffer import RawPacket
+from mqttium.enums import MQTTProtocolVersion, QoS
+from mqttium.errors import ProtocolError
+from mqttium.packets import _ack_v311 as ack_v311
+from mqttium.packets import _ack_v5 as ack_v5
+from mqttium.packets import _connack_v311 as connack_v311
+from mqttium.packets import _connack_v5 as connack_v5
+from mqttium.packets import _control_v311 as control_v311
+from mqttium.packets import _control_v5 as control_v5
+from mqttium.packets import _publish_v311 as publish_v311
+from mqttium.packets import _publish_v5 as publish_v5
+from mqttium.packets import _suback_v311 as suback_v311
+from mqttium.packets import _suback_v5 as suback_v5
+from mqttium.packets import _subscribe_v311 as subscribe_v311
+from mqttium.packets import _subscribe_v5 as subscribe_v5
+from mqttium.transport.writes import WriteItem
+from mqttium.types import Message, Properties
+
+
+def _auth_requires_v5(_remaining: bytes) -> tuple[int, Properties | None]:
+    raise ProtocolError("AUTH requires MQTT 5")
+
+
+@dataclass(frozen=True, slots=True)
+class CodecBindings:
+    """One closed set of specialized encode/decode callables for a protocol."""
+
+    protocol: MQTTProtocolVersion
+    is_mqtt5: bool
+
+    decode_puback: Callable[[bytes], tuple[int, int, Properties | None]]
+    decode_pubrec: Callable[[bytes], tuple[int, int, Properties | None]]
+    decode_pubrel: Callable[[bytes], tuple[int, int, Properties | None]]
+    decode_pubcomp: Callable[[bytes], tuple[int, int, Properties | None]]
+    encode_pubrel: Callable[..., bytes]
+
+    decode_connack: Callable[[bytes], tuple[bool, int, Properties | None]]
+    decode_suback: Callable[[bytes], tuple[int, tuple[int, ...], Properties | None]]
+    decode_unsuback: Callable[[bytes], tuple[int, tuple[int, ...], Properties | None]]
+    decode_disconnect: Callable[[bytes], tuple[int, Properties | None]]
+    decode_auth: Callable[[bytes], tuple[int, Properties | None]]
+
+    encode_pingreq: Callable[[], bytes]
+    encode_pingresp: Callable[[], bytes]
+    encode_disconnect: Callable[..., bytes]
+
+    encode_publish_item: Callable[..., WriteItem]
+    decode_publish_qos0: Callable[[RawPacket], Message] | None
+    decode_publish_qos12: (
+        Callable[[RawPacket], tuple[str, bytes, int, bool, bool]] | None
+    )
+    decode_publish_v5: (
+        Callable[
+            [RawPacket, QoS],
+            tuple[str, bytes, int | None, bool, bool, Properties],
+        ]
+        | None
+    )
+
+    encode_subscribe: Callable[..., bytes]
+    encode_unsubscribe: Callable[..., bytes]
+
+
+def bind_codec(protocol: MQTTProtocolVersion) -> CodecBindings:
+    """Bind every specialized primitive for *protocol* exactly once."""
+    if protocol is MQTTProtocolVersion.MQTTv5:
+        return CodecBindings(
+            protocol=protocol,
+            is_mqtt5=True,
+            decode_puback=ack_v5.decode_puback_v5,
+            decode_pubrec=ack_v5.decode_pubrec_v5,
+            decode_pubrel=ack_v5.decode_pubrel_v5,
+            decode_pubcomp=ack_v5.decode_pubcomp_v5,
+            encode_pubrel=ack_v5.encode_pubrel_v5,
+            decode_connack=connack_v5.decode_connack_v5,
+            decode_suback=suback_v5.decode_suback_v5,
+            decode_unsuback=suback_v5.decode_unsuback_v5,
+            decode_disconnect=control_v5.decode_disconnect_v5,
+            decode_auth=control_v5.decode_auth_v5,
+            encode_pingreq=control_v5.encode_pingreq,
+            encode_pingresp=control_v5.encode_pingresp,
+            encode_disconnect=control_v5.encode_disconnect_v5,
+            encode_publish_item=publish_v5.encode_publish_item_v5,
+            decode_publish_qos0=None,
+            decode_publish_qos12=None,
+            decode_publish_v5=publish_v5.decode_publish_fields_v5,
+            encode_subscribe=subscribe_v5.encode_subscribe_v5,
+            encode_unsubscribe=subscribe_v5.encode_unsubscribe_v5,
+        )
+    # MQTT 3.1.1 and the MQTT 3.1 leftover share the 3.1.1 acknowledgement and
+    # control shapes; PUBLISH ingress for 3.1 still uses PublishPacket.decode.
+    return CodecBindings(
+        protocol=protocol,
+        is_mqtt5=False,
+        decode_puback=ack_v311.decode_puback_v311,
+        decode_pubrec=ack_v311.decode_pubrec_v311,
+        decode_pubrel=ack_v311.decode_pubrel_v311,
+        decode_pubcomp=ack_v311.decode_pubcomp_v311,
+        encode_pubrel=ack_v311.encode_pubrel_v311,
+        decode_connack=connack_v311.decode_connack_v311,
+        decode_suback=suback_v311.decode_suback_v311,
+        decode_unsuback=suback_v311.decode_unsuback_v311,
+        decode_disconnect=control_v311.decode_disconnect_v311,
+        decode_auth=_auth_requires_v5,
+        encode_pingreq=control_v311.encode_pingreq,
+        encode_pingresp=control_v311.encode_pingresp,
+        encode_disconnect=control_v311.encode_disconnect_v311,
+        encode_publish_item=publish_v311.encode_publish_item_v311,
+        decode_publish_qos0=publish_v311.decode_qos0_message_v311,
+        decode_publish_qos12=publish_v311.decode_qos12_fields_v311,
+        decode_publish_v5=None,
+        encode_subscribe=subscribe_v311.encode_subscribe_v311,
+        encode_unsubscribe=subscribe_v311.encode_unsubscribe_v311,
+    )

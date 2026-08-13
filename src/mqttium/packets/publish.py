@@ -1,18 +1,23 @@
-"""PUBLISH encode/decode."""
+"""PUBLISH encode/decode.
+
+Specialized v3.1.1 / v5.0 primitives own the common encode and inbound field
+decode paths. ``PublishPacket`` remains the Provisional typed view and the
+MQTT 3.1 fallback decoder.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
 from mqttium.codec.packet_validation import require_nonzero_mid
-from mqttium.codec.primitives import encode_utf8, unpack_utf8, unpack_u16
+from mqttium.codec.primitives import unpack_utf8, unpack_u16
 from mqttium.codec.properties import PUBLISH, decode_properties
-from mqttium.codec.vbi import MAX_VBI, append_vbi
-from mqttium.enums import MQTTProtocolVersion, PacketType, QoS
-from mqttium.errors import MalformedPacketError, PacketTooLargeError, ProtocolError
-from mqttium.packets._common import _props_or_empty, _require_outbound_mid
+from mqttium.enums import MQTTProtocolVersion, QoS
+from mqttium.errors import MalformedPacketError
+from mqttium.packets._publish_v311 import encode_publish_item_v311
+from mqttium.packets._publish_v5 import encode_publish_item_v5
 from mqttium.topics import validate_received_publish_topic
-from mqttium.transport.writes import SEGMENT_THRESHOLD, WriteItem
+from mqttium.transport.writes import WriteItem
 from mqttium.types import Properties
 
 
@@ -29,53 +34,27 @@ def encode_publish_item(
     _topic_bytes: bytes | None = None,
 ) -> WriteItem:
     """Validate and encode one outbound PUBLISH exactly once."""
-
-    # Every internal caller has already validated and converted, so the common
-    # case is an exact QoS member. Re-running the enum call on it costs about
-    # 0.32 us -- roughly 4% of a QoS 0 publication -- to return its argument.
-    if type(qos) is QoS:
-        level = qos
-    else:
-        try:
-            level = QoS(qos)
-        except ValueError as exc:
-            raise ProtocolError(f"Invalid PUBLISH QoS {qos!r}") from exc
-    if level and mid is None:
-        raise ProtocolError("QoS > 0 PUBLISH requires a packet identifier")
-    if level == QoS.AT_MOST_ONCE and mid is not None:
-        raise ProtocolError("QoS 0 PUBLISH must not carry a packet identifier")
-    if level == QoS.AT_MOST_ONCE and dup:
-        raise ProtocolError("QoS 0 PUBLISH must not set DUP")
-    if mid is not None:
-        _require_outbound_mid(mid, PUBLISH)
-
-    flags = (int(level) << 1) | (0x01 if retain else 0) | (0x08 if dup else 0)
-    topic_bytes = encode_utf8(topic) if _topic_bytes is None else _topic_bytes
-    topic_size = len(topic_bytes)
-    props = _props_or_empty(properties, PUBLISH, protocol)
-    payload_size = len(payload)
-    remaining_length = 2 + topic_size + (2 if level else 0) + len(props) + payload_size
-    if remaining_length > MAX_VBI:
-        raise PacketTooLargeError(
-            f"PUBLISH remaining length {remaining_length} exceeds MQTT wire maximum {MAX_VBI}"
+    if protocol is MQTTProtocolVersion.MQTTv5:
+        return encode_publish_item_v5(
+            topic,
+            payload,
+            qos=qos,
+            retain=retain,
+            dup=dup,
+            mid=mid,
+            properties=properties,
+            _topic_bytes=_topic_bytes,
         )
-
-    header = bytearray()
-    header.append(int(PacketType.PUBLISH) | flags)
-    append_vbi(header, remaining_length)
-    header.append((topic_size >> 8) & 0xFF)
-    header.append(topic_size & 0xFF)
-    header.extend(topic_bytes)
-    if level:
-        assert mid is not None
-        header.append((mid >> 8) & 0xFF)
-        header.append(mid & 0xFF)
-    header.extend(props)
-
-    if payload_size >= SEGMENT_THRESHOLD:
-        return bytes(header), bytes(payload)
-    header.extend(payload)
-    return bytes(header)
+    return encode_publish_item_v311(
+        topic,
+        payload,
+        qos=qos,
+        retain=retain,
+        dup=dup,
+        mid=mid,
+        properties=properties,
+        _topic_bytes=_topic_bytes,
+    )
 
 
 @dataclass(slots=True, frozen=True)
