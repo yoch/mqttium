@@ -34,7 +34,7 @@ jobs:
           cat >/tmp/pr204-mosquitto.conf <<'MOSQ'
           persistence false
           allow_anonymous true
-          max_inflight_messages 1000
+          max_inflight_messages 64
           max_queued_messages 100000
           max_queued_bytes 0
           connection_messages false
