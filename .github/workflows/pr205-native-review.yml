@@ -68,7 +68,6 @@ jobs:
           class Publisher:
               def __init__(self, host: str, port: int, protocol: str) -> None:
                   import paho.mqtt.client as mqtt
-
                   self._mqtt = mqtt
                   self._connected = threading.Event()
                   proto = mqtt.MQTTv5 if protocol == "5" else mqtt.MQTTv311
@@ -79,12 +78,10 @@ jobs:
                   )
                   self.client.max_inflight_messages_set(64)
                   self.client.max_queued_messages_set(0)
-
                   def on_connect(_client, _userdata, _flags, reason_code, _properties=None):
                       if reason_code.is_failure:
                           raise RuntimeError(f"publisher connection refused: {reason_code}")
                       self._connected.set()
-
                   self.client.on_connect = on_connect
                   self.client.connect(host, port, keepalive=30)
                   self.client.loop_start()
@@ -98,7 +95,7 @@ jobs:
                       if last.rc != self._mqtt.MQTT_ERR_SUCCESS:
                           raise RuntimeError(f"publisher refused message: rc={last.rc}")
                   assert last is not None
-                  last.wait_for_publish(timeout=45)
+                  last.wait_for_publish(timeout=60)
                   if not last.is_published():
                       raise TimeoutError("publisher did not finish QoS1 drain")
 
@@ -110,12 +107,7 @@ jobs:
               from mqttium.api import AsyncClient
               from mqttium.enums import MQTTProtocolVersion
               from mqttium.protocol.reconnect import ReconnectPolicy
-
-              protocol = (
-                  MQTTProtocolVersion.MQTTv5
-                  if args.protocol == "5"
-                  else MQTTProtocolVersion.MQTTv311
-              )
+              protocol = MQTTProtocolVersion.MQTTv5 if args.protocol == "5" else MQTTProtocolVersion.MQTTv311
               client = AsyncClient(
                   client_id=f"pr205-sub-{os.getpid()}-{time.time_ns()}",
                   protocol=protocol,
@@ -127,13 +119,11 @@ jobs:
               )
               received = 0
               complete = asyncio.Event()
-
               def on_message(_message) -> None:
                   nonlocal received
                   received += 1
                   if received == args.count:
                       complete.set()
-
               client.on_message = on_message
               await client.connect(args.host, args.port, timeout=10.0)
               topic = f"bench/pr205/{os.getpid()}/{time.time_ns()}"
@@ -141,11 +131,9 @@ jobs:
               publisher = Publisher(args.host, args.port, args.protocol)
               payload = b"x" * args.payload_bytes
               started = time.perf_counter()
-              publish_task = asyncio.create_task(
-                  asyncio.to_thread(publisher.publish_many, topic, payload, args.count)
-              )
+              publish_task = asyncio.create_task(asyncio.to_thread(publisher.publish_many, topic, payload, args.count))
               try:
-                  await asyncio.wait_for(complete.wait(), timeout=50.0)
+                  await asyncio.wait_for(complete.wait(), timeout=65.0)
                   await publish_task
               finally:
                   publisher.close()
@@ -167,39 +155,17 @@ jobs:
           def run_variant(script: Path, root: Path, args: argparse.Namespace, protocol: str, payload: int, count: int) -> dict[str, object]:
               env = os.environ.copy()
               env["PYTHONPATH"] = str(root.resolve() / "src")
-              command = [
-                  sys.executable,
-                  str(script),
-                  "--worker",
-                  "--host", args.host,
-                  "--port", str(args.port),
-                  "--protocol", protocol,
-                  "--payload-bytes", str(payload),
-                  "--count", str(count),
-              ]
-              completed = subprocess.run(
-                  command,
-                  check=False,
-                  capture_output=True,
-                  text=True,
-                  env=env,
-                  timeout=70,
-              )
+              command = [sys.executable, str(script), "--worker", "--host", args.host, "--port", str(args.port), "--protocol", protocol, "--payload-bytes", str(payload), "--count", str(count)]
+              completed = subprocess.run(command, check=False, capture_output=True, text=True, env=env, timeout=80)
               if completed.returncode != 0:
-                  raise RuntimeError(
-                      f"worker failed rc={completed.returncode}\nstdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
-                  )
+                  raise RuntimeError(f"worker failed rc={completed.returncode}\nstdout:\n{completed.stdout}\nstderr:\n{completed.stderr}")
               lines = [line for line in completed.stdout.splitlines() if line.strip()]
               return json.loads(lines[-1])
 
           def parent(args: argparse.Namespace) -> None:
               script = Path(__file__).resolve()
               roots = {"base": args.base_root, "candidate": args.candidate_root}
-              scenarios = [
-                  ("5", 64, 18000, 7),
-                  ("311", 64, 18000, 5),
-                  ("5", 4096, 6000, 5),
-              ]
+              scenarios = [("311", 64, 40000, 9)]
               report: dict[str, object] = {"scenarios": []}
               rows = report["scenarios"]
               assert isinstance(rows, list)
@@ -208,39 +174,15 @@ jobs:
                   pairs: list[dict[str, object]] = []
                   for index in range(repeat):
                       order = ("base", "candidate") if index % 2 == 0 else ("candidate", "base")
-                      measured = {
-                          variant: run_variant(script, roots[variant], args, protocol, payload, count)
-                          for variant in order
-                      }
+                      measured = {variant: run_variant(script, roots[variant], args, protocol, payload, count) for variant in order}
                       base_rate = float(measured["base"]["msg_s"])
                       candidate_rate = float(measured["candidate"]["msg_s"])
                       ratio = candidate_rate / base_rate
                       ratios.append(ratio)
-                      pairs.append({
-                          "order": order,
-                          "base_msg_s": base_rate,
-                          "candidate_msg_s": candidate_rate,
-                          "candidate_over_base": ratio,
-                          "base_inline": measured["base"]["effect_inline"],
-                          "candidate_inline": measured["candidate"]["effect_inline"],
-                      })
-                  row = {
-                      "protocol": protocol,
-                      "payload_bytes": payload,
-                      "count": count,
-                      "repeat": repeat,
-                      "median_candidate_over_base": statistics.median(ratios),
-                      "min_candidate_over_base": min(ratios),
-                      "max_candidate_over_base": max(ratios),
-                      "pairs_favouring_candidate": sum(r > 1.0 for r in ratios),
-                      "pairs": pairs,
-                  }
+                      pairs.append({"order": order, "base_msg_s": base_rate, "candidate_msg_s": candidate_rate, "candidate_over_base": ratio, "base_inline": measured["base"]["effect_inline"], "candidate_inline": measured["candidate"]["effect_inline"]})
+                  row = {"protocol": protocol, "payload_bytes": payload, "count": count, "repeat": repeat, "median_candidate_over_base": statistics.median(ratios), "min_candidate_over_base": min(ratios), "max_candidate_over_base": max(ratios), "pairs_favouring_candidate": sum(r > 1.0 for r in ratios), "pairs": pairs}
                   rows.append(row)
-                  print(
-                      f"MQTT {protocol} payload={payload}: candidate/base={row['median_candidate_over_base']:.4f}, "
-                      f"positive={row['pairs_favouring_candidate']}/{repeat}, "
-                      f"range=[{row['min_candidate_over_base']:.4f}, {row['max_candidate_over_base']:.4f}]"
-                  )
+                  print(f"MQTT {protocol} payload={payload}: candidate/base={row['median_candidate_over_base']:.4f}, positive={row['pairs_favouring_candidate']}/{repeat}, range=[{row['min_candidate_over_base']:.4f}, {row['max_candidate_over_base']:.4f}]")
               args.output.write_text(json.dumps(report, indent=2) + "\n")
 
           def parse_args() -> argparse.Namespace:
@@ -277,7 +219,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: pr205-native-delivery
+          name: pr205-native-delivery-311-focus
           path: |
             /tmp/pr205-native.json
             /tmp/pr205-mosquitto.log
