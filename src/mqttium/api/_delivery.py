@@ -15,7 +15,7 @@ from typing import Any, Literal
 
 from mqttium.api.stats import DeliveryStats
 from mqttium.codec.properties import PUBLISH, encode_properties
-from mqttium.enums import MQTTProtocolVersion, QoS
+from mqttium.enums import MQTTProtocolVersion
 from mqttium.errors import MessageDeliveryError
 from mqttium.protocol.effects import EffectKind, EngineEffect
 from mqttium.types import Message
@@ -382,9 +382,6 @@ class ApplicationDelivery:
     ) -> int:
         if len(effects) < 2:
             return 0
-        first: Message = effects[0].data
-        if first.qos != QoS.AT_MOST_ONCE:
-            return 0
         callback_delivery, iterator_delivery = self._modes(callback)
         if not callback_delivery and not iterator_delivery:
             return 0
@@ -394,7 +391,7 @@ class ApplicationDelivery:
             if effect.kind is not EffectKind.MESSAGE:
                 break
             message: Message = effect.data
-            if message.qos != QoS.AT_MOST_ONCE or not self._is_small(message, 1):
+            if effect.requires_delivery_mark is not False or not self._is_small(message, 1):
                 break
             if iterator_delivery and self.messages_queue.full():
                 break

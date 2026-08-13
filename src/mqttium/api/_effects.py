@@ -145,6 +145,19 @@ class EffectPump:
         if self.waiters:
             self.progress.set()
 
+    def _consume_message_batch(self, epoch: int) -> bool:
+        """Apply a consecutive non-persisted small-MESSAGE prefix."""
+        applied = self.owner._apply_message_effect_batch_inline(self.pending, epoch)
+        if not applied:
+            return False
+        for _ in range(applied):
+            self.pending.popleft()
+            self.inline_effects += 1
+            self._complete()
+        if not self.pending:
+            self.pending_epoch = None
+        return True
+
     def drain_inline(self) -> None:
         if self.draining_inline or self.lock.locked():
             return
@@ -160,6 +173,10 @@ class EffectPump:
         try:
             while self.pending:
                 effect = self.pending[0]
+                if effect.kind is EffectKind.MESSAGE:
+                    if self._consume_message_batch(epoch):
+                        continue
+                    break
                 if not self.owner._apply_effect_inline(effect, epoch):
                     break
                 self.pending.popleft()
@@ -195,16 +212,7 @@ class EffectPump:
                         self.discard_connection_effects()
                         continue
                     if effect.kind is EffectKind.MESSAGE:
-                        applied_inline = self.owner._apply_message_effect_batch_inline(
-                            self.pending, epoch
-                        )
-                        if applied_inline:
-                            for _ in range(applied_inline):
-                                self.pending.popleft()
-                                self.inline_effects += 1
-                                self._complete()
-                            if not self.pending:
-                                self.pending_epoch = None
+                        if self._consume_message_batch(epoch):
                             continue
                     try:
                         await self.owner._apply_effect(effect, nowait=False, epoch=epoch)

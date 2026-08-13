@@ -468,6 +468,7 @@ class InboundSession:
                 mid=mid,
                 properties=properties,
             ),
+            requires_delivery_mark=True,
         )
 
     def _on_qos1(
@@ -574,6 +575,7 @@ class InboundSession:
                 mid=mid,
                 properties=properties,
             ),
+            requires_delivery_mark=config.manual_ack,
         )
         if not config.manual_ack:
             self._pending_auto_qos1_mids.add(mid)
@@ -813,6 +815,7 @@ class InboundSession:
                 mid=inbound.mid,
                 properties=inbound.properties,
             ),
+            requires_delivery_mark=True,
         )
 
     # --- aliases and Receive Maximum --------------------------------------
