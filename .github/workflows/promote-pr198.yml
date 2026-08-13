@@ -1,0 +1,45 @@
+name: Promote PR198
+on:
+  push:
+    branches: [review/perf-cursor-batch]
+permissions:
+  contents: write
+jobs:
+  promote:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - name: Apply reviewed PR198 delta
+        run: |
+          git diff c34a9499ed2723054c2e0d3b730248f176be0856..origin/cursor/v311-qos2-decode-6aff -- src tests docs > /tmp/pr198.patch
+          git apply --3way --whitespace=error-all /tmp/pr198.patch
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('CHANGELOG.md')
+          text=p.read_text()
+          marker='## [Unreleased]\n'
+          note='\n- Optimize MQTT 3.1.1 inbound QoS 2 PUBLISH decoding by reusing the specialized QoS 1/2 field parser, avoiding a transient `PublishPacket` without changing QoS 2 state semantics.\n'
+          if note.strip() not in text:
+              text=text.replace(marker, marker+note, 1)
+              p.write_text(text)
+          PY
+          git diff --check
+      - run: python -m pip install -e ".[dev,security]"
+      - run: ruff format --check src tests benchmarks
+      - run: ruff check src tests benchmarks
+      - run: mypy src/mqttium
+      - run: bandit -q -ll -r src
+      - run: python -m pytest -q tests/unit
+      - name: Commit clean branch
+        run: |
+          git config user.name yoch
+          git config user.email yoch.melka@gmail.com
+          git add CHANGELOG.md docs src tests
+          git commit -m "Optimize MQTT 3.1.1 QoS 2 PUBLISH decoding"
+          git push --force origin HEAD:cursor/v311-qos2-decode-6aff
