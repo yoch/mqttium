@@ -12,9 +12,7 @@ from collections.abc import Iterator
 from typing import TYPE_CHECKING, NoReturn
 
 from mqttium.codec.buffer import RawPacket
-from mqttium.codec.packet_validation import require_nonzero_mid, require_reason_code
-from mqttium.codec.primitives import unpack_u16, unpack_utf8
-from mqttium.codec.properties import PUBLISH, decode_properties, encode_properties
+from mqttium.codec.properties import PUBLISH, encode_properties
 from mqttium.enums import InboundQoSState, MQTTProtocolVersion, PacketType, QoS
 from mqttium.errors import MalformedPacketError, ProtocolError
 from mqttium.persistence.memory import (
@@ -24,9 +22,8 @@ from mqttium.persistence.memory import (
 )
 from mqttium.packets import (
     PublishPacket,
-    PubRelPacket,
 )
-from mqttium.packets.acks import _PUBREL_REASONS, encode_success_ack
+from mqttium.packets.acks import encode_success_ack
 from mqttium.protocol.effects import EffectKind
 from mqttium.protocol.stats import InboundStats
 from mqttium.topics import validate_received_publish_topic
@@ -87,60 +84,6 @@ class InboundReplayCursor:
         self._pending = message
 
 
-def _decode_v311_qos0_message(raw: RawPacket) -> Message:
-    if raw.flags & 0x08:
-        raise MalformedPacketError("QoS 0 PUBLISH must not set DUP")
-    topic, payload_pos = unpack_utf8(raw.remaining)
-    validate_received_publish_topic(topic, utf8_validated=True)
-    return Message(
-        topic=topic,
-        payload=raw.remaining[payload_pos:],
-        qos=QoS.AT_MOST_ONCE,
-        retain=bool(raw.flags & 0x01),
-        dup=False,
-        mid=None,
-        properties=None,
-    )
-
-
-def _decode_v311_qos1_fields(
-    raw: RawPacket,
-) -> tuple[str, bytes, int, bool, bool]:
-    """Decode MQTT 3.1.1 QoS 1/2 PUBLISH fields (identical wire layout)."""
-    topic, pos = unpack_utf8(raw.remaining)
-    validate_received_publish_topic(topic, utf8_validated=True)
-    mid, pos = unpack_u16(raw.remaining, pos)
-    require_nonzero_mid(mid, "PUBLISH")
-    return topic, raw.remaining[pos:], mid, bool(raw.flags & 0x01), bool(raw.flags & 0x08)
-
-
-def _decode_v5_publish_fields(
-    raw: RawPacket,
-    qos: QoS,
-) -> tuple[str, bytes, int | None, bool, bool, Properties]:
-    """Decode MQTT 5 PUBLISH fields without constructing a PublishPacket."""
-
-    dup = bool(raw.flags & 0x08)
-    if qos is QoS.AT_MOST_ONCE and dup:
-        raise MalformedPacketError("QoS 0 PUBLISH must not set DUP")
-    topic, pos = unpack_utf8(raw.remaining)
-    mid: int | None = None
-    if qos:
-        mid, pos = unpack_u16(raw.remaining, pos)
-        require_nonzero_mid(mid, "PUBLISH")
-    properties, pos = decode_properties(raw.remaining, pos, PUBLISH)
-    # Preserve #128: a non-empty Topic Name must be validated before it can
-    # establish or replace a connection-scoped Topic Alias.
-    validate_received_publish_topic(topic, utf8_validated=True)
-    return (
-        topic,
-        raw.remaining[pos:],
-        mid,
-        bool(raw.flags & 0x01),
-        dup,
-        properties,
-    )
-
 
 class InboundSession:
     """Authoritative inbound QoS and connection-scoped alias state."""
@@ -148,6 +91,7 @@ class InboundSession:
     __slots__ = (
         "_aliases",
         "_bounded_replay_store",
+        "_decode_pubrel",
         "_engine",
         "_inflight",
         "_paged_store",
@@ -175,6 +119,7 @@ class InboundSession:
         self._bounded_replay_store = (
             self.store if isinstance(self.store, BoundedInboundReplayStore) else None
         )
+        self._decode_pubrel = engine.codec.decode_pubrel
         self._aliases: dict[int, str] = {}
         self._inflight = 0
         # Auto-ACK QoS 1 identifiers whose PUBACK is still inside the current
@@ -288,12 +233,15 @@ class InboundSession:
         engine = self._engine
         config = self.config
         qos_raw = (raw.flags >> 1) & 0x03
-        if config.protocol is MQTTProtocolVersion.MQTTv311:
+        codec = engine.codec
+        if codec.protocol is MQTTProtocolVersion.MQTTv311:
+            assert codec.decode_publish_qos0 is not None
+            assert codec.decode_publish_qos12 is not None
             if qos_raw == int(QoS.AT_MOST_ONCE):
-                engine._emit(EffectKind.MESSAGE, _decode_v311_qos0_message(raw))
+                engine._emit(EffectKind.MESSAGE, codec.decode_publish_qos0(raw))
                 return
             if qos_raw == int(QoS.AT_LEAST_ONCE):
-                topic, payload, mid, retain, dup = _decode_v311_qos1_fields(raw)
+                topic, payload, mid, retain, dup = codec.decode_publish_qos12(raw)
                 self._on_qos1(
                     topic=topic,
                     payload=payload,
@@ -304,7 +252,7 @@ class InboundSession:
                 )
                 return
             if qos_raw == int(QoS.EXACTLY_ONCE):
-                topic, payload, mid, retain, dup = _decode_v311_qos1_fields(raw)
+                topic, payload, mid, retain, dup = codec.decode_publish_qos12(raw)
                 self._on_qos2(
                     topic=topic,
                     payload=payload,
@@ -314,11 +262,12 @@ class InboundSession:
                     properties=None,
                 )
                 return
-        elif config.protocol is MQTTProtocolVersion.MQTTv5:
+        elif codec.is_mqtt5:
             if qos_raw == 3:
                 raise MalformedPacketError("Invalid PUBLISH QoS 3")
             qos = QoS(qos_raw)
-            topic, payload, decoded_mid, retain, dup, properties = _decode_v5_publish_fields(
+            assert codec.decode_publish_v5 is not None
+            topic, payload, decoded_mid, retain, dup, properties = codec.decode_publish_v5(
                 raw, qos
             )
             topic = self._resolve_topic_fields(topic, properties)
@@ -590,23 +539,9 @@ class InboundSession:
         engine = self._engine
         config = self.config
         store = self.store
-        remaining = raw.remaining
-        size = len(remaining)
-        if size == 2:
-            mid = (remaining[0] << 8) | remaining[1]
-            require_nonzero_mid(mid, "PUBREL")
-        elif size == 3 and config.protocol is MQTTProtocolVersion.MQTTv5:
-            # MQTT 5 may send an explicit reason code with no property table
-            # (three bytes). PUBREL reasons are only 0x00/0x92; anything else
-            # fails require_reason_code. Only MQTT 5 may take this branch:
-            # three bytes is malformed under 3.1.1.
-            mid = (remaining[0] << 8) | remaining[1]
-            require_nonzero_mid(mid, "PUBREL")
-            require_reason_code(remaining[2], _PUBREL_REASONS, "PUBREL")
-        else:
-            rel = PubRelPacket.decode(remaining, config.protocol)
-            engine._validate_inbound_problem_information(PacketType.PUBREL, rel.properties)
-            mid = rel.mid
+        mid, _reason_code, properties = self._decode_pubrel(raw.remaining)
+        if properties is not None:
+            engine._validate_inbound_problem_information(PacketType.PUBREL, properties)
         transitions = self._transitions
         if transitions is not None:
             meta = transitions.in_meta(mid)

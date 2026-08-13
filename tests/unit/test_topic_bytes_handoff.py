@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import mqttium.packets.publish as publish_module
+import mqttium.packets._publish_v5 as publish_v5_module
 import mqttium.protocol.outbound as outbound_module
 import mqttium.topics as topics_module
 
@@ -21,7 +21,7 @@ def test_qos0_validation_hands_topic_bytes_to_encoder(monkeypatch) -> None:
     validation_calls = 0
     encoder_calls = 0
     original_validation_encode = topics_module.encode_utf8
-    original_packet_encode = publish_module.encode_utf8
+    original_packet_encode = publish_v5_module.encode_utf8
 
     def validation_encode(topic: str) -> bytes:
         nonlocal validation_calls
@@ -34,7 +34,7 @@ def test_qos0_validation_hands_topic_bytes_to_encoder(monkeypatch) -> None:
         return original_packet_encode(topic)
 
     monkeypatch.setattr(topics_module, "encode_utf8", validation_encode)
-    monkeypatch.setattr(publish_module, "encode_utf8", packet_encode)
+    monkeypatch.setattr(publish_v5_module, "encode_utf8", packet_encode)
 
     engine = _connected_engine()
     item = engine.outbound.prepare_qos0("capteurs/été/température", b"payload")

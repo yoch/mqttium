@@ -6,6 +6,12 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- Specialize encode/decode primitives per MQTT version across acknowledgements,
+  PUBLISH, CONNACK, SUBACK/UNSUBACK, CONNECT/SUBSCRIBE, and control packets,
+  bind them once via `packets._bindings.bind_codec` on `ProtocolEngine`
+  construction, and keep Provisional packet dataclasses as factories over those
+  primitives so hot handlers no longer re-test protocol per packet.
+
 - Fast-path MQTT 5 acknowledgement bodies that carry an explicit reason code
   and no property table (three bytes), so common broker shapes such as Mosquitto
   PUBACK/PUBREC `0x10` no longer fall through to the full packet decoder on the
