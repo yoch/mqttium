@@ -21,6 +21,10 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Harden MQTT-over-WebSocket teardown and handshake handling: close the TCP
+  stream before any cancellable close wait, bracket IPv6 literals in the HTTP
+  `Host` header, and enforce the configured handshake timeout as one total
+  deadline instead of resetting it for each received chunk.
 - Local MQTT protocol failures now complete teardown even when the negotiated
   Maximum Packet Size prevents sending the normative DISCONNECT, close the
   runtime transport, and surface CONNACK validation failures to `connect()`
