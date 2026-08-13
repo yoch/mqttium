@@ -234,8 +234,20 @@ class ProtocolEngine:
     ) -> bool:
         return self.outbound.can_ever_admit_many(messages)
 
-    def _emit(self, kind: EffectKind, data: Any = None) -> None:
-        self._effects.append(EngineEffect(kind=kind, data=data))
+    def _emit(
+        self,
+        kind: EffectKind,
+        data: Any = None,
+        *,
+        requires_delivery_mark: bool = False,
+    ) -> None:
+        self._effects.append(
+            EngineEffect(
+                kind=kind,
+                data=data,
+                requires_delivery_mark=requires_delivery_mark,
+            )
+        )
 
     def _send(self, packet: WriteItem) -> None:
         self._emit(EffectKind.SEND, packet)

@@ -6,6 +6,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- Batch consecutive small non-persisted MESSAGE effects (QoS 0 and fresh automatic QoS 1) directly during the inline effect drain, and skip the absent-row delivery mark for automatic QoS 1 while retaining marks for persisted replay/manual/QoS 2 records.
+
 - Hold the inbound Receive Maximum slot for an automatic QoS 1 PUBACK until
   the effect batch is handed off, so pipelined PUBLISH packets are admitted by
   the ordinary acquire path instead of a second decode that reconstructed the

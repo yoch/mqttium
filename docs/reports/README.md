@@ -97,6 +97,7 @@ implemented — the report exists so the choice stays falsifiable.
 
 | Date | Report | Question answered |
 | --- | --- | --- |
+| 2026-08-13 | [`AUTO-QOS1-MESSAGE-BATCH-DELIVERY.md`](AUTO-QOS1-MESSAGE-BATCH-DELIVERY.md) | Can fresh automatic QoS 1 MESSAGE effects share the small-message inline batch without weakening persisted replay semantics? |
 | 2026-08-13 | [`RM-SLOT-UNTIL-HANDOFF.md`](RM-SLOT-UNTIL-HANDOFF.md) | Should auto-ACK QoS 1 keep the Receive Maximum slot until `take_effects()` instead of reconstructing occupancy with a second decode? |
 | 2026-08-12 | [`QOS2-V311-DECODE.md`](QOS2-V311-DECODE.md) | Should inbound MQTT 3.1.1 QoS 2 PUBLISH use the same field decoder as QoS 1? |
 | 2026-08-12 | [`ACK-SUCCESS-FASTPATH.md`](ACK-SUCCESS-FASTPATH.md) | Can common success/no-properties acknowledgement frames bypass transient packet objects without weakening long-form MQTT 5 validation? |

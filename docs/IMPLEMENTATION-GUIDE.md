@@ -169,7 +169,11 @@ admit.
 
 User callbacks run outside engine critical sections. Exceptions are isolated and
 reported through the established callback policy; they do not stop the protocol
-reader or leak delivery capacity.
+reader or leak delivery capacity. Consecutive small MESSAGE effects that require
+no persisted delivery mark (QoS 0 and fresh automatic QoS 1) may transfer to the
+bounded callback/iterator queues during the inline effect drain. Persisted QoS 1,
+QoS 2 and replay deliveries keep the established awaited path and are marked only
+after application delivery accepts them.
 
 ## Persistence
 
