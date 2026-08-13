@@ -24,7 +24,7 @@ def _publish(host: str, port: int, topic: str, count: int, payload: bytes, proto
         client_id=f"pr204-pub-{os.getpid()}-{time.time_ns()}",
         protocol=proto,
     )
-    client.max_inflight_messages_set(1000)
+    client.max_inflight_messages_set(32)
     client.max_queued_messages_set(0)
 
     def on_connect(_client, _userdata, _flags, reason_code, _properties=None):
@@ -44,7 +44,7 @@ def _publish(host: str, port: int, topic: str, count: int, payload: bytes, proto
             if last.rc != mqtt.MQTT_ERR_SUCCESS:
                 raise RuntimeError(f"publisher refused message: rc={last.rc}")
         assert last is not None
-        last.wait_for_publish(timeout=30)
+        last.wait_for_publish(timeout=20)
         if not last.is_published():
             raise TimeoutError("publisher did not finish QoS1 drain")
     finally:
@@ -61,7 +61,7 @@ async def _worker(args: argparse.Namespace) -> dict[str, object]:
     client = AsyncClient(
         client_id=f"pr204-sub-{os.getpid()}-{time.time_ns()}",
         protocol=protocol,
-        local_receive_maximum=1000,
+        local_receive_maximum=256,
         message_delivery="callback",
         max_pending_callbacks=max(4096, args.count + 256),
         max_pending_delivery_bytes=None,
@@ -93,8 +93,13 @@ async def _worker(args: argparse.Namespace) -> dict[str, object]:
             args.protocol,
         )
     )
-    await asyncio.wait_for(complete.wait(), timeout=45.0)
-    await publish_task
+    try:
+        await asyncio.wait_for(complete.wait(), timeout=20.0)
+        await publish_task
+    except BaseException:
+        if not publish_task.done():
+            publish_task.cancel()
+        raise
     elapsed = time.perf_counter() - started
     stats = client.stats()
     await client.disconnect()
@@ -111,7 +116,14 @@ async def _worker(args: argparse.Namespace) -> dict[str, object]:
     }
 
 
-def _run_variant(script: Path, root: Path, args: argparse.Namespace, protocol: str, payload: int, count: int) -> dict[str, object]:
+def _run_variant(
+    script: Path,
+    root: Path,
+    args: argparse.Namespace,
+    protocol: str,
+    payload: int,
+    count: int,
+) -> dict[str, object]:
     env = os.environ.copy()
     env["PYTHONPATH"] = str(root.resolve() / "src")
     command = [
@@ -129,7 +141,20 @@ def _run_variant(script: Path, root: Path, args: argparse.Namespace, protocol: s
         "--count",
         str(count),
     ]
-    completed = subprocess.run(command, check=True, capture_output=True, text=True, env=env, timeout=60)
+    completed = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=35,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"worker failed rc={completed.returncode}\n"
+            f"stdout:\n{completed.stdout}\n"
+            f"stderr:\n{completed.stderr}"
+        )
     lines = [line for line in completed.stdout.splitlines() if line.strip()]
     return json.loads(lines[-1])
 
@@ -137,7 +162,12 @@ def _run_variant(script: Path, root: Path, args: argparse.Namespace, protocol: s
 def _parent(args: argparse.Namespace) -> None:
     script = Path(__file__).resolve()
     roots = {"base": args.base_root, "candidate": args.candidate_root}
-    scenarios = [("311", 64, 12000), ("5", 64, 12000), ("311", 4096, 4000), ("5", 4096, 4000)]
+    scenarios = [
+        ("311", 64, 1500),
+        ("5", 64, 1500),
+        ("311", 4096, 750),
+        ("5", 4096, 750),
+    ]
     report: dict[str, object] = {"repeat": args.repeat, "scenarios": []}
     output = report["scenarios"]
     assert isinstance(output, list)
@@ -189,7 +219,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-root", type=Path)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=11883)
-    parser.add_argument("--repeat", type=int, default=7)
+    parser.add_argument("--repeat", type=int, default=5)
     parser.add_argument("--protocol", choices=("311", "5"))
     parser.add_argument("--payload-bytes", type=int)
     parser.add_argument("--count", type=int)
