@@ -30,7 +30,7 @@ class ConnectPacket:
     protocol: MQTTProtocolVersion = MQTTProtocolVersion.MQTTv311
     properties: Properties | None = None
 
-    def encode(self) -> bytes:
+    def encode(self) -> bytes:  # noqa: C901 - includes the legacy MQTT 3.1 encoder
         if self.protocol is MQTTProtocolVersion.MQTTv311:
             return encode_connect_v311(
                 self.client_id,

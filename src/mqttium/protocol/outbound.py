@@ -34,7 +34,6 @@ from mqttium.errors import (
     ProtocolError,
     SessionDiscardedError,
 )
-from mqttium.packets.acks import encode_success_ack
 from mqttium.persistence.memory import PagedInflightStore, TransitionInflightStore
 from mqttium.protocol.effects import EffectKind, PublishFailure, PublishHandle
 from mqttium.protocol.flow_control import FlowControl
@@ -48,28 +47,8 @@ if TYPE_CHECKING:
     from mqttium.protocol.engine import ProtocolEngine
 
 
-def _encode_stored_publish(
-    msg: OutboundMessage,
-    *,
-    encode_publish,
-    dup: bool,
-) -> WriteItem:
-    """Encode one stored outbound PUBLISH without a short-lived packet object.
-
-    QoS 0 already calls the bound encoder directly. QoS 1/2 ``_launch``
-    still constructed a ``PublishPacket`` only to call ``encode_write_item``,
-    which is a one-line wrapper around the same function. The dataclass
-    measured about 0.84 µs here — roughly the encode itself.
-    """
-    return encode_publish(
-        msg.topic,
-        msg.payload,
-        qos=msg.qos,
-        retain=msg.retain,
-        dup=dup,
-        mid=msg.mid,
-        properties=msg.properties,
-    )
+def _encode_pubrel_success(mid: int) -> bytes:
+    return bytes((0x62, 2, mid >> 8, mid & 0xFF))
 
 
 def _retain_publish_item(item: WriteItem) -> WriteItem | None:
@@ -94,6 +73,7 @@ class OutboundSession:
         "_decode_puback",
         "_decode_pubcomp",
         "_decode_pubrec",
+        "_encode_publish",
         "_encode_pubrel",
         "_engine",
         "_queued",
@@ -126,6 +106,7 @@ class OutboundSession:
         self._decode_puback = codec.decode_puback
         self._decode_pubrec = codec.decode_pubrec
         self._decode_pubcomp = codec.decode_pubcomp
+        self._encode_publish = codec.encode_publish_item
         self._encode_pubrel = codec.encode_pubrel
         self.packet_ids = PacketIdPool()
         self.flow = FlowControl(self.config.local_receive_maximum)
@@ -374,7 +355,7 @@ class OutboundSession:
         properties: Properties | None,
         topic_bytes: bytes,
     ) -> WriteItem:
-        item = self._engine.codec.encode_publish_item(
+        item = self._encode_publish(
             topic,
             payload,
             qos=QoS.AT_MOST_ONCE,
@@ -595,7 +576,7 @@ class OutboundSession:
                 compact=True,
             )
             if changed is not None:
-                self._send(encode_success_ack(PacketType.PUBREL, mid, flags=0x02))
+                self._send(_encode_pubrel_success(mid))
                 return
             if transitions.out_meta(mid) is None:
                 self._send_orphan_pubrel(mid)
@@ -616,7 +597,7 @@ class OutboundSession:
         msg.properties = None
         msg.encoded_publish = None
         if msg.encoded_pubrel is None:
-            msg.encoded_pubrel = encode_success_ack(PacketType.PUBREL, mid, flags=0x02)
+            msg.encoded_pubrel = _encode_pubrel_success(mid)
         self.store.update_out(msg)
         self._send(msg.encoded_pubrel)
 
@@ -652,7 +633,15 @@ class OutboundSession:
     def _launch(self, msg: OutboundMessage, *, persisted: bool = False) -> None:
         wire = msg.encoded_publish
         if wire is None:
-            wire = _encode_stored_publish(msg, encode_publish=self._engine.codec.encode_publish_item, dup=msg.dup)
+            wire = self._encode_publish(
+                msg.topic,
+                msg.payload,
+                qos=msg.qos,
+                retain=msg.retain,
+                dup=msg.dup,
+                mid=msg.mid,
+                properties=msg.properties,
+            )
         self._engine._check_outbound_size(wire)
         target_state = (
             OutboundQoSState.WAIT_PUBACK
@@ -712,7 +701,15 @@ class OutboundSession:
             msg.dup = True
             retained = msg.encoded_publish
             if retained is None:
-                wire = _encode_stored_publish(msg, encode_publish=self._engine.codec.encode_publish_item, dup=True)
+                wire = self._encode_publish(
+                    msg.topic,
+                    msg.payload,
+                    qos=msg.qos,
+                    retain=msg.retain,
+                    dup=True,
+                    mid=msg.mid,
+                    properties=msg.properties,
+                )
             else:
                 # Segmented frames share the original payload. The first replay
                 # replaces only their small header; later replays reuse the
@@ -726,7 +723,7 @@ class OutboundSession:
             return
         if msg.state is OutboundQoSState.WAIT_PUBCOMP:
             if msg.encoded_pubrel is None:
-                msg.encoded_pubrel = encode_success_ack(PacketType.PUBREL, msg.mid, flags=0x02)
+                msg.encoded_pubrel = _encode_pubrel_success(msg.mid)
                 self.store.update_out(msg)
             self._engine._check_outbound_size(msg.encoded_pubrel)
             self._send(msg.encoded_pubrel)
@@ -1013,7 +1010,7 @@ class OutboundSession:
         if msg.state is OutboundQoSState.WAIT_PUBCOMP:
             pubrel = msg.encoded_pubrel if isinstance(msg, OutboundMessage) else None
             if pubrel is None:
-                pubrel = encode_success_ack(PacketType.PUBREL, msg.mid, flags=0x02)
+                pubrel = _encode_pubrel_success(msg.mid)
             engine._check_outbound_size(pubrel)
             return
         if int(msg.qos) > negotiated.maximum_qos:

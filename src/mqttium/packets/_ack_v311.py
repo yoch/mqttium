@@ -7,43 +7,58 @@ exist under 3.1.1.
 
 from __future__ import annotations
 
-from mqttium.enums import PacketType
 from mqttium.errors import MalformedPacketError, ProtocolError
 from mqttium.types import Properties
 
 
-def _success_frame(packet_type: PacketType, mid: int, *, flags: int = 0) -> bytes:
-    return bytes((int(packet_type) | (flags & 0x0F), 2, mid >> 8, mid & 0xFF))
-
-
-def _decode_mid(remaining: bytes, packet_name: str) -> int:
+def decode_puback_v311(remaining: bytes) -> tuple[int, int, Properties | None]:
     size = len(remaining)
     if size != 2:
         raise MalformedPacketError(
-            f"{packet_name} has {size - 2} unexpected trailing byte(s)"
-            if size > 2
-            else f"{packet_name} too short"
+            f"PUBACK has {size - 2} unexpected trailing byte(s)" if size > 2 else "PUBACK too short"
         )
     mid = (remaining[0] << 8) | remaining[1]
     if mid == 0:
-        raise MalformedPacketError(f"{packet_name} packet identifier must not be 0")
-    return mid
-
-
-def decode_puback_v311(remaining: bytes) -> tuple[int, int, Properties | None]:
-    return _decode_mid(remaining, "PUBACK"), 0, None
+        raise MalformedPacketError("PUBACK packet identifier must not be 0")
+    return mid, 0, None
 
 
 def decode_pubrec_v311(remaining: bytes) -> tuple[int, int, Properties | None]:
-    return _decode_mid(remaining, "PUBREC"), 0, None
+    size = len(remaining)
+    if size != 2:
+        raise MalformedPacketError(
+            f"PUBREC has {size - 2} unexpected trailing byte(s)" if size > 2 else "PUBREC too short"
+        )
+    mid = (remaining[0] << 8) | remaining[1]
+    if mid == 0:
+        raise MalformedPacketError("PUBREC packet identifier must not be 0")
+    return mid, 0, None
 
 
 def decode_pubrel_v311(remaining: bytes) -> tuple[int, int, Properties | None]:
-    return _decode_mid(remaining, "PUBREL"), 0, None
+    size = len(remaining)
+    if size != 2:
+        raise MalformedPacketError(
+            f"PUBREL has {size - 2} unexpected trailing byte(s)" if size > 2 else "PUBREL too short"
+        )
+    mid = (remaining[0] << 8) | remaining[1]
+    if mid == 0:
+        raise MalformedPacketError("PUBREL packet identifier must not be 0")
+    return mid, 0, None
 
 
 def decode_pubcomp_v311(remaining: bytes) -> tuple[int, int, Properties | None]:
-    return _decode_mid(remaining, "PUBCOMP"), 0, None
+    size = len(remaining)
+    if size != 2:
+        raise MalformedPacketError(
+            f"PUBCOMP has {size - 2} unexpected trailing byte(s)"
+            if size > 2
+            else "PUBCOMP too short"
+        )
+    mid = (remaining[0] << 8) | remaining[1]
+    if mid == 0:
+        raise MalformedPacketError("PUBCOMP packet identifier must not be 0")
+    return mid, 0, None
 
 
 def encode_puback_v311(
@@ -55,7 +70,7 @@ def encode_puback_v311(
         raise ProtocolError("PUBACK packet identifier must be in 1..65535")
     if reason_code != 0 or (properties and properties.values):
         raise ProtocolError("PUBACK reason/properties require MQTT 5")
-    return _success_frame(PacketType.PUBACK, mid)
+    return bytes((0x40, 2, mid >> 8, mid & 0xFF))
 
 
 def encode_pubrec_v311(
@@ -67,7 +82,7 @@ def encode_pubrec_v311(
         raise ProtocolError("PUBREC packet identifier must be in 1..65535")
     if reason_code != 0 or (properties and properties.values):
         raise ProtocolError("PUBREC reason/properties require MQTT 5")
-    return _success_frame(PacketType.PUBREC, mid)
+    return bytes((0x50, 2, mid >> 8, mid & 0xFF))
 
 
 def encode_pubrel_v311(
@@ -79,7 +94,7 @@ def encode_pubrel_v311(
         raise ProtocolError("PUBREL packet identifier must be in 1..65535")
     if reason_code != 0 or (properties and properties.values):
         raise ProtocolError("PUBREL reason/properties require MQTT 5")
-    return _success_frame(PacketType.PUBREL, mid, flags=0x02)
+    return bytes((0x62, 2, mid >> 8, mid & 0xFF))
 
 
 def encode_pubcomp_v311(
@@ -91,4 +106,4 @@ def encode_pubcomp_v311(
         raise ProtocolError("PUBCOMP packet identifier must be in 1..65535")
     if reason_code != 0 or (properties and properties.values):
         raise ProtocolError("PUBCOMP reason/properties require MQTT 5")
-    return _success_frame(PacketType.PUBCOMP, mid)
+    return bytes((0x70, 2, mid >> 8, mid & 0xFF))

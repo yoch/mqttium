@@ -23,7 +23,11 @@ from mqttium.persistence.memory import (
 from mqttium.packets import (
     PublishPacket,
 )
-from mqttium.packets.acks import encode_success_ack
+from mqttium.packets._publish_v311 import (
+    decode_qos0_message_v311,
+    decode_qos12_fields_v311,
+)
+from mqttium.packets._publish_v5 import decode_publish_fields_v5
 from mqttium.protocol.effects import EffectKind
 from mqttium.protocol.stats import InboundStats
 from mqttium.topics import validate_received_publish_topic
@@ -45,7 +49,15 @@ REPLAY_BATCH_BYTES = 1 << 20
 
 def _encode_puback_success(mid: int) -> bytes:
     """Encode the fixed success/no-properties PUBACK for an already-validated MID."""
-    return encode_success_ack(PacketType.PUBACK, mid)
+    return bytes((0x40, 2, mid >> 8, mid & 0xFF))
+
+
+def _encode_pubrec_success(mid: int) -> bytes:
+    return bytes((0x50, 2, mid >> 8, mid & 0xFF))
+
+
+def _encode_pubcomp_success(mid: int) -> bytes:
+    return bytes((0x70, 2, mid >> 8, mid & 0xFF))
 
 
 class InboundReplayCursor:
@@ -101,6 +113,7 @@ class InboundSession:
         "_replay",
         "_transitions",
         "config",
+        "handle_publish",
         "store",
     )
 
@@ -119,6 +132,13 @@ class InboundSession:
             self.store if isinstance(self.store, BoundedInboundReplayStore) else None
         )
         self._decode_pubrel = engine.codec.decode_pubrel
+        protocol = self.config.protocol
+        if protocol is MQTTProtocolVersion.MQTTv5:
+            self.handle_publish = self._on_publish_v5
+        elif protocol is MQTTProtocolVersion.MQTTv311:
+            self.handle_publish = self._on_publish_v311
+        else:
+            self.handle_publish = self._on_publish_v31
         self._aliases: dict[int, str] = {}
         self._inflight = 0
         # Auto-ACK QoS 1 identifiers whose PUBACK is still inside the current
@@ -227,75 +247,58 @@ class InboundSession:
 
     # --- packet handlers ---------------------------------------------------
 
-    def on_publish(self, raw: RawPacket) -> None:
-        """Handle one inbound PUBLISH without adding an engine wrapper frame."""
+    def _on_publish_v311(self, raw: RawPacket) -> None:
         engine = self._engine
-        config = self.config
         qos_raw = (raw.flags >> 1) & 0x03
-        codec = engine.codec
-        if codec.protocol is MQTTProtocolVersion.MQTTv311:
-            assert codec.decode_publish_qos0 is not None
-            assert codec.decode_publish_qos12 is not None
-            if qos_raw == int(QoS.AT_MOST_ONCE):
-                engine._emit(EffectKind.MESSAGE, codec.decode_publish_qos0(raw))
-                return
-            if qos_raw == int(QoS.AT_LEAST_ONCE):
-                topic, payload, mid, retain, dup = codec.decode_publish_qos12(raw)
-                self._on_qos1(
-                    topic=topic,
-                    payload=payload,
-                    mid=mid,
-                    retain=retain,
-                    dup=dup,
-                    properties=None,
-                )
-                return
-            if qos_raw == int(QoS.EXACTLY_ONCE):
-                topic, payload, mid, retain, dup = codec.decode_publish_qos12(raw)
-                self._on_qos2(
-                    topic=topic,
-                    payload=payload,
-                    mid=mid,
-                    retain=retain,
-                    dup=dup,
-                    properties=None,
-                )
-                return
-        elif codec.is_mqtt5:
-            if qos_raw == 3:
-                raise MalformedPacketError("Invalid PUBLISH QoS 3")
-            qos = QoS(qos_raw)
-            assert codec.decode_publish_v5 is not None
-            topic, payload, decoded_mid, retain, dup, properties = codec.decode_publish_v5(
-                raw, qos
+        if qos_raw == int(QoS.AT_MOST_ONCE):
+            engine._emit(EffectKind.MESSAGE, decode_qos0_message_v311(raw))
+            return
+        if qos_raw == 3:
+            raise MalformedPacketError("Invalid PUBLISH QoS 3")
+        topic, payload, mid, retain, dup = decode_qos12_fields_v311(raw)
+        if qos_raw == int(QoS.AT_LEAST_ONCE):
+            self._on_qos1(
+                topic=topic,
+                payload=payload,
+                mid=mid,
+                retain=retain,
+                dup=dup,
+                properties=None,
             )
-            topic = self._resolve_topic_fields(topic, properties)
-            if qos is QoS.AT_MOST_ONCE:
-                engine._emit(
-                    EffectKind.MESSAGE,
-                    Message(
-                        topic=topic,
-                        payload=payload,
-                        qos=qos,
-                        retain=retain,
-                        dup=False,
-                        mid=None,
-                        properties=properties,
-                    ),
-                )
-                return
-            assert decoded_mid is not None
-            if qos is QoS.AT_LEAST_ONCE:
-                self._on_qos1(
+            return
+        self._on_qos2(
+            topic=topic,
+            payload=payload,
+            mid=mid,
+            retain=retain,
+            dup=dup,
+            properties=None,
+        )
+
+    def _on_publish_v5(self, raw: RawPacket) -> None:
+        qos_raw = (raw.flags >> 1) & 0x03
+        if qos_raw == 3:
+            raise MalformedPacketError("Invalid PUBLISH QoS 3")
+        qos = QoS(qos_raw)
+        topic, payload, decoded_mid, retain, dup, properties = decode_publish_fields_v5(raw, qos)
+        topic = self._resolve_topic_fields(topic, properties)
+        if qos is QoS.AT_MOST_ONCE:
+            self._engine._emit(
+                EffectKind.MESSAGE,
+                Message(
                     topic=topic,
                     payload=payload,
-                    mid=decoded_mid,
+                    qos=qos,
                     retain=retain,
-                    dup=dup,
+                    dup=False,
+                    mid=None,
                     properties=properties,
-                )
-                return
-            self._on_qos2(
+                ),
+            )
+            return
+        assert decoded_mid is not None
+        if qos is QoS.AT_LEAST_ONCE:
+            self._on_qos1(
                 topic=topic,
                 payload=payload,
                 mid=decoded_mid,
@@ -304,15 +307,22 @@ class InboundSession:
                 properties=properties,
             )
             return
+        self._on_qos2(
+            topic=topic,
+            payload=payload,
+            mid=decoded_mid,
+            retain=retain,
+            dup=dup,
+            properties=properties,
+        )
 
-        # MQTT 3.1 keeps the generic decoder for every QoS. MQTT 3.1.1 QoS 0/1/2
-        # and MQTT 5 all QoS have already returned. Neither remaining path has a
-        # property table.
-        packet = PublishPacket.decode(raw.flags, raw.remaining, config.protocol)
+    def _on_publish_v31(self, raw: RawPacket) -> None:
+        """Retain the generic decoder only for the legacy MQTT 3.1 protocol."""
+        packet = PublishPacket.decode(raw.flags, raw.remaining, MQTTProtocolVersion.MQTTv31)
         topic = self._resolve_topic(packet)
         validate_received_publish_topic(topic, utf8_validated=True)
         if packet.qos is QoS.AT_MOST_ONCE:
-            engine._emit(
+            self._engine._emit(
                 EffectKind.MESSAGE,
                 Message(
                     topic=topic,
@@ -374,7 +384,7 @@ class InboundSession:
         if existing is not None:
             if existing.state is InboundQoSState.WAIT_PUBACK:
                 self._reject_packet_id_collision(mid, "QoS 2", "QoS 1")
-            engine._send(encode_success_ack(PacketType.PUBREC, mid))
+            engine._send(_encode_pubrec_success(mid))
             return
         if mid in self._pending_auto_qos1_mids:
             # The same identifier cannot start a QoS 2 exchange while the QoS 1
@@ -404,7 +414,7 @@ class InboundSession:
             raise
         # Runtime effect application is SEND-first. Produce the protocol ACK in
         # that order here so every QoS2 delivery avoids EffectPump repartition.
-        engine._send(encode_success_ack(PacketType.PUBREC, mid))
+        engine._send(_encode_pubrec_success(mid))
         engine._emit(
             EffectKind.MESSAGE,
             Message(
@@ -545,7 +555,7 @@ class InboundSession:
         if transitions is not None:
             meta = transitions.in_meta(mid)
             if meta is None:
-                engine._send(encode_success_ack(PacketType.PUBCOMP, mid))
+                engine._send(_encode_pubcomp_success(mid))
                 return
             if meta.state is InboundQoSState.WAIT_USER_ACK:
                 if config.manual_ack:
@@ -553,7 +563,7 @@ class InboundSession:
                 completed = transitions.complete_in(mid, InboundQoSState.WAIT_USER_ACK)
                 if completed is None:
                     raise ProtocolError(f"Inbound mid={mid} changed while completing PUBREL")
-                engine._send(encode_success_ack(PacketType.PUBCOMP, mid))
+                engine._send(_encode_pubcomp_success(mid))
                 self._release_slot(completed.logical_size)
                 return
             if meta.state is not InboundQoSState.WAIT_PUBREL:
@@ -570,13 +580,13 @@ class InboundSession:
             completed = transitions.complete_in(mid, InboundQoSState.WAIT_PUBREL)
             if completed is None:
                 raise ProtocolError(f"Inbound mid={mid} changed while completing PUBREL")
-            engine._send(encode_success_ack(PacketType.PUBCOMP, mid))
+            engine._send(_encode_pubcomp_success(mid))
             self._release_slot(completed.logical_size)
             return
 
         inbound = store.get_in(mid)
         if inbound is None:
-            engine._send(encode_success_ack(PacketType.PUBCOMP, mid))
+            engine._send(_encode_pubcomp_success(mid))
             return
         if inbound.state is InboundQoSState.WAIT_USER_ACK:
             if config.manual_ack:
@@ -584,7 +594,7 @@ class InboundSession:
             popped = store.pop_in(mid)
             if popped is None:
                 raise ProtocolError(f"Inbound mid={mid} disappeared while completing PUBREL")
-            engine._send(encode_success_ack(PacketType.PUBCOMP, mid))
+            engine._send(_encode_pubcomp_success(mid))
             self._release_slot(self.stored_logical_size(popped))
             return
         if inbound.state is not InboundQoSState.WAIT_PUBREL:
@@ -596,7 +606,7 @@ class InboundSession:
         popped = store.pop_in(mid)
         if popped is None:
             raise ProtocolError(f"Inbound mid={mid} disappeared while completing PUBREL")
-        engine._send(encode_success_ack(PacketType.PUBCOMP, mid))
+        engine._send(_encode_pubcomp_success(mid))
         self._release_slot(self.stored_logical_size(popped))
 
     # --- application acknowledgement and replay ---------------------------
@@ -641,9 +651,10 @@ class InboundSession:
         if state not in (InboundQoSState.WAIT_PUBACK, InboundQoSState.WAIT_USER_ACK):
             raise ProtocolError(f"Inbound mid={mid} is not awaiting ack (state={state!r})")
 
-        wire = encode_success_ack(
-            PacketType.PUBACK if state is InboundQoSState.WAIT_PUBACK else PacketType.PUBCOMP,
-            mid,
+        wire = (
+            _encode_puback_success(mid)
+            if state is InboundQoSState.WAIT_PUBACK
+            else _encode_pubcomp_success(mid)
         )
         self._engine._check_outbound_size(wire)
 

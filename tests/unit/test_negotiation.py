@@ -94,9 +94,7 @@ def test_maximum_packet_size_applies_to_disconnect_before_state_change() -> None
 
 
 def test_pubrec_failure_emits_publish_failed() -> None:
-    engine = ProtocolEngine(
-        EngineConfig(client_id="c", protocol=MQTTProtocolVersion.MQTTv5)
-    )
+    engine = ProtocolEngine(EngineConfig(client_id="c", protocol=MQTTProtocolVersion.MQTTv5))
     engine.begin_connect()
     _feed(engine, _connack_v5())
     engine.take_effects()

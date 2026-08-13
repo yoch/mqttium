@@ -56,11 +56,19 @@ def main() -> None:
     results: dict[str, object] = {"count": args.count, "repeat": args.repeat, "cases": {}}
     for name, body in bodies.items():
         if name.startswith("v311"):
-            primitive = lambda b=body: decode_puback_v311(b)
-            packet = lambda b=body: PubAckPacket.decode(b, MQTTProtocolVersion.MQTTv311)
+
+            def primitive(b=body):
+                return decode_puback_v311(b)
+
+            def packet(b=body):
+                return PubAckPacket.decode(b, MQTTProtocolVersion.MQTTv311)
         else:
-            primitive = lambda b=body: decode_puback_v5(b)
-            packet = lambda b=body: PubAckPacket.decode(b, MQTTProtocolVersion.MQTTv5)
+
+            def primitive(b=body):
+                return decode_puback_v5(b)
+
+            def packet(b=body):
+                return PubAckPacket.decode(b, MQTTProtocolVersion.MQTTv5)
 
         # Packet.decode is now a factory over the primitive, so measure the
         # factory overhead separately from a hand-rolled generic baseline by

@@ -10,7 +10,7 @@ from mqttium.packets._common import encode_frame
 from mqttium.types import Properties
 
 
-def encode_connect_v5(
+def encode_connect_v5(  # noqa: C901 - linear wire-contract validation
     client_id: str,
     clean_start: bool = True,
     keepalive: int = 60,

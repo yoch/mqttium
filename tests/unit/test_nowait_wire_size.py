@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-import mqttium.protocol.outbound as outbound_module
+import mqttium.packets._publish_v311 as publish_v311_module
 from mqttium.api import AsyncClient
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, QoS
 from mqttium.packets import PublishPacket
@@ -63,7 +63,7 @@ async def test_publish_nowait_encodes_only_the_real_frame(monkeypatch) -> None:
     packet_calls = 0
     item_calls = 0
     original_packet = PublishPacket.encode_write_item
-    original_item = outbound_module.encode_publish_item
+    original_item = publish_v311_module.encode_publish_item_v311
 
     def counted_packet(
         self: PublishPacket,
@@ -79,7 +79,7 @@ async def test_publish_nowait_encodes_only_the_real_frame(monkeypatch) -> None:
         return original_item(*args, **kwargs)
 
     monkeypatch.setattr(PublishPacket, "encode_write_item", counted_packet)
-    monkeypatch.setattr(outbound_module, "encode_publish_item", counted_item)
+    monkeypatch.setattr(publish_v311_module, "encode_publish_item_v311", counted_item)
     client = AsyncClient(max_outbound_messages=8)
     client._engine.state = ConnectionState.CONNECTED
 

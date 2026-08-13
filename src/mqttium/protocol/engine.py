@@ -24,10 +24,8 @@ from mqttium.packets import (
     ConnectPacket,
     SubAckPacket,
     SubscribeOptions,
-    SubscribePacket,
     Subscription,
     UnsubAckPacket,
-    UnsubscribePacket,
 )
 from mqttium.packets._bindings import CodecBindings, bind_codec
 from mqttium.persistence.memory import (
@@ -120,7 +118,7 @@ class ProtocolEngine:
         self._auth_method: str | None = None
         self._handlers = {
             PacketType.CONNACK: self._on_connack,
-            PacketType.PUBLISH: self.inbound.on_publish,
+            PacketType.PUBLISH: self.inbound.handle_publish,
             PacketType.PUBACK: self.outbound.on_puback,
             PacketType.PUBREC: self.outbound.on_pubrec,
             PacketType.PUBREL: self.inbound.on_pubrel,
@@ -413,12 +411,7 @@ class ProtocolEngine:
 
         mid = self.outbound.packet_ids.allocate()
         try:
-            packet = SubscribePacket(
-                mid=mid,
-                subscriptions=tuple(subscriptions),
-                properties=properties,
-            )
-            wire = packet.encode(self.config.protocol)
+            wire = self.codec.encode_subscribe(mid, tuple(subscriptions), properties)
             self._check_outbound_size(wire)
         except Exception:
             self.outbound.packet_ids.release(mid)
@@ -442,8 +435,7 @@ class ProtocolEngine:
             validate_subscribe_filter(topic)
         mid = self.outbound.packet_ids.allocate()
         try:
-            packet = UnsubscribePacket(mid=mid, topics=topic_list)
-            wire = packet.encode(self.config.protocol)
+            wire = self.codec.encode_unsubscribe(mid, topic_list)
             self._check_outbound_size(wire)
         except Exception:
             self.outbound.packet_ids.release(mid)

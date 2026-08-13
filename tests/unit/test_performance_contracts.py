@@ -143,7 +143,7 @@ async def test_nowait_admission_still_refuses_when_the_writer_is_loaded() -> Non
 
 
 def test_success_acks_encode_to_the_fixed_four_byte_frame() -> None:
-    """The shortcut must produce exactly what the generic encoder produced."""
+    """Every specialized success encoder produces the fixed wire frame."""
     from mqttium.enums import PacketType
     from mqttium.packets.acks import PubAckPacket, PubCompPacket, PubRecPacket, PubRelPacket
 
@@ -165,8 +165,8 @@ def test_success_acks_encode_to_the_fixed_four_byte_frame() -> None:
                 assert len(encoded) == 4
 
 
-def test_acks_with_reason_or_properties_keep_the_generic_encoding() -> None:
-    """Only the zero-reason, no-property case may take the shortcut."""
+def test_acks_with_reason_or_properties_keep_the_full_encoding() -> None:
+    """Only the zero-reason, no-property case may use the shortest frame."""
     from mqttium.packets.acks import PubAckPacket
 
     with_reason = PubAckPacket(mid=9, reason_code=0x10).encode(MQTTProtocolVersion.MQTTv5)

@@ -9,8 +9,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from mqttium.codec.buffer import RawPacket
-from mqttium.enums import MQTTProtocolVersion, QoS
+from mqttium.enums import MQTTProtocolVersion
 from mqttium.errors import ProtocolError
 from mqttium.packets import _ack_v311 as ack_v311
 from mqttium.packets import _ack_v5 as ack_v5
@@ -25,7 +24,7 @@ from mqttium.packets import _suback_v5 as suback_v5
 from mqttium.packets import _subscribe_v311 as subscribe_v311
 from mqttium.packets import _subscribe_v5 as subscribe_v5
 from mqttium.transport.writes import WriteItem
-from mqttium.types import Message, Properties
+from mqttium.types import Properties
 
 
 def _auth_requires_v5(_remaining: bytes) -> tuple[int, Properties | None]:
@@ -56,17 +55,6 @@ class CodecBindings:
     encode_disconnect: Callable[..., bytes]
 
     encode_publish_item: Callable[..., WriteItem]
-    decode_publish_qos0: Callable[[RawPacket], Message] | None
-    decode_publish_qos12: (
-        Callable[[RawPacket], tuple[str, bytes, int, bool, bool]] | None
-    )
-    decode_publish_v5: (
-        Callable[
-            [RawPacket, QoS],
-            tuple[str, bytes, int | None, bool, bool, Properties],
-        ]
-        | None
-    )
 
     encode_subscribe: Callable[..., bytes]
     encode_unsubscribe: Callable[..., bytes]
@@ -92,9 +80,6 @@ def bind_codec(protocol: MQTTProtocolVersion) -> CodecBindings:
             encode_pingresp=control_v5.encode_pingresp,
             encode_disconnect=control_v5.encode_disconnect_v5,
             encode_publish_item=publish_v5.encode_publish_item_v5,
-            decode_publish_qos0=None,
-            decode_publish_qos12=None,
-            decode_publish_v5=publish_v5.decode_publish_fields_v5,
             encode_subscribe=subscribe_v5.encode_subscribe_v5,
             encode_unsubscribe=subscribe_v5.encode_unsubscribe_v5,
         )
@@ -117,9 +102,6 @@ def bind_codec(protocol: MQTTProtocolVersion) -> CodecBindings:
         encode_pingresp=control_v311.encode_pingresp,
         encode_disconnect=control_v311.encode_disconnect_v311,
         encode_publish_item=publish_v311.encode_publish_item_v311,
-        decode_publish_qos0=publish_v311.decode_qos0_message_v311,
-        decode_publish_qos12=publish_v311.decode_qos12_fields_v311,
-        decode_publish_v5=None,
         encode_subscribe=subscribe_v311.encode_subscribe_v311,
         encode_unsubscribe=subscribe_v311.encode_unsubscribe_v311,
     )

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-import mqttium.codec.properties as properties_module
+import pytest
+
 import mqttium.packets._ack_v5 as ack_v5
 import mqttium.protocol.inbound as inbound_module
 
@@ -10,7 +11,12 @@ from mqttium.codec.buffer import RawPacket
 from mqttium.codec.primitives import pack_u16, pack_utf8
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, PacketType
 from mqttium.packets import PubAckPacket, PubCompPacket, PubRecPacket, PubRelPacket
-from mqttium.packets._ack_v5 import decode_puback_v5
+from mqttium.packets._ack_v5 import (
+    decode_puback_v5,
+    decode_pubcomp_v5,
+    decode_pubrec_v5,
+    decode_pubrel_v5,
+)
 from mqttium.protocol.config import EngineConfig
 from mqttium.protocol.effects import EffectKind
 from mqttium.protocol.engine import ProtocolEngine
@@ -18,14 +24,14 @@ from mqttium.types import Properties
 
 
 def test_auto_qos1_puback_skips_packet_dataclass(monkeypatch) -> None:
-    calls: list[PacketType] = []
-    original = inbound_module.encode_success_ack
+    calls: list[int] = []
+    original = inbound_module._encode_puback_success
 
-    def counted(packet_type, mid, **kwargs):
-        calls.append(packet_type)
-        return original(packet_type, mid, **kwargs)
+    def counted(mid: int) -> bytes:
+        calls.append(mid)
+        return original(mid)
 
-    monkeypatch.setattr(inbound_module, "encode_success_ack", counted)
+    monkeypatch.setattr(inbound_module, "_encode_puback_success", counted)
     engine = ProtocolEngine(EngineConfig(protocol=MQTTProtocolVersion.MQTTv311))
     engine.state = ConnectionState.CONNECTED
 
@@ -38,14 +44,14 @@ def test_auto_qos1_puback_skips_packet_dataclass(monkeypatch) -> None:
     )
     effects = engine.take_effects()
 
-    assert calls == [PacketType.PUBACK]
+    assert calls == [7]
     assert [effect.kind for effect in effects] == [EffectKind.SEND, EffectKind.MESSAGE]
     assert effects[0].data == b"\x40\x02\x00\x07"
 
 
 def test_success_puback_settle_skips_property_decoder(monkeypatch) -> None:
     calls = 0
-    original = properties_module.decode_properties
+    original = ack_v5.decode_properties
 
     def counted(*args, **kwargs):
         nonlocal calls
@@ -67,14 +73,14 @@ def test_success_puback_settle_skips_property_decoder(monkeypatch) -> None:
 
 
 def test_auto_qos2_pubrec_skips_packet_dataclass(monkeypatch) -> None:
-    calls: list[PacketType] = []
-    original = inbound_module.encode_success_ack
+    calls: list[int] = []
+    original = inbound_module._encode_pubrec_success
 
-    def counted(packet_type, mid, **kwargs):
-        calls.append(packet_type)
-        return original(packet_type, mid, **kwargs)
+    def counted(mid: int) -> bytes:
+        calls.append(mid)
+        return original(mid)
 
-    monkeypatch.setattr(inbound_module, "encode_success_ack", counted)
+    monkeypatch.setattr(inbound_module, "_encode_pubrec_success", counted)
     engine = ProtocolEngine(EngineConfig(protocol=MQTTProtocolVersion.MQTTv311))
     engine.state = ConnectionState.CONNECTED
 
@@ -87,21 +93,21 @@ def test_auto_qos2_pubrec_skips_packet_dataclass(monkeypatch) -> None:
     )
     effects = engine.take_effects()
 
-    assert calls == [PacketType.PUBREC]
+    assert calls == [7]
     assert [effect.kind for effect in effects] == [EffectKind.SEND, EffectKind.MESSAGE]
     assert effects[0].data == b"\x50\x02\x00\x07"
 
 
 def test_success_pubrec_settle_skips_property_decoder(monkeypatch) -> None:
     calls = 0
-    original = properties_module.decode_properties
+    original = ack_v5.decode_properties
 
     def counted(*args, **kwargs):
         nonlocal calls
         calls += 1
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(properties_module, "decode_properties", counted)
+    monkeypatch.setattr(ack_v5, "decode_properties", counted)
     engine = ProtocolEngine(EngineConfig(protocol=MQTTProtocolVersion.MQTTv5))
     engine.state = ConnectionState.CONNECTED
     handle = engine.queue_publish("ack/hot", b"payload", qos=2)
@@ -118,14 +124,14 @@ def test_success_pubrec_settle_skips_property_decoder(monkeypatch) -> None:
 
 def test_success_pubcomp_settle_skips_property_decoder(monkeypatch) -> None:
     calls = 0
-    original = properties_module.decode_properties
+    original = ack_v5.decode_properties
 
     def counted(*args, **kwargs):
         nonlocal calls
         calls += 1
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(properties_module, "decode_properties", counted)
+    monkeypatch.setattr(ack_v5, "decode_properties", counted)
     engine = ProtocolEngine(EngineConfig(protocol=MQTTProtocolVersion.MQTTv5))
     engine.state = ConnectionState.CONNECTED
     handle = engine.queue_publish("ack/hot", b"payload", qos=2)
@@ -141,16 +147,7 @@ def test_success_pubcomp_settle_skips_property_decoder(monkeypatch) -> None:
     assert any(effect.kind is EffectKind.PUBLISH_COMPLETE for effect in effects)
 
 
-def test_success_pubrel_skips_property_decoder(monkeypatch) -> None:
-    calls = 0
-    original = properties_module.decode_properties
-
-    def counted(*args, **kwargs):
-        nonlocal calls
-        calls += 1
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(properties_module, "decode_properties", counted)
+def test_success_pubrel_uses_the_bound_v311_decoder() -> None:
     engine = ProtocolEngine(EngineConfig(protocol=MQTTProtocolVersion.MQTTv311))
     engine.state = ConnectionState.CONNECTED
     engine.handle_raw(
@@ -165,7 +162,6 @@ def test_success_pubrel_skips_property_decoder(monkeypatch) -> None:
     engine.handle_raw(RawPacket(PacketType.PUBREL, 0x02, pack_u16(9)))
     effects = engine.take_effects()
 
-    assert calls == 0
     assert any(effect.data == b"\x70\x02\x00\x09" for effect in effects)
 
 
@@ -177,14 +173,14 @@ def test_reason_bearing_puback_skips_property_decoder(monkeypatch) -> None:
     empty Properties() either.
     """
     calls = 0
-    original = properties_module.decode_properties
+    original = ack_v5.decode_properties
 
     def counted(*args, **kwargs):
         nonlocal calls
         calls += 1
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(properties_module, "decode_properties", counted)
+    monkeypatch.setattr(ack_v5, "decode_properties", counted)
     engine = ProtocolEngine(EngineConfig(protocol=MQTTProtocolVersion.MQTTv5))
     engine.state = ConnectionState.CONNECTED
     handle = engine.queue_publish("ack/hot", b"payload", qos=1)
@@ -204,14 +200,14 @@ def test_reason_bearing_puback_skips_property_decoder(monkeypatch) -> None:
 
 def test_reason_bearing_pubrec_skips_property_decoder(monkeypatch) -> None:
     calls = 0
-    original = properties_module.decode_properties
+    original = ack_v5.decode_properties
 
     def counted(*args, **kwargs):
         nonlocal calls
         calls += 1
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(properties_module, "decode_properties", counted)
+    monkeypatch.setattr(ack_v5, "decode_properties", counted)
     engine = ProtocolEngine(EngineConfig(protocol=MQTTProtocolVersion.MQTTv5))
     engine.state = ConnectionState.CONNECTED
     handle = engine.queue_publish("ack/hot", b"payload", qos=2)
@@ -224,21 +220,37 @@ def test_reason_bearing_pubrec_skips_property_decoder(monkeypatch) -> None:
     assert calls == 0
 
 
+@pytest.mark.parametrize(
+    ("decoder", "reason"),
+    [
+        (decode_puback_v5, 0x10),
+        (decode_pubrec_v5, 0x10),
+        (decode_pubrel_v5, 0x92),
+        (decode_pubcomp_v5, 0x92),
+    ],
+)
+def test_every_three_byte_ack_decoder_skips_properties(monkeypatch, decoder, reason) -> None:
+    def unexpected(*_args, **_kwargs):
+        raise AssertionError("three-byte ACK must not decode properties")
+
+    monkeypatch.setattr(ack_v5, "decode_properties", unexpected)
+
+    assert decoder(b"\x00\x09" + bytes((reason,))) == (9, reason, None)
+
+
 def test_property_bearing_puback_uses_property_decoder(monkeypatch) -> None:
     """Anything carrying a property table still needs decode_properties."""
     calls = 0
-    original = properties_module.decode_properties
+    original = ack_v5.decode_properties
 
     def counted(*args, **kwargs):
         nonlocal calls
         calls += 1
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(properties_module, "decode_properties", counted)
     monkeypatch.setattr(ack_v5, "decode_properties", counted)
     engine = ProtocolEngine(EngineConfig(protocol=MQTTProtocolVersion.MQTTv5))
     engine.state = ConnectionState.CONNECTED
-    engine.outbound._decode_puback = ack_v5.decode_puback_v5
     handle = engine.queue_publish("ack/hot", b"payload", qos=1)
     assert handle.mid is not None
     engine.take_effects()

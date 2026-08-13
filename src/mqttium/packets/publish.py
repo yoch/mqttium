@@ -77,7 +77,17 @@ class PublishPacket:
         self,
         protocol: MQTTProtocolVersion = MQTTProtocolVersion.MQTTv311,
     ) -> WriteItem:
-        return encode_publish_item(
+        if protocol is MQTTProtocolVersion.MQTTv5:
+            return encode_publish_item_v5(
+                self.topic,
+                self.payload,
+                qos=self.qos,
+                retain=self.retain,
+                dup=self.dup,
+                mid=self.mid,
+                properties=self.properties,
+            )
+        return encode_publish_item_v311(
             self.topic,
             self.payload,
             qos=self.qos,
@@ -85,7 +95,6 @@ class PublishPacket:
             dup=self.dup,
             mid=self.mid,
             properties=self.properties,
-            protocol=protocol,
         )
 
     @classmethod

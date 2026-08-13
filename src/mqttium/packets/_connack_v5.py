@@ -46,7 +46,5 @@ def decode_connack_v5(remaining: bytes) -> tuple[bool, int, Properties | None]:
     properties, pos = decode_properties(remaining, 2, CONNACK)
     require_end(pos, len(remaining), CONNACK)
     if reason != 0 and session_present:
-        raise MalformedPacketError(
-            "CONNACK Session Present must be 0 when connection is refused"
-        )
+        raise MalformedPacketError("CONNACK Session Present must be 0 when connection is refused")
     return session_present, reason, properties
