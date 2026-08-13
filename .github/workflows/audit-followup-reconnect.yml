@@ -1,0 +1,67 @@
+name: Audit follow-up reconnect
+
+on:
+  push:
+    branches:
+      - agent/fix-reconnect-retry-audit
+    paths:
+      - .github/workflows/audit-followup-reconnect.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch-validate-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/fix-reconnect-retry-audit
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Apply validated Bugbot follow-up
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          p = Path('src/mqttium/api/async_client.py')
+          s = p.read_text()
+          old = '''        reason = None\n        if self._last_disconnect is not None and self._last_disconnect.from_broker:\n            reason = self._last_disconnect.reason_code\n        return (\n'''
+          new = '''        reason = None\n        if self._last_disconnect is not None and self._last_disconnect.from_broker:\n            reason = self._last_disconnect.reason_code\n        elif self._last_connack_reason is not None:\n            reason = self._last_connack_reason\n        return (\n'''
+          assert s.count(old) == 1
+          p.write_text(s.replace(old, new, 1))
+
+          p = Path('tests/unit/test_reconnect_retry_loop.py')
+          s = p.read_text()
+          old = '''    assert client._last_connack_reason == 5\n    assert isinstance(client._disconnect_exc, ProtocolError)\n'''
+          new = '''    assert client._last_connack_reason == 5\n    assert isinstance(client._disconnect_exc, ProtocolError)\n    assert not client._will_reconnect()\n\n    # Terminal refusal must also be visible to producers already parked on\n    # outbound admission capacity. Once final teardown wakes them, they must\n    # fail instead of treating a stopped reconnect loop as still live.\n    client._teardown_final = True\n    assert client._publish_wait_failure() is client._disconnect_exc\n'''
+          assert s.count(old) == 1
+          p.write_text(s.replace(old, new, 1))
+          PY
+          git rm .github/workflows/audit-followup-reconnect.yml
+          git diff --check
+      - name: Install validation dependencies
+        run: python -m pip install -e '.[dev,security]'
+      - name: Quality and unit gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          ruff format --check src tests benchmarks
+          ruff check src tests benchmarks
+          mypy src/mqttium
+          bandit -q -ll -r src
+          python -m pytest -q tests/unit
+      - name: Commit validated follow-up
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'ChatGPT Audit Runner'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/mqttium/api/async_client.py tests/unit/test_reconnect_retry_loop.py
+          git commit -m 'Handle terminal CONNACK in reconnect admission policy'
+          git push origin HEAD:agent/fix-reconnect-retry-audit
