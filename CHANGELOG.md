@@ -6,6 +6,17 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Changed
+
+- Rationalize the protocol engine internals without behaviour change: in-flight
+  SUBSCRIBE/UNSUBSCRIBE requests are tracked in one structure instead of a set
+  kept in sync with a dict, the two `queue_subscribe`/`queue_unsubscribe`
+  allocation/rollback paths share one helper, `InboundSession.on_pubrel` runs
+  one state machine over both store shapes instead of two parallel copies, the
+  outbound flow window is restarted from CONNACK in one place, and the
+  unreachable broker-PINGREQ handler (already refused by the per-state packet
+  gate) is removed.
+
 ## [1.0.0rc3] - 2026-08-13
 
 - Replace generic packet encode/decode dispatch with direct MQTT 3.1.1 and

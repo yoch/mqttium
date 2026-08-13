@@ -49,10 +49,6 @@ def encode_unsubscribe_v311(
     return encode_frame(PacketType.UNSUBSCRIBE, 0x02, body)
 
 
-if TYPE_CHECKING:
-    from mqttium.packets.subscription import Subscription
-
-
 def encode_subscribe_v5(
     mid: int,
     subscriptions: tuple[Subscription, ...],
