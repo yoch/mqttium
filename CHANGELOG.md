@@ -6,6 +6,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- Optimize MQTT 3.1.1 inbound QoS 2 PUBLISH decoding by reusing the specialized QoS 1/2 field parser, avoiding a transient `PublishPacket` without changing QoS 2 state semantics.
+
 ### Fixed
 
 - Local MQTT protocol failures now complete teardown even when the negotiated
