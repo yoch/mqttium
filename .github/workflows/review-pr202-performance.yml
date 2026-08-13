@@ -1,0 +1,74 @@
+name: Review PR202 performance
+on:
+  push:
+    branches: [review/pr202-performance]
+permissions:
+  contents: read
+jobs:
+  measure:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          path: base
+      - uses: actions/checkout@v7
+        with:
+          ref: cursor/rm-preflight-validate-6aff
+          path: candidate
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - name: Paired pending-handoff engine path
+        run: |
+          cat > /tmp/measure.py <<'PY'
+          import json, os, statistics, subprocess, sys
+          from pathlib import Path
+
+          WORKER = r'''
+          import json, os, time
+          from mqttium.codec.buffer import RawPacket
+          from mqttium.codec.primitives import pack_u16, pack_utf8
+          from mqttium.enums import ConnectionState, MQTTProtocolVersion, PacketType
+          from mqttium.protocol.config import EngineConfig
+          from mqttium.protocol.engine import ProtocolEngine
+
+          size=int(os.environ['PAYLOAD'])
+          count=5000 if size <= 4096 else 1500
+          samples=[]
+          body=b'x'*size
+          for rep in range(13):
+              e=ProtocolEngine(EngineConfig(protocol=MQTTProtocolVersion.MQTTv5, local_receive_maximum=65535))
+              e.state=ConnectionState.CONNECTED
+              # Keep one auto-QoS1 acknowledgement in the runtime handoff window,
+              # forcing every incoming QoS1 PUBLISH through the preflight.
+              e._pending_auto_qos1_mids.add(65535)
+              start=time.perf_counter_ns()
+              for i in range(1,count+1):
+                  mid=((i-1)%65000)+1
+                  raw=RawPacket(PacketType.PUBLISH,0x02,pack_utf8('bench/preflight')+pack_u16(mid)+b'\x00'+body)
+                  e.handle_raw(raw)
+                  e.take_effects()
+              elapsed=time.perf_counter_ns()-start
+              if rep>=2:
+                  samples.append(count*1e9/elapsed)
+          print(json.dumps(samples))
+          '''
+
+          def run(root, payload):
+              env=os.environ.copy()
+              env['PYTHONPATH']=str(Path(root).resolve()/'src')
+              env['PAYLOAD']=str(payload)
+              return json.loads(subprocess.check_output([sys.executable,'-c',WORKER],env=env,text=True))
+
+          results={}
+          for payload in (64,4096,65536):
+              b=run('base',payload); c=run('candidate',payload)
+              ratios=[y/x for x,y in zip(b,c)]
+              results[str(payload)]={'base':b,'candidate':c,'ratios':ratios,'median_ratio':statistics.median(ratios)}
+          print(json.dumps(results,indent=2))
+          if min(v['median_ratio'] for v in results.values()) < 1.03:
+              raise SystemExit('candidate did not clear 3% on every measured pending-handoff payload')
+          PY
+          python /tmp/measure.py
