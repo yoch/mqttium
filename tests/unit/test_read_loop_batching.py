@@ -19,11 +19,11 @@ def pingresp() -> bytes:
     return b"\xd0\x00"
 
 
-def publish(mid: int) -> bytes:
+def publish(mid: int, qos: QoS = QoS.AT_LEAST_ONCE) -> bytes:
     return PublishPacket(
         topic="batch/receive-maximum",
         payload=b"x",
-        qos=QoS.AT_LEAST_ONCE,
+        qos=qos,
         retain=False,
         dup=False,
         mid=mid,
@@ -198,4 +198,18 @@ async def test_autoack_batch_uses_only_the_remaining_receive_maximum_window() ->
     assert handled == 2
     assert next_calls == 3
     assert acquisitions == 3 + TEARDOWN_ACQUISITIONS
+    assert not isinstance(client._disconnect_exc, ProtocolError)
+
+
+async def test_qos2_filling_window_after_autoack_forces_handoff() -> None:
+    next_calls, acquisitions, handled, client = await _run_reads(
+        [publish(1) + publish(2, QoS.EXACTLY_ONCE) + publish(3)],
+        local_receive_maximum=2,
+    )
+
+    assert handled == 3
+    assert next_calls == 4
+    # Two handoff boundaries, the confirming empty decode and QoS 2's
+    # persisted delivery mark each acquire the engine lock before teardown.
+    assert acquisitions == 4 + TEARDOWN_ACQUISITIONS
     assert not isinstance(client._disconnect_exc, ProtocolError)

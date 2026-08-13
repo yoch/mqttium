@@ -15,8 +15,13 @@ exactly when pending automatic PUBACKs fill the remaining Receive Maximum
 window. This also covers a window partly occupied by manual-ACK or QoS 2 state,
 without shrinking the 256-packet batch for QoS 0 and control traffic. Targeted
 read-loop tests assert both sides of that boundary. The final 30-second
-gate-config soaks completed with 17,000 MQTT 3.1.1 messages and 17,500 MQTT 5
+gate-config soaks completed with 18,500 MQTT 3.1.1 messages and 17,500 MQTT 5
 messages received, with stable resource assessment.
+
+Cursor Bugbot then identified the mixed in-batch order automatic QoS 1 → QoS 2:
+the QoS 2 acquisition could fill the last slot after the automatic PUBACK was
+queued. The shared slot-acquisition path now raises the same handoff boundary,
+and a direct QoS 1 → QoS 2 → QoS 1 read-loop regression covers the report.
 
 The retained memory thresholds were also revalidated against RC2 and the
 current candidate. The property-heavy peak was identical (20.0136 MiB), and
@@ -26,9 +31,9 @@ performance claim.
 
 ## Local validation
 
-The reviewed `quick` profile passed on the release tree
-(`/tmp/mqttium-rc3/6900175/quick-reviewed`): ruff format/check, mypy, Bandit,
-unit coverage (1,001 tests, 88.69% total),
+The reviewed `quick` profile passed on the release tree after the Bugbot fix
+(`/tmp/mqttium-rc3/7648cfb/quick-bugbot-fixed`): ruff format/check, mypy,
+Bandit, unit coverage (1,002 tests, 88.69% total),
 mandatory broker integration, hot-path allocation profiling, memory thresholds,
 application stress, and both 30-second reconnect soaks.
 

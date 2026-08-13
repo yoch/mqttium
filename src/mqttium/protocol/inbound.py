@@ -856,6 +856,12 @@ class InboundSession:
             self._protocol_disconnect(0x97)
             raise ProtocolError("Pending inbound byte limit reached")
         self._inflight += 1
+        # A preceding automatic QoS 1 PUBLISH in this engine batch may own
+        # slots that take_effects() can release. QoS 2 (or another acquiring
+        # path) can fill the remainder after that QoS 1 handler returned, so
+        # detect the handoff boundary at the shared counter owner as well.
+        if self._pending_auto_qos1_mids and self._inflight >= self.config.local_receive_maximum:
+            self._autoack_handoff_required = True
         if logical_size is not None:
             self._pending_bytes += logical_size
             self._pending_high_water_bytes = max(
