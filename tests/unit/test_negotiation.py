@@ -77,6 +77,25 @@ def test_maximum_packet_size_enforced() -> None:
         engine.queue_publish("t", b"x" * 100, qos=0)
 
 
+def test_queued_qos_rejected_on_resumed_session_connack() -> None:
+    """Replay-time validation is the one pass on the session-present branch."""
+    engine = ProtocolEngine(
+        EngineConfig(client_id="c", protocol=MQTTProtocolVersion.MQTTv5, clean_start=False)
+    )
+    handle = engine.queue_publish("t", b"x", qos=2)
+    assert handle.mid is not None
+    engine.begin_connect()
+    props = Properties()
+    props.set("maximum_qos", 1)
+    _feed(engine, _connack_v5(props, session_present=True))
+    effects = engine.take_effects()
+
+    assert any(e.kind is EffectKind.PUBLISH_FAILED and e.data.mid == handle.mid for e in effects)
+    assert not any(e.kind is EffectKind.SEND for e in effects)
+    assert engine.store.get_out(handle.mid) is None
+    assert not engine.packet_ids.in_use(handle.mid)
+
+
 def test_maximum_packet_size_applies_to_disconnect_before_state_change() -> None:
     engine = ProtocolEngine(EngineConfig(client_id="c", protocol=MQTTProtocolVersion.MQTTv5))
     engine.begin_connect()

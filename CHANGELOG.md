@@ -16,6 +16,13 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   outbound flow window is restarted from CONNACK in one place, and the
   unreachable broker-PINGREQ handler (already refused by the per-state packet
   gate) is removed.
+- Validate offline-queued publications once per CONNACK instead of twice on the
+  resumed-session branch: `replay_session` already checks every record against
+  the new negotiation before retransmitting or re-queueing it, so the second
+  full-queue pass — which re-encoded each message's MQTT 5 property table — is
+  gone. Resuming a session with 10,000 queued QoS 1 publications handles the
+  CONNACK about one third faster; failure effects and their ordering are
+  unchanged.
 
 ## [1.0.0rc3] - 2026-08-13
 

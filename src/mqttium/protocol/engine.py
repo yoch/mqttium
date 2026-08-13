@@ -615,11 +615,15 @@ class ProtocolEngine:
             outbound.purge_after_clean_session(sub_mids_pending=bool(self._pending_sub_requests))
             self.inbound.discard_session()
             outbound.reset_flow_for_connection()
+            # Queued messages were admitted against the previous negotiation
+            # (or none at all); check them against the new one now. The
+            # resumed-session branch needs no second pass: replay_session()
+            # validates every record before it is retransmitted or re-queued.
+            outbound.fail_queued_violating_negotiation()
         else:
             # Begins by resetting the flow window to the negotiated limit.
             outbound.replay_session()
 
-        outbound.fail_queued_violating_negotiation()
         self._emit(EffectKind.CONNACK, connack)
         if connack.session_present:
             self.inbound.replay_session()
