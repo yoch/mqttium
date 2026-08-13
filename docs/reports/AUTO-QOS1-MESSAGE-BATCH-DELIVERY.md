@@ -59,7 +59,10 @@ persisted QoS1 replay under a current auto-ack configuration that still marks
 the durable row delivered.
 
 The reviewed rebuild also passed ruff and mypy together with the Receive Maximum
-handoff regressions introduced by #204.
+handoff regressions introduced by #204. A final conservative-default correction
+was then checked against the complete Python 3.11 unit suite after CI exposed a
+legacy direct `EngineEffect(MESSAGE, ...)` construction; the full suite passed
+with the tri-state fallback in place.
 
 ## Broker-backed performance validation
 
