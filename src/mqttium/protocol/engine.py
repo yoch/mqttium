@@ -22,16 +22,12 @@ from mqttium.packets import (
     AuthPacket,
     ConnAckPacket,
     ConnectPacket,
-    DisconnectPacket,
     SubAckPacket,
     SubscribeOptions,
-    SubscribePacket,
     Subscription,
     UnsubAckPacket,
-    UnsubscribePacket,
-    encode_disconnect,
-    encode_pingreq,
 )
+from mqttium.packets._bindings import CodecBindings, bind_codec
 from mqttium.persistence.memory import (
     InflightStore,
     MemoryInflightStore,
@@ -107,6 +103,9 @@ class ProtocolEngine:
         self.negotiated = NegotiatedSettings()
         self._pending_connect = False
         self._effects: list[EngineEffect] = []
+        # Specialized codecs are bound once; handlers and sessions never branch
+        # on protocol per packet.
+        self.codec: CodecBindings = bind_codec(self.config.protocol)
         # Each direction owns its protocol state; the engine keeps connection
         # state, packet dispatch and the one ordered effect stream.
         self.outbound = OutboundSession(self)
@@ -119,7 +118,7 @@ class ProtocolEngine:
         self._auth_method: str | None = None
         self._handlers = {
             PacketType.CONNACK: self._on_connack,
-            PacketType.PUBLISH: self.inbound.on_publish,
+            PacketType.PUBLISH: self.inbound.handle_publish,
             PacketType.PUBACK: self.outbound.on_puback,
             PacketType.PUBREC: self.outbound.on_pubrec,
             PacketType.PUBREL: self.inbound.on_pubrel,
@@ -412,12 +411,7 @@ class ProtocolEngine:
 
         mid = self.outbound.packet_ids.allocate()
         try:
-            packet = SubscribePacket(
-                mid=mid,
-                subscriptions=tuple(subscriptions),
-                properties=properties,
-            )
-            wire = packet.encode(self.config.protocol)
+            wire = self.codec.encode_subscribe(mid, tuple(subscriptions), properties)
             self._check_outbound_size(wire)
         except Exception:
             self.outbound.packet_ids.release(mid)
@@ -441,8 +435,7 @@ class ProtocolEngine:
             validate_subscribe_filter(topic)
         mid = self.outbound.packet_ids.allocate()
         try:
-            packet = UnsubscribePacket(mid=mid, topics=topic_list)
-            wire = packet.encode(self.config.protocol)
+            wire = self.codec.encode_unsubscribe(mid, topic_list)
             self._check_outbound_size(wire)
         except Exception:
             self.outbound.packet_ids.release(mid)
@@ -455,7 +448,7 @@ class ProtocolEngine:
     def queue_ping(self) -> None:
         if self.state != ConnectionState.CONNECTED:
             raise NotConnectedError("PINGREQ requires an active connection")
-        wire = encode_pingreq()
+        wire = self.codec.encode_pingreq()
         self._check_outbound_size(wire)
         self._send(wire)
 
@@ -467,7 +460,7 @@ class ProtocolEngine:
         if self.state != ConnectionState.CONNECTED:
             raise NotConnectedError("disconnect requires an active connection")
         self._check_disconnect_session_expiry(properties)
-        wire = encode_disconnect(reason_code, self.config.protocol, properties)
+        wire = self.codec.encode_disconnect(reason_code, properties)
         self._check_outbound_size(wire)
         self.state = ConnectionState.DISCONNECTING
         return wire
@@ -481,7 +474,7 @@ class ProtocolEngine:
         that as an ungraceful disconnect, which may publish a configured Will.
         Failing locally preserves the semantics requested by clean shutdown.
         """
-        if self.config.protocol != MQTTProtocolVersion.MQTTv5 or properties is None:
+        if not self.codec.is_mqtt5 or properties is None:
             return
         requested = properties.get("session_expiry_interval")
         if not requested:
@@ -543,9 +536,14 @@ class ProtocolEngine:
     def _on_connack(self, raw: RawPacket) -> None:
         if not self._pending_connect or self.state != ConnectionState.CONNECTING:
             raise ProtocolError("Unexpected CONNACK (already negotiated)")
-        connack = ConnAckPacket.decode(raw.remaining, self.config.protocol)
+        session_present, reason_code, properties = self.codec.decode_connack(raw.remaining)
+        connack = ConnAckPacket(
+            session_present=session_present,
+            reason_code=reason_code,
+            properties=properties,
+        )
         self._pending_connect = False
-        if self.config.protocol == MQTTProtocolVersion.MQTTv5:
+        if self.codec.is_mqtt5:
             connack_method = (
                 connack.properties.get("authentication_method")
                 if connack.properties is not None
@@ -574,7 +572,7 @@ class ProtocolEngine:
             )
             return
 
-        if self.config.protocol == MQTTProtocolVersion.MQTTv5 and not self.config.client_id:
+        if self.codec.is_mqtt5 and not self.config.client_id:
             assigned_client_id = (
                 connack.properties.get("assigned_client_identifier")
                 if connack.properties is not None
@@ -649,27 +647,31 @@ class ProtocolEngine:
         self.inbound.ack(mid)
 
     def _on_suback(self, raw: RawPacket) -> None:
-        ack = SubAckPacket.decode(raw.remaining, self.config.protocol)
-        self._validate_inbound_problem_information(PacketType.SUBACK, ack.properties)
+        mid, reason_codes, properties = self.codec.decode_suback(raw.remaining)
+        self._validate_inbound_problem_information(PacketType.SUBACK, properties)
         self._complete_subscription_request(
-            ack.mid,
+            mid,
             PacketType.SUBACK,
-            len(ack.reason_codes),
+            len(reason_codes),
         )
-        self._emit(EffectKind.SUBACK, ack)
+        self._emit(
+            EffectKind.SUBACK,
+            SubAckPacket(mid=mid, reason_codes=reason_codes, properties=properties),
+        )
 
     def _on_unsuback(self, raw: RawPacket) -> None:
-        ack = UnsubAckPacket.decode(raw.remaining, self.config.protocol)
-        self._validate_inbound_problem_information(PacketType.UNSUBACK, ack.properties)
-        reason_count = (
-            len(ack.reason_codes) if self.config.protocol is MQTTProtocolVersion.MQTTv5 else None
-        )
+        mid, reason_codes, properties = self.codec.decode_unsuback(raw.remaining)
+        self._validate_inbound_problem_information(PacketType.UNSUBACK, properties)
+        reason_count = len(reason_codes) if self.codec.is_mqtt5 else None
         self._complete_subscription_request(
-            ack.mid,
+            mid,
             PacketType.UNSUBACK,
             reason_count,
         )
-        self._emit(EffectKind.UNSUBACK, ack)
+        self._emit(
+            EffectKind.UNSUBACK,
+            UnsubAckPacket(mid=mid, reason_codes=reason_codes, properties=properties),
+        )
 
     def _complete_subscription_request(
         self,
@@ -710,7 +712,7 @@ class ProtocolEngine:
     ) -> None:
         """Enforce the Request Problem Information obligation negotiated in CONNECT."""
         if (
-            self.config.protocol != MQTTProtocolVersion.MQTTv5
+            not self.codec.is_mqtt5
             or self._sent_request_problem_information != 0
             or packet_type in (PacketType.PUBLISH, PacketType.CONNACK, PacketType.DISCONNECT)
             or properties is None
@@ -724,18 +726,18 @@ class ProtocolEngine:
         )
 
     def _on_disconnect(self, raw: RawPacket) -> None:
-        packet = DisconnectPacket.decode(raw.remaining, self.config.protocol)
+        reason_code, properties = self.codec.decode_disconnect(raw.remaining)
         if (
-            self.config.protocol is MQTTProtocolVersion.MQTTv5
-            and packet.properties is not None
-            and packet.properties.get("session_expiry_interval") is not None
+            self.codec.is_mqtt5
+            and properties is not None
+            and properties.get("session_expiry_interval") is not None
         ):
             self.state = ConnectionState.DISCONNECTED
             self._emit(
                 EffectKind.DISCONNECTED,
                 DisconnectInfo(
-                    reason_code=packet.reason_code,
-                    properties=packet.properties,
+                    reason_code=reason_code,
+                    properties=properties,
                     from_broker=True,
                 ),
             )
@@ -746,17 +748,18 @@ class ProtocolEngine:
         self._emit(
             EffectKind.DISCONNECTED,
             DisconnectInfo(
-                reason_code=packet.reason_code,
-                properties=packet.properties,
+                reason_code=reason_code,
+                properties=properties,
                 from_broker=True,
             ),
         )
 
     def _on_auth(self, raw: RawPacket) -> None:
-        if self.config.protocol != MQTTProtocolVersion.MQTTv5:
+        if not self.codec.is_mqtt5:
             self._protocol_disconnect(0x82)
             raise ProtocolError("AUTH is not valid in MQTT 3.1.1")
-        packet = AuthPacket.decode(raw.remaining, self.config.protocol)
+        reason_code, properties = self.codec.decode_auth(raw.remaining)
+        packet = AuthPacket(reason_code=reason_code, properties=properties)
         self._validate_inbound_problem_information(PacketType.AUTH, packet.properties)
         if self._auth_method is None:
             self._reject_auth_method()
@@ -782,12 +785,12 @@ class ProtocolEngine:
 
     def _protocol_disconnect(self, reason_code: int) -> None:
         """Tear the connection down, announcing why when the version allows it."""
-        if self.config.protocol == MQTTProtocolVersion.MQTTv5:
+        if self.codec.is_mqtt5:
             # MQTT 3.1.1 DISCONNECT carries no reason code. MQTT 5 does, but a
             # negotiated Maximum Packet Size can make even the normative error
             # packet impossible to send. Connection state must still become
             # terminal in that case.
-            packet = encode_disconnect(reason_code, self.config.protocol)
+            packet = self.codec.encode_disconnect(reason_code)
             try:
                 self._check_outbound_size(packet)
             except PacketTooLargeError:

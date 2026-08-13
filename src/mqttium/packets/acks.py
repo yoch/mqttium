@@ -1,113 +1,36 @@
 """PUBACK / PUBREC / PUBREL / PUBCOMP encode/decode.
 
-All four share a body shape — packet identifier, optional reason code, optional
-properties — so a single decode/encode pair drives every class.
+Specialized v3.1.1 / v5.0 primitives own the wire parse and frame build.
+The packet dataclasses are thin factories over those primitives for tests,
+fuzzing and Provisional ``mqttium.packets`` consumers.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from mqttium.codec.packet_validation import (
-    require_end,
-    require_nonzero_mid,
-    require_reason_code,
+from mqttium.enums import MQTTProtocolVersion
+from mqttium.packets._ack import (
+    decode_puback_v311,
+    decode_pubcomp_v311,
+    decode_pubrec_v311,
+    decode_pubrel_v311,
+    encode_puback_v311,
+    encode_pubcomp_v311,
+    encode_pubrec_v311,
+    encode_pubrel_v311,
 )
-from mqttium.codec.primitives import pack_u16, unpack_u16
-from mqttium.codec.properties import (
-    PUBACK,
-    PUBCOMP,
-    PUBREC,
-    PUBREL,
-    decode_properties,
-    encode_properties,
-)
-from mqttium.enums import MQTTProtocolVersion, PacketType
-from mqttium.errors import MalformedPacketError, ProtocolError
-from mqttium.packets._common import (
-    _require_outbound_mid,
-    _require_outbound_reason,
-    encode_frame,
+from mqttium.packets._ack import (
+    decode_puback_v5,
+    decode_pubcomp_v5,
+    decode_pubrec_v5,
+    decode_pubrel_v5,
+    encode_puback_v5,
+    encode_pubcomp_v5,
+    encode_pubrec_v5,
+    encode_pubrel_v5,
 )
 from mqttium.types import Properties
-
-_PUBACK_REASONS = frozenset({0x00, 0x10, 0x80, 0x83, 0x87, 0x90, 0x91, 0x97, 0x99})
-_PUBREC_REASONS = _PUBACK_REASONS
-_PUBREL_REASONS = frozenset({0x00, 0x92})
-_PUBCOMP_REASONS = _PUBREL_REASONS
-_ACK_REASONS = {
-    PUBACK: _PUBACK_REASONS,
-    PUBREC: _PUBREC_REASONS,
-    PUBREL: _PUBREL_REASONS,
-    PUBCOMP: _PUBCOMP_REASONS,
-}
-
-
-def encode_success_ack(packet_type: PacketType, mid: int, *, flags: int = 0) -> bytes:
-    """Fixed four-byte success/no-properties acknowledgement.
-
-    MQTT 5 omits a zero reason code when nothing follows it, so the frame is
-    identical in both protocol versions. Reason code 0 is in every ack's allowed
-    set. This is the common case on both QoS legs.
-    """
-    return bytes((int(packet_type) | (flags & 0x0F), 2, mid >> 8, mid & 0xFF))
-
-
-def _decode_ack_with_reason(
-    remaining: bytes,
-    protocol: MQTTProtocolVersion,
-    packet_name: str,
-) -> tuple[int, int, Properties | None]:
-    if len(remaining) < 2:
-        raise MalformedPacketError(f"{packet_name} too short")
-    mid, pos = unpack_u16(remaining, 0)
-    require_nonzero_mid(mid, packet_name)
-    reason = 0
-    properties: Properties | None = None
-    if protocol == MQTTProtocolVersion.MQTTv5:
-        if pos < len(remaining):
-            reason = remaining[pos]
-            pos += 1
-            if pos < len(remaining):
-                properties, pos = decode_properties(remaining, pos, packet_name)
-        require_reason_code(reason, _ACK_REASONS[packet_name], packet_name)
-        require_end(pos, len(remaining), packet_name)
-    else:
-        require_end(pos, len(remaining), packet_name)
-    return mid, reason, properties
-
-
-def _encode_ack_with_reason(
-    packet_type: PacketType,
-    flags: int,
-    mid: int,
-    reason_code: int,
-    properties: Properties | None,
-    packet_name: str,
-    protocol: MQTTProtocolVersion,
-) -> bytes:
-    _require_outbound_mid(mid, packet_name)
-    if reason_code == 0 and not (properties and properties.values):
-        # A success acknowledgement with no properties is a fixed four-byte
-        # frame, identically in both protocol versions: MQTT 5 omits a zero
-        # reason code when nothing follows it, and a remaining length of 2
-        # encodes as a single VBI byte. Reason code 0 is in every ack's allowed
-        # set, so the check below cannot reject what this returns.
-        #
-        # This is the common case on both QoS legs -- every PUBACK a subscriber
-        # sends, and every PUBREC/PUBREL/PUBCOMP of an uncontested QoS 2
-        # handshake -- and building it through the generic encoder measured
-        # about 1.15 us against 0.11 us for the frame itself.
-        return encode_success_ack(packet_type, mid, flags=flags)
-    body = bytearray(pack_u16(mid))
-    if protocol == MQTTProtocolVersion.MQTTv5:
-        _require_outbound_reason(reason_code, _ACK_REASONS[packet_name], packet_name)
-        if reason_code != 0 or (properties and properties.values):
-            body.append(reason_code)
-            body.extend(encode_properties(properties, packet_name))
-    elif reason_code != 0 or (properties and properties.values):
-        raise ProtocolError(f"{packet_name} reason/properties require MQTT 5")
-    return encode_frame(packet_type, flags, body)
 
 
 @dataclass(slots=True, frozen=True)
@@ -117,9 +40,9 @@ class PubAckPacket:
     properties: Properties | None = None
 
     def encode(self, protocol: MQTTProtocolVersion = MQTTProtocolVersion.MQTTv311) -> bytes:
-        return _encode_ack_with_reason(
-            PacketType.PUBACK, 0, self.mid, self.reason_code, self.properties, PUBACK, protocol
-        )
+        if protocol is MQTTProtocolVersion.MQTTv5:
+            return encode_puback_v5(self.mid, self.reason_code, self.properties)
+        return encode_puback_v311(self.mid, self.reason_code, self.properties)
 
     @classmethod
     def decode(
@@ -127,7 +50,10 @@ class PubAckPacket:
         remaining: bytes,
         protocol: MQTTProtocolVersion = MQTTProtocolVersion.MQTTv311,
     ) -> PubAckPacket:
-        mid, reason, props = _decode_ack_with_reason(remaining, protocol, PUBACK)
+        if protocol is MQTTProtocolVersion.MQTTv5:
+            mid, reason, props = decode_puback_v5(remaining)
+        else:
+            mid, reason, props = decode_puback_v311(remaining)
         return cls(mid=mid, reason_code=reason, properties=props)
 
 
@@ -138,9 +64,9 @@ class PubRecPacket:
     properties: Properties | None = None
 
     def encode(self, protocol: MQTTProtocolVersion = MQTTProtocolVersion.MQTTv311) -> bytes:
-        return _encode_ack_with_reason(
-            PacketType.PUBREC, 0, self.mid, self.reason_code, self.properties, PUBREC, protocol
-        )
+        if protocol is MQTTProtocolVersion.MQTTv5:
+            return encode_pubrec_v5(self.mid, self.reason_code, self.properties)
+        return encode_pubrec_v311(self.mid, self.reason_code, self.properties)
 
     @classmethod
     def decode(
@@ -148,7 +74,10 @@ class PubRecPacket:
         remaining: bytes,
         protocol: MQTTProtocolVersion = MQTTProtocolVersion.MQTTv311,
     ) -> PubRecPacket:
-        mid, reason, props = _decode_ack_with_reason(remaining, protocol, PUBREC)
+        if protocol is MQTTProtocolVersion.MQTTv5:
+            mid, reason, props = decode_pubrec_v5(remaining)
+        else:
+            mid, reason, props = decode_pubrec_v311(remaining)
         return cls(mid=mid, reason_code=reason, properties=props)
 
 
@@ -159,9 +88,9 @@ class PubRelPacket:
     properties: Properties | None = None
 
     def encode(self, protocol: MQTTProtocolVersion = MQTTProtocolVersion.MQTTv311) -> bytes:
-        return _encode_ack_with_reason(
-            PacketType.PUBREL, 0x02, self.mid, self.reason_code, self.properties, PUBREL, protocol
-        )
+        if protocol is MQTTProtocolVersion.MQTTv5:
+            return encode_pubrel_v5(self.mid, self.reason_code, self.properties)
+        return encode_pubrel_v311(self.mid, self.reason_code, self.properties)
 
     @classmethod
     def decode(
@@ -169,7 +98,10 @@ class PubRelPacket:
         remaining: bytes,
         protocol: MQTTProtocolVersion = MQTTProtocolVersion.MQTTv311,
     ) -> PubRelPacket:
-        mid, reason, props = _decode_ack_with_reason(remaining, protocol, PUBREL)
+        if protocol is MQTTProtocolVersion.MQTTv5:
+            mid, reason, props = decode_pubrel_v5(remaining)
+        else:
+            mid, reason, props = decode_pubrel_v311(remaining)
         return cls(mid=mid, reason_code=reason, properties=props)
 
 
@@ -180,9 +112,9 @@ class PubCompPacket:
     properties: Properties | None = None
 
     def encode(self, protocol: MQTTProtocolVersion = MQTTProtocolVersion.MQTTv311) -> bytes:
-        return _encode_ack_with_reason(
-            PacketType.PUBCOMP, 0, self.mid, self.reason_code, self.properties, PUBCOMP, protocol
-        )
+        if protocol is MQTTProtocolVersion.MQTTv5:
+            return encode_pubcomp_v5(self.mid, self.reason_code, self.properties)
+        return encode_pubcomp_v311(self.mid, self.reason_code, self.properties)
 
     @classmethod
     def decode(
@@ -190,5 +122,8 @@ class PubCompPacket:
         remaining: bytes,
         protocol: MQTTProtocolVersion = MQTTProtocolVersion.MQTTv311,
     ) -> PubCompPacket:
-        mid, reason, props = _decode_ack_with_reason(remaining, protocol, PUBCOMP)
+        if protocol is MQTTProtocolVersion.MQTTv5:
+            mid, reason, props = decode_pubcomp_v5(remaining)
+        else:
+            mid, reason, props = decode_pubcomp_v311(remaining)
         return cls(mid=mid, reason_code=reason, properties=props)

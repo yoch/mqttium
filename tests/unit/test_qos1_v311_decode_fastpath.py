@@ -14,7 +14,7 @@ from mqttium.enums import (
 from mqttium.errors import MalformedPacketError
 from mqttium.packets import PublishPacket
 from mqttium.protocol.engine import EffectKind, EngineConfig, ProtocolEngine
-from mqttium.protocol.inbound import _decode_v311_qos1_fields
+from mqttium.packets._publish import decode_qos12_fields_v311 as _decode_v311_qos1_fields
 
 
 def _connected(*, manual_ack: bool = False) -> ProtocolEngine:

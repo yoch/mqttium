@@ -6,6 +6,13 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- Replace generic packet encode/decode dispatch with direct MQTT 3.1.1 and
+  MQTT 5 primitives across acknowledgements, PUBLISH, CONNECT/CONNACK,
+  subscriptions and control packets. Protocol sessions bind their hot PUBLISH
+  and acknowledgement paths once, avoiding per-packet version branches,
+  generic helper frames and transient packet dataclasses while the Provisional
+  packet views remain available as thin factories.
+
 - Batch consecutive small non-persisted MESSAGE effects (QoS 0 and fresh automatic QoS 1) directly during the inline effect drain, and skip the absent-row delivery mark for automatic QoS 1 while retaining marks for persisted replay/manual/QoS 2 records.
 
 - Hold the inbound Receive Maximum slot for an automatic QoS 1 PUBACK until

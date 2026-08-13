@@ -64,7 +64,10 @@ def _encode(scenario: str) -> ScenarioMeasurement:
     from mqttium.enums import MQTTProtocolVersion, QoS
     from mqttium.packets import PublishPacket
 
-    qos = QoS.AT_MOST_ONCE if scenario == "encode_qos0" else QoS.AT_LEAST_ONCE
+    qos = QoS.AT_MOST_ONCE if "qos0" in scenario else QoS.AT_LEAST_ONCE
+    protocol = (
+        MQTTProtocolVersion.MQTTv5 if scenario.endswith("_v5") else MQTTProtocolVersion.MQTTv311
+    )
     packet = PublishPacket(
         topic=TOPIC,
         payload=PAYLOAD,
@@ -73,26 +76,25 @@ def _encode(scenario: str) -> ScenarioMeasurement:
         dup=False,
         mid=None if qos == QoS.AT_MOST_ONCE else 42,
     )
-    return _measure(
-        lambda: packet.encode(MQTTProtocolVersion.MQTTv311), operations=120_000, warmup=2_000
-    )
+    return _measure(lambda: packet.encode(protocol), operations=1_000_000, warmup=10_000)
 
 
-def _ingress_qos0(_scenario: str) -> ScenarioMeasurement:
+def _ingress_qos0(scenario: str) -> ScenarioMeasurement:
     from mqttium.codec.buffer import IncrementalDecoder
     from mqttium.enums import ConnectionState, MQTTProtocolVersion, QoS
     from mqttium.packets import PublishPacket
     from mqttium.protocol.engine import EngineConfig, ProtocolEngine
 
+    protocol = (
+        MQTTProtocolVersion.MQTTv5 if scenario.endswith("_v5") else MQTTProtocolVersion.MQTTv311
+    )
     packet = PublishPacket(
         topic=TOPIC, payload=PAYLOAD, qos=QoS.AT_MOST_ONCE, retain=False, dup=False
     )
     decoder = IncrementalDecoder()
-    decoder.feed(packet.encode(MQTTProtocolVersion.MQTTv311))
+    decoder.feed(packet.encode(protocol))
     raw = decoder.drain_packets()[0]
-    engine = ProtocolEngine(
-        EngineConfig(client_id="paired-ingress", protocol=MQTTProtocolVersion.MQTTv311)
-    )
+    engine = ProtocolEngine(EngineConfig(client_id="paired-ingress", protocol=protocol))
     engine.state = ConnectionState.CONNECTED
 
     def run() -> None:
@@ -154,12 +156,41 @@ def _persistence_cycle(scenario: str) -> ScenarioMeasurement:
 
     try:
         operation = qos1_cycle if qos == QoS.AT_LEAST_ONCE else qos2_cycle
-        return _measure(operation, operations=5_000, warmup=500)
+        operations = 50_000 if scenario == "qos1_cycle_memory" else 5_000
+        return _measure(operation, operations=operations, warmup=500)
     finally:
         close = getattr(store, "close", None)
         if close is not None:
             close()
         shutil.rmtree(directory, ignore_errors=True)
+
+
+def _mqtt5_puback_reason_cycle(_scenario: str) -> ScenarioMeasurement:
+    from mqttium.codec.buffer import RawPacket
+    from mqttium.codec.primitives import pack_u16
+    from mqttium.enums import ConnectionState, MQTTProtocolVersion, PacketType
+    from mqttium.protocol.engine import EngineConfig, ProtocolEngine
+
+    engine = ProtocolEngine(
+        EngineConfig(
+            client_id="paired-mqtt5-puback",
+            protocol=MQTTProtocolVersion.MQTTv5,
+            max_pending_outbound_messages=None,
+            max_pending_outbound_bytes=None,
+        )
+    )
+    engine.state = ConnectionState.CONNECTED
+
+    def run() -> None:
+        handle = engine.queue_publish(TOPIC, b"x", qos=1)
+        engine.take_effects()
+        mid = handle.mid
+        if mid is None:
+            raise RuntimeError("QoS 1 publish returned no MID")
+        engine.handle_raw(RawPacket(PacketType.PUBACK, 0, pack_u16(mid) + b"\x10"))
+        engine.take_effects()
+
+    return _measure(run, operations=60_000, warmup=2_000)
 
 
 def _ingress_qos1(_scenario: str) -> ScenarioMeasurement:
@@ -420,10 +451,14 @@ def _receipt(_scenario: str) -> ScenarioMeasurement:
 REGISTRY: dict[str, Callable[[str], ScenarioMeasurement]] = {
     "encode_qos0": _encode,
     "encode_qos1": _encode,
+    "encode_qos0_v5": _encode,
+    "encode_qos1_v5": _encode,
     "ingress_engine_qos0": _ingress_qos0,
+    "ingress_engine_qos0_v5": _ingress_qos0,
     "qos1_cycle_memory": _persistence_cycle,
     "qos1_cycle_sqlite": _persistence_cycle,
     "qos2_cycle_sqlite": _persistence_cycle,
+    "mqtt5_puback_reason_cycle": _mqtt5_puback_reason_cycle,
     "ingress_publish_qos1": _ingress_qos1,
     "writer_try_enqueue": _writer,
     "writer_enqueue_async": _writer,

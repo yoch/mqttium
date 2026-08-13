@@ -8,7 +8,7 @@ import inspect
 import pytest
 
 import mqttium.compat.paho as paho_compat
-import mqttium.protocol.outbound as outbound_module
+import mqttium.packets._publish as publish_v5_module
 from mqttium.api import AsyncClient
 from mqttium.api.models import PublishMessage
 from mqttium.codec.buffer import IncrementalDecoder
@@ -219,7 +219,7 @@ async def test_publish_nowait_direct_path_encodes_mqtt5_properties(monkeypatch) 
     properties.add_user_property("source", "native-fast-path")
     client = AsyncClient(protocol=MQTTProtocolVersion.MQTTv5, max_outbound_messages=8)
     client._engine.state = ConnectionState.CONNECTED
-    original_encode = outbound_module.encode_publish_item
+    original_encode = publish_v5_module.encode_publish_item_v5
     encode_calls = 0
 
     def counted_encode(*args, **kwargs):
@@ -227,7 +227,8 @@ async def test_publish_nowait_direct_path_encodes_mqtt5_properties(monkeypatch) 
         encode_calls += 1
         return original_encode(*args, **kwargs)
 
-    monkeypatch.setattr(outbound_module, "encode_publish_item", counted_encode)
+    monkeypatch.setattr(publish_v5_module, "encode_publish_item_v5", counted_encode)
+    client._engine.outbound._encode_publish = publish_v5_module.encode_publish_item_v5
 
     receipt = client.publish_nowait(
         "native/mqtt5",

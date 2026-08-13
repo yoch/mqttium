@@ -94,17 +94,15 @@ def test_maximum_packet_size_applies_to_disconnect_before_state_change() -> None
 
 
 def test_pubrec_failure_emits_publish_failed() -> None:
-    engine = ProtocolEngine(EngineConfig(client_id="c"))
+    engine = ProtocolEngine(EngineConfig(client_id="c", protocol=MQTTProtocolVersion.MQTTv5))
     engine.begin_connect()
-    _feed(engine, encode_frame(PacketType.CONNACK, 0, b"\x00\x00"))
+    _feed(engine, _connack_v5())
     engine.take_effects()
     handle = engine.queue_publish("t", b"x", qos=2)
     engine.take_effects()
     mid = handle.mid
     assert mid is not None
 
-    # Craft MQTT 3.1.1 PUBREC — reason codes only on v5, so switch protocol path:
-    engine.config.protocol = MQTTProtocolVersion.MQTTv5
     body = bytes([mid >> 8, mid & 0xFF, 0x80, 0x00])  # reason 0x80 + empty props
     _feed(engine, encode_frame(PacketType.PUBREC, 0, body))
     effects = engine.take_effects()
