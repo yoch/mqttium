@@ -1234,12 +1234,17 @@ class AsyncClient:
                 # Process one bounded packet batch at a time. Applying its
                 # effects before decoding the next batch propagates delivery
                 # byte backpressure all the way to transport.read().
+                # The packet bound must also respect the local Receive Maximum:
+                # auto-PUBACK slots are held until this batch is handed to the
+                # effect pump, so decoding more packets than that window could
+                # admit a 101st QoS 1/2 PUBLISH before the first ACKs progress.
+                ingress_packet_limit = min(256, self._engine.config.local_receive_maximum)
                 while True:
                     async with self._engine_lock:
                         with self._engine.store.batch():
                             handled, handled_bytes = self._decoder.process_packets_bounded(
                                 self._engine.handle_raw,
-                                limit=256,
+                                limit=ingress_packet_limit,
                                 max_bytes=self._max_ingress_batch_bytes,
                             )
                         if handled:
@@ -1250,7 +1255,10 @@ class AsyncClient:
                     # buffer, so there is nothing to decode until the next
                     # read(). Re-entering only to observe handled == 0 cost a
                     # second lock acquisition and bounded decode per read.
-                    if handled < 256 and handled_bytes < self._max_ingress_batch_bytes:
+                    if (
+                        handled < ingress_packet_limit
+                        and handled_bytes < self._max_ingress_batch_bytes
+                    ):
                         break
                     await asyncio.sleep(0)
         except asyncio.CancelledError:

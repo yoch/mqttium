@@ -59,12 +59,14 @@ class _CountingDecoder:
         self._decoder = decoder
         self.decodes = 0
         self.handled = 0
+        self.limits: list[int] = []
 
     def feed(self, data: bytes) -> None:
         self._decoder.feed(data)
 
     def process_packets_bounded(self, callback, *, limit: int, max_bytes: int):
         self.decodes += 1
+        self.limits.append(limit)
         count, decoded_bytes = self._decoder.process_packets_bounded(
             callback, limit=limit, max_bytes=max_bytes
         )
@@ -76,8 +78,16 @@ class _CountingDecoder:
 TEARDOWN_ACQUISITIONS = 1
 
 
-async def _run_reads(reads: list[bytes], *, max_ingress_batch_bytes: int = 1024 * 1024):
-    client = AsyncClient(max_ingress_batch_bytes=max_ingress_batch_bytes)
+async def _run_reads(
+    reads: list[bytes],
+    *,
+    max_ingress_batch_bytes: int = 1024 * 1024,
+    local_receive_maximum: int = 100,
+):
+    client = AsyncClient(
+        max_ingress_batch_bytes=max_ingress_batch_bytes,
+        local_receive_maximum=local_receive_maximum,
+    )
     client._engine.state = ConnectionState.CONNECTED
     client._transport = _ScriptedTransport(reads)
     lock = _CountingLock()
@@ -86,51 +96,56 @@ async def _run_reads(reads: list[bytes], *, max_ingress_batch_bytes: int = 1024 
     client._decoder = decoder
 
     await client._read_loop()
-    return decoder.decodes, lock.acquisitions, decoder.handled
+    return decoder.decodes, lock.acquisitions, decoder.handled, decoder.limits
 
 
 async def test_short_batch_decodes_once_per_read() -> None:
     """A batch under both bounds emptied the buffer: no confirming re-entry."""
-    decodes, acquisitions, handled = await _run_reads([puback(1)])
+    decodes, acquisitions, handled, limits = await _run_reads([puback(1)])
 
     assert handled == 1
     assert decodes == 1
     assert acquisitions == 1 + TEARDOWN_ACQUISITIONS
+    assert limits == [100]
 
 
 async def test_each_read_costs_exactly_one_decode() -> None:
-    decodes, acquisitions, handled = await _run_reads([puback(1), puback(2), puback(3)])
+    decodes, acquisitions, handled, limits = await _run_reads([puback(1), puback(2), puback(3)])
 
     assert handled == 3
     assert decodes == 3
     assert acquisitions == 3 + TEARDOWN_ACQUISITIONS
+    assert limits == [100, 100, 100]
 
 
 async def test_full_count_batch_re_enters_to_find_the_buffer_empty() -> None:
     """Hitting the count bound is not evidence the buffer drained."""
     wire = b"".join(puback(mid) for mid in range(1, 257))
-    decodes, acquisitions, handled = await _run_reads([wire])
+    decodes, acquisitions, handled, limits = await _run_reads([wire])
 
     assert handled == 256
-    assert decodes == 2
-    assert acquisitions == 2 + TEARDOWN_ACQUISITIONS
+    assert decodes == 3
+    assert acquisitions == 3 + TEARDOWN_ACQUISITIONS
+    assert limits == [100, 100, 100]
 
 
 async def test_byte_bounded_batch_re_enters_until_the_buffer_drains() -> None:
     """Each PUBACK charges len(remaining) + 5, so 20 bytes admits three."""
     wire = b"".join(puback(mid) for mid in range(1, 7))
-    decodes, acquisitions, handled = await _run_reads([wire], max_ingress_batch_bytes=20)
+    decodes, acquisitions, handled, limits = await _run_reads([wire], max_ingress_batch_bytes=20)
 
     assert handled == 6
     assert decodes == 3
     assert acquisitions == 3 + TEARDOWN_ACQUISITIONS
+    assert limits == [100, 100, 100]
 
 
 async def test_packet_split_across_reads_is_completed() -> None:
     """A partial trailing packet decodes nothing until its remainder arrives."""
     frame = puback(9)
-    decodes, acquisitions, handled = await _run_reads([frame[:3], frame[3:]])
+    decodes, acquisitions, handled, limits = await _run_reads([frame[:3], frame[3:]])
 
     assert handled == 1
     assert decodes == 2
     assert acquisitions == 2 + TEARDOWN_ACQUISITIONS
+    assert limits == [100, 100]
