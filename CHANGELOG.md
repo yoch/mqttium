@@ -25,6 +25,19 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   stream before any cancellable close wait, bracket IPv6 literals in the HTTP
   `Host` header, and enforce the configured handshake timeout as one total
   deadline instead of resetting it for each received chunk.
+- Correct MQTT string and PUBLISH conformance: preserve legal U+FEFF text,
+  reject empty MQTT 3.1.1 inbound Topic Names at the packet boundary, surface
+  PUBLISH wire-limit overflow as `PacketTooLargeError`, reject semantic Will
+  fields without a Will Topic, and normalize reason-only MQTT 5 ACK properties.
+- Harden the Paho VERSION2 façade: serialize `loop_start()` ownership, reject
+  blocking publish waits and disconnects from the network thread, propagate
+  QoS 0 admission failures through `MQTTMessageInfo`, restore Paho's
+  `is_connected()` method shape and `ConnectFlags`, accept `payload=None` as a
+  zero-length publish, and validate per-topic callback filters.
+- Keep automatic reconnect eligible after failed transport/CONNACK attempts, so
+  the configured retry policy can reach later attempts and terminal exhaustion
+  settles pending receipts; carry refused CONNACK reason codes structurally
+  instead of recovering them from exception text.
 - Local MQTT protocol failures now complete teardown even when the negotiated
   Maximum Packet Size prevents sending the normative DISCONNECT, close the
   runtime transport, and surface CONNACK validation failures to `connect()`

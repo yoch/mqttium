@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING
 from mqttium.codec.buffer import RawPacket
 from mqttium.codec.packet_validation import require_nonzero_mid
 from mqttium.codec.properties import PUBLISH, encode_properties
-from mqttium.codec.vbi import vbi_len
+from mqttium.codec.vbi import MAX_VBI, vbi_len
 from mqttium.enums import (
     ConnectionState,
     MQTTProtocolVersion,
@@ -886,6 +886,10 @@ class OutboundSession:
         qos: QoS,
     ) -> int:
         remaining = 2 + topic_bytes + (2 if qos else 0) + wire_property_bytes + payload_size
+        if remaining > MAX_VBI:
+            raise PacketTooLargeError(
+                f"PUBLISH remaining length {remaining} exceeds MQTT wire maximum {MAX_VBI}"
+            )
         return 1 + vbi_len(remaining) + remaining
 
     def publish_wire_size(

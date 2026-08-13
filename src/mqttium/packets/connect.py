@@ -74,8 +74,13 @@ class ConnectPacket:
             will_qos = QoS(self.will_qos)
         except ValueError as exc:
             raise ProtocolError(f"Invalid Will QoS {self.will_qos!r}") from exc
-        if self.will_topic is None and (will_qos or self.will_retain):
-            raise ProtocolError("Will QoS/retain require a Will topic")
+        if self.will_topic is None:
+            if will_qos or self.will_retain:
+                raise ProtocolError("Will QoS/retain require a Will topic")
+            if self.will_payload or (
+                self.will_properties is not None and self.will_properties.values
+            ):
+                raise ProtocolError("Will payload/properties require a Will topic")
         if self.password is not None and len(self.password) > 65535:
             raise ProtocolError("Password exceeds MQTT binary-data limit")
         if len(self.will_payload) > 65535:

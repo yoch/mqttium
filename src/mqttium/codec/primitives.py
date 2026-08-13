@@ -137,5 +137,3 @@ def _validate_mqtt_utf8(
     # topic four times where twice is enough.
     if "\x00" in text:
         raise error_type("[MQTT-1.5.4-2] Null in UTF-8 data")
-    if "﻿" in text:
-        raise error_type("[MQTT-1.5.4-3] U+FEFF in UTF-8 data")

@@ -53,6 +53,8 @@ await client.disconnect()
 Important compatibility differences:
 
 - only `CallbackAPIVersion.VERSION2` is supported;
+- call `client.is_connected()` as a method, matching Paho. Builds before the
+  post-RC2 compatibility fix accidentally exposed it as a boolean property;
 - MQTTium does not reproduce non-compliant QoS republishing after a clean
   session;
 - use native `await client.connect()` instead of Paho's historical
@@ -76,6 +78,14 @@ that operation to another thread or convert the callback path to the native
 client.
 
 See [`COMPAT.md`](COMPAT.md) for the complete supported surface.
+
+## Provisional packet-view normalization
+
+Post-RC2 builds normalize MQTT 5 PUBACK/PUBREC/PUBREL/PUBCOMP packets that carry
+an explicit zero reason code but no properties to the same semantic shape as
+the shortest two-byte body: `properties is None`. Code that inspected an empty
+`Properties()` object to distinguish those wire spellings should stop relying
+on that representation detail.
 
 ## From gmqtt
 

@@ -72,7 +72,7 @@ def test_compat_connect_publish_qos1() -> None:
         assert info.is_published()
         rc, mid = client.subscribe("t/#")
         assert rc == 0 and mid > 0
-        assert client.is_connected
+        assert client.is_connected()
         assert client.disconnect() == 0
     finally:
         client.loop_stop()
@@ -145,6 +145,7 @@ def test_off_loop_qos0_on_publish_keeps_handoff_path() -> None:
     try:
         assert client.connect("fake", 1883) == 0
         info = client.publish("race/t", b"x", qos=0)
+        info.wait_for_publish(timeout=2.0)
         assert info.is_published()
         assert subscribed.wait(timeout=3.0)
         assert not errors
