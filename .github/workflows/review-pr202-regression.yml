@@ -1,0 +1,63 @@
+name: Review PR202 normal ingress
+on:
+  push:
+    branches: [review/pr202-performance]
+permissions:
+  contents: read
+jobs:
+  measure:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          path: base
+      - uses: actions/checkout@v7
+        with:
+          ref: cursor/rm-preflight-validate-6aff
+          path: candidate
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - name: Paired ordinary MQTT5 ingress
+        run: |
+          cat > /tmp/measure.py <<'PY'
+          import json, os, statistics, subprocess, sys
+          from pathlib import Path
+
+          WORKER = r'''
+          import json,time
+          from mqttium.codec.buffer import RawPacket
+          from mqttium.codec.primitives import pack_u16, pack_utf8
+          from mqttium.enums import ConnectionState, MQTTProtocolVersion, PacketType
+          from mqttium.protocol.config import EngineConfig
+          from mqttium.protocol.engine import ProtocolEngine
+          size=int(os.environ['PAYLOAD'])
+          body=b'x'*size
+          raw=RawPacket(PacketType.PUBLISH,0x02,pack_utf8('bench/ordinary')+pack_u16(17)+b'\x00'+body)
+          count=12000 if size <= 4096 else 3000
+          samples=[]
+          for rep in range(13):
+              e=ProtocolEngine(EngineConfig(protocol=MQTTProtocolVersion.MQTTv5, local_receive_maximum=65535))
+              e.state=ConnectionState.CONNECTED
+              start=time.perf_counter_ns()
+              for _ in range(count):
+                  e.handle_raw(raw)
+                  e.take_effects()
+              elapsed=time.perf_counter_ns()-start
+              if rep>=2:samples.append(count*1e9/elapsed)
+          print(json.dumps(samples))
+          '''
+          def run(root,payload):
+              env=os.environ.copy();env['PYTHONPATH']=str(Path(root).resolve()/'src');env['PAYLOAD']=str(payload)
+              return json.loads(subprocess.check_output([sys.executable,'-c',WORKER],env=env,text=True))
+          out={}
+          for payload in (64,4096,65536):
+              b=run('base',payload);c=run('candidate',payload);r=[y/x for x,y in zip(b,c)]
+              out[str(payload)]={'base':b,'candidate':c,'ratios':r,'median_ratio':statistics.median(r)}
+          print(json.dumps(out,indent=2))
+          if min(v['median_ratio'] for v in out.values()) < 0.97:
+              raise SystemExit('candidate regressed ordinary MQTT5 ingress by more than 3%')
+          PY
+          python /tmp/measure.py
