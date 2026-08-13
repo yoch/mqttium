@@ -7,9 +7,9 @@ from dataclasses import dataclass
 from mqttium.codec.packet_validation import require_nonzero_mid
 from mqttium.codec.primitives import encode_utf8, unpack_utf8, unpack_u16
 from mqttium.codec.properties import PUBLISH, decode_properties
-from mqttium.codec.vbi import append_vbi
+from mqttium.codec.vbi import MAX_VBI, append_vbi
 from mqttium.enums import MQTTProtocolVersion, PacketType, QoS
-from mqttium.errors import MalformedPacketError, ProtocolError
+from mqttium.errors import MalformedPacketError, PacketTooLargeError, ProtocolError
 from mqttium.packets._common import _props_or_empty, _require_outbound_mid
 from mqttium.topics import validate_received_publish_topic
 from mqttium.transport.writes import SEGMENT_THRESHOLD, WriteItem
@@ -55,6 +55,10 @@ def encode_publish_item(
     props = _props_or_empty(properties, PUBLISH, protocol)
     payload_size = len(payload)
     remaining_length = 2 + topic_size + (2 if level else 0) + len(props) + payload_size
+    if remaining_length > MAX_VBI:
+        raise PacketTooLargeError(
+            f"PUBLISH remaining length {remaining_length} exceeds MQTT wire maximum {MAX_VBI}"
+        )
 
     header = bytearray()
     header.append(int(PacketType.PUBLISH) | flags)
@@ -129,10 +133,11 @@ class PublishPacket:
         properties: Properties | None = None
         if protocol == MQTTProtocolVersion.MQTTv5:
             properties, pos = decode_properties(remaining, pos, PUBLISH)
-            # Validate a non-empty Topic Name before the inbound session can
-            # establish a Topic Alias from it. Empty is intentionally deferred:
-            # MQTT 5 permits it only when a previously established alias is used.
-            validate_received_publish_topic(topic, utf8_validated=True)
+        # Validate before the inbound session can mutate alias/state. MQTT 5
+        # alone may defer an empty Topic Name for Topic Alias resolution.
+        validate_received_publish_topic(topic, utf8_validated=True)
+        if protocol != MQTTProtocolVersion.MQTTv5 and not topic:
+            raise MalformedPacketError("PUBLISH topic must not be empty")
         # The remainder is the PUBLISH payload and may be empty.
         payload = remaining[pos:]
         return cls(

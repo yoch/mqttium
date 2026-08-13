@@ -79,6 +79,14 @@ client.
 
 See [`COMPAT.md`](COMPAT.md) for the complete supported surface.
 
+## Provisional packet-view normalization
+
+Post-RC2 builds normalize MQTT 5 PUBACK/PUBREC/PUBREL/PUBCOMP packets that carry
+an explicit zero reason code but no properties to the same semantic shape as
+the shortest two-byte body: `properties is None`. Code that inspected an empty
+`Properties()` object to distinguish those wire spellings should stop relying
+on that representation detail.
+
 ## From gmqtt
 
 ```python

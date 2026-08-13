@@ -21,6 +21,10 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Correct MQTT string and PUBLISH conformance: preserve legal U+FEFF text,
+  reject empty MQTT 3.1.1 inbound Topic Names at the packet boundary, surface
+  PUBLISH wire-limit overflow as `PacketTooLargeError`, reject semantic Will
+  fields without a Will Topic, and normalize reason-only MQTT 5 ACK properties.
 - Harden the Paho VERSION2 façade: serialize `loop_start()` ownership, reject
   blocking publish waits and disconnects from the network thread, propagate
   QoS 0 admission failures through `MQTTMessageInfo`, restore Paho's

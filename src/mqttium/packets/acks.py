@@ -70,8 +70,6 @@ def _decode_ack_with_reason(
             pos += 1
             if pos < len(remaining):
                 properties, pos = decode_properties(remaining, pos, packet_name)
-            else:
-                properties = Properties()
         require_reason_code(reason, _ACK_REASONS[packet_name], packet_name)
         require_end(pos, len(remaining), packet_name)
     else:

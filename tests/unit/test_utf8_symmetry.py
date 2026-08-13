@@ -11,7 +11,7 @@ from mqttium.packets import PublishPacket
 from mqttium.types import Properties
 
 
-@pytest.mark.parametrize("value", ["a\x00b", "\ufeff", "\ud800"])
+@pytest.mark.parametrize("value", ["a\x00b", "\ud800"])
 def test_pack_utf8_rejects_forbidden_outbound_text(value: str) -> None:
     with pytest.raises(ProtocolError):
         pack_utf8(value)
