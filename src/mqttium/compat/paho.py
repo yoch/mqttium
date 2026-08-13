@@ -300,20 +300,40 @@ class Client:
         return bool(self._run_loop_mutation(lambda: self._async.is_connected))
 
     def loop_start(self) -> None:
-        with self._loop_state_lock:
-            if self._thread is not None and self._thread.is_alive():
-                return
-            self._started.clear()
-            self._stopping.clear()
-            thread = threading.Thread(target=self._run_loop, name="mqttium-paho-loop", daemon=True)
-            self._thread = thread
-            try:
-                thread.start()
-            except BaseException:
-                if self._thread is thread:
-                    self._thread = None
-                raise
-        if not self._started.wait(timeout=5.0):
+        while True:
+            stopping_thread: threading.Thread | None = None
+            with self._loop_state_lock:
+                thread = self._thread
+                if thread is not None and thread.is_alive():
+                    if self._stopping.is_set():
+                        stopping_thread = thread
+                    else:
+                        started = self._started
+                        break
+                else:
+                    self._started.clear()
+                    self._stopping.clear()
+                    thread = threading.Thread(
+                        target=self._run_loop, name="mqttium-paho-loop", daemon=True
+                    )
+                    self._thread = thread
+                    try:
+                        thread.start()
+                    except BaseException:
+                        if self._thread is thread:
+                            self._thread = None
+                        raise
+                    started = self._started
+                    break
+
+            assert stopping_thread is not None
+            if stopping_thread is threading.current_thread():
+                raise RuntimeError("Cannot restart a stopping network loop from its own thread")
+            stopping_thread.join(timeout=5.0)
+            if stopping_thread.is_alive():
+                raise RuntimeError("Previous background loop did not stop")
+
+        if not started.wait(timeout=5.0):
             raise RuntimeError("Failed to start background loop")
 
     def loop_stop(self) -> None:
@@ -357,6 +377,11 @@ class Client:
             if pending:
                 loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
             loop.close()
+            with self._loop_state_lock:
+                if self._loop is loop:
+                    self._loop = None
+                if self._thread is threading.current_thread():
+                    self._thread = None
 
     def _submit(
         self,

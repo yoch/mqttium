@@ -66,6 +66,59 @@ def test_loop_start_serializes_first_thread_creation(monkeypatch: pytest.MonkeyP
     assert constructor_calls == 1
 
 
+def test_concurrent_loop_start_waits_for_existing_thread_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller that loses the creation race must still wait for loop readiness."""
+    client = Client()
+    real_thread = threading.Thread
+    fake_started = threading.Event()
+
+    class DelayedNetworkThread:
+        def __init__(self) -> None:
+            self._alive = False
+
+        def start(self) -> None:
+            self._alive = True
+            fake_started.set()
+
+        def is_alive(self) -> bool:
+            return self._alive
+
+        def join(self, timeout: float | None = None) -> None:
+            del timeout
+            self._alive = False
+
+    monkeypatch.setattr(
+        paho.threading,
+        "Thread",
+        lambda *args, **kwargs: DelayedNetworkThread(),
+    )
+
+    returned = [threading.Event(), threading.Event()]
+
+    def call_start(index: int) -> None:
+        client.loop_start()
+        returned[index].set()
+
+    first = real_thread(target=call_start, args=(0,))
+    first.start()
+    assert fake_started.wait(timeout=1.0)
+
+    second = real_thread(target=call_start, args=(1,))
+    second.start()
+    time.sleep(0.05)
+    assert not returned[0].is_set()
+    assert not returned[1].is_set()
+
+    client._started.set()
+    first.join(timeout=1.0)
+    second.join(timeout=1.0)
+    assert returned[0].is_set()
+    assert returned[1].is_set()
+    client._thread = None
+
+
 @pytest.mark.asyncio
 async def test_wait_for_publish_rejects_network_event_loop() -> None:
     loop = asyncio.get_running_loop()
@@ -170,6 +223,12 @@ def test_loop_stop_from_network_thread_does_not_join_itself() -> None:
     thread.join(timeout=2.0)
     assert not thread.is_alive()
     assert errors == []
+    assert client._thread is None
+    assert client._loop is None
 
-    # Clear the now-stale references left by the self-stop path.
+    client.loop_start()
+    restarted_loop = client._loop
+    restarted_thread = client._thread
+    assert restarted_loop is not None and restarted_loop.is_running()
+    assert restarted_thread is not None and restarted_thread.is_alive()
     client.loop_stop()
