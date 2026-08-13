@@ -21,6 +21,10 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Correct MQTT string and PUBLISH conformance: preserve legal U+FEFF text,
+  reject empty MQTT 3.1.1 inbound Topic Names at the packet boundary, surface
+  PUBLISH wire-limit overflow as `PacketTooLargeError`, reject semantic Will
+  fields without a Will Topic, and normalize reason-only MQTT 5 ACK properties.
 - Local MQTT protocol failures now complete teardown even when the negotiated
   Maximum Packet Size prevents sending the normative DISCONNECT, close the
   runtime transport, and surface CONNACK validation failures to `connect()`

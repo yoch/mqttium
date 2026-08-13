@@ -279,7 +279,6 @@ def test_validate_utf8_does_not_encode_an_ascii_string(monkeypatch) -> None:
     ("text", "rule"),
     [
         ("capteurs/\x00/x", "1.5.4-2"),
-        ("capteurs/﻿/x", "1.5.4-3"),
         ("capteurs/\ud800/x", "1.5.4-1"),
         ("\udfff", "1.5.4-1"),
         ("ascii\x00", "1.5.4-2"),

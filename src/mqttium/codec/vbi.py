@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from mqttium.errors import MalformedPacketError
 
-_MAX_VBI = 268_435_455
+MAX_VBI = 268_435_455
 
 # Precomputed single-byte VBIs (remaining length / prop length < 128).
 _VBI_ONE = tuple(bytes((i,)) for i in range(128))
@@ -15,7 +15,7 @@ def encode_vbi(value: int) -> bytes:
         if value < 0:
             raise ValueError(f"VBI out of range: {value}")
         return _VBI_ONE[value]
-    if value > _MAX_VBI:
+    if value > MAX_VBI:
         raise ValueError(f"VBI out of range: {value}")
     out = bytearray()
     while True:
@@ -31,7 +31,7 @@ def encode_vbi(value: int) -> bytes:
 
 def append_vbi(buf: bytearray, value: int) -> None:
     """Encode a VBI directly into *buf* (avoids intermediate bytes)."""
-    if not 0 <= value <= _MAX_VBI:
+    if not 0 <= value <= MAX_VBI:
         raise ValueError(f"VBI out of range: {value}")
     while True:
         digit = value % 128
@@ -73,17 +73,13 @@ def decode_vbi(buffer: bytes | bytearray | memoryview, offset: int = 0) -> tuple
         if byte & 0x80 == 0:
             break
         multiplier *= 128
-        if multiplier > 128 * 128 * 128:
-            raise MalformedPacketError("Malformed Variable Byte Integer")
-    if value > _MAX_VBI:
-        raise MalformedPacketError("Variable Byte Integer exceeds maximum")
     if encoded_bytes != vbi_len(value):
         raise MalformedPacketError("Non-canonical Variable Byte Integer")
     return value, pos
 
 
 def vbi_len(value: int) -> int:
-    if not 0 <= value <= _MAX_VBI:
+    if not 0 <= value <= MAX_VBI:
         raise ValueError(f"VBI out of range: {value}")
     if value < 128:
         return 1

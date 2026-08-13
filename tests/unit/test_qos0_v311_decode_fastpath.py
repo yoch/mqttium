@@ -25,7 +25,6 @@ def _connected(
         ("bench/telemetry", b"payload", False),
         ("capteur/température", b"", True),
         ("a/b/c", b"x" * 4096, False),
-        ("", b"existing-v311-parity", False),
     ],
 )
 def test_v311_qos0_direct_decode_matches_generic_packet(
@@ -74,6 +73,7 @@ def test_v311_qos0_engine_emits_direct_message(monkeypatch) -> None:
     ("flags", "remaining", "error_type", "match"),
     [
         (0x08, pack_utf8("bench/dup") + b"x", MalformedPacketError, "must not set DUP"),
+        (0x00, pack_utf8("") + b"x", MalformedPacketError, "must not be empty"),
         (
             0x00,
             pack_utf8("bench/+") + b"x",

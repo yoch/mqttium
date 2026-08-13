@@ -91,6 +91,8 @@ def _decode_v311_qos0_message(raw: RawPacket) -> Message:
     if raw.flags & 0x08:
         raise MalformedPacketError("QoS 0 PUBLISH must not set DUP")
     topic, payload_pos = unpack_utf8(raw.remaining)
+    if not topic:
+        raise MalformedPacketError("PUBLISH topic must not be empty")
     validate_received_publish_topic(topic, utf8_validated=True)
     return Message(
         topic=topic,
@@ -108,6 +110,8 @@ def _decode_v311_qos1_fields(
 ) -> tuple[str, bytes, int, bool, bool]:
     """Decode MQTT 3.1.1 QoS 1/2 PUBLISH fields (identical wire layout)."""
     topic, pos = unpack_utf8(raw.remaining)
+    if not topic:
+        raise MalformedPacketError("PUBLISH topic must not be empty")
     validate_received_publish_topic(topic, utf8_validated=True)
     mid, pos = unpack_u16(raw.remaining, pos)
     require_nonzero_mid(mid, "PUBLISH")
