@@ -1,0 +1,60 @@
+name: Audit bootstrap protocol
+
+on:
+  push:
+    branches:
+      - agent/fix-protocol-conformance-audit
+    paths:
+      - .github/workflows/audit-bootstrap-protocol.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply-validate-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/fix-protocol-conformance-audit
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Load exact audited patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin chatgpt-workbench-jobs
+          git show FETCH_HEAD:.cgw/jobs/audit-protocol-20260813.b64 > /tmp/job.b64
+          python - <<'PY'
+          import base64, gzip, json
+          from pathlib import Path
+          raw = base64.urlsafe_b64decode(Path('/tmp/job.b64').read_text())
+          job = json.loads(gzip.decompress(raw))
+          Path('/tmp/audit.patch').write_text(job['patch'])
+          PY
+          git apply --check --whitespace=error-all /tmp/audit.patch
+          git apply --index --whitespace=error-all /tmp/audit.patch
+          git rm .github/workflows/audit-bootstrap-protocol.yml
+          git diff --cached --check
+      - name: Install validation dependencies
+        run: python -m pip install -e '.[dev,security]'
+      - name: Quality and unit gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          ruff format --check src tests benchmarks
+          ruff check src tests benchmarks
+          mypy src/mqttium
+          bandit -q -ll -r src
+          python -m pytest -q tests/unit
+      - name: Commit exact validated patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'ChatGPT Audit Runner'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Fix MQTT protocol conformance audit findings'
+          git push origin HEAD:agent/fix-protocol-conformance-audit
