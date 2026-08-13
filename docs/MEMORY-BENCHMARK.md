@@ -156,9 +156,10 @@ consumers finish.
 
 ### `websocket_batching_4k`
 
-Masks 300 frames through `write_many()`, enough to cross the 1 MiB batch boundary
-once. A counting writer deliberately retains no frame, so the measured peak is
-the transport's current batch rather than an artificial history of every write.
+Masks 300 MQTT parts through `write_many()`. The transport coalesces them into
+bounded 256 KiB payloads (ten writer segments across five batches); a counting
+writer deliberately retains no frame, so the measured peak is the transport's
+current batch rather than an artificial history of every write.
 
 ### `reconnect_epoch_cleanup_4k`
 

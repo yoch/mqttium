@@ -6,6 +6,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [1.0.0rc3] - 2026-08-13
+
 - Replace generic packet encode/decode dispatch with direct MQTT 3.1.1 and
   MQTT 5 primitives across acknowledgements, PUBLISH, CONNECT/CONNACK,
   subscriptions and control packets. Protocol sessions bind their hot PUBLISH
@@ -69,6 +71,14 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - Automatic reconnect stops on permanent MQTT 5 connection refusals such as
   Banned and protocol/configuration errors, while transient capacity failures
   such as Connection rate exceeded remain eligible for backoff and retry.
+
+- Refresh the retained memory benchmark contract for the current bounded
+  WebSocket coalescing path and its RC2-equivalent property-heavy allocation
+  baseline.
+- End asynchronous ingress batches exactly when automatic QoS 1 acknowledgements
+  fill the remaining local Receive Maximum window, preventing another PUBLISH
+  from being admitted before those acknowledgements reach the effect pump while
+  preserving full-size batches for QoS 0 and control traffic.
 
 ## [1.0.0rc2] - 2026-08-12
 
@@ -527,7 +537,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - Pre-spin-out comparative analysis and generated coverage data from the
   published source tree.
 
-[Unreleased]: https://github.com/yoch/mqttium/compare/v1.0.0rc2...HEAD
+[Unreleased]: https://github.com/yoch/mqttium/compare/v1.0.0rc3...HEAD
+[1.0.0rc3]: https://github.com/yoch/mqttium/compare/v1.0.0rc2...v1.0.0rc3
 [1.0.0rc2]: https://github.com/yoch/mqttium/compare/v1.0.0rc1...v1.0.0rc2
 [1.0.0rc1]: https://github.com/yoch/mqttium/compare/v0.2.0b4...v1.0.0rc1
 [0.2.0b4]: https://github.com/yoch/mqttium/compare/v0.2.0b3...v0.2.0b4

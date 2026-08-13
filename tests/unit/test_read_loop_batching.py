@@ -5,12 +5,29 @@ from __future__ import annotations
 import asyncio
 
 from mqttium.api import AsyncClient
-from mqttium.enums import ConnectionState
+from mqttium.enums import ConnectionState, MQTTProtocolVersion, QoS
+from mqttium.errors import ProtocolError
+from mqttium.packets import PublishPacket
 
 
 def puback(mid: int) -> bytes:
     """A minimal MQTT 3.1.1 PUBACK for a mid that is not in flight."""
     return b"\x40\x02" + mid.to_bytes(2, "big")
+
+
+def pingresp() -> bytes:
+    return b"\xd0\x00"
+
+
+def publish(mid: int, qos: QoS = QoS.AT_LEAST_ONCE) -> bytes:
+    return PublishPacket(
+        topic="batch/receive-maximum",
+        payload=b"x",
+        qos=qos,
+        retain=False,
+        dup=False,
+        mid=mid,
+    ).encode(MQTTProtocolVersion.MQTTv311)
 
 
 class _ScriptedTransport:
@@ -53,32 +70,41 @@ class _CountingLock:
 
 
 class _CountingDecoder:
-    """Delegate to the real decoder while counting bounded decode calls."""
+    """Delegate to the real decoder while counting packet extraction."""
 
     def __init__(self, decoder) -> None:
         self._decoder = decoder
-        self.decodes = 0
+        self.next_calls = 0
         self.handled = 0
 
     def feed(self, data: bytes) -> None:
         self._decoder.feed(data)
 
-    def process_packets_bounded(self, callback, *, limit: int, max_bytes: int):
-        self.decodes += 1
-        count, decoded_bytes = self._decoder.process_packets_bounded(
-            callback, limit=limit, max_bytes=max_bytes
-        )
-        self.handled += count
-        return count, decoded_bytes
+    def next_packet(self):
+        self.next_calls += 1
+        packet = self._decoder.next_packet()
+        if packet is not None:
+            self.handled += 1
+        return packet
 
 
 # _read_loop's finally block takes the engine lock once to notify closure.
 TEARDOWN_ACQUISITIONS = 1
 
 
-async def _run_reads(reads: list[bytes], *, max_ingress_batch_bytes: int = 1024 * 1024):
-    client = AsyncClient(max_ingress_batch_bytes=max_ingress_batch_bytes)
+async def _run_reads(
+    reads: list[bytes],
+    *,
+    max_ingress_batch_bytes: int = 1024 * 1024,
+    local_receive_maximum: int = 100,
+    initial_inflight: int = 0,
+):
+    client = AsyncClient(
+        max_ingress_batch_bytes=max_ingress_batch_bytes,
+        local_receive_maximum=local_receive_maximum,
+    )
     client._engine.state = ConnectionState.CONNECTED
+    client._engine._inbound_inflight = initial_inflight
     client._transport = _ScriptedTransport(reads)
     lock = _CountingLock()
     client._engine_lock = lock
@@ -86,51 +112,104 @@ async def _run_reads(reads: list[bytes], *, max_ingress_batch_bytes: int = 1024 
     client._decoder = decoder
 
     await client._read_loop()
-    return decoder.decodes, lock.acquisitions, decoder.handled
+    return decoder.next_calls, lock.acquisitions, decoder.handled, client
 
 
 async def test_short_batch_decodes_once_per_read() -> None:
     """A batch under both bounds emptied the buffer: no confirming re-entry."""
-    decodes, acquisitions, handled = await _run_reads([puback(1)])
+    next_calls, acquisitions, handled, _client = await _run_reads([puback(1)])
 
     assert handled == 1
-    assert decodes == 1
+    assert next_calls == 2
     assert acquisitions == 1 + TEARDOWN_ACQUISITIONS
 
 
 async def test_each_read_costs_exactly_one_decode() -> None:
-    decodes, acquisitions, handled = await _run_reads([puback(1), puback(2), puback(3)])
+    next_calls, acquisitions, handled, _client = await _run_reads([puback(1), puback(2), puback(3)])
 
     assert handled == 3
-    assert decodes == 3
+    assert next_calls == 6
     assert acquisitions == 3 + TEARDOWN_ACQUISITIONS
 
 
 async def test_full_count_batch_re_enters_to_find_the_buffer_empty() -> None:
     """Hitting the count bound is not evidence the buffer drained."""
     wire = b"".join(puback(mid) for mid in range(1, 257))
-    decodes, acquisitions, handled = await _run_reads([wire])
+    next_calls, acquisitions, handled, _client = await _run_reads([wire])
 
     assert handled == 256
-    assert decodes == 2
+    assert next_calls == 257
     assert acquisitions == 2 + TEARDOWN_ACQUISITIONS
 
 
 async def test_byte_bounded_batch_re_enters_until_the_buffer_drains() -> None:
     """Each PUBACK charges len(remaining) + 5, so 20 bytes admits three."""
     wire = b"".join(puback(mid) for mid in range(1, 7))
-    decodes, acquisitions, handled = await _run_reads([wire], max_ingress_batch_bytes=20)
+    next_calls, acquisitions, handled, _client = await _run_reads(
+        [wire], max_ingress_batch_bytes=20
+    )
 
     assert handled == 6
-    assert decodes == 3
+    assert next_calls == 7
     assert acquisitions == 3 + TEARDOWN_ACQUISITIONS
 
 
 async def test_packet_split_across_reads_is_completed() -> None:
     """A partial trailing packet decodes nothing until its remainder arrives."""
     frame = puback(9)
-    decodes, acquisitions, handled = await _run_reads([frame[:3], frame[3:]])
+    next_calls, acquisitions, handled, _client = await _run_reads([frame[:3], frame[3:]])
 
     assert handled == 1
-    assert decodes == 2
+    assert next_calls == 3
     assert acquisitions == 2 + TEARDOWN_ACQUISITIONS
+
+
+async def test_receive_maximum_only_bounds_autoack_publish_batches() -> None:
+    next_calls, acquisitions, handled, client = await _run_reads(
+        [pingresp() * 256],
+        local_receive_maximum=1,
+    )
+
+    assert handled == 256
+    assert next_calls == 257
+    assert acquisitions == 2 + TEARDOWN_ACQUISITIONS
+    assert not isinstance(client._disconnect_exc, ProtocolError)
+
+
+async def test_autoack_batch_hands_off_before_receive_maximum_is_exceeded() -> None:
+    next_calls, acquisitions, handled, client = await _run_reads(
+        [publish(1) + publish(2) + publish(3)],
+        local_receive_maximum=2,
+    )
+
+    assert handled == 3
+    assert next_calls == 4
+    assert acquisitions == 2 + TEARDOWN_ACQUISITIONS
+    assert not isinstance(client._disconnect_exc, ProtocolError)
+
+
+async def test_autoack_batch_uses_only_the_remaining_receive_maximum_window() -> None:
+    next_calls, acquisitions, handled, client = await _run_reads(
+        [publish(1) + publish(2)],
+        local_receive_maximum=2,
+        initial_inflight=1,
+    )
+
+    assert handled == 2
+    assert next_calls == 3
+    assert acquisitions == 3 + TEARDOWN_ACQUISITIONS
+    assert not isinstance(client._disconnect_exc, ProtocolError)
+
+
+async def test_qos2_filling_window_after_autoack_forces_handoff() -> None:
+    next_calls, acquisitions, handled, client = await _run_reads(
+        [publish(1) + publish(2, QoS.EXACTLY_ONCE) + publish(3)],
+        local_receive_maximum=2,
+    )
+
+    assert handled == 3
+    assert next_calls == 4
+    # Two handoff boundaries, the confirming empty decode and QoS 2's
+    # persisted delivery mark each acquire the engine lock before teardown.
+    assert acquisitions == 4 + TEARDOWN_ACQUISITIONS
+    assert not isinstance(client._disconnect_exc, ProtocolError)

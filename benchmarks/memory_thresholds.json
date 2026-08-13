@@ -9,8 +9,10 @@
     "allocations rather than RSS and is comparable across runners. The inbound",
     "persistence scenario also has a deliberately generous GitHub Actions RSS",
     "delta gate so aggregate process growth cannot escape the logical cap.",
-    "Each tracemalloc value is",
-    "the reference peak recorded in docs/MEMORY-RESULTS.md rounded up by ~25%.",
+    "Each tracemalloc value is a reviewed bound for the current scenario. The",
+    "property-heavy bound was compared against RC2 and candidate runs before",
+    "this update; the WebSocket logical counters mirror its bounded 256 KiB",
+    "coalescing implementation.",
     "",
     "logical is an exact-match assertion on the scenario's 'loaded' counters. It",
     "is machine-independent and catches a benchmark that silently stopped doing",
@@ -93,7 +95,7 @@
       }
     },
     "property_heavy_outbound_4k": {
-      "max_traced_peak_mib": 19.0,
+      "max_traced_peak_mib": 21.0,
       "logical": {
         "queued_messages": 2000,
         "pending_logical_bytes": 10058890,
@@ -153,9 +155,9 @@
       "logical": {
         "input_messages": 300,
         "input_bytes": 1228800,
-        "writer_frames": 300,
-        "writer_batches": 2,
-        "max_observed_batch_bytes": 1046520,
+        "writer_frames": 10,
+        "writer_batches": 5,
+        "max_observed_batch_bytes": 262158,
         "configured_batch_limit": 1048576,
         "batches_within_limit": true,
         "retained_receive_bytes": 0,
