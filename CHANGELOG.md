@@ -21,6 +21,10 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Keep automatic reconnect eligible after failed transport/CONNACK attempts, so
+  the configured retry policy can reach later attempts and terminal exhaustion
+  settles pending receipts; carry refused CONNACK reason codes structurally
+  instead of recovering them from exception text.
 - Local MQTT protocol failures now complete teardown even when the negotiated
   Maximum Packet Size prevents sending the normative DISCONNECT, close the
   runtime transport, and surface CONNACK validation failures to `connect()`

@@ -293,6 +293,7 @@ class AsyncClient:
         self._intentional_disconnect = False
         self._transport_factory: Callable[..., Awaitable[AsyncTransport]] = TcpTransport.connect
         self._last_disconnect: DisconnectInfo | None = None
+        self._last_connack_reason: int | None = None
 
         self.on_message: OnMessage | None = None
         self.on_connect: OnConnect | None = None
@@ -772,6 +773,7 @@ class AsyncClient:
         *,
         ssl: ssl.SSLContext | bool | None = None,
         timeout: float = 30.0,
+        reconnect_attempt: bool = False,
     ) -> ConnAckPacket:
         loop = asyncio.get_running_loop()
         owner_loop = self._owner_loop
@@ -781,6 +783,7 @@ class AsyncClient:
             raise RuntimeError("AsyncClient is bound to a different event loop")
         if self._engine.state in (ConnectionState.CONNECTED, ConnectionState.CONNECTING):
             raise ProtocolError("Already connected or connecting")
+        self._last_connack_reason = None
         # Effects belong to a protocol/transport epoch. QoS replay and
         # inbound redelivery are rebuilt from the engine/store after
         # CONNACK; no old effect may cross into the new connection.
@@ -811,6 +814,7 @@ class AsyncClient:
             except TimeoutError as exc:
                 raise MQTTTimeoutError("CONNACK timed out") from exc
             if connack.reason_code != 0:
+                self._last_connack_reason = connack.reason_code
                 raise ProtocolError(f"Connection refused: reason_code={connack.reason_code}")
             self._connected_at = time.monotonic()
             self._write_pump.last_outbound = time.monotonic()
@@ -819,7 +823,8 @@ class AsyncClient:
             )
             return connack
         except BaseException:
-            self._intentional_disconnect = True
+            if not reconnect_attempt:
+                self._intentional_disconnect = True
             if self._connack_fut is not None and not self._connack_fut.done():
                 self._connack_fut.cancel()
             try:
@@ -1436,13 +1441,8 @@ class AsyncClient:
                 reason = None
                 if self._last_disconnect is not None and self._last_disconnect.from_broker:
                     reason = self._last_disconnect.reason_code
-                elif isinstance(self._disconnect_exc, ProtocolError):
-                    msg = str(self._disconnect_exc)
-                    if "reason_code=" in msg:
-                        try:
-                            reason = int(msg.rsplit("=", 1)[-1])
-                        except ValueError:
-                            reason = None
+                elif self._last_connack_reason is not None:
+                    reason = self._last_connack_reason
                 if not self._reconnect.should_retry(reason, self._engine.config.protocol):
                     self._fail_pending(self._disconnect_exc or MQTTError("Reconnect exhausted"))
                     return
@@ -1458,6 +1458,7 @@ class AsyncClient:
                             self._port,
                             ssl=self._ssl,
                             timeout=self._reconnect.connect_timeout,
+                            reconnect_attempt=True,
                         )
                     # Only clear backoff after the connection stays up.
                     await asyncio.sleep(self._reconnect.stable_after)
