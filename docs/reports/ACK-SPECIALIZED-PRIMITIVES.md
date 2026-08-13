@@ -2,8 +2,8 @@
 
 Date: 2026-08-13
 
-Base: branch `perf/specialized-codec-primitives` (successor to the three-byte
-session fast-path checkpoint).
+Base: `main` at `e4e4482`; candidate rebases and supersedes the concurrent
+three-byte session fast path (#212) and specialized-codec branch (#213).
 
 ## Question
 
@@ -13,9 +13,9 @@ Python work as MQTT 3.1.1's two-byte success body?
 
 ## Change
 
-- `packets/_ack_v311.py` and `packets/_ack_v5.py` own encode/decode. The
-  fast-path shapes (2 bytes; MQTT 5 3 bytes) are the body of the decoder, not
-  a prelude that falls back to a generic helper.
+- `packets/_ack_v311.py` and `packets/_ack_v5.py` own direct encode/decode
+  functions per packet type. The fast-path shapes (2 bytes; MQTT 5 3 bytes)
+  contain no generic helper call.
 - Absent properties return `None` (no empty `Properties()` on the three-byte
   form).
 - `Pub*Packet` dataclasses are factories over those primitives.
@@ -24,28 +24,31 @@ Python work as MQTT 3.1.1's two-byte success body?
 
 ## Evidence (local micro)
 
-`sys.setprofile` mqttium call counts per decode:
+MQTTium call depth per engine ACK decode:
 
 | Shape | Calls | Call stack |
 | --- | --- | --- |
-| v3.1.1 2-byte | 2 | `decode_puback_v311` → `_decode_mid` |
-| v5 2-byte | 2 | `decode_puback_v5` → `_decode_ack_v5` |
-| v5 3-byte `0x10` | 2 | same |
-| v5 4-byte empty props | 5 | includes `decode_properties` |
+| v3.1.1 2-byte | 1 | `decode_puback_v311` |
+| v5 2-byte | 1 | `decode_puback_v5` |
+| v5 3-byte `0x10` | 1 | `decode_puback_v5` |
+| v5 4-byte empty props | property path | includes `decode_properties` |
 
-Pre-change generic path was 5.0 (v3.1.1) / 6.0 (v5) mqttium calls for the same
-ACK family. Criterion met: v5 three-byte is the same order as v3.1.1 two-byte
-(1–2 calls, not 6).
+Pre-change generic path was 5.0 (v3.1.1) / 6.0 (v5) MQTTium calls for the same
+ACK family. The common forms now execute one direct decode primitive.
 
-`benchmarks/ack_specialized_decode.py` (200k ops × 7 repeats, this host):
+`benchmarks/ack_specialized_decode.py` (300k ops × 9 repeats, this host):
 
 | Shape | Primitive ops/s | Packet factory ops/s |
 | --- | --- | --- |
-| v5 3-byte `0x10` | ~2.53e6 | ~5.6e5 |
-| v5 4-byte empty props | ~9.4e5 | ~3.7e5 |
+| v5 3-byte `0x10` | ~2.76e6 | ~5.92e5 |
+| v5 4-byte empty props | ~1.01e6 | ~3.73e5 |
 
-The factory still allocates the dataclass; sessions call the primitive
-directly and never pay that.
+The factory still allocates the dataclass; sessions call the primitive directly
+and never pay that. A paired full engine cycle (QoS 1 admission, PUBLISH encode,
+MQTT 5 three-byte PUBACK and settlement) measured candidate/main **1.1654x**
+(11/11 pairs favouring candidate; base CV 2.27%, candidate CV 3.12%). Against
+#212 it measured **1.0723x** (10/11; CV 4.32% / 3.04%). Raw outputs remain build
+artefacts under `/tmp` per the benchmark contract.
 
 ## Network
 
