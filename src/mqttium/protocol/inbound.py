@@ -151,6 +151,7 @@ class InboundSession:
         "_engine",
         "_inflight",
         "_paged_store",
+        "_pending_auto_qos1_mids",
         "_pending_bytes",
         "_pending_high_water_bytes",
         "_recovered_mids",
@@ -176,6 +177,11 @@ class InboundSession:
         )
         self._aliases: dict[int, str] = {}
         self._inflight = 0
+        # Auto-ACK QoS 1 identifiers whose PUBACK is still inside the current
+        # effect batch. The Receive Maximum slot stays held until take_effects()
+        # (or connection teardown) so a pipelined PUBLISH is admitted by the
+        # ordinary acquire path instead of a second decode.
+        self._pending_auto_qos1_mids: set[int] = set()
         self._replay: InboundReplayCursor | None = None
         self._recovered_mids, self._pending_bytes = self._load_recovered_state()
         self._pending_high_water_bytes = self._pending_bytes
@@ -225,12 +231,14 @@ class InboundSession:
         """Reset state scoped to one network connection before CONNECT."""
         self._aliases.clear()
         self._inflight = 0
+        self._pending_auto_qos1_mids.clear()
         # A replay belongs to the connection that started it: its continuation
         # effect is dropped with the epoch, so the cursor must go too.
         self._replay = None
 
     def transport_closed(self) -> None:
         self._aliases.clear()
+        self.release_pending_auto_qos1()
 
     def discard_session(self) -> None:
         """Drop inbound state after CONNACK reports no previous session."""
@@ -239,6 +247,19 @@ class InboundSession:
         self._replay = None
         self._inflight = 0
         self._pending_bytes = 0
+        self._pending_auto_qos1_mids.clear()
+
+    def release_pending_auto_qos1(self) -> None:
+        """Free Receive Maximum slots once auto-PUBACKs leave the engine batch."""
+        pending = self._pending_auto_qos1_mids
+        n = len(pending)
+        if not n:
+            return
+        pending.clear()
+        if self._inflight >= n:
+            self._inflight -= n
+        else:
+            self._inflight = 0
 
     @property
     def replay_pending(self) -> bool:
@@ -407,6 +428,13 @@ class InboundSession:
                 self._reject_packet_id_collision(mid, "QoS 2", "QoS 1")
             engine._send(encode_success_ack(PacketType.PUBREC, mid))
             return
+        if mid in self._pending_auto_qos1_mids:
+            # The same identifier cannot start a QoS 2 exchange while the QoS 1
+            # auto-PUBACK is still outstanding from the broker's point of view.
+            self._protocol_disconnect(0x82)
+            raise ProtocolError(
+                f"Inbound packet identifier {mid} reused by QoS 2 while QoS 1 PUBACK is pending"
+            )
 
         logical_size = self.logical_size(topic, payload, properties)
         self._acquire_slot(logical_size)
@@ -493,6 +521,24 @@ class InboundSession:
             # owns while leaving the QoS 2 record live.
             self._reject_packet_id_collision(mid, "QoS 1", "QoS 2")
 
+        if not config.manual_ack and mid in self._pending_auto_qos1_mids:
+            # Retransmission of an auto-ACK identifier still in this effect
+            # batch: the Receive Maximum slot is already held.
+            self._engine._send(_encode_puback_success(mid))
+            self._engine._emit(
+                EffectKind.MESSAGE,
+                Message(
+                    topic=topic,
+                    payload=payload,
+                    qos=QoS.AT_LEAST_ONCE,
+                    retain=retain,
+                    dup=dup,
+                    mid=mid,
+                    properties=properties,
+                ),
+            )
+            return
+
         logical_size = self.logical_size(topic, payload, properties) if config.manual_ack else None
         self._acquire_slot(logical_size)
         if config.manual_ack:
@@ -530,7 +576,7 @@ class InboundSession:
             ),
         )
         if not config.manual_ack:
-            self._release_slot()
+            self._pending_auto_qos1_mids.add(mid)
 
     def on_pubrel(self, raw: RawPacket) -> None:  # noqa: C901
         engine = self._engine

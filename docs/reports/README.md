@@ -97,6 +97,7 @@ implemented — the report exists so the choice stays falsifiable.
 
 | Date | Report | Question answered |
 | --- | --- | --- |
+| 2026-08-13 | [`RM-SLOT-UNTIL-HANDOFF.md`](RM-SLOT-UNTIL-HANDOFF.md) | Should auto-ACK QoS 1 keep the Receive Maximum slot until `take_effects()` instead of reconstructing occupancy with a second decode? |
 | 2026-08-12 | [`QOS2-V311-DECODE.md`](QOS2-V311-DECODE.md) | Should inbound MQTT 3.1.1 QoS 2 PUBLISH use the same field decoder as QoS 1? |
 | 2026-08-12 | [`ACK-SUCCESS-FASTPATH.md`](ACK-SUCCESS-FASTPATH.md) | Can common success/no-properties acknowledgement frames bypass transient packet objects without weakening long-form MQTT 5 validation? |
 | 2026-08-12 | [`QOS12-LAUNCH-ENCODE.md`](QOS12-LAUNCH-ENCODE.md) | Should stored outbound QoS 1/2 launches call the functional PUBLISH encoder directly instead of constructing a transient packet object? |
