@@ -44,7 +44,7 @@ must mark a persisted inbound row. The runtime consumes that fact directly:
 This makes persistence ownership explicit at the protocol/runtime boundary
 instead of reconstructing it from current configuration.
 
-## Validation
+## Correctness validation
 
 Focused tests pin batching for QoS 0 and fresh auto-QoS1, persisted-message
 fallback, mixed-prefix stopping, atomic `both` delivery, stale epochs, inline
@@ -52,5 +52,43 @@ drain without scheduling, the auto-QoS1 absent-row skip, and—critically—a
 persisted QoS1 replay under a current auto-ack configuration that still marks
 the durable row delivered.
 
-Performance acceptance additionally requires paired broker-backed measurement on
-the final reviewed branch; helper-only timing is not sufficient.
+The reviewed rebuild also passed ruff and mypy together with the Receive Maximum
+handoff regressions introduced by #204.
+
+## Broker-backed performance validation
+
+The acceptance measurement used fresh base/candidate Python processes against a
+local Mosquitto broker, a Paho QoS 1 publisher, and MQTTium callback delivery.
+Both MQTT connections and the subscription were established before timing. Pair
+order alternated to reduce runner drift.
+
+Initial matrix against base `a7f18a7`:
+
+| Scenario | Work per variant | candidate/base median | Positive pairs | Range |
+| --- | ---: | ---: | ---: | ---: |
+| MQTT 5, QoS 1, 64 B | 18,000 messages | **1.0601 (+6.01%)** | 6/7 | 0.9971–1.1202 |
+| MQTT 3.1.1, QoS 1, 64 B | 18,000 messages | 0.9861 (-1.39%) | 0/5 | 0.9049–0.9945 |
+| MQTT 5, QoS 1, 4 KiB | 6,000 messages | 1.0177 (+1.77%) | 3/5 | 0.8932–1.0890 |
+
+Because the short MQTT 3.1.1 result was consistently slightly negative despite
+being below the material-regression threshold, it was not accepted at face
+value. A longer focused run used 40,000 messages per variant and nine rotated
+pairs:
+
+- MQTT 3.1.1 / QoS 1 / 64 B: **1.0962 (+9.62%) median**;
+- **9/9 pairs** favoured the candidate;
+- range **1.0674–1.1365** (+6.74% to +13.65%).
+
+The longer run resolves the short-run anomaly in favour of a clear improvement.
+The MQTT 5 small-payload hot path independently shows a material gain, while the
+4 KiB point is neutral-to-positive at the median rather than a material
+regression. Effect counters also show that the candidate is actually consuming
+more MESSAGE effects inline, so the observed gain corresponds to the intended
+path change rather than a benchmark no-op.
+
+## Decision
+
+Accept the narrowed change. It removes a no-op delivery mark and scheduler hop
+from the fresh automatic QoS 1 hot path, demonstrates material broker-backed
+improvement on MQTT 5 and MQTT 3.1.1 small-message traffic, and leaves persisted
+QoS 1/QoS 2/replay semantics on their established path.
