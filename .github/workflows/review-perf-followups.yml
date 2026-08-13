@@ -1,0 +1,125 @@
+name: Review performance followups
+
+on:
+  push:
+    branches: [review/perf-cursor-batch]
+
+permissions:
+  contents: read
+
+jobs:
+  pr197-semantics:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+          path: base
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+          path: candidate
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - name: Apply PR 197 source diff
+        working-directory: candidate
+        run: |
+          git diff c34a9499ed2723054c2e0d3b730248f176be0856..origin/cursor/rm-preflight-mid-6aff -- src tests > /tmp/pr197.patch
+          git apply --3way /tmp/pr197.patch
+      - name: Compare saturated invalid MQTT5 PUBLISH semantics
+        run: |
+          cat > /tmp/check197.py <<'PY'
+          import json, os, subprocess, sys
+          from pathlib import Path
+
+          code = r'''
+          import json
+          from mqttium.codec.buffer import RawPacket
+          from mqttium.codec.primitives import pack_u16, pack_utf8
+          from mqttium.enums import ConnectionState, MQTTProtocolVersion, PacketType
+          from mqttium.protocol.config import EngineConfig
+          from mqttium.protocol.engine import ProtocolEngine
+
+          e = ProtocolEngine(EngineConfig(protocol=MQTTProtocolVersion.MQTTv5, local_receive_maximum=1))
+          e.state = ConnectionState.CONNECTED
+          e._pending_auto_qos1_mids.add(1)
+          # QoS1, MID 2, zero property length, but wildcard Topic Name is invalid
+          # for a received PUBLISH. The generic decoder validates it before the
+          # pending-handoff Receive Maximum check can classify the packet.
+          raw = RawPacket(PacketType.PUBLISH, 0x02, pack_utf8('invalid/+') + pack_u16(2) + b'\x00payload')
+          e.handle_raw(raw)
+          effects = e.take_effects()
+          print(json.dumps({
+              'state': e.state.name,
+              'effects': [x.kind.name for x in effects],
+              'data': [str(x.data) for x in effects],
+          }))
+          '''
+          def run(root):
+              env=os.environ.copy(); env['PYTHONPATH']=str(Path(root).resolve()/'src')
+              return json.loads(subprocess.check_output([sys.executable,'-c',code],env=env,text=True))
+          base=run('base'); candidate=run('candidate')
+          print(json.dumps({'base':base,'candidate':candidate}, indent=2))
+          if base == candidate:
+              raise SystemExit('expected differential not reproduced')
+          PY
+          python /tmp/check197.py
+
+  pr199-performance:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: c34a9499ed2723054c2e0d3b730248f176be0856
+          path: base
+      - uses: actions/checkout@v7
+        with:
+          ref: cursor/ack-success-fastpath-6aff
+          path: candidate
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - name: Paired QoS2 cycle
+        run: |
+          python base/benchmarks/paired_regression.py \
+            --base-root base --candidate-root candidate \
+            --scenario qos2_cycle_sqlite --repeat 11 \
+            --output /tmp/pr199.json
+          cat /tmp/pr199.json
+      - name: Paired in-memory QoS2 handshake
+        run: |
+          cat > /tmp/qos2_ack_cycle.py <<'PY'
+          import json, os, statistics, subprocess, sys
+          from pathlib import Path
+          worker=r'''
+          import json,time
+          from mqttium.codec.buffer import IncrementalDecoder
+          from mqttium.enums import ConnectionState, MQTTProtocolVersion, QoS
+          from mqttium.protocol.config import EngineConfig
+          from mqttium.protocol.engine import ProtocolEngine
+          from mqttium.packets import PubRecPacket, PubCompPacket
+          samples=[]; n=15000
+          for rep in range(13):
+              e=ProtocolEngine(EngineConfig(protocol=MQTTProtocolVersion.MQTTv311, max_outbound_inflight=1))
+              e.state=ConnectionState.CONNECTED
+              start=time.perf_counter_ns()
+              for i in range(n):
+                  h=e.queue_publish('bench/q2',b'x'*32,qos=QoS.EXACTLY_ONCE)
+                  e.take_effects(); mid=h.mid
+                  d=IncrementalDecoder(); d.feed(PubRecPacket(mid=mid).encode(MQTTProtocolVersion.MQTTv311)); e.handle_raw(d.next_packet()); e.take_effects()
+                  d=IncrementalDecoder(); d.feed(PubCompPacket(mid=mid).encode(MQTTProtocolVersion.MQTTv311)); e.handle_raw(d.next_packet()); e.take_effects()
+              elapsed=time.perf_counter_ns()-start
+              if rep>=2:samples.append(n*1e9/elapsed)
+          print(json.dumps(samples))
+          '''
+          def run(root):
+              env=os.environ.copy();env['PYTHONPATH']=str(Path(root).resolve()/'src')
+              return json.loads(subprocess.check_output([sys.executable,'-c',worker],env=env,text=True))
+          b=run('base');c=run('candidate');r=[y/x for x,y in zip(b,c)]
+          print(json.dumps({'base':b,'candidate':c,'ratios':r,'median_ratio':statistics.median(r)},indent=2))
+          PY
+          python /tmp/qos2_ack_cycle.py
