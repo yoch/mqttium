@@ -7,7 +7,7 @@ effects out. This is the correctness core that AsyncClient adapts.
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, KeysView
 from typing import Any
 
 from mqttium.codec.buffer import RawPacket
@@ -126,16 +126,15 @@ class ProtocolEngine:
             PacketType.SUBACK: self._on_suback,
             PacketType.UNSUBACK: self._on_unsuback,
             PacketType.PINGRESP: self._on_pingresp,
-            PacketType.PINGREQ: self._on_pingreq,
             PacketType.DISCONNECT: self._on_disconnect,
             PacketType.AUTH: self._on_auth,
         }
         # Hydrate packet ids + offline queue from a durable store (restart).
         self.outbound.hydrate()
-        # MIDs of in-flight SUBSCRIBE/UNSUBSCRIBE (never collide with PUBLISH).
-        self._pending_sub_mids: set[int] = set()
-        # Keep the exact request shape so an acknowledgement cannot complete a
-        # request merely because it happens to reuse the same packet identifier.
+        # In-flight SUBSCRIBE/UNSUBSCRIBE by MID (never collides with PUBLISH).
+        # The exact request shape is kept so an acknowledgement cannot complete
+        # a request merely because it happens to reuse the same packet
+        # identifier.
         self._pending_sub_requests: dict[int, tuple[PacketType, int]] = {}
 
     def take_effects(self) -> list[EngineEffect]:
@@ -217,6 +216,15 @@ class ProtocolEngine:
     @_recovered_inbound_mids.setter
     def _recovered_inbound_mids(self, value: set[int]) -> None:
         self.inbound._recovered_mids = value
+
+    @property
+    def _pending_sub_mids(self) -> KeysView[int]:
+        """Read-only view of the in-flight SUBSCRIBE/UNSUBSCRIBE identifiers.
+
+        `_pending_sub_requests` is the one source of truth; this keeps the
+        diagnostic surface used by tests and the fuzzer.
+        """
+        return self._pending_sub_requests.keys()
 
     def can_ever_admit_publish(
         self,
@@ -390,58 +398,56 @@ class ProtocolEngine:
             raise NotConnectedError("subscribe requires an active connection")
 
         subscriptions: list[Subscription] = []
-        if isinstance(topics, str):
-            options = SubscribeOptions(qos=QoS(qos))
-            validate_subscribe_filter(topics)
-            self._check_subscribe_capabilities(topics, options, properties)
-            subscriptions.append(Subscription(topic=topics, options=options))
-        else:
-            for item in topics:
-                if isinstance(item, str):
-                    topic, options = item, SubscribeOptions(qos=QoS(qos))
+        items = (topics,) if isinstance(topics, str) else topics
+        for item in items:
+            if isinstance(item, str):
+                topic, options = item, SubscribeOptions(qos=QoS(qos))
+            else:
+                topic, opt = item
+                if isinstance(opt, SubscribeOptions):
+                    options = opt
                 else:
-                    topic, opt = item
-                    if isinstance(opt, SubscribeOptions):
-                        options = opt
-                    else:
-                        options = SubscribeOptions(qos=QoS(opt))
-                validate_subscribe_filter(topic)
-                self._check_subscribe_capabilities(topic, options, properties)
-                subscriptions.append(Subscription(topic=topic, options=options))
+                    options = SubscribeOptions(qos=QoS(opt))
+            validate_subscribe_filter(topic)
+            self._check_subscribe_capabilities(topic, options, properties)
+            subscriptions.append(Subscription(topic=topic, options=options))
 
-        mid = self.outbound.packet_ids.allocate()
-        try:
-            wire = self.codec.encode_subscribe(mid, tuple(subscriptions), properties)
-            self._check_outbound_size(wire)
-        except Exception:
-            self.outbound.packet_ids.release(mid)
-            raise
-        self._pending_sub_mids.add(mid)
-        self._pending_sub_requests[mid] = (PacketType.SUBACK, len(subscriptions))
-        self._send(wire)
-        return mid
+        subs = tuple(subscriptions)
+        return self._send_subscription_request(
+            lambda mid: self.codec.encode_subscribe(mid, subs, properties),
+            PacketType.SUBACK,
+            len(subs),
+        )
 
     def queue_unsubscribe(self, topics: str | Iterable[str]) -> int:
         if self.state != ConnectionState.CONNECTED:
             raise NotConnectedError("unsubscribe requires an active connection")
-        topic_list: tuple[str, ...]
-        if isinstance(topics, str):
-            topic_list = (topics,)
-        else:
-            topic_list = tuple(topics)
+        topic_list = (topics,) if isinstance(topics, str) else tuple(topics)
         if not topic_list:
             raise ProtocolError("unsubscribe requires at least one topic")
         for topic in topic_list:
             validate_subscribe_filter(topic)
+        return self._send_subscription_request(
+            lambda mid: self.codec.encode_unsubscribe(mid, topic_list),
+            PacketType.UNSUBACK,
+            len(topic_list),
+        )
+
+    def _send_subscription_request(
+        self,
+        encode: Callable[[int], WriteItem],
+        ack_type: PacketType,
+        expected_count: int,
+    ) -> int:
+        """Allocate a MID, encode and send, registering the expected ACK shape."""
         mid = self.outbound.packet_ids.allocate()
         try:
-            wire = self.codec.encode_unsubscribe(mid, topic_list)
+            wire = encode(mid)
             self._check_outbound_size(wire)
         except Exception:
             self.outbound.packet_ids.release(mid)
             raise
-        self._pending_sub_mids.add(mid)
-        self._pending_sub_requests[mid] = (PacketType.UNSUBACK, len(topic_list))
+        self._pending_sub_requests[mid] = (ack_type, expected_count)
         self._send(wire)
         return mid
 
@@ -495,15 +501,14 @@ class ProtocolEngine:
         self.inbound.transport_closed()
         self._pending_connect = False
         # Release sub/unsub MIDs still in flight — no ACK will arrive now.
-        if self._pending_sub_mids:
+        if self._pending_sub_requests:
             if self.outbound.pending_messages == 0:
                 # No publish MID survives this transport: reset in constant time.
                 self.outbound.packet_ids.clear()
             else:
-                for mid in self._pending_sub_mids:
+                for mid in self._pending_sub_requests:
                     self.outbound.packet_ids.release(mid)
-            self._pending_sub_mids.clear()
-        self._pending_sub_requests.clear()
+            self._pending_sub_requests.clear()
         if was != ConnectionState.DISCONNECTED:
             self._emit(EffectKind.DISCONNECTED, DisconnectInfo(from_broker=False))
 
@@ -520,11 +525,10 @@ class ProtocolEngine:
                 raise ProtocolError(
                     f"Unexpected {raw.packet_type.name} while state={self.state.name}"
                 )
-            handler = self._handlers.get(raw.packet_type)
-            if handler is None:
-                raise ProtocolError(f"Unhandled packet {raw.packet_type!r}")
+            # Every allowed packet type has a handler; the state gate above is
+            # the one place that refuses everything else (PINGREQ included).
             effect_start = len(self._effects)
-            handler(raw)
+            self._handlers[raw.packet_type](raw)
             self._validate_new_outbound_effects(effect_start)
         except (ProtocolError, MalformedPacketError, PacketTooLargeError) as exc:
             self._emit(EffectKind.PROTOCOL_ERROR, str(exc))
@@ -602,28 +606,24 @@ class ProtocolEngine:
             requested_session_expiry=self._sent_session_expiry_interval,
             local_client_id=self.config.client_id,
         )
-        self.outbound.flow.apply_broker_receive_maximum(
-            self.negotiated.receive_maximum,
-            self.config.max_outbound_inflight,
-        )
 
         self.state = ConnectionState.CONNECTED
         self.session_present = connack.session_present
         self._update_session_resume_preference()
         outbound = self.outbound
         if not connack.session_present:
-            outbound.purge_after_clean_session(sub_mids_pending=bool(self._pending_sub_mids))
+            outbound.purge_after_clean_session(sub_mids_pending=bool(self._pending_sub_requests))
             self.inbound.discard_session()
-            outbound.flow.reset()
-            # Re-apply negotiated limit after reset.
-            outbound.flow.apply_broker_receive_maximum(
-                self.negotiated.receive_maximum,
-                self.config.max_outbound_inflight,
-            )
+            outbound.reset_flow_for_connection()
+            # Queued messages were admitted against the previous negotiation
+            # (or none at all); check them against the new one now. The
+            # resumed-session branch needs no second pass: replay_session()
+            # validates every record before it is retransmitted or re-queued.
+            outbound.fail_queued_violating_negotiation()
         else:
+            # Begins by resetting the flow window to the negotiated limit.
             outbound.replay_session()
 
-        outbound.fail_queued_violating_negotiation()
         self._emit(EffectKind.CONNACK, connack)
         if connack.session_present:
             self.inbound.replay_session()
@@ -680,7 +680,7 @@ class ProtocolEngine:
         reason_count: int | None,
     ) -> None:
         expected = self._pending_sub_requests.get(mid)
-        if mid not in self._pending_sub_mids or expected is None:
+        if expected is None:
             raise ProtocolError(f"{ack_type.name} for unknown mid {mid}")
         expected_type, expected_count = expected
         if ack_type is not expected_type:
@@ -692,8 +692,7 @@ class ProtocolEngine:
                 f"{ack_type.name} for mid {mid} has {reason_count} reason codes; "
                 f"expected {expected_count}"
             )
-        self._pending_sub_mids.discard(mid)
-        self._pending_sub_requests.pop(mid, None)
+        del self._pending_sub_requests[mid]
         self.outbound.packet_ids.release(mid)
 
     def _on_pingresp(self, raw: RawPacket) -> None:
@@ -701,20 +700,19 @@ class ProtocolEngine:
             raise MalformedPacketError("PINGRESP remaining length must be 0")
         self._emit(EffectKind.PINGRESP)
 
-    def _on_pingreq(self, raw: RawPacket) -> None:
-        # Brokers must not send PINGREQ to clients.
-        raise ProtocolError("Unexpected PINGREQ from broker")
-
     def _validate_inbound_problem_information(
         self,
         packet_type: PacketType,
         properties: Properties | None,
     ) -> None:
-        """Enforce the Request Problem Information obligation negotiated in CONNECT."""
+        """Enforce the Request Problem Information obligation negotiated in CONNECT.
+
+        PUBLISH, CONNACK and DISCONNECT are exempt by specification
+        (§3.1.2.11.7) and are never routed through this check.
+        """
         if (
             not self.codec.is_mqtt5
             or self._sent_request_problem_information != 0
-            or packet_type in (PacketType.PUBLISH, PacketType.CONNACK, PacketType.DISCONNECT)
             or properties is None
         ):
             return
@@ -727,23 +725,6 @@ class ProtocolEngine:
 
     def _on_disconnect(self, raw: RawPacket) -> None:
         reason_code, properties = self.codec.decode_disconnect(raw.remaining)
-        if (
-            self.codec.is_mqtt5
-            and properties is not None
-            and properties.get("session_expiry_interval") is not None
-        ):
-            self.state = ConnectionState.DISCONNECTED
-            self._emit(
-                EffectKind.DISCONNECTED,
-                DisconnectInfo(
-                    reason_code=reason_code,
-                    properties=properties,
-                    from_broker=True,
-                ),
-            )
-            raise ProtocolError(
-                "Server must not send Session Expiry Interval in DISCONNECT [MQTT-3.14.2-2]"
-            )
         self.state = ConnectionState.DISCONNECTED
         self._emit(
             EffectKind.DISCONNECTED,
@@ -753,6 +734,16 @@ class ProtocolEngine:
                 from_broker=True,
             ),
         )
+        if (
+            self.codec.is_mqtt5
+            and properties is not None
+            and properties.get("session_expiry_interval") is not None
+        ):
+            # The DISCONNECTED effect above still stands; this only adds the
+            # PROTOCOL_ERROR effect via handle_raw, as before.
+            raise ProtocolError(
+                "Server must not send Session Expiry Interval in DISCONNECT [MQTT-3.14.2-2]"
+            )
 
     def _on_auth(self, raw: RawPacket) -> None:
         if not self.codec.is_mqtt5:
@@ -762,7 +753,7 @@ class ProtocolEngine:
         packet = AuthPacket(reason_code=reason_code, properties=properties)
         self._validate_inbound_problem_information(PacketType.AUTH, packet.properties)
         if self._auth_method is None:
-            self._reject_auth_method()
+            self._protocol_disconnect(0x82)
             return
         packet_method = (
             packet.properties.get("authentication_method")
@@ -770,7 +761,7 @@ class ProtocolEngine:
             else None
         )
         if packet_method is not None and packet_method != self._auth_method:
-            self._reject_auth_method()
+            self._protocol_disconnect(0x82)
             return
         if packet.reason_code == 0x19:
             # MQTT 5 Table 3-11 assigns Re-authenticate to Client→Server only.
@@ -802,9 +793,6 @@ class ProtocolEngine:
             EffectKind.DISCONNECTED,
             DisconnectInfo(reason_code=reason_code, from_broker=False),
         )
-
-    def _reject_auth_method(self) -> None:
-        self._protocol_disconnect(0x82)
 
     def queue_auth(
         self,

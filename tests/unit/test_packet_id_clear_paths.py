@@ -88,7 +88,8 @@ def test_failed_batch_preserves_packet_ids_that_predate_it() -> None:
 def test_transport_close_clears_a_sub_only_pool() -> None:
     engine, pool = _tracking_engine()
     engine.state = ConnectionState.CONNECTED
-    engine._pending_sub_mids.update((pool.allocate(), pool.allocate()))
+    for mid in (pool.allocate(), pool.allocate()):
+        engine._pending_sub_requests[mid] = (PacketType.SUBACK, 1)
 
     engine.notify_transport_closed()
 
@@ -104,7 +105,7 @@ def test_transport_close_keeps_publish_ids_when_releasing_subscriptions() -> Non
     publish_mid = pool.allocate()
     sub_mid = pool.allocate()
     engine.outbound._pending_messages = 1
-    engine._pending_sub_mids.add(sub_mid)
+    engine._pending_sub_requests[sub_mid] = (PacketType.SUBACK, 1)
 
     engine.notify_transport_closed()
 

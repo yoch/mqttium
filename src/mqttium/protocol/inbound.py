@@ -553,31 +553,31 @@ class InboundSession:
             if self._inflight >= config.local_receive_maximum:
                 self._autoack_handoff_required = True
 
-    def on_pubrel(self, raw: RawPacket) -> None:  # noqa: C901
+    def on_pubrel(self, raw: RawPacket) -> None:
         engine = self._engine
         config = self.config
         store = self.store
         mid, _reason_code, properties = self._decode_pubrel(raw.remaining)
         if properties is not None:
             engine._validate_inbound_problem_information(PacketType.PUBREL, properties)
+        # One state machine for both store shapes: a transition-capable store
+        # answers through metadata only, the base interface reads the record.
         transitions = self._transitions
-        if transitions is not None:
-            meta = transitions.in_meta(mid)
-            if meta is None:
-                engine._send(_encode_pubcomp_success(mid))
+        record: InboundMessage | InboundRecordMeta | None = (
+            transitions.in_meta(mid) if transitions is not None else store.get_in(mid)
+        )
+        if record is None:
+            engine._send(_encode_pubcomp_success(mid))
+            return
+        state = record.state
+        if state is InboundQoSState.WAIT_USER_ACK:
+            if config.manual_ack:
                 return
-            if meta.state is InboundQoSState.WAIT_USER_ACK:
-                if config.manual_ack:
-                    return
-                completed = transitions.complete_in(mid, InboundQoSState.WAIT_USER_ACK)
-                if completed is None:
-                    raise ProtocolError(f"Inbound mid={mid} changed while completing PUBREL")
-                engine._send(_encode_pubcomp_success(mid))
-                self._release_slot(completed.logical_size)
-                return
-            if meta.state is not InboundQoSState.WAIT_PUBREL:
-                raise ProtocolError(f"PUBREL for inbound mid={mid} in invalid state {meta.state!r}")
-            if config.manual_ack and not meta.user_acked:
+        elif state is not InboundQoSState.WAIT_PUBREL:
+            raise ProtocolError(f"PUBREL for inbound mid={mid} in invalid state {state!r}")
+        elif config.manual_ack and not record.user_acked:
+            # The exchange completes when the application calls ack().
+            if transitions is not None:
                 changed = transitions.transition_in(
                     mid,
                     InboundQoSState.WAIT_PUBREL,
@@ -585,38 +585,23 @@ class InboundSession:
                 )
                 if changed is None:
                     raise ProtocolError(f"Inbound mid={mid} changed while processing PUBREL")
-                return
-            completed = transitions.complete_in(mid, InboundQoSState.WAIT_PUBREL)
+            else:
+                assert isinstance(record, InboundMessage)
+                record.state = InboundQoSState.WAIT_USER_ACK
+                store.update_in(record)
+            return
+        if transitions is not None:
+            completed = transitions.complete_in(mid, state)
             if completed is None:
                 raise ProtocolError(f"Inbound mid={mid} changed while completing PUBREL")
-            engine._send(_encode_pubcomp_success(mid))
-            self._release_slot(completed.logical_size)
-            return
-
-        inbound = store.get_in(mid)
-        if inbound is None:
-            engine._send(_encode_pubcomp_success(mid))
-            return
-        if inbound.state is InboundQoSState.WAIT_USER_ACK:
-            if config.manual_ack:
-                return
+            logical_size = completed.logical_size
+        else:
             popped = store.pop_in(mid)
             if popped is None:
                 raise ProtocolError(f"Inbound mid={mid} disappeared while completing PUBREL")
-            engine._send(_encode_pubcomp_success(mid))
-            self._release_slot(self.stored_logical_size(popped))
-            return
-        if inbound.state is not InboundQoSState.WAIT_PUBREL:
-            raise ProtocolError(f"PUBREL for inbound mid={mid} in invalid state {inbound.state!r}")
-        if config.manual_ack and not inbound.user_acked:
-            inbound.state = InboundQoSState.WAIT_USER_ACK
-            store.update_in(inbound)
-            return
-        popped = store.pop_in(mid)
-        if popped is None:
-            raise ProtocolError(f"Inbound mid={mid} disappeared while completing PUBREL")
+            logical_size = self.stored_logical_size(popped)
         engine._send(_encode_pubcomp_success(mid))
-        self._release_slot(self.stored_logical_size(popped))
+        self._release_slot(logical_size)
 
     # --- application acknowledgement and replay ---------------------------
 

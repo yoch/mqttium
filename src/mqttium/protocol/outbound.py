@@ -731,9 +731,7 @@ class OutboundSession:
         raise ProtocolError(f"Cannot retransmit outbound state {msg.state!r}")
 
     def drain(self) -> None:
-        while self._queued and self.flow.available > 0:
-            if not self.flow.try_acquire():
-                break
+        while self._queued and self.flow.try_acquire():
             stored = self._queued[0]
             try:
                 msg = self.materialize(stored)
@@ -965,13 +963,16 @@ class OutboundSession:
             self.packet_ids.release(msg.mid)
             self._fail(msg.mid, exc)
 
-    def replay_session(self) -> None:
-        engine = self._engine
+    def reset_flow_for_connection(self) -> None:
+        """Restart the outbound window from the CONNACK-negotiated limit."""
         self.flow.reset()
         self.flow.apply_broker_receive_maximum(
-            engine.negotiated.receive_maximum,
+            self._engine.negotiated.receive_maximum,
             self.config.max_outbound_inflight,
         )
+
+    def replay_session(self) -> None:
+        self.reset_flow_for_connection()
         self._queued.clear()
         for page in self.store_summary_pages():
             for msg in page:
