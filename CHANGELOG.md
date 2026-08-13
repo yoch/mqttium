@@ -75,10 +75,10 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - Refresh the retained memory benchmark contract for the current bounded
   WebSocket coalescing path and its RC2-equivalent property-heavy allocation
   baseline.
-- Bound each asynchronous ingress decode batch by the configured local Receive
-  Maximum, preventing the specialized decoder's higher throughput from
-  admitting QoS 1/2 packets before the preceding automatic acknowledgements
-  reach the effect pump.
+- End asynchronous ingress batches exactly when automatic QoS 1 acknowledgements
+  fill the remaining local Receive Maximum window, preventing another PUBLISH
+  from being admitted before those acknowledgements reach the effect pump while
+  preserving full-size batches for QoS 0 and control traffic.
 
 ## [1.0.0rc2] - 2026-08-12
 

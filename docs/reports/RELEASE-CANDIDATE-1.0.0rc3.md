@@ -10,10 +10,13 @@ with the default `local_receive_maximum=100`, a 256-packet decoder batch could
 admit a 101st QoS 1/2 PUBLISH before the first automatic PUBACKs reached the
 effect pump. The failure reproduced against the release-gate Mosquitto limits
 as `ProtocolError("Receive Maximum exceeded")` during the reconnect soak; the
-pre-#216 baseline did not reproduce it. The reader now caps each decode batch
-at `min(256, local_receive_maximum)`, and the read-loop batching tests assert
-the bound. A 30-second gate-config soak then completed with 19,000 MQTT 3.1.1
-messages and 17,000 MQTT 5 messages received, with stable resource assessment.
+pre-#216 baseline did not reproduce it. The reader now ends a decode batch
+exactly when pending automatic PUBACKs fill the remaining Receive Maximum
+window. This also covers a window partly occupied by manual-ACK or QoS 2 state,
+without shrinking the 256-packet batch for QoS 0 and control traffic. Targeted
+read-loop tests assert both sides of that boundary. The final 30-second
+gate-config soaks completed with 17,000 MQTT 3.1.1 messages and 17,500 MQTT 5
+messages received, with stable resource assessment.
 
 The retained memory thresholds were also revalidated against RC2 and the
 current candidate. The property-heavy peak was identical (20.0136 MiB), and
@@ -23,8 +26,9 @@ performance claim.
 
 ## Local validation
 
-The final `quick` profile passed on the release tree (`/tmp/mqttium-rc3/19df6bd/quick-final2`):
-ruff format/check, mypy, Bandit, unit coverage (998 tests, 88.66% total),
+The reviewed `quick` profile passed on the release tree
+(`/tmp/mqttium-rc3/6900175/quick-reviewed`): ruff format/check, mypy, Bandit,
+unit coverage (1,001 tests, 88.69% total),
 mandatory broker integration, hot-path allocation profiling, memory thresholds,
 application stress, and both 30-second reconnect soaks.
 

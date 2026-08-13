@@ -105,6 +105,7 @@ class InboundSession:
         "_decode_pubrel",
         "_engine",
         "_inflight",
+        "_autoack_handoff_required",
         "_paged_store",
         "_pending_auto_qos1_mids",
         "_pending_bytes",
@@ -141,6 +142,7 @@ class InboundSession:
             self.handle_publish = self._on_publish_v31
         self._aliases: dict[int, str] = {}
         self._inflight = 0
+        self._autoack_handoff_required = False
         # Auto-ACK QoS 1 identifiers whose PUBACK is still inside the current
         # effect batch. The Receive Maximum slot stays held until take_effects()
         # (or connection teardown) so a pipelined PUBLISH is admitted by the
@@ -195,6 +197,7 @@ class InboundSession:
         """Reset state scoped to one network connection before CONNECT."""
         self._aliases.clear()
         self._inflight = 0
+        self._autoack_handoff_required = False
         self._pending_auto_qos1_mids.clear()
         # A replay belongs to the connection that started it: its continuation
         # effect is dropped with the epoch, so the cursor must go too.
@@ -211,10 +214,12 @@ class InboundSession:
         self._replay = None
         self._inflight = 0
         self._pending_bytes = 0
+        self._autoack_handoff_required = False
         self._pending_auto_qos1_mids.clear()
 
     def release_pending_auto_qos1(self) -> None:
         """Free Receive Maximum slots once auto-PUBACKs leave the engine batch."""
+        self._autoack_handoff_required = False
         pending = self._pending_auto_qos1_mids
         n = len(pending)
         if not n:
@@ -480,6 +485,8 @@ class InboundSession:
                 # immediately without freeing the protocol slot early.
                 self._release_pending_bytes(recovered_logical_size)
                 self._pending_auto_qos1_mids.add(mid)
+                if self._inflight >= config.local_receive_maximum:
+                    self._autoack_handoff_required = True
                 return
             # The record belongs to an unfinished QoS 2 exchange. Accepting the
             # QoS 1 PUBLISH would acknowledge an identifier the broker still
@@ -543,6 +550,8 @@ class InboundSession:
         )
         if not config.manual_ack:
             self._pending_auto_qos1_mids.add(mid)
+            if self._inflight >= config.local_receive_maximum:
+                self._autoack_handoff_required = True
 
     def on_pubrel(self, raw: RawPacket) -> None:  # noqa: C901
         engine = self._engine
