@@ -99,7 +99,8 @@ outbound acknowledgements or application delivery.
 `InboundSession` symmetrically owns incoming PUBLISH state:
 
 - inbound topic aliases;
-- local Receive Maximum accounting;
+- local Receive Maximum accounting, including auto-acknowledgements still
+  inside the current effect batch;
 - inbound QoS 1/2 persistence;
 - duplicate suppression, manual acknowledgement, and replay.
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from mqttium.codec.buffer import IncrementalDecoder
+from mqttium.codec.primitives import pack_u16, pack_utf8
 from mqttium.codec.properties import CONNACK, encode_properties
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, PacketType, QoS
 from mqttium.packets import PublishPacket, encode_frame
@@ -77,7 +78,7 @@ def test_pending_qos1_puback_counts_against_fresh_qos2() -> None:
     assert messages == [b"\x01"]
     assert engine.state is ConnectionState.DISCONNECTED
     error = next(effect.data for effect in effects if effect.kind is EffectKind.PROTOCOL_ERROR)
-    assert "Receive Maximum exceeded by QoS 2" in error
+    assert "Receive Maximum exceeded" in error
 
 
 def test_cross_qos_reuse_of_pending_autoack_mid_is_protocol_error() -> None:
@@ -138,3 +139,48 @@ def test_duplicate_qos1_before_puback_handoff_does_not_consume_second_slot() -> 
     assert len([effect for effect in effects if effect.kind is EffectKind.MESSAGE]) == 2
     assert len([effect for effect in effects if effect.kind is EffectKind.SEND]) == 2
     assert not any(effect.kind is EffectKind.PROTOCOL_ERROR for effect in effects)
+
+
+def test_autoack_receive_maximum_slot_is_held_until_handoff() -> None:
+    engine = _engine(receive_maximum=1)
+
+    _feed(engine, _publish(1))
+    assert engine._inbound_inflight == 1
+    engine.take_effects()
+    assert engine._inbound_inflight == 0
+
+
+def test_pipelined_qos1_does_not_use_generic_publish_decode(monkeypatch) -> None:
+    calls = 0
+    original = PublishPacket.decode
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(PublishPacket, "decode", counted)
+    engine = _engine(receive_maximum=8)
+    for mid in range(1, 5):
+        _feed(engine, _publish(mid))
+    effects = engine.take_effects()
+
+    assert calls == 0
+    assert engine.state is ConnectionState.CONNECTED
+    assert len([effect for effect in effects if effect.kind is EffectKind.MESSAGE]) == 4
+
+
+def test_mqtt5_wildcard_is_rejected_before_receive_maximum() -> None:
+    engine = _engine(receive_maximum=1)
+
+    _feed(engine, _publish(1))
+    remaining = pack_utf8("a/+/b") + pack_u16(2) + b"\x00" + b"x"
+    _feed(engine, encode_frame(PacketType.PUBLISH, 0x02, remaining))
+    effects = engine.take_effects()
+
+    assert engine.state is ConnectionState.CONNECTED
+    error = next(effect.data for effect in effects if effect.kind is EffectKind.PROTOCOL_ERROR)
+    assert "wildcards" in error
+    assert not any(effect.kind is EffectKind.DISCONNECTED for effect in effects)
+    messages = [effect.data.payload for effect in effects if effect.kind is EffectKind.MESSAGE]
+    assert messages == [b"\x01"]

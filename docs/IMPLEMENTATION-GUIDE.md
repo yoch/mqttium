@@ -130,6 +130,13 @@ acknowledgement is enabled. QoS 2 is delivered on the initial PUBLISH and
 deduplicated by packet ID until PUBREL. PUBREC remains immediate; manual mode
 defers PUBCOMP.
 
+Automatic QoS 1 acknowledgements hold the local Receive Maximum slot until
+`take_effects()` hands the PUBACK to the runtime. A retransmission of that
+identifier in the same batch reuses the slot; a new identifier is admitted
+through the ordinary acquire path. Packet-identifier reuse across unfinished
+QoS 1 and QoS 2 exchanges is a protocol error, including when the QoS 1
+PUBACK has been emitted but not yet handed off.
+
 Duplicate PUBLISH and PUBREL packets repeat the required protocol response but
 never redeliver application data. Orphan PUBREL is answered idempotently.
 

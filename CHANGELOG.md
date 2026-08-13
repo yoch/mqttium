@@ -6,6 +6,11 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- Hold the inbound Receive Maximum slot for an automatic QoS 1 PUBACK until
+  the effect batch is handed off, so pipelined PUBLISH packets are admitted by
+  the ordinary acquire path instead of a second decode that reconstructed the
+  count from SEND bytes.
+
 - Fast-path common success/no-properties PUBREC, PUBREL and PUBCOMP frames without transient packet objects while retaining full MQTT 5 property/RPI validation for longer acknowledgement forms.
 
 - Avoid transient `PublishPacket` allocation when launching or re-encoding stored QoS 1/2 outbound messages; call the shared functional PUBLISH encoder directly while preserving byte output and replay semantics.
