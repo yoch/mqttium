@@ -515,7 +515,13 @@ class InboundSession:
                         raise ProtocolError(f"Inbound mid={mid} changed while acknowledging")
                     recovered_logical_size = completed_meta.logical_size
                 self._engine._send(_encode_puback_success(mid))
-                self._release_slot(recovered_logical_size)
+                # The restored Receive Maximum slot remains owned until this
+                # PUBACK leaves the engine effect batch, exactly like a fresh
+                # automatic QoS 1 acknowledgement. The persisted record is
+                # already complete, so its byte reservation can be released
+                # immediately without freeing the protocol slot early.
+                self._release_pending_bytes(recovered_logical_size)
+                self._pending_auto_qos1_mids.add(mid)
                 return
             # The record belongs to an unfinished QoS 2 exchange. Accepting the
             # QoS 1 PUBLISH would acknowledge an identifier the broker still
@@ -897,6 +903,9 @@ class InboundSession:
     def _release_slot(self, logical_size: int | None = None) -> None:
         if self._inflight > 0:
             self._inflight -= 1
+        self._release_pending_bytes(logical_size)
+
+    def _release_pending_bytes(self, logical_size: int | None) -> None:
         if logical_size is None:
             return
         if logical_size <= 0 or logical_size > self._pending_bytes:
