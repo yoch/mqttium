@@ -429,7 +429,7 @@ class ApplicationDelivery:
                 continue
             await self.message_ready.wait()
 
-    async def reset_stream(self) -> None:
+    def reset_stream(self) -> None:
         if not self.closed.is_set():
             return
         while True:

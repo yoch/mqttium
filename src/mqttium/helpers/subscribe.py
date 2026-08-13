@@ -31,6 +31,8 @@ async def simple(
 
     Returns a single ``Message`` when ``msg_count == 1``, else a list.
     """
+    if msg_count <= 0:
+        raise ValueError("msg_count must be greater than 0")
     topic_list = normalize_topics(topics)
     client = create_client(
         client_id=client_id,

@@ -101,7 +101,7 @@ def test_queued_launch_failure_releases_resources_and_emits_failure() -> None:
         store=store,
     )
     engine.state = ConnectionState.CONNECTED
-    engine.flow.apply_broker_receive_maximum(65535, 65535, 1)
+    engine.flow.apply_broker_receive_maximum(65535, 1)
 
     first = engine.queue_publish("rollback/first", b"1", qos=1)
     second = engine.queue_publish("rollback/second", b"2", qos=1)

@@ -32,7 +32,7 @@ See [`STABILITY.md`](STABILITY.md) and the retained historical
 - [x] Publish reproducible release benchmark artefacts from pinned runner
       profiles.
 - [ ] Complete and review the local `rc` manifest, then promote the candidate
-      from `1.0.0rc1` to `1.0.0`.
+      from `1.0.0rc2` to `1.0.0`.
 - [ ] After the source is clean, run one Python 3.11–3.14 and EMQX/HiveMQ
       GitHub matrix for the first RC.
 - [ ] Run the multi-hour fuzz and soak campaign after the first RC, before a

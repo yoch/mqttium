@@ -606,7 +606,6 @@ class ProtocolEngine:
         )
         self.outbound.flow.apply_broker_receive_maximum(
             self.negotiated.receive_maximum,
-            self.config.local_receive_maximum,
             self.config.max_outbound_inflight,
         )
 
@@ -621,7 +620,6 @@ class ProtocolEngine:
             # Re-apply negotiated limit after reset.
             outbound.flow.apply_broker_receive_maximum(
                 self.negotiated.receive_maximum,
-                self.config.local_receive_maximum,
                 self.config.max_outbound_inflight,
             )
         else:

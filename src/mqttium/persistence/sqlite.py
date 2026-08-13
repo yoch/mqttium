@@ -41,6 +41,7 @@ _RecordT = TypeVar("_RecordT")
 # builds, and Python may be linked against either. Page fetches stay under the
 # floor so a large `page_size` cannot produce "too many SQL variables".
 _MAX_SQL_VARIABLES = 900
+_SQLITE_BUSY_TIMEOUT_SECONDS = 5.0
 
 # Page statements: fully written out, never composed, so no SQL text in this
 # module derives from a value. Every column except `payload` is listed first, so
@@ -191,14 +192,24 @@ class SqliteInflightStore:
         self._batch_depth = 0
         self._transaction_started = False
         self._rollback_only = False
-        self._conn = sqlite3.connect(self._path, check_same_thread=False)
+        self._conn = sqlite3.connect(
+            self._path,
+            timeout=_SQLITE_BUSY_TIMEOUT_SECONDS,
+            check_same_thread=False,
+        )
         self._conn.row_factory = sqlite3.Row
         self._closed = False
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=NORMAL")
-        self._prepare_schema()
-        self._out_seq = self._max_seq("outbound")
-        self._in_seq = self._max_seq("inbound")
+        try:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+            self._prepare_schema()
+            self._out_seq = self._max_seq("outbound")
+            self._in_seq = self._max_seq("inbound")
+        except BaseException:
+            if not self._closed:
+                self._conn.close()
+                self._closed = True
+            raise
 
     # --- schema ------------------------------------------------------------
 
@@ -214,6 +225,12 @@ class SqliteInflightStore:
                 f"(schema {version} > {SQLITE_SCHEMA_VERSION})"
             )
         if version == SQLITE_SCHEMA_VERSION:
+            missing = [table for table in ("outbound", "inbound") if not self._table_exists(table)]
+            if missing:
+                names = ", ".join(missing)
+                raise RuntimeError(
+                    f"{self._path} has schema version {version} but is missing table(s): {names}"
+                )
             return
         # A pre-versioning database reports 0 while already holding tables; a
         # genuinely empty file reports 0 with nothing in sqlite_master.
