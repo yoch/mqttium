@@ -120,3 +120,10 @@ async def test_terminal_connack_reason_stops_reconnect_without_string_parsing() 
     assert calls == 1
     assert client._last_connack_reason == 5
     assert isinstance(client._disconnect_exc, ProtocolError)
+    assert not client._will_reconnect()
+
+    # Terminal refusal must also be visible to producers already parked on
+    # outbound admission capacity. Once final teardown wakes them, they must
+    # fail instead of treating a stopped reconnect loop as still live.
+    client._teardown_final = True
+    assert client._publish_wait_failure() is client._disconnect_exc

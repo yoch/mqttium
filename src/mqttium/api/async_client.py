@@ -1307,6 +1307,8 @@ class AsyncClient:
         reason = None
         if self._last_disconnect is not None and self._last_disconnect.from_broker:
             reason = self._last_disconnect.reason_code
+        elif self._last_connack_reason is not None:
+            reason = self._last_connack_reason
         return (
             not isinstance(self._disconnect_exc, MessageDeliveryError)
             and not self._intentional_disconnect
