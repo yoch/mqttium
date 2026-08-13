@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from mqttium.enums import MQTTProtocolVersion, PacketType
-from mqttium.packets import _ack_v311, _ack_v5, _publish_v311, _publish_v5
+from mqttium.packets import _ack, _publish
 from mqttium.protocol.config import EngineConfig
 from mqttium.protocol.engine import ProtocolEngine
 from mqttium.protocol.inbound import InboundSession
@@ -50,15 +50,15 @@ def test_legacy_inbound_diagnostics_are_views_not_duplicate_state() -> None:
     [
         (
             MQTTProtocolVersion.MQTTv311,
-            _ack_v311.decode_puback_v311,
-            _ack_v311.decode_pubrel_v311,
-            _publish_v311.encode_publish_item_v311,
+            _ack.decode_puback_v311,
+            _ack.decode_pubrel_v311,
+            _publish.encode_publish_item_v311,
         ),
         (
             MQTTProtocolVersion.MQTTv5,
-            _ack_v5.decode_puback_v5,
-            _ack_v5.decode_pubrel_v5,
-            _publish_v5.encode_publish_item_v5,
+            _ack.decode_puback_v5,
+            _ack.decode_pubrel_v5,
+            _publish.encode_publish_item_v5,
         ),
     ],
 )

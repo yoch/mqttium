@@ -14,8 +14,7 @@ from mqttium.codec.primitives import unpack_utf8, unpack_u16
 from mqttium.codec.properties import PUBLISH, decode_properties
 from mqttium.enums import MQTTProtocolVersion, QoS
 from mqttium.errors import MalformedPacketError
-from mqttium.packets._publish_v311 import encode_publish_item_v311
-from mqttium.packets._publish_v5 import encode_publish_item_v5
+from mqttium.packets._publish import encode_publish_item_v311, encode_publish_item_v5
 from mqttium.topics import validate_received_publish_topic
 from mqttium.transport.writes import WriteItem
 from mqttium.types import Properties

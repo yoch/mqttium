@@ -11,18 +11,12 @@ from dataclasses import dataclass
 
 from mqttium.enums import MQTTProtocolVersion
 from mqttium.errors import ProtocolError
-from mqttium.packets import _ack_v311 as ack_v311
-from mqttium.packets import _ack_v5 as ack_v5
-from mqttium.packets import _connack_v311 as connack_v311
-from mqttium.packets import _connack_v5 as connack_v5
-from mqttium.packets import _control_v311 as control_v311
-from mqttium.packets import _control_v5 as control_v5
-from mqttium.packets import _publish_v311 as publish_v311
-from mqttium.packets import _publish_v5 as publish_v5
-from mqttium.packets import _suback_v311 as suback_v311
-from mqttium.packets import _suback_v5 as suback_v5
-from mqttium.packets import _subscribe_v311 as subscribe_v311
-from mqttium.packets import _subscribe_v5 as subscribe_v5
+from mqttium.packets import _ack as ack
+from mqttium.packets import _connack as connack
+from mqttium.packets import _control as control
+from mqttium.packets import _publish as publish
+from mqttium.packets import _suback as suback
+from mqttium.packets import _subscribe as subscribe
 from mqttium.transport.writes import WriteItem
 from mqttium.types import Properties
 
@@ -66,42 +60,42 @@ def bind_codec(protocol: MQTTProtocolVersion) -> CodecBindings:
         return CodecBindings(
             protocol=protocol,
             is_mqtt5=True,
-            decode_puback=ack_v5.decode_puback_v5,
-            decode_pubrec=ack_v5.decode_pubrec_v5,
-            decode_pubrel=ack_v5.decode_pubrel_v5,
-            decode_pubcomp=ack_v5.decode_pubcomp_v5,
-            encode_pubrel=ack_v5.encode_pubrel_v5,
-            decode_connack=connack_v5.decode_connack_v5,
-            decode_suback=suback_v5.decode_suback_v5,
-            decode_unsuback=suback_v5.decode_unsuback_v5,
-            decode_disconnect=control_v5.decode_disconnect_v5,
-            decode_auth=control_v5.decode_auth_v5,
-            encode_pingreq=control_v5.encode_pingreq,
-            encode_pingresp=control_v5.encode_pingresp,
-            encode_disconnect=control_v5.encode_disconnect_v5,
-            encode_publish_item=publish_v5.encode_publish_item_v5,
-            encode_subscribe=subscribe_v5.encode_subscribe_v5,
-            encode_unsubscribe=subscribe_v5.encode_unsubscribe_v5,
+            decode_puback=ack.decode_puback_v5,
+            decode_pubrec=ack.decode_pubrec_v5,
+            decode_pubrel=ack.decode_pubrel_v5,
+            decode_pubcomp=ack.decode_pubcomp_v5,
+            encode_pubrel=ack.encode_pubrel_v5,
+            decode_connack=connack.decode_connack_v5,
+            decode_suback=suback.decode_suback_v5,
+            decode_unsuback=suback.decode_unsuback_v5,
+            decode_disconnect=control.decode_disconnect_v5,
+            decode_auth=control.decode_auth_v5,
+            encode_pingreq=control.encode_pingreq,
+            encode_pingresp=control.encode_pingresp,
+            encode_disconnect=control.encode_disconnect_v5,
+            encode_publish_item=publish.encode_publish_item_v5,
+            encode_subscribe=subscribe.encode_subscribe_v5,
+            encode_unsubscribe=subscribe.encode_unsubscribe_v5,
         )
     # MQTT 3.1.1 and the MQTT 3.1 leftover share the 3.1.1 acknowledgement and
     # control shapes; PUBLISH ingress for 3.1 still uses PublishPacket.decode.
     return CodecBindings(
         protocol=protocol,
         is_mqtt5=False,
-        decode_puback=ack_v311.decode_puback_v311,
-        decode_pubrec=ack_v311.decode_pubrec_v311,
-        decode_pubrel=ack_v311.decode_pubrel_v311,
-        decode_pubcomp=ack_v311.decode_pubcomp_v311,
-        encode_pubrel=ack_v311.encode_pubrel_v311,
-        decode_connack=connack_v311.decode_connack_v311,
-        decode_suback=suback_v311.decode_suback_v311,
-        decode_unsuback=suback_v311.decode_unsuback_v311,
-        decode_disconnect=control_v311.decode_disconnect_v311,
+        decode_puback=ack.decode_puback_v311,
+        decode_pubrec=ack.decode_pubrec_v311,
+        decode_pubrel=ack.decode_pubrel_v311,
+        decode_pubcomp=ack.decode_pubcomp_v311,
+        encode_pubrel=ack.encode_pubrel_v311,
+        decode_connack=connack.decode_connack_v311,
+        decode_suback=suback.decode_suback_v311,
+        decode_unsuback=suback.decode_unsuback_v311,
+        decode_disconnect=control.decode_disconnect_v311,
         decode_auth=_auth_requires_v5,
-        encode_pingreq=control_v311.encode_pingreq,
-        encode_pingresp=control_v311.encode_pingresp,
-        encode_disconnect=control_v311.encode_disconnect_v311,
-        encode_publish_item=publish_v311.encode_publish_item_v311,
-        encode_subscribe=subscribe_v311.encode_subscribe_v311,
-        encode_unsubscribe=subscribe_v311.encode_unsubscribe_v311,
+        encode_pingreq=control.encode_pingreq,
+        encode_pingresp=control.encode_pingresp,
+        encode_disconnect=control.encode_disconnect_v311,
+        encode_publish_item=publish.encode_publish_item_v311,
+        encode_subscribe=subscribe.encode_subscribe_v311,
+        encode_unsubscribe=subscribe.encode_unsubscribe_v311,
     )

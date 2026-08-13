@@ -10,7 +10,7 @@ from mqttium.codec.buffer import RawPacket
 from mqttium.codec.primitives import pack_u16, pack_utf8
 from mqttium.enums import MQTTProtocolVersion, PacketType, QoS
 from mqttium.packets import PublishPacket
-from mqttium.packets._publish_v311 import decode_qos12_fields_v311 as _decode_v311_qos1_fields
+from mqttium.packets._publish import decode_qos12_fields_v311 as _decode_v311_qos1_fields
 from mqttium.types import Message
 
 

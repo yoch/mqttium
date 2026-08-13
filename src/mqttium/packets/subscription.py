@@ -6,10 +6,18 @@ from dataclasses import dataclass
 
 from mqttium.enums import MQTTProtocolVersion, QoS
 from mqttium.errors import ProtocolError
-from mqttium.packets._suback_v311 import decode_suback_v311, decode_unsuback_v311
-from mqttium.packets._suback_v5 import decode_suback_v5, decode_unsuback_v5
-from mqttium.packets._subscribe_v311 import encode_subscribe_v311, encode_unsubscribe_v311
-from mqttium.packets._subscribe_v5 import encode_subscribe_v5, encode_unsubscribe_v5
+from mqttium.packets._suback import (
+    decode_suback_v311,
+    decode_suback_v5,
+    decode_unsuback_v311,
+    decode_unsuback_v5,
+)
+from mqttium.packets._subscribe import (
+    encode_subscribe_v311,
+    encode_subscribe_v5,
+    encode_unsubscribe_v311,
+    encode_unsubscribe_v5,
+)
 from mqttium.types import Properties
 
 

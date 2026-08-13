@@ -7,10 +7,8 @@ from dataclasses import dataclass
 from mqttium.codec.primitives import pack_utf8, pack_u16
 from mqttium.enums import MQTTProtocolVersion, PacketType, QoS
 from mqttium.errors import ProtocolError
-from mqttium.packets._connack_v311 import decode_connack_v311
-from mqttium.packets._connack_v5 import decode_connack_v5
-from mqttium.packets._connect_v311 import encode_connect_v311
-from mqttium.packets._connect_v5 import encode_connect_v5
+from mqttium.packets._connack import decode_connack_v311, decode_connack_v5
+from mqttium.packets._connect import encode_connect_v311, encode_connect_v5
 from mqttium.packets._common import encode_frame
 from mqttium.types import Properties
 

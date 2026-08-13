@@ -7,13 +7,13 @@ from dataclasses import dataclass
 from mqttium.codec.properties import AUTH, encode_properties
 from mqttium.enums import MQTTProtocolVersion, PacketType
 from mqttium.errors import ProtocolError
-from mqttium.packets._control_v311 import (
+from mqttium.packets._control import (
     decode_disconnect_v311,
     encode_disconnect_v311,
     encode_pingreq as encode_pingreq_v311,
     encode_pingresp as encode_pingresp_v311,
 )
-from mqttium.packets._control_v5 import (
+from mqttium.packets._control import (
     decode_auth_v5,
     decode_disconnect_v5,
     encode_disconnect_v5,

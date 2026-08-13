@@ -13,7 +13,7 @@ Python work as MQTT 3.1.1's two-byte success body?
 
 ## Change
 
-- `packets/_ack_v311.py` and `packets/_ack_v5.py` own direct encode/decode
+- `packets/_ack.py` owns direct MQTT 3.1.1 and MQTT 5 encode/decode
   functions per packet type. The fast-path shapes (2 bytes; MQTT 5 3 bytes)
   contain no generic helper call.
 - Absent properties return `None` (no empty `Properties()` on the three-byte

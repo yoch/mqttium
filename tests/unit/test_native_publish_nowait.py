@@ -8,7 +8,7 @@ import inspect
 import pytest
 
 import mqttium.compat.paho as paho_compat
-import mqttium.packets._publish_v5 as publish_v5_module
+import mqttium.packets._publish as publish_v5_module
 from mqttium.api import AsyncClient
 from mqttium.api.models import PublishMessage
 from mqttium.codec.buffer import IncrementalDecoder

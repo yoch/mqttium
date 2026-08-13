@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import pytest
 
-import mqttium.packets._ack_v5 as ack_v5
+import mqttium.packets._ack as ack_v5
 import mqttium.protocol.inbound as inbound_module
 
 from mqttium.codec.buffer import RawPacket
 from mqttium.codec.primitives import pack_u16, pack_utf8
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, PacketType
 from mqttium.packets import PubAckPacket, PubCompPacket, PubRecPacket, PubRelPacket
-from mqttium.packets._ack_v5 import (
+from mqttium.packets._ack import (
     decode_puback_v5,
     decode_pubcomp_v5,
     decode_pubrec_v5,

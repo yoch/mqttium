@@ -7,7 +7,7 @@ from mqttium.codec.primitives import pack_u16, pack_utf8
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, PacketType, QoS
 from mqttium.errors import MalformedPacketError
 from mqttium.packets import PublishPacket
-from mqttium.packets._publish_v311 import decode_qos0_message_v311 as _decode_v311_qos0_message
+from mqttium.packets._publish import decode_qos0_message_v311 as _decode_v311_qos0_message
 from mqttium.protocol.engine import EffectKind, EngineConfig, ProtocolEngine
 
 

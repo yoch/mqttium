@@ -23,11 +23,11 @@ from mqttium.persistence.memory import (
 from mqttium.packets import (
     PublishPacket,
 )
-from mqttium.packets._publish_v311 import (
+from mqttium.packets._publish import (
     decode_qos0_message_v311,
     decode_qos12_fields_v311,
+    decode_publish_fields_v5,
 )
-from mqttium.packets._publish_v5 import decode_publish_fields_v5
 from mqttium.protocol.effects import EffectKind
 from mqttium.protocol.stats import InboundStats
 from mqttium.topics import validate_received_publish_topic

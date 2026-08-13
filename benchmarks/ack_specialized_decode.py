@@ -14,8 +14,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from mqttium.packets import PubAckPacket
-from mqttium.packets._ack_v311 import decode_puback_v311
-from mqttium.packets._ack_v5 import decode_puback_v5
+from mqttium.packets._ack import decode_puback_v311, decode_puback_v5
 from mqttium.enums import MQTTProtocolVersion
 
 

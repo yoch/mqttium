@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import mqttium.packets._publish_v5 as publish_v5_module
+import mqttium.packets._publish as publish_v5_module
 import mqttium.protocol.outbound as outbound_module
 import mqttium.topics as topics_module
 

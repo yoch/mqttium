@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-import mqttium.packets._publish_v311 as publish_v311_module
+import mqttium.packets._publish as publish_v311_module
 from mqttium.api import AsyncClient
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, QoS
 from mqttium.packets import PublishPacket

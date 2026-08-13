@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from mqttium.enums import MQTTProtocolVersion
-from mqttium.packets._ack_v311 import (
+from mqttium.packets._ack import (
     decode_puback_v311,
     decode_pubcomp_v311,
     decode_pubrec_v311,
@@ -20,7 +20,7 @@ from mqttium.packets._ack_v311 import (
     encode_pubrec_v311,
     encode_pubrel_v311,
 )
-from mqttium.packets._ack_v5 import (
+from mqttium.packets._ack import (
     decode_puback_v5,
     decode_pubcomp_v5,
     decode_pubrec_v5,

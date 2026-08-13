@@ -1,17 +1,61 @@
-"""Specialized MQTT 5 control packet primitives."""
+"""Version-specialized MQTT control packet primitives.
+
+Functions remain deliberately specialized by protocol version; grouping them
+by packet family keeps navigation simple without adding hot-path dispatch.
+"""
 
 from __future__ import annotations
 
-from mqttium.codec.packet_validation import require_end, require_reason_code
-from mqttium.codec.properties import AUTH, DISCONNECT, decode_properties, encode_properties
-from mqttium.enums import PacketType
+from mqttium.codec.packet_validation import require_end
+from mqttium.codec.properties import DISCONNECT
 from mqttium.errors import ProtocolError
-from mqttium.packets._common import _require_outbound_reason, encode_frame
 from mqttium.types import Properties
+from mqttium.codec.packet_validation import require_reason_code
+from mqttium.codec.properties import AUTH, decode_properties, encode_properties
+from mqttium.enums import PacketType
+from mqttium.packets._common import _require_outbound_reason, encode_frame
+
 
 _PINGREQ = b"\xc0\x00"
+
+
 _PINGRESP = b"\xd0\x00"
+
+
 _DISCONNECT = b"\xe0\x00"
+
+
+def decode_disconnect_v311(remaining: bytes) -> tuple[int, Properties | None]:
+    require_end(0, len(remaining), DISCONNECT)
+    return 0, None
+
+
+def encode_pingreq() -> bytes:
+    return _PINGREQ
+
+
+def encode_pingresp() -> bytes:
+    return _PINGRESP
+
+
+def encode_disconnect_v311(
+    reason_code: int = 0,
+    properties: Properties | None = None,
+) -> bytes:
+    if reason_code != 0 or (properties and properties.values):
+        raise ProtocolError("DISCONNECT reason/properties require MQTT 5")
+    return _DISCONNECT
+
+
+_PINGREQ = b"\xc0\x00"
+
+
+_PINGRESP = b"\xd0\x00"
+
+
+_DISCONNECT = b"\xe0\x00"
+
+
 _DISCONNECT_REASONS = frozenset(
     {
         0x00,
@@ -46,6 +90,8 @@ _DISCONNECT_REASONS = frozenset(
         0xA2,
     }
 )
+
+
 _CLIENT_DISCONNECT_REASONS = frozenset(
     {
         0x00,
@@ -64,6 +110,8 @@ _CLIENT_DISCONNECT_REASONS = frozenset(
         0x99,
     }
 )
+
+
 _AUTH_REASONS = frozenset({0x00, 0x18, 0x19})
 
 
@@ -89,14 +137,6 @@ def decode_disconnect_v5(remaining: bytes) -> tuple[int, Properties | None]:
 
 def decode_auth_v5(remaining: bytes) -> tuple[int, Properties | None]:
     return _decode_control_v5(remaining, AUTH, _AUTH_REASONS)
-
-
-def encode_pingreq() -> bytes:
-    return _PINGREQ
-
-
-def encode_pingresp() -> bytes:
-    return _PINGRESP
 
 
 def encode_disconnect_v5(
