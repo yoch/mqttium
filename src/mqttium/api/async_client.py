@@ -814,8 +814,13 @@ class AsyncClient:
             except TimeoutError as exc:
                 raise MQTTTimeoutError("CONNACK timed out") from exc
             if connack.reason_code != 0:
-                self._last_connack_reason = connack.reason_code
-                raise ProtocolError(f"Connection refused: reason_code={connack.reason_code}")
+                refusal = self._disconnect_exc
+                if not isinstance(refusal, ProtocolError):
+                    refusal = ProtocolError(
+                        f"Connection refused: reason_code={connack.reason_code}"
+                    )
+                    self._disconnect_exc = refusal
+                raise refusal
             self._connected_at = time.monotonic()
             self._write_pump.last_outbound = time.monotonic()
             self._keepalive_task = asyncio.create_task(
@@ -1491,8 +1496,7 @@ class AsyncClient:
             return self._try_enqueue_outbound(effect.data, epoch=epoch)
         if kind is EffectKind.CONNACK and self.on_connect is None:
             connack: ConnAckPacket = effect.data
-            if self._connack_fut is not None and not self._connack_fut.done():
-                self._connack_fut.set_result(connack)
+            self._resolve_connack(connack)
             return True
         if kind is EffectKind.PUBLISH_COMPLETE and self.on_publish is None:
             self._settle_publish(effect.data, None)
@@ -1547,8 +1551,7 @@ class AsyncClient:
             await self._enqueue_outbound(effect.data, nowait=nowait, epoch=epoch)
         elif kind is EffectKind.CONNACK:
             connack: ConnAckPacket = effect.data
-            if self._connack_fut is not None and not self._connack_fut.done():
-                self._connack_fut.set_result(connack)
+            self._resolve_connack(connack)
             if self.on_connect is not None:
                 await self._enqueue_callback(self.on_connect, connack)
         elif kind is EffectKind.AUTH:
@@ -1703,6 +1706,15 @@ class AsyncClient:
     def _notify_publish_space(self) -> None:
         if self._publish_waiters:
             self._publish_space.set()
+
+    def _resolve_connack(self, connack: ConnAckPacket) -> None:
+        if connack.reason_code != 0:
+            self._last_connack_reason = connack.reason_code
+            self._disconnect_exc = ProtocolError(
+                f"Connection refused: reason_code={connack.reason_code}"
+            )
+        if self._connack_fut is not None and not self._connack_fut.done():
+            self._connack_fut.set_result(connack)
 
     def _publish_wait_failure(self) -> BaseException | None:
         """Why a producer must not park on outbound admission capacity.

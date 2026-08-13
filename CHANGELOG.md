@@ -21,6 +21,9 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Preserve the broker's terminal CONNACK refusal error when reconnect gives up,
+  so pending publish receipts and admission waiters no longer receive a generic
+  `Connection closed` failure during reader teardown.
 - Harden MQTT-over-WebSocket teardown and handshake handling: close the TCP
   stream before any cancellable close wait, bracket IPv6 literals in the HTTP
   `Host` header, and enforce the configured handshake timeout as one total

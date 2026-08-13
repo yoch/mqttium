@@ -114,6 +114,8 @@ async def test_terminal_connack_reason_stops_reconnect_without_string_parsing() 
 
     client._transport_factory = factory
     client._intentional_disconnect = False
+    receipt = PublishReceipt(mid=7, qos=QoS.AT_LEAST_ONCE)
+    client._receipts[7] = receipt
 
     await asyncio.wait_for(client._reconnect_loop(), timeout=1.0)
 
@@ -127,3 +129,5 @@ async def test_terminal_connack_reason_stops_reconnect_without_string_parsing() 
     # fail instead of treating a stopped reconnect loop as still live.
     client._teardown_final = True
     assert client._publish_wait_failure() is client._disconnect_exc
+    with pytest.raises(ProtocolError, match="Connection refused: reason_code=5"):
+        await receipt.wait()
