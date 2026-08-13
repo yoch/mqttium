@@ -8,6 +8,9 @@ be committed.
 
 - `hotpath_profile.py` counts calls, primitive calls, and allocations. These
   exact measurements are the first place to look for redundant work.
+- `native_kernel_probe.py` reports nanoseconds per operation for codec
+  primitives, `Message` construction, engine ingress and WebSocket masking. It
+  is a diagnostic for compiled-kernel experiments, not a paired A/B.
 - `paired_regression.py` compares isolated implementation paths in fresh
   processes and alternating order.
 - `paired_network.py` records advisory closed-loop QoS 1 capacity and PUBACK

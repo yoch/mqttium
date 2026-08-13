@@ -67,11 +67,15 @@ which records what already shipped.
 ## Optional extensions
 
 - [x] Extract inbound application delivery into a dedicated controller with
-      measured mode-specialised admission and unchanged Stable API semantics.
+  measured mode-specialised admission and unchanged Stable API semantics.
 - [ ] Concrete enhanced-authentication plugins such as SCRAM where broker demand
-      justifies them.
+  justifies them.
 - [ ] Additional Paho compatibility surface only when backed by behavioural tests.
 - [x] Long-running fuzz campaigns and corpus retention outside normal pull-request CI.
+- [ ] Optional compiled codec overlay (mypyc, then Cython) only after 1.0 and
+  only if a prototype clears the benchmarking gate. Evaluated and deferred in
+  [`reports/NATIVE-ACCELERATION.md`](reports/NATIVE-ACCELERATION.md); do not
+  compile the protocol engine or wrap VBI/UTF-8 as standalone extensions.
 
 ## Permanent quality gates
 

@@ -90,6 +90,15 @@ outcome live here.
 | 2026-08-04 | [`MEMORY-RESULTS.md`](MEMORY-RESULTS.md) | After-state for the same scenarios, once admission, delivery-budget, pagination and lazy-hydration corrections landed. |
 | 2026-08-04 | [`MEMORY-PROFILE-FOLLOW-UP.md`](MEMORY-PROFILE-FOLLOW-UP.md) | How each audit recommendation was closed, and which ones got a numeric regression guard. |
 
+## Architecture evaluations
+
+Dated answers to "should we change the implementation strategy?", as opposed to
+a single hot-path A/B that already shipped.
+
+| Date | Report | Question answered |
+| --- | --- | --- |
+| 2026-08-13 | [`NATIVE-ACCELERATION.md`](NATIVE-ACCELERATION.md) | Would compiled codec fragments (mypyc, Cython, C, Rust) buy a significant gain without giving up a Pythonic, dependency-free client? |
+
 ## Hot-path decisions
 
 Each answers one question with a measurement, and the answer is already
