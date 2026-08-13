@@ -1,0 +1,45 @@
+name: Promote PR201
+on:
+  push:
+    branches: [review/promote-pr201]
+permissions:
+  contents: write
+jobs:
+  promote:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - name: Apply reviewed PR201 delta
+        run: |
+          git diff c34a9499ed2723054c2e0d3b730248f176be0856..origin/cursor/launch-encode-item-6aff -- src tests docs > /tmp/pr201.patch
+          git apply --3way --whitespace=error-all /tmp/pr201.patch
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('CHANGELOG.md')
+          text=p.read_text()
+          marker='## [Unreleased]\n'
+          note='\n- Avoid transient `PublishPacket` allocation when launching or re-encoding stored QoS 1/2 outbound messages; call the shared functional PUBLISH encoder directly while preserving byte output and replay semantics.\n'
+          if note.strip() not in text:
+              text=text.replace(marker, marker+note, 1)
+              p.write_text(text)
+          PY
+          git diff --check
+      - run: python -m pip install -e ".[dev,security]"
+      - run: ruff format --check src tests benchmarks
+      - run: ruff check src tests benchmarks
+      - run: mypy src/mqttium
+      - run: bandit -q -ll -r src
+      - run: python -m pytest -q tests/unit
+      - name: Commit clean branch
+        run: |
+          git config user.name yoch
+          git config user.email yoch.melka@gmail.com
+          git add CHANGELOG.md docs src tests
+          git commit -m "Encode QoS 1/2 launch without a PublishPacket"
+          git push --force origin HEAD:cursor/launch-encode-item-6aff
