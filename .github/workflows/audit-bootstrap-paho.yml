@@ -27,24 +27,17 @@ jobs:
         run: |
           set -euo pipefail
           git fetch --no-tags origin chatgpt-workbench-jobs
-          git show FETCH_HEAD:.cgw/jobs/audit-paho-20260813.b64 > /tmp/job-full.b64
-          : > /tmp/job-chunks.b64
+          : > /tmp/job.b64
           for n in 0 1 2 3; do
-            git show "FETCH_HEAD:.cgw/jobs/audit-paho-20260813.part${n}" >> /tmp/job-chunks.b64
+            git show "FETCH_HEAD:.cgw/jobs/audit-paho-20260813.part${n}" >> /tmp/job.b64
           done
           python - <<'PY'
-          import base64, gzip, json
+          import base64, gzip, hashlib, json
           from pathlib import Path
 
-          full = Path('/tmp/job-full.b64').read_text().strip()
-          chunks = Path('/tmp/job-chunks.b64').read_text().strip()
-          assert len(full) == 9082, len(full)
-          assert len(chunks) == 9081, len(chunks)
-          candidates = [i for i in range(len(full)) if full[:i] == chunks[:i] and full[i + 1:] == chunks[i:]]
-          assert len(candidates) == 1, candidates
-          i = candidates[0]
-          encoded = chunks[:i] + full[i] + chunks[i:]
-          assert encoded == full
+          encoded = Path('/tmp/job.b64').read_text().strip()
+          assert len(encoded) == 9082, len(encoded)
+          assert hashlib.sha256(encoded.encode()).hexdigest() == '85fd461017bda094e2ed084f1a6fbde7ed7e70f72c6269066de4e2d801089886'
           encoded += '=' * (-len(encoded) % 4)
           raw = base64.urlsafe_b64decode(encoded)
           job = json.loads(gzip.decompress(raw))
