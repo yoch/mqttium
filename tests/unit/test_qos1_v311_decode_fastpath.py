@@ -29,21 +29,24 @@ def _connected(*, manual_ack: bool = False) -> ProtocolEngine:
 
 
 @pytest.mark.parametrize(
-    ("topic", "payload", "retain", "dup", "mid"),
+    ("topic", "payload", "retain", "dup", "mid", "qos_flag"),
     [
-        ("bench/request", b"payload", False, False, 1),
-        ("capteur/température", b"", True, True, 65535),
-        ("a/b/c", b"x" * 4096, False, True, 42),
+        ("bench/request", b"payload", False, False, 1, 0x02),
+        ("capteur/température", b"", True, True, 65535, 0x02),
+        ("a/b/c", b"x" * 4096, False, True, 42, 0x02),
+        ("bench/exactly", b"payload", False, False, 3, 0x04),
+        ("capteur/température", b"", True, True, 65535, 0x04),
     ],
 )
-def test_v311_qos1_fields_match_generic_packet(
+def test_v311_identified_fields_match_generic_packet(
     topic: str,
     payload: bytes,
     retain: bool,
     dup: bool,
     mid: int,
+    qos_flag: int,
 ) -> None:
-    flags = 0x02 | int(retain) | (0x08 if dup else 0)
+    flags = qos_flag | int(retain) | (0x08 if dup else 0)
     raw = RawPacket(
         PacketType.PUBLISH,
         flags,
@@ -163,7 +166,7 @@ def test_mqtt5_qos1_and_qos2_use_direct_fields(monkeypatch) -> None:
     assert calls == 0
 
 
-def test_v311_qos2_remains_generic(monkeypatch) -> None:
+def test_v311_qos2_avoids_generic_packet(monkeypatch) -> None:
     calls = 0
     original = PublishPacket.decode
 
@@ -182,4 +185,9 @@ def test_v311_qos2_remains_generic(monkeypatch) -> None:
             pack_utf8("bench/qos2") + pack_u16(3) + b"payload",
         )
     )
-    assert calls == 1
+    effects = engine.take_effects()
+    assert calls == 0
+    assert effects[0].kind is EffectKind.SEND
+    assert effects[1].kind is EffectKind.MESSAGE
+    assert effects[1].data.qos is QoS.EXACTLY_ONCE
+    assert effects[1].data.mid == 3

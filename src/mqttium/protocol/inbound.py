@@ -108,6 +108,7 @@ def _decode_v311_qos0_message(raw: RawPacket) -> Message:
 def _decode_v311_qos1_fields(
     raw: RawPacket,
 ) -> tuple[str, bytes, int, bool, bool]:
+    """Decode MQTT 3.1.1 QoS 1/2 PUBLISH fields (identical wire layout)."""
     topic, pos = unpack_utf8(raw.remaining)
     validate_received_publish_topic(topic, utf8_validated=True)
     mid, pos = unpack_u16(raw.remaining, pos)
@@ -283,6 +284,17 @@ class InboundSession:
                     properties=None,
                 )
                 return
+            if qos_raw == int(QoS.EXACTLY_ONCE):
+                topic, payload, mid, retain, dup = _decode_v311_qos1_fields(raw)
+                self._on_qos2(
+                    topic=topic,
+                    payload=payload,
+                    mid=mid,
+                    retain=retain,
+                    dup=dup,
+                    properties=None,
+                )
+                return
         elif config.protocol is MQTTProtocolVersion.MQTTv5:
             if qos_raw == 3:
                 raise MalformedPacketError("Invalid PUBLISH QoS 3")
@@ -326,8 +338,9 @@ class InboundSession:
             )
             return
 
-        # MQTT 3.1 keeps the generic decoder for every QoS; MQTT 3.1.1 only
-        # reaches this point for QoS 2. Neither protocol has a property table.
+        # MQTT 3.1 keeps the generic decoder for every QoS. MQTT 3.1.1 QoS 0/1/2
+        # and MQTT 5 all QoS have already returned. Neither remaining path has a
+        # property table.
         packet = PublishPacket.decode(raw.flags, raw.remaining, config.protocol)
         topic = self._resolve_topic(packet)
         validate_received_publish_topic(topic, utf8_validated=True)

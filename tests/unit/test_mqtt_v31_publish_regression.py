@@ -7,6 +7,7 @@ import pytest
 from mqttium.codec.buffer import RawPacket
 from mqttium.codec.primitives import pack_u16, pack_utf8
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, PacketType, QoS
+from mqttium.packets import PublishPacket
 from mqttium.protocol.config import EngineConfig
 from mqttium.protocol.effects import EffectKind
 from mqttium.protocol.engine import ProtocolEngine
@@ -48,3 +49,24 @@ def test_v31_qos12_preserves_payload_prefix(qos: QoS) -> None:
     assert messages[0].qos is qos
     assert messages[0].payload == b"\x00body"
     assert not any(effect.kind is EffectKind.PROTOCOL_ERROR for effect in effects)
+
+
+def test_v31_qos2_still_uses_generic_packet(monkeypatch) -> None:
+    calls = 0
+    original = PublishPacket.decode
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(PublishPacket, "decode", counted)
+    engine = _engine()
+    engine.handle_raw(
+        RawPacket(
+            PacketType.PUBLISH,
+            0x04,
+            pack_utf8("v31/qos2") + pack_u16(3) + b"payload",
+        )
+    )
+    assert calls == 1
