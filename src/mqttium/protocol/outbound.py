@@ -38,7 +38,6 @@ from mqttium.errors import (
 from mqttium.packets import (
     PubAckPacket,
     PubCompPacket,
-    PublishPacket,
     PubRecPacket,
     PubRelPacket,
 )
@@ -54,6 +53,31 @@ from mqttium.types import OutboundMessage, OutboundMessageSummary, Properties
 
 if TYPE_CHECKING:
     from mqttium.protocol.engine import ProtocolEngine
+
+
+def _encode_stored_publish(
+    msg: OutboundMessage,
+    *,
+    protocol: MQTTProtocolVersion,
+    dup: bool,
+) -> WriteItem:
+    """Encode one stored outbound PUBLISH without a short-lived packet object.
+
+    QoS 0 already calls ``encode_publish_item`` directly. QoS 1/2 ``_launch``
+    still constructed a ``PublishPacket`` only to call ``encode_write_item``,
+    which is a one-line wrapper around the same function. The dataclass
+    measured about 0.84 µs here — roughly the encode itself.
+    """
+    return encode_publish_item(
+        msg.topic,
+        msg.payload,
+        qos=msg.qos,
+        retain=msg.retain,
+        dup=dup,
+        mid=msg.mid,
+        properties=msg.properties,
+        protocol=protocol,
+    )
 
 
 def _retain_publish_item(item: WriteItem) -> WriteItem | None:
@@ -646,15 +670,7 @@ class OutboundSession:
     def _launch(self, msg: OutboundMessage, *, persisted: bool = False) -> None:
         wire = msg.encoded_publish
         if wire is None:
-            wire = PublishPacket(
-                topic=msg.topic,
-                payload=msg.payload,
-                qos=msg.qos,
-                retain=msg.retain,
-                dup=msg.dup,
-                mid=msg.mid,
-                properties=msg.properties,
-            ).encode_write_item(self.config.protocol)
+            wire = _encode_stored_publish(msg, protocol=self.config.protocol, dup=msg.dup)
         self._engine._check_outbound_size(wire)
         target_state = (
             OutboundQoSState.WAIT_PUBACK
@@ -714,15 +730,7 @@ class OutboundSession:
             msg.dup = True
             retained = msg.encoded_publish
             if retained is None:
-                wire = PublishPacket(
-                    topic=msg.topic,
-                    payload=msg.payload,
-                    qos=msg.qos,
-                    retain=msg.retain,
-                    dup=True,
-                    mid=msg.mid,
-                    properties=msg.properties,
-                ).encode_write_item(self.config.protocol)
+                wire = _encode_stored_publish(msg, protocol=self.config.protocol, dup=True)
             else:
                 # Segmented frames share the original payload. The first replay
                 # replaces only their small header; later replays reuse the

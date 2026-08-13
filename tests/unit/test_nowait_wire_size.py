@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import pytest
 
+import mqttium.protocol.outbound as outbound_module
 from mqttium.api import AsyncClient
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, QoS
 from mqttium.packets import PublishPacket
+from mqttium.packets.publish import encode_publish_item
+from mqttium.protocol.effects import EffectKind
 from mqttium.protocol.engine import EngineConfig, ProtocolEngine
 from mqttium.transport.writes import item_size
 from mqttium.types import Properties
@@ -57,23 +60,63 @@ def test_publish_wire_size_matches_encoded_frame(
 
 
 async def test_publish_nowait_encodes_only_the_real_frame(monkeypatch) -> None:
-    calls = 0
-    original = PublishPacket.encode_write_item
+    packet_calls = 0
+    item_calls = 0
+    original_packet = PublishPacket.encode_write_item
+    original_item = outbound_module.encode_publish_item
 
-    def counted(
+    def counted_packet(
         self: PublishPacket,
         protocol: MQTTProtocolVersion = MQTTProtocolVersion.MQTTv311,
     ):
-        nonlocal calls
-        calls += 1
-        return original(self, protocol)
+        nonlocal packet_calls
+        packet_calls += 1
+        return original_packet(self, protocol)
 
-    monkeypatch.setattr(PublishPacket, "encode_write_item", counted)
+    def counted_item(*args, **kwargs):
+        nonlocal item_calls
+        item_calls += 1
+        return original_item(*args, **kwargs)
+
+    monkeypatch.setattr(PublishPacket, "encode_write_item", counted_packet)
+    monkeypatch.setattr(outbound_module, "encode_publish_item", counted_item)
     client = AsyncClient(max_outbound_messages=8)
     client._engine.state = ConnectionState.CONNECTED
 
     receipt = client.publish_nowait("bench/nowait", b"payload", qos=1)
 
     assert receipt.mid is not None
-    assert calls == 1
+    assert packet_calls == 0
+    assert item_calls == 1
     assert client._effect_flush_task is None
+
+
+def test_qos1_launch_frame_matches_publish_packet() -> None:
+    """Dropping the packet object must not change the bytes on the wire."""
+    engine = ProtocolEngine(EngineConfig())
+    engine.state = ConnectionState.CONNECTED
+    handle = engine.queue_publish("bench/launch", b"payload", qos=QoS.AT_LEAST_ONCE, retain=True)
+    effects = engine.take_effects()
+    sent = next(effect.data for effect in effects if effect.kind is EffectKind.SEND)
+    expected = encode_publish_item(
+        "bench/launch",
+        b"payload",
+        qos=QoS.AT_LEAST_ONCE,
+        retain=True,
+        dup=False,
+        mid=handle.mid,
+        properties=None,
+    )
+    assert sent == expected
+    assert (
+        sent
+        == PublishPacket(
+            topic="bench/launch",
+            payload=b"payload",
+            qos=QoS.AT_LEAST_ONCE,
+            retain=True,
+            dup=False,
+            mid=handle.mid,
+            properties=None,
+        ).encode_write_item()
+    )
