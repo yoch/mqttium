@@ -25,6 +25,41 @@ jobs:
           git show origin/review/promote-pr199:.github/promote_pr199.py > /tmp/promote_pr199.py
           git show origin/review/promote-pr199:.github/bench_pr199.py > /tmp/bench_pr199.py
           python /tmp/promote_pr199.py
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('src/mqttium/protocol/inbound.py')
+          text = p.read_text()
+          old = '''    def _on_qos2(
+              self,
+              *,
+              topic: str,
+              payload: bytes,
+              mid: int,
+              retain: bool,
+              dup: bool,
+              properties: Properties | None,
+          ) -> None:
+              engine = self._engine
+              config = self.config
+              store = self.store
+'''
+          new = '''    def _on_qos2(
+              self,
+              *,
+              topic: str,
+              payload: bytes,
+              mid: int,
+              retain: bool,
+              dup: bool,
+              properties: Properties | None,
+          ) -> None:
+              engine = self._engine
+              store = self.store
+'''
+          if text.count(old) != 1:
+              raise RuntimeError(f'expected one _on_qos2 config block, got {text.count(old)}')
+          p.write_text(text.replace(old, new, 1))
+          PY
           git diff --check
       - name: Validate cumulative implementation
         run: |
