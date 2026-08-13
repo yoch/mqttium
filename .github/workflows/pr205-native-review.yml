@@ -1,0 +1,285 @@
+name: PR205 native delivery review
+
+on:
+  push:
+    branches:
+      - cursor/qos12-message-batch-6aff
+
+permissions:
+  contents: read
+
+jobs:
+  paired-native-delivery:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out candidate
+        uses: actions/checkout@v7
+        with:
+          ref: cursor/qos12-message-batch-6aff
+          path: candidate
+      - name: Check out base
+        uses: actions/checkout@v7
+        with:
+          ref: a7f18a7b4090bc01336c25ede657efafb8850740
+          path: base
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - name: Install benchmark dependencies
+        run: |
+          python -m pip install -q paho-mqtt
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mosquitto
+          cat >/tmp/pr205-mosquitto.conf <<'MOSQ'
+          persistence false
+          allow_anonymous true
+          max_inflight_messages 128
+          max_queued_messages 100000
+          max_queued_bytes 0
+          connection_messages false
+          log_type error
+          listener 11884 127.0.0.1
+          MOSQ
+          mosquitto -c /tmp/pr205-mosquitto.conf >/tmp/pr205-mosquitto.log 2>&1 &
+          for i in $(seq 1 50); do
+            (echo >/dev/tcp/127.0.0.1/11884) >/dev/null 2>&1 && exit 0
+            sleep 0.2
+          done
+          cat /tmp/pr205-mosquitto.log
+          exit 1
+      - name: Run rotated paired broker-backed QoS1 delivery
+        shell: bash
+        run: |
+          cat >/tmp/pr205_bench.py <<'PY'
+          from __future__ import annotations
+
+          import argparse
+          import asyncio
+          import json
+          import os
+          import statistics
+          import subprocess
+          import sys
+          import threading
+          import time
+          from pathlib import Path
+
+          class Publisher:
+              def __init__(self, host: str, port: int, protocol: str) -> None:
+                  import paho.mqtt.client as mqtt
+
+                  self._mqtt = mqtt
+                  self._connected = threading.Event()
+                  proto = mqtt.MQTTv5 if protocol == "5" else mqtt.MQTTv311
+                  self.client = mqtt.Client(
+                      mqtt.CallbackAPIVersion.VERSION2,
+                      client_id=f"pr205-pub-{os.getpid()}-{time.time_ns()}",
+                      protocol=proto,
+                  )
+                  self.client.max_inflight_messages_set(64)
+                  self.client.max_queued_messages_set(0)
+
+                  def on_connect(_client, _userdata, _flags, reason_code, _properties=None):
+                      if reason_code.is_failure:
+                          raise RuntimeError(f"publisher connection refused: {reason_code}")
+                      self._connected.set()
+
+                  self.client.on_connect = on_connect
+                  self.client.connect(host, port, keepalive=30)
+                  self.client.loop_start()
+                  if not self._connected.wait(timeout=10):
+                      raise TimeoutError("publisher CONNACK timeout")
+
+              def publish_many(self, topic: str, payload: bytes, count: int) -> None:
+                  last = None
+                  for _ in range(count):
+                      last = self.client.publish(topic, payload, qos=1)
+                      if last.rc != self._mqtt.MQTT_ERR_SUCCESS:
+                          raise RuntimeError(f"publisher refused message: rc={last.rc}")
+                  assert last is not None
+                  last.wait_for_publish(timeout=45)
+                  if not last.is_published():
+                      raise TimeoutError("publisher did not finish QoS1 drain")
+
+              def close(self) -> None:
+                  self.client.disconnect()
+                  self.client.loop_stop()
+
+          async def worker(args: argparse.Namespace) -> dict[str, object]:
+              from mqttium.api import AsyncClient
+              from mqttium.enums import MQTTProtocolVersion
+              from mqttium.protocol.reconnect import ReconnectPolicy
+
+              protocol = (
+                  MQTTProtocolVersion.MQTTv5
+                  if args.protocol == "5"
+                  else MQTTProtocolVersion.MQTTv311
+              )
+              client = AsyncClient(
+                  client_id=f"pr205-sub-{os.getpid()}-{time.time_ns()}",
+                  protocol=protocol,
+                  local_receive_maximum=256,
+                  message_delivery="callback",
+                  max_pending_callbacks=args.count + 1024,
+                  max_pending_delivery_bytes=None,
+                  reconnect=ReconnectPolicy(enabled=False),
+              )
+              received = 0
+              complete = asyncio.Event()
+
+              def on_message(_message) -> None:
+                  nonlocal received
+                  received += 1
+                  if received == args.count:
+                      complete.set()
+
+              client.on_message = on_message
+              await client.connect(args.host, args.port, timeout=10.0)
+              topic = f"bench/pr205/{os.getpid()}/{time.time_ns()}"
+              await client.subscribe(topic, qos=1)
+              publisher = Publisher(args.host, args.port, args.protocol)
+              payload = b"x" * args.payload_bytes
+              started = time.perf_counter()
+              publish_task = asyncio.create_task(
+                  asyncio.to_thread(publisher.publish_many, topic, payload, args.count)
+              )
+              try:
+                  await asyncio.wait_for(complete.wait(), timeout=50.0)
+                  await publish_task
+              finally:
+                  publisher.close()
+              elapsed = time.perf_counter() - started
+              stats = client.stats()
+              await client.disconnect()
+              return {
+                  "protocol": args.protocol,
+                  "payload_bytes": args.payload_bytes,
+                  "count": args.count,
+                  "elapsed_s": elapsed,
+                  "msg_s": args.count / elapsed,
+                  "received": received,
+                  "effect_inline": stats.effects.inline_effects,
+                  "effect_enqueued": stats.effects.enqueued,
+                  "effect_suspensions": stats.effects.apply_suspensions,
+              }
+
+          def run_variant(script: Path, root: Path, args: argparse.Namespace, protocol: str, payload: int, count: int) -> dict[str, object]:
+              env = os.environ.copy()
+              env["PYTHONPATH"] = str(root.resolve() / "src")
+              command = [
+                  sys.executable,
+                  str(script),
+                  "--worker",
+                  "--host", args.host,
+                  "--port", str(args.port),
+                  "--protocol", protocol,
+                  "--payload-bytes", str(payload),
+                  "--count", str(count),
+              ]
+              completed = subprocess.run(
+                  command,
+                  check=False,
+                  capture_output=True,
+                  text=True,
+                  env=env,
+                  timeout=70,
+              )
+              if completed.returncode != 0:
+                  raise RuntimeError(
+                      f"worker failed rc={completed.returncode}\nstdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
+                  )
+              lines = [line for line in completed.stdout.splitlines() if line.strip()]
+              return json.loads(lines[-1])
+
+          def parent(args: argparse.Namespace) -> None:
+              script = Path(__file__).resolve()
+              roots = {"base": args.base_root, "candidate": args.candidate_root}
+              scenarios = [
+                  ("5", 64, 18000, 7),
+                  ("311", 64, 18000, 5),
+                  ("5", 4096, 6000, 5),
+              ]
+              report: dict[str, object] = {"scenarios": []}
+              rows = report["scenarios"]
+              assert isinstance(rows, list)
+              for protocol, payload, count, repeat in scenarios:
+                  ratios: list[float] = []
+                  pairs: list[dict[str, object]] = []
+                  for index in range(repeat):
+                      order = ("base", "candidate") if index % 2 == 0 else ("candidate", "base")
+                      measured = {
+                          variant: run_variant(script, roots[variant], args, protocol, payload, count)
+                          for variant in order
+                      }
+                      base_rate = float(measured["base"]["msg_s"])
+                      candidate_rate = float(measured["candidate"]["msg_s"])
+                      ratio = candidate_rate / base_rate
+                      ratios.append(ratio)
+                      pairs.append({
+                          "order": order,
+                          "base_msg_s": base_rate,
+                          "candidate_msg_s": candidate_rate,
+                          "candidate_over_base": ratio,
+                          "base_inline": measured["base"]["effect_inline"],
+                          "candidate_inline": measured["candidate"]["effect_inline"],
+                      })
+                  row = {
+                      "protocol": protocol,
+                      "payload_bytes": payload,
+                      "count": count,
+                      "repeat": repeat,
+                      "median_candidate_over_base": statistics.median(ratios),
+                      "min_candidate_over_base": min(ratios),
+                      "max_candidate_over_base": max(ratios),
+                      "pairs_favouring_candidate": sum(r > 1.0 for r in ratios),
+                      "pairs": pairs,
+                  }
+                  rows.append(row)
+                  print(
+                      f"MQTT {protocol} payload={payload}: candidate/base={row['median_candidate_over_base']:.4f}, "
+                      f"positive={row['pairs_favouring_candidate']}/{repeat}, "
+                      f"range=[{row['min_candidate_over_base']:.4f}, {row['max_candidate_over_base']:.4f}]"
+                  )
+              args.output.write_text(json.dumps(report, indent=2) + "\n")
+
+          def parse_args() -> argparse.Namespace:
+              parser = argparse.ArgumentParser()
+              parser.add_argument("--worker", action="store_true")
+              parser.add_argument("--base-root", type=Path)
+              parser.add_argument("--candidate-root", type=Path)
+              parser.add_argument("--host", default="127.0.0.1")
+              parser.add_argument("--port", type=int, default=11884)
+              parser.add_argument("--protocol", choices=("311", "5"))
+              parser.add_argument("--payload-bytes", type=int)
+              parser.add_argument("--count", type=int)
+              parser.add_argument("--output", type=Path, default=Path("/tmp/pr205-native.json"))
+              args = parser.parse_args()
+              if args.worker:
+                  if args.protocol is None or args.payload_bytes is None or args.count is None:
+                      parser.error("worker arguments are required")
+              elif args.base_root is None or args.candidate_root is None:
+                  parser.error("base and candidate roots are required")
+              return args
+
+          if __name__ == "__main__":
+              args = parse_args()
+              if args.worker:
+                  print(json.dumps(asyncio.run(worker(args))))
+              else:
+                  parent(args)
+          PY
+          python /tmp/pr205_bench.py --base-root base --candidate-root candidate --output /tmp/pr205-native.json
+      - name: Show report
+        if: always()
+        run: cat /tmp/pr205-native.json || true
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pr205-native-delivery
+          path: |
+            /tmp/pr205-native.json
+            /tmp/pr205-mosquitto.log
+          if-no-files-found: warn
+          retention-days: 7
