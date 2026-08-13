@@ -1,4 +1,4 @@
-"""Temporary paired native QoS1 ingress review for PR #204."""
+"""Temporary focused paired native QoS1 ingress review for PR #204."""
 
 from __future__ import annotations
 
@@ -14,7 +14,16 @@ import time
 from pathlib import Path
 
 
-def _publish(host: str, port: int, topic: str, count: int, payload: bytes, protocol: str) -> None:
+def _publish(
+    host: str,
+    port: int,
+    topic: str,
+    count: int,
+    payload: bytes,
+    protocol: str,
+    ready: threading.Event,
+    start_gate: threading.Event,
+) -> None:
     import paho.mqtt.client as mqtt
 
     connected = threading.Event()
@@ -38,13 +47,16 @@ def _publish(host: str, port: int, topic: str, count: int, payload: bytes, proto
     try:
         if not connected.wait(timeout=10):
             raise TimeoutError("publisher CONNACK timeout")
+        ready.set()
+        if not start_gate.wait(timeout=10):
+            raise TimeoutError("benchmark start gate timeout")
         last = None
         for _ in range(count):
             last = client.publish(topic, payload, qos=1)
             if last.rc != mqtt.MQTT_ERR_SUCCESS:
                 raise RuntimeError(f"publisher refused message: rc={last.rc}")
         assert last is not None
-        last.wait_for_publish(timeout=30)
+        last.wait_for_publish(timeout=45)
         if not last.is_published():
             raise TimeoutError("publisher did not finish QoS1 drain")
     finally:
@@ -81,7 +93,8 @@ async def _worker(args: argparse.Namespace) -> dict[str, object]:
     topic = f"bench/pr204/{os.getpid()}/{time.time_ns()}"
     await client.subscribe(topic, qos=1)
     payload = b"x" * args.payload_bytes
-    started = time.perf_counter()
+    publisher_ready = threading.Event()
+    start_gate = threading.Event()
     publish_task = asyncio.create_task(
         asyncio.to_thread(
             _publish,
@@ -91,10 +104,18 @@ async def _worker(args: argparse.Namespace) -> dict[str, object]:
             args.count,
             payload,
             args.protocol,
+            publisher_ready,
+            start_gate,
         )
     )
+    if not await asyncio.to_thread(publisher_ready.wait, 10):
+        raise TimeoutError("publisher did not become ready")
+    # Both MQTT connections and the subscription are established before timing.
+    await asyncio.sleep(0)
+    started = time.perf_counter()
+    start_gate.set()
     try:
-        await asyncio.wait_for(complete.wait(), timeout=45.0)
+        await asyncio.wait_for(complete.wait(), timeout=60.0)
         await publish_task
     except BaseException:
         if not publish_task.done():
@@ -147,7 +168,7 @@ def _run_variant(
         capture_output=True,
         text=True,
         env=env,
-        timeout=60,
+        timeout=75,
     )
     if completed.returncode != 0:
         raise RuntimeError(
@@ -162,12 +183,9 @@ def _run_variant(
 def _parent(args: argparse.Namespace) -> None:
     script = Path(__file__).resolve()
     roots = {"base": args.base_root, "candidate": args.candidate_root}
-    scenarios = [
-        ("311", 64, 8000),
-        ("5", 64, 8000),
-        ("311", 4096, 3000),
-        ("5", 4096, 3000),
-    ]
+    # Focus the confirmatory run on the only scenario whose prior median crossed
+    # the 3% regression threshold: MQTT 5 QoS1, 64-byte payload.
+    scenarios = [("5", 64, 20000)]
     report: dict[str, object] = {"repeat": args.repeat, "scenarios": []}
     output = report["scenarios"]
     assert isinstance(output, list)
@@ -219,7 +237,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-root", type=Path)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=11883)
-    parser.add_argument("--repeat", type=int, default=5)
+    parser.add_argument("--repeat", type=int, default=7)
     parser.add_argument("--protocol", choices=("311", "5"))
     parser.add_argument("--payload-bytes", type=int)
     parser.add_argument("--count", type=int)
