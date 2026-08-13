@@ -44,7 +44,7 @@ def _publish(host: str, port: int, topic: str, count: int, payload: bytes, proto
             if last.rc != mqtt.MQTT_ERR_SUCCESS:
                 raise RuntimeError(f"publisher refused message: rc={last.rc}")
         assert last is not None
-        last.wait_for_publish(timeout=20)
+        last.wait_for_publish(timeout=30)
         if not last.is_published():
             raise TimeoutError("publisher did not finish QoS1 drain")
     finally:
@@ -94,7 +94,7 @@ async def _worker(args: argparse.Namespace) -> dict[str, object]:
         )
     )
     try:
-        await asyncio.wait_for(complete.wait(), timeout=20.0)
+        await asyncio.wait_for(complete.wait(), timeout=45.0)
         await publish_task
     except BaseException:
         if not publish_task.done():
@@ -147,7 +147,7 @@ def _run_variant(
         capture_output=True,
         text=True,
         env=env,
-        timeout=35,
+        timeout=60,
     )
     if completed.returncode != 0:
         raise RuntimeError(
@@ -163,10 +163,10 @@ def _parent(args: argparse.Namespace) -> None:
     script = Path(__file__).resolve()
     roots = {"base": args.base_root, "candidate": args.candidate_root}
     scenarios = [
-        ("311", 64, 1500),
-        ("5", 64, 1500),
-        ("311", 4096, 750),
-        ("5", 4096, 750),
+        ("311", 64, 8000),
+        ("5", 64, 8000),
+        ("311", 4096, 3000),
+        ("5", 4096, 3000),
     ]
     report: dict[str, object] = {"repeat": args.repeat, "scenarios": []}
     output = report["scenarios"]
