@@ -1,6 +1,6 @@
 # Public API stability policy
 
-MQTTium is at `1.0.0rc3`. This document defines the frozen Stable API candidate
+MQTTium is at `1.0.0rc4`. This document defines the frozen Stable API candidate
 and separates that contract from implementation objects that remain importable
 in Python.
 
@@ -154,7 +154,7 @@ Internal names have no deprecation guarantee.
 
 ## Release gate
 
-This classification is the frozen `1.0.0rc3` contract. Promotion to `1.0.0`
+This classification is the frozen `1.0.0rc4` contract. Promotion to `1.0.0`
 requires the complete local reconnect, backpressure, memory and
 broker-interoperability evidence described in [`STABILITY.md`](STABILITY.md),
 plus evidence that no major public redesign is expected.

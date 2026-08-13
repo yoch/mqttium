@@ -6,6 +6,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [1.0.0rc4] - 2026-08-13
+
 ### Changed
 
 - Rationalize the protocol engine internals without behaviour change: in-flight
@@ -555,7 +557,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - Pre-spin-out comparative analysis and generated coverage data from the
   published source tree.
 
-[Unreleased]: https://github.com/yoch/mqttium/compare/v1.0.0rc3...HEAD
+[Unreleased]: https://github.com/yoch/mqttium/compare/v1.0.0rc4...HEAD
+[1.0.0rc4]: https://github.com/yoch/mqttium/compare/v1.0.0rc3...v1.0.0rc4
 [1.0.0rc3]: https://github.com/yoch/mqttium/compare/v1.0.0rc2...v1.0.0rc3
 [1.0.0rc2]: https://github.com/yoch/mqttium/compare/v1.0.0rc1...v1.0.0rc2
 [1.0.0rc1]: https://github.com/yoch/mqttium/compare/v0.2.0b4...v1.0.0rc1
