@@ -31,7 +31,9 @@ jobs:
           python - <<'PY'
           import base64, gzip, json
           from pathlib import Path
-          raw = base64.urlsafe_b64decode(Path('/tmp/job.b64').read_text())
+          encoded = Path('/tmp/job.b64').read_text().strip()
+          encoded += '=' * (-len(encoded) % 4)
+          raw = base64.urlsafe_b64decode(encoded)
           job = json.loads(gzip.decompress(raw))
           Path('/tmp/audit.patch').write_text(job['patch'])
           PY
