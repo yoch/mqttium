@@ -232,3 +232,62 @@ def test_loop_stop_from_network_thread_does_not_join_itself() -> None:
     assert restarted_loop is not None and restarted_loop.is_running()
     assert restarted_thread is not None and restarted_thread.is_alive()
     client.loop_stop()
+
+
+def test_loop_stop_never_stops_or_clears_a_replacement_generation() -> None:
+    client = Client()
+    wait_entered = threading.Event()
+    released = threading.Event()
+
+    class ControlledStarted:
+        def is_set(self) -> bool:
+            return released.is_set()
+
+        def wait(self, timeout: float | None = None) -> bool:
+            wait_entered.set()
+            return released.wait(timeout)
+
+        def set(self) -> None:
+            released.set()
+
+    class FakeThread:
+        def is_alive(self) -> bool:
+            return True
+
+        def join(self, timeout: float | None = None) -> None:
+            del timeout
+
+    class ReplacementLoop:
+        def __init__(self) -> None:
+            self.stop_calls = 0
+
+        def is_running(self) -> bool:
+            return True
+
+        def call_soon_threadsafe(self, callback: Any) -> None:
+            callback()
+
+        def stop(self) -> None:
+            self.stop_calls += 1
+
+    old_thread = FakeThread()
+    replacement_thread = FakeThread()
+    replacement_loop = ReplacementLoop()
+    client._thread = old_thread  # type: ignore[assignment]
+    client._loop = None
+    client._started = ControlledStarted()  # type: ignore[assignment]
+
+    stopper = threading.Thread(target=client.loop_stop)
+    stopper.start()
+    assert wait_entered.wait(timeout=1.0)
+
+    with client._loop_state_lock:
+        client._thread = replacement_thread  # type: ignore[assignment]
+        client._loop = replacement_loop  # type: ignore[assignment]
+    client._started.set()
+
+    stopper.join(timeout=1.0)
+    assert not stopper.is_alive()
+    assert replacement_loop.stop_calls == 0
+    assert client._thread is replacement_thread
+    assert client._loop is replacement_loop
