@@ -557,9 +557,9 @@ class AsyncClient:
         """True when a native QoS 0 write can bypass the effect adapter safely."""
 
         return (
-            not self._pending_effects
+            (self.on_publish is None or self._has_callback_capacity(callback_count))
+            and not self._pending_effects
             and not self._engine.has_pending_effects
-            and (self.on_publish is None or self._has_callback_capacity(callback_count))
         )
 
     def _try_direct_qos0_publish(

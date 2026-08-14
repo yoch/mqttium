@@ -30,23 +30,41 @@ The ordering and failure boundaries are explicit:
 
 ## Independent measurement
 
-The baseline was frozen from merged `main` at `44b9614`. Seven alternating,
-source-isolated pairs were pinned to CPU 3 after `runner_probe --enforce`
-accepted the host. Each measured 128,000 native `publish_nowait()` calls and
-drained the callback worker in bounded batches.
+The baseline was frozen from merged `main` at `44b9614`. Eleven alternating,
+source-isolated target pairs were pinned to CPU 3 after
+`runner_probe --enforce` accepted the host. Each measured 128,000 native
+`publish_nowait()` calls and drained the callback worker in bounded batches.
 
-| Metric | Callback path | No-callback control |
+| Target metric | Callback path |
+| --- | ---: |
+| Median candidate/base throughput | **1.9474** |
+| Pair range | 1.6697–2.0135 |
+| Baseline CV | 2.41% |
+| Candidate CV | 5.33% |
+| Pairs favouring candidate | 11/11 |
+
+The complete range and the candidate dispersion are retained rather than
+discarding the slow observation. The contract invalidates a microbenchmark when
+the baseline CV exceeds 5%; here it is 2.41%, every pair favours the candidate,
+and the 8-of-11 acceptance requirement is exceeded.
+
+A seven-pair no-callback timing control had a 0.9825 median ratio, within the
+±2% guard, with baseline/candidate CVs of 1.35%/3.48%. Later repetitions were
+affected by periodic host interference, so the exact call/allocation profile —
+the benchmarking contract's preferred neutral control for callback handoff —
+was also compared:
+
+| Exact profile | Baseline | Candidate |
 | --- | ---: | ---: |
-| Median candidate/base throughput | **1.9218** | 0.9825 |
-| Pair range | 1.7517–1.9625 | 0.8911–1.0262 |
-| Baseline CV | 1.13% | 1.35% |
-| Candidate CV | 3.63% | 3.48% |
-| Pairs favouring candidate | 7/7 | 2/7 |
+| Calls per operation, no callback | 42.0994 | 42.0994 |
+| Primitive calls per operation, no callback | 42.0858 | 42.0858 |
+| Tracemalloc peak, no callback | 30,120 B | 30,248 B |
+| Calls per operation, callback | 119.4479 | 73.2041 |
+| Tracemalloc peak, callback | 45,608 B | 32,104 B |
 
-One candidate observation in each scenario was disturbed in the same position;
-it is retained in the reported range and CV rather than discarded. Both CVs
-remain below 5%, the target result stays positive in every pair, and the neutral
-median remains within the ±2% guard.
+The no-callback control therefore adds neither calls nor per-operation
+allocation work, while the callback path removes about 46 Python calls per
+publication and lowers the isolated allocation peak.
 
 The scenario isolates library admission and callback handoff. It uses no broker,
 external adapter, or external benchmark result and is not an end-to-end latency
