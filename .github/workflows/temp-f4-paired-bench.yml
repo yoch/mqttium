@@ -1,4 +1,4 @@
-name: Temporary Finding 4 paired benchmark
+name: Temporary Finding 4/5 paired benchmark
 
 on:
   push:
@@ -18,11 +18,12 @@ jobs:
           python-version: '3.12'
       - name: Install dependencies
         run: python -m pip install -e ".[dev]"
-      - name: Compare main and candidate on one runner
+      - name: Compare main and selective candidate on one runner
         shell: bash
         run: |
           git worktree add /tmp/mqttium-main 4962b8b92e7c1a24658ddb1898cdeb205854c58e
-          cat > /tmp/f4_bench.py <<'PY'
+          git worktree add /tmp/mqttium-candidate b2c357846054fc172e9adf27bb7e296e09c635b4
+          cat > /tmp/f45_bench.py <<'PY'
           from __future__ import annotations
 
           import asyncio
@@ -35,9 +36,9 @@ jobs:
           from mqttium.protocol.effects import EffectKind, EngineEffect
           from mqttium.types import Message, Properties
 
-          N = 30000
-          WARM = 3000
-          TRIALS = 7
+          N = 40000
+          WARM = 4000
+          TRIALS = 9
 
           def iot_properties() -> Properties:
               p = Properties()
@@ -53,11 +54,17 @@ jobs:
               p.set("correlation_data", b"x" * 200)
               return p
 
-          async def one_case(name: str, protocol: MQTTProtocolVersion, props: Properties | None) -> None:
+          async def one_case(
+              name: str,
+              protocol: MQTTProtocolVersion,
+              props: Properties | None,
+              *,
+              decoded_hint: bool,
+          ) -> None:
               message = Message(topic="sensors/t", payload=b"hello", properties=props)
               kwargs = {}
               fields = getattr(EngineEffect, "__dataclass_fields__", {})
-              if props is not None and "decoded_property_wire_size" in fields:
+              if decoded_hint and props is not None and "decoded_property_wire_size" in fields:
                   kwargs["decoded_property_wire_size"] = len(encode_properties(props, PUBLISH))
               effect = EngineEffect(
                   EffectKind.MESSAGE,
@@ -91,14 +98,25 @@ jobs:
               )
 
           async def main() -> None:
-              await one_case("v5-no-properties", MQTTProtocolVersion.MQTTv5, None)
-              await one_case("v5-small-iot-properties", MQTTProtocolVersion.MQTTv5, iot_properties())
-              await one_case("v5-oversized-properties", MQTTProtocolVersion.MQTTv5, big_properties())
-              await one_case("v311-no-properties", MQTTProtocolVersion.MQTTv311, None)
+              await one_case(
+                  "v5-no-properties", MQTTProtocolVersion.MQTTv5, None, decoded_hint=False
+              )
+              await one_case(
+                  "v311-no-properties", MQTTProtocolVersion.MQTTv311, None, decoded_hint=False
+              )
+              await one_case(
+                  "v5-small-decoded", MQTTProtocolVersion.MQTTv5, iot_properties(), decoded_hint=True
+              )
+              await one_case(
+                  "v5-oversized-decoded", MQTTProtocolVersion.MQTTv5, big_properties(), decoded_hint=True
+              )
+              await one_case(
+                  "v5-small-application", MQTTProtocolVersion.MQTTv5, iot_properties(), decoded_hint=False
+              )
 
           asyncio.run(main())
           PY
           echo "=== MAIN ==="
-          PYTHONPATH=/tmp/mqttium-main/src python /tmp/f4_bench.py
-          echo "=== CANDIDATE ==="
-          PYTHONPATH="$GITHUB_WORKSPACE/src" python /tmp/f4_bench.py
+          PYTHONPATH=/tmp/mqttium-main/src python /tmp/f45_bench.py
+          echo "=== SELECTIVE CANDIDATE ==="
+          PYTHONPATH=/tmp/mqttium-candidate/src python /tmp/f45_bench.py
