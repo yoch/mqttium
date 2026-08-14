@@ -6,6 +6,20 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Changed
+
+- Admit QoS 1/2 `on_publish` callbacks directly to the bounded callback worker
+  when capacity is immediately available, settling the receipt without an
+  intermediate effect-task wake-up. Callback execution remains isolated, and
+  a full callback queue retains the existing ordered backpressure path.
+- Clarify that native QoS 0 receipts and `on_publish` callbacks mark writer
+  admission rather than socket drain or broker receipt, including how to size
+  the writer byte budget and handle immediate backpressure.
+- Extend the independent paced open-loop benchmark with fixed absolute rates,
+  outbound-window sweeps and automatic same-tree A/A control validation while
+  preserving the existing calibrated-fraction release mode; correlate callback
+  completions in FIFO order so reused MQTT packet identifiers remain measurable.
+
 ## [1.0.0rc4] - 2026-08-13
 
 ### Changed

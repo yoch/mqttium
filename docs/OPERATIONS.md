@@ -52,6 +52,28 @@ The Paho facade cannot suspend a synchronous caller for writer progress. It
 returns `MQTT_ERR_QUEUE_SIZE` when its cross-thread handoff or native unfinished
 publication budget is full. Configure its request and byte limits separately.
 
+### QoS 0 completion is writer admission
+
+MQTT has no broker acknowledgement for QoS 0. MQTTium therefore completes the
+`PublishReceipt` and schedules `on_publish` after the encoded packet has been
+admitted to the writer queue. This boundary does **not** mean that the transport
+has written the bytes, that the socket send buffer has drained, or that the
+broker has received the publication.
+
+Consequently, an `on_publish` counter is not a socket-level outstanding-byte
+limit for QoS 0: incrementing before `publish_nowait()` and decrementing in the
+callback can happen within the same event-loop turn while the writer queue keeps
+growing. Use `await client.publish(...)` when the producer should wait for
+writer capacity. A `publish_nowait()` producer must catch `FlowControlError` and
+apply its own shed, retry or spill policy.
+
+Size `max_outbound_bytes` from the encoded bytes that may accumulate during the
+largest supported burst, not only from the message count. This matters most for
+64 KiB and 1 MiB payloads. To preserve forward progress, an empty writer queue
+admits one item larger than its byte limit; no second item is admitted until
+enough capacity is released. Inspect `client.stats().writer` to distinguish
+local queue pressure from protocol-level unfinished QoS state.
+
 ## Runtime snapshots
 
 Call `client.stats()` on the client's owning event-loop thread:

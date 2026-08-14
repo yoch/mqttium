@@ -5,16 +5,19 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import os
 import statistics
 import subprocess
 import sys
 import time
+from collections import deque
 from dataclasses import asdict, dataclass
 from itertools import product
 from pathlib import Path
 
 from paired_network import (
+    InvalidMeasurement,
     _eligibility,
     _evaluation,
     _write_evaluation,
@@ -24,12 +27,53 @@ from paired_network import (
 )
 
 
+DEFAULT_FRACTIONS = (0.50, 0.75, 0.90, 1.00)
+
+
+@dataclass(frozen=True, slots=True)
+class LoadPoint:
+    mode: str
+    value: float
+
+
+class CallbackCompletionTracker:
+    """Correlate callbacks with publishes while packet identifiers are reused."""
+
+    def __init__(self) -> None:
+        self.completions: asyncio.Queue[tuple[int, int]] = asyncio.Queue()
+        self.published_ns: dict[int, deque[int]] = {}
+        self.early: dict[int, deque[int]] = {}
+
+    def record_publish(self, mid: int, sent_ns: int) -> None:
+        self.published_ns.setdefault(mid, deque()).append(sent_ns)
+        early = self.early.get(mid)
+        if early:
+            self.completions.put_nowait((mid, early.popleft()))
+            if not early:
+                del self.early[mid]
+
+    def record_completion(self, mid: int, finished_ns: int) -> None:
+        if mid in self.published_ns:
+            self.completions.put_nowait((mid, finished_ns))
+        else:
+            self.early.setdefault(mid, deque()).append(finished_ns)
+
+    async def next_latency_ms(self, timeout: float) -> float:
+        mid, finished_ns = await asyncio.wait_for(self.completions.get(), timeout=timeout)
+        sent = self.published_ns[mid]
+        sent_ns = sent.popleft()
+        if not sent:
+            del self.published_ns[mid]
+        return (finished_ns - sent_ns) / 1_000_000
+
+
 @dataclass
 class OpenLoopResult:
     mode: str
     completion: str
     protocol: str
     payload_bytes: int
+    window: int
     count: int
     target_rate: float
     offered_rate: float
@@ -72,9 +116,7 @@ async def _connected_client(protocol: str, window: int):
 
 async def sample(args: argparse.Namespace, topic: str) -> OpenLoopResult:
     client = await _connected_client(args.protocol, args.window)
-    completions: asyncio.Queue[tuple[int, int]] = asyncio.Queue()
-    published_ns: dict[int, int] = {}
-    early: dict[int, int] = {}
+    callback_tracker = CallbackCompletionTracker()
     latencies: list[float] = []
     receipt_tasks: list[asyncio.Task[None]] = []
 
@@ -86,11 +128,7 @@ async def sample(args: argparse.Namespace, topic: str) -> OpenLoopResult:
 
         def on_publish(mid: int | None, *_unused: object) -> None:
             assert mid is not None
-            finished = time.monotonic_ns()
-            if mid in published_ns:
-                completions.put_nowait((mid, finished))
-            else:
-                early[mid] = finished
+            callback_tracker.record_completion(mid, time.monotonic_ns())
 
         client.on_publish = on_publish
 
@@ -119,16 +157,13 @@ async def sample(args: argparse.Namespace, topic: str) -> OpenLoopResult:
             if args.completion == "receipt":
                 receipt_tasks.append(asyncio.create_task(observe_receipt(receipt, sent_ns)))
             else:
-                published_ns[receipt.mid] = sent_ns
-                if receipt.mid in early:
-                    completions.put_nowait((receipt.mid, early.pop(receipt.mid)))
+                callback_tracker.record_publish(receipt.mid, sent_ns)
         offered_elapsed = max(loop.time() - offered_started, 1e-9)
         if args.completion == "receipt":
             await asyncio.gather(*receipt_tasks)
         else:
             for _ in range(args.count):
-                mid, finished = await asyncio.wait_for(completions.get(), timeout=args.timeout)
-                latencies.append((finished - published_ns.pop(mid)) / 1_000_000)
+                latencies.append(await callback_tracker.next_latency_ms(args.timeout))
         completed_elapsed = max(loop.time() - offered_started, 1e-9)
         effects = client.stats().effects
         return OpenLoopResult(
@@ -136,6 +171,7 @@ async def sample(args: argparse.Namespace, topic: str) -> OpenLoopResult:
             completion=args.completion,
             protocol=args.protocol,
             payload_bytes=args.payload_bytes,
+            window=args.window,
             count=args.count,
             target_rate=args.target_rate,
             offered_rate=args.count / offered_elapsed,
@@ -193,6 +229,7 @@ def _run_worker(
     protocol: str,
     payload_bytes: int,
     completion: str,
+    window: int,
     count: int,
     target_rate: float = 0.0,
 ) -> dict[str, object]:
@@ -217,7 +254,7 @@ def _run_worker(
         "--count",
         str(count),
         "--window",
-        str(args.window),
+        str(window),
         "--target-rate",
         str(target_rate),
         "--timeout",
@@ -225,16 +262,30 @@ def _run_worker(
     ]
     if args.cpu is not None:
         command.extend(("--cpu", str(args.cpu)))
-    completed = subprocess.run(
-        command,
-        check=True,
-        capture_output=True,
-        text=True,
-        env=environment,
-        timeout=args.timeout + max(30, count / max(target_rate, 1.0) * 2),
-    )
+    timeout = args.timeout + max(30, count / max(target_rate, 1.0) * 2)
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise InvalidMeasurement(f"open-loop worker timed out after {timeout:.1f}s") from exc
+    if completed.returncode:
+        diagnostic = (completed.stderr or completed.stdout or "no worker output").strip()
+        raise InvalidMeasurement(
+            f"open-loop worker exited {completed.returncode}: {diagnostic[-2000:]}"
+        )
     lines = [line for line in completed.stdout.splitlines() if line.strip()]
-    return json.loads(lines[-1])
+    try:
+        return json.loads(lines[-1])
+    except (IndexError, json.JSONDecodeError) as exc:
+        raise InvalidMeasurement(
+            f"open-loop worker returned malformed output: {completed.stdout[-2000:]!r}"
+        ) from exc
 
 
 def _cv(values: list[float]) -> float:
@@ -249,14 +300,67 @@ def _number(mapping: dict[str, object], key: str) -> float:
     return float(value)
 
 
+def _csv_floats(raw: str | None, *, option: str) -> list[float]:
+    if raw is None:
+        return []
+    values: list[float] = []
+    for field in raw.split(","):
+        field = field.strip()
+        if not field:
+            continue
+        try:
+            value = float(field)
+        except ValueError as exc:
+            raise ValueError(f"{option} accepts comma-separated numbers") from exc
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"{option} values must be positive")
+        values.append(value)
+    return values
+
+
+def _load_points(fractions: str | None, target_rates: str | None) -> list[LoadPoint]:
+    rates = _csv_floats(target_rates, option="--target-rates")
+    if fractions is None:
+        fraction_values = [] if rates else list(DEFAULT_FRACTIONS)
+    else:
+        fraction_values = _csv_floats(fractions, option="--fractions")
+    points = [LoadPoint("capacity_fraction", value) for value in fraction_values]
+    points.extend(LoadPoint("absolute_rate", value) for value in rates)
+    if not points:
+        raise ValueError("at least one --fractions or --target-rates value is required")
+    return points
+
+
+def _parent_windows(window: int, windows: str | None) -> list[int]:
+    if windows is None:
+        return [window]
+    values: list[int] = []
+    for field in windows.split(","):
+        field = field.strip()
+        if not field:
+            continue
+        try:
+            value = int(field)
+        except ValueError as exc:
+            raise ValueError("--windows accepts comma-separated integers") from exc
+        if value <= 0:
+            raise ValueError("--windows values must be positive")
+        values.append(value)
+    if not values:
+        raise ValueError("--windows requires at least one value")
+    return values
+
+
 def parent(args: argparse.Namespace) -> int:
     script = Path(__file__).resolve()
     roots = {"base": args.base_root.resolve(), "candidate": args.candidate_root.resolve()}
     protocols = args.protocols.split(",")
     payloads = [int(value) for value in args.payloads.split(",")]
     completions = args.completions.split(",")
-    fractions = [float(value) for value in args.fractions.split(",")]
+    windows = _parent_windows(args.window, args.windows)
+    load_points = _load_points(args.fractions, args.target_rates)
     eligibility = _eligibility(args.preflight_report)
+    aa_control = roots["base"] == roots["candidate"]
     output: dict[str, object] = {
         "base_root": str(roots["base"]),
         "candidate_root": str(roots["candidate"]),
@@ -266,6 +370,7 @@ def parent(args: argparse.Namespace) -> int:
             "max_baseline_cv": args.max_baseline_cv,
             "min_completed_ratio": args.min_completed_ratio,
             "max_loop_lag_ratio": args.max_loop_lag_ratio,
+            "max_aa_ratio_deviation": args.max_aa_ratio_deviation,
         },
         "harness": {
             "subscriber_reader": "separate_process",
@@ -274,6 +379,7 @@ def parent(args: argparse.Namespace) -> int:
             "publisher_cpu": args.cpu,
             "target_sample_seconds": args.target_sample_seconds,
             "maximum_count": args.max_count,
+            "aa_control": aa_control,
         },
         "scenarios": [],
         "failures": [],
@@ -288,8 +394,10 @@ def parent(args: argparse.Namespace) -> int:
         _write_evaluation(args, output)
         return 2
 
-    capacities: dict[tuple[str, str, int, str], float] = {}
-    for protocol, payload_bytes, completion in product(protocols, payloads, completions):
+    capacities: dict[tuple[str, str, int, str, int], float] = {}
+    for protocol, payload_bytes, completion, window in product(
+        protocols, payloads, completions, windows
+    ):
         calibration_count = args.count_small if payload_bytes <= 256 else args.count_large
         for variant, root in roots.items():
             calibration = _run_worker(
@@ -300,9 +408,10 @@ def parent(args: argparse.Namespace) -> int:
                 protocol=protocol,
                 payload_bytes=payload_bytes,
                 completion=completion,
+                window=window,
                 count=calibration_count,
             )
-            capacities[(variant, protocol, payload_bytes, completion)] = _number(
+            capacities[(variant, protocol, payload_bytes, completion, window)] = _number(
                 calibration, "capacity"
             )
 
@@ -310,16 +419,18 @@ def parent(args: argparse.Namespace) -> int:
     regressions: list[str] = []
     scenarios = output["scenarios"]
     assert isinstance(scenarios, list)
-    for protocol, payload_bytes, completion, fraction in product(
-        protocols, payloads, completions, fractions
+    for protocol, payload_bytes, completion, window, load_point in product(
+        protocols, payloads, completions, windows, load_points
     ):
         count = args.count_small if payload_bytes <= 256 else args.count_large
+        minimum_capacity = min(
+            capacities[("base", protocol, payload_bytes, completion, window)],
+            capacities[("candidate", protocol, payload_bytes, completion, window)],
+        )
         target = (
-            min(
-                capacities[("base", protocol, payload_bytes, completion)],
-                capacities[("candidate", protocol, payload_bytes, completion)],
-            )
-            * fraction
+            minimum_capacity * load_point.value
+            if load_point.mode == "capacity_fraction"
+            else load_point.value
         )
         requested_count = count
         count = calibrated_sample_count(
@@ -341,6 +452,7 @@ def parent(args: argparse.Namespace) -> int:
                     protocol=protocol,
                     payload_bytes=payload_bytes,
                     completion=completion,
+                    window=window,
                     count=count,
                     target_rate=target,
                 )
@@ -351,6 +463,7 @@ def parent(args: argparse.Namespace) -> int:
             pairs.append({"order": list(order), **pair_results})
         base_rates = [_number(item, "completed_rate") for item in samples["base"]]
         candidate_rates = [_number(item, "completed_rate") for item in samples["candidate"]]
+        base_latencies = [_number(item, "ack_latency_p50_ms") for item in samples["base"]]
         throughput_ratios = [
             candidate / base for base, candidate in zip(base_rates, candidate_rates, strict=True)
         ]
@@ -359,6 +472,7 @@ def parent(args: argparse.Namespace) -> int:
             for base, candidate in zip(samples["base"], samples["candidate"], strict=True)
         ]
         base_cv = _cv(base_rates)
+        base_latency_cv = _cv(base_latencies)
         completed_ratio = statistics.median(throughput_ratios)
         loop_lag_ratio = statistics.median(lag_ratios)
         latency_wins = sum(
@@ -368,24 +482,47 @@ def parent(args: argparse.Namespace) -> int:
         scenario: dict[str, object] = {
             "protocol": protocol,
             "payload_bytes": payload_bytes,
+            "window": window,
             "completion": completion,
-            "load_fraction": fraction,
+            "load_mode": load_point.mode,
+            "load_fraction": (load_point.value if load_point.mode == "capacity_fraction" else None),
+            "requested_target_rate": (
+                load_point.value if load_point.mode == "absolute_rate" else None
+            ),
             "requested_count": requested_count,
             "count": count,
             "target_sample_seconds": args.target_sample_seconds,
             "target_rate": target,
-            "base_capacity": capacities[("base", protocol, payload_bytes, completion)],
-            "candidate_capacity": capacities[("candidate", protocol, payload_bytes, completion)],
+            "base_capacity": capacities[("base", protocol, payload_bytes, completion, window)],
+            "candidate_capacity": capacities[
+                ("candidate", protocol, payload_bytes, completion, window)
+            ],
             "base_completed_cv": base_cv,
+            "base_ack_latency_p50_cv": base_latency_cv,
             "median_candidate_over_base_completed": completed_ratio,
             "median_candidate_over_base_loop_lag_p95": loop_lag_ratio,
             "pairs_favouring_candidate_latency": latency_wins,
             "pairs": pairs,
         }
         scenarios.append(scenario)
-        label = f"protocol={protocol} payload={payload_bytes} completion={completion} load={fraction:.2f}"
+        load_label = (
+            f"load={load_point.value:.2f}"
+            if load_point.mode == "capacity_fraction"
+            else f"rate={load_point.value:g}msg/s"
+        )
+        label = (
+            f"protocol={protocol} payload={payload_bytes} window={window} "
+            f"completion={completion} {load_label}"
+        )
         if base_cv > args.max_baseline_cv:
-            invalidations.append(f"{label}: baseline CV {base_cv:.2%}")
+            invalidations.append(f"{label}: baseline completed-rate CV {base_cv:.2%}")
+        if base_latency_cv > args.max_baseline_cv:
+            invalidations.append(f"{label}: baseline p50-latency CV {base_latency_cv:.2%}")
+        if aa_control and abs(completed_ratio - 1.0) > args.max_aa_ratio_deviation:
+            invalidations.append(
+                f"{label}: A/A completed ratio {completed_ratio:.4f} outside "
+                f"1+/-{args.max_aa_ratio_deviation:.2%}"
+            )
         if completed_ratio < args.min_completed_ratio:
             regressions.append(f"{label}: completed ratio {completed_ratio:.4f}")
         if loop_lag_ratio > args.max_loop_lag_ratio:
@@ -424,11 +561,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--payloads", default="64,4096")
     parser.add_argument("--completion", choices=("receipt", "callback"), default="receipt")
     parser.add_argument("--completions", default="receipt,callback")
-    parser.add_argument("--fractions", default="0.50,0.75,0.90,1.00")
+    parser.add_argument("--fractions")
+    parser.add_argument("--target-rates")
     parser.add_argument("--count", type=int, default=1_000)
     parser.add_argument("--count-small", type=int, default=2_000)
     parser.add_argument("--count-large", type=int, default=1_000)
     parser.add_argument("--window", type=int, default=100)
+    parser.add_argument("--windows")
     parser.add_argument("--target-rate", type=float, default=1_000.0)
     parser.add_argument("--target-sample-seconds", type=float, default=1.5)
     parser.add_argument("--max-count", type=int, default=50_000)
@@ -440,6 +579,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-baseline-cv", type=float, default=0.05)
     parser.add_argument("--min-completed-ratio", type=float, default=0.97)
     parser.add_argument("--max-loop-lag-ratio", type=float, default=1.05)
+    parser.add_argument("--max-aa-ratio-deviation", type=float, default=0.02)
     parser.add_argument("--output", type=Path, default=Path("/tmp/paired-open-loop.json"))
     parser.add_argument("--summary-output", type=Path)
     args = parser.parse_args()
@@ -453,6 +593,16 @@ def parse_args() -> argparse.Namespace:
         parser.error("--target-sample-seconds must be positive")
     if args.max_count <= 0:
         parser.error("--max-count must be positive")
+    if args.window <= 0:
+        parser.error("--window must be positive")
+    if args.max_aa_ratio_deviation < 0:
+        parser.error("--max-aa-ratio-deviation must be non-negative")
+    if not args.worker:
+        try:
+            _parent_windows(args.window, args.windows)
+            _load_points(args.fractions, args.target_rates)
+        except ValueError as exc:
+            parser.error(str(exc))
     return args
 
 

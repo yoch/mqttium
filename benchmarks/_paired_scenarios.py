@@ -448,6 +448,51 @@ def _receipt(_scenario: str) -> ScenarioMeasurement:
     )
 
 
+def _publish_completion(scenario: str) -> ScenarioMeasurement:
+    from mqttium.api import AsyncClient
+    from mqttium.api.models import PublishReceipt
+    from mqttium.enums import QoS
+    from mqttium.protocol.effects import EffectKind
+
+    client = AsyncClient(
+        client_id="paired-publish-completion",
+        max_pending_callbacks=4_096,
+    )
+    callback = scenario.endswith("callback")
+    if callback:
+        client.on_publish = lambda _mid, _reason: None
+
+    def complete() -> None:
+        receipt = PublishReceipt(mid=1, qos=QoS.AT_LEAST_ONCE)
+        client._register_publish_receipt(1, receipt)
+        client._engine._emit(EffectKind.PUBLISH_COMPLETE, 1)
+        client._collect_effects_locked()
+        if not callback and not receipt.is_done():
+            raise RuntimeError("inline receipt completion did not settle")
+
+    if not callback:
+        return _measure(complete, operations=100_000, warmup=2_000)
+
+    async def run_callback() -> ScenarioMeasurement:
+        batch_size = 64
+        warmup_batches = 32
+        measured_batches = 2_000
+        started = 0.0
+        for batch in range(warmup_batches + measured_batches):
+            if batch == warmup_batches:
+                started = time.perf_counter()
+            for _ in range(batch_size):
+                complete()
+            await client._drain_effects()
+            await client._callback_queue.join()
+        elapsed = time.perf_counter() - started
+        await client._shutdown_callback_worker(drain=False)
+        operations = measured_batches * batch_size
+        return ScenarioMeasurement(elapsed, operations, operations / elapsed)
+
+    return asyncio.run(run_callback())
+
+
 REGISTRY: dict[str, Callable[[str], ScenarioMeasurement]] = {
     "encode_qos0": _encode,
     "encode_qos1": _encode,
@@ -475,6 +520,8 @@ REGISTRY: dict[str, Callable[[str], ScenarioMeasurement]] = {
     "delivery_both": _delivery,
     "websocket_mask_4k": _websocket_mask,
     "receipt_settle_unawaited": _receipt,
+    "publish_complete_receipt": _publish_completion,
+    "publish_complete_callback": _publish_completion,
 }
 
 

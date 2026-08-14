@@ -13,7 +13,9 @@ be committed.
 - `paired_network.py` records advisory closed-loop QoS 1 capacity and PUBACK
   latency. It is not a release gate because its A/A control exceeded the noise
   budget even on a preflight-eligible host.
-- `paired_open_loop.py` measures completion and loop lag at calibrated load.
+- `paired_open_loop.py` measures completion and loop lag at calibrated or fixed
+  absolute load. It can sweep outbound windows while calling `AsyncClient`
+  directly; no cross-client adapter participates in the measurement.
 - `application_stress.py` exercises callbacks, iterators, backpressure, memory,
   and SQLite persistence.
 - `memory_profile.py` enforces versioned tracemalloc and logical-counter limits.
@@ -54,6 +56,9 @@ four rules to prevent that:
    calibration.
 4. Open-loop calibration runs the same subscriber, completion tracking, and
    telemetry path as the paced sample. The only difference is pacing itself.
+5. Callback completion timestamps are correlated FIFO per MQTT packet
+   identifier. Packet identifiers may be reused before the observer consumes an
+   earlier queued callback, so one timestamp slot per MID is not sufficient.
 
 When a CPU is selected, the publisher worker is pinned only after the subscriber
 and observer have started. The observer therefore does not inherit the
@@ -71,10 +76,39 @@ It includes local admission and queue residence as well as broker and transport
 time. PUBACK proves broker acceptance; independent subscriber completion proves
 delivery to the observer.
 
+Receipt completion is observed by an awaiting task, so its timestamp includes
+that task's scheduling delay. At high rates this can have substantially higher
+CV than callback observation and must not be used as a neutral latency control
+unless its own A/A cell passes. Exact call/allocation profiles are the preferred
+neutral control for changes limited to callback handoff.
+
 Larger inflight windows can improve throughput through batching while increasing
 latency. Sweep the window before calling a high-window latency change a protocol
 regression. Open-loop measurements are preferable when the question is latency
 at a known fraction of capacity.
+
+Use fixed absolute rates when the question names a concrete workload rather
+than a fraction of the implementation's capacity. For example, an independent
+MQTT 3.1.1 diagnostic at 5,000 and 10,000 messages/s can use:
+
+```bash
+python benchmarks/runner_probe.py \
+  --output /tmp/mqttium-runner.json --enforce
+
+python benchmarks/paired_open_loop.py \
+  --base-root . --candidate-root . \
+  --protocols 311 --payloads 64,4096 \
+  --completions receipt,callback --windows 8,32,64,128 \
+  --target-rates 5000,10000 --repeat 12 \
+  --policy strict --preflight-report /tmp/mqttium-runner.json \
+  --output /tmp/mqttium-open-loop-aa.json
+```
+
+When `--target-rates` is present, fixed-rate points run by themselves unless
+`--fractions` is also supplied explicitly. With neither option, the retained
+`0.50,0.75,0.90,1.00` capacity-fraction sweep remains the default. Passing the
+same source root on both sides is an A/A control and enforces the neutral
+completed-rate ratio within 2% in addition to the normal CV checks.
 
 ## A practical optimisation order
 

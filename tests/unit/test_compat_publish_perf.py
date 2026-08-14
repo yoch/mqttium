@@ -18,6 +18,7 @@ from mqttium.enums import ConnectionState, MQTTProtocolVersion, OutboundQoSState
 from mqttium.errors import ProtocolError
 from mqttium.packets import PubAckPacket
 from mqttium.protocol.engine import EffectKind, ProtocolEngine, PublishFailure
+from mqttium.protocol.effects import EngineEffect
 from mqttium.protocol.packet_ids import PacketIdPool
 from mqttium.types import OutboundMessage
 
@@ -110,11 +111,8 @@ async def test_old_completion_cannot_settle_reused_mid() -> None:
     old_batch._register(mid)
     client._register_publish_receipt(mid, old_receipt)
     client._register_batch_receipt(mid, old_batch)
-    client._engine._emit(EffectKind.PUBLISH_COMPLETE, mid)
-    client._collect_effects_locked()
+    effect = EngineEffect(EffectKind.PUBLISH_COMPLETE, mid)
     assert not old_receipt.is_done()
-    assert client._pending_effects
-    effect = client._pending_effects.popleft()
 
     new_receipt = PublishReceipt(mid=mid, qos=QoS.AT_LEAST_ONCE)
     new_batch = PublishBatchReceipt()
@@ -140,13 +138,11 @@ async def test_old_failure_cannot_fail_reused_mid() -> None:
     old_receipt = PublishReceipt(mid=mid, qos=QoS.AT_LEAST_ONCE)
     client._register_publish_receipt(mid, old_receipt)
     failure = ProtocolError("old publish failed")
-    client._engine._emit(
+    effect = EngineEffect(
         EffectKind.PUBLISH_FAILED,
         PublishFailure(mid=mid, reason=failure),
     )
-    client._collect_effects_locked()
     assert not old_receipt.is_done()
-    effect = client._pending_effects.popleft()
 
     new_receipt = PublishReceipt(mid=mid, qos=QoS.AT_LEAST_ONCE)
     client._register_publish_receipt(mid, new_receipt)

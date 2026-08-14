@@ -13,6 +13,7 @@ from mqttium.api import AsyncClient
 from mqttium.api.models import PublishMessage
 from mqttium.codec.buffer import IncrementalDecoder
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, PacketType, QoS
+from mqttium.errors import FlowControlError
 from mqttium.packets import PublishPacket
 from mqttium.protocol.effects import EffectKind, EngineEffect
 from mqttium.types import Properties
@@ -76,6 +77,33 @@ async def test_publish_nowait_coalesces_async_effect_flush(monkeypatch) -> None:
     await task
     await client._callback_queue.join()
     assert seen == [None] * 100
+    await client._shutdown_callback_worker(drain=False)
+
+
+async def test_qos0_callback_marks_writer_admission_not_transport_drain() -> None:
+    client = AsyncClient(max_outbound_messages=1, max_outbound_bytes=1024)
+    client._engine.state = ConnectionState.CONNECTED
+    seen: list[tuple[int | None, BaseException | None]] = []
+    client.on_publish = lambda mid, error: seen.append((mid, error))
+
+    receipt = client.publish_nowait("native/qos0-boundary", b"first", qos=0)
+    task = client._effect_flush_task
+    assert task is not None
+    await task
+    await client._callback_queue.join()
+
+    assert receipt.is_done()
+    assert seen == [(None, None)]
+    assert client.stats().writer.queued_messages == 1
+    queued_bytes = client.stats().writer.queued_bytes
+
+    with pytest.raises(FlowControlError):
+        client.publish_nowait("native/qos0-boundary", b"second", qos=0)
+
+    assert client.stats().writer.queued_messages == 1
+    assert client.stats().writer.queued_bytes == queued_bytes
+    assert not client._engine.has_pending_effects
+    assert not client._effect_pump.pending
     await client._shutdown_callback_worker(drain=False)
 
 
