@@ -35,30 +35,29 @@ def unpack_u32(buffer: bytes | bytearray | memoryview, offset: int = 0) -> tuple
     return _U32.unpack_from(buffer, offset)[0], offset + 4
 
 
-def validate_utf8(value: str) -> None:
-    """Apply the MQTT UTF-8 rules without building the encoded form.
+def validate_utf8(value: str) -> int:
+    """Apply the MQTT UTF-8 rules without retaining the encoded form.
 
-    For a caller that only wants the rejection -- topic validation, which runs
-    before the encoder that will produce the bytes anyway -- ``encode_utf8``
-    encodes a string whose result is then discarded. A code point never encodes
-    to fewer than one byte, so an ASCII string's character count is already its
-    byte count and needs no encoding at all. Anything else is encoded exactly
-    once, for the length bound, and that same encoding answers the surrogate
-    rule.
+    Returns the MQTT byte length so a later wire-size check does not encode the
+    same string again. An ASCII string's character count is already its byte
+    count. Anything else is encoded exactly once, for the length bound, and
+    that same encoding answers the surrogate rule.
     """
     if not isinstance(value, str):
         raise ProtocolError(f"MQTT UTF-8 value must be str, got {type(value).__name__}")
     _validate_mqtt_utf8(value, error_type=ProtocolError)
     if value.isascii():
-        if len(value) > 65535:
+        n = len(value)
+        if n > 65535:
             raise ProtocolError("UTF-8 string too long for MQTT")
-        return
+        return n
     try:
         data = value.encode("utf-8")
     except UnicodeEncodeError as exc:
         raise ProtocolError("[MQTT-1.5.4-1] Surrogate in UTF-8 data") from exc
     if len(data) > 65535:
         raise ProtocolError("UTF-8 string too long for MQTT")
+    return len(data)
 
 
 def encode_utf8(value: str) -> bytes:
@@ -132,8 +131,8 @@ def _validate_mqtt_utf8(
     # The third rule -- no surrogates -- is deliberately absent. Surrogates are
     # the only code points strict UTF-8 refuses, so every caller already
     # answers that rule through the conversion it performs anyway: encode_utf8
-    # and validate_utf8 encode, and unpack_utf8 decodes, which cannot produce
-    # one. Testing it here as well made a non-ASCII publication encode its
-    # topic four times where twice is enough.
+    # encodes, validate_utf8 encodes when the string is not ASCII, and
+    # unpack_utf8 decodes. Testing it here as well made a non-ASCII publication
+    # encode its topic four times where the connected launch path encodes once.
     if "\x00" in text:
         raise error_type("[MQTT-1.5.4-2] Null in UTF-8 data")

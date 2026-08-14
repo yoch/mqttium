@@ -6,25 +6,26 @@ from mqttium.codec.primitives import encode_utf8, validate_utf8
 from mqttium.errors import MalformedPacketError, ProtocolError
 
 
-def validate_publish_topic(topic: str, *, allow_empty: bool = False) -> None:
-    """Validate a PUBLISH topic name (no wildcards).
+def validate_publish_topic(topic: str, *, allow_empty: bool = False) -> int:
+    """Validate a PUBLISH topic name (no wildcards) and return its MQTT byte length.
 
     ``allow_empty`` is for MQTT 5 topic-alias reuse (topic string empty, alias set).
     """
     if not topic:
         if allow_empty:
-            return
+            return 0
         raise ProtocolError("PUBLISH topic must not be empty")
-    _check_utf8_mqtt_topic(topic)
+    size = _check_utf8_mqtt_topic(topic)
     if "+" in topic or "#" in topic:
         raise ProtocolError("PUBLISH topic must not contain wildcards")
+    return size
 
 
 def encode_validated_publish_topic(topic: str) -> bytes:
     """Validate an outbound PUBLISH topic and return its MQTT UTF-8 bytes.
 
-    This is the QoS 0 hot-path companion to :func:`validate_publish_topic`: the
-    caller is about to encode the packet immediately, so retaining the validated
+    Companion to :func:`validate_publish_topic` for callers that encode
+    immediately (QoS 0, and connected QoS 1/2 launch). Retaining the validated
     bytes avoids scanning/encoding the Topic Name a second time.
     """
     if not topic:
@@ -96,8 +97,8 @@ def _validate_filter_levels(topic_filter: str) -> None:
             raise ProtocolError("'+' must occupy its own filter level")
 
 
-def _check_utf8_mqtt_topic(topic: str) -> None:
+def _check_utf8_mqtt_topic(topic: str) -> int:
     try:
-        validate_utf8(topic)
+        return validate_utf8(topic)
     except ProtocolError as exc:
         raise ProtocolError(f"Invalid MQTT topic: {exc}") from exc
