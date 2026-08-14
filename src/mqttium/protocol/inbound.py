@@ -318,6 +318,7 @@ class InboundSession:
             property_wire_size,
         ) = decode_publish_fields_v5(raw, qos)
         topic = self._resolve_topic_fields(topic, properties)
+        decoded_property_wire_size = property_wire_size if properties.values else None
         if qos is QoS.AT_MOST_ONCE:
             self._engine._emit(
                 EffectKind.MESSAGE,
@@ -330,7 +331,7 @@ class InboundSession:
                     mid=None,
                     properties=properties,
                 ),
-                decoded_property_wire_size=property_wire_size,
+                decoded_property_wire_size=decoded_property_wire_size,
             )
             return
         assert decoded_mid is not None
@@ -342,7 +343,7 @@ class InboundSession:
                 retain=retain,
                 dup=dup,
                 properties=properties,
-                decoded_property_wire_size=property_wire_size,
+                decoded_property_wire_size=decoded_property_wire_size,
             )
             return
         self._on_qos2(
@@ -352,7 +353,7 @@ class InboundSession:
             retain=retain,
             dup=dup,
             properties=properties,
-            decoded_property_wire_size=property_wire_size,
+            decoded_property_wire_size=decoded_property_wire_size,
         )
 
     def _on_publish_v31(self, raw: RawPacket) -> None:
@@ -435,7 +436,7 @@ class InboundSession:
                 f"Inbound packet identifier {mid} reused by QoS 2 while QoS 1 PUBACK is pending"
             )
 
-        logical_size = self.logical_size(topic, payload, properties)
+        logical_size = self.logical_size(topic, payload, properties, decoded_property_wire_size)
         self._acquire_slot(logical_size)
         inbound = InboundMessage(
             mid=mid,
@@ -550,7 +551,11 @@ class InboundSession:
             )
             return
 
-        logical_size = self.logical_size(topic, payload, properties) if config.manual_ack else None
+        logical_size = (
+            self.logical_size(topic, payload, properties, decoded_property_wire_size)
+            if config.manual_ack
+            else None
+        )
         self._acquire_slot(logical_size)
         if config.manual_ack:
             try:
@@ -846,6 +851,7 @@ class InboundSession:
         topic: str,
         payload: bytes,
         properties: Properties | None,
+        decoded_property_wire_size: int | None = None,
     ) -> int:
         property_bytes = 0
         if (
@@ -853,7 +859,10 @@ class InboundSession:
             and properties is not None
             and properties.values
         ):
-            property_bytes = len(encode_properties(properties, PUBLISH))
+            if decoded_property_wire_size is None:
+                property_bytes = len(encode_properties(properties, PUBLISH))
+            else:
+                property_bytes = decoded_property_wire_size
         topic_bytes = len(topic) if topic.isascii() else len(topic.encode("utf-8"))
         return len(payload) + topic_bytes + property_bytes
 

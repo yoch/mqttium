@@ -261,6 +261,7 @@ class AsyncClient:
         self._delivery_logical_size = self._delivery.logical_size
         self._put_message = self._delivery.put_message
         self._accept_message = self._delivery.acceptor()
+        self._accept_decoded_message = self._delivery.decoded_acceptor()
         self._ensure_callback_worker = self._delivery.ensure_callback_worker
         self._spawn_callback = self._delivery.spawn_callback
         self._try_enqueue_callback = self._delivery.try_enqueue_callback
@@ -1642,9 +1643,13 @@ class AsyncClient:
                     self._collect_effects_locked()
         elif kind is EffectKind.MESSAGE:
             message: Message = effect.data
-            pending_delivery = self._accept_message(
-                message, self.on_message, effect.decoded_property_wire_size
-            )
+            property_wire_size = effect.decoded_property_wire_size
+            if property_wire_size is None:
+                pending_delivery = self._accept_message(message, self.on_message)
+            else:
+                pending_delivery = self._accept_decoded_message(
+                    message, self.on_message, property_wire_size
+                )
             if pending_delivery is not None:
                 await pending_delivery
             if effect.requires_delivery_mark is not False and message.mid is not None:

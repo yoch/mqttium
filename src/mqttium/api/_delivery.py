@@ -38,8 +38,9 @@ DeliveryToken = AccountedDeliveryToken | None
 CallbackJob = tuple[Callable[..., Any], tuple[Any, ...], DeliveryToken]
 TrackedIteratorMessage = tuple[Message, AccountedDeliveryToken]
 IteratorQueueItem = Message | TrackedIteratorMessage
-MessageAcceptor = Callable[
-    [Message, Callable[[Message], Any] | None, int | None], Awaitable[None] | None
+MessageAcceptor = Callable[[Message, Callable[[Message], Any] | None], Awaitable[None] | None]
+DecodedMessageAcceptor = Callable[
+    [Message, Callable[[Message], Any] | None, int], Awaitable[None] | None
 ]
 
 
@@ -78,21 +79,29 @@ def _budget_partition(
     return small_budget, small_limit, accounted_limit
 
 
-def _fits_small_limit(
-    message: Message,
-    limit: int | None,
-    decoded_property_wire_size: int | None = None,
-) -> bool:
+def _fits_small_limit(message: Message, limit: int | None, property_wire_size: int | None) -> bool:
+    if property_wire_size is None:
+        return False
     if limit is None:
         return True
-    if limit <= 0:
+    return limit > 0 and len(message.payload) + 4 * len(message.topic) + property_wire_size <= limit
+
+
+def _is_small_delivery(
+    message: Message,
+    references: int,
+    limit: int | None,
+    decoded_property_wire_size: int | None,
+) -> bool:
+    if not references:
         return False
-    property_size = 0
-    if message.properties:
-        if decoded_property_wire_size is None:
-            return False
-        property_size = decoded_property_wire_size
-    return len(message.payload) + 4 * len(message.topic) + property_size <= limit
+    if decoded_property_wire_size is not None:
+        return _fits_small_limit(message, limit, decoded_property_wire_size)
+    return limit is None or (
+        limit > 0
+        and not message.properties
+        and len(message.payload) + 4 * len(message.topic) <= limit
+    )
 
 
 class ApplicationDelivery:
@@ -157,11 +166,17 @@ class ApplicationDelivery:
             "both": self._accept_both_fast,
         }[self.mode]
 
+    def decoded_acceptor(self) -> DecodedMessageAcceptor:
+        """Return the mode-specialized admission path for a fresh decoded table."""
+        return {
+            "auto": self._accept_auto_decoded,
+            "iterator": self._accept_iterator_decoded,
+            "callback": self._accept_callback_decoded,
+            "both": self._accept_both_decoded,
+        }[self.mode]
+
     def _accept_iterator_unaccounted(
-        self,
-        message: Message,
-        _callback: Callable[[Message], Any] | None,
-        _decoded_property_wire_size: int | None = None,
+        self, message: Message, _callback: Callable[[Message], Any] | None
     ) -> Awaitable[None] | None:
         try:
             self.messages_queue.put_nowait(message)
@@ -171,10 +186,7 @@ class ApplicationDelivery:
         return None
 
     def _accept_callback_unaccounted(
-        self,
-        message: Message,
-        callback: Callable[[Message], Any] | None,
-        _decoded_property_wire_size: int | None = None,
+        self, message: Message, callback: Callable[[Message], Any] | None
     ) -> Awaitable[None] | None:
         if callback is None:
             return None
@@ -187,10 +199,7 @@ class ApplicationDelivery:
         return None
 
     def _accept_both_unaccounted(
-        self,
-        message: Message,
-        callback: Callable[[Message], Any] | None,
-        _decoded_property_wire_size: int | None = None,
+        self, message: Message, callback: Callable[[Message], Any] | None
     ) -> Awaitable[None] | None:
         if callback is None:
             return self.accept(message, callback)
@@ -208,80 +217,151 @@ class ApplicationDelivery:
         return None
 
     def _accept_iterator_fast(
-        self,
-        message: Message,
-        _callback: Callable[[Message], Any] | None,
-        decoded_property_wire_size: int | None = None,
+        self, message: Message, _callback: Callable[[Message], Any] | None
     ) -> Awaitable[None] | None:
+        limit = self.small_message_limit
         if (
-            not _fits_small_limit(message, self.small_message_limit, decoded_property_wire_size)
-            or self.messages_queue.full()
-        ):
-            return self.accept(message, None, decoded_property_wire_size)
+            limit is not None
+            and (
+                limit <= 0
+                or bool(message.properties)
+                or len(message.payload) + 4 * len(message.topic) > limit
+            )
+        ) or self.messages_queue.full():
+            return self.accept(message, None)
         self.messages_queue.put_nowait(message)
         self.message_ready.set()
         return None
 
     def _accept_callback_fast(
-        self,
-        message: Message,
-        callback: Callable[[Message], Any] | None,
-        decoded_property_wire_size: int | None = None,
+        self, message: Message, callback: Callable[[Message], Any] | None
     ) -> Awaitable[None] | None:
         if callback is None:
             return None
+        limit = self.small_message_limit
         if (
-            not _fits_small_limit(message, self.small_message_limit, decoded_property_wire_size)
-            or self.callback_queue.full()
-        ):
-            return self.accept(message, callback, decoded_property_wire_size)
+            limit is not None
+            and (
+                limit <= 0
+                or bool(message.properties)
+                or len(message.payload) + 4 * len(message.topic) > limit
+            )
+        ) or self.callback_queue.full():
+            return self.accept(message, callback)
         self.ensure_callback_worker()
         self.callback_queue.put_nowait((callback, (message,), None))
         return None
 
     def _accept_both_fast(
-        self,
-        message: Message,
-        callback: Callable[[Message], Any] | None,
-        decoded_property_wire_size: int | None = None,
+        self, message: Message, callback: Callable[[Message], Any] | None
     ) -> Awaitable[None] | None:
         if callback is None:
             return self.accept(message, callback)
+        limit = self.small_message_limit
         if (
-            not _fits_small_limit(message, self.small_message_limit, decoded_property_wire_size)
+            (
+                limit is not None
+                and (
+                    limit <= 0
+                    or bool(message.properties)
+                    or len(message.payload) + 4 * len(message.topic) > limit
+                )
+            )
             or self.messages_queue.full()
             or self.callback_queue.full()
         ):
-            return self.accept(message, callback, decoded_property_wire_size)
+            return self.accept(message, callback)
         self.messages_queue.put_nowait(message)
         self.message_ready.set()
         self.ensure_callback_worker()
         self.callback_queue.put_nowait((callback, (message,), None))
         return None
 
-    def _accept_auto_fast(
+    def _accept_iterator_decoded(
+        self,
+        message: Message,
+        _callback: Callable[[Message], Any] | None,
+        property_wire_size: int,
+    ) -> Awaitable[None] | None:
+        if (
+            not _fits_small_limit(message, self.small_message_limit, property_wire_size)
+            or self.messages_queue.full()
+        ):
+            return self.accept(message, None, decoded_property_wire_size=property_wire_size)
+        self.messages_queue.put_nowait(message)
+        self.message_ready.set()
+        return None
+
+    def _accept_callback_decoded(
         self,
         message: Message,
         callback: Callable[[Message], Any] | None,
-        decoded_property_wire_size: int | None = None,
+        property_wire_size: int,
     ) -> Awaitable[None] | None:
         if callback is None:
-            return self._accept_iterator_fast(message, None, decoded_property_wire_size)
-        return self._accept_callback_fast(message, callback, decoded_property_wire_size)
+            return None
+        if (
+            not _fits_small_limit(message, self.small_message_limit, property_wire_size)
+            or self.callback_queue.full()
+        ):
+            return self.accept(message, callback, decoded_property_wire_size=property_wire_size)
+        self.ensure_callback_worker()
+        self.callback_queue.put_nowait((callback, (message,), None))
+        return None
+
+    def _accept_both_decoded(
+        self,
+        message: Message,
+        callback: Callable[[Message], Any] | None,
+        property_wire_size: int,
+    ) -> Awaitable[None] | None:
+        if callback is None:
+            return self.accept(message, callback, decoded_property_wire_size=property_wire_size)
+        if (
+            not _fits_small_limit(message, self.small_message_limit, property_wire_size)
+            or self.messages_queue.full()
+            or self.callback_queue.full()
+        ):
+            return self.accept(message, callback, decoded_property_wire_size=property_wire_size)
+        self.messages_queue.put_nowait(message)
+        self.message_ready.set()
+        self.ensure_callback_worker()
+        self.callback_queue.put_nowait((callback, (message,), None))
+        return None
+
+    def _accept_auto_decoded(
+        self,
+        message: Message,
+        callback: Callable[[Message], Any] | None,
+        property_wire_size: int,
+    ) -> Awaitable[None] | None:
+        if callback is None:
+            return self._accept_iterator_decoded(message, None, property_wire_size)
+        return self._accept_callback_decoded(message, callback, property_wire_size)
+
+    def _accept_auto_fast(
+        self, message: Message, callback: Callable[[Message], Any] | None
+    ) -> Awaitable[None] | None:
+        if callback is None:
+            return self._accept_iterator_fast(message, None)
+        return self._accept_callback_fast(message, callback)
 
     async def accept(
         self,
         message: Message,
         callback: Callable[[Message], Any] | None,
+        *,
         decoded_property_wire_size: int | None = None,
     ) -> None:
         """Accept one message using one controller boundary on the hot path."""
         callback_delivery = callback is not None and self.callback_mode
         iterator_delivery = self.iterator_mode or (self.auto_mode and callback is None)
         references = int(iterator_delivery) + int(callback_delivery)
-        small_delivery = bool(
-            references
-            and _fits_small_limit(message, self.small_message_limit, decoded_property_wire_size)
+        small_delivery = _is_small_delivery(
+            message,
+            references,
+            self.small_message_limit,
+            decoded_property_wire_size,
         )
         if small_delivery:
             if iterator_delivery:
@@ -305,7 +385,9 @@ class ApplicationDelivery:
         iterator_enqueued = False
         callback_enqueued = False
         if references:
-            logical_bytes = self._reservable_size(message)
+            logical_bytes = self._reservable_size(
+                message, decoded_property_wire_size=decoded_property_wire_size
+            )
             token = self.try_reserve(logical_bytes, references)
             if token is None:
                 token = await self.reserve_slow(logical_bytes, references)
@@ -379,15 +461,23 @@ class ApplicationDelivery:
         )
         return callback_delivery, iterator_delivery
 
-    def _is_small(
-        self,
-        message: Message,
-        references: int,
-        decoded_property_wire_size: int | None = None,
-    ) -> bool:
+    def _is_small(self, message: Message, references: int) -> bool:
+        limit = self.small_message_limit
         return bool(
             references
-            and _fits_small_limit(message, self.small_message_limit, decoded_property_wire_size)
+            and (
+                limit is None
+                or (
+                    limit > 0
+                    and not message.properties
+                    and len(message.payload) + 4 * len(message.topic) <= limit
+                )
+            )
+        )
+
+    def _is_small_decoded(self, message: Message, references: int, property_wire_size: int) -> bool:
+        return bool(
+            references and _fits_small_limit(message, self.small_message_limit, property_wire_size)
         )
 
     def deliver_batch_inline(
@@ -404,9 +494,13 @@ class ApplicationDelivery:
             if effect.kind is not EffectKind.MESSAGE:
                 break
             message: Message = effect.data
-            if effect.requires_delivery_mark is not False or not self._is_small(
-                message, 1, effect.decoded_property_wire_size
-            ):
+            if effect.requires_delivery_mark is not False:
+                break
+            property_wire_size = effect.decoded_property_wire_size
+            if property_wire_size is None:
+                if not self._is_small(message, 1):
+                    break
+            elif not self._is_small_decoded(message, 1, property_wire_size):
                 break
             if iterator_delivery and self.messages_queue.full():
                 break
@@ -517,17 +611,26 @@ class ApplicationDelivery:
     async def release(self, token: AccountedDeliveryToken) -> None:
         self.release_nowait(token)
 
-    def logical_size(self, message: Message) -> int:
+    def logical_size(
+        self, message: Message, *, decoded_property_wire_size: int | None = None
+    ) -> int:
         property_bytes = 0
         if self.protocol == MQTTProtocolVersion.MQTTv5 and message.properties:
-            property_bytes = len(encode_properties(message.properties, PUBLISH))
+            if decoded_property_wire_size is None:
+                property_bytes = len(encode_properties(message.properties, PUBLISH))
+            else:
+                property_bytes = decoded_property_wire_size
         topic_bytes = (
             len(message.topic) if message.topic.isascii() else len(message.topic.encode("utf-8"))
         )
         return len(message.payload) + topic_bytes + property_bytes
 
-    def _reservable_size(self, message: Message) -> int:
-        logical_bytes = self.logical_size(message)
+    def _reservable_size(
+        self, message: Message, *, decoded_property_wire_size: int | None = None
+    ) -> int:
+        logical_bytes = self.logical_size(
+            message, decoded_property_wire_size=decoded_property_wire_size
+        )
         limit = self.accounted_limit
         if limit is not None and logical_bytes > limit:
             raise MessageDeliveryError(

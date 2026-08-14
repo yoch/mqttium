@@ -133,12 +133,16 @@ async def test_application_built_properties_stay_accounted() -> None:
     assert client.pending_delivery_bytes > 0
 
 
-async def test_decoded_oversized_properties_stay_accounted() -> None:
+async def test_decoded_oversized_properties_stay_accounted(monkeypatch) -> None:
     properties = Properties()
     properties.set("correlation_data", b"x" * 200)
     _engine, effect = _fresh_message_effect(properties)
     assert effect.decoded_property_wire_size is not None
 
+    def fail_encode(*_args: object, **_kwargs: object) -> bytes:
+        raise AssertionError("fresh decoded accounted delivery must reuse the known table size")
+
+    monkeypatch.setattr(delivery_module, "encode_properties", fail_encode)
     client = AsyncClient(
         message_delivery="iterator",
         protocol=MQTTProtocolVersion.MQTTv5,
@@ -149,6 +153,29 @@ async def test_decoded_oversized_properties_stay_accounted() -> None:
     item = client._messages.get_nowait()
     assert isinstance(item, tuple)
     assert client.pending_delivery_bytes > 0
+
+
+def test_inbound_logical_size_reuses_fresh_decoded_table(monkeypatch) -> None:
+    engine, effect = _fresh_message_effect(_iot_properties())
+    message = effect.data
+    assert isinstance(message, Message)
+    assert message.properties is not None
+    property_wire_size = effect.decoded_property_wire_size
+    assert property_wire_size is not None
+
+    def fail_encode(*_args: object, **_kwargs: object) -> bytes:
+        raise AssertionError("fresh inbound sizing must reuse the decoded table size")
+
+    monkeypatch.setattr("mqttium.protocol.inbound.encode_properties", fail_encode)
+    size = engine.inbound.logical_size(
+        message.topic, message.payload, message.properties, property_wire_size
+    )
+    assert size == len(message.payload) + len(message.topic) + property_wire_size
+
+
+def test_empty_decoded_property_table_keeps_generic_path() -> None:
+    _engine, effect = _fresh_message_effect(Properties())
+    assert effect.decoded_property_wire_size is None
 
 
 def test_decoded_property_size_honors_small_limit_boundary() -> None:
