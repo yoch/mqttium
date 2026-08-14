@@ -60,15 +60,23 @@ async def test_small_auto_qos1_callback_messages_share_the_batch() -> None:
     await client._shutdown_callback_worker(drain=False)
 
 
-def test_single_message_keeps_the_established_effect_path() -> None:
-    client = AsyncClient(message_delivery="iterator")
+@pytest.mark.parametrize("mode", ["iterator", "callback", "both"])
+async def test_single_eligible_message_uses_inline_delivery(mode: str) -> None:
+    client = AsyncClient(message_delivery=mode)  # type: ignore[arg-type]
+    seen: list[Message] = []
+    if mode in ("callback", "both"):
+        client.on_message = seen.append
 
     applied = client._apply_message_effect_batch_inline(
         deque([_effect()]), client._connection_epoch
     )
 
-    assert applied == 0
-    assert client._messages.empty()
+    assert applied == 1
+    assert client._messages.qsize() == int(mode in ("iterator", "both"))
+    if mode in ("callback", "both"):
+        await client._callback_queue.join()
+        assert len(seen) == 1
+        await client._shutdown_callback_worker(drain=False)
 
 
 def test_stale_epoch_keeps_the_established_effect_path() -> None:
@@ -193,6 +201,21 @@ def test_drain_inline_applies_auto_qos1_batch_without_scheduling() -> None:
     assert not pump.pending
     assert pump.task is None
     assert client._messages.qsize() == 2
+
+
+def test_drain_inline_applies_one_eligible_message_without_scheduling() -> None:
+    client = AsyncClient(message_delivery="iterator")
+    pump = client._effect_pump
+    pump.pending = deque([_effect()])
+    pump.pending_epoch = client._connection_epoch
+    pump.enqueued = 1
+
+    pump.drain_inline()
+
+    assert not pump.pending
+    assert pump.task is None
+    assert pump.enqueued == pump.applied == 1
+    assert client._messages.qsize() == 1
 
 
 @pytest.mark.asyncio

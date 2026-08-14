@@ -380,8 +380,6 @@ class ApplicationDelivery:
         effects: deque[EngineEffect],
         callback: Callable[[Message], Any] | None,
     ) -> int:
-        if len(effects) < 2:
-            return 0
         callback_delivery, iterator_delivery = self._modes(callback)
         if not callback_delivery and not iterator_delivery:
             return 0

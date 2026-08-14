@@ -430,6 +430,41 @@ def _delivery(scenario: str) -> ScenarioMeasurement:
     return asyncio.run(run())
 
 
+def _single_message_effect(_scenario: str) -> ScenarioMeasurement:
+    from mqttium.api import AsyncClient
+    from mqttium.protocol.effects import EffectKind
+    from mqttium.types import Message
+
+    client = AsyncClient(
+        message_delivery="callback",
+        max_pending_callbacks=4_096,
+        max_pending_delivery_bytes=None,
+    )
+    client.on_message = lambda _message: None
+    message = Message(topic=TOPIC, payload=b"x")
+
+    async def run() -> ScenarioMeasurement:
+        warmup = 1_000
+        operations = 30_000
+        started = 0.0
+        for index in range(warmup + operations):
+            if index == warmup:
+                started = time.perf_counter()
+            client._engine._emit(
+                EffectKind.MESSAGE,
+                message,
+                requires_delivery_mark=False,
+            )
+            client._collect_effects_locked()
+            await client._drain_effects()
+        await client._callback_queue.join()
+        elapsed = time.perf_counter() - started
+        await client._shutdown_callback_worker(drain=False)
+        return ScenarioMeasurement(elapsed, operations, operations / elapsed)
+
+    return asyncio.run(run())
+
+
 def _websocket_mask(_scenario: str) -> ScenarioMeasurement:
     from mqttium.transport.websocket import _mask_payload
 
@@ -518,6 +553,7 @@ REGISTRY: dict[str, Callable[[str], ScenarioMeasurement]] = {
     "delivery_callback": _delivery,
     "delivery_iterator": _delivery,
     "delivery_both": _delivery,
+    "effect_single_message_callback": _single_message_effect,
     "websocket_mask_4k": _websocket_mask,
     "receipt_settle_unawaited": _receipt,
     "publish_complete_receipt": _publish_completion,
