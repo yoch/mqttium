@@ -12,6 +12,11 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   callback/iterator delivery queues, avoiding an EffectPump task wake-up while
   retaining the existing capacity, persistence-mark and callback-isolation
   guards.
+- Admit native QoS 0 `on_publish` callbacks directly to the bounded callback
+  worker after atomic writer admission, avoiding the intermediate effect-task
+  wake-up when callback capacity is immediately available. Full callback queues
+  retain the existing ordered backpressure path, including atomic batch
+  fallback.
 - Admit QoS 1/2 `on_publish` callbacks directly to the bounded callback worker
   when capacity is immediately available, settling the receipt without an
   intermediate effect-task wake-up. Callback execution remains isolated, and

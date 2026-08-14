@@ -260,11 +260,34 @@ def _native_publish(scenario: str) -> ScenarioMeasurement:
     from mqttium.api.async_client import AsyncClient
     from mqttium.enums import ConnectionState
 
-    client = AsyncClient(client_id="paired-native-publish")
+    callback = scenario == "native_publish_nowait_qos0_callback"
+    client = AsyncClient(
+        client_id="paired-native-publish",
+        max_pending_callbacks=4_096,
+    )
     _install_discard_writer(client)
     client._engine.state = ConnectionState.CONNECTED
+    if callback:
+        client.on_publish = lambda _mid, _reason: None
 
     async def run() -> ScenarioMeasurement:
+        if callback:
+            batch_size = 64
+            warmup_batches = 32
+            measured_batches = 2_000
+            started = 0.0
+            for batch in range(warmup_batches + measured_batches):
+                if batch == warmup_batches:
+                    started = time.perf_counter()
+                for _ in range(batch_size):
+                    client.publish_nowait(TOPIC, b"x", qos=0)
+                await client._drain_effects()
+                await client._callback_queue.join()
+            elapsed = time.perf_counter() - started
+            await client._shutdown_callback_worker(drain=False)
+            operations = measured_batches * batch_size
+            return ScenarioMeasurement(elapsed, operations, operations / elapsed)
+
         warmup = 2_000
         operations = 60_000
         started = 0.0
@@ -544,6 +567,7 @@ REGISTRY: dict[str, Callable[[str], ScenarioMeasurement]] = {
     "writer_enqueue_async": _writer,
     "async_publish_nowait_qos0": _native_publish,
     "native_publish_nowait_qos0": _native_publish,
+    "native_publish_nowait_qos0_callback": _native_publish,
     "compat_publish_qos1": _compat_qos1,
     "compat_publish_qos0_batch": _compat_qos0,
     "effect_send_inline": _effects,

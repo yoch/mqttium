@@ -115,7 +115,7 @@ def test_publish_from_on_message_waits_for_puback() -> None:
 
 
 def test_inner_publish_callback_tracks_the_facade_callback() -> None:
-    """The façade must not charge users for a callback they never installed."""
+    """The native direct path retains callback-worker isolation for the façade."""
     client = Client(CallbackAPIVersion.VERSION2, client_id="cb-gate")
 
     assert client.on_publish is None
@@ -128,7 +128,7 @@ def test_inner_publish_callback_tracks_the_facade_callback() -> None:
     client.on_publish = on_publish
     assert client.on_publish is on_publish
     assert client._async.on_publish is not None
-    assert client._async._direct_qos0_ready() is False
+    assert client._async._direct_qos0_ready() is True
 
     client.on_publish = None
     assert client._async.on_publish is None

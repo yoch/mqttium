@@ -101,6 +101,7 @@ implemented — the report exists so the choice stays falsifiable.
 
 | Date | Report | Question answered |
 | --- | --- | --- |
+| 2026-08-14 | [`NATIVE-QOS0-CALLBACK-DIRECT-2026-08-14.md`](NATIVE-QOS0-CALLBACK-DIRECT-2026-08-14.md) | Can native QoS 0 writer admission enqueue an isolated `on_publish` callback directly without weakening queue bounds or batch atomicity? |
 | 2026-08-13 | [`ACK-SPECIALIZED-PRIMITIVES.md`](ACK-SPECIALIZED-PRIMITIVES.md) | Can per-version ACK decode primitives make MQTT 5 three-byte bodies cost the same call count as MQTT 3.1.1 two-byte success? Superseded in scope by the full specialized-codec bind table on the same branch. |
 | 2026-08-13 | [`AUTO-QOS1-MESSAGE-BATCH-DELIVERY.md`](AUTO-QOS1-MESSAGE-BATCH-DELIVERY.md) | Can fresh automatic QoS 1 MESSAGE effects share the small-message inline batch without weakening persisted replay semantics? |
 | 2026-08-13 | [`RM-SLOT-UNTIL-HANDOFF.md`](RM-SLOT-UNTIL-HANDOFF.md) | Should auto-ACK QoS 1 keep the Receive Maximum slot until `take_effects()` instead of reconstructing occupancy with a second decode? |
