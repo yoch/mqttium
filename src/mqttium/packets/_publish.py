@@ -9,6 +9,7 @@ from __future__ import annotations
 from mqttium.codec.buffer import RawPacket
 from mqttium.codec.packet_validation import require_nonzero_mid
 from mqttium.codec.primitives import encode_utf8, unpack_u16, unpack_utf8
+from mqttium.codec.properties import PUBLISH, decode_properties, encode_properties
 from mqttium.codec.vbi import MAX_VBI, append_vbi
 from mqttium.enums import PacketType, QoS
 from mqttium.errors import MalformedPacketError, PacketTooLargeError, ProtocolError
@@ -16,7 +17,6 @@ from mqttium.packets._common import _require_outbound_mid
 from mqttium.topics import validate_received_publish_topic
 from mqttium.transport.writes import SEGMENT_THRESHOLD, WriteItem
 from mqttium.types import Message, Properties
-from mqttium.codec.properties import PUBLISH, decode_properties, encode_properties
 
 
 def decode_qos0_message_v311(raw: RawPacket) -> Message:
@@ -58,6 +58,7 @@ def encode_publish_item_v311(
     mid: int | None,
     properties: Properties | None = None,
     _topic_bytes: bytes | None = None,
+    _property_bytes: bytes | None = None,
 ) -> WriteItem:
     if type(qos) is QoS:
         level = qos
@@ -142,6 +143,7 @@ def encode_publish_item_v5(
     mid: int | None,
     properties: Properties | None,
     _topic_bytes: bytes | None = None,
+    _property_bytes: bytes | None = None,
 ) -> WriteItem:
     if type(qos) is QoS:
         level = qos
@@ -162,7 +164,9 @@ def encode_publish_item_v5(
     flags = (int(level) << 1) | (0x01 if retain else 0) | (0x08 if dup else 0)
     topic_bytes = encode_utf8(topic) if _topic_bytes is None else _topic_bytes
     topic_size = len(topic_bytes)
-    if not properties or not properties.values:
+    if _property_bytes is not None:
+        props = _property_bytes
+    elif not properties or not properties.values:
         props = _EMPTY_PROPS
     else:
         props = encode_properties(properties, PUBLISH)

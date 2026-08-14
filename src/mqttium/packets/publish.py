@@ -31,6 +31,7 @@ def encode_publish_item(
     properties: Properties | None,
     protocol: MQTTProtocolVersion = MQTTProtocolVersion.MQTTv311,
     _topic_bytes: bytes | None = None,
+    _property_bytes: bytes | None = None,
 ) -> WriteItem:
     """Validate and encode one outbound PUBLISH exactly once."""
     if protocol is MQTTProtocolVersion.MQTTv5:
@@ -43,6 +44,7 @@ def encode_publish_item(
             mid=mid,
             properties=properties,
             _topic_bytes=_topic_bytes,
+            _property_bytes=_property_bytes,
         )
     return encode_publish_item_v311(
         topic,
@@ -53,6 +55,7 @@ def encode_publish_item(
         mid=mid,
         properties=properties,
         _topic_bytes=_topic_bytes,
+        _property_bytes=_property_bytes,
     )
 
 
