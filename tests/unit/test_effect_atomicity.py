@@ -99,12 +99,20 @@ async def test_scheduled_flush_records_wakeup_while_active() -> None:
             await release.wait()
 
     client._apply_effect = controlled_apply  # type: ignore[method-assign]
-    client._engine._emit(EffectKind.MESSAGE, Message(topic="first", payload=b"1"))
+    client._engine._emit(
+        EffectKind.MESSAGE,
+        Message(topic="first", payload=b"1"),
+        requires_delivery_mark=True,
+    )
     client._collect_effects_locked()
     client._schedule_effect_flush()
     await started.wait()
 
-    client._engine._emit(EffectKind.MESSAGE, Message(topic="second", payload=b"2"))
+    client._engine._emit(
+        EffectKind.MESSAGE,
+        Message(topic="second", payload=b"2"),
+        requires_delivery_mark=True,
+    )
     client._collect_effects_locked()
     client._schedule_effect_flush()
     release.set()

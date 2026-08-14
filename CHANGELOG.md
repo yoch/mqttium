@@ -8,6 +8,10 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Changed
 
+- Transfer one eligible small inbound MESSAGE directly to the bounded
+  callback/iterator delivery queues, avoiding an EffectPump task wake-up while
+  retaining the existing capacity, persistence-mark and callback-isolation
+  guards.
 - Admit QoS 1/2 `on_publish` callbacks directly to the bounded callback worker
   when capacity is immediately available, settling the receipt without an
   intermediate effect-task wake-up. Callback execution remains isolated, and
