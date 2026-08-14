@@ -370,15 +370,33 @@ MQTT 5 half of the QoS 0 specialization, not the property byte.
 
 `decode_qos0_message_v5` unpacks the Topic Name, decodes the property table and
 builds the `Message` with `QoS.AT_MOST_ONCE`. `_on_publish_v5` takes that path
-when the QoS bits are 0. `_resolve_topic_fields` runs only when the Topic Name
-is empty or the decoded table carries `topic_alias`, so establishing and
-reusing an inbound alias is unchanged. QoS 1/2 still use
-`decode_publish_fields_v5`. Empty MQTT 5 tables still produce `Properties()`,
-not `None`, so `message.properties is None` continues to distinguish 3.1.1.
+when the QoS bits are 0. `_maybe_resolve_topic` calls `_resolve_topic_fields`
+only when the Topic Name is empty or the decoded table carries `topic_alias`,
+so establishing and reusing an inbound alias is unchanged on QoS 0 and QoS 1/2.
+QoS 1/2 still use `decode_publish_fields_v5`. Empty MQTT 5 tables still produce
+`Properties()`, not `None`, so `message.properties is None` continues to
+distinguish 3.1.1.
 
 ## Confirmation after Finding 6
 
-Same host, 20 000 isolated cycles after the change (filled after tests).
+Same host, 20 000 isolated `handle_raw` + `take_effects` cycles after the
+change:
+
+| Path | before µs | after µs |
+| --- | ---: | ---: |
+| MQTT 3.1.1 QoS 0 | 2.28 | 2.29 |
+| MQTT 5 empty QoS 0 | **3.04** | **2.67** |
+| MQTT 5 IoT QoS 0 | 6.60 | 6.06 |
+
+Empty MQTT 5 vs 3.1.1: **+0.76 → +0.38 µs**, matching `decode_properties` of
+`0x00` plus `Properties()` — the protocol tax, not leftover Python. Wrappers:
+`decode_publish_fields_v5` = 0.00, `_resolve_topic_fields` = 0.00 on the
+empty-table QoS 0 and QoS 1 paths. Alias establish/reuse still calls resolve.
+
+`tests/unit/test_qos0_v5_decode_fastpath.py` pins the decoder against
+`PublishPacket.decode`, the generic-parser skip, the alias skip, QoS 1 still
+using `decode_publish_fields_v5`, DUP/wildcard validation, empty-topic-without-alias,
+and alias reuse. `tests/unit`: 1067 passed.
 
 ## Remaining leads (measured, not treated as defects)
 

@@ -13,6 +13,7 @@ from mqttium.packets._publish import (
     decode_qos0_message_v5 as _decode_v5_qos0_message,
 )
 from mqttium.protocol.engine import EffectKind, EngineConfig, ProtocolEngine
+from mqttium.protocol.inbound import InboundSession
 from mqttium.types import Properties
 
 
@@ -100,18 +101,58 @@ def test_v5_qos0_engine_skips_generic_field_decoder(monkeypatch) -> None:
 
 def test_v5_qos0_empty_table_skips_alias_resolution(monkeypatch) -> None:
     calls = 0
-    engine = _connected()
-    original = engine.inbound._resolve_topic_fields
+    original = InboundSession._resolve_topic_fields
 
-    def counted(topic, props):
+    def counted(self, topic, props):
         nonlocal calls
         calls += 1
-        return original(topic, props)
+        return original(self, topic, props)
 
-    monkeypatch.setattr(engine.inbound, "_resolve_topic_fields", counted)
+    monkeypatch.setattr(InboundSession, "_resolve_topic_fields", counted)
+    engine = _connected()
     engine.handle_raw(_raw("bench/no-alias", b"x"))
     effects = engine.take_effects()
     assert effects[0].data.topic == "bench/no-alias"
+    assert calls == 0
+
+
+def test_v5_qos0_properties_without_alias_skip_resolution(monkeypatch) -> None:
+    calls = 0
+    original = InboundSession._resolve_topic_fields
+
+    def counted(self, topic, props):
+        nonlocal calls
+        calls += 1
+        return original(self, topic, props)
+
+    monkeypatch.setattr(InboundSession, "_resolve_topic_fields", counted)
+    props = Properties()
+    props.set("content_type", "text/plain")
+    engine = _connected()
+    engine.handle_raw(_raw("bench/typed", b"x", props))
+    engine.take_effects()
+    assert calls == 0
+
+
+def test_v5_qos1_empty_table_skips_alias_resolution(monkeypatch) -> None:
+    calls = 0
+    original = InboundSession._resolve_topic_fields
+
+    def counted(self, topic, props):
+        nonlocal calls
+        calls += 1
+        return original(self, topic, props)
+
+    monkeypatch.setattr(InboundSession, "_resolve_topic_fields", counted)
+    engine = _connected()
+    engine.handle_raw(
+        RawPacket(
+            PacketType.PUBLISH,
+            0x02,
+            pack_utf8("bench/v5/qos1") + pack_u16(9) + b"\x00" + b"payload",
+        )
+    )
+    engine.take_effects()
     assert calls == 0
 
 

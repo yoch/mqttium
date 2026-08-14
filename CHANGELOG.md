@@ -36,9 +36,9 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   limit. Application-built property bags without a decoded length stay
   accounted. Accounted inbound sizing reuses that decoded table length
   instead of encoding the properties again.
-- Decode inbound MQTT 5 QoS 0 PUBLISH directly into the delivered `Message`
-  and skip Topic Alias resolution when the Topic Name is present and the
-  property table carries no alias, matching the MQTT 3.1.1 QoS 0 path.
+- Decode inbound MQTT 5 QoS 0 PUBLISH directly into the delivered `Message`.
+  Topic Alias resolution runs only when the Topic Name is empty or the
+  property table carries an alias, for QoS 0 and QoS 1/2.
 
 ## [1.0.0rc4] - 2026-08-13
 

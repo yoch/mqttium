@@ -308,26 +308,24 @@ class InboundSession:
         qos_raw = (raw.flags >> 1) & 0x03
         if qos_raw == int(QoS.AT_MOST_ONCE):
             message = decode_qos0_message_v5(raw)
-            props = message.properties
-            if not message.topic or (props and props.get("topic_alias") is not None):
-                topic = self._resolve_topic_fields(message.topic, props)
-                if topic != message.topic:
-                    message = Message(
-                        topic=topic,
-                        payload=message.payload,
-                        qos=QoS.AT_MOST_ONCE,
-                        retain=message.retain,
-                        dup=False,
-                        mid=None,
-                        properties=props,
-                    )
+            topic = self._maybe_resolve_topic(message.topic, message.properties)
+            if topic != message.topic:
+                message = Message(
+                    topic=topic,
+                    payload=message.payload,
+                    qos=QoS.AT_MOST_ONCE,
+                    retain=message.retain,
+                    dup=False,
+                    mid=None,
+                    properties=message.properties,
+                )
             self._engine._emit(EffectKind.MESSAGE, message)
             return
         if qos_raw == 3:
             raise MalformedPacketError("Invalid PUBLISH QoS 3")
         qos = QoS(qos_raw)
         topic, payload, decoded_mid, retain, dup, properties = decode_publish_fields_v5(raw, qos)
-        topic = self._resolve_topic_fields(topic, properties)
+        topic = self._maybe_resolve_topic(topic, properties)
         assert decoded_mid is not None
         if qos is QoS.AT_LEAST_ONCE:
             self._on_qos1(
@@ -804,7 +802,12 @@ class InboundSession:
     # --- aliases and Receive Maximum --------------------------------------
 
     def _resolve_topic(self, packet: PublishPacket) -> str:
-        return self._resolve_topic_fields(packet.topic, packet.properties)
+        return self._maybe_resolve_topic(packet.topic, packet.properties)
+
+    def _maybe_resolve_topic(self, topic: str, props: Properties | None) -> str:
+        if topic and not (props and props.get("topic_alias") is not None):
+            return topic
+        return self._resolve_topic_fields(topic, props)
 
     def _resolve_topic_fields(self, topic: str, props: Properties | None) -> str:
         if self.config.protocol != MQTTProtocolVersion.MQTTv5:
