@@ -375,4 +375,5 @@ def decode_properties(
 
     if pos != end:
         raise MalformedPacketError("Properties length does not match consumed bytes")
+    result._wire_size = end - offset
     return result, end

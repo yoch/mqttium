@@ -34,6 +34,10 @@ class Properties:
     _encoded: dict[str, tuple[tuple[tuple[str, Any], ...], bytes]] = field(
         default_factory=dict, init=False, repr=False, compare=False
     )
+    # Decoded MQTT property-table length including the property-length VBI.
+    # Zero means unknown (an application-built bag); small-delivery then stays
+    # on the accounted path rather than encoding just to measure.
+    _wire_size: int = field(default=0, init=False, repr=False, compare=False)
 
     def _signature(self) -> tuple[tuple[str, Any], ...]:
         return tuple(
@@ -45,10 +49,12 @@ class Properties:
 
     def set(self, name: str, value: Any) -> None:
         self.values[name] = value
+        self._wire_size = 0
 
     def add_user_property(self, key: str, value: str) -> None:
         items = self.values.setdefault("user_property", [])
         items.append((key, value))
+        self._wire_size = 0
 
     def __bool__(self) -> bool:
         return bool(self.values)

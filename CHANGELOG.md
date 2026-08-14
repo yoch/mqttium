@@ -29,6 +29,13 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   preserving the existing calibrated-fraction release mode; correlate callback
   completions in FIFO order so reused MQTT packet identifiers remain measurable.
 
+### Fixed
+
+- Admit decoded MQTT 5 publications onto the unaccounted small-delivery path
+  when payload, topic bound and property-table bytes fit the small-message
+  limit. Application-built property bags without a decoded length stay
+  accounted.
+
 ## [1.0.0rc4] - 2026-08-13
 
 ### Changed

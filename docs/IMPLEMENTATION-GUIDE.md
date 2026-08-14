@@ -45,7 +45,10 @@ thin factories over the same primitives.
 
 MQTT UTF-8 validation applies on both encode and decode. Topics reject wildcards
 and U+0000. Filters validate `+` and `#` placement, shared-subscription prefixes,
-and empty group names before mutating engine state.
+and empty group names before mutating engine state. ``validate_utf8`` returns the
+MQTT byte length so a later size check does not encode the string again.
+Connected QoS 1/2 admission retains Topic Name bytes for the launch encoder, the
+same handoff as QoS 0; an offline queue keeps only that length.
 
 ## MQTT 5 properties
 
@@ -65,7 +68,9 @@ Encoding and decoding must enforce:
 - unknown property identifiers produce `MalformedPacketError`.
 
 The no-properties path encodes to one zero byte without constructing temporary
-containers.
+containers. Outbound QoS 1/2 admission encodes a non-empty MQTT 5 property
+table once; those bytes are reused by the PUBLISH encoder on the launch path.
+Direct mutation of ``Properties.values`` still busts the encode cache.
 
 ## CONNACK negotiation
 
@@ -174,7 +179,9 @@ multiple consumers is charged once and released after the final reference.
 
 The small-message reserve prevents one large payload from starving telemetry.
 It is disabled when it would make a single otherwise valid packet impossible to
-admit.
+admit. Decoded MQTT 5 property bytes count toward that limit when the table
+length is known from the wire; an application-built bag without that length
+stays on the accounted path.
 
 User callbacks run outside engine critical sections. Exceptions are isolated and
 reported through the established callback policy; they do not stop the protocol

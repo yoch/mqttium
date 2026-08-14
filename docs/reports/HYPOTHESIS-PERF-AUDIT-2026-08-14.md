@@ -167,21 +167,145 @@ Isolated connected MQTT 5 QoS 1 launch, same IoT property bag reused across
 
 `tests/unit/test_property_bytes_handoff.py` pins the encoder skip and wire
 identity. `tests/unit`: 1012 passed, including the launch-failure double that
-now accepts `_property_bytes`.
+now accepts `_property_bytes`. Findings 1–3 later landed on `main` as #225,
+#226 and #227.
+
+## Finding 3 — connected QoS 1/2 encodes a non-ASCII Topic Name three times
+
+Hypothesis for a connected QoS 1 launch (memory store, MQTT 5, no properties),
+matching the documented "non-ASCII publication encodes its topic twice, not
+four" leftover from `0.2.0b4`:
+
+| Probe | Expected per launch | Why |
+| --- | ---: | --- |
+| `str.encode` on the Topic Name | 1 | validation produces the bytes; the encoder reuses them, as QoS 0 already does |
+| wall vs ASCII of the same encoded size | ~1× | encoding is the variable cost; everything else is identical |
+
+Measured after Findings 1–2, before this handoff, 5 000 connected QoS 1
+publish+PUBACK cycles, `CountingStr.encode`:
+
+| Topic | `str.encode` | µs/msg | vs ASCII |
+| --- | ---: | ---: | ---: |
+| ASCII 64 B | 1 | 4.00 | 1.00× |
+| UTF-8 short (`capteurs/été`) | **3** | 4.35 | 1.09× |
+| UTF-8 256 B | 3 | 4.81 vs 4.11 | 1.17× |
+| UTF-8 1024 B | 3 | 5.80 vs 4.53 | 1.28× |
+| UTF-8 4096 B | 3 | **9.46 vs 4.65** | **2.03×** |
+
+The three encodes were `validate_utf8` (discarded), `size_parts`
+`topic.encode("utf-8")` (discarded), and `encode_utf8` in the PUBLISH encoder.
+QoS 0 already hands `_topic_bytes` from `encode_validated_publish_topic`.
+Connected QoS 1 did not, because PR #178 kept that path validation-only so a
+queued record would not retain a discarded copy. The connected launch path
+encodes immediately; it is the same situation as QoS 0.
+
+Time, not just the count, is the defect: a 4 KiB UTF-8 Topic Name costs twice
+an ASCII name of the same encoded size.
+
+## Fix (Finding 3)
+
+`validate_utf8` / `validate_publish_topic` return the MQTT byte length.
+`size_parts` accepts that length so it does not encode again to measure.
+When the session is connected, `_validate_publish_request` uses
+`encode_validated_publish_topic` for QoS 1/2 as well as QoS 0, and
+`_try_launch` passes `_topic_bytes` into the encoder. An offline queue still
+calls `validate_publish_topic` only — no discarded Topic Name copy on a
+10 000-deep wait.
+
+## Confirmation after Finding 3
+
+Paired isolated loop on this host, 8 000 connected MQTT 5 QoS 1
+publish+PUBACK cycles, median of 5 trials, `time.process_time` (equal to wall
+here). `CountingStr.encode` is 1 after the fix, 3 before.
+
+| Topic | before µs | after µs | encodes |
+| --- | ---: | ---: | ---: |
+| ASCII 4096 B | 9.16 | 8.68 | 1 → 1 |
+| UTF-8 4096 B | **14.60** | **10.38** | **3 → 1** |
+| ASCII 64 B | 8.25 | 8.08 | 1 → 1 |
+| UTF-8 short | 8.39 | 7.98 | **3 → 1** |
+
+UTF-8 4096 B vs ASCII of the same encoded size: **1.59× → 1.20×**. The leftover
+1.20× is the one necessary encode (~1.64 µs for 4 KiB UTF-8 vs ~80 ns ASCII).
+The two discarded encodes were the defect: ~4.2 µs, matching 2 × 1.64 µs.
+
+`tests/unit/test_topic_bytes_handoff.py` pins the encoder skip, the offline
+non-retain, MQTT 3.1.1, `CountingStr.encode == 1`, and wire identity.
+`tests/unit`: 1019 passed.
+
+This is not a release-gate throughput claim. The host is a cloud agent VM; the
+ratio and the encode counts are the evidence.
+
+## Finding 4 — small-delivery vetoes decoded MQTT 5 properties that fit the limit
+
+Hypothesis for iterator delivery of a typical IoT property bag
+(`content_type`, `payload_format_indicator`, `message_expiry_interval`, two
+user properties) on a 5-byte payload and a short ASCII topic, default
+`AsyncClient` budgets (`small_limit` = 127):
+
+| Probe | Expected | Why |
+| --- | --- | --- |
+| small-path enqueue | yes | payload + 4×topic + encoded table = 104 ≤ 127 |
+| `encode_properties` during accept | 0 | size is known from the decoded table |
+| CPU vs no-properties | ~1× | same unaccounted put_nowait |
+
+Measured before this change, 5 000 `AsyncClient._apply_effect` cycles:
+
+| Message | footprint | accounted | µs |
+| --- | ---: | ---: | ---: |
+| `properties=None` | 41 | 0 | 0.64 |
+| empty `Properties()` | 41 | 0 | 0.71 |
+| IoT bag (application-built) | 104 | **5000** | **3.65** |
+| `payload_format_indicator` only | 44 | **5000** | 2.03 |
+
+104 ≤ 127, so the size check would have admitted the bag. `_accept_iterator_fast`
+vetoed on `bool(message.properties)` and fell through to `logical_size`, which
+re-encoded the table. Earlier this audit listed that skip as documented; the
+contract only talks about large **payloads** starving telemetry. The bool veto
+is coarser than the limit it sits next to.
+
+The encoded table length is already on the wire at decode. Re-encoding it to
+learn a size the decoder just consumed is the same class of leftover as
+Findings 2 and 3.
+
+## Fix (Finding 4)
+
+`decode_properties` records `_wire_size` (property-length VBI plus table).
+`set()` / `add_user_property` clear it. Small-delivery adds that length to the
+existing `len(payload) + 4 * len(topic)` bound. An application-built bag with
+`_wire_size == 0` stays on the accounted path, so tests that inject a
+`Properties()` without going through the decoder do not silently become
+unaccounted.
+
+Oversized bags (200-byte `correlation_data`) remain accounted.
+
+## Confirmation after Finding 4
+
+Same host, 8 000 iterator-delivery cycles, messages produced by decoding a
+real MQTT 5 PUBLISH:
+
+| Message | µs | accounted |
+| --- | ---: | ---: |
+| no properties | 0.68 | 0 |
+| empty table | 0.84 | 0 |
+| IoT bag (decoded) | **0.77** | **0** |
+
+Delivery of the IoT bag is 3.65 → 0.77 µs (**4.7×**), in line with the
+no-properties path. `tests/unit/test_small_delivery_properties.py` pins the
+small-path enqueue, the application-built accounted fallback, oversized
+decode, and `set()` invalidation. `tests/unit`: 1023 passed.
 
 ## Remaining leads (measured, not treated as defects)
 
 Same host, 5 000 iterations unless noted. MQTT 5 inbound uses a valid CONNACK
 with `client_id="probe"`.
 
-- **MQTT 5 inbound properties vs `small_delivery`.** Engine-only QoS 0 decode
-  is 4.55 µs without properties and 8.29 µs with the IoT bag (0 encodes either
-  way). Adding iterator delivery: 4.77 µs on the small path (`small=1`, 0
-  encode) vs 18.90 µs when properties are present (`small=0`, 1 uncached
-  `delivery.logical_size` encode). Warm `logical_size` after that first encode
-  is 2.32 µs (cache hit, still one `_signature`). The batch skip for
-  property-bearing messages is documented. Seeding `_encoded` from the wire
-  slice at decode would still pay `_signature` on the size path; not done here.
+- Engine-only MQTT 5 decode of a property-bearing PUBLISH remains a decode-walk
+  cost (first pass: 8.29 µs with the IoT bag vs 4.55 µs without). Delivery no
+  longer multiplies that (Finding 4).
+- `_check_outbound_size` still calls `item_size` when `maximum_packet_size is
+  None` (one call per connected QoS 1 launch). Previously left as ~1%;
+  threading the size through the encoder is the widening that audit refused.
 - **Inbound topic aliases.** Empty Topic Name + alias 1: 1.00
   `_resolve_topic_fields` per PUBLISH, 0 property encodes, 5.34 µs. Matches
   "one dict lookup, no re-encode".

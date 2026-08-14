@@ -76,6 +76,25 @@ def _budget_partition(
     return small_budget, small_limit, accounted_limit
 
 
+def _fits_small_limit(message: Message, limit: int) -> bool:
+    """True when *message* may use the unaccounted small-delivery reserve.
+
+    Topic size is the established 4× character bound. Property bytes are the
+    decoded MQTT table length when the bag came from the wire; an
+    application-built bag has no length, so it stays on the accounted path
+    instead of encoding just to measure.
+    """
+    if limit <= 0:
+        return False
+    extra = 0
+    props = message.properties
+    if props is not None and props.values:
+        extra = props._wire_size
+        if extra <= 0:
+            return False
+    return len(message.payload) + 4 * len(message.topic) + extra <= limit
+
+
 class ApplicationDelivery:
     """Own bounded message delivery, callbacks and their accounting."""
 
@@ -184,12 +203,7 @@ class ApplicationDelivery:
     ) -> Awaitable[None] | None:
         limit = self.small_message_limit
         if (
-            limit is not None
-            and (
-                limit <= 0
-                or bool(message.properties)
-                or len(message.payload) + 4 * len(message.topic) > limit
-            )
+            limit is not None and not _fits_small_limit(message, limit)
         ) or self.messages_queue.full():
             return self.accept(message, None)
         self.messages_queue.put_nowait(message)
@@ -203,12 +217,7 @@ class ApplicationDelivery:
             return None
         limit = self.small_message_limit
         if (
-            limit is not None
-            and (
-                limit <= 0
-                or bool(message.properties)
-                or len(message.payload) + 4 * len(message.topic) > limit
-            )
+            limit is not None and not _fits_small_limit(message, limit)
         ) or self.callback_queue.full():
             return self.accept(message, callback)
         self.ensure_callback_worker()
@@ -222,14 +231,7 @@ class ApplicationDelivery:
             return self.accept(message, callback)
         limit = self.small_message_limit
         if (
-            (
-                limit is not None
-                and (
-                    limit <= 0
-                    or bool(message.properties)
-                    or len(message.payload) + 4 * len(message.topic) > limit
-                )
-            )
+            (limit is not None and not _fits_small_limit(message, limit))
             or self.messages_queue.full()
             or self.callback_queue.full()
         ):
@@ -258,12 +260,7 @@ class ApplicationDelivery:
         references = int(iterator_delivery) + int(callback_delivery)
         small_limit = self.small_message_limit
         small_delivery = references and (
-            small_limit is None
-            or (
-                small_limit > 0
-                and not message.properties
-                and len(message.payload) + 4 * len(message.topic) <= small_limit
-            )
+            small_limit is None or _fits_small_limit(message, small_limit)
         )
         if small_delivery:
             if iterator_delivery:
@@ -363,17 +360,7 @@ class ApplicationDelivery:
 
     def _is_small(self, message: Message, references: int) -> bool:
         limit = self.small_message_limit
-        return bool(
-            references
-            and (
-                limit is None
-                or (
-                    limit > 0
-                    and not message.properties
-                    and len(message.payload) + 4 * len(message.topic) <= limit
-                )
-            )
-        )
+        return bool(references and (limit is None or _fits_small_limit(message, limit)))
 
     def deliver_batch_inline(
         self,
