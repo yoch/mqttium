@@ -1,0 +1,63 @@
+name: Temporary Finding 4/5 selective final
+
+on:
+  push:
+    branches:
+      - agent/small-delivery-decoded-properties
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-validate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/small-delivery-decoded-properties
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Apply final selective design and validate
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          workflow = Path('.github/workflows/temp-f45-selective-v2.yml').read_text().splitlines()
+          start = next(i for i, line in enumerate(workflow) if line == '          from pathlib import Path')
+          end = next(i for i in range(start + 1, len(workflow)) if workflow[i] == '          PY')
+          script = '\n'.join(
+              line[10:] if line.startswith('          ') else line
+              for line in workflow[start:end]
+          )
+          exec(compile(script, 'f45-selective-v2-transform', 'exec'), {})
+
+          p = Path('src/mqttium/api/_delivery.py')
+          text = p.read_text()
+          old = '''def _fits_small_limit(message: Message, limit: int | None, property_wire_size: int) -> bool:\n    if limit is None:\n        return True\n    return (\n        limit > 0\n        and len(message.payload) + 4 * len(message.topic) + property_wire_size <= limit\n    )\n'''
+          new = '''def _fits_small_limit(\n    message: Message, limit: int | None, property_wire_size: int | None\n) -> bool:\n    if property_wire_size is None:\n        return False\n    if limit is None:\n        return True\n    return (\n        limit > 0\n        and len(message.payload) + 4 * len(message.topic) + property_wire_size <= limit\n    )\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f'decoded helper source mismatch: {text.count(old)}')
+          p.write_text(text.replace(old, new, 1))
+          PY
+
+          python -m pip install -e ".[dev,security]"
+          ruff format src/mqttium/api/_delivery.py src/mqttium/api/async_client.py src/mqttium/packets/_publish.py src/mqttium/protocol/effects.py src/mqttium/protocol/engine.py src/mqttium/protocol/inbound.py tests/unit/test_small_delivery_properties.py
+          ruff check src/mqttium/api/_delivery.py src/mqttium/api/async_client.py src/mqttium/packets/_publish.py src/mqttium/protocol/effects.py src/mqttium/protocol/engine.py src/mqttium/protocol/inbound.py tests/unit/test_small_delivery_properties.py
+          mypy src/mqttium
+          python -m pytest -q tests/unit/test_small_delivery_properties.py tests/unit/test_delivery_byte_budget.py tests/unit/test_batched_message_effects.py tests/unit/test_inbound_byte_budget.py tests/unit/test_inbound_replay_streaming.py
+          python -m pytest -q tests/unit
+
+          rm -f .github/workflows/temp-f45-selective.yml \
+                .github/workflows/temp-f45-selective-v2.yml \
+                .github/workflows/temp-f45-selective-v3.yml \
+                .github/workflows/temp-f45-selective-final.yml \
+                .github/workflows/temp-f4-specialized-v4.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Scope decoded property sizing to fresh effects"
+          git push origin HEAD:agent/small-delivery-decoded-properties
