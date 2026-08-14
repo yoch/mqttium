@@ -112,6 +112,7 @@ class InboundSession:
         "_pending_high_water_bytes",
         "_recovered_mids",
         "_replay",
+        "_stored_inbound",
         "_transitions",
         "config",
         "handle_publish",
@@ -151,6 +152,10 @@ class InboundSession:
         self._replay: InboundReplayCursor | None = None
         self._recovered_mids, self._pending_bytes = self._load_recovered_state()
         self._pending_high_water_bytes = self._pending_bytes
+        # Occupancy of the inbound store, not the Receive Maximum counter.
+        # Automatic QoS 1 never writes a row, so a durable subscriber whose
+        # inbound table is empty must not probe SQLite on every PUBLISH.
+        self._stored_inbound = len(self._recovered_mids)
 
     def _load_recovered_state(self) -> tuple[set[int], int]:
         """Restore persisted identifiers and their logical byte reservation."""
@@ -214,6 +219,7 @@ class InboundSession:
         self._replay = None
         self._inflight = 0
         self._pending_bytes = 0
+        self._stored_inbound = 0
         self._autoack_handoff_required = False
         self._pending_auto_qos1_mids.clear()
 
@@ -249,6 +255,23 @@ class InboundSession:
             ),
             pending_byte_limit=self.config.max_pending_inbound_bytes,
         )
+
+    def _lookup_stored_inbound(self, mid: int) -> InboundMessage | InboundRecordMeta | None:
+        """Return a persisted inbound record without probing an empty store."""
+        if not self._stored_inbound:
+            return None
+        transitions = self._transitions
+        if transitions is not None:
+            return transitions.in_meta(mid)
+        return self.store.get_in(mid)
+
+    def _remember_inbound(self) -> None:
+        self._stored_inbound += 1
+
+    def _forget_inbound(self) -> None:
+        if self._stored_inbound <= 0:
+            raise AssertionError("inbound stored-record count underflow")
+        self._stored_inbound -= 1
 
     # --- packet handlers ---------------------------------------------------
 
@@ -373,19 +396,20 @@ class InboundSession:
         engine = self._engine
         store = self.store
         transitions = self._transitions
-        # Existence is the common question and the cheapest to answer, so it
-        # stays first: a fresh PUBLISH finds nothing and pays exactly one
-        # lookup. Only once a record turns up does the state matter, and it
-        # has to, because the inbound store is keyed by identifier alone —
-        # a record under this mid is a QoS 2 duplicate only if it is in a
-        # QoS 2 phase. Reading it back costs a second metadata query on the
-        # rare duplicate path rather than on every inbound QoS 2 PUBLISH.
         existing: InboundMessage | InboundRecordMeta | None = None
-        if transitions is not None:
-            if transitions.contains_in(mid):
-                existing = transitions.in_meta(mid)
-        else:
-            existing = store.get_in(mid)
+        if self._stored_inbound:
+            # Existence is the common question and the cheapest to answer, so it
+            # stays first: a fresh PUBLISH finds nothing and pays exactly one
+            # lookup. Only once a record turns up does the state matter, and it
+            # has to, because the inbound store is keyed by identifier alone —
+            # a record under this mid is a QoS 2 duplicate only if it is in a
+            # QoS 2 phase. Reading it back costs a second metadata query on the
+            # rare duplicate path rather than on every inbound QoS 2 PUBLISH.
+            if transitions is not None:
+                if transitions.contains_in(mid):
+                    existing = transitions.in_meta(mid)
+            else:
+                existing = store.get_in(mid)
         if existing is not None:
             if existing.state is InboundQoSState.WAIT_PUBACK:
                 self._reject_packet_id_collision(mid, "QoS 2", "QoS 1")
@@ -417,6 +441,7 @@ class InboundSession:
         except Exception:
             self._release_slot(logical_size)
             raise
+        self._remember_inbound()
         # Runtime effect application is SEND-first. Produce the protocol ACK in
         # that order here so every QoS2 delivery avoids EffectPump repartition.
         engine._send(_encode_pubrec_success(mid))
@@ -447,9 +472,7 @@ class InboundSession:
         config = self.config
         store = self.store
         transitions = self._transitions
-        existing: InboundMessage | InboundRecordMeta | None = (
-            transitions.in_meta(mid) if transitions is not None else store.get_in(mid)
-        )
+        existing: InboundMessage | InboundRecordMeta | None = self._lookup_stored_inbound(mid)
         if existing is not None:
             # A duplicate QoS1 publish reuses the existing Receive Maximum slot,
             # but is surfaced again so an application can complete manual ACK
@@ -477,6 +500,7 @@ class InboundSession:
                     if completed_meta is None:
                         raise ProtocolError(f"Inbound mid={mid} changed while acknowledging")
                     recovered_logical_size = completed_meta.logical_size
+                self._forget_inbound()
                 self._engine._send(_encode_puback_success(mid))
                 # The restored Receive Maximum slot remains owned until this
                 # PUBACK leaves the engine effect batch, exactly like a fresh
@@ -531,6 +555,7 @@ class InboundSession:
             except Exception:
                 self._release_slot(logical_size)
                 raise
+            self._remember_inbound()
         if not config.manual_ack:
             # Match the runtime's mandatory SEND-before-application order at the
             # producer, avoiding an EffectPump repartition on every auto-ACK.
@@ -563,9 +588,7 @@ class InboundSession:
         # One state machine for both store shapes: a transition-capable store
         # answers through metadata only, the base interface reads the record.
         transitions = self._transitions
-        record: InboundMessage | InboundRecordMeta | None = (
-            transitions.in_meta(mid) if transitions is not None else store.get_in(mid)
-        )
+        record: InboundMessage | InboundRecordMeta | None = self._lookup_stored_inbound(mid)
         if record is None:
             engine._send(_encode_pubcomp_success(mid))
             return
@@ -600,12 +623,15 @@ class InboundSession:
             if popped is None:
                 raise ProtocolError(f"Inbound mid={mid} disappeared while completing PUBREL")
             logical_size = self.stored_logical_size(popped)
+        self._forget_inbound()
         engine._send(_encode_pubcomp_success(mid))
         self._release_slot(logical_size)
 
     # --- application acknowledgement and replay ---------------------------
 
     def mark_delivered(self, mid: int) -> None:
+        if not self._stored_inbound:
+            return
         transitions = self._transitions
         if transitions is not None:
             # One conditional UPDATE. This runs for every delivered QoS 1/2
@@ -626,9 +652,7 @@ class InboundSession:
             raise ProtocolError("manual_ack is disabled")
         store = self.store
         transitions = self._transitions
-        record: InboundMessage | InboundRecordMeta | None = (
-            transitions.in_meta(mid) if transitions is not None else store.get_in(mid)
-        )
+        record: InboundMessage | InboundRecordMeta | None = self._lookup_stored_inbound(mid)
         if record is None:
             raise ProtocolError(f"No pending inbound ack for mid={mid}")
         state = record.state
@@ -663,6 +687,7 @@ class InboundSession:
             if completed is None:
                 raise ProtocolError(f"Inbound mid={mid} changed while acknowledging")
             logical_size = completed.logical_size
+        self._forget_inbound()
         self._engine._send(wire)
         self._release_slot(logical_size)
 
