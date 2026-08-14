@@ -308,7 +308,15 @@ class InboundSession:
         if qos_raw == 3:
             raise MalformedPacketError("Invalid PUBLISH QoS 3")
         qos = QoS(qos_raw)
-        topic, payload, decoded_mid, retain, dup, properties = decode_publish_fields_v5(raw, qos)
+        (
+            topic,
+            payload,
+            decoded_mid,
+            retain,
+            dup,
+            properties,
+            property_wire_size,
+        ) = decode_publish_fields_v5(raw, qos)
         topic = self._resolve_topic_fields(topic, properties)
         if qos is QoS.AT_MOST_ONCE:
             self._engine._emit(
@@ -322,6 +330,7 @@ class InboundSession:
                     mid=None,
                     properties=properties,
                 ),
+                decoded_property_wire_size=property_wire_size,
             )
             return
         assert decoded_mid is not None
@@ -333,6 +342,7 @@ class InboundSession:
                 retain=retain,
                 dup=dup,
                 properties=properties,
+                decoded_property_wire_size=property_wire_size,
             )
             return
         self._on_qos2(
@@ -342,6 +352,7 @@ class InboundSession:
             retain=retain,
             dup=dup,
             properties=properties,
+            decoded_property_wire_size=property_wire_size,
         )
 
     def _on_publish_v31(self, raw: RawPacket) -> None:
@@ -392,6 +403,7 @@ class InboundSession:
         retain: bool,
         dup: bool,
         properties: Properties | None,
+        decoded_property_wire_size: int | None = None,
     ) -> None:
         engine = self._engine
         store = self.store
@@ -457,6 +469,7 @@ class InboundSession:
                 properties=properties,
             ),
             requires_delivery_mark=True,
+            decoded_property_wire_size=decoded_property_wire_size,
         )
 
     def _on_qos1(
@@ -468,6 +481,7 @@ class InboundSession:
         retain: bool,
         dup: bool,
         properties: Properties | None,
+        decoded_property_wire_size: int | None = None,
     ) -> None:
         config = self.config
         store = self.store
@@ -532,6 +546,7 @@ class InboundSession:
                     mid=mid,
                     properties=properties,
                 ),
+                decoded_property_wire_size=decoded_property_wire_size,
             )
             return
 
@@ -572,6 +587,7 @@ class InboundSession:
                 properties=properties,
             ),
             requires_delivery_mark=config.manual_ack,
+            decoded_property_wire_size=decoded_property_wire_size,
         )
         if not config.manual_ack:
             self._pending_auto_qos1_mids.add(mid)

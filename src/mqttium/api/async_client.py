@@ -1642,7 +1642,9 @@ class AsyncClient:
                     self._collect_effects_locked()
         elif kind is EffectKind.MESSAGE:
             message: Message = effect.data
-            pending_delivery = self._accept_message(message, self.on_message)
+            pending_delivery = self._accept_message(
+                message, self.on_message, effect.decoded_property_wire_size
+            )
             if pending_delivery is not None:
                 await pending_delivery
             if effect.requires_delivery_mark is not False and message.mid is not None:

@@ -38,7 +38,9 @@ DeliveryToken = AccountedDeliveryToken | None
 CallbackJob = tuple[Callable[..., Any], tuple[Any, ...], DeliveryToken]
 TrackedIteratorMessage = tuple[Message, AccountedDeliveryToken]
 IteratorQueueItem = Message | TrackedIteratorMessage
-MessageAcceptor = Callable[[Message, Callable[[Message], Any] | None], Awaitable[None] | None]
+MessageAcceptor = Callable[
+    [Message, Callable[[Message], Any] | None, int | None], Awaitable[None] | None
+]
 
 
 class _DeliveryQueue(asyncio.Queue[IteratorQueueItem]):
@@ -74,6 +76,23 @@ def _budget_partition(
     if small_limit <= 0 or accounted_limit < minimum_single_message_capacity:
         return 0, 0, max_pending_delivery_bytes
     return small_budget, small_limit, accounted_limit
+
+
+def _fits_small_limit(
+    message: Message,
+    limit: int | None,
+    decoded_property_wire_size: int | None = None,
+) -> bool:
+    if limit is None:
+        return True
+    if limit <= 0:
+        return False
+    property_size = 0
+    if message.properties:
+        if decoded_property_wire_size is None:
+            return False
+        property_size = decoded_property_wire_size
+    return len(message.payload) + 4 * len(message.topic) + property_size <= limit
 
 
 class ApplicationDelivery:
@@ -139,7 +158,10 @@ class ApplicationDelivery:
         }[self.mode]
 
     def _accept_iterator_unaccounted(
-        self, message: Message, _callback: Callable[[Message], Any] | None
+        self,
+        message: Message,
+        _callback: Callable[[Message], Any] | None,
+        _decoded_property_wire_size: int | None = None,
     ) -> Awaitable[None] | None:
         try:
             self.messages_queue.put_nowait(message)
@@ -149,7 +171,10 @@ class ApplicationDelivery:
         return None
 
     def _accept_callback_unaccounted(
-        self, message: Message, callback: Callable[[Message], Any] | None
+        self,
+        message: Message,
+        callback: Callable[[Message], Any] | None,
+        _decoded_property_wire_size: int | None = None,
     ) -> Awaitable[None] | None:
         if callback is None:
             return None
@@ -162,7 +187,10 @@ class ApplicationDelivery:
         return None
 
     def _accept_both_unaccounted(
-        self, message: Message, callback: Callable[[Message], Any] | None
+        self,
+        message: Message,
+        callback: Callable[[Message], Any] | None,
+        _decoded_property_wire_size: int | None = None,
     ) -> Awaitable[None] | None:
         if callback is None:
             return self.accept(message, callback)
@@ -180,60 +208,51 @@ class ApplicationDelivery:
         return None
 
     def _accept_iterator_fast(
-        self, message: Message, _callback: Callable[[Message], Any] | None
+        self,
+        message: Message,
+        _callback: Callable[[Message], Any] | None,
+        decoded_property_wire_size: int | None = None,
     ) -> Awaitable[None] | None:
-        limit = self.small_message_limit
         if (
-            limit is not None
-            and (
-                limit <= 0
-                or bool(message.properties)
-                or len(message.payload) + 4 * len(message.topic) > limit
-            )
-        ) or self.messages_queue.full():
-            return self.accept(message, None)
+            not _fits_small_limit(message, self.small_message_limit, decoded_property_wire_size)
+            or self.messages_queue.full()
+        ):
+            return self.accept(message, None, decoded_property_wire_size)
         self.messages_queue.put_nowait(message)
         self.message_ready.set()
         return None
 
     def _accept_callback_fast(
-        self, message: Message, callback: Callable[[Message], Any] | None
+        self,
+        message: Message,
+        callback: Callable[[Message], Any] | None,
+        decoded_property_wire_size: int | None = None,
     ) -> Awaitable[None] | None:
         if callback is None:
             return None
-        limit = self.small_message_limit
         if (
-            limit is not None
-            and (
-                limit <= 0
-                or bool(message.properties)
-                or len(message.payload) + 4 * len(message.topic) > limit
-            )
-        ) or self.callback_queue.full():
-            return self.accept(message, callback)
+            not _fits_small_limit(message, self.small_message_limit, decoded_property_wire_size)
+            or self.callback_queue.full()
+        ):
+            return self.accept(message, callback, decoded_property_wire_size)
         self.ensure_callback_worker()
         self.callback_queue.put_nowait((callback, (message,), None))
         return None
 
     def _accept_both_fast(
-        self, message: Message, callback: Callable[[Message], Any] | None
+        self,
+        message: Message,
+        callback: Callable[[Message], Any] | None,
+        decoded_property_wire_size: int | None = None,
     ) -> Awaitable[None] | None:
         if callback is None:
             return self.accept(message, callback)
-        limit = self.small_message_limit
         if (
-            (
-                limit is not None
-                and (
-                    limit <= 0
-                    or bool(message.properties)
-                    or len(message.payload) + 4 * len(message.topic) > limit
-                )
-            )
+            not _fits_small_limit(message, self.small_message_limit, decoded_property_wire_size)
             or self.messages_queue.full()
             or self.callback_queue.full()
         ):
-            return self.accept(message, callback)
+            return self.accept(message, callback, decoded_property_wire_size)
         self.messages_queue.put_nowait(message)
         self.message_ready.set()
         self.ensure_callback_worker()
@@ -241,29 +260,28 @@ class ApplicationDelivery:
         return None
 
     def _accept_auto_fast(
-        self, message: Message, callback: Callable[[Message], Any] | None
+        self,
+        message: Message,
+        callback: Callable[[Message], Any] | None,
+        decoded_property_wire_size: int | None = None,
     ) -> Awaitable[None] | None:
         if callback is None:
-            return self._accept_iterator_fast(message, None)
-        return self._accept_callback_fast(message, callback)
+            return self._accept_iterator_fast(message, None, decoded_property_wire_size)
+        return self._accept_callback_fast(message, callback, decoded_property_wire_size)
 
     async def accept(
         self,
         message: Message,
         callback: Callable[[Message], Any] | None,
+        decoded_property_wire_size: int | None = None,
     ) -> None:
         """Accept one message using one controller boundary on the hot path."""
         callback_delivery = callback is not None and self.callback_mode
         iterator_delivery = self.iterator_mode or (self.auto_mode and callback is None)
         references = int(iterator_delivery) + int(callback_delivery)
-        small_limit = self.small_message_limit
-        small_delivery = references and (
-            small_limit is None
-            or (
-                small_limit > 0
-                and not message.properties
-                and len(message.payload) + 4 * len(message.topic) <= small_limit
-            )
+        small_delivery = bool(
+            references
+            and _fits_small_limit(message, self.small_message_limit, decoded_property_wire_size)
         )
         if small_delivery:
             if iterator_delivery:
@@ -361,18 +379,15 @@ class ApplicationDelivery:
         )
         return callback_delivery, iterator_delivery
 
-    def _is_small(self, message: Message, references: int) -> bool:
-        limit = self.small_message_limit
+    def _is_small(
+        self,
+        message: Message,
+        references: int,
+        decoded_property_wire_size: int | None = None,
+    ) -> bool:
         return bool(
             references
-            and (
-                limit is None
-                or (
-                    limit > 0
-                    and not message.properties
-                    and len(message.payload) + 4 * len(message.topic) <= limit
-                )
-            )
+            and _fits_small_limit(message, self.small_message_limit, decoded_property_wire_size)
         )
 
     def deliver_batch_inline(
@@ -389,7 +404,9 @@ class ApplicationDelivery:
             if effect.kind is not EffectKind.MESSAGE:
                 break
             message: Message = effect.data
-            if effect.requires_delivery_mark is not False or not self._is_small(message, 1):
+            if effect.requires_delivery_mark is not False or not self._is_small(
+                message, 1, effect.decoded_property_wire_size
+            ):
                 break
             if iterator_delivery and self.messages_queue.full():
                 break
