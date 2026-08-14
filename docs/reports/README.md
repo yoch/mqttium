@@ -14,6 +14,7 @@ descriptions of current behaviour are the contracts in
 
 | Date | Report | Records |
 | --- | --- | --- |
+| 2026-08-14 | [`ASYNC-HANDOFF-AUDIT-2026-08-14.md`](ASYNC-HANDOFF-AUDIT-2026-08-14.md) | Codebase-wide audit of avoidable async handoffs: two measured hot-path changes isolated in PRs #221 and #223, and an explicit no-change decision for cold CONNACK callback handling. |
 | 2026-08-14 | [`INDEPENDENT-QOS0-LATENCY-AUDIT-2026-08-14.md`](INDEPENDENT-QOS0-LATENCY-AUDIT-2026-08-14.md) | Independent native audit of QoS 0 completion/backpressure and direct latency diagnosis: callback scheduling was the bottleneck; a bounded fast admission path was retained after eligible-host A/A and A/B validation. |
 | 2026-08-13 | [`RELEASE-CANDIDATE-1.0.0rc4.md`](RELEASE-CANDIDATE-1.0.0rc4.md) | RC4 release evidence for the reviewed protocol-engine rationalisation, the resumed-session validation reduction, clean local quick/package gates, and the strict runner-preflight limitation. |
 | 2026-08-13 | [`RELEASE-CANDIDATE-1.0.0rc3.md`](RELEASE-CANDIDATE-1.0.0rc3.md) | RC3 release evidence, including the Receive Maximum regression found after #216, its bounded-ingress fix, local quick/package validation, and the runner-preflight limitation. |
