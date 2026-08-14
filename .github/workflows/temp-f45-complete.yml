@@ -1,0 +1,182 @@
+name: Temporary Finding 4/5 complete candidate
+
+on:
+  push:
+    branches: [agent/f45-complete-eval]
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-validate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/f45-complete-eval
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build complete candidate
+        shell: bash
+        run: |
+          git show 4962b8b92e7c1a24658ddb1898cdeb205854c58e:src/mqttium/api/_delivery.py > /tmp/main_delivery.py
+          git show origin/agent/f45-parallel-delivery-eval:.github/workflows/temp-parallel-delivery-eval.yml > /tmp/parallel-base.yml
+          python - <<'PY'
+          from pathlib import Path
+
+          # Reuse the already-validated transformation that restores generic
+          # delivery/accounting byte-for-byte from main and creates a parallel
+          # decoded-only slow path. The only correction is the one-line marker
+          # for ensure_callback_worker diagnosed in the evaluation runner.
+          lines = Path('/tmp/parallel-base.yml').read_text().splitlines()
+          start = next(i for i, line in enumerate(lines) if line == '          from pathlib import Path')
+          end = next(i for i in range(start + 1, len(lines)) if lines[i] == '          PY')
+          script = '\n'.join(
+              line[10:] if line.startswith('          ') else line
+              for line in lines[start:end]
+          )
+          script = script.replace(
+              "'    def ensure_callback_worker(\\n'",
+              "'    def ensure_callback_worker(self) -> None:\\n'",
+          )
+          exec(compile(script, 'parallel-delivery-transform', 'exec'), {})
+
+          def replace_once(path: str, old: str, new: str) -> None:
+              p = Path(path)
+              text = p.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'{path}: expected one match, got {count}: {old[:120]!r}')
+              p.write_text(text.replace(old, new, 1))
+
+          # A distinct internal effect kind guarantees generic/replay/application
+          # MESSAGE interpretation never even reads the decoded-size metadata.
+          replace_once(
+              'src/mqttium/protocol/effects.py',
+              '    MESSAGE = auto()\n    CONNACK = auto()\n',
+              '    MESSAGE = auto()\n    DECODED_MESSAGE = auto()\n    CONNACK = auto()\n',
+          )
+
+          # Fresh MQTT 5 property-bearing PUBLISH effects alone get the special
+          # kind. Empty tables, MQTT 3.x and store/replay emissions stay MESSAGE.
+          p = Path('src/mqttium/protocol/inbound.py')
+          text = p.read_text()
+          def replace_message_kinds(start_marker: str, end_marker: str, expected: int) -> None:
+              global text
+              start = text.index(start_marker)
+              end = text.index(end_marker, start)
+              block = text[start:end]
+              needle = 'EffectKind.MESSAGE,'
+              count = block.count(needle)
+              if count != expected:
+                  raise SystemExit(f'{start_marker}: expected {expected} MESSAGE emits, got {count}')
+              replacement = '(\n                EffectKind.DECODED_MESSAGE\n                if decoded_property_wire_size is not None\n                else EffectKind.MESSAGE\n            ),'
+              block = block.replace(needle, replacement)
+              text = text[:start] + block + text[end:]
+
+          replace_message_kinds('    def _on_publish_v5(', '    def _on_publish_v31(', 1)
+          replace_message_kinds('    def _on_qos2(', '    def _on_qos1(', 1)
+          replace_message_kinds('    def _on_qos1(', '    def on_pubrel(', 2)
+          p.write_text(text)
+
+          # Restore the historical generic MESSAGE inline batch exactly from
+          # main. Decoded messages get an independent equivalent batch path.
+          p = Path('src/mqttium/api/_delivery.py')
+          text = p.read_text()
+          main = Path('/tmp/main_delivery.py').read_text()
+          c_start = text.index('    def deliver_batch_inline(\n')
+          c_end = text.index('    async def messages(\n', c_start)
+          m_start = main.index('    def deliver_batch_inline(\n')
+          m_end = main.index('    async def messages(\n', m_start)
+          generic_batch = main[m_start:m_end]
+          decoded_batch = '''    def deliver_decoded_batch_inline(\n        self,\n        effects: deque[EngineEffect],\n        callback: Callable[[Message], Any] | None,\n    ) -> int:\n        callback_delivery, iterator_delivery = self._modes(callback)\n        if not callback_delivery and not iterator_delivery:\n            return 0\n        callback_worker_ready = False\n        applied = 0\n        for effect in effects:\n            if effect.kind is not EffectKind.DECODED_MESSAGE:\n                break\n            message: Message = effect.data\n            property_wire_size = effect.decoded_property_wire_size\n            if (\n                effect.requires_delivery_mark is not False\n                or property_wire_size is None\n                or not self._is_small_decoded(message, 1, property_wire_size)\n            ):\n                break\n            if iterator_delivery and self.messages_queue.full():\n                break\n            if callback_delivery and self.callback_queue.full():\n                break\n            if iterator_delivery:\n                self.messages_queue.put_nowait(message)\n            if callback_delivery:\n                assert callback is not None\n                if not callback_worker_ready:\n                    self.ensure_callback_worker()\n                    callback_worker_ready = True\n                self.callback_queue.put_nowait((callback, (message,), None))\n            applied += 1\n        if applied and iterator_delivery:\n            self.message_ready.set()\n        return applied\n\n'''
+          p.write_text(text[:c_start] + generic_batch + decoded_batch + text[c_end:])
+
+          # EffectPump keeps its existing MESSAGE batching untouched and gains
+          # an exactly parallel consumer for DECODED_MESSAGE.
+          replace_once(
+              'src/mqttium/api/_effects.py',
+              '''    def _apply_message_effect_batch_inline(\n        self, effects: deque[EngineEffect], epoch: int\n    ) -> int: ...\n\n    async def _apply_effect(\n''',
+              '''    def _apply_message_effect_batch_inline(\n        self, effects: deque[EngineEffect], epoch: int\n    ) -> int: ...\n\n    def _apply_decoded_message_effect_batch_inline(\n        self, effects: deque[EngineEffect], epoch: int\n    ) -> int: ...\n\n    async def _apply_effect(\n''',
+          )
+          replace_once(
+              'src/mqttium/api/_effects.py',
+              '''    def drain_inline(self) -> None:\n''',
+              '''    def _consume_decoded_message_batch(self, epoch: int) -> bool:\n        applied = self.owner._apply_decoded_message_effect_batch_inline(self.pending, epoch)\n        if not applied:\n            return False\n        for _ in range(applied):\n            self.pending.popleft()\n            self.inline_effects += 1\n            self._complete()\n        if not self.pending:\n            self.pending_epoch = None\n        return True\n\n    def drain_inline(self) -> None:\n''',
+          )
+          replace_once(
+              'src/mqttium/api/_effects.py',
+              '''                if effect.kind is EffectKind.MESSAGE:\n                    if self._consume_message_batch(epoch):\n                        continue\n                    break\n                if not self.owner._apply_effect_inline(effect, epoch):\n''',
+              '''                if effect.kind is EffectKind.MESSAGE:\n                    if self._consume_message_batch(epoch):\n                        continue\n                    break\n                if effect.kind is EffectKind.DECODED_MESSAGE:\n                    if self._consume_decoded_message_batch(epoch):\n                        continue\n                    break\n                if not self.owner._apply_effect_inline(effect, epoch):\n''',
+          )
+          replace_once(
+              'src/mqttium/api/_effects.py',
+              '''                    if effect.kind is EffectKind.MESSAGE:\n                        if self._consume_message_batch(epoch):\n                            continue\n                    try:\n''',
+              '''                    if effect.kind is EffectKind.MESSAGE:\n                        if self._consume_message_batch(epoch):\n                            continue\n                    elif effect.kind is EffectKind.DECODED_MESSAGE:\n                        if self._consume_decoded_message_batch(epoch):\n                            continue\n                    try:\n''',
+          )
+
+          # Generic MESSAGE application is restored exactly. The decoded kind
+          # alone calls the parallel acceptor and carries the ephemeral hint.
+          replace_once(
+              'src/mqttium/api/async_client.py',
+              '''    def _apply_message_effect_batch_inline(\n        self,\n        effects: deque[EngineEffect],\n        epoch: int,\n    ) -> int:\n        if epoch != self._connection_epoch:\n            return 0\n        return self._delivery.deliver_batch_inline(effects, self.on_message)\n\n    async def _flush_effects''',
+              '''    def _apply_message_effect_batch_inline(\n        self,\n        effects: deque[EngineEffect],\n        epoch: int,\n    ) -> int:\n        if epoch != self._connection_epoch:\n            return 0\n        return self._delivery.deliver_batch_inline(effects, self.on_message)\n\n    def _apply_decoded_message_effect_batch_inline(\n        self,\n        effects: deque[EngineEffect],\n        epoch: int,\n    ) -> int:\n        if epoch != self._connection_epoch:\n            return 0\n        return self._delivery.deliver_decoded_batch_inline(effects, self.on_message)\n\n    async def _flush_effects''',
+          )
+          replace_once(
+              'src/mqttium/api/async_client.py',
+              '''        elif kind is EffectKind.MESSAGE:\n            message: Message = effect.data\n            property_wire_size = effect.decoded_property_wire_size\n            if property_wire_size is None:\n                pending_delivery = self._accept_message(message, self.on_message)\n            else:\n                pending_delivery = self._accept_decoded_message(\n                    message, self.on_message, property_wire_size\n                )\n            if pending_delivery is not None:\n                await pending_delivery\n            if effect.requires_delivery_mark is not False and message.mid is not None:\n                async with self._engine_lock:\n                    self._engine.mark_inbound_delivered(message.mid)\n''',
+              '''        elif kind is EffectKind.MESSAGE:\n            message: Message = effect.data\n            pending_delivery = self._accept_message(message, self.on_message)\n            if pending_delivery is not None:\n                await pending_delivery\n            if effect.requires_delivery_mark is not False and message.mid is not None:\n                async with self._engine_lock:\n                    self._engine.mark_inbound_delivered(message.mid)\n        elif kind is EffectKind.DECODED_MESSAGE:\n            message = effect.data\n            property_wire_size = effect.decoded_property_wire_size\n            assert property_wire_size is not None\n            pending_delivery = self._accept_decoded_message(\n                message, self.on_message, property_wire_size\n            )\n            if pending_delivery is not None:\n                await pending_delivery\n            if effect.requires_delivery_mark is not False and message.mid is not None:\n                async with self._engine_lock:\n                    self._engine.mark_inbound_delivered(message.mid)\n''',
+          )
+
+          # Update and strengthen the focused regression file.
+          p = Path('tests/unit/test_small_delivery_properties.py')
+          text = p.read_text()
+          replace = lambda old, new: text.replace(old, new, 1)
+          old = '''    message_effects = [effect for effect in effects if effect.kind is EffectKind.MESSAGE]\n'''
+          new = '''    message_effects = [\n        effect\n        for effect in effects\n        if effect.kind in (EffectKind.MESSAGE, EffectKind.DECODED_MESSAGE)\n    ]\n'''
+          if text.count(old) != 1: raise SystemExit('test helper filter mismatch')
+          text = text.replace(old, new, 1)
+          old = '''    assert effect.decoded_property_wire_size == len(encode_properties(message.properties, PUBLISH))\n'''
+          new = '''    assert effect.kind is EffectKind.DECODED_MESSAGE\n    assert effect.decoded_property_wire_size == len(encode_properties(message.properties, PUBLISH))\n'''
+          if text.count(old) != 1: raise SystemExit('test kind assertion mismatch')
+          text = text.replace(old, new, 1)
+          old = '''def test_empty_decoded_property_table_keeps_generic_path() -> None:\n    _engine, effect = _fresh_message_effect(Properties())\n    assert effect.decoded_property_wire_size is None\n'''
+          new = '''def test_empty_decoded_property_table_keeps_generic_path() -> None:\n    _engine, effect = _fresh_message_effect(Properties())\n    assert effect.kind is EffectKind.MESSAGE\n    assert effect.decoded_property_wire_size is None\n'''
+          if text.count(old) != 1: raise SystemExit('test empty kind mismatch')
+          text = text.replace(old, new, 1)
+          old = '''    applied = client._apply_message_effect_batch_inline(effects, client._connection_epoch)\n'''
+          new = '''    assert first.kind is EffectKind.DECODED_MESSAGE\n    assert second.kind is EffectKind.DECODED_MESSAGE\n    applied = client._apply_decoded_message_effect_batch_inline(\n        effects, client._connection_epoch\n    )\n'''
+          if text.count(old) != 1: raise SystemExit('test batch call mismatch')
+          text = text.replace(old, new, 1)
+          insertion = '''\n\n@pytest.mark.parametrize(\n    ("qos", "mid"),\n    [\n        (QoS.AT_MOST_ONCE, None),\n        (QoS.AT_LEAST_ONCE, 7),\n        (QoS.EXACTLY_ONCE, 7),\n    ],\n)\ndef test_all_fresh_property_bearing_qos_levels_use_decoded_effect_kind(\n    qos: QoS, mid: int | None\n) -> None:\n    _engine, effect = _fresh_message_effect(_iot_properties(), qos=qos, mid=mid)\n    assert effect.kind is EffectKind.DECODED_MESSAGE\n    assert effect.decoded_property_wire_size is not None\n\n\ndef test_effect_pump_batches_decoded_messages_inline() -> None:\n    _engine, first = _fresh_message_effect(_iot_properties())\n    _engine, second = _fresh_message_effect(_iot_properties())\n    client = AsyncClient(\n        message_delivery="iterator",\n        protocol=MQTTProtocolVersion.MQTTv5,\n        client_id="probe",\n    )\n    pump = client._effect_pump\n    pump.pending.extend([first, second])\n    pump.pending_epoch = client._connection_epoch\n    pump.enqueued = 2\n\n    pump.drain_inline()\n\n    assert not pump.pending\n    assert pump.applied == 2\n    assert pump.inline_effects == 2\n    assert client._messages.get_nowait() is first.data\n    assert client._messages.get_nowait() is second.data\n'''
+          marker = '\n\nasync def test_replay_never_reuses_fresh_decoded_property_size_after_direct_mutation() -> None:\n'
+          if text.count(marker) != 1: raise SystemExit('test insertion marker mismatch')
+          text = text.replace(marker, insertion + marker, 1)
+          p.write_text(text)
+          PY
+
+          python -m pip install -e ".[dev,security]"
+          ruff format src/mqttium/api/_delivery.py src/mqttium/api/_effects.py src/mqttium/api/async_client.py src/mqttium/packets/_publish.py src/mqttium/protocol/effects.py src/mqttium/protocol/engine.py src/mqttium/protocol/inbound.py tests/unit/test_small_delivery_properties.py
+          ruff check src/mqttium tests/unit/test_small_delivery_properties.py
+          mypy src/mqttium
+          python -m pytest -q \
+            tests/unit/test_small_delivery_properties.py \
+            tests/unit/test_batched_message_effects.py \
+            tests/unit/test_effect_pump.py \
+            tests/unit/test_delivery_byte_budget.py \
+            tests/unit/test_inbound_byte_budget.py \
+            tests/unit/test_inbound_replay_streaming.py \
+            tests/unit/test_qos2_matrix.py \
+            tests/unit/test_manual_ack.py \
+            tests/unit/test_autoack_receive_maximum_handoff.py
+          python -m pytest -q tests/unit
+
+          rm .github/workflows/temp-f45-complete.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Isolate fresh decoded property sizing"
+          git push origin HEAD:agent/f45-complete-eval
