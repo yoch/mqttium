@@ -41,15 +41,17 @@ and the two admissions. If either capacity is unavailable, the operation uses
 the established engine/effect path. A batch preflights every callback slot
 before admitting any direct write.
 
-Seven final alternating source-isolated microbenchmark pairs measured the
+Eleven final alternating source-isolated microbenchmark pairs measured the
 whole `publish_nowait()` plus callback-worker completion path in batches of 64
 on an eligible host, pinned to one CPU:
 
-- median candidate/base throughput: **1.9218**;
-- range: **1.7517–1.9625**;
-- baseline CV: **1.13%**; candidate CV: **3.63%**;
-- pairs favouring the candidate: **7/7**;
-- unchanged no-callback control: **0.9825**, inside the ±2% guard.
+- median candidate/base throughput: **1.9474**;
+- range: **1.6697–2.0135**;
+- baseline CV: **2.41%**; candidate CV: **5.33%**;
+- pairs favouring the candidate: **11/11**;
+- seven-pair no-callback timing control: **0.9825**, inside the ±2% guard;
+- exact no-callback profile: identical calls and primitive calls per operation;
+- exact callback profile: **119.4479 to 73.2041 calls per operation**.
 
 The retained design covers callback-after-writer admission, full callback and
 writer queues, immediate refusal, pending-effect ordering, batch atomicity,
