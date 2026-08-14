@@ -1,0 +1,112 @@
+name: Temporary isolated decoded delivery evaluation
+
+on:
+  push:
+    branches: [agent/f45-parallel-delivery-eval]
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/f45-parallel-delivery-eval
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Isolate decoded delivery and benchmark
+        shell: bash
+        run: |
+          git show 4962b8b92e7c1a24658ddb1898cdeb205854c58e:src/mqttium/api/_delivery.py > /tmp/main_delivery.py
+          python - <<'PY'
+          from pathlib import Path
+
+          p = Path('src/mqttium/api/_delivery.py')
+          text = p.read_text()
+          main = Path('/tmp/main_delivery.py').read_text()
+
+          # Restore generic accept() exactly from main.
+          c_start = text.index('    async def accept(\n')
+          c_end = text.index('    def _release_unqueued(\n', c_start)
+          m_start = main.index('    async def accept(\n')
+          m_end = main.index('    def _release_unqueued(\n', m_start)
+          generic_accept = main[m_start:m_end]
+
+          decoded_accept = '''    async def accept_decoded(\n        self,\n        message: Message,\n        callback: Callable[[Message], Any] | None,\n        property_wire_size: int,\n    ) -> None:\n        """Accept one fresh decoded MQTT 5 message using its trusted table size."""\n        callback_delivery = callback is not None and self.callback_mode\n        iterator_delivery = self.iterator_mode or (self.auto_mode and callback is None)\n        references = int(iterator_delivery) + int(callback_delivery)\n        small_delivery = bool(\n            references\n            and _fits_small_limit(message, self.small_message_limit, property_wire_size)\n        )\n        if small_delivery:\n            if iterator_delivery:\n                try:\n                    self.messages_queue.put_nowait(message)\n                except asyncio.QueueFull:\n                    await self.put_message(message)\n                else:\n                    self.message_ready.set()\n            if callback_delivery:\n                assert callback is not None\n                self.ensure_callback_worker()\n                job: CallbackJob = (callback, (message,), None)\n                try:\n                    self.callback_queue.put_nowait(job)\n                except asyncio.QueueFull:\n                    await self.enqueue_callback_job_slow(job)\n            return\n\n        token: DeliveryToken = None\n        iterator_enqueued = False\n        callback_enqueued = False\n        if references:\n            logical_bytes = self._decoded_reservable_size(message, property_wire_size)\n            token = self.try_reserve(logical_bytes, references)\n            if token is None:\n                token = await self.reserve_slow(logical_bytes, references)\n        try:\n            if iterator_delivery:\n                item: IteratorQueueItem = (message, token) if token is not None else message\n                try:\n                    self.messages_queue.put_nowait(item)\n                except asyncio.QueueFull:\n                    await self.put_message(item)\n                else:\n                    self.message_ready.set()\n                iterator_enqueued = True\n            if callback_delivery:\n                assert callback is not None\n                self.ensure_callback_worker()\n                job = (callback, (message,), token)\n                try:\n                    self.callback_queue.put_nowait(job)\n                except asyncio.QueueFull:\n                    await self.enqueue_callback_job_slow(job)\n                callback_enqueued = True\n        except BaseException:\n            self._release_unqueued(\n                token,\n                references=references,\n                iterator_enqueued=iterator_enqueued,\n                callback_enqueued=callback_enqueued,\n            )\n            raise\n\n'''
+          text = text[:c_start] + generic_accept + decoded_accept + text[c_end:]
+
+          # Decoded fast acceptors fall back only to the decoded slow path.
+          text = text.replace(
+              'return self.accept(message, None, decoded_property_wire_size=property_wire_size)',
+              'return self.accept_decoded(message, None, property_wire_size)',
+          )
+          text = text.replace(
+              'return self.accept(message, callback, decoded_property_wire_size=property_wire_size)',
+              'return self.accept_decoded(message, callback, property_wire_size)',
+          )
+          if 'decoded_property_wire_size=property_wire_size' in text:
+              raise SystemExit('stale decoded accept fallback remains')
+
+          # Restore generic logical_size/_reservable_size exactly from main and
+          # add decoded-only equivalents next to them.
+          c_start = text.index('    def logical_size(\n')
+          c_end = text.index('    def ensure_callback_worker(\n', c_start)
+          m_start = main.index('    def logical_size(self, message: Message) -> int:\n')
+          m_end = main.index('    def ensure_callback_worker(\n', m_start)
+          generic_sizes = main[m_start:m_end]
+          decoded_sizes = '''    def _decoded_logical_size(\n        self, message: Message, property_wire_size: int\n    ) -> int:\n        topic_bytes = (\n            len(message.topic)\n            if message.topic.isascii()\n            else len(message.topic.encode("utf-8"))\n        )\n        return len(message.payload) + topic_bytes + property_wire_size\n\n    def _decoded_reservable_size(\n        self, message: Message, property_wire_size: int\n    ) -> int:\n        logical_bytes = self._decoded_logical_size(message, property_wire_size)\n        limit = self.accounted_limit\n        if limit is not None and logical_bytes > limit:\n            raise MessageDeliveryError(\n                f"Message requires {logical_bytes} delivery bytes, exceeding limit {limit}"\n            )\n        return logical_bytes\n\n'''
+          text = text[:c_start] + generic_sizes + decoded_sizes + text[c_end:]
+
+          # Remove the generalized helper no longer used by generic accept().
+          h_start = text.index('def _is_small_delivery(\n')
+          h_end = text.index('\n\nclass ApplicationDelivery:', h_start)
+          text = text[:h_start] + text[h_end+2:]
+
+          p.write_text(text)
+          PY
+
+          # Async decoded branch uses the isolated slow path only through the
+          # pre-bound decoded acceptor; no generic delivery API is widened.
+          python -m pip install -e ".[dev,security]" >/dev/null
+          ruff format src/mqttium/api/_delivery.py
+          ruff check src/mqttium/api/_delivery.py src/mqttium/api/async_client.py
+          mypy src/mqttium >/dev/null
+          python -m pytest -q tests/unit/test_small_delivery_properties.py tests/unit/test_delivery_byte_budget.py tests/unit/test_batched_message_effects.py
+          python -m pytest -q tests/unit
+
+          git worktree add /tmp/main 4962b8b92e7c1a24658ddb1898cdeb205854c58e >/dev/null
+          cat >/tmp/bench.py <<'PY'
+          import asyncio,statistics,time
+          from mqttium.api.async_client import AsyncClient
+          from mqttium.codec.properties import PUBLISH,encode_properties
+          from mqttium.enums import MQTTProtocolVersion
+          from mqttium.protocol.effects import EffectKind,EngineEffect
+          from mqttium.types import Message,Properties
+          N=50000; W=5000; T=11
+          def iot():
+              p=Properties(); p.set('content_type','application/octet-stream'); p.set('payload_format_indicator',1); p.set('message_expiry_interval',60); p.add_user_property('device','probe'); p.add_user_property('site','lab'); return p
+          def big():
+              p=Properties(); p.set('correlation_data',b'x'*200); return p
+          async def case(name,props,decoded=False,proto=MQTTProtocolVersion.MQTTv5):
+              m=Message(topic='sensors/t',payload=b'hello',properties=props); kw={}
+              if decoded and props is not None and 'decoded_property_wire_size' in getattr(EngineEffect,'__dataclass_fields__',{}):
+                  kw['decoded_property_wire_size']=len(encode_properties(props,PUBLISH))
+              e=EngineEffect(EffectKind.MESSAGE,m,requires_delivery_mark=False,**kw); c=AsyncClient(message_delivery='iterator',protocol=proto,client_id='b')
+              async def one():
+                  await c._apply_effect(e,nowait=False); x=c._messages.get_nowait()
+                  if isinstance(x,tuple): c._delivery.release_nowait(x[1])
+              for _ in range(W): await one()
+              xs=[]
+              for _ in range(T):
+                  t=time.perf_counter_ns()
+                  for _ in range(N): await one()
+                  xs.append((time.perf_counter_ns()-t)/N/1000)
+              print(name,round(statistics.median(xs),4),[round(x,4) for x in xs])
+          async def main():
+              await case('v5-none',None); await case('v311-none',None,proto=MQTTProtocolVersion.MQTTv311)
+              await case('app-props',iot()); await case('decoded-small',iot(),True); await case('decoded-big',big(),True)
+          asyncio.run(main())
+          PY
+          echo MAIN; PYTHONPATH=/tmp/main/src python /tmp/bench.py
+          echo PARALLEL; PYTHONPATH=$GITHUB_WORKSPACE/src python /tmp/bench.py
