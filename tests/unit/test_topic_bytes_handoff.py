@@ -1,14 +1,32 @@
-"""QoS 0 reuses the Topic Name bytes produced by outbound validation."""
+"""Outbound PUBLISH reuses Topic Name bytes produced by validation on the launch path."""
 
 from __future__ import annotations
+
+import pytest
 
 import mqttium.packets._publish as publish_v5_module
 import mqttium.protocol.outbound as outbound_module
 import mqttium.topics as topics_module
 
-from mqttium.enums import ConnectionState, MQTTProtocolVersion
+from mqttium.enums import ConnectionState, MQTTProtocolVersion, QoS
+from mqttium.packets import PubAckPacket
+from mqttium.packets._publish import encode_publish_item_v5
 from mqttium.protocol.config import EngineConfig
+from mqttium.protocol.effects import EffectKind
 from mqttium.protocol.engine import ProtocolEngine
+from tests.support import feed_engine, write_item_bytes
+
+
+def _counting_str(value: str) -> tuple[str, list[int]]:
+    original = str.encode
+    encodes: list[int] = []
+
+    class CountingStr(str):
+        def encode(self, *args, **kwargs):  # type: ignore[override]
+            encodes.append(1)
+            return original(self, *args, **kwargs)
+
+    return CountingStr(value), encodes
 
 
 def _connected_engine() -> ProtocolEngine:
@@ -44,13 +62,131 @@ def test_qos0_validation_hands_topic_bytes_to_encoder(monkeypatch) -> None:
     assert encoder_calls == 0
 
 
-def test_qos1_validation_does_not_preencode_topic(monkeypatch) -> None:
+def test_qos1_connected_hands_topic_bytes_to_encoder(monkeypatch) -> None:
+    validation_calls = 0
+    encoder_calls = 0
+    original_validation_encode = topics_module.encode_utf8
+    original_packet_encode = publish_v5_module.encode_utf8
+
+    def validation_encode(topic: str) -> bytes:
+        nonlocal validation_calls
+        validation_calls += 1
+        return original_validation_encode(topic)
+
+    def packet_encode(topic: str) -> bytes:
+        nonlocal encoder_calls
+        encoder_calls += 1
+        return original_packet_encode(topic)
+
+    monkeypatch.setattr(topics_module, "encode_utf8", validation_encode)
+    monkeypatch.setattr(publish_v5_module, "encode_utf8", packet_encode)
+
+    engine = _connected_engine()
+    handle = engine.queue_publish("capteurs/été/température", b"payload", qos=1)
+
+    assert handle.mid is not None
+    assert validation_calls == 1
+    assert encoder_calls == 0
+
+
+def test_qos1_offline_validation_does_not_preencode_topic(monkeypatch) -> None:
     def unexpected_preencode(_topic: str) -> bytes:
-        raise AssertionError("QoS 1 validation must not allocate Topic Name bytes")
+        raise AssertionError("offline QoS 1 validation must not allocate Topic Name bytes")
 
     monkeypatch.setattr(outbound_module, "encode_validated_publish_topic", unexpected_preencode)
 
-    engine = _connected_engine()
+    engine = ProtocolEngine(EngineConfig(protocol=MQTTProtocolVersion.MQTTv5))
     handle = engine.queue_publish("capteurs/qos1", b"payload", qos=1)
 
     assert handle.mid is not None
+
+
+def test_qos1_connected_utf8_encodes_topic_once() -> None:
+    topic, encodes = _counting_str("é" * 256)
+    engine = _connected_engine()
+    handle = engine.queue_publish(topic, b"payload", qos=1)
+
+    assert handle.mid is not None
+    assert len(encodes) == 1
+
+
+def test_qos1_connected_ascii_encodes_topic_once() -> None:
+    topic, encodes = _counting_str("sensors/" + "a" * 256)
+    engine = _connected_engine()
+    handle = engine.queue_publish(topic, b"payload", qos=1)
+
+    assert handle.mid is not None
+    assert len(encodes) == 1
+
+
+def test_qos1_offline_utf8_encodes_topic_once_for_length() -> None:
+    topic, encodes = _counting_str("é" * 256)
+    engine = ProtocolEngine(EngineConfig(protocol=MQTTProtocolVersion.MQTTv5))
+    handle = engine.queue_publish(topic, b"payload", qos=1)
+
+    assert handle.mid is not None
+    assert len(encodes) == 1
+
+
+def test_qos1_connected_v311_utf8_encodes_topic_once() -> None:
+    topic, encodes = _counting_str("é" * 256)
+    engine = ProtocolEngine(EngineConfig(protocol=MQTTProtocolVersion.MQTTv311))
+    engine.state = ConnectionState.CONNECTED
+    handle = engine.queue_publish(topic, b"payload", qos=1)
+
+    assert handle.mid is not None
+    assert len(encodes) == 1
+
+
+@pytest.mark.parametrize("qos", [QoS.AT_LEAST_ONCE, QoS.EXACTLY_ONCE])
+@pytest.mark.parametrize(
+    ("topic_text", "encodes_while_queued", "encodes_after_drain"),
+    [
+        ("sensors/" + "a" * 256, 0, 1),
+        ("é" * 256, 1, 2),
+    ],
+)
+def test_saturated_flow_does_not_discard_preencoded_topic_bytes(
+    qos: QoS,
+    topic_text: str,
+    encodes_while_queued: int,
+    encodes_after_drain: int,
+) -> None:
+    engine = _connected_engine()
+    engine.outbound.flow.limit = 1
+
+    blocker = engine.queue_publish("capteurs/blocker", b"one", qos=QoS.AT_LEAST_ONCE)
+    assert blocker.mid is not None
+    engine.take_effects()
+
+    topic, encodes = _counting_str(topic_text)
+    queued = engine.queue_publish(topic, b"two", qos=qos)
+
+    assert queued.mid is not None
+    assert engine.outbound.stats().queued_messages == 1
+    assert len(encodes) == encodes_while_queued
+
+    feed_engine(engine, PubAckPacket(mid=blocker.mid).encode(engine.config.protocol))
+    sends = [effect for effect in engine.take_effects() if effect.kind is EffectKind.SEND]
+
+    assert len(sends) == 1
+    assert len(encodes) == encodes_after_drain
+
+
+def test_qos1_topic_handoff_matches_direct_encode() -> None:
+    topic = "capteurs/été/température"
+    engine = _connected_engine()
+    handle = engine.queue_publish(topic, b"payload", qos=1)
+    sends = [effect.data for effect in engine.take_effects() if effect.kind is EffectKind.SEND]
+    assert len(sends) == 1
+
+    expected = encode_publish_item_v5(
+        topic,
+        b"payload",
+        qos=QoS.AT_LEAST_ONCE,
+        retain=False,
+        dup=False,
+        mid=handle.mid,
+        properties=None,
+    )
+    assert write_item_bytes(sends[0]) == write_item_bytes(expected)

@@ -243,11 +243,11 @@ def test_validate_utf8_bounds_length_in_bytes_not_characters() -> None:
     """The MQTT limit is 65535 bytes; skipping the encode must not lose that."""
     from mqttium.codec.primitives import validate_utf8
 
-    validate_utf8("é" * 32767)  # 65534 bytes
+    assert validate_utf8("é" * 32767) == 65534
     with pytest.raises(ProtocolError, match="too long"):
         validate_utf8("é" * 32768)  # 65536 bytes, only 32768 characters
 
-    validate_utf8("x" * 65535)
+    assert validate_utf8("x" * 65535) == 65535
     with pytest.raises(ProtocolError, match="too long"):
         validate_utf8("x" * 65536)
 
@@ -264,15 +264,16 @@ def test_validate_utf8_does_not_encode_an_ascii_string(monkeypatch) -> None:
             encoded.append(str(self))
             return original(self, *args, **kwargs)
 
-    primitives.validate_utf8(Tracking("sensors/temperature/room-12"))
+    ascii_topic = Tracking("sensors/temperature/room-12")
+    assert primitives.validate_utf8(ascii_topic) == len(ascii_topic)
     assert encoded == [], "an ASCII topic must be validated without producing bytes"
 
-    # A non-ASCII string is encoded: once to reject surrogates, once to measure
-    # its byte length. Both are C-level and that branch is an order of
-    # magnitude cheaper than the character loop it replaced, so the count is
-    # not what this pins -- only that ASCII pays neither.
-    primitives.validate_utf8(Tracking("capteurs/température"))
-    assert encoded
+    # A non-ASCII string is encoded once: that conversion answers the surrogate
+    # rule and yields the MQTT byte length. ASCII pays neither.
+    assert primitives.validate_utf8(Tracking("capteurs/température")) == len(
+        "capteurs/température".encode()
+    )
+    assert len(encoded) == 1
 
 
 @pytest.mark.parametrize(

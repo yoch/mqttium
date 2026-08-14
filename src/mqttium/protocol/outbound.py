@@ -293,8 +293,13 @@ class OutboundSession:
         qos: QoS | int,
         retain: bool,
         properties: Properties | None,
-    ) -> tuple[QoS, bytes | None]:
-        """Validate one outbound PUBLISH and retain QoS 0 Topic Name bytes."""
+    ) -> tuple[QoS, bytes | None, int]:
+        """Validate one outbound PUBLISH and retain Topic Name bytes when launching.
+
+        QoS 0 always encodes immediately. QoS 1/2 encode when the session is
+        connected so the launch path can reuse the bytes; an offline queue
+        only needs the byte length, and must not retain a discarded copy.
+        """
 
         level = QoS(qos)
         # An empty Topic Name is legal only after this client has established
@@ -305,11 +310,15 @@ class OutboundSession:
         # Keep the generic validator's allow_empty primitive for a future
         # stateful alias implementation, but do not use it from outbound API
         # admission until that state exists.
+        engine = self._engine
         topic_bytes: bytes | None
-        if level is QoS.AT_MOST_ONCE:
+        if level is QoS.AT_MOST_ONCE or (
+            engine.state == ConnectionState.CONNECTED and self.flow.available > 0
+        ):
             topic_bytes = encode_validated_publish_topic(topic)
+            topic_size = len(topic_bytes)
         else:
-            validate_publish_topic(topic)
+            topic_size = validate_publish_topic(topic)
             topic_bytes = None
 
         if (
@@ -325,7 +334,6 @@ class OutboundSession:
                 "subscription_identifier is not allowed on an outbound PUBLISH [MQTT-3.3.4-6]"
             )
 
-        engine = self._engine
         if engine.state == ConnectionState.CONNECTED:
             negotiated = engine.negotiated
             if level > negotiated.maximum_qos:
@@ -344,7 +352,7 @@ class OutboundSession:
 
         if engine.state != ConnectionState.CONNECTED and level == QoS.AT_MOST_ONCE:
             raise NotConnectedError("Cannot publish QoS 0 while disconnected")
-        return level, topic_bytes
+        return level, topic_bytes, topic_size
 
     def _prepare_qos0_validated(
         self,
@@ -378,7 +386,7 @@ class OutboundSession:
     ) -> WriteItem:
         """Prepare a mutation-free QoS 0 publication for the native runtime."""
 
-        _qos, topic_bytes = self._validate_publish_request(
+        _qos, topic_bytes, _topic_size = self._validate_publish_request(
             topic, QoS.AT_MOST_ONCE, retain, properties
         )
         assert topic_bytes is not None
@@ -400,7 +408,9 @@ class OutboundSession:
         properties: Properties | None = None,
     ) -> PublishHandle:
         engine = self._engine
-        qos, topic_bytes = self._validate_publish_request(topic, qos, retain, properties)
+        qos, topic_bytes, topic_size = self._validate_publish_request(
+            topic, qos, retain, properties
+        )
 
         if qos == QoS.AT_MOST_ONCE:
             assert topic_bytes is not None
@@ -417,11 +427,12 @@ class OutboundSession:
             self._emit(EffectKind.PUBLISH_COMPLETE, None)
             return PublishHandle(mid=None, qos=qos)
 
-        # One property encode and one topic measurement feed both the wire-size
-        # check and the logical budget. The encoder reuses those bytes so a
-        # property table is not walked a second time on the launch path.
+        # One property encode and the Topic Name bytes from validation feed both
+        # the wire-size check and the logical budget. The encoder reuses both so
+        # a property table is not walked a second time and a non-ASCII topic is
+        # not encoded again on the launch path.
         topic_size, wire_property_bytes, logical_property_bytes, property_bytes = self.size_parts(
-            topic, properties
+            topic, properties, topic_size=topic_size
         )
         # Validate packet size before reserving local memory or a packet id.
         self._check_publish_wire_size(topic_size, wire_property_bytes, len(payload), qos)
@@ -451,7 +462,7 @@ class OutboundSession:
             # Defer wire encode until launch: avoids double work when messages sit
             # in the Receive Maximum queue.
             if engine.state == ConnectionState.CONNECTED and self._try_launch(
-                msg, _property_bytes=property_bytes
+                msg, _property_bytes=property_bytes, _topic_bytes=topic_bytes
             ):
                 return PublishHandle(mid=mid, qos=qos)
 
@@ -641,6 +652,7 @@ class OutboundSession:
         *,
         persisted: bool = False,
         _property_bytes: bytes | None = None,
+        _topic_bytes: bytes | None = None,
     ) -> None:
         wire = msg.encoded_publish
         if wire is None:
@@ -653,6 +665,7 @@ class OutboundSession:
                 mid=msg.mid,
                 properties=msg.properties,
                 _property_bytes=_property_bytes,
+                _topic_bytes=_topic_bytes,
             )
         self._engine._check_outbound_size(wire)
         target_state = (
@@ -700,11 +713,12 @@ class OutboundSession:
         msg: OutboundMessage,
         *,
         _property_bytes: bytes | None = None,
+        _topic_bytes: bytes | None = None,
     ) -> bool:
         if not self.flow.try_acquire():
             return False
         try:
-            self._launch(msg, _property_bytes=_property_bytes)
+            self._launch(msg, _property_bytes=_property_bytes, _topic_bytes=_topic_bytes)
         except Exception:
             self.flow.release()
             raise
@@ -847,6 +861,8 @@ class OutboundSession:
         self,
         topic: str,
         properties: Properties | None,
+        *,
+        topic_size: int | None = None,
     ) -> tuple[int, int, int, bytes | None]:
         """Topic byte count, wire property bytes, logical property bytes, encoded table.
 
@@ -854,16 +870,19 @@ class OutboundSession:
         when there are no properties; the logical budget accounts for
         application data only, so it does not. MQTT 5 returns the encoded table
         so the PUBLISH encoder can reuse it; MQTT 3.1.1 returns ``None``.
+        Admission passes *topic_size* from validation so a non-ASCII Topic Name
+        is not encoded a second time just to learn its length.
         """
-        topic_bytes = len(topic) if topic.isascii() else len(topic.encode("utf-8"))
+        if topic_size is None:
+            topic_size = len(topic) if topic.isascii() else len(topic.encode("utf-8"))
         if self.config.protocol != MQTTProtocolVersion.MQTTv5:
-            return topic_bytes, 0, 0, None
+            return topic_size, 0, 0, None
         if properties is None or not properties.values:
             # An empty property table encodes to the single length byte 0x00.
-            return topic_bytes, 1, 0, b"\x00"
+            return topic_size, 1, 0, b"\x00"
         encoded = encode_properties(properties, PUBLISH)
         wire_property_bytes = len(encoded)
-        return topic_bytes, wire_property_bytes, wire_property_bytes, encoded
+        return topic_size, wire_property_bytes, wire_property_bytes, encoded
 
     @staticmethod
     def _publish_wire_size_from_parts(

@@ -22,7 +22,12 @@ def test_publish_topic_rejects_wildcards() -> None:
 
 
 def test_publish_topic_allow_empty_for_alias() -> None:
-    validate_publish_topic("", allow_empty=True)
+    assert validate_publish_topic("", allow_empty=True) == 0
+
+
+def test_publish_topic_returns_mqtt_byte_length() -> None:
+    assert validate_publish_topic("sensors/temp") == 12
+    assert validate_publish_topic("capteurs/été") == len("capteurs/été".encode())
 
 
 def test_subscribe_filter_ok() -> None:
