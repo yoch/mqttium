@@ -141,7 +141,9 @@ def test_rollback_restores_exact_state_after_failure_at_each_step(
             outbound.store = _FailingStore(outbound.store)
         elif step == "launch_encode":
             monkeypatch.setattr(
-                OutboundSession, "_launch", lambda self, msg: (_ for _ in ()).throw(_Boom())
+                OutboundSession,
+                "_launch",
+                lambda self, msg, **_kwargs: (_ for _ in ()).throw(_Boom()),
             )
         else:  # flow_acquire — fail after the slot has been taken
             outbound.flow = _FailingFlow(outbound.flow)
