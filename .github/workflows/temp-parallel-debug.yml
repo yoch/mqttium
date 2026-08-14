@@ -1,0 +1,34 @@
+name: Temporary parallel transform marker check
+on:
+  push:
+    branches: [agent/f45-parallel-delivery-eval]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/f45-parallel-delivery-eval
+          fetch-depth: 0
+      - name: Check markers
+        shell: bash
+        run: |
+          git show 4962b8b92e7c1a24658ddb1898cdeb205854c58e:src/mqttium/api/_delivery.py > /tmp/main_delivery.py
+          python - <<'PY'
+          from pathlib import Path
+          text=Path('src/mqttium/api/_delivery.py').read_text(); main=Path('/tmp/main_delivery.py').read_text()
+          checks=[
+            ('candidate accept','    async def accept(\n',text),
+            ('candidate release','    def _release_unqueued(\n',text),
+            ('main accept','    async def accept(\n',main),
+            ('main release','    def _release_unqueued(\n',main),
+            ('candidate logical multiline','    def logical_size(\n',text),
+            ('candidate logical one-line','    def logical_size(self, message: Message) -> int:\n',text),
+            ('candidate ensure','    def ensure_callback_worker(\n',text),
+            ('main logical','    def logical_size(self, message: Message) -> int:\n',main),
+            ('main ensure','    def ensure_callback_worker(\n',main),
+            ('candidate helper','def _is_small_delivery(\n',text),
+            ('candidate class','\n\nclass ApplicationDelivery:',text),
+          ]
+          for label,needle,hay in checks: print(label,hay.find(needle))
+          PY
