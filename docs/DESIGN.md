@@ -53,6 +53,10 @@ tested without a broker.
 flush worker. A single immediately applicable effect is handled inline; it does
 not allocate a task or enter the deque. Suspended work is tagged with the
 connection epoch so effects from an old transport cannot modify a new session.
+For terminal QoS 1/2 publishes, inline application may admit `on_publish` to
+the bounded callback queue and settle the receipt immediately. User callback
+code still runs only in the callback worker; a full queue falls back to the
+ordered effect path and its existing backpressure.
 
 ### Network writes
 

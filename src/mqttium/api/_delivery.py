@@ -533,6 +533,15 @@ class ApplicationDelivery:
         except asyncio.QueueFull as exc:
             raise MessageDeliveryError("Callback delivery queue is full") from exc
 
+    def try_enqueue_callback(self, callback: Callable[..., Any], *args: Any) -> bool:
+        """Enqueue one callback without suspending or weakening the queue bound."""
+        self.ensure_callback_worker()
+        try:
+            self.callback_queue.put_nowait((callback, args, None))
+        except asyncio.QueueFull:
+            return False
+        return True
+
     async def enqueue_callback(
         self,
         callback: Callable[..., Any],

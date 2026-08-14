@@ -263,6 +263,7 @@ class AsyncClient:
         self._accept_message = self._delivery.acceptor()
         self._ensure_callback_worker = self._delivery.ensure_callback_worker
         self._spawn_callback = self._delivery.spawn_callback
+        self._try_enqueue_callback = self._delivery.try_enqueue_callback
         self._enqueue_callback = self._delivery.enqueue_callback
         self._report_callback_error = self._delivery.report_callback_error
         self._shutdown_callback_worker = self._delivery.shutdown_callbacks
@@ -1523,11 +1524,25 @@ class AsyncClient:
             connack: ConnAckPacket = effect.data
             self._resolve_connack(connack)
             return True
-        if kind is EffectKind.PUBLISH_COMPLETE and self.on_publish is None:
-            self._settle_publish(effect.data, None)
+        if kind is EffectKind.PUBLISH_COMPLETE:
+            mid: int | None = effect.data
+            callback = self.on_publish
+            if callback is not None:
+                # QoS 0 deliberately retains its SEND/completion effect path so
+                # writer admission remains ordered before the callback. QoS 1/2
+                # are already terminal here; admitting their callback to the
+                # bounded worker queue cannot run user code in this call.
+                if mid is None or not self._try_enqueue_callback(callback, mid, None):
+                    return False
+            self._settle_publish(mid, None)
             return True
-        if kind is EffectKind.PUBLISH_FAILED and self.on_publish is None:
+        if kind is EffectKind.PUBLISH_FAILED:
             failure: PublishFailure = effect.data
+            callback = self.on_publish
+            if callback is not None and not self._try_enqueue_callback(
+                callback, failure.mid, failure.reason
+            ):
+                return False
             self._settle_publish(failure.mid, failure.reason)
             return True
         if kind is EffectKind.SUBACK:

@@ -158,7 +158,9 @@ surfaces as a confusing failure elsewhere:
 `_collect_effects_locked()` (i.e. `EffectPump.collect_from_engine` in `api/_effects.py`) drains the
 engine and applies the common single-effect case inline (`_apply_effect_inline`) with no accounting
 at all — the counters and the `_pending_effects` deque exist only for genuinely async slow paths
-(backpressure waits, callback dispatch). When several
+(backpressure waits and callback-queue saturation). Terminal QoS 1/2 publish callbacks may be
+admitted inline to the bounded callback queue, but user callback code still runs only in the
+isolated callback worker. When several
 effects are produced, `SEND` effects are reordered first so wire order is preserved before any
 application-visible event fires; leftovers are drained by the `mqttium-effect-flush` task.
 
