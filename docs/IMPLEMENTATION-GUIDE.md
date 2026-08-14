@@ -199,7 +199,11 @@ length.
 
 ## API completion and errors
 
-- QoS 0 receipts complete at writer admission.
+- QoS 0 receipts complete at writer admission. When callback capacity is
+  immediately available, `on_publish` is admitted to the isolated callback
+  worker in the same loop turn; otherwise the whole operation retains the
+  ordered EffectPump path. A batch must preflight every callback before any
+  direct writer admission.
 - QoS 1 receipts complete at PUBACK.
 - QoS 2 receipts complete at PUBCOMP.
 - SUBACK and UNSUBACK return all per-filter reason codes; a reason code at or

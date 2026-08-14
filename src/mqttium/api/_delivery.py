@@ -540,6 +540,24 @@ class ApplicationDelivery:
             return False
         return True
 
+    def has_callback_capacity(self, count: int = 1) -> bool:
+        """Whether ``count`` callbacks can be admitted without suspending."""
+        maximum = self.callback_queue.maxsize
+        return maximum <= 0 or self.callback_queue.qsize() + count <= maximum
+
+    def enqueue_callback_repeated_nowait(
+        self,
+        callback: Callable[..., Any],
+        args: tuple[Any, ...],
+        count: int,
+    ) -> None:
+        """Enqueue a preflighted callback batch without yielding."""
+        if not self.has_callback_capacity(count):
+            raise RuntimeError("callback batch exceeds preflighted capacity")
+        self.ensure_callback_worker()
+        for _ in range(count):
+            self.callback_queue.put_nowait((callback, args, None))
+
     async def enqueue_callback(
         self,
         callback: Callable[..., Any],

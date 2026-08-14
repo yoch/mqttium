@@ -264,6 +264,8 @@ class AsyncClient:
         self._ensure_callback_worker = self._delivery.ensure_callback_worker
         self._spawn_callback = self._delivery.spawn_callback
         self._try_enqueue_callback = self._delivery.try_enqueue_callback
+        self._has_callback_capacity = self._delivery.has_callback_capacity
+        self._enqueue_callback_repeated_nowait = self._delivery.enqueue_callback_repeated_nowait
         self._enqueue_callback = self._delivery.enqueue_callback
         self._report_callback_error = self._delivery.report_callback_error
         self._shutdown_callback_worker = self._delivery.shutdown_callbacks
@@ -551,13 +553,13 @@ class AsyncClient:
         self._register_publish_receipt(handle.mid, receipt)
         return receipt
 
-    def _direct_qos0_ready(self) -> bool:
+    def _direct_qos0_ready(self, callback_count: int = 1) -> bool:
         """True when a native QoS 0 write can bypass the effect adapter safely."""
 
         return (
-            self.on_publish is None
-            and not self._pending_effects
+            not self._pending_effects
             and not self._engine.has_pending_effects
+            and (self.on_publish is None or self._has_callback_capacity(callback_count))
         )
 
     def _try_direct_qos0_publish(
@@ -575,6 +577,7 @@ class AsyncClient:
         # still raise ValueError from _validate_publish_request downstream.
         if qos != QoS.AT_MOST_ONCE or not self._direct_qos0_ready():
             return None
+        callback = self.on_publish
         item = self._engine.outbound.prepare_qos0(
             topic,
             payload,
@@ -588,6 +591,8 @@ class AsyncClient:
             if nowait:
                 raise FlowControlError(self._write_pump.refusal(item_size(item)))
             return None
+        if callback is not None:
+            self._enqueue_callback_repeated_nowait(callback, (None, None), 1)
         return PublishReceipt(mid=None, qos=QoS.AT_MOST_ONCE)
 
     def _try_direct_qos0_many(
@@ -597,7 +602,7 @@ class AsyncClient:
         *,
         nowait: bool,
     ) -> bool:
-        if not requests or not self._direct_qos0_ready():
+        if not requests or not self._direct_qos0_ready(len(requests)):
             return False
         for _topic, _payload, qos, _retain, _properties in requests:
             if qos != QoS.AT_MOST_ONCE:
@@ -617,6 +622,13 @@ class AsyncClient:
             if nowait:
                 raise FlowControlError(self._write_pump.refusal_many(items))
             return False
+        callback = self.on_publish
+        if callback is not None:
+            self._enqueue_callback_repeated_nowait(
+                callback,
+                (None, None),
+                len(requests),
+            )
         for _ in requests:
             receipt._register(None)
         return True

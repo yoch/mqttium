@@ -56,25 +56,19 @@ async def test_publish_nowait_registers_qos1_receipt() -> None:
     assert client._pop_publish_receipt(receipt.mid) is receipt
 
 
-async def test_publish_nowait_coalesces_async_effect_flush(monkeypatch) -> None:
+async def test_publish_nowait_callback_uses_direct_writer_admission() -> None:
     client = AsyncClient(max_outbound_messages=512)
     client._engine.state = ConnectionState.CONNECTED
     seen: list[int | None] = []
     client.on_publish = lambda mid, _error: seen.append(mid)
 
-    def direct_path_forbidden(*_args, **_kwargs):
-        raise AssertionError("on_publish must retain the standard effect path")
-
-    monkeypatch.setattr(type(client._engine.outbound), "prepare_qos0", direct_path_forbidden)
-
     for _ in range(100):
         client.publish_nowait("native/qos0", b"x", qos=0)
 
-    assert client._effect_pump.enqueued > 0
-    task = client._effect_flush_task
-    assert task is not None
-    assert not task.done()
-    await task
+    assert client._effect_pump.enqueued == 0
+    assert client._effect_flush_task is None
+    assert client.stats().writer.queued_messages == 100
+    assert seen == []
     await client._callback_queue.join()
     assert seen == [None] * 100
     await client._shutdown_callback_worker(drain=False)
@@ -87,9 +81,7 @@ async def test_qos0_callback_marks_writer_admission_not_transport_drain() -> Non
     client.on_publish = lambda mid, error: seen.append((mid, error))
 
     receipt = client.publish_nowait("native/qos0-boundary", b"first", qos=0)
-    task = client._effect_flush_task
-    assert task is not None
-    await task
+    assert client._effect_flush_task is None
     await client._callback_queue.join()
 
     assert receipt.is_done()
@@ -145,15 +137,18 @@ async def test_await_publish_qos0_uses_the_direct_path() -> None:
     assert isinstance(client._outbound.get_nowait(), bytes)
 
 
-async def test_await_publish_qos0_keeps_the_effect_path_under_on_publish(monkeypatch) -> None:
+async def test_await_publish_qos0_callback_keeps_the_direct_path() -> None:
     client = AsyncClient(max_outbound_messages=8)
     client._engine.state = ConnectionState.CONNECTED
-    client.on_publish = lambda _mid, _error: None
-    _forbid_direct_path(client, monkeypatch)
+    seen: list[tuple[int | None, BaseException | None]] = []
+    client.on_publish = lambda mid, error: seen.append((mid, error))
 
     await client.publish("native/await-qos0", b"x", qos=0)
 
-    assert client._effect_pump.batches > 0
+    assert client._effect_pump.batches == 0
+    assert seen == []
+    await client._callback_queue.join()
+    assert seen == [(None, None)]
     await client._shutdown_callback_worker(drain=False)
 
 
@@ -173,15 +168,23 @@ async def test_publish_many_qos0_uses_the_direct_path() -> None:
     assert isinstance(client._outbound.get_nowait(), bytes)
 
 
-async def test_publish_many_keeps_the_effect_path_under_on_publish(monkeypatch) -> None:
+async def test_publish_many_callback_keeps_the_direct_path() -> None:
     client = AsyncClient(max_outbound_messages=8)
     client._engine.state = ConnectionState.CONNECTED
-    client.on_publish = lambda _mid, _error: None
-    _forbid_direct_path(client, monkeypatch)
+    seen: list[tuple[int | None, BaseException | None]] = []
+    client.on_publish = lambda mid, error: seen.append((mid, error))
 
-    await client.publish_many([PublishMessage("native/batch", b"a", 0)])
+    receipt = await client.publish_many(
+        [PublishMessage("native/batch", b"a", 0), PublishMessage("native/batch", b"b", 0)]
+    )
 
-    assert client._effect_pump.batches > 0
+    assert receipt.submitted == 2
+    assert receipt.completed == 2
+    assert client._effect_pump.batches == 0
+    assert client.stats().writer.queued_messages == 2
+    assert seen == []
+    await client._callback_queue.join()
+    assert seen == [(None, None), (None, None)]
     await client._shutdown_callback_worker(drain=False)
 
 
@@ -220,25 +223,68 @@ async def test_direct_path_is_gated_on_drained_effect_queues() -> None:
     assert client._direct_qos0_ready() is True
 
 
-async def test_direct_path_returns_when_on_publish_is_cleared() -> None:
-    """Installing a callback disables the fast path; clearing it restores it."""
-    client = AsyncClient(max_outbound_messages=32)
+async def test_direct_path_requires_capacity_for_every_publish_callback() -> None:
+    """A full callback queue sends the entire operation through the effect pump."""
+    client = AsyncClient(max_outbound_messages=32, max_pending_callbacks=1)
     client._engine.state = ConnectionState.CONNECTED
+    blocker_seen: list[str] = []
+    client._callback_queue.put_nowait((lambda: blocker_seen.append("blocker"), (), None))
 
-    client.on_publish = lambda _mid, _error: None
+    seen: list[tuple[int | None, BaseException | None]] = []
+    client.on_publish = lambda mid, error: seen.append((mid, error))
     assert client._direct_qos0_ready() is False
-    client.publish_nowait("native/gate", b"x", qos=0)
+    receipt = client.publish_nowait("native/gate", b"x", qos=0)
     assert client._effect_pump.enqueued > 0
 
     await client._drain_effects()
     await client._callback_queue.join()
+    assert receipt.is_done()
+    assert blocker_seen == ["blocker"]
+    assert seen == [(None, None)]
     await client._shutdown_callback_worker(drain=False)
 
-    client.on_publish = None
-    assert client._direct_qos0_ready() is True
-    before = client._effect_pump.enqueued
-    client.publish_nowait("native/gate", b"x", qos=0)
-    assert client._effect_pump.enqueued == before
+
+async def test_direct_path_writer_refusal_does_not_enqueue_a_callback() -> None:
+    """Writer admission remains the atomic boundary for callback completion."""
+    client = AsyncClient(max_outbound_messages=1, max_pending_callbacks=8)
+    client._engine.state = ConnectionState.CONNECTED
+    seen: list[tuple[int | None, BaseException | None]] = []
+    client.on_publish = lambda mid, error: seen.append((mid, error))
+
+    client.publish_nowait("native/full", b"first", qos=0)
+    with pytest.raises(FlowControlError):
+        client.publish_nowait("native/full", b"second", qos=0)
+
+    assert client.stats().writer.queued_messages == 1
+    assert client._callback_queue.qsize() == 1
+    assert not client._engine.has_pending_effects
+    assert not client._effect_pump.pending
+    await client._callback_queue.join()
+    assert seen == [(None, None)]
+    await client._shutdown_callback_worker(drain=False)
+
+
+async def test_publish_many_callback_capacity_falls_back_atomically() -> None:
+    """Insufficient callback capacity must not split a batch across paths."""
+    client = AsyncClient(max_outbound_messages=8, max_pending_callbacks=2)
+    client._engine.state = ConnectionState.CONNECTED
+    blocker_seen: list[str] = []
+    client._callback_queue.put_nowait((lambda: blocker_seen.append("blocker"), (), None))
+    seen: list[tuple[int | None, BaseException | None]] = []
+    client.on_publish = lambda mid, error: seen.append((mid, error))
+
+    receipt = await client.publish_many(
+        [PublishMessage("native/batch", b"a", 0), PublishMessage("native/batch", b"b", 0)]
+    )
+
+    assert client._effect_pump.batches > 0
+    await client._drain_effects()
+    await client._callback_queue.join()
+    assert receipt.submitted == 2
+    assert receipt.completed == 2
+    assert blocker_seen == ["blocker"]
+    assert seen == [(None, None), (None, None)]
+    await client._shutdown_callback_worker(drain=False)
 
 
 async def test_publish_nowait_direct_path_encodes_mqtt5_properties(monkeypatch) -> None:
