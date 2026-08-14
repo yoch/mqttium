@@ -41,7 +41,10 @@ Hot handlers therefore contain neither a per-packet protocol branch nor a
 generic codec helper call. Acknowledgement bodies treat the two-byte success
 form and the MQTT 5 three-byte explicit-reason form as primary paths; absent
 properties are ``None``. Provisional ``mqttium.packets`` dataclasses remain
-thin factories over the same primitives.
+thin factories over the same primitives. Inbound MQTT 5 QoS 0 PUBLISH decodes
+directly into the delivered ``Message``, matching MQTT 3.1.1; Topic Alias
+resolution runs only when the Topic Name is empty or the decoded table carries
+``topic_alias``. QoS 1/2 keep the generic field decoder.
 
 MQTT UTF-8 validation applies on both encode and decode. Topics reject wildcards
 and U+0000. Filters validate `+` and `#` placement, shared-subscription prefixes,

@@ -329,27 +329,78 @@ message remains charged against the accounted budget.
 `_wire_size` when it is positive. Application-built bags (`_wire_size == 0`)
 still encode. Empty tables still contribute 0 logical bytes.
 
+## Finding 6 — MQTT 5 QoS 0 still uses the generic field decoder
+
+MQTT 3.1.1 QoS 0 already decodes straight into the delivered `Message`
+(`decode_qos0_message_v311`). MQTT 5 skipped `PublishPacket` but still ran every
+QoS 0 PUBLISH through `QoS(qos_raw)`, `decode_publish_fields_v5` (the QoS 1/2
+field parser) and `_resolve_topic_fields`, then constructed a second `Message`.
+
+Hypothesis for engine-only inbound QoS 0 with an empty MQTT 5 property table
+and a non-empty Topic Name (no alias):
+
+| Probe | Expected per message | Why |
+| --- | ---: | --- |
+| `decode_publish_fields_v5` | 0 | QoS 0 has its own decoder, as 3.1.1 already does |
+| `QoS()` | 0 | the handler branches on the flag bits; the message uses `AT_MOST_ONCE` |
+| `_resolve_topic_fields` | 0 | empty table cannot carry `topic_alias`; Topic Name is present |
+| `decode_properties` | 1 | MQTT 5 requires the property-length byte |
+| wall vs MQTT 3.1.1 | ~ decode_properties + `Properties()` | protocol tax, not leftover Python |
+
+Measured before this change, 20 000 isolated `handle_raw` + `take_effects`
+cycles, `time.process_time`:
+
+| Path | µs | vs 3.1.1 |
+| --- | ---: | ---: |
+| MQTT 3.1.1 | 2.28 | — |
+| MQTT 5 empty table | **3.04** | **+0.76** |
+| MQTT 5 IoT bag | 6.60 | +4.31 |
+
+`cProfile` on 8 000 empty MQTT 5 frames: 6 extra Python calls per message vs
+3.1.1, including `QoS.__call__`, `_resolve_topic_fields` and `dict.get` for an
+alias that cannot exist. Isolated pieces: `QoS(0)` 0.19 µs, `_resolve` 0.12 µs,
+`Message()` 0.84 µs (paid again after the field tuple). `decode_properties` of
+`0x00` is 0.25 µs and is the one necessary extra.
+
+A monkey-patched specialized handler on the same process: empty table **2.50 µs**
+(−0.54 vs current), IoT bag 5.91 µs (−0.69). The leftover is the incomplete
+MQTT 5 half of the QoS 0 specialization, not the property byte.
+
+## Fix (Finding 6)
+
+`decode_qos0_message_v5` unpacks the Topic Name, decodes the property table and
+builds the `Message` with `QoS.AT_MOST_ONCE`. `_on_publish_v5` takes that path
+when the QoS bits are 0. `_resolve_topic_fields` runs only when the Topic Name
+is empty or the decoded table carries `topic_alias`, so establishing and
+reusing an inbound alias is unchanged. QoS 1/2 still use
+`decode_publish_fields_v5`. Empty MQTT 5 tables still produce `Properties()`,
+not `None`, so `message.properties is None` continues to distinguish 3.1.1.
+
+## Confirmation after Finding 6
+
+Same host, 20 000 isolated cycles after the change (filled after tests).
+
 ## Remaining leads (measured, not treated as defects)
 
-Same host, 5 000 iterations unless noted. MQTT 5 inbound uses a valid CONNACK
-with `client_id="probe"`.
+Same host. MQTT 5 inbound uses `client_id="probe"`.
 
 - Engine-only MQTT 5 decode of a property-bearing PUBLISH remains a decode-walk
-  cost (after rebase: 7.73 µs IoT bag vs 4.20 µs empty vs 3.48 µs MQTT 3.1.1).
-  Delivery no longer multiplies that (Findings 4–5).
+  cost after Finding 6 (the empty-table gap vs 3.1.1 should shrink to
+  `Properties()` plus `decode_properties`). Delivery no longer multiplies that
+  (Findings 4–5).
 - `_check_outbound_size` still calls `item_size` when `maximum_packet_size is
-  None` (one call per connected QoS 1 launch). Previously left as ~1%;
-  threading the size through the encoder is the widening that audit refused.
-- **Inbound topic aliases.** Empty Topic Name + alias 1: 1.00
-  `_resolve_topic_fields` per PUBLISH, 0 property encodes, 5.34 µs. Matches
-  "one dict lookup, no re-encode".
+  None` (78 ns on this host). Threading the size through the encoder is the
+  widening that earlier passes refused; an early return is ~1% of a QoS 1
+  launch and is left.
+- **Inbound topic aliases.** Empty Topic Name + alias 1 still pays one
+  `_resolve_topic_fields` per PUBLISH by design.
 - **SQLite session resume** of 256 inflight 4 KiB QoS 1 records: 262 `SELECT`
   (ordered mid lists, two `out_summary_pages` scans — hydrate then replay —
   then `SELECT * FROM outbound WHERE mid=?` once per record). The payload reads
   are required to retransmit; the extra summary scan is cheap next to those
-  256 BLOBs. Summaries remain the right design for a large `QUEUED` queue.
+  256 BLOBs.
 - **`can_ever_admit` wait path:** 1.00 cache-hit `encode_properties` via
-  `logical_size`, 2.77 µs. Success-path launch does not call this.
+  `logical_size`. Success-path launch does not call this.
 - SQLite `BEGIN`/`COMMIT` per `put_out` and `complete_out` is unchanged;
   `batch()` remains `queue_publish_many` only.
 - `TopicMatcher` linear wildcard scan: unchanged from the first pass

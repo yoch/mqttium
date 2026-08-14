@@ -37,6 +37,28 @@ def decode_qos0_message_v311(raw: RawPacket) -> Message:
     )
 
 
+def decode_qos0_message_v5(raw: RawPacket) -> Message:
+    """Decode MQTT 5 QoS 0 PUBLISH directly into the delivered ``Message``.
+
+    An empty Topic Name is left for ``InboundSession`` Topic Alias resolution;
+    a non-empty name is validated here before the session can store an alias.
+    """
+    if raw.flags & 0x08:
+        raise MalformedPacketError("QoS 0 PUBLISH must not set DUP")
+    topic, pos = unpack_utf8(raw.remaining)
+    properties, pos = decode_properties(raw.remaining, pos, PUBLISH)
+    validate_received_publish_topic(topic, utf8_validated=True)
+    return Message(
+        topic=topic,
+        payload=raw.remaining[pos:],
+        qos=QoS.AT_MOST_ONCE,
+        retain=bool(raw.flags & 0x01),
+        dup=False,
+        mid=None,
+        properties=properties,
+    )
+
+
 def decode_qos12_fields_v311(raw: RawPacket) -> tuple[str, bytes, int, bool, bool]:
     """Decode MQTT 3.1.1 QoS 1/2 PUBLISH fields (identical wire layout)."""
     topic, pos = unpack_utf8(raw.remaining)
