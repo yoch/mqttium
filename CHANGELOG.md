@@ -34,7 +34,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - Admit decoded MQTT 5 publications onto the unaccounted small-delivery path
   when payload, topic bound and property-table bytes fit the small-message
   limit. Application-built property bags without a decoded length stay
-  accounted.
+  accounted. Accounted inbound sizing reuses that decoded table length
+  instead of encoding the properties again.
 
 ## [1.0.0rc4] - 2026-08-13
 

@@ -293,7 +293,41 @@ real MQTT 5 PUBLISH:
 Delivery of the IoT bag is 3.65 → 0.77 µs (**4.7×**), in line with the
 no-properties path. `tests/unit/test_small_delivery_properties.py` pins the
 small-path enqueue, the application-built accounted fallback, oversized
-decode, and `set()` invalidation. `tests/unit`: 1023 passed.
+decode, and `set()` invalidation.
+
+After rebase onto `4962b8b` (`main` with #221/#223/#225/#226/#227), Finding 4
+still holds: decoded IoT bag 0.74 µs, accounted=0, `encode_properties`=0.
+
+## Finding 5 — accounted inbound still re-encodes a decoded property table
+
+Finding 4 recorded `_wire_size` and used it only as the small-path gate.
+Messages that do not fit `small_limit` still called `logical_size` →
+`encode_properties`.
+
+Hypothesis for a decoded 200-byte `correlation_data` PUBLISH (footprint 246 >
+127) after Finding 4:
+
+| Probe | Expected | Why |
+| --- | --- | --- |
+| small-path | no | 246 > 127 |
+| `encode_properties` during accept | 0 | `_wire_size` is the table length already |
+| accounted | all | oversized on purpose |
+
+Measured after Finding 4, before this reuse, 2 000 then 8 000 iterator cycles:
+
+| | encode/msg | µs | accounted |
+| --- | ---: | ---: | ---: |
+| before | 1.00 | 2.47 | all |
+| after | **0.00** | **1.37** | all |
+
+The 1.10 µs gap is the discarded encode (`_signature` plus table walk). The
+message remains charged against the accounted budget.
+
+## Fix (Finding 5)
+
+`ApplicationDelivery.logical_size` and `InboundSession.logical_size` use
+`_wire_size` when it is positive. Application-built bags (`_wire_size == 0`)
+still encode. Empty tables still contribute 0 logical bytes.
 
 ## Remaining leads (measured, not treated as defects)
 
@@ -301,8 +335,8 @@ Same host, 5 000 iterations unless noted. MQTT 5 inbound uses a valid CONNACK
 with `client_id="probe"`.
 
 - Engine-only MQTT 5 decode of a property-bearing PUBLISH remains a decode-walk
-  cost (first pass: 8.29 µs with the IoT bag vs 4.55 µs without). Delivery no
-  longer multiplies that (Finding 4).
+  cost (after rebase: 7.73 µs IoT bag vs 4.20 µs empty vs 3.48 µs MQTT 3.1.1).
+  Delivery no longer multiplies that (Findings 4–5).
 - `_check_outbound_size` still calls `item_size` when `maximum_packet_size is
   None` (one call per connected QoS 1 launch). Previously left as ~1%;
   threading the size through the encoder is the widening that audit refused.

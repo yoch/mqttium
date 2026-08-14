@@ -181,7 +181,8 @@ The small-message reserve prevents one large payload from starving telemetry.
 It is disabled when it would make a single otherwise valid packet impossible to
 admit. Decoded MQTT 5 property bytes count toward that limit when the table
 length is known from the wire; an application-built bag without that length
-stays on the accounted path.
+stays on the accounted path. Accounted delivery and inbound slot sizing use
+that same decoded length instead of encoding the table again.
 
 User callbacks run outside engine critical sections. Exceptions are isolated and
 reported through the established callback policy; they do not stop the protocol

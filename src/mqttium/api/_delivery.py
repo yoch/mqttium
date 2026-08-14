@@ -489,8 +489,11 @@ class ApplicationDelivery:
 
     def logical_size(self, message: Message) -> int:
         property_bytes = 0
-        if self.protocol == MQTTProtocolVersion.MQTTv5 and message.properties:
-            property_bytes = len(encode_properties(message.properties, PUBLISH))
+        props = message.properties
+        if self.protocol == MQTTProtocolVersion.MQTTv5 and props and props.values:
+            property_bytes = props._wire_size
+            if property_bytes <= 0:
+                property_bytes = len(encode_properties(props, PUBLISH))
         topic_bytes = (
             len(message.topic) if message.topic.isascii() else len(message.topic.encode("utf-8"))
         )

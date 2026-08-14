@@ -837,7 +837,9 @@ class InboundSession:
             and properties is not None
             and properties.values
         ):
-            property_bytes = len(encode_properties(properties, PUBLISH))
+            property_bytes = properties._wire_size
+            if property_bytes <= 0:
+                property_bytes = len(encode_properties(properties, PUBLISH))
         topic_bytes = len(topic) if topic.isascii() else len(topic.encode("utf-8"))
         return len(payload) + topic_bytes + property_bytes
 

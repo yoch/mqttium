@@ -100,6 +100,41 @@ async def test_decoded_oversized_properties_stay_accounted() -> None:
     assert client.pending_delivery_bytes > 0
 
 
+async def test_decoded_oversized_properties_do_not_reencode_for_size(monkeypatch) -> None:
+    properties = Properties()
+    properties.set("correlation_data", b"x" * 200)
+    message = _decoded_qos0_message(properties)
+    assert message.properties is not None
+    expected = len(message.payload) + len(message.topic) + message.properties._wire_size
+
+    def unexpected_encode(_properties: object, _packet: object) -> bytes:
+        raise AssertionError("decoded property table length must not be re-encoded")
+
+    monkeypatch.setattr("mqttium.api._delivery.encode_properties", unexpected_encode)
+    monkeypatch.setattr("mqttium.protocol.inbound.encode_properties", unexpected_encode)
+
+    client = AsyncClient(
+        message_delivery="iterator",
+        protocol=MQTTProtocolVersion.MQTTv5,
+        client_id="probe",
+    )
+    await client._apply_effect(EngineEffect(EffectKind.MESSAGE, message), nowait=False)
+    item = client._messages.get_nowait()
+    assert item == (message, expected)
+
+
+def test_inbound_logical_size_uses_decoded_wire_size(monkeypatch) -> None:
+    def unexpected_encode(_properties: object, _packet: object) -> bytes:
+        raise AssertionError("decoded property table length must not be re-encoded")
+
+    monkeypatch.setattr("mqttium.protocol.inbound.encode_properties", unexpected_encode)
+    message = _decoded_qos0_message(_iot_properties())
+    assert message.properties is not None
+    engine = ProtocolEngine(EngineConfig(protocol=MQTTProtocolVersion.MQTTv5, client_id="probe"))
+    size = engine.inbound.logical_size(message.topic, message.payload, message.properties)
+    assert size == len(message.payload) + len(message.topic) + message.properties._wire_size
+
+
 def test_decode_properties_records_wire_size() -> None:
     encoded = encode_properties(_iot_properties(), PUBLISH)
     decoded, end = decode_properties(encoded, 0, PUBLISH)
