@@ -1,0 +1,51 @@
+name: Temporary isolated decoded delivery evaluation v2
+
+on:
+  push:
+    branches: [agent/f45-parallel-delivery-eval]
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/f45-parallel-delivery-eval
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Apply corrected transform
+        shell: bash
+        run: |
+          git show 4962b8b92e7c1a24658ddb1898cdeb205854c58e:src/mqttium/api/_delivery.py > /tmp/main_delivery.py
+          python - <<'PY'
+          from pathlib import Path
+          lines=Path('.github/workflows/temp-parallel-delivery-eval.yml').read_text().splitlines()
+          start=next(i for i,l in enumerate(lines) if l == '          from pathlib import Path')
+          end=next(i for i in range(start+1,len(lines)) if lines[i] == '          PY')
+          script='\n'.join(l[10:] if l.startswith('          ') else l for l in lines[start:end])
+          script=script.replace("'    def ensure_callback_worker(\\n'", "'    def ensure_callback_worker(self) -> None:\\n'")
+          exec(compile(script,'parallel-delivery-transform','exec'),{})
+          PY
+          python -m pip install -e ".[dev,security]" >/dev/null
+          ruff format src/mqttium/api/_delivery.py
+          ruff check src/mqttium/api/_delivery.py src/mqttium/api/async_client.py
+          mypy src/mqttium >/dev/null
+          python -m pytest -q tests/unit/test_small_delivery_properties.py tests/unit/test_delivery_byte_budget.py tests/unit/test_batched_message_effects.py
+          python -m pytest -q tests/unit
+      - name: Pair benchmark
+        shell: bash
+        run: |
+          git worktree add /tmp/main 4962b8b92e7c1a24658ddb1898cdeb205854c58e >/dev/null
+          python - <<'PY'
+          from pathlib import Path
+          lines=Path('.github/workflows/temp-parallel-delivery-eval.yml').read_text().splitlines()
+          start=next(i for i,l in enumerate(lines) if l == '          import asyncio,statistics,time')
+          end=next(i for i in range(start+1,len(lines)) if lines[i] == '          PY')
+          Path('/tmp/bench.py').write_text('\n'.join(l[10:] if l.startswith('          ') else l for l in lines[start:end]))
+          PY
+          echo MAIN
+          PYTHONPATH=/tmp/main/src python /tmp/bench.py
+          echo PARALLEL
+          PYTHONPATH=$GITHUB_WORKSPACE/src python /tmp/bench.py
