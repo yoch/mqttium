@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import pytest
+
 import mqttium.packets._publish as publish_v5_module
 import mqttium.protocol.outbound as outbound_module
 import mqttium.topics as topics_module
 
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, QoS
+from mqttium.packets import PubAckPacket
 from mqttium.packets._publish import encode_publish_item_v5
 from mqttium.protocol.config import EngineConfig
 from mqttium.protocol.effects import EffectKind
 from mqttium.protocol.engine import ProtocolEngine
-from tests.support import write_item_bytes
+from tests.support import feed_engine, write_item_bytes
 
 
 def _counting_str(value: str) -> tuple[str, list[int]]:
@@ -133,6 +136,41 @@ def test_qos1_connected_v311_utf8_encodes_topic_once() -> None:
 
     assert handle.mid is not None
     assert len(encodes) == 1
+
+
+@pytest.mark.parametrize("qos", [QoS.AT_LEAST_ONCE, QoS.EXACTLY_ONCE])
+@pytest.mark.parametrize(
+    ("topic_text", "encodes_while_queued", "encodes_after_drain"),
+    [
+        ("sensors/" + "a" * 256, 0, 1),
+        ("é" * 256, 1, 2),
+    ],
+)
+def test_saturated_flow_does_not_discard_preencoded_topic_bytes(
+    qos: QoS,
+    topic_text: str,
+    encodes_while_queued: int,
+    encodes_after_drain: int,
+) -> None:
+    engine = _connected_engine()
+    engine.outbound.flow.limit = 1
+
+    blocker = engine.queue_publish("capteurs/blocker", b"one", qos=QoS.AT_LEAST_ONCE)
+    assert blocker.mid is not None
+    engine.take_effects()
+
+    topic, encodes = _counting_str(topic_text)
+    queued = engine.queue_publish(topic, b"two", qos=qos)
+
+    assert queued.mid is not None
+    assert engine.outbound.stats().queued_messages == 1
+    assert len(encodes) == encodes_while_queued
+
+    feed_engine(engine, PubAckPacket(mid=blocker.mid).encode(engine.config.protocol))
+    sends = [effect for effect in engine.take_effects() if effect.kind is EffectKind.SEND]
+
+    assert len(sends) == 1
+    assert len(encodes) == encodes_after_drain
 
 
 def test_qos1_topic_handoff_matches_direct_encode() -> None:

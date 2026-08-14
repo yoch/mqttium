@@ -312,7 +312,9 @@ class OutboundSession:
         # admission until that state exists.
         engine = self._engine
         topic_bytes: bytes | None
-        if level is QoS.AT_MOST_ONCE or engine.state == ConnectionState.CONNECTED:
+        if level is QoS.AT_MOST_ONCE or (
+            engine.state == ConnectionState.CONNECTED and self.flow.available > 0
+        ):
             topic_bytes = encode_validated_publish_topic(topic)
             topic_size = len(topic_bytes)
         else:
