@@ -1,0 +1,129 @@
+name: Temporary Finding 4 minimal runtime evaluator
+
+on:
+  push:
+    branches:
+      - agent/f4-minimal-eval2
+
+permissions:
+  contents: write
+
+jobs:
+  evaluate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/f4-minimal-eval2
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build and validate minimal design
+        shell: bash
+        run: |
+          git checkout 4962b8b92e7c1a24658ddb1898cdeb205854c58e -- src/mqttium/api/_delivery.py src/mqttium/api/async_client.py
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: str, old: str, new: str) -> None:
+              p = Path(path)
+              text = p.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one match, got {count}: {old[:100]!r}")
+              p.write_text(text.replace(old, new, 1))
+
+          replace_once(
+              "src/mqttium/packets/_publish.py",
+              ") -> tuple[str, bytes, int | None, bool, bool, Properties, int]:\n",
+              ") -> tuple[str, bytes, int | None, bool, bool, Properties, int | None]:\n",
+          )
+          replace_once(
+              "src/mqttium/packets/_publish.py",
+              "    property_wire_size = pos - properties_pos\n",
+              "    property_wire_size = pos - properties_pos if properties else None\n",
+          )
+
+          p = Path("src/mqttium/api/_delivery.py")
+          text = p.read_text()
+          old = '''    async def accept(
+        self,
+        message: Message,
+        callback: Callable[[Message], Any] | None,
+    ) -> None:
+'''
+          new = '''    async def accept(
+        self,
+        message: Message,
+        callback: Callable[[Message], Any] | None,
+        *,
+        decoded_property_wire_size: int | None = None,
+    ) -> None:
+'''
+          if text.count(old) != 1:
+              raise SystemExit("accept signature mismatch")
+          text = text.replace(old, new, 1)
+          old = '''        small_limit = self.small_message_limit
+        small_delivery = references and (
+            small_limit is None
+            or (
+                small_limit > 0
+                and not message.properties
+                and len(message.payload) + 4 * len(message.topic) <= small_limit
+            )
+        )
+'''
+          new = '''        small_limit = self.small_message_limit
+        if decoded_property_wire_size is None:
+            small_delivery = references and (
+                small_limit is None
+                or (
+                    small_limit > 0
+                    and not message.properties
+                    and len(message.payload) + 4 * len(message.topic) <= small_limit
+                )
+            )
+        else:
+            small_delivery = bool(
+                references
+                and small_limit is not None
+                and small_limit > 0
+                and len(message.payload)
+                + 4 * len(message.topic)
+                + decoded_property_wire_size
+                <= small_limit
+            )
+'''
+          if text.count(old) != 1:
+              raise SystemExit("small decision mismatch")
+          p.write_text(text.replace(old, new, 1))
+
+          replace_once(
+              "src/mqttium/api/async_client.py",
+              "            pending_delivery = self._accept_message(message, self.on_message)\n",
+              "            property_wire_size = effect.decoded_property_wire_size\n"
+              "            if property_wire_size is None:\n"
+              "                pending_delivery = self._accept_message(message, self.on_message)\n"
+              "            else:\n"
+              "                pending_delivery = self._delivery.accept(\n"
+              "                    message,\n"
+              "                    self.on_message,\n"
+              "                    decoded_property_wire_size=property_wire_size,\n"
+              "                )\n",
+          )
+          PY
+
+          python -m pip install -e ".[dev,security]"
+          ruff format src/mqttium/api/_delivery.py src/mqttium/api/async_client.py src/mqttium/packets/_publish.py tests/unit/test_small_delivery_properties_v2.py
+          ruff check src/mqttium tests/unit/test_small_delivery_properties_v2.py
+          mypy src/mqttium
+          python -m pytest -q tests/unit/test_small_delivery_properties_v2.py tests/unit/test_delivery_byte_budget.py tests/unit/test_property_encoding_cache.py tests/unit/test_inbound_recovery.py tests/unit/test_qos2_matrix.py
+          python -m pytest -q tests/unit
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/mqttium/api/_delivery.py src/mqttium/api/async_client.py src/mqttium/packets/_publish.py tests/unit/test_small_delivery_properties_v2.py
+          git commit -m "Minimize decoded property small-delivery handoff"
+          git push
