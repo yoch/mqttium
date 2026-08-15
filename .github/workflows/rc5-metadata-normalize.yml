@@ -1,0 +1,90 @@
+name: Normalize RC5 metadata
+
+on:
+  push:
+    branches:
+      - release/1.0.0rc5
+    paths:
+      - .github/workflows/rc5-metadata-normalize.yml
+
+permissions:
+  contents: write
+
+jobs:
+  normalize:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: release/1.0.0rc5
+          fetch-depth: 0
+      - name: Normalize release metadata
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          def rewrite(path: str, old: str, new: str) -> None:
+              p = Path(path)
+              text = p.read_text(encoding="utf-8")
+              if old not in text:
+                  raise SystemExit(f"expected text not found in {path}: {old!r}")
+              p.write_text(text.replace(old, new), encoding="utf-8")
+
+          rewrite(
+              "README.md",
+              "> **Status:** release candidate (`1.0.0rc4`).",
+              "> **Status:** release candidate (`1.0.0rc5`).",
+          )
+
+          api = Path("docs/API-STABILITY.md")
+          api_text = api.read_text(encoding="utf-8")
+          if "1.0.0rc4" not in api_text:
+              raise SystemExit("expected rc4 API stability marker not found")
+          api.write_text(api_text.replace("1.0.0rc4", "1.0.0rc5"), encoding="utf-8")
+
+          roadmap = Path("docs/ROADMAP.md")
+          roadmap_text = roadmap.read_text(encoding="utf-8")
+          if "1.0.0rc4" not in roadmap_text:
+              raise SystemExit("expected rc4 roadmap marker not found")
+          roadmap.write_text(roadmap_text.replace("1.0.0rc4", "1.0.0rc5"), encoding="utf-8")
+
+          changelog = Path("CHANGELOG.md")
+          text = changelog.read_text(encoding="utf-8")
+          marker = "## [Unreleased]\n\n### Changed\n"
+          if marker not in text:
+              raise SystemExit("unexpected CHANGELOG Unreleased layout")
+          text = text.replace(
+              marker,
+              "## [Unreleased]\n\n## [1.0.0rc5] - 2026-08-16\n\n### Changed\n",
+              1,
+          )
+          extra = """\
+- Skip empty durable inbound-store metadata probes on the automatic QoS 1 steady-state path while retaining collision checks as soon as persisted inbound state exists.\n- Reuse MQTT 5 property-table bytes already encoded during immediate QoS 1/2 admission; queued publications continue to encode their current mutable properties at launch.\n- Reuse validated Topic Name bytes on immediate QoS 1/2 launch only when flow capacity is available, avoiding eager bytes that would be discarded by a saturated connected queue.\n- Carry the exact wire size of fresh decoded MQTT 5 properties as ephemeral effect metadata so small and accounted delivery avoid re-encoding without storing stale size state on mutable `Properties` or in persistence.\n- Decode inbound MQTT 5 QoS 0 directly into the delivered `Message`, preserve the decoded-property-size handoff, and skip Topic Alias resolution only for non-empty alias-free Topic Names; QoS 1/2 retain the generic field decoder.\n\n"""
+          rc4 = "## [1.0.0rc4] - 2026-08-13"
+          if rc4 not in text:
+              raise SystemExit("rc4 changelog marker not found")
+          text = text.replace(rc4, extra + rc4, 1)
+          old_links = "[Unreleased]: https://github.com/yoch/mqttium/compare/v1.0.0rc4...HEAD\n[1.0.0rc4]:"
+          new_links = "[Unreleased]: https://github.com/yoch/mqttium/compare/v1.0.0rc5...HEAD\n[1.0.0rc5]: https://github.com/yoch/mqttium/compare/v1.0.0rc4...v1.0.0rc5\n[1.0.0rc4]:"
+          if old_links not in text:
+              raise SystemExit("rc4 changelog links not found")
+          text = text.replace(old_links, new_links, 1)
+          changelog.write_text(text, encoding="utf-8")
+
+          reports = Path("docs/reports/README.md")
+          reports_text = reports.read_text(encoding="utf-8")
+          row = "| 2026-08-16 | [`RELEASE-CANDIDATE-1.0.0rc5.md`](RELEASE-CANDIDATE-1.0.0rc5.md) | RC5 release evidence for the post-RC4 callback/delivery and MQTT 5 hot-path improvements, repository-wide Bugbot reconciliation, and exact artifact gates. |\n"
+          if "RELEASE-CANDIDATE-1.0.0rc5.md" not in reports_text:
+              table_sep = "| --- | --- | --- |\n"
+              if table_sep not in reports_text:
+                  raise SystemExit("reports index table marker not found")
+              reports_text = reports_text.replace(table_sep, table_sep + row, 1)
+              reports.write_text(reports_text, encoding="utf-8")
+          PY
+          rm .github/workflows/rc5-metadata-normalize.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md CHANGELOG.md docs/API-STABILITY.md docs/ROADMAP.md docs/reports/README.md .github/workflows/rc5-metadata-normalize.yml
+          git diff --cached --check
+          git commit -m "Complete 1.0.0rc5 release metadata"
+          git push origin HEAD:release/1.0.0rc5
