@@ -1,6 +1,7 @@
 # Release candidate report — 1.0.0rc5
 
 Candidate source before release metadata: `478e3d7f` (`main`, 2026-08-15).
+Release metadata is normalized across the package version, README, changelog, API stability policy, roadmap and report index on the final candidate branch.
 
 ## Scope
 
