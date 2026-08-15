@@ -109,8 +109,8 @@ _EMPTY_PROPS = b"\x00"
 def decode_publish_fields_v5(
     raw: RawPacket,
     qos: QoS,
-) -> tuple[str, bytes, int | None, bool, bool, Properties]:
-    """Decode MQTT 5 PUBLISH fields without constructing a PublishPacket."""
+) -> tuple[str, bytes, int | None, bool, bool, Properties, int]:
+    """Decode MQTT 5 PUBLISH fields and its property-table wire size."""
     dup = bool(raw.flags & 0x08)
     if qos is QoS.AT_MOST_ONCE and dup:
         raise MalformedPacketError("QoS 0 PUBLISH must not set DUP")
@@ -119,7 +119,9 @@ def decode_publish_fields_v5(
     if qos:
         mid, pos = unpack_u16(raw.remaining, pos)
         require_nonzero_mid(mid, "PUBLISH")
+    properties_pos = pos
     properties, pos = decode_properties(raw.remaining, pos, PUBLISH)
+    property_wire_size = pos - properties_pos
     # Preserve #128: a non-empty Topic Name must be validated before it can
     # establish or replace a connection-scoped Topic Alias.
     validate_received_publish_topic(topic, utf8_validated=True)
@@ -130,6 +132,7 @@ def decode_publish_fields_v5(
         bool(raw.flags & 0x01),
         dup,
         properties,
+        property_wire_size,
     )
 
 

@@ -18,6 +18,7 @@ from mqttium.types import Properties
 class EffectKind(Enum):
     SEND = auto()
     MESSAGE = auto()
+    DECODED_MESSAGE = auto()
     CONNACK = auto()
     PUBLISH_COMPLETE = auto()
     PUBLISH_FAILED = auto()
@@ -41,6 +42,10 @@ class EngineEffect:
     # required, True means one is required, and None preserves the conservative
     # legacy behavior for unclassified/internal effects constructed directly.
     requires_delivery_mark: bool | None = None
+    # MESSAGE only: exact MQTT 5 property-table bytes observed while decoding
+    # this fresh PUBLISH. None means no trusted decode-time size is available;
+    # store/replay effects deliberately omit it.
+    decoded_property_wire_size: int | None = None
 
 
 @dataclass(slots=True)

@@ -107,7 +107,12 @@ def test_inbound_publish_still_carries_a_subscription_identifier() -> None:
             properties=properties,
         ).encode(MQTTProtocolVersion.MQTTv5),
     )
-    messages = [e.data for e in engine.take_effects() if e.kind is EffectKind.MESSAGE]
+    effects = engine.take_effects()
+    messages = [
+        effect.data
+        for effect in effects
+        if effect.kind in (EffectKind.MESSAGE, EffectKind.DECODED_MESSAGE)
+    ]
     assert len(messages) == 1
     assert messages[0].properties is not None
     assert messages[0].properties.get("subscription_identifier") == [7]
