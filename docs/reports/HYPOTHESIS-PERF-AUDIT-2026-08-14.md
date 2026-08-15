@@ -398,18 +398,80 @@ empty-table QoS 0 and QoS 1 paths. Alias establish/reuse still calls resolve.
 using `decode_publish_fields_v5`, DUP/wildcard validation, empty-topic-without-alias,
 and alias reuse. `tests/unit`: 1067 passed.
 
+## Critical pass after Finding 6
+
+Same host. The bar is the same as Findings 1–6: leftover work of a computation
+already paid, on a success path, with CPU that is not noise. Protocol tax,
+owned-bytes copies, wait/backpressure paths, and safety checks that cost tens
+of nanoseconds are not defects. Several tempting fixes fail that bar.
+
+### `publish_nowait` preview encode (refused)
+
+`_check_nowait_publish_capacity` already skips sizing when the writer queue is
+empty, because that size cannot change admission and `queue_publish` encodes
+immediately afterwards. A QoS 1 burst with a lagging writer is the remaining
+case: after the first SEND, the queue is non-empty and `flow.available > 0`
+(AsyncClient's default window is 100), so messages 2–100 call
+`publish_wire_size` → `size_parts` → `encode_properties` (cache hit, **2.09 µs**
+signature freeze) and then `queue_publish` does the same walk again.
+
+Instrumented `publish_nowait` MQTT 5 IoT bag, 500 iterations, no PUBACK:
+
+| Writer | encode/msg | preview/msg |
+| --- | ---: | ---: |
+| empty at start | 1.20 | 0.20 |
+| primed 1 byte | 1.20 | 0.20 |
+
+The 0.20 is exactly the default window (100/500). After Receive Maximum is
+full, `will_send` is false and preview is skipped — the packet will not hit the
+writer. Default `publish()` (not nowait) never previews; encode/launch stays
+**1.00**.
+
+A generalization of the empty-queue skip ("remaining writer capacity exceeds
+any legal packet") does not fire: the client's fallback maximum packet size is
+16 MiB and the writer budget is 1 MiB. Using `_wire_size` after encode, or the
+encode cache without a signature check, is unsafe for in-place `values`
+mutation — Finding 2 already refused that. Threading preview bytes into
+`queue_publish` widens the admission API for a nowait-only burst. Left.
+
+### Other measured non-fixes
+
+- **`_check_outbound_size` when `maximum_packet_size is None`:** 75 ns
+  (`item_size` 51 ns). An early return is ~1% of a QoS 1 launch. The post-encode
+  check is the only size gate on QoS 0 and a belt-and-suspenders check on QoS
+  1/2 after `_check_publish_wire_size`. Not worth removing a safety compare.
+- **Inbound payload `remaining[pos:]`:** 0.05 µs at 16 B, 1.30 µs at 64 KiB.
+  That is CPython copying owned `bytes`, not a discarded encode. Avoiding it
+  means `Message.payload` is no longer `bytes`, or PUBLISH decode reads the
+  reusable buffer — both break the owned-bytes invariant.
+- **IncrementalDecoder vs pre-built `RawPacket`:** +1.4 µs at 16 B, +4.7 µs at
+  64 KiB. Framing copy into the reusable buffer plus one owned `remaining`.
+  Production always pays this; engine-only benches do not. Not leftover.
+- **MQTT 5 vs 3.1.1 inbound QoS 1 empty table:** +0.78 µs (4.16 vs 3.38). QoS 1
+  still needs the generic field parser (packet id, `_on_qos1` state). The gap
+  is `decode_properties` + `Properties()` + `QoS()` (~0.19 µs). Specializing
+  QoS 1 the way Finding 6 specialized QoS 0 would duplicate mid/state logic
+  for a fraction of a microsecond. Left.
+- **`PacketType.from_byte`:** 89 ns per frame. Necessary dispatch.
+- **Empty `Properties()` singleton for MQTT 5 `0x00`:** ~0.14 µs. `set()` on a
+  shared bag would leak across messages. Left.
+- **SQLite `BEGIN`/`COMMIT` per `put_out`:** unchanged; `batch()` remains
+  `queue_publish_many` only. Single-publish autocommit is durability, not
+  leftover.
+- **`TopicMatcher` linear wildcards, inbound aliases, SQLite resume SELECTs,
+  `can_ever_admit`:** unchanged from earlier passes; they match the contract.
+
+No code change in this pass.
+
 ## Remaining leads (measured, not treated as defects)
 
 Same host. MQTT 5 inbound uses `client_id="probe"`.
 
 - Engine-only MQTT 5 decode of a property-bearing PUBLISH remains a decode-walk
-  cost after Finding 6 (the empty-table gap vs 3.1.1 should shrink to
-  `Properties()` plus `decode_properties`). Delivery no longer multiplies that
-  (Findings 4–5).
+  cost after Finding 6 (~3.4 µs IoT vs empty). Delivery no longer multiplies
+  that (Findings 4–5).
 - `_check_outbound_size` still calls `item_size` when `maximum_packet_size is
-  None` (78 ns on this host). Threading the size through the encoder is the
-  widening that earlier passes refused; an early return is ~1% of a QoS 1
-  launch and is left.
+  None` (75 ns). See the critical pass.
 - **Inbound topic aliases.** Empty Topic Name + alias 1 still pays one
   `_resolve_topic_fields` per PUBLISH by design.
 - **SQLite session resume** of 256 inflight 4 KiB QoS 1 records: 262 `SELECT`
