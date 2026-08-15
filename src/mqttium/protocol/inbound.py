@@ -25,6 +25,7 @@ from mqttium.packets import (
 )
 from mqttium.packets._publish import (
     decode_qos0_message_v311,
+    decode_qos0_message_v5,
     decode_qos12_fields_v311,
     decode_publish_fields_v5,
 )
@@ -305,6 +306,33 @@ class InboundSession:
 
     def _on_publish_v5(self, raw: RawPacket) -> None:
         qos_raw = (raw.flags >> 1) & 0x03
+        if qos_raw == int(QoS.AT_MOST_ONCE):
+            message, property_wire_size = decode_qos0_message_v5(raw)
+            properties = message.properties
+            assert properties is not None
+            if not message.topic or properties.get("topic_alias") is not None:
+                topic = self._resolve_topic_fields(message.topic, properties)
+                if topic != message.topic:
+                    message = Message(
+                        topic=topic,
+                        payload=message.payload,
+                        qos=QoS.AT_MOST_ONCE,
+                        retain=message.retain,
+                        dup=False,
+                        mid=None,
+                        properties=properties,
+                    )
+            decoded_property_wire_size = property_wire_size if properties.values else None
+            self._engine._emit(
+                (
+                    EffectKind.DECODED_MESSAGE
+                    if decoded_property_wire_size is not None
+                    else EffectKind.MESSAGE
+                ),
+                message,
+                decoded_property_wire_size=decoded_property_wire_size,
+            )
+            return
         if qos_raw == 3:
             raise MalformedPacketError("Invalid PUBLISH QoS 3")
         qos = QoS(qos_raw)
@@ -317,27 +345,9 @@ class InboundSession:
             properties,
             property_wire_size,
         ) = decode_publish_fields_v5(raw, qos)
-        topic = self._resolve_topic_fields(topic, properties)
+        if not topic or properties.get("topic_alias") is not None:
+            topic = self._resolve_topic_fields(topic, properties)
         decoded_property_wire_size = property_wire_size if properties.values else None
-        if qos is QoS.AT_MOST_ONCE:
-            self._engine._emit(
-                (
-                    EffectKind.DECODED_MESSAGE
-                    if decoded_property_wire_size is not None
-                    else EffectKind.MESSAGE
-                ),
-                Message(
-                    topic=topic,
-                    payload=payload,
-                    qos=qos,
-                    retain=retain,
-                    dup=False,
-                    mid=None,
-                    properties=properties,
-                ),
-                decoded_property_wire_size=decoded_property_wire_size,
-            )
-            return
         assert decoded_mid is not None
         if qos is QoS.AT_LEAST_ONCE:
             self._on_qos1(
