@@ -18,6 +18,7 @@ from mqttium.types import Properties
 class EffectKind(Enum):
     SEND = auto()
     MESSAGE = auto()
+    DECODED_MESSAGE = auto()
     CONNACK = auto()
     PUBLISH_COMPLETE = auto()
     PUBLISH_FAILED = auto()

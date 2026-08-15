@@ -1584,6 +1584,15 @@ class AsyncClient:
             return 0
         return self._delivery.deliver_batch_inline(effects, self.on_message)
 
+    def _apply_decoded_message_effect_batch_inline(
+        self,
+        effects: deque[EngineEffect],
+        epoch: int,
+    ) -> int:
+        if epoch != self._connection_epoch:
+            return 0
+        return self._delivery.deliver_decoded_batch_inline(effects, self.on_message)
+
     async def _flush_effects(self, *, nowait: bool = False) -> None:
         async with self._engine_lock:
             self._collect_effects_locked()
@@ -1643,13 +1652,19 @@ class AsyncClient:
                     self._collect_effects_locked()
         elif kind is EffectKind.MESSAGE:
             message: Message = effect.data
+            pending_delivery = self._accept_message(message, self.on_message)
+            if pending_delivery is not None:
+                await pending_delivery
+            if effect.requires_delivery_mark is not False and message.mid is not None:
+                async with self._engine_lock:
+                    self._engine.mark_inbound_delivered(message.mid)
+        elif kind is EffectKind.DECODED_MESSAGE:
+            message = effect.data
             property_wire_size = effect.decoded_property_wire_size
-            if property_wire_size is None:
-                pending_delivery = self._accept_message(message, self.on_message)
-            else:
-                pending_delivery = self._accept_decoded_message(
-                    message, self.on_message, property_wire_size
-                )
+            assert property_wire_size is not None
+            pending_delivery = self._accept_decoded_message(
+                message, self.on_message, property_wire_size
+            )
             if pending_delivery is not None:
                 await pending_delivery
             if effect.requires_delivery_mark is not False and message.mid is not None:

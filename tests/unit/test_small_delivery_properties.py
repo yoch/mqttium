@@ -64,7 +64,11 @@ def _fresh_message_effect(
     assert raw is not None
     engine.handle_raw(raw)
     effects = engine.take_effects()
-    message_effects = [effect for effect in effects if effect.kind is EffectKind.MESSAGE]
+    message_effects = [
+        effect
+        for effect in effects
+        if effect.kind in (EffectKind.MESSAGE, EffectKind.DECODED_MESSAGE)
+    ]
     assert len(message_effects) == 1
     return engine, message_effects[0]
 
@@ -75,6 +79,7 @@ async def test_decoded_iot_properties_use_small_delivery_in_all_modes(mode: str)
     message = effect.data
     assert isinstance(message, Message)
     assert message.properties is not None
+    assert effect.kind is EffectKind.DECODED_MESSAGE
     assert effect.decoded_property_wire_size == len(encode_properties(message.properties, PUBLISH))
 
     client = AsyncClient(
@@ -175,6 +180,7 @@ def test_inbound_logical_size_reuses_fresh_decoded_table(monkeypatch) -> None:
 
 def test_empty_decoded_property_table_keeps_generic_path() -> None:
     _engine, effect = _fresh_message_effect(Properties())
+    assert effect.kind is EffectKind.MESSAGE
     assert effect.decoded_property_wire_size is None
 
 
@@ -201,10 +207,50 @@ def test_decoded_properties_can_join_inline_small_delivery_batch() -> None:
     )
     effects = deque([first, second])
 
-    applied = client._apply_message_effect_batch_inline(effects, client._connection_epoch)
+    assert first.kind is EffectKind.DECODED_MESSAGE
+    assert second.kind is EffectKind.DECODED_MESSAGE
+    applied = client._apply_decoded_message_effect_batch_inline(effects, client._connection_epoch)
 
     assert applied == 2
     assert client.pending_delivery_bytes == 0
+    assert client._messages.get_nowait() is first.data
+    assert client._messages.get_nowait() is second.data
+
+
+@pytest.mark.parametrize(
+    ("qos", "mid"),
+    [
+        (QoS.AT_MOST_ONCE, None),
+        (QoS.AT_LEAST_ONCE, 7),
+        (QoS.EXACTLY_ONCE, 7),
+    ],
+)
+def test_all_fresh_property_bearing_qos_levels_use_decoded_effect_kind(
+    qos: QoS, mid: int | None
+) -> None:
+    _engine, effect = _fresh_message_effect(_iot_properties(), qos=qos, mid=mid)
+    assert effect.kind is EffectKind.DECODED_MESSAGE
+    assert effect.decoded_property_wire_size is not None
+
+
+def test_effect_pump_batches_decoded_messages_inline() -> None:
+    _engine, first = _fresh_message_effect(_iot_properties())
+    _engine, second = _fresh_message_effect(_iot_properties())
+    client = AsyncClient(
+        message_delivery="iterator",
+        protocol=MQTTProtocolVersion.MQTTv5,
+        client_id="probe",
+    )
+    pump = client._effect_pump
+    pump.pending.extend([first, second])
+    pump.pending_epoch = client._connection_epoch
+    pump.enqueued = 2
+
+    pump.drain_inline()
+
+    assert not pump.pending
+    assert pump.applied == 2
+    assert pump.inline_effects == 2
     assert client._messages.get_nowait() is first.data
     assert client._messages.get_nowait() is second.data
 

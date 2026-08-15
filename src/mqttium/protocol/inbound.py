@@ -321,7 +321,11 @@ class InboundSession:
         decoded_property_wire_size = property_wire_size if properties.values else None
         if qos is QoS.AT_MOST_ONCE:
             self._engine._emit(
-                EffectKind.MESSAGE,
+                (
+                    EffectKind.DECODED_MESSAGE
+                    if decoded_property_wire_size is not None
+                    else EffectKind.MESSAGE
+                ),
                 Message(
                     topic=topic,
                     payload=payload,
@@ -459,7 +463,11 @@ class InboundSession:
         # that order here so every QoS2 delivery avoids EffectPump repartition.
         engine._send(_encode_pubrec_success(mid))
         engine._emit(
-            EffectKind.MESSAGE,
+            (
+                EffectKind.DECODED_MESSAGE
+                if decoded_property_wire_size is not None
+                else EffectKind.MESSAGE
+            ),
             Message(
                 topic=topic,
                 payload=payload,
@@ -537,7 +545,11 @@ class InboundSession:
             # batch: the Receive Maximum slot is already held.
             self._engine._send(_encode_puback_success(mid))
             self._engine._emit(
-                EffectKind.MESSAGE,
+                (
+                    EffectKind.DECODED_MESSAGE
+                    if decoded_property_wire_size is not None
+                    else EffectKind.MESSAGE
+                ),
                 Message(
                     topic=topic,
                     payload=payload,
@@ -581,7 +593,11 @@ class InboundSession:
             # producer, avoiding an EffectPump repartition on every auto-ACK.
             self._engine._send(_encode_puback_success(mid))
         self._engine._emit(
-            EffectKind.MESSAGE,
+            (
+                EffectKind.DECODED_MESSAGE
+                if decoded_property_wire_size is not None
+                else EffectKind.MESSAGE
+            ),
             Message(
                 topic=topic,
                 payload=payload,
