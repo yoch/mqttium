@@ -1,0 +1,197 @@
+name: Temporary Finding 6 scope benchmark
+
+on:
+  push:
+    branches: [agent/f6-direct-decode-eval]
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Build variants and benchmark
+        shell: bash
+        run: |
+          python -m pip install -e . >/dev/null
+          git worktree add /tmp/f6-main 9bd486c4b213fa67ba28ed00fe2fec14579fd446 >/dev/null
+          cp -a /tmp/f6-main /tmp/f6-b
+          cp -a /tmp/f6-main /tmp/f6-c
+          python - <<'PY'
+          from pathlib import Path
+
+          decoder = '''\n\ndef decode_qos0_message_v5(raw: RawPacket) -> tuple[Message, int]:\n    \"\"\"Decode MQTT 5 QoS 0 directly and return the property-table wire size.\"\"\"\n    if raw.flags & 0x08:\n        raise MalformedPacketError(\"QoS 0 PUBLISH must not set DUP\")\n    topic, pos = unpack_utf8(raw.remaining)\n    properties_pos = pos\n    properties, pos = decode_properties(raw.remaining, pos, PUBLISH)\n    property_wire_size = pos - properties_pos\n    validate_received_publish_topic(topic, utf8_validated=True)\n    return (\n        Message(\n            topic=topic,\n            payload=raw.remaining[pos:],\n            qos=QoS.AT_MOST_ONCE,\n            retain=bool(raw.flags & 0x01),\n            dup=False,\n            mid=None,\n            properties=properties,\n        ),\n        property_wire_size,\n    )\n'''
+
+          handler_b = '''    def _on_publish_v5(self, raw: RawPacket) -> None:\n        qos_raw = (raw.flags >> 1) & 0x03\n        if qos_raw == int(QoS.AT_MOST_ONCE):\n            message, property_wire_size = decode_qos0_message_v5(raw)\n            properties = message.properties\n            assert properties is not None\n            if not message.topic or properties.get(\"topic_alias\") is not None:\n                topic = self._resolve_topic_fields(message.topic, properties)\n                if topic != message.topic:\n                    message = Message(\n                        topic=topic,\n                        payload=message.payload,\n                        qos=QoS.AT_MOST_ONCE,\n                        retain=message.retain,\n                        dup=False,\n                        mid=None,\n                        properties=properties,\n                    )\n            decoded_property_wire_size = property_wire_size if properties.values else None\n            self._engine._emit(\n                (\n                    EffectKind.DECODED_MESSAGE\n                    if decoded_property_wire_size is not None\n                    else EffectKind.MESSAGE\n                ),\n                message,\n                decoded_property_wire_size=decoded_property_wire_size,\n            )\n            return\n        if qos_raw == 3:\n            raise MalformedPacketError(\"Invalid PUBLISH QoS 3\")\n        qos = QoS(qos_raw)\n        (\n            topic,\n            payload,\n            decoded_mid,\n            retain,\n            dup,\n            properties,\n            property_wire_size,\n        ) = decode_publish_fields_v5(raw, qos)\n        topic = self._resolve_topic_fields(topic, properties)\n        decoded_property_wire_size = property_wire_size if properties.values else None\n        assert decoded_mid is not None\n        if qos is QoS.AT_LEAST_ONCE:\n            self._on_qos1(\n                topic=topic,\n                payload=payload,\n                mid=decoded_mid,\n                retain=retain,\n                dup=dup,\n                properties=properties,\n                decoded_property_wire_size=decoded_property_wire_size,\n            )\n            return\n        self._on_qos2(\n            topic=topic,\n            payload=payload,\n            mid=decoded_mid,\n            retain=retain,\n            dup=dup,\n            properties=properties,\n            decoded_property_wire_size=decoded_property_wire_size,\n        )\n\n'''
+
+          def patch(root: str, *, skip_q12_alias: bool) -> None:
+              root = Path(root)
+              pub = root / 'src/mqttium/packets/_publish.py'
+              text = pub.read_text()
+              marker = '\n\ndef decode_qos12_fields_v311('
+              if text.count(marker) != 1:
+                  raise SystemExit('publish insertion marker mismatch')
+              pub.write_text(text.replace(marker, decoder + marker, 1))
+
+              inbound = root / 'src/mqttium/protocol/inbound.py'
+              text = inbound.read_text()
+              old = '    decode_qos0_message_v311,\n'
+              if text.count(old) != 1:
+                  raise SystemExit('inbound import marker mismatch')
+              text = text.replace(old, old + '    decode_qos0_message_v5,\n', 1)
+              start = text.index('    def _on_publish_v5(self, raw: RawPacket) -> None:\n')
+              end = text.index('    def _on_publish_v31(self, raw: RawPacket) -> None:\n', start)
+              block = handler_b
+              if skip_q12_alias:
+                  old_resolve = '        topic = self._resolve_topic_fields(topic, properties)\n'
+                  new_resolve = '''        if not topic or properties.get(\"topic_alias\") is not None:\n            topic = self._resolve_topic_fields(topic, properties)\n'''
+                  if block.count(old_resolve) != 1:
+                      raise SystemExit('q12 resolve marker mismatch')
+                  block = block.replace(old_resolve, new_resolve, 1)
+              inbound.write_text(text[:start] + block + text[end:])
+
+          patch('/tmp/f6-b', skip_q12_alias=False)
+          patch('/tmp/f6-c', skip_q12_alias=True)
+          PY
+
+          cat >/tmp/f6_bench.py <<'PY'
+          import statistics
+          import time
+
+          import mqttium.protocol.inbound as inbound_mod
+          from mqttium.codec.buffer import RawPacket
+          from mqttium.codec.primitives import pack_u16, pack_utf8
+          from mqttium.codec.properties import PUBLISH, encode_properties
+          from mqttium.enums import ConnectionState, MQTTProtocolVersion, PacketType
+          from mqttium.protocol.config import EngineConfig
+          from mqttium.protocol.effects import EffectKind
+          from mqttium.protocol.engine import ProtocolEngine
+          from mqttium.protocol.inbound import InboundSession
+          from mqttium.types import Properties
+
+          Q0_N = 20000
+          Q1_N = 3500
+          TRIALS = 7
+
+          def engine():
+              e = ProtocolEngine(EngineConfig(protocol=MQTTProtocolVersion.MQTTv5, client_id='bench'))
+              e.state = ConnectionState.CONNECTED
+              return e
+
+          def props_iot():
+              p = Properties()
+              p.set('content_type', 'application/octet-stream')
+              p.set('payload_format_indicator', 1)
+              p.set('message_expiry_interval', 60)
+              p.add_user_property('device', 'probe')
+              p.add_user_property('site', 'lab')
+              return p
+
+          EMPTY = b'\x00'
+          IOT = encode_properties(props_iot(), PUBLISH)
+          TOPIC = pack_utf8('sensors/t')
+          PAYLOAD = b'hello'
+          Q0_EMPTY = RawPacket(PacketType.PUBLISH, 0, TOPIC + EMPTY + PAYLOAD)
+          Q0_IOT = RawPacket(PacketType.PUBLISH, 0, TOPIC + IOT + PAYLOAD)
+          Q1_EMPTY = [RawPacket(PacketType.PUBLISH, 0x02, TOPIC + pack_u16(i + 1) + EMPTY + PAYLOAD) for i in range(Q1_N)]
+          Q1_IOT = [RawPacket(PacketType.PUBLISH, 0x02, TOPIC + pack_u16(i + 1) + IOT + PAYLOAD) for i in range(Q1_N)]
+
+          def q0_case(raw):
+              xs = []
+              for _ in range(TRIALS):
+                  e = engine()
+                  for _ in range(1000):
+                      e.handle_raw(raw); e.take_effects()
+                  t = time.process_time_ns()
+                  for _ in range(Q0_N):
+                      e.handle_raw(raw); e.take_effects()
+                  xs.append((time.process_time_ns() - t) / Q0_N / 1000)
+              return statistics.median(xs), xs
+
+          def q1_case(raws):
+              xs = []
+              for _ in range(TRIALS):
+                  e = engine()
+                  t = time.process_time_ns()
+                  for raw in raws:
+                      e.handle_raw(raw); e.take_effects()
+                  xs.append((time.process_time_ns() - t) / len(raws) / 1000)
+              return statistics.median(xs), xs
+
+          def probe(raw):
+              fields = 0
+              resolves = 0
+              orig_fields = inbound_mod.decode_publish_fields_v5
+              orig_resolve = InboundSession._resolve_topic_fields
+              def counted_fields(*a, **kw):
+                  nonlocal fields
+                  fields += 1
+                  return orig_fields(*a, **kw)
+              def counted_resolve(self, *a, **kw):
+                  nonlocal resolves
+                  resolves += 1
+                  return orig_resolve(self, *a, **kw)
+              inbound_mod.decode_publish_fields_v5 = counted_fields
+              InboundSession._resolve_topic_fields = counted_resolve
+              try:
+                  e = engine(); e.handle_raw(raw); effects = e.take_effects()
+              finally:
+                  inbound_mod.decode_publish_fields_v5 = orig_fields
+                  InboundSession._resolve_topic_fields = orig_resolve
+              msg = next((x for x in effects if x.kind in (EffectKind.MESSAGE, EffectKind.DECODED_MESSAGE)), None)
+              hint = None if msg is None else msg.decoded_property_wire_size
+              kind = None if msg is None else msg.kind.name
+              return fields, resolves, kind, hint
+
+          for name, fn, arg in [
+              ('q0-empty', q0_case, Q0_EMPTY),
+              ('q0-iot', q0_case, Q0_IOT),
+              ('q1-empty', q1_case, Q1_EMPTY),
+              ('q1-iot', q1_case, Q1_IOT),
+          ]:
+              med, xs = fn(arg)
+              print(name, f'{med:.4f}', [round(x, 4) for x in xs])
+          print('probe-q0-empty', probe(Q0_EMPTY))
+          print('probe-q0-iot', probe(Q0_IOT))
+          print('probe-q1-empty', probe(Q1_EMPTY[0]))
+          print('probe-q1-iot', probe(Q1_IOT[0]))
+          PY
+
+          run_variant() { PYTHONPATH="$1/src" python /tmp/f6_bench.py; }
+          echo '=== A main ==='; run_variant /tmp/f6-main
+          echo '=== B direct-q0 ==='; run_variant /tmp/f6-b
+          echo '=== C direct-q0-plus-q12-alias-skip ==='; run_variant /tmp/f6-c
+          echo '=== C repeat ==='; run_variant /tmp/f6-c
+          echo '=== B repeat ==='; run_variant /tmp/f6-b
+          echo '=== A repeat ==='; run_variant /tmp/f6-main
+
+          PYTHONPATH=/tmp/f6-b/src python - <<'PY'
+          from mqttium.codec.buffer import RawPacket
+          from mqttium.codec.primitives import pack_utf8
+          from mqttium.codec.properties import PUBLISH, encode_properties
+          from mqttium.enums import ConnectionState, MQTTProtocolVersion, PacketType
+          from mqttium.protocol.config import EngineConfig
+          from mqttium.protocol.effects import EffectKind
+          from mqttium.protocol.engine import ProtocolEngine
+          from mqttium.types import Properties
+
+          p = Properties(); p.set('content_type', 'text/plain')
+          table = encode_properties(p, PUBLISH)
+          raw = RawPacket(PacketType.PUBLISH, 0, pack_utf8('bench/v5') + table + b'body')
+          e = ProtocolEngine(EngineConfig(protocol=MQTTProtocolVersion.MQTTv5, client_id='probe'))
+          e.state = ConnectionState.CONNECTED
+          e.handle_raw(raw)
+          effects = e.take_effects()
+          m = next(x for x in effects if x.kind in (EffectKind.MESSAGE, EffectKind.DECODED_MESSAGE))
+          assert m.kind is EffectKind.DECODED_MESSAGE
+          assert m.decoded_property_wire_size == len(table)
+          assert m.data.properties is not None and m.data.properties.get('content_type') == 'text/plain'
+          print('handoff-ok', m.kind.name, m.decoded_property_wire_size)
+          PY
