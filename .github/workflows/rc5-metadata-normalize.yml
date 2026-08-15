@@ -58,8 +58,13 @@ jobs:
               "## [Unreleased]\n\n## [1.0.0rc5] - 2026-08-16\n\n### Changed\n",
               1,
           )
-          extra = """\
-- Skip empty durable inbound-store metadata probes on the automatic QoS 1 steady-state path while retaining collision checks as soon as persisted inbound state exists.\n- Reuse MQTT 5 property-table bytes already encoded during immediate QoS 1/2 admission; queued publications continue to encode their current mutable properties at launch.\n- Reuse validated Topic Name bytes on immediate QoS 1/2 launch only when flow capacity is available, avoiding eager bytes that would be discarded by a saturated connected queue.\n- Carry the exact wire size of fresh decoded MQTT 5 properties as ephemeral effect metadata so small and accounted delivery avoid re-encoding without storing stale size state on mutable `Properties` or in persistence.\n- Decode inbound MQTT 5 QoS 0 directly into the delivered `Message`, preserve the decoded-property-size handoff, and skip Topic Alias resolution only for non-empty alias-free Topic Names; QoS 1/2 retain the generic field decoder.\n\n"""
+          extra = (
+              "- Skip empty durable inbound-store metadata probes on the automatic QoS 1 steady-state path while retaining collision checks as soon as persisted inbound state exists.\n"
+              "- Reuse MQTT 5 property-table bytes already encoded during immediate QoS 1/2 admission; queued publications continue to encode their current mutable properties at launch.\n"
+              "- Reuse validated Topic Name bytes on immediate QoS 1/2 launch only when flow capacity is available, avoiding eager bytes that would be discarded by a saturated connected queue.\n"
+              "- Carry the exact wire size of fresh decoded MQTT 5 properties as ephemeral effect metadata so small and accounted delivery avoid re-encoding without storing stale size state on mutable `Properties` or in persistence.\n"
+              "- Decode inbound MQTT 5 QoS 0 directly into the delivered `Message`, preserve the decoded-property-size handoff, and skip Topic Alias resolution only for non-empty alias-free Topic Names; QoS 1/2 retain the generic field decoder.\n\n"
+          )
           rc4 = "## [1.0.0rc4] - 2026-08-13"
           if rc4 not in text:
               raise SystemExit("rc4 changelog marker not found")
