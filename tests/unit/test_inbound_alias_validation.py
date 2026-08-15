@@ -54,7 +54,9 @@ def test_invalid_topic_does_not_establish_inbound_alias() -> None:
 
     assert engine.inbound._aliases == {}
     assert any(effect.kind is EffectKind.PROTOCOL_ERROR for effect in effects)
-    assert not any(effect.kind is EffectKind.MESSAGE for effect in effects)
+    assert not any(
+        effect.kind in (EffectKind.MESSAGE, EffectKind.DECODED_MESSAGE) for effect in effects
+    )
 
 
 def test_valid_topic_still_establishes_inbound_alias() -> None:
@@ -86,6 +88,10 @@ def test_valid_topic_still_establishes_inbound_alias() -> None:
     _feed(engine, second)
     effects = engine.take_effects()
 
-    message = next(effect.data for effect in effects if effect.kind is EffectKind.MESSAGE)
+    message = next(
+        effect.data
+        for effect in effects
+        if effect.kind in (EffectKind.MESSAGE, EffectKind.DECODED_MESSAGE)
+    )
     assert message.topic == "valid/topic"
     assert message.payload == b"second"
