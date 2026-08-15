@@ -485,3 +485,23 @@ Same host. MQTT 5 inbound uses `client_id="probe"`.
   `batch()` remains `queue_publish_many` only.
 - `TopicMatcher` linear wildcard scan: unchanged from the first pass
   (~2.7 µs/lookup with 200 exact + 5 wildcards).
+
+## Bugbot (2026-08-15)
+
+Ran Bugbot on the four finding PRs.
+
+| PR | Finding | Result |
+| --- | --- | --- |
+| [#225](https://github.com/yoch/mqttium/pull/225) (merged) | 1 empty inbound probes | no bugs |
+| [#226](https://github.com/yoch/mqttium/pull/226) (merged) | 2 property-bytes handoff | no bugs |
+| [#227](https://github.com/yoch/mqttium/pull/227) (merged) | 3 Topic Name bytes | no bugs |
+| [#222](https://github.com/yoch/mqttium/pull/222) (open) | 4–6 `_wire_size` / QoS 0 decode | one medium |
+
+The #222 note is that `_wire_size` is cleared by `set()` / `add_user_property`
+but not by in-place `values` mutation, unlike the encode cache which snapshots
+mutable values. That mismatch is real as a contract split, not as an inbound
+bug: delivery and inbound `logical_size` run before user code sees the
+`Message`. A later outbound publish of the same bag still goes through
+`encode_properties` and its signature. Walking `_signature()` on every decoded
+PUBLISH would undo Findings 4–5 (~1.85 µs of a cache hit). Left as documented
+intent, with a unit test that pins the split.

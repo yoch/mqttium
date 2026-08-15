@@ -37,6 +37,10 @@ class Properties:
     # Decoded MQTT property-table length including the property-length VBI.
     # Zero means unknown (an application-built bag); small-delivery then stays
     # on the accounted path rather than encoding just to measure.
+    # Cleared by set() / add_user_property. In-place ``values`` mutation is
+    # deliberately not observed here: inbound accept runs before user code, and
+    # a signature walk on every decoded PUBLISH would undo Findings 4–5. The
+    # encode cache still snapshots mutable values for a later outbound encode.
     _wire_size: int = field(default=0, init=False, repr=False, compare=False)
 
     def _signature(self) -> tuple[tuple[str, Any], ...]:

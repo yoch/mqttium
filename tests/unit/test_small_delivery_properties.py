@@ -142,3 +142,20 @@ def test_decode_properties_records_wire_size() -> None:
     assert decoded._wire_size == len(encoded)
     decoded.set("content_type", "text/plain")
     assert decoded._wire_size == 0
+
+
+def test_inplace_values_mutation_does_not_clear_decoded_wire_size() -> None:
+    """Inbound sizing trusts the decoded table; encode cache still signatures.
+
+    Direct ``values`` writes are the encode-cache contract (Finding 2). Applying
+    the same snapshot to ``_wire_size`` would re-walk every inbound PUBLISH.
+    Accept runs before user code sees the message; ``set()`` still invalidates.
+    """
+    encoded = encode_properties(_iot_properties(), PUBLISH)
+    decoded, _end = decode_properties(encoded, 0, PUBLISH)
+    wire = decoded._wire_size
+    assert wire > 0
+    decoded.values["content_type"] = "text/plain"
+    assert decoded._wire_size == wire
+    decoded.set("payload_format_indicator", 0)
+    assert decoded._wire_size == 0
