@@ -37,6 +37,29 @@ def decode_qos0_message_v311(raw: RawPacket) -> Message:
     )
 
 
+def decode_qos0_message_v5(raw: RawPacket) -> tuple[Message, int]:
+    """Decode MQTT 5 QoS 0 directly and return its property-table wire size."""
+    if raw.flags & 0x08:
+        raise MalformedPacketError("QoS 0 PUBLISH must not set DUP")
+    topic, pos = unpack_utf8(raw.remaining)
+    properties_pos = pos
+    properties, pos = decode_properties(raw.remaining, pos, PUBLISH)
+    property_wire_size = pos - properties_pos
+    validate_received_publish_topic(topic, utf8_validated=True)
+    return (
+        Message(
+            topic=topic,
+            payload=raw.remaining[pos:],
+            qos=QoS.AT_MOST_ONCE,
+            retain=bool(raw.flags & 0x01),
+            dup=False,
+            mid=None,
+            properties=properties,
+        ),
+        property_wire_size,
+    )
+
+
 def decode_qos12_fields_v311(raw: RawPacket) -> tuple[str, bytes, int, bool, bool]:
     """Decode MQTT 3.1.1 QoS 1/2 PUBLISH fields (identical wire layout)."""
     topic, pos = unpack_utf8(raw.remaining)
