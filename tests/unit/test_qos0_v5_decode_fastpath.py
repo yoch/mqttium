@@ -1,51 +1,4 @@
-name: Temporary Finding 6 candidate builder
-
-on:
-  push:
-    branches: [agent/f6-direct-decode-eval]
-
-permissions:
-  contents: write
-
-jobs:
-  build:
-    if: github.actor != 'github-actions[bot]'
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: agent/f6-direct-decode-eval
-          fetch-depth: 0
-      - uses: actions/setup-python@v7
-        with:
-          python-version: '3.12'
-      - name: Patch, validate, and publish candidate
-        shell: bash
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-
-          pub = Path('src/mqttium/packets/_publish.py')
-          text = pub.read_text()
-          marker = '\n\ndef decode_qos12_fields_v311('
-          decoder = '''\n\ndef decode_qos0_message_v5(raw: RawPacket) -> tuple[Message, int]:\n    \"\"\"Decode MQTT 5 QoS 0 directly and return its property-table wire size.\"\"\"\n    if raw.flags & 0x08:\n        raise MalformedPacketError(\"QoS 0 PUBLISH must not set DUP\")\n    topic, pos = unpack_utf8(raw.remaining)\n    properties_pos = pos\n    properties, pos = decode_properties(raw.remaining, pos, PUBLISH)\n    property_wire_size = pos - properties_pos\n    validate_received_publish_topic(topic, utf8_validated=True)\n    return (\n        Message(\n            topic=topic,\n            payload=raw.remaining[pos:],\n            qos=QoS.AT_MOST_ONCE,\n            retain=bool(raw.flags & 0x01),\n            dup=False,\n            mid=None,\n            properties=properties,\n        ),\n        property_wire_size,\n    )\n'''
-          if text.count(marker) != 1:
-              raise SystemExit('publish insertion marker mismatch')
-          pub.write_text(text.replace(marker, decoder + marker, 1))
-
-          inbound = Path('src/mqttium/protocol/inbound.py')
-          text = inbound.read_text()
-          old = '    decode_qos0_message_v311,\n'
-          if text.count(old) != 1:
-              raise SystemExit('inbound import marker mismatch')
-          text = text.replace(old, old + '    decode_qos0_message_v5,\n', 1)
-          start = text.index('    def _on_publish_v5(self, raw: RawPacket) -> None:\n')
-          end = text.index('    def _on_publish_v31(self, raw: RawPacket) -> None:\n', start)
-          handler = '''    def _on_publish_v5(self, raw: RawPacket) -> None:\n        qos_raw = (raw.flags >> 1) & 0x03\n        if qos_raw == int(QoS.AT_MOST_ONCE):\n            message, property_wire_size = decode_qos0_message_v5(raw)\n            properties = message.properties\n            assert properties is not None\n            if not message.topic or properties.get(\"topic_alias\") is not None:\n                topic = self._resolve_topic_fields(message.topic, properties)\n                if topic != message.topic:\n                    message = Message(\n                        topic=topic,\n                        payload=message.payload,\n                        qos=QoS.AT_MOST_ONCE,\n                        retain=message.retain,\n                        dup=False,\n                        mid=None,\n                        properties=properties,\n                    )\n            decoded_property_wire_size = property_wire_size if properties.values else None\n            self._engine._emit(\n                (\n                    EffectKind.DECODED_MESSAGE\n                    if decoded_property_wire_size is not None\n                    else EffectKind.MESSAGE\n                ),\n                message,\n                decoded_property_wire_size=decoded_property_wire_size,\n            )\n            return\n        if qos_raw == 3:\n            raise MalformedPacketError(\"Invalid PUBLISH QoS 3\")\n        qos = QoS(qos_raw)\n        (\n            topic,\n            payload,\n            decoded_mid,\n            retain,\n            dup,\n            properties,\n            property_wire_size,\n        ) = decode_publish_fields_v5(raw, qos)\n        if not topic or properties.get(\"topic_alias\") is not None:\n            topic = self._resolve_topic_fields(topic, properties)\n        decoded_property_wire_size = property_wire_size if properties.values else None\n        assert decoded_mid is not None\n        if qos is QoS.AT_LEAST_ONCE:\n            self._on_qos1(\n                topic=topic,\n                payload=payload,\n                mid=decoded_mid,\n                retain=retain,\n                dup=dup,\n                properties=properties,\n                decoded_property_wire_size=decoded_property_wire_size,\n            )\n            return\n        self._on_qos2(\n            topic=topic,\n            payload=payload,\n            mid=decoded_mid,\n            retain=retain,\n            dup=dup,\n            properties=properties,\n            decoded_property_wire_size=decoded_property_wire_size,\n        )\n\n'''
-          inbound.write_text(text[:start] + handler + text[end:])
-
-          tests = Path('tests/unit/test_qos0_v5_decode_fastpath.py')
-          tests.write_text(r'''from __future__ import annotations
+from __future__ import annotations
 
 import pytest
 
@@ -56,7 +9,7 @@ from mqttium.codec.properties import PUBLISH, encode_properties
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, PacketType, QoS
 from mqttium.errors import MalformedPacketError
 from mqttium.packets import PublishPacket
-from mqttium.packets._publish import decode_publish_fields_v5, decode_qos0_message_v5
+from mqttium.packets._publish import decode_qos0_message_v5
 from mqttium.protocol.effects import EffectKind, EngineEffect
 from mqttium.protocol.engine import EngineConfig, ProtocolEngine
 from mqttium.protocol.inbound import InboundSession
@@ -182,13 +135,7 @@ def test_v5_qos0_empty_table_keeps_generic_message_effect() -> None:
     assert not effect.data.properties
 
 
-@pytest.mark.parametrize(
-    ("properties", "expected_kind"),
-    [(None, EffectKind.MESSAGE), (Properties(), EffectKind.MESSAGE)],
-)
-def test_v5_qos0_alias_free_topic_skips_resolution(
-    monkeypatch, properties: Properties | None, expected_kind: EffectKind
-) -> None:
+def test_v5_qos0_alias_free_topic_skips_resolution(monkeypatch) -> None:
     calls = 0
     original = InboundSession._resolve_topic_fields
 
@@ -199,10 +146,10 @@ def test_v5_qos0_alias_free_topic_skips_resolution(
 
     monkeypatch.setattr(InboundSession, "_resolve_topic_fields", counted)
     engine = _connected()
-    engine.handle_raw(_raw("bench/no-alias", b"x", properties))
+    engine.handle_raw(_raw("bench/no-alias", b"x"))
     effect = _message_effect(engine.take_effects())
 
-    assert effect.kind is expected_kind
+    assert effect.kind is EffectKind.MESSAGE
     assert effect.data.topic == "bench/no-alias"
     assert calls == 0
 
@@ -307,7 +254,7 @@ def test_v5_qos0_topic_alias_establish_and_reuse_preserve_hint() -> None:
     assert second.decoded_property_wire_size == len(table)
 
 
-@pytest.mark.parametrize(("alias", "maximum"), [(0, 10), (2, 1)])
+@pytest.mark.parametrize(("alias", "maximum"), [(2, 1)])
 def test_v5_qos0_invalid_topic_alias_never_delivers(alias: int, maximum: int) -> None:
     properties = Properties()
     properties.set("topic_alias", alias)
@@ -319,25 +266,18 @@ def test_v5_qos0_invalid_topic_alias_never_delivers(alias: int, maximum: int) ->
     assert not any(
         effect.kind in (EffectKind.MESSAGE, EffectKind.DECODED_MESSAGE) for effect in effects
     )
-''')
-          PY
 
-          rm .github/workflows/temp-f6-scope-benchmark.yml .github/workflows/temp-f6-build.yml
-          python -m pip install -e ".[dev,security]"
-          ruff format src/mqttium/packets/_publish.py src/mqttium/protocol/inbound.py tests/unit/test_qos0_v5_decode_fastpath.py
-          ruff check src/mqttium tests/unit/test_qos0_v5_decode_fastpath.py
-          mypy src/mqttium
-          python -m pytest -q \
-            tests/unit/test_qos0_v5_decode_fastpath.py \
-            tests/unit/test_small_delivery_properties.py \
-            tests/unit/test_inbound_alias_validation.py \
-            tests/unit/test_conformance_statements.py \
-            tests/unit/test_qos2_matrix.py \
-            tests/unit/test_manual_ack.py \
-            tests/unit/test_autoack_receive_maximum_handoff.py
-          python -m pytest -q tests/unit
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git commit -m "Specialize inbound MQTT 5 QoS 0 decode"
-          git push origin HEAD:agent/f6-direct-decode-eval
+
+def test_v5_qos0_zero_topic_alias_on_wire_never_delivers() -> None:
+    # Topic Alias is property id 0x23 with a two-byte integer value. The
+    # outbound encoder correctly refuses zero, so construct the malformed peer
+    # packet directly to exercise inbound validation.
+    remaining = pack_utf8("sensors/temp") + b"\x03\x23\x00\x00" + b"x"
+    engine = _connected(alias_maximum=10)
+    engine.handle_raw(RawPacket(PacketType.PUBLISH, 0, remaining))
+    effects = engine.take_effects()
+
+    assert any(effect.kind is EffectKind.PROTOCOL_ERROR for effect in effects)
+    assert not any(
+        effect.kind in (EffectKind.MESSAGE, EffectKind.DECODED_MESSAGE) for effect in effects
+    )
