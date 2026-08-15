@@ -6,6 +6,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [1.0.0rc5] - 2026-08-16
+
 ### Changed
 
 - Transfer one eligible small inbound MESSAGE directly to the bounded
@@ -28,6 +30,12 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   outbound-window sweeps and automatic same-tree A/A control validation while
   preserving the existing calibrated-fraction release mode; correlate callback
   completions in FIFO order so reused MQTT packet identifiers remain measurable.
+
+- Skip empty durable inbound-store metadata probes on the automatic QoS 1 steady-state path while retaining collision checks as soon as persisted inbound state exists.
+- Reuse MQTT 5 property-table bytes already encoded during immediate QoS 1/2 admission; queued publications continue to encode their current mutable properties at launch.
+- Reuse validated Topic Name bytes on immediate QoS 1/2 launch only when flow capacity is available, avoiding eager bytes that would be discarded by a saturated connected queue.
+- Carry the exact wire size of fresh decoded MQTT 5 properties as ephemeral effect metadata so small and accounted delivery avoid re-encoding without storing stale size state on mutable `Properties` or in persistence.
+- Decode inbound MQTT 5 QoS 0 directly into the delivered `Message`, preserve the decoded-property-size handoff, and skip Topic Alias resolution only for non-empty alias-free Topic Names; QoS 1/2 retain the generic field decoder.
 
 ## [1.0.0rc4] - 2026-08-13
 
@@ -580,7 +588,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - Pre-spin-out comparative analysis and generated coverage data from the
   published source tree.
 
-[Unreleased]: https://github.com/yoch/mqttium/compare/v1.0.0rc4...HEAD
+[Unreleased]: https://github.com/yoch/mqttium/compare/v1.0.0rc5...HEAD
+[1.0.0rc5]: https://github.com/yoch/mqttium/compare/v1.0.0rc4...v1.0.0rc5
 [1.0.0rc4]: https://github.com/yoch/mqttium/compare/v1.0.0rc3...v1.0.0rc4
 [1.0.0rc3]: https://github.com/yoch/mqttium/compare/v1.0.0rc2...v1.0.0rc3
 [1.0.0rc2]: https://github.com/yoch/mqttium/compare/v1.0.0rc1...v1.0.0rc2
