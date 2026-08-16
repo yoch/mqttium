@@ -68,6 +68,10 @@ class WriterStats:
     batched_bytes: int
     segmented_writes: int
     enqueue_suspensions: int
+    # Frames written straight to the transport because the writer task would
+    # have added an event-loop turn without doing anything else.
+    eager_writes: int = 0
+    eager_bytes: int = 0
 
 
 @dataclass(slots=True, frozen=True)

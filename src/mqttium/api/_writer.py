@@ -53,6 +53,15 @@ class WritePump:
         self.batched_bytes = 0
         self.segmented_writes = 0
         self.enqueue_suspensions = 0
+        self.eager_writes = 0
+        self.eager_bytes = 0
+        # True for the whole of the writer task's batch, including between the
+        # two halves of a segmented write. Nothing may write to the transport
+        # while it is set.
+        self._writing = False
+        # Resolved once per connection: absent on transports that do not offer
+        # a non-awaiting write.
+        self._write_nowait: Callable[[bytes], bool] | None = None
 
     @property
     def queued_messages(self) -> int:
@@ -75,6 +84,8 @@ class WritePump:
             batched_bytes=self.batched_bytes,
             segmented_writes=self.segmented_writes,
             enqueue_suspensions=self.enqueue_suspensions,
+            eager_writes=self.eager_writes,
+            eager_bytes=self.eager_bytes,
         )
 
     def _sample_high_water(self, queued_messages: int | None = None) -> None:
@@ -89,18 +100,25 @@ class WritePump:
         self._sample_high_water()
         self.queue = asyncio.Queue()
         self.queued_bytes = 0
+        # The next start() rebinds it. Until then there is no transport this
+        # pump may write to.
+        self._write_nowait = None
+        self._writing = False
 
     def start(self, transport: AsyncTransport) -> None:
         task = self.task
         if task is not None and not task.done():
             raise RuntimeError("WritePump is already running")
         self.transport = transport
+        self._writing = False
+        self._write_nowait = getattr(transport, "write_nowait", None)
         self.task = asyncio.create_task(self._run(), name="mqttium-writer")
 
     async def stop(self) -> None:
         task = self.task
         if task is None:
             self.transport = None
+            self._write_nowait = None
             return
         if task is asyncio.current_task():
             return
@@ -112,6 +130,10 @@ class WritePump:
                 pass
         self.task = None
         self.transport = None
+        # Drop the eager path with the transport it was resolved from, so a
+        # frame can never be written to a transport this pump no longer owns.
+        self._write_nowait = None
+        self._writing = False
 
     async def join(self) -> None:
         await self.queue.join()
@@ -126,6 +148,8 @@ class WritePump:
 
     def discard(self) -> None:
         self._sample_high_water()
+        self._write_nowait = None
+        self._writing = False
         while True:
             try:
                 self.queue.get_nowait()
@@ -200,6 +224,46 @@ class WritePump:
             bytes_used += size
         return self.refusal()
 
+    def _try_write_eager(self, item: WriteItem) -> bool:
+        """Write straight through when the writer task would only add a hop.
+
+        Every queued frame costs one event-loop turn: the writer task has to be
+        scheduled out of ``await queue.get()`` before a single byte moves. When
+        nothing is queued and no write is in flight, that turn buys nothing.
+
+        Wire order is preserved because all five conditions hold together, and
+        each one is load-bearing:
+
+        * ``_write_nowait`` is absent unless the transport's write is a plain
+          buffer append;
+        * ``_writing`` covers the writer task's whole batch — a segmented item
+          is two consecutive writes, and a frame landing between them would
+          corrupt the packet;
+        * an empty queue is what makes this ordered: ``put_nowait`` leaves the
+          item visible until the writer pops it, so a non-empty queue always
+          means an earlier frame is still owed;
+        * a producer suspended in :meth:`enqueue` must not be overtaken;
+        * segmented items are never written eagerly, for the reason above.
+
+        None of the checks can be invalidated between them: this runs to
+        completion without awaiting.
+        """
+        write_nowait = self._write_nowait
+        if (
+            write_nowait is None
+            or self._writing
+            or self.waiters
+            or isinstance(item, tuple)
+            or not self.queue.empty()
+        ):
+            return False
+        if not write_nowait(item):
+            return False
+        self.eager_writes += 1
+        self.eager_bytes += len(item)
+        self.last_outbound = time.monotonic()
+        return True
+
     def try_enqueue(self, item: WriteItem, *, epoch: int | None = None) -> bool:
         if epoch is None:
             epoch = self.epoch
@@ -208,6 +272,8 @@ class WritePump:
         size = item_size(item)
         if not self.can_enqueue_size(size):
             return False
+        if self._try_write_eager(item):
+            return True
         self.queue.put_nowait(item)
         self.queued_bytes += size
         return True
@@ -315,6 +381,10 @@ class WritePump:
                         break
                 self.batches += 1
                 self.batched_items += len(batch)
+                # Set before the first await and held across the whole batch:
+                # this is what stops an eager write from landing between the two
+                # halves of a segmented item.
+                self._writing = True
                 try:
                     # Coalesce contiguous small frames into one writelines call.
                     # Never await drain() after the batch (deadlocks vs reader ACK).
@@ -330,6 +400,7 @@ class WritePump:
                     await self._write_contiguous(transport, contiguous)
                     self.last_outbound = time.monotonic()
                 finally:
+                    self._writing = False
                     released = 0
                     for data in batch:
                         released += item_size(data)
@@ -342,4 +413,11 @@ class WritePump:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            # The transport has failed and this task is giving up on it. Drop
+            # the eager binding first: the reconnect path does not call stop()
+            # (AsyncClient only stops the pump when it will not reconnect), so
+            # without this a producer racing the reader's teardown could still
+            # write straight into the dead transport.
+            self._write_nowait = None
+            self._writing = False
             await self.on_failure(exc)

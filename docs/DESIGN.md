@@ -144,7 +144,9 @@ reason code.
 
 `PublishReceipt.wait()` means:
 
-- QoS 0: accepted by the single writer queue;
+- QoS 0: admitted by the writer — queued, or buffered straight to the transport
+  when that costs no ordering (see `IMPLEMENTATION-GUIDE.md` invariant 1).
+  Neither means the bytes have reached the network;
 - QoS 1: PUBACK received;
 - QoS 2: PUBCOMP received.
 
