@@ -96,3 +96,24 @@ def test_removing_callback_does_not_drop_already_queued_correlation() -> None:
     assert 29 not in client._facade_mid_map
     assert facade_mid not in client._active_facade_mids
     assert not client._facade_receipts
+
+
+def test_final_bulk_failure_retires_mid_even_with_publish_callback_installed() -> None:
+    client = Client()
+    client._async._engine.state = ConnectionState.CONNECTED
+    client._install_publish_dispatch(lambda *_args: None)
+    facade_mid, reserved = client._reserve_next_facade_mid()
+    assert reserved
+
+    receipt = PublishReceipt(mid=31, qos=QoS.AT_LEAST_ONCE)
+    client._async._register_publish_receipt(31, receipt)
+    client._register_facade_mid(receipt, facade_mid)
+
+    failure = RuntimeError("connection lost")
+    client._async._fail_pending(failure)
+
+    assert receipt.is_done()
+    assert receipt._error is failure
+    assert facade_mid not in client._active_facade_mids
+    assert 31 not in client._facade_mid_map
+    assert not client._facade_receipts
