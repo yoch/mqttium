@@ -115,6 +115,7 @@ class ProtocolEngine:
         self._sent_clean_start = False
         self._sent_session_expiry_interval: int | None = None
         self._sent_request_problem_information = 1
+        self._sent_request_response_information = 0
         self._auth_method: str | None = None
         self._handlers = {
             PacketType.CONNACK: self._on_connack,
@@ -358,6 +359,12 @@ class ProtocolEngine:
         self._sent_request_problem_information = (
             1 if request_problem_information is None else int(request_problem_information)
         )
+        request_response_information = (
+            connect_props.get("request_response_information") if connect_props is not None else None
+        )
+        self._sent_request_response_information = (
+            0 if request_response_information is None else int(request_response_information)
+        )
         self.state = ConnectionState.CONNECTING
         self._pending_connect = True
         self.inbound.start_connection()
@@ -565,6 +572,15 @@ class ProtocolEngine:
             ):
                 self._protocol_disconnect(0x82)
                 raise ProtocolError("CONNACK authentication_data requires authentication_method")
+            if (
+                self._sent_request_response_information == 0
+                and connack.properties is not None
+                and connack.properties.get("response_information") is not None
+            ):
+                self._protocol_disconnect(0x82)
+                raise ProtocolError(
+                    "CONNACK response_information was not requested [MQTT-3.1.2-28]"
+                )
         if connack.reason_code != 0:
             self.state = ConnectionState.DISCONNECTED
             self._emit(EffectKind.CONNACK, connack)
