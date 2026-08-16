@@ -47,15 +47,6 @@ def encode_disconnect_v311(
     return _DISCONNECT
 
 
-_PINGREQ = b"\xc0\x00"
-
-
-_PINGRESP = b"\xd0\x00"
-
-
-_DISCONNECT = b"\xe0\x00"
-
-
 _DISCONNECT_REASONS = frozenset(
     {
         0x00,

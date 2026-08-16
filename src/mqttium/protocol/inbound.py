@@ -782,8 +782,8 @@ class InboundSession:
                 raise ProtocolError(f"Inbound mid={mid} changed while acknowledging")
             logical_size = completed.logical_size
         self._forget_inbound()
-        if state is InboundQoSState.WAIT_USER_ACK:
-            self._session_state_qos2 -= 1
+        # The guard above already rejected every state but WAIT_USER_ACK.
+        self._session_state_qos2 -= 1
         self._engine._send(wire)
         self._release_slot(logical_size)
 

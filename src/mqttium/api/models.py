@@ -158,9 +158,9 @@ class PublishBatchReceipt:
 
     async def _wait_pending_at_most(self, limit: int) -> None:
         while len(self._pending) > limit:
+            # Clear before waiting so a settle between the two cannot be lost;
+            # the loop condition re-checks after every wakeup.
             self._progress.clear()
-            if len(self._pending) <= limit:
-                break
             await self._progress.wait()
 
     def _finish_if_ready(self) -> None:

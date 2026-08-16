@@ -68,8 +68,9 @@ class IncrementalDecoder:
     def feed(self, data: bytes | bytearray | memoryview) -> None:
         if not data:
             return
-        if self._start and self._start > _COMPACT_THRESHOLD:
-            self._compact()
+        if self._start > _COMPACT_THRESHOLD:
+            del self._buf[: self._start]
+            self._start = 0
         self._buf.extend(data)
         buffered = len(self._buf) - self._start
         if buffered > self._high_water:
@@ -158,17 +159,6 @@ class IncrementalDecoder:
             packets.append(packet)
         return packets
 
-    def process_packets(self, callback: Callable[[RawPacket], None], limit: int = 100) -> int:
-        """Decode up to *limit* packets, invoking *callback* without a list alloc."""
-        n = 0
-        for _ in range(limit):
-            packet = self.next_packet()
-            if packet is None:
-                break
-            callback(packet)
-            n += 1
-        return n
-
     def process_packets_bounded(
         self,
         callback: Callable[[RawPacket], None],
@@ -199,9 +189,3 @@ class IncrementalDecoder:
             if decoded_bytes >= max_bytes:
                 break
         return count, decoded_bytes
-
-    def _compact(self) -> None:
-        if self._start <= 0:
-            return
-        del self._buf[: self._start]
-        self._start = 0

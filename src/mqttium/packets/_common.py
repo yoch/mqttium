@@ -2,13 +2,9 @@
 
 from __future__ import annotations
 
-from mqttium.codec.properties import encode_properties
 from mqttium.codec.vbi import append_vbi
-from mqttium.enums import MQTTProtocolVersion, PacketType
+from mqttium.enums import PacketType
 from mqttium.errors import ProtocolError
-from mqttium.types import Properties
-
-_EMPTY_PROPS_V5 = b"\x00"
 
 
 def encode_frame(packet_type: PacketType, flags: int, remaining: bytes | bytearray) -> bytes:
@@ -19,18 +15,6 @@ def encode_frame(packet_type: PacketType, flags: int, remaining: bytes | bytearr
     append_vbi(header, len(remaining))
     header.extend(remaining)
     return bytes(header)
-
-
-def _props_or_empty(
-    props: Properties | None,
-    packet: str,
-    protocol: MQTTProtocolVersion,
-) -> bytes:
-    if protocol != MQTTProtocolVersion.MQTTv5:
-        return b""
-    if not props or not props.values:
-        return _EMPTY_PROPS_V5
-    return encode_properties(props, packet)
 
 
 def _require_outbound_mid(mid: int, what: str) -> None:

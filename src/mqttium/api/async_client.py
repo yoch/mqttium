@@ -255,14 +255,12 @@ class AsyncClient:
         # Keep established private test/compatibility seams as direct bound
         # operations while the controller remains the sole state owner.
         self._try_reserve_delivery = self._delivery.try_reserve
-        self._reserve_delivery_slow = self._delivery.reserve_slow
         self._release_delivery_reference_nowait = self._delivery.release_nowait
         self._release_delivery_reference = self._delivery.release
         self._delivery_logical_size = self._delivery.logical_size
         self._put_message = self._delivery.put_message
         self._accept_message = self._delivery.acceptor()
         self._accept_decoded_message = self._delivery.decoded_acceptor()
-        self._ensure_callback_worker = self._delivery.ensure_callback_worker
         self._spawn_callback = self._delivery.spawn_callback
         self._try_enqueue_callback = self._delivery.try_enqueue_callback
         self._has_callback_capacity = self._delivery.has_callback_capacity
@@ -359,10 +357,6 @@ class AsyncClient:
         return self._delivery.pending_high_water_bytes
 
     @property
-    def _delivery_waiters(self) -> int:
-        return self._delivery.waiters
-
-    @property
     def _delivery_accounted_limit(self) -> int | None:
         return self._delivery.accounted_limit
 
@@ -415,14 +409,6 @@ class AsyncClient:
     @property
     def _outbound_waiters(self) -> int:
         return self._write_pump.waiters
-
-    @property
-    def _last_outbound(self) -> float:
-        return self._write_pump.last_outbound
-
-    @_last_outbound.setter
-    def _last_outbound(self, value: float) -> None:
-        self._write_pump.last_outbound = value
 
     def stats(self) -> ClientStats:
         """Return an immutable point-in-time runtime snapshot.
@@ -1644,12 +1630,9 @@ class AsyncClient:
             return 0
         return self._delivery.deliver_decoded_batch_inline(effects, self.on_message)
 
-    async def _flush_effects(self, *, nowait: bool = False) -> None:
+    async def _flush_effects(self) -> None:
         async with self._engine_lock:
             self._collect_effects_locked()
-        if nowait:
-            self._schedule_effect_flush()
-            return
         await self._drain_effects()
 
     async def _apply_effect(  # noqa: C901 -- reduced from 44; remaining branches own lifecycle

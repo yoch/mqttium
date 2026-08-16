@@ -226,6 +226,9 @@ class EffectPump:
                     effect = self.pending[0]
                     epoch = self.pending_epoch
                     if epoch is None:
+                        # Unreachable: the epoch is stamped whenever the deque
+                        # becomes non-empty and cleared only when it empties.
+                        # Retained to narrow `int | None` for the calls below.
                         self.pending.clear()
                         break
                     if epoch != self.owner._connection_epoch:

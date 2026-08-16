@@ -177,10 +177,6 @@ class ProtocolEngine:
     def flow(self) -> FlowControl:
         return self.outbound.flow
 
-    @flow.setter
-    def flow(self, flow: FlowControl) -> None:
-        self.outbound.flow = flow
-
     @property
     def _queued(self) -> deque[OutboundMessage | OutboundMessageSummary]:
         return self.outbound._queued
@@ -217,10 +213,6 @@ class ProtocolEngine:
     @property
     def _recovered_inbound_mids(self) -> set[int]:
         return self.inbound._recovered_mids
-
-    @_recovered_inbound_mids.setter
-    def _recovered_inbound_mids(self, value: set[int]) -> None:
-        self.inbound._recovered_mids = value
 
     @property
     def _pending_sub_mids(self) -> KeysView[int]:
