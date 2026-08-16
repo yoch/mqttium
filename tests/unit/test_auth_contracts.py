@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from mqttium.codec.buffer import IncrementalDecoder, RawPacket
+from mqttium.codec.properties import encode_properties
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, PacketType
 from mqttium.errors import ProtocolError
 from mqttium.packets import AuthPacket
@@ -116,7 +117,9 @@ def test_broker_cannot_send_reauthenticate_reason_after_connack() -> None:
         )
     )
     engine.begin_connect()
-    engine.handle_raw(RawPacket(PacketType.CONNACK, 0, b"\x00\x00\x00"))
+    body = bytearray((0x00, 0x00))
+    body.extend(encode_properties(_props(), "CONNACK"))
+    engine.handle_raw(RawPacket(PacketType.CONNACK, 0, bytes(body)))
     engine.take_effects()
 
     engine.handle_raw(_raw_auth(0x19, "demo"))

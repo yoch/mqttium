@@ -117,6 +117,10 @@ class ProtocolEngine:
         self._sent_request_problem_information = 1
         self._sent_request_response_information = 0
         self._auth_method: str | None = None
+        # True only between a Client Re-authenticate AUTH (0x19) and the
+        # Server's terminal AUTH Success (0x00). Initial enhanced authentication
+        # is represented by CONNECTING and completes with CONNACK instead.
+        self._reauth_in_progress = False
         self._handlers = {
             PacketType.CONNACK: self._on_connack,
             PacketType.PUBLISH: self.inbound.handle_publish,
@@ -349,6 +353,7 @@ class ProtocolEngine:
         self._auth_method = (
             str(configured_auth_method) if configured_auth_method is not None else None
         )
+        self._reauth_in_progress = False
         self._sent_clean_start = clean_start
         self._sent_session_expiry_interval = (
             connect_props.get("session_expiry_interval") if connect_props is not None else None
@@ -509,6 +514,7 @@ class ProtocolEngine:
         self.state = ConnectionState.DISCONNECTED
         self.inbound.transport_closed()
         self._pending_connect = False
+        self._reauth_in_progress = False
         # Release sub/unsub MIDs still in flight — no ACK will arrive now.
         if self._pending_sub_requests:
             if self.outbound.pending_messages == 0:
@@ -566,6 +572,15 @@ class ProtocolEngine:
                 self._protocol_disconnect(0x82)
                 raise ProtocolError("CONNACK authentication_method does not match CONNECT")
             if (
+                connack.reason_code == 0
+                and self._auth_method is not None
+                and connack_method is None
+            ):
+                self._protocol_disconnect(0x82)
+                raise ProtocolError(
+                    "Successful CONNACK must repeat CONNECT authentication_method [MQTT-4.12.0-5]"
+                )
+            if (
                 connack.properties is not None
                 and connack.properties.get("authentication_data") is not None
                 and self._auth_method is None
@@ -582,6 +597,7 @@ class ProtocolEngine:
                     "CONNACK response_information was not requested [MQTT-3.1.2-28]"
                 )
         if connack.reason_code != 0:
+            self._reauth_in_progress = False
             self.state = ConnectionState.DISCONNECTED
             self._emit(EffectKind.CONNACK, connack)
             self._emit(
@@ -625,6 +641,7 @@ class ProtocolEngine:
             local_client_id=self.config.client_id,
         )
 
+        self._reauth_in_progress = False
         self.state = ConnectionState.CONNECTED
         self.session_present = connack.session_present
         self._update_session_resume_preference()
@@ -743,6 +760,7 @@ class ProtocolEngine:
 
     def _on_disconnect(self, raw: RawPacket) -> None:
         reason_code, properties = self.codec.decode_disconnect(raw.remaining)
+        self._reauth_in_progress = False
         self.state = ConnectionState.DISCONNECTED
         self._emit(
             EffectKind.DISCONNECTED,
@@ -772,19 +790,41 @@ class ProtocolEngine:
         self._validate_inbound_problem_information(PacketType.AUTH, packet.properties)
         if self._auth_method is None:
             self._protocol_disconnect(0x82)
-            return
+            raise ProtocolError("Broker AUTH is invalid without authentication_method in CONNECT")
         packet_method = (
             packet.properties.get("authentication_method")
             if packet.properties is not None
             else None
         )
-        if packet_method is not None and packet_method != self._auth_method:
+        if packet_method != self._auth_method:
             self._protocol_disconnect(0x82)
-            return
+            if packet_method is None:
+                raise ProtocolError(
+                    "AUTH must repeat CONNECT authentication_method [MQTT-4.12.0-5]"
+                )
+            raise ProtocolError("AUTH authentication_method does not match CONNECT")
         if packet.reason_code == 0x19:
             # MQTT 5 Table 3-11 assigns Re-authenticate to Client→Server only.
             self._protocol_disconnect(0x82)
             raise ProtocolError("Broker must not send Re-authenticate AUTH (0x19)")
+        if self.state is ConnectionState.CONNECTING:
+            if packet.reason_code != 0x18:
+                self._protocol_disconnect(0x82)
+                raise ProtocolError(
+                    "Server AUTH during initial authentication must use Continue "
+                    "authentication (0x18) [MQTT-4.12.0-2]"
+                )
+        elif self.state is ConnectionState.CONNECTED:
+            if not self._reauth_in_progress:
+                self._protocol_disconnect(0x82)
+                raise ProtocolError(
+                    "Server AUTH while connected requires Client-initiated re-authentication"
+                )
+            if packet.reason_code == 0x00:
+                self._reauth_in_progress = False
+            elif packet.reason_code != 0x18:
+                self._protocol_disconnect(0x82)
+                raise ProtocolError("Invalid Server AUTH reason during re-authentication")
         if not self.config.accept_auth:
             # The peer continued an exchange the runtime cannot service. This is
             # a protocol failure on the active connection, not a CONNACK refusal.
@@ -806,6 +846,7 @@ class ProtocolEngine:
                 pass
             else:
                 self._send(packet)
+        self._reauth_in_progress = False
         self.state = ConnectionState.DISCONNECTED
         self._emit(
             EffectKind.DISCONNECTED,
@@ -833,8 +874,13 @@ class ProtocolEngine:
                 f"AUTH reason_code 0x{reason_code:02X} is not one a Client may send; "
                 "use 0x18 (Continue authentication) or 0x19 (Re-authenticate)"
             )
-        if reason_code == 0x19 and self.state is not ConnectionState.CONNECTED:
-            raise ProtocolError("Re-authenticate AUTH requires a connected session")
+        if reason_code == 0x19:
+            if self.state is not ConnectionState.CONNECTED:
+                raise ProtocolError("Re-authenticate AUTH requires a connected session")
+            if self._reauth_in_progress:
+                raise ProtocolError("Re-authentication is already in progress")
+        elif self.state is ConnectionState.CONNECTED and not self._reauth_in_progress:
+            raise ProtocolError("Continue authentication AUTH requires an active re-authentication")
         auth_properties = Properties(
             values=dict(properties.values) if properties is not None else {}
         )
@@ -849,6 +895,8 @@ class ProtocolEngine:
         ).encode(self.config.protocol)
         self._check_outbound_size(wire)
         self._send(wire)
+        if reason_code == 0x19:
+            self._reauth_in_progress = True
 
     def _check_outbound_size(self, wire: WriteItem) -> None:
         limit = self.negotiated.maximum_packet_size

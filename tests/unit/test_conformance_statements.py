@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 
 from mqttium.codec.buffer import IncrementalDecoder
+from mqttium.codec.properties import encode_properties
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, OutboundQoSState, PacketType, QoS
 from mqttium.errors import ProtocolError
 from mqttium.packets import PublishPacket, encode_frame
@@ -370,6 +371,13 @@ def test_mqtt_3_3_2_8_topic_alias_zero_is_refused() -> None:
         engine.queue_publish("t/x", b"v", qos=QoS.AT_MOST_ONCE, properties=properties)
 
 
+def _auth_connack(method: str = "M") -> bytes:
+    properties = Properties({"authentication_method": method})
+    body = bytearray((0x00, 0x00))
+    body.extend(encode_properties(properties, "CONNACK"))
+    return encode_frame(PacketType.CONNACK, 0, body)
+
+
 def test_mqtt_3_15_1_1_auth_reserved_flags_are_validated() -> None:
     """[MQTT-3.15.1-1] Bits 3,2,1 and 0 of the Fixed Header of the AUTH packet
     are reserved and MUST all be set to 0."""
@@ -385,8 +393,9 @@ def test_mqtt_3_15_1_1_auth_reserved_flags_are_validated() -> None:
         MemoryInflightStore(),
     )
     engine.begin_connect()
-    _feed(engine, encode_frame(PacketType.CONNACK, 0, b"\x00\x00\x00"))
+    _feed(engine, _auth_connack())
     engine.take_effects()
+    assert engine.state is ConnectionState.CONNECTED
     assert _rejects(engine, encode_frame(PacketType.AUTH, 0b0001, b"\x18\x00"))
 
 
@@ -620,8 +629,9 @@ def _auth_engine(*, connected: bool) -> ProtocolEngine:
     engine.begin_connect()
     engine.take_effects()
     if connected:
-        _feed(engine, encode_frame(PacketType.CONNACK, 0, b"\x00\x00\x00"))
+        _feed(engine, _auth_connack())
         engine.take_effects()
+        assert engine.state is ConnectionState.CONNECTED
     return engine
 
 
