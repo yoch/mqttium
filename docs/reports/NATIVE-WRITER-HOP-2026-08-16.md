@@ -134,14 +134,73 @@ the number is a timer artifact. A caveat has been added to
 This affects any future candidate that makes the publisher faster or slower —
 which is most of them — so it is worth checking before trusting a lag verdict.
 
-## Not measured
+## Corroboration: MQTT 5, outbound windows, payload size, reconnect
 
-- MQTT 5, payloads other than 256 B, and windows other than 64. The hop removed
-  is per-frame and version-independent, but only this cell was measured.
+These were listed as unmeasured in the first draft of this report. They have
+since been checked. **Only the MQTT 3.1.1 / window 64 cells above are
+certified**; everything in this section is corroborative or deterministic.
+
+**MQTT 5, windows 20 and 64** — four cells, `--repeat 6`, same host:
+
+| window | rate | gain | pairs | lag ratio | completed |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 20 | 2 500 | +29.5 % | 6/6 | 0.968 | 1.0144 |
+| 20 | 7 500 | +26.5 % | 6/6 | 0.774 | 1.0097 |
+| 64 | 2 500 | +29.7 % | 6/6 | 0.962 | 1.0150 |
+| 64 | 7 500 | +18.4 % | 6/6 | 0.929 | 1.0069 |
+
+Every cell gains, every pair favours the candidate, no cell shows a loop-lag
+increase, and both outbound windows behave alike. **None of them certifies**:
+across three attempts no single cell had a clean A/A *and* a clean A/B at the
+same time — the failing gate moved between runs (A/A baseline CV 14.36 %, A/B
+baseline CV 49.99 %, A/A baseline CV 5.50 %), which is what a host too busy to
+measure looks like. The last attempt needed 42 probe retries, about ten
+minutes, merely to find an eligible moment.
+
+One A/A cell reported a loop-lag ratio of **1.1651 with identical code on both
+arms**, and the same cell returned 1.001 and 0.981 on a later run. That is the
+artifact described above appearing inside a control, and is independent
+evidence that the metric — not the change — is what misbehaves.
+
+A structural argument, offered as an argument and not as evidence: the eager
+path operates on frames the codec has already encoded, so it cannot be
+sensitive to what is inside them. MQTT 5 differs from 3.1.1 only in frame
+content.
+
+**Payload size** — deterministic, no timing involved. Twenty QoS 0 publications
+per size, against a transport modelling a socket buffer:
+
+| payload | segmented | eager | queued |
+| ---: | :---: | ---: | ---: |
+| 256 B | no | 20/20 | 0 |
+| 4 KiB | no | 19/20 | 1 |
+| 32 KiB | no | 14/20 | 6 |
+| 64 KiB | no | 10/20 | 10 |
+| 128 KiB | **yes** | **0/20** | 40 |
+| 1 MiB | **yes** | **0/20** | 40 |
+
+Two thresholds disengage the path and both matter: `write_nowait` declines once
+the socket buffer is above its 64 KiB high-water mark, and a segmented
+`(header, payload)` item past `SEGMENT_THRESHOLD` (128 KiB) is never eligible.
+Large publications therefore take exactly the path they took before this
+change, which is what makes them regression-free rather than merely untested.
+Pinned by `tests/unit/test_write_pump_eager.py`.
+
+**Reconnect** — `benchmarks/soak.py`, 40 cycles, 500 messages each, MQTT 5,
+forced reconnect every 3 cycles: 21 000 published and 21 000 received across 13
+forced reconnects, `resource_assessment.status = stable`, no publisher idle
+violations, file descriptors flat at 10 and tasks at 8. This run is what
+prompted the audit that found the stale-binding defect fixed in the commit
+after this one.
+
+## Still not measured
+
 - WebSocket, which has no `write_nowait` and keeps the queued path unchanged.
 - The `receipt` completion discipline, which the attribution report established
   is not a valid neutral control for this change.
 - Rates above 10 000 msgs/s, where the base arm's CV made every cell unusable.
+- Payloads between 128 KiB and 1 MiB under load against a real broker; only the
+  deterministic path selection above was checked for them.
 
 ## Reproduction
 
