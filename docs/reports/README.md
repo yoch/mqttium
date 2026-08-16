@@ -14,6 +14,7 @@ descriptions of current behaviour are the contracts in
 
 | Date | Report | Records |
 | --- | --- | --- |
+| 2026-08-16 | [`NATIVE-WRITER-HOP-2026-08-16.md`](NATIVE-WRITER-HOP-2026-08-16.md) | Validates the eager write that removes the writer-task hop: +16.7% to +27.8% callback p50 at four load points on an eligible host, throughput unchanged or better. Also documents why the harness's loop-lag ratio penalises the faster arm inside a transition band. |
 | 2026-08-16 | [`NATIVE-PUBACK-ATTRIBUTION-2026-08-16.md`](NATIVE-PUBACK-ATTRIBUTION-2026-08-16.md) | Diagnostic-only attribution for Gap B of the floors plan, on an ineligible host: the isolated callback worker is the faster of the two completion disciplines, so the inline-on_publish experiment is not justified; the writer-task hop is exactly one event-loop turn on every outbound packet. No code changed. |
 | 2026-08-16 | [`COMPAT-PUBLISH-HANDOFF-2026-08-16.md`](COMPAT-PUBLISH-HANDOFF-2026-08-16.md) | Answers Gaps A, C and D of the floors plan: the compat QoS 1/2 publish handoff stopped blocking the producer thread (measured single-producer drain batch 1.00 to 203.50), QoS 0 moved to the writer-direct path (2 effects per message to 0), and why the proposed thread-safe PacketIdPool was rejected. |
 | 2026-08-16 | [`FLOORS-NOT-CEILINGS-2026-08-16.md`](FLOORS-NOT-CEILINGS-2026-08-16.md) | Work plan: treat Paho QoS 1 throughput and awscrt/paho equal-offer PUBACK latency as attainable floors. No code change; experiments are to be run in this repository. |

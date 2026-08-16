@@ -138,6 +138,27 @@ In both cases:
 - memory limits and public semantics must remain unchanged;
 - added complexity requires an explicit, measured trade-off.
 
+The loop-lag ratio is only readable when both arms sit in the same pacing
+regime, and it silently penalises the faster one when they do not.
+`loop_lag_p95` measures how late the paced publisher wakes relative to its own
+deadline, so it is bimodal: while the publisher still has slack it genuinely
+sleeps between messages and the value sits on a plateau set by timer wake-up
+granularity (~1 ms on the reference host); once its per-iteration work exceeds
+the pacing interval it stops sleeping and the value collapses by roughly 5× to
+something that measures loop congestion. A candidate that changes publisher
+per-iteration cost moves the rate at which that transition happens, so at rates
+inside the transition band the ratio compares a plateau value against a
+collapsed one and reports a large regression for what is in fact an
+improvement. Baseline CV inflates in the same band, because the slower arm
+flips between modes from sample to sample.
+
+Before trusting a lag verdict, compare the two arms' **absolute**
+`loop_lag_p95`: values near the plateau mean the publisher is still sleeping and
+the number is a timer artifact, not congestion. Choose load points where both
+arms are on the same side of the transition. A worked example, including the
+sweep that identified the band, is in
+[`reports/NATIVE-WRITER-HOP-2026-08-16.md`](reports/NATIVE-WRITER-HOP-2026-08-16.md).
+
 ## Memory thresholds
 
 `check_memory_thresholds.py` validates `memory_profile.py` immediately after the

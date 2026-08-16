@@ -16,6 +16,11 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   transport write, in 50 of 50 publishes, becomes 0. The same turn was paid by
   every automatic PUBACK. Wire order and the one-write-in-flight rule are
   unchanged; segmented `(header, payload)` frames are never written this way.
+  Validated on a preflight-eligible host against a live broker: median callback
+  p50 latency improves by 16.7% to 27.8% across four load points (2 500, 4 000,
+  4 500 and 7 500 msgs/s) with every pair favouring the change, while the
+  completed rate is unchanged or slightly higher. See
+  `docs/reports/NATIVE-WRITER-HOP-2026-08-16.md`.
 - `mqttium.compat.paho`: QoS 1/2 `publish()` no longer blocks the calling thread
   until the network loop has allocated a packet identifier. All QoS levels now
   return as soon as the request is accepted, matching Paho's shape. Measured with
