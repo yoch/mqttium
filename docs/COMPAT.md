@@ -64,7 +64,7 @@ For one-shot helpers, prefer the async-native `mqttium.helpers` API instead of
 | `connect_async` | Supported | Not supported | Use `AsyncClient` for native asynchronous operation |
 | Non-compliant QoS > 0 republish with a clean session | Historically ambiguous | **Strict MQTT behavior** | Correctness takes precedence over bug compatibility |
 | MID for QoS 0 | Allocated | `None` | QoS 0 has no protocol packet identifier |
-| `MQTTMessageInfo.mid` for QoS 1/2 | The wire packet identifier | A façade correlation identifier, wrapping over `1..65535` and reserved until that publication settles | `publish()` returns before loop-side admission, so no packet identifier exists yet. Packet identifiers stay loop-owned (§8); the façade binds its own value to the real one and translates back when `on_publish` is dispatched. A wrap collision with an active façade MID is refused with `MQTT_ERR_QUEUE_SIZE`, rather than aliasing two live publications |
+| `MQTTMessageInfo.mid` for QoS 1/2 | The wire packet identifier | A façade correlation identifier, wrapping over `1..65535` and reserved through completion delivery | `publish()` returns before loop-side admission, so no packet identifier exists yet. Packet identifiers stay loop-owned (§8); the façade binds its own value to the real one and translates back when `on_publish` is dispatched. If no callback is due, the MID retires when the native receipt settles; if a dispatcher is already due, it stays reserved until that dispatch finishes. A wrap collision with an active façade MID is refused with `MQTT_ERR_QUEUE_SIZE` instead of aliasing two live/completing publications |
 | Blocking calls from the network thread | Often tolerated from callbacks | **Rejected** with `RuntimeError` | Waiting on the same loop would deadlock the single-writer architecture |
 | Off-network-thread `publish()` | Internal queue and immediate return | QoS 0/1/2 share a coalesced façade queue and **all return immediately** | No publish waits for the network loop or for writer progress, ordering is preserved across QoS levels, and the protocol engine remains loop-owned |
 | WebSocket / proxy / SOCKS support | Broad surface | WebSocket through `AsyncClient.connect_ws`; not through the sync façade | Keep transport concerns separate from compatibility concerns |
@@ -144,19 +144,21 @@ configured high enough for the largest publication accepted by the façade.
 No caller waits for the loop. Packet identifiers remain loop-owned, so the
 façade cannot hand back a wire identifier at `publish()` time; it mints a
 correlation identifier from its own wrapping `1..65535` namespace instead. The
-calling thread reserves that façade MID until the publication's native receipt
-settles; if the wrapping generator lands on a façade MID that is still active,
-the new publication is refused rather than sharing an identifier. Once the
-network loop commits the request, the façade binds its MID to the real packet
-identifier and translates it back when `on_publish` is dispatched.
+calling thread reserves that façade MID until completion no longer has a publish
+dispatcher to deliver. If the wrapping generator lands on a façade MID that is
+still active, the new publication is refused rather than sharing an identifier.
+Once the network loop commits the request, the façade binds its MID to the real
+packet identifier and translates it back when `on_publish` is dispatched.
 
-Correlation state follows the publication lifetime, not the instantaneous
-callback setting. This matters because `on_publish` may be added or removed
-while a QoS 1/2 publication is still in flight, and a dispatcher may already be
-queued when the property changes. A private one-shot receipt-settlement hook
-retires the façade reservation even if the application never waits on the
-handle; correlation is retained only as long as a current or already-queued
-dispatcher can still consume it. The inner `AsyncClient.on_publish` remains
+Correlation state follows the completion-delivery lifetime, not the
+instantaneous callback setting. This matters because `on_publish` may be added
+or removed while a QoS 1/2 publication is still in flight, and a dispatcher may
+already be queued when the property changes. A private one-shot receipt-settlement
+hook retires the façade reservation immediately when no dispatcher can still be
+delivered; otherwise the queued dispatcher owns the reservation and releases it
+after the publish callback path finishes. Thus an application that never waits
+on the handle cannot leak an active MID, while a slow/already-queued callback
+cannot race a wrapped MID reuse. The inner `AsyncClient.on_publish` remains
 installed only while the user callback is configured, preserving the native
 no-callback fast path.
 
@@ -200,6 +202,6 @@ still pending, which is what preserves ordering across QoS levels.
 - `tests/unit/test_compat_lib_subset.py` — behavioral compatibility subset
 - `tests/unit/test_compat_publish_perf.py` — effect ordering, MID reuse, mixed-QoS coalescing, cancellation, loop shutdown, and concurrent QoS 1 admission
 - `tests/unit/test_compat_publish_edges.py` — oversized drain handling and complete QoS 2 publish handshake
-- `tests/unit/test_compat_facade_mid_lifecycle.py` — façade MID wrap collisions, settlement release, and callback-toggle correlation
+- `tests/unit/test_compat_facade_mid_lifecycle.py` — façade MID wrap collisions, settlement/callback release, and callback-toggle correlation
 - `tests/integration/test_compat_publish_live.py` — end-to-end QoS 0 and concurrent QoS 1 callbacks and delivery
 - `benchmarks/compat_qosn_submit_ab.py` — coroutine, callback, and coalesced QoS 1 submit-rate/latency comparison
