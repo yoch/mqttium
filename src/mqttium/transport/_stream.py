@@ -37,6 +37,25 @@ class StreamTransport:
         self._writer.write(data)
         await self._drain_if_needed()
 
+    def write_nowait(self, data: bytes) -> bool:
+        """Buffer one frame without awaiting, or decline when a drain is due.
+
+        The high-water mark is checked *before* writing, not after: a caller on
+        this path cannot await a drain, so it must never create the need for
+        one. Declining sends the frame back to the writer task, which can.
+
+        Returning ``False`` therefore means nothing was written, and the caller
+        still owns the frame. This is deliberately absent from
+        :class:`AsyncTransport`: it is an optimisation a transport may offer,
+        not an obligation, and a transport whose write is more than a buffer
+        append (WebSocket masks and may flush control frames first) must not
+        provide it.
+        """
+        if write_buffer_needs_drain(self._writer):
+            return False
+        self._writer.write(data)
+        return True
+
     async def write_many(self, parts: list[bytes]) -> None:
         if not parts:
             return

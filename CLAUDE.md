@@ -118,8 +118,8 @@ Two layers, strictly separated:
   futures, receipts and messages. Two runtime mechanisms are factored out into their own owners,
   and the client keeps only read-only views of their state:
   - `api/_writer.py` — `WritePump` owns the write queue, byte/count backpressure, batching, the
-    single writer task and the last-write timestamp. `AsyncClient` decides what a writer failure
-    does to protocol state; it does not touch the queue.
+    writer task, the eager `write_nowait` bypass and the last-write timestamp. `AsyncClient`
+    decides what a writer failure does to protocol state; it does not touch the queue.
   - `api/_effects.py` — `EffectPump` owns the connection-scoped effect deque, the inline/slow-path
     accounting and the `mqttium-effect-flush` task. `AsyncClient._collect_effects_locked` is bound
     to `EffectPump.collect_from_engine` at construction, and `_pending_effects`,
@@ -135,8 +135,15 @@ timer, socket or callback belongs in the client. Do not leak `asyncio` into `pro
 These come from `docs/IMPLEMENTATION-GUIDE.md` §1 and have dedicated regression tests — breaking one
 surfaces as a confusing failure elsewhere:
 
-1. **Single writer.** Exactly one task writes to the transport, fed by a FIFO queue. Wire order ==
-   the order of engine `SEND` effects. Nothing else calls `transport.write`.
+1. **Single writer.** `WritePump` is the only component that writes to the transport, and at most
+   one write is in flight at a time. Wire order == the order of engine `SEND` effects. Nothing
+   outside `WritePump` calls `transport.write`. The writing *task* is not fixed: when the queue is
+   empty, no write is in flight and nobody is waiting on `enqueue()`, `try_enqueue` buffers a
+   non-segmented frame straight through the transport's optional `write_nowait` and skips the
+   writer-task wakeup (one event-loop turn per outbound packet, PUBACKs included). The `_writing`
+   flag is what makes that safe — a segmented `(header, payload)` item is two consecutive writes,
+   and a frame landing between them would corrupt the packet — so never take the eager path for a
+   tuple item, and never clear `_writing` before the whole batch has been written.
 2. **Receipts before wire.** A future/receipt keyed by a packet id is registered *before* the packet
    can leave; the ACK may land during the very next `await`.
 3. **Owned bytes.** The engine only ever receives owned `bytes`; `IncrementalDecoder` copies at the

@@ -8,6 +8,14 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Changed
 
+- Outbound writes no longer always cost an event-loop turn. When the writer
+  queue is empty, no write is in flight and no producer is waiting for queue
+  space, `WritePump` buffers a non-segmented frame straight through the
+  transport, instead of waking the writer task to do it. Measured by counting
+  loop iterations (not timings): 1 turn between `publish_nowait()` and the
+  transport write, in 50 of 50 publishes, becomes 0. The same turn was paid by
+  every automatic PUBACK. Wire order and the one-write-in-flight rule are
+  unchanged; segmented `(header, payload)` frames are never written this way.
 - `mqttium.compat.paho`: QoS 1/2 `publish()` no longer blocks the calling thread
   until the network loop has allocated a packet identifier. All QoS levels now
   return as soon as the request is accepted, matching Paho's shape. Measured with
@@ -33,6 +41,12 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Added
 
+- `ClientStats.writer` gains `eager_writes` and `eager_bytes`: how many frames
+  bypassed the writer-task wakeup, and how many bytes they carried.
+- `StreamTransport.write_nowait(data) -> bool` (TCP and Unix): buffer one frame
+  without awaiting, declining when a drain is due. It is deliberately **not** on
+  the `AsyncTransport` protocol — a transport may offer it, and one whose write
+  is more than a buffer append must not, so `WebSocketTransport` does not.
 - `mqttium.compat.paho.Client(max_outbound_inflight=...)`: cap unfinished QoS 1/2
   publications below the broker's Receive Maximum. Attach-time only, so it can no
   longer be reached only by rebuilding the inner `AsyncClient`.
