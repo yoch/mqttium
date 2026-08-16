@@ -69,7 +69,9 @@ def test_engine_emits_auth_when_accepted() -> None:
     )
     engine.begin_connect()
     engine.take_effects()
-    full = AuthPacket(reason_code=0x18).encode()
+    auth_props = Properties()
+    auth_props.set("authentication_method", "demo")
+    full = AuthPacket(reason_code=0x18, properties=auth_props).encode()
     from mqttium.codec.vbi import decode_vbi
 
     _, pos = decode_vbi(full, 1)
@@ -95,14 +97,19 @@ async def test_async_client_auth_handler_exchange() -> None:
             for raw in self._decoder.drain_packets():
                 if raw.packet_type is PacketType.CONNECT:
                     # Challenge then CONNACK success.
-                    challenge = AuthPacket(reason_code=0x18)
                     props = Properties()
                     props.set("authentication_method", "demo")
                     challenge = AuthPacket(reason_code=0x18, properties=props)
                     self._rx.put_nowait(challenge.encode())
                 elif raw.packet_type is PacketType.AUTH:
-                    # CONNACK success with empty MQTT5 properties.
-                    self._rx.put_nowait(encode_frame(PacketType.CONNACK, 0, b"\x00\x00\x00"))
+                    # Successful enhanced-auth CONNACK repeats the method.
+                    from mqttium.codec.properties import encode_properties
+
+                    props = Properties()
+                    props.set("authentication_method", "demo")
+                    body = bytearray([0x00, 0x00])
+                    body.extend(encode_properties(props, "CONNACK"))
+                    self._rx.put_nowait(encode_frame(PacketType.CONNACK, 0, body))
 
         async def read(self, n: int = 65536) -> bytes:
             return await self._rx.get()
