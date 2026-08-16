@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from typing import cast
 
 from mqttium.transport._stream import StreamTransport, _WRITE_BUFFER_HIGH_WATER
 
@@ -25,7 +26,13 @@ class _Writer:
 
 def _stream(buffered: int) -> tuple[StreamTransport, _Writer]:
     writer = _Writer(_BufferTransport(buffered))
-    stream = StreamTransport(asyncio.StreamReader(), writer)  # type: ignore[arg-type]
+    # write_nowait() only consults the writer/transport. Keep this unit test
+    # independent of asyncio's process-global event-loop policy so it behaves
+    # identically on Python 3.11 through 3.14.
+    stream = StreamTransport(
+        cast(asyncio.StreamReader, object()),
+        cast(asyncio.StreamWriter, writer),
+    )
     return stream, writer
 
 
