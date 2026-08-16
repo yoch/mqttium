@@ -14,6 +14,7 @@ descriptions of current behaviour are the contracts in
 
 | Date | Report | Records |
 | --- | --- | --- |
+| 2026-08-16 | [`FLOORS-NOT-CEILINGS-2026-08-16.md`](FLOORS-NOT-CEILINGS-2026-08-16.md) | Work plan: treat Paho QoS 1 throughput and awscrt/paho equal-offer PUBACK latency as attainable floors. No code change; experiments are to be run in this repository. |
 | 2026-08-16 | [`RELEASE-CANDIDATE-1.0.0rc5.md`](RELEASE-CANDIDATE-1.0.0rc5.md) | RC5 release evidence for the post-RC4 callback/delivery and MQTT 5 hot-path improvements, repository-wide Bugbot reconciliation, and exact artifact gates. |
 | 2026-08-14 | [`SINGLE-MESSAGE-INLINE-DELIVERY-2026-08-14.md`](SINGLE-MESSAGE-INLINE-DELIVERY-2026-08-14.md) | Removes the conservative two-effect threshold from the existing bounded inline MESSAGE admission after source-isolated scheduler-path validation. |
 | 2026-08-14 | [`INDEPENDENT-QOS0-LATENCY-AUDIT-2026-08-14.md`](INDEPENDENT-QOS0-LATENCY-AUDIT-2026-08-14.md) | Independent native audit of QoS 0 completion/backpressure and direct latency diagnosis: callback scheduling was the bottleneck; a bounded fast admission path was retained after eligible-host A/A and A/B validation. |
@@ -82,6 +83,10 @@ sets the offered rate for every open-loop point.
 
 Do not treat the cross-client latency column as a statement about MQTTium until that harness can
 defend it.
+
+The 2026-08-16 external campaign (`1.0.0rc5`) is summarised as floors — not as a glass ceiling —
+in [`FLOORS-NOT-CEILINGS-2026-08-16.md`](FLOORS-NOT-CEILINGS-2026-08-16.md). Equal-offer PUBACK
+and sync-peer QoS 1 remain the comparisons that matter; native QoS 0/1/2 capacity already leads.
 
 ## Memory campaign
 
