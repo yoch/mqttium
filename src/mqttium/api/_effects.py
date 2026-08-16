@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Protocol
 
 from mqttium.api.stats import EffectStats
@@ -149,21 +150,18 @@ class EffectPump:
         if self.waiters:
             self.progress.set()
 
-    def _consume_message_batch(self, epoch: int) -> bool:
-        """Apply a consecutive non-persisted small-MESSAGE prefix."""
-        applied = self.owner._apply_message_effect_batch_inline(self.pending, epoch)
-        if not applied:
-            return False
-        for _ in range(applied):
-            self.pending.popleft()
-            self.inline_effects += 1
-            self._complete()
-        if not self.pending:
-            self.pending_epoch = None
-        return True
+    def _consume_batch(
+        self,
+        apply: Callable[[deque[EngineEffect], int], int],
+        epoch: int,
+    ) -> bool:
+        """Apply a consecutive non-persisted small-message prefix.
 
-    def _consume_decoded_message_batch(self, epoch: int) -> bool:
-        applied = self.owner._apply_decoded_message_effect_batch_inline(self.pending, epoch)
+        `apply` is the owner's MESSAGE or DECODED_MESSAGE batch acceptor; only
+        which one is bound differs between the two kinds. One call per batch,
+        not per message.
+        """
+        applied = apply(self.pending, epoch)
         if not applied:
             return False
         for _ in range(applied):
@@ -190,11 +188,13 @@ class EffectPump:
             while self.pending:
                 effect = self.pending[0]
                 if effect.kind is EffectKind.MESSAGE:
-                    if self._consume_message_batch(epoch):
+                    if self._consume_batch(self.owner._apply_message_effect_batch_inline, epoch):
                         continue
                     break
                 if effect.kind is EffectKind.DECODED_MESSAGE:
-                    if self._consume_decoded_message_batch(epoch):
+                    if self._consume_batch(
+                        self.owner._apply_decoded_message_effect_batch_inline, epoch
+                    ):
                         continue
                     break
                 if not self.owner._apply_effect_inline(effect, epoch):
@@ -235,10 +235,14 @@ class EffectPump:
                         self.discard_connection_effects()
                         continue
                     if effect.kind is EffectKind.MESSAGE:
-                        if self._consume_message_batch(epoch):
+                        if self._consume_batch(
+                            self.owner._apply_message_effect_batch_inline, epoch
+                        ):
                             continue
                     elif effect.kind is EffectKind.DECODED_MESSAGE:
-                        if self._consume_decoded_message_batch(epoch):
+                        if self._consume_batch(
+                            self.owner._apply_decoded_message_effect_batch_inline, epoch
+                        ):
                             continue
                     try:
                         await self.owner._apply_effect(effect, nowait=False, epoch=epoch)

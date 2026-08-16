@@ -2,6 +2,16 @@
 
 Functions remain deliberately specialized by protocol version; grouping them
 by packet family keeps navigation simple without adding hot-path dispatch.
+
+The asymmetry between the decoders and the encoders here is deliberate. The
+**decoders** are what the engine binds and calls per acknowledgement, and each
+one is a direct, helper-free implementation: that is the property measured in
+`docs/reports/ACK-SPECIALIZED-PRIMITIVES.md` and it must not be factored away.
+The **encoders** are not on that path at all — the engine writes success
+acknowledgements from four-byte literals in the directional sessions, and the
+only encoder it can reach is PUBREL, for an orphan PUBREC. Their sole remaining
+consumers are the `Pub*Packet` dataclasses, so they share one implementation
+per version rather than repeating it four times.
 """
 
 from __future__ import annotations
@@ -70,52 +80,42 @@ def decode_pubcomp_v311(remaining: bytes) -> tuple[int, int, Properties | None]:
     return mid, 0, None
 
 
-def encode_puback_v311(
+def _encode_ack_v311(
+    first_byte: int,
+    packet: str,
     mid: int,
-    reason_code: int = 0,
-    properties: Properties | None = None,
+    reason_code: int,
+    properties: Properties | None,
 ) -> bytes:
     if not 1 <= mid <= 65535:
-        raise ProtocolError("PUBACK packet identifier must be in 1..65535")
+        raise ProtocolError(f"{packet} packet identifier must be in 1..65535")
     if reason_code != 0 or (properties and properties.values):
-        raise ProtocolError("PUBACK reason/properties require MQTT 5")
-    return bytes((0x40, 2, mid >> 8, mid & 0xFF))
+        raise ProtocolError(f"{packet} reason/properties require MQTT 5")
+    return bytes((first_byte, 2, mid >> 8, mid & 0xFF))
+
+
+def encode_puback_v311(
+    mid: int, reason_code: int = 0, properties: Properties | None = None
+) -> bytes:
+    return _encode_ack_v311(0x40, PUBACK, mid, reason_code, properties)
 
 
 def encode_pubrec_v311(
-    mid: int,
-    reason_code: int = 0,
-    properties: Properties | None = None,
+    mid: int, reason_code: int = 0, properties: Properties | None = None
 ) -> bytes:
-    if not 1 <= mid <= 65535:
-        raise ProtocolError("PUBREC packet identifier must be in 1..65535")
-    if reason_code != 0 or (properties and properties.values):
-        raise ProtocolError("PUBREC reason/properties require MQTT 5")
-    return bytes((0x50, 2, mid >> 8, mid & 0xFF))
+    return _encode_ack_v311(0x50, PUBREC, mid, reason_code, properties)
 
 
 def encode_pubrel_v311(
-    mid: int,
-    reason_code: int = 0,
-    properties: Properties | None = None,
+    mid: int, reason_code: int = 0, properties: Properties | None = None
 ) -> bytes:
-    if not 1 <= mid <= 65535:
-        raise ProtocolError("PUBREL packet identifier must be in 1..65535")
-    if reason_code != 0 or (properties and properties.values):
-        raise ProtocolError("PUBREL reason/properties require MQTT 5")
-    return bytes((0x62, 2, mid >> 8, mid & 0xFF))
+    return _encode_ack_v311(0x62, PUBREL, mid, reason_code, properties)
 
 
 def encode_pubcomp_v311(
-    mid: int,
-    reason_code: int = 0,
-    properties: Properties | None = None,
+    mid: int, reason_code: int = 0, properties: Properties | None = None
 ) -> bytes:
-    if not 1 <= mid <= 65535:
-        raise ProtocolError("PUBCOMP packet identifier must be in 1..65535")
-    if reason_code != 0 or (properties and properties.values):
-        raise ProtocolError("PUBCOMP reason/properties require MQTT 5")
-    return bytes((0x70, 2, mid >> 8, mid & 0xFF))
+    return _encode_ack_v311(0x70, PUBCOMP, mid, reason_code, properties)
 
 
 _PUBACK_REASONS = frozenset({0x00, 0x10, 0x80, 0x83, 0x87, 0x90, 0x91, 0x97, 0x99})
@@ -206,85 +206,43 @@ def decode_pubcomp_v5(remaining: bytes) -> tuple[int, int, Properties | None]:
     return mid, reason, properties
 
 
-def encode_puback_v5(
+def _encode_ack_v5(
+    first_byte: int,
+    packet: str,
+    allowed: frozenset[int],
     mid: int,
-    reason_code: int = 0,
-    properties: Properties | None = None,
+    reason_code: int,
+    properties: Properties | None,
 ) -> bytes:
     if not 1 <= mid <= 65535:
-        raise ProtocolError("PUBACK packet identifier must be in 1..65535")
+        raise ProtocolError(f"{packet} packet identifier must be in 1..65535")
     if reason_code == 0 and not (properties and properties.values):
-        return bytes((0x40, 2, mid >> 8, mid & 0xFF))
-    if reason_code not in _PUBACK_REASONS:
-        raise ProtocolError(f"PUBACK contains invalid reason code 0x{reason_code:02x}")
+        return bytes((first_byte, 2, mid >> 8, mid & 0xFF))
+    if reason_code not in allowed:
+        raise ProtocolError(f"{packet} contains invalid reason code 0x{reason_code:02x}")
     if not (properties and properties.values):
-        return bytes((0x40, 3, mid >> 8, mid & 0xFF, reason_code))
+        return bytes((first_byte, 3, mid >> 8, mid & 0xFF, reason_code))
     body = bytearray((mid >> 8, mid & 0xFF, reason_code))
-    body.extend(encode_properties(properties, PUBACK))
-    header = bytearray((0x40,))
+    body.extend(encode_properties(properties, packet))
+    header = bytearray((first_byte,))
     append_vbi(header, len(body))
     header.extend(body)
     return bytes(header)
 
 
-def encode_pubrec_v5(
-    mid: int,
-    reason_code: int = 0,
-    properties: Properties | None = None,
-) -> bytes:
-    if not 1 <= mid <= 65535:
-        raise ProtocolError("PUBREC packet identifier must be in 1..65535")
-    if reason_code == 0 and not (properties and properties.values):
-        return bytes((0x50, 2, mid >> 8, mid & 0xFF))
-    if reason_code not in _PUBREC_REASONS:
-        raise ProtocolError(f"PUBREC contains invalid reason code 0x{reason_code:02x}")
-    if not (properties and properties.values):
-        return bytes((0x50, 3, mid >> 8, mid & 0xFF, reason_code))
-    body = bytearray((mid >> 8, mid & 0xFF, reason_code))
-    body.extend(encode_properties(properties, PUBREC))
-    header = bytearray((0x50,))
-    append_vbi(header, len(body))
-    header.extend(body)
-    return bytes(header)
+def encode_puback_v5(mid: int, reason_code: int = 0, properties: Properties | None = None) -> bytes:
+    return _encode_ack_v5(0x40, PUBACK, _PUBACK_REASONS, mid, reason_code, properties)
 
 
-def encode_pubrel_v5(
-    mid: int,
-    reason_code: int = 0,
-    properties: Properties | None = None,
-) -> bytes:
-    if not 1 <= mid <= 65535:
-        raise ProtocolError("PUBREL packet identifier must be in 1..65535")
-    if reason_code == 0 and not (properties and properties.values):
-        return bytes((0x62, 2, mid >> 8, mid & 0xFF))
-    if reason_code not in _PUBREL_REASONS:
-        raise ProtocolError(f"PUBREL contains invalid reason code 0x{reason_code:02x}")
-    if not (properties and properties.values):
-        return bytes((0x62, 3, mid >> 8, mid & 0xFF, reason_code))
-    body = bytearray((mid >> 8, mid & 0xFF, reason_code))
-    body.extend(encode_properties(properties, PUBREL))
-    header = bytearray((0x62,))
-    append_vbi(header, len(body))
-    header.extend(body)
-    return bytes(header)
+def encode_pubrec_v5(mid: int, reason_code: int = 0, properties: Properties | None = None) -> bytes:
+    return _encode_ack_v5(0x50, PUBREC, _PUBREC_REASONS, mid, reason_code, properties)
+
+
+def encode_pubrel_v5(mid: int, reason_code: int = 0, properties: Properties | None = None) -> bytes:
+    return _encode_ack_v5(0x62, PUBREL, _PUBREL_REASONS, mid, reason_code, properties)
 
 
 def encode_pubcomp_v5(
-    mid: int,
-    reason_code: int = 0,
-    properties: Properties | None = None,
+    mid: int, reason_code: int = 0, properties: Properties | None = None
 ) -> bytes:
-    if not 1 <= mid <= 65535:
-        raise ProtocolError("PUBCOMP packet identifier must be in 1..65535")
-    if reason_code == 0 and not (properties and properties.values):
-        return bytes((0x70, 2, mid >> 8, mid & 0xFF))
-    if reason_code not in _PUBCOMP_REASONS:
-        raise ProtocolError(f"PUBCOMP contains invalid reason code 0x{reason_code:02x}")
-    if not (properties and properties.values):
-        return bytes((0x70, 3, mid >> 8, mid & 0xFF, reason_code))
-    body = bytearray((mid >> 8, mid & 0xFF, reason_code))
-    body.extend(encode_properties(properties, PUBCOMP))
-    header = bytearray((0x70,))
-    append_vbi(header, len(body))
-    header.extend(body)
-    return bytes(header)
+    return _encode_ack_v5(0x70, PUBCOMP, _PUBCOMP_REASONS, mid, reason_code, properties)

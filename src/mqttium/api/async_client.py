@@ -868,21 +868,27 @@ class AsyncClient:
             raise MQTTError("Connection cancelled by disconnect()")
         return connack_fut.result()
 
-    async def _send_connecting_disconnect(self, reason_code: int) -> None:
-        packet = self._engine.begin_disconnect(reason_code)
-        admitted = self._try_enqueue_outbound(packet, epoch=self._connection_epoch)
-        if not admitted:
+    async def _flush_terminal_packet(self, packet: WriteItem, timeout: float) -> None:
+        """Admit a terminal packet and wait, bounded, for the writer to drain it.
+
+        Shutdown must not wait for application traffic to free a bounded queue,
+        so a packet that cannot be admitted immediately is dropped rather than
+        parked. StaleConnectionEffect is deliberately not caught here: whether a
+        dead epoch is an error depends on the caller.
+        """
+        if not self._try_enqueue_outbound(packet, epoch=self._connection_epoch):
             return
         writer_task = self._write_pump.task
         if writer_task is None or writer_task.done():
             return
         try:
-            await asyncio.wait_for(
-                self._write_pump.join(),
-                timeout=_GRACEFUL_DISCONNECT_DRAIN_TIMEOUT,
-            )
+            await asyncio.wait_for(self._write_pump.join(), timeout=timeout)
         except TimeoutError:
             pass
+
+    async def _send_connecting_disconnect(self, reason_code: int) -> None:
+        packet = self._engine.begin_disconnect(reason_code)
+        await self._flush_terminal_packet(packet, _GRACEFUL_DISCONNECT_DRAIN_TIMEOUT)
 
     async def disconnect(self, reason_code: int = 0) -> None:
         self._intentional_disconnect = True
@@ -921,27 +927,12 @@ class AsyncClient:
                 return
             try:
                 if packet is not None:
-                    # Shutdown must not wait for application traffic to free a
-                    # bounded queue. If the terminal packet cannot be admitted
-                    # immediately, close the transport instead of deadlocking.
                     try:
-                        admitted = self._try_enqueue_outbound(
-                            packet,
-                            epoch=self._connection_epoch,
+                        await self._flush_terminal_packet(
+                            packet, _GRACEFUL_DISCONNECT_DRAIN_TIMEOUT
                         )
                     except StaleConnectionEffect:
-                        admitted = False
-                    if admitted:
-                        try:
-                            # Skip the wait if the writer already died.
-                            writer_task = self._write_pump.task
-                            if writer_task is not None and not writer_task.done():
-                                await asyncio.wait_for(
-                                    self._write_pump.join(),
-                                    timeout=_GRACEFUL_DISCONNECT_DRAIN_TIMEOUT,
-                                )
-                        except TimeoutError:
-                            pass
+                        pass
             finally:
                 await self._force_close()
 
@@ -1387,12 +1378,14 @@ class AsyncClient:
                     self._reconnect_loop(), name="mqttium-reconnect"
                 )
 
-    def _will_reconnect(self) -> bool:
-        reason = None
+    def _retry_reason(self) -> int | None:
+        """The reason code the reconnect policy judges: broker DISCONNECT, else CONNACK."""
         if self._last_disconnect is not None and self._last_disconnect.from_broker:
-            reason = self._last_disconnect.reason_code
-        elif self._last_connack_reason is not None:
-            reason = self._last_connack_reason
+            return self._last_disconnect.reason_code
+        return self._last_connack_reason
+
+    def _will_reconnect(self) -> bool:
+        reason = self._retry_reason()
         return (
             not isinstance(self._disconnect_exc, MessageDeliveryError)
             and not self._intentional_disconnect
@@ -1524,11 +1517,7 @@ class AsyncClient:
     async def _reconnect_loop(self) -> None:
         try:
             while self._reconnect.enabled and not self._intentional_disconnect:
-                reason = None
-                if self._last_disconnect is not None and self._last_disconnect.from_broker:
-                    reason = self._last_disconnect.reason_code
-                elif self._last_connack_reason is not None:
-                    reason = self._last_connack_reason
+                reason = self._retry_reason()
                 if not self._reconnect.should_retry(reason, self._engine.config.protocol):
                     self._fail_pending(self._disconnect_exc or MQTTError("Reconnect exhausted"))
                     return
@@ -1957,18 +1946,7 @@ class AsyncClient:
         try:
             packet = encode_disconnect(reason, MQTTProtocolVersion.MQTTv5)
             self._engine._check_outbound_size(packet)
-            admitted = self._try_enqueue_outbound(packet, epoch=self._connection_epoch)
-            if not admitted:
-                return
-            writer_task = self._write_pump.task
-            if writer_task is not None and not writer_task.done():
-                try:
-                    await asyncio.wait_for(
-                        self._write_pump.join(),
-                        timeout=_FATAL_DISCONNECT_DRAIN_TIMEOUT,
-                    )
-                except TimeoutError:
-                    pass
+            await self._flush_terminal_packet(packet, _FATAL_DISCONNECT_DRAIN_TIMEOUT)
         except Exception:
             pass
 

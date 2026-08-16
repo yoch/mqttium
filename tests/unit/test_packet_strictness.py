@@ -109,3 +109,49 @@ def test_connect_validates_keepalive_and_will_fields() -> None:
         ConnectPacket(client_id="x", keepalive=65536).encode()
     with pytest.raises(ProtocolError, match="Will QoS"):
         ConnectPacket(client_id="x", will_qos=QoS.AT_LEAST_ONCE).encode()
+
+
+def test_connect_encodes_each_protocol_version_layout() -> None:
+    """Pin the three CONNECT wire layouts, which share one encoder.
+
+    They differ only in the Protocol Name/Level prefix and in whether property
+    tables are present. MQTT 3.1 in particular had no encoding coverage while
+    its encoder lived inline in ConnectPacket.encode.
+    """
+    fields = dict(
+        client_id="c1",
+        clean_start=True,
+        keepalive=60,
+        username="u",
+        password=b"pw",
+        will_topic="w/t",
+        will_payload=b"bye",
+        will_qos=QoS.AT_LEAST_ONCE,
+        will_retain=True,
+    )
+    # Will + will QoS 1 + will retain + clean start + username + password.
+    flags = 0xEE
+    tail = b"\x00\x02c1" + b"\x00\x03w/t\x00\x03bye" + b"\x00\x01u" + b"\x00\x02pw"
+
+    v31 = ConnectPacket(protocol=MQTTProtocolVersion.MQTTv31, **fields).encode()
+    assert v31[2:11] == b"\x00\x06MQIsdp\x03"
+    assert v31[11] == flags
+    assert v31[12:14] == b"\x00\x3c"
+    assert v31[14:] == tail
+
+    v311 = ConnectPacket(protocol=V311, **fields).encode()
+    assert v311[2:9] == b"\x00\x04MQTT\x04"
+    assert v311[9] == flags
+    assert v311[10:12] == b"\x00\x3c"
+    assert v311[12:] == tail
+
+    # MQTT 5 interleaves an empty CONNECT table after keepalive and an empty
+    # WILL table before the Will Topic.
+    v5 = ConnectPacket(protocol=V5, **fields).encode()
+    assert v5[2:9] == b"\x00\x04MQTT\x05"
+    assert v5[9] == flags
+    assert v5[10:12] == b"\x00\x3c"
+    assert (
+        v5[12:]
+        == b"\x00" + b"\x00\x02c1" + b"\x00" + b"\x00\x03w/t\x00\x03bye" + b"\x00\x01u\x00\x02pw"
+    )
