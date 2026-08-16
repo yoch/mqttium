@@ -948,6 +948,16 @@ class Client:
             pending.append(entry)
         receipt._on_settle = self._settle_facade_receipt
 
+    def _receipt_still_registered(self, receipt: PublishReceipt) -> bool:
+        """Whether AsyncClient is bulk-settling this receipt without a callback."""
+        real_mid = receipt.mid
+        if real_mid is None:
+            return False
+        current = self._async._receipts.get(real_mid)
+        if current is receipt:
+            return True
+        return isinstance(current, deque) and any(item is receipt for item in current)
+
     def _facade_receipt_settled(self, receipt: PublishReceipt) -> None:
         """Retire a façade MID unless an on_publish dispatcher still owns it."""
         receipt_id = id(receipt)
@@ -956,11 +966,15 @@ class Client:
             return
         real_mid, facade_mid = binding
 
-        # AsyncClient captures/queues its publish callback around settlement. If
-        # the inner dispatcher is still installed on a live connection, keep
-        # the reservation until _dispatch_publish completes. This mirrors Paho,
-        # which removes the outbound MID only after on_publish returns.
-        if self._async.on_publish is not None and self._async.is_connected:
+        # Normal completion pops the receipt before settling it. AsyncClient's
+        # final bulk-failure path instead settles receipts while they are still
+        # registered and does not emit one on_publish callback per receipt. Keep
+        # a reservation only for the former case, when an inner dispatcher is
+        # actually installed and can consume the correlation entry.
+        callback_owns_mid = (
+            self._async.on_publish is not None and not self._receipt_still_registered(receipt)
+        )
+        if callback_owns_mid:
             return
 
         self._facade_receipts.pop(receipt_id, None)
