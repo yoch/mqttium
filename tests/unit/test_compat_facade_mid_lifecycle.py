@@ -33,7 +33,8 @@ def test_facade_mid_is_retired_without_user_callback_or_waiter() -> None:
 
     receipt = PublishReceipt(mid=7, qos=QoS.AT_LEAST_ONCE)
     client._register_facade_mid(receipt, facade_mid)
-    assert client._facade_mid_map[7][0][1] == facade_mid
+    assert client._facade_receipts[id(receipt)] == (7, facade_mid)
+    assert 7 not in client._facade_mid_map
     assert facade_mid in client._active_facade_mids
 
     receipt._settle()
