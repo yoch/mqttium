@@ -950,6 +950,13 @@ class OutboundSession:
         else:
             yield tuple(self.store.out_items())
 
+    def has_client_session_state(self) -> bool:
+        """Whether the client has an outbound exchange the Server can resume."""
+        # Hydration reserves a flow slot for every persisted WAIT_* exchange it
+        # can admit. The window is never reset before CONNACK, so a non-zero
+        # count is an O(1) proof that at least one sent QoS 1/2 exchange exists.
+        return self.flow.inflight > 0
+
     def hydrate(self) -> None:
         """Recover packet ids and the offline queue from a durable store."""
         with self.store.batch():
