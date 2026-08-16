@@ -17,7 +17,6 @@ from typing import Any
 from mqttium.api import AsyncClient, PublishMessage
 from mqttium.enums import MQTTProtocolVersion
 from mqttium.protocol.reconnect import ReconnectPolicy
-from mqttium.types import Properties
 
 try:
     import psutil
@@ -178,10 +177,6 @@ async def _disconnect_clients(
 async def run(args: argparse.Namespace) -> dict[str, object]:
     run_id = uuid.uuid4().hex[:12]
     topic = f"mqttium/soak/{run_id}"
-    connect_properties = None
-    if args.protocol is MQTTProtocolVersion.MQTTv5:
-        connect_properties = Properties(values={"session_expiry_interval": 60})
-
     subscriber = AsyncClient(
         f"mqttium-soak-sub-{run_id}",
         protocol=args.protocol,
@@ -192,8 +187,7 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
     publisher = AsyncClient(
         f"mqttium-soak-pub-{run_id}",
         protocol=args.protocol,
-        clean_start=False,
-        connect_properties=connect_properties,
+        clean_start=True,
         reconnect=ReconnectPolicy(
             enabled=True,
             initial_delay=0.05,

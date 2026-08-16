@@ -114,6 +114,7 @@ class InboundSession:
         "_recovered_mids",
         "_replay",
         "_stored_inbound",
+        "_session_state_qos2",
         "_transitions",
         "config",
         "handle_publish",
@@ -151,21 +152,31 @@ class InboundSession:
         # ordinary acquire path instead of a second decode.
         self._pending_auto_qos1_mids: set[int] = set()
         self._replay: InboundReplayCursor | None = None
-        self._recovered_mids, self._pending_bytes = self._load_recovered_state()
+        (
+            self._recovered_mids,
+            self._pending_bytes,
+            self._session_state_qos2,
+        ) = self._load_recovered_state()
         self._pending_high_water_bytes = self._pending_bytes
         # Occupancy of the inbound store, not the Receive Maximum counter.
         # Automatic QoS 1 never writes a row, so a durable subscriber whose
         # inbound table is empty must not probe SQLite on every PUBLISH.
         self._stored_inbound = len(self._recovered_mids)
 
-    def _load_recovered_state(self) -> tuple[set[int], int]:
-        """Restore persisted identifiers and their logical byte reservation."""
+    def _load_recovered_state(self) -> tuple[set[int], int, int]:
+        """Restore persisted identifiers, byte reservation, and QoS 2 state count."""
         transitions = self._transitions
         if transitions is None:
             eager_mids: set[int] = set()
             pending_bytes = 0
+            session_state_qos2 = 0
             for message in self.store.in_items():
                 eager_mids.add(message.mid)
+                if message.state in (
+                    InboundQoSState.WAIT_PUBREL,
+                    InboundQoSState.WAIT_USER_ACK,
+                ):
+                    session_state_qos2 += 1
                 size = message.logical_size or self.logical_size(
                     message.topic,
                     message.payload,
@@ -173,13 +184,19 @@ class InboundSession:
                 )
                 message.logical_size = size
                 pending_bytes += size
-            return eager_mids, pending_bytes
+            return eager_mids, pending_bytes, session_state_qos2
         mids: set[int] = set()
         pending_bytes = 0
+        session_state_qos2 = 0
         unknown_sizes: set[int] = set()
         for page in transitions.in_index_pages(REPLAY_PAGE_SIZE):
             for meta in page:
                 mids.add(meta.mid)
+                if meta.state in (
+                    InboundQoSState.WAIT_PUBREL,
+                    InboundQoSState.WAIT_USER_ACK,
+                ):
+                    session_state_qos2 += 1
                 if meta.logical_size > 0:
                     pending_bytes += meta.logical_size
                 else:
@@ -195,7 +212,7 @@ class InboundSession:
                         f"Inbound mid={message.mid} disappeared while restoring byte accounting"
                     )
                 pending_bytes += size
-        return mids, pending_bytes
+        return mids, pending_bytes, session_state_qos2
 
     # --- lifecycle ---------------------------------------------------------
 
@@ -221,6 +238,7 @@ class InboundSession:
         self._inflight = 0
         self._pending_bytes = 0
         self._stored_inbound = 0
+        self._session_state_qos2 = 0
         self._autoack_handoff_required = False
         self._pending_auto_qos1_mids.clear()
 
@@ -241,6 +259,10 @@ class InboundSession:
     def replay_pending(self) -> bool:
         """True while restart redelivery still has batches to emit."""
         return self._replay is not None
+
+    def has_client_session_state(self) -> bool:
+        """Whether an incomplete inbound QoS 2 exchange can be resumed."""
+        return self._session_state_qos2 > 0
 
     def stats(self) -> InboundStats:
         """Snapshot this session's own accounting."""
@@ -469,6 +491,7 @@ class InboundSession:
             self._release_slot(logical_size)
             raise
         self._remember_inbound()
+        self._session_state_qos2 += 1
         # Runtime effect application is SEND-first. Produce the protocol ACK in
         # that order here so every QoS2 delivery avoids EffectPump repartition.
         engine._send(_encode_pubrec_success(mid))
@@ -671,6 +694,7 @@ class InboundSession:
                 raise ProtocolError(f"Inbound mid={mid} disappeared while completing PUBREL")
             logical_size = self.stored_logical_size(popped)
         self._forget_inbound()
+        self._session_state_qos2 -= 1
         engine._send(_encode_pubcomp_success(mid))
         self._release_slot(logical_size)
 
@@ -735,6 +759,8 @@ class InboundSession:
                 raise ProtocolError(f"Inbound mid={mid} changed while acknowledging")
             logical_size = completed.logical_size
         self._forget_inbound()
+        if state is InboundQoSState.WAIT_USER_ACK:
+            self._session_state_qos2 -= 1
         self._engine._send(wire)
         self._release_slot(logical_size)
 
