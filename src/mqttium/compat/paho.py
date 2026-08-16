@@ -9,10 +9,12 @@ from __future__ import annotations
 import asyncio
 import enum
 import threading
+from collections import deque
 from collections.abc import Callable
-from concurrent.futures import Future, TimeoutError as FutureTimeoutError
+from concurrent.futures import Future
 from contextlib import suppress
 from dataclasses import dataclass, field
+from itertools import count
 from queue import Empty, SimpleQueue
 from typing import Any
 
@@ -33,8 +35,11 @@ class CallbackAPIVersion(enum.Enum):
 MQTT_ERR_SUCCESS = 0
 MQTT_ERR_QUEUE_SIZE = 15
 
-_PUBLISH_HANDOFF_TIMEOUT = 5.0
 _LOOP_HANDOFF_TIMEOUT = 5.0
+# Façade correlation identifiers wrap like Paho's, so an application that
+# already treats `mid` as a 16-bit value keeps working. They are NOT the wire
+# packet identifiers: see the `mid` row in docs/COMPAT.md.
+_MAX_FACADE_MID = 65_535
 _PUBLISH_BATCH_MAX_MESSAGES = 256
 _PUBLISH_BATCH_MAX_BYTES = 1 * 1024 * 1024
 
@@ -63,12 +68,15 @@ class MQTTMessageInfo:
     _handoff: Future[None] | None = field(default=None, repr=False)
     rc: int = 0
 
-    def wait_for_publish(self, timeout: float | None = None) -> None:
-        """Block until the publish completes; raise on protocol/transport error."""
+    def _raise_for_rc(self) -> None:
         if self.rc == MQTT_ERR_QUEUE_SIZE:
             raise ValueError("Message is not queued due to ERR_QUEUE_SIZE")
         if self.rc != MQTT_ERR_SUCCESS:
             raise RuntimeError(f"Message publish failed with rc={self.rc}")
+
+    def wait_for_publish(self, timeout: float | None = None) -> None:
+        """Block until the publish completes; raise on protocol/transport error."""
+        self._raise_for_rc()
         try:
             running_loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -77,6 +85,10 @@ class MQTTMessageInfo:
             raise RuntimeError("wait_for_publish() cannot block the network event loop")
         if self._handoff is not None:
             self._handoff.result(timeout)
+            # publish() returns before loop-side admission, so a refusal can
+            # land on rc after the handle was handed back. Re-check rather than
+            # report success for a publication that was never queued.
+            self._raise_for_rc()
         if self._receipt is None or self._receipt.is_done():
             if self._receipt is not None and self._receipt._error is not None:
                 raise self._receipt._error
@@ -87,14 +99,12 @@ class MQTTMessageInfo:
         fut.result(timeout)
 
     def is_published(self) -> bool:
-        if self.rc == MQTT_ERR_QUEUE_SIZE:
-            raise ValueError("Message is not queued due to ERR_QUEUE_SIZE")
-        if self.rc != MQTT_ERR_SUCCESS:
-            raise RuntimeError(f"Message publish failed with rc={self.rc}")
+        self._raise_for_rc()
         if self._handoff is not None:
             if not self._handoff.done():
                 return False
             self._handoff.result()
+            self._raise_for_rc()
         return self._receipt is None or self._receipt.is_done()
 
 
@@ -106,7 +116,7 @@ class _PendingPublish:
         "payload",
         "retain",
         "qos",
-        "future",
+        "info",
         "completion",
         "logical_size",
     )
@@ -117,14 +127,16 @@ class _PendingPublish:
         payload: bytes,
         retain: bool,
         qos: QoS,
-        future: Future[MQTTMessageInfo] | None,
-        completion: Future[None] | None = None,
+        info: MQTTMessageInfo | None,
+        completion: Future[None],
     ) -> None:
         self.topic = topic
         self.payload: bytes | None = payload
         self.retain = retain
         self.qos = qos
-        self.future = future
+        # The handle the producer thread already holds. QoS 0 has none: it has
+        # no receipt to attach and no packet identifier to correlate.
+        self.info = info
         self.completion = completion
         topic_size = len(topic) if topic.isascii() else len(topic.encode("utf-8"))
         self.logical_size = topic_size + len(payload)
@@ -210,6 +222,16 @@ class Client:
         self._pending_publish_requests = 0
         self._pending_publish_bytes = 0
         self._publish_drain_scheduled = False
+        # Paho allocates the identifier on the calling thread and returns; the
+        # engine's packet identifiers stay loop-owned (COMPAT.md §8), so the
+        # façade mints its own correlation namespace instead. `itertools.count`
+        # advances atomically, which is what lets `publish()` return without
+        # taking a lock or waiting for the loop.
+        self._facade_mids = count()
+        # real packet id -> façade mids, oldest first. Written when a QoS 1/2
+        # publication is committed and read when its completion is dispatched,
+        # both on the network loop, so it needs no lock.
+        self._facade_mid_map: dict[int, deque[int]] = {}
 
         self.on_connect: Callable[..., Any] | None = None
         self.on_disconnect: Callable[..., Any] | None = None
@@ -235,9 +257,20 @@ class Client:
         dispatcher unconditionally therefore charged every façade user for a
         callback they had not asked for, and cost them the fast path outright.
         """
+        # Installed on the loop, together with the flag `_register_facade_mid`
+        # reads: setting the flag first would open a window in which
+        # correlation ids are recorded with no dispatcher to drain them.
+        self._run_loop_mutation(lambda: self._install_publish_dispatch(callback))
+
+    def _install_publish_dispatch(self, callback: Callable[..., Any] | None) -> None:
         self._on_publish = callback
         dispatch = self._dispatch_publish if callback is not None else None
-        self._run_loop_mutation(lambda: setattr(self._async, "on_publish", dispatch))
+        self._async.on_publish = dispatch
+        if dispatch is None:
+            # Nothing will drain the correlation map once the dispatcher is
+            # gone. Entries for publications still in flight are dropped, not
+            # leaked; their completions have no callback left to reach.
+            self._facade_mid_map.clear()
 
     def user_data_set(self, userdata: Any) -> None:
         self._run_loop_mutation(lambda: setattr(self, "_userdata", userdata))
@@ -378,6 +411,10 @@ class Client:
             self._fail_pending_publish_requests(
                 RuntimeError("network loop stopped before publish admission")
             )
+            # Committed publications can no longer complete: nothing is left to
+            # dispatch their callbacks, so their correlation entries would
+            # outlive the loop generation that created them.
+            self._facade_mid_map.clear()
             pending = asyncio.all_tasks(loop)
             for task in pending:
                 task.cancel()
@@ -590,12 +627,8 @@ class Client:
             self._publish_drain_scheduled = False
         for request in pending:
             request.discard_payload()
-            future = request.future
-            if future is not None and not future.done():
-                future.set_exception(error)
-            completion = request.completion
-            if completion is not None and not completion.done():
-                completion.set_exception(error)
+            if not request.completion.done():
+                request.completion.set_exception(error)
 
     def _report_qos0_publish_error(self, error: BaseException) -> None:
         try:
@@ -610,7 +643,9 @@ class Client:
                     }
                 )
 
-    def _commit_qosn_publish_on_loop(self, request: _PendingPublish) -> MQTTMessageInfo:
+    def _commit_qosn_publish_on_loop(self, request: _PendingPublish) -> None:
+        info = request.info
+        assert info is not None
         receipt = self._queue_qosn_on_loop(
             request.topic,
             request.payload if request.payload is not None else b"",
@@ -618,68 +653,74 @@ class Client:
             retain=request.retain,
         )
         assert receipt.mid is not None
-        return MQTTMessageInfo(mid=receipt.mid, _receipt=receipt, _loop=self._loop)
+        self._register_facade_mid(receipt, info.mid)
+        # The producer thread reads `_receipt` only after the handoff future
+        # resolves, and that future is settled below. Publishing the receipt
+        # first is what makes the read safe without a lock.
+        info._receipt = receipt
 
     def _finalize_publish_effects(self) -> None:
         self._finalize_async_commands()
 
-    def _drain_publish_requests(self) -> None:  # noqa: C901
+    def _commit_publish_request(self, request: _PendingPublish) -> None:
+        """Admit one request on the loop. Raises when admission is refused."""
+        if request.qos is QoS.AT_MOST_ONCE:
+            self._queue_qos0_on_loop(
+                request.topic,
+                request.payload if request.payload is not None else b"",
+                retain=request.retain,
+            )
+        else:
+            self._commit_qosn_publish_on_loop(request)
+
+    def _reject_publish_request(
+        self, request: _PendingPublish, error: BaseException, *, refused: bool
+    ) -> bool:
+        """Record one failed admission; True when the caller must still settle it.
+
+        QoS 0 has no handle to carry an rc, so it is settled here and reported
+        through ``on_publish`` instead.
+        """
+        info = request.info
+        if info is None:
+            if not request.completion.done():
+                request.completion.set_exception(error)
+            self._report_qos0_publish_error(error)
+            return False
+        if refused:
+            # QoS 1/2 keeps Paho's shape: a refusal is an rc on the handle,
+            # which wait_for_publish()/is_published() check before they ever
+            # look at the handoff.
+            info.rc = MQTT_ERR_QUEUE_SIZE
+        return True
+
+    def _drain_publish_requests(self) -> None:
         """Commit a bounded mixed-QoS batch on the owning network loop."""
         batch, has_more = self._take_publish_batch()
-        results: list[
-            tuple[Future[MQTTMessageInfo], MQTTMessageInfo | None, BaseException | None]
-        ] = []
-        qos0_completions: list[Future[None]] = []
+        # (request, admission error). Settled only after the batch's effects are
+        # finalized, so a caller never observes a completion the writer has not
+        # yet accepted.
+        settled: list[tuple[_PendingPublish, BaseException | None]] = []
         committed = False
 
         try:
             for request in batch:
-                future = request.future
-                completion = request.completion
                 if self._stopping.is_set():
                     stop_error = RuntimeError("network loop stopped before publish admission")
-                    if future is not None and not future.done():
-                        future.set_exception(stop_error)
-                    if completion is not None and not completion.done():
-                        completion.set_exception(stop_error)
-                    continue
-                if future is not None and not future.set_running_or_notify_cancel():
+                    if not request.completion.done():
+                        request.completion.set_exception(stop_error)
                     continue
                 try:
-                    if request.qos is QoS.AT_MOST_ONCE:
-                        self._queue_qos0_on_loop(
-                            request.topic,
-                            request.payload if request.payload is not None else b"",
-                            retain=request.retain,
-                        )
-                        committed = True
-                        if completion is not None:
-                            qos0_completions.append(completion)
-                    else:
-                        info = self._commit_qosn_publish_on_loop(request)
-                        committed = True
-                        assert future is not None
-                        results.append((future, info, None))
+                    self._commit_publish_request(request)
                 except FlowControlError as exc:
-                    if future is None:
-                        if completion is not None and not completion.done():
-                            completion.set_exception(exc)
-                        self._report_qos0_publish_error(exc)
-                    else:
-                        results.append(
-                            (
-                                future,
-                                MQTTMessageInfo(mid=None, rc=MQTT_ERR_QUEUE_SIZE),
-                                None,
-                            )
-                        )
+                    if self._reject_publish_request(request, exc, refused=True):
+                        settled.append((request, None))
                 except BaseException as exc:
-                    if future is None:
-                        if completion is not None and not completion.done():
-                            completion.set_exception(exc)
-                        self._report_qos0_publish_error(exc)
-                    else:
-                        results.append((future, None, exc))
+                    if self._reject_publish_request(request, exc, refused=False):
+                        settled.append((request, exc))
+                else:
+                    committed = True
+                    settled.append((request, None))
         finally:
             for request in batch:
                 request.discard_payload()
@@ -700,41 +741,37 @@ class Client:
                         }
                     )
 
-        for completion in qos0_completions:
+        self._settle_publish_batch(settled, finalize_error)
+        self._reschedule_drain(has_more)
+
+    def _settle_publish_batch(
+        self,
+        settled: list[tuple[_PendingPublish, BaseException | None]],
+        finalize_error: BaseException | None,
+    ) -> None:
+        for request, error in settled:
+            completion = request.completion
             if completion.done():
                 continue
-            if finalize_error is None:
+            if error is not None:
+                completion.set_exception(error)
+            elif finalize_error is None:
                 completion.set_result(None)
             else:
                 completion.set_exception(finalize_error)
-                self._report_qos0_publish_error(finalize_error)
+                if request.qos is QoS.AT_MOST_ONCE:
+                    self._report_qos0_publish_error(finalize_error)
 
-        for future, result_info, error in results:
-            if error is not None:
-                future.set_exception(error)
-            else:
-                assert result_info is not None
-                future.set_result(result_info)
-
-        if has_more:
-            if self._stopping.is_set():
-                self._fail_pending_publish_requests(
-                    RuntimeError("network loop stopped before publish admission")
-                )
+    def _reschedule_drain(self, has_more: bool) -> None:
+        if not has_more:
+            # Close the producer race atomically with the scheduled flag. Queue
+            # insertion uses the same lock, so an empty queue is authoritative here.
+            with self._publish_schedule_lock:
+                has_more = not self._publish_pending.empty()
+                if not has_more:
+                    self._publish_drain_scheduled = False
+            if not has_more:
                 return
-            loop = self._loop
-            if loop is not None and loop.is_running():
-                loop.call_soon(self._drain_publish_requests)
-            return
-
-        # Close the producer race atomically with the scheduled flag. Queue
-        # insertion uses the same lock, so an empty queue is authoritative here.
-        with self._publish_schedule_lock:
-            has_pending = not self._publish_pending.empty()
-            if not has_pending:
-                self._publish_drain_scheduled = False
-        if not has_pending:
-            return
         if self._stopping.is_set():
             self._fail_pending_publish_requests(
                 RuntimeError("network loop stopped before publish admission")
@@ -751,11 +788,13 @@ class Client:
         qos: int = 0,
         retain: bool = False,
     ) -> MQTTMessageInfo:
-        """Queue a publish without waiting for TCP writer progress.
+        """Queue a publish without waiting for the network loop.
 
-        QoS 0 uses a coalesced façade queue. QoS 1/2 wait only for loop-side MID
-        allocation and receipt registration; admission failures return
-        ``MQTT_ERR_QUEUE_SIZE``.
+        Every QoS shares one coalesced façade queue and returns as soon as the
+        request is accepted, like Paho. ``mid`` is a façade correlation
+        identifier, not the wire packet identifier. Ingress saturation returns
+        ``MQTT_ERR_QUEUE_SIZE`` synchronously; a later admission refusal
+        surfaces through ``wait_for_publish()`` / ``is_published()``.
         """
         if payload is None:
             data = b""
@@ -777,6 +816,7 @@ class Client:
                         qos=requested_qos,
                         retain=retain,
                     )
+                    info = MQTTMessageInfo(mid=None, _receipt=receipt, _loop=self._loop)
                 else:
                     receipt = self._queue_qosn_on_loop(
                         topic,
@@ -784,44 +824,71 @@ class Client:
                         qos=requested_qos,
                         retain=retain,
                     )
-                info = MQTTMessageInfo(
-                    mid=receipt.mid,
-                    _receipt=receipt,
-                    _loop=self._loop,
-                )
+                    # Mint from the same namespace as the off-loop path: two
+                    # namespaces would let a façade mid collide with a real one
+                    # and make on_publish correlation ambiguous.
+                    info = MQTTMessageInfo(
+                        mid=self._next_facade_mid(),
+                        _receipt=receipt,
+                        _loop=self._loop,
+                    )
+                    self._register_facade_mid(receipt, info.mid)
             except FlowControlError:
                 return MQTTMessageInfo(mid=None, rc=MQTT_ERR_QUEUE_SIZE)
             self._finalize_publish_effects()
             return info
 
+        completion: Future[None] = Future()
         if requested_qos is QoS.AT_MOST_ONCE:
-            completion: Future[None] = Future()
             info = MQTTMessageInfo(mid=None, _loop=self._loop, _handoff=completion)
-            request = _PendingPublish(
-                topic, data, retain, requested_qos, None, completion=completion
+            request = _PendingPublish(topic, data, retain, requested_qos, None, completion)
+        else:
+            info = MQTTMessageInfo(
+                mid=self._next_facade_mid(), _loop=self._loop, _handoff=completion
             )
-            if not self._enqueue_publish_request(request):
-                request.discard_payload()
-                return MQTTMessageInfo(mid=None, rc=MQTT_ERR_QUEUE_SIZE)
-            return info
-
-        future: Future[MQTTMessageInfo] = Future()
-        request = _PendingPublish(topic, data, retain, requested_qos, future)
+            request = _PendingPublish(topic, data, retain, requested_qos, info, completion)
         if not self._enqueue_publish_request(request):
             request.discard_payload()
             return MQTTMessageInfo(mid=None, rc=MQTT_ERR_QUEUE_SIZE)
-        try:
-            return future.result(timeout=_PUBLISH_HANDOFF_TIMEOUT)
-        except FutureTimeoutError as exc:
-            if future.cancel():
-                request.discard_payload()
-                raise RuntimeError("publish handoff timed out before admission") from exc
-            # Admission has begun. The commit section is synchronous and bounded;
-            # returning its authoritative result avoids a false failure followed
-            # by a real publish.
-            return future.result()
+        return info
+
+    def _next_facade_mid(self) -> int:
+        return next(self._facade_mids) % _MAX_FACADE_MID + 1
+
+    def _register_facade_mid(self, receipt: PublishReceipt, facade_mid: int | None) -> None:
+        """Bind a committed packet identifier to its façade correlation id.
+
+        Only while an ``on_publish`` callback is installed: ``_dispatch_publish``
+        is what drains the map, and it is installed on the inner client only for
+        as long as the user callback is. Registering without it would leak, and
+        keeping the inner callback installed unconditionally would cost the
+        no-callback fast paths in ``AsyncClient``.
+        """
+        real_mid = receipt.mid
+        if real_mid is None or facade_mid is None or self._on_publish is None:
+            return
+        # Packet identifiers are reused, so completions are matched FIFO per
+        # identifier, exactly as AsyncClient settles its receipts.
+        pending = self._facade_mid_map.get(real_mid)
+        if pending is None:
+            self._facade_mid_map[real_mid] = deque((facade_mid,))
+        else:
+            pending.append(facade_mid)
+
+    def _resolve_facade_mid(self, real_mid: int) -> int:
+        pending = self._facade_mid_map.get(real_mid)
+        if pending is None:
+            # A publication committed before this façade bound the identifier
+            # (direct AsyncClient use). Report what the engine reported.
+            return real_mid
+        facade_mid = pending.popleft()
+        if not pending:
+            del self._facade_mid_map[real_mid]
+        return facade_mid
 
     def _dispatch_publish(self, mid: int | None, error: BaseException | None) -> None:
+        if mid is not None:
+            mid = self._resolve_facade_mid(mid)
         if self.on_publish is None:
             return
         reason_code = 0 if error is None else 1

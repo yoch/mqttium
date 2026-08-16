@@ -222,9 +222,166 @@ def test_off_loop_qosn_publish_avoids_coroutine_handoff(
 
         info = client.publish(f"perf/qos{qos}", b"x", qos=qos)
         assert info.mid is not None
-        assert client._async._pop_publish_receipt(info.mid) is info._receipt
+        # The handle is returned before admission, so the receipt lands later.
+        assert info._handoff is not None
+        info._handoff.result(timeout=5.0)
+        receipt = info._receipt
+        assert receipt is not None
+        assert receipt.mid is not None
+        assert client._async._pop_publish_receipt(receipt.mid) is receipt
     finally:
         client.loop_stop()
+
+
+def test_facade_mid_is_independent_of_the_wire_packet_id() -> None:
+    """``MQTTMessageInfo.mid`` is a façade correlation id, not the packet id.
+
+    Advancing the façade counter past the engine's frontier makes the two
+    namespaces observably different, so nothing can pass by coincidence.
+    """
+    client = Client(CallbackAPIVersion.VERSION2, client_id="facade-mid")
+    client.loop_start()
+    try:
+        client._async._engine.state = ConnectionState.CONNECTED
+        for _ in range(10):
+            client._next_facade_mid()
+
+        info = client.publish("facade/mid", b"x", qos=1)
+        assert info._handoff is not None
+        info._handoff.result(timeout=5.0)
+
+        receipt = info._receipt
+        assert receipt is not None
+        assert receipt.mid == 1
+        assert info.mid == 11
+    finally:
+        client.loop_stop()
+
+
+def test_facade_mids_resolve_fifo_when_a_packet_id_is_reused() -> None:
+    """Reused packet identifiers must not cross their correlation ids."""
+    client = Client(CallbackAPIVersion.VERSION2, client_id="facade-mid-fifo")
+    client.on_publish = lambda *_args: None
+    receipt = PublishReceipt(mid=7, qos=QoS.AT_LEAST_ONCE)
+    client._register_facade_mid(receipt, 101)
+    client._register_facade_mid(receipt, 102)
+
+    assert client._resolve_facade_mid(7) == 101
+    assert client._resolve_facade_mid(7) == 102
+    assert not client._facade_mid_map
+    # An identifier this façade never bound is reported as the engine gave it.
+    assert client._resolve_facade_mid(7) == 7
+
+
+def _settle_publish_on_loop(client: Client, mid: int) -> None:
+    done = threading.Event()
+
+    def settle() -> None:
+        try:
+            client._async._settle_publish(mid, None)
+        finally:
+            done.set()
+
+    assert client._loop is not None
+    client._loop.call_soon_threadsafe(settle)
+    assert done.wait(timeout=5.0)
+
+
+def test_single_producer_drains_batches_larger_than_one() -> None:
+    """The defect Gap A fixes: one producer must fill a real batch.
+
+    While ``publish()`` blocked on loop-side admission, the coalesced queue
+    could only ever hold the one request its caller was waiting for.
+    """
+    client = Client(CallbackAPIVersion.VERSION2, client_id="single-producer-batch")
+    batches: list[int] = []
+    original_take = client._take_publish_batch
+
+    def measured_take() -> Any:
+        batch, has_more = original_take()
+        batches.append(len(batch))
+        return batch, has_more
+
+    client._take_publish_batch = measured_take  # type: ignore[method-assign]
+    client.loop_start()
+    try:
+        client._async._engine.state = ConnectionState.CONNECTED
+        infos = [client.publish(f"batch/{index}", b"x", qos=1) for index in range(200)]
+        for info in infos:
+            assert info._handoff is not None
+            info._handoff.result(timeout=5.0)
+
+        assert max(batches) > 1
+        assert len({info.mid for info in infos}) == 200
+    finally:
+        client.loop_stop()
+
+
+def test_concurrent_publishers_get_unique_facade_mids() -> None:
+    client = Client(CallbackAPIVersion.VERSION2, client_id="facade-mid-concurrent")
+    client.loop_start()
+    mids: list[int | None] = []
+    errors: list[BaseException] = []
+    lock = threading.Lock()
+    try:
+        client._async._engine.state = ConnectionState.CONNECTED
+
+        def worker(worker_id: int) -> None:
+            local: list[int | None] = []
+            try:
+                for index in range(40):
+                    info = client.publish(f"concurrent/{worker_id}/{index}", b"x", qos=1)
+                    local.append(info.mid)
+            except BaseException as exc:  # pragma: no cover - failure path
+                with lock:
+                    errors.append(exc)
+            finally:
+                with lock:
+                    mids.extend(local)
+
+        threads = [threading.Thread(target=worker, args=(index,)) for index in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10.0)
+
+        assert not errors
+        assert len(mids) == 320
+        assert len(set(mids)) == 320
+    finally:
+        client.loop_stop()
+
+
+def test_facade_mid_map_is_cleared_when_the_callback_is_removed() -> None:
+    client = Client(CallbackAPIVersion.VERSION2, client_id="facade-mid-cleanup")
+    client.on_publish = lambda *_args: None
+    client.loop_start()
+    try:
+        client._async._engine.state = ConnectionState.CONNECTED
+        info = client.publish("cleanup/one", b"x", qos=1)
+        assert info._handoff is not None
+        info._handoff.result(timeout=5.0)
+        assert client._facade_mid_map
+
+        client.on_publish = None
+        assert not client._facade_mid_map
+    finally:
+        client.loop_stop()
+
+
+def test_facade_mid_map_is_cleared_when_the_loop_stops() -> None:
+    client = Client(CallbackAPIVersion.VERSION2, client_id="facade-mid-stop")
+    client.on_publish = lambda *_args: None
+    client.loop_start()
+    try:
+        client._async._engine.state = ConnectionState.CONNECTED
+        info = client.publish("stop/one", b"x", qos=1)
+        assert info._handoff is not None
+        info._handoff.result(timeout=5.0)
+        assert client._facade_mid_map
+    finally:
+        client.loop_stop()
+    assert not client._facade_mid_map
 
 
 def test_mixed_qos_requests_preserve_ingress_order(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -524,31 +681,46 @@ def test_publish_on_network_thread_outside_callback_is_inline() -> None:
         client.loop_stop()
 
 
-def test_publish_timeout_cancels_before_admission(monkeypatch: pytest.MonkeyPatch) -> None:
-    client = Client(CallbackAPIVersion.VERSION2, client_id="cancel-before-admission")
+def test_qosn_publish_does_not_wait_for_the_loop() -> None:
+    """The producer thread never blocks on loop-side admission.
+
+    This is the whole point of the façade MID namespace: with the loop wedged,
+    ``publish()`` must still return a usable handle immediately, and admission
+    must complete correctly once the loop is released.
+    """
+    client = Client(CallbackAPIVersion.VERSION2, client_id="nonblocking-qosn")
     client.loop_start()
     release = threading.Event()
     started = threading.Event()
     try:
         client._async._engine.state = ConnectionState.CONNECTED
-        monkeypatch.setattr(paho_compat, "_PUBLISH_HANDOFF_TIMEOUT", 0.01)
 
         def block_loop() -> None:
             started.set()
-            release.wait(timeout=2.0)
+            release.wait(timeout=5.0)
 
         assert client._loop is not None
         client._loop.call_soon_threadsafe(block_loop)
         assert started.wait(timeout=1.0)
 
-        with pytest.raises(RuntimeError, match="before admission"):
-            client.publish("timeout/cancelled", b"x", qos=1)
-        release.set()
-        time.sleep(0.05)
+        before = time.monotonic()
+        info = client.publish("nonblocking/qos1", b"x", qos=1)
+        elapsed = time.monotonic() - before
 
+        assert info.mid is not None
+        assert info.rc == 0
+        # The loop stays blocked for seconds; anything near that means the
+        # producer waited for admission.
+        assert elapsed < 0.5
+        # Nothing has been committed yet: the handle precedes the protocol state.
         assert client._async._engine.pending_outbound_messages == 0
-        assert not client._async._engine.packet_ids
-        assert not client._async._receipts
+
+        release.set()
+        assert info._handoff is not None
+        info._handoff.result(timeout=5.0)
+
+        assert client._async._engine.pending_outbound_messages == 1
+        assert info._receipt is not None
         assert client._pending_publish_requests == 0
         assert client._pending_publish_bytes == 0
     finally:
@@ -556,85 +728,69 @@ def test_publish_timeout_cancels_before_admission(monkeypatch: pytest.MonkeyPatc
         client.loop_stop()
 
 
-def test_publish_timeout_after_admission_returns_authoritative_result(
+def test_publish_handoff_settles_only_after_effect_finalization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    client = Client(CallbackAPIVersion.VERSION2, client_id="commit-after-timeout")
+    """A caller never observes a completion the writer has not yet accepted."""
+    client = Client(CallbackAPIVersion.VERSION2, client_id="settle-after-finalize")
     client.loop_start()
     release = threading.Event()
     started = threading.Event()
     original_finalize = client._finalize_publish_effects
     try:
         client._async._engine.state = ConnectionState.CONNECTED
-        monkeypatch.setattr(paho_compat, "_PUBLISH_HANDOFF_TIMEOUT", 0.01)
 
         def slow_finalize() -> None:
             started.set()
-            release.wait(timeout=2.0)
+            release.wait(timeout=5.0)
             original_finalize()
 
         monkeypatch.setattr(client, "_finalize_publish_effects", slow_finalize)
 
-        def release_later() -> None:
-            assert started.wait(timeout=1.0)
-            time.sleep(0.03)
-            release.set()
-
-        releaser = threading.Thread(target=release_later)
-        releaser.start()
-        info = client.publish("timeout/committed", b"x", qos=1)
-        releaser.join(timeout=1.0)
-
+        info = client.publish("finalize/committed", b"x", qos=1)
         assert info.mid is not None
+        assert started.wait(timeout=1.0)
+
+        assert info._handoff is not None
+        assert not info._handoff.done()
+
+        release.set()
+        info._handoff.result(timeout=5.0)
         assert client._async._engine.pending_outbound_messages == 1
     finally:
         release.set()
         client.loop_stop()
 
 
-def test_loop_stop_fails_queued_qos1_publish(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_loop_stop_fails_queued_qos1_publish() -> None:
+    """A publication queued when the loop stops fails on its handle."""
     client = Client(CallbackAPIVersion.VERSION2, client_id="stop-pending")
     client.loop_start()
     release = threading.Event()
     started = threading.Event()
-    errors: list[BaseException] = []
     try:
         client._async._engine.state = ConnectionState.CONNECTED
-        monkeypatch.setattr(paho_compat, "_PUBLISH_HANDOFF_TIMEOUT", 2.0)
 
         def block_loop() -> None:
             started.set()
-            release.wait(timeout=2.0)
+            release.wait(timeout=5.0)
 
         assert client._loop is not None
         client._loop.call_soon_threadsafe(block_loop)
         assert started.wait(timeout=1.0)
 
-        def publish() -> None:
-            try:
-                client.publish("stop/pending", b"x", qos=1)
-            except BaseException as exc:
-                errors.append(exc)
-
-        publisher = threading.Thread(target=publish)
-        publisher.start()
-        deadline = time.monotonic() + 1.0
-        while time.monotonic() < deadline:
-            if client._publish_spillover is not None or not client._publish_pending.empty():
-                break
-            time.sleep(0.001)
-        else:
-            raise AssertionError("publish request was not queued")
+        info = client.publish("stop/pending", b"x", qos=1)
+        assert info.mid is not None
+        assert not client._publish_pending.empty() or client._publish_spillover is not None
 
         releaser = threading.Thread(target=lambda: (time.sleep(0.05), release.set()))
         releaser.start()
         client.loop_stop()
-        publisher.join(timeout=1.0)
-        releaser.join(timeout=1.0)
+        releaser.join(timeout=2.0)
 
-        assert not publisher.is_alive()
-        assert len(errors) == 1
-        assert "stopped before publish admission" in str(errors[0])
+        with pytest.raises(RuntimeError, match="stopped before publish admission"):
+            info.wait_for_publish(timeout=2.0)
+
         assert client._async._engine.pending_outbound_messages == 0
         assert client._pending_publish_requests == 0
         assert client._pending_publish_bytes == 0
