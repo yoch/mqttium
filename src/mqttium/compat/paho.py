@@ -231,15 +231,15 @@ class Client:
         self._facade_mid_lock = threading.Lock()
         self._last_facade_mid = 0
         self._active_facade_mids: set[int] = set()
-        # A receipt settles on the network loop. The reverse index lets its
-        # one-shot settle hook decide whether the reservation can retire there
-        # or must survive until an already-planned on_publish dispatcher runs.
+        # Receipt identity is the authoritative correlation/lifetime index.
+        # It survives callback toggles and lets the settle hook decide whether
+        # a façade MID can retire or is owned by a queued publish dispatcher.
         self._facade_receipts: dict[int, tuple[int, int]] = {}
         self._settle_facade_receipt = self._facade_receipt_settled
-        # real packet id -> (receipt identity, façade mid), oldest first. This
-        # remains loop-confined. Entries are retained only until either the
-        # queued on_publish dispatcher consumes them or a completion occurs
-        # while no dispatcher can be queued.
+        # Fast dispatcher index: real packet id -> (receipt identity, façade
+        # mid), oldest first. It is loop-confined and only needs to be populated
+        # while on_publish is installed; the authoritative receipt index above
+        # preserves correlation while callbacks are disabled.
         self._facade_mid_map: dict[int, deque[tuple[int, int]]] = {}
 
         self.on_connect: Callable[..., Any] | None = None
@@ -266,9 +266,9 @@ class Client:
         dispatcher unconditionally therefore charged every façade user for a
         callback they had not asked for, and cost them the fast path outright.
 
-        Correlation entries are not cleared when the callback is removed: a
-        dispatcher may already be queued. Receipt settlement retires entries
-        that complete while no dispatcher can run.
+        Removing the callback clears only the fast wire-MID lookup. Receipt
+        identity remains authoritative, so an already-queued dispatcher or a
+        callback reinstalled before completion still resolves the façade MID.
         """
         # Installed on the loop together with `_on_publish`, so completion sees
         # an internally consistent callback state.
@@ -277,6 +277,18 @@ class Client:
     def _install_publish_dispatch(self, callback: Callable[..., Any] | None) -> None:
         self._on_publish = callback
         self._async.on_publish = self._dispatch_publish if callback is not None else None
+        self._facade_mid_map.clear()
+        if callback is None:
+            return
+        # Rebuild the fast index from the authoritative receipt bindings. Dict
+        # insertion order preserves FIFO for a wire MID that has been reused.
+        for receipt_id, (real_mid, facade_mid) in self._facade_receipts.items():
+            pending = self._facade_mid_map.get(real_mid)
+            entry = (receipt_id, facade_mid)
+            if pending is None:
+                self._facade_mid_map[real_mid] = deque((entry,))
+            else:
+                pending.append(entry)
 
     def user_data_set(self, userdata: Any) -> None:
         self._run_loop_mutation(lambda: setattr(self, "_userdata", userdata))
@@ -901,6 +913,18 @@ class Client:
             return MQTTMessageInfo(mid=None, rc=MQTT_ERR_QUEUE_SIZE)
         return info
 
+    def _next_facade_mid_locked(self) -> int:
+        mid = self._last_facade_mid + 1
+        if mid > _MAX_FACADE_MID:
+            mid = 1
+        self._last_facade_mid = mid
+        return mid
+
+    def _next_facade_mid(self) -> int:
+        """Advance the façade MID generator without reserving the value."""
+        with self._facade_mid_lock:
+            return self._next_facade_mid_locked()
+
     def _reserve_next_facade_mid(self) -> tuple[int, bool]:
         """Generate Paho's next wrapping MID and reserve it if it is free.
 
@@ -910,10 +934,7 @@ class Client:
         this calling-thread operation to one lock acquisition and one set lookup.
         """
         with self._facade_mid_lock:
-            mid = self._last_facade_mid + 1
-            if mid > _MAX_FACADE_MID:
-                mid = 1
-            self._last_facade_mid = mid
+            mid = self._next_facade_mid_locked()
             if mid in self._active_facade_mids:
                 return mid, False
             self._active_facade_mids.add(mid)
@@ -930,10 +951,11 @@ class Client:
 
         Correlation is registered even while the user callback is ``None`` so a
         callback installed before the ACK still sees the MID returned by
-        ``publish()``. The receipt's one-shot settle hook retires immediately
-        when no publish dispatcher exists; otherwise the reservation survives
-        until that dispatcher has delivered the completion, matching Paho's
-        active-MID lifetime.
+        ``publish()``. Receipt identity is authoritative; the fast wire-MID map
+        is populated only while a dispatcher is installed. The receipt's
+        one-shot settle hook retires immediately when no publish dispatcher
+        exists; otherwise the reservation survives until that dispatcher has
+        delivered completion, matching Paho's active-MID lifetime.
         """
         real_mid = receipt.mid
         if real_mid is None or facade_mid is None:
@@ -941,11 +963,12 @@ class Client:
         receipt_id = id(receipt)
         entry = (receipt_id, facade_mid)
         self._facade_receipts[receipt_id] = (real_mid, facade_mid)
-        pending = self._facade_mid_map.get(real_mid)
-        if pending is None:
-            self._facade_mid_map[real_mid] = deque((entry,))
-        else:
-            pending.append(entry)
+        if self._async.on_publish is not None:
+            pending = self._facade_mid_map.get(real_mid)
+            if pending is None:
+                self._facade_mid_map[real_mid] = deque((entry,))
+            else:
+                pending.append(entry)
         receipt._on_settle = self._settle_facade_receipt
 
     def _receipt_still_registered(self, receipt: PublishReceipt) -> bool:
@@ -970,7 +993,7 @@ class Client:
         # final bulk-failure path instead settles receipts while they are still
         # registered and does not emit one on_publish callback per receipt. Keep
         # a reservation only for the former case, when an inner dispatcher is
-        # actually installed and can consume the correlation entry.
+        # actually installed and can consume the authoritative binding.
         callback_owns_mid = (
             self._async.on_publish is not None and not self._receipt_still_registered(receipt)
         )
@@ -991,15 +1014,32 @@ class Client:
     def _take_facade_mid(self, real_mid: int) -> tuple[int, int | None]:
         """Consume one wire-to-façade correlation; return MID and release token."""
         pending = self._facade_mid_map.get(real_mid)
-        if pending is None:
-            # A publication committed before this façade bound the identifier
-            # (direct AsyncClient use). Report what the engine reported.
-            return real_mid, None
-        receipt_id, facade_mid = pending.popleft()
-        self._facade_receipts.pop(receipt_id, None)
-        if not pending:
-            del self._facade_mid_map[real_mid]
-        return facade_mid, facade_mid
+        if pending:
+            receipt_id, facade_mid = pending.popleft()
+            self._facade_receipts.pop(receipt_id, None)
+            if not pending:
+                del self._facade_mid_map[real_mid]
+            return facade_mid, facade_mid
+
+        # The callback may have been removed after AsyncClient queued this
+        # dispatcher, which deliberately clears the fast map. The authoritative
+        # receipt bindings survive that toggle, so consume the oldest matching
+        # binding directly. Dict insertion order preserves reuse FIFO.
+        for receipt_id, binding in self._facade_receipts.items():
+            bound_real_mid, facade_mid = binding
+            if bound_real_mid == real_mid:
+                del self._facade_receipts[receipt_id]
+                return facade_mid, facade_mid
+
+        # A publication committed before this façade bound the identifier
+        # (direct AsyncClient use). Report what the engine reported.
+        return real_mid, None
+
+    def _resolve_facade_mid(self, real_mid: int) -> int:
+        """Consume one correlation outside the callback path (test/debug helper)."""
+        facade_mid, release_mid = self._take_facade_mid(real_mid)
+        self._release_facade_mid(release_mid)
+        return facade_mid
 
     def _dispatch_publish(self, mid: int | None, error: BaseException | None) -> None:
         release_mid: int | None = None
