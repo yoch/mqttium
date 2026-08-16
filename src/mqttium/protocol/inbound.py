@@ -8,6 +8,7 @@ stream; handlers emit through it so observable effect ordering does not change.
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Iterator
 from typing import TYPE_CHECKING, NoReturn
 
@@ -109,6 +110,8 @@ class InboundSession:
         "_autoack_handoff_required",
         "_paged_store",
         "_pending_auto_qos1_mids",
+        "_pending_manual_qos1_acks",
+        "_manual_qos1_order",
         "_pending_bytes",
         "_pending_high_water_bytes",
         "_recovered_mids",
@@ -151,23 +154,29 @@ class InboundSession:
         # (or connection teardown) so a pipelined PUBLISH is admitted by the
         # ordinary acquire path instead of a second decode.
         self._pending_auto_qos1_mids: set[int] = set()
+        self._pending_manual_qos1_acks: set[int] = set()
         self._replay: InboundReplayCursor | None = None
         (
             self._recovered_mids,
             self._pending_bytes,
             self._session_state_qos2,
+            recovered_qos1,
         ) = self._load_recovered_state()
+        self._manual_qos1_order: deque[int] = deque(
+            recovered_qos1 if self.config.manual_ack else ()
+        )
         self._pending_high_water_bytes = self._pending_bytes
         # Occupancy of the inbound store, not the Receive Maximum counter.
         # Automatic QoS 1 never writes a row, so a durable subscriber whose
         # inbound table is empty must not probe SQLite on every PUBLISH.
         self._stored_inbound = len(self._recovered_mids)
 
-    def _load_recovered_state(self) -> tuple[set[int], int, int]:
-        """Restore persisted identifiers, byte reservation, and QoS 2 state count."""
+    def _load_recovered_state(self) -> tuple[set[int], int, int, tuple[int, ...]]:
+        """Restore identifiers, bytes, QoS 2 count, and durable QoS 1 arrival order."""
         transitions = self._transitions
         if transitions is None:
             eager_mids: set[int] = set()
+            eager_qos1: list[int] = []
             pending_bytes = 0
             session_state_qos2 = 0
             for message in self.store.in_items():
@@ -177,6 +186,8 @@ class InboundSession:
                     InboundQoSState.WAIT_USER_ACK,
                 ):
                     session_state_qos2 += 1
+                if message.state is InboundQoSState.WAIT_PUBACK:
+                    eager_qos1.append(message.mid)
                 size = message.logical_size or self.logical_size(
                     message.topic,
                     message.payload,
@@ -184,8 +195,9 @@ class InboundSession:
                 )
                 message.logical_size = size
                 pending_bytes += size
-            return eager_mids, pending_bytes, session_state_qos2
+            return eager_mids, pending_bytes, session_state_qos2, tuple(eager_qos1)
         mids: set[int] = set()
+        recovered_qos1: list[int] = []
         pending_bytes = 0
         session_state_qos2 = 0
         unknown_sizes: set[int] = set()
@@ -197,6 +209,8 @@ class InboundSession:
                     InboundQoSState.WAIT_USER_ACK,
                 ):
                     session_state_qos2 += 1
+                if meta.state is InboundQoSState.WAIT_PUBACK:
+                    recovered_qos1.append(meta.mid)
                 if meta.logical_size > 0:
                     pending_bytes += meta.logical_size
                 else:
@@ -212,7 +226,7 @@ class InboundSession:
                         f"Inbound mid={message.mid} disappeared while restoring byte accounting"
                     )
                 pending_bytes += size
-        return mids, pending_bytes, session_state_qos2
+        return mids, pending_bytes, session_state_qos2, tuple(recovered_qos1)
 
     # --- lifecycle ---------------------------------------------------------
 
@@ -222,12 +236,14 @@ class InboundSession:
         self._inflight = 0
         self._autoack_handoff_required = False
         self._pending_auto_qos1_mids.clear()
+        self._pending_manual_qos1_acks.clear()
         # A replay belongs to the connection that started it: its continuation
         # effect is dropped with the epoch, so the cursor must go too.
         self._replay = None
 
     def transport_closed(self) -> None:
         self._aliases.clear()
+        self._pending_manual_qos1_acks.clear()
         self.release_pending_auto_qos1()
 
     def discard_session(self) -> None:
@@ -241,6 +257,8 @@ class InboundSession:
         self._session_state_qos2 = 0
         self._autoack_handoff_required = False
         self._pending_auto_qos1_mids.clear()
+        self._pending_manual_qos1_acks.clear()
+        self._manual_qos1_order.clear()
 
     def release_pending_auto_qos1(self) -> None:
         """Free Receive Maximum slots once auto-PUBACKs leave the engine batch."""
@@ -621,6 +639,7 @@ class InboundSession:
                 self._release_slot(logical_size)
                 raise
             self._remember_inbound()
+            self._manual_qos1_order.append(mid)
         if not config.manual_ack:
             # Match the runtime's mandatory SEND-before-application order at the
             # producer, avoiding an EffectPump repartition on every auto-ACK.
@@ -737,14 +756,18 @@ class InboundSession:
                 if changed is None:
                     raise ProtocolError(f"Inbound mid={mid} changed while acknowledging")
             return
-        if state not in (InboundQoSState.WAIT_PUBACK, InboundQoSState.WAIT_USER_ACK):
+        if state is InboundQoSState.WAIT_PUBACK:
+            # PUBACK ordering is defined by PUBLISH arrival, not by application
+            # ack() call order [MQTT-4.6.0-2]. Keep the Receive Maximum slot and
+            # durable record until every earlier QoS 1 delivery is ready too.
+            self._engine._check_outbound_size(_encode_puback_success(mid))
+            self._pending_manual_qos1_acks.add(mid)
+            self._drain_manual_qos1_acks()
+            return
+        if state is not InboundQoSState.WAIT_USER_ACK:
             raise ProtocolError(f"Inbound mid={mid} is not awaiting ack (state={state!r})")
 
-        wire = (
-            _encode_puback_success(mid)
-            if state is InboundQoSState.WAIT_PUBACK
-            else _encode_pubcomp_success(mid)
-        )
+        wire = _encode_pubcomp_success(mid)
         self._engine._check_outbound_size(wire)
 
         if isinstance(record, InboundMessage):
@@ -763,6 +786,34 @@ class InboundSession:
             self._session_state_qos2 -= 1
         self._engine._send(wire)
         self._release_slot(logical_size)
+
+    def _drain_manual_qos1_acks(self) -> None:
+        """Emit the ready prefix of manual QoS 1 acknowledgements in arrival order."""
+        order = self._manual_qos1_order
+        ready = self._pending_manual_qos1_acks
+        store = self.store
+        transitions = self._transitions
+        while order and order[0] in ready:
+            mid = order[0]
+            record = self._lookup_stored_inbound(mid)
+            if record is None or record.state is not InboundQoSState.WAIT_PUBACK:
+                raise ProtocolError(f"Inbound QoS 1 order lost pending mid={mid}")
+            if isinstance(record, InboundMessage):
+                popped = store.pop_in(mid)
+                if popped is None:
+                    raise ProtocolError(f"Inbound mid={mid} disappeared while acknowledging")
+                logical_size = self.stored_logical_size(popped)
+            else:
+                assert transitions is not None
+                completed = transitions.complete_in(mid, InboundQoSState.WAIT_PUBACK)
+                if completed is None:
+                    raise ProtocolError(f"Inbound mid={mid} changed while acknowledging")
+                logical_size = completed.logical_size
+            order.popleft()
+            ready.remove(mid)
+            self._forget_inbound()
+            self._engine._send(_encode_puback_success(mid))
+            self._release_slot(logical_size)
 
     def replay_session(self) -> None:
         """Restore Receive Maximum accounting and start redelivering.
