@@ -54,7 +54,13 @@ def test_callback_installed_after_publish_keeps_mid_active_through_callback() ->
 
     seen: list[tuple[int | None, bool]] = []
 
-    def on_publish(_client: Client, _userdata: object, mid: int | None, _rc: int, _props: object) -> None:
+    def on_publish(
+        _client: Client,
+        _userdata: object,
+        mid: int | None,
+        _rc: int,
+        _props: object,
+    ) -> None:
         seen.append((mid, facade_mid in client._active_facade_mids))
 
     client._install_publish_dispatch(on_publish)
