@@ -6,6 +6,20 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- Answer a PUBREC carrying a Reason Code of 0x80 or greater by ending the QoS 2
+  exchange on every store, as MQTT 5 §4.3.3 requires. The check previously sat
+  inside the conditional-transition branch, so a third-party `InflightStore`
+  without the `TransitionInflightStore` extension reached the "no such record"
+  test first and answered an unknown packet identifier with an orphan
+  PUBREL 0x92. The shipped memory and SQLite stores were never affected.
+
+### Changed
+
+- Removed `IncrementalDecoder.process_packets` (Provisional). It had no caller;
+  `process_packets_bounded` is the count- and byte-bounded form the client uses.
+
 ## [1.0.0rc6] - 2026-08-16
 
 ### Fixed

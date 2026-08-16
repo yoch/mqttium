@@ -586,11 +586,17 @@ class OutboundSession:
         mid, reason_code, properties = self._decode_pubrec(raw.remaining)
         if properties is not None:
             self._engine._validate_inbound_problem_information(PacketType.PUBREC, properties)
+        # MQTT 5 §4.3.3: a PUBREC carrying a Reason Code of 0x80 or greater ends
+        # the QoS 2 exchange -- the publication failed and no PUBREL follows.
+        # This is shared by both store paths on purpose: it used to sit inside
+        # the transition branch only, so a store without conditional transitions
+        # reached the `msg is None` test first and answered an unknown MID with
+        # an orphan PUBREL 0x92 that the specification does not allow.
+        if reason_code >= 128:
+            self._fail_after_pubrec(mid, reason_code)
+            return
         transitions = self._transitions
         if transitions is not None:
-            if reason_code >= 128:
-                self._fail_after_pubrec(mid, reason_code)
-                return
             changed = transitions.transition_out(
                 mid,
                 OutboundQoSState.WAIT_PUBREC,
@@ -609,9 +615,6 @@ class OutboundSession:
             self._send_orphan_pubrel(mid)
             return
         if msg.state is not OutboundQoSState.WAIT_PUBREC:
-            return
-        if reason_code >= 128:
-            self._fail_after_pubrec(mid, reason_code)
             return
         msg.state = OutboundQoSState.WAIT_PUBCOMP
         msg.topic = ""
