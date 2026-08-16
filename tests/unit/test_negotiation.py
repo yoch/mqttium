@@ -4,14 +4,15 @@ from __future__ import annotations
 
 from mqttium.codec.buffer import IncrementalDecoder
 from mqttium.codec.properties import encode_properties
-from mqttium.enums import ConnectionState, MQTTProtocolVersion
+from mqttium.enums import ConnectionState, InboundQoSState, MQTTProtocolVersion, QoS
 from mqttium.errors import PacketTooLargeError, ProtocolError
 from mqttium.packets import encode_frame
 from mqttium.enums import PacketType
+from mqttium.persistence.memory import MemoryInflightStore
 from mqttium.protocol.engine import EffectKind, EngineConfig, ProtocolEngine
 from mqttium.protocol.negotiated import NegotiatedSettings
 from mqttium.protocol.reconnect import ReconnectPolicy, is_terminal_connack
-from mqttium.types import Properties
+from mqttium.types import InboundMessage, Properties
 import pytest
 
 
@@ -79,8 +80,22 @@ def test_maximum_packet_size_enforced() -> None:
 
 def test_queued_qos_rejected_on_resumed_session_connack() -> None:
     """Replay-time validation is the one pass on the session-present branch."""
+    store = MemoryInflightStore()
+    # Keep Session Present=1 valid: queued outbound work alone is not Client
+    # Session State, so seed an independent incomplete inbound QoS 2 exchange.
+    store.put_in(
+        InboundMessage(
+            mid=42,
+            topic="resume/state",
+            payload=b"x",
+            qos=QoS.EXACTLY_ONCE,
+            retain=False,
+            state=InboundQoSState.WAIT_PUBREL,
+        )
+    )
     engine = ProtocolEngine(
-        EngineConfig(client_id="c", protocol=MQTTProtocolVersion.MQTTv5, clean_start=False)
+        EngineConfig(client_id="c", protocol=MQTTProtocolVersion.MQTTv5, clean_start=False),
+        store=store,
     )
     handle = engine.queue_publish("t", b"x", qos=2)
     assert handle.mid is not None

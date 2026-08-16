@@ -113,8 +113,8 @@ def test_sqlite_restart_replays_queued(tmp_path: Path) -> None:
     engine = ProtocolEngine(EngineConfig(client_id="c1", clean_start=False), store=store2)
     assert engine.packet_ids.in_use(9)
     engine.begin_connect()
-    # session_present=1
-    _feed(engine, encode_frame(PacketType.CONNACK, 0, bytes((0x01, 0x00))))
+    # A QUEUED record was never sent, so it is not Client Session State.
+    _feed(engine, encode_frame(PacketType.CONNACK, 0, bytes((0x00, 0x00))))
     effects = engine.take_effects()
     sends = [e for e in effects if e.kind is EffectKind.SEND]
     assert len(sends) == 1

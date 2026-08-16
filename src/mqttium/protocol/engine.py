@@ -633,6 +633,16 @@ class ProtocolEngine:
             raise ProtocolError(
                 "CONNACK reports Session Present after Clean Start [MQTT-3.2.2-1/-2]"
             )
+        if (
+            self.codec.is_mqtt5
+            and connack.session_present
+            and not self.outbound.has_client_session_state()
+            and not self.inbound.has_client_session_state()
+        ):
+            self._protocol_disconnect(0x82)
+            raise ProtocolError(
+                "CONNACK reports Session Present but the Client has no Session State [MQTT-3.2.2-4]"
+            )
 
         self.negotiated = NegotiatedSettings.from_connack(
             connack.properties,

@@ -159,7 +159,7 @@ async def test_nowait_batch_writer_rejection_is_atomic() -> None:
 
 
 class _ClosingTransport:
-    """Answers CONNECT with a session-present CONNACK, then closes on demand."""
+    """Answers CONNECT with a fresh-session CONNACK, then closes on demand."""
 
     def __init__(self) -> None:
         self._rx: asyncio.Queue[bytes] = asyncio.Queue()
@@ -167,9 +167,7 @@ class _ClosingTransport:
 
     async def write(self, data: bytes) -> None:
         if data and data[0] == PacketType.CONNECT:
-            # session_present=1 keeps queued QoS 1 messages replayable, so the
-            # admission budget stays occupied across the disconnect.
-            self._rx.put_nowait(encode_frame(PacketType.CONNACK, 0, b"\x01\x00"))
+            self._rx.put_nowait(encode_frame(PacketType.CONNACK, 0, b"\x00\x00"))
 
     async def read(self, n: int = 65536) -> bytes:
         return await self._rx.get()

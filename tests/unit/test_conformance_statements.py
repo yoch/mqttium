@@ -344,19 +344,14 @@ def test_clean_start_does_not_replay_stale_local_session_state() -> None:
     assert not any(e.kind is EffectKind.PUBLISH_COMPLETE for e in effects)
 
 
-@pytest.mark.parametrize("session_present", [True, False])
-def test_session_present_is_accepted_when_no_clean_start_was_requested(
-    session_present: bool,
-) -> None:
-    """Only the combination the specification forbids may close the connection."""
+def test_session_present_zero_is_accepted_when_no_clean_start_was_requested() -> None:
+    """A missing Server session remains valid when Clean Start was false."""
     engine = ProtocolEngine(
         EngineConfig(client_id="c", protocol=MQTTProtocolVersion.MQTTv5, clean_start=False),
         MemoryInflightStore(),
     )
     engine.begin_connect()
-    _feed(
-        engine, _connack_wire(session_present=session_present, protocol=MQTTProtocolVersion.MQTTv5)
-    )
+    _feed(engine, _connack_wire(session_present=False, protocol=MQTTProtocolVersion.MQTTv5))
     engine.take_effects()
     assert engine.state is ConnectionState.CONNECTED
 
