@@ -120,7 +120,7 @@ jobs:
               owner,
               repo,
               workflow_id: "publish.yml",
-              ref: "main",
+              ref: tag,
               inputs: {
                 tag,
                 prerelease: "true",
