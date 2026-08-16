@@ -6,6 +6,25 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [1.0.0rc6] - 2026-08-16
+
+### Fixed
+
+- Enforce MQTT 5 enhanced-authentication phase sequencing: require Authentication
+  Method where mandated, reject AUTH Success during initial CONNECT authentication,
+  and accept Server AUTH Success/Continue while CONNECTED only during an active
+  client re-authentication exchange.
+- Reject unsolicited CONNACK Response Information unless the CONNECT wire snapshot
+  requested it.
+- Allow graceful `disconnect()` while CONNECT is in flight without turning an
+  intentional shutdown into a Will-triggering transport abort.
+- Reject MQTT 5 `Session Present=1` when the client retains no MQTT Client Session
+  State, using hydrated O(1) state rather than a second persistence scan.
+- Reject the Client-only `Disconnect with Will Message` reason when it is received
+  from a Server.
+- Preserve manual QoS 1 PUBACK wire order when application acknowledgements arrive
+  out of order, including recovered durable state across reconnect.
+
 ### Changed
 
 - Outbound writes no longer always cost an event-loop turn. When the writer
@@ -645,7 +664,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - Pre-spin-out comparative analysis and generated coverage data from the
   published source tree.
 
-[Unreleased]: https://github.com/yoch/mqttium/compare/v1.0.0rc5...HEAD
+[Unreleased]: https://github.com/yoch/mqttium/compare/v1.0.0rc6...HEAD
+[1.0.0rc6]: https://github.com/yoch/mqttium/compare/v1.0.0rc5...v1.0.0rc6
 [1.0.0rc5]: https://github.com/yoch/mqttium/compare/v1.0.0rc4...v1.0.0rc5
 [1.0.0rc4]: https://github.com/yoch/mqttium/compare/v1.0.0rc3...v1.0.0rc4
 [1.0.0rc3]: https://github.com/yoch/mqttium/compare/v1.0.0rc2...v1.0.0rc3
