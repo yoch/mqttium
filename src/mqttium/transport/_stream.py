@@ -38,20 +38,27 @@ class StreamTransport:
         await self._drain_if_needed()
 
     def write_nowait(self, data: bytes) -> bool:
-        """Buffer one frame without awaiting, or decline when a drain is due.
+        """Buffer one frame without awaiting when it fits below high-water.
 
-        The high-water mark is checked *before* writing, not after: a caller on
-        this path cannot await a drain, so it must never create the need for
-        one. Declining sends the frame back to the writer task, which can.
+        The eager path cannot await a drain, so it is admitted only when the
+        *resulting* socket-buffer size stays at or below the local high-water
+        mark. Checking the post-write size matters because a contiguous MQTT 5
+        frame can be much larger than the publish payload segmentation threshold
+        (for example, because of large properties).
 
-        Returning ``False`` therefore means nothing was written, and the caller
-        still owns the frame. This is deliberately absent from
+        Returning ``False`` means nothing was written and the caller still owns
+        the frame. It can therefore fall back to the writer task, which is able
+        to await drain/backpressure. This method is deliberately absent from
         :class:`AsyncTransport`: it is an optimisation a transport may offer,
         not an obligation, and a transport whose write is more than a buffer
         append (WebSocket masks and may flush control frames first) must not
         provide it.
         """
-        if write_buffer_needs_drain(self._writer):
+        transport = self._writer.transport
+        if (
+            transport is not None
+            and transport.get_write_buffer_size() + len(data) > _WRITE_BUFFER_HIGH_WATER
+        ):
             return False
         self._writer.write(data)
         return True
