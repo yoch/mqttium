@@ -32,7 +32,6 @@ from mqttium.packets._publish import (
 )
 from mqttium.protocol.effects import EffectKind
 from mqttium.protocol.stats import InboundStats
-from mqttium.topics import validate_received_publish_topic
 from mqttium.types import InboundMessage, InboundRecordMeta, Message, Properties
 
 if TYPE_CHECKING:
@@ -413,8 +412,9 @@ class InboundSession:
     def _on_publish_v31(self, raw: RawPacket) -> None:
         """Retain the generic decoder only for the legacy MQTT 3.1 protocol."""
         packet = PublishPacket.decode(raw.flags, raw.remaining, MQTTProtocolVersion.MQTTv31)
-        topic = self._resolve_topic(packet)
-        validate_received_publish_topic(topic, utf8_validated=True)
+        # PublishPacket.decode already validated the topic and rejected an empty
+        # one for non-MQTT 5; MQTT 3.1 has no topic aliases to resolve.
+        topic = packet.topic
         if packet.qos is QoS.AT_MOST_ONCE:
             self._engine._emit(
                 EffectKind.MESSAGE,
@@ -923,12 +923,8 @@ class InboundSession:
 
     # --- aliases and Receive Maximum --------------------------------------
 
-    def _resolve_topic(self, packet: PublishPacket) -> str:
-        return self._resolve_topic_fields(packet.topic, packet.properties)
-
     def _resolve_topic_fields(self, topic: str, props: Properties | None) -> str:
-        if self.config.protocol != MQTTProtocolVersion.MQTTv5:
-            return topic
+        """Resolve an MQTT 5 Topic Alias. Only the MQTT 5 handlers call this."""
         alias = props.get("topic_alias") if props else None
         if alias is None:
             if not topic:

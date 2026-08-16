@@ -504,30 +504,23 @@ class ApplicationDelivery:
         self.message_ready.set()
 
     def _modes(self, callback: Callable[[Message], Any] | None) -> tuple[bool, bool]:
-        callback_delivery = callback is not None and self.mode in ("auto", "callback", "both")
-        iterator_delivery = self.mode in ("iterator", "both") or (
-            self.mode == "auto" and callback is None
-        )
+        """Resolve the two delivery destinations from the modes cached at init."""
+        callback_delivery = callback is not None and self.callback_mode
+        iterator_delivery = self.iterator_mode or (self.auto_mode and callback is None)
         return callback_delivery, iterator_delivery
 
-    def _is_small(self, message: Message, references: int) -> bool:
+    def _is_small(self, message: Message) -> bool:
         limit = self.small_message_limit
-        return bool(
-            references
-            and (
-                limit is None
-                or (
-                    limit > 0
-                    and not message.properties
-                    and len(message.payload) + 4 * len(message.topic) <= limit
-                )
-            )
+        if limit is None:
+            return True
+        return (
+            limit > 0
+            and not message.properties
+            and len(message.payload) + 4 * len(message.topic) <= limit
         )
 
-    def _is_small_decoded(self, message: Message, references: int, property_wire_size: int) -> bool:
-        return bool(
-            references and _fits_small_limit(message, self.small_message_limit, property_wire_size)
-        )
+    def _is_small_decoded(self, message: Message, property_wire_size: int) -> bool:
+        return _fits_small_limit(message, self.small_message_limit, property_wire_size)
 
     def deliver_batch_inline(
         self,
@@ -537,13 +530,16 @@ class ApplicationDelivery:
         callback_delivery, iterator_delivery = self._modes(callback)
         if not callback_delivery and not iterator_delivery:
             return 0
+        # Bind the callback once instead of re-testing `callback_delivery` and
+        # asserting non-None per message; `cb is not None` carries both facts.
+        cb = callback if callback_delivery else None
         callback_worker_ready = False
         applied = 0
         for effect in effects:
             if effect.kind is not EffectKind.MESSAGE:
                 break
             message: Message = effect.data
-            if effect.requires_delivery_mark is not False or not self._is_small(message, 1):
+            if effect.requires_delivery_mark is not False or not self._is_small(message):
                 break
             if iterator_delivery and self.messages_queue.full():
                 break
@@ -551,12 +547,11 @@ class ApplicationDelivery:
                 break
             if iterator_delivery:
                 self.messages_queue.put_nowait(message)
-            if callback_delivery:
-                assert callback is not None
+            if cb is not None:
                 if not callback_worker_ready:
                     self.ensure_callback_worker()
                     callback_worker_ready = True
-                self.callback_queue.put_nowait((callback, (message,), None))
+                self.callback_queue.put_nowait((cb, (message,), None))
             applied += 1
         if applied and iterator_delivery:
             self.message_ready.set()
@@ -570,6 +565,9 @@ class ApplicationDelivery:
         callback_delivery, iterator_delivery = self._modes(callback)
         if not callback_delivery and not iterator_delivery:
             return 0
+        # Bind the callback once instead of re-testing `callback_delivery` and
+        # asserting non-None per message; `cb is not None` carries both facts.
+        cb = callback if callback_delivery else None
         callback_worker_ready = False
         applied = 0
         for effect in effects:
@@ -580,7 +578,7 @@ class ApplicationDelivery:
             if (
                 effect.requires_delivery_mark is not False
                 or property_wire_size is None
-                or not self._is_small_decoded(message, 1, property_wire_size)
+                or not self._is_small_decoded(message, property_wire_size)
             ):
                 break
             if iterator_delivery and self.messages_queue.full():
@@ -589,12 +587,11 @@ class ApplicationDelivery:
                 break
             if iterator_delivery:
                 self.messages_queue.put_nowait(message)
-            if callback_delivery:
-                assert callback is not None
+            if cb is not None:
                 if not callback_worker_ready:
                     self.ensure_callback_worker()
                     callback_worker_ready = True
-                self.callback_queue.put_nowait((callback, (message,), None))
+                self.callback_queue.put_nowait((cb, (message,), None))
             applied += 1
         if applied and iterator_delivery:
             self.message_ready.set()

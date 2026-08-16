@@ -311,12 +311,16 @@ def encode_properties(props: Properties | None, packet: str) -> bytes:
         return b"\x00"
 
     signature = props._signature()
-    cached = props._encoded.get(packet)
-    if cached is not None and cached[0] == signature:
-        return cached[1]
+    cache = props._encoded
+    if cache is None:
+        cache = props._encoded = {}
+    else:
+        cached = cache.get(packet)
+        if cached is not None and cached[0] == signature:
+            return cached[1]
 
     encoded = _encode_properties_uncached(props, packet)
-    props._encoded[packet] = (signature, encoded)
+    cache[packet] = (signature, encoded)
     return encoded
 
 
@@ -340,7 +344,9 @@ def decode_properties(
         raise MalformedPacketError("Properties length exceeds remaining data")
 
     result = Properties()
-    seen: set[str] = set()
+    # `result.values` is the seen-set: every branch below that records a name
+    # also inserts it there, so a separate set would track the same keys.
+    seen = result.values
     while pos < end:
         prop_id = buf[pos]
         pos += 1
@@ -362,16 +368,13 @@ def decode_properties(
                 if spec.name in seen:
                     raise MalformedPacketError("Duplicate subscription_identifier on SUBSCRIBE")
                 result.set(spec.name, value)
-                seen.add(spec.name)
             else:
-                items = result.values.setdefault(spec.name, [])
+                items = seen.setdefault(spec.name, [])
                 items.append(value)
-                seen.add(spec.name)
         else:
             if spec.name in seen:
                 raise MalformedPacketError(f"Duplicate property {spec.name}")
             result.set(spec.name, value)
-            seen.add(spec.name)
 
     if pos != end:
         raise MalformedPacketError("Properties length does not match consumed bytes")

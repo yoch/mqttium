@@ -306,6 +306,8 @@ class AsyncClient:
 
     # Diagnostic compatibility views. Effect state has one owner in EffectPump;
     # these historical read-only names remain for tests and instrumentation.
+    # Runtime code goes through `self._effect_pump` directly — a descriptor call
+    # per publish and per ingress batch is not worth the shorter spelling.
     @property
     def _pending_effects(self) -> deque[EngineEffect]:
         return self._effect_pump.pending
@@ -546,7 +548,7 @@ class AsyncClient:
 
         return (
             (self.on_publish is None or self._has_callback_capacity(callback_count))
-            and not self._pending_effects
+            and not self._effect_pump.pending
             and not self._engine.has_pending_effects
         )
 
@@ -1052,7 +1054,7 @@ class AsyncClient:
                     self._collect_effects_locked()
                     self._drain_effects_inline()
             if not wait_for_space:
-                if self._pending_effects:
+                if self._effect_pump.pending:
                     if nowait:
                         self._schedule_effect_flush()
                     else:
@@ -1279,6 +1281,7 @@ class AsyncClient:
         decoder = self._decoder
         engine = self._engine
         handle_raw = engine.handle_raw
+        inbound = engine.inbound
         max_bytes = self._max_ingress_batch_bytes
         count = 0
         decoded_bytes = 0
@@ -1293,7 +1296,7 @@ class AsyncClient:
             # when their batch fills the remaining Receive Maximum window, so
             # the effect handoff below can release them before another PUBLISH.
             # Control packets and QoS 0 traffic retain the full 256-packet batch.
-            if engine.inbound._autoack_handoff_required:
+            if inbound._autoack_handoff_required:
                 return count, decoded_bytes, True
             if decoded_bytes >= max_bytes:
                 break
@@ -1316,7 +1319,7 @@ class AsyncClient:
                             handled, handled_bytes, handoff_required = self._process_ingress_batch()
                         if handled:
                             self._collect_effects_locked()
-                    if self._pending_effects:
+                    if self._effect_pump.pending:
                         await self._drain_effects()
                     # A batch that stopped short of both bounds emptied the
                     # buffer, so there is nothing to decode until the next
@@ -1809,7 +1812,10 @@ class AsyncClient:
                 batch = self._pop_batch_receipt(mid)
                 if batch is not None:
                     batch._complete(mid, reason)
-        self._notify_publish_space()
+        # Inlined: _settle_publish runs per acknowledgement, and the common case
+        # has no waiter at all. The named helper stays for the teardown callers.
+        if self._publish_waiters:
+            self._publish_space.set()
 
     def _notify_publish_space(self) -> None:
         if self._publish_waiters:

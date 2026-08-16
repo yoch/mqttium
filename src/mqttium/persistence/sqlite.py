@@ -534,14 +534,18 @@ class SqliteInflightStore:
                 (
                     msg.mid,
                     msg.topic,
-                    sqlite3.Binary(msg.payload),
-                    int(msg.qos),
-                    int(msg.retain),
-                    int(msg.state),
-                    int(msg.dup),
+                    # sqlite3 binds bytes as a BLOB and IntEnum/bool as an
+                    # integer, so neither sqlite3.Binary (which is memoryview)
+                    # nor int() buys anything on this per-publish write. Every
+                    # reader coerces on the way out (_row_to_out).
+                    msg.payload,
+                    msg.qos,
+                    msg.retain,
+                    msg.state,
+                    msg.dup,
                     _props_to_json(msg.properties),
                     self._out_seq,
-                    int(msg.logical_size),
+                    msg.logical_size,
                 ),
             )
             self._commit_if_needed()
@@ -704,15 +708,15 @@ class SqliteInflightStore:
                 (
                     msg.mid,
                     msg.topic,
-                    sqlite3.Binary(msg.payload),
-                    int(msg.qos),
-                    int(msg.retain),
-                    int(msg.state),
-                    int(msg.delivered),
+                    msg.payload,
+                    msg.qos,
+                    msg.retain,
+                    msg.state,
+                    msg.delivered,
                     _props_to_json(msg.properties),
-                    int(msg.user_acked),
+                    msg.user_acked,
                     self._in_seq,
-                    int(msg.logical_size),
+                    msg.logical_size,
                 ),
             )
             self._commit_if_needed()

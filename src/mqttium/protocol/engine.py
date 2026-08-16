@@ -134,6 +134,13 @@ class ProtocolEngine:
             PacketType.DISCONNECT: self._on_disconnect,
             PacketType.AUTH: self._on_auth,
         }
+        # What a state accepts and what handles it are one table, so `handle_raw`
+        # resolves both in a single lookup and adding a packet type is one edit.
+        # Anything absent is refused — PINGREQ included.
+        self._handlers_by_state = {
+            state: {ptype: self._handlers[ptype] for ptype in allowed}
+            for state, allowed in _ALLOWED_PACKETS_BY_STATE.items()
+        }
         # Hydrate packet ids + offline queue from a durable store (restart).
         self.outbound.hydrate()
         # In-flight SUBSCRIBE/UNSUBSCRIBE by MID (never collides with PUBLISH).
@@ -148,7 +155,11 @@ class ProtocolEngine:
         # Handing the complete effect batch to the runtime is the first
         # boundary at which an auto-PUBACK can make progress toward the
         # transport. Release the Receive Maximum slots held for this batch.
-        self.inbound.release_pending_auto_qos1()
+        # `_autoack_handoff_required` is only ever set alongside a non-empty
+        # mid set, so an empty set means there is nothing to release.
+        inbound = self.inbound
+        if inbound._pending_auto_qos1_mids:
+            inbound.release_pending_auto_qos1()
         return effects
 
     @property
@@ -527,16 +538,16 @@ class ProtocolEngine:
             return
         try:
             validate_raw_packet(raw)
-            allowed = _ALLOWED_PACKETS_BY_STATE.get(self.state, frozenset())
-            if raw.packet_type not in allowed:
+            handlers = self._handlers_by_state.get(self.state)
+            handler = handlers.get(raw.packet_type) if handlers is not None else None
+            if handler is None:
                 raise ProtocolError(
                     f"Unexpected {raw.packet_type.name} while state={self.state.name}"
                 )
-            # Every allowed packet type has a handler; the state gate above is
-            # the one place that refuses everything else (PINGREQ included).
             effect_start = len(self._effects)
-            self._handlers[raw.packet_type](raw)
-            self._validate_new_outbound_effects(effect_start)
+            handler(raw)
+            if self.negotiated.maximum_packet_size is not None:
+                self._validate_new_outbound_effects(effect_start)
         except (ProtocolError, MalformedPacketError, PacketTooLargeError) as exc:
             self._emit(EffectKind.PROTOCOL_ERROR, str(exc))
         except Exception as exc:
@@ -902,8 +913,10 @@ class ProtocolEngine:
 
     def _check_outbound_size(self, wire: WriteItem) -> None:
         limit = self.negotiated.maximum_packet_size
+        if limit is None:
+            return
         size = item_size(wire)
-        if limit is not None and size > limit:
+        if size > limit:
             raise PacketTooLargeError(
                 f"Encoded packet size {size} exceeds broker maximum_packet_size {limit}"
             )
@@ -915,9 +928,10 @@ class ProtocolEngine:
         returned from a public queue_* method. Validate the whole newly-produced
         batch before exposing any of it so an oversized PUBACK/PUBREC/PUBCOMP
         cannot escape while its paired MESSAGE remains application-visible.
+
+        `handle_raw` only calls this when the broker negotiated a limit, so the
+        common case costs no call at all.
         """
-        if self.negotiated.maximum_packet_size is None:
-            return
         try:
             for effect in self._effects[start:]:
                 if effect.kind is EffectKind.SEND:
