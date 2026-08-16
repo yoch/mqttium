@@ -1,0 +1,40 @@
+name: Hosted validated PR240 workbench
+
+on:
+  push:
+    branches: [chatgpt-workbench-jobs]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.event.head_commit.message == 'run hosted pr240'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CGW_ROOT: ${{ runner.temp }}/cgw
+      CGW_ALLOWED_IMAGES: python:3.12-bookworm,node:24-bookworm,ubuntu:24.04
+      CGW_DOCKER_SNAP_COMPAT: 'false'
+      CGW_JOB_BRANCH: chatgpt-workbench-jobs
+      CGW_REPOSITORY: yoch/mqttium
+      CGW_PR_NUMBER: '240'
+      CGW_HEAD_REF: cursor/bug-session-present-without-state-b363
+      CGW_HEAD_SHA: bce13a008a204dd4914b002cc3b3b2b1b5c3a574
+      CGW_HEAD_REPO: yoch/mqttium
+      CGW_JOB_ID: session-state-240-20260816
+    steps:
+      - name: Check out trusted controller
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          path: control
+          persist-credentials: false
+      - name: Execute validated job
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python control/.github/chatgpt-workbench/processor.py execute
+      - name: Push validated result
+        env:
+          CGW_PUSH_TOKEN: ${{ github.token }}
+        run: python control/.github/chatgpt-workbench/processor.py push
