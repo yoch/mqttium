@@ -8,6 +8,7 @@ from mqttium.enums import (
     ConnectionState,
     InboundQoSState,
     MQTTProtocolVersion,
+    OutboundQoSState,
     PacketType,
     QoS,
 )
@@ -16,7 +17,7 @@ from mqttium.persistence.memory import MemoryInflightStore
 from mqttium.protocol.config import EngineConfig
 from mqttium.protocol.effects import EffectKind
 from mqttium.protocol.engine import ProtocolEngine
-from mqttium.types import InboundMessage
+from mqttium.types import InboundMessage, OutboundMessage
 
 
 def _feed(engine: ProtocolEngine, wire: bytes) -> None:
@@ -40,6 +41,16 @@ def _publish(mid: int, *, qos: QoS = QoS.AT_LEAST_ONCE, dup: bool = False) -> by
 
 def _recovered_engine(receive_maximum: int) -> ProtocolEngine:
     store = MemoryInflightStore()
+    store.put_out(
+        OutboundMessage(
+            mid=99,
+            topic="resume/state",
+            payload=b"x",
+            qos=QoS.AT_LEAST_ONCE,
+            retain=False,
+            state=OutboundQoSState.WAIT_PUBACK,
+        )
+    )
     store.put_in(
         InboundMessage(
             mid=7,

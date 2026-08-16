@@ -14,8 +14,9 @@ from mqttium.protocol.reconnect import ReconnectPolicy
 
 
 class Brokerside:
-    def __init__(self) -> None:
+    def __init__(self, *, session_present: bool) -> None:
         self._rx: asyncio.Queue[bytes] = asyncio.Queue()
+        self._session_present = session_present
         self._decoder = IncrementalDecoder()
         self._closing = False
         self.hold_pubacks = False
@@ -25,7 +26,8 @@ class Brokerside:
         self._decoder.feed(data)
         for raw in self._decoder.drain_packets():
             if raw.packet_type is PacketType.CONNECT:
-                self._rx.put_nowait(encode_frame(PacketType.CONNACK, 0, b"\x01\x00"))
+                flags = 0x01 if self._session_present else 0x00
+                self._rx.put_nowait(encode_frame(PacketType.CONNACK, 0, bytes((flags, 0x00))))
             elif raw.packet_type is PacketType.PUBLISH:
                 pub = PublishPacket.decode(raw.flags, raw.remaining)
                 if pub.qos == QoS.AT_LEAST_ONCE and pub.mid is not None:
@@ -58,7 +60,7 @@ async def test_receipt_survives_and_completes_after_reconnect() -> None:
     )
 
     async def factory(host: str, port: int, *, ssl=None):
-        b = Brokerside()
+        b = Brokerside(session_present=bool(brokers))
         brokers.append(b)
         return b
 

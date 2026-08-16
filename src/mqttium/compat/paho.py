@@ -14,7 +14,6 @@ from collections.abc import Callable
 from concurrent.futures import Future
 from contextlib import suppress
 from dataclasses import dataclass, field
-from itertools import count
 from queue import Empty, SimpleQueue
 from typing import Any
 
@@ -225,16 +224,23 @@ class Client:
         self._pending_publish_requests = 0
         self._pending_publish_bytes = 0
         self._publish_drain_scheduled = False
-        # Paho allocates the identifier on the calling thread and returns; the
-        # engine's packet identifiers stay loop-owned (COMPAT.md §8), so the
-        # façade mints its own correlation namespace instead. `itertools.count`
-        # advances atomically, which is what lets `publish()` return without
-        # taking a lock or waiting for the loop.
-        self._facade_mids = count()
-        # real packet id -> façade mids, oldest first. Written when a QoS 1/2
-        # publication is committed and read when its completion is dispatched,
-        # both on the network loop, so it needs no lock.
-        self._facade_mid_map: dict[int, deque[int]] = {}
+        # Paho allocates its wrapping 1..65535 message id on the calling thread
+        # and refuses the publication if that id is still active. Keep that
+        # lifetime rule entirely inside the façade instead of moving the
+        # protocol engine's packet-id pool off-loop.
+        self._facade_mid_lock = threading.Lock()
+        self._last_facade_mid = 0
+        self._active_facade_mids: set[int] = set()
+        # Receipt identity is the authoritative correlation/lifetime index.
+        # It survives callback toggles and lets the settle hook decide whether
+        # a façade MID can retire or is owned by a queued publish dispatcher.
+        self._facade_receipts: dict[int, tuple[int, int]] = {}
+        self._settle_facade_receipt = self._facade_receipt_settled
+        # Fast dispatcher index: real packet id -> (receipt identity, façade
+        # mid), oldest first. It is loop-confined and only needs to be populated
+        # while on_publish is installed; the authoritative receipt index above
+        # preserves correlation while callbacks are disabled.
+        self._facade_mid_map: dict[int, deque[tuple[int, int]]] = {}
 
         self.on_connect: Callable[..., Any] | None = None
         self.on_disconnect: Callable[..., Any] | None = None
@@ -259,21 +265,30 @@ class Client:
         completion through the callback queue when it is not. Installing the
         dispatcher unconditionally therefore charged every façade user for a
         callback they had not asked for, and cost them the fast path outright.
+
+        Removing the callback clears only the fast wire-MID lookup. Receipt
+        identity remains authoritative, so an already-queued dispatcher or a
+        callback reinstalled before completion still resolves the façade MID.
         """
-        # Installed on the loop, together with the flag `_register_facade_mid`
-        # reads: setting the flag first would open a window in which
-        # correlation ids are recorded with no dispatcher to drain them.
+        # Installed on the loop together with `_on_publish`, so completion sees
+        # an internally consistent callback state.
         self._run_loop_mutation(lambda: self._install_publish_dispatch(callback))
 
     def _install_publish_dispatch(self, callback: Callable[..., Any] | None) -> None:
         self._on_publish = callback
-        dispatch = self._dispatch_publish if callback is not None else None
-        self._async.on_publish = dispatch
-        if dispatch is None:
-            # Nothing will drain the correlation map once the dispatcher is
-            # gone. Entries for publications still in flight are dropped, not
-            # leaked; their completions have no callback left to reach.
-            self._facade_mid_map.clear()
+        self._async.on_publish = self._dispatch_publish if callback is not None else None
+        self._facade_mid_map.clear()
+        if callback is None:
+            return
+        # Rebuild the fast index from the authoritative receipt bindings. Dict
+        # insertion order preserves FIFO for a wire MID that has been reused.
+        for receipt_id, (real_mid, facade_mid) in self._facade_receipts.items():
+            pending = self._facade_mid_map.get(real_mid)
+            entry = (receipt_id, facade_mid)
+            if pending is None:
+                self._facade_mid_map[real_mid] = deque((entry,))
+            else:
+                pending.append(entry)
 
     def user_data_set(self, userdata: Any) -> None:
         self._run_loop_mutation(lambda: setattr(self, "_userdata", userdata))
@@ -414,10 +429,13 @@ class Client:
             self._fail_pending_publish_requests(
                 RuntimeError("network loop stopped before publish admission")
             )
-            # Committed publications can no longer complete: nothing is left to
-            # dispatch their callbacks, so their correlation entries would
-            # outlive the loop generation that created them.
+            # No completion from this loop generation can be correlated after
+            # it stops. Receipt hooks may still run while tasks are cancelled;
+            # their discard/remove operations are deliberately idempotent.
             self._facade_mid_map.clear()
+            self._facade_receipts.clear()
+            with self._facade_mid_lock:
+                self._active_facade_mids.clear()
             pending = asyncio.all_tasks(loop)
             for task in pending:
                 task.cancel()
@@ -630,6 +648,8 @@ class Client:
             self._publish_drain_scheduled = False
         for request in pending:
             request.discard_payload()
+            if request.info is not None:
+                self._release_facade_mid(request.info.mid)
             if not request.completion.done():
                 request.completion.set_exception(error)
 
@@ -707,6 +727,9 @@ class Client:
                 request.completion.set_exception(error)
             self._report_qos0_publish_error(error)
             return False
+        # No native receipt exists when loop-side admission raises, so the
+        # façade reservation has no later settlement hook that could retire it.
+        self._release_facade_mid(info.mid)
         if refused:
             # QoS 1/2 keeps Paho's shape: a refusal is an rc on the handle,
             # which wait_for_publish()/is_published() check before they ever
@@ -727,6 +750,8 @@ class Client:
             for request in batch:
                 if self._stopping.is_set():
                     stop_error = RuntimeError("network loop stopped before publish admission")
+                    if request.info is not None:
+                        self._release_facade_mid(request.info.mid)
                     if not request.completion.done():
                         request.completion.set_exception(stop_error)
                     continue
@@ -828,6 +853,11 @@ class Client:
         assert self._loop is not None
 
         if self._on_network_thread():
+            facade_mid: int | None = None
+            if requested_qos is not QoS.AT_MOST_ONCE:
+                facade_mid, reserved = self._reserve_next_facade_mid()
+                if not reserved:
+                    return MQTTMessageInfo(mid=facade_mid, rc=MQTT_ERR_QUEUE_SIZE)
             try:
                 if requested_qos is QoS.AT_MOST_ONCE:
                     receipt = self._async._queue_publish_on_loop(
@@ -844,17 +874,19 @@ class Client:
                         qos=requested_qos,
                         retain=retain,
                     )
-                    # Mint from the same namespace as the off-loop path: two
-                    # namespaces would let a façade mid collide with a real one
-                    # and make on_publish correlation ambiguous.
+                    assert facade_mid is not None
                     info = MQTTMessageInfo(
-                        mid=self._next_facade_mid(),
+                        mid=facade_mid,
                         _receipt=receipt,
                         _loop=self._loop,
                     )
-                    self._register_facade_mid(receipt, info.mid)
+                    self._register_facade_mid(receipt, facade_mid)
             except FlowControlError:
-                return MQTTMessageInfo(mid=None, rc=MQTT_ERR_QUEUE_SIZE)
+                self._release_facade_mid(facade_mid)
+                return MQTTMessageInfo(mid=facade_mid, rc=MQTT_ERR_QUEUE_SIZE)
+            except BaseException:
+                self._release_facade_mid(facade_mid)
+                raise
             self._finalize_publish_effects()
             return info
 
@@ -863,63 +895,173 @@ class Client:
             info = MQTTMessageInfo(mid=None, _loop=self._loop, _handoff=completion)
             request = _PendingPublish(topic, data, retain, requested_qos, None, completion)
         else:
-            info = MQTTMessageInfo(
-                mid=self._next_facade_mid(), _loop=self._loop, _handoff=completion
-            )
+            facade_mid, reserved = self._reserve_next_facade_mid()
+            if not reserved:
+                return MQTTMessageInfo(mid=facade_mid, rc=MQTT_ERR_QUEUE_SIZE)
+            info = MQTTMessageInfo(mid=facade_mid, _loop=self._loop, _handoff=completion)
             request = _PendingPublish(topic, data, retain, requested_qos, info, completion)
-        if not self._enqueue_publish_request(request):
+        try:
+            accepted = self._enqueue_publish_request(request)
+        except BaseException:
+            if request.info is not None:
+                self._release_facade_mid(request.info.mid)
+            raise
+        if not accepted:
             request.discard_payload()
+            if request.info is not None:
+                self._release_facade_mid(request.info.mid)
             return MQTTMessageInfo(mid=None, rc=MQTT_ERR_QUEUE_SIZE)
         return info
 
+    def _next_facade_mid_locked(self) -> int:
+        mid = self._last_facade_mid + 1
+        if mid > _MAX_FACADE_MID:
+            mid = 1
+        self._last_facade_mid = mid
+        return mid
+
     def _next_facade_mid(self) -> int:
-        return next(self._facade_mids) % _MAX_FACADE_MID + 1
+        """Advance the façade MID generator without reserving the value."""
+        with self._facade_mid_lock:
+            return self._next_facade_mid_locked()
+
+    def _reserve_next_facade_mid(self) -> tuple[int, bool]:
+        """Generate Paho's next wrapping MID and reserve it if it is free.
+
+        Paho does not search for another free identifier after a wrap collision:
+        the generated MID is returned with ``MQTT_ERR_QUEUE_SIZE``. Mirroring
+        that detail keeps overload/collision behaviour deterministic and bounds
+        this calling-thread operation to one lock acquisition and one set lookup.
+        """
+        with self._facade_mid_lock:
+            mid = self._next_facade_mid_locked()
+            if mid in self._active_facade_mids:
+                return mid, False
+            self._active_facade_mids.add(mid)
+            return mid, True
+
+    def _release_facade_mid(self, facade_mid: int | None) -> None:
+        if facade_mid is None:
+            return
+        with self._facade_mid_lock:
+            self._active_facade_mids.discard(facade_mid)
 
     def _register_facade_mid(self, receipt: PublishReceipt, facade_mid: int | None) -> None:
-        """Bind a committed packet identifier to its façade correlation id.
+        """Bind one committed wire MID to the façade MID and its lifetime.
 
-        Only while an ``on_publish`` callback is installed: ``_dispatch_publish``
-        is what drains the map, and it is installed on the inner client only for
-        as long as the user callback is. Registering without it would leak, and
-        keeping the inner callback installed unconditionally would cost the
-        no-callback fast paths in ``AsyncClient``.
+        Correlation is registered even while the user callback is ``None`` so a
+        callback installed before the ACK still sees the MID returned by
+        ``publish()``. Receipt identity is authoritative; the fast wire-MID map
+        is populated only while a dispatcher is installed. The receipt's
+        one-shot settle hook retires immediately when no publish dispatcher
+        exists; otherwise the reservation survives until that dispatcher has
+        delivered completion, matching Paho's active-MID lifetime.
         """
         real_mid = receipt.mid
-        if real_mid is None or facade_mid is None or self._on_publish is None:
+        if real_mid is None or facade_mid is None:
             return
-        # Packet identifiers are reused, so completions are matched FIFO per
-        # identifier, exactly as AsyncClient settles its receipts.
+        receipt_id = id(receipt)
+        entry = (receipt_id, facade_mid)
+        self._facade_receipts[receipt_id] = (real_mid, facade_mid)
+        if self._async.on_publish is not None:
+            pending = self._facade_mid_map.get(real_mid)
+            if pending is None:
+                self._facade_mid_map[real_mid] = deque((entry,))
+            else:
+                pending.append(entry)
+        receipt._on_settle = self._settle_facade_receipt
+
+    def _receipt_still_registered(self, receipt: PublishReceipt) -> bool:
+        """Whether AsyncClient is bulk-settling this receipt without a callback."""
+        real_mid = receipt.mid
+        if real_mid is None:
+            return False
+        current = self._async._receipts.get(real_mid)
+        if current is receipt:
+            return True
+        return isinstance(current, deque) and any(item is receipt for item in current)
+
+    def _facade_receipt_settled(self, receipt: PublishReceipt) -> None:
+        """Retire a façade MID unless an on_publish dispatcher still owns it."""
+        receipt_id = id(receipt)
+        binding = self._facade_receipts.get(receipt_id)
+        if binding is None:
+            return
+        real_mid, facade_mid = binding
+
+        # Normal completion pops the receipt before settling it. AsyncClient's
+        # final bulk-failure path instead settles receipts while they are still
+        # registered and does not emit one on_publish callback per receipt. Keep
+        # a reservation only for the former case, when an inner dispatcher is
+        # actually installed and can consume the authoritative binding.
+        callback_owns_mid = (
+            self._async.on_publish is not None and not self._receipt_still_registered(receipt)
+        )
+        if callback_owns_mid:
+            return
+
+        self._facade_receipts.pop(receipt_id, None)
+        self._release_facade_mid(facade_mid)
         pending = self._facade_mid_map.get(real_mid)
         if pending is None:
-            self._facade_mid_map[real_mid] = deque((facade_mid,))
-        else:
-            pending.append(facade_mid)
+            return
+        entry = (receipt_id, facade_mid)
+        with suppress(ValueError):
+            pending.remove(entry)
+        if not pending:
+            self._facade_mid_map.pop(real_mid, None)
+
+    def _take_facade_mid(self, real_mid: int) -> tuple[int, int | None]:
+        """Consume one wire-to-façade correlation; return MID and release token."""
+        pending = self._facade_mid_map.get(real_mid)
+        if pending:
+            receipt_id, facade_mid = pending.popleft()
+            self._facade_receipts.pop(receipt_id, None)
+            if not pending:
+                del self._facade_mid_map[real_mid]
+            return facade_mid, facade_mid
+
+        # The callback may have been removed after AsyncClient queued this
+        # dispatcher, which deliberately clears the fast map. The authoritative
+        # receipt bindings survive that toggle, so consume the oldest matching
+        # binding directly. Dict insertion order preserves reuse FIFO.
+        for receipt_id, binding in self._facade_receipts.items():
+            bound_real_mid, facade_mid = binding
+            if bound_real_mid == real_mid:
+                del self._facade_receipts[receipt_id]
+                return facade_mid, facade_mid
+
+        # A publication committed before this façade bound the identifier
+        # (direct AsyncClient use). Report what the engine reported.
+        return real_mid, None
 
     def _resolve_facade_mid(self, real_mid: int) -> int:
-        pending = self._facade_mid_map.get(real_mid)
-        if pending is None:
-            # A publication committed before this façade bound the identifier
-            # (direct AsyncClient use). Report what the engine reported.
-            return real_mid
-        facade_mid = pending.popleft()
-        if not pending:
-            del self._facade_mid_map[real_mid]
+        """Consume one correlation outside the callback path (test/debug helper)."""
+        facade_mid, release_mid = self._take_facade_mid(real_mid)
+        self._release_facade_mid(release_mid)
         return facade_mid
 
     def _dispatch_publish(self, mid: int | None, error: BaseException | None) -> None:
+        release_mid: int | None = None
         if mid is not None:
-            mid = self._resolve_facade_mid(mid)
-        if self.on_publish is None:
-            return
-        reason_code = 0 if error is None else 1
-        self._safe_callback(
-            self.on_publish,
-            self,
-            self._userdata,
-            mid,
-            reason_code,
-            None,
-        )
+            mid, release_mid = self._take_facade_mid(mid)
+        try:
+            if self.on_publish is None:
+                return
+            reason_code = 0 if error is None else 1
+            self._safe_callback(
+                self.on_publish,
+                self,
+                self._userdata,
+                mid,
+                reason_code,
+                None,
+            )
+        finally:
+            # Paho removes the outbound message/MID after on_publish returns.
+            # Keep the same active-ID lifetime even though mqttium dispatches
+            # callbacks through a separate worker.
+            self._release_facade_mid(release_mid)
 
     def subscribe(self, topic: str, qos: int = 0) -> tuple[int, int]:
         """Paho-style: return ``(0, mid)`` without awaiting SUBACK."""
