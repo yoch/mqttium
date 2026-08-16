@@ -18,10 +18,11 @@ from typing import Any
 
 import pytest
 
-from mqttium.enums import ConnectionState, QoS
+from mqttium.enums import ConnectionState, OutboundQoSState, QoS
 from mqttium.errors import FlowControlError
 from mqttium.persistence.memory import MemoryInflightStore
 from mqttium.persistence.sqlite import SqliteInflightStore
+from mqttium.protocol.effects import EffectKind
 from mqttium.protocol.engine import EngineConfig, ProtocolEngine
 from mqttium.protocol.outbound import OutboundSession
 
@@ -299,3 +300,34 @@ def test_qos0_in_a_batch_acquires_nothing(tmp_path: Path) -> None:
         assert after["pending_bytes"] == before["pending_bytes"]
         assert after["used_mids"] == before["used_mids"]
         assert after["store_mids"] == before["store_mids"]
+
+
+# --- the launch decision is the validation decision ---------------------------
+
+
+def test_launch_decision_matches_the_validation_snapshot(tmp_path: Path) -> None:
+    """`topic_bytes is not None` stands in for `CONNECTED and window free`.
+
+    `queue_publish` decides whether to launch a QoS > 0 message from the topic
+    bytes produced during validation, rather than re-reading connection state
+    and the flow window a second time. The substitution is only sound while
+    nothing between the two observations can change either, so pin both
+    outcomes: a free window launches and takes exactly one slot, a full window
+    queues and takes none.
+    """
+    for engine in [
+        _engine(local_receive_maximum=1, max_outbound_inflight=1),
+        _engine(tmp_path / "decision", local_receive_maximum=1, max_outbound_inflight=1),
+    ]:
+        launched = engine.queue_publish("a/b", b"1", qos=QoS.AT_LEAST_ONCE)
+        assert engine.flow.inflight == 1
+        assert [e.kind for e in engine.take_effects()] == [EffectKind.SEND]
+        assert engine.store.get_out(launched.mid or 0).state is OutboundQoSState.WAIT_PUBACK
+        assert [msg.mid for msg in engine._queued] == []
+
+        # Window now full: same connection state, opposite decision.
+        queued = engine.queue_publish("a/b", b"2", qos=QoS.AT_LEAST_ONCE)
+        assert engine.flow.inflight == 1, "a queued publish must not take a slot"
+        assert engine.take_effects() == []
+        assert engine.store.get_out(queued.mid or 0).state is OutboundQoSState.QUEUED
+        assert [msg.mid for msg in engine._queued] == [queued.mid]

@@ -106,6 +106,7 @@ class InboundSession:
         "_decode_pubrel",
         "_engine",
         "_inflight",
+        "_is_v5",
         "_autoack_handoff_required",
         "_paged_store",
         "_pending_auto_qos1_mids",
@@ -138,6 +139,8 @@ class InboundSession:
             self.store if isinstance(self.store, BoundedInboundReplayStore) else None
         )
         self._decode_pubrel = engine.codec.decode_pubrel
+        # Fixed for the engine's lifetime, like the codec bindings above.
+        self._is_v5 = engine.codec.is_mqtt5
         protocol = self.config.protocol
         if protocol is MQTTProtocolVersion.MQTTv5:
             self.handle_publish = self._on_publish_v5
@@ -465,16 +468,16 @@ class InboundSession:
         transitions = self._transitions
         existing: InboundMessage | InboundRecordMeta | None = None
         if self._stored_inbound:
-            # Existence is the common question and the cheapest to answer, so it
-            # stays first: a fresh PUBLISH finds nothing and pays exactly one
-            # lookup. Only once a record turns up does the state matter, and it
-            # has to, because the inbound store is keyed by identifier alone —
-            # a record under this mid is a QoS 2 duplicate only if it is in a
-            # QoS 2 phase. Reading it back costs a second metadata query on the
-            # rare duplicate path rather than on every inbound QoS 2 PUBLISH.
+            # One lookup answers both questions. The store is keyed by identifier
+            # alone, so a record under this mid is a QoS 2 duplicate only if it is
+            # in a QoS 2 phase, and the state comes back with the existence test.
+            # Both stores return None for an absent record without allocating,
+            # and the metadata columns precede `payload` in the SQLite row, so a
+            # miss costs the same as the bare existence query it replaces while a
+            # duplicate no longer costs two. The `_stored_inbound` guard stays
+            # inlined: it keeps the whole probe off the fresh-PUBLISH path.
             if transitions is not None:
-                if transitions.contains_in(mid):
-                    existing = transitions.in_meta(mid)
+                existing = transitions.in_meta(mid)
             else:
                 existing = store.get_in(mid)
         if existing is not None:
@@ -953,11 +956,7 @@ class InboundSession:
         decoded_property_wire_size: int | None = None,
     ) -> int:
         property_bytes = 0
-        if (
-            self.config.protocol == MQTTProtocolVersion.MQTTv5
-            and properties is not None
-            and properties.values
-        ):
+        if self._is_v5 and properties is not None and properties.values:
             if decoded_property_wire_size is None:
                 property_bytes = len(encode_properties(properties, PUBLISH))
             else:
@@ -976,7 +975,9 @@ class InboundSession:
         return message.logical_size
 
     def _acquire_slot(self, logical_size: int | None = None) -> None:
-        if self._inflight >= self.config.local_receive_maximum:
+        receive_maximum = self.config.local_receive_maximum
+        inflight = self._inflight
+        if inflight >= receive_maximum:
             # MQTT 5 §3.3.4: DISCONNECT 0x93 (Receive Maximum exceeded).
             self._protocol_disconnect(0x93)
             raise ProtocolError("Receive Maximum exceeded")
@@ -989,19 +990,21 @@ class InboundSession:
             # MQTT 5 §4.13: DISCONNECT 0x97 (Quota exceeded).
             self._protocol_disconnect(0x97)
             raise ProtocolError("Pending inbound byte limit reached")
-        self._inflight += 1
+        inflight += 1
+        self._inflight = inflight
         # A preceding automatic QoS 1 PUBLISH in this engine batch may own
         # slots that take_effects() can release. QoS 2 (or another acquiring
         # path) can fill the remainder after that QoS 1 handler returned, so
         # detect the handoff boundary at the shared counter owner as well.
-        if self._pending_auto_qos1_mids and self._inflight >= self.config.local_receive_maximum:
+        if inflight >= receive_maximum and self._pending_auto_qos1_mids:
             self._autoack_handoff_required = True
         if logical_size is not None:
-            self._pending_bytes += logical_size
-            self._pending_high_water_bytes = max(
-                self._pending_high_water_bytes,
-                self._pending_bytes,
-            )
+            pending = self._pending_bytes + logical_size
+            self._pending_bytes = pending
+            # Plain compare, matching OutboundSession._reserve; max() is a
+            # builtin call on a per-message path.
+            if pending > self._pending_high_water_bytes:
+                self._pending_high_water_bytes = pending
 
     def _release_slot(self, logical_size: int | None = None) -> None:
         if self._inflight > 0:
