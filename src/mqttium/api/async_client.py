@@ -274,6 +274,7 @@ class AsyncClient:
         self._publish_waiters = 0
         self._publish_space = asyncio.Event()
         self._connack_fut: asyncio.Future[ConnAckPacket] | None = None
+        self._connect_disconnect_fut: asyncio.Future[int] | None = None
         self._receipts: dict[int, PublishReceipt | deque[PublishReceipt]] = {}
         self._batch_receipts: dict[int, PublishBatchReceipt | deque[PublishBatchReceipt]] = {}
         self._sub_futs: dict[int, asyncio.Future[SubscribeResult]] = {}
@@ -820,13 +821,17 @@ class AsyncClient:
             self._ping_pending = False
             connect_packet = self._engine.begin_connect()
             self._connack_fut = loop.create_future()
+            self._connect_disconnect_fut = loop.create_future()
             self._write_pump.start(transport)
             await self._enqueue_outbound(connect_packet)
             self._reader_task = asyncio.create_task(self._read_loop(), name="mqttium-reader")
             try:
-                connack = await asyncio.wait_for(self._connack_fut, timeout=timeout)
-            except TimeoutError as exc:
-                raise MQTTTimeoutError("CONNACK timed out") from exc
+                connack = await self._await_connack_or_disconnect(timeout)
+            finally:
+                connect_disconnect_fut = self._connect_disconnect_fut
+                self._connect_disconnect_fut = None
+                if connect_disconnect_fut is not None and not connect_disconnect_fut.done():
+                    connect_disconnect_fut.cancel()
             if connack.reason_code != 0:
                 refusal = self._disconnect_exc
                 if not isinstance(refusal, ProtocolError):
@@ -858,17 +863,63 @@ class AsyncClient:
                 self._engine.take_effects()
             raise
 
+    async def _await_connack_or_disconnect(self, timeout: float) -> ConnAckPacket:
+        connack_fut = self._connack_fut
+        disconnect_fut = self._connect_disconnect_fut
+        if connack_fut is None or disconnect_fut is None:
+            raise RuntimeError("CONNECT wait futures are not initialized")
+        done, _ = await asyncio.wait(
+            (connack_fut, disconnect_fut),
+            timeout=timeout,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if not done:
+            raise MQTTTimeoutError("CONNACK timed out")
+        if disconnect_fut in done:
+            await self._send_connecting_disconnect(disconnect_fut.result())
+            raise MQTTError("Connection cancelled by disconnect()")
+        return connack_fut.result()
+
+    async def _send_connecting_disconnect(self, reason_code: int) -> None:
+        packet = self._engine.begin_disconnect(reason_code)
+        admitted = self._try_enqueue_outbound(packet, epoch=self._connection_epoch)
+        if not admitted:
+            return
+        writer_task = self._write_pump.task
+        if writer_task is None or writer_task.done():
+            return
+        try:
+            await asyncio.wait_for(
+                self._write_pump.join(),
+                timeout=_GRACEFUL_DISCONNECT_DRAIN_TIMEOUT,
+            )
+        except TimeoutError:
+            pass
+
     async def disconnect(self, reason_code: int = 0) -> None:
         self._intentional_disconnect = True
-        reconnect_task = self._reconnect_task
-        if reconnect_task is not None and reconnect_task is not asyncio.current_task():
-            reconnect_task.cancel()
-            try:
-                await reconnect_task
-            except asyncio.CancelledError:
-                pass
-            self._reconnect_task = None
+        connect_disconnect_fut = self._connect_disconnect_fut
+        disconnecting_connect = (
+            self._engine.state is ConnectionState.CONNECTING
+            and connect_disconnect_fut is not None
+            and not connect_disconnect_fut.done()
+        )
+        if disconnecting_connect:
+            assert connect_disconnect_fut is not None
+            self._engine.codec.encode_disconnect(reason_code)
+            connect_disconnect_fut.set_result(reason_code)
+        else:
+            reconnect_task = self._reconnect_task
+            if reconnect_task is not None and reconnect_task is not asyncio.current_task():
+                reconnect_task.cancel()
+                try:
+                    await reconnect_task
+                except asyncio.CancelledError:
+                    pass
+                self._reconnect_task = None
         async with self._lifecycle_lock:
+            if disconnecting_connect:
+                return
             if self._transport is None:
                 return
             # Preserve validation semantics: an invalid reason code must fail

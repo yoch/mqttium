@@ -477,7 +477,7 @@ class ProtocolEngine:
         reason_code: int = 0,
         properties: Properties | None = None,
     ) -> bytes:
-        if self.state != ConnectionState.CONNECTED:
+        if self.state not in (ConnectionState.CONNECTING, ConnectionState.CONNECTED):
             raise NotConnectedError("disconnect requires an active connection")
         self._check_disconnect_session_expiry(properties)
         wire = self.codec.encode_disconnect(reason_code, properties)
