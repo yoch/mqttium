@@ -1,0 +1,128 @@
+name: Publish MQTTium 1.0.0rc6
+
+on:
+  push:
+    branches:
+      - ops/publish-1.0.0rc6
+    paths:
+      - .github/workflows/ops-publish-1.0.0rc6.yml
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Create exact tag and GitHub pre-release, then dispatch PyPI publication
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const target = "32e99a4987aadb7e6d70b97b9443f21708a2c8aa";
+            const tag = "v1.0.0rc6";
+            const version = "1.0.0rc6";
+
+            const main = await github.rest.git.getRef({ owner, repo, ref: "heads/main" });
+            if (main.data.object.sha !== target) {
+              core.setFailed(`main moved: expected ${target}, got ${main.data.object.sha}`);
+              return;
+            }
+
+            const versionFile = await github.rest.repos.getContent({
+              owner,
+              repo,
+              path: "src/mqttium/__init__.py",
+              ref: target,
+            });
+            if (Array.isArray(versionFile.data) || versionFile.data.type !== "file") {
+              core.setFailed("Cannot read src/mqttium/__init__.py at release target");
+              return;
+            }
+            const source = Buffer.from(versionFile.data.content, "base64").toString("utf8");
+            if (!source.includes(`__version__ = "${version}"`)) {
+              core.setFailed(`Release target does not declare ${version}`);
+              return;
+            }
+
+            let tagExists = false;
+            try {
+              const existing = await github.rest.git.getRef({ owner, repo, ref: `tags/${tag}` });
+              tagExists = true;
+              if (existing.data.object.sha !== target) {
+                core.setFailed(`Existing ${tag} points to ${existing.data.object.sha}, expected ${target}`);
+                return;
+              }
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
+            if (!tagExists) {
+              await github.rest.git.createRef({
+                owner,
+                repo,
+                ref: `refs/tags/${tag}`,
+                sha: target,
+              });
+            }
+
+            let releaseExists = false;
+            try {
+              const existingRelease = await github.rest.repos.getReleaseByTag({ owner, repo, tag });
+              releaseExists = true;
+              if (!existingRelease.data.prerelease || existingRelease.data.draft) {
+                core.setFailed(`Existing release ${tag} is not a published pre-release`);
+                return;
+              }
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
+
+            if (!releaseExists) {
+              await github.rest.repos.createRelease({
+                owner,
+                repo,
+                tag_name: tag,
+                target_commitish: target,
+                name: "MQTTium 1.0.0rc6",
+                draft: false,
+                prerelease: true,
+                body: `MQTTium 1.0.0rc6 is the next release candidate for the dependency-free,
+            async-native MQTT 3.1.1 / 5.0 client.
+
+            Highlights:
+
+            - hardens MQTT 5 enhanced-authentication sequencing, CONNACK Response Information,
+              Session Present validation, Server DISCONNECT reason direction, and graceful
+              disconnect while CONNECT is in flight;
+            - preserves manual QoS 1 PUBACK wire order even when application acknowledgements
+              arrive out of order, including durable recovered sessions;
+            - removes the producer-thread network-loop MID round trip from Paho-compatible
+              QoS 1/2 publish while preserving safe facade-MID lifetime and correlation;
+            - adds an ordered eager TCP/Unix writer path for eligible contiguous frames,
+              removing one event-loop writer-task hop while retaining FIFO, backpressure,
+              segmentation, and a projected 64 KiB socket-buffer admission bound.
+
+            The exact 1.0.0rc6 release head passed repository CI across Python 3.11-3.14 on
+            Linux, macOS and Windows, quality, package and fuzz gates, plus isolated wheel/sdist
+            build/install and transport/resilience release smokes. The retained performance
+            reports remain scoped to the commits and paths they actually measured.
+
+            Full details are available in CHANGELOG.md and the RC6 release report.
+
+            **Full Changelog**: https://github.com/yoch/mqttium/compare/v1.0.0rc5...v1.0.0rc6`,
+              });
+            }
+
+            await github.rest.actions.createWorkflowDispatch({
+              owner,
+              repo,
+              workflow_id: "publish.yml",
+              ref: "main",
+              inputs: {
+                tag,
+                prerelease: "true",
+              },
+            });
