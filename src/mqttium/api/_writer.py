@@ -100,6 +100,10 @@ class WritePump:
         self._sample_high_water()
         self.queue = asyncio.Queue()
         self.queued_bytes = 0
+        # The next start() rebinds it. Until then there is no transport this
+        # pump may write to.
+        self._write_nowait = None
+        self._writing = False
 
     def start(self, transport: AsyncTransport) -> None:
         task = self.task
@@ -144,6 +148,8 @@ class WritePump:
 
     def discard(self) -> None:
         self._sample_high_water()
+        self._write_nowait = None
+        self._writing = False
         while True:
             try:
                 self.queue.get_nowait()
@@ -407,4 +413,11 @@ class WritePump:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            # The transport has failed and this task is giving up on it. Drop
+            # the eager binding first: the reconnect path does not call stop()
+            # (AsyncClient only stops the pump when it will not reconnect), so
+            # without this a producer racing the reader's teardown could still
+            # write straight into the dead transport.
+            self._write_nowait = None
+            self._writing = False
             await self.on_failure(exc)

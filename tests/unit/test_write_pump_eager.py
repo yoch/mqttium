@@ -312,3 +312,101 @@ async def test_batched_frames_are_not_counted_as_eager() -> None:
         assert transport.written == [b"a", b"b", b"c"]
     finally:
         await pump.stop()
+
+
+class _FailingTransport(_EagerTransport):
+    """Fails every awaited write, and records anything written after close."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.closed = False
+
+    def write_nowait(self, data: bytes) -> bool:
+        self.calls.append(("after-close" if self.closed else "eager", data))
+        return True
+
+    async def write(self, data: bytes) -> None:
+        raise ConnectionResetError("connection lost")
+
+    async def write_many(self, parts: list[bytes]) -> None:
+        raise ConnectionResetError("connection lost")
+
+    async def close(self) -> None:
+        self.closed = True
+
+    def is_closing(self) -> bool:
+        return self.closed
+
+
+@pytest.mark.asyncio
+async def test_writer_failure_drops_the_eager_binding() -> None:
+    """A dead transport must not stay reachable through the eager path.
+
+    The reconnect path does not call `stop()` — `AsyncClient` only stops the
+    pump when it will *not* reconnect — so the pump has to release the binding
+    itself as soon as the writer sees the transport fail. The connection epoch
+    is the primary guard; this is the one that does not depend on how promptly
+    the reader's teardown runs.
+    """
+    failures: list[BaseException] = []
+
+    async def record(exc: BaseException) -> None:
+        failures.append(exc)
+
+    transport = _FailingTransport()
+    pump = WritePump(max_bytes=1 << 20, max_messages=100, on_failure=record)
+    pump.start(transport)
+
+    pump.queue.put_nowait(b"boom")
+    pump.queued_bytes = 4
+    for _ in range(8):
+        await asyncio.sleep(0)
+
+    assert pump.task is not None and pump.task.done()
+    assert [type(exc).__name__ for exc in failures] == ["ConnectionResetError"]
+    await transport.close()
+
+    # Same-epoch publish arriving during the outage, before reset()/start().
+    assert pump.try_enqueue(b"during-outage") is True
+    assert pump._write_nowait is None
+    assert not [data for kind, data in transport.calls if kind == "after-close"]
+    assert pump.queued_messages == 1
+
+
+@pytest.mark.asyncio
+async def test_reset_drops_the_eager_binding_until_the_next_start() -> None:
+    old = _EagerTransport()
+    pump = _pump()
+    pump.start(old)
+    await pump.stop()
+
+    pump.reset()
+    assert pump._write_nowait is None
+    assert pump.try_enqueue(b"between-connections") is True
+    assert old.written == []
+
+    new = _EagerTransport()
+    pump.start(new)
+    try:
+        # The queued frame goes out on the new transport, the eager path is live
+        # again, and the old transport is never touched.
+        await pump.join()
+        assert pump.try_enqueue(b"after-reconnect") is True
+        assert new.written == [b"between-connections", b"after-reconnect"]
+        assert old.written == []
+    finally:
+        await pump.stop()
+
+
+@pytest.mark.asyncio
+async def test_discard_drops_the_eager_binding() -> None:
+    transport = _EagerTransport()
+    pump = _pump()
+    pump.start(transport)
+    await pump.stop()
+    pump.start(transport)
+    pump.discard()
+    assert pump._write_nowait is None
+    assert pump.try_enqueue(b"after-discard") is True
+    assert transport.written == []
+    await pump.stop()
