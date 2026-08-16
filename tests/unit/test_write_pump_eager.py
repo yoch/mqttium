@@ -410,3 +410,49 @@ async def test_discard_drops_the_eager_binding() -> None:
     assert pump.try_enqueue(b"after-discard") is True
     assert transport.written == []
     await pump.stop()
+
+
+@pytest.mark.asyncio
+async def test_large_payloads_fall_back_to_the_queued_path() -> None:
+    """Payloads past SEGMENT_THRESHOLD keep exactly their pre-eager behaviour.
+
+    Two thresholds disengage the eager path as frames grow, and both matter:
+    a segmented `(header, payload)` item is never eager, and `write_nowait`
+    declines once the socket buffer is above its high-water mark. Large
+    publications therefore take the same path they always did.
+    """
+
+    class _BufferedTransport(_EagerTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.buffered = 0
+
+        def write_nowait(self, data: bytes) -> bool:
+            if self.buffered > 64 * 1024:
+                return False
+            self.buffered += len(data)
+            return super().write_nowait(data)
+
+        async def write(self, data: bytes) -> None:
+            self.buffered = 0
+            await super().write(data)
+
+        async def write_many(self, parts: list[bytes]) -> None:
+            self.buffered = 0
+            await super().write_many(parts)
+
+    transport = _BufferedTransport()
+    pump = _pump(max_bytes=64 * 1024 * 1024, max_messages=10_000)
+    pump.start(transport)
+    try:
+        # Segmented items never take the eager path, whatever the queue state.
+        for _ in range(5):
+            pump.try_enqueue((b"header", b"x" * (200 * 1024)))
+        await pump.join()
+        assert pump.eager_writes == 0
+
+        # A small frame is eager again once the queue has drained.
+        assert pump.try_enqueue(b"small") is True
+        assert pump.eager_writes == 1
+    finally:
+        await pump.stop()

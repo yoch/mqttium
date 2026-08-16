@@ -220,7 +220,8 @@ not `AsyncClient` must pump `continue_inbound_replay()` itself while `inbound.re
   meanwhile comes back *shorter* — same contract as `MemoryInflightStore`.
 - `transport/` — `AsyncTransport` protocol over TCP/TLS, Unix and WebSocket. A `WriteItem`
   (`writes.py`) is either `bytes` or a `(header, payload)` tuple: payloads past
-  `SEGMENT_THRESHOLD` (1 MiB) are written as two consecutive writes instead of being concatenated.
+  `SEGMENT_THRESHOLD` (128 KiB) are written as two consecutive writes instead of being
+  concatenated. A segmented item is never eligible for the writer's eager path.
 - `dispatch/matcher.py` — `TopicMatcher`, the filter→callback index used for callback dispatch. It
   deliberately duplicates a small amount of filter logic rather than sharing engine state, and
   values may legitimately be `None`.
