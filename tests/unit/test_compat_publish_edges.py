@@ -2,17 +2,28 @@
 
 from __future__ import annotations
 
+import time
+from concurrent.futures import Future
+
 import pytest
 
 import mqttium.compat.paho as paho_compat
 from mqttium.codec.buffer import IncrementalDecoder
 from mqttium.compat.paho import CallbackAPIVersion, Client
 from mqttium.enums import PacketType, QoS
-from mqttium.packets import PubCompPacket, PubRecPacket, PublishPacket, encode_frame
+from mqttium.packets import (
+    PubAckPacket,
+    PubCompPacket,
+    PubRecPacket,
+    PublishPacket,
+    encode_frame,
+)
 from tests.support import QueueTransport
 
 
-class _QoS2Broker(QueueTransport):
+class _AckingBroker(QueueTransport):
+    """Minimal broker stub that completes the QoS 1 and QoS 2 handshakes."""
+
     def __init__(self) -> None:
         super().__init__()
         self._decoder = IncrementalDecoder()
@@ -26,8 +37,12 @@ class _QoS2Broker(QueueTransport):
             elif raw.packet_type is PacketType.PUBLISH:
                 publish = PublishPacket.decode(raw.flags, raw.remaining)
                 self.publishes.append(publish)
-                if publish.qos is QoS.EXACTLY_ONCE and publish.mid is not None:
+                if publish.mid is None:
+                    continue
+                if publish.qos is QoS.EXACTLY_ONCE:
                     self.push_rx(PubRecPacket(mid=publish.mid).encode())
+                elif publish.qos is QoS.AT_LEAST_ONCE:
+                    self.push_rx(PubAckPacket(mid=publish.mid).encode())
             elif raw.packet_type is PacketType.PUBREL:
                 mid = int.from_bytes(raw.remaining[:2], "big")
                 self.push_rx(PubCompPacket(mid=mid).encode())
@@ -39,9 +54,11 @@ def test_oversized_publish_is_processed_alone(
     client = Client(CallbackAPIVersion.VERSION2, client_id="oversized-batch")
     monkeypatch.setattr(paho_compat, "_PUBLISH_BATCH_MAX_BYTES", 20)
     requests = [
-        paho_compat._PendingPublish("small", b"x", False, QoS.AT_MOST_ONCE, None),
-        paho_compat._PendingPublish("oversized", b"x" * 20, False, QoS.AT_MOST_ONCE, None),
-        paho_compat._PendingPublish("tail", b"x", False, QoS.AT_MOST_ONCE, None),
+        paho_compat._PendingPublish("small", b"x", False, QoS.AT_MOST_ONCE, None, Future()),
+        paho_compat._PendingPublish(
+            "oversized", b"x" * 20, False, QoS.AT_MOST_ONCE, None, Future()
+        ),
+        paho_compat._PendingPublish("tail", b"x", False, QoS.AT_MOST_ONCE, None, Future()),
     ]
     for request in requests:
         client._publish_pending.put(request)
@@ -60,7 +77,7 @@ def test_oversized_publish_is_processed_alone(
 
 
 def test_compat_qos2_publish_completes_full_handshake() -> None:
-    broker = _QoS2Broker()
+    broker = _AckingBroker()
     client = Client(CallbackAPIVersion.VERSION2, client_id="compat-qos2")
 
     async def factory(
@@ -68,7 +85,7 @@ def test_compat_qos2_publish_completes_full_handshake() -> None:
         port: int,
         *,
         ssl: object | None = None,
-    ) -> _QoS2Broker:
+    ) -> _AckingBroker:
         return broker
 
     client._async._transport_factory = factory
@@ -82,6 +99,92 @@ def test_compat_qos2_publish_completes_full_handshake() -> None:
             publish.topic == "out/2" and publish.qos is QoS.EXACTLY_ONCE
             for publish in broker.publishes
         )
+    finally:
+        client.disconnect()
+        client.loop_stop()
+
+
+def test_direct_qos0_drain_preserves_order_across_qos_levels() -> None:
+    """A writer-direct QoS 0 must never overtake a QoS 1 committed before it.
+
+    The direct path writes to the writer queue immediately, while a QoS 1 SEND
+    waits for the batch's effect flush. `_direct_qos0_ready()` declining while
+    effects are pending is what keeps the wire in ingress order; this pins it.
+    """
+    broker = _AckingBroker()
+    client = Client(CallbackAPIVersion.VERSION2, client_id="compat-qos-order")
+
+    async def factory(
+        host: str,
+        port: int,
+        *,
+        ssl: object | None = None,
+    ) -> _AckingBroker:
+        return broker
+
+    client._async._transport_factory = factory
+    client.loop_start()
+    try:
+        assert client.connect("fake", 1883) == 0
+        # One batch, alternating QoS, published from a non-loop thread.
+        topics = [f"order/{index}" for index in range(20)]
+        infos = [
+            client.publish(topic, b"x", qos=1 if index % 2 else 0)
+            for index, topic in enumerate(topics)
+        ]
+        for info in infos:
+            info.wait_for_publish(timeout=5.0)
+
+        deadline = time.monotonic() + 2.0
+        while len(broker.publishes) < len(topics) and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert [publish.topic for publish in broker.publishes] == topics
+    finally:
+        client.disconnect()
+        client.loop_stop()
+
+
+def test_on_publish_reports_the_facade_mid_not_the_packet_id() -> None:
+    """The callback correlates with the value ``publish()`` handed back.
+
+    The façade counter is advanced first so the two namespaces are observably
+    different and a coincidental match cannot pass.
+    """
+    broker = _AckingBroker()
+    client = Client(CallbackAPIVersion.VERSION2, client_id="compat-facade-mid")
+    seen: list[int | None] = []
+    client.on_publish = lambda _client, _userdata, mid, _rc, _props: seen.append(mid)
+
+    async def factory(
+        host: str,
+        port: int,
+        *,
+        ssl: object | None = None,
+    ) -> _AckingBroker:
+        return broker
+
+    client._async._transport_factory = factory
+    client.loop_start()
+    try:
+        assert client.connect("fake", 1883) == 0
+        for _ in range(50):
+            client._next_facade_mid()
+
+        infos = [client.publish(f"facade/{index}", b"x", qos=1) for index in range(3)]
+        for info in infos:
+            info.wait_for_publish(timeout=2.0)
+
+        deadline = time.monotonic() + 2.0
+        while len(seen) < 3 and time.monotonic() < deadline:
+            time.sleep(0.005)
+
+        facade_mids = [info.mid for info in infos]
+        assert facade_mids == [51, 52, 53]
+        assert seen == facade_mids
+        # What actually went on the wire is the engine's packet identifier.
+        wire_mids = {publish.mid for publish in broker.publishes}
+        assert wire_mids.isdisjoint(facade_mids)
+        assert not client._facade_mid_map
     finally:
         client.disconnect()
         client.loop_stop()

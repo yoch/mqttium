@@ -14,6 +14,8 @@ descriptions of current behaviour are the contracts in
 
 | Date | Report | Records |
 | --- | --- | --- |
+| 2026-08-16 | [`COMPAT-PUBLISH-HANDOFF-2026-08-16.md`](COMPAT-PUBLISH-HANDOFF-2026-08-16.md) | Answers Gaps A, C and D of the floors plan: the compat QoS 1/2 publish handoff stopped blocking the producer thread (measured single-producer drain batch 1.00 to 203.50), QoS 0 moved to the writer-direct path (2 effects per message to 0), and why the proposed thread-safe PacketIdPool was rejected. |
+| 2026-08-16 | [`FLOORS-NOT-CEILINGS-2026-08-16.md`](FLOORS-NOT-CEILINGS-2026-08-16.md) | Work plan: treat Paho QoS 1 throughput and awscrt/paho equal-offer PUBACK latency as attainable floors. No code change; experiments are to be run in this repository. |
 | 2026-08-16 | [`RELEASE-CANDIDATE-1.0.0rc5.md`](RELEASE-CANDIDATE-1.0.0rc5.md) | RC5 release evidence for the post-RC4 callback/delivery and MQTT 5 hot-path improvements, repository-wide Bugbot reconciliation, and exact artifact gates. |
 | 2026-08-14 | [`SINGLE-MESSAGE-INLINE-DELIVERY-2026-08-14.md`](SINGLE-MESSAGE-INLINE-DELIVERY-2026-08-14.md) | Removes the conservative two-effect threshold from the existing bounded inline MESSAGE admission after source-isolated scheduler-path validation. |
 | 2026-08-14 | [`INDEPENDENT-QOS0-LATENCY-AUDIT-2026-08-14.md`](INDEPENDENT-QOS0-LATENCY-AUDIT-2026-08-14.md) | Independent native audit of QoS 0 completion/backpressure and direct latency diagnosis: callback scheduling was the bottleneck; a bounded fast admission path was retained after eligible-host A/A and A/B validation. |
@@ -82,6 +84,16 @@ sets the offered rate for every open-loop point.
 
 Do not treat the cross-client latency column as a statement about MQTTium until that harness can
 defend it.
+
+The 2026-08-16 external campaign (`1.0.0rc5`) is summarised as floors — not as a glass ceiling —
+in [`FLOORS-NOT-CEILINGS-2026-08-16.md`](FLOORS-NOT-CEILINGS-2026-08-16.md). Equal-offer PUBACK
+and sync-peer QoS 1 remain the comparisons that matter; native QoS 0/1/2 capacity already leads.
+
+[`COMPAT-PUBLISH-HANDOFF-2026-08-16.md`](COMPAT-PUBLISH-HANDOFF-2026-08-16.md) closes the compat
+half of that plan and supersedes its Gap A proposal: the packet-identifier namespace is owned by
+the façade rather than shared with a locked `PacketIdPool`, so `COMPAT.md` §8 is unchanged. It also
+records four harnesses that failed their own A/A control, so no local timing claim is made for the
+QoS 0 drain change. Gap B remains open.
 
 ## Memory campaign
 

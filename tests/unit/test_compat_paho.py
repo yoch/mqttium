@@ -158,7 +158,13 @@ async def _noop() -> None:
     return None
 
 
-def test_publish_returns_queue_size_rc_when_admission_is_full() -> None:
+def test_publish_reports_queue_size_rc_when_admission_is_full() -> None:
+    """Engine-side refusal reaches the caller through the publish handle.
+
+    ``publish()`` returns before loop-side admission, so this refusal is
+    asynchronous. It must still be observable, and with the same rc and the
+    same exceptions as a synchronous ingress refusal.
+    """
     client = Client(
         CallbackAPIVersion.VERSION2,
         client_id="queue-full",
@@ -172,16 +178,49 @@ def test_publish_returns_queue_size_rc_when_admission_is_full() -> None:
         assert first.mid is not None
 
         rejected = client.publish("queue/rejected", b"two", qos=1)
-        assert rejected.rc == 15
-        assert rejected.mid is None
+        # Waiting on the handle is what surfaces the refusal; both requests have
+        # necessarily been drained by the time it returns.
         with pytest.raises(ValueError, match="ERR_QUEUE_SIZE"):
-            rejected.wait_for_publish(timeout=0.01)
+            rejected.wait_for_publish(timeout=5.0)
+        assert rejected.rc == 15
         with pytest.raises(ValueError, match="ERR_QUEUE_SIZE"):
             rejected.is_published()
 
+        # The refused publication consumed no protocol state.
         assert client._async._engine.pending_outbound_messages == 1
         assert len(client._async._engine.packet_ids) == 1
         assert len(client._async._receipts) == 1
+    finally:
+        client.loop_stop()
+
+
+def test_publish_returns_queue_size_rc_when_ingress_is_full() -> None:
+    """Ingress saturation is still refused synchronously, with mid None."""
+    client = Client(
+        CallbackAPIVersion.VERSION2,
+        client_id="ingress-full",
+        max_pending_publish_requests=1,
+    )
+    client.loop_start()
+    try:
+        # Block the loop so the first request cannot be drained, then overflow.
+        release = threading.Event()
+        assert client._loop is not None
+        client._loop.call_soon_threadsafe(lambda: release.wait(5.0))
+        try:
+            accepted = client.publish("ingress/first", b"one", qos=1)
+            assert accepted.rc == 0
+            rejected = client.publish("ingress/rejected", b"two", qos=1)
+            assert rejected.rc == 15
+            assert rejected.mid is None
+            with pytest.raises(ValueError, match="ERR_QUEUE_SIZE"):
+                rejected.wait_for_publish(timeout=0.01)
+        finally:
+            release.set()
+        # The accepted request is still admitted once the loop is released.
+        assert accepted._handoff is not None
+        accepted._handoff.result(timeout=5.0)
+        assert accepted.rc == 0
     finally:
         client.loop_stop()
 
@@ -190,3 +229,19 @@ def test_paho_zero_queue_setting_maps_to_unlimited() -> None:
     client = Client(CallbackAPIVersion.VERSION2, client_id="queue-unlimited")
     client.max_queued_messages_set(0)
     assert client._async._engine.config.max_pending_outbound_messages is None
+
+
+def test_max_outbound_inflight_is_settable_at_construction() -> None:
+    """Attach-time only: EngineConfig refuses it once the engine is attached."""
+    client = Client(CallbackAPIVersion.VERSION2, client_id="inflight", max_outbound_inflight=7)
+    assert client._async._engine.config.max_outbound_inflight == 7
+
+
+def test_max_outbound_inflight_defaults_to_broker_receive_maximum() -> None:
+    client = Client(CallbackAPIVersion.VERSION2, client_id="inflight-default")
+    assert client._async._engine.config.max_outbound_inflight is None
+
+
+def test_max_outbound_inflight_is_validated() -> None:
+    with pytest.raises(ValueError, match="max_outbound_inflight"):
+        Client(CallbackAPIVersion.VERSION2, client_id="inflight-bad", max_outbound_inflight=0)

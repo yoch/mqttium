@@ -152,6 +152,9 @@ def test_publish_none_is_zero_length_payload() -> None:
 
     client.loop_start()
     try:
+        # Decline the writer-direct path so the captured fallback runs: this
+        # test is about payload normalisation, not about which path admits it.
+        client._try_direct_qos0_publish = lambda *args, **kwargs: None
         client._queue_qos0_on_loop = queue_qos0
         client._finalize_publish_effects = lambda: None
         info = client.publish("retain/clear", None, qos=0, retain=True)
