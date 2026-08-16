@@ -43,7 +43,7 @@ def test_facade_mid_is_retired_without_user_callback_or_waiter() -> None:
     assert not client._facade_receipts
 
 
-def test_callback_installed_after_publish_keeps_facade_correlation() -> None:
+def test_callback_installed_after_publish_keeps_mid_active_through_callback() -> None:
     client = Client()
     client._async._engine.state = ConnectionState.CONNECTED
     facade_mid, reserved = client._reserve_next_facade_mid()
@@ -52,15 +52,21 @@ def test_callback_installed_after_publish_keeps_facade_correlation() -> None:
     receipt = PublishReceipt(mid=23, qos=QoS.AT_LEAST_ONCE)
     client._register_facade_mid(receipt, facade_mid)
 
-    seen: list[int | None] = []
-    client._install_publish_dispatch(lambda _c, _u, mid, _rc, _props: seen.append(mid))
+    seen: list[tuple[int | None, bool]] = []
+
+    def on_publish(_client: Client, _userdata: object, mid: int | None, _rc: int, _props: object) -> None:
+        seen.append((mid, facade_mid in client._active_facade_mids))
+
+    client._install_publish_dispatch(on_publish)
 
     receipt._settle()
+    assert facade_mid in client._active_facade_mids
     client._dispatch_publish(23, None)
 
-    assert seen == [facade_mid]
+    assert seen == [(facade_mid, True)]
     assert 23 not in client._facade_mid_map
     assert facade_mid not in client._active_facade_mids
+    assert not client._facade_receipts
 
 
 def test_removing_callback_does_not_drop_already_queued_correlation() -> None:
@@ -75,7 +81,12 @@ def test_removing_callback_does_not_drop_already_queued_correlation() -> None:
     receipt._settle()
 
     # AsyncClient can already have queued the dispatcher when the user removes
-    # the callback. The mapping must survive until that queued dispatcher runs.
+    # the callback. The mapping and reservation must survive until that queued
+    # dispatcher runs, even though it will find no user callback to invoke.
+    assert facade_mid in client._active_facade_mids
     client._install_publish_dispatch(None)
-    assert client._resolve_facade_mid(29) == facade_mid
+    client._dispatch_publish(29, None)
+
     assert 29 not in client._facade_mid_map
+    assert facade_mid not in client._active_facade_mids
+    assert not client._facade_receipts
