@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MappingProxyType
 from collections.abc import Callable, Mapping
 
@@ -183,6 +183,12 @@ class PublishReceipt:
     are raised by :meth:`wait` after it resolves, so a receipt that fails and is
     never awaited cannot leave an unretrieved exception behind -- which matters
     here, because the library installs no logging to absorb one.
+
+    ``_on_settle`` is an internal, optional synchronous observer for adapters
+    that must retire bookkeeping at the exact receipt lifetime boundary. It is
+    cleared before invocation so a defensive duplicate settlement cannot run it
+    twice. Native receipts leave it as ``None`` and pay only one predictable
+    branch on completion.
     """
 
     mid: int | None
@@ -190,10 +196,17 @@ class PublishReceipt:
     _future: asyncio.Future[None] | None = None
     _error: BaseException | None = None
     _settled: bool = False
+    _on_settle: Callable[[PublishReceipt], None] | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
     def _settle(self) -> None:
         """Mark completion and wake a waiter if one is parked."""
         self._settled = True
+        on_settle = self._on_settle
+        if on_settle is not None:
+            self._on_settle = None
+            on_settle(self)
         future = self._future
         if future is not None and not future.done():
             future.set_result(None)
