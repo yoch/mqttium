@@ -19,7 +19,9 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   Validated on a preflight-eligible host against a live broker: median callback
   p50 latency improves by 16.7% to 27.8% across four load points (2 500, 4 000,
   4 500 and 7 500 msgs/s) with every pair favouring the change, while the
-  completed rate is unchanged or slightly higher. See
+  completed rate is unchanged or slightly higher. Certified on MQTT 3.1.1 with
+  an outbound window of 64, and independently on MQTT 5 with a window of 20
+  (+26.6 % and +25.6 %). See
   `docs/reports/NATIVE-WRITER-HOP-2026-08-16.md`.
 - `mqttium.compat.paho`: QoS 1/2 `publish()` no longer blocks the calling thread
   until the network loop has allocated a packet identifier. All QoS levels now

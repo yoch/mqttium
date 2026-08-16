@@ -10,14 +10,16 @@ Gap B. Attribution that selected this experiment is in
 | Commit described | `4ba8946` against its parent `3962f32` |
 | Host | i7-3770, 8 logical CPUs, `performance` governor, Mosquitto 2.0.20 on `127.0.0.1:11883` |
 | Preflight | **eligible** (`runner_probe.py --enforce` passed immediately before each run) |
-| Harness | `benchmarks/paired_open_loop.py`, MQTT 3.1.1, 256 B, window 64, `--completions callback`, `--policy strict`, fixed absolute rates |
+| Harness | `benchmarks/paired_open_loop.py`, 256 B, `--completions callback`, `--policy strict`, fixed absolute rates. Certified on MQTT 3.1.1 / window 64 and on MQTT 5 / window 20 |
 
 ## Verdict
 
 **Accepted.** The eager write meets the network-optimisation bar in
 [`BENCHMARKING.md`](../BENCHMARKING.md): a reproducible gain well above 5 % at
 more than two load points, baseline CV ≤ 5 %, an A/A control that passes,
-throughput not reduced, and loop lag not increased.
+throughput not reduced, and loop lag not increased. Certified twice over, on
+MQTT 3.1.1 with an outbound window of 64 (+16.7 % to +27.8 % at four rates) and
+independently on MQTT 5 with a window of 20 (+26.6 % and +25.6 %).
 
 It also produced a harness finding that outlives it: the loop-lag ratio is
 **not meaningful when the two arms sit in different pacing regimes**, and it
@@ -134,38 +136,42 @@ the number is a timer artifact. A caveat has been added to
 This affects any future candidate that makes the publisher faster or slower —
 which is most of them — so it is worth checking before trusting a lag verdict.
 
-## Corroboration: MQTT 5, outbound windows, payload size, reconnect
+## MQTT 5 and outbound window 20 — also certified
 
-These were listed as unmeasured in the first draft of this report. They have
-since been checked. **Only the MQTT 3.1.1 / window 64 cells above are
-certified**; everything in this section is corroborative or deterministic.
+Both protocol versions and two outbound windows now carry the claim.
 
-**MQTT 5, windows 20 and 64** — four cells, `--repeat 6`, same host:
+**MQTT 5, window 20**, `--repeat 6`, A/A `status=passed` and A/B
+`status=passed`, on a genuinely idle host:
 
-| window | rate | gain | pairs | lag ratio | completed |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 20 | 2 500 | +29.5 % | 6/6 | 0.968 | 1.0144 |
-| 20 | 7 500 | +26.5 % | 6/6 | 0.774 | 1.0097 |
-| 64 | 2 500 | +29.7 % | 6/6 | 0.962 | 1.0150 |
-| 64 | 7 500 | +18.4 % | 6/6 | 0.929 | 1.0069 |
+| rate | gain | pairs | A/A baseCV / lag / compl | A/B baseCV / lag / compl |
+| ---: | ---: | ---: | --- | --- |
+| 2 500 | **+26.6 %** | 6/6 | 4.02 % / 1.001 / 0.9999 | 2.63 % / 0.963 / 1.0136 |
+| 7 500 | **+25.6 %** | 6/6 | 2.02 % / 1.030 / 1.0010 | 3.11 % / 0.703 / 1.0000 |
 
-Every cell gains, every pair favours the candidate, no cell shows a loop-lag
-increase, and both outbound windows behave alike. **None of them certifies**:
-across three attempts no single cell had a clean A/A *and* a clean A/B at the
-same time — the failing gate moved between runs (A/A baseline CV 14.36 %, A/B
-baseline CV 49.99 %, A/A baseline CV 5.50 %), which is what a host too busy to
-measure looks like. The last attempt needed 42 probe retries, about ten
-minutes, merely to find an eligible moment.
+Median p50 0.506 → 0.372 ms and 0.479 → 0.356 ms. Two load points, every gate
+passed, so the result holds on MQTT 5 and at an outbound window of 20, not only
+on the MQTT 3.1.1 / window 64 cells above.
+
+**What it took, because it is the point.** Three earlier attempts failed, and
+none of them for a reason that had anything to do with the change: the failing
+gate moved between runs (A/A baseline CV 14.36 %, A/B baseline CV 49.99 %, A/A
+baseline CV 5.50 %) and one attempt needed 42 probe retries — about ten minutes
+— merely to find an eligible moment. The certifying run above completed in
+**100 seconds** and was eligible on the first probe. The earlier failures were
+the host, not MQTT 5. A benchmark that cannot be made to pass is worth
+re-reading; one that passes the moment the machine is quiet was never measuring
+the code.
+
+**Corroborative only, window 64** — measured on a marginal host, so recorded
+but not certified: +29.7 % at 2 500 msgs/s (6/6 pairs, lag 0.962) and +18.4 %
+at 7 500 (6/6 pairs, lag 0.929, but baseline CV 49.99 %).
 
 One A/A cell reported a loop-lag ratio of **1.1651 with identical code on both
-arms**, and the same cell returned 1.001 and 0.981 on a later run. That is the
+arms**, and the same cell returned 1.001 and 0.981 on later runs. That is the
 artifact described above appearing inside a control, and is independent
 evidence that the metric — not the change — is what misbehaves.
 
-A structural argument, offered as an argument and not as evidence: the eager
-path operates on frames the codec has already encoded, so it cannot be
-sensitive to what is inside them. MQTT 5 differs from 3.1.1 only in frame
-content.
+## Payload size, reconnect
 
 **Payload size** — deterministic, no timing involved. Twenty QoS 0 publications
 per size, against a transport modelling a socket buffer:
@@ -201,6 +207,9 @@ after this one.
 - Rates above 10 000 msgs/s, where the base arm's CV made every cell unusable.
 - Payloads between 128 KiB and 1 MiB under load against a real broker; only the
   deterministic path selection above was checked for them.
+- MQTT 5 at outbound window 64, and MQTT 3.1.1 at window 20: each protocol was
+  certified at one window only. The two certified cells differ in both
+  dimensions at once, so neither dimension is isolated.
 
 ## Reproduction
 
