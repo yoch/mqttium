@@ -111,6 +111,9 @@ _CLIENT_DISCONNECT_REASONS = frozenset(
     }
 )
 
+# MQTT 5 Table 3-10: 0x04 (Disconnect with Will Message) is Client-only.
+_SERVER_DISCONNECT_REASONS = _DISCONNECT_REASONS - {0x04}
+
 
 _AUTH_REASONS = frozenset({0x00, 0x18, 0x19})
 
@@ -132,7 +135,7 @@ def _decode_control_v5(
 
 
 def decode_disconnect_v5(remaining: bytes) -> tuple[int, Properties | None]:
-    return _decode_control_v5(remaining, DISCONNECT, _DISCONNECT_REASONS)
+    return _decode_control_v5(remaining, DISCONNECT, _SERVER_DISCONNECT_REASONS)
 
 
 def decode_auth_v5(remaining: bytes) -> tuple[int, Properties | None]:
