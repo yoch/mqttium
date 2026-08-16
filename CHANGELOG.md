@@ -6,6 +6,42 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Changed
+
+- `mqttium.compat.paho`: QoS 1/2 `publish()` no longer blocks the calling thread
+  until the network loop has allocated a packet identifier. All QoS levels now
+  return as soon as the request is accepted, matching Paho's shape. Measured with
+  `benchmarks/compat_qosn_submit_ab.py` on a preflight-eligible host, the
+  single-producer mean drain batch rose from 1.00 to 224.88 and the coalesced
+  path went from 0.69x to 2.67x the one-callback-per-message handoff it is meant
+  to beat. This is a submit-rate benchmark with no broker I/O.
+- `mqttium.compat.paho`: `MQTTMessageInfo.mid` for QoS 1/2 is now a façade
+  correlation identifier wrapping over `1..65535`, not the wire packet
+  identifier. `on_publish` reports the same value `publish()` returned. Packet
+  identifiers remain owned by the network loop (`docs/COMPAT.md` §8).
+- `mqttium.compat.paho`: an admission refusal that happens after `publish()`
+  returned is reported as `rc = MQTT_ERR_QUEUE_SIZE` on the returned handle
+  rather than synchronously. `wait_for_publish()` and `is_published()` re-check
+  `rc` once admission has settled, so a refused publication cannot report
+  success. Cross-thread ingress saturation is still refused synchronously with
+  `mid = None`. Because a producer can now outrun the loop, `MQTT_ERR_QUEUE_SIZE`
+  is reachable for QoS 1/2 under sustained overload; producers must shed.
+- `mqttium.compat.paho`: QoS 0 is committed through the same writer-direct path
+  the native client uses, removing 2 engine effects and 2 effect-pump round
+  trips per message (exact counts), with the effect path kept as the fallback.
+  Ordering across QoS levels is unchanged.
+
+### Added
+
+- `mqttium.compat.paho.Client(max_outbound_inflight=...)`: cap unfinished QoS 1/2
+  publications below the broker's Receive Maximum. Attach-time only, so it can no
+  longer be reached only by rebuilding the inner `AsyncClient`.
+
+### Removed
+
+- `mqttium.compat.paho._PUBLISH_HANDOFF_TIMEOUT` (internal): `publish()` no
+  longer waits for loop-side admission, so there is nothing to time out.
+
 ## [1.0.0rc5] - 2026-08-16
 
 ### Changed

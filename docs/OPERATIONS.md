@@ -67,6 +67,15 @@ growing. Use `await client.publish(...)` when the producer should wait for
 writer capacity. A `publish_nowait()` producer must catch `FlowControlError` and
 apply its own shed, retry or spill policy.
 
+A `publish_nowait()` producer sending large payloads will saturate the writer
+byte budget (`max_outbound_bytes`, 1 MiB by default) long before it exhausts the
+message count, and a producer that merely retries on `FlowControlError` will
+busy-spin against it. Shed, slow down, or spill instead — or use
+`publish_backpressure="wait"` (the default) with `await client.publish(...)` and
+let the client apply the backpressure for you. Do **not** set the pending bounds
+to `None` to make the error go away: unbounded queues move the failure from a
+catchable exception to memory exhaustion.
+
 Size `max_outbound_bytes` from the encoded bytes that may accumulate during the
 largest supported burst, not only from the message count. This matters most for
 64 KiB and 1 MiB payloads. To preserve forward progress, an empty writer queue
@@ -128,6 +137,25 @@ The snapshot also reports retain, wildcard, shared-subscription and
 subscription-identifier availability, topic alias maximum, session expiry and
 server references. MQTTium validates operations against these settings and
 raises rather than silently downgrading unsupported work.
+
+### Inbound concurrency is capped below the protocol maximum
+
+`AsyncClient(local_receive_maximum=...)` defaults to **100**, not to the
+protocol maximum of 65,535 that `EngineConfig` uses for direct-engine consumers.
+It is the Receive Maximum MQTTium advertises to the broker, so it bounds how
+many inbound QoS 1/2 publications the broker may have unacknowledged at once —
+including automatic acknowledgement. A subscriber that needs more inbound
+concurrency must raise it explicitly:
+
+```python
+client = AsyncClient(local_receive_maximum=1000)
+```
+
+The two defaults differ deliberately and both are frozen for 1.0: the engine
+default is the protocol maximum, and the client default is a bounded
+application-facing window. Raising it increases the memory the inbound path may
+hold. It is unrelated to `max_outbound_inflight`, which bounds *outbound*
+unfinished publications and is capped by the broker's own Receive Maximum.
 
 ## Timeouts
 

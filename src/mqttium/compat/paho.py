@@ -182,6 +182,7 @@ class Client:
         max_pending_inbound_bytes: int | None = 64 * 1024 * 1024,
         max_pending_publish_requests: int = 10_000,
         max_pending_publish_bytes: int = 64 * 1024 * 1024,
+        max_outbound_inflight: int | None = None,
     ) -> None:
         if callback_api_version is not CallbackAPIVersion.VERSION2:
             raise ValueError("mqttium.compat.paho only supports CallbackAPIVersion.VERSION2")
@@ -199,6 +200,7 @@ class Client:
             max_pending_outbound_messages=max_pending_outbound_messages,
             max_pending_outbound_bytes=max_pending_outbound_bytes,
             max_pending_inbound_bytes=max_pending_inbound_bytes,
+            max_outbound_inflight=max_outbound_inflight,
             publish_backpressure="error",
         )
         # Cache the hot adapter boundary methods once. This avoids repeated

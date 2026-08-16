@@ -229,3 +229,19 @@ def test_paho_zero_queue_setting_maps_to_unlimited() -> None:
     client = Client(CallbackAPIVersion.VERSION2, client_id="queue-unlimited")
     client.max_queued_messages_set(0)
     assert client._async._engine.config.max_pending_outbound_messages is None
+
+
+def test_max_outbound_inflight_is_settable_at_construction() -> None:
+    """Attach-time only: EngineConfig refuses it once the engine is attached."""
+    client = Client(CallbackAPIVersion.VERSION2, client_id="inflight", max_outbound_inflight=7)
+    assert client._async._engine.config.max_outbound_inflight == 7
+
+
+def test_max_outbound_inflight_defaults_to_broker_receive_maximum() -> None:
+    client = Client(CallbackAPIVersion.VERSION2, client_id="inflight-default")
+    assert client._async._engine.config.max_outbound_inflight is None
+
+
+def test_max_outbound_inflight_is_validated() -> None:
+    with pytest.raises(ValueError, match="max_outbound_inflight"):
+        Client(CallbackAPIVersion.VERSION2, client_id="inflight-bad", max_outbound_inflight=0)
