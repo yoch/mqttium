@@ -206,6 +206,7 @@ class Client:
         # protocol and receipt state behind the AsyncClient boundary.
         self._queue_qosn_on_loop = self._async._queue_qosn_on_loop
         self._queue_qos0_on_loop = self._async._queue_qos0_on_loop
+        self._try_direct_qos0_publish = self._async._try_direct_qos0_publish
         self._finalize_async_commands = self._async._finalize_loop_commands
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
@@ -665,11 +666,28 @@ class Client:
     def _commit_publish_request(self, request: _PendingPublish) -> None:
         """Admit one request on the loop. Raises when admission is refused."""
         if request.qos is QoS.AT_MOST_ONCE:
-            self._queue_qos0_on_loop(
-                request.topic,
-                request.payload if request.payload is not None else b"",
-                retain=request.retain,
-            )
+            payload = request.payload if request.payload is not None else b""
+            # Same writer-direct path the native client takes. It declines
+            # whenever effects are already pending — which is exactly the case
+            # after a QoS 1/2 commit earlier in this batch, whose SEND is not
+            # flushed until _finalize_publish_effects(). That is what keeps
+            # ordering across QoS levels (COMPAT.md).
+            #
+            # nowait=False deliberately: a full writer queue must fall back to
+            # the effect path, which defers the SEND rather than refusing it.
+            # The direct path is an optimisation, never a new failure mode.
+            if (
+                self._try_direct_qos0_publish(
+                    request.topic,
+                    payload,
+                    qos=QoS.AT_MOST_ONCE,
+                    retain=request.retain,
+                    properties=None,
+                    nowait=False,
+                )
+                is None
+            ):
+                self._queue_qos0_on_loop(request.topic, payload, retain=request.retain)
         else:
             self._commit_qosn_publish_on_loop(request)
 

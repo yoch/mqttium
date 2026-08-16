@@ -104,6 +104,46 @@ def test_compat_qos2_publish_completes_full_handshake() -> None:
         client.loop_stop()
 
 
+def test_direct_qos0_drain_preserves_order_across_qos_levels() -> None:
+    """A writer-direct QoS 0 must never overtake a QoS 1 committed before it.
+
+    The direct path writes to the writer queue immediately, while a QoS 1 SEND
+    waits for the batch's effect flush. `_direct_qos0_ready()` declining while
+    effects are pending is what keeps the wire in ingress order; this pins it.
+    """
+    broker = _AckingBroker()
+    client = Client(CallbackAPIVersion.VERSION2, client_id="compat-qos-order")
+
+    async def factory(
+        host: str,
+        port: int,
+        *,
+        ssl: object | None = None,
+    ) -> _AckingBroker:
+        return broker
+
+    client._async._transport_factory = factory
+    client.loop_start()
+    try:
+        assert client.connect("fake", 1883) == 0
+        # One batch, alternating QoS, published from a non-loop thread.
+        topics = [f"order/{index}" for index in range(20)]
+        infos = [
+            client.publish(topic, b"x", qos=1 if index % 2 else 0)
+            for index, topic in enumerate(topics)
+        ]
+        for info in infos:
+            info.wait_for_publish(timeout=5.0)
+
+        deadline = time.monotonic() + 2.0
+        while len(broker.publishes) < len(topics) and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert [publish.topic for publish in broker.publishes] == topics
+    finally:
+        client.disconnect()
+        client.loop_stop()
+
+
 def test_on_publish_reports_the_facade_mid_not_the_packet_id() -> None:
     """The callback correlates with the value ``publish()`` handed back.
 

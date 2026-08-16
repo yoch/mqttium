@@ -190,13 +190,16 @@ def test_off_loop_qos0_publish_uses_coalesced_loop_queue(monkeypatch: pytest.Mon
     for _ in range(100):
         info = client.publish("perf/qos0", b"x", qos=0)
         assert info.mid is None
+    # One loop wakeup for the whole run: that is what the coalesced queue buys.
     assert len(loop.calls) == 1
     callback, args = loop.calls.pop()
     callback(*args)
-    assert [effect.kind for effect in client._async._pending_effects] == [
-        *([EffectKind.SEND] * 100),
-        *([EffectKind.PUBLISH_COMPLETE] * 100),
-    ]
+
+    # Every message reached the writer, and the drain took the writer-direct
+    # path rather than routing each one through the effect adapter.
+    assert client._async._write_pump.queue.qsize() == 100
+    assert not client._async._pending_effects
+    assert not client._async._engine.has_pending_effects
 
 
 @pytest.mark.parametrize("qos", [1, 2])
@@ -403,13 +406,15 @@ def test_mixed_qos_requests_preserve_ingress_order(monkeypatch: pytest.MonkeyPat
     loop = LoopStub()
     client._loop = cast(asyncio.AbstractEventLoop, loop)
     order: list[str] = []
-    original_queue_publish = client._async._engine.queue_publish
+    original_commit = client._commit_publish_request
 
-    def traced_queue_publish(topic: str, *args: Any, **kwargs: Any):
-        order.append(topic)
-        return original_queue_publish(topic, *args, **kwargs)
+    def traced_commit(request: Any) -> None:
+        # Observed at the facade boundary, so the assertion holds for both the
+        # writer-direct QoS 0 path and the effect path.
+        order.append(request.topic)
+        return original_commit(request)
 
-    monkeypatch.setattr(client._async._engine, "queue_publish", traced_queue_publish)
+    monkeypatch.setattr(client, "_commit_publish_request", traced_commit)
     monkeypatch.setattr(
         client,
         "_finalize_publish_effects",
@@ -470,14 +475,16 @@ def test_publish_batches_are_count_bounded(monkeypatch: pytest.MonkeyPatch) -> N
     loop = LoopStub()
     client._loop = cast(asyncio.AbstractEventLoop, loop)
     committed: list[str] = []
-    original_queue_publish = client._async._engine.queue_publish
+    original_commit = client._commit_publish_request
 
-    def traced_queue_publish(topic: str, *args: Any, **kwargs: Any):
-        committed.append(topic)
-        return original_queue_publish(topic, *args, **kwargs)
+    def traced_commit(request: Any) -> None:
+        # Observed at the facade boundary, so the assertion holds for both the
+        # writer-direct QoS 0 path and the effect path.
+        committed.append(request.topic)
+        return original_commit(request)
 
     monkeypatch.setattr(paho_compat, "_PUBLISH_BATCH_MAX_MESSAGES", 2)
-    monkeypatch.setattr(client._async._engine, "queue_publish", traced_queue_publish)
+    monkeypatch.setattr(client, "_commit_publish_request", traced_commit)
     monkeypatch.setattr(
         client,
         "_finalize_publish_effects",
@@ -517,14 +524,16 @@ def test_publish_batches_are_byte_bounded(monkeypatch: pytest.MonkeyPatch) -> No
     loop = LoopStub()
     client._loop = cast(asyncio.AbstractEventLoop, loop)
     committed: list[str] = []
-    original_queue_publish = client._async._engine.queue_publish
+    original_commit = client._commit_publish_request
 
-    def traced_queue_publish(topic: str, *args: Any, **kwargs: Any):
-        committed.append(topic)
-        return original_queue_publish(topic, *args, **kwargs)
+    def traced_commit(request: Any) -> None:
+        # Observed at the facade boundary, so the assertion holds for both the
+        # writer-direct QoS 0 path and the effect path.
+        committed.append(request.topic)
+        return original_commit(request)
 
     monkeypatch.setattr(paho_compat, "_PUBLISH_BATCH_MAX_BYTES", 20)
-    monkeypatch.setattr(client._async._engine, "queue_publish", traced_queue_publish)
+    monkeypatch.setattr(client, "_commit_publish_request", traced_commit)
     monkeypatch.setattr(
         client,
         "_finalize_publish_effects",
@@ -566,11 +575,13 @@ def test_publish_enqueued_during_finalization_schedules_next_drain(
     loop = LoopStub()
     client._loop = cast(asyncio.AbstractEventLoop, loop)
     committed: list[str] = []
-    original_queue_publish = client._async._engine.queue_publish
+    original_commit = client._commit_publish_request
 
-    def traced_queue_publish(topic: str, *args: Any, **kwargs: Any):
-        committed.append(topic)
-        return original_queue_publish(topic, *args, **kwargs)
+    def traced_commit(request: Any) -> None:
+        # Observed at the facade boundary, so the assertion holds for both the
+        # writer-direct QoS 0 path and the effect path.
+        committed.append(request.topic)
+        return original_commit(request)
 
     enqueue_tail = True
 
@@ -581,7 +592,7 @@ def test_publish_enqueued_during_finalization_schedules_next_drain(
             enqueue_tail = False
             client.publish("tail/second", b"x", qos=0)
 
-    monkeypatch.setattr(client._async._engine, "queue_publish", traced_queue_publish)
+    monkeypatch.setattr(client, "_commit_publish_request", traced_commit)
     monkeypatch.setattr(client, "_finalize_publish_effects", finalize)
 
     client.publish("tail/first", b"x", qos=0)
