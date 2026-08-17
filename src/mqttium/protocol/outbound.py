@@ -404,6 +404,8 @@ class OutboundSession:
         retain: bool = False,
         properties: Properties | None = None,
     ) -> PublishHandle:
+        if self._engine.state is ConnectionState.DISCONNECTING:
+            raise NotConnectedError("publish is not allowed while disconnecting")
         qos, topic_bytes, topic_size = self._validate_publish_request(
             topic, qos, retain, properties
         )

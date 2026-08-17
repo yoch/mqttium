@@ -517,7 +517,7 @@ class AsyncClient:
         Keeping finalization separate lets adapters commit a bounded batch and
         collect/drain effects once.
         """
-        handle = self._engine.queue_publish(
+        handle = self._engine.outbound.queue_publish(
             topic,
             payload,
             qos=qos,
@@ -621,7 +621,7 @@ class AsyncClient:
         properties: Properties | None = None,
     ) -> PublishReceipt:
         """Admit QoS 1/2 and register its receipt for loop-bound adapters."""
-        handle = self._engine.queue_publish(
+        handle = self._engine.outbound.queue_publish(
             topic,
             payload,
             qos=qos,
@@ -642,7 +642,7 @@ class AsyncClient:
         properties: Properties | None = None,
     ) -> None:
         """Admit QoS 0 without allocating a receipt, for batched adapters."""
-        self._engine.queue_publish(
+        self._engine.outbound.queue_publish(
             topic,
             payload,
             qos=QoS.AT_MOST_ONCE,
@@ -1003,7 +1003,7 @@ class AsyncClient:
                         self._check_nowait_publish_capacity(topic, data, qos, retain, properties)
                     # Keep the native async hot path inline. Routing these
                     # operations through the adapter boundary measured 2.36% slower.
-                    handle = self._engine.queue_publish(
+                    handle = self._engine.outbound.queue_publish(
                         topic,
                         data,
                         qos=qos,
@@ -1059,7 +1059,7 @@ class AsyncClient:
                         return
                     if nowait:
                         self._check_nowait_publish_many_capacity(requests)
-                    handles = self._engine.queue_publish_many(requests)
+                    handles = self._engine.outbound.queue_publish_many(requests)
                 except FlowControlError as flow_exc:
                     if (
                         nowait
@@ -1676,7 +1676,7 @@ class AsyncClient:
                 await pending_delivery
             if effect.requires_delivery_mark is not False and message.mid is not None:
                 async with self._engine_lock:
-                    self._engine.mark_inbound_delivered(message.mid)
+                    self._engine.inbound.mark_delivered(message.mid)
         elif kind is EffectKind.DECODED_MESSAGE:
             message = effect.data
             property_wire_size = effect.decoded_property_wire_size
@@ -1688,7 +1688,7 @@ class AsyncClient:
                 await pending_delivery
             if effect.requires_delivery_mark is not False and message.mid is not None:
                 async with self._engine_lock:
-                    self._engine.mark_inbound_delivered(message.mid)
+                    self._engine.inbound.mark_delivered(message.mid)
         elif kind is EffectKind.PUBLISH_COMPLETE:
             mid: int | None = effect.data
             self._settle_publish(mid, None)

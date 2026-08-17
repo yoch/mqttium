@@ -387,8 +387,13 @@ class ProtocolEngine:
         retain: bool = False,
         properties: Properties | None = None,
     ) -> PublishHandle:
-        if self.state is ConnectionState.DISCONNECTING:
-            raise NotConnectedError("publish is not allowed while disconnecting")
+        """Provisional facade over `engine.outbound.queue_publish`.
+
+        AsyncClient calls the session directly: this is the hottest path in the
+        library and the forwarder was a Python frame per publish. The
+        DISCONNECTING guard now lives in the session, so both entry points
+        enforce it.
+        """
         return self.outbound.queue_publish(
             topic, payload, qos=qos, retain=retain, properties=properties
         )
@@ -397,8 +402,7 @@ class ProtocolEngine:
         self,
         messages: Iterable[tuple[str, bytes, QoS | int, bool, Properties | None]],
     ) -> list[PublishHandle]:
-        if self.state is ConnectionState.DISCONNECTING:
-            raise NotConnectedError("publish is not allowed while disconnecting")
+        """Provisional facade; the guard lives in the session (see queue_publish)."""
         return self.outbound.queue_publish_many(messages)
 
     def queue_subscribe(
