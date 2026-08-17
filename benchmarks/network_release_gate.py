@@ -718,7 +718,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--protocols", default="311")
     parser.add_argument("--completions", default="callback")
     parser.add_argument("--payloads", default="64")
-    parser.add_argument("--windows", default="1,8,64")
+    parser.add_argument("--windows", default="1,20,64")
     parser.add_argument(
         "--cycle-seeds",
         type=_parse_cycle_seeds,
