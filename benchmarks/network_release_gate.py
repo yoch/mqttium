@@ -14,13 +14,12 @@ import math
 import statistics
 import subprocess
 import sys
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 
-# Two-sided 95% Student-t critical values. Network release runs require at least
-# six pairs, so the low-df entries mostly make the helper safe for unit tests.
 _T_975 = {
     1: 12.706,
     2: 4.303,
@@ -140,20 +139,23 @@ def control_failures(
     label: str,
     estimate: PairEstimate,
     *,
-    floor: float,
-    ceiling: float,
+    bias_floor: float,
+    bias_ceiling: float,
+    equivalence_floor: float,
+    equivalence_ceiling: float,
 ) -> list[str]:
-    """Require a same-code CI to contain 1 and fit inside equivalence bounds."""
+    """Require same-code bias and uncertainty to fit predeclared budgets."""
     failures: list[str] = []
-    if not estimate.lower_95 <= 1.0 <= estimate.upper_95:
+    if not bias_floor <= estimate.geometric_mean <= bias_ceiling:
         failures.append(
-            f"{label}: same-code 95% CI [{estimate.lower_95:.4f}, "
-            f"{estimate.upper_95:.4f}] does not contain 1.0"
+            f"{label}: same-code estimate {estimate.geometric_mean:.4f} "
+            f"outside bias budget [{bias_floor:.4f}, {bias_ceiling:.4f}]"
         )
-    if estimate.lower_95 < floor or estimate.upper_95 > ceiling:
+    if estimate.lower_95 < equivalence_floor or estimate.upper_95 > equivalence_ceiling:
         failures.append(
             f"{label}: same-code 95% CI [{estimate.lower_95:.4f}, "
-            f"{estimate.upper_95:.4f}] exceeds equivalence [{floor:.4f}, {ceiling:.4f}]"
+            f"{estimate.upper_95:.4f}] exceeds equivalence "
+            f"[{equivalence_floor:.4f}, {equivalence_ceiling:.4f}]"
         )
     return failures
 
@@ -208,10 +210,14 @@ def _pair_estimates(scenario: dict[str, Any]) -> tuple[PairEstimate, PairEstimat
 def evaluate_control_payload(
     payload: dict[str, Any],
     *,
-    throughput_floor: float,
-    throughput_ceiling: float,
-    ack_p50_floor: float,
-    ack_p50_ceiling: float,
+    throughput_bias_floor: float,
+    throughput_bias_ceiling: float,
+    throughput_equivalence_floor: float,
+    throughput_equivalence_ceiling: float,
+    ack_p50_bias_floor: float,
+    ack_p50_bias_ceiling: float,
+    ack_p50_equivalence_floor: float,
+    ack_p50_equivalence_ceiling: float,
 ) -> list[ScenarioEvaluation]:
     evaluations: list[ScenarioEvaluation] = []
     for scenario in payload["scenarios"]:
@@ -220,15 +226,19 @@ def evaluate_control_payload(
         failures = control_failures(
             f"{key} throughput",
             throughput,
-            floor=throughput_floor,
-            ceiling=throughput_ceiling,
+            bias_floor=throughput_bias_floor,
+            bias_ceiling=throughput_bias_ceiling,
+            equivalence_floor=throughput_equivalence_floor,
+            equivalence_ceiling=throughput_equivalence_ceiling,
         )
         failures.extend(
             control_failures(
                 f"{key} ACK p50",
                 ack_p50,
-                floor=ack_p50_floor,
-                ceiling=ack_p50_ceiling,
+                bias_floor=ack_p50_bias_floor,
+                bias_ceiling=ack_p50_bias_ceiling,
+                equivalence_floor=ack_p50_equivalence_floor,
+                equivalence_ceiling=ack_p50_equivalence_ceiling,
             )
         )
         evaluations.append(
@@ -342,7 +352,16 @@ def _engine_command(
     return command
 
 
-def _fresh_preflight(args: argparse.Namespace, *, label: str, raw_dir: Path) -> Path:
+def _fresh_preflight(
+    args: argparse.Namespace,
+    *,
+    label: str,
+    raw_dir: Path,
+    quiet_seconds: float,
+) -> Path:
+    if quiet_seconds > 0:
+        print(f"{label}: fixed inter-phase quiet period {quiet_seconds:.0f}s")
+        time.sleep(quiet_seconds)
     output = raw_dir / f"{label}-preflight.json"
     command = [
         sys.executable,
@@ -365,9 +384,15 @@ def _run_engine(
     base_root: Path,
     candidate_root: Path,
     raw_dir: Path,
+    quiet_seconds: float,
 ) -> dict[str, Any]:
     output = raw_dir / f"{label}.json"
-    preflight_report = _fresh_preflight(args, label=label, raw_dir=raw_dir)
+    preflight_report = _fresh_preflight(
+        args,
+        label=label,
+        raw_dir=raw_dir,
+        quiet_seconds=quiet_seconds,
+    )
     command = _engine_command(
         args,
         base_root=base_root,
@@ -429,6 +454,20 @@ def _write_result(output: Path, payload: dict[str, Any]) -> None:
     output.with_suffix(".md").write_text("\n".join(lines), encoding="utf-8")
 
 
+def _control_evaluations(args: argparse.Namespace, payload: dict[str, Any]) -> list[ScenarioEvaluation]:
+    return evaluate_control_payload(
+        payload,
+        throughput_bias_floor=args.control_throughput_bias_floor,
+        throughput_bias_ceiling=args.control_throughput_bias_ceiling,
+        throughput_equivalence_floor=args.control_throughput_floor,
+        throughput_equivalence_ceiling=args.control_throughput_ceiling,
+        ack_p50_bias_floor=args.control_ack_p50_bias_floor,
+        ack_p50_bias_ceiling=args.control_ack_p50_bias_ceiling,
+        ack_p50_equivalence_floor=args.control_ack_p50_floor,
+        ack_p50_equivalence_ceiling=args.control_ack_p50_ceiling,
+    )
+
+
 def parent(args: argparse.Namespace) -> int:
     base_root = args.base_root.resolve()
     candidate_root = args.candidate_root.resolve()
@@ -441,11 +480,26 @@ def parent(args: argparse.Namespace) -> int:
         "candidate_sha": _git_sha(candidate_root),
         "repeat": args.repeat,
         "thresholds": {
-            "control_throughput": [args.control_throughput_floor, args.control_throughput_ceiling],
-            "control_ack_p50": [args.control_ack_p50_floor, args.control_ack_p50_ceiling],
+            "control_throughput_bias": [
+                args.control_throughput_bias_floor,
+                args.control_throughput_bias_ceiling,
+            ],
+            "control_throughput_equivalence": [
+                args.control_throughput_floor,
+                args.control_throughput_ceiling,
+            ],
+            "control_ack_p50_bias": [
+                args.control_ack_p50_bias_floor,
+                args.control_ack_p50_bias_ceiling,
+            ],
+            "control_ack_p50_equivalence": [
+                args.control_ack_p50_floor,
+                args.control_ack_p50_ceiling,
+            ],
             "min_throughput": args.min_throughput,
             "max_ack_p50": args.max_ack_p50,
             "confidence": 0.95,
+            "inter_phase_quiet_seconds": args.inter_phase_quiet_seconds,
         },
         "raw_arm_cv": "diagnostic_only",
         "base_control": [],
@@ -460,14 +514,9 @@ def parent(args: argparse.Namespace) -> int:
             base_root=base_root,
             candidate_root=base_root,
             raw_dir=raw_dir,
+            quiet_seconds=0.0,
         )
-        base_control = evaluate_control_payload(
-            base_control_payload,
-            throughput_floor=args.control_throughput_floor,
-            throughput_ceiling=args.control_throughput_ceiling,
-            ack_p50_floor=args.control_ack_p50_floor,
-            ack_p50_ceiling=args.control_ack_p50_ceiling,
-        )
+        base_control = _control_evaluations(args, base_control_payload)
         result["base_control"] = [_evaluation_dict(item) for item in base_control]
         failures = [failure for item in base_control for failure in item.failures]
         if failures:
@@ -482,14 +531,9 @@ def parent(args: argparse.Namespace) -> int:
             base_root=candidate_root,
             candidate_root=candidate_root,
             raw_dir=raw_dir,
+            quiet_seconds=args.inter_phase_quiet_seconds,
         )
-        candidate_control = evaluate_control_payload(
-            candidate_control_payload,
-            throughput_floor=args.control_throughput_floor,
-            throughput_ceiling=args.control_throughput_ceiling,
-            ack_p50_floor=args.control_ack_p50_floor,
-            ack_p50_ceiling=args.control_ack_p50_ceiling,
-        )
+        candidate_control = _control_evaluations(args, candidate_control_payload)
         result["candidate_control"] = [_evaluation_dict(item) for item in candidate_control]
         failures = [failure for item in candidate_control for failure in item.failures]
         if failures:
@@ -504,6 +548,7 @@ def parent(args: argparse.Namespace) -> int:
             base_root=base_root,
             candidate_root=candidate_root,
             raw_dir=raw_dir,
+            quiet_seconds=args.inter_phase_quiet_seconds,
         )
         ab = evaluate_ab_payload(
             ab_payload,
@@ -536,7 +581,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--protocols", default="311")
     parser.add_argument("--completions", default="callback")
     parser.add_argument("--payloads", default="64")
-    parser.add_argument("--windows", default="1,8,64")
+    parser.add_argument("--windows", default="1,20,64")
     parser.add_argument("--repeat", type=int, default=12)
     parser.add_argument("--count-small", type=int, default=6_000)
     parser.add_argument("--count-large", type=int, default=3_000)
@@ -545,8 +590,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument("--cpu", type=int)
     parser.add_argument("--runner-probe", type=Path, default=Path("benchmarks/runner_probe.py"))
+    parser.add_argument("--inter-phase-quiet-seconds", type=float, default=60.0)
+    parser.add_argument("--control-throughput-bias-floor", type=float, default=0.98)
+    parser.add_argument("--control-throughput-bias-ceiling", type=float, default=1.02)
     parser.add_argument("--control-throughput-floor", type=float, default=0.95)
     parser.add_argument("--control-throughput-ceiling", type=float, default=1.05)
+    parser.add_argument("--control-ack-p50-bias-floor", type=float, default=0.95)
+    parser.add_argument("--control-ack-p50-bias-ceiling", type=float, default=1.05)
     parser.add_argument("--control-ack-p50-floor", type=float, default=0.90)
     parser.add_argument("--control-ack-p50-ceiling", type=float, default=1.10)
     parser.add_argument("--min-throughput", type=float, default=0.95)
@@ -558,10 +608,30 @@ def parse_args() -> argparse.Namespace:
         parser.error("--repeat must be an even count of at least 6")
     if args.target_sample_seconds <= 0:
         parser.error("--target-sample-seconds must be positive")
+    if args.inter_phase_quiet_seconds < 0:
+        parser.error("--inter-phase-quiet-seconds must be non-negative")
     if not 0 < args.control_throughput_floor < 1 < args.control_throughput_ceiling:
-        parser.error("throughput control bounds must straddle 1.0")
+        parser.error("throughput control equivalence bounds must straddle 1.0")
+    if not 0 < args.control_throughput_bias_floor < 1 < args.control_throughput_bias_ceiling:
+        parser.error("throughput control bias bounds must straddle 1.0")
+    if not (
+        args.control_throughput_floor
+        <= args.control_throughput_bias_floor
+        < args.control_throughput_bias_ceiling
+        <= args.control_throughput_ceiling
+    ):
+        parser.error("throughput bias budget must fit inside equivalence bounds")
     if not 0 < args.control_ack_p50_floor < 1 < args.control_ack_p50_ceiling:
-        parser.error("ACK p50 control bounds must straddle 1.0")
+        parser.error("ACK p50 control equivalence bounds must straddle 1.0")
+    if not 0 < args.control_ack_p50_bias_floor < 1 < args.control_ack_p50_bias_ceiling:
+        parser.error("ACK p50 control bias bounds must straddle 1.0")
+    if not (
+        args.control_ack_p50_floor
+        <= args.control_ack_p50_bias_floor
+        < args.control_ack_p50_bias_ceiling
+        <= args.control_ack_p50_ceiling
+    ):
+        parser.error("ACK p50 bias budget must fit inside equivalence bounds")
     return args
 
 
