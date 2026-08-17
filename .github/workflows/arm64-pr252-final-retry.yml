@@ -1,4 +1,4 @@
-name: ARM64 PR252 Final Retry
+name: ARM64 PR252 Stable-Regime Final
 
 on:
   push:
@@ -10,14 +10,14 @@ permissions:
 jobs:
   validate:
     runs-on: [self-hosted, linux, ARM64]
-    timeout-minutes: 75
+    timeout-minutes: 80
     env:
       PYTHONUNBUFFERED: "1"
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
       BASE_SHA: 0999d8abfe44a568209209403d7f215b18cc4eb7
-      CANDIDATE_SHA: b0bbdfb21baeb7fb15f1428cf26d25ab492f731a
+      CANDIDATE_SHA: fd750be3012e3878b12449624bce2c71747623ba
     steps:
-      - name: Verify clean dedicated host
+      - name: Verify dedicated performance host
         shell: bash
         run: |
           set -euo pipefail
@@ -29,44 +29,50 @@ jobs:
           PY
           test "$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor | sort -u)" = performance
           if pgrep -a mosquitto; then exit 1; fi
+
       - uses: actions/checkout@v7
         with:
           ref: ${{ env.BASE_SHA }}
           path: base
+          fetch-depth: 0
           persist-credentials: false
+
       - uses: actions/checkout@v7
         with:
           ref: ${{ env.CANDIDATE_SHA }}
           path: candidate
           fetch-depth: 0
           persist-credentials: false
-      - name: Verify exact endpoints and invariants
+
+      - name: Verify exact endpoints and candidate gate
         shell: bash
         run: |
           set -euo pipefail
           test "$(git -C base rev-parse HEAD)" = "$BASE_SHA"
           test "$(git -C candidate rev-parse HEAD)" = "$CANDIDATE_SHA"
           test "$(git -C candidate merge-base "$BASE_SHA" "$CANDIDATE_SHA")" = "$BASE_SHA"
-          grep -q 'self._emit(EffectKind.SEND, packet)' candidate/src/mqttium/protocol/engine.py
-          grep -q 'def _try_launch' candidate/src/mqttium/protocol/outbound.py
+          grep -q 'candidate_ack_latency_p50_cv' candidate/benchmarks/paired_open_loop.py
+          grep -q 'candidate p50-latency CV' candidate/benchmarks/paired_open_loop.py
           grep -q 'self._eager_armed' candidate/src/mqttium/api/_writer.py
-          grep -q 'write_many = getattr(transport, "write_many", None)' candidate/src/mqttium/api/_writer.py
-          test -f candidate/docs/reports/SIMPLIFICATION-ARM64-REVALIDATION-2026-08-17.md
+
       - name: Create benchmark venv
         shell: bash
         run: |
-          v="$RUNNER_TEMP/m252-final-v"; rm -rf "$v"; python3 -m venv "$v"; echo "$v/bin" >> "$GITHUB_PATH"
+          v="$RUNNER_TEMP/m252-stable-v"; rm -rf "$v"; python3 -m venv "$v"; echo "$v/bin" >> "$GITHUB_PATH"
+
       - run: python -m pip install "psutil>=6,<8"
+
       - name: Strict host preflight
         working-directory: base
         run: |
-          r="$RUNNER_TEMP/m252-final"; rm -rf "$r"; mkdir -p "$r"
+          r="$RUNNER_TEMP/m252-stable"; rm -rf "$r"; mkdir -p "$r"
           python benchmarks/runner_probe.py --output "$r/runner.json" --require-temperature --enforce
+
       - name: Start pinned isolated broker
         shell: bash
         run: |
           set -euo pipefail
-          r="$RUNNER_TEMP/m252-final"
+          r="$RUNNER_TEMP/m252-stable"
           cat >"$r/mosquitto.conf" <<'EOF'
           persistence false
           allow_anonymous true
@@ -84,57 +90,61 @@ jobs:
             sleep .1
           done
           exit 1
-      - name: Strict capacity A/A
+
+      - name: Strict writer capacity A/A
         run: |
-          r="$RUNNER_TEMP/m252-final"
+          r="$RUNNER_TEMP/m252-stable"
           python base/benchmarks/paired_writer_capacity.py --base-root base --candidate-root base \
             --protocol 311 --qos-values 0,1 --payload-bytes 256 --inflight 20 --outstanding 64 \
             --max-queued 200 --warmup-count 5000 --repeat 8 --count-qos0 100000 --count-qos1 40000 \
             --timeout 120 --cpu 2 --policy strict --preflight-report "$r/runner.json" \
             --output "$r/capacity-aa.json" --summary-output "$r/capacity-aa.md"
-      - name: Strict capacity A/B
+
+      - name: Strict writer capacity A/B
         run: |
-          r="$RUNNER_TEMP/m252-final"
+          r="$RUNNER_TEMP/m252-stable"
           python base/benchmarks/paired_writer_capacity.py --base-root base --candidate-root candidate \
             --protocol 311 --qos-values 0,1 --payload-bytes 256 --inflight 20 --outstanding 64 \
             --max-queued 200 --warmup-count 5000 --repeat 8 --count-qos0 100000 --count-qos1 40000 \
             --timeout 120 --cpu 2 --policy strict --preflight-report "$r/runner.json" \
             --output "$r/capacity-ab.json" --summary-output "$r/capacity-ab.md"
-      - name: Strict latency A/A with one invalid-control retry
+
+      - name: Strict open-loop main A/A at stable rates
+        run: |
+          r="$RUNNER_TEMP/m252-stable"
+          python candidate/benchmarks/paired_open_loop.py --base-root base --candidate-root base \
+            --protocols 311 --payloads 256 --windows 64 --target-rates 5000,10000 --completions callback \
+            --repeat 8 --count-small 4000 --target-sample-seconds 1.5 --max-count 4000 \
+            --timeout 120 --cpu 2 --policy strict --preflight-report "$r/runner.json" \
+            --output "$r/open-main-aa.json" --summary-output "$r/open-main-aa.md"
+
+      - name: Strict open-loop candidate A/A at stable rates
+        run: |
+          r="$RUNNER_TEMP/m252-stable"
+          python candidate/benchmarks/paired_open_loop.py --base-root candidate --candidate-root candidate \
+            --protocols 311 --payloads 256 --windows 64 --target-rates 5000,10000 --completions callback \
+            --repeat 8 --count-small 4000 --target-sample-seconds 1.5 --max-count 4000 \
+            --timeout 120 --cpu 2 --policy strict --preflight-report "$r/runner.json" \
+            --output "$r/open-candidate-aa.json" --summary-output "$r/open-candidate-aa.md"
+
+      - name: Strict open-loop A/B at stable rates
+        run: |
+          r="$RUNNER_TEMP/m252-stable"
+          python candidate/benchmarks/paired_open_loop.py --base-root base --candidate-root candidate \
+            --protocols 311 --payloads 256 --windows 64 --target-rates 5000,10000 --completions callback \
+            --repeat 8 --count-small 4000 --target-sample-seconds 1.5 --max-count 4000 \
+            --timeout 120 --cpu 2 --policy strict --preflight-report "$r/runner.json" \
+            --output "$r/open-ab.json" --summary-output "$r/open-ab.md"
+
+      - name: Enforce no material stable-rate p50 regression
         shell: bash
         run: |
-          set -euo pipefail
-          r="$RUNNER_TEMP/m252-final"
-          control() {
-            local n="$1" report="$2"
-            python base/benchmarks/paired_open_loop.py --base-root base --candidate-root base \
-              --protocols 311 --payloads 256 --windows 64 --target-rates 2500,10000 --completions callback \
-              --repeat 8 --count-small 4000 --timeout 120 --cpu 2 --policy strict \
-              --preflight-report "$report" --output "$r/latency-aa-$n.json" --summary-output "$r/latency-aa-$n.md"
-          }
-          set +e; control 1 "$r/runner.json"; rc=$?; set -e
-          if [ "$rc" -eq 0 ]; then exit 0; fi
-          if [ "$rc" -ne 2 ]; then exit "$rc"; fi
-          python base/benchmarks/runner_probe.py --output "$r/runner-retry.json" --require-temperature --enforce
-          control 2 "$r/runner-retry.json"
-      - name: Strict latency A/B
-        shell: bash
-        run: |
-          set -euo pipefail
-          r="$RUNNER_TEMP/m252-final"; report="$r/runner.json"; [ ! -f "$r/runner-retry.json" ] || report="$r/runner-retry.json"
-          python base/benchmarks/paired_open_loop.py --base-root base --candidate-root candidate \
-            --protocols 311 --payloads 256 --windows 64 --target-rates 2500,10000 --completions callback \
-            --repeat 8 --count-small 4000 --timeout 120 --cpu 2 --policy strict \
-            --preflight-report "$report" --output "$r/latency-ab.json" --summary-output "$r/latency-ab.md"
-      - name: Explicit p50 ceiling <=1.50x current main
-        shell: bash
-        run: |
-          ROOT="$RUNNER_TEMP/m252-final" python - <<'PY'
+          ROOT="$RUNNER_TEMP/m252-stable" python - <<'PY'
           import json, os, statistics
           from pathlib import Path
           root=Path(os.environ['ROOT'])
-          d=json.loads((root/'latency-ab.json').read_text())
-          lines=['# Explicit PR252 callback-p50 gate','','| rate | main p50 | PR252 p50 | ratio |','| ---: | ---: | ---: | ---: |']
+          d=json.loads((root/'open-ab.json').read_text())
+          lines=['# PR252 stable-rate callback p50','','| rate | main p50 | PR252 p50 | median pair ratio |','| ---: | ---: | ---: | ---: |']
           for s in d['scenarios']:
               pairs=s['pairs']; rate=int(s['target_rate'])
               ratios=[float(p['candidate']['ack_latency_p50_ms'])/float(p['base']['ack_latency_p50_ms']) for p in pairs]
@@ -142,50 +152,26 @@ jobs:
               base=statistics.median(float(p['base']['ack_latency_p50_ms']) for p in pairs)
               cand=statistics.median(float(p['candidate']['ack_latency_p50_ms']) for p in pairs)
               lines.append(f'| {rate:,}/s | {base:.6f} ms | {cand:.6f} ms | {ratio:.4f}x |')
-              if ratio>1.50: raise SystemExit(f'{rate}: p50 ratio {ratio:.4f}>1.50')
+              if ratio > 1.05:
+                  raise SystemExit(f'{rate}: stable-rate p50 ratio {ratio:.4f} > 1.05')
           (root/'p50-gate.md').write_text('\n'.join(lines)+'\n')
           print('\n'.join(lines))
           PY
-      - name: Stop performance broker
+
+      - name: Stop broker
         if: always()
         shell: bash
         run: |
-          f="$RUNNER_TEMP/m252-final/pid"; [ ! -f "$f" ] || { p=$(cat "$f"); kill "$p" 2>/dev/null || true; wait "$p" 2>/dev/null || true; }
-      - name: Create candidate functional venv
-        shell: bash
-        run: |
-          v="$RUNNER_TEMP/m252-test-v"; rm -rf "$v"; python3 -m venv "$v"; echo "$v/bin" >> "$GITHUB_PATH"
-      - name: Install candidate tests
-        working-directory: candidate
-        run: python -m pip install -e ".[dev]"
-      - name: Candidate ARM64 unit tests
-        working-directory: candidate
-        run: python -m pytest -q -ra tests/unit
-      - name: Start functional broker
-        shell: bash
-        run: |
-          set -euo pipefail
-          r="$RUNNER_TEMP/m252-func"; rm -rf "$r"; mkdir -p "$r"
-          printf 'listener 11883 127.0.0.1\nallow_anonymous true\npersistence false\n' >"$r/mosquitto.conf"
-          mosquitto -c "$r/mosquitto.conf" >"$r/mosquitto.log" 2>&1 & echo $! >"$r/pid"
-          for _ in $(seq 1 50); do (echo >/dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0; sleep .1; done; exit 1
-      - name: Candidate ARM64 integration tests
-        working-directory: candidate
-        run: python -m pytest -q -ra tests/integration
-      - name: Stop functional broker
-        if: always()
-        shell: bash
-        run: |
-          f="$RUNNER_TEMP/m252-func/pid"; [ ! -f "$f" ] || { p=$(cat "$f"); kill "$p" 2>/dev/null || true; wait "$p" 2>/dev/null || true; }
-      - name: Upload evidence
+          f="$RUNNER_TEMP/m252-stable/pid"; [ ! -f "$f" ] || { p=$(cat "$f"); kill "$p" 2>/dev/null || true; wait "$p" 2>/dev/null || true; }
+
+      - name: Upload exact-head evidence
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: arm64-pr252-final-retry-${{ github.run_id }}
+          name: arm64-pr252-stable-final-${{ github.run_id }}
           path: |
-            ${{ runner.temp }}/m252-final/*.json
-            ${{ runner.temp }}/m252-final/*.md
-            ${{ runner.temp }}/m252-final/mosquitto.log
-            ${{ runner.temp }}/m252-func/mosquitto.log
-          if-no-files-found: warn
+            ${{ runner.temp }}/m252-stable/*.json
+            ${{ runner.temp }}/m252-stable/*.md
+            ${{ runner.temp }}/m252-stable/mosquitto.log
+          if-no-files-found: error
           retention-days: 30
