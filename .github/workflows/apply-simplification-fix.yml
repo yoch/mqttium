@@ -1,0 +1,152 @@
+name: Apply Simplification Fix Retry
+
+on:
+  push:
+    branches: [agent/arm64-runner-probe]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      TARGET_BRANCH: refactor/simplification-audit-2026-08-16
+      EXPECTED_HEAD: 3ee2a3c5a78b0ea487ddbdf7927665b519fddd45
+      EXPECTED_MAIN: 0999d8abfe44a568209209403d7f215b18cc4eb7
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.EXPECTED_HEAD }}
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Pin endpoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "+refs/heads/main:refs/remotes/origin/main" "+refs/heads/${TARGET_BRANCH}:refs/remotes/origin/target"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          test "$(git rev-parse refs/remotes/origin/target)" = "$EXPECTED_HEAD"
+          test "$(git rev-parse refs/remotes/origin/main)" = "$EXPECTED_MAIN"
+          test "$(git merge-base HEAD refs/remotes/origin/main)" = "$EXPECTED_MAIN"
+      - name: Apply exact measured correction and report
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('src/mqttium/protocol/engine.py'); t=p.read_text()
+          old='''        self._effects.append(\n            EngineEffect(kind, data, requires_delivery_mark, decoded_property_wire_size)\n        )\n\n    def _send(self, packet: WriteItem) -> None:\n        # Appends directly rather than delegating to _emit: SEND is the most\n        # frequent effect and this is one Python frame per outbound packet.\n        self._effects.append(EngineEffect(EffectKind.SEND, packet, False, None))\n'''
+          new='''        self._effects.append(\n            EngineEffect(\n                kind=kind,\n                data=data,\n                requires_delivery_mark=requires_delivery_mark,\n                decoded_property_wire_size=decoded_property_wire_size,\n            )\n        )\n\n    def _send(self, packet: WriteItem) -> None:\n        self._emit(EffectKind.SEND, packet)\n'''
+          assert t.count(old)==1
+          p.write_text(t.replace(old,new))
+
+          p=Path('src/mqttium/protocol/outbound.py'); t=p.read_text()
+          old='''            if topic_bytes is not None and self.flow.try_acquire():\n                self._launch(msg, _property_bytes=property_bytes, _topic_bytes=topic_bytes)\n                return PublishHandle(mid=mid, qos=qos)\n'''
+          new='''            if self._engine.state == ConnectionState.CONNECTED and self._try_launch(\n                msg, _property_bytes=property_bytes, _topic_bytes=topic_bytes\n            ):\n                return PublishHandle(mid=mid, qos=qos)\n'''
+          assert t.count(old)==1 and '    def _try_launch(' not in t
+          t=t.replace(old,new)
+          anchor='    def _retransmit(self, msg: OutboundMessage) -> None:\n'
+          method='''    def _try_launch(\n        self,\n        msg: OutboundMessage,\n        *,\n        _property_bytes: bytes | None = None,\n        _topic_bytes: bytes | None = None,\n    ) -> bool:\n        if not self.flow.try_acquire():\n            return False\n        try:\n            self._launch(msg, _property_bytes=_property_bytes, _topic_bytes=_topic_bytes)\n        except Exception:\n            self.flow.release()\n            raise\n        return True\n\n'''
+          assert t.count(anchor)==1
+          p.write_text(t.replace(anchor,method+anchor))
+
+          w=Path('src/mqttium/api/_writer.py').read_text()
+          assert 'write_many = getattr(transport, "write_many", None)' in w
+          assert '_write_contiguous(transport, write_many, contiguous)' in w
+          assert 'self._eager_armed' in w and 'def _rearm_eager_if_idle' in w
+          PY
+          cat > docs/reports/SIMPLIFICATION-ARM64-REVALIDATION-2026-08-17.md <<'EOF'
+          # Simplification audit — ARM64 revalidation after issue #253
+
+          Date: 2026-08-17
+
+          This report supersedes the performance-acceptance conclusion of
+          `SIMPLIFICATION-AUDIT-2026-08-16.md` for PR #252 after rebasing it onto
+          the issue-#253 writer correction and ARM64 runner integration. The older
+          dated report is intentionally left unchanged.
+
+          ## Revalidation finding
+
+          The rebased tree at `3ee2a3c5a78b0ea487ddbdf7927665b519fddd45`
+          passed functional CI (`32014996281`), long fuzz (`32014996232`) and
+          finalization (`32014996294`). Strict Pi-5 current-main-vs-candidate
+          validation (`32015071488`) nevertheless found a scheduling regression:
+          capacity A/A and A/B passed and latency A/A passed, but at 2,500 msg/s
+          callback p50 moved from about 0.334 ms on current main to about 1.361 ms
+          on #252 (~4.07x, 0/8 favourable pairs). At 10,000 msg/s p50 remained
+          slightly favourable while loop-lag rose to about 6.35x.
+
+          A linear scan (`32015752809`) located the transition exactly at rebased
+          commit `832f808e413dd47fd922469110316751ba205906`, `perf: remove
+          Python frames from the publish and acknowledgement paths`. Source and
+          interaction isolation (`32016075623`, `32016317775`, `32017494910`,
+          `32018097989`, `32018272639`) showed that this is an interaction rather
+          than one bad line:
+
+          - writer-only, inbound-only and outbound-only substitutions were neutral
+            in isolation;
+          - either engine micro-optimization alone still left the slow 2,500/s
+            plateau, even with `_try_launch` restored;
+          - restoring outbound forwarding wrappers was worse;
+          - reverting the writer's once-per-task `write_many` lookup was worse.
+
+          The smallest measured correction that recovered the useful scheduling
+          regime is therefore:
+
+          1. restore the engine effect-emission boundary: `_send` delegates to
+             `_emit` and `EngineEffect` uses the explicit keyword construction;
+          2. restore the outbound `_try_launch` admission/compensation boundary;
+          3. retain the independent writer `write_many` cache, inbound
+             specialization and direct outbound effect forwarding.
+
+          In screening run `32017494910`, that combination moved 2,500/s p50 from
+          the ~1.36 ms plateau to about 0.476 ms, kept 10,000/s favourable (~0.262
+          ms versus ~0.285 ms), and returned loop lag to a comparable regime.
+          These screening numbers are not final evidence; the committed corrected
+          HEAD requires fresh A/A and A/B validation.
+
+          ## Corrected-HEAD acceptance contract
+
+          The comparison baseline is current post-#254/#255 main
+          `0999d8abfe44a568209209403d7f215b18cc4eb7`. Acceptance requires:
+
+          - full functional CI, fuzz and finalization green;
+          - strict closed-loop capacity A/A valid and A/B >=95% of current main
+            for QoS 0 and QoS 1;
+          - paced callback-latency A/A valid at 2,500 and 10,000 msg/s;
+          - paced A/B passing completion and loop-lag gates;
+          - median candidate/main callback p50 <=1.50x at each acceptance rate.
+
+          The explicit p50 ceiling exists because the original ~4x regression can
+          otherwise hide behind neutral throughput and a host-dependent loop-lag
+          regime. It is a regression guard, not a performance target.
+          EOF
+          git diff --check
+          mapfile -t changed < <({ git diff --name-only; git ls-files --others --exclude-standard; } | sort -u)
+          expected=(docs/reports/SIMPLIFICATION-ARM64-REVALIDATION-2026-08-17.md src/mqttium/protocol/engine.py src/mqttium/protocol/outbound.py)
+          mapfile -t expected_sorted < <(printf '%s\n' "${expected[@]}" | sort)
+          test "${#changed[@]}" -eq 3
+          test "$(printf '%s\n' "${changed[@]}")" = "$(printf '%s\n' "${expected_sorted[@]}")"
+      - uses: actions/setup-python@v7
+        with: {python-version: "3.13"}
+      - name: Focused validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install -e ".[dev]"
+          python -m ruff format --check src/mqttium/protocol/engine.py src/mqttium/protocol/outbound.py
+          python -m ruff check src/mqttium/protocol/engine.py src/mqttium/protocol/outbound.py
+          python -m pytest -q tests/unit/test_qos_engine.py tests/unit/test_outbound_transaction.py tests/unit/test_write_pump_eager.py tests/unit/test_batch_receipt_progress.py tests/unit/test_performance_contracts.py
+      - name: Commit and push with lease
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name yoch
+          git config user.email yoch.melka@gmail.com
+          git add src/mqttium/protocol/engine.py src/mqttium/protocol/outbound.py docs/reports/SIMPLIFICATION-ARM64-REVALIDATION-2026-08-17.md
+          git commit -m "perf: preserve eager writer scheduling after simplification"
+          git fetch --no-tags origin "+refs/heads/${TARGET_BRANCH}:refs/remotes/origin/target-final"
+          test "$(git rev-parse refs/remotes/origin/target-final)" = "$EXPECTED_HEAD"
+          git push --force-with-lease="refs/heads/${TARGET_BRANCH}:${EXPECTED_HEAD}" origin "HEAD:refs/heads/${TARGET_BRANCH}"
