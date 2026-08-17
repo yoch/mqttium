@@ -1,4 +1,4 @@
-name: ARM64 Exact 254 Latency Evidence
+name: ARM64 Final 254 Evidence
 
 on:
   push:
@@ -9,9 +9,9 @@ permissions:
   contents: read
 
 jobs:
-  latency:
+  final-evidence:
     runs-on: [self-hosted, linux, ARM64]
-    timeout-minutes: 30
+    timeout-minutes: 45
     env:
       PYTHONUNBUFFERED: "1"
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
@@ -36,25 +36,32 @@ jobs:
             exit 1
           fi
 
-      - name: Check out exact #254 harness and candidate
+      - name: Check out exact final #254 HEAD
         uses: actions/checkout@v7
         with:
-          ref: 5008d69a889d9100f7f3fb2623e6b08a72126524
+          ref: dd64ed16dfb48e2b1cd1b50ac0d5290547627916
           path: candidate
           persist-credentials: false
 
-      - name: Check out exact pre-eager baseline
+      - name: Check out rc5 capacity baseline
+        uses: actions/checkout@v7
+        with:
+          ref: v1.0.0rc5
+          path: base-cap
+          persist-credentials: false
+
+      - name: Check out pre-eager latency baseline
         uses: actions/checkout@v7
         with:
           ref: 3962f328331b8414a755332aefc3b3d7c261dc6f
-          path: base
+          path: base-lat
           persist-credentials: false
 
       - name: Create isolated benchmark venv
         shell: bash
         run: |
           set -euo pipefail
-          venv="$RUNNER_TEMP/mqttium-exact254-latency-venv"
+          venv="$RUNNER_TEMP/mqttium-final254-venv"
           rm -rf "$venv"
           python3 -m venv "$venv"
           echo "$venv/bin" >> "$GITHUB_PATH"
@@ -67,7 +74,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          root="$RUNNER_TEMP/mqttium-exact254-latency"
+          root="$RUNNER_TEMP/mqttium-final254"
           rm -rf "$root"
           mkdir -p "$root"
           python benchmarks/runner_probe.py \
@@ -79,7 +86,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          root="$RUNNER_TEMP/mqttium-exact254-latency"
+          root="$RUNNER_TEMP/mqttium-final254"
           cat > "$root/mosquitto.conf" <<'EOF'
           persistence false
           allow_anonymous true
@@ -94,18 +101,56 @@ jobs:
           echo "$!" > "$root/mosquitto.pid"
           for _ in $(seq 1 50); do
             (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            if ! kill -0 "$(cat "$root/mosquitto.pid")" 2>/dev/null; then
+              cat "$root/mosquitto.log"
+              exit 1
+            fi
             sleep 0.1
           done
           cat "$root/mosquitto.log"
           exit 1
 
-      - name: Run exact #254 A/B and independent A/A on comparable regimes
+      - name: Collect exact-head strict capacity and latency evidence
         shell: bash
         run: |
           set +e
           set -u -o pipefail
-          root="$RUNNER_TEMP/mqttium-exact254-latency"
-          common=(
+          root="$RUNNER_TEMP/mqttium-final254"
+
+          capacity_common=(
+            --protocol 311
+            --qos-values 0,1
+            --payload-bytes 256
+            --inflight 20
+            --outstanding 64
+            --max-queued 200
+            --warmup-count 5000
+            --repeat 8
+            --count-qos0 100000
+            --count-qos1 40000
+            --timeout 120
+            --cpu 2
+            --policy strict
+            --preflight-report "$root/preflight.json"
+          )
+
+          echo '=== capacity A/A: rc5 versus rc5 ==='
+          python candidate/benchmarks/paired_writer_capacity.py \
+            --base-root base-cap --candidate-root base-cap \
+            "${capacity_common[@]}" \
+            --output "$root/capacity-aa.json" \
+            --summary-output "$root/capacity-aa.md"
+          cap_aa=$?
+
+          echo '=== capacity A/B: rc5 versus exact final #254 ==='
+          python candidate/benchmarks/paired_writer_capacity.py \
+            --base-root base-cap --candidate-root candidate \
+            "${capacity_common[@]}" \
+            --output "$root/capacity-ab.json" \
+            --summary-output "$root/capacity-ab.md"
+          cap_ab=$?
+
+          latency_common=(
             --protocols 311
             --payloads 256
             --windows 64
@@ -119,40 +164,40 @@ jobs:
             --preflight-report "$root/preflight.json"
           )
 
-          echo '=== A/B: pre-eager 3962f32 versus exact #254 HEAD ==='
+          echo '=== latency A/A: pre-eager versus itself ==='
           python candidate/benchmarks/paired_open_loop.py \
-            --base-root base --candidate-root candidate \
-            "${common[@]}" \
-            --output "$root/ab.json" \
-            --summary-output "$root/ab.md"
-          ab_status=$?
+            --base-root base-lat --candidate-root base-lat \
+            "${latency_common[@]}" \
+            --output "$root/latency-aa.json" \
+            --summary-output "$root/latency-aa.md"
+          lat_aa=$?
 
-          echo '=== A/A: pre-eager 3962f32 versus itself ==='
+          echo '=== latency A/B: pre-eager versus exact final #254 ==='
           python candidate/benchmarks/paired_open_loop.py \
-            --base-root base --candidate-root base \
-            "${common[@]}" \
-            --output "$root/aa.json" \
-            --summary-output "$root/aa.md"
-          aa_status=$?
+            --base-root base-lat --candidate-root candidate \
+            "${latency_common[@]}" \
+            --output "$root/latency-ab.json" \
+            --summary-output "$root/latency-ab.md"
+          lat_ab=$?
 
-          printf 'ab_status=%s\naa_status=%s\n' "$ab_status" "$aa_status" | tee "$root/status.txt"
-          if [ "$ab_status" -ne 0 ] || [ "$aa_status" -ne 0 ]; then
+          printf 'capacity_aa=%s\ncapacity_ab=%s\nlatency_aa=%s\nlatency_ab=%s\n' \
+            "$cap_aa" "$cap_ab" "$lat_aa" "$lat_ab" | tee "$root/status.txt"
+
+          if [ "$cap_aa" -ne 0 ] || [ "$cap_ab" -ne 0 ] || [ "$lat_aa" -ne 0 ] || [ "$lat_ab" -ne 0 ]; then
             exit 1
           fi
 
-      - name: Upload exact evidence
+      - name: Upload exact-head evidence
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: arm64-exact254-latency-${{ github.run_id }}
+          name: arm64-final254-${{ github.run_id }}
           path: |
-            ${{ runner.temp }}/mqttium-exact254-latency/preflight.json
-            ${{ runner.temp }}/mqttium-exact254-latency/aa.json
-            ${{ runner.temp }}/mqttium-exact254-latency/aa.md
-            ${{ runner.temp }}/mqttium-exact254-latency/ab.json
-            ${{ runner.temp }}/mqttium-exact254-latency/ab.md
-            ${{ runner.temp }}/mqttium-exact254-latency/status.txt
-            ${{ runner.temp }}/mqttium-exact254-latency/mosquitto.log
+            ${{ runner.temp }}/mqttium-final254/preflight.json
+            ${{ runner.temp }}/mqttium-final254/*.json
+            ${{ runner.temp }}/mqttium-final254/*.md
+            ${{ runner.temp }}/mqttium-final254/status.txt
+            ${{ runner.temp }}/mqttium-final254/mosquitto.log
           if-no-files-found: error
           retention-days: 30
 
@@ -160,7 +205,7 @@ jobs:
         if: always()
         shell: bash
         run: |
-          pidfile="$RUNNER_TEMP/mqttium-exact254-latency/mosquitto.pid"
+          pidfile="$RUNNER_TEMP/mqttium-final254/mosquitto.pid"
           if [ -f "$pidfile" ]; then
             pid="$(cat "$pidfile")"
             kill "$pid" 2>/dev/null || true
