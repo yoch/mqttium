@@ -1,4 +1,4 @@
-name: ARM64 Eager Budget Screen
+name: ARM64 Eager Gap Screen
 
 on:
   push:
@@ -57,13 +57,13 @@ jobs:
           path: base-lat
           persist-credentials: false
 
-      - name: Create eager-budget variants from exact #254
+      - name: Create inter-arrival gap variants from exact #254
         shell: bash
         run: |
           set -euo pipefail
-          for budget in 2 4 8; do
-            cp -a harness "candidate-b${budget}"
-            rm -rf "candidate-b${budget}/.git"
+          for gap in 60 75 90; do
+            cp -a harness "candidate-g${gap}"
+            rm -rf "candidate-g${gap}/.git"
           done
           python - <<'PY'
           from pathlib import Path
@@ -74,16 +74,17 @@ jobs:
                   raise SystemExit(f"{label}: expected one match, found {count}")
               return text.replace(old, new, 1)
 
-          for budget in (2, 4, 8):
-              path = Path(f"candidate-b{budget}/src/mqttium/api/_writer.py")
+          for gap_us in (60, 75, 90):
+              gap_ns = gap_us * 1000
+              path = Path(f"candidate-g{gap_us}/src/mqttium/api/_writer.py")
               text = path.read_text()
               text = replace_once(
                   text,
                   "        self._eager_generation = 0\n",
                   "        self._eager_generation = 0\n"
-                  "        # Experimental per-loop eager credit for #253 screening.\n"
-                  "        self._eager_budget = 0\n",
-                  "init budget",
+                  "        # Experimental inter-arrival cutoff for #253 screening.\n"
+                  "        self._last_eager_ns = 0\n",
+                  "init timestamp",
               )
               text = replace_once(
                   text,
@@ -91,71 +92,71 @@ jobs:
                   "        generation = self._eager_generation\n"
                   "        asyncio.get_running_loop().call_soon(self._rearm_eager_if_idle, generation)\n"
                   "        self.eager_writes += 1\n",
-                  "        self._eager_budget -= 1\n"
-                  "        if self._eager_budget <= 0:\n"
-                  "            self._eager_armed = False\n"
-                  "        generation = self._eager_generation\n"
-                  "        asyncio.get_running_loop().call_soon(self._rearm_eager_if_idle, generation)\n"
+                  f"        self._last_eager_ns = now_ns\n"
                   "        self.eager_writes += 1\n",
                   "successful eager",
               )
               text = replace_once(
                   text,
-                  "            not self._eager_armed\n"
-                  "            or write_nowait is None\n",
-                  "            not self._eager_armed\n"
-                  "            or self._eager_budget <= 0\n"
-                  "            or write_nowait is None\n",
-                  "eager gate",
+                  "        if not write_nowait(item):\n"
+                  "            return False\n"
+                  "        self._last_eager_ns = now_ns\n",
+                  f"        now_ns = time.monotonic_ns()\n"
+                  f"        if self._last_eager_ns and now_ns - self._last_eager_ns < {gap_ns}:\n"
+                  "            return False\n"
+                  "        if not write_nowait(item):\n"
+                  "            return False\n"
+                  "        self._last_eager_ns = now_ns\n",
+                  "gap gate",
               )
               text = replace_once(
                   text,
                   "            self._eager_armed = True\n\n"
                   "    def reset",
-                  f"            self._eager_armed = True\n"
-                  f"            self._eager_budget = {budget}\n\n"
+                  "            self._eager_armed = True\n"
+                  "            self._last_eager_ns = 0\n\n"
                   "    def reset",
-                  "callback rearm",
+                  "callback idle state",
               )
               text = replace_once(
                   text,
                   "        self._eager_armed = self._write_nowait is not None\n"
                   "        self.task = asyncio.create_task",
-                  f"        self._eager_armed = self._write_nowait is not None\n"
-                  f"        self._eager_budget = {budget} if self._eager_armed else 0\n"
+                  "        self._eager_armed = self._write_nowait is not None\n"
+                  "        self._last_eager_ns = 0\n"
                   "        self.task = asyncio.create_task",
-                  "start budget",
+                  "start timestamp",
               )
               text = replace_once(
                   text,
                   "        self._eager_armed = False\n"
                   "        self._write_nowait = None\n",
                   "        self._eager_armed = False\n"
-                  "        self._eager_budget = 0\n"
+                  "        self._last_eager_ns = 0\n"
                   "        self._write_nowait = None\n",
-                  "drop budget",
+                  "drop timestamp",
               )
               text = replace_once(
                   text,
                   "                if queue.empty() and self._write_nowait is not None:\n"
                   "                    self._eager_armed = True\n"
                   "                first = await queue.get()\n",
-                  f"                if queue.empty() and self._write_nowait is not None:\n"
-                  f"                    self._eager_armed = True\n"
-                  f"                    self._eager_budget = {budget}\n"
+                  "                if queue.empty() and self._write_nowait is not None:\n"
+                  "                    self._eager_armed = True\n"
+                  "                    self._last_eager_ns = 0\n"
                   "                first = await queue.get()\n",
-                  "writer idle rearm",
+                  "writer idle state",
               )
               path.write_text(text)
               compile(text, str(path), "exec")
-              print(f"prepared budget={budget}: {path}")
+              print(f"prepared gap={gap_us}us: {path}")
           PY
 
       - name: Create isolated benchmark venv
         shell: bash
         run: |
           set -euo pipefail
-          venv="$RUNNER_TEMP/mqttium-budget-screen-venv"
+          venv="$RUNNER_TEMP/mqttium-gap-screen-venv"
           rm -rf "$venv"
           python3 -m venv "$venv"
           echo "$venv/bin" >> "$GITHUB_PATH"
@@ -168,7 +169,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          root="$RUNNER_TEMP/mqttium-budget-screen"
+          root="$RUNNER_TEMP/mqttium-gap-screen"
           rm -rf "$root"
           mkdir -p "$root"
           python benchmarks/runner_probe.py \
@@ -180,7 +181,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          root="$RUNNER_TEMP/mqttium-budget-screen"
+          root="$RUNNER_TEMP/mqttium-gap-screen"
           cat > "$root/mosquitto.conf" <<'EOF'
           persistence false
           allow_anonymous true
@@ -200,53 +201,51 @@ jobs:
           cat "$root/mosquitto.log"
           exit 1
 
-      - name: Screen eager budgets 2, 4, 8
+      - name: Screen inter-arrival gaps 60, 75, 90 us
         shell: bash
         run: |
           set +e
           set -u -o pipefail
-          root="$RUNNER_TEMP/mqttium-budget-screen"
+          root="$RUNNER_TEMP/mqttium-gap-screen"
           : > "$root/status.txt"
-          overall=0
-          for budget in 2 4 8; do
-            echo "=== budget=$budget capacity rc5 -> candidate ==="
+          for gap in 60 75 90; do
+            echo "=== gap=${gap}us capacity rc5 -> candidate ==="
             python harness/benchmarks/paired_writer_capacity.py \
-              --base-root base-cap --candidate-root "candidate-b${budget}" \
+              --base-root base-cap --candidate-root "candidate-g${gap}" \
               --protocol 311 --qos-values 0,1 --payload-bytes 256 \
               --inflight 20 --outstanding 64 --max-queued 200 \
               --warmup-count 2000 --repeat 4 --count-qos0 50000 --count-qos1 20000 \
               --timeout 120 --cpu 2 --policy strict --preflight-report "$root/preflight.json" \
-              --output "$root/b${budget}-capacity.json" \
-              --summary-output "$root/b${budget}-capacity.md"
+              --output "$root/g${gap}-capacity.json" \
+              --summary-output "$root/g${gap}-capacity.md"
             cap=$?
 
-            echo "=== budget=$budget paced pre-eager -> candidate ==="
+            echo "=== gap=${gap}us paced pre-eager -> candidate ==="
             python harness/benchmarks/paired_open_loop.py \
-              --base-root base-lat --candidate-root "candidate-b${budget}" \
+              --base-root base-lat --candidate-root "candidate-g${gap}" \
               --protocols 311 --payloads 256 --windows 64 \
-              --target-rates 2500,7500 --completions callback \
+              --target-rates 2500,7500,10000 --completions callback \
               --repeat 4 --count-small 4000 --timeout 120 --cpu 2 \
               --policy strict --preflight-report "$root/preflight.json" \
-              --output "$root/b${budget}-paced.json" \
-              --summary-output "$root/b${budget}-paced.md"
+              --output "$root/g${gap}-paced.json" \
+              --summary-output "$root/g${gap}-paced.md"
             paced=$?
 
-            printf 'budget=%s capacity=%s paced=%s\n' "$budget" "$cap" "$paced" | tee -a "$root/status.txt"
-            printf 'temperature_after_b%s=' "$budget"; cat /sys/class/thermal/thermal_zone0/temp
+            printf 'gap_us=%s capacity=%s paced=%s\n' "$gap" "$cap" "$paced" | tee -a "$root/status.txt"
+            printf 'temperature_after_g%s=' "$gap"; cat /sys/class/thermal/thermal_zone0/temp
           done
-          # Screening intentionally does not fail on a rejected variant.
           exit 0
 
       - name: Upload screening evidence
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: arm64-eager-budget-screen-${{ github.run_id }}
+          name: arm64-eager-gap-screen-${{ github.run_id }}
           path: |
-            ${{ runner.temp }}/mqttium-budget-screen/*.json
-            ${{ runner.temp }}/mqttium-budget-screen/*.md
-            ${{ runner.temp }}/mqttium-budget-screen/status.txt
-            ${{ runner.temp }}/mqttium-budget-screen/mosquitto.log
+            ${{ runner.temp }}/mqttium-gap-screen/*.json
+            ${{ runner.temp }}/mqttium-gap-screen/*.md
+            ${{ runner.temp }}/mqttium-gap-screen/status.txt
+            ${{ runner.temp }}/mqttium-gap-screen/mosquitto.log
           if-no-files-found: error
           retention-days: 30
 
@@ -254,7 +253,7 @@ jobs:
         if: always()
         shell: bash
         run: |
-          pidfile="$RUNNER_TEMP/mqttium-budget-screen/mosquitto.pid"
+          pidfile="$RUNNER_TEMP/mqttium-gap-screen/mosquitto.pid"
           if [ -f "$pidfile" ]; then
             pid="$(cat "$pidfile")"
             kill "$pid" 2>/dev/null || true
