@@ -1,4 +1,4 @@
-name: ARM64 Writer Capacity Evidence
+name: ARM64 Paced Writer Evidence
 
 on:
   push:
@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 jobs:
-  capacity:
+  paced:
     runs-on: [self-hosted, linux, ARM64]
     timeout-minutes: 45
     env:
@@ -42,10 +42,10 @@ jobs:
           path: harness
           persist-credentials: false
 
-      - name: Check out rc5 baseline
+      - name: Check out exact pre-eager baseline
         uses: actions/checkout@v7
         with:
-          ref: v1.0.0rc5
+          ref: 3962f328331b8414a755332aefc3b3d7c261dc6f
           path: base
           persist-credentials: false
 
@@ -60,7 +60,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          venv="$RUNNER_TEMP/mqttium-writer-capacity-venv"
+          venv="$RUNNER_TEMP/mqttium-paced-venv"
           rm -rf "$venv"
           python3 -m venv "$venv"
           echo "$venv/bin" >> "$GITHUB_PATH"
@@ -68,12 +68,34 @@ jobs:
       - name: Install preflight dependency
         run: python -m pip install "psutil>=6,<8"
 
+      - name: Provide Mosquitto observer client without host mutation
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v mosquitto_sub >/dev/null 2>&1; then
+            mosquitto_sub -h 2>&1 | head -n 2
+            exit 0
+          fi
+          root="$RUNNER_TEMP/mqttium-mosquitto-clients"
+          rm -rf "$root"
+          mkdir -p "$root/pkgs" "$root/root"
+          cd "$root/pkgs"
+          apt-get download mosquitto-clients
+          dpkg-deb -x ./*.deb "$root/root"
+          test -x "$root/root/usr/bin/mosquitto_sub"
+          ldd "$root/root/usr/bin/mosquitto_sub" | tee "$root/ldd.txt"
+          if grep -q 'not found' "$root/ldd.txt"; then
+            echo 'temporary mosquitto_sub has unresolved libraries' >&2
+            exit 1
+          fi
+          echo "$root/root/usr/bin" >> "$GITHUB_PATH"
+
       - name: Strict runner preflight
         working-directory: harness
         shell: bash
         run: |
           set -euo pipefail
-          root="$RUNNER_TEMP/mqttium-writer-capacity"
+          root="$RUNNER_TEMP/mqttium-paced"
           rm -rf "$root"
           mkdir -p "$root"
           python benchmarks/runner_probe.py \
@@ -85,7 +107,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          root="$RUNNER_TEMP/mqttium-writer-capacity"
+          root="$RUNNER_TEMP/mqttium-paced"
           cat > "$root/mosquitto.conf" <<'EOF'
           persistence false
           allow_anonymous true
@@ -109,31 +131,27 @@ jobs:
           cat "$root/mosquitto.log"
           exit 1
 
-      - name: Run strict A/A then A/B writer-capacity evidence
-        id: capacity
+      - name: Run strict A/A then A/B paced acceptance cells
         shell: bash
         run: |
           set -uo pipefail
-          root="$RUNNER_TEMP/mqttium-writer-capacity"
+          root="$RUNNER_TEMP/mqttium-paced"
           common=(
-            --protocol 311
-            --qos-values 0,1
-            --payload-bytes 256
-            --inflight 20
-            --outstanding 64
-            --max-queued 200
-            --warmup-count 5000
+            --protocols 311
+            --payloads 256
+            --windows 64
+            --target-rates 2500,7500
+            --completions callback
             --repeat 8
-            --count-qos0 100000
-            --count-qos1 40000
+            --count-small 4000
             --timeout 120
             --cpu 2
             --policy strict
             --preflight-report "$root/preflight.json"
           )
 
-          echo '=== A/A: v1.0.0rc5 versus itself ==='
-          python harness/benchmarks/paired_writer_capacity.py \
+          echo '=== A/A: pre-eager 3962f32 versus itself ==='
+          python harness/benchmarks/paired_open_loop.py \
             --base-root base --candidate-root base \
             "${common[@]}" \
             --output "$root/aa.json" \
@@ -141,8 +159,8 @@ jobs:
           aa_status=$?
           echo "A/A exit=$aa_status"
 
-          echo '=== A/B: v1.0.0rc5 versus #254 exact HEAD ==='
-          python harness/benchmarks/paired_writer_capacity.py \
+          echo '=== A/B: pre-eager 3962f32 versus #254 exact HEAD ==='
+          python harness/benchmarks/paired_open_loop.py \
             --base-root base --candidate-root candidate \
             "${common[@]}" \
             --output "$root/ab.json" \
@@ -159,15 +177,15 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: arm64-writer-capacity-${{ github.run_id }}
+          name: arm64-paced-writer-${{ github.run_id }}
           path: |
-            ${{ runner.temp }}/mqttium-writer-capacity/preflight.json
-            ${{ runner.temp }}/mqttium-writer-capacity/aa.json
-            ${{ runner.temp }}/mqttium-writer-capacity/aa.md
-            ${{ runner.temp }}/mqttium-writer-capacity/ab.json
-            ${{ runner.temp }}/mqttium-writer-capacity/ab.md
-            ${{ runner.temp }}/mqttium-writer-capacity/status.txt
-            ${{ runner.temp }}/mqttium-writer-capacity/mosquitto.log
+            ${{ runner.temp }}/mqttium-paced/preflight.json
+            ${{ runner.temp }}/mqttium-paced/aa.json
+            ${{ runner.temp }}/mqttium-paced/aa.md
+            ${{ runner.temp }}/mqttium-paced/ab.json
+            ${{ runner.temp }}/mqttium-paced/ab.md
+            ${{ runner.temp }}/mqttium-paced/status.txt
+            ${{ runner.temp }}/mqttium-paced/mosquitto.log
           if-no-files-found: warn
           retention-days: 30
 
@@ -175,7 +193,7 @@ jobs:
         if: always()
         shell: bash
         run: |
-          pidfile="$RUNNER_TEMP/mqttium-writer-capacity/mosquitto.pid"
+          pidfile="$RUNNER_TEMP/mqttium-paced/mosquitto.pid"
           if [ -f "$pidfile" ]; then
             pid="$(cat "$pidfile")"
             kill "$pid" 2>/dev/null || true
