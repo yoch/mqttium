@@ -1,4 +1,4 @@
-name: ARM64 Eager Gap Screen
+name: ARM64 Exact 254 Latency Evidence
 
 on:
   push:
@@ -9,9 +9,9 @@ permissions:
   contents: read
 
 jobs:
-  screen:
+  latency:
     runs-on: [self-hosted, linux, ARM64]
-    timeout-minutes: 45
+    timeout-minutes: 30
     env:
       PYTHONUNBUFFERED: "1"
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
@@ -36,127 +36,25 @@ jobs:
             exit 1
           fi
 
-      - name: Check out exact #254 harness and template
+      - name: Check out exact #254 harness and candidate
         uses: actions/checkout@v7
         with:
           ref: 5008d69a889d9100f7f3fb2623e6b08a72126524
-          path: harness
+          path: candidate
           persist-credentials: false
 
-      - name: Check out rc5 capacity baseline
-        uses: actions/checkout@v7
-        with:
-          ref: v1.0.0rc5
-          path: base-cap
-          persist-credentials: false
-
-      - name: Check out exact pre-eager latency baseline
+      - name: Check out exact pre-eager baseline
         uses: actions/checkout@v7
         with:
           ref: 3962f328331b8414a755332aefc3b3d7c261dc6f
-          path: base-lat
+          path: base
           persist-credentials: false
-
-      - name: Create inter-arrival gap variants from exact #254
-        shell: bash
-        run: |
-          set -euo pipefail
-          for gap in 60 75 90; do
-            cp -a harness "candidate-g${gap}"
-            rm -rf "candidate-g${gap}/.git"
-          done
-          python - <<'PY'
-          from pathlib import Path
-
-          def replace_once(text: str, old: str, new: str, label: str) -> str:
-              count = text.count(old)
-              if count != 1:
-                  raise SystemExit(f"{label}: expected one match, found {count}")
-              return text.replace(old, new, 1)
-
-          for gap_us in (60, 75, 90):
-              gap_ns = gap_us * 1000
-              path = Path(f"candidate-g{gap_us}/src/mqttium/api/_writer.py")
-              text = path.read_text()
-              text = replace_once(
-                  text,
-                  "        self._eager_generation = 0\n",
-                  "        self._eager_generation = 0\n"
-                  "        # Experimental inter-arrival cutoff for #253 screening.\n"
-                  "        self._last_eager_ns = 0\n",
-                  "init timestamp",
-              )
-              text = replace_once(
-                  text,
-                  "        self._eager_armed = False\n"
-                  "        generation = self._eager_generation\n"
-                  "        asyncio.get_running_loop().call_soon(self._rearm_eager_if_idle, generation)\n"
-                  "        self.eager_writes += 1\n",
-                  f"        self._last_eager_ns = now_ns\n"
-                  "        self.eager_writes += 1\n",
-                  "successful eager",
-              )
-              text = replace_once(
-                  text,
-                  "        if not write_nowait(item):\n"
-                  "            return False\n"
-                  "        self._last_eager_ns = now_ns\n",
-                  f"        now_ns = time.monotonic_ns()\n"
-                  f"        if self._last_eager_ns and now_ns - self._last_eager_ns < {gap_ns}:\n"
-                  "            return False\n"
-                  "        if not write_nowait(item):\n"
-                  "            return False\n"
-                  "        self._last_eager_ns = now_ns\n",
-                  "gap gate",
-              )
-              text = replace_once(
-                  text,
-                  "            self._eager_armed = True\n\n"
-                  "    def reset",
-                  "            self._eager_armed = True\n"
-                  "            self._last_eager_ns = 0\n\n"
-                  "    def reset",
-                  "callback idle state",
-              )
-              text = replace_once(
-                  text,
-                  "        self._eager_armed = self._write_nowait is not None\n"
-                  "        self.task = asyncio.create_task",
-                  "        self._eager_armed = self._write_nowait is not None\n"
-                  "        self._last_eager_ns = 0\n"
-                  "        self.task = asyncio.create_task",
-                  "start timestamp",
-              )
-              text = replace_once(
-                  text,
-                  "        self._eager_armed = False\n"
-                  "        self._write_nowait = None\n",
-                  "        self._eager_armed = False\n"
-                  "        self._last_eager_ns = 0\n"
-                  "        self._write_nowait = None\n",
-                  "drop timestamp",
-              )
-              text = replace_once(
-                  text,
-                  "                if queue.empty() and self._write_nowait is not None:\n"
-                  "                    self._eager_armed = True\n"
-                  "                first = await queue.get()\n",
-                  "                if queue.empty() and self._write_nowait is not None:\n"
-                  "                    self._eager_armed = True\n"
-                  "                    self._last_eager_ns = 0\n"
-                  "                first = await queue.get()\n",
-                  "writer idle state",
-              )
-              path.write_text(text)
-              compile(text, str(path), "exec")
-              print(f"prepared gap={gap_us}us: {path}")
-          PY
 
       - name: Create isolated benchmark venv
         shell: bash
         run: |
           set -euo pipefail
-          venv="$RUNNER_TEMP/mqttium-gap-screen-venv"
+          venv="$RUNNER_TEMP/mqttium-exact254-latency-venv"
           rm -rf "$venv"
           python3 -m venv "$venv"
           echo "$venv/bin" >> "$GITHUB_PATH"
@@ -165,11 +63,11 @@ jobs:
         run: python -m pip install "psutil>=6,<8"
 
       - name: Strict runner preflight
-        working-directory: harness
+        working-directory: candidate
         shell: bash
         run: |
           set -euo pipefail
-          root="$RUNNER_TEMP/mqttium-gap-screen"
+          root="$RUNNER_TEMP/mqttium-exact254-latency"
           rm -rf "$root"
           mkdir -p "$root"
           python benchmarks/runner_probe.py \
@@ -181,7 +79,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          root="$RUNNER_TEMP/mqttium-gap-screen"
+          root="$RUNNER_TEMP/mqttium-exact254-latency"
           cat > "$root/mosquitto.conf" <<'EOF'
           persistence false
           allow_anonymous true
@@ -201,51 +99,60 @@ jobs:
           cat "$root/mosquitto.log"
           exit 1
 
-      - name: Screen inter-arrival gaps 60, 75, 90 us
+      - name: Run exact #254 A/B and independent A/A on comparable regimes
         shell: bash
         run: |
           set +e
           set -u -o pipefail
-          root="$RUNNER_TEMP/mqttium-gap-screen"
-          : > "$root/status.txt"
-          for gap in 60 75 90; do
-            echo "=== gap=${gap}us capacity rc5 -> candidate ==="
-            python harness/benchmarks/paired_writer_capacity.py \
-              --base-root base-cap --candidate-root "candidate-g${gap}" \
-              --protocol 311 --qos-values 0,1 --payload-bytes 256 \
-              --inflight 20 --outstanding 64 --max-queued 200 \
-              --warmup-count 2000 --repeat 4 --count-qos0 50000 --count-qos1 20000 \
-              --timeout 120 --cpu 2 --policy strict --preflight-report "$root/preflight.json" \
-              --output "$root/g${gap}-capacity.json" \
-              --summary-output "$root/g${gap}-capacity.md"
-            cap=$?
+          root="$RUNNER_TEMP/mqttium-exact254-latency"
+          common=(
+            --protocols 311
+            --payloads 256
+            --windows 64
+            --target-rates 2500,10000
+            --completions callback
+            --repeat 8
+            --count-small 4000
+            --timeout 120
+            --cpu 2
+            --policy strict
+            --preflight-report "$root/preflight.json"
+          )
 
-            echo "=== gap=${gap}us paced pre-eager -> candidate ==="
-            python harness/benchmarks/paired_open_loop.py \
-              --base-root base-lat --candidate-root "candidate-g${gap}" \
-              --protocols 311 --payloads 256 --windows 64 \
-              --target-rates 2500,7500,10000 --completions callback \
-              --repeat 4 --count-small 4000 --timeout 120 --cpu 2 \
-              --policy strict --preflight-report "$root/preflight.json" \
-              --output "$root/g${gap}-paced.json" \
-              --summary-output "$root/g${gap}-paced.md"
-            paced=$?
+          echo '=== A/B: pre-eager 3962f32 versus exact #254 HEAD ==='
+          python candidate/benchmarks/paired_open_loop.py \
+            --base-root base --candidate-root candidate \
+            "${common[@]}" \
+            --output "$root/ab.json" \
+            --summary-output "$root/ab.md"
+          ab_status=$?
 
-            printf 'gap_us=%s capacity=%s paced=%s\n' "$gap" "$cap" "$paced" | tee -a "$root/status.txt"
-            printf 'temperature_after_g%s=' "$gap"; cat /sys/class/thermal/thermal_zone0/temp
-          done
-          exit 0
+          echo '=== A/A: pre-eager 3962f32 versus itself ==='
+          python candidate/benchmarks/paired_open_loop.py \
+            --base-root base --candidate-root base \
+            "${common[@]}" \
+            --output "$root/aa.json" \
+            --summary-output "$root/aa.md"
+          aa_status=$?
 
-      - name: Upload screening evidence
+          printf 'ab_status=%s\naa_status=%s\n' "$ab_status" "$aa_status" | tee "$root/status.txt"
+          if [ "$ab_status" -ne 0 ] || [ "$aa_status" -ne 0 ]; then
+            exit 1
+          fi
+
+      - name: Upload exact evidence
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: arm64-eager-gap-screen-${{ github.run_id }}
+          name: arm64-exact254-latency-${{ github.run_id }}
           path: |
-            ${{ runner.temp }}/mqttium-gap-screen/*.json
-            ${{ runner.temp }}/mqttium-gap-screen/*.md
-            ${{ runner.temp }}/mqttium-gap-screen/status.txt
-            ${{ runner.temp }}/mqttium-gap-screen/mosquitto.log
+            ${{ runner.temp }}/mqttium-exact254-latency/preflight.json
+            ${{ runner.temp }}/mqttium-exact254-latency/aa.json
+            ${{ runner.temp }}/mqttium-exact254-latency/aa.md
+            ${{ runner.temp }}/mqttium-exact254-latency/ab.json
+            ${{ runner.temp }}/mqttium-exact254-latency/ab.md
+            ${{ runner.temp }}/mqttium-exact254-latency/status.txt
+            ${{ runner.temp }}/mqttium-exact254-latency/mosquitto.log
           if-no-files-found: error
           retention-days: 30
 
@@ -253,7 +160,7 @@ jobs:
         if: always()
         shell: bash
         run: |
-          pidfile="$RUNNER_TEMP/mqttium-gap-screen/mosquitto.pid"
+          pidfile="$RUNNER_TEMP/mqttium-exact254-latency/mosquitto.pid"
           if [ -f "$pidfile" ]; then
             pid="$(cat "$pidfile")"
             kill "$pid" 2>/dev/null || true
