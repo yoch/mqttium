@@ -134,6 +134,13 @@ class ProtocolEngine:
             PacketType.DISCONNECT: self._on_disconnect,
             PacketType.AUTH: self._on_auth,
         }
+        # What a state accepts and what handles it are one table, so `handle_raw`
+        # resolves both in a single lookup and adding a packet type is one edit.
+        # Anything absent is refused — PINGREQ included.
+        self._handlers_by_state = {
+            state: {ptype: self._handlers[ptype] for ptype in allowed}
+            for state, allowed in _ALLOWED_PACKETS_BY_STATE.items()
+        }
         # Hydrate packet ids + offline queue from a durable store (restart).
         self.outbound.hydrate()
         # In-flight SUBSCRIBE/UNSUBSCRIBE by MID (never collides with PUBLISH).
@@ -148,7 +155,11 @@ class ProtocolEngine:
         # Handing the complete effect batch to the runtime is the first
         # boundary at which an auto-PUBACK can make progress toward the
         # transport. Release the Receive Maximum slots held for this batch.
-        self.inbound.release_pending_auto_qos1()
+        # `_autoack_handoff_required` is only ever set alongside a non-empty
+        # mid set, so an empty set means there is nothing to release.
+        inbound = self.inbound
+        if inbound._pending_auto_qos1_mids:
+            inbound.release_pending_auto_qos1()
         return effects
 
     @property
@@ -176,10 +187,6 @@ class ProtocolEngine:
     @property
     def flow(self) -> FlowControl:
         return self.outbound.flow
-
-    @flow.setter
-    def flow(self, flow: FlowControl) -> None:
-        self.outbound.flow = flow
 
     @property
     def _queued(self) -> deque[OutboundMessage | OutboundMessageSummary]:
@@ -217,10 +224,6 @@ class ProtocolEngine:
     @property
     def _recovered_inbound_mids(self) -> set[int]:
         return self.inbound._recovered_mids
-
-    @_recovered_inbound_mids.setter
-    def _recovered_inbound_mids(self, value: set[int]) -> None:
-        self.inbound._recovered_mids = value
 
     @property
     def _pending_sub_mids(self) -> KeysView[int]:
@@ -387,8 +390,13 @@ class ProtocolEngine:
         retain: bool = False,
         properties: Properties | None = None,
     ) -> PublishHandle:
-        if self.state is ConnectionState.DISCONNECTING:
-            raise NotConnectedError("publish is not allowed while disconnecting")
+        """Provisional facade over `engine.outbound.queue_publish`.
+
+        AsyncClient calls the session directly: this is the hottest path in the
+        library and the forwarder was a Python frame per publish. The
+        DISCONNECTING guard now lives in the session, so both entry points
+        enforce it.
+        """
         return self.outbound.queue_publish(
             topic, payload, qos=qos, retain=retain, properties=properties
         )
@@ -397,8 +405,7 @@ class ProtocolEngine:
         self,
         messages: Iterable[tuple[str, bytes, QoS | int, bool, Properties | None]],
     ) -> list[PublishHandle]:
-        if self.state is ConnectionState.DISCONNECTING:
-            raise NotConnectedError("publish is not allowed while disconnecting")
+        """Provisional facade; the guard lives in the session (see queue_publish)."""
         return self.outbound.queue_publish_many(messages)
 
     def queue_subscribe(
@@ -468,7 +475,7 @@ class ProtocolEngine:
     def queue_ping(self) -> None:
         if self.state != ConnectionState.CONNECTED:
             raise NotConnectedError("PINGREQ requires an active connection")
-        wire = self.codec.encode_pingreq()
+        wire = self.codec.pingreq_frame
         self._check_outbound_size(wire)
         self._send(wire)
 
@@ -535,16 +542,16 @@ class ProtocolEngine:
             return
         try:
             validate_raw_packet(raw)
-            allowed = _ALLOWED_PACKETS_BY_STATE.get(self.state, frozenset())
-            if raw.packet_type not in allowed:
+            handlers = self._handlers_by_state.get(self.state)
+            handler = handlers.get(raw.packet_type) if handlers is not None else None
+            if handler is None:
                 raise ProtocolError(
                     f"Unexpected {raw.packet_type.name} while state={self.state.name}"
                 )
-            # Every allowed packet type has a handler; the state gate above is
-            # the one place that refuses everything else (PINGREQ included).
             effect_start = len(self._effects)
-            self._handlers[raw.packet_type](raw)
-            self._validate_new_outbound_effects(effect_start)
+            handler(raw)
+            if self.negotiated.maximum_packet_size is not None:
+                self._validate_new_outbound_effects(effect_start)
         except (ProtocolError, MalformedPacketError, PacketTooLargeError) as exc:
             self._emit(EffectKind.PROTOCOL_ERROR, str(exc))
         except Exception as exc:
@@ -910,8 +917,10 @@ class ProtocolEngine:
 
     def _check_outbound_size(self, wire: WriteItem) -> None:
         limit = self.negotiated.maximum_packet_size
+        if limit is None:
+            return
         size = item_size(wire)
-        if limit is not None and size > limit:
+        if size > limit:
             raise PacketTooLargeError(
                 f"Encoded packet size {size} exceeds broker maximum_packet_size {limit}"
             )
@@ -923,9 +932,10 @@ class ProtocolEngine:
         returned from a public queue_* method. Validate the whole newly-produced
         batch before exposing any of it so an oversized PUBACK/PUBREC/PUBCOMP
         cannot escape while its paired MESSAGE remains application-visible.
+
+        `handle_raw` only calls this when the broker negotiated a limit, so the
+        common case costs no call at all.
         """
-        if self.negotiated.maximum_packet_size is None:
-            return
         try:
             for effect in self._effects[start:]:
                 if effect.kind is EffectKind.SEND:

@@ -22,7 +22,6 @@ from mqttium.codec.properties import PUBLISH, encode_properties
 from mqttium.codec.vbi import MAX_VBI, vbi_len
 from mqttium.enums import (
     ConnectionState,
-    MQTTProtocolVersion,
     OutboundQoSState,
     PacketType,
     QoS,
@@ -38,6 +37,8 @@ from mqttium.persistence.memory import PagedInflightStore, TransitionInflightSto
 from mqttium.protocol.effects import EffectKind, PublishFailure, PublishHandle
 from mqttium.protocol.flow_control import FlowControl
 from mqttium.protocol.packet_ids import PacketIdPool
+from mqttium.packets._ack import encode_pubrel_success as _encode_pubrel_success
+from mqttium.protocol._sizing import publish_logical_size
 from mqttium.protocol.stats import OutboundStats
 from mqttium.topics import encode_validated_publish_topic, validate_publish_topic
 from mqttium.transport.writes import WriteItem
@@ -45,10 +46,6 @@ from mqttium.types import OutboundMessage, OutboundMessageSummary, Properties
 
 if TYPE_CHECKING:
     from mqttium.protocol.engine import ProtocolEngine
-
-
-def _encode_pubrel_success(mid: int) -> bytes:
-    return bytes((0x62, 2, mid >> 8, mid & 0xFF))
 
 
 def _retain_publish_item(item: WriteItem) -> WriteItem | None:
@@ -76,6 +73,7 @@ class OutboundSession:
         "_encode_publish",
         "_encode_pubrel",
         "_engine",
+        "_is_v5",
         "_queued",
         "_paged_store",
         "_transitions",
@@ -103,6 +101,10 @@ class OutboundSession:
         self._transitions = self.store if isinstance(self.store, TransitionInflightStore) else None
         # Version-specialized ack codecs come from the engine's one-shot bind.
         codec = engine.codec
+        # The protocol is fixed for the engine's lifetime (it is not in
+        # _RUNTIME_MUTABLE_ENGINE_CONFIG_FIELDS), so resolve it once here
+        # rather than comparing enums on the publish path.
+        self._is_v5 = codec.is_mqtt5
         self._decode_puback = codec.decode_puback
         self._decode_pubrec = codec.decode_pubrec
         self._decode_pubcomp = codec.decode_pubcomp
@@ -118,14 +120,9 @@ class OutboundSession:
 
     # --- effect emission ---------------------------------------------------
     # Always routed through the engine, never into a cached list: take_effects()
-    # rebinds the list, and _emit is an interception point that must see every
-    # effect in the order it was produced.
-
-    def _emit(self, kind: EffectKind, data: object = None) -> None:
-        self._engine._emit(kind, data)
-
-    def _send(self, packet: WriteItem) -> None:
-        self._engine._send(packet)
+    # rebinds the list, so the engine's `_effects` is the one sink. Emission
+    # calls `self._engine._emit` / `._send` directly, as InboundSession does;
+    # a forwarding wrapper here cost a Python frame per publish and per ACK.
 
     def _fail(self, mid: int, reason: BaseException) -> None:
         self._engine._emit(EffectKind.PUBLISH_FAILED, PublishFailure(mid=mid, reason=reason))
@@ -323,7 +320,7 @@ class OutboundSession:
 
         if (
             properties is not None
-            and self.config.protocol == MQTTProtocolVersion.MQTTv5
+            and self._is_v5
             and properties.get("subscription_identifier") is not None
         ):
             # [MQTT-3.3.4-6]: a PUBLISH sent from a Client to a Server MUST NOT
@@ -407,7 +404,8 @@ class OutboundSession:
         retain: bool = False,
         properties: Properties | None = None,
     ) -> PublishHandle:
-        engine = self._engine
+        if self._engine.state is ConnectionState.DISCONNECTING:
+            raise NotConnectedError("publish is not allowed while disconnecting")
         qos, topic_bytes, topic_size = self._validate_publish_request(
             topic, qos, retain, properties
         )
@@ -421,10 +419,10 @@ class OutboundSession:
                 properties=properties,
                 topic_bytes=topic_bytes,
             )
-            self._send(item)
+            self._engine._send(item)
             # Completion follows SEND so compatibility on_publish cannot run
             # before the outbound queue has accepted the frame.
-            self._emit(EffectKind.PUBLISH_COMPLETE, None)
+            self._engine._emit(EffectKind.PUBLISH_COMPLETE, None)
             return PublishHandle(mid=None, qos=qos)
 
         # One property encode and the Topic Name bytes from validation feed both
@@ -461,7 +459,14 @@ class OutboundSession:
 
             # Defer wire encode until launch: avoids double work when messages sit
             # in the Receive Maximum queue.
-            if engine.state == ConnectionState.CONNECTED and self._try_launch(
+            #
+            # `topic_bytes is not None` records that validation observed an
+            # active connection with window available. Keep the explicit state
+            # check and `_try_launch` acquisition here as the launch commit point:
+            # `_try_launch` owns the slot compensation if encoding/persistence
+            # raises, while the outer rollback restores the remaining admission
+            # bookkeeping.
+            if self._engine.state == ConnectionState.CONNECTED and self._try_launch(
                 msg, _property_bytes=property_bytes, _topic_bytes=topic_bytes
             ):
                 return PublishHandle(mid=mid, qos=qos)
@@ -572,7 +577,7 @@ class OutboundSession:
         if reason_code >= 128:
             self._fail(mid, ProtocolError(f"PUBACK reason_code={reason_code}"))
         else:
-            self._emit(EffectKind.PUBLISH_COMPLETE, mid)
+            self._engine._emit(EffectKind.PUBLISH_COMPLETE, mid)
         self.packet_ids.release(mid)
         self.drain()
 
@@ -580,11 +585,17 @@ class OutboundSession:
         mid, reason_code, properties = self._decode_pubrec(raw.remaining)
         if properties is not None:
             self._engine._validate_inbound_problem_information(PacketType.PUBREC, properties)
+        # MQTT 5 §4.3.3: a PUBREC carrying a Reason Code of 0x80 or greater ends
+        # the QoS 2 exchange -- the publication failed and no PUBREL follows.
+        # This is shared by both store paths on purpose: it used to sit inside
+        # the transition branch only, so a store without conditional transitions
+        # reached the `msg is None` test first and answered an unknown MID with
+        # an orphan PUBREL 0x92 that the specification does not allow.
+        if reason_code >= 128:
+            self._fail_after_pubrec(mid, reason_code)
+            return
         transitions = self._transitions
         if transitions is not None:
-            if reason_code >= 128:
-                self._fail_after_pubrec(mid, reason_code)
-                return
             changed = transitions.transition_out(
                 mid,
                 OutboundQoSState.WAIT_PUBREC,
@@ -592,7 +603,7 @@ class OutboundSession:
                 compact=True,
             )
             if changed is not None:
-                self._send(_encode_pubrel_success(mid))
+                self._engine._send(_encode_pubrel_success(mid))
                 return
             if transitions.out_meta(mid) is None:
                 self._send_orphan_pubrel(mid)
@@ -604,9 +615,6 @@ class OutboundSession:
             return
         if msg.state is not OutboundQoSState.WAIT_PUBREC:
             return
-        if reason_code >= 128:
-            self._fail_after_pubrec(mid, reason_code)
-            return
         msg.state = OutboundQoSState.WAIT_PUBCOMP
         msg.topic = ""
         msg.payload = b""
@@ -615,12 +623,12 @@ class OutboundSession:
         if msg.encoded_pubrel is None:
             msg.encoded_pubrel = _encode_pubrel_success(mid)
         self.store.update_out(msg)
-        self._send(msg.encoded_pubrel)
+        self._engine._send(msg.encoded_pubrel)
 
     def _send_orphan_pubrel(self, mid: int) -> None:
         """Answer a PUBREC with no matching record: PUBREL, 0x92 when MQTT 5."""
         reason = 0x92 if self._engine.codec.is_mqtt5 else 0
-        self._send(self._encode_pubrel(mid, reason))
+        self._engine._send(self._encode_pubrel(mid, reason))
 
     def _fail_after_pubrec(self, mid: int, reason_code: int) -> None:
         if not self._settle(mid, OutboundQoSState.WAIT_PUBREC):
@@ -640,7 +648,7 @@ class OutboundSession:
         if reason_code >= 128:
             self._fail(mid, ProtocolError(f"PUBCOMP reason_code={reason_code}"))
         else:
-            self._emit(EffectKind.PUBLISH_COMPLETE, mid)
+            self._engine._emit(EffectKind.PUBLISH_COMPLETE, mid)
         self.packet_ids.release(mid)
         self.drain()
 
@@ -706,7 +714,7 @@ class OutboundSession:
             msg.state = target_state
             msg.encoded_publish = retained
             self.store.put_out(msg)
-        self._send(wire)
+        self._engine._send(wire)
 
     def _try_launch(
         self,
@@ -750,14 +758,14 @@ class OutboundSession:
             self._engine._check_outbound_size(wire)
             msg.encoded_publish = _retain_publish_item(wire)
             self.store.update_out(msg)
-            self._send(wire)
+            self._engine._send(wire)
             return
         if msg.state is OutboundQoSState.WAIT_PUBCOMP:
             if msg.encoded_pubrel is None:
                 msg.encoded_pubrel = _encode_pubrel_success(msg.mid)
                 self.store.update_out(msg)
             self._engine._check_outbound_size(msg.encoded_pubrel)
-            self._send(msg.encoded_pubrel)
+            self._engine._send(msg.encoded_pubrel)
             return
         raise ProtocolError(f"Cannot retransmit outbound state {msg.state!r}")
 
@@ -834,15 +842,7 @@ class OutboundSession:
         payload_size: int,
         properties: Properties | None,
     ) -> int:
-        property_bytes = 0
-        if (
-            self.config.protocol == MQTTProtocolVersion.MQTTv5
-            and properties is not None
-            and properties.values
-        ):
-            property_bytes = len(encode_properties(properties, PUBLISH))
-        topic_bytes = len(topic) if topic.isascii() else len(topic.encode("utf-8"))
-        return payload_size + topic_bytes + property_bytes
+        return publish_logical_size(self._is_v5, topic, payload_size, properties)
 
     def stored_logical_size(self, stored: OutboundMessage | OutboundMessageSummary) -> int:
         if stored.logical_size > 0:
@@ -875,7 +875,7 @@ class OutboundSession:
         """
         if topic_size is None:
             topic_size = len(topic) if topic.isascii() else len(topic.encode("utf-8"))
-        if self.config.protocol != MQTTProtocolVersion.MQTTv5:
+        if not self._is_v5:
             return topic_size, 0, 0, None
         if properties is None or not properties.values:
             # An empty property table encodes to the single length byte 0x00.

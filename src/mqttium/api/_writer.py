@@ -387,10 +387,14 @@ class WritePump:
             self.queue.put_nowait(item)
             self.queued_bytes += size
 
-    async def _write_contiguous(self, transport: AsyncTransport, parts: list[bytes]) -> None:
+    async def _write_contiguous(
+        self,
+        transport: AsyncTransport,
+        write_many: Callable[[list[bytes]], Awaitable[None]] | None,
+        parts: list[bytes],
+    ) -> None:
         if not parts:
             return
-        write_many = getattr(transport, "write_many", None)
         if write_many is not None:
             await write_many(parts)
         else:
@@ -402,6 +406,10 @@ class WritePump:
         transport = self.transport
         if transport is None:
             raise RuntimeError("WritePump started without a transport")
+        # Resolved once per writer task rather than per batch. The local dies
+        # with the task, so unlike `_write_nowait` it needs no explicit
+        # clearing: it can never outlive the transport it was resolved from.
+        write_many = getattr(transport, "write_many", None)
         queue = self.queue
         try:
             while True:
@@ -432,12 +440,12 @@ class WritePump:
                     for data in batch:
                         if isinstance(data, tuple):
                             self.segmented_writes += 1
-                            await self._write_contiguous(transport, contiguous)
+                            await self._write_contiguous(transport, write_many, contiguous)
                             for part in data:
                                 await transport.write(part)
                         else:
                             contiguous.append(data)
-                    await self._write_contiguous(transport, contiguous)
+                    await self._write_contiguous(transport, write_many, contiguous)
                     self.last_outbound = time.monotonic()
                 finally:
                     self._writing = False

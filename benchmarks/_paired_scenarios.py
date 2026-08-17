@@ -551,6 +551,23 @@ def _publish_completion(scenario: str) -> ScenarioMeasurement:
     return asyncio.run(run_callback())
 
 
+def _prime_process_wide_tables() -> None:
+    """Build lazily-initialised module tables before anything is profiled.
+
+    `websocket._xor_tables()` allocates a 256x256 XOR table on first use: one
+    time per process, ~65 500 profiler-visible calls. Whichever measurement
+    touched it first absorbed that cost, which made `websocket_mask_4k` report
+    either 8.5 or 11.8 calls/op on identical code. Priming at import time keeps
+    it out of every profiled window instead of an arbitrary one.
+    """
+    from mqttium.transport.websocket import _xor_tables
+
+    _xor_tables()
+
+
+_prime_process_wide_tables()
+
+
 REGISTRY: dict[str, Callable[[str], ScenarioMeasurement]] = {
     "encode_qos0": _encode,
     "encode_qos1": _encode,

@@ -47,15 +47,6 @@ def encode_disconnect_v311(
     return _DISCONNECT
 
 
-_PINGREQ = b"\xc0\x00"
-
-
-_PINGRESP = b"\xd0\x00"
-
-
-_DISCONNECT = b"\xe0\x00"
-
-
 _DISCONNECT_REASONS = frozenset(
     {
         0x00,
@@ -136,6 +127,14 @@ def _decode_control_v5(
 
 def decode_disconnect_v5(remaining: bytes) -> tuple[int, Properties | None]:
     return _decode_control_v5(remaining, DISCONNECT, _SERVER_DISCONNECT_REASONS)
+
+
+def encode_auth_v5(reason_code: int, properties: Properties | None) -> bytes:
+    _require_outbound_reason(reason_code, _AUTH_REASONS, AUTH)
+    body = bytearray()
+    body.append(reason_code)
+    body.extend(encode_properties(properties, AUTH))
+    return encode_frame(PacketType.AUTH, 0, body)
 
 
 def decode_auth_v5(remaining: bytes) -> tuple[int, Properties | None]:

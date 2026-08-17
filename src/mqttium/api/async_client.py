@@ -32,7 +32,6 @@ from mqttium.api.models import (
 from mqttium.api.stats import (
     ClientStats,
     DecoderStats,
-    ProtocolStats,
     ReceiptStats,
     TaskStats,
     TransportStats,
@@ -255,14 +254,12 @@ class AsyncClient:
         # Keep established private test/compatibility seams as direct bound
         # operations while the controller remains the sole state owner.
         self._try_reserve_delivery = self._delivery.try_reserve
-        self._reserve_delivery_slow = self._delivery.reserve_slow
         self._release_delivery_reference_nowait = self._delivery.release_nowait
         self._release_delivery_reference = self._delivery.release
         self._delivery_logical_size = self._delivery.logical_size
         self._put_message = self._delivery.put_message
         self._accept_message = self._delivery.acceptor()
         self._accept_decoded_message = self._delivery.decoded_acceptor()
-        self._ensure_callback_worker = self._delivery.ensure_callback_worker
         self._spawn_callback = self._delivery.spawn_callback
         self._try_enqueue_callback = self._delivery.try_enqueue_callback
         self._has_callback_capacity = self._delivery.has_callback_capacity
@@ -308,6 +305,8 @@ class AsyncClient:
 
     # Diagnostic compatibility views. Effect state has one owner in EffectPump;
     # these historical read-only names remain for tests and instrumentation.
+    # Runtime code goes through `self._effect_pump` directly — a descriptor call
+    # per publish and per ingress batch is not worth the shorter spelling.
     @property
     def _pending_effects(self) -> deque[EngineEffect]:
         return self._effect_pump.pending
@@ -357,10 +356,6 @@ class AsyncClient:
     @property
     def _pending_delivery_high_water_bytes(self) -> int:
         return self._delivery.pending_high_water_bytes
-
-    @property
-    def _delivery_waiters(self) -> int:
-        return self._delivery.waiters
 
     @property
     def _delivery_accounted_limit(self) -> int | None:
@@ -416,14 +411,6 @@ class AsyncClient:
     def _outbound_waiters(self) -> int:
         return self._write_pump.waiters
 
-    @property
-    def _last_outbound(self) -> float:
-        return self._write_pump.last_outbound
-
-    @_last_outbound.setter
-    def _last_outbound(self, value: float) -> None:
-        self._write_pump.last_outbound = value
-
     def stats(self) -> ClientStats:
         """Return an immutable point-in-time runtime snapshot.
 
@@ -463,17 +450,6 @@ class AsyncClient:
                 reconnect=running(self._reconnect_task),
                 effect_flush=running(effect_pump.task),
                 callback_worker=running(self._callback_worker_task),
-            ),
-            protocol=ProtocolStats(
-                pending_outbound_messages=outbound_stats.pending_messages,
-                pending_outbound_bytes=outbound_stats.pending_bytes,
-                pending_outbound_high_water_messages=(outbound_stats.pending_high_water_messages),
-                pending_outbound_high_water_bytes=outbound_stats.pending_high_water_bytes,
-                queued_outbound_messages=outbound_stats.queued_messages,
-                flow_inflight=outbound_stats.flow_inflight,
-                flow_limit=outbound_stats.flow_limit,
-                packet_ids_in_use=outbound_stats.packet_ids_in_use,
-                inbound_inflight=inbound_stats.inflight,
             ),
             outbound=outbound_stats,
             inbound=inbound_stats,
@@ -541,7 +517,7 @@ class AsyncClient:
         Keeping finalization separate lets adapters commit a bounded batch and
         collect/drain effects once.
         """
-        handle = self._engine.queue_publish(
+        handle = self._engine.outbound.queue_publish(
             topic,
             payload,
             qos=qos,
@@ -560,7 +536,7 @@ class AsyncClient:
 
         return (
             (self.on_publish is None or self._has_callback_capacity(callback_count))
-            and not self._pending_effects
+            and not self._effect_pump.pending
             and not self._engine.has_pending_effects
         )
 
@@ -645,7 +621,7 @@ class AsyncClient:
         properties: Properties | None = None,
     ) -> PublishReceipt:
         """Admit QoS 1/2 and register its receipt for loop-bound adapters."""
-        handle = self._engine.queue_publish(
+        handle = self._engine.outbound.queue_publish(
             topic,
             payload,
             qos=qos,
@@ -666,7 +642,7 @@ class AsyncClient:
         properties: Properties | None = None,
     ) -> None:
         """Admit QoS 0 without allocating a receipt, for batched adapters."""
-        self._engine.queue_publish(
+        self._engine.outbound.queue_publish(
             topic,
             payload,
             qos=QoS.AT_MOST_ONCE,
@@ -880,21 +856,27 @@ class AsyncClient:
             raise MQTTError("Connection cancelled by disconnect()")
         return connack_fut.result()
 
-    async def _send_connecting_disconnect(self, reason_code: int) -> None:
-        packet = self._engine.begin_disconnect(reason_code)
-        admitted = self._try_enqueue_outbound(packet, epoch=self._connection_epoch)
-        if not admitted:
+    async def _flush_terminal_packet(self, packet: WriteItem, timeout: float) -> None:
+        """Admit a terminal packet and wait, bounded, for the writer to drain it.
+
+        Shutdown must not wait for application traffic to free a bounded queue,
+        so a packet that cannot be admitted immediately is dropped rather than
+        parked. StaleConnectionEffect is deliberately not caught here: whether a
+        dead epoch is an error depends on the caller.
+        """
+        if not self._try_enqueue_outbound(packet, epoch=self._connection_epoch):
             return
         writer_task = self._write_pump.task
         if writer_task is None or writer_task.done():
             return
         try:
-            await asyncio.wait_for(
-                self._write_pump.join(),
-                timeout=_GRACEFUL_DISCONNECT_DRAIN_TIMEOUT,
-            )
+            await asyncio.wait_for(self._write_pump.join(), timeout=timeout)
         except TimeoutError:
             pass
+
+    async def _send_connecting_disconnect(self, reason_code: int) -> None:
+        packet = self._engine.begin_disconnect(reason_code)
+        await self._flush_terminal_packet(packet, _GRACEFUL_DISCONNECT_DRAIN_TIMEOUT)
 
     async def disconnect(self, reason_code: int = 0) -> None:
         self._intentional_disconnect = True
@@ -933,27 +915,12 @@ class AsyncClient:
                 return
             try:
                 if packet is not None:
-                    # Shutdown must not wait for application traffic to free a
-                    # bounded queue. If the terminal packet cannot be admitted
-                    # immediately, close the transport instead of deadlocking.
                     try:
-                        admitted = self._try_enqueue_outbound(
-                            packet,
-                            epoch=self._connection_epoch,
+                        await self._flush_terminal_packet(
+                            packet, _GRACEFUL_DISCONNECT_DRAIN_TIMEOUT
                         )
                     except StaleConnectionEffect:
-                        admitted = False
-                    if admitted:
-                        try:
-                            # Skip the wait if the writer already died.
-                            writer_task = self._write_pump.task
-                            if writer_task is not None and not writer_task.done():
-                                await asyncio.wait_for(
-                                    self._write_pump.join(),
-                                    timeout=_GRACEFUL_DISCONNECT_DRAIN_TIMEOUT,
-                                )
-                        except TimeoutError:
-                            pass
+                        pass
             finally:
                 await self._force_close()
 
@@ -1036,7 +1003,7 @@ class AsyncClient:
                         self._check_nowait_publish_capacity(topic, data, qos, retain, properties)
                     # Keep the native async hot path inline. Routing these
                     # operations through the adapter boundary measured 2.36% slower.
-                    handle = self._engine.queue_publish(
+                    handle = self._engine.outbound.queue_publish(
                         topic,
                         data,
                         qos=qos,
@@ -1066,7 +1033,7 @@ class AsyncClient:
                     self._collect_effects_locked()
                     self._drain_effects_inline()
             if not wait_for_space:
-                if self._pending_effects:
+                if self._effect_pump.pending:
                     if nowait:
                         self._schedule_effect_flush()
                     else:
@@ -1092,7 +1059,7 @@ class AsyncClient:
                         return
                     if nowait:
                         self._check_nowait_publish_many_capacity(requests)
-                    handles = self._engine.queue_publish_many(requests)
+                    handles = self._engine.outbound.queue_publish_many(requests)
                 except FlowControlError as flow_exc:
                     if (
                         nowait
@@ -1264,9 +1231,14 @@ class AsyncClient:
             self._unsub_futs.pop(mid, None)
             raise MQTTTimeoutError(f"UNSUBACK timed out for mid={mid}") from exc
 
-    async def messages(self) -> AsyncIterator[Message]:
-        async for message in self._delivery.messages():
-            yield message
+    def messages(self) -> AsyncIterator[Message]:
+        """Iterate delivered messages.
+
+        Returns the delivery controller's iterator rather than re-yielding from
+        it, which would cost one generator resume/suspend per message. `async
+        for` and `anext()` are unaffected; only `inspect.isasyncgenfunction` is.
+        """
+        return self._delivery.messages()
 
     async def ack(self, message: Message) -> None:
         """Acknowledge an inbound QoS>0 message when ``manual_ack=True``.
@@ -1293,6 +1265,7 @@ class AsyncClient:
         decoder = self._decoder
         engine = self._engine
         handle_raw = engine.handle_raw
+        inbound = engine.inbound
         max_bytes = self._max_ingress_batch_bytes
         count = 0
         decoded_bytes = 0
@@ -1307,7 +1280,7 @@ class AsyncClient:
             # when their batch fills the remaining Receive Maximum window, so
             # the effect handoff below can release them before another PUBLISH.
             # Control packets and QoS 0 traffic retain the full 256-packet batch.
-            if engine.inbound._autoack_handoff_required:
+            if inbound._autoack_handoff_required:
                 return count, decoded_bytes, True
             if decoded_bytes >= max_bytes:
                 break
@@ -1330,7 +1303,7 @@ class AsyncClient:
                             handled, handled_bytes, handoff_required = self._process_ingress_batch()
                         if handled:
                             self._collect_effects_locked()
-                    if self._pending_effects:
+                    if self._effect_pump.pending:
                         await self._drain_effects()
                     # A batch that stopped short of both bounds emptied the
                     # buffer, so there is nothing to decode until the next
@@ -1398,12 +1371,14 @@ class AsyncClient:
                     self._reconnect_loop(), name="mqttium-reconnect"
                 )
 
-    def _will_reconnect(self) -> bool:
-        reason = None
+    def _retry_reason(self) -> int | None:
+        """The reason code the reconnect policy judges: broker DISCONNECT, else CONNACK."""
         if self._last_disconnect is not None and self._last_disconnect.from_broker:
-            reason = self._last_disconnect.reason_code
-        elif self._last_connack_reason is not None:
-            reason = self._last_connack_reason
+            return self._last_disconnect.reason_code
+        return self._last_connack_reason
+
+    def _will_reconnect(self) -> bool:
+        reason = self._retry_reason()
         return (
             not isinstance(self._disconnect_exc, MessageDeliveryError)
             and not self._intentional_disconnect
@@ -1535,11 +1510,7 @@ class AsyncClient:
     async def _reconnect_loop(self) -> None:
         try:
             while self._reconnect.enabled and not self._intentional_disconnect:
-                reason = None
-                if self._last_disconnect is not None and self._last_disconnect.from_broker:
-                    reason = self._last_disconnect.reason_code
-                elif self._last_connack_reason is not None:
-                    reason = self._last_connack_reason
+                reason = self._retry_reason()
                 if not self._reconnect.should_retry(reason, self._engine.config.protocol):
                     self._fail_pending(self._disconnect_exc or MQTTError("Reconnect exhausted"))
                     return
@@ -1644,12 +1615,9 @@ class AsyncClient:
             return 0
         return self._delivery.deliver_decoded_batch_inline(effects, self.on_message)
 
-    async def _flush_effects(self, *, nowait: bool = False) -> None:
+    async def _flush_effects(self) -> None:
         async with self._engine_lock:
             self._collect_effects_locked()
-        if nowait:
-            self._schedule_effect_flush()
-            return
         await self._drain_effects()
 
     async def _apply_effect(  # noqa: C901 -- reduced from 44; remaining branches own lifecycle
@@ -1708,7 +1676,7 @@ class AsyncClient:
                 await pending_delivery
             if effect.requires_delivery_mark is not False and message.mid is not None:
                 async with self._engine_lock:
-                    self._engine.mark_inbound_delivered(message.mid)
+                    self._engine.inbound.mark_delivered(message.mid)
         elif kind is EffectKind.DECODED_MESSAGE:
             message = effect.data
             property_wire_size = effect.decoded_property_wire_size
@@ -1720,7 +1688,7 @@ class AsyncClient:
                 await pending_delivery
             if effect.requires_delivery_mark is not False and message.mid is not None:
                 async with self._engine_lock:
-                    self._engine.mark_inbound_delivered(message.mid)
+                    self._engine.inbound.mark_delivered(message.mid)
         elif kind is EffectKind.PUBLISH_COMPLETE:
             mid: int | None = effect.data
             self._settle_publish(mid, None)
@@ -1826,7 +1794,10 @@ class AsyncClient:
                 batch = self._pop_batch_receipt(mid)
                 if batch is not None:
                     batch._complete(mid, reason)
-        self._notify_publish_space()
+        # Inlined: _settle_publish runs per acknowledgement, and the common case
+        # has no waiter at all. The named helper stays for the teardown callers.
+        if self._publish_waiters:
+            self._publish_space.set()
 
     def _notify_publish_space(self) -> None:
         if self._publish_waiters:
@@ -1968,18 +1939,7 @@ class AsyncClient:
         try:
             packet = encode_disconnect(reason, MQTTProtocolVersion.MQTTv5)
             self._engine._check_outbound_size(packet)
-            admitted = self._try_enqueue_outbound(packet, epoch=self._connection_epoch)
-            if not admitted:
-                return
-            writer_task = self._write_pump.task
-            if writer_task is not None and not writer_task.done():
-                try:
-                    await asyncio.wait_for(
-                        self._write_pump.join(),
-                        timeout=_FATAL_DISCONNECT_DRAIN_TIMEOUT,
-                    )
-                except TimeoutError:
-                    pass
+            await self._flush_terminal_packet(packet, _FATAL_DISCONNECT_DRAIN_TIMEOUT)
         except Exception:
             pass
 

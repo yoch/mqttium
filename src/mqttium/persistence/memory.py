@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from itertools import islice
 from contextlib import AbstractContextManager, nullcontext
-from typing import Protocol, runtime_checkable
+from typing import Protocol, TypeVar, runtime_checkable
 
 from mqttium.enums import InboundQoSState, OutboundQoSState
 from mqttium.types import (
@@ -183,6 +183,9 @@ class TransitionInflightStore(InflightStore, Protocol):
     ) -> InboundRecordMeta | None: ...
 
 
+_RecordT = TypeVar("_RecordT")
+
+
 class MemoryInflightStore:
     """Ordered dict-backed store. Insertion order is retransmission order."""
 
@@ -221,14 +224,26 @@ class MemoryInflightStore:
     def out_items(self) -> Iterator[OutboundMessage]:
         return iter(self._out.values())
 
-    def out_pages(self, page_size: int = 256) -> Iterator[tuple[OutboundMessage, ...]]:
+    @staticmethod
+    def _pages(
+        records: dict[int, _RecordT],
+        page_size: int,
+    ) -> Iterator[tuple[_RecordT, ...]]:
+        """Page a record table, snapshotting identifiers before the first yield.
+
+        A page whose records were acknowledged meanwhile comes back shorter --
+        the same contract SqliteInflightStore offers.
+        """
         if page_size <= 0:
             raise ValueError("page_size must be positive")
-        mids = iter(tuple(self._out))
+        mids = iter(tuple(records))
         while page := tuple(islice(mids, page_size)):
-            messages = tuple(self._out[mid] for mid in page if mid in self._out)
+            messages = tuple(record for mid in page if (record := records.get(mid)) is not None)
             if messages:
                 yield messages
+
+    def out_pages(self, page_size: int = 256) -> Iterator[tuple[OutboundMessage, ...]]:
+        return self._pages(self._out, page_size)
 
     def out_summary_pages(
         self, page_size: int = 256
@@ -309,13 +324,7 @@ class MemoryInflightStore:
         return iter(self._in.values())
 
     def in_pages(self, page_size: int = 256) -> Iterator[tuple[InboundMessage, ...]]:
-        if page_size <= 0:
-            raise ValueError("page_size must be positive")
-        mids = iter(tuple(self._in))
-        while page := tuple(islice(mids, page_size)):
-            messages = tuple(self._in[mid] for mid in page if mid in self._in)
-            if messages:
-                yield messages
+        return self._pages(self._in, page_size)
 
     def in_count(self) -> int:
         return len(self._in)
@@ -335,7 +344,16 @@ class MemoryInflightStore:
             message = self._in.get(mid)
             if message is None:
                 continue
-            message_bytes = len(message.payload) + len(message.topic.encode("utf-8"))
+            # logical_size is maintained by the inbound session (and backfilled
+            # at hydration), so replay does not encode every topic to size it.
+            message_bytes = message.logical_size or (
+                len(message.payload)
+                + (
+                    len(message.topic)
+                    if message.topic.isascii()
+                    else len(message.topic.encode("utf-8"))
+                )
+            )
             if messages and (
                 len(messages) >= max_messages or hydrated_bytes + message_bytes > max_bytes
             ):

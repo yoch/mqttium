@@ -6,6 +6,36 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- Answer a PUBREC carrying a Reason Code of 0x80 or greater by ending the QoS 2
+  exchange on every store, as MQTT 5 §4.3.3 requires. The check previously sat
+  inside the conditional-transition branch, so a third-party `InflightStore`
+  without the `TransitionInflightStore` extension reached the "no such record"
+  test first and answered an unknown packet identifier with an orphan
+  PUBREL 0x92. The shipped memory and SQLite stores were never affected.
+
+### Removed
+
+- `ClientStats.protocol` and the `ProtocolStats` type (Provisional). The
+  aggregate was documented as retained for pre-stable compatibility and every
+  one of its nine fields duplicated a value already present in
+  `ClientStats.outbound` / `ClientStats.inbound`. Read those instead — the
+  mapping is one-to-one, e.g. `stats().protocol.flow_inflight` becomes
+  `stats().outbound.flow_inflight`, and `stats().protocol.inbound_inflight`
+  becomes `stats().inbound.inflight`.
+- `IncrementalDecoder.process_packets` (Provisional). It had no caller;
+  `process_packets_bounded` is the count- and byte-bounded form the client uses.
+
+### Changed
+
+- `AsyncClient.messages()` returns the delivery iterator directly instead of
+  being an async generator that re-yields from it, removing one generator
+  resume/suspend per delivered message. `async for client.messages()` and
+  `anext(client.messages())` are unaffected; only
+  `inspect.isasyncgenfunction(AsyncClient.messages)` changes from `True` to
+  `False`.
+
 ## [1.0.0rc6] - 2026-08-16
 
 ### Fixed

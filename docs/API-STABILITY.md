@@ -127,9 +127,10 @@ consecutively on the owning loop and represent one practically consistent view,
 not a lock-free cross-thread atomic transaction.
 
 Each section is produced by the component that owns the state, and `stats()`
-only assembles them. `ClientStats.protocol` remains a deprecated compatibility
-aggregate; new code should use `ClientStats.outbound` and
-`ClientStats.inbound`.
+only assembles them. `ClientStats.protocol` was part of the frozen `1.0.0rc6`
+Provisional snapshot as a deprecated compatibility aggregate; it is removed by
+the post-rc6 candidate. New code should use `ClientStats.outbound` and
+`ClientStats.inbound`; the changelog carries the migration mapping.
 
 ## Compatibility façade
 

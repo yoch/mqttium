@@ -15,10 +15,6 @@ def pack_u16(value: int) -> bytes:
     return _U16.pack(value)
 
 
-def append_u16(buf: bytearray, value: int) -> None:
-    buf += _U16.pack(value)
-
-
 def unpack_u16(buffer: bytes | bytearray | memoryview, offset: int = 0) -> tuple[int, int]:
     if offset + 2 > len(buffer):
         raise MalformedPacketError("Incomplete uint16")
