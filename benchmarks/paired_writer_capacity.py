@@ -159,9 +159,7 @@ async def _sample(args: argparse.Namespace) -> CapacityResult:
     from mqttium.enums import MQTTProtocolVersion
     from mqttium.protocol.reconnect import ReconnectPolicy
 
-    protocol = (
-        MQTTProtocolVersion.MQTTv5 if args.protocol == "5" else MQTTProtocolVersion.MQTTv311
-    )
+    protocol = MQTTProtocolVersion.MQTTv5 if args.protocol == "5" else MQTTProtocolVersion.MQTTv311
     client = AsyncClient(
         client_id=f"writer-capacity-{os.getpid()}-{time.time_ns()}",
         protocol=protocol,
@@ -291,10 +289,7 @@ def assess_rates(
     label: str,
 ) -> tuple[float, float, list[str], list[str]]:
     """Evaluate one paired cell; split invalid measurement from regression."""
-    ratios = [
-        candidate / base
-        for base, candidate in zip(base_rates, candidate_rates, strict=True)
-    ]
+    ratios = [candidate / base for base, candidate in zip(base_rates, candidate_rates, strict=True)]
     ratio = statistics.median(ratios)
     baseline_cv = _cv(base_rates)
     invalidations: list[str] = []
@@ -303,8 +298,7 @@ def assess_rates(
         invalidations.append(f"{label}: baseline CV {baseline_cv:.2%}")
     if aa_control and abs(ratio - 1.0) > max_aa_ratio_deviation:
         invalidations.append(
-            f"{label}: A/A completed ratio {ratio:.4f} outside "
-            f"1+/-{max_aa_ratio_deviation:.2%}"
+            f"{label}: A/A completed ratio {ratio:.4f} outside 1+/-{max_aa_ratio_deviation:.2%}"
         )
     if not aa_control and ratio < min_completed_ratio:
         regressions.append(f"{label}: candidate/base completed ratio {ratio:.4f}")
@@ -394,8 +388,7 @@ def parent(args: argparse.Namespace) -> int:
                     "base": asdict(measured["base"]),
                     "candidate": asdict(measured["candidate"]),
                     "candidate_over_base_completed": (
-                        measured["candidate"].completed_rate
-                        / measured["base"].completed_rate
+                        measured["candidate"].completed_rate / measured["base"].completed_rate
                     ),
                 }
             )
