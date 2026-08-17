@@ -1,4 +1,4 @@
-name: ARM64 PR252 Yielding-Pacer Evaluation
+name: ARM64 PR252 Closed-Loop Network Validation
 
 on:
   push:
@@ -10,7 +10,7 @@ permissions:
 jobs:
   validate:
     runs-on: [self-hosted, linux, ARM64]
-    timeout-minutes: 55
+    timeout-minutes: 70
     env:
       PYTHONUNBUFFERED: "1"
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
@@ -23,6 +23,10 @@ jobs:
           set -euo pipefail
           test "$(uname -m)" = aarch64
           test "$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor | sort -u)" = performance
+          command -v python3
+          command -v mosquitto
+          command -v mosquitto_sub
+          command -v taskset
           if pgrep -a mosquitto; then exit 1; fi
 
       - uses: actions/checkout@v7
@@ -39,43 +43,39 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Verify exact endpoints and patch only the harness
+      - name: Verify exact endpoints and untouched network harness
         shell: bash
         run: |
           set -euo pipefail
           test "$(git -C base rev-parse HEAD)" = "$BASE_SHA"
           test "$(git -C candidate rev-parse HEAD)" = "$CANDIDATE_SHA"
           test "$(git -C candidate merge-base "$BASE_SHA" "$CANDIDATE_SHA")" = "$BASE_SHA"
-          python3 - <<'PY'
-          from pathlib import Path
-          p=Path('candidate/benchmarks/paired_open_loop.py')
-          t=p.read_text()
-          old='''            if paced:\n                delay = deadline - loop.time()\n                if delay > 0:\n                    await asyncio.sleep(delay)\n'''
-          new='''            if paced:\n                delay = deadline - loop.time()\n                await asyncio.sleep(max(0.0, delay))\n'''
-          assert t.count(old) == 1
-          p.write_text(t.replace(old,new))
-          PY
-          git -C candidate diff --check
-          test "$(git -C candidate diff --name-only)" = "benchmarks/paired_open_loop.py"
+          test -z "$(git -C base status --porcelain)"
+          test -z "$(git -C candidate status --porcelain)"
 
       - name: Create benchmark venv
         shell: bash
         run: |
-          v="$RUNNER_TEMP/m252-yield-v"; rm -rf "$v"; python3 -m venv "$v"; echo "$v/bin" >> "$GITHUB_PATH"
+          v="$RUNNER_TEMP/m252-net-v"
+          rm -rf "$v"
+          python3 -m venv "$v"
+          echo "$v/bin" >> "$GITHUB_PATH"
 
       - run: python -m pip install "psutil>=6,<8"
 
       - name: Fresh strict preflight
         working-directory: base
         run: |
-          r="$RUNNER_TEMP/m252-yield"; rm -rf "$r"; mkdir -p "$r"
+          r="$RUNNER_TEMP/m252-net"
+          rm -rf "$r"
+          mkdir -p "$r"
           python benchmarks/runner_probe.py --output "$r/runner.json" --require-temperature --enforce
 
       - name: Start pinned broker
         shell: bash
         run: |
           set -euo pipefail
-          r="$RUNNER_TEMP/m252-yield"
+          r="$RUNNER_TEMP/m252-net"
           cat >"$r/mosquitto.conf" <<'EOF'
           persistence false
           allow_anonymous true
@@ -94,59 +94,127 @@ jobs:
           done
           exit 1
 
-      - name: Main A/A with yielding pacer
+      - name: Main A/A closed-loop network control
         run: |
-          r="$RUNNER_TEMP/m252-yield"
-          python candidate/benchmarks/paired_open_loop.py --base-root base --candidate-root base \
-            --protocols 311 --payloads 256 --windows 64 --target-rates 2500,5000,10000 --completions callback \
-            --repeat 8 --count-small 4000 --target-sample-seconds 1.5 --max-count 4000 \
-            --timeout 120 --cpu 2 --policy strict --preflight-report "$r/runner.json" \
+          r="$RUNNER_TEMP/m252-net"
+          python candidate/benchmarks/paired_network.py --base-root base --candidate-root base \
+            --protocols 311 --payloads 256 --windows 1,8,64 --completions callback \
+            --repeat 8 --count-small 4000 --target-sample-seconds 1.5 --max-count 50000 \
+            --timeout 120 --cpu 2 --policy advisory --preflight-report "$r/runner.json" \
             --output "$r/main-aa.json" --summary-output "$r/main-aa.md"
 
-      - name: Candidate A/A with yielding pacer
+      - name: Candidate A/A closed-loop network control
         run: |
-          r="$RUNNER_TEMP/m252-yield"
-          python candidate/benchmarks/paired_open_loop.py --base-root candidate --candidate-root candidate \
-            --protocols 311 --payloads 256 --windows 64 --target-rates 2500,5000,10000 --completions callback \
-            --repeat 8 --count-small 4000 --target-sample-seconds 1.5 --max-count 4000 \
-            --timeout 120 --cpu 2 --policy strict --preflight-report "$r/runner.json" \
+          r="$RUNNER_TEMP/m252-net"
+          python candidate/benchmarks/paired_network.py --base-root candidate --candidate-root candidate \
+            --protocols 311 --payloads 256 --windows 1,8,64 --completions callback \
+            --repeat 8 --count-small 4000 --target-sample-seconds 1.5 --max-count 50000 \
+            --timeout 120 --cpu 2 --policy advisory --preflight-report "$r/runner.json" \
             --output "$r/candidate-aa.json" --summary-output "$r/candidate-aa.md"
 
-      - name: A/B with yielding pacer
+      - name: Main versus PR252 closed-loop network
         run: |
-          r="$RUNNER_TEMP/m252-yield"
-          python candidate/benchmarks/paired_open_loop.py --base-root base --candidate-root candidate \
-            --protocols 311 --payloads 256 --windows 64 --target-rates 2500,5000,10000 --completions callback \
-            --repeat 8 --count-small 4000 --target-sample-seconds 1.5 --max-count 4000 \
-            --timeout 120 --cpu 2 --policy strict --preflight-report "$r/runner.json" \
+          r="$RUNNER_TEMP/m252-net"
+          python candidate/benchmarks/paired_network.py --base-root base --candidate-root candidate \
+            --protocols 311 --payloads 256 --windows 1,8,64 --completions callback \
+            --repeat 8 --count-small 4000 --target-sample-seconds 1.5 --max-count 50000 \
+            --timeout 120 --cpu 2 --policy advisory --preflight-report "$r/runner.json" \
             --output "$r/ab.json" --summary-output "$r/ab.md"
 
-      - name: Summarize p50 ratios
+      - name: Enforce symmetric controls and comparison gates
         shell: bash
         run: |
-          ROOT="$RUNNER_TEMP/m252-yield" python - <<'PY'
+          ROOT="$RUNNER_TEMP/m252-net" python - <<'PY'
           import json, os, statistics
           from pathlib import Path
-          d=json.loads((Path(os.environ['ROOT'])/'ab.json').read_text())
-          for s in d['scenarios']:
-              ratios=[float(p['candidate']['ack_latency_p50_ms'])/float(p['base']['ack_latency_p50_ms']) for p in s['pairs']]
-              print(f"rate={int(s['target_rate'])} p50_ratio={statistics.median(ratios):.4f} wins={s['pairs_favouring_candidate_latency']}/8")
+
+          root = Path(os.environ["ROOT"])
+          failures = []
+          lines = [
+              "# PR252 closed-loop network validation",
+              "",
+              "All CV checks are symmetric: both nominal arms of each A/A control must be stable.",
+              "",
+              "| run | window | ack ratio | base ack CV | cand ack CV | p50 ratio | ack-p50 ratio |",
+              "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+          ]
+
+          def cv(values):
+              mean = statistics.fmean(values)
+              return statistics.stdev(values) / mean if len(values) > 1 and mean else 0.0
+
+          def inspect(path, label, same_tree):
+              data = json.loads((root / path).read_text())
+              if data.get("eligibility", {}).get("eligible") is not True:
+                  failures.append(f"{label}: runner ineligible")
+              if data.get("status") == "invalid":
+                  failures.append(f"{label}: harness marked measurement invalid: {data.get('failures')}")
+              for scenario in data["scenarios"]:
+                  pairs = scenario["pairs"]
+                  base_ack = [float(p["base"]["publisher_ack_msg_s"]) for p in pairs]
+                  cand_ack = [float(p["candidate"]["publisher_ack_msg_s"]) for p in pairs]
+                  base_p50 = [float(p["base"]["latency_p50_ms"]) for p in pairs]
+                  cand_p50 = [float(p["candidate"]["latency_p50_ms"]) for p in pairs]
+                  base_ack_p50 = [float(p["base"]["ack_latency_p50_ms"]) for p in pairs]
+                  cand_ack_p50 = [float(p["candidate"]["ack_latency_p50_ms"]) for p in pairs]
+                  ratios = [c / b for b, c in zip(base_ack, cand_ack)]
+                  p50_ratios = [c / b for b, c in zip(base_p50, cand_p50)]
+                  ack_p50_ratios = [c / b for b, c in zip(base_ack_p50, cand_ack_p50)]
+                  ack_ratio = statistics.median(ratios)
+                  p50_ratio = statistics.median(p50_ratios)
+                  ack_p50_ratio = statistics.median(ack_p50_ratios)
+                  bcv, ccv = cv(base_ack), cv(cand_ack)
+                  window = int(scenario["window"])
+                  lines.append(
+                      f"| {label} | {window} | {ack_ratio:.4f}x | {bcv:.2%} | {ccv:.2%} | {p50_ratio:.4f}x | {ack_p50_ratio:.4f}x |"
+                  )
+                  if bcv > 0.05:
+                      failures.append(f"{label} window={window}: base ack CV {bcv:.2%} > 5%")
+                  if ccv > 0.05:
+                      failures.append(f"{label} window={window}: candidate ack CV {ccv:.2%} > 5%")
+                  if same_tree:
+                      if not 0.95 <= ack_ratio <= 1.05:
+                          failures.append(f"{label} window={window}: same-tree ack ratio {ack_ratio:.4f} outside 0.95..1.05")
+                  else:
+                      if ack_ratio < 0.95:
+                          failures.append(f"{label} window={window}: PR252/main ack ratio {ack_ratio:.4f} < 0.95")
+                      if p50_ratio > 1.10:
+                          failures.append(f"{label} window={window}: end-to-end p50 ratio {p50_ratio:.4f} > 1.10")
+                      if ack_p50_ratio > 1.10:
+                          failures.append(f"{label} window={window}: ACK p50 ratio {ack_p50_ratio:.4f} > 1.10")
+              return data
+
+          inspect("main-aa.json", "main A/A", True)
+          inspect("candidate-aa.json", "PR252 A/A", True)
+          inspect("ab.json", "A/B", False)
+
+          lines.extend(("", "## Verdict", ""))
+          if failures:
+              lines.append("**FAILED / INVALID**")
+              lines.extend(f"- {failure}" for failure in failures)
+          else:
+              lines.append("**PASSED**")
+          (root / "gate.md").write_text("\n".join(lines) + "\n")
+          print("\n".join(lines))
+          if failures:
+              raise SystemExit(1)
           PY
 
       - name: Stop broker
         if: always()
         shell: bash
         run: |
-          f="$RUNNER_TEMP/m252-yield/pid"; [ ! -f "$f" ] || { p=$(cat "$f"); kill "$p" 2>/dev/null || true; wait "$p" 2>/dev/null || true; }
+          f="$RUNNER_TEMP/m252-net/pid"
+          [ ! -f "$f" ] || { p=$(cat "$f"); kill "$p" 2>/dev/null || true; wait "$p" 2>/dev/null || true; }
 
       - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: arm64-pr252-yielding-pacer-${{ github.run_id }}
+          name: arm64-pr252-closed-loop-network-${{ github.run_id }}
           path: |
-            ${{ runner.temp }}/m252-yield/*.json
-            ${{ runner.temp }}/m252-yield/*.md
-            ${{ runner.temp }}/m252-yield/mosquitto.log
+            ${{ runner.temp }}/m252-net/*.json
+            ${{ runner.temp }}/m252-net/*.md
+            ${{ runner.temp }}/m252-net/mosquitto.log
           if-no-files-found: error
           retention-days: 30
