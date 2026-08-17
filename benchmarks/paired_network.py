@@ -18,7 +18,7 @@ import subprocess
 import sys
 import time
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from itertools import product
 from pathlib import Path
 
@@ -52,6 +52,50 @@ class WorkerResult:
 
 class InvalidMeasurement(RuntimeError):
     """A worker could not produce a trustworthy sample."""
+
+
+@dataclass
+class CallbackGenerationTracker:
+    """Match delayed ``on_publish`` callbacks to reused MQTT packet IDs.
+
+    Packet IDs may be reused once the protocol ACK releases them, while the
+    application callback is still queued. A scalar ``mid -> timestamp`` map
+    therefore loses generations under concurrent publishing. Keep FIFO
+    generations per MID so delayed callbacks cannot consume a newer publish.
+    """
+
+    starts: dict[int, deque[int]] = field(default_factory=dict)
+    early: dict[int, deque[int]] = field(default_factory=dict)
+
+    def register(self, mid: int, sent_ns: int) -> tuple[int, int] | None:
+        starts = self.starts.setdefault(mid, deque())
+        starts.append(sent_ns)
+        early = self.early.get(mid)
+        if not early:
+            return None
+        finished_ns = early.popleft()
+        matched_sent_ns = starts.popleft()
+        if not starts:
+            self.starts.pop(mid, None)
+        if not early:
+            self.early.pop(mid, None)
+        return matched_sent_ns, finished_ns
+
+    def complete(self, mid: int, finished_ns: int) -> tuple[int, int] | None:
+        starts = self.starts.get(mid)
+        if not starts:
+            self.early.setdefault(mid, deque()).append(finished_ns)
+            return None
+        sent_ns = starts.popleft()
+        if not starts:
+            self.starts.pop(mid, None)
+        return sent_ns, finished_ns
+
+    def pending_counts(self) -> tuple[int, int]:
+        return (
+            sum(len(starts) for starts in self.starts.values()),
+            sum(len(completions) for completions in self.early.values()),
+        )
 
 
 def percentile(values: list[float], fraction: float) -> float:
@@ -182,8 +226,7 @@ async def publish(
     await client.connect(host, port, timeout=10.0)
     pending: deque[tuple[PublishReceipt, int]] = deque()
     completed: asyncio.Queue[tuple[int, int]] = asyncio.Queue()
-    publish_started: dict[int, int] = {}
-    early_completion: dict[int, int] = {}
+    callback_generations = CallbackGenerationTracker()
     ack_latencies: list[float] = []
     outstanding = 0
     if completion == "callback":
@@ -191,10 +234,9 @@ async def publish(
         def on_publish(mid: int | None, *_args: object) -> None:
             assert mid is not None
             finished = time.monotonic_ns()
-            if mid in publish_started:
-                completed.put_nowait((mid, finished))
-            else:
-                early_completion[mid] = finished
+            match = callback_generations.complete(mid, finished)
+            if match is not None:
+                completed.put_nowait(match)
 
         client.on_publish = on_publish
     started = time.perf_counter()
@@ -209,13 +251,13 @@ async def publish(
                 ack_latencies.append((time.monotonic_ns() - sent_ns) / 1_000_000)
         else:
             assert receipt.mid is not None
-            publish_started[receipt.mid] = published_ns
-            if receipt.mid in early_completion:
-                completed.put_nowait((receipt.mid, early_completion.pop(receipt.mid)))
+            match = callback_generations.register(receipt.mid, published_ns)
+            if match is not None:
+                completed.put_nowait(match)
             outstanding += 1
             if outstanding >= window:
-                mid, finished = await completed.get()
-                ack_latencies.append((finished - publish_started.pop(mid)) / 1_000_000)
+                sent_ns, finished = await completed.get()
+                ack_latencies.append((finished - sent_ns) / 1_000_000)
                 outstanding -= 1
     if completion == "receipt":
         for receipt, sent_ns in pending:
@@ -223,8 +265,14 @@ async def publish(
             ack_latencies.append((time.monotonic_ns() - sent_ns) / 1_000_000)
     else:
         for _ in range(outstanding):
-            mid, finished = await completed.get()
-            ack_latencies.append((finished - publish_started.pop(mid)) / 1_000_000)
+            sent_ns, finished = await completed.get()
+            ack_latencies.append((finished - sent_ns) / 1_000_000)
+        pending_starts, early_callbacks = callback_generations.pending_counts()
+        if pending_starts or early_callbacks:
+            raise RuntimeError(
+                "callback generation accounting leaked "
+                f"starts={pending_starts} early={early_callbacks}"
+            )
     elapsed = time.perf_counter() - started
     effects = client.stats().effects
     await client.disconnect()
@@ -368,6 +416,23 @@ def median(values: list[float]) -> float:
 def coefficient_of_variation(values: list[float]) -> float:
     mean = statistics.fmean(values)
     return statistics.stdev(values) / mean if len(values) > 1 and mean else 0.0
+
+
+def arm_variability(
+    label: str,
+    base_values: list[float],
+    candidate_values: list[float],
+    maximum_cv: float,
+) -> tuple[float, float, list[str]]:
+    """Validate measurement stability symmetrically across both paired arms."""
+    base_cv = coefficient_of_variation(base_values)
+    candidate_cv = coefficient_of_variation(candidate_values)
+    invalidations: list[str] = []
+    if base_cv > maximum_cv:
+        invalidations.append(f"{label}: baseline CV {base_cv:.2%}")
+    if candidate_cv > maximum_cv:
+        invalidations.append(f"{label}: candidate CV {candidate_cv:.2%}")
+    return base_cv, candidate_cv, invalidations
 
 
 def calibrated_sample_count(
@@ -611,7 +676,13 @@ def parent(args: argparse.Namespace) -> int:
                 )
 
             ratio = median(ack_ratios)
-            baseline_cv = coefficient_of_variation(base_ack_rates)
+            label = (
+                f"protocol={protocol} completion={completion} "
+                f"payload={payload_bytes} window={window}"
+            )
+            baseline_cv, candidate_cv, variability_invalidations = arm_variability(
+                label, base_ack_rates, candidate_ack_rates, args.max_baseline_cv
+            )
             scenario = {
                 "protocol": protocol,
                 "completion": completion,
@@ -623,7 +694,7 @@ def parent(args: argparse.Namespace) -> int:
                 "calibration": {variant: asdict(result) for variant, result in calibration.items()},
                 "median_candidate_over_base_ack": ratio,
                 "base_ack_cv": baseline_cv,
-                "candidate_ack_cv": coefficient_of_variation(candidate_ack_rates),
+                "candidate_ack_cv": candidate_cv,
                 "median_candidate_minus_base_p50_ms": median(p50_deltas),
                 "median_candidate_minus_base_p95_ms": median(p95_deltas),
                 "base_median_p50_ms": median(base_p50),
@@ -635,18 +706,14 @@ def parent(args: argparse.Namespace) -> int:
             scenarios_output = payload["scenarios"]
             assert isinstance(scenarios_output, list)
             scenarios_output.append(scenario)
-            label = (
-                f"protocol={protocol} completion={completion} "
-                f"payload={payload_bytes} window={window}"
-            )
-            if baseline_cv > args.max_baseline_cv:
-                invalidations.append(f"{label}: baseline CV {baseline_cv:.2%}")
+            invalidations.extend(variability_invalidations)
             if ratio < args.min_ack_ratio:
                 regressions.append(f"{label}: candidate/base {ratio:.4f}")
             print(
                 f"protocol={protocol:3s} completion={completion:8s} "
                 f"payload={payload_bytes:4d} window={window:3d} "
                 f"ack candidate/base={ratio:.4f} base_cv={baseline_cv:.2%} "
+                f"candidate_cv={candidate_cv:.2%} "
                 f"p50 base={median(base_p50):7.2f}ms "
                 f"candidate={median(candidate_p50):7.2f}ms "
                 f"delta={median(p50_deltas):+7.2f}ms"
@@ -695,7 +762,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--count-large", type=int, default=750)
     parser.add_argument("--target-sample-seconds", type=float, default=1.5)
     parser.add_argument("--max-count", type=int, default=50_000)
-    parser.add_argument("--max-baseline-cv", type=float, default=0.05)
+    parser.add_argument(
+        "--max-baseline-cv",
+        type=float,
+        default=0.05,
+        help="maximum ACK-rate CV allowed for either paired arm (legacy option name)",
+    )
     parser.add_argument("--min-ack-ratio", type=float, default=0.95)
     parser.add_argument("--policy", choices=("advisory", "strict"), default="advisory")
     parser.add_argument("--preflight-report", type=Path)
