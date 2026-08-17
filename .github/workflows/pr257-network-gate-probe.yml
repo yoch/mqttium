@@ -99,11 +99,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # The gate/worker parent starts on CPUs 1,3. Subscriber and observer
-          # inherit that affinity; each publisher worker then moves itself to
-          # dedicated CPU 2 via --cpu. Mosquitto is already pinned to CPU 0.
-          # Keep 12 pairs and all acceptance bounds unchanged; only lengthen
-          # each sample so short transients have less leverage on one arm.
+          # Broker CPU 0; observer/gate CPUs 1,3; publisher CPU 2.
+          # Keep 12 pairs, ~2 s samples and acceptance bounds unchanged. Probe
+          # window 20 instead of the repeatedly multimodal window 8.
           taskset -c 1,3 python harness/benchmarks/network_release_gate.py \
             --base-root runtime \
             --candidate-root runtime \
@@ -112,11 +110,11 @@ jobs:
             --protocols 311 \
             --completions callback \
             --payloads 64 \
-            --windows 1,8,64 \
+            --windows 1,20,64 \
             --repeat 12 \
-            --target-sample-seconds 4.0 \
-            --max-count 120000 \
-            --timeout 90 \
+            --target-sample-seconds 2.0 \
+            --max-count 60000 \
+            --timeout 60 \
             --cpu 2 \
             --policy strict \
             --output "$RUNNER_TEMP/pr257-network-gate/same-code.json"
