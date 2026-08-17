@@ -1,4 +1,4 @@
-name: ARM64 Delayed Idle Rearm Evidence
+name: ARM64 254 Direct Structural Comparison
 
 on:
   push:
@@ -9,9 +9,9 @@ permissions:
   contents: read
 
 jobs:
-  final-evidence:
+  direct-comparison:
     runs-on: [self-hosted, linux, ARM64]
-    timeout-minutes: 45
+    timeout-minutes: 25
     env:
       PYTHONUNBUFFERED: "1"
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
@@ -27,20 +27,24 @@ jobs:
           command -v mosquitto_sub
           command -v taskset
           governors="$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor | sort -u)"
-          printf 'governors=%s\n' "$governors"
           test "$governors" = "performance"
-          printf 'temperature='; cat /sys/class/thermal/thermal_zone0/temp
-          uptime
           if pgrep -a mosquitto; then
             echo 'A pre-existing mosquitto process is running; refusing benchmark host.' >&2
             exit 1
           fi
 
-      - name: Check out exact 254 HEAD
+      - name: Check out exact current 254 HEAD
         uses: actions/checkout@v7
         with:
           ref: dd64ed16dfb48e2b1cd1b50ac0d5290547627916
-          path: candidate
+          path: current
+          persist-credentials: false
+
+      - name: Check out experiment tree
+        uses: actions/checkout@v7
+        with:
+          ref: dd64ed16dfb48e2b1cd1b50ac0d5290547627916
+          path: variant
           persist-credentials: false
 
       - name: Apply delayed idle rearm variant
@@ -49,7 +53,7 @@ jobs:
           set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
-          path = Path("candidate/src/mqttium/api/_writer.py")
+          path = Path("variant/src/mqttium/api/_writer.py")
           text = path.read_text()
           old = """                # Reaching the idle queue wait is an independent re-arm point:\n                # it covers a batch that just drained even when no eager write\n                # scheduled the producer-side next-turn callback.\n                if queue.empty() and self._write_nowait is not None:\n                    self._eager_armed = True\n                first = await queue.get()\n"""
           new = """                # After a batch drains, defer eager re-arming by one loop turn.\n                # Already-runnable producers therefore stay on the batching path;\n                # genuine idle time restores eager before the next paced write.\n                if (\n                    queue.empty()\n                    and self._write_nowait is not None\n                    and not self._eager_armed\n                ):\n                    generation = self._eager_generation\n                    asyncio.get_running_loop().call_soon(\n                        self._rearm_eager_if_idle, generation\n                    )\n                first = await queue.get()\n"""
@@ -57,27 +61,13 @@ jobs:
               raise SystemExit("expected writer block not found")
           path.write_text(text.replace(old, new, 1))
           PY
-          git -C candidate diff --check
-
-      - name: Check out rc5 capacity baseline
-        uses: actions/checkout@v7
-        with:
-          ref: v1.0.0rc5
-          path: base-cap
-          persist-credentials: false
-
-      - name: Check out pre-eager latency baseline
-        uses: actions/checkout@v7
-        with:
-          ref: 3962f328331b8414a755332aefc3b3d7c261dc6f
-          path: base-lat
-          persist-credentials: false
+          git -C variant diff --check
 
       - name: Create isolated benchmark venv
         shell: bash
         run: |
           set -euo pipefail
-          venv="$RUNNER_TEMP/mqttium-delayed-idle-venv"
+          venv="$RUNNER_TEMP/mqttium-direct-variant-venv"
           rm -rf "$venv"
           python3 -m venv "$venv"
           echo "$venv/bin" >> "$GITHUB_PATH"
@@ -86,11 +76,11 @@ jobs:
         run: python -m pip install "psutil>=6,<8"
 
       - name: Strict runner preflight
-        working-directory: candidate
+        working-directory: current
         shell: bash
         run: |
           set -euo pipefail
-          root="$RUNNER_TEMP/mqttium-delayed-idle"
+          root="$RUNNER_TEMP/mqttium-direct-variant"
           rm -rf "$root"
           mkdir -p "$root"
           python benchmarks/runner_probe.py \
@@ -102,7 +92,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          root="$RUNNER_TEMP/mqttium-delayed-idle"
+          root="$RUNNER_TEMP/mqttium-direct-variant"
           cat > "$root/mosquitto.conf" <<'EOF'
           persistence false
           allow_anonymous true
@@ -126,94 +116,32 @@ jobs:
           cat "$root/mosquitto.log"
           exit 1
 
-      - name: Collect strict capacity and latency evidence
+      - name: Compare current 254 with structural variant
         shell: bash
         run: |
-          set +e
-          set -u -o pipefail
-          root="$RUNNER_TEMP/mqttium-delayed-idle"
+          set -euo pipefail
+          root="$RUNNER_TEMP/mqttium-direct-variant"
+          python current/benchmarks/paired_writer_capacity.py \
+            --base-root current --candidate-root variant \
+            --protocol 311 --qos-values 0,1 --payload-bytes 256 \
+            --inflight 20 --outstanding 64 --max-queued 200 \
+            --warmup-count 5000 --repeat 8 \
+            --count-qos0 100000 --count-qos1 40000 \
+            --timeout 120 --cpu 2 \
+            --policy strict --preflight-report "$root/preflight.json" \
+            --output "$root/direct.json" \
+            --summary-output "$root/direct.md"
 
-          capacity_common=(
-            --protocol 311
-            --qos-values 0,1
-            --payload-bytes 256
-            --inflight 20
-            --outstanding 64
-            --max-queued 200
-            --warmup-count 5000
-            --repeat 8
-            --count-qos0 100000
-            --count-qos1 40000
-            --timeout 120
-            --cpu 2
-            --policy strict
-            --preflight-report "$root/preflight.json"
-          )
-
-          echo '=== capacity A/A ==='
-          python candidate/benchmarks/paired_writer_capacity.py \
-            --base-root base-cap --candidate-root base-cap \
-            "${capacity_common[@]}" \
-            --output "$root/capacity-aa.json" \
-            --summary-output "$root/capacity-aa.md"
-          cap_aa=$?
-
-          echo '=== capacity A/B variant ==='
-          python candidate/benchmarks/paired_writer_capacity.py \
-            --base-root base-cap --candidate-root candidate \
-            "${capacity_common[@]}" \
-            --output "$root/capacity-ab.json" \
-            --summary-output "$root/capacity-ab.md"
-          cap_ab=$?
-
-          latency_common=(
-            --protocols 311
-            --payloads 256
-            --windows 64
-            --target-rates 2500,10000
-            --completions callback
-            --repeat 8
-            --count-small 4000
-            --timeout 120
-            --cpu 2
-            --policy strict
-            --preflight-report "$root/preflight.json"
-          )
-
-          echo '=== latency A/A ==='
-          python candidate/benchmarks/paired_open_loop.py \
-            --base-root base-lat --candidate-root base-lat \
-            "${latency_common[@]}" \
-            --output "$root/latency-aa.json" \
-            --summary-output "$root/latency-aa.md"
-          lat_aa=$?
-
-          echo '=== latency A/B variant ==='
-          python candidate/benchmarks/paired_open_loop.py \
-            --base-root base-lat --candidate-root candidate \
-            "${latency_common[@]}" \
-            --output "$root/latency-ab.json" \
-            --summary-output "$root/latency-ab.md"
-          lat_ab=$?
-
-          printf 'capacity_aa=%s\ncapacity_ab=%s\nlatency_aa=%s\nlatency_ab=%s\n' \
-            "$cap_aa" "$cap_ab" "$lat_aa" "$lat_ab" | tee "$root/status.txt"
-
-          if [ "$cap_aa" -ne 0 ] || [ "$cap_ab" -ne 0 ] || [ "$lat_aa" -ne 0 ] || [ "$lat_ab" -ne 0 ]; then
-            exit 1
-          fi
-
-      - name: Upload evidence
+      - name: Upload direct comparison
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: arm64-delayed-idle-${{ github.run_id }}
+          name: arm64-direct-variant-${{ github.run_id }}
           path: |
-            ${{ runner.temp }}/mqttium-delayed-idle/preflight.json
-            ${{ runner.temp }}/mqttium-delayed-idle/*.json
-            ${{ runner.temp }}/mqttium-delayed-idle/*.md
-            ${{ runner.temp }}/mqttium-delayed-idle/status.txt
-            ${{ runner.temp }}/mqttium-delayed-idle/mosquitto.log
+            ${{ runner.temp }}/mqttium-direct-variant/direct.json
+            ${{ runner.temp }}/mqttium-direct-variant/direct.md
+            ${{ runner.temp }}/mqttium-direct-variant/preflight.json
+            ${{ runner.temp }}/mqttium-direct-variant/mosquitto.log
           if-no-files-found: error
           retention-days: 30
 
@@ -221,7 +149,7 @@ jobs:
         if: always()
         shell: bash
         run: |
-          pidfile="$RUNNER_TEMP/mqttium-delayed-idle/mosquitto.pid"
+          pidfile="$RUNNER_TEMP/mqttium-direct-variant/mosquitto.pid"
           if [ -f "$pidfile" ]; then
             pid="$(cat "$pidfile")"
             kill "$pid" 2>/dev/null || true
