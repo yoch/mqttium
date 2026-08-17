@@ -158,3 +158,68 @@ def test_fixed_rate_parent_records_windows_and_enforces_same_tree_control(
     assert result["scenarios"][0]["load_mode"] == "absolute_rate"
     assert result["scenarios"][0]["requested_target_rate"] == 5000.0
     assert any("A/A completed ratio" in item for item in result["invalidations"])
+
+
+def test_parent_invalidates_candidate_only_variability(
+    open_loop, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    base_root = tmp_path / "base"
+    candidate_root = tmp_path / "candidate"
+    base_root.mkdir()
+    candidate_root.mkdir()
+    samples = {
+        base_root.resolve(): iter(((100.0, 0.5),) * 4),
+        candidate_root.resolve(): iter(((80.0, 0.2), (120.0, 0.8), (80.0, 0.2), (120.0, 0.8))),
+    }
+
+    def fake_run_worker(*call_args, **kwargs):
+        if kwargs["mode"] == "calibrate":
+            return {"capacity": 12_000.0}
+        completed_rate, latency = next(samples[Path(call_args[1]).resolve()])
+        return {
+            "completed_rate": completed_rate,
+            "ack_latency_p50_ms": latency,
+            "loop_lag_p95_ms": 0.1,
+        }
+
+    monkeypatch.setattr(open_loop, "_run_worker", fake_run_worker)
+    output = tmp_path / "candidate-variability.json"
+    args = Namespace(
+        base_root=base_root,
+        candidate_root=candidate_root,
+        protocols="311",
+        payloads="64",
+        completions="callback",
+        window=64,
+        windows=None,
+        fractions=None,
+        target_rates="5000",
+        preflight_report=None,
+        policy="advisory",
+        max_baseline_cv=0.05,
+        min_completed_ratio=0.97,
+        max_loop_lag_ratio=1.05,
+        max_aa_ratio_deviation=0.02,
+        cpu=None,
+        target_sample_seconds=0.01,
+        max_count=10,
+        count_small=1,
+        count_large=1,
+        repeat=4,
+        host="127.0.0.1",
+        port=11883,
+        timeout=1.0,
+        output=output,
+        summary_output=None,
+    )
+
+    assert open_loop.parent(args) == 0
+    result = open_loop.json.loads(output.read_text())
+    scenario = result["scenarios"][0]
+    assert scenario["base_completed_cv"] == 0.0
+    assert scenario["base_ack_latency_p50_cv"] == 0.0
+    assert scenario["candidate_completed_cv"] > 0.05
+    assert scenario["candidate_ack_latency_p50_cv"] > 0.05
+    assert result["status"] == "invalid"
+    assert any("candidate completed-rate CV" in item for item in result["invalidations"])
+    assert any("candidate p50-latency CV" in item for item in result["invalidations"])
