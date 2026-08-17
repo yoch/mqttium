@@ -19,8 +19,30 @@ The ARM64 workflows therefore run only from trusted default-branch code:
 - `ARM64 Finalization Soak`: manual dispatch;
 - `Published ARM64 Smoke`: manual dispatch of an exact published version.
 
+`ARM64 Paired Regression` necessarily executes the selected base/candidate
+source trees. Treat that workflow as a privileged maintainer operation: use
+only refs or exact SHAs whose code has already been reviewed and intentionally
+trusted for execution on the persistent runner. Never point it at an arbitrary
+external pull-request head merely to obtain a performance number.
+
 The existing GitHub-hosted PR, release, fuzz, macOS, and Windows workflows
-remain the primary gates.
+remain the primary portability/version gates.
+
+## Validated host model
+
+The repository runner probe on 2026-08-17 observed the actual `rpi5` runner as:
+
+- Raspberry Pi 5 Model B, AArch64, 4 logical CPUs;
+- Debian GNU/Linux 13 (trixie);
+- GitHub Actions runner 2.336.0;
+- system Python 3.13.5;
+- a working native `python3 -m venv` / pip environment.
+
+`actions/setup-python` does **not** currently provide a Python ARM64 build for
+Debian 13, so the self-hosted workflows deliberately use the validated system
+Python 3.13 and create a fresh venv for each job. Python 3.11-3.14 compatibility
+continues to be enforced by the existing GitHub-hosted matrix rather than being
+claimed by this ARM64 runner.
 
 ## Host setup
 
@@ -31,15 +53,16 @@ account:
 
 ```bash
 sudo apt update
-sudo apt install -y mosquitto mosquitto-clients openssl
+sudo apt install -y python3-venv mosquitto mosquitto-clients openssl
 ```
 
 The ARM64 workflows intentionally do not run `apt`, `sudo`, Docker, or `tc`.
 
-For benchmark evidence, use active cooling and set the CPU frequency governor
+For benchmark evidence, use active cooling and set every CPU frequency governor
 to `performance` before running the dedicated benchmark workflows. The
 benchmark preflight rejects excessive background load, a non-performance
-governor, or missing/unsafe temperature readings.
+governor, or missing/unsafe temperature readings. This is intentionally stricter
+than ordinary ARM64 CI.
 
 WAN/netem measurements stay on GitHub-hosted infrastructure. Giving the
 persistent runner permission to mutate network qdiscs would widen its host
