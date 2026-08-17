@@ -27,15 +27,17 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
-
       - name: Verify ARM64 host prerequisites
         shell: bash
         run: |
           set -euo pipefail
           test "$(uname -m)" = "aarch64"
+          command -v python3
+          python3 - <<'PY'
+          import sys
+          if sys.version_info[:2] != (3, 13):
+              raise SystemExit(f"expected system Python 3.13, got {sys.version}")
+          PY
           command -v mosquitto
           command -v openssl
 
@@ -45,7 +47,7 @@ jobs:
           set -euo pipefail
           venv="$RUNNER_TEMP/mqttium-published-venv"
           rm -rf "$venv"
-          python -m venv "$venv"
+          python3 -m venv "$venv"
           echo "$venv/bin" >> "$GITHUB_PATH"
 
       - name: Install exact published wheel
@@ -81,7 +83,8 @@ jobs:
             -CAcreateserial \
             -extfile "$root/tls/server.ext" \
             -out "$root/tls/server.crt"
-          chmod 0644 "$root/tls/server.key"
+          chmod 0600 "$root/tls/ca.key" "$root/tls/server.key"
+          chmod 0644 "$root/tls/ca.crt" "$root/tls/server.crt"
 
           cat > "$root/mosquitto.conf" <<EOF
           persistence false
