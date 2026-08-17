@@ -1,91 +1,80 @@
-name: ARM64 Simplification Writer Decision Probe
+name: ARM64 Simplification Relevant Rollback
 
 on:
   push:
-    branches:
-      - agent/arm64-runner-probe
+    branches: [agent/arm64-runner-probe]
 
 permissions:
   contents: read
 
 jobs:
-  probe:
+  validate:
     runs-on: [self-hosted, linux, ARM64]
-    timeout-minutes: 30
+    timeout-minutes: 35
     env:
       PYTHONUNBUFFERED: "1"
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
       MAIN_SHA: 0999d8abfe44a568209209403d7f215b18cc4eb7
       FINAL_SHA: 3ee2a3c5a78b0ea487ddbdf7927665b519fddd45
-
     steps:
       - name: Verify clean performance host
         shell: bash
         run: |
           set -euo pipefail
-          test "$(uname -m)" = "aarch64"
-          command -v python3
-          command -v mosquitto
-          command -v mosquitto_sub
-          command -v taskset
-          test "$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor | sort -u)" = "performance"
+          test "$(uname -m)" = aarch64
+          command -v python3; command -v mosquitto; command -v taskset
+          test "$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor | sort -u)" = performance
           if pgrep -a mosquitto; then exit 1; fi
-
-      - name: Check out exact main
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ env.MAIN_SHA }}
-          path: base
-          persist-credentials: false
-
-      - name: Check out exact PR 252
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ env.FINAL_SHA }}
-          path: candidate
-          persist-credentials: false
-
-      - name: Construct best corrective candidate so far
+      - uses: actions/checkout@v7
+        with: {ref: "${{ env.MAIN_SHA }}", path: base, persist-credentials: false}
+      - uses: actions/checkout@v7
+        with: {ref: "${{ env.FINAL_SHA }}", path: candidate, persist-credentials: false}
+      - name: Roll back only engine, launch boundary and writer lookup
         shell: bash
         run: |
           set -euo pipefail
-          cp -a candidate candidate-engine-launch
           python - <<'PY'
           from pathlib import Path
-          engine = Path('candidate-engine-launch/src/mqttium/protocol/engine.py')
-          text = engine.read_text()
-          old = '''        self._effects.append(\n            EngineEffect(kind, data, requires_delivery_mark, decoded_property_wire_size)\n        )\n\n    def _send(self, packet: WriteItem) -> None:\n        # Appends directly rather than delegating to _emit: SEND is the most\n        # frequent effect and this is one Python frame per outbound packet.\n        self._effects.append(EngineEffect(EffectKind.SEND, packet, False, None))\n'''
-          new = '''        self._effects.append(\n            EngineEffect(\n                kind=kind,\n                data=data,\n                requires_delivery_mark=requires_delivery_mark,\n                decoded_property_wire_size=decoded_property_wire_size,\n            )\n        )\n\n    def _send(self, packet: WriteItem) -> None:\n        self._emit(EffectKind.SEND, packet)\n'''
-          assert text.count(old) == 1
-          engine.write_text(text.replace(old, new))
 
-          out = Path('candidate-engine-launch/src/mqttium/protocol/outbound.py')
-          text = out.read_text()
-          old = '''            if topic_bytes is not None and self.flow.try_acquire():\n                self._launch(msg, _property_bytes=property_bytes, _topic_bytes=topic_bytes)\n                return PublishHandle(mid=mid, qos=qos)\n'''
-          new = '''            if self._engine.state == ConnectionState.CONNECTED and self._try_launch(\n                msg, _property_bytes=property_bytes, _topic_bytes=topic_bytes\n            ):\n                return PublishHandle(mid=mid, qos=qos)\n'''
-          method = '''    def _try_launch(\n        self,\n        msg: OutboundMessage,\n        *,\n        _property_bytes: bytes | None = None,\n        _topic_bytes: bytes | None = None,\n    ) -> bool:\n        if not self.flow.try_acquire():\n            return False\n        try:\n            self._launch(msg, _property_bytes=_property_bytes, _topic_bytes=_topic_bytes)\n        except Exception:\n            self.flow.release()\n            raise\n        return True\n\n'''
-          anchor = '    def _retransmit(self, msg: OutboundMessage) -> None:\n'
-          assert text.count(old) == 1 and text.count(anchor) == 1
-          text = text.replace(old, new).replace(anchor, method + anchor)
-          out.write_text(text)
+          p=Path('candidate/src/mqttium/protocol/engine.py'); t=p.read_text()
+          old='''        self._effects.append(\n            EngineEffect(kind, data, requires_delivery_mark, decoded_property_wire_size)\n        )\n\n    def _send(self, packet: WriteItem) -> None:\n        # Appends directly rather than delegating to _emit: SEND is the most\n        # frequent effect and this is one Python frame per outbound packet.\n        self._effects.append(EngineEffect(EffectKind.SEND, packet, False, None))\n'''
+          new='''        self._effects.append(\n            EngineEffect(\n                kind=kind, data=data, requires_delivery_mark=requires_delivery_mark,\n                decoded_property_wire_size=decoded_property_wire_size,\n            )\n        )\n\n    def _send(self, packet: WriteItem) -> None:\n        self._emit(EffectKind.SEND, packet)\n'''
+          assert t.count(old)==1; p.write_text(t.replace(old,new))
+
+          p=Path('candidate/src/mqttium/protocol/outbound.py'); t=p.read_text()
+          old='''            if topic_bytes is not None and self.flow.try_acquire():\n                self._launch(msg, _property_bytes=property_bytes, _topic_bytes=topic_bytes)\n                return PublishHandle(mid=mid, qos=qos)\n'''
+          new='''            if self._engine.state == ConnectionState.CONNECTED and self._try_launch(\n                msg, _property_bytes=property_bytes, _topic_bytes=topic_bytes\n            ):\n                return PublishHandle(mid=mid, qos=qos)\n'''
+          method='''    def _try_launch(\n        self, msg: OutboundMessage, *, _property_bytes: bytes | None = None,\n        _topic_bytes: bytes | None = None,\n    ) -> bool:\n        if not self.flow.try_acquire():\n            return False\n        try:\n            self._launch(msg, _property_bytes=_property_bytes, _topic_bytes=_topic_bytes)\n        except Exception:\n            self.flow.release()\n            raise\n        return True\n\n'''
+          anchor='    def _retransmit(self, msg: OutboundMessage) -> None:\n'
+          assert t.count(old)==1 and t.count(anchor)==1
+          p.write_text(t.replace(old,new).replace(anchor,method+anchor))
+
+          p=Path('candidate/src/mqttium/api/_writer.py'); t=p.read_text()
+          old='''    async def _write_contiguous(\n        self,\n        transport: AsyncTransport,\n        write_many: Callable[[list[bytes]], Awaitable[None]] | None,\n        parts: list[bytes],\n    ) -> None:\n        if not parts:\n            return\n        if write_many is not None:\n'''
+          new='''    async def _write_contiguous(self, transport: AsyncTransport, parts: list[bytes]) -> None:\n        if not parts:\n            return\n        write_many = getattr(transport, "write_many", None)\n        if write_many is not None:\n'''
+          assert t.count(old)==1; t=t.replace(old,new)
+          old='''        # Resolved once per writer task rather than per batch. The local dies\n        # with the task, so unlike `_write_nowait` it needs no explicit\n        # clearing: it can never outlive the transport it was resolved from.\n        write_many = getattr(transport, "write_many", None)\n'''
+          assert t.count(old)==1; t=t.replace(old,'')
+          assert t.count('await self._write_contiguous(transport, write_many, contiguous)')==2
+          t=t.replace('await self._write_contiguous(transport, write_many, contiguous)', 'await self._write_contiguous(transport, contiguous)')
+          p.write_text(t)
           PY
-
+          git -C candidate diff --check
+          grep -q 'self._eager_armed' candidate/src/mqttium/api/_writer.py
       - name: Create venv
         shell: bash
         run: |
-          set -euo pipefail
-          venv="$RUNNER_TEMP/mqttium-252-decision-venv"
-          rm -rf "$venv"
-          python3 -m venv "$venv"
-          echo "$venv/bin" >> "$GITHUB_PATH"
-
-      - name: Start isolated broker pinned to CPU 0
+          v="$RUNNER_TEMP/m252-v"; rm -rf "$v"; python3 -m venv "$v"; echo "$v/bin" >> "$GITHUB_PATH"
+      - run: python -m pip install "psutil>=6,<8"
+      - name: Preflight
+        working-directory: base
+        run: |
+          mkdir -p "$RUNNER_TEMP/m252"; python benchmarks/runner_probe.py --output "$RUNNER_TEMP/m252/runner.json" --require-temperature --enforce
+      - name: Broker
         shell: bash
         run: |
           set -euo pipefail
-          root="$RUNNER_TEMP/mqttium-252-decision"
-          rm -rf "$root" && mkdir -p "$root"
-          cat > "$root/mosquitto.conf" <<'EOF'
+          r="$RUNNER_TEMP/m252"; cat > "$r/mosquitto.conf" <<'EOF'
           persistence false
           allow_anonymous true
           max_inflight_messages 1000
@@ -95,113 +84,22 @@ jobs:
           log_type error
           listener 11883 127.0.0.1
           EOF
-          taskset -c 0 mosquitto -c "$root/mosquitto.conf" > "$root/mosquitto.log" 2>&1 &
-          echo "$!" > "$root/mosquitto.pid"
-          for _ in $(seq 1 50); do
-            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
-            kill -0 "$(cat "$root/mosquitto.pid")" 2>/dev/null || exit 1
-            sleep 0.1
-          done
-          exit 1
-
-      - name: Run paced QoS1 samples with writer decision counters
-        shell: bash
+          taskset -c 0 mosquitto -c "$r/mosquitto.conf" >"$r/mosquitto.log" 2>&1 & echo $! >"$r/pid"
+          for _ in $(seq 1 50); do (echo >/dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0; sleep .1; done; exit 1
+      - name: Paired screen
         run: |
-          set -euo pipefail
-          root="$RUNNER_TEMP/mqttium-252-decision"
-          cat > "$root/sample.py" <<'PY'
-          import asyncio, json, os, statistics, sys, time
-          from collections import deque
-
-          async def main():
-              from mqttium.api import AsyncClient
-              from mqttium.protocol.reconnect import ReconnectPolicy
-              client = AsyncClient(
-                  client_id=f'decision-{os.getpid()}-{time.time_ns()}',
-                  max_outbound_inflight=64,
-                  max_pending_outbound_messages=None,
-                  max_pending_outbound_bytes=None,
-                  reconnect=ReconnectPolicy(enabled=False),
-              )
-              published = {}
-              early = {}
-              done = asyncio.Queue()
-              def cb(mid, *_):
-                  now = time.monotonic_ns()
-                  if mid in published:
-                      done.put_nowait((mid, now))
-                  else:
-                      early.setdefault(mid, deque()).append(now)
-              client.on_publish = cb
-              await client.connect('127.0.0.1', 11883, timeout=30)
-              loop = asyncio.get_running_loop()
-              start = loop.time() + 0.05
-              interval = 1/2500
-              count = 4000
-              lat = []
-              try:
-                  for i in range(count):
-                      deadline = start + i * interval
-                      delay = deadline - loop.time()
-                      if delay > 0:
-                          await asyncio.sleep(delay)
-                      sent = time.monotonic_ns()
-                      r = await client.publish('bench/decision', b'x'*256, qos=1)
-                      mid = r.mid
-                      published.setdefault(mid, deque()).append(sent)
-                      q = early.get(mid)
-                      if q:
-                          done.put_nowait((mid, q.popleft()))
-                          if not q: del early[mid]
-                  for _ in range(count):
-                      mid, finished = await done.get()
-                      sent = published[mid].popleft()
-                      if not published[mid]: del published[mid]
-                      lat.append((finished-sent)/1_000_000)
-                  s = client.stats()
-                  print(json.dumps({
-                      'p50_ms': statistics.median(lat),
-                      'p95_ms': sorted(lat)[int(.95*(len(lat)-1))],
-                      'eager_writes': s.writer.eager_writes,
-                      'batches': s.writer.batches,
-                      'batched_items': s.writer.batched_items,
-                      'segmented_writes': s.writer.segmented_writes,
-                      'effects_inline': s.effects.inline_effects,
-                      'effects_enqueued': s.effects.enqueued,
-                  }))
-              finally:
-                  await client.disconnect()
-          asyncio.run(main())
-          PY
-          printf 'variant,run,p50_ms,p95_ms,eager_writes,batches,batched_items,segmented_writes,effects_inline,effects_enqueued\n' > "$root/results.csv"
-          for run in 1 2 3 4; do
-            for variant in base candidate candidate-engine-launch; do
-              json=$(PYTHONPATH="$PWD/$variant/src" taskset -c 2 python "$root/sample.py")
-              VARIANT="$variant" RUN="$run" JSON="$json" python - <<'PY' >> "$root/results.csv"
-          import csv, json, os, sys
-          d=json.loads(os.environ['JSON'])
-          csv.writer(sys.stdout).writerow([os.environ['VARIANT'], os.environ['RUN'], d['p50_ms'], d['p95_ms'], d['eager_writes'], d['batches'], d['batched_items'], d['segmented_writes'], d['effects_inline'], d['effects_enqueued']])
-          PY
-            done
-          done
-          cat "$root/results.csv"
-
-      - name: Upload evidence
-        if: always()
+          python base/benchmarks/paired_open_loop.py --base-root base --candidate-root candidate \
+            --protocols 311 --payloads 256 --windows 64 --target-rates 2500,10000 \
+            --completions callback --repeat 6 --count-small 4000 --timeout 120 --cpu 2 \
+            --policy advisory --preflight-report "$RUNNER_TEMP/m252/runner.json" \
+            --output "$RUNNER_TEMP/m252/ab.json" --summary-output "$RUNNER_TEMP/m252/ab.md"
+      - if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: arm64-pr252-writer-decisions-${{ github.run_id }}
-          path: |
-            ${{ runner.temp }}/mqttium-252-decision/results.csv
-            ${{ runner.temp }}/mqttium-252-decision/mosquitto.log
-          if-no-files-found: error
+          name: arm64-pr252-relevant-rollback-${{ github.run_id }}
+          path: ${{ runner.temp }}/m252/*
           retention-days: 30
-
-      - name: Stop isolated broker
-        if: always()
+      - if: always()
         shell: bash
         run: |
-          pidfile="$RUNNER_TEMP/mqttium-252-decision/mosquitto.pid"
-          if [ -f "$pidfile" ]; then
-            pid="$(cat "$pidfile")"; kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
-          fi
+          [ ! -f "$RUNNER_TEMP/m252/pid" ] || { p=$(cat "$RUNNER_TEMP/m252/pid"); kill "$p" 2>/dev/null || true; wait "$p" 2>/dev/null || true; }
