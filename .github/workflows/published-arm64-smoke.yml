@@ -1,0 +1,177 @@
+name: Published ARM64 Smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Published MQTTium version to validate
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: published-arm64-smoke-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 30
+    env:
+      MQTTIUM_VERSION: ${{ inputs.version }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Verify ARM64 host prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "aarch64"
+          command -v mosquitto
+          command -v openssl
+
+      - name: Create isolated virtual environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          venv="$RUNNER_TEMP/mqttium-published-venv"
+          rm -rf "$venv"
+          python -m venv "$venv"
+          echo "$venv/bin" >> "$GITHUB_PATH"
+
+      - name: Install exact published wheel
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install --no-cache-dir --only-binary=mqttium \
+            "mqttium==$MQTTIUM_VERSION"
+          python -m pip check
+
+      - name: Start isolated TCP, TLS, WebSocket, and Unix listeners
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/mqttium-published"
+          rm -rf "$root"
+          mkdir -p "$root/tls"
+
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+            -subj '/CN=MQTTium ARM64 Test CA' \
+            -keyout "$root/tls/ca.key" \
+            -out "$root/tls/ca.crt"
+          openssl req -newkey rsa:2048 -nodes \
+            -subj '/CN=localhost' \
+            -keyout "$root/tls/server.key" \
+            -out "$root/tls/server.csr"
+          printf 'subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n' \
+            > "$root/tls/server.ext"
+          openssl x509 -req -days 1 \
+            -in "$root/tls/server.csr" \
+            -CA "$root/tls/ca.crt" \
+            -CAkey "$root/tls/ca.key" \
+            -CAcreateserial \
+            -extfile "$root/tls/server.ext" \
+            -out "$root/tls/server.crt"
+          chmod 0644 "$root/tls/server.key"
+
+          cat > "$root/mosquitto.conf" <<EOF
+          persistence false
+
+          listener 11886 127.0.0.1
+          protocol mqtt
+          allow_anonymous true
+
+          listener 18083 127.0.0.1
+          protocol websockets
+          socket_domain ipv4
+          allow_anonymous true
+
+          listener 0 $root/mqttium.sock
+          protocol mqtt
+          allow_anonymous true
+
+          listener 18884 127.0.0.1
+          protocol mqtt
+          allow_anonymous true
+          cafile $root/tls/ca.crt
+          certfile $root/tls/server.crt
+          keyfile $root/tls/server.key
+          EOF
+
+          mosquitto -c "$root/mosquitto.conf" > "$root/mosquitto.log" 2>&1 &
+          echo "$!" > "$root/mosquitto.pid"
+          for _ in $(seq 1 60); do
+            tcp=0
+            ws=0
+            tls=0
+            unix=0
+            (echo > /dev/tcp/127.0.0.1/11886) >/dev/null 2>&1 && tcp=1
+            (echo > /dev/tcp/127.0.0.1/18083) >/dev/null 2>&1 && ws=1
+            (echo > /dev/tcp/127.0.0.1/18884) >/dev/null 2>&1 && tls=1
+            [ -S "$root/mqttium.sock" ] && unix=1
+            if [ "$tcp" = 1 ] && [ "$ws" = 1 ] && [ "$tls" = 1 ] && [ "$unix" = 1 ]; then
+              exit 0
+            fi
+            if ! kill -0 "$(cat "$root/mosquitto.pid")" 2>/dev/null; then
+              cat "$root/mosquitto.log"
+              exit 1
+            fi
+            sleep 0.2
+          done
+          cat "$root/mosquitto.log"
+          exit 1
+
+      - name: Exercise installed Stable API
+        run: |
+          python -I tests/installed_distribution_smoke.py \
+            --expected-version "$MQTTIUM_VERSION" \
+            --host 127.0.0.1 --port 11886
+
+      - name: Exercise TLS and SQLite restart
+        run: |
+          root="$RUNNER_TEMP/mqttium-published"
+          python -I tests/installed_distribution_resilience_smoke.py tls \
+            --expected-version "$MQTTIUM_VERSION" \
+            --host localhost --port 18884 --ca-file "$root/tls/ca.crt"
+          python -I tests/installed_distribution_resilience_smoke.py sqlite-write \
+            --expected-version "$MQTTIUM_VERSION" \
+            --database "$root/inflight.sqlite"
+          python -I tests/installed_distribution_resilience_smoke.py sqlite-read \
+            --expected-version "$MQTTIUM_VERSION" \
+            --database "$root/inflight.sqlite"
+
+      - name: Exercise transports, Paho migration, cancellation, and shutdown
+        run: |
+          root="$RUNNER_TEMP/mqttium-published"
+          python -I tests/installed_distribution_extended_smoke.py websocket \
+            --expected-version "$MQTTIUM_VERSION" \
+            --url ws://127.0.0.1:18083/mqtt
+          python -I tests/installed_distribution_extended_smoke.py unix \
+            --expected-version "$MQTTIUM_VERSION" \
+            --socket "$root/mqttium.sock"
+          python -I tests/installed_distribution_extended_smoke.py paho \
+            --expected-version "$MQTTIUM_VERSION" \
+            --host 127.0.0.1 --port 11886
+          python -I tests/installed_distribution_extended_smoke.py shutdown \
+            --expected-version "$MQTTIUM_VERSION" \
+            --host 127.0.0.1 --port 11886
+
+      - name: Stop isolated Mosquitto
+        if: always()
+        shell: bash
+        run: |
+          pidfile="$RUNNER_TEMP/mqttium-published/mosquitto.pid"
+          if [ -f "$pidfile" ]; then
+            pid="$(cat "$pidfile")"
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+          fi

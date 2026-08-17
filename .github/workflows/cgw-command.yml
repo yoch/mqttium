@@ -20,19 +20,13 @@ concurrency:
 jobs:
   controller-smoke:
     if: github.event_name == 'pull_request'
-    runs-on:
-      - self-hosted
-      - linux
-      - x64
-      - ${{ vars.CGW_RUNNER_LABEL || 'cgw' }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
-    env:
-      CGW_DOCKER_SNAP_COMPAT: ${{ vars.CGW_DOCKER_SNAP_COMPAT || 'false' }}
-      CGW_DOCKER_UID: ${{ vars.CGW_DOCKER_UID }}
-      CGW_DOCKER_GID: ${{ vars.CGW_DOCKER_GID }}
     steps:
       - name: Check out controller branch
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Validate Python syntax
         run: python -m py_compile .github/chatgpt-workbench/processor.py
@@ -92,7 +86,7 @@ jobs:
     runs-on:
       - self-hosted
       - linux
-      - x64
+      - ${{ vars.CGW_RUNNER_ARCH || 'x64' }}
       - ${{ vars.CGW_RUNNER_LABEL || 'cgw' }}
     timeout-minutes: 120
     env:

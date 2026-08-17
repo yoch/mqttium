@@ -1,0 +1,94 @@
+name: ARM64 CI
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: arm64-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ARM64 / Python ${{ matrix.python-version }}
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.14"]
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Verify ARM64 host prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "aarch64"
+          command -v openssl
+          command -v mosquitto
+
+      - name: Create isolated virtual environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          venv="$RUNNER_TEMP/mqttium-venv"
+          rm -rf "$venv"
+          python -m venv "$venv"
+          echo "$venv/bin" >> "$GITHUB_PATH"
+
+      - name: Install test dependencies
+        run: python -m pip install -e ".[dev]"
+
+      - name: Unit tests
+        run: python -m pytest -q -ra tests/unit
+
+      - name: Start isolated Mosquitto
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/mqttium-mosquitto"
+          rm -rf "$root"
+          mkdir -p "$root"
+          cat > "$root/mosquitto.conf" <<'EOF'
+          listener 11883 127.0.0.1
+          allow_anonymous true
+          persistence false
+          EOF
+          mosquitto -c "$root/mosquitto.conf" > "$root/mosquitto.log" 2>&1 &
+          echo "$!" > "$root/mosquitto.pid"
+          for _ in $(seq 1 50); do
+            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            if ! kill -0 "$(cat "$root/mosquitto.pid")" 2>/dev/null; then
+              cat "$root/mosquitto.log"
+              exit 1
+            fi
+            sleep 0.2
+          done
+          cat "$root/mosquitto.log"
+          exit 1
+
+      - name: Integration tests
+        run: python -m pytest -q -ra tests/integration
+
+      - name: Stop isolated Mosquitto
+        if: always()
+        shell: bash
+        run: |
+          pidfile="$RUNNER_TEMP/mqttium-mosquitto/mosquitto.pid"
+          if [ -f "$pidfile" ]; then
+            pid="$(cat "$pidfile")"
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+          fi

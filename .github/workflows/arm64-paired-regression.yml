@@ -1,0 +1,169 @@
+name: ARM64 Paired Regression
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: Baseline commit, branch, or tag
+        required: true
+        default: v0.2.0b2
+        type: string
+      candidate_ref:
+        description: Candidate commit, branch, or tag
+        required: true
+        default: main
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: arm64-paired-regression
+  cancel-in-progress: false
+
+jobs:
+  paired:
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 45
+    env:
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+    steps:
+      - name: Check out benchmark harness
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          path: harness
+          persist-credentials: false
+
+      - name: Check out candidate
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.candidate_ref }}
+          path: candidate
+          persist-credentials: false
+
+      - name: Check out base
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.base_ref }}
+          path: base
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Verify dedicated runner prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "aarch64"
+          command -v mosquitto
+          command -v mosquitto_sub
+
+      - name: Create isolated virtual environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          venv="$RUNNER_TEMP/mqttium-paired-venv"
+          rm -rf "$venv"
+          python -m venv "$venv"
+          echo "$venv/bin" >> "$GITHUB_PATH"
+
+      - run: python -m pip install "psutil>=6"
+
+      - name: Enforce dedicated-runner preflight
+        working-directory: harness
+        run: |
+          python benchmarks/runner_probe.py \
+            --output "$RUNNER_TEMP/mqttium-paired/runner.json" \
+            --require-temperature \
+            --enforce
+
+      - name: Start isolated broker
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/mqttium-paired"
+          mkdir -p "$root"
+          cat > "$root/mosquitto.conf" <<'EOF'
+          persistence false
+          allow_anonymous true
+          max_inflight_messages 1000
+          max_queued_messages 100000
+          max_queued_bytes 0
+          connection_messages false
+          log_type error
+          listener 11883 127.0.0.1
+          EOF
+          mosquitto -c "$root/mosquitto.conf" > "$root/mosquitto.log" 2>&1 &
+          echo "$!" > "$root/mosquitto.pid"
+          for _ in $(seq 1 50); do
+            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            if ! kill -0 "$(cat "$root/mosquitto.pid")" 2>/dev/null; then
+              cat "$root/mosquitto.log"
+              exit 1
+            fi
+            sleep 0.2
+          done
+          cat "$root/mosquitto.log"
+          exit 1
+
+      - name: Paired microbenchmarks
+        run: |
+          python harness/benchmarks/paired_regression.py \
+            --base-root base \
+            --candidate-root candidate \
+            --repeat 11 \
+            --output "$RUNNER_TEMP/mqttium-paired/micro.json"
+
+      - name: Strict paired network and latency sweep
+        run: |
+          python harness/benchmarks/paired_network.py \
+            --base-root base \
+            --candidate-root candidate \
+            --policy strict \
+            --preflight-report "$RUNNER_TEMP/mqttium-paired/runner.json" \
+            --repeat 8 \
+            --windows 1,8,32,64,128 \
+            --protocols 311,5 \
+            --payloads 64,4096 \
+            --count-small 20000 \
+            --count-large 8000 \
+            --output "$RUNNER_TEMP/mqttium-paired/network.json"
+
+      - name: Strict native QoS 1 receipt/callback diagnostic
+        run: |
+          python harness/benchmarks/paired_network.py \
+            --base-root base --candidate-root candidate \
+            --policy strict \
+            --preflight-report "$RUNNER_TEMP/mqttium-paired/runner.json" \
+            --repeat 4 --windows 64 --protocols 311 \
+            --payloads 64 --completions receipt,callback \
+            --count-small 5000 \
+            --output "$RUNNER_TEMP/mqttium-paired/qos1-completion.json"
+
+      - name: Upload paired measurements
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: arm64-paired-regression-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/mqttium-paired/*.json
+            ${{ runner.temp }}/mqttium-paired/*.md
+            ${{ runner.temp }}/mqttium-paired/mosquitto.log
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Stop isolated Mosquitto
+        if: always()
+        shell: bash
+        run: |
+          pidfile="$RUNNER_TEMP/mqttium-paired/mosquitto.pid"
+          if [ -f "$pidfile" ]; then
+            pid="$(cat "$pidfile")"
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+          fi
