@@ -213,28 +213,63 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          root="$RUNNER_TEMP/mqttium-paired"
+          run_control() {
+            local attempt="$1"
+            python harness/benchmarks/paired_open_loop.py \
+              --base-root latency-base --candidate-root latency-base \
+              --protocols 311 --payloads 256 --windows 64 \
+              --target-rates 2500,10000 --completions callback \
+              --repeat 8 --count-small 4000 --timeout 120 --cpu 2 \
+              --policy strict \
+              --preflight-report "$root/runner.json" \
+              --output "$root/writer-latency-aa-attempt-${attempt}.json" \
+              --summary-output "$root/writer-latency-aa-attempt-${attempt}.md"
+          }
+
+          set +e
+          run_control 1
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ]; then
+            exit 0
+          fi
+          if [ "$rc" -ne 2 ]; then
+            echo "A/A control failed operationally with exit code $rc; not retrying." >&2
+            exit "$rc"
+          fi
+
+          echo "A/A control was statistically invalid; retrying exactly once. Both attempts are retained."
+          python harness/benchmarks/runner_probe.py \
+            --output "$root/runner-latency-retry.json" \
+            --require-temperature \
+            --enforce
           python harness/benchmarks/paired_open_loop.py \
             --base-root latency-base --candidate-root latency-base \
             --protocols 311 --payloads 256 --windows 64 \
             --target-rates 2500,10000 --completions callback \
             --repeat 8 --count-small 4000 --timeout 120 --cpu 2 \
             --policy strict \
-            --preflight-report "$RUNNER_TEMP/mqttium-paired/runner.json" \
-            --output "$RUNNER_TEMP/mqttium-paired/writer-latency-aa.json" \
-            --summary-output "$RUNNER_TEMP/mqttium-paired/writer-latency-aa.md"
+            --preflight-report "$root/runner-latency-retry.json" \
+            --output "$root/writer-latency-aa-attempt-2.json" \
+            --summary-output "$root/writer-latency-aa-attempt-2.md"
 
       - name: Strict paced writer-latency A/B gate
         if: steps.writer_gate.outputs.available == 'true'
         shell: bash
         run: |
           set -euo pipefail
+          preflight="$RUNNER_TEMP/mqttium-paired/runner.json"
+          if [ -f "$RUNNER_TEMP/mqttium-paired/runner-latency-retry.json" ]; then
+            preflight="$RUNNER_TEMP/mqttium-paired/runner-latency-retry.json"
+          fi
           python harness/benchmarks/paired_open_loop.py \
             --base-root latency-base --candidate-root candidate \
             --protocols 311 --payloads 256 --windows 64 \
             --target-rates 2500,10000 --completions callback \
             --repeat 8 --count-small 4000 --timeout 120 --cpu 2 \
             --policy strict \
-            --preflight-report "$RUNNER_TEMP/mqttium-paired/runner.json" \
+            --preflight-report "$preflight" \
             --output "$RUNNER_TEMP/mqttium-paired/writer-latency-ab.json" \
             --summary-output "$RUNNER_TEMP/mqttium-paired/writer-latency-ab.md"
 
