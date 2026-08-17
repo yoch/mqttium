@@ -45,6 +45,7 @@ jobs:
           command -v mosquitto
           command -v mosquitto_sub
           command -v taskset
+          test "$(nproc)" -ge 4
           if pgrep -a mosquitto; then
             echo "pre-existing Mosquitto would contaminate benchmark evidence" >&2
             exit 1
@@ -98,7 +99,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python harness/benchmarks/network_release_gate.py \
+          # The gate/worker parent starts on CPUs 1,3. Subscriber and observer
+          # inherit that affinity; each publisher worker then moves itself to
+          # dedicated CPU 2 via --cpu. Mosquitto is already pinned to CPU 0.
+          taskset -c 1,3 python harness/benchmarks/network_release_gate.py \
             --base-root runtime \
             --candidate-root runtime \
             --engine harness/benchmarks/paired_network.py \
