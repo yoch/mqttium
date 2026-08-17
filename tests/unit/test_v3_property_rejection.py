@@ -84,9 +84,9 @@ def test_packet_views_reject_nonempty_v5_properties(protocol: MQTTProtocolVersio
     with pytest.raises(ProtocolError, match="CONNECT properties require MQTT 5"):
         ConnectPacket(client_id="c", protocol=protocol, properties=props).encode()
     with pytest.raises(ProtocolError, match="PUBLISH properties require MQTT 5"):
-        PublishPacket(
-            "topic", b"x", QoS.AT_MOST_ONCE, False, False, properties=props
-        ).encode(protocol)
+        PublishPacket("topic", b"x", QoS.AT_MOST_ONCE, False, False, properties=props).encode(
+            protocol
+        )
     with pytest.raises(ProtocolError, match="PUBLISH properties require MQTT 5"):
         encode_publish_item(
             "topic",
@@ -108,15 +108,13 @@ def test_packet_views_reject_nonempty_v5_properties(protocol: MQTTProtocolVersio
 @pytest.mark.parametrize("protocol", V3_PROTOCOLS)
 def test_empty_properties_remain_wire_equivalent_to_none(protocol: MQTTProtocolVersion) -> None:
     empty = Properties()
-    assert PublishPacket(
-        "topic", b"x", QoS.AT_MOST_ONCE, False, False, properties=empty
-    ).encode(protocol) == PublishPacket(
-        "topic", b"x", QoS.AT_MOST_ONCE, False, False
-    ).encode(protocol)
-    sub = Subscription("topic/#", SubscribeOptions())
-    assert SubscribePacket(1, (sub,), empty).encode(protocol) == SubscribePacket(
-        1, (sub,)
-    ).encode(protocol)
-    assert UnsubscribePacket(1, ("topic/#",), empty).encode(
+    assert PublishPacket("topic", b"x", QoS.AT_MOST_ONCE, False, False, properties=empty).encode(
         protocol
-    ) == UnsubscribePacket(1, ("topic/#",)).encode(protocol)
+    ) == PublishPacket("topic", b"x", QoS.AT_MOST_ONCE, False, False).encode(protocol)
+    sub = Subscription("topic/#", SubscribeOptions())
+    assert SubscribePacket(1, (sub,), empty).encode(protocol) == SubscribePacket(1, (sub,)).encode(
+        protocol
+    )
+    assert UnsubscribePacket(1, ("topic/#",), empty).encode(protocol) == UnsubscribePacket(
+        1, ("topic/#",)
+    ).encode(protocol)
