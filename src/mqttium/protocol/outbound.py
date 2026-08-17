@@ -1027,11 +1027,20 @@ class OutboundSession:
         """Fail every unacknowledged publication: the broker dropped the session.
 
         `_queued` mirrors every outbound record that must survive a missing
-        broker session. With no queued work and no SUB/UNSUB in flight, every
-        packet id belongs to a record discarded here, so the pool is reset in
-        constant time rather than id by id — it reclaims its accumulated hashing
-        capacity only on a full clear.
+        broker session — including WAIT_* entries `replay_session()` left there
+        when the Receive Maximum window could not admit their retransmission.
+        Those records are failed below, so their queue entries must go with
+        them: a stale entry made `drain()` re-materialise a deleted record,
+        double-release its byte reservation and retransmit a packet id the
+        pool no longer owns.
+
+        With no queued work and no SUB/UNSUB in flight, every packet id belongs
+        to a record discarded here, so the pool is reset in constant time
+        rather than id by id — it reclaims its accumulated hashing capacity
+        only on a full clear.
         """
+        if any(m.state is not OutboundQoSState.QUEUED for m in self._queued):
+            self._queued = deque(m for m in self._queued if m.state is OutboundQoSState.QUEUED)
         clear_abandoned_packet_ids = not self._queued and not sub_mids_pending
         for page in self.store_summary_pages():
             for msg in page:

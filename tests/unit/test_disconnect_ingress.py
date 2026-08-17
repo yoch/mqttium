@@ -46,14 +46,22 @@ def test_disconnecting_drops_inflight_publish_without_effects() -> None:
     assert engine.take_effects() == []
 
 
-def test_disconnected_state_still_rejects_inbound_packets() -> None:
+def test_disconnected_state_ignores_inbound_packets() -> None:
+    """Trailing buffered packets after a terminal state must not raise.
+
+    After a broker DISCONNECT (or a refused CONNACK), the read loop may still
+    decode packets the peer had already sent. Surfacing them as
+    PROTOCOL_ERROR made the runtime overwrite `_disconnect_exc` with an
+    "Unexpected X while state=DISCONNECTED" noise error, masking the real
+    disconnect reason. They are transport noise, exactly like the packets
+    ignored while DISCONNECTING.
+    """
     engine = _connected_engine()
-    engine.notify_transport_closed()
-    engine.take_effects()
+    _feed(engine, encode_frame(PacketType.DISCONNECT, 0, b""))
+    assert engine.state is ConnectionState.DISCONNECTED
 
     _feed(engine, encode_frame(PacketType.PINGRESP, 0, b""))
     effects = engine.take_effects()
 
-    assert len(effects) == 1
-    assert effects[0].kind is EffectKind.PROTOCOL_ERROR
-    assert effects[0].data == "Unexpected PINGRESP while state=DISCONNECTED"
+    assert not any(e.kind is EffectKind.PROTOCOL_ERROR for e in effects)
+    assert engine.state is ConnectionState.DISCONNECTED
