@@ -1,4 +1,4 @@
-name: ARM64 Simplification Engine Rollback
+name: ARM64 Simplification Scheduling Boundaries
 
 on:
   push:
@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 jobs:
-  validate:
+  isolate:
     runs-on: [self-hosted, linux, ARM64]
     timeout-minutes: 45
     env:
@@ -42,32 +42,96 @@ jobs:
         uses: actions/checkout@v7
         with:
           ref: ${{ env.FINAL_SHA }}
-          path: candidate
+          path: final
           persist-credentials: false
 
-      - name: Apply exact engine-only rollback in candidate checkout
+      - name: Construct scheduling-boundary variants
         shell: bash
         run: |
           set -euo pipefail
-          python - <<'PY'
-          from pathlib import Path
-          path = Path('candidate/src/mqttium/protocol/engine.py')
-          text = path.read_text()
-          old = '''        self._effects.append(\n            EngineEffect(kind, data, requires_delivery_mark, decoded_property_wire_size)\n        )\n\n    def _send(self, packet: WriteItem) -> None:\n        # Appends directly rather than delegating to _emit: SEND is the most\n        # frequent effect and this is one Python frame per outbound packet.\n        self._effects.append(EngineEffect(EffectKind.SEND, packet, False, None))\n'''
-          new = '''        self._effects.append(\n            EngineEffect(\n                kind=kind,\n                data=data,\n                requires_delivery_mark=requires_delivery_mark,\n                decoded_property_wire_size=decoded_property_wire_size,\n            )\n        )\n\n    def _send(self, packet: WriteItem) -> None:\n        self._emit(EffectKind.SEND, packet)\n'''
-          assert text.count(old) == 1, 'unexpected engine hotpath shape'
-          path.write_text(text.replace(old, new))
-          PY
-          git -C candidate diff --check
-          test "$(git -C candidate diff --name-only)" = "src/mqttium/protocol/engine.py"
-          grep -q 'self._emit(EffectKind.SEND, packet)' candidate/src/mqttium/protocol/engine.py
-          grep -q 'self._eager_armed' candidate/src/mqttium/api/_writer.py
+          root="$RUNNER_TEMP/mqttium-252-boundaries"
+          rm -rf "$root"
+          mkdir -p "$root/results"
+          for variant in launch engine engine_launch wrappers engine_wrappers; do
+            cp -a final "$root/$variant"
+          done
 
-      - name: Create isolated benchmark venv
+          ROOT="$root" python - <<'PY'
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ['ROOT'])
+
+          engine_old = '''        self._effects.append(\n            EngineEffect(kind, data, requires_delivery_mark, decoded_property_wire_size)\n        )\n\n    def _send(self, packet: WriteItem) -> None:\n        # Appends directly rather than delegating to _emit: SEND is the most\n        # frequent effect and this is one Python frame per outbound packet.\n        self._effects.append(EngineEffect(EffectKind.SEND, packet, False, None))\n'''
+          engine_new = '''        self._effects.append(\n            EngineEffect(\n                kind=kind,\n                data=data,\n                requires_delivery_mark=requires_delivery_mark,\n                decoded_property_wire_size=decoded_property_wire_size,\n            )\n        )\n\n    def _send(self, packet: WriteItem) -> None:\n        self._emit(EffectKind.SEND, packet)\n'''
+
+          launch_old = '''            if topic_bytes is not None and self.flow.try_acquire():\n                self._launch(msg, _property_bytes=property_bytes, _topic_bytes=topic_bytes)\n                return PublishHandle(mid=mid, qos=qos)\n'''
+          launch_new = '''            if self._engine.state == ConnectionState.CONNECTED and self._try_launch(\n                msg, _property_bytes=property_bytes, _topic_bytes=topic_bytes\n            ):\n                return PublishHandle(mid=mid, qos=qos)\n'''
+          launch_method = '''\n    def _try_launch(\n        self,\n        msg: OutboundMessage,\n        *,\n        _property_bytes: bytes | None = None,\n        _topic_bytes: bytes | None = None,\n    ) -> bool:\n        if not self.flow.try_acquire():\n            return False\n        try:\n            self._launch(msg, _property_bytes=_property_bytes, _topic_bytes=_topic_bytes)\n        except Exception:\n            self.flow.release()\n            raise\n        return True\n\n'''
+          launch_anchor = '    def _retransmit(self, msg: OutboundMessage) -> None:\n'
+
+          wrappers_anchor = '''    # rebinds the list, so the engine's `_effects` is the one sink. Emission\n    # calls `self._engine._emit` / `._send` directly, as InboundSession does;\n    # a forwarding wrapper here cost a Python frame per publish and per ACK.\n\n'''
+          wrappers_block = '''    # rebinds the list, and `_emit` remains the single interception point for\n    # outbound effects.\n\n    def _emit(self, kind: EffectKind, data: object = None) -> None:\n        self._engine._emit(kind, data)\n\n    def _send(self, packet: WriteItem) -> None:\n        self._engine._send(packet)\n\n'''
+
+          def rollback_engine(tree: Path) -> None:
+              path = tree / 'src/mqttium/protocol/engine.py'
+              text = path.read_text()
+              assert text.count(engine_old) == 1
+              path.write_text(text.replace(engine_old, engine_new))
+
+          def rollback_launch(tree: Path) -> None:
+              path = tree / 'src/mqttium/protocol/outbound.py'
+              text = path.read_text()
+              assert text.count(launch_old) == 1
+              assert text.count(launch_anchor) == 1
+              text = text.replace(launch_old, launch_new)
+              text = text.replace(launch_anchor, launch_method + launch_anchor)
+              path.write_text(text)
+
+          def rollback_wrappers(tree: Path) -> None:
+              path = tree / 'src/mqttium/protocol/outbound.py'
+              text = path.read_text()
+              assert text.count(wrappers_anchor) == 1
+              text = text.replace(wrappers_anchor, wrappers_block)
+              # Restore forwarding only at the effect/send sites changed by the
+              # hotpath commit; validation/check helpers remain direct.
+              replacements = {
+                  '            self._engine._send(item)\n': '            self._send(item)\n',
+                  '            self._engine._emit(EffectKind.PUBLISH_COMPLETE, None)\n': '            self._emit(EffectKind.PUBLISH_COMPLETE, None)\n',
+                  '            self._engine._emit(EffectKind.PUBLISH_COMPLETE, mid)\n': '            self._emit(EffectKind.PUBLISH_COMPLETE, mid)\n',
+                  '                self._engine._send(_encode_pubrel_success(mid))\n': '                self._send(_encode_pubrel_success(mid))\n',
+                  '        self._engine._send(msg.encoded_pubrel)\n': '        self._send(msg.encoded_pubrel)\n',
+                  '        self._engine._send(wire)\n': '        self._send(wire)\n',
+                  '            self._engine._send(wire)\n': '            self._send(wire)\n',
+                  '            self._engine._send(msg.encoded_pubrel)\n': '            self._send(msg.encoded_pubrel)\n',
+              }
+              for old, new in replacements.items():
+                  if old in text:
+                      text = text.replace(old, new)
+              path.write_text(text)
+
+          rollback_launch(root / 'launch')
+          rollback_engine(root / 'engine')
+          rollback_engine(root / 'engine_launch')
+          rollback_launch(root / 'engine_launch')
+          rollback_wrappers(root / 'wrappers')
+          rollback_engine(root / 'engine_wrappers')
+          rollback_wrappers(root / 'engine_wrappers')
+          PY
+
+          for variant in launch engine engine_launch wrappers engine_wrappers; do
+            git -C "$root/$variant" diff --check
+            grep -q 'self._eager_armed' "$root/$variant/src/mqttium/api/_writer.py"
+          done
+          grep -q 'def _try_launch' "$root/launch/src/mqttium/protocol/outbound.py"
+          grep -q 'self._emit(EffectKind.SEND, packet)' "$root/engine/src/mqttium/protocol/engine.py"
+          grep -q 'def _send(self, packet: WriteItem)' "$root/wrappers/src/mqttium/protocol/outbound.py"
+
+      - name: Create venv
         shell: bash
         run: |
           set -euo pipefail
-          venv="$RUNNER_TEMP/mqttium-252-engine-rollback-venv"
+          venv="$RUNNER_TEMP/mqttium-252-boundaries-venv"
           rm -rf "$venv"
           python3 -m venv "$venv"
           echo "$venv/bin" >> "$GITHUB_PATH"
@@ -77,15 +141,15 @@ jobs:
       - name: Enforce strict runner preflight
         working-directory: base
         run: |
-          root="$RUNNER_TEMP/mqttium-252-engine-rollback"
-          rm -rf "$root" && mkdir -p "$root"
-          python benchmarks/runner_probe.py --output "$root/runner.json" --require-temperature --enforce
+          python benchmarks/runner_probe.py \
+            --output "$RUNNER_TEMP/mqttium-252-boundaries/runner.json" \
+            --require-temperature --enforce
 
       - name: Start isolated broker pinned to CPU 0
         shell: bash
         run: |
           set -euo pipefail
-          root="$RUNNER_TEMP/mqttium-252-engine-rollback"
+          root="$RUNNER_TEMP/mqttium-252-boundaries"
           cat > "$root/mosquitto.conf" <<'EOF'
           persistence false
           allow_anonymous true
@@ -105,50 +169,46 @@ jobs:
           done
           exit 1
 
-      - name: Strict latency A/A control
+      - name: Measure final-state variants at 2500 and 10000 msg/s
         shell: bash
         run: |
           set -euo pipefail
-          root="$RUNNER_TEMP/mqttium-252-engine-rollback"
-          control() {
-            local attempt="$1" report="$2"
+          root="$RUNNER_TEMP/mqttium-252-boundaries"
+          printf 'variant,rate,p50_ratio,base_p50_ms,candidate_p50_ms,completed_ratio,loop_lag_ratio,cpu_ratio\n' > "$root/boundaries.csv"
+          for variant in launch engine engine_launch wrappers engine_wrappers; do
+            out="$root/results/${variant}.json"
             python base/benchmarks/paired_open_loop.py \
-              --base-root base --candidate-root base \
+              --base-root base --candidate-root "$root/$variant" \
               --protocols 311 --payloads 256 --windows 64 \
               --target-rates 2500,10000 --completions callback \
-              --repeat 8 --count-small 4000 --timeout 120 --cpu 2 \
-              --policy strict --preflight-report "$report" \
-              --output "$root/aa-${attempt}.json" --summary-output "$root/aa-${attempt}.md"
-          }
-          set +e; control 1 "$root/runner.json"; rc=$?; set -e
-          if [ "$rc" -eq 0 ]; then exit 0; fi
-          if [ "$rc" -ne 2 ]; then exit "$rc"; fi
-          python base/benchmarks/runner_probe.py --output "$root/runner-retry.json" --require-temperature --enforce
-          control 2 "$root/runner-retry.json"
-
-      - name: Strict latency A/B current main vs engine-rollback candidate
-        shell: bash
-        run: |
-          set -euo pipefail
-          root="$RUNNER_TEMP/mqttium-252-engine-rollback"
-          report="$root/runner.json"; [ ! -f "$root/runner-retry.json" ] || report="$root/runner-retry.json"
-          python base/benchmarks/paired_open_loop.py \
-            --base-root base --candidate-root candidate \
-            --protocols 311 --payloads 256 --windows 64 \
-            --target-rates 2500,10000 --completions callback \
-            --repeat 8 --count-small 4000 --timeout 120 --cpu 2 \
-            --policy strict --preflight-report "$report" \
-            --output "$root/ab.json" --summary-output "$root/ab.md"
+              --repeat 4 --count-small 4000 --timeout 120 --cpu 2 \
+              --policy advisory --preflight-report "$root/runner.json" \
+              --output "$out" >/dev/null
+            VARIANT="$variant" OUT="$out" python - <<'PY' >> "$root/boundaries.csv"
+          import csv, json, os, statistics, sys
+          for s in json.load(open(os.environ['OUT']))['scenarios']:
+              pairs = s['pairs']
+              ratio = lambda key: statistics.median(float(p['candidate'][key]) / max(float(p['base'][key]), 1e-9) for p in pairs)
+              med = lambda side, key: statistics.median(float(p[side][key]) for p in pairs)
+              csv.writer(sys.stdout).writerow([
+                  os.environ['VARIANT'], int(s['target_rate']), f"{ratio('ack_latency_p50_ms'):.6f}",
+                  f"{med('base','ack_latency_p50_ms'):.6f}", f"{med('candidate','ack_latency_p50_ms'):.6f}",
+                  f"{ratio('completed_rate'):.6f}", f"{ratio('loop_lag_p95_ms'):.6f}", f"{ratio('cpu_seconds'):.6f}"
+              ])
+          PY
+          done
+          cat "$root/boundaries.csv"
 
       - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: arm64-pr252-engine-rollback-${{ github.run_id }}
+          name: arm64-pr252-boundaries-${{ github.run_id }}
           path: |
-            ${{ runner.temp }}/mqttium-252-engine-rollback/*.json
-            ${{ runner.temp }}/mqttium-252-engine-rollback/*.md
-            ${{ runner.temp }}/mqttium-252-engine-rollback/mosquitto.log
+            ${{ runner.temp }}/mqttium-252-boundaries/boundaries.csv
+            ${{ runner.temp }}/mqttium-252-boundaries/results/*.json
+            ${{ runner.temp }}/mqttium-252-boundaries/runner.json
+            ${{ runner.temp }}/mqttium-252-boundaries/mosquitto.log
           if-no-files-found: error
           retention-days: 30
 
@@ -156,7 +216,7 @@ jobs:
         if: always()
         shell: bash
         run: |
-          pidfile="$RUNNER_TEMP/mqttium-252-engine-rollback/mosquitto.pid"
+          pidfile="$RUNNER_TEMP/mqttium-252-boundaries/mosquitto.pid"
           if [ -f "$pidfile" ]; then
             pid="$(cat "$pidfile")"; kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
           fi
