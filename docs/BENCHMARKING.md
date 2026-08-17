@@ -16,6 +16,11 @@ be committed.
 - `paired_open_loop.py` measures completion and loop lag at calibrated or fixed
   absolute load. It can sweep outbound windows while calling `AsyncClient`
   directly; no cross-client adapter participates in the measurement.
+- `paired_writer_capacity.py` protects the native `publish_nowait` closed-loop
+  writer regime for QoS 0/1. It yields once per application outstanding window
+  and yields/retries on synchronous backpressure, matching the scheduling shape
+  used by the external native capacity harness. Its primary metric is the
+  candidate/base completed-rate ratio, not an absolute cross-machine rate.
 - `application_stress.py` exercises callbacks, iterators, backpressure, memory,
   and SQLite persistence.
 - `memory_profile.py` enforces versioned tracemalloc and logical-counter limits.
@@ -38,6 +43,54 @@ diagnostic, regardless of whether it exposes a strict exit mode for experiments.
 
 Hosted GitHub runners are useful for functional coverage and advisory numbers.
 They are not authoritative for latency or small throughput changes.
+
+### Closed-loop writer-capacity regression gate
+
+The eager-write optimisation has two intentionally different regimes: paced
+traffic should keep the zero-hop first write, while a synchronous producer burst
+must seed once and then let the writer task batch the rest. Open-loop latency
+cells cannot prove the latter. `paired_writer_capacity.py` therefore runs the
+native producer on its own event loop with the same application discipline as
+the external capacity harness: MQTT 3.1.1, 256-byte payloads, protocol inflight
+20, application outstanding 64, and one cooperative yield per 64 successful
+submissions. A `FlowControlError` yields once and retries the same unit of work.
+QoS 0 counts successful native admission, then drains the writer outside the
+timed interval; QoS 1 counts actual publish completion.
+
+For a writer-regime change, first validate the new harness as A/A on one source
+tree, then compare the historical baseline and candidate on the same eligible
+host. For the rc5-to-current eager regression the strict sequence is:
+
+```bash
+python benchmarks/runner_probe.py \
+  --output /tmp/mqttium-runner.json --enforce
+
+# Harness control: BASE_RC5 is a checkout/worktree of v1.0.0rc5.
+python benchmarks/paired_writer_capacity.py \
+  --base-root "$BASE_RC5" --candidate-root "$BASE_RC5" \
+  --protocol 311 --qos-values 0,1 --payload-bytes 256 \
+  --inflight 20 --outstanding 64 --max-queued 200 --repeat 8 \
+  --policy strict --preflight-report /tmp/mqttium-runner.json \
+  --output /tmp/mqttium-writer-capacity-aa.json
+
+python benchmarks/paired_writer_capacity.py \
+  --base-root "$BASE_RC5" --candidate-root . \
+  --protocol 311 --qos-values 0,1 --payload-bytes 256 \
+  --inflight 20 --outstanding 64 --max-queued 200 --repeat 8 \
+  --policy strict --preflight-report /tmp/mqttium-runner.json \
+  --output /tmp/mqttium-writer-capacity-ab.json
+```
+
+The A/A median completed-rate ratio must stay within 2% and baseline CV at or
+below 5%. The A/B candidate must retain at least 95% of the rc5 completed rate
+for both QoS 0 and QoS 1. This is a regression floor, not a claim that rc5 is an
+optimal ceiling. The paced open-loop acceptance cells at 2,500 and 7,500
+messages/s remain separate evidence and must still be retained; recovering
+capacity by simply disabling eager writes would fail that side of the contract.
+
+The GitHub `Paired Regression` workflow runs a shorter version of this cell as
+**advisory** functional/diagnostic coverage. Its hosted-runner numbers are not a
+substitute for the strict eligible-host A/A and A/B sequence above.
 
 ## Keeping the harness out of the result
 

@@ -62,6 +62,15 @@ class WritePump:
         # Resolved once per connection: absent on transports that do not offer
         # a non-awaiting write.
         self._write_nowait: Callable[[bytes], bool] | None = None
+        # At most one eager write may happen before the event loop regains
+        # control. A tight producer therefore seeds the transport immediately,
+        # then queues the rest so the writer task can coalesce them. A paced
+        # producer is re-armed on the next loop turn while the writer is idle.
+        self._eager_armed = False
+        # Delayed re-arm callbacks carry this generation. Lifecycle changes
+        # invalidate it so a callback from an old transport can never arm a new
+        # connection.
+        self._eager_generation = 0
 
     @property
     def queued_messages(self) -> int:
@@ -95,6 +104,20 @@ class WritePump:
         if self.queued_bytes > self.high_water_bytes:
             self.high_water_bytes = self.queued_bytes
 
+    def _drop_eager_binding(self) -> None:
+        self._eager_generation += 1
+        self._eager_armed = False
+        self._write_nowait = None
+
+    def _rearm_eager_if_idle(self, generation: int) -> None:
+        if (
+            generation == self._eager_generation
+            and self._write_nowait is not None
+            and not self._writing
+            and self.queue.empty()
+        ):
+            self._eager_armed = True
+
     def reset(self) -> None:
         """Start a new transport epoch with an empty queue."""
         self._sample_high_water()
@@ -102,7 +125,7 @@ class WritePump:
         self.queued_bytes = 0
         # The next start() rebinds it. Until then there is no transport this
         # pump may write to.
-        self._write_nowait = None
+        self._drop_eager_binding()
         self._writing = False
 
     def start(self, transport: AsyncTransport) -> None:
@@ -111,14 +134,19 @@ class WritePump:
             raise RuntimeError("WritePump is already running")
         self.transport = transport
         self._writing = False
+        self._eager_generation += 1
         self._write_nowait = getattr(transport, "write_nowait", None)
+        self._eager_armed = self._write_nowait is not None
         self.task = asyncio.create_task(self._run(), name="mqttium-writer")
 
     async def stop(self) -> None:
         task = self.task
+        # Invalidate the producer-side path before the first await. A pending
+        # re-arm callback from this connection then becomes harmless even if the
+        # writer task cancellation yields back to the loop.
+        self._drop_eager_binding()
         if task is None:
             self.transport = None
-            self._write_nowait = None
             return
         if task is asyncio.current_task():
             return
@@ -130,9 +158,6 @@ class WritePump:
                 pass
         self.task = None
         self.transport = None
-        # Drop the eager path with the transport it was resolved from, so a
-        # frame can never be written to a transport this pump no longer owns.
-        self._write_nowait = None
         self._writing = False
 
     async def join(self) -> None:
@@ -148,7 +173,7 @@ class WritePump:
 
     def discard(self) -> None:
         self._sample_high_water()
-        self._write_nowait = None
+        self._drop_eager_binding()
         self._writing = False
         while True:
             try:
@@ -231,8 +256,13 @@ class WritePump:
         scheduled out of ``await queue.get()`` before a single byte moves. When
         nothing is queued and no write is in flight, that turn buys nothing.
 
-        Wire order is preserved because all five conditions hold together, and
-        each one is load-bearing:
+        ``_eager_armed`` limits that shortcut to the first write before the loop
+        regains control. A synchronous producer burst therefore wakes the writer
+        on its second frame and lets the existing batch path do the throughput
+        work, while a paced producer can still take the zero-hop path each time.
+
+        Wire order is preserved because the five original conditions still hold
+        together, and each one is load-bearing:
 
         * ``_write_nowait`` is absent unless the transport's write is a plain
           buffer append;
@@ -250,7 +280,8 @@ class WritePump:
         """
         write_nowait = self._write_nowait
         if (
-            write_nowait is None
+            not self._eager_armed
+            or write_nowait is None
             or self._writing
             or self.waiters
             or isinstance(item, tuple)
@@ -259,6 +290,9 @@ class WritePump:
             return False
         if not write_nowait(item):
             return False
+        self._eager_armed = False
+        generation = self._eager_generation
+        asyncio.get_running_loop().call_soon(self._rearm_eager_if_idle, generation)
         self.eager_writes += 1
         self.eager_bytes += len(item)
         self.last_outbound = time.monotonic()
@@ -371,7 +405,13 @@ class WritePump:
         queue = self.queue
         try:
             while True:
+                # Reaching the idle queue wait is an independent re-arm point:
+                # it covers a batch that just drained even when no eager write
+                # scheduled the producer-side next-turn callback.
+                if queue.empty() and self._write_nowait is not None:
+                    self._eager_armed = True
                 first = await queue.get()
+                self._eager_armed = False
                 self._sample_high_water(queue.qsize() + 1)
                 batch: list[WriteItem] = [first]
                 while len(batch) < 256:
@@ -418,6 +458,6 @@ class WritePump:
             # (AsyncClient only stops the pump when it will not reconnect), so
             # without this a producer racing the reader's teardown could still
             # write straight into the dead transport.
-            self._write_nowait = None
+            self._drop_eager_binding()
             self._writing = False
             await self.on_failure(exc)

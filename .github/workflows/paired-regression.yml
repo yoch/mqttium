@@ -105,6 +105,17 @@ jobs:
             --payloads 64 --completions receipt,callback \
             --count-small 5000 \
             --output /tmp/mqttium-paired/qos1-completion.json
+      - name: Advisory closed-loop native writer capacity
+        run: |
+          python harness/benchmarks/paired_writer_capacity.py \
+            --base-root base --candidate-root candidate \
+            --policy advisory \
+            --preflight-report /tmp/mqttium-paired/runner.json \
+            --protocol 311 --qos-values 0,1 \
+            --payload-bytes 256 --inflight 20 --outstanding 64 \
+            --max-queued 200 --warmup-count 2000 \
+            --repeat 4 --count-qos0 50000 --count-qos1 20000 \
+            --output /tmp/mqttium-paired/writer-capacity.json
       - name: Upload paired measurements
         if: always()
         uses: actions/upload-artifact@v7
