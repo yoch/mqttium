@@ -14,19 +14,46 @@ A release-grade run is fail-closed and always executes these phases in order:
 
 1. fresh dedicated-runner preflight;
 2. baseline same-code A/A;
-3. fresh preflight;
+3. fixed 60-second quiet period, then a fresh preflight;
 4. candidate same-code A/A;
-5. fresh preflight;
+5. fixed 60-second quiet period, then a fresh preflight;
 6. baseline-versus-candidate A/B, only if both controls passed.
 
-A failed A/A invalidates the experiment. The A/B phase is not run, because a
-benchmark that cannot prove neutrality on identical code cannot support a release
-claim about different code.
+The quiet periods are deterministic. The gate never probes repeatedly until it
+happens to find an eligible instant. This matters because `runner_probe.py` uses
+the one-minute load average: an immediate post-benchmark preflight measures work
+performed by the benchmark phase itself.
 
-The default network cell is MQTT 3.1.1, callback completion, 64-byte payloads,
-windows 1/8/64, 12 paired samples and a target of approximately two seconds per
-sample. The publisher may be pinned to a dedicated CPU; the broker and subscriber
-must not inherit that affinity.
+A failed A/A invalidates the experiment. The A/B phase is not run, because a
+benchmark that cannot demonstrate bounded same-code bias and enough precision
+cannot support a release claim about different code.
+
+The calibrated default network cell is MQTT 3.1.1, callback completion, 64-byte
+payloads, windows **1/20/64**, 12 paired samples and a target of approximately two
+seconds per sample.
+
+On the dedicated four-core ARM64 runner, the recommended isolation is:
+
+- Mosquitto broker: CPU 0;
+- gate, subscriber and observer: CPUs 1 and 3;
+- publisher worker: CPU 2.
+
+This can be achieved by launching the gate under `taskset -c 1,3` and passing
+`--cpu 2`; the broker is started separately under `taskset -c 0`.
+
+### Why window 8 is not a release point
+
+During pre-A/B same-code calibration, `window=8` repeatedly showed a second
+execution regime: individual publisher workers sometimes consumed materially
+more CPU and fell from roughly 18-19k ACK/s into the 15-17k range. The effect
+survived publisher/observer CPU isolation and doubling sample duration from about
+two to four seconds. Longer samples therefore did not solve it.
+
+`window=20`, by contrast, passed the same-code first control together with
+windows 1 and 64 at the original approximately two-second duration. Window 8 is
+retained for advisory diagnostics; it is not silently discarded and should not
+be promoted back into release evidence until its multimodality is understood or
+shown to be stable under repeated same-code controls.
 
 ## Statistical unit: complete ABBA cycles
 
@@ -55,23 +82,26 @@ experimental design.
 
 ## Same-code control gates
 
-A control must demonstrate both neutrality and enough precision to protect the
-claimed regression floor.
+A same-code control must demonstrate **small systematic bias** and **enough
+precision to protect the release margin**. Requiring a 95% CI to contain exactly
+`1.0` is deliberately not used: with enough precision, an immaterial same-code
+offset can exclude exactly 1 while still ruling out every materially relevant
+regression. That is a difference test, not an equivalence requirement.
 
-For publisher ACK throughput, the 95% confidence interval must:
+Publisher ACK throughput must satisfy both:
 
-- contain `1.0`;
-- lie entirely inside `[0.95, 1.05]`.
+- geometric-mean candidate/base estimate inside `[0.98, 1.02]`;
+- entire 95% CI inside `[0.95, 1.05]`.
 
-For publisher ACK p50 latency, the 95% confidence interval must:
+Publisher ACK p50 latency must satisfy both:
 
-- contain `1.0`;
-- lie entirely inside `[0.90, 1.10]`.
+- geometric-mean candidate/base estimate inside `[0.95, 1.05]`;
+- entire 95% CI inside `[0.90, 1.10]`.
 
-These are equivalence checks, not requests for a favourable point estimate. A
-same-code run whose CI is narrow but systematically excludes `1.0` is invalid,
-as is a same-code run whose CI contains `1.0` but is too wide to exclude the
-regression size the A/B gate claims to protect.
+The tighter point-estimate bands prevent a narrow but systematically biased
+same-code result from consuming most of the later no-regression budget. The wider
+confidence bands prove that uncertainty itself is small enough to rule out the
+regression size the A/B gate is intended to protect.
 
 Both the historical baseline and candidate source trees must pass their own
 same-code control before A/B is allowed.
@@ -107,7 +137,7 @@ because one raw arm crosses a 5% CV threshold throws away exactly the pairing
 that the experiment was designed to exploit.
 
 Conversely, a low raw-arm CV does not rescue a biased or imprecise paired
-estimator. The mandatory same-code confidence intervals are the gate that proves
+estimator. The mandatory same-code bias and confidence-interval gates prove that
 the complete measurement chain can distinguish neutrality at the required
 resolution.
 
@@ -122,13 +152,13 @@ Run Mosquitto separately on the dedicated benchmark host, then compare two exact
 checkouts/worktrees:
 
 ```bash
-python benchmarks/network_release_gate.py \
+taskset -c 1,3 python benchmarks/network_release_gate.py \
   --base-root "$BASE" \
   --candidate-root "$CANDIDATE" \
   --protocols 311 \
   --completions callback \
   --payloads 64 \
-  --windows 1,8,64 \
+  --windows 1,20,64 \
   --repeat 12 \
   --target-sample-seconds 2.0 \
   --cpu 2 \
@@ -136,13 +166,14 @@ python benchmarks/network_release_gate.py \
   --output /tmp/mqttium-network-release.json
 ```
 
-The gate runs `benchmarks/runner_probe.py --require-temperature --enforce`
-immediately before each of the three measurement phases and stores each preflight
-beside the raw acquisition JSON.
+The first preflight runs immediately before baseline A/A. The gate then waits the
+fixed `--inter-phase-quiet-seconds` value (60 seconds by default) before each
+subsequent fresh `runner_probe.py --require-temperature --enforce` invocation.
+Each report is stored beside the raw acquisition JSON.
 
 The top-level JSON and Markdown summary record exact base/candidate SHAs, control
-results, A/B results and 95% confidence intervals. The raw phase artifacts are
-kept in a sibling directory named `<output-stem>-raw/`.
+results, A/B results, bias budgets and 95% confidence intervals. The raw phase
+artifacts are kept in a sibling directory named `<output-stem>-raw/`.
 
 ## Retry and evidence policy
 
@@ -153,6 +184,12 @@ An **invalid** run caused by an ineligible host or acquisition failure may be
 repeated once after the external cause is corrected and a fresh preflight passes.
 Retain both attempts. If the repeated experiment is still invalid, stop and fix
 the environment or harness before making a release claim.
+
+Changes to release points, sample duration or statistical thresholds must be
+calibrated on same-code controls **before** viewing the A/B result they will judge.
+The calibration history that led to windows 1/20/64 is retained in the PR
+conversation and ARM64 artifacts; no pre-#252 versus post-#252 A/B was run while
+those choices were being made.
 
 ## Scope
 
