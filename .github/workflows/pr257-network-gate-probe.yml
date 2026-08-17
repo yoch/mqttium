@@ -1,0 +1,140 @@
+name: PR257 Network Gate Probe
+
+on:
+  push:
+    branches:
+      - bench/network-paired-release-gate
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr257-network-gate-probe
+  cancel-in-progress: true
+
+jobs:
+  same-code-gate:
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 45
+    env:
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      RUNTIME_SHA: 4677e5500fb33da6b087616e960086e586d96ac7
+
+    steps:
+      - name: Check out gate harness
+        uses: actions/checkout@v7
+        with:
+          path: harness
+          persist-credentials: false
+
+      - name: Check out exact same-code runtime
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RUNTIME_SHA }}
+          path: runtime
+          persist-credentials: false
+
+      - name: Verify exact endpoints and dedicated runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C runtime rev-parse HEAD)" = "$RUNTIME_SHA"
+          test "$(uname -m)" = "aarch64"
+          command -v python3
+          command -v mosquitto
+          command -v mosquitto_sub
+          command -v taskset
+          if pgrep -a mosquitto; then
+            echo "pre-existing Mosquitto would contaminate benchmark evidence" >&2
+            exit 1
+          fi
+
+      - name: Create isolated virtual environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          venv="$RUNNER_TEMP/pr257-network-gate-venv"
+          rm -rf "$venv"
+          python3 -m venv "$venv"
+          echo "$venv/bin" >> "$GITHUB_PATH"
+
+      - name: Install probe dependency
+        run: python -m pip install "psutil>=6,<8"
+
+      - name: Start isolated broker on CPU 0
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/pr257-network-gate"
+          rm -rf "$root"
+          mkdir -p "$root"
+          cat > "$root/mosquitto.conf" <<'EOF'
+          persistence false
+          allow_anonymous true
+          max_inflight_messages 1000
+          max_queued_messages 100000
+          max_queued_bytes 0
+          connection_messages false
+          log_type error
+          listener 11883 127.0.0.1
+          EOF
+          taskset -c 0 mosquitto -c "$root/mosquitto.conf" > "$root/mosquitto.log" 2>&1 &
+          echo "$!" > "$root/mosquitto.pid"
+          for _ in $(seq 1 50); do
+            if (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1; then
+              exit 0
+            fi
+            if ! kill -0 "$(cat "$root/mosquitto.pid")" 2>/dev/null; then
+              cat "$root/mosquitto.log"
+              exit 1
+            fi
+            sleep 0.2
+          done
+          cat "$root/mosquitto.log"
+          exit 1
+
+      - name: Same-code release-gate validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python harness/benchmarks/network_release_gate.py \
+            --base-root runtime \
+            --candidate-root runtime \
+            --engine harness/benchmarks/paired_network.py \
+            --runner-probe harness/benchmarks/runner_probe.py \
+            --protocols 311 \
+            --completions callback \
+            --payloads 64 \
+            --windows 1,8,64 \
+            --repeat 12 \
+            --target-sample-seconds 2.0 \
+            --max-count 60000 \
+            --timeout 60 \
+            --cpu 2 \
+            --policy strict \
+            --output "$RUNNER_TEMP/pr257-network-gate/same-code.json"
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pr257-network-gate-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/pr257-network-gate/*.json
+            ${{ runner.temp }}/pr257-network-gate/*.md
+            ${{ runner.temp }}/pr257-network-gate/*-raw/*
+            ${{ runner.temp }}/pr257-network-gate/mosquitto.log
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Stop isolated broker
+        if: always()
+        shell: bash
+        run: |
+          pidfile="$RUNNER_TEMP/pr257-network-gate/mosquitto.pid"
+          if [ -f "$pidfile" ]; then
+            pid="$(cat "$pidfile")"
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+          fi
