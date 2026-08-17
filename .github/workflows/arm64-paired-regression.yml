@@ -168,7 +168,7 @@ jobs:
             --summary-output "$RUNNER_TEMP/mqttium-paired/qos1-completion.md"
 
       - name: Strict closed-loop writer-capacity A/A control
-        id: writer-gate
+        id: writer_gate
         shell: bash
         run: |
           set -euo pipefail
@@ -192,7 +192,7 @@ jobs:
             --summary-output "$RUNNER_TEMP/mqttium-paired/writer-capacity-aa.md"
 
       - name: Strict closed-loop writer-capacity A/B gate
-        if: steps.writer-gate.outputs.available == 'true'
+        if: steps.writer_gate.outputs.available == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -209,7 +209,7 @@ jobs:
             --summary-output "$RUNNER_TEMP/mqttium-paired/writer-capacity-ab.md"
 
       - name: Strict paced writer-latency A/A control
-        if: steps.writer-gate.outputs.available == 'true'
+        if: steps.writer_gate.outputs.available == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -224,7 +224,7 @@ jobs:
             --summary-output "$RUNNER_TEMP/mqttium-paired/writer-latency-aa.md"
 
       - name: Strict paced writer-latency A/B gate
-        if: steps.writer-gate.outputs.available == 'true'
+        if: steps.writer_gate.outputs.available == 'true'
         shell: bash
         run: |
           set -euo pipefail
