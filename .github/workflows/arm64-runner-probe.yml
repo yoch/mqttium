@@ -1,206 +1,311 @@
-name: Apply Simplification Scheduling Correction
+name: ARM64 Final PR252 Validation
 
 on:
   push:
     branches: [agent/arm64-runner-probe]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  apply:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 25
+  validate:
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 75
     env:
-      TARGET_BRANCH: refactor/simplification-audit-2026-08-16
-      EXPECTED_HEAD: 3ee2a3c5a78b0ea487ddbdf7927665b519fddd45
-      EXPECTED_MAIN: 0999d8abfe44a568209209403d7f215b18cc4eb7
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      BASE_SHA: 0999d8abfe44a568209209403d7f215b18cc4eb7
+      CANDIDATE_SHA: b0bbdfb21baeb7fb15f1428cf26d25ab492f731a
 
     steps:
-      - name: Check out exact target branch
+      - name: Verify clean dedicated host
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "aarch64"
+          command -v python3
+          command -v mosquitto
+          command -v mosquitto_sub
+          command -v taskset
+          python3 - <<'PY'
+          import sys
+          assert sys.version_info[:2] == (3, 13), sys.version
+          PY
+          governors="$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor | sort -u)"
+          test "$governors" = "performance"
+          if pgrep -a mosquitto; then
+            echo "pre-existing Mosquitto would contaminate paired evidence" >&2
+            exit 1
+          fi
+
+      - name: Check out exact current main
         uses: actions/checkout@v7
         with:
-          ref: ${{ env.EXPECTED_HEAD }}
-          fetch-depth: 0
-          persist-credentials: true
+          ref: ${{ env.BASE_SHA }}
+          path: base
+          persist-credentials: false
 
-      - name: Pin remote endpoints before editing
+      - name: Check out exact corrected PR252
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+          path: candidate
+          persist-credentials: false
+
+      - name: Verify exact endpoints and corrected invariants
         shell: bash
         run: |
           set -euo pipefail
-          git fetch --no-tags origin \
-            "+refs/heads/main:refs/remotes/origin/main" \
-            "+refs/heads/${TARGET_BRANCH}:refs/remotes/origin/target"
-          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-          test "$(git rev-parse refs/remotes/origin/target)" = "$EXPECTED_HEAD"
-          test "$(git rev-parse refs/remotes/origin/main)" = "$EXPECTED_MAIN"
-          test "$(git merge-base HEAD refs/remotes/origin/main)" = "$EXPECTED_MAIN"
+          test "$(git -C base rev-parse HEAD)" = "$BASE_SHA"
+          test "$(git -C candidate rev-parse HEAD)" = "$CANDIDATE_SHA"
+          test "$(git -C candidate merge-base "$BASE_SHA" "$CANDIDATE_SHA")" = "$BASE_SHA"
+          grep -q 'self._emit(EffectKind.SEND, packet)' candidate/src/mqttium/protocol/engine.py
+          grep -q 'def _try_launch' candidate/src/mqttium/protocol/outbound.py
+          grep -q 'self._eager_armed' candidate/src/mqttium/api/_writer.py
+          grep -q 'write_many = getattr(transport, "write_many", None)' candidate/src/mqttium/api/_writer.py
+          test -f candidate/docs/reports/SIMPLIFICATION-ARM64-REVALIDATION-2026-08-17.md
 
-      - name: Apply only the measured scheduling correction
+      - name: Create isolated benchmark venv
         shell: bash
         run: |
           set -euo pipefail
-          python - <<'PY'
+          venv="$RUNNER_TEMP/mqttium-252-final-bench-venv"
+          rm -rf "$venv"
+          python3 -m venv "$venv"
+          echo "$venv/bin" >> "$GITHUB_PATH"
+
+      - run: python -m pip install "psutil>=6,<8"
+
+      - name: Enforce strict runner preflight
+        working-directory: base
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/mqttium-252-final"
+          rm -rf "$root"
+          mkdir -p "$root"
+          python benchmarks/runner_probe.py \
+            --output "$root/runner.json" \
+            --require-temperature --enforce
+
+      - name: Start isolated broker pinned to CPU 0
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/mqttium-252-final"
+          cat > "$root/mosquitto.conf" <<'EOF'
+          persistence false
+          allow_anonymous true
+          max_inflight_messages 1000
+          max_queued_messages 100000
+          max_queued_bytes 0
+          connection_messages false
+          log_type error
+          listener 11883 127.0.0.1
+          EOF
+          taskset -c 0 mosquitto -c "$root/mosquitto.conf" > "$root/mosquitto.log" 2>&1 &
+          echo "$!" > "$root/mosquitto.pid"
+          for _ in $(seq 1 50); do
+            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            if ! kill -0 "$(cat "$root/mosquitto.pid")" 2>/dev/null; then
+              cat "$root/mosquitto.log"
+              exit 1
+            fi
+            sleep 0.1
+          done
+          cat "$root/mosquitto.log"
+          exit 1
+
+      - name: Strict writer capacity A/A
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/mqttium-252-final"
+          python base/benchmarks/paired_writer_capacity.py \
+            --base-root base --candidate-root base \
+            --protocol 311 --qos-values 0,1 --payload-bytes 256 \
+            --inflight 20 --outstanding 64 --max-queued 200 \
+            --warmup-count 5000 --repeat 8 \
+            --count-qos0 100000 --count-qos1 40000 \
+            --timeout 120 --cpu 2 --policy strict \
+            --preflight-report "$root/runner.json" \
+            --output "$root/capacity-aa.json" \
+            --summary-output "$root/capacity-aa.md"
+
+      - name: Strict writer capacity A/B current main vs PR252
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/mqttium-252-final"
+          python base/benchmarks/paired_writer_capacity.py \
+            --base-root base --candidate-root candidate \
+            --protocol 311 --qos-values 0,1 --payload-bytes 256 \
+            --inflight 20 --outstanding 64 --max-queued 200 \
+            --warmup-count 5000 --repeat 8 \
+            --count-qos0 100000 --count-qos1 40000 \
+            --timeout 120 --cpu 2 --policy strict \
+            --preflight-report "$root/runner.json" \
+            --output "$root/capacity-ab.json" \
+            --summary-output "$root/capacity-ab.md"
+
+      - name: Strict paced latency A/A with one invalid-control retry
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/mqttium-252-final"
+          control() {
+            local attempt="$1" report="$2"
+            python base/benchmarks/paired_open_loop.py \
+              --base-root base --candidate-root base \
+              --protocols 311 --payloads 256 --windows 64 \
+              --target-rates 2500,10000 --completions callback \
+              --repeat 8 --count-small 4000 --timeout 120 --cpu 2 \
+              --policy strict --preflight-report "$report" \
+              --output "$root/latency-aa-${attempt}.json" \
+              --summary-output "$root/latency-aa-${attempt}.md"
+          }
+          set +e
+          control 1 "$root/runner.json"
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ]; then
+            exit 0
+          fi
+          if [ "$rc" -ne 2 ]; then
+            exit "$rc"
+          fi
+          python base/benchmarks/runner_probe.py \
+            --output "$root/runner-retry.json" \
+            --require-temperature --enforce
+          control 2 "$root/runner-retry.json"
+
+      - name: Strict paced latency A/B current main vs PR252
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/mqttium-252-final"
+          report="$root/runner.json"
+          [ ! -f "$root/runner-retry.json" ] || report="$root/runner-retry.json"
+          python base/benchmarks/paired_open_loop.py \
+            --base-root base --candidate-root candidate \
+            --protocols 311 --payloads 256 --windows 64 \
+            --target-rates 2500,10000 --completions callback \
+            --repeat 8 --count-small 4000 --timeout 120 --cpu 2 \
+            --policy strict --preflight-report "$report" \
+            --output "$root/latency-ab.json" \
+            --summary-output "$root/latency-ab.md"
+
+      - name: Enforce explicit callback p50 regression ceiling
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/mqttium-252-final" python - <<'PY'
+          import json
+          import os
+          import statistics
           from pathlib import Path
 
-          engine = Path("src/mqttium/protocol/engine.py")
-          text = engine.read_text()
-          old = '''        self._effects.append(\n            EngineEffect(kind, data, requires_delivery_mark, decoded_property_wire_size)\n        )\n\n    def _send(self, packet: WriteItem) -> None:\n        # Appends directly rather than delegating to _emit: SEND is the most\n        # frequent effect and this is one Python frame per outbound packet.\n        self._effects.append(EngineEffect(EffectKind.SEND, packet, False, None))\n'''
-          new = '''        self._effects.append(\n            EngineEffect(\n                kind=kind,\n                data=data,\n                requires_delivery_mark=requires_delivery_mark,\n                decoded_property_wire_size=decoded_property_wire_size,\n            )\n        )\n\n    def _send(self, packet: WriteItem) -> None:\n        self._emit(EffectKind.SEND, packet)\n'''
-          assert text.count(old) == 1, "unexpected engine effect hotpath shape"
-          engine.write_text(text.replace(old, new))
-
-          outbound = Path("src/mqttium/protocol/outbound.py")
-          text = outbound.read_text()
-          old = '''            if topic_bytes is not None and self.flow.try_acquire():\n                self._launch(msg, _property_bytes=property_bytes, _topic_bytes=topic_bytes)\n                return PublishHandle(mid=mid, qos=qos)\n'''
-          new = '''            if self._engine.state == ConnectionState.CONNECTED and self._try_launch(\n                msg, _property_bytes=property_bytes, _topic_bytes=topic_bytes\n            ):\n                return PublishHandle(mid=mid, qos=qos)\n'''
-          assert text.count(old) == 1, "unexpected outbound launch hotpath shape"
-          assert "    def _try_launch(" not in text
-          text = text.replace(old, new)
-          anchor = "    def _retransmit(self, msg: OutboundMessage) -> None:\n"
-          method = '''    def _try_launch(\n        self,\n        msg: OutboundMessage,\n        *,\n        _property_bytes: bytes | None = None,\n        _topic_bytes: bytes | None = None,\n    ) -> bool:\n        if not self.flow.try_acquire():\n            return False\n        try:\n            self._launch(msg, _property_bytes=_property_bytes, _topic_bytes=_topic_bytes)\n        except Exception:\n            self.flow.release()\n            raise\n        return True\n\n'''
-          assert text.count(anchor) == 1
-          outbound.write_text(text.replace(anchor, method + anchor))
-
-          # The independent writer lookup optimization did not cause the timing
-          # regression and its rollback was measurably worse. Keep it.
-          writer = Path("src/mqttium/api/_writer.py").read_text()
-          assert 'write_many = getattr(transport, "write_many", None)' in writer
-          assert "_write_contiguous(transport, write_many, contiguous)" in writer
-          assert "self._eager_armed" in writer
-          assert "def _rearm_eager_if_idle" in writer
+          root = Path(os.environ["ROOT"])
+          data = json.loads((root / "latency-ab.json").read_text())
+          rows = []
+          for scenario in data["scenarios"]:
+              rate = int(scenario["target_rate"])
+              ratios = [
+                  float(pair["candidate"]["ack_latency_p50_ms"])
+                  / float(pair["base"]["ack_latency_p50_ms"])
+                  for pair in scenario["pairs"]
+              ]
+              ratio = statistics.median(ratios)
+              base = statistics.median(
+                  float(pair["base"]["ack_latency_p50_ms"]) for pair in scenario["pairs"]
+              )
+              candidate = statistics.median(
+                  float(pair["candidate"]["ack_latency_p50_ms"])
+                  for pair in scenario["pairs"]
+              )
+              rows.append((rate, ratio, base, candidate))
+              if ratio > 1.50:
+                  raise SystemExit(
+                      f"rate={rate}: candidate/main callback p50 ratio {ratio:.4f} > 1.50"
+                  )
+          text = ["# Explicit PR252 callback-p50 gate", "", "| rate | main p50 | PR252 p50 | ratio |", "| ---: | ---: | ---: | ---: |"]
+          for rate, ratio, base, candidate in rows:
+              text.append(f"| {rate:,}/s | {base:.6f} ms | {candidate:.6f} ms | {ratio:.4f}x |")
+          (root / "p50-gate.md").write_text("\n".join(text) + "\n")
+          print((root / "p50-gate.md").read_text())
           PY
 
-          cat > docs/reports/SIMPLIFICATION-ARM64-REVALIDATION-2026-08-17.md <<'EOF'
-          # Simplification audit — ARM64 revalidation after issue #253
+      - name: Stop performance broker
+        if: always()
+        shell: bash
+        run: |
+          pidfile="$RUNNER_TEMP/mqttium-252-final/mosquitto.pid"
+          if [ -f "$pidfile" ]; then
+            pid="$(cat "$pidfile")"
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+          fi
 
-          Date: 2026-08-17
+      - name: Create isolated ARM64 functional venv
+        shell: bash
+        run: |
+          set -euo pipefail
+          venv="$RUNNER_TEMP/mqttium-252-final-test-venv"
+          rm -rf "$venv"
+          python3 -m venv "$venv"
+          echo "$venv/bin" >> "$GITHUB_PATH"
 
-          This report supersedes the performance acceptance conclusion of
-          `SIMPLIFICATION-AUDIT-2026-08-16.md` for PR #252 after rebasing that PR
-          onto the issue-#253 writer correction and the ARM64 runner integration.
-          The original report remains unchanged because dated reports record the
-          evidence available when they were written.
+      - name: Install candidate test dependencies
+        working-directory: candidate
+        run: python -m pip install -e ".[dev]"
 
-          ## Why the revalidation was necessary
+      - name: Candidate ARM64 unit tests
+        working-directory: candidate
+        run: python -m pytest -q -ra tests/unit
 
-          PR #254 changed the writer scheduling contract to preserve the eager
-          single-frame latency win while forcing tight synchronous producers back
-          through the existing batcher. PR #252 overlaps `_writer.py`, so its old
-          microbench evidence could not be treated as current after #254 landed.
-
-          The rebased #252 tree first passed the complete functional suite on exact
-          HEAD `3ee2a3c5a78b0ea487ddbdf7927665b519fddd45` (CI `32014996281`,
-          long fuzz `32014996232`, finalization `32014996294`). A strict Pi 5
-          current-main-vs-candidate campaign (`32015071488`) then found a real
-          scheduling regression that those functional tests cannot expose:
-
-          - closed-loop writer capacity A/A and A/B passed;
-          - paced-latency A/A passed;
-          - at 2,500 msg/s callback p50 moved from about 0.334 ms on current main
-            to about 1.361 ms on #252, roughly 4.07x, losing all eight pairs;
-          - at 10,000 msg/s callback p50 remained slightly favourable, but the
-            loop-lag ratio was about 6.35 and the strict campaign failed.
-
-          ## Attribution
-
-          A linear scan of all 17 rebased commits (`32015752809`) located the
-          transition exactly at rebased commit `832f808e413dd47fd922469110316751ba205906`,
-          `perf: remove Python frames from the publish and acknowledgement paths`.
-          The three preceding commits stayed near the ~0.33 ms regime; that commit
-          moved immediately onto the slower pacing plateau.
-
-          Source-isolated and interaction experiments then rejected simplistic
-          attribution:
-
-          - writer-only, inbound-only and outbound-only substitutions were neutral
-            in isolation (`32016075623`);
-          - `engine.py` alone contributed the largest movement, but no single file
-            reproduced the whole effect;
-          - restoring only `_send -> _emit` or only keyword `EngineEffect`
-            construction, even together with `_try_launch`, did not recover the
-            2,500 msg/s regime (`32018272639`);
-          - restoring the outbound forwarding wrappers was worse;
-          - reverting the writer's once-per-task `write_many` lookup was also worse
-            (`32018097989`), so that optimization is retained.
-
-          The smallest correction that consistently recovered the useful regime is
-          therefore the combination measured in `32017494910`:
-
-          1. restore the engine effect-emission boundary (`_send` delegates to
-             `_emit`, and `EngineEffect` is built through the explicit keyword
-             path);
-          2. restore the `_try_launch` admission/compensation boundary in
-             `OutboundSession`;
-          3. retain the independent `write_many` caching, inbound specialization,
-             and direct outbound effect forwarding that did not cause the issue.
-
-          In the screening campaign, this combination reduced the candidate's
-          2,500 msg/s p50 from the ~1.36 ms plateau to about 0.476 ms while keeping
-          10,000 msg/s favourable (~0.262 ms versus ~0.285 ms) and returning loop
-          lag to the comparable regime. That screening result is not final release
-          evidence; the corrected committed HEAD must pass a fresh exact-head A/A
-          plus A/B campaign.
-
-          ## Acceptance rule for the corrected PR
-
-          Revalidation is against the current post-#254/#255 main commit
-          `0999d8abfe44a568209209403d7f215b18cc4eb7`, not against the older rc5
-          capacity or pre-eager latency anchors alone. The corrected exact HEAD is
-          acceptable only if:
-
-          - the full functional CI/fuzz/finalization suite is green;
-          - strict closed-loop capacity A/A is valid and A/B retains at least 95%
-            of current main for QoS 0 and QoS 1;
-          - paced callback latency A/A is valid at 2,500 and 10,000 msg/s;
-          - paced A/B passes the existing completion and loop-lag gates;
-          - median candidate/main callback p50 is no worse than 1.50x at either
-            acceptance rate. This explicit p50 ceiling is required because the
-            original ~4x regression could otherwise be hidden when throughput is
-            neutral and the kernel pacing regime happens to keep loop lag inside
-            its own threshold.
-
-          The 1.50x ceiling is a regression guard against giving back the eager
-          writer improvement; it is not a claim that 50% degradation is a desired
-          target. The selected correction screened materially below that ceiling,
-          and the final exact-head numbers are recorded in the PR once available.
+      - name: Start functional broker
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/mqttium-252-final-functional"
+          rm -rf "$root" && mkdir -p "$root"
+          cat > "$root/mosquitto.conf" <<'EOF'
+          listener 11883 127.0.0.1
+          allow_anonymous true
+          persistence false
           EOF
+          mosquitto -c "$root/mosquitto.conf" > "$root/mosquitto.log" 2>&1 &
+          echo "$!" > "$root/mosquitto.pid"
+          for _ in $(seq 1 50); do
+            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            sleep 0.1
+          done
+          exit 1
 
-          git diff --check
-          test "$(git diff --name-only | sort)" = "$(printf '%s\n' docs/reports/SIMPLIFICATION-ARM64-REVALIDATION-2026-08-17.md src/mqttium/protocol/engine.py src/mqttium/protocol/outbound.py | sort)"
+      - name: Candidate ARM64 integration tests
+        working-directory: candidate
+        run: python -m pytest -q -ra tests/integration
 
-      - name: Targeted validation before write
-        uses: actions/setup-python@v7
+      - name: Stop functional broker
+        if: always()
+        shell: bash
+        run: |
+          pidfile="$RUNNER_TEMP/mqttium-252-final-functional/mosquitto.pid"
+          if [ -f "$pidfile" ]; then
+            pid="$(cat "$pidfile")"
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+          fi
+
+      - name: Upload exact-head evidence
+        if: always()
+        uses: actions/upload-artifact@v7
         with:
-          python-version: "3.13"
-
-      - name: Run focused correctness and quality gates
-        shell: bash
-        run: |
-          set -euo pipefail
-          python -m pip install -e ".[dev]"
-          python -m ruff format --check src/mqttium/protocol/engine.py src/mqttium/protocol/outbound.py
-          python -m ruff check src/mqttium/protocol/engine.py src/mqttium/protocol/outbound.py
-          python -m pytest -q \
-            tests/unit/test_qos_engine.py \
-            tests/unit/test_outbound_transaction.py \
-            tests/unit/test_write_pump_eager.py \
-            tests/unit/test_batch_receipt_progress.py \
-            tests/unit/test_performance_contracts.py
-
-      - name: Commit and push with exact lease
-        shell: bash
-        run: |
-          set -euo pipefail
-          git config user.name yoch
-          git config user.email yoch.melka@gmail.com
-          git add \
-            src/mqttium/protocol/engine.py \
-            src/mqttium/protocol/outbound.py \
-            docs/reports/SIMPLIFICATION-ARM64-REVALIDATION-2026-08-17.md
-          git commit -m "perf: preserve eager writer scheduling after simplification"
-          git fetch --no-tags origin "+refs/heads/${TARGET_BRANCH}:refs/remotes/origin/target-final"
-          test "$(git rev-parse refs/remotes/origin/target-final)" = "$EXPECTED_HEAD"
-          git push \
-            --force-with-lease="refs/heads/${TARGET_BRANCH}:${EXPECTED_HEAD}" \
-            origin "HEAD:refs/heads/${TARGET_BRANCH}"
+          name: arm64-pr252-final-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/mqttium-252-final/*.json
+            ${{ runner.temp }}/mqttium-252-final/*.md
+            ${{ runner.temp }}/mqttium-252-final/mosquitto.log
+            ${{ runner.temp }}/mqttium-252-final-functional/mosquitto.log
+          if-no-files-found: warn
+          retention-days: 30
