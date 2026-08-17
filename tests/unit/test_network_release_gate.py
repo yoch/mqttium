@@ -109,14 +109,10 @@ def test_same_code_control_does_not_require_ci_to_contain_exactly_one() -> None:
 def test_regression_gate_uses_confidence_bounds_not_raw_arm_cv() -> None:
     throughput = paired_ratio_estimate([0.99, 1.01] * 6, ORDERS_12)
     ack = paired_ratio_estimate([0.98, 1.02] * 6, ORDERS_12)
-    assert regression_failures(
-        "cell", throughput, ack, min_throughput=0.95, max_ack_p50=1.10
-    ) == []
+    assert regression_failures("cell", throughput, ack, min_throughput=0.95, max_ack_p50=1.10) == []
 
     slow = paired_ratio_estimate([0.92] * 12, ORDERS_12)
-    failures = regression_failures(
-        "cell", slow, ack, min_throughput=0.95, max_ack_p50=1.10
-    )
+    failures = regression_failures("cell", slow, ack, min_throughput=0.95, max_ack_p50=1.10)
     assert any("throughput lower 95% bound" in failure for failure in failures)
 
     latent = paired_ratio_estimate([1.15] * 12, ORDERS_12)
@@ -232,9 +228,7 @@ def test_seeded_engine_cycle_sets_pythonhashseed(
     raw_dir = tmp_path / "raw"
     raw_dir.mkdir()
 
-    def fake_run(
-        command: list[str], *, check: bool, env: dict[str, str]
-    ) -> SimpleNamespace:
+    def fake_run(command: list[str], *, check: bool, env: dict[str, str]) -> SimpleNamespace:
         assert check is False
         assert env["PYTHONHASHSEED"] == "5"
         output = Path(command[command.index("--output") + 1])
