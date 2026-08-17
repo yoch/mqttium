@@ -270,8 +270,15 @@ class ProtocolEngine:
         self._emit(EffectKind.SEND, packet)
 
     def begin_connect(self) -> bytes:
-        if self.state in (ConnectionState.CONNECTED, ConnectionState.CONNECTING):
-            raise ProtocolError("Already connected or connecting")
+        if self.state in (
+            ConnectionState.CONNECTED,
+            ConnectionState.CONNECTING,
+            ConnectionState.DISCONNECTING,
+        ):
+            # DISCONNECTING included: the final DISCONNECT is still draining to
+            # the transport, so a CONNECT now would race the teardown and flip
+            # the state machine to CONNECTING under a closing connection.
+            raise ProtocolError("Already connected, connecting or disconnecting")
 
         clean_start = self.config.clean_start
         if self._prefer_session_resume:
@@ -538,7 +545,11 @@ class ProtocolEngine:
         # DISCONNECT is the client's final MQTT Control Packet. The peer may still
         # have packets already in flight before the transport actually closes, but
         # dispatching them could emit ACKs or user-visible effects after DISCONNECT.
-        if self.state is ConnectionState.DISCONNECTING:
+        # The same applies to every terminal state: once DISCONNECTED (broker
+        # DISCONNECT, refused CONNACK or local teardown), buffered trailing
+        # packets would otherwise surface as a PROTOCOL_ERROR that masks the
+        # real disconnect reason at the runtime boundary.
+        if self.state in (ConnectionState.DISCONNECTING, ConnectionState.DISCONNECTED):
             return
         try:
             validate_raw_packet(raw)
