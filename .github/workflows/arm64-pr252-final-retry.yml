@@ -1,4 +1,4 @@
-name: ARM64 PR252 Bounded Closed-Loop Diagnostic
+name: ARM64 Paired-Network MID Generation Probe
 
 on:
   push:
@@ -10,7 +10,7 @@ permissions:
 jobs:
   validate:
     runs-on: [self-hosted, linux, ARM64]
-    timeout-minutes: 30
+    timeout-minutes: 10
     env:
       PYTHONUNBUFFERED: "1"
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
@@ -44,20 +44,21 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Verify exact endpoints and untouched harness
+      - name: Verify exact endpoints
         shell: bash
         run: |
           set -euo pipefail
           test "$(git -C base rev-parse HEAD)" = "$BASE_SHA"
           test "$(git -C candidate rev-parse HEAD)" = "$CANDIDATE_SHA"
           test "$(git -C candidate merge-base "$BASE_SHA" "$CANDIDATE_SHA")" = "$BASE_SHA"
+          test "$(git -C base hash-object benchmarks/paired_network.py)" = "$(git -C candidate hash-object benchmarks/paired_network.py)"
           test -z "$(git -C base status --porcelain)"
           test -z "$(git -C candidate status --porcelain)"
 
       - name: Create benchmark venv
         shell: bash
         run: |
-          v="$RUNNER_TEMP/m252-net-v"
+          v="$RUNNER_TEMP/m252-mid-v"
           rm -rf "$v"
           python3 -m venv "$v"
           echo "$v/bin" >> "$GITHUB_PATH"
@@ -67,7 +68,7 @@ jobs:
       - name: Fresh strict preflight
         working-directory: base
         run: |
-          r="$RUNNER_TEMP/m252-net"
+          r="$RUNNER_TEMP/m252-mid"
           rm -rf "$r"
           mkdir -p "$r"
           python benchmarks/runner_probe.py --output "$r/runner.json" --require-temperature --enforce
@@ -76,7 +77,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          r="$RUNNER_TEMP/m252-net"
+          r="$RUNNER_TEMP/m252-mid"
           cat >"$r/mosquitto.conf" <<'EOF'
           persistence false
           allow_anonymous true
@@ -95,145 +96,107 @@ jobs:
           done
           exit 1
 
-      - name: Main A/A bounded cells
+      - name: Build temporary FIFO-by-MID-generation harness
         shell: bash
         run: |
           set -euo pipefail
-          r="$RUNNER_TEMP/m252-net"
-          for w in 1 8 64; do
-            echo "[$(date -Is)] START main A/A window=$w count=4000 repeat=4"
-            timeout --signal=TERM --kill-after=5s 120s \
-              python candidate/benchmarks/paired_network.py --base-root base --candidate-root base \
-                --protocols 311 --payloads 256 --windows "$w" --completions callback \
-                --repeat 4 --count-small 4000 --target-sample-seconds 0.1 --max-count 4000 \
-                --timeout 45 --cpu 2 --policy advisory --preflight-report "$r/runner.json" \
-                --output "$r/main-aa-w${w}.json" --summary-output "$r/main-aa-w${w}.md"
-            echo "[$(date -Is)] DONE  main A/A window=$w"
-          done
-
-      - name: PR252 A/A bounded cells
-        shell: bash
-        run: |
-          set -euo pipefail
-          r="$RUNNER_TEMP/m252-net"
-          for w in 1 8 64; do
-            echo "[$(date -Is)] START PR252 A/A window=$w count=4000 repeat=4"
-            timeout --signal=TERM --kill-after=5s 120s \
-              python candidate/benchmarks/paired_network.py --base-root candidate --candidate-root candidate \
-                --protocols 311 --payloads 256 --windows "$w" --completions callback \
-                --repeat 4 --count-small 4000 --target-sample-seconds 0.1 --max-count 4000 \
-                --timeout 45 --cpu 2 --policy advisory --preflight-report "$r/runner.json" \
-                --output "$r/candidate-aa-w${w}.json" --summary-output "$r/candidate-aa-w${w}.md"
-            echo "[$(date -Is)] DONE  PR252 A/A window=$w"
-          done
-
-      - name: Main versus PR252 bounded cells
-        shell: bash
-        run: |
-          set -euo pipefail
-          r="$RUNNER_TEMP/m252-net"
-          for w in 1 8 64; do
-            echo "[$(date -Is)] START A/B window=$w count=4000 repeat=4"
-            timeout --signal=TERM --kill-after=5s 120s \
-              python candidate/benchmarks/paired_network.py --base-root base --candidate-root candidate \
-                --protocols 311 --payloads 256 --windows "$w" --completions callback \
-                --repeat 4 --count-small 4000 --target-sample-seconds 0.1 --max-count 4000 \
-                --timeout 45 --cpu 2 --policy advisory --preflight-report "$r/runner.json" \
-                --output "$r/ab-w${w}.json" --summary-output "$r/ab-w${w}.md"
-            echo "[$(date -Is)] DONE  A/B window=$w"
-          done
-
-      - name: Enforce symmetric controls and comparison gates
-        shell: bash
-        run: |
-          ROOT="$RUNNER_TEMP/m252-net" python - <<'PY'
-          import json, os, statistics
+          r="$RUNNER_TEMP/m252-mid"
+          cp candidate/benchmarks/paired_network.py "$r/paired_network_fifo.py"
+          HARNESS="$r/paired_network_fifo.py" python - <<'PY'
+          import os
           from pathlib import Path
 
-          root = Path(os.environ["ROOT"])
-          failures = []
-          lines = [
-              "# PR252 bounded closed-loop diagnostic",
-              "",
-              "Every cell uses exactly 4,000 messages, repeat=4, and an external 120s wall-clock timeout.",
-              "",
-              "| run | window | ack ratio | base ack CV | cand ack CV | p50 ratio | ack-p50 ratio |",
-              "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+          p = Path(os.environ["HARNESS"])
+          text = p.read_text()
+          replacements = [
+              (
+                  '''    completed: asyncio.Queue[tuple[int, int]] = asyncio.Queue()\n    publish_started: dict[int, int] = {}\n    early_completion: dict[int, int] = {}\n''',
+                  '''    # Completion queue carries the generation's start timestamp, not only MID.\n    completed: asyncio.Queue[tuple[int, int]] = asyncio.Queue()\n    publish_started: dict[int, deque[int]] = {}\n    early_completion: dict[int, deque[int]] = {}\n''',
+              ),
+              (
+                  '''            if mid in publish_started:\n                completed.put_nowait((mid, finished))\n            else:\n                early_completion[mid] = finished\n''',
+                  '''            starts = publish_started.get(mid)\n            if starts:\n                sent_ns = starts.popleft()\n                if not starts:\n                    publish_started.pop(mid, None)\n                completed.put_nowait((sent_ns, finished))\n            else:\n                early_completion.setdefault(mid, deque()).append(finished)\n''',
+              ),
+              (
+                  '''            assert receipt.mid is not None\n            publish_started[receipt.mid] = published_ns\n            if receipt.mid in early_completion:\n                completed.put_nowait((receipt.mid, early_completion.pop(receipt.mid)))\n            outstanding += 1\n            if outstanding >= window:\n                mid, finished = await completed.get()\n                ack_latencies.append((finished - publish_started.pop(mid)) / 1_000_000)\n                outstanding -= 1\n''',
+                  '''            assert receipt.mid is not None\n            starts = publish_started.setdefault(receipt.mid, deque())\n            starts.append(published_ns)\n            early = early_completion.get(receipt.mid)\n            if early:\n                finished = early.popleft()\n                sent_ns = starts.popleft()\n                if not starts:\n                    publish_started.pop(receipt.mid, None)\n                if not early:\n                    early_completion.pop(receipt.mid, None)\n                completed.put_nowait((sent_ns, finished))\n            outstanding += 1\n            if outstanding >= window:\n                sent_ns, finished = await completed.get()\n                ack_latencies.append((finished - sent_ns) / 1_000_000)\n                outstanding -= 1\n''',
+              ),
+              (
+                  '''    else:\n        for _ in range(outstanding):\n            mid, finished = await completed.get()\n            ack_latencies.append((finished - publish_started.pop(mid)) / 1_000_000)\n    elapsed = time.perf_counter() - started\n''',
+                  '''    else:\n        for _ in range(outstanding):\n            sent_ns, finished = await completed.get()\n            ack_latencies.append((finished - sent_ns) / 1_000_000)\n        if publish_started or early_completion:\n            raise RuntimeError(\n                f"callback generation accounting leaked starts={sum(map(len, publish_started.values()))} "\n                f"early={sum(map(len, early_completion.values()))}"\n            )\n    elapsed = time.perf_counter() - started\n''',
+              ),
           ]
+          for old, new in replacements:
+              assert text.count(old) == 1, old
+              text = text.replace(old, new)
+          p.write_text(text)
+          PY
+          python -m py_compile "$r/paired_network_fifo.py"
+          echo "Temporary harness patched; exact source trees remain untouched"
+          test -z "$(git -C base status --porcelain)"
+          test -z "$(git -C candidate status --porcelain)"
 
-          def cv(values):
-              mean = statistics.fmean(values)
-              return statistics.stdev(values) / mean if len(values) > 1 and mean else 0.0
+      - name: Main window=8 with FIFO generation tracking
+        shell: bash
+        run: |
+          set -euo pipefail
+          r="$RUNNER_TEMP/m252-mid"
+          echo "[$(date -Is)] START main A/A window=8"
+          timeout --signal=TERM --kill-after=5s 90s \
+            python "$r/paired_network_fifo.py" --base-root base --candidate-root base \
+              --protocols 311 --payloads 256 --windows 8 --completions callback \
+              --repeat 4 --count-small 4000 --target-sample-seconds 0.1 --max-count 4000 \
+              --timeout 20 --cpu 2 --policy strict --preflight-report "$r/runner.json" \
+              --output "$r/main-aa.json" --summary-output "$r/main-aa.md"
+          echo "[$(date -Is)] DONE main A/A window=8"
 
-          def inspect(path, label, same_tree):
-              data = json.loads((root / path).read_text())
-              if data.get("eligibility", {}).get("eligible") is not True:
-                  failures.append(f"{label}: runner ineligible")
-              if data.get("status") == "invalid":
-                  failures.append(f"{label}: harness invalid: {data.get('failures')}")
-              scenario = data["scenarios"][0]
-              pairs = scenario["pairs"]
-              base_ack = [float(p["base"]["publisher_ack_msg_s"]) for p in pairs]
-              cand_ack = [float(p["candidate"]["publisher_ack_msg_s"]) for p in pairs]
-              base_p50 = [float(p["base"]["latency_p50_ms"]) for p in pairs]
-              cand_p50 = [float(p["candidate"]["latency_p50_ms"]) for p in pairs]
-              base_ack_p50 = [float(p["base"]["ack_latency_p50_ms"]) for p in pairs]
-              cand_ack_p50 = [float(p["candidate"]["ack_latency_p50_ms"]) for p in pairs]
-              ack_ratio = statistics.median(c / b for b, c in zip(base_ack, cand_ack))
-              p50_ratio = statistics.median(c / b for b, c in zip(base_p50, cand_p50))
-              ack_p50_ratio = statistics.median(c / b for b, c in zip(base_ack_p50, cand_ack_p50))
-              bcv, ccv = cv(base_ack), cv(cand_ack)
-              window = int(scenario["window"])
-              lines.append(
-                  f"| {label} | {window} | {ack_ratio:.4f}x | {bcv:.2%} | {ccv:.2%} | {p50_ratio:.4f}x | {ack_p50_ratio:.4f}x |"
+      - name: PR252 window=8 with FIFO generation tracking
+        shell: bash
+        run: |
+          set -euo pipefail
+          r="$RUNNER_TEMP/m252-mid"
+          echo "[$(date -Is)] START PR252 A/A window=8"
+          timeout --signal=TERM --kill-after=5s 90s \
+            python "$r/paired_network_fifo.py" --base-root candidate --candidate-root candidate \
+              --protocols 311 --payloads 256 --windows 8 --completions callback \
+              --repeat 4 --count-small 4000 --target-sample-seconds 0.1 --max-count 4000 \
+              --timeout 20 --cpu 2 --policy strict --preflight-report "$r/runner.json" \
+              --output "$r/candidate-aa.json" --summary-output "$r/candidate-aa.md"
+          echo "[$(date -Is)] DONE PR252 A/A window=8"
+
+      - name: Summarize fixed-harness controls
+        shell: bash
+        run: |
+          ROOT="$RUNNER_TEMP/m252-mid" python - <<'PY'
+          import json, os
+          from pathlib import Path
+          root = Path(os.environ["ROOT"])
+          for name in ("main-aa", "candidate-aa"):
+              data = json.loads((root / f"{name}.json").read_text())
+              s = data["scenarios"][0]
+              print(
+                  f"{name}: status={data['status']} ratio={s['median_candidate_over_base_ack']:.4f} "
+                  f"base_cv={s['base_ack_cv']:.2%} candidate_cv={s['candidate_ack_cv']:.2%} "
+                  f"p50_base={s['base_median_p50_ms']:.6f}ms p50_candidate={s['candidate_median_p50_ms']:.6f}ms"
               )
-              if bcv > 0.05:
-                  failures.append(f"{label} window={window}: base ack CV {bcv:.2%} > 5%")
-              if ccv > 0.05:
-                  failures.append(f"{label} window={window}: candidate ack CV {ccv:.2%} > 5%")
-              if same_tree:
-                  if not 0.95 <= ack_ratio <= 1.05:
-                      failures.append(f"{label} window={window}: same-tree ack ratio {ack_ratio:.4f} outside 0.95..1.05")
-              else:
-                  if ack_ratio < 0.95:
-                      failures.append(f"{label} window={window}: PR252/main ack ratio {ack_ratio:.4f} < 0.95")
-                  if p50_ratio > 1.10:
-                      failures.append(f"{label} window={window}: end-to-end p50 ratio {p50_ratio:.4f} > 1.10")
-                  if ack_p50_ratio > 1.10:
-                      failures.append(f"{label} window={window}: ACK p50 ratio {ack_p50_ratio:.4f} > 1.10")
-
-          for w in (1, 8, 64):
-              inspect(f"main-aa-w{w}.json", "main A/A", True)
-              inspect(f"candidate-aa-w{w}.json", "PR252 A/A", True)
-              inspect(f"ab-w{w}.json", "A/B", False)
-
-          lines.extend(("", "## Verdict", ""))
-          if failures:
-              lines.append("**FAILED / INVALID**")
-              lines.extend(f"- {failure}" for failure in failures)
-          else:
-              lines.append("**PASSED**")
-          (root / "gate.md").write_text("\n".join(lines) + "\n")
-          print("\n".join(lines))
-          if failures:
-              raise SystemExit(1)
           PY
 
       - name: Stop broker
         if: always()
         shell: bash
         run: |
-          f="$RUNNER_TEMP/m252-net/pid"
+          f="$RUNNER_TEMP/m252-mid/pid"
           [ ! -f "$f" ] || { p=$(cat "$f"); kill "$p" 2>/dev/null || true; wait "$p" 2>/dev/null || true; }
 
       - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: arm64-pr252-bounded-network-${{ github.run_id }}
+          name: arm64-pr252-mid-generation-${{ github.run_id }}
           path: |
-            ${{ runner.temp }}/m252-net/*.json
-            ${{ runner.temp }}/m252-net/*.md
-            ${{ runner.temp }}/m252-net/mosquitto.log
+            ${{ runner.temp }}/m252-mid/*.json
+            ${{ runner.temp }}/m252-mid/*.md
+            ${{ runner.temp }}/m252-mid/paired_network_fifo.py
+            ${{ runner.temp }}/m252-mid/mosquitto.log
           if-no-files-found: error
           retention-days: 30
