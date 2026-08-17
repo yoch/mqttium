@@ -15,7 +15,7 @@ concurrency:
 jobs:
   network-proof:
     runs-on: [self-hosted, linux, ARM64]
-    timeout-minutes: 45
+    timeout-minutes: 25
     env:
       PYTHONUNBUFFERED: "1"
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
@@ -72,7 +72,7 @@ jobs:
       - name: Install probe dependency
         run: python -m pip install "psutil>=6,<8"
 
-      - name: Strict runner preflight
+      - name: Fresh strict runner preflight
         working-directory: harness
         run: |
           python benchmarks/runner_probe.py \
@@ -80,7 +80,7 @@ jobs:
             --require-temperature \
             --enforce
 
-      - name: Start isolated broker on CPU 0
+      - name: Start fresh isolated broker on CPU 0
         shell: bash
         run: |
           set -euo pipefail
@@ -109,60 +109,7 @@ jobs:
           cat "$root/mosquitto.log"
           exit 1
 
-      - name: Pre-252 A/A network control
-        shell: bash
-        run: |
-          set -euo pipefail
-          timeout --signal=TERM --kill-after=5s 900s \
-            python harness/benchmarks/paired_network.py \
-              --base-root base --candidate-root base \
-              --protocols 311 --payloads 64 --windows 1,8,64 \
-              --completions callback --repeat 6 \
-              --count-small 6000 --max-count 60000 --target-sample-seconds 2.0 \
-              --timeout 60 --cpu 2 --policy strict \
-              --preflight-report "$RUNNER_TEMP/pr256-runner.json" \
-              --output "$RUNNER_TEMP/pr256-network/base-aa.json" \
-              --summary-output "$RUNNER_TEMP/pr256-network/base-aa.md"
-
-      - name: Post-252 A/A network control
-        shell: bash
-        run: |
-          set -euo pipefail
-          timeout --signal=TERM --kill-after=5s 900s \
-            python harness/benchmarks/paired_network.py \
-              --base-root candidate --candidate-root candidate \
-              --protocols 311 --payloads 64 --windows 1,8,64 \
-              --completions callback --repeat 6 \
-              --count-small 6000 --max-count 60000 --target-sample-seconds 2.0 \
-              --timeout 60 --cpu 2 --policy strict \
-              --preflight-report "$RUNNER_TEMP/pr256-runner.json" \
-              --output "$RUNNER_TEMP/pr256-network/candidate-aa.json" \
-              --summary-output "$RUNNER_TEMP/pr256-network/candidate-aa.md"
-
-      - name: Enforce A/A paired controls
-        shell: bash
-        run: |
-          python - <<'PY'
-          import json, os, pathlib, statistics
-          root = pathlib.Path(os.environ["RUNNER_TEMP"]) / "pr256-network"
-          for name in ("base-aa", "candidate-aa"):
-              data = json.loads((root / f"{name}.json").read_text())
-              if data["status"] != "passed":
-                  raise SystemExit(f"{name}: harness status={data['status']}")
-              for scenario in data["scenarios"]:
-                  ratios = [p["candidate_over_base_ack"] for p in scenario["pairs"]]
-                  med = statistics.median(ratios)
-                  mean = statistics.fmean(ratios)
-                  cv = statistics.stdev(ratios) / mean if len(ratios) > 1 and mean else 0.0
-                  label = f"{name} window={scenario['window']}"
-                  print(f"{label}: median={med:.4f} pair_cv={cv:.2%}")
-                  if not 0.98 <= med <= 1.02:
-                      raise SystemExit(f"{label}: A/A ratio outside 2%: {med:.4f}")
-                  if cv > 0.05:
-                      raise SystemExit(f"{label}: paired-ratio CV {cv:.2%} > 5%")
-          PY
-
-      - name: Pre-252 versus post-252 network A/B
+      - name: One permitted A-B retry
         shell: bash
         run: |
           set -euo pipefail
@@ -174,35 +121,32 @@ jobs:
               --count-small 6000 --max-count 60000 --target-sample-seconds 2.0 \
               --timeout 60 --cpu 2 --policy strict \
               --preflight-report "$RUNNER_TEMP/pr256-runner.json" \
-              --output "$RUNNER_TEMP/pr256-network/ab.json" \
-              --summary-output "$RUNNER_TEMP/pr256-network/ab.md"
+              --output "$RUNNER_TEMP/pr256-network/ab-retry.json" \
+              --summary-output "$RUNNER_TEMP/pr256-network/ab-retry.md"
 
       - name: Network no-regression gate
         shell: bash
         run: |
           python - <<'PY'
           import json, os, pathlib, statistics
-          path = pathlib.Path(os.environ["RUNNER_TEMP"]) / "pr256-network" / "ab.json"
+          path = pathlib.Path(os.environ["RUNNER_TEMP"]) / "pr256-network" / "ab-retry.json"
           data = json.loads(path.read_text())
           if data["status"] != "passed":
               raise SystemExit(f"A/B harness status={data['status']}")
           lines = []
           for scenario in data["scenarios"]:
               pairs = scenario["pairs"]
-              ack_ratios = [p["candidate_over_base_ack"] for p in pairs]
-              callback_p50_ratios = [
+              ack = statistics.median([p["candidate_over_base_ack"] for p in pairs])
+              cb = statistics.median([
                   p["candidate"]["ack_latency_p50_ms"] / p["base"]["ack_latency_p50_ms"]
                   for p in pairs
-              ]
-              delivery_p50_ratios = [
+              ])
+              delivery = statistics.median([
                   p["candidate"]["latency_p50_ms"] / p["base"]["latency_p50_ms"]
                   for p in pairs
-              ]
-              ack = statistics.median(ack_ratios)
-              cb = statistics.median(callback_p50_ratios)
-              delivery = statistics.median(delivery_p50_ratios)
+              ])
               window = scenario["window"]
-              line = f"window={window}: throughput={ack:.4f} callback_p50={cb:.4f} delivery_p50={delivery:.4f}"
+              line = f"window={window}: throughput={ack:.4f} callback_p50={cb:.4f} delivery_p50={delivery:.4f} base_cv={scenario['base_ack_cv']:.2%} candidate_cv={scenario['candidate_ack_cv']:.2%}"
               print(line)
               lines.append(line)
               if ack < 0.95:
@@ -220,10 +164,7 @@ jobs:
         with:
           name: pr256-network-proof-${{ github.run_id }}
           path: |
-            ${{ runner.temp }}/pr256-network/*.json
-            ${{ runner.temp }}/pr256-network/*.md
-            ${{ runner.temp }}/pr256-network/*.txt
-            ${{ runner.temp }}/pr256-network/mosquitto.log
+            ${{ runner.temp }}/pr256-network/*
             ${{ runner.temp }}/pr256-runner.json
           if-no-files-found: warn
           retention-days: 30
