@@ -1,107 +1,206 @@
-name: ARM64 Simplification Engine Split
+name: Apply Simplification Scheduling Correction
 
 on:
   push:
     branches: [agent/arm64-runner-probe]
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  split:
-    runs-on: [self-hosted, linux, ARM64]
-    timeout-minutes: 30
+  apply:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
     env:
-      PYTHONUNBUFFERED: "1"
-      PIP_DISABLE_PIP_VERSION_CHECK: "1"
-      MAIN_SHA: 0999d8abfe44a568209209403d7f215b18cc4eb7
-      FINAL_SHA: 3ee2a3c5a78b0ea487ddbdf7927665b519fddd45
+      TARGET_BRANCH: refactor/simplification-audit-2026-08-16
+      EXPECTED_HEAD: 3ee2a3c5a78b0ea487ddbdf7927665b519fddd45
+      EXPECTED_MAIN: 0999d8abfe44a568209209403d7f215b18cc4eb7
+
     steps:
-      - name: Verify host
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "$(uname -m)" = aarch64
-          command -v python3; command -v mosquitto; command -v taskset
-          test "$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor | sort -u)" = performance
-          if pgrep -a mosquitto; then exit 1; fi
-      - uses: actions/checkout@v7
-        with: {ref: "${{ env.MAIN_SHA }}", path: base, persist-credentials: false}
-      - uses: actions/checkout@v7
-        with: {ref: "${{ env.FINAL_SHA }}", path: final, persist-credentials: false}
-      - name: Build send+launch and constructor+launch variants
-        shell: bash
-        run: |
-          set -euo pipefail
-          r="$RUNNER_TEMP/m252-split"; rm -rf "$r"; mkdir -p "$r/results"
-          cp -a final "$r/send_launch"; cp -a final "$r/constructor_launch"
-          ROOT="$r" python - <<'PY'
-          import os
-          from pathlib import Path
-          root=Path(os.environ['ROOT'])
-          launch_old='''            if topic_bytes is not None and self.flow.try_acquire():\n                self._launch(msg, _property_bytes=property_bytes, _topic_bytes=topic_bytes)\n                return PublishHandle(mid=mid, qos=qos)\n'''
-          launch_new='''            if self._engine.state == ConnectionState.CONNECTED and self._try_launch(\n                msg, _property_bytes=property_bytes, _topic_bytes=topic_bytes\n            ):\n                return PublishHandle(mid=mid, qos=qos)\n'''
-          method='''    def _try_launch(\n        self, msg: OutboundMessage, *, _property_bytes: bytes | None = None,\n        _topic_bytes: bytes | None = None,\n    ) -> bool:\n        if not self.flow.try_acquire():\n            return False\n        try:\n            self._launch(msg, _property_bytes=_property_bytes, _topic_bytes=_topic_bytes)\n        except Exception:\n            self.flow.release()\n            raise\n        return True\n\n'''
-          anchor='    def _retransmit(self, msg: OutboundMessage) -> None:\n'
-          for name in ('send_launch','constructor_launch'):
-              p=root/name/'src/mqttium/protocol/outbound.py'; t=p.read_text()
-              assert t.count(launch_old)==1 and t.count(anchor)==1
-              p.write_text(t.replace(launch_old,launch_new).replace(anchor,method+anchor))
-
-          # send_launch: only restore _send delegation; keep positional EngineEffect construction.
-          p=root/'send_launch/src/mqttium/protocol/engine.py'; t=p.read_text()
-          old='''    def _send(self, packet: WriteItem) -> None:\n        # Appends directly rather than delegating to _emit: SEND is the most\n        # frequent effect and this is one Python frame per outbound packet.\n        self._effects.append(EngineEffect(EffectKind.SEND, packet, False, None))\n'''
-          new='''    def _send(self, packet: WriteItem) -> None:\n        self._emit(EffectKind.SEND, packet)\n'''
-          assert t.count(old)==1; p.write_text(t.replace(old,new))
-
-          # constructor_launch: only restore keyword construction; keep direct _send append.
-          p=root/'constructor_launch/src/mqttium/protocol/engine.py'; t=p.read_text()
-          old='''        self._effects.append(\n            EngineEffect(kind, data, requires_delivery_mark, decoded_property_wire_size)\n        )\n'''
-          new='''        self._effects.append(\n            EngineEffect(\n                kind=kind,\n                data=data,\n                requires_delivery_mark=requires_delivery_mark,\n                decoded_property_wire_size=decoded_property_wire_size,\n            )\n        )\n'''
-          assert t.count(old)==1; p.write_text(t.replace(old,new))
-          PY
-      - name: Venv
-        shell: bash
-        run: |
-          v="$RUNNER_TEMP/m252-split-v"; rm -rf "$v"; python3 -m venv "$v"; echo "$v/bin" >> "$GITHUB_PATH"
-      - run: python -m pip install "psutil>=6,<8"
-      - name: Preflight
-        working-directory: base
-        run: python benchmarks/runner_probe.py --output "$RUNNER_TEMP/m252-split/runner.json" --require-temperature --enforce
-      - name: Broker
-        shell: bash
-        run: |
-          set -euo pipefail
-          r="$RUNNER_TEMP/m252-split"; cat >"$r/mosquitto.conf" <<'EOF'
-          persistence false
-          allow_anonymous true
-          max_inflight_messages 1000
-          max_queued_messages 100000
-          max_queued_bytes 0
-          connection_messages false
-          log_type error
-          listener 11883 127.0.0.1
-          EOF
-          taskset -c 0 mosquitto -c "$r/mosquitto.conf" >"$r/mosquitto.log" 2>&1 & echo $! >"$r/pid"
-          for _ in $(seq 1 50); do (echo >/dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0; sleep .1; done; exit 1
-      - name: Measure
-        shell: bash
-        run: |
-          set -euo pipefail
-          r="$RUNNER_TEMP/m252-split"
-          for v in send_launch constructor_launch; do
-            python base/benchmarks/paired_open_loop.py --base-root base --candidate-root "$r/$v" \
-              --protocols 311 --payloads 256 --windows 64 --target-rates 2500,10000 \
-              --completions callback --repeat 6 --count-small 4000 --timeout 120 --cpu 2 \
-              --policy advisory --preflight-report "$r/runner.json" \
-              --output "$r/results/$v.json" --summary-output "$r/results/$v.md"
-          done
-      - if: always()
-        uses: actions/upload-artifact@v7
+      - name: Check out exact target branch
+        uses: actions/checkout@v7
         with:
-          name: arm64-pr252-engine-split-${{ github.run_id }}
-          path: ${{ runner.temp }}/m252-split/*
-          retention-days: 30
-      - if: always()
+          ref: ${{ env.EXPECTED_HEAD }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Pin remote endpoints before editing
         shell: bash
-        run: '[ ! -f "$RUNNER_TEMP/m252-split/pid" ] || { p=$(cat "$RUNNER_TEMP/m252-split/pid"); kill "$p" 2>/dev/null || true; wait "$p" 2>/dev/null || true; }'
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin \
+            "+refs/heads/main:refs/remotes/origin/main" \
+            "+refs/heads/${TARGET_BRANCH}:refs/remotes/origin/target"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          test "$(git rev-parse refs/remotes/origin/target)" = "$EXPECTED_HEAD"
+          test "$(git rev-parse refs/remotes/origin/main)" = "$EXPECTED_MAIN"
+          test "$(git merge-base HEAD refs/remotes/origin/main)" = "$EXPECTED_MAIN"
+
+      - name: Apply only the measured scheduling correction
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          engine = Path("src/mqttium/protocol/engine.py")
+          text = engine.read_text()
+          old = '''        self._effects.append(\n            EngineEffect(kind, data, requires_delivery_mark, decoded_property_wire_size)\n        )\n\n    def _send(self, packet: WriteItem) -> None:\n        # Appends directly rather than delegating to _emit: SEND is the most\n        # frequent effect and this is one Python frame per outbound packet.\n        self._effects.append(EngineEffect(EffectKind.SEND, packet, False, None))\n'''
+          new = '''        self._effects.append(\n            EngineEffect(\n                kind=kind,\n                data=data,\n                requires_delivery_mark=requires_delivery_mark,\n                decoded_property_wire_size=decoded_property_wire_size,\n            )\n        )\n\n    def _send(self, packet: WriteItem) -> None:\n        self._emit(EffectKind.SEND, packet)\n'''
+          assert text.count(old) == 1, "unexpected engine effect hotpath shape"
+          engine.write_text(text.replace(old, new))
+
+          outbound = Path("src/mqttium/protocol/outbound.py")
+          text = outbound.read_text()
+          old = '''            if topic_bytes is not None and self.flow.try_acquire():\n                self._launch(msg, _property_bytes=property_bytes, _topic_bytes=topic_bytes)\n                return PublishHandle(mid=mid, qos=qos)\n'''
+          new = '''            if self._engine.state == ConnectionState.CONNECTED and self._try_launch(\n                msg, _property_bytes=property_bytes, _topic_bytes=topic_bytes\n            ):\n                return PublishHandle(mid=mid, qos=qos)\n'''
+          assert text.count(old) == 1, "unexpected outbound launch hotpath shape"
+          assert "    def _try_launch(" not in text
+          text = text.replace(old, new)
+          anchor = "    def _retransmit(self, msg: OutboundMessage) -> None:\n"
+          method = '''    def _try_launch(\n        self,\n        msg: OutboundMessage,\n        *,\n        _property_bytes: bytes | None = None,\n        _topic_bytes: bytes | None = None,\n    ) -> bool:\n        if not self.flow.try_acquire():\n            return False\n        try:\n            self._launch(msg, _property_bytes=_property_bytes, _topic_bytes=_topic_bytes)\n        except Exception:\n            self.flow.release()\n            raise\n        return True\n\n'''
+          assert text.count(anchor) == 1
+          outbound.write_text(text.replace(anchor, method + anchor))
+
+          # The independent writer lookup optimization did not cause the timing
+          # regression and its rollback was measurably worse. Keep it.
+          writer = Path("src/mqttium/api/_writer.py").read_text()
+          assert 'write_many = getattr(transport, "write_many", None)' in writer
+          assert "_write_contiguous(transport, write_many, contiguous)" in writer
+          assert "self._eager_armed" in writer
+          assert "def _rearm_eager_if_idle" in writer
+          PY
+
+          cat > docs/reports/SIMPLIFICATION-ARM64-REVALIDATION-2026-08-17.md <<'EOF'
+          # Simplification audit — ARM64 revalidation after issue #253
+
+          Date: 2026-08-17
+
+          This report supersedes the performance acceptance conclusion of
+          `SIMPLIFICATION-AUDIT-2026-08-16.md` for PR #252 after rebasing that PR
+          onto the issue-#253 writer correction and the ARM64 runner integration.
+          The original report remains unchanged because dated reports record the
+          evidence available when they were written.
+
+          ## Why the revalidation was necessary
+
+          PR #254 changed the writer scheduling contract to preserve the eager
+          single-frame latency win while forcing tight synchronous producers back
+          through the existing batcher. PR #252 overlaps `_writer.py`, so its old
+          microbench evidence could not be treated as current after #254 landed.
+
+          The rebased #252 tree first passed the complete functional suite on exact
+          HEAD `3ee2a3c5a78b0ea487ddbdf7927665b519fddd45` (CI `32014996281`,
+          long fuzz `32014996232`, finalization `32014996294`). A strict Pi 5
+          current-main-vs-candidate campaign (`32015071488`) then found a real
+          scheduling regression that those functional tests cannot expose:
+
+          - closed-loop writer capacity A/A and A/B passed;
+          - paced-latency A/A passed;
+          - at 2,500 msg/s callback p50 moved from about 0.334 ms on current main
+            to about 1.361 ms on #252, roughly 4.07x, losing all eight pairs;
+          - at 10,000 msg/s callback p50 remained slightly favourable, but the
+            loop-lag ratio was about 6.35 and the strict campaign failed.
+
+          ## Attribution
+
+          A linear scan of all 17 rebased commits (`32015752809`) located the
+          transition exactly at rebased commit `832f808e413dd47fd922469110316751ba205906`,
+          `perf: remove Python frames from the publish and acknowledgement paths`.
+          The three preceding commits stayed near the ~0.33 ms regime; that commit
+          moved immediately onto the slower pacing plateau.
+
+          Source-isolated and interaction experiments then rejected simplistic
+          attribution:
+
+          - writer-only, inbound-only and outbound-only substitutions were neutral
+            in isolation (`32016075623`);
+          - `engine.py` alone contributed the largest movement, but no single file
+            reproduced the whole effect;
+          - restoring only `_send -> _emit` or only keyword `EngineEffect`
+            construction, even together with `_try_launch`, did not recover the
+            2,500 msg/s regime (`32018272639`);
+          - restoring the outbound forwarding wrappers was worse;
+          - reverting the writer's once-per-task `write_many` lookup was also worse
+            (`32018097989`), so that optimization is retained.
+
+          The smallest correction that consistently recovered the useful regime is
+          therefore the combination measured in `32017494910`:
+
+          1. restore the engine effect-emission boundary (`_send` delegates to
+             `_emit`, and `EngineEffect` is built through the explicit keyword
+             path);
+          2. restore the `_try_launch` admission/compensation boundary in
+             `OutboundSession`;
+          3. retain the independent `write_many` caching, inbound specialization,
+             and direct outbound effect forwarding that did not cause the issue.
+
+          In the screening campaign, this combination reduced the candidate's
+          2,500 msg/s p50 from the ~1.36 ms plateau to about 0.476 ms while keeping
+          10,000 msg/s favourable (~0.262 ms versus ~0.285 ms) and returning loop
+          lag to the comparable regime. That screening result is not final release
+          evidence; the corrected committed HEAD must pass a fresh exact-head A/A
+          plus A/B campaign.
+
+          ## Acceptance rule for the corrected PR
+
+          Revalidation is against the current post-#254/#255 main commit
+          `0999d8abfe44a568209209403d7f215b18cc4eb7`, not against the older rc5
+          capacity or pre-eager latency anchors alone. The corrected exact HEAD is
+          acceptable only if:
+
+          - the full functional CI/fuzz/finalization suite is green;
+          - strict closed-loop capacity A/A is valid and A/B retains at least 95%
+            of current main for QoS 0 and QoS 1;
+          - paced callback latency A/A is valid at 2,500 and 10,000 msg/s;
+          - paced A/B passes the existing completion and loop-lag gates;
+          - median candidate/main callback p50 is no worse than 1.50x at either
+            acceptance rate. This explicit p50 ceiling is required because the
+            original ~4x regression could otherwise be hidden when throughput is
+            neutral and the kernel pacing regime happens to keep loop lag inside
+            its own threshold.
+
+          The 1.50x ceiling is a regression guard against giving back the eager
+          writer improvement; it is not a claim that 50% degradation is a desired
+          target. The selected correction screened materially below that ceiling,
+          and the final exact-head numbers are recorded in the PR once available.
+          EOF
+
+          git diff --check
+          test "$(git diff --name-only | sort)" = "$(printf '%s\n' docs/reports/SIMPLIFICATION-ARM64-REVALIDATION-2026-08-17.md src/mqttium/protocol/engine.py src/mqttium/protocol/outbound.py | sort)"
+
+      - name: Targeted validation before write
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Run focused correctness and quality gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install -e ".[dev]"
+          python -m ruff format --check src/mqttium/protocol/engine.py src/mqttium/protocol/outbound.py
+          python -m ruff check src/mqttium/protocol/engine.py src/mqttium/protocol/outbound.py
+          python -m pytest -q \
+            tests/unit/test_qos_engine.py \
+            tests/unit/test_outbound_transaction.py \
+            tests/unit/test_write_pump_eager.py \
+            tests/unit/test_batch_receipt_progress.py \
+            tests/unit/test_performance_contracts.py
+
+      - name: Commit and push with exact lease
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name yoch
+          git config user.email yoch.melka@gmail.com
+          git add \
+            src/mqttium/protocol/engine.py \
+            src/mqttium/protocol/outbound.py \
+            docs/reports/SIMPLIFICATION-ARM64-REVALIDATION-2026-08-17.md
+          git commit -m "perf: preserve eager writer scheduling after simplification"
+          git fetch --no-tags origin "+refs/heads/${TARGET_BRANCH}:refs/remotes/origin/target-final"
+          test "$(git rev-parse refs/remotes/origin/target-final)" = "$EXPECTED_HEAD"
+          git push \
+            --force-with-lease="refs/heads/${TARGET_BRANCH}:${EXPECTED_HEAD}" \
+            origin "HEAD:refs/heads/${TARGET_BRANCH}"
