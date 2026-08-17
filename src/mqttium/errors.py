@@ -21,6 +21,10 @@ class PacketTooLargeError(ProtocolError):
     """Packet exceeds local or negotiated maximum size."""
 
 
+class MandatoryResponseTooLargeError(PacketTooLargeError):
+    """A peer limit makes a mandatory local MQTT response impossible to send."""
+
+
 class FlowControlError(MQTTError):
     """Outbound inflight window exhausted (raise mode)."""
 
