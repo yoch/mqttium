@@ -1,4 +1,4 @@
-name: ARM64 Final PR Validation
+name: Rebase Simplification PR
 
 on:
   push:
@@ -6,366 +6,191 @@ on:
       - agent/arm64-runner-probe
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  paired-latency:
-    runs-on: [self-hosted, linux, ARM64]
-    timeout-minutes: 35
+  rebase-252:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
     env:
-      PYTHONUNBUFFERED: "1"
-      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      EXPECTED_MAIN: 0999d8abfe44a568209209403d7f215b18cc4eb7
+      EXPECTED_HEAD: 79143941ce18fbe5b55a8a75ae9af8f5a507760d
+      TARGET_BRANCH: refactor/simplification-audit-2026-08-16
 
     steps:
-      - name: Verify clean performance host
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "$(uname -m)" = "aarch64"
-          command -v python3
-          command -v mosquitto
-          command -v mosquitto_sub
-          command -v taskset
-          governors="$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor | sort -u)"
-          test "$governors" = "performance"
-          if pgrep -a mosquitto; then
-            echo 'A pre-existing Mosquitto process would contaminate evidence.' >&2
-            exit 1
-          fi
-
-      - name: Check out exact final 255 HEAD
+      - name: Check out trusted controller branch
         uses: actions/checkout@v7
         with:
-          ref: d32d3020fa9af2b013cc98689156bd8a7a18ebe5
-          path: infra
-          persist-credentials: false
+          fetch-depth: 0
 
-      - name: Check out exact final 254 HEAD
-        uses: actions/checkout@v7
-        with:
-          ref: 8cabd28d8747ec417f5658865bf5ef8e391736ff
-          path: candidate
-          persist-credentials: false
-
-      - name: Check out exact pre-eager latency baseline
-        uses: actions/checkout@v7
-        with:
-          ref: 3962f328331b8414a755332aefc3b3d7c261dc6f
-          path: latency-base
-          persist-credentials: false
-
-      - name: Create isolated venv
+      - name: Fetch and pin both rebase endpoints
         shell: bash
         run: |
           set -euo pipefail
-          venv="$RUNNER_TEMP/mqttium-final-latency-venv"
-          rm -rf "$venv"
-          python3 -m venv "$venv"
-          echo "$venv/bin" >> "$GITHUB_PATH"
+          git fetch --no-tags origin \
+            "+refs/heads/main:refs/remotes/origin/main" \
+            "+refs/heads/${TARGET_BRANCH}:refs/remotes/origin/target"
+          test "$(git rev-parse refs/remotes/origin/main)" = "$EXPECTED_MAIN"
+          test "$(git rev-parse refs/remotes/origin/target)" = "$EXPECTED_HEAD"
+          git config user.name yoch
+          git config user.email yoch.melka@gmail.com
+          git checkout -B rebase-work refs/remotes/origin/target
 
-      - run: python -m pip install "psutil>=6,<8"
-
-      - name: Initial strict preflight
-        working-directory: infra
+      - name: Rebase with fail-closed writer resolution
         shell: bash
         run: |
           set -euo pipefail
-          root="$RUNNER_TEMP/mqttium-final-latency"
-          rm -rf "$root"
-          mkdir -p "$root"
-          python benchmarks/runner_probe.py \
-            --output "$root/runner.json" \
-            --require-temperature \
-            --enforce
-
-      - name: Start isolated broker pinned to CPU 0
-        shell: bash
-        run: |
-          set -euo pipefail
-          root="$RUNNER_TEMP/mqttium-final-latency"
-          cat > "$root/mosquitto.conf" <<'EOF'
-          persistence false
-          allow_anonymous true
-          max_inflight_messages 1000
-          max_queued_messages 100000
-          max_queued_bytes 0
-          connection_messages false
-          log_type error
-          listener 11883 127.0.0.1
-          EOF
-          taskset -c 0 mosquitto -c "$root/mosquitto.conf" > "$root/mosquitto.log" 2>&1 &
-          echo "$!" > "$root/mosquitto.pid"
-          for _ in $(seq 1 50); do
-            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
-            if ! kill -0 "$(cat "$root/mosquitto.pid")" 2>/dev/null; then
-              cat "$root/mosquitto.log"
-              exit 1
-            fi
-            sleep 0.1
-          done
-          cat "$root/mosquitto.log"
-          exit 1
-
-      - name: Strict latency A/A with final retry policy
-        shell: bash
-        run: |
-          set -euo pipefail
-          root="$RUNNER_TEMP/mqttium-final-latency"
-          run_control() {
-            local attempt="$1"
-            python infra/benchmarks/paired_open_loop.py \
-              --base-root latency-base --candidate-root latency-base \
-              --protocols 311 --payloads 256 --windows 64 \
-              --target-rates 2500,10000 --completions callback \
-              --repeat 8 --count-small 4000 --timeout 120 --cpu 2 \
-              --policy strict --preflight-report "$root/runner.json" \
-              --output "$root/aa-attempt-${attempt}.json" \
-              --summary-output "$root/aa-attempt-${attempt}.md"
-          }
           set +e
-          run_control 1
+          GIT_EDITOR=true git rebase refs/remotes/origin/main
           rc=$?
           set -e
-          if [ "$rc" -eq 0 ]; then
-            exit 0
-          fi
-          if [ "$rc" -ne 2 ]; then
-            exit "$rc"
-          fi
-          python infra/benchmarks/runner_probe.py \
-            --output "$root/runner-latency-retry.json" \
-            --require-temperature \
-            --enforce
-          python infra/benchmarks/paired_open_loop.py \
-            --base-root latency-base --candidate-root latency-base \
-            --protocols 311 --payloads 256 --windows 64 \
-            --target-rates 2500,10000 --completions callback \
-            --repeat 8 --count-small 4000 --timeout 120 --cpu 2 \
-            --policy strict --preflight-report "$root/runner-latency-retry.json" \
-            --output "$root/aa-attempt-2.json" \
-            --summary-output "$root/aa-attempt-2.md"
 
-      - name: Strict latency A/B on exact 254 HEAD
-        shell: bash
-        run: |
-          set -euo pipefail
-          root="$RUNNER_TEMP/mqttium-final-latency"
-          preflight="$root/runner.json"
-          if [ -f "$root/runner-latency-retry.json" ]; then
-            preflight="$root/runner-latency-retry.json"
-          fi
-          python infra/benchmarks/paired_open_loop.py \
-            --base-root latency-base --candidate-root candidate \
-            --protocols 311 --payloads 256 --windows 64 \
-            --target-rates 2500,10000 --completions callback \
-            --repeat 8 --count-small 4000 --timeout 120 --cpu 2 \
-            --policy strict --preflight-report "$preflight" \
-            --output "$root/ab.json" \
-            --summary-output "$root/ab.md"
+          while [ "$rc" -ne 0 ]; do
+            if [ ! -d .git/rebase-merge ] && [ ! -d .git/rebase-apply ]; then
+              echo "rebase failed outside a resolvable conflict" >&2
+              exit "$rc"
+            fi
 
-      - name: Upload latency evidence
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: arm64-final-latency-${{ github.run_id }}
-          path: |
-            ${{ runner.temp }}/mqttium-final-latency/*.json
-            ${{ runner.temp }}/mqttium-final-latency/*.md
-            ${{ runner.temp }}/mqttium-final-latency/mosquitto.log
-          if-no-files-found: error
-          retention-days: 30
-
-      - name: Stop isolated broker
-        if: always()
-        shell: bash
-        run: |
-          pidfile="$RUNNER_TEMP/mqttium-final-latency/mosquitto.pid"
-          if [ -f "$pidfile" ]; then
-            pid="$(cat "$pidfile")"
-            kill "$pid" 2>/dev/null || true
-            wait "$pid" 2>/dev/null || true
-          fi
-
-  arm64-ci:
-    runs-on: [self-hosted, linux, ARM64]
-    timeout-minutes: 35
-    env:
-      PIP_DISABLE_PIP_VERSION_CHECK: "1"
-
-    steps:
-      - name: Verify clean ARM64 host
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "$(uname -m)" = "aarch64"
-          command -v python3
-          command -v openssl
-          command -v mosquitto
-          if pgrep -a mosquitto; then
-            echo 'A stale Mosquitto process is present.' >&2
-            exit 1
-          fi
-
-      - name: Check out exact final 255 HEAD
-        uses: actions/checkout@v7
-        with:
-          ref: d32d3020fa9af2b013cc98689156bd8a7a18ebe5
-          path: infra
-          persist-credentials: false
-
-      - name: Create isolated test venv
-        shell: bash
-        run: |
-          set -euo pipefail
-          venv="$RUNNER_TEMP/mqttium-final-ci-venv"
-          rm -rf "$venv"
-          python3 -m venv "$venv"
-          echo "$venv/bin" >> "$GITHUB_PATH"
-
-      - name: Install test dependencies
-        working-directory: infra
-        run: python -m pip install -e ".[dev]"
-
-      - name: Unit tests
-        working-directory: infra
-        run: python -m pytest -q -ra tests/unit
-
-      - name: Start isolated Mosquitto
-        shell: bash
-        run: |
-          set -euo pipefail
-          root="$RUNNER_TEMP/mqttium-final-ci-broker"
-          rm -rf "$root"
-          mkdir -p "$root"
-          cat > "$root/mosquitto.conf" <<'EOF'
-          listener 11883 127.0.0.1
-          allow_anonymous true
-          persistence false
-          EOF
-          mosquitto -c "$root/mosquitto.conf" > "$root/mosquitto.log" 2>&1 &
-          echo "$!" > "$root/mosquitto.pid"
-          for _ in $(seq 1 50); do
-            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
-            if ! kill -0 "$(cat "$root/mosquitto.pid")" 2>/dev/null; then
-              cat "$root/mosquitto.log"
+            mapfile -t conflicts < <(git diff --name-only --diff-filter=U)
+            if [ "${#conflicts[@]}" -ne 1 ] || [ "${conflicts[0]}" != "src/mqttium/api/_writer.py" ]; then
+              printf 'unexpected rebase conflicts:\n' >&2
+              printf '  %s\n' "${conflicts[@]}" >&2
               exit 1
             fi
-            sleep 0.2
+
+            # During rebase, --ours is the already-rebased tree (new main plus
+            # earlier replayed commits). Preserve #254 wholesale, then reapply
+            # only #252's orthogonal write_many lookup caching change.
+            git checkout --ours src/mqttium/api/_writer.py
+            python - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/mqttium/api/_writer.py")
+          text = path.read_text()
+
+          old = '''    async def _write_contiguous(self, transport: AsyncTransport, parts: list[bytes]) -> None:\n        if not parts:\n            return\n        write_many = getattr(transport, "write_many", None)\n        if write_many is not None:\n'''
+          new = '''    async def _write_contiguous(\n        self,\n        transport: AsyncTransport,\n        write_many: Callable[[list[bytes]], Awaitable[None]] | None,\n        parts: list[bytes],\n    ) -> None:\n        if not parts:\n            return\n        if write_many is not None:\n'''
+          assert text.count(old) == 1, "unexpected _write_contiguous shape"
+          text = text.replace(old, new)
+
+          old = '''        transport = self.transport\n        if transport is None:\n            raise RuntimeError("WritePump started without a transport")\n        queue = self.queue\n'''
+          new = '''        transport = self.transport\n        if transport is None:\n            raise RuntimeError("WritePump started without a transport")\n        # Resolved once per writer task rather than per batch. The local dies\n        # with the task, so unlike `_write_nowait` it needs no explicit\n        # clearing: it can never outlive the transport it was resolved from.\n        write_many = getattr(transport, "write_many", None)\n        queue = self.queue\n'''
+          assert text.count(old) == 1, "unexpected _run prologue shape"
+          text = text.replace(old, new)
+
+          assert text.count("await self._write_contiguous(transport, contiguous)") == 2
+          text = text.replace(
+              "await self._write_contiguous(transport, contiguous)",
+              "await self._write_contiguous(transport, write_many, contiguous)",
+          )
+
+          for required in (
+              "self._eager_armed",
+              "self._eager_generation",
+              "def _rearm_eager_if_idle",
+              "call_soon(self._rearm_eager_if_idle",
+          ):
+              assert required in text, f"lost #254 invariant: {required}"
+          path.write_text(text)
+          PY
+            git add src/mqttium/api/_writer.py
+
+            set +e
+            GIT_EDITOR=true git rebase --continue
+            rc=$?
+            set -e
           done
-          exit 1
 
-      - name: Integration tests
-        working-directory: infra
-        run: python -m pytest -q -ra tests/integration
-
-      - name: Stop isolated Mosquitto
-        if: always()
+      - name: Verify rebased tree and invariants
         shell: bash
         run: |
-          pidfile="$RUNNER_TEMP/mqttium-final-ci-broker/mosquitto.pid"
-          if [ -f "$pidfile" ]; then
-            pid="$(cat "$pidfile")"
-            kill "$pid" 2>/dev/null || true
-            wait "$pid" 2>/dev/null || true
-          fi
+          set -euo pipefail
+          test "$(git merge-base HEAD refs/remotes/origin/main)" = "$EXPECTED_MAIN"
+          test "$(git diff --name-only refs/remotes/origin/main...HEAD | wc -l)" -eq 38
+          python - <<'PY'
+          from pathlib import Path
 
-  benchmark-host-smoke:
-    runs-on: [self-hosted, linux, ARM64]
-    timeout-minutes: 15
-    env:
-      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+          expected = {
+              "CHANGELOG.md",
+              "benchmarks/_paired_scenarios.py",
+              "docs/API-STABILITY.md",
+              "docs/reports/README.md",
+              "docs/reports/SIMPLIFICATION-AUDIT-2026-08-16.md",
+              "src/mqttium/api/_delivery.py",
+              "src/mqttium/api/_effects.py",
+              "src/mqttium/api/_writer.py",
+              "src/mqttium/api/async_client.py",
+              "src/mqttium/api/stats.py",
+              "src/mqttium/codec/buffer.py",
+              "src/mqttium/codec/primitives.py",
+              "src/mqttium/codec/properties.py",
+              "src/mqttium/packets/_ack.py",
+              "src/mqttium/packets/_bindings.py",
+              "src/mqttium/packets/_common.py",
+              "src/mqttium/packets/_connect.py",
+              "src/mqttium/packets/_control.py",
+              "src/mqttium/packets/_publish.py",
+              "src/mqttium/packets/connect.py",
+              "src/mqttium/packets/control.py",
+              "src/mqttium/persistence/memory.py",
+              "src/mqttium/persistence/sqlite.py",
+              "src/mqttium/protocol/_sizing.py",
+              "src/mqttium/protocol/engine.py",
+              "src/mqttium/protocol/inbound.py",
+              "src/mqttium/protocol/outbound.py",
+              "src/mqttium/protocol/reconnect.py",
+              "src/mqttium/types.py",
+              "tests/unit/test_batch_receipt_progress.py",
+              "tests/unit/test_client_stats.py",
+              "tests/unit/test_outbound_transaction.py",
+              "tests/unit/test_packet_strictness.py",
+              "tests/unit/test_performance_contracts.py",
+              "tests/unit/test_property_encoding_cache.py",
+              "tests/unit/test_small_delivery_properties.py",
+              "tests/unit/test_sqlite_migration.py",
+              "tests/unit/test_store_transitions.py",
+          }
+          import subprocess
+          actual = set(subprocess.check_output(
+              ["git", "diff", "--name-only", "refs/remotes/origin/main...HEAD"],
+              text=True,
+          ).splitlines())
+          assert actual == expected, (sorted(expected - actual), sorted(actual - expected))
 
-    steps:
-      - name: Check out exact final 255 HEAD
-        uses: actions/checkout@v7
+          writer = Path("src/mqttium/api/_writer.py").read_text()
+          for required in (
+              "self._eager_armed",
+              "self._eager_generation",
+              "def _rearm_eager_if_idle",
+              "call_soon(self._rearm_eager_if_idle",
+              'write_many = getattr(transport, "write_many", None)',
+              "_write_contiguous(transport, write_many, contiguous)",
+          ):
+              assert required in writer, required
+          PY
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v7
         with:
-          ref: d32d3020fa9af2b013cc98689156bd8a7a18ebe5
-          path: infra
-          persist-credentials: false
+          python-version: "3.13"
 
-      - name: Verify scheduled benchmark prerequisites and cleanliness guard
+      - name: Targeted regression validation before branch rewrite
         shell: bash
         run: |
           set -euo pipefail
-          test "$(uname -m)" = "aarch64"
-          command -v python3
-          command -v mosquitto
-          command -v mosquitto_sub
-          command -v openssl
-          if pgrep -a mosquitto; then
-            echo 'A pre-existing Mosquitto process would contaminate benchmark evidence.' >&2
-            exit 1
-          fi
+          python -m pip install -e ".[dev]"
+          python -m ruff check src/mqttium/api/_writer.py tests/unit/test_write_pump_eager.py tests/unit/test_batch_receipt_progress.py
+          python -m pytest -q \
+            tests/unit/test_write_pump_eager.py \
+            tests/unit/test_batch_receipt_progress.py
 
-      - name: Create probe venv
+      - name: Rewrite target branch with exact lease
         shell: bash
         run: |
           set -euo pipefail
-          venv="$RUNNER_TEMP/mqttium-benchmark-smoke-venv"
-          rm -rf "$venv"
-          python3 -m venv "$venv"
-          echo "$venv/bin" >> "$GITHUB_PATH"
-
-      - run: python -m pip install "psutil>=6,<8"
-
-      - name: Enforce benchmark preflight
-        working-directory: infra
-        run: |
-          python benchmarks/runner_probe.py \
-            --output "$RUNNER_TEMP/mqttium-benchmark-smoke/preflight.json" \
-            --require-temperature \
-            --enforce
-
-      - name: Reproduce scheduled TCP and TLS broker startup
-        shell: bash
-        run: |
-          set -euo pipefail
-          root="$RUNNER_TEMP/mqttium-benchmark-smoke"
-          mkdir -p "$root"
-          openssl req -x509 -newkey rsa:2048 -nodes \
-            -keyout "$root/key.pem" -out "$root/cert.pem" \
-            -days 1 -subj '/CN=localhost' \
-            -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1' >/dev/null 2>&1
-          chmod 0600 "$root/key.pem"
-          chmod 0644 "$root/cert.pem"
-          cat > "$root/mosquitto.conf" <<EOF
-          persistence false
-          allow_anonymous true
-          max_inflight_messages 1000
-          max_queued_messages 100000
-          max_queued_bytes 0
-          connection_messages false
-          log_type error
-          listener 11883 127.0.0.1
-          listener 18884 127.0.0.1
-          cafile $root/cert.pem
-          certfile $root/cert.pem
-          keyfile $root/key.pem
-          require_certificate false
-          EOF
-          mosquitto -c "$root/mosquitto.conf" > "$root/mosquitto.log" 2>&1 &
-          echo "$!" > "$root/mosquitto.pid"
-          for _ in $(seq 1 50); do
-            if (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && \
-               (echo > /dev/tcp/127.0.0.1/18884) >/dev/null 2>&1; then
-              exit 0
-            fi
-            if ! kill -0 "$(cat "$root/mosquitto.pid")" 2>/dev/null; then
-              cat "$root/mosquitto.log"
-              exit 1
-            fi
-            sleep 0.2
-          done
-          cat "$root/mosquitto.log"
-          exit 1
-
-      - name: Stop benchmark broker
-        if: always()
-        shell: bash
-        run: |
-          pidfile="$RUNNER_TEMP/mqttium-benchmark-smoke/mosquitto.pid"
-          if [ -f "$pidfile" ]; then
-            pid="$(cat "$pidfile")"
-            kill "$pid" 2>/dev/null || true
-            wait "$pid" 2>/dev/null || true
-          fi
+          test "$(git rev-parse refs/remotes/origin/main)" = "$EXPECTED_MAIN"
+          git fetch --no-tags origin "+refs/heads/${TARGET_BRANCH}:refs/remotes/origin/target-final"
+          test "$(git rev-parse refs/remotes/origin/target-final)" = "$EXPECTED_HEAD"
+          git push \
+            --force-with-lease="refs/heads/${TARGET_BRANCH}:${EXPECTED_HEAD}" \
+            origin "HEAD:refs/heads/${TARGET_BRANCH}"
