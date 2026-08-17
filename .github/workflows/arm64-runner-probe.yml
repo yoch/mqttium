@@ -1,0 +1,68 @@
+name: ARM64 Runner Probe
+
+on:
+  push:
+    branches:
+      - agent/arm64-runner-probe
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 10
+    steps:
+      - name: Probe host without repository checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo '=== runner ==='
+          printf 'name=%s\n' "${RUNNER_NAME:-}"
+          printf 'os=%s arch=%s environment=%s\n' "${RUNNER_OS:-}" "${RUNNER_ARCH:-}" "${RUNNER_ENVIRONMENT:-}"
+          echo '=== uname ==='
+          uname -a
+          echo '=== os-release ==='
+          cat /etc/os-release
+          echo '=== python ==='
+          command -v python3 || true
+          python3 --version || true
+          command -v python || true
+          python --version || true
+          echo '=== broker/tooling ==='
+          command -v mosquitto || true
+          mosquitto -h 2>&1 | head -n 2 || true
+          command -v mosquitto_sub || true
+          command -v openssl || true
+          openssl version || true
+          echo '=== cpu ==='
+          nproc
+          grep -m1 -E '^(Model|model name|Hardware)' /proc/cpuinfo || true
+          for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+            [ -r "$f" ] && printf '%s=%s\n' "$f" "$(cat "$f")"
+          done
+          echo '=== thermal ==='
+          for f in /sys/class/thermal/thermal_zone*/temp; do
+            [ -r "$f" ] || continue
+            type="$(cat "${f%/temp}/type" 2>/dev/null || true)"
+            printf '%s %s=%s\n' "$f" "$type" "$(cat "$f")"
+          done
+          echo '=== resources ==='
+          free -h || true
+          df -h "$RUNNER_TEMP" || true
+          uptime || true
+
+      - name: Check setup-python ARM64 availability
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+
+      - name: Confirm setup-python result
+        run: |
+          python --version
+          python - <<'PY'
+          import platform, sys
+          print(sys.executable)
+          print(platform.platform())
+          print(platform.machine())
+          PY
