@@ -454,7 +454,9 @@ def _write_result(output: Path, payload: dict[str, Any]) -> None:
     output.with_suffix(".md").write_text("\n".join(lines), encoding="utf-8")
 
 
-def _control_evaluations(args: argparse.Namespace, payload: dict[str, Any]) -> list[ScenarioEvaluation]:
+def _control_evaluations(
+    args: argparse.Namespace, payload: dict[str, Any]
+) -> list[ScenarioEvaluation]:
     return evaluate_control_payload(
         payload,
         throughput_bias_floor=args.control_throughput_bias_floor,
