@@ -14,9 +14,8 @@ from mqttium.codec.buffer import RawPacket
 from mqttium.enums import InboundQoSState, PacketType, QoS
 from mqttium.errors import MalformedPacketError, MandatoryResponseTooLargeError, ProtocolError
 from mqttium.packets._publish import decode_publish_fields_v5
-from mqttium.types import InboundMessage
-
 from mqttium.protocol.inbound import InboundSession
+from mqttium.types import InboundMessage
 
 
 class TinyPacketLimitInbound:
