@@ -13,9 +13,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  seed-blocked-abba:
+  full-same-code-gate:
     runs-on: [self-hosted, linux, ARM64]
-    timeout-minutes: 35
+    timeout-minutes: 45
     env:
       PYTHONUNBUFFERED: "1"
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
@@ -47,7 +47,7 @@ jobs:
           command -v taskset
           test "$(nproc)" -ge 4
           if pgrep -a mosquitto; then
-            echo "pre-existing Mosquitto would contaminate diagnostic" >&2
+            echo "pre-existing Mosquitto would contaminate release evidence" >&2
             exit 1
           fi
           for cpu in 0 1 2 3; do
@@ -60,7 +60,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          venv="$RUNNER_TEMP/pr257-seed-block-venv"
+          venv="$RUNNER_TEMP/pr257-network-release-venv"
           rm -rf "$venv"
           python3 -m venv "$venv"
           echo "$venv/bin" >> "$GITHUB_PATH"
@@ -72,7 +72,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          root="$RUNNER_TEMP/pr257-seed-block"
+          root="$RUNNER_TEMP/pr257-network-release"
           rm -rf "$root"
           mkdir -p "$root"
           cat > "$root/mosquitto.conf" <<'EOF'
@@ -100,131 +100,48 @@ jobs:
           cat "$root/mosquitto.log"
           exit 1
 
-      - name: Acquire one twelve-cycle same-code control
+      - name: Full same-code release gate
         shell: bash
         run: |
           set -euo pipefail
-          root="$RUNNER_TEMP/pr257-seed-block"
-          for block in a b; do
-            if [ "$block" = b ]; then
-              echo "===== fixed 60s quiet period at control midpoint ====="
-              sleep 60
-            fi
-            python harness/benchmarks/runner_probe.py \
-              --output "$root/preflight-$block.json" \
-              --require-temperature --enforce
+          # The gate and subscriber/observer chain inherit CPUs 1,3. Every
+          # publisher worker then pins itself to CPU 2; Mosquitto is on CPU 0.
+          taskset -c 1,3 python harness/benchmarks/network_release_gate.py \
+            --base-root runtime \
+            --candidate-root runtime \
+            --engine harness/benchmarks/paired_network.py \
+            --runner-probe harness/benchmarks/runner_probe.py \
+            --protocols 311 \
+            --completions callback \
+            --payloads 64 \
+            --windows 1,8,64 \
+            --cycle-seeds 0,1,2,3,4,5 \
+            --target-sample-seconds 2.0 \
+            --max-count 60000 \
+            --timeout 60 \
+            --cpu 2 \
+            --inter-phase-quiet-seconds 60 \
+            --policy strict \
+            --output "$RUNNER_TEMP/pr257-network-release/same-code.json"
 
-            # Each seed owns one complete ABBA cycle (two opposite-order pairs).
-            # The deterministic 0..5 schedule is repeated exactly once after the
-            # midpoint, yielding twelve independent cycle observations total.
-            for seed in 0 1 2 3 4 5; do
-              echo "===== block=$block seed=$seed ====="
-              PYTHONHASHSEED="$seed" taskset -c 1,3 python harness/benchmarks/paired_network.py \
-                --base-root runtime --candidate-root runtime \
-                --protocols 311 --completions callback --payloads 64 --windows 8,20 \
-                --repeat 2 --count-small 6000 --target-sample-seconds 2.0 --max-count 60000 \
-                --timeout 60 --cpu 2 --policy advisory --max-baseline-cv 10.0 --min-ack-ratio 0.0 \
-                --preflight-report "$root/preflight-$block.json" \
-                --output "$root/$block-seed-$seed.json" \
-                --summary-output "$root/$block-seed-$seed.md"
-            done
-          done
-
-      - name: Evaluate pooled twelve-cycle control
-        shell: bash
-        run: |
-          set -euo pipefail
-          PYTHONPATH=harness python - <<'PY'
-          import json
-          import os
-          import pathlib
-
-          from benchmarks.network_release_gate import control_failures, paired_ratio_estimate
-
-          root = pathlib.Path(os.environ["RUNNER_TEMP"]) / "pr257-seed-block"
-
-          def collect(blocks):
-              by_window = {
-                  8: {"throughput": [], "ack": [], "orders": []},
-                  20: {"throughput": [], "ack": [], "orders": []},
-              }
-              for block in blocks:
-                  for seed in range(6):
-                      data = json.loads((root / f"{block}-seed-{seed}.json").read_text())
-                      for scenario in data["scenarios"]:
-                          bucket = by_window[scenario["window"]]
-                          for pair in scenario["pairs"]:
-                              base = pair["base"]
-                              candidate = pair["candidate"]
-                              bucket["orders"].append(pair["order"])
-                              bucket["throughput"].append(
-                                  candidate["publisher_ack_msg_s"] / base["publisher_ack_msg_s"]
-                              )
-                              bucket["ack"].append(
-                                  candidate["ack_latency_p50_ms"] / base["ack_latency_p50_ms"]
-                              )
-              return by_window
-
-          # Half-control summaries are diagnostic only. They deliberately do not
-          # decide validity because six cycles were shown to be underpowered.
-          for block in ("a", "b"):
-              print(f"===== diagnostic half-control {block.upper()} =====")
-              for window, bucket in collect((block,)).items():
-                  throughput = paired_ratio_estimate(bucket["throughput"], bucket["orders"])
-                  ack = paired_ratio_estimate(bucket["ack"], bucket["orders"])
-                  print(
-                      f"window={window} throughput={throughput.geometric_mean:.5f} "
-                      f"ci=[{throughput.lower_95:.5f},{throughput.upper_95:.5f}] "
-                      f"ack={ack.geometric_mean:.5f} "
-                      f"ci=[{ack.lower_95:.5f},{ack.upper_95:.5f}]"
-                  )
-
-          print("===== pooled twelve-cycle release control =====")
-          failures = []
-          pooled = collect(("a", "b"))
-          for window in (8, 20):
-              bucket = pooled[window]
-              throughput = paired_ratio_estimate(bucket["throughput"], bucket["orders"])
-              ack = paired_ratio_estimate(bucket["ack"], bucket["orders"])
-              cell_failures = control_failures(
-                  f"window={window} throughput",
-                  throughput,
-                  bias_floor=0.98,
-                  bias_ceiling=1.02,
-                  equivalence_floor=0.95,
-                  equivalence_ceiling=1.05,
-              )
-              cell_failures += control_failures(
-                  f"window={window} ACK p50",
-                  ack,
-                  bias_floor=0.95,
-                  bias_ceiling=1.05,
-                  equivalence_floor=0.90,
-                  equivalence_ceiling=1.10,
-              )
-              print(
-                  f"window={window} cycles={throughput.cycles} "
-                  f"throughput={throughput.geometric_mean:.5f} "
-                  f"ci=[{throughput.lower_95:.5f},{throughput.upper_95:.5f}] "
-                  f"pair_cv={throughput.pair_ratio_cv:.2%} "
-                  f"ack={ack.geometric_mean:.5f} "
-                  f"ci=[{ack.lower_95:.5f},{ack.upper_95:.5f}] "
-                  f"ack_pair_cv={ack.pair_ratio_cv:.2%} "
-                  f"status={'PASS' if not cell_failures else 'INVALID'}"
-              )
-              for failure in cell_failures:
-                  print(f"  - {failure}")
-              failures.extend(cell_failures)
-
-          if failures:
-              raise SystemExit(2)
-          PY
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pr257-network-release-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/pr257-network-release/*.json
+            ${{ runner.temp }}/pr257-network-release/*.md
+            ${{ runner.temp }}/pr257-network-release/*-raw/*
+            ${{ runner.temp }}/pr257-network-release/mosquitto.log
+          if-no-files-found: warn
+          retention-days: 30
 
       - name: Stop isolated broker
         if: always()
         shell: bash
         run: |
-          pidfile="$RUNNER_TEMP/pr257-seed-block/mosquitto.pid"
+          pidfile="$RUNNER_TEMP/pr257-network-release/mosquitto.pid"
           if [ -f "$pidfile" ]; then
             pid="$(cat "$pidfile")"
             kill "$pid" 2>/dev/null || true
