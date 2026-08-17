@@ -16,7 +16,7 @@ jobs:
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
       BASE_SHA: 0999d8abfe44a568209209403d7f215b18cc4eb7
       CANDIDATE_SHA: fd750be3012e3878b12449624bce2c71747623ba
-      HARNESS_SHA: fd750be3012e3878b12449624bce2c71747623ba
+      HARNESS_SHA: 0999d8abfe44a568209209403d7f215b18cc4eb7
 
     steps:
       - name: Verify dedicated host
@@ -61,7 +61,7 @@ jobs:
           test -z "$(git -C candidate status --porcelain)"
           test -z "$(git -C harness status --porcelain)"
           test "$(git -C harness hash-object benchmarks/paired_regression.py)" = 126cf66b63f0ba32a928a3f75c2066762ae72cca
-          test "$(git -C harness hash-object benchmarks/_paired_scenarios.py)" = b6df11d4dd25cd1a5344f3d55d78b8b051fa33ff
+          test "$(git -C harness hash-object benchmarks/_paired_scenarios.py)" = 11063c3007ef3cb42181843f6fd6f8cba915dacd
 
       - name: Create benchmark venv
         shell: bash
