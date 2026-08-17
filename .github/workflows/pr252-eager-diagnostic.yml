@@ -30,12 +30,14 @@ jobs:
         with:
           ref: ${{ env.BASE_SHA }}
           path: base
+          fetch-depth: 0
           persist-credentials: false
 
       - uses: actions/checkout@v7
         with:
           ref: ${{ env.CANDIDATE_SHA }}
           path: candidate
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Verify exact endpoints
