@@ -20,18 +20,10 @@ jobs:
           echo '=== runner ==='
           printf 'name=%s\n' "${RUNNER_NAME:-}"
           printf 'os=%s arch=%s environment=%s\n' "${RUNNER_OS:-}" "${RUNNER_ARCH:-}" "${RUNNER_ENVIRONMENT:-}"
-          echo '=== uname ==='
-          uname -a
-          echo '=== os-release ==='
-          cat /etc/os-release
-          echo '=== python ==='
-          command -v python3
           python3 --version
           echo '=== broker/tooling ==='
           command -v mosquitto || true
           command -v mosquitto_sub || true
-          command -v openssl
-          openssl version
           echo '=== cpu ==='
           nproc
           grep -m1 -E '^(Model|model name|Hardware)' /proc/cpuinfo || true
@@ -39,23 +31,12 @@ jobs:
             [ -r "$f" ] || continue
             printf '%s=%s writable=%s\n' "$f" "$(cat "$f")" "$([ -w "$f" ] && echo yes || echo no)"
           done
-          echo '=== privilege ==='
-          if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
-            echo 'passwordless_sudo=yes'
-          else
-            echo 'passwordless_sudo=no'
-          fi
-          echo '=== package availability ==='
-          apt-cache policy mosquitto mosquitto-clients libmosquitto1 2>/dev/null || true
           echo '=== thermal ==='
           for f in /sys/class/thermal/thermal_zone*/temp; do
             [ -r "$f" ] || continue
             type="$(cat "${f%/temp}/type" 2>/dev/null || true)"
             printf '%s %s=%s\n' "$f" "$type" "$(cat "$f")"
           done
-          echo '=== resources ==='
-          free -h || true
-          df -h "$RUNNER_TEMP" || true
           uptime || true
 
       - name: Validate native Python virtualenv
@@ -67,9 +48,30 @@ jobs:
           python3 -m venv "$venv"
           "$venv/bin/python" --version
           "$venv/bin/python" -m pip --version
-          "$venv/bin/python" - <<'PY'
-          import platform, sys
-          print(sys.executable)
-          print(platform.platform())
-          print(platform.machine())
-          PY
+
+      - name: Try unprivileged local Mosquitto extraction
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/arm64-local-mosquitto"
+          rm -rf "$root"
+          mkdir -p "$root/pkgs" "$root/root"
+          cd "$root/pkgs"
+          apt-get download mosquitto mosquitto-clients libmosquitto1
+          for deb in ./*.deb; do
+            dpkg-deb -x "$deb" "$root/root"
+          done
+          export PATH="$root/root/usr/bin:$root/root/usr/sbin:$PATH"
+          libdir="$(find "$root/root/usr/lib" -type f -name 'libmosquitto.so.*' -printf '%h\n' | head -n1 || true)"
+          if [ -n "$libdir" ]; then
+            export LD_LIBRARY_PATH="$libdir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          fi
+          command -v mosquitto
+          command -v mosquitto_sub
+          ldd "$(command -v mosquitto)" | tee "$root/ldd.txt"
+          if grep -q 'not found' "$root/ldd.txt"; then
+            echo 'local Mosquitto has unresolved shared libraries'
+            exit 2
+          fi
+          mosquitto -h 2>&1 | head -n 2
+          mosquitto_sub -h 2>&1 | head -n 2
