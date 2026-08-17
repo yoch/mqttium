@@ -1,4 +1,4 @@
-name: ARM64 254 Delayed Idle Rearm Experiment
+name: ARM64 Delayed Idle Rearm Evidence
 
 on:
   push:
@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 jobs:
-  experiment:
+  final-evidence:
     runs-on: [self-hosted, linux, ARM64]
     timeout-minutes: 45
     env:
@@ -36,58 +36,28 @@ jobs:
             exit 1
           fi
 
-      - name: Check out exact #254 HEAD twice
+      - name: Check out exact 254 HEAD
         uses: actions/checkout@v7
         with:
           ref: dd64ed16dfb48e2b1cd1b50ac0d5290547627916
-          path: current
+          path: candidate
           persist-credentials: false
 
-      - name: Check out experiment tree
-        uses: actions/checkout@v7
-        with:
-          ref: dd64ed16dfb48e2b1cd1b50ac0d5290547627916
-          path: variant
-          persist-credentials: false
-
-      - name: Apply structural delayed-idle-rearm experiment
+      - name: Apply delayed idle rearm variant
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
-
-          path = Path('variant/src/mqttium/api/_writer.py')
+          path = Path("candidate/src/mqttium/api/_writer.py")
           text = path.read_text()
-          old = '''                # Reaching the idle queue wait is an independent re-arm point:
-                # it covers a batch that just drained even when no eager write
-                # scheduled the producer-side next-turn callback.
-                if queue.empty() and self._write_nowait is not None:
-                    self._eager_armed = True
-                first = await queue.get()
-'''
-          new = '''                # After a batch drains, defer eager re-arming by one loop turn.
-                # A producer that is already runnable therefore seeds the next
-                # sustained burst through the queue/batcher instead of paying
-                # one eager write per cooperative window. Genuine idle time
-                # still restores the zero-hop path before the next paced write.
-                if (
-                    queue.empty()
-                    and self._write_nowait is not None
-                    and not self._eager_armed
-                ):
-                    generation = self._eager_generation
-                    asyncio.get_running_loop().call_soon(
-                        self._rearm_eager_if_idle, generation
-                    )
-                first = await queue.get()
-'''
+          old = """                # Reaching the idle queue wait is an independent re-arm point:\n                # it covers a batch that just drained even when no eager write\n                # scheduled the producer-side next-turn callback.\n                if queue.empty() and self._write_nowait is not None:\n                    self._eager_armed = True\n                first = await queue.get()\n"""
+          new = """                # After a batch drains, defer eager re-arming by one loop turn.\n                # Already-runnable producers therefore stay on the batching path;\n                # genuine idle time restores eager before the next paced write.\n                if (\n                    queue.empty()\n                    and self._write_nowait is not None\n                    and not self._eager_armed\n                ):\n                    generation = self._eager_generation\n                    asyncio.get_running_loop().call_soon(\n                        self._rearm_eager_if_idle, generation\n                    )\n                first = await queue.get()\n"""
           if old not in text:
-              raise SystemExit('expected writer block not found')
+              raise SystemExit("expected writer block not found")
           path.write_text(text.replace(old, new, 1))
           PY
-          git -C variant diff --check
-          git -C variant diff -- src/mqttium/api/_writer.py
+          git -C candidate diff --check
 
       - name: Check out rc5 capacity baseline
         uses: actions/checkout@v7
@@ -107,7 +77,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          venv="$RUNNER_TEMP/mqttium-idle-rearm-venv"
+          venv="$RUNNER_TEMP/mqttium-delayed-idle-venv"
           rm -rf "$venv"
           python3 -m venv "$venv"
           echo "$venv/bin" >> "$GITHUB_PATH"
@@ -116,11 +86,11 @@ jobs:
         run: python -m pip install "psutil>=6,<8"
 
       - name: Strict runner preflight
-        working-directory: current
+        working-directory: candidate
         shell: bash
         run: |
           set -euo pipefail
-          root="$RUNNER_TEMP/mqttium-idle-rearm"
+          root="$RUNNER_TEMP/mqttium-delayed-idle"
           rm -rf "$root"
           mkdir -p "$root"
           python benchmarks/runner_probe.py \
@@ -132,7 +102,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          root="$RUNNER_TEMP/mqttium-idle-rearm"
+          root="$RUNNER_TEMP/mqttium-delayed-idle"
           cat > "$root/mosquitto.conf" <<'EOF'
           persistence false
           allow_anonymous true
@@ -156,12 +126,12 @@ jobs:
           cat "$root/mosquitto.log"
           exit 1
 
-      - name: Run strict acceptance on the structural variant
+      - name: Collect strict capacity and latency evidence
         shell: bash
         run: |
           set +e
           set -u -o pipefail
-          root="$RUNNER_TEMP/mqttium-idle-rearm"
+          root="$RUNNER_TEMP/mqttium-delayed-idle"
 
           capacity_common=(
             --protocol 311
@@ -180,29 +150,21 @@ jobs:
             --preflight-report "$root/preflight.json"
           )
 
-          echo '=== capacity A/A: rc5 versus rc5 ==='
-          python current/benchmarks/paired_writer_capacity.py \
+          echo '=== capacity A/A ==='
+          python candidate/benchmarks/paired_writer_capacity.py \
             --base-root base-cap --candidate-root base-cap \
             "${capacity_common[@]}" \
             --output "$root/capacity-aa.json" \
             --summary-output "$root/capacity-aa.md"
           cap_aa=$?
 
-          echo '=== capacity A/B: rc5 versus delayed-idle variant ==='
-          python current/benchmarks/paired_writer_capacity.py \
-            --base-root base-cap --candidate-root variant \
+          echo '=== capacity A/B variant ==='
+          python candidate/benchmarks/paired_writer_capacity.py \
+            --base-root base-cap --candidate-root candidate \
             "${capacity_common[@]}" \
-            --output "$root/capacity-variant.json" \
-            --summary-output "$root/capacity-variant.md"
-          cap_variant=$?
-
-          echo '=== capacity current #254 versus delayed-idle variant ==='
-          python current/benchmarks/paired_writer_capacity.py \
-            --base-root current --candidate-root variant \
-            "${capacity_common[@]}" \
-            --output "$root/capacity-current-vs-variant.json" \
-            --summary-output "$root/capacity-current-vs-variant.md"
-          cap_direct=$?
+            --output "$root/capacity-ab.json" \
+            --summary-output "$root/capacity-ab.md"
+          cap_ab=$?
 
           latency_common=(
             --protocols 311
@@ -218,40 +180,40 @@ jobs:
             --preflight-report "$root/preflight.json"
           )
 
-          echo '=== latency A/A: pre-eager versus itself ==='
-          python current/benchmarks/paired_open_loop.py \
+          echo '=== latency A/A ==='
+          python candidate/benchmarks/paired_open_loop.py \
             --base-root base-lat --candidate-root base-lat \
             "${latency_common[@]}" \
             --output "$root/latency-aa.json" \
             --summary-output "$root/latency-aa.md"
           lat_aa=$?
 
-          echo '=== latency A/B: pre-eager versus delayed-idle variant ==='
-          python current/benchmarks/paired_open_loop.py \
-            --base-root base-lat --candidate-root variant \
+          echo '=== latency A/B variant ==='
+          python candidate/benchmarks/paired_open_loop.py \
+            --base-root base-lat --candidate-root candidate \
             "${latency_common[@]}" \
-            --output "$root/latency-variant.json" \
-            --summary-output "$root/latency-variant.md"
-          lat_variant=$?
+            --output "$root/latency-ab.json" \
+            --summary-output "$root/latency-ab.md"
+          lat_ab=$?
 
-          printf 'capacity_aa=%s\ncapacity_variant=%s\ncapacity_direct=%s\nlatency_aa=%s\nlatency_variant=%s\n' \
-            "$cap_aa" "$cap_variant" "$cap_direct" "$lat_aa" "$lat_variant" | tee "$root/status.txt"
+          printf 'capacity_aa=%s\ncapacity_ab=%s\nlatency_aa=%s\nlatency_ab=%s\n' \
+            "$cap_aa" "$cap_ab" "$lat_aa" "$lat_ab" | tee "$root/status.txt"
 
-          if [ "$cap_aa" -ne 0 ] || [ "$cap_variant" -ne 0 ] || [ "$cap_direct" -ne 0 ] || [ "$lat_aa" -ne 0 ] || [ "$lat_variant" -ne 0 ]; then
+          if [ "$cap_aa" -ne 0 ] || [ "$cap_ab" -ne 0 ] || [ "$lat_aa" -ne 0 ] || [ "$lat_ab" -ne 0 ]; then
             exit 1
           fi
 
-      - name: Upload experiment evidence
+      - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: arm64-idle-rearm-${{ github.run_id }}
+          name: arm64-delayed-idle-${{ github.run_id }}
           path: |
-            ${{ runner.temp }}/mqttium-idle-rearm/preflight.json
-            ${{ runner.temp }}/mqttium-idle-rearm/*.json
-            ${{ runner.temp }}/mqttium-idle-rearm/*.md
-            ${{ runner.temp }}/mqttium-idle-rearm/status.txt
-            ${{ runner.temp }}/mqttium-idle-rearm/mosquitto.log
+            ${{ runner.temp }}/mqttium-delayed-idle/preflight.json
+            ${{ runner.temp }}/mqttium-delayed-idle/*.json
+            ${{ runner.temp }}/mqttium-delayed-idle/*.md
+            ${{ runner.temp }}/mqttium-delayed-idle/status.txt
+            ${{ runner.temp }}/mqttium-delayed-idle/mosquitto.log
           if-no-files-found: error
           retention-days: 30
 
@@ -259,7 +221,7 @@ jobs:
         if: always()
         shell: bash
         run: |
-          pidfile="$RUNNER_TEMP/mqttium-idle-rearm/mosquitto.pid"
+          pidfile="$RUNNER_TEMP/mqttium-delayed-idle/mosquitto.pid"
           if [ -f "$pidfile" ]; then
             pid="$(cat "$pidfile")"
             kill "$pid" 2>/dev/null || true
