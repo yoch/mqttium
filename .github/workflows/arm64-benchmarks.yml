@@ -25,15 +25,17 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
-
       - name: Verify dedicated runner prerequisites
         shell: bash
         run: |
           set -euo pipefail
           test "$(uname -m)" = "aarch64"
+          command -v python3
+          python3 - <<'PY'
+          import sys
+          if sys.version_info[:2] != (3, 13):
+              raise SystemExit(f"expected system Python 3.13, got {sys.version}")
+          PY
           command -v mosquitto
           command -v mosquitto_sub
           command -v openssl
@@ -44,11 +46,11 @@ jobs:
           set -euo pipefail
           venv="$RUNNER_TEMP/mqttium-bench-venv"
           rm -rf "$venv"
-          python -m venv "$venv"
+          python3 -m venv "$venv"
           echo "$venv/bin" >> "$GITHUB_PATH"
 
       - name: Install benchmark dependencies
-        run: python -m pip install -e ".[dev]" paho-mqtt==2.1.0 gmqtt==0.7.0 "psutil>=6"
+        run: python -m pip install -e ".[dev]" paho-mqtt==2.1.0 gmqtt==0.7.0 "psutil>=6,<8"
 
       - name: Enforce dedicated-runner preflight
         run: |
@@ -69,7 +71,8 @@ jobs:
             -out "$root/cert.pem" \
             -days 1 -subj '/CN=localhost' \
             -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1'
-          chmod 0644 "$root/key.pem" "$root/cert.pem"
+          chmod 0600 "$root/key.pem"
+          chmod 0644 "$root/cert.pem"
           cat > "$root/mosquitto.conf" <<EOF
           persistence false
           allow_anonymous true
