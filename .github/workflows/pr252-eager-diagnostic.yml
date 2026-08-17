@@ -1,4 +1,4 @@
-name: PR252 Candidate Stability Diagnostic
+name: PR252 Pacing Regime Map
 
 on:
   push:
@@ -51,45 +51,38 @@ jobs:
       - name: Instrument benchmark copy with writer counters
         shell: bash
         run: |
-          set -euo pipefail
           cp base/benchmarks/paired_open_loop.py base/benchmarks/diag_open_loop.py
           python3 - <<'PY'
           from pathlib import Path
-          p = Path('base/benchmarks/diag_open_loop.py')
-          t = p.read_text()
-          old = '''    effect_inline: int\n    effect_enqueued: int\n    effect_suspensions: int\n'''
-          new = old + '''    writer_eager_writes: int\n    writer_batches: int\n    writer_batched_items: int\n'''
-          assert t.count(old) == 1
-          t = t.replace(old, new)
-          old = '''        effects = client.stats().effects\n        return OpenLoopResult(\n'''
-          new = '''        stats = client.stats()\n        effects = stats.effects\n        writer = stats.writer\n        return OpenLoopResult(\n'''
-          assert t.count(old) == 1
-          t = t.replace(old, new)
-          old = '''            effect_inline=effects.inline_effects,\n            effect_enqueued=effects.enqueued,\n            effect_suspensions=effects.apply_suspensions,\n'''
-          new = old + '''            writer_eager_writes=writer.eager_writes,\n            writer_batches=writer.batches,\n            writer_batched_items=writer.batched_items,\n'''
-          assert t.count(old) == 1
-          t = t.replace(old, new)
-          p.write_text(t)
+          p=Path('base/benchmarks/diag_open_loop.py'); t=p.read_text()
+          old='''    effect_inline: int\n    effect_enqueued: int\n    effect_suspensions: int\n'''
+          new=old+'''    writer_eager_writes: int\n    writer_batches: int\n    writer_batched_items: int\n'''
+          assert t.count(old)==1; t=t.replace(old,new)
+          old='''        effects = client.stats().effects\n        return OpenLoopResult(\n'''
+          new='''        stats = client.stats()\n        effects = stats.effects\n        writer = stats.writer\n        return OpenLoopResult(\n'''
+          assert t.count(old)==1; t=t.replace(old,new)
+          old='''            effect_inline=effects.inline_effects,\n            effect_enqueued=effects.enqueued,\n            effect_suspensions=effects.apply_suspensions,\n'''
+          new=old+'''            writer_eager_writes=writer.eager_writes,\n            writer_batches=writer.batches,\n            writer_batched_items=writer.batched_items,\n'''
+          assert t.count(old)==1; p.write_text(t.replace(old,new))
           PY
 
       - name: Create benchmark venv
         shell: bash
         run: |
-          v="$RUNNER_TEMP/pr252-stability-v"; rm -rf "$v"; python3 -m venv "$v"; echo "$v/bin" >> "$GITHUB_PATH"
-
+          v="$RUNNER_TEMP/pr252-map-v"; rm -rf "$v"; python3 -m venv "$v"; echo "$v/bin" >> "$GITHUB_PATH"
       - run: python -m pip install "psutil>=6,<8"
 
       - name: Strict host preflight
         working-directory: base
         run: |
-          r="$RUNNER_TEMP/pr252-stability"; rm -rf "$r"; mkdir -p "$r"
+          r="$RUNNER_TEMP/pr252-map"; rm -rf "$r"; mkdir -p "$r"
           python benchmarks/runner_probe.py --output "$r/runner.json" --require-temperature --enforce
 
       - name: Start isolated broker pinned to CPU 0
         shell: bash
         run: |
           set -euo pipefail
-          r="$RUNNER_TEMP/pr252-stability"
+          r="$RUNNER_TEMP/pr252-map"
           cat >"$r/mosquitto.conf" <<'EOF'
           persistence false
           allow_anonymous true
@@ -101,60 +94,44 @@ jobs:
           listener 11883 127.0.0.1
           EOF
           taskset -c 0 mosquitto -c "$r/mosquitto.conf" >"$r/mosquitto.log" 2>&1 & echo $! >"$r/pid"
-          for _ in $(seq 1 50); do
-            (echo >/dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
-            kill -0 "$(cat "$r/pid")" 2>/dev/null || exit 1
-            sleep .1
-          done
+          for _ in $(seq 1 50); do (echo >/dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0; sleep .1; done
           exit 1
 
-      - name: Base A/A stability at 2500/s
+      - name: Candidate A/A rate map
         shell: bash
         run: |
-          r="$RUNNER_TEMP/pr252-stability"
-          python base/benchmarks/diag_open_loop.py --base-root base --candidate-root base \
-            --protocols 311 --payloads 256 --windows 64 --target-rates 2500 --completions callback \
-            --repeat 16 --count-small 4000 --target-sample-seconds 1.5 --max-count 4000 \
-            --timeout 120 --cpu 2 --policy advisory --preflight-report "$r/runner.json" \
-            --output "$r/base-aa.json" --summary-output "$r/base-aa.md"
-
-      - name: Candidate A/A stability at 2500/s
-        shell: bash
-        run: |
-          r="$RUNNER_TEMP/pr252-stability"
+          r="$RUNNER_TEMP/pr252-map"
           python base/benchmarks/diag_open_loop.py --base-root candidate --candidate-root candidate \
-            --protocols 311 --payloads 256 --windows 64 --target-rates 2500 --completions callback \
-            --repeat 16 --count-small 4000 --target-sample-seconds 1.5 --max-count 4000 \
+            --protocols 311 --payloads 256 --windows 64 \
+            --target-rates 500,1000,1500,2000,2500,3000,5000,10000 --completions callback \
+            --repeat 4 --count-small 4000 --target-sample-seconds 1.0 --max-count 4000 \
             --timeout 120 --cpu 2 --policy advisory --preflight-report "$r/runner.json" \
-            --output "$r/candidate-aa.json" --summary-output "$r/candidate-aa.md"
+            --output "$r/map.json" --summary-output "$r/map.md"
 
-      - name: Summarize intrinsic distributions
+      - name: Summarize rate stability
         shell: bash
         run: |
-          ROOT="$RUNNER_TEMP/pr252-stability" python - <<'PY'
+          ROOT="$RUNNER_TEMP/pr252-map" python - <<'PY'
           import json, os, statistics
           from pathlib import Path
-          root=Path(os.environ['ROOT'])
-          for name in ('base-aa','candidate-aa'):
-              d=json.loads((root/f'{name}.json').read_text())
-              pairs=d['scenarios'][0]['pairs']
-              samples=[p[side] for p in pairs for side in ('base','candidate')]
+          d=json.loads((Path(os.environ['ROOT'])/'map.json').read_text())
+          print('rate,p50_median_ms,p50_cv,p50_min,p50_max,eager_median,eager_fraction,lag_median_ms')
+          for s in d['scenarios']:
+              samples=[p[side] for p in s['pairs'] for side in ('base','candidate')]
               p50=[float(x['ack_latency_p50_ms']) for x in samples]
               eager=[int(x['writer_eager_writes']) for x in samples]
-              batches=[int(x['writer_batches']) for x in samples]
-              print(name)
-              print(' p50=', p50)
-              print(' p50_median=', statistics.median(p50), 'p50_cv=', statistics.stdev(p50)/statistics.fmean(p50))
-              print(' eager=', eager, 'eager_median=', statistics.median(eager))
-              print(' batches_median=', statistics.median(batches))
+              lag=[float(x['loop_lag_p95_ms']) for x in samples]
+              count=int(s['count'])
+              cv=statistics.stdev(p50)/statistics.fmean(p50)
+              print(f"{int(s['target_rate'])},{statistics.median(p50):.6f},{cv:.6f},{min(p50):.6f},{max(p50):.6f},{statistics.median(eager):.1f},{statistics.median(eager)/count:.6f},{statistics.median(lag):.6f}")
           PY
 
-      - name: Upload stability evidence
+      - name: Upload pacing map
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: pr252-candidate-stability-${{ github.run_id }}
-          path: ${{ runner.temp }}/pr252-stability/*
+          name: pr252-pacing-map-${{ github.run_id }}
+          path: ${{ runner.temp }}/pr252-map/*
           if-no-files-found: error
           retention-days: 30
 
@@ -162,4 +139,4 @@ jobs:
         if: always()
         shell: bash
         run: |
-          f="$RUNNER_TEMP/pr252-stability/pid"; [ ! -f "$f" ] || { p=$(cat "$f"); kill "$p" 2>/dev/null || true; wait "$p" 2>/dev/null || true; }
+          f="$RUNNER_TEMP/pr252-map/pid"; [ ! -f "$f" ] || { p=$(cat "$f"); kill "$p" 2>/dev/null || true; wait "$p" 2>/dev/null || true; }
