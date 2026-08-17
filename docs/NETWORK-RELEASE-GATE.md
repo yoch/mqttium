@@ -2,58 +2,84 @@
 
 `benchmarks/paired_network.py` remains the low-level acquisition engine. It records
 closed-loop QoS 1 throughput, publisher ACK latency and independent subscriber
-latency, and it intentionally remains useful as an advisory diagnostic on its own.
+latency and remains useful as an advisory diagnostic on its own.
 
-`benchmarks/network_release_gate.py` adds the release decision layer. The two jobs
-are deliberately separate: acquisition should not silently change statistical
-policy, and statistical policy should be testable without a broker.
+`benchmarks/network_release_gate.py` adds the release decision layer. Acquisition
+and statistical policy stay separate so that instrumentation changes do not
+silently redefine release criteria.
+
+## Intended use and cost
+
+This is a **deep, manual release/audit gate**, not routine CI. On the dedicated
+Raspberry Pi 5 ARM64 runner, the complete three-phase protocol takes roughly
+20-30 minutes. Do not add it to push, pull-request or normal `main` workflows.
+
+GitHub provides `.github/workflows/arm64-network-release-gate.yml` as an explicit
+`workflow_dispatch` entry point. It runs only when a maintainer deliberately
+supplies a baseline and candidate ref.
+
+For day-to-day investigation, use the cheaper advisory network sweep or focused
+microbenchmarks instead.
 
 ## Required sequence
 
-A release-grade run is fail-closed and always executes these phases in order:
+A release-grade run is fail-closed and executes these phases in order:
 
 1. fresh dedicated-runner preflight;
 2. baseline same-code A/A;
-3. fixed 60-second quiet period, then a fresh preflight;
+3. fixed 60-second quiet period and fresh preflight;
 4. candidate same-code A/A;
-5. fixed 60-second quiet period, then a fresh preflight;
+5. fixed 60-second quiet period and fresh preflight;
 6. baseline-versus-candidate A/B, only if both controls passed.
 
-The quiet periods are deterministic. The gate never probes repeatedly until it
-happens to find an eligible instant. This matters because `runner_probe.py` uses
-the one-minute load average: an immediate post-benchmark preflight measures work
-performed by the benchmark phase itself.
+The quiet periods are deterministic. The gate never retries preflight until the
+host happens to look eligible. `runner_probe.py` uses the one-minute load average,
+so an immediate post-benchmark preflight would measure work from the benchmark
+itself.
 
-A failed A/A invalidates the experiment. The A/B phase is not run, because a
-benchmark that cannot demonstrate bounded same-code bias and enough precision
-cannot support a release claim about different code.
+A failed A/A invalidates the experiment. The A/B phase is not interpreted when
+the measurement chain cannot demonstrate bounded same-code bias and adequate
+precision.
 
-The calibrated default network cell is MQTT 3.1.1, callback completion, 64-byte
-payloads, windows **1/20/64**, 12 paired samples and a target of approximately two
-seconds per sample.
+## Calibrated default cell
 
-On the dedicated four-core ARM64 runner, the recommended isolation is:
+The validated default release cell is:
+
+- MQTT 3.1.1;
+- callback completion;
+- 64-byte payloads;
+- windows **1/20/64**;
+- two blocks;
+- deterministic `PYTHONHASHSEED` values `0,1,2,3,4,5` per block;
+- one complete ABBA cycle per seed and block;
+- therefore **12 complete ABBA cycles / 24 paired samples per scenario**;
+- approximately two seconds target duration per low-level sample;
+- 60-second fixed quiet periods between blocks/phases.
+
+On the four-core ARM64 runner, use:
 
 - Mosquitto broker: CPU 0;
 - gate, subscriber and observer: CPUs 1 and 3;
 - publisher worker: CPU 2.
 
-This can be achieved by launching the gate under `taskset -c 1,3` and passing
-`--cpu 2`; the broker is started separately under `taskset -c 0`.
+Launch the gate under `taskset -c 1,3`, pass `--cpu 2`, and start Mosquitto
+separately under `taskset -c 0`.
 
 ### Why window 8 is not a release point
 
-During pre-A/B same-code calibration, `window=8` repeatedly showed a second
-execution regime: individual publisher workers sometimes consumed materially
-more CPU and fell from roughly 18-19k ACK/s into the 15-17k range. The effect
-survived publisher/observer CPU isolation and doubling sample duration from about
-two to four seconds. Longer samples therefore did not solve it.
+Same-code calibration repeatedly exposed a second execution regime at
+`window=8`: individual publisher workers could consume materially more CPU and
+fall from the normal ACK-rate regime. The effect survived CPU isolation and
+longer samples.
 
-`window=20`, by contrast, passed the same-code first control together with
-windows 1 and 64 at the original approximately two-second duration. Window 8 is
-retained for advisory diagnostics; it is not silently discarded and should not
-be promoted back into release evidence until its multimodality is understood or
-shown to be stable under repeated same-code controls.
+A later full prospective same-code gate also failed its throughput-equivalence
+confidence interval at window 8, while windows 1 and 64 remained precise.
+`window=20` subsequently passed the complete prospective same-code protocol with
+windows 1 and 64.
+
+Window 8 remains available for advisory diagnostics. It must not be promoted
+back into release evidence unless a new same-code calibration, chosen before any
+A/B result is viewed, demonstrates that the second regime is no longer relevant.
 
 ## Statistical unit: complete ABBA cycles
 
@@ -66,27 +92,25 @@ shown to be stable under repeated same-code controls.
 - ...
 
 Two adjacent opposite-order pairs form one complete ABBA cycle. The release gate
-therefore does **not** pretend that 12 pairs are 12 independent observations.
-For each metric it first computes the candidate/base ratio for every pair, then
-collapses each adjacent pair into one cycle ratio using the geometric mean:
+therefore does **not** treat each pair as an independent statistical observation.
+For every metric it computes candidate/base per pair and collapses each adjacent
+opposite-order pair into one cycle ratio:
 
 `cycle_ratio = sqrt(pair_ratio_forward * pair_ratio_reverse)`
 
-The confidence interval is computed on the log of those cycle ratios with a
-two-sided 95% Student-t interval. With the default `--repeat 12`, the statistical
-sample contains six complete ABBA cycles.
+The confidence interval is computed on log cycle ratios with a two-sided 95%
+Student-t interval. With the validated defaults, each scenario contributes 12
+complete cycles.
 
 This construction cancels first-order position/drift effects that reverse with
-measurement order and keeps the estimator aligned with the benchmark's actual
-experimental design.
+measurement order and keeps the estimator aligned with the experiment design.
 
 ## Same-code control gates
 
-A same-code control must demonstrate **small systematic bias** and **enough
-precision to protect the release margin**. Requiring a 95% CI to contain exactly
-`1.0` is deliberately not used: with enough precision, an immaterial same-code
-offset can exclude exactly 1 while still ruling out every materially relevant
-regression. That is a difference test, not an equivalence requirement.
+A same-code control must demonstrate both small systematic bias and enough
+precision to protect the later no-regression margin. A CI is deliberately not
+required to contain exactly `1.0`; that would be a difference test rather than
+an equivalence requirement.
 
 Publisher ACK throughput must satisfy both:
 
@@ -98,57 +122,44 @@ Publisher ACK p50 latency must satisfy both:
 - geometric-mean candidate/base estimate inside `[0.95, 1.05]`;
 - entire 95% CI inside `[0.90, 1.10]`.
 
-The tighter point-estimate bands prevent a narrow but systematically biased
-same-code result from consuming most of the later no-regression budget. The wider
-confidence bands prove that uncertainty itself is small enough to rule out the
-regression size the A/B gate is intended to protect.
-
-Both the historical baseline and candidate source trees must pass their own
-same-code control before A/B is allowed.
+Both baseline and candidate source trees must pass their own same-code controls
+before A/B is allowed.
 
 ## A/B no-regression gates
 
-After both controls pass, the candidate is accepted only when every selected
-scenario satisfies:
+After both controls pass, every selected scenario must satisfy:
 
-- throughput: lower 95% confidence bound of candidate/base is at least `0.95`;
-- publisher ACK p50 latency: upper 95% confidence bound of candidate/base is at
-  most `1.10`.
+- throughput lower 95% confidence bound of candidate/base >= `0.95`;
+- publisher ACK p50 upper 95% confidence bound of candidate/base <= `1.10`.
 
 The decision therefore uses uncertainty around the paired estimator rather than
-only a median ratio.
+only a median or point ratio.
 
-Independent subscriber delivery p50 is retained in the output but is diagnostic
-for this gate. It includes observer and subscriber scheduling noise in addition
-to the client path. It should become a blocking metric only after its own A/A
-precision has been demonstrated and a separate acceptance margin has been
-predeclared.
+Independent subscriber delivery p50 remains recorded but diagnostic. It includes
+observer/subscriber scheduling noise in addition to the client path and should
+become blocking only after its own A/A precision and acceptance margin have been
+validated separately.
 
-## Why raw arm CV is diagnostic, not the decision statistic
+## Raw arm CV is diagnostic here
 
-The acquisition engine records CV for the absolute base and candidate ACK-rate
-samples. Those values remain visible in every scenario and are useful health
-telemetry.
+`paired_network.py` records CV for absolute base and candidate ACK-rate samples.
+Those values remain useful health telemetry, but they are not the release
+decision statistic in this wrapper.
 
-They are not, by themselves, the release decision statistic. In a paired ABBA
-design, common-mode machine or broker variation can move both absolute arms while
-the within-cycle candidate/base estimator remains precise. Rejecting solely
-because one raw arm crosses a 5% CV threshold throws away exactly the pairing
-that the experiment was designed to exploit.
-
+In a paired ABBA design, common-mode host or broker variation may move both
+absolute arms while the within-cycle candidate/base estimator remains precise.
 Conversely, a low raw-arm CV does not rescue a biased or imprecise paired
-estimator. The mandatory same-code bias and confidence-interval gates prove that
-the complete measurement chain can distinguish neutrality at the required
-resolution.
+estimator. The mandatory same-code bias and confidence-interval gates are the
+validity test for `network_release_gate.py`.
 
-`network_release_gate.py` therefore invokes `paired_network.py` with its legacy
-raw-CV and point-ratio rejection thresholds disabled, while retaining those raw
-values in the artifacts. Worker failures, malformed output, incomplete callback
-accounting and failed fresh preflights remain hard invalidations.
+The wrapper therefore disables the low-level engine's legacy raw-CV and point
+ratio rejection thresholds while preserving raw values in artifacts. Worker
+failures, malformed output, incomplete callback accounting and failed fresh
+preflights remain hard invalidations.
 
-## Example
+## Command-line example
 
-Run Mosquitto separately on the dedicated benchmark host, then compare two exact
+Run Mosquitto separately on the dedicated benchmark host, then compare exact
 checkouts/worktrees:
 
 ```bash
@@ -159,45 +170,40 @@ taskset -c 1,3 python benchmarks/network_release_gate.py \
   --completions callback \
   --payloads 64 \
   --windows 1,20,64 \
-  --repeat 12 \
+  --cycle-seeds 0,1,2,3,4,5 \
   --target-sample-seconds 2.0 \
   --cpu 2 \
+  --inter-phase-quiet-seconds 60 \
   --policy strict \
   --output /tmp/mqttium-network-release.json
 ```
 
-The first preflight runs immediately before baseline A/A. The gate then waits the
-fixed `--inter-phase-quiet-seconds` value (60 seconds by default) before each
-subsequent fresh `runner_probe.py --require-temperature --enforce` invocation.
-Each report is stored beside the raw acquisition JSON.
-
 The top-level JSON and Markdown summary record exact base/candidate SHAs, control
-results, A/B results, bias budgets and 95% confidence intervals. The raw phase
-artifacts are kept in a sibling directory named `<output-stem>-raw/`.
+results, A/B results, thresholds and 95% confidence intervals. Raw phase
+artifacts live beside them in `<output-stem>-raw/`.
 
 ## Retry and evidence policy
 
-Do not rerun a statistical **failure** until it passes and then report only the
-favourable result. A failed no-regression bound is evidence against the candidate.
+Do not rerun a statistical **failure** until it passes and report only the
+favourable result. A failed no-regression bound is evidence against the
+candidate.
 
-An **invalid** run caused by an ineligible host or acquisition failure may be
-repeated once after the external cause is corrected and a fresh preflight passes.
-Retain both attempts. If the repeated experiment is still invalid, stop and fix
-the environment or harness before making a release claim.
+An **invalid** run caused by an external host/provisioning or acquisition failure
+may be repeated once after that cause is corrected and a fresh preflight passes.
+Retain both attempts. If the repeated experiment is still invalid, fix the
+environment or harness before making a release claim.
 
-Changes to release points, sample duration or statistical thresholds must be
-calibrated on same-code controls **before** viewing the A/B result they will judge.
-The calibration history that led to windows 1/20/64 is retained in the PR
-conversation and ARM64 artifacts; no pre-#252 versus post-#252 A/B was run while
-those choices were being made.
+Changes to release points, sample duration, seed schedule or statistical
+thresholds must be calibrated on same-code controls **before** viewing the A/B
+result they will judge.
 
 ## Scope
 
 The default gate uses a real Mosquitto broker and real TCP sockets on loopback.
 It covers the complete client/broker PUBACK path and independent subscriber
-observation without introducing uncontrolled LAN jitter.
+observation without uncontrolled LAN jitter.
 
 For changes whose risk specifically involves kernel/network-device behaviour,
 Nagle/coalescing, physical-network jitter or remote-broker interaction, add a
-separate two-host LAN experiment. Do not silently reinterpret a loopback result
-as proof of wide-area network behaviour.
+separate two-host LAN experiment. Do not reinterpret a loopback result as proof
+of wide-area network behaviour.
