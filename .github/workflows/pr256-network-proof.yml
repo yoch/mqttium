@@ -143,8 +143,8 @@ jobs:
         shell: bash
         run: |
           python - <<'PY'
-          import json, pathlib, statistics
-          root = pathlib.Path("$RUNNER_TEMP/pr256-network")
+          import json, os, pathlib, statistics
+          root = pathlib.Path(os.environ["RUNNER_TEMP"]) / "pr256-network"
           for name in ("base-aa", "candidate-aa"):
               data = json.loads((root / f"{name}.json").read_text())
               if data["status"] != "passed":
@@ -181,8 +181,8 @@ jobs:
         shell: bash
         run: |
           python - <<'PY'
-          import json, pathlib, statistics
-          path = pathlib.Path("$RUNNER_TEMP/pr256-network/ab.json")
+          import json, os, pathlib, statistics
+          path = pathlib.Path(os.environ["RUNNER_TEMP"]) / "pr256-network" / "ab.json"
           data = json.loads(path.read_text())
           if data["status"] != "passed":
               raise SystemExit(f"A/B harness status={data['status']}")
