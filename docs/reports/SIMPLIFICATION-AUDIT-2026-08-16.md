@@ -94,8 +94,12 @@ No scenario regresses. The four `encode_*` scenarios, `websocket_mask_4k`,
 exactly neutral, which is the expected shape: nothing in this audit touched the
 PUBLISH encoder or the delivery queues' inner loops.
 
-Source: **562 insertions, 669 deletions** across 20 files;
-`pytest tests/unit tests/integration` goes from 1168 to 1172 passing, 0 skipped.
+Source across the whole audit: **1 069 insertions, 1 173 deletions** over 27
+files; `pytest tests/unit tests/integration` goes from 1168 to 1171 passing,
+0 skipped, coverage 90.15%. The table above is the first five waves; the sixth
+(below) is neutral on these scenarios because none of them carries an MQTT 5
+property table or crosses `AsyncClient`, and its two measurements are quoted
+where they were taken.
 
 Traced peak moves two ways. It rises ~10% on the four ingress/cycle scenarios —
 a flat ~600 bytes per engine for the two per-state handler dicts, constant
@@ -104,7 +108,7 @@ committed limit in `memory_thresholds.json` still passes with headroom.
 
 ## What was changed
 
-Five waves, each independently revertable, each gated as above.
+Six waves, each independently revertable, each gated as above.
 
 ### 1 — Dead code
 
@@ -255,6 +259,66 @@ duplicate check the fallback carried. Covered by
 `MemoryInflightStore` and the extension-less `PlainInflightStore`; it fails on
 the previous code with exactly the orphan PUBREL 0x92.
 
+### 6 — Second pass: the rest of the audited scope
+
+Applied after the first five waves, closing everything the audit had found and
+judged worth doing.
+
+- **`_on_qos1` is bound to its acknowledgement mode at construction**, like
+  `handle_publish` and the codec primitives already were. `manual_ack` is not
+  runtime-mutable, yet the handler re-tested it five times per inbound QoS 1
+  PUBLISH and threaded a `logical_size: int | None` tri-state through
+  `_acquire_slot` that meant only "automatic mode reserves no bytes". This
+  removes branches, not calls, so `hotpath_profile.py` cannot see it; advisory
+  paired A/B on this (non-certified) host put `ingress_publish_qos1` at
+  candidate/base **1.0331**, base CV 0.83%, over 7 pairs.
+- **MQTT 5 property values dispatch through the spec.** Two seven-branch `is`
+  chains and two string compares (`name == "response_topic"`,
+  `name == "subscription_identifier"`) became per-type codecs attached to each
+  `PropertySpec` at import, plus `topic_value` / `subscribe_singleton` flags
+  alongside the `nonzero` / `zero_one` that were already declared. Five of the
+  seven decoders turn out to be the primitive itself, so those lose a frame
+  too: a four-property PUBLISH table decodes in **45.0 calls/op instead of 47.0
+  and 5210 ns instead of 5773** (best of 5 × 100k).
+
+  Worth recording the first attempt, which was *worse*: keying the codec tables
+  by `PropType` cost **more** than the if-chain it replaced, because `PropType`
+  is an `Enum` and `Enum.__hash__` is a Python-level function — two extra calls
+  per property. Enum members are expensive dict keys on a hot path.
+- **`AsyncClient` calls the directional sessions directly.**
+  `ProtocolEngine.queue_publish`, `queue_publish_many` and
+  `mark_inbound_delivered` were forwarders crossed per publish and per
+  delivered QoS 1/2 message. The `DISCONNECTING` guard moved into
+  `OutboundSession.queue_publish` (which `queue_publish_many` admits through,
+  so it inherits it); the engine methods remain the Provisional facade.
+- **Cold-path dedup finished**: one `publish_logical_size` in a new
+  `protocol/_sizing.py` for the two directional copies that had already
+  drifted; the four validation-free ACK-success literals moved next to their
+  validating twins in `packets/_ack.py`; `encode_auth_v5` moved beside
+  `decode_auth_v5` with one `_AUTH_REASONS`; `CodecBindings.encode_pingresp`
+  (never called) and `encode_pingreq` (version-invariant) replaced by a
+  `pingreq_frame` constant; `_fetch_by_mids` shared by the SQLite pager and the
+  replay batcher; `_ordered_mids` fed straight from the cursor.
+- **The SQLite migration block was misnamed, not just duplicated.**
+  `_migrate_to_v2`'s inbound half and `_migrate_to_v4` were the same four
+  statements, and *both* rebuilt from the current column constants — so
+  `_migrate_to_v2` never produced a v2 table. The `if 2 <= version < 4` gate
+  was a guard against rebuilding twice, not a statement about schema versions,
+  and a v5 column would have made it wrong. Now three steps named for what they
+  do, gated by which tables still need work.
+- **Provisional/Stable surface**: `ClientStats.protocol` and `ProtocolStats`
+  removed (nine fields duplicating `outbound`/`inbound` in the same snapshot);
+  `AsyncClient.messages()` returns the delivery iterator instead of re-yielding
+  from it; `is_terminal_connack` reads the terminal sets directly instead of
+  constructing a `ReconnectPolicy` per call — verified equivalent across all
+  256 reason codes on both protocols.
+
+Two tests were strengthened rather than merely re-pointed while doing this.
+`test_connected_qos1_launch_reuses_cached_property_body` now publishes twice:
+with a single publish, admission hands its property bytes straight to the launch
+encoder, so the assertion held whether or not the cache worked. Disabling the
+cache now fails both cached-body tests; before, it failed only one.
+
 ## Looks redundant, is load-bearing
 
 Recorded so the next reader does not "clean up" a measured decision.
@@ -292,6 +356,12 @@ Recorded so the next reader does not "clean up" a measured decision.
 
 Real findings, each deserving its own change rather than a place in a
 simplification pass.
+
+- **`deliver_batch_inline` / `deliver_decoded_batch_inline`** still differ only
+  in the effect kind and the size test, and merging them would save ~35 lines.
+  Declined on this audit's own rule: they are the ingress hot loop, and a shared
+  body has to read `effect.decoded_property_wire_size` on the plain MESSAGE path
+  too. One attribute load per delivered message is not worth 35 lines.
 
 - **`transport/websocket.py:497`** — `del buf[:total]` per frame is an O(n)
   memmove on the read path, while `codec/buffer.py` solved exactly this with a
