@@ -114,7 +114,7 @@ jobs:
             --protocols 311 \
             --completions callback \
             --payloads 64 \
-            --windows 1,8,64 \
+            --windows 1,20,64 \
             --cycle-seeds 0,1,2,3,4,5 \
             --target-sample-seconds 2.0 \
             --max-count 60000 \
