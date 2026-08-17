@@ -238,12 +238,21 @@ class SqliteInflightStore:
         try:
             legacy = self._table_exists("outbound") or self._table_exists("inbound")
             self._create_schema()
-            if version < 2 and legacy:
-                self._migrate_to_v2()
-            if version < 3 and legacy:
-                self._migrate_to_v3()
-            if 2 <= version < 4 and legacy:
-                self._migrate_to_v4()
+            if legacy:
+                # Each rebuild below recreates its table from the *current*
+                # column constants, not from the schema of the version it is
+                # upgrading to -- there is only ever one target, the schema this
+                # build declares. So the gates say which tables still need
+                # rebuilding, not which historical shape to produce:
+                #   outbound gained logical_size and payload-last order in v2;
+                #   inbound gained logical_size in v4 and needs no other change,
+                #   which is why one rebuild covers every version below it.
+                if version < 2:
+                    self._rebuild_outbound()
+                if version < 4:
+                    self._rebuild_inbound()
+                if version < 3:
+                    self._compact_wait_pubcomp_records()
             conn.execute(f"PRAGMA user_version={SQLITE_SCHEMA_VERSION}")
         except BaseException:
             # One transaction for the whole upgrade: an interrupted migration
@@ -291,8 +300,8 @@ class SqliteInflightStore:
         conn.execute(f"CREATE TABLE IF NOT EXISTS outbound ({self.OUTBOUND_COLUMNS})")
         conn.execute(f"CREATE TABLE IF NOT EXISTS inbound ({self.INBOUND_COLUMNS})")
 
-    def _migrate_to_v2(self) -> None:
-        """Schema 1 → 2: persisted logical size and payload-last column order.
+    def _rebuild_outbound(self) -> None:
+        """Rebuild `outbound` in the current column order (schema 1 -> 2 and on).
 
         Reordering columns requires a table rebuild, which is also the cheapest
         moment to add `logical_size`. Migrated rows keep it at 0, which the
@@ -302,30 +311,38 @@ class SqliteInflightStore:
         Deliberately no `seq` index: ordered pagination is served by one sorted
         metadata pass (see `_ordered_mids`), which measured faster than the
         indexed page-per-query form while costing nothing on every INSERT and
-        DELETE of the publish hot path.
+        DELETE of the publish hot path. Rebuilding drops the old table, and with
+        it any index a previous build had created on it.
         """
-        # Rebuilding drops each old table, and with it any index a previous
-        # build had created on it. The literal `0` supplies `logical_size` for
-        # rows written before the column existed.
         self._rebuild_table(
             "outbound",
-            f"CREATE TABLE outbound__v2 ({self.OUTBOUND_COLUMNS})",
-            "INSERT INTO outbound__v2 SELECT mid, seq, qos, retain, state, dup,"
+            f"CREATE TABLE outbound__new ({self.OUTBOUND_COLUMNS})",
+            # The literal `0` supplies `logical_size` for rows written before
+            # the column existed.
+            "INSERT INTO outbound__new SELECT mid, seq, qos, retain, state, dup,"
             " 0, topic, properties, payload FROM outbound",
             "DROP TABLE outbound",
-            "ALTER TABLE outbound__v2 RENAME TO outbound",
-        )
-        self._rebuild_table(
-            "inbound",
-            f"CREATE TABLE inbound__v2 ({self.INBOUND_COLUMNS})",
-            "INSERT INTO inbound__v2 SELECT mid, seq, qos, retain, state,"
-            " delivered, user_acked, 0, topic, properties, payload FROM inbound",
-            "DROP TABLE inbound",
-            "ALTER TABLE inbound__v2 RENAME TO inbound",
+            "ALTER TABLE outbound__new RENAME TO outbound",
         )
 
-    def _migrate_to_v3(self) -> None:
-        """Discard PUBLISH application data after the QoS 2 PUBREC phase.
+    def _rebuild_inbound(self) -> None:
+        """Rebuild `inbound` in the current column order (durable byte accounting).
+
+        Every pre-4 schema stores the same inbound columns, so one rebuild
+        serves schema 1, 2 and 3 alike; this was previously written out twice,
+        identically, once under a "to v2" name and once under a "to v4" name.
+        """
+        self._rebuild_table(
+            "inbound",
+            f"CREATE TABLE inbound__new ({self.INBOUND_COLUMNS})",
+            "INSERT INTO inbound__new SELECT mid, seq, qos, retain, state,"
+            " delivered, user_acked, 0, topic, properties, payload FROM inbound",
+            "DROP TABLE inbound",
+            "ALTER TABLE inbound__new RENAME TO inbound",
+        )
+
+    def _compact_wait_pubcomp_records(self) -> None:
+        """Discard PUBLISH application data after the QoS 2 PUBREC phase (schema 3).
 
         A ``WAIT_PUBCOMP`` record only retransmits PUBREL. Its original logical
         size remains durable so the admission budget is released exactly once
@@ -338,17 +355,6 @@ class SqliteInflightStore:
             WHERE state=?
             """,
             (int(OutboundQoSState.WAIT_PUBCOMP),),
-        )
-
-    def _migrate_to_v4(self) -> None:
-        """Schema 2/3 → 4: durable inbound logical byte accounting."""
-        self._rebuild_table(
-            "inbound",
-            f"CREATE TABLE inbound__v4 ({self.INBOUND_COLUMNS})",
-            "INSERT INTO inbound__v4 SELECT mid, seq, qos, retain, state,"
-            " delivered, user_acked, 0, topic, properties, payload FROM inbound",
-            "DROP TABLE inbound",
-            "ALTER TABLE inbound__v4 RENAME TO inbound",
         )
 
     def _rebuild_table(self, table: str, *statements: str) -> None:
