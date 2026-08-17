@@ -102,7 +102,7 @@ jobs:
             --base-root runtime \
             --candidate-root runtime \
             --engine harness/benchmarks/paired_network.py \
-            --runner-probe harness/benchmarks/runner_probe.py \
+            --runner-probe harness/benchmarks/network_release_preflight.py \
             --protocols 311 \
             --completions callback \
             --payloads 64 \
