@@ -131,10 +131,11 @@ jobs:
           cat "$root/mosquitto.log"
           exit 1
 
-      - name: Run strict A/A then A/B paced acceptance cells
+      - name: Collect strict A/B and independent A/A control
         shell: bash
         run: |
-          set -uo pipefail
+          set +e
+          set -u -o pipefail
           root="$RUNNER_TEMP/mqttium-paced"
           common=(
             --protocols 311
@@ -150,15 +151,6 @@ jobs:
             --preflight-report "$root/preflight.json"
           )
 
-          echo '=== A/A: pre-eager 3962f32 versus itself ==='
-          python harness/benchmarks/paired_open_loop.py \
-            --base-root base --candidate-root base \
-            "${common[@]}" \
-            --output "$root/aa.json" \
-            --summary-output "$root/aa.md"
-          aa_status=$?
-          echo "A/A exit=$aa_status"
-
           echo '=== A/B: pre-eager 3962f32 versus #254 exact HEAD ==='
           python harness/benchmarks/paired_open_loop.py \
             --base-root base --candidate-root candidate \
@@ -168,8 +160,17 @@ jobs:
           ab_status=$?
           echo "A/B exit=$ab_status"
 
-          printf 'aa_status=%s\nab_status=%s\n' "$aa_status" "$ab_status" | tee "$root/status.txt"
-          if [ "$aa_status" -ne 0 ] || [ "$ab_status" -ne 0 ]; then
+          echo '=== independent A/A retry: pre-eager 3962f32 versus itself ==='
+          python harness/benchmarks/paired_open_loop.py \
+            --base-root base --candidate-root base \
+            "${common[@]}" \
+            --output "$root/aa.json" \
+            --summary-output "$root/aa.md"
+          aa_status=$?
+          echo "A/A exit=$aa_status"
+
+          printf 'ab_status=%s\naa_status=%s\n' "$ab_status" "$aa_status" | tee "$root/status.txt"
+          if [ "$ab_status" -ne 0 ] || [ "$aa_status" -ne 0 ]; then
             exit 1
           fi
 
