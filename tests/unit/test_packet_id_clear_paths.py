@@ -125,7 +125,6 @@ def test_missing_session_clears_all_abandoned_inflight_packet_ids_once() -> None
         pool.reserve(mid)
     engine.packet_ids = pool
     engine.state = ConnectionState.CONNECTING
-    engine._pending_connect = True
 
     engine._on_connack(RawPacket(PacketType.CONNACK, 0, b"\x00\x00"))
 
@@ -145,7 +144,6 @@ def test_missing_session_preserves_queued_packet_ids() -> None:
     pool.reserve(23)
     engine.packet_ids = pool
     engine.state = ConnectionState.CONNECTING
-    engine._pending_connect = True
 
     engine._on_connack(RawPacket(PacketType.CONNACK, 0, b"\x00\x00"))
 

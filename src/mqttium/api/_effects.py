@@ -60,7 +60,7 @@ class EffectPump:
         self.owner = owner
         self.lock = asyncio.Lock()
         self.pending: deque[EngineEffect] = deque()
-        self.pending_epoch: int | None = None
+        self.pending_epoch = owner._connection_epoch
         self.enqueued = 0
         self.applied = 0
         self.pending_high_water = 0
@@ -168,21 +168,19 @@ class EffectPump:
             self.pending.popleft()
             self.inline_effects += 1
             self._complete()
-        if not self.pending:
-            self.pending_epoch = None
         return True
 
     def drain_inline(self) -> None:
         if self.draining_inline or self.lock.locked():
             return
-        epoch = self.pending_epoch
-        if epoch is None:
+        if not self.pending:
             return
+        epoch = self.pending_epoch
         if epoch != self.owner._connection_epoch:
             self.discard_connection_effects()
-            epoch = self.pending_epoch
-            if epoch is None:
+            if not self.pending:
                 return
+            epoch = self.pending_epoch
         self.draining_inline = True
         try:
             while self.pending:
@@ -202,8 +200,6 @@ class EffectPump:
                 self.pending.popleft()
                 self.inline_effects += 1
                 self._complete()
-            if not self.pending:
-                self.pending_epoch = None
         finally:
             self.draining_inline = False
         if self.pending:
@@ -225,12 +221,6 @@ class EffectPump:
                 while self.pending:
                     effect = self.pending[0]
                     epoch = self.pending_epoch
-                    if epoch is None:
-                        # Unreachable: the epoch is stamped whenever the deque
-                        # becomes non-empty and cleared only when it empties.
-                        # Retained to narrow `int | None` for the calls below.
-                        self.pending.clear()
-                        break
                     if epoch != self.owner._connection_epoch:
                         self.discard_connection_effects()
                         continue
@@ -267,8 +257,6 @@ class EffectPump:
                         if self.pending and self.pending[0] is effect:
                             self.pending.popleft()
                             self._complete()
-                    if not self.pending:
-                        self.pending_epoch = None
                 if not self.flush_requested:
                     return
 
@@ -342,7 +330,8 @@ class EffectPump:
             discarded += 1
 
         self.pending = retained
-        self.pending_epoch = self.owner._connection_epoch if retained else None
+        if retained:
+            self.pending_epoch = self.owner._connection_epoch
         self.applied += discarded
         if self.waiters:
             self.progress.set()

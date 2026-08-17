@@ -503,7 +503,7 @@ class ApplicationDelivery:
             if effect.kind is not EffectKind.MESSAGE:
                 break
             message: Message = effect.data
-            if effect.requires_delivery_mark is not False or not self._is_small(message):
+            if effect.requires_delivery_mark or not self._is_small(message):
                 break
             if iterator_delivery and self.messages_queue.full():
                 break
@@ -540,7 +540,7 @@ class ApplicationDelivery:
             message: Message = effect.data
             property_wire_size = effect.decoded_property_wire_size
             if (
-                effect.requires_delivery_mark is not False
+                effect.requires_delivery_mark
                 or property_wire_size is None
                 or not self._is_small_decoded(message, property_wire_size)
             ):

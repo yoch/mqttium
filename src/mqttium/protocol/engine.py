@@ -103,7 +103,6 @@ class ProtocolEngine:
         self.state = ConnectionState.NEW
         self.session_present = False
         self.negotiated = NegotiatedSettings()
-        self._pending_connect = False
         self._effects: list[EngineEffect] = []
         # Specialized codecs are bound once; handlers and sessions never branch
         # on protocol per packet.
@@ -383,7 +382,6 @@ class ProtocolEngine:
             0 if request_response_information is None else int(request_response_information)
         )
         self.state = ConnectionState.CONNECTING
-        self._pending_connect = True
         self.inbound.start_connection()
         # Negotiated capabilities are connection-scoped. Queued messages are
         # validated against the new values only after the next CONNACK.
@@ -529,7 +527,6 @@ class ProtocolEngine:
         was = self.state
         self.state = ConnectionState.DISCONNECTED
         self.inbound.transport_closed()
-        self._pending_connect = False
         self._reauth_in_progress = False
         # Release sub/unsub MIDs still in flight — no ACK will arrive now.
         if self._pending_sub_requests:
@@ -583,7 +580,7 @@ class ProtocolEngine:
             self._emit(EffectKind.PROTOCOL_ERROR, f"Internal handler error: {exc!r}")
 
     def _on_connack(self, raw: RawPacket) -> None:
-        if not self._pending_connect or self.state != ConnectionState.CONNECTING:
+        if self.state != ConnectionState.CONNECTING:
             raise ProtocolError("Unexpected CONNACK (already negotiated)")
         session_present, reason_code, properties = self.codec.decode_connack(raw.remaining)
         connack = ConnAckPacket(
@@ -591,7 +588,6 @@ class ProtocolEngine:
             reason_code=reason_code,
             properties=properties,
         )
-        self._pending_connect = False
         if self.codec.is_mqtt5:
             connack_method = (
                 connack.properties.get("authentication_method")

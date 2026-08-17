@@ -704,7 +704,6 @@ def test_mqtt_3_1_3_7_empty_client_id_requires_a_clean_session(
         with pytest.raises(ProtocolError, match="MQTT-3.1.3-7"):
             engine.begin_connect()
         assert engine.state is ConnectionState.NEW
-        assert not engine._pending_connect
 
 
 def test_empty_client_id_is_caught_when_a_resumed_session_forces_clean_start() -> None:
@@ -718,7 +717,6 @@ def test_empty_client_id_is_caught_when_a_resumed_session_forces_clean_start() -
     with pytest.raises(ProtocolError, match="MQTT-3.1.3-7"):
         engine.begin_connect()
     assert engine.state is ConnectionState.NEW
-    assert not engine._pending_connect
 
 
 @pytest.mark.parametrize(

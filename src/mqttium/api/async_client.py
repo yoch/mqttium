@@ -283,7 +283,6 @@ class AsyncClient:
         self._teardown_final = False
         self._ping_pending = False
         self._ping_deadline = 0.0
-        self._connected_at = 0.0
         self._host = ""
         self._port = 1883
         self._ssl: ssl.SSLContext | bool | None = None
@@ -817,7 +816,6 @@ class AsyncClient:
                     )
                     self._disconnect_exc = refusal
                 raise refusal
-            self._connected_at = time.monotonic()
             self._write_pump.last_outbound = time.monotonic()
             self._keepalive_task = asyncio.create_task(
                 self._keepalive_loop(), name="mqttium-keepalive"
@@ -1689,7 +1687,7 @@ class AsyncClient:
             pending_delivery = self._accept_message(message, self.on_message)
             if pending_delivery is not None:
                 await pending_delivery
-            if effect.requires_delivery_mark is not False and message.mid is not None:
+            if effect.requires_delivery_mark and message.mid is not None:
                 async with self._engine_lock:
                     self._engine.inbound.mark_delivered(message.mid)
         elif kind is EffectKind.DECODED_MESSAGE:
@@ -1701,7 +1699,7 @@ class AsyncClient:
             )
             if pending_delivery is not None:
                 await pending_delivery
-            if effect.requires_delivery_mark is not False and message.mid is not None:
+            if effect.requires_delivery_mark and message.mid is not None:
                 async with self._engine_lock:
                     self._engine.inbound.mark_delivered(message.mid)
         elif kind is EffectKind.PUBLISH_COMPLETE:
