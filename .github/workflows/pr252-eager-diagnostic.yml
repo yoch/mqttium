@@ -1,142 +1,134 @@
-name: PR252 Pacing Regime Map
+name: Apply PR252 Open-loop Stability Contract
 
 on:
   push:
     branches: [agent/pr252-eager-diagnostic]
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  diagnose:
-    runs-on: [self-hosted, linux, ARM64]
-    timeout-minutes: 30
+  apply:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     env:
-      PYTHONUNBUFFERED: "1"
-      PIP_DISABLE_PIP_VERSION_CHECK: "1"
-      BASE_SHA: 0999d8abfe44a568209209403d7f215b18cc4eb7
-      CANDIDATE_SHA: b0bbdfb21baeb7fb15f1428cf26d25ab492f731a
+      TARGET_BRANCH: refactor/simplification-audit-2026-08-16
+      EXPECTED_HEAD: b0bbdfb21baeb7fb15f1428cf26d25ab492f731a
+      EXPECTED_MAIN: 0999d8abfe44a568209209403d7f215b18cc4eb7
     steps:
-      - name: Verify clean performance host
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "$(uname -m)" = aarch64
-          command -v python3; command -v mosquitto; command -v mosquitto_sub; command -v taskset
-          test "$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor | sort -u)" = performance
-          if pgrep -a mosquitto; then exit 1; fi
-
       - uses: actions/checkout@v7
         with:
-          ref: ${{ env.BASE_SHA }}
-          path: base
           fetch-depth: 0
-          persist-credentials: false
 
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ env.CANDIDATE_SHA }}
-          path: candidate
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Verify exact endpoints
+      - name: Pin target and base
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git -C base rev-parse HEAD)" = "$BASE_SHA"
-          test "$(git -C candidate rev-parse HEAD)" = "$CANDIDATE_SHA"
-          test "$(git -C candidate merge-base "$BASE_SHA" "$CANDIDATE_SHA")" = "$BASE_SHA"
+          git fetch --no-tags origin \
+            "+refs/heads/main:refs/remotes/origin/main" \
+            "+refs/heads/${TARGET_BRANCH}:refs/remotes/origin/target"
+          test "$(git rev-parse refs/remotes/origin/main)" = "$EXPECTED_MAIN"
+          test "$(git rev-parse refs/remotes/origin/target)" = "$EXPECTED_HEAD"
+          test "$(git merge-base refs/remotes/origin/main refs/remotes/origin/target)" = "$EXPECTED_MAIN"
+          git config user.name yoch
+          git config user.email yoch.melka@gmail.com
+          git checkout -B target-work refs/remotes/origin/target
 
-      - name: Instrument benchmark copy with writer counters
-        shell: bash
-        run: |
-          cp base/benchmarks/paired_open_loop.py base/benchmarks/diag_open_loop.py
-          python3 - <<'PY'
-          from pathlib import Path
-          p=Path('base/benchmarks/diag_open_loop.py'); t=p.read_text()
-          old='''    effect_inline: int\n    effect_enqueued: int\n    effect_suspensions: int\n'''
-          new=old+'''    writer_eager_writes: int\n    writer_batches: int\n    writer_batched_items: int\n'''
-          assert t.count(old)==1; t=t.replace(old,new)
-          old='''        effects = client.stats().effects\n        return OpenLoopResult(\n'''
-          new='''        stats = client.stats()\n        effects = stats.effects\n        writer = stats.writer\n        return OpenLoopResult(\n'''
-          assert t.count(old)==1; t=t.replace(old,new)
-          old='''            effect_inline=effects.inline_effects,\n            effect_enqueued=effects.enqueued,\n            effect_suspensions=effects.apply_suspensions,\n'''
-          new=old+'''            writer_eager_writes=writer.eager_writes,\n            writer_batches=writer.batches,\n            writer_batched_items=writer.batched_items,\n'''
-          assert t.count(old)==1; p.write_text(t.replace(old,new))
-          PY
-
-      - name: Create benchmark venv
-        shell: bash
-        run: |
-          v="$RUNNER_TEMP/pr252-map-v"; rm -rf "$v"; python3 -m venv "$v"; echo "$v/bin" >> "$GITHUB_PATH"
-      - run: python -m pip install "psutil>=6,<8"
-
-      - name: Strict host preflight
-        working-directory: base
-        run: |
-          r="$RUNNER_TEMP/pr252-map"; rm -rf "$r"; mkdir -p "$r"
-          python benchmarks/runner_probe.py --output "$r/runner.json" --require-temperature --enforce
-
-      - name: Start isolated broker pinned to CPU 0
+      - name: Apply symmetric stability contract
         shell: bash
         run: |
           set -euo pipefail
-          r="$RUNNER_TEMP/pr252-map"
-          cat >"$r/mosquitto.conf" <<'EOF'
-          persistence false
-          allow_anonymous true
-          max_inflight_messages 1000
-          max_queued_messages 100000
-          max_queued_bytes 0
-          connection_messages false
-          log_type error
-          listener 11883 127.0.0.1
-          EOF
-          taskset -c 0 mosquitto -c "$r/mosquitto.conf" >"$r/mosquitto.log" 2>&1 & echo $! >"$r/pid"
-          for _ in $(seq 1 50); do (echo >/dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0; sleep .1; done
-          exit 1
-
-      - name: Candidate A/A rate map
-        shell: bash
-        run: |
-          r="$RUNNER_TEMP/pr252-map"
-          python base/benchmarks/diag_open_loop.py --base-root candidate --candidate-root candidate \
-            --protocols 311 --payloads 256 --windows 64 \
-            --target-rates 500,1000,1500,2000,2500,3000,5000,10000 --completions callback \
-            --repeat 4 --count-small 4000 --target-sample-seconds 1.0 --max-count 4000 \
-            --timeout 120 --cpu 2 --policy advisory --preflight-report "$r/runner.json" \
-            --output "$r/map.json" --summary-output "$r/map.md"
-
-      - name: Summarize rate stability
-        shell: bash
-        run: |
-          ROOT="$RUNNER_TEMP/pr252-map" python - <<'PY'
-          import json, os, statistics
+          python - <<'PY'
           from pathlib import Path
-          d=json.loads((Path(os.environ['ROOT'])/'map.json').read_text())
-          print('rate,p50_median_ms,p50_cv,p50_min,p50_max,eager_median,eager_fraction,lag_median_ms')
-          for s in d['scenarios']:
-              samples=[p[side] for p in s['pairs'] for side in ('base','candidate')]
-              p50=[float(x['ack_latency_p50_ms']) for x in samples]
-              eager=[int(x['writer_eager_writes']) for x in samples]
-              lag=[float(x['loop_lag_p95_ms']) for x in samples]
-              count=int(s['count'])
-              cv=statistics.stdev(p50)/statistics.fmean(p50)
-              print(f"{int(s['target_rate'])},{statistics.median(p50):.6f},{cv:.6f},{min(p50):.6f},{max(p50):.6f},{statistics.median(eager):.1f},{statistics.median(eager)/count:.6f},{statistics.median(lag):.6f}")
+
+          def replace_once(path: Path, old: str, new: str) -> None:
+              text = path.read_text()
+              count = text.count(old)
+              assert count == 1, f"{path}: expected one match, found {count}: {old[:80]!r}"
+              path.write_text(text.replace(old, new))
+
+          bench = Path("benchmarks/paired_open_loop.py")
+          replace_once(
+              bench,
+              '''        candidate_rates = [_number(item, "completed_rate") for item in samples["candidate"]]\n        base_latencies = [_number(item, "ack_latency_p50_ms") for item in samples["base"]]\n''',
+              '''        candidate_rates = [_number(item, "completed_rate") for item in samples["candidate"]]\n        base_latencies = [_number(item, "ack_latency_p50_ms") for item in samples["base"]]\n        candidate_latencies = [\n            _number(item, "ack_latency_p50_ms") for item in samples["candidate"]\n        ]\n''',
+          )
+          replace_once(
+              bench,
+              '''        base_cv = _cv(base_rates)\n        base_latency_cv = _cv(base_latencies)\n''',
+              '''        base_cv = _cv(base_rates)\n        candidate_cv = _cv(candidate_rates)\n        base_latency_cv = _cv(base_latencies)\n        candidate_latency_cv = _cv(candidate_latencies)\n''',
+          )
+          replace_once(
+              bench,
+              '''            "base_completed_cv": base_cv,\n            "base_ack_latency_p50_cv": base_latency_cv,\n''',
+              '''            "base_completed_cv": base_cv,\n            "candidate_completed_cv": candidate_cv,\n            "base_ack_latency_p50_cv": base_latency_cv,\n            "candidate_ack_latency_p50_cv": candidate_latency_cv,\n''',
+          )
+          replace_once(
+              bench,
+              '''        if base_cv > args.max_baseline_cv:\n            invalidations.append(f"{label}: baseline completed-rate CV {base_cv:.2%}")\n        if base_latency_cv > args.max_baseline_cv:\n            invalidations.append(f"{label}: baseline p50-latency CV {base_latency_cv:.2%}")\n''',
+              '''        if base_cv > args.max_baseline_cv:\n            invalidations.append(f"{label}: baseline completed-rate CV {base_cv:.2%}")\n        if candidate_cv > args.max_baseline_cv:\n            invalidations.append(f"{label}: candidate completed-rate CV {candidate_cv:.2%}")\n        if base_latency_cv > args.max_baseline_cv:\n            invalidations.append(f"{label}: baseline p50-latency CV {base_latency_cv:.2%}")\n        if candidate_latency_cv > args.max_baseline_cv:\n            invalidations.append(f"{label}: candidate p50-latency CV {candidate_latency_cv:.2%}")\n''',
+          )
+
+          tests = Path("tests/unit/test_paired_open_loop.py")
+          text = tests.read_text()
+          marker = "def test_parent_invalidates_candidate_only_variability("
+          assert marker not in text
+          text += '''\n\ndef test_parent_invalidates_candidate_only_variability(\n    open_loop, monkeypatch: pytest.MonkeyPatch, tmp_path: Path\n) -> None:\n    base_root = tmp_path / "base"\n    candidate_root = tmp_path / "candidate"\n    base_root.mkdir()\n    candidate_root.mkdir()\n    samples = {\n        base_root.resolve(): iter(((100.0, 0.5),) * 4),\n        candidate_root.resolve(): iter(\n            ((80.0, 0.2), (120.0, 0.8), (80.0, 0.2), (120.0, 0.8))\n        ),\n    }\n\n    def fake_run_worker(*call_args, **kwargs):\n        if kwargs["mode"] == "calibrate":\n            return {"capacity": 12_000.0}\n        root = Path(call_args[1]).resolve()\n        completed_rate, latency = next(samples[root])\n        return {\n            "completed_rate": completed_rate,\n            "ack_latency_p50_ms": latency,\n            "loop_lag_p95_ms": 0.1,\n        }\n\n    monkeypatch.setattr(open_loop, "_run_worker", fake_run_worker)\n    output = tmp_path / "candidate-variability.json"\n    args = Namespace(\n        base_root=base_root,\n        candidate_root=candidate_root,\n        protocols="311",\n        payloads="64",\n        completions="callback",\n        window=64,\n        windows=None,\n        fractions=None,\n        target_rates="5000",\n        preflight_report=None,\n        policy="advisory",\n        max_baseline_cv=0.05,\n        min_completed_ratio=0.97,\n        max_loop_lag_ratio=1.05,\n        max_aa_ratio_deviation=0.02,\n        cpu=None,\n        target_sample_seconds=0.01,\n        max_count=10,\n        count_small=1,\n        count_large=1,\n        repeat=4,\n        host="127.0.0.1",\n        port=11883,\n        timeout=1.0,\n        output=output,\n        summary_output=None,\n    )\n\n    assert open_loop.parent(args) == 0\n    result = open_loop.json.loads(output.read_text())\n    scenario = result["scenarios"][0]\n    assert scenario["base_completed_cv"] == 0.0\n    assert scenario["base_ack_latency_p50_cv"] == 0.0\n    assert scenario["candidate_completed_cv"] > 0.05\n    assert scenario["candidate_ack_latency_p50_cv"] > 0.05\n    assert result["status"] == "invalid"\n    assert any("candidate completed-rate CV" in item for item in result["invalidations"])\n    assert any("candidate p50-latency CV" in item for item in result["invalidations"])\n'''
+          tests.write_text(text)
+
+          docs = Path("docs/BENCHMARKING.md")
+          replace_once(
+              docs,
+              '''Paired measurements use fresh interpreters and alternate base/candidate order in\ncomplete ABBA cycles. Read the pair distribution as well as the median. A result\nis invalid when baseline CV exceeds 5%, and a control scenario that should not\nmove must remain within 2%. A benchmark that cannot satisfy its A/A control is\ndiagnostic, regardless of whether it exposes a strict exit mode for experiments.\n''',
+              '''Paired measurements use fresh interpreters and alternate base/candidate order in\ncomplete ABBA cycles. Read the pair distribution as well as the median. A result\nis invalid when either arm's completed-rate or p50-latency CV exceeds 5%, and a\ncontrol scenario that should not move must remain within 2%. The historical\n`--max-baseline-cv` option is the shared per-arm stability ceiling. A benchmark\nthat cannot satisfy its A/A control on either source tree is diagnostic,\nregardless of whether it exposes a strict exit mode for experiments.\n''',
+          )
+          replace_once(
+              docs,
+              '''The A/A median completed-rate ratio must stay within 2% and baseline CV at or\nbelow 5%. The A/B candidate must retain at least 95% of the rc5 completed rate\nfor both QoS 0 and QoS 1. This is a regression floor, not a claim that rc5 is an\noptimal ceiling. The paced open-loop acceptance cells at 2,500 and 7,500\nmessages/s remain separate evidence and must still be retained; recovering\ncapacity by simply disabling eager writes would fail that side of the contract.\n''',
+              '''The A/A median completed-rate ratio must stay within 2% and baseline CV at or\nbelow 5%. The A/B candidate must retain at least 95% of the rc5 completed rate\nfor both QoS 0 and QoS 1. This is a regression floor, not a claim that rc5 is an\noptimal ceiling. Paced open-loop evidence remains separate, but a fixed rate is\nacceptance evidence only when both source trees pass their own A/A stability at\nthat rate. Historical 2,500/7,500 cells are diagnostic when either tree falls\ninside a timer-transition band; recovering capacity by simply disabling eager\nwrites would still fail the paced side of the contract.\n''',
+          )
+          replace_once(
+              docs,
+              '''When `--target-rates` is present, fixed-rate points run by themselves unless\n`--fractions` is also supplied explicitly. With neither option, the retained\n`0.50,0.75,0.90,1.00` capacity-fraction sweep remains the default. Passing the\nsame source root on both sides is an A/A control and enforces the neutral\ncompleted-rate ratio within 2% in addition to the normal CV checks.\n''',
+              '''When `--target-rates` is present, fixed-rate points run by themselves unless\n`--fractions` is also supplied explicitly. With neither option, the retained\n`0.50,0.75,0.90,1.00` capacity-fraction sweep remains the default. Passing the\nsame source root on both sides is an A/A control and enforces the neutral\ncompleted-rate ratio within 2% in addition to the normal CV checks. Before an\nA/B claim, run that A/A control independently on both source trees: an unstable\ncandidate cannot be legitimised by a stable baseline or by a plausible median\nA/B ratio.\n''',
+          )
+          replace_once(
+              docs,
+              '''- baseline CV must be at most 5%;\n''',
+              '''- each arm's completed-rate and p50-latency CV must be at most 5%;\n''',
+          )
+          replace_once(
+              docs,
+              '''Baseline CV inflates in the same band, because the slower arm\nflips between modes from sample to sample.\n\nBefore trusting a lag verdict, compare the two arms' **absolute**\n''',
+              '''Baseline CV inflates in the same band, because the slower arm\nflips between modes from sample to sample.\n\nThe same timer alias can appear directly in callback/receipt p50 even when\noffered rate and loop lag look neutral. A faster implementation may consume\nseveral overdue publishes in one timer wake; with a writer policy that rearms\none eager write per event-loop turn, that changes the eager/batched mix without\nlosing capacity. For fixed-rate evidence, therefore reject a cell when either\narm's own p50 CV exceeds the stability ceiling instead of interpreting its\nmedian A/B latency ratio. Select rates where both source trees are independently\nstable.\n\nBefore trusting a lag verdict, compare the two arms' **absolute**\n''',
+          )
+
+          report = Path("docs/reports/SIMPLIFICATION-ARM64-REVALIDATION-2026-08-17.md")
+          text = report.read_text()
+          start = text.index("## Corrected-HEAD acceptance contract")
+          replacement = '''## Corrected-HEAD measurement follow-up\n\nThe corrected runtime HEAD `b0bbdfb21baeb7fb15f1428cf26d25ab492f731a`\npassed functional CI (`32019206970`), long fuzz (`32019206645`) and\nfinalization (`32019206803`). Exact ARM64 run `32019390794` also passed\nstrict closed-loop capacity A/A and A/B; the candidate retained about 102.9%\nof current-main capacity for both QoS 0 and QoS 1. At 10,000 msg/s callback\np50 was favourable (~0.259 ms candidate versus ~0.287 ms main).\n\nThe apparent remaining 2,500 msg/s p50 regression was not a stable A/B\nquantity. Its eight pair ratios ranged from roughly 1.00x to 4.20x. Direct\nwriter-counter diagnostics (`32020415978`) showed essentially the same eager\nwrite share on both trees, while candidate-only A/A (`32020574606`) exposed\nthe real measurement failure: current main had about 3.8% p50 CV, but the\ncandidate had about 61% p50 CV and alternated between ~0.34-0.5 ms and ~1.39\nms plateaus. Offered rate and loop lag remained essentially unchanged.\n\nA candidate-only pacing sweep (`32020930121`) confirmed timer aliasing rather\nthan a monotonic runtime slowdown. On the same exact source tree, 2,000 and\n3,000 msg/s were stable on slow timer plateaus, 2,500 msg/s was strongly\nbimodal, while 5,000 msg/s was stable near ~0.336 ms (about 0.4% p50 CV) and\n10,000 msg/s remained stable enough for the retained 5% ceiling (about 4.6%\np50 CV). The effect follows the event-loop wake cadence and the intentional\none-eager-write-per-loop-turn policy from issue #253.\n\nThis exposed a harness defect: `paired_open_loop.py` rejected high baseline\ncompleted-rate/p50 CV but did not apply the same stability check to the\ncandidate arm. A noisy candidate could therefore produce a formally passing\nstrict A/B run with a meaningless median. The benchmark now applies the same\n5% stability ceiling to completed rate and p50 latency on both arms. The\nhistorical CLI name `--max-baseline-cv` is retained for compatibility.\n\n## Final acceptance contract\n\nThe comparison baseline remains post-#254/#255 main\n`0999d8abfe44a568209209403d7f215b18cc4eb7`. Final acceptance requires:\n\n- full functional CI, fuzz and finalization green on the exact final HEAD;\n- strict closed-loop capacity A/A valid and A/B >=95% of current main for\n  QoS 0 and QoS 1;\n- independent A/A open-loop stability for **both** main and candidate at the\n  selected fixed rates;\n- paced A/B completion and loop-lag gates passing at stable rates;\n- no material callback-latency regression at those stable rates.\n\nFor this revalidation, 5,000 and 10,000 msg/s are the selected ARM64 callback\nrates because the candidate-only screen places both outside its unstable\n2,500 msg/s timer-transition cell. They still require fresh exact-final-HEAD\nbase A/A, candidate A/A and A/B runs; the exploratory sweep is not itself\nacceptance evidence.\n'''
+          report.write_text(text[:start] + replacement)
           PY
 
-      - name: Upload pacing map
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: pr252-pacing-map-${{ github.run_id }}
-          path: ${{ runner.temp }}/pr252-map/*
-          if-no-files-found: error
-          retention-days: 30
-
-      - name: Stop broker
-        if: always()
+      - name: Validate focused changes
         shell: bash
         run: |
-          f="$RUNNER_TEMP/pr252-map/pid"; [ ! -f "$f" ] || { p=$(cat "$f"); kill "$p" 2>/dev/null || true; wait "$p" 2>/dev/null || true; }
+          set -euo pipefail
+          python -m pip install -e ".[dev]"
+          python -m ruff format --check benchmarks/paired_open_loop.py tests/unit/test_paired_open_loop.py
+          python -m ruff check benchmarks/paired_open_loop.py tests/unit/test_paired_open_loop.py
+          python -m pytest -q tests/unit/test_paired_open_loop.py
+          git diff --check
+          git status --short
+          test "$(git diff --name-only | wc -l)" -eq 4
+          test "$(git diff --name-only | sort)" = "$(printf '%s\n' benchmarks/paired_open_loop.py docs/BENCHMARKING.md docs/reports/SIMPLIFICATION-ARM64-REVALIDATION-2026-08-17.md tests/unit/test_paired_open_loop.py | sort)"
+
+      - name: Commit and push with lease
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add benchmarks/paired_open_loop.py tests/unit/test_paired_open_loop.py docs/BENCHMARKING.md docs/reports/SIMPLIFICATION-ARM64-REVALIDATION-2026-08-17.md
+          git commit -m "bench: reject unstable open-loop candidate arms"
+          git fetch --no-tags origin "+refs/heads/${TARGET_BRANCH}:refs/remotes/origin/target-final"
+          test "$(git rev-parse refs/remotes/origin/target-final)" = "$EXPECTED_HEAD"
+          git push --force-with-lease="refs/heads/${TARGET_BRANCH}:${EXPECTED_HEAD}" origin "HEAD:refs/heads/${TARGET_BRANCH}"
