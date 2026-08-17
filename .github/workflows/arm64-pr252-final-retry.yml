@@ -1,202 +1,142 @@
-name: ARM64 Paired-Network MID Generation Probe
+name: Apply Paired-Network Harness Fix
 
 on:
   push:
     branches: [agent/arm64-runner-probe]
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  validate:
-    runs-on: [self-hosted, linux, ARM64]
+  patch:
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
-      PYTHONUNBUFFERED: "1"
-      PIP_DISABLE_PIP_VERSION_CHECK: "1"
-      BASE_SHA: 0999d8abfe44a568209209403d7f215b18cc4eb7
-      CANDIDATE_SHA: fd750be3012e3878b12449624bce2c71747623ba
+      TARGET_BRANCH: fix/paired-network-callback-generations
+      EXPECTED_SHA: 0999d8abfe44a568209209403d7f215b18cc4eb7
     steps:
-      - name: Verify dedicated host
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "$(uname -m)" = aarch64
-          test "$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor | sort -u)" = performance
-          command -v python3
-          command -v mosquitto
-          command -v mosquitto_sub
-          command -v taskset
-          command -v timeout
-          if pgrep -a mosquitto; then exit 1; fi
-
       - uses: actions/checkout@v7
         with:
-          ref: ${{ env.BASE_SHA }}
-          path: base
+          ref: ${{ env.TARGET_BRANCH }}
           fetch-depth: 0
-          persist-credentials: false
 
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ env.CANDIDATE_SHA }}
-          path: candidate
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Verify exact endpoints
+      - name: Verify exact target
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git -C base rev-parse HEAD)" = "$BASE_SHA"
-          test "$(git -C candidate rev-parse HEAD)" = "$CANDIDATE_SHA"
-          test "$(git -C candidate merge-base "$BASE_SHA" "$CANDIDATE_SHA")" = "$BASE_SHA"
-          test "$(git -C base hash-object benchmarks/paired_network.py)" = "$(git -C candidate hash-object benchmarks/paired_network.py)"
-          test -z "$(git -C base status --porcelain)"
-          test -z "$(git -C candidate status --porcelain)"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          test -z "$(git status --porcelain)"
+          test "$(git hash-object benchmarks/paired_network.py)" = 20ddd95241e541f64c242412b96d3897822b598e
+          test "$(git hash-object tests/unit/test_paired_network_gate.py)" = b7944787de34a1e508d268302f7d734dcd57ce70
 
-      - name: Create benchmark venv
-        shell: bash
-        run: |
-          v="$RUNNER_TEMP/m252-mid-v"
-          rm -rf "$v"
-          python3 -m venv "$v"
-          echo "$v/bin" >> "$GITHUB_PATH"
-
-      - run: python -m pip install "psutil>=6,<8"
-
-      - name: Fresh strict preflight
-        working-directory: base
-        run: |
-          r="$RUNNER_TEMP/m252-mid"
-          rm -rf "$r"
-          mkdir -p "$r"
-          python benchmarks/runner_probe.py --output "$r/runner.json" --require-temperature --enforce
-
-      - name: Start pinned broker
+      - name: Apply fail-closed source patch
         shell: bash
         run: |
           set -euo pipefail
-          r="$RUNNER_TEMP/m252-mid"
-          cat >"$r/mosquitto.conf" <<'EOF'
-          persistence false
-          allow_anonymous true
-          max_inflight_messages 1000
-          max_queued_messages 100000
-          max_queued_bytes 0
-          connection_messages false
-          log_type error
-          listener 11883 127.0.0.1
-          EOF
-          taskset -c 0 mosquitto -c "$r/mosquitto.conf" >"$r/mosquitto.log" 2>&1 & echo $! >"$r/pid"
-          for _ in $(seq 1 50); do
-            (echo >/dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
-            kill -0 "$(cat "$r/pid")" 2>/dev/null || exit 1
-            sleep .1
-          done
-          exit 1
-
-      - name: Build temporary FIFO-by-MID-generation harness
-        shell: bash
-        run: |
-          set -euo pipefail
-          r="$RUNNER_TEMP/m252-mid"
-          cp candidate/benchmarks/paired_network.py "$r/paired_network_fifo.py"
-          HARNESS="$r/paired_network_fifo.py" python - <<'PY'
-          import os
+          python - <<'PY'
           from pathlib import Path
 
-          p = Path(os.environ["HARNESS"])
+          p = Path("benchmarks/paired_network.py")
           text = p.read_text()
-          replacements = [
-              (
-                  '''    completed: asyncio.Queue[tuple[int, int]] = asyncio.Queue()\n    publish_started: dict[int, int] = {}\n    early_completion: dict[int, int] = {}\n''',
-                  '''    # Completion queue carries the generation's start timestamp, not only MID.\n    completed: asyncio.Queue[tuple[int, int]] = asyncio.Queue()\n    publish_started: dict[int, deque[int]] = {}\n    early_completion: dict[int, deque[int]] = {}\n''',
-              ),
-              (
-                  '''            if mid in publish_started:\n                completed.put_nowait((mid, finished))\n            else:\n                early_completion[mid] = finished\n''',
-                  '''            starts = publish_started.get(mid)\n            if starts:\n                sent_ns = starts.popleft()\n                if not starts:\n                    publish_started.pop(mid, None)\n                completed.put_nowait((sent_ns, finished))\n            else:\n                early_completion.setdefault(mid, deque()).append(finished)\n''',
-              ),
-              (
-                  '''            assert receipt.mid is not None\n            publish_started[receipt.mid] = published_ns\n            if receipt.mid in early_completion:\n                completed.put_nowait((receipt.mid, early_completion.pop(receipt.mid)))\n            outstanding += 1\n            if outstanding >= window:\n                mid, finished = await completed.get()\n                ack_latencies.append((finished - publish_started.pop(mid)) / 1_000_000)\n                outstanding -= 1\n''',
-                  '''            assert receipt.mid is not None\n            starts = publish_started.setdefault(receipt.mid, deque())\n            starts.append(published_ns)\n            early = early_completion.get(receipt.mid)\n            if early:\n                finished = early.popleft()\n                sent_ns = starts.popleft()\n                if not starts:\n                    publish_started.pop(receipt.mid, None)\n                if not early:\n                    early_completion.pop(receipt.mid, None)\n                completed.put_nowait((sent_ns, finished))\n            outstanding += 1\n            if outstanding >= window:\n                sent_ns, finished = await completed.get()\n                ack_latencies.append((finished - sent_ns) / 1_000_000)\n                outstanding -= 1\n''',
-              ),
-              (
-                  '''    else:\n        for _ in range(outstanding):\n            mid, finished = await completed.get()\n            ack_latencies.append((finished - publish_started.pop(mid)) / 1_000_000)\n    elapsed = time.perf_counter() - started\n''',
-                  '''    else:\n        for _ in range(outstanding):\n            sent_ns, finished = await completed.get()\n            ack_latencies.append((finished - sent_ns) / 1_000_000)\n        if publish_started or early_completion:\n            raise RuntimeError(\n                f"callback generation accounting leaked starts={sum(map(len, publish_started.values()))} "\n                f"early={sum(map(len, early_completion.values()))}"\n            )\n    elapsed = time.perf_counter() - started\n''',
-              ),
-          ]
-          for old, new in replacements:
-              assert text.count(old) == 1, old
+
+          def replace_once(old: str, new: str) -> None:
+              global text
+              if text.count(old) != 1:
+                  raise SystemExit(f"expected exactly one source match, found {text.count(old)}: {old[:80]!r}")
               text = text.replace(old, new)
+
+          replace_once(
+              "from dataclasses import asdict, dataclass\n",
+              "from dataclasses import asdict, dataclass, field\n",
+          )
+          replace_once(
+              '''class InvalidMeasurement(RuntimeError):\n    """A worker could not produce a trustworthy sample."""\n\n\n''',
+              '''class InvalidMeasurement(RuntimeError):\n    """A worker could not produce a trustworthy sample."""\n\n\n@dataclass\nclass CallbackGenerationTracker:\n    """Match delayed ``on_publish`` callbacks to reused MQTT packet IDs.\n\n    Packet IDs may be reused once the protocol ACK releases them, while the\n    application callback is still queued. A scalar ``mid -> timestamp`` map\n    therefore loses generations under concurrent publishing. Keep FIFO\n    generations per MID so delayed callbacks cannot consume a newer publish.\n    """\n\n    starts: dict[int, deque[int]] = field(default_factory=dict)\n    early: dict[int, deque[int]] = field(default_factory=dict)\n\n    def register(self, mid: int, sent_ns: int) -> tuple[int, int] | None:\n        starts = self.starts.setdefault(mid, deque())\n        starts.append(sent_ns)\n        early = self.early.get(mid)\n        if not early:\n            return None\n        finished_ns = early.popleft()\n        matched_sent_ns = starts.popleft()\n        if not starts:\n            self.starts.pop(mid, None)\n        if not early:\n            self.early.pop(mid, None)\n        return matched_sent_ns, finished_ns\n\n    def complete(self, mid: int, finished_ns: int) -> tuple[int, int] | None:\n        starts = self.starts.get(mid)\n        if not starts:\n            self.early.setdefault(mid, deque()).append(finished_ns)\n            return None\n        sent_ns = starts.popleft()\n        if not starts:\n            self.starts.pop(mid, None)\n        return sent_ns, finished_ns\n\n    def pending_counts(self) -> tuple[int, int]:\n        return (\n            sum(len(starts) for starts in self.starts.values()),\n            sum(len(completions) for completions in self.early.values()),\n        )\n\n\n''',
+          )
+          replace_once(
+              '''    pending: deque[tuple[PublishReceipt, int]] = deque()\n    completed: asyncio.Queue[tuple[int, int]] = asyncio.Queue()\n    publish_started: dict[int, int] = {}\n    early_completion: dict[int, int] = {}\n''',
+              '''    pending: deque[tuple[PublishReceipt, int]] = deque()\n    completed: asyncio.Queue[tuple[int, int]] = asyncio.Queue()\n    callback_generations = CallbackGenerationTracker()\n''',
+          )
+          replace_once(
+              '''            if mid in publish_started:\n                completed.put_nowait((mid, finished))\n            else:\n                early_completion[mid] = finished\n''',
+              '''            match = callback_generations.complete(mid, finished)\n            if match is not None:\n                completed.put_nowait(match)\n''',
+          )
+          replace_once(
+              '''            assert receipt.mid is not None\n            publish_started[receipt.mid] = published_ns\n            if receipt.mid in early_completion:\n                completed.put_nowait((receipt.mid, early_completion.pop(receipt.mid)))\n            outstanding += 1\n            if outstanding >= window:\n                mid, finished = await completed.get()\n                ack_latencies.append((finished - publish_started.pop(mid)) / 1_000_000)\n                outstanding -= 1\n''',
+              '''            assert receipt.mid is not None\n            match = callback_generations.register(receipt.mid, published_ns)\n            if match is not None:\n                completed.put_nowait(match)\n            outstanding += 1\n            if outstanding >= window:\n                sent_ns, finished = await completed.get()\n                ack_latencies.append((finished - sent_ns) / 1_000_000)\n                outstanding -= 1\n''',
+          )
+          replace_once(
+              '''    else:\n        for _ in range(outstanding):\n            mid, finished = await completed.get()\n            ack_latencies.append((finished - publish_started.pop(mid)) / 1_000_000)\n    elapsed = time.perf_counter() - started\n''',
+              '''    else:\n        for _ in range(outstanding):\n            sent_ns, finished = await completed.get()\n            ack_latencies.append((finished - sent_ns) / 1_000_000)\n        pending_starts, early_callbacks = callback_generations.pending_counts()\n        if pending_starts or early_callbacks:\n            raise RuntimeError(\n                "callback generation accounting leaked "\n                f"starts={pending_starts} early={early_callbacks}"\n            )\n    elapsed = time.perf_counter() - started\n''',
+          )
+          replace_once(
+              '''def calibrated_sample_count(\n    requested: int, rates: list[float], minimum_seconds: float, maximum: int\n) -> int:\n''',
+              '''def arm_variability(\n    label: str,\n    base_values: list[float],\n    candidate_values: list[float],\n    maximum_cv: float,\n) -> tuple[float, float, list[str]]:\n    """Validate measurement stability symmetrically across both paired arms."""\n    base_cv = coefficient_of_variation(base_values)\n    candidate_cv = coefficient_of_variation(candidate_values)\n    invalidations: list[str] = []\n    if base_cv > maximum_cv:\n        invalidations.append(f"{label}: baseline CV {base_cv:.2%}")\n    if candidate_cv > maximum_cv:\n        invalidations.append(f"{label}: candidate CV {candidate_cv:.2%}")\n    return base_cv, candidate_cv, invalidations\n\n\ndef calibrated_sample_count(\n    requested: int, rates: list[float], minimum_seconds: float, maximum: int\n) -> int:\n''',
+          )
+          replace_once(
+              '''            ratio = median(ack_ratios)\n            baseline_cv = coefficient_of_variation(base_ack_rates)\n            scenario = {\n''',
+              '''            ratio = median(ack_ratios)\n            label = (\n                f"protocol={protocol} completion={completion} "\n                f"payload={payload_bytes} window={window}"\n            )\n            baseline_cv, candidate_cv, variability_invalidations = arm_variability(\n                label, base_ack_rates, candidate_ack_rates, args.max_baseline_cv\n            )\n            scenario = {\n''',
+          )
+          replace_once(
+              '''                "base_ack_cv": baseline_cv,\n                "candidate_ack_cv": coefficient_of_variation(candidate_ack_rates),\n''',
+              '''                "base_ack_cv": baseline_cv,\n                "candidate_ack_cv": candidate_cv,\n''',
+          )
+          replace_once(
+              '''            label = (\n                f"protocol={protocol} completion={completion} "\n                f"payload={payload_bytes} window={window}"\n            )\n            if baseline_cv > args.max_baseline_cv:\n                invalidations.append(f"{label}: baseline CV {baseline_cv:.2%}")\n            if ratio < args.min_ack_ratio:\n''',
+              '''            invalidations.extend(variability_invalidations)\n            if ratio < args.min_ack_ratio:\n''',
+          )
+          replace_once(
+              '''                f"ack candidate/base={ratio:.4f} base_cv={baseline_cv:.2%} "\n                f"p50 base={median(base_p50):7.2f}ms "\n''',
+              '''                f"ack candidate/base={ratio:.4f} base_cv={baseline_cv:.2%} "\n                f"candidate_cv={candidate_cv:.2%} "\n                f"p50 base={median(base_p50):7.2f}ms "\n''',
+          )
+          replace_once(
+              '''    parser.add_argument("--max-baseline-cv", type=float, default=0.05)\n''',
+              '''    parser.add_argument(\n        "--max-baseline-cv",\n        type=float,\n        default=0.05,\n        help="maximum ACK-rate CV allowed for either paired arm (legacy option name)",\n    )\n''',
+          )
+          p.write_text(text)
+
+          p = Path("tests/unit/test_paired_network_gate.py")
+          text = p.read_text()
+
+          def replace_test_once(old: str, new: str) -> None:
+              global text
+              if text.count(old) != 1:
+                  raise SystemExit(f"expected exactly one test match, found {text.count(old)}: {old[:80]!r}")
+              text = text.replace(old, new)
+
+          replace_test_once(
+              '''from benchmarks.paired_network import (\n    InvalidMeasurement,\n''',
+              '''from benchmarks.paired_network import (\n    CallbackGenerationTracker,\n    InvalidMeasurement,\n''',
+          )
+          replace_test_once(
+              '''    _write_evaluation,\n    calibrated_sample_count,\n''',
+              '''    _write_evaluation,\n    arm_variability,\n    calibrated_sample_count,\n''',
+          )
+          replace_test_once(
+              '''def test_observer_runs_outside_publisher_and_preserves_sequence() -> None:\n''',
+              '''def test_callback_generation_tracker_preserves_reused_mid_fifo() -> None:\n    tracker = CallbackGenerationTracker()\n\n    assert tracker.register(7, 100) is None\n    assert tracker.register(7, 200) is None\n    assert tracker.complete(7, 150) == (100, 150)\n    assert tracker.complete(7, 250) == (200, 250)\n    assert tracker.pending_counts() == (0, 0)\n\n\ndef test_callback_generation_tracker_matches_early_callback() -> None:\n    tracker = CallbackGenerationTracker()\n\n    assert tracker.complete(9, 150) is None\n    assert tracker.register(9, 100) == (100, 150)\n    assert tracker.pending_counts() == (0, 0)\n\n\ndef test_candidate_only_variability_invalidates_measurement() -> None:\n    base_cv, candidate_cv, invalidations = arm_variability(\n        "window=8",\n        [100.0, 100.5, 99.5, 100.0],\n        [80.0, 120.0, 85.0, 115.0],\n        0.05,\n    )\n\n    assert base_cv < 0.05\n    assert candidate_cv > 0.05\n    assert invalidations == [f"window=8: candidate CV {candidate_cv:.2%}"]\n\n\ndef test_observer_runs_outside_publisher_and_preserves_sequence() -> None:\n''',
+          )
           p.write_text(text)
           PY
-          python -m py_compile "$r/paired_network_fifo.py"
-          echo "Temporary harness patched; exact source trees remain untouched"
-          test -z "$(git -C base status --porcelain)"
-          test -z "$(git -C candidate status --porcelain)"
+          git diff --check
+          test "$(git diff --name-only | sort)" = $'benchmarks/paired_network.py\ntests/unit/test_paired_network_gate.py'
 
-      - name: Main window=8 with FIFO generation tracking
+      - name: Targeted validation
         shell: bash
         run: |
           set -euo pipefail
-          r="$RUNNER_TEMP/m252-mid"
-          echo "[$(date -Is)] START main A/A window=8"
-          timeout --signal=TERM --kill-after=5s 90s \
-            python "$r/paired_network_fifo.py" --base-root base --candidate-root base \
-              --protocols 311 --payloads 256 --windows 8 --completions callback \
-              --repeat 4 --count-small 4000 --target-sample-seconds 0.1 --max-count 4000 \
-              --timeout 20 --cpu 2 --policy strict --preflight-report "$r/runner.json" \
-              --output "$r/main-aa.json" --summary-output "$r/main-aa.md"
-          echo "[$(date -Is)] DONE main A/A window=8"
+          python -m pip install -e '.[dev]'
+          python -m pytest -q tests/unit/test_paired_network_gate.py
+          ruff check benchmarks/paired_network.py tests/unit/test_paired_network_gate.py
 
-      - name: PR252 window=8 with FIFO generation tracking
+      - name: Commit and push exact fix branch
         shell: bash
         run: |
           set -euo pipefail
-          r="$RUNNER_TEMP/m252-mid"
-          echo "[$(date -Is)] START PR252 A/A window=8"
-          timeout --signal=TERM --kill-after=5s 90s \
-            python "$r/paired_network_fifo.py" --base-root candidate --candidate-root candidate \
-              --protocols 311 --payloads 256 --windows 8 --completions callback \
-              --repeat 4 --count-small 4000 --target-sample-seconds 0.1 --max-count 4000 \
-              --timeout 20 --cpu 2 --policy strict --preflight-report "$r/runner.json" \
-              --output "$r/candidate-aa.json" --summary-output "$r/candidate-aa.md"
-          echo "[$(date -Is)] DONE PR252 A/A window=8"
-
-      - name: Summarize fixed-harness controls
-        shell: bash
-        run: |
-          ROOT="$RUNNER_TEMP/m252-mid" python - <<'PY'
-          import json, os
-          from pathlib import Path
-          root = Path(os.environ["ROOT"])
-          for name in ("main-aa", "candidate-aa"):
-              data = json.loads((root / f"{name}.json").read_text())
-              s = data["scenarios"][0]
-              print(
-                  f"{name}: status={data['status']} ratio={s['median_candidate_over_base_ack']:.4f} "
-                  f"base_cv={s['base_ack_cv']:.2%} candidate_cv={s['candidate_ack_cv']:.2%} "
-                  f"p50_base={s['base_median_p50_ms']:.6f}ms p50_candidate={s['candidate_median_p50_ms']:.6f}ms"
-              )
-          PY
-
-      - name: Stop broker
-        if: always()
-        shell: bash
-        run: |
-          f="$RUNNER_TEMP/m252-mid/pid"
-          [ ! -f "$f" ] || { p=$(cat "$f"); kill "$p" 2>/dev/null || true; wait "$p" 2>/dev/null || true; }
-
-      - name: Upload evidence
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: arm64-pr252-mid-generation-${{ github.run_id }}
-          path: |
-            ${{ runner.temp }}/m252-mid/*.json
-            ${{ runner.temp }}/m252-mid/*.md
-            ${{ runner.temp }}/m252-mid/paired_network_fifo.py
-            ${{ runner.temp }}/m252-mid/mosquitto.log
-          if-no-files-found: error
-          retention-days: 30
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add benchmarks/paired_network.py tests/unit/test_paired_network_gate.py
+          git diff --cached --check
+          git commit -m "bench: track callback generations in paired network"
+          git push origin "HEAD:$TARGET_BRANCH"
