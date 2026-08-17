@@ -11,8 +11,12 @@ be committed.
 - `paired_regression.py` compares isolated implementation paths in fresh
   processes and alternating order.
 - `paired_network.py` records advisory closed-loop QoS 1 capacity and PUBACK
-  latency. It is not a release gate because its A/A control exceeded the noise
-  budget even on a preflight-eligible host.
+  latency. It is not a release gate because its raw-arm A/A stability is not
+  reliable enough to use its legacy CV rule as a general release decision.
+- `network_release_gate.py` wraps a calibrated `paired_network.py` subset in
+  mandatory baseline/candidate A/A controls and confidence-bound ABBA-cycle
+  evaluation. It is a deep manual release/audit gate; see
+  [`NETWORK-RELEASE-GATE.md`](NETWORK-RELEASE-GATE.md).
 - `paired_open_loop.py` measures completion and loop lag at calibrated or fixed
   absolute load. It can sweep outbound windows while calling `AsyncClient`
   directly; no cross-client adapter participates in the measurement.
@@ -36,10 +40,13 @@ Python, and broker metadata. A strict performance run requires `--enforce`. An
 ineligible host produces no release evidence, even if its ratio looks good.
 
 Paired measurements use fresh interpreters and alternate base/candidate order in
-complete ABBA cycles. Read the pair distribution as well as the median. A result
-is invalid when baseline CV exceeds 5%, and a control scenario that should not
-move must remain within 2%. A benchmark that cannot satisfy its A/A control is
-diagnostic, regardless of whether it exposes a strict exit mode for experiments.
+complete ABBA cycles. Read the pair distribution as well as the aggregate.
+Benchmark-specific validity rules still apply: the legacy strict harnesses that
+explicitly gate raw arms retain their CV limits and neutral-control budgets.
+`network_release_gate.py` is deliberately different: raw arm CV is diagnostic,
+and validity comes from bounded same-code bias plus 95% equivalence intervals on
+complete ABBA-cycle ratios. A benchmark that cannot satisfy its own declared A/A
+control is diagnostic, regardless of whether it exposes a strict exit mode.
 
 Hosted GitHub runners are useful for functional coverage and advisory numbers.
 They are not authoritative for latency or small throughput changes.
@@ -95,7 +102,7 @@ substitute for the strict eligible-host A/A and A/B sequence above.
 ## Keeping the harness out of the result
 
 A benchmark can become its own bottleneck. MQTTium's network harness follows
-four rules to prevent that:
+five rules to prevent that:
 
 1. The process running `AsyncClient` contains no subscriber reader thread.
    `mosquitto_sub` output is timestamped in a separate observer process, so
@@ -182,14 +189,20 @@ A micro optimisation is retained when it removes demonstrated work, improves by
 at least 2%, and favours the candidate in at least 8 of 11 pairs. A network
 optimisation requires a reproducible gain of at least 5% at two load points.
 
-In both cases:
+Unless a benchmark-specific contract explicitly replaces them, the generic
+acceptance checks are:
 
-- baseline CV must be at most 5%;
-- the neutral control must stay within 2%;
-- non-targeted throughput must not fall by more than 3%;
-- loop lag must not rise by more than 5%;
-- memory limits and public semantics must remain unchanged;
-- added complexity requires an explicit, measured trade-off.
+- baseline CV at most 5%;
+- neutral control within 2%;
+- non-targeted throughput not down by more than 3%;
+- loop lag not up by more than 5%;
+- memory limits and public semantics unchanged;
+- added complexity justified by an explicit, measured trade-off.
+
+`network_release_gate.py` is a no-regression release gate rather than the generic
+optimisation-acceptance test above. Its calibrated same-code equivalence and A/B
+confidence-bound contract, including diagnostic-only raw CV, is defined in
+[`NETWORK-RELEASE-GATE.md`](NETWORK-RELEASE-GATE.md).
 
 The loop-lag ratio is only readable when both arms sit in the same pacing
 regime, and it silently penalises the faster one when they do not.
