@@ -1380,7 +1380,7 @@ class AsyncClient:
     def _will_reconnect(self) -> bool:
         reason = self._retry_reason()
         return (
-            not isinstance(self._disconnect_exc, MessageDeliveryError)
+            not isinstance(self._disconnect_exc, (MessageDeliveryError, AssertionError))
             and not self._intentional_disconnect
             and self._reconnect.enabled
             and self._reconnect.should_retry(reason, self._engine.config.protocol)
@@ -1537,6 +1537,11 @@ class AsyncClient:
                     continue
                 except Exception as exc:
                     self._disconnect_exc = exc
+                    if isinstance(exc, AssertionError):
+                        # Never reuse an engine after a proven local invariant
+                        # violation, including one raised during reconnect.
+                        self._fail_pending(exc)
+                        return
                     continue
         except asyncio.CancelledError:
             raise
