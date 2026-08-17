@@ -118,7 +118,7 @@ jobs:
               --base-root base --candidate-root base \
               --protocols 311 --payloads 64 --windows 1,8,64 \
               --completions callback --repeat 6 \
-              --count-small 6000 --max-count 6000 --target-sample-seconds 0.1 \
+              --count-small 6000 --max-count 60000 --target-sample-seconds 2.0 \
               --timeout 60 --cpu 2 --policy strict \
               --preflight-report "$RUNNER_TEMP/pr256-runner.json" \
               --output "$RUNNER_TEMP/pr256-network/base-aa.json" \
@@ -133,7 +133,7 @@ jobs:
               --base-root candidate --candidate-root candidate \
               --protocols 311 --payloads 64 --windows 1,8,64 \
               --completions callback --repeat 6 \
-              --count-small 6000 --max-count 6000 --target-sample-seconds 0.1 \
+              --count-small 6000 --max-count 60000 --target-sample-seconds 2.0 \
               --timeout 60 --cpu 2 --policy strict \
               --preflight-report "$RUNNER_TEMP/pr256-runner.json" \
               --output "$RUNNER_TEMP/pr256-network/candidate-aa.json" \
@@ -171,7 +171,7 @@ jobs:
               --base-root base --candidate-root candidate \
               --protocols 311 --payloads 64 --windows 1,8,64 \
               --completions callback --repeat 6 \
-              --count-small 6000 --max-count 6000 --target-sample-seconds 0.1 \
+              --count-small 6000 --max-count 60000 --target-sample-seconds 2.0 \
               --timeout 60 --cpu 2 --policy strict \
               --preflight-report "$RUNNER_TEMP/pr256-runner.json" \
               --output "$RUNNER_TEMP/pr256-network/ab.json" \
