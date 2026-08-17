@@ -36,7 +36,7 @@ jobs:
           test "$(git -C harness rev-parse HEAD)" = "$GITHUB_SHA"
           test "$(git -C runtime rev-parse HEAD)" = "$RUNTIME_SHA"
 
-      - name: Verify dedicated runner
+      - name: Verify dedicated runner and CPU frequency policy
         shell: bash
         run: |
           set -euo pipefail
@@ -50,6 +50,11 @@ jobs:
             echo "pre-existing Mosquitto would contaminate diagnostic" >&2
             exit 1
           fi
+          for cpu in 0 1 2 3; do
+            root="/sys/devices/system/cpu/cpu${cpu}/cpufreq"
+            echo "cpu=$cpu governor=$(cat "$root/scaling_governor") min=$(cat "$root/scaling_min_freq") max=$(cat "$root/scaling_max_freq") cur=$(cat "$root/scaling_cur_freq")"
+          done
+          command -v vcgencmd >/dev/null 2>&1 && vcgencmd get_throttled || true
 
       - name: Create isolated virtual environment
         shell: bash
@@ -102,10 +107,21 @@ jobs:
           cat "$root/mosquitto.log"
           exit 1
 
-      - name: Same-code window-20 raw diagnostic
+      - name: Same-code exact gate-settings window-20 diagnostic
         shell: bash
         run: |
           set -euo pipefail
+          root="$RUNNER_TEMP/pr257-window20"
+          freq="/sys/devices/system/cpu/cpu2/cpufreq/scaling_cur_freq"
+          (
+            while true; do
+              printf '%s ' "$(date +%s.%N)"
+              cat "$freq"
+              sleep 0.05
+            done
+          ) > "$root/cpu2-freq.log" &
+          monitor_pid=$!
+          trap 'kill "$monitor_pid" 2>/dev/null || true' EXIT
           taskset -c 1,3 python harness/benchmarks/paired_network.py \
             --base-root runtime \
             --candidate-root runtime \
@@ -114,6 +130,7 @@ jobs:
             --payloads 64 \
             --windows 20 \
             --repeat 12 \
+            --count-small 6000 \
             --target-sample-seconds 2.0 \
             --max-count 60000 \
             --timeout 60 \
@@ -121,45 +138,56 @@ jobs:
             --policy advisory \
             --max-baseline-cv 10.0 \
             --min-ack-ratio 0.0 \
-            --preflight-report "$RUNNER_TEMP/pr257-window20/preflight.json" \
-            --output "$RUNNER_TEMP/pr257-window20/raw.json" \
-            --summary-output "$RUNNER_TEMP/pr257-window20/raw.md"
+            --preflight-report "$root/preflight.json" \
+            --output "$root/raw.json" \
+            --summary-output "$root/raw.md"
+          kill "$monitor_pid" 2>/dev/null || true
+          wait "$monitor_pid" 2>/dev/null || true
+          trap - EXIT
 
-      - name: Print pair-level diagnostic
+      - name: Print pair-level and frequency diagnostic
         if: always()
         shell: bash
         run: |
           python - <<'PY'
-          import json, os, pathlib, statistics
+          import collections, json, os, pathlib, statistics
           root = pathlib.Path(os.environ["RUNNER_TEMP"]) / "pr257-window20"
           path = root / "raw.json"
           print("===== preflight =====")
           print((root / "preflight.json").read_text() if (root / "preflight.json").exists() else "missing")
+          freq_path = root / "cpu2-freq.log"
+          if freq_path.exists():
+              freqs = [int(line.split()[1]) for line in freq_path.read_text().splitlines() if len(line.split()) == 2]
+              print("===== CPU2 frequency distribution =====")
+              print(dict(sorted(collections.Counter(freqs).items())))
+              if freqs:
+                  print(f"freq_min={min(freqs)} freq_max={max(freqs)} samples={len(freqs)}")
           if not path.exists():
               raise SystemExit("raw diagnostic JSON missing")
           data = json.loads(path.read_text())
-          print("===== pair-level window 20 =====")
           scenario = data["scenarios"][0]
+          print(f"count={scenario['count']} target={scenario['target_sample_seconds']}")
+          print("===== pair-level window 20 =====")
           ratios = []
+          ack_seconds = []
           for index, pair in enumerate(scenario["pairs"], 1):
               b, c = pair["base"], pair["candidate"]
               ratio = c["publisher_ack_msg_s"] / b["publisher_ack_msg_s"]
               ratios.append(ratio)
+              ack_seconds.extend((b["publisher_ack_seconds"], c["publisher_ack_seconds"]))
               print(
                   f"pair={index:02d} order={'/'.join(pair['order'])} "
                   f"base_rate={b['publisher_ack_msg_s']:.2f} cand_rate={c['publisher_ack_msg_s']:.2f} "
                   f"ratio={ratio:.5f} "
-                  f"base_cpu={b.get('cpu_seconds', float('nan')):.4f} "
-                  f"cand_cpu={c.get('cpu_seconds', float('nan')):.4f} "
-                  f"base_elapsed={b.get('publisher_elapsed_s', b.get('elapsed_s', float('nan'))):.4f} "
-                  f"cand_elapsed={c.get('publisher_elapsed_s', c.get('elapsed_s', float('nan'))):.4f} "
-                  f"base_ack_p50={b['ack_latency_p50_ms']:.5f} "
-                  f"cand_ack_p50={c['ack_latency_p50_ms']:.5f}"
+                  f"base_cpu={b['cpu_seconds']:.4f} cand_cpu={c['cpu_seconds']:.4f} "
+                  f"base_ack_s={b['publisher_ack_seconds']:.4f} cand_ack_s={c['publisher_ack_seconds']:.4f} "
+                  f"base_ack_p50={b['ack_latency_p50_ms']:.5f} cand_ack_p50={c['ack_latency_p50_ms']:.5f}"
               )
           forward = [ratios[i] for i in range(0, len(ratios), 2)]
           reverse = [ratios[i] for i in range(1, len(ratios), 2)]
           print(f"median_all={statistics.median(ratios):.5f}")
           print(f"mean_forward={statistics.fmean(forward):.5f} mean_reverse={statistics.fmean(reverse):.5f}")
+          print(f"ack_seconds_min={min(ack_seconds):.4f} max={max(ack_seconds):.4f}")
           print("===== raw JSON =====")
           print(json.dumps(data, indent=2))
           PY
