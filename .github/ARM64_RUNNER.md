@@ -36,7 +36,9 @@ The repository runner probe on 2026-08-17 observed the actual `rpi5` runner as:
 - Debian GNU/Linux 13 (trixie);
 - GitHub Actions runner 2.336.0;
 - system Python 3.13.5;
-- a working native `python3 -m venv` / pip environment.
+- a working native `python3 -m venv` / pip environment;
+- native Mosquitto broker/client tools and `taskset` available;
+- all CPU governors set to `performance` during strict validation.
 
 `actions/setup-python` does **not** currently provide a Python ARM64 build for
 Debian 13, so the self-hosted workflows deliberately use the validated system
@@ -53,9 +55,10 @@ account:
 
 ```bash
 sudo apt update
-sudo apt install -y python3-venv mosquitto mosquitto-clients openssl
+sudo apt install -y python3-venv mosquitto mosquitto-clients openssl util-linux
 ```
 
+`taskset` is provided by `util-linux`; the workflow verifies it explicitly.
 The ARM64 workflows intentionally do not run `apt`, `sudo`, Docker, or `tc`.
 
 For benchmark evidence, use active cooling and set every CPU frequency governor
@@ -64,9 +67,55 @@ benchmark preflight rejects excessive background load, a non-performance
 governor, or missing/unsafe temperature readings. This is intentionally stricter
 than ordinary ARM64 CI.
 
+If the host can reboot unattended, make the governor selection persistent with
+a root-owned host configuration rather than granting the runner account
+privilege to change it. A reboot that restores `ondemand` is safe: strict
+benchmark jobs fail closed at preflight instead of producing misleading
+performance evidence.
+
+The system Mosquitto service should remain stopped/disabled when the machine is
+used as the dedicated benchmark runner. `ARM64 Paired Regression` refuses to run
+if a Mosquitto process already exists, then starts its own isolated broker for
+the job.
+
 WAN/netem measurements stay on GitHub-hosted infrastructure. Giving the
 persistent runner permission to mutate network qdiscs would widen its host
 privileges for little additional ARM-specific coverage.
+
+## Authoritative writer-regression contract
+
+`ARM64 Paired Regression` separates diagnostic measurements from release
+evidence.
+
+The broad `paired_network.py` sweeps are **advisory**. They are useful for
+investigation, but that harness has historically failed its own neutral A/A noise
+budget and therefore must not become a strict release gate merely because it is
+running on fixed hardware.
+
+When the candidate provides `benchmarks/paired_writer_capacity.py`, the workflow
+adds four strict writer-specific campaigns under one enforced eligible-host
+preflight:
+
+1. closed-loop capacity A/A: capacity baseline versus itself;
+2. closed-loop capacity A/B: capacity baseline versus candidate;
+3. paced callback latency A/A: pre-eager latency baseline versus itself;
+4. paced callback latency A/B: pre-eager latency baseline versus candidate.
+
+The isolated broker is pinned to CPU 0 and publisher workers to CPU 2. Capacity
+uses MQTT 3.1.1, 256-byte payloads, inflight 20, application outstanding 64,
+writer queue 200, eight ABBA pairs, 100,000 QoS 0 operations and 40,000 QoS 1
+operations. A/A must remain neutral and A/B must retain at least 95% of the
+reviewed capacity baseline for both QoS levels.
+
+Paced latency uses MQTT 3.1.1, 256-byte payloads, window 64, callback completion,
+eight ABBA pairs and fixed rates 2,500 and 10,000 messages/s. Those are the two
+same-regime Pi 5 cells validated for issue #253; 7,500/s lies in this host's
+kernel timer/pacing transition and is not used as an ARM64 acceptance point.
+
+Defaults are intentionally reviewable historical anchors rather than moving
+branches: capacity starts from `v1.0.0rc5` and latency from exact pre-eager commit
+`3962f328331b8414a755332aefc3b3d7c261dc6f`. A maintainer may override them at
+manual dispatch only with other reviewed/trusted refs.
 
 ## Persistent-runner hygiene
 
@@ -79,9 +128,10 @@ workflows therefore:
 - disable persisted checkout credentials;
 - avoid Docker and privileged host operations.
 
-A hard-killed job can still bypass cleanup. If a later job reports that one of
-the dedicated ports is already occupied, inspect and terminate the stale
-runner-owned Mosquitto process before retrying.
+A hard-killed job can still bypass cleanup. If a later job reports a
+pre-existing runner-owned Mosquitto process, inspect and terminate it before
+retrying. Do not weaken the preflight to make the benchmark proceed on a dirty
+host.
 
 ## ChatGPT Persistent Workbench
 
