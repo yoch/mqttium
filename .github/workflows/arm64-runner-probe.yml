@@ -1,4 +1,4 @@
-name: ARM64 Simplification Without Compound Hotpath
+name: ARM64 Simplification Surgical Reversion
 
 on:
   push:
@@ -9,14 +9,15 @@ permissions:
   contents: read
 
 jobs:
-  validate:
+  isolate:
     runs-on: [self-hosted, linux, ARM64]
-    timeout-minutes: 60
+    timeout-minutes: 40
     env:
       PYTHONUNBUFFERED: "1"
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
       MAIN_SHA: 0999d8abfe44a568209209403d7f215b18cc4eb7
-      PRE_SHA: e443448981c56709a935332769a9e95216e3f660
+      FINAL_SHA: 3ee2a3c5a78b0ea487ddbdf7927665b519fddd45
+      HOTPATH_SHA: 832f808e413dd47fd922469110316751ba205906
 
     steps:
       - name: Verify clean performance host
@@ -31,85 +32,113 @@ jobs:
           test "$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor | sort -u)" = "performance"
           if pgrep -a mosquitto; then exit 1; fi
 
-      - name: Check out exact current main
+      - name: Check out current main harness
         uses: actions/checkout@v7
         with:
           ref: ${{ env.MAIN_SHA }}
           path: base
           persist-credentials: false
 
-      - name: Check out full simplification history
+      - name: Check out full final history
         uses: actions/checkout@v7
         with:
-          ref: 3ee2a3c5a78b0ea487ddbdf7927665b519fddd45
+          ref: ${{ env.FINAL_SHA }}
           path: history
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Rebuild final simplification tree while omitting 832f808
+      - name: Construct exact surgical variants
         shell: bash
         run: |
           set -euo pipefail
+          root="$RUNNER_TEMP/mqttium-252-surgical"
+          rm -rf "$root"
+          mkdir -p "$root/results"
           git -C history config user.name yoch
           git -C history config user.email yoch.melka@gmail.com
-          work="$RUNNER_TEMP/mqttium-252-without-hotpath"
-          rm -rf "$work"
-          git -C history worktree add --detach "$work" "$PRE_SHA"
-          commits=(
-            bed7e6b22cc4625c96f7d76dddf0a3c420a24bae
-            4c3b5faa3b463b30a6faac67216368d54a97935f
-            0892f73a610836c3b568849ad99b871a9ddb6457
-            8f32c6ddd91bfad6fb5d5555fa149e6e70c2003d
-            a5c6062c7963999ed35a0d0c981616c633366e7d
-            c13daa394a5fdbb125cc623709c93e3010f66c01
-            038712e87f67549034e2e344ebd82757b90ad04e
-            e4f579f17e2dd1030f83d0d57f1b90372a3e5052
-            62efd1099a3906514922df11615f43baa12d2c3f
-            f5527780ad898080758d5e8b83ea7d33067a5067
-            0b740b2002d432211f33f69e2d7ce01034dd3aa7
-            97cf3f8235d99e29c30e2dd4a558d79a5f1df9a8
-            645609a6f9bc3a8ae65ee8e7abb0486ecb31d352
-          )
-          for sha in "${commits[@]}"; do
-            git -C "$work" cherry-pick "$sha"
-          done
-          printf 'rebuilt_head=%s\n' "$(git -C "$work" rev-parse HEAD)"
-          git -C "$work" log --oneline --decorate -20
 
-          # The rebuilt tree must retain the issue-253 eager scheduling fix and
-          # the later #252 correctness fixes, while the compound hotpath commit
-          # itself is absent from ancestry.
-          grep -q 'self._eager_armed' "$work/src/mqttium/api/_writer.py"
-          grep -q 'def _rearm_eager_if_idle' "$work/src/mqttium/api/_writer.py"
-          grep -q 'progress.clear()' "$work/src/mqttium/api/_delivery.py"
-          if git -C "$work" merge-base --is-ancestor 832f808e413dd47fd922469110316751ba205906 HEAD; then
-            echo 'compound hotpath commit unexpectedly retained' >&2
-            exit 1
-          fi
+          build_reverted() {
+            local name="$1"
+            local dir="$root/$name"
+            git -C history worktree add --detach "$dir" "$FINAL_SHA" >/dev/null
+            git -C "$dir" config user.name yoch
+            git -C "$dir" config user.email yoch.melka@gmail.com
+            set +e
+            GIT_EDITOR=true git -C "$dir" revert --no-commit "$HOTPATH_SHA" >/tmp/${name}-revert.log 2>&1
+            rc=$?
+            set -e
+            if [ "$rc" -ne 0 ]; then
+              mapfile -t conflicts < <(git -C "$dir" diff --name-only --diff-filter=U)
+              if [ "${#conflicts[@]}" -ne 1 ] || [ "${conflicts[0]}" != "src/mqttium/protocol/inbound.py" ]; then
+                cat /tmp/${name}-revert.log >&2
+                printf 'unexpected conflicts for %s: %s\n' "$name" "${conflicts[*]}" >&2
+                exit 1
+              fi
+              # Later QoS1-ingress specialization depends on the inbound half of
+              # the compound commit. Retain the final inbound file; this study is
+              # intentionally about writer/engine/outbound hotpaths only.
+              git -C "$dir" checkout --ours -- src/mqttium/protocol/inbound.py
+              git -C "$dir" add src/mqttium/protocol/inbound.py
+              GIT_EDITOR=true git -C "$dir" revert --continue >/dev/null
+            fi
+            # The test added for the reverted outbound launch substitution is not
+            # runtime code; keep the final test tree identical for every variant.
+            git -C "$dir" checkout "$FINAL_SHA" -- tests/unit/test_outbound_transaction.py
+          }
 
-      - name: Create isolated benchmark venv
+          build_reverted engine
+          build_reverted engine_outbound
+          build_reverted all3
+
+          # engine-only: restore final writer + outbound.
+          git -C "$root/engine" checkout "$FINAL_SHA" -- \
+            src/mqttium/api/_writer.py src/mqttium/protocol/outbound.py
+          # engine+outbound: restore final writer only.
+          git -C "$root/engine_outbound" checkout "$FINAL_SHA" -- src/mqttium/api/_writer.py
+          # all3 keeps writer+engine+outbound reverted.
+
+          python - <<'PY'
+          import os, subprocess
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'mqttium-252-surgical'
+          expected = {
+              'engine': {'src/mqttium/protocol/engine.py'},
+              'engine_outbound': {'src/mqttium/protocol/engine.py', 'src/mqttium/protocol/outbound.py'},
+              'all3': {'src/mqttium/api/_writer.py', 'src/mqttium/protocol/engine.py', 'src/mqttium/protocol/outbound.py'},
+          }
+          final = os.environ['FINAL_SHA']
+          for name, paths in expected.items():
+              out = subprocess.check_output(
+                  ['git', '-C', str(root / name), 'diff', '--name-only', final], text=True
+              ).splitlines()
+              assert set(out) == paths, (name, out)
+              text = (root / name / 'src/mqttium/protocol/inbound.py').read_text()
+              assert '_is_v5' in text
+          PY
+
+      - name: Create venv and preflight
         shell: bash
         run: |
           set -euo pipefail
-          venv="$RUNNER_TEMP/mqttium-252-without-hotpath-venv"
+          venv="$RUNNER_TEMP/mqttium-252-surgical-venv"
           rm -rf "$venv"
           python3 -m venv "$venv"
           echo "$venv/bin" >> "$GITHUB_PATH"
 
       - run: python -m pip install "psutil>=6,<8"
 
-      - name: Enforce strict runner preflight
+      - name: Strict runner preflight
         working-directory: base
         run: |
-          root="$RUNNER_TEMP/mqttium-252-without-hotpath-evidence"
-          rm -rf "$root" && mkdir -p "$root"
-          python benchmarks/runner_probe.py --output "$root/runner.json" --require-temperature --enforce
+          python benchmarks/runner_probe.py \
+            --output "$RUNNER_TEMP/mqttium-252-surgical/runner.json" \
+            --require-temperature --enforce
 
       - name: Start isolated broker pinned to CPU 0
         shell: bash
         run: |
           set -euo pipefail
-          root="$RUNNER_TEMP/mqttium-252-without-hotpath-evidence"
+          root="$RUNNER_TEMP/mqttium-252-surgical"
           cat > "$root/mosquitto.conf" <<'EOF'
           persistence false
           allow_anonymous true
@@ -129,101 +158,45 @@ jobs:
           done
           exit 1
 
-      - name: Quick 2500/s callback screen
+      - name: Measure surgical variants at both acceptance rates
         shell: bash
         run: |
           set -euo pipefail
-          root="$RUNNER_TEMP/mqttium-252-without-hotpath-evidence"
-          candidate="$RUNNER_TEMP/mqttium-252-without-hotpath"
-          python base/benchmarks/paired_open_loop.py \
-            --base-root base --candidate-root "$candidate" \
-            --protocols 311 --payloads 256 --windows 64 \
-            --target-rates 2500 --completions callback \
-            --repeat 4 --count-small 4000 --target-sample-seconds 1.5 --max-count 4000 \
-            --timeout 120 --cpu 2 --policy advisory \
-            --preflight-report "$root/runner.json" --output "$root/quick.json"
-          python - <<'PY'
-          import json, os, statistics
-          p = json.load(open(os.path.join(os.environ['RUNNER_TEMP'], 'mqttium-252-without-hotpath-evidence', 'quick.json')))['scenarios'][0]['pairs']
-          ratios = [x['candidate']['ack_latency_p50_ms'] / x['base']['ack_latency_p50_ms'] for x in p]
-          ratio = statistics.median(ratios)
-          print(f'quick_p50_ratio={ratio:.4f}')
-          if ratio > 1.50:
-              raise SystemExit(f'2500/s callback latency still unstable/regressed: {ratio:.4f}x')
-          PY
-
-      - name: Strict writer capacity A/A
-        shell: bash
-        run: |
-          set -euo pipefail
-          root="$RUNNER_TEMP/mqttium-252-without-hotpath-evidence"
-          python base/benchmarks/paired_writer_capacity.py \
-            --base-root base --candidate-root base \
-            --protocol 311 --qos-values 0,1 --payload-bytes 256 \
-            --inflight 20 --outstanding 64 --max-queued 200 \
-            --warmup-count 5000 --repeat 8 --count-qos0 100000 --count-qos1 40000 \
-            --timeout 120 --cpu 2 --policy strict --preflight-report "$root/runner.json" \
-            --output "$root/capacity-aa.json" --summary-output "$root/capacity-aa.md"
-
-      - name: Strict writer capacity A/B
-        shell: bash
-        run: |
-          set -euo pipefail
-          root="$RUNNER_TEMP/mqttium-252-without-hotpath-evidence"
-          candidate="$RUNNER_TEMP/mqttium-252-without-hotpath"
-          python base/benchmarks/paired_writer_capacity.py \
-            --base-root base --candidate-root "$candidate" \
-            --protocol 311 --qos-values 0,1 --payload-bytes 256 \
-            --inflight 20 --outstanding 64 --max-queued 200 \
-            --warmup-count 5000 --repeat 8 --count-qos0 100000 --count-qos1 40000 \
-            --timeout 120 --cpu 2 --policy strict --preflight-report "$root/runner.json" \
-            --output "$root/capacity-ab.json" --summary-output "$root/capacity-ab.md"
-
-      - name: Strict writer latency A/A with one invalid-control retry
-        shell: bash
-        run: |
-          set -euo pipefail
-          root="$RUNNER_TEMP/mqttium-252-without-hotpath-evidence"
-          control() {
-            local attempt="$1" report="$2"
+          root="$RUNNER_TEMP/mqttium-252-surgical"
+          printf 'variant,rate,p50_ratio,base_p50_ms,candidate_p50_ms,completed_ratio,loop_lag_ratio,cpu_ratio\n' > "$root/surgical.csv"
+          for variant in engine engine_outbound all3; do
+            out="$root/results/${variant}.json"
             python base/benchmarks/paired_open_loop.py \
-              --base-root base --candidate-root base \
+              --base-root base --candidate-root "$root/$variant" \
               --protocols 311 --payloads 256 --windows 64 \
               --target-rates 2500,10000 --completions callback \
-              --repeat 8 --count-small 4000 --timeout 120 --cpu 2 \
-              --policy strict --preflight-report "$report" \
-              --output "$root/latency-aa-${attempt}.json" --summary-output "$root/latency-aa-${attempt}.md"
-          }
-          set +e; control 1 "$root/runner.json"; rc=$?; set -e
-          if [ "$rc" -eq 0 ]; then exit 0; fi
-          if [ "$rc" -ne 2 ]; then exit "$rc"; fi
-          python base/benchmarks/runner_probe.py --output "$root/runner-retry.json" --require-temperature --enforce
-          control 2 "$root/runner-retry.json"
+              --repeat 4 --count-small 4000 --timeout 120 --cpu 2 \
+              --policy advisory --preflight-report "$root/runner.json" --output "$out" >/dev/null
+            VARIANT="$variant" OUT="$out" python - <<'PY' >> "$root/surgical.csv"
+          import csv, json, os, statistics, sys
+          for s in json.load(open(os.environ['OUT']))['scenarios']:
+              pairs = s['pairs']
+              ratio = lambda key: statistics.median(float(p['candidate'][key]) / max(float(p['base'][key]), 1e-9) for p in pairs)
+              med = lambda side, key: statistics.median(float(p[side][key]) for p in pairs)
+              csv.writer(sys.stdout).writerow([
+                  os.environ['VARIANT'], int(s['target_rate']), f"{ratio('ack_latency_p50_ms'):.6f}",
+                  f"{med('base','ack_latency_p50_ms'):.6f}", f"{med('candidate','ack_latency_p50_ms'):.6f}",
+                  f"{ratio('completed_rate'):.6f}", f"{ratio('loop_lag_p95_ms'):.6f}", f"{ratio('cpu_seconds'):.6f}"
+              ])
+          PY
+          done
+          cat "$root/surgical.csv"
 
-      - name: Strict writer latency A/B
-        shell: bash
-        run: |
-          set -euo pipefail
-          root="$RUNNER_TEMP/mqttium-252-without-hotpath-evidence"
-          candidate="$RUNNER_TEMP/mqttium-252-without-hotpath"
-          report="$root/runner.json"; [ ! -f "$root/runner-retry.json" ] || report="$root/runner-retry.json"
-          python base/benchmarks/paired_open_loop.py \
-            --base-root base --candidate-root "$candidate" \
-            --protocols 311 --payloads 256 --windows 64 \
-            --target-rates 2500,10000 --completions callback \
-            --repeat 8 --count-small 4000 --timeout 120 --cpu 2 \
-            --policy strict --preflight-report "$report" \
-            --output "$root/latency-ab.json" --summary-output "$root/latency-ab.md"
-
-      - name: Upload evidence
+      - name: Upload surgical evidence
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: arm64-pr252-without-hotpath-${{ github.run_id }}
+          name: arm64-pr252-surgical-${{ github.run_id }}
           path: |
-            ${{ runner.temp }}/mqttium-252-without-hotpath-evidence/*.json
-            ${{ runner.temp }}/mqttium-252-without-hotpath-evidence/*.md
-            ${{ runner.temp }}/mqttium-252-without-hotpath-evidence/mosquitto.log
+            ${{ runner.temp }}/mqttium-252-surgical/surgical.csv
+            ${{ runner.temp }}/mqttium-252-surgical/results/*.json
+            ${{ runner.temp }}/mqttium-252-surgical/runner.json
+            ${{ runner.temp }}/mqttium-252-surgical/mosquitto.log
           if-no-files-found: warn
           retention-days: 30
 
@@ -231,7 +204,7 @@ jobs:
         if: always()
         shell: bash
         run: |
-          pidfile="$RUNNER_TEMP/mqttium-252-without-hotpath-evidence/mosquitto.pid"
+          pidfile="$RUNNER_TEMP/mqttium-252-surgical/mosquitto.pid"
           if [ -f "$pidfile" ]; then
             pid="$(cat "$pidfile")"; kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
           fi
