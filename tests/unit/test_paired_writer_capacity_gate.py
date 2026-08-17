@@ -56,9 +56,7 @@ def test_aa_ratio_drift_over_two_percent_invalidates_measurement() -> None:
     )
 
     assert ratio > 1.02
-    assert invalidations == [
-        f"qos=0: A/A completed ratio {ratio:.4f} outside 1+/-2.00%"
-    ]
+    assert invalidations == [f"qos=0: A/A completed ratio {ratio:.4f} outside 1+/-2.00%"]
     assert regressions == []
 
 
