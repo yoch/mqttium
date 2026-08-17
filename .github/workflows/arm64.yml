@@ -14,28 +14,26 @@ concurrency:
 
 jobs:
   test:
-    name: ARM64 / Python ${{ matrix.python-version }}
+    name: ARM64 / system Python 3.13
     runs-on: [self-hosted, linux, ARM64]
     timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.12", "3.14"]
 
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@v7
-        with:
-          python-version: ${{ matrix.python-version }}
-
       - name: Verify ARM64 host prerequisites
         shell: bash
         run: |
           set -euo pipefail
           test "$(uname -m)" = "aarch64"
+          command -v python3
+          python3 - <<'PY'
+          import sys
+          if sys.version_info[:2] != (3, 13):
+              raise SystemExit(f"expected system Python 3.13, got {sys.version}")
+          PY
           command -v openssl
           command -v mosquitto
 
@@ -45,7 +43,7 @@ jobs:
           set -euo pipefail
           venv="$RUNNER_TEMP/mqttium-venv"
           rm -rf "$venv"
-          python -m venv "$venv"
+          python3 -m venv "$venv"
           echo "$venv/bin" >> "$GITHUB_PATH"
 
       - name: Install test dependencies
