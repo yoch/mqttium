@@ -112,6 +112,15 @@ eight ABBA pairs and fixed rates 2,500 and 10,000 messages/s. Those are the two
 same-regime Pi 5 cells validated for issue #253; 7,500/s lies in this host's
 kernel timer/pacing transition and is not used as an ARM64 acceptance point.
 
+A strict latency A/A can occasionally classify an otherwise eligible run as
+statistically invalid rather than proving a regression. The workflow retries
+that **control only** exactly once, and only when the harness returns its
+`invalid measurement` exit code 2. It reruns the host preflight first and retains
+both attempts as artifacts. Operational failures are never retried, two invalid
+controls still fail the workflow, and A/B never runs unless a control passes.
+This avoids accepting noisy evidence without silently turning the thresholds
+into a best-of-N search.
+
 Defaults are intentionally reviewable historical anchors rather than moving
 branches: capacity starts from `v1.0.0rc5` and latency from exact pre-eager commit
 `3962f328331b8414a755332aefc3b3d7c261dc6f`. A maintainer may override them at
