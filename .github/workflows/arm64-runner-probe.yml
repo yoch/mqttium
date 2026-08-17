@@ -13,65 +13,60 @@ jobs:
     runs-on: [self-hosted, linux, ARM64]
     timeout-minutes: 10
     steps:
-      - name: Probe host without repository checkout
+      - name: Verify prepared host
         shell: bash
         run: |
           set -euo pipefail
-          echo '=== runner ==='
-          printf 'name=%s\n' "${RUNNER_NAME:-}"
-          printf 'os=%s arch=%s environment=%s\n' "${RUNNER_OS:-}" "${RUNNER_ARCH:-}" "${RUNNER_ENVIRONMENT:-}"
-          python3 --version
-          echo '=== broker/tooling ==='
-          command -v mosquitto || true
-          command -v mosquitto_sub || true
-          echo '=== cpu ==='
-          nproc
-          grep -m1 -E '^(Model|model name|Hardware)' /proc/cpuinfo || true
-          for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
-            [ -r "$f" ] || continue
-            printf '%s=%s writable=%s\n' "$f" "$(cat "$f")" "$([ -w "$f" ] && echo yes || echo no)"
-          done
-          echo '=== thermal ==='
-          for f in /sys/class/thermal/thermal_zone*/temp; do
-            [ -r "$f" ] || continue
-            type="$(cat "${f%/temp}/type" 2>/dev/null || true)"
-            printf '%s %s=%s\n' "$f" "$type" "$(cat "$f")"
-          done
-          uptime || true
-
-      - name: Validate native Python virtualenv
-        shell: bash
-        run: |
-          set -euo pipefail
-          venv="$RUNNER_TEMP/arm64-probe-venv"
-          rm -rf "$venv"
-          python3 -m venv "$venv"
-          "$venv/bin/python" --version
-          "$venv/bin/python" -m pip --version
-
-      - name: Try unprivileged local Mosquitto extraction
-        shell: bash
-        run: |
-          set -euo pipefail
-          root="$RUNNER_TEMP/arm64-local-mosquitto"
-          rm -rf "$root"
-          mkdir -p "$root/pkgs" "$root/root"
-          cd "$root/pkgs"
-          apt-get download \
-            mosquitto mosquitto-clients libmosquitto1 \
-            libdlt2 libwebsockets19
-          for deb in ./*.deb; do
-            dpkg-deb -x "$deb" "$root/root"
-          done
-          export PATH="$root/root/usr/bin:$root/root/usr/sbin:$PATH"
-          libdirs="$(find "$root/root/usr/lib" -type f \( -name 'libmosquitto.so.*' -o -name 'libdlt.so.*' -o -name 'libwebsockets.so.*' \) -printf '%h\n' | sort -u | paste -sd: -)"
-          export LD_LIBRARY_PATH="$libdirs${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          test "$(uname -m)" = "aarch64"
+          command -v python3
           command -v mosquitto
           command -v mosquitto_sub
-          ldd "$(command -v mosquitto)" | tee "$root/ldd.txt"
-          if grep -q 'not found' "$root/ldd.txt"; then
-            echo 'local Mosquitto has unresolved shared libraries'
-            exit 2
-          fi
+          command -v openssl
+          python3 --version
           mosquitto -h 2>&1 | head -n 2
-          mosquitto_sub -h 2>&1 | head -n 2
+          governors="$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor | sort -u)"
+          printf 'governors=%s\n' "$governors"
+          test "$governors" = "performance"
+          printf 'temperature='; cat /sys/class/thermal/thermal_zone0/temp
+          uptime
+          if pgrep -a mosquitto; then
+            echo 'A pre-existing mosquitto process is running; refusing benchmark host.' >&2
+            exit 1
+          fi
+
+      - name: Check out exact benchmark harness
+        uses: actions/checkout@v7
+        with:
+          ref: 5008d69a889d9100f7f3fb2623e6b08a72126524
+          path: harness
+          persist-credentials: false
+
+      - name: Create isolated benchmark venv
+        shell: bash
+        run: |
+          set -euo pipefail
+          venv="$RUNNER_TEMP/mqttium-perf-probe-venv"
+          rm -rf "$venv"
+          python3 -m venv "$venv"
+          echo "$venv/bin" >> "$GITHUB_PATH"
+
+      - name: Install preflight dependency
+        run: python -m pip install "psutil>=6,<8"
+
+      - name: Strict benchmark preflight
+        working-directory: harness
+        run: |
+          mkdir -p "$RUNNER_TEMP/mqttium-perf-probe"
+          python benchmarks/runner_probe.py \
+            --output "$RUNNER_TEMP/mqttium-perf-probe/preflight.json" \
+            --require-temperature \
+            --enforce
+
+      - name: Upload preflight
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: arm64-perf-preflight-${{ github.run_id }}
+          path: ${{ runner.temp }}/mqttium-perf-probe/preflight.json
+          if-no-files-found: warn
+          retention-days: 7
