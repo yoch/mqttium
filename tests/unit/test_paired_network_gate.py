@@ -10,10 +10,12 @@ from pathlib import Path
 import pytest
 
 from benchmarks.paired_network import (
+    CallbackGenerationTracker,
     InvalidMeasurement,
     _eligibility,
     _evaluation,
     _write_evaluation,
+    arm_variability,
     calibrated_sample_count,
     run_worker,
 )
@@ -119,6 +121,37 @@ def test_sample_count_enforces_duration_and_cap() -> None:
     assert calibrated_sample_count(750, [10_000.0, 12_000.0], 1.5, 50_000) == 18_000
     assert calibrated_sample_count(20_000, [1_000.0, 1_200.0], 1.5, 50_000) == 20_000
     assert calibrated_sample_count(750, [100_000.0, 90_000.0], 1.5, 50_000) == 50_000
+
+
+def test_callback_generation_tracker_preserves_reused_mid_fifo() -> None:
+    tracker = CallbackGenerationTracker()
+
+    assert tracker.register(7, 100) is None
+    assert tracker.register(7, 200) is None
+    assert tracker.complete(7, 150) == (100, 150)
+    assert tracker.complete(7, 250) == (200, 250)
+    assert tracker.pending_counts() == (0, 0)
+
+
+def test_callback_generation_tracker_matches_early_callback() -> None:
+    tracker = CallbackGenerationTracker()
+
+    assert tracker.complete(9, 150) is None
+    assert tracker.register(9, 100) == (100, 150)
+    assert tracker.pending_counts() == (0, 0)
+
+
+def test_candidate_only_variability_invalidates_measurement() -> None:
+    base_cv, candidate_cv, invalidations = arm_variability(
+        "window=8",
+        [100.0, 100.5, 99.5, 100.0],
+        [80.0, 120.0, 85.0, 115.0],
+        0.05,
+    )
+
+    assert base_cv < 0.05
+    assert candidate_cv > 0.05
+    assert invalidations == [f"window=8: candidate CV {candidate_cv:.2%}"]
 
 
 def test_observer_runs_outside_publisher_and_preserves_sequence() -> None:
