@@ -57,15 +57,15 @@ jobs:
           rm -rf "$root"
           mkdir -p "$root/pkgs" "$root/root"
           cd "$root/pkgs"
-          apt-get download mosquitto mosquitto-clients libmosquitto1
+          apt-get download \
+            mosquitto mosquitto-clients libmosquitto1 \
+            libdlt2 libwebsockets19
           for deb in ./*.deb; do
             dpkg-deb -x "$deb" "$root/root"
           done
           export PATH="$root/root/usr/bin:$root/root/usr/sbin:$PATH"
-          libdir="$(find "$root/root/usr/lib" -type f -name 'libmosquitto.so.*' -printf '%h\n' | head -n1 || true)"
-          if [ -n "$libdir" ]; then
-            export LD_LIBRARY_PATH="$libdir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-          fi
+          libdirs="$(find "$root/root/usr/lib" -type f \( -name 'libmosquitto.so.*' -o -name 'libdlt.so.*' -o -name 'libwebsockets.so.*' \) -printf '%h\n' | sort -u | paste -sd: -)"
+          export LD_LIBRARY_PATH="$libdirs${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           command -v mosquitto
           command -v mosquitto_sub
           ldd "$(command -v mosquitto)" | tee "$root/ldd.txt"
