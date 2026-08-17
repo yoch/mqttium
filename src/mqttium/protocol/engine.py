@@ -426,6 +426,12 @@ class ProtocolEngine:
     ) -> int:
         if self.state != ConnectionState.CONNECTED:
             raise NotConnectedError("subscribe requires an active connection")
+        if (
+            self.config.protocol != MQTTProtocolVersion.MQTTv5
+            and properties is not None
+            and properties.values
+        ):
+            raise ProtocolError("SUBSCRIBE properties require MQTT 5")
 
         subscriptions: list[Subscription] = []
         items = (topics,) if isinstance(topics, str) else topics

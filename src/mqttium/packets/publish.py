@@ -13,7 +13,7 @@ from mqttium.codec.packet_validation import require_nonzero_mid
 from mqttium.codec.primitives import unpack_utf8, unpack_u16
 from mqttium.codec.properties import PUBLISH, decode_properties
 from mqttium.enums import MQTTProtocolVersion, QoS
-from mqttium.errors import MalformedPacketError
+from mqttium.errors import MalformedPacketError, ProtocolError
 from mqttium.packets._publish import encode_publish_item_v311, encode_publish_item_v5
 from mqttium.topics import validate_received_publish_topic
 from mqttium.transport.writes import WriteItem
@@ -46,6 +46,8 @@ def encode_publish_item(
             _topic_bytes=_topic_bytes,
             _property_bytes=_property_bytes,
         )
+    if properties is not None and properties.values:
+        raise ProtocolError("PUBLISH properties require MQTT 5")
     return encode_publish_item_v311(
         topic,
         payload,
@@ -89,6 +91,8 @@ class PublishPacket:
                 mid=self.mid,
                 properties=self.properties,
             )
+        if self.properties is not None and self.properties.values:
+            raise ProtocolError("PUBLISH properties require MQTT 5")
         return encode_publish_item_v311(
             self.topic,
             self.payload,
