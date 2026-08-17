@@ -460,14 +460,12 @@ class OutboundSession:
             # Defer wire encode until launch: avoids double work when messages sit
             # in the Receive Maximum queue.
             #
-            # For QoS > 0, `topic_bytes is not None` *is* the conjunction
-            # `state is CONNECTED and flow.available > 0` recorded during
-            # validation (see _validate_publish_request). Nothing between the two
-            # observations can change either — the engine is synchronous and none
-            # of the intervening steps touch connection state or the window — so
-            # this re-reads neither, and never attempts a doomed acquire.
-            # A raise inside _launch unwinds through the shared _rollback below,
-            # whose `inflight_start` snapshot releases the slot acquired here.
+            # `topic_bytes is not None` records that validation observed an
+            # active connection with window available. Keep the explicit state
+            # check and `_try_launch` acquisition here as the launch commit point:
+            # `_try_launch` owns the slot compensation if encoding/persistence
+            # raises, while the outer rollback restores the remaining admission
+            # bookkeeping.
             if self._engine.state == ConnectionState.CONNECTED and self._try_launch(
                 msg, _property_bytes=property_bytes, _topic_bytes=topic_bytes
             ):
