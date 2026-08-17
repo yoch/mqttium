@@ -254,18 +254,94 @@ async def test_eager_write_cannot_land_inside_a_segmented_write() -> None:
 
 
 @pytest.mark.asyncio
-async def test_eager_writes_do_not_consume_queue_capacity() -> None:
-    """They never enter the queue, so they must not be accounted against it."""
+async def test_only_first_write_of_a_synchronous_burst_is_eager() -> None:
+    """A tight producer seeds once, then wakes the writer's batching path."""
     transport = _EagerTransport()
-    pump = _pump(max_messages=2, max_bytes=8)
+    pump = _pump(max_messages=32, max_bytes=64)
     pump.start(transport)
     try:
         for _ in range(20):
             assert pump.try_enqueue(b"x") is True
-        assert pump.queued_messages == 0
-        assert pump.queued_bytes == 0
-        assert pump.eager_writes == 20
+
+        # No yield yet: exactly the first frame bypassed the task. The rest are
+        # visible together for one writer batch instead of 19 more eager writes.
+        assert transport.written == [b"x"]
+        assert pump.eager_writes == 1
+        assert pump.queued_messages == 19
+        assert pump.queued_bytes == 19
+
+        await pump.join()
         assert transport.written == [b"x"] * 20
+        assert pump.batches == 1
+        assert pump.batched_items == 19
+    finally:
+        await pump.stop()
+
+
+@pytest.mark.asyncio
+async def test_synchronous_burst_respects_queue_capacity_after_first_eager() -> None:
+    """Eager is not an escape hatch from normal burst backpressure."""
+    transport = _EagerTransport()
+    pump = _pump(max_messages=2, max_bytes=8)
+    pump.start(transport)
+    try:
+        assert pump.try_enqueue(b"1") is True  # eager
+        assert pump.try_enqueue(b"2") is True  # queued
+        assert pump.try_enqueue(b"3") is True  # queued, queue now full
+        assert pump.try_enqueue(b"4") is False
+
+        assert transport.written == [b"1"]
+        assert pump.eager_writes == 1
+        assert pump.queued_messages == 2
+        assert pump.queued_bytes == 2
+
+        await pump.join()
+        assert transport.written == [b"1", b"2", b"3"]
+    finally:
+        await pump.stop()
+
+
+@pytest.mark.asyncio
+async def test_paced_writes_rearm_eager_on_the_next_loop_turn() -> None:
+    """Yielding between writes keeps the latency win that eager was added for."""
+    transport = _EagerTransport()
+    pump = _pump()
+    pump.start(transport)
+    try:
+        for index in range(5):
+            frame = str(index).encode()
+            assert pump.try_enqueue(frame) is True
+            # Each paced frame reaches the transport on the producer stack.
+            assert transport.written == [str(i).encode() for i in range(index + 1)]
+            assert pump.queued_messages == 0
+            await asyncio.sleep(0)
+
+        assert pump.eager_writes == 5
+        assert pump.batches == 0
+    finally:
+        await pump.stop()
+
+
+@pytest.mark.asyncio
+async def test_stale_rearm_cannot_arm_a_new_transport_generation() -> None:
+    old = _EagerTransport()
+    pump = _pump()
+    pump.start(old)
+    stale_generation = pump._eager_generation
+    await pump.stop()
+
+    new = _EagerTransport()
+    pump.start(new)
+    try:
+        current_generation = pump._eager_generation
+        pump._eager_armed = False
+
+        # Model a delayed call_soon callback left by the old connection.
+        pump._rearm_eager_if_idle(stale_generation)
+        assert pump._eager_armed is False
+
+        pump._rearm_eager_if_idle(current_generation)
+        assert pump._eager_armed is True
     finally:
         await pump.stop()
 
