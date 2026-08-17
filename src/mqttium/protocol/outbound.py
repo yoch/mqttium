@@ -37,6 +37,8 @@ from mqttium.persistence.memory import PagedInflightStore, TransitionInflightSto
 from mqttium.protocol.effects import EffectKind, PublishFailure, PublishHandle
 from mqttium.protocol.flow_control import FlowControl
 from mqttium.protocol.packet_ids import PacketIdPool
+from mqttium.packets._ack import encode_pubrel_success as _encode_pubrel_success
+from mqttium.protocol._sizing import publish_logical_size
 from mqttium.protocol.stats import OutboundStats
 from mqttium.topics import encode_validated_publish_topic, validate_publish_topic
 from mqttium.transport.writes import WriteItem
@@ -44,10 +46,6 @@ from mqttium.types import OutboundMessage, OutboundMessageSummary, Properties
 
 if TYPE_CHECKING:
     from mqttium.protocol.engine import ProtocolEngine
-
-
-def _encode_pubrel_success(mid: int) -> bytes:
-    return bytes((0x62, 2, mid >> 8, mid & 0xFF))
 
 
 def _retain_publish_item(item: WriteItem) -> WriteItem | None:
@@ -827,11 +825,7 @@ class OutboundSession:
         payload_size: int,
         properties: Properties | None,
     ) -> int:
-        property_bytes = 0
-        if self._is_v5 and properties is not None and properties.values:
-            property_bytes = len(encode_properties(properties, PUBLISH))
-        topic_bytes = len(topic) if topic.isascii() else len(topic.encode("utf-8"))
-        return payload_size + topic_bytes + property_bytes
+        return publish_logical_size(self._is_v5, topic, payload_size, properties)
 
     def stored_logical_size(self, stored: OutboundMessage | OutboundMessageSummary) -> int:
         if stored.logical_size > 0:

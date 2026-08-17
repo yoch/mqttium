@@ -80,6 +80,26 @@ def decode_pubcomp_v311(remaining: bytes) -> tuple[int, int, Properties | None]:
     return mid, 0, None
 
 
+# Validation-free success acknowledgements. The directional sessions send these
+# per message for an identifier the decoder already validated, so they skip the
+# range and reason/property checks their `encode_*` twins below perform. Same
+# bytes, no call depth: this is the shape ACK-SPECIALIZED-PRIMITIVES.md bought.
+def encode_puback_success(mid: int) -> bytes:
+    return bytes((0x40, 2, mid >> 8, mid & 0xFF))
+
+
+def encode_pubrec_success(mid: int) -> bytes:
+    return bytes((0x50, 2, mid >> 8, mid & 0xFF))
+
+
+def encode_pubrel_success(mid: int) -> bytes:
+    return bytes((0x62, 2, mid >> 8, mid & 0xFF))
+
+
+def encode_pubcomp_success(mid: int) -> bytes:
+    return bytes((0x70, 2, mid >> 8, mid & 0xFF))
+
+
 def _encode_ack_v311(
     first_byte: int,
     packet: str,

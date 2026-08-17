@@ -468,7 +468,7 @@ class ProtocolEngine:
     def queue_ping(self) -> None:
         if self.state != ConnectionState.CONNECTED:
             raise NotConnectedError("PINGREQ requires an active connection")
-        wire = self.codec.encode_pingreq()
+        wire = self.codec.pingreq_frame
         self._check_outbound_size(wire)
         self._send(wire)
 

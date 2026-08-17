@@ -19,7 +19,7 @@ import json
 import sqlite3
 import threading
 from array import array
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Literal, TypeVar
@@ -388,8 +388,11 @@ class SqliteInflightStore:
         maintained on every publish.
         """
         with self._lock:
-            rows = self._conn.execute(self._ORDERED_MIDS_SQL[table]).fetchall()
-        return array("q", (int(row[0]) for row in rows))
+            cursor = self._conn.execute(self._ORDERED_MIDS_SQL[table])
+            # Fed straight from the cursor: fetchall() would materialise a Row
+            # object per record before the array is built, which on a full
+            # session replay is the allocation this method exists to avoid.
+            return array("q", (int(row[0]) for row in cursor))
 
     def _pages(
         self,
@@ -407,25 +410,7 @@ class SqliteInflightStore:
             raise ValueError("page_size must be positive")
         mids = self._ordered_mids(table)
         for start in range(0, len(mids), page_size):
-            chunk = mids[start : start + page_size]
-            by_mid: dict[int, sqlite3.Row] = {}
-            # `page_size` is caller-controlled and each identifier binds one SQL
-            # variable, so the fetch is split under the oldest documented
-            # SQLITE_MAX_VARIABLE_NUMBER rather than trusting the build.
-            for offset in range(0, len(chunk), _MAX_SQL_VARIABLES):
-                sub = chunk[offset : offset + _MAX_SQL_VARIABLES]
-                placeholders = ",".join("?" * len(sub))
-                with self._lock:
-                    rows = self._conn.execute(
-                        f"{select_prefix} ({placeholders})", tuple(sub)
-                    ).fetchall()
-                by_mid.update((int(row["mid"]), row) for row in rows)
-            if not by_mid:
-                continue
-            # `IN` returns rows in primary-key order, so insertion order is
-            # restored from the chunk. Records deleted since the snapshot are
-            # simply absent, exactly as in MemoryInflightStore.
-            page = tuple(build(row) for mid in chunk if (row := by_mid.get(mid)) is not None)
+            page = self._fetch_by_mids(select_prefix, mids[start : start + page_size], build)
             if page:
                 yield page
 
@@ -770,15 +755,33 @@ class SqliteInflightStore:
             raise RuntimeError("Failed to count inbound records")
         return int(row[0])
 
-    def _in_messages_for_mids(self, mids: tuple[int, ...]) -> tuple[InboundMessage, ...]:
+    def _fetch_by_mids(
+        self,
+        select_prefix: str,
+        mids: Sequence[int],
+        build: Callable[[sqlite3.Row], _RecordT],
+    ) -> tuple[_RecordT, ...]:
+        """Read a set of identifiers back in the order they were given.
+
+        `select_prefix` is a complete constant statement ending in `mid IN`; the
+        only thing appended is the placeholder run. The read is split under the
+        oldest documented SQLITE_MAX_VARIABLE_NUMBER because the caller controls
+        how many identifiers arrive. `IN` returns rows in primary-key order, so
+        the requested order is restored from `mids`; records deleted since the
+        identifiers were snapshotted are simply absent, exactly as in
+        MemoryInflightStore.
+        """
         by_mid: dict[int, sqlite3.Row] = {}
         for offset in range(0, len(mids), _MAX_SQL_VARIABLES):
-            sub = mids[offset : offset + _MAX_SQL_VARIABLES]
+            sub = tuple(mids[offset : offset + _MAX_SQL_VARIABLES])
             placeholders = ",".join("?" * len(sub))
             with self._lock:
-                rows = self._conn.execute(f"{_IN_PAGE_SQL} ({placeholders})", sub).fetchall()
+                rows = self._conn.execute(f"{select_prefix} ({placeholders})", sub).fetchall()
             by_mid.update((int(row["mid"]), row) for row in rows)
-        return tuple(_row_to_in(row) for mid in mids if (row := by_mid.get(mid)) is not None)
+        return tuple(build(row) for mid in mids if (row := by_mid.get(mid)) is not None)
+
+    def _in_messages_for_mids(self, mids: tuple[int, ...]) -> tuple[InboundMessage, ...]:
+        return self._fetch_by_mids(_IN_PAGE_SQL, mids, _row_to_in)
 
     def in_replay_pages(
         self,

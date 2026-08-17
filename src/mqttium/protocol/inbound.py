@@ -13,7 +13,6 @@ from collections.abc import Iterator
 from typing import TYPE_CHECKING, NoReturn
 
 from mqttium.codec.buffer import RawPacket
-from mqttium.codec.properties import PUBLISH, encode_properties
 from mqttium.enums import InboundQoSState, MQTTProtocolVersion, PacketType, QoS
 from mqttium.errors import MalformedPacketError, ProtocolError
 from mqttium.persistence.memory import (
@@ -24,6 +23,11 @@ from mqttium.persistence.memory import (
 from mqttium.packets import (
     PublishPacket,
 )
+from mqttium.packets._ack import (
+    encode_pubcomp_success as _encode_pubcomp_success,
+    encode_puback_success as _encode_puback_success,
+    encode_pubrec_success as _encode_pubrec_success,
+)
 from mqttium.packets._publish import (
     decode_qos0_message_v311,
     decode_qos0_message_v5,
@@ -31,6 +35,7 @@ from mqttium.packets._publish import (
     decode_publish_fields_v5,
 )
 from mqttium.protocol.effects import EffectKind
+from mqttium.protocol._sizing import publish_logical_size
 from mqttium.protocol.stats import InboundStats
 from mqttium.types import InboundMessage, InboundRecordMeta, Message, Properties
 
@@ -46,19 +51,6 @@ REPLAY_PAGE_SIZE = 256
 REPLAY_SCAN_LIMIT = 256
 REPLAY_BATCH_MESSAGES = 64
 REPLAY_BATCH_BYTES = 1 << 20
-
-
-def _encode_puback_success(mid: int) -> bytes:
-    """Encode the fixed success/no-properties PUBACK for an already-validated MID."""
-    return bytes((0x40, 2, mid >> 8, mid & 0xFF))
-
-
-def _encode_pubrec_success(mid: int) -> bytes:
-    return bytes((0x50, 2, mid >> 8, mid & 0xFF))
-
-
-def _encode_pubcomp_success(mid: int) -> bytes:
-    return bytes((0x70, 2, mid >> 8, mid & 0xFF))
 
 
 class InboundReplayCursor:
@@ -1004,14 +996,9 @@ class InboundSession:
         properties: Properties | None,
         decoded_property_wire_size: int | None = None,
     ) -> int:
-        property_bytes = 0
-        if self._is_v5 and properties is not None and properties.values:
-            if decoded_property_wire_size is None:
-                property_bytes = len(encode_properties(properties, PUBLISH))
-            else:
-                property_bytes = decoded_property_wire_size
-        topic_bytes = len(topic) if topic.isascii() else len(topic.encode("utf-8"))
-        return len(payload) + topic_bytes + property_bytes
+        return publish_logical_size(
+            self._is_v5, topic, len(payload), properties, decoded_property_wire_size
+        )
 
     def stored_logical_size(self, message: InboundMessage) -> int:
         if message.logical_size > 0:

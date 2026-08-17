@@ -44,8 +44,10 @@ class CodecBindings:
     decode_disconnect: Callable[[bytes], tuple[int, Properties | None]]
     decode_auth: Callable[[bytes], tuple[int, Properties | None]]
 
-    encode_pingreq: Callable[[], bytes]
-    encode_pingresp: Callable[[], bytes]
+    # PINGREQ carries no data and is byte-identical in every protocol
+    # version, so the binding holds the frame rather than a callable. A
+    # client never encodes PINGRESP, so there is no binding for it.
+    pingreq_frame: bytes
     encode_disconnect: Callable[..., bytes]
 
     encode_publish_item: Callable[..., WriteItem]
@@ -70,8 +72,7 @@ def bind_codec(protocol: MQTTProtocolVersion) -> CodecBindings:
             decode_unsuback=suback.decode_unsuback_v5,
             decode_disconnect=control.decode_disconnect_v5,
             decode_auth=control.decode_auth_v5,
-            encode_pingreq=control.encode_pingreq,
-            encode_pingresp=control.encode_pingresp,
+            pingreq_frame=control.encode_pingreq(),
             encode_disconnect=control.encode_disconnect_v5,
             encode_publish_item=publish.encode_publish_item_v5,
             encode_subscribe=subscribe.encode_subscribe_v5,
@@ -92,8 +93,7 @@ def bind_codec(protocol: MQTTProtocolVersion) -> CodecBindings:
         decode_unsuback=suback.decode_unsuback_v311,
         decode_disconnect=control.decode_disconnect_v311,
         decode_auth=_auth_requires_v5,
-        encode_pingreq=control.encode_pingreq,
-        encode_pingresp=control.encode_pingresp,
+        pingreq_frame=control.encode_pingreq(),
         encode_disconnect=control.encode_disconnect_v311,
         encode_publish_item=publish.encode_publish_item_v311,
         encode_subscribe=subscribe.encode_subscribe_v311,
