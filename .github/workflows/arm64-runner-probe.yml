@@ -36,8 +36,17 @@ jobs:
           nproc
           grep -m1 -E '^(Model|model name|Hardware)' /proc/cpuinfo || true
           for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
-            [ -r "$f" ] && printf '%s=%s\n' "$f" "$(cat "$f")"
+            [ -r "$f" ] || continue
+            printf '%s=%s writable=%s\n' "$f" "$(cat "$f")" "$([ -w "$f" ] && echo yes || echo no)"
           done
+          echo '=== privilege ==='
+          if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+            echo 'passwordless_sudo=yes'
+          else
+            echo 'passwordless_sudo=no'
+          fi
+          echo '=== package availability ==='
+          apt-cache policy mosquitto mosquitto-clients libmosquitto1 2>/dev/null || true
           echo '=== thermal ==='
           for f in /sys/class/thermal/thermal_zone*/temp; do
             [ -r "$f" ] || continue
