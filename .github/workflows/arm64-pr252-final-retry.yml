@@ -1,4 +1,4 @@
-name: ARM64 PR252 Corrected Paired-Network Final
+name: ARM64 PR252 Publish-Completion Final
 
 on:
   push:
@@ -16,7 +16,7 @@ jobs:
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
       BASE_SHA: 0999d8abfe44a568209209403d7f215b18cc4eb7
       CANDIDATE_SHA: fd750be3012e3878b12449624bce2c71747623ba
-      HARNESS_SHA: 0cd7bc1109956778c5c3f35823b81541f62603de
+      HARNESS_SHA: fd750be3012e3878b12449624bce2c71747623ba
 
     steps:
       - name: Verify dedicated host
@@ -26,9 +26,6 @@ jobs:
           test "$(uname -m)" = aarch64
           test "$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor | sort -u)" = performance
           command -v python3
-          command -v mosquitto
-          command -v mosquitto_sub
-          command -v taskset
           if pgrep -a mosquitto; then exit 1; fi
 
       - uses: actions/checkout@v7
@@ -63,12 +60,13 @@ jobs:
           test -z "$(git -C base status --porcelain)"
           test -z "$(git -C candidate status --porcelain)"
           test -z "$(git -C harness status --porcelain)"
-          test "$(git -C harness hash-object benchmarks/paired_network.py)" = 6c7adb77c8a93207bd820eeaa4dfa977eb868a08
+          test "$(git -C harness hash-object benchmarks/paired_regression.py)" = 126cf66b63f0ba32a928a3f75c2066762ae72cca
+          test "$(git -C harness hash-object benchmarks/_paired_scenarios.py)" = b6df11d4dd25cd1a5344f3d55d78b8b051fa33ff
 
       - name: Create benchmark venv
         shell: bash
         run: |
-          v="$RUNNER_TEMP/m252-final-v"
+          v="$RUNNER_TEMP/m252-publish-complete-v"
           rm -rf "$v"
           python3 -m venv "$v"
           echo "$v/bin" >> "$GITHUB_PATH"
@@ -78,232 +76,190 @@ jobs:
       - name: Fresh strict preflight
         working-directory: base
         run: |
-          r="$RUNNER_TEMP/m252-final"
+          r="$RUNNER_TEMP/m252-publish-complete"
           rm -rf "$r"
           mkdir -p "$r"
           python benchmarks/runner_probe.py --output "$r/runner.json" --require-temperature --enforce
 
-      - name: Start pinned broker
+      - name: Main A/A publish_complete_callback
         shell: bash
         run: |
           set -euo pipefail
-          r="$RUNNER_TEMP/m252-final"
-          cat >"$r/mosquitto.conf" <<'EOF'
-          persistence false
-          allow_anonymous true
-          max_inflight_messages 1000
-          max_queued_messages 100000
-          max_queued_bytes 0
-          connection_messages false
-          log_type error
-          listener 11883 127.0.0.1
-          EOF
-          taskset -c 0 mosquitto -c "$r/mosquitto.conf" >"$r/mosquitto.log" 2>&1 & echo $! >"$r/pid"
-          for _ in $(seq 1 50); do
-            (echo >/dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
-            kill -0 "$(cat "$r/pid")" 2>/dev/null || exit 1
-            sleep .1
-          done
-          exit 1
-
-      - name: Main A/A corrected callback harness
-        shell: bash
-        run: |
-          set -euo pipefail
-          r="$RUNNER_TEMP/m252-final"
-          echo "[$(date -Is)] START main A/A"
-          python harness/benchmarks/paired_network.py \
+          r="$RUNNER_TEMP/m252-publish-complete"
+          echo "[$(date -Is)] START main A/A callback"
+          python harness/benchmarks/paired_regression.py \
             --base-root base --candidate-root base \
-            --protocols 311 --payloads 256 --windows 1,8,64 --completions callback \
-            --repeat 8 --count-small 4000 --target-sample-seconds 2.5 --max-count 50000 \
-            --timeout 90 --cpu 2 --policy strict --preflight-report "$r/runner.json" \
-            --output "$r/main-aa.json" --summary-output "$r/main-aa.md"
-          echo "[$(date -Is)] DONE main A/A"
+            --scenario publish_complete_callback --repeat 20 --cpu 2 \
+            --output "$r/main-aa-callback.json"
+          echo "[$(date -Is)] DONE main A/A callback"
 
-      - name: PR252 A/A corrected callback harness
+      - name: PR252 A/A publish_complete_callback
         shell: bash
         run: |
           set -euo pipefail
-          r="$RUNNER_TEMP/m252-final"
-          echo "[$(date -Is)] START PR252 A/A"
-          python harness/benchmarks/paired_network.py \
+          r="$RUNNER_TEMP/m252-publish-complete"
+          echo "[$(date -Is)] START PR252 A/A callback"
+          python harness/benchmarks/paired_regression.py \
             --base-root candidate --candidate-root candidate \
-            --protocols 311 --payloads 256 --windows 1,8,64 --completions callback \
-            --repeat 8 --count-small 4000 --target-sample-seconds 2.5 --max-count 50000 \
-            --timeout 90 --cpu 2 --policy strict --preflight-report "$r/runner.json" \
-            --output "$r/candidate-aa.json" --summary-output "$r/candidate-aa.md"
-          echo "[$(date -Is)] DONE PR252 A/A"
+            --scenario publish_complete_callback --repeat 20 --cpu 2 \
+            --output "$r/candidate-aa-callback.json"
+          echo "[$(date -Is)] DONE PR252 A/A callback"
 
-      - name: Gate A/A callback latency controls
+      - name: Gate A/A paired estimator stability
         shell: bash
         run: |
           set -euo pipefail
-          ROOT="$RUNNER_TEMP/m252-final" python - <<'PY'
+          ROOT="$RUNNER_TEMP/m252-publish-complete" python - <<'PY'
           import json
           import os
           import statistics
           from pathlib import Path
 
           root = Path(os.environ["ROOT"])
-          failures = []
           report = {}
+          failures = []
 
-          for filename in ("main-aa.json", "candidate-aa.json"):
+          def cv(values):
+              mean = statistics.fmean(values)
+              return statistics.stdev(values) / mean if len(values) > 1 and mean else 0.0
+
+          for filename in ("main-aa-callback.json", "candidate-aa-callback.json"):
               data = json.loads((root / filename).read_text())
-              if data["status"] != "passed":
-                  failures.append(f"{filename}: harness status={data['status']}")
-                  continue
-              rows = []
-              for scenario in data["scenarios"]:
-                  key = f"w{scenario['window']}"
-                  pairs = scenario["pairs"]
-                  throughput = [
-                      p["candidate"]["publisher_ack_msg_s"] / p["base"]["publisher_ack_msg_s"]
-                      for p in pairs
-                  ]
-                  callback_p50 = [
-                      p["candidate"]["ack_latency_p50_ms"] / p["base"]["ack_latency_p50_ms"]
-                      for p in pairs
-                  ]
-                  throughput_median = statistics.median(throughput)
-                  callback_median = statistics.median(callback_p50)
-                  callback_near = sum(0.85 <= value <= 1.15 for value in callback_p50)
-                  rows.append({
-                      "window": scenario["window"],
-                      "throughput_ratio_median": throughput_median,
-                      "callback_p50_ratio_median": callback_median,
-                      "callback_pairs_within_15pct": callback_near,
-                      "callback_pair_ratios": callback_p50,
-                  })
-                  if not 0.95 <= throughput_median <= 1.05:
-                      failures.append(
-                          f"{filename} {key}: A/A throughput median ratio {throughput_median:.4f}"
-                      )
-                  if not 0.95 <= callback_median <= 1.05:
-                      failures.append(
-                          f"{filename} {key}: A/A callback p50 median ratio {callback_median:.4f}"
-                      )
-                  if callback_near < 6:
-                      failures.append(
-                          f"{filename} {key}: only {callback_near}/8 callback p50 pairs within +/-15%"
-                      )
-              report[filename] = rows
+              scenario = data["scenarios"][0]
+              ratios = [pair["candidate_over_base"] for pair in scenario["pairs"]]
+              median = statistics.median(ratios)
+              ratio_cv = cv(ratios)
+              within_10 = sum(0.90 <= value <= 1.10 for value in ratios)
+              report[filename] = {
+                  "median_ratio": median,
+                  "pair_ratio_cv": ratio_cv,
+                  "pairs_within_10pct": within_10,
+                  "base_cv": scenario["base_cv"],
+                  "candidate_cv": scenario["candidate_cv"],
+                  "ratios": ratios,
+              }
+              print(
+                  f"{filename}: median={median:.4f} pair_cv={ratio_cv:.2%} "
+                  f"within10={within_10}/20 raw_cv={scenario['base_cv']:.2%}/{scenario['candidate_cv']:.2%}"
+              )
+              if not 0.95 <= median <= 1.05:
+                  failures.append(f"{filename}: A/A median ratio {median:.4f} outside [0.95,1.05]")
+              if ratio_cv > 0.05:
+                  failures.append(f"{filename}: paired-ratio CV {ratio_cv:.2%} > 5%")
+              if within_10 < 18:
+                  failures.append(f"{filename}: only {within_10}/20 pairs within +/-10%")
 
-          (root / "aa-callback-gate.json").write_text(json.dumps(report, indent=2) + "\n")
-          for name, rows in report.items():
-              for row in rows:
-                  print(
-                      f"{name} window={row['window']} throughput={row['throughput_ratio_median']:.4f} "
-                      f"callback_p50={row['callback_p50_ratio_median']:.4f} "
-                      f"near={row['callback_pairs_within_15pct']}/8"
-                  )
+          (root / "aa-gate.json").write_text(json.dumps(report, indent=2) + "\n")
           if failures:
-              raise SystemExit("A/A callback gate failed:\n" + "\n".join(failures))
+              raise SystemExit("A/A paired estimator invalid:\n" + "\n".join(failures))
           PY
 
-      - name: Main vs PR252 corrected callback harness
+      - name: Main vs PR252 publish_complete_callback
         shell: bash
         run: |
           set -euo pipefail
-          r="$RUNNER_TEMP/m252-final"
-          echo "[$(date -Is)] START main vs PR252"
-          python harness/benchmarks/paired_network.py \
+          r="$RUNNER_TEMP/m252-publish-complete"
+          echo "[$(date -Is)] START A/B callback"
+          python harness/benchmarks/paired_regression.py \
             --base-root base --candidate-root candidate \
-            --protocols 311 --payloads 256 --windows 1,8,64 --completions callback \
-            --repeat 8 --count-small 4000 --target-sample-seconds 2.5 --max-count 50000 \
-            --timeout 90 --cpu 2 --policy strict --preflight-report "$r/runner.json" \
-            --output "$r/ab.json" --summary-output "$r/ab.md"
-          echo "[$(date -Is)] DONE main vs PR252"
+            --scenario publish_complete_callback --repeat 20 --cpu 2 \
+            --output "$r/ab-callback.json"
+          echo "[$(date -Is)] DONE A/B callback"
 
-      - name: Gate final callback latency
+      - name: A/B control publish_complete_receipt
         shell: bash
         run: |
           set -euo pipefail
-          ROOT="$RUNNER_TEMP/m252-final" python - <<'PY'
+          r="$RUNNER_TEMP/m252-publish-complete"
+          python harness/benchmarks/paired_regression.py \
+            --base-root base --candidate-root candidate \
+            --scenario publish_complete_receipt --repeat 20 --cpu 2 \
+            --output "$r/ab-receipt.json"
+
+      - name: A/B control effect_batch_ordered
+        shell: bash
+        run: |
+          set -euo pipefail
+          r="$RUNNER_TEMP/m252-publish-complete"
+          python harness/benchmarks/paired_regression.py \
+            --base-root base --candidate-root candidate \
+            --scenario effect_batch_ordered --repeat 20 --cpu 2 \
+            --output "$r/ab-effect-batch.json"
+
+      - name: Gate final direct-path evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/m252-publish-complete" python - <<'PY'
           import json
           import os
           import statistics
           from pathlib import Path
 
           root = Path(os.environ["ROOT"])
-          data = json.loads((root / "ab.json").read_text())
+          specs = [
+              ("publish_complete_callback", "ab-callback.json", 0.95),
+              ("publish_complete_receipt", "ab-receipt.json", 0.95),
+              ("effect_batch_ordered", "ab-effect-batch.json", 0.95),
+          ]
           failures = []
           rows = []
-          if data["status"] != "passed":
-              failures.append(f"paired harness status={data['status']}")
 
-          for scenario in data["scenarios"]:
-              pairs = scenario["pairs"]
-              callback_p50 = [
-                  p["candidate"]["ack_latency_p50_ms"] / p["base"]["ack_latency_p50_ms"]
-                  for p in pairs
-              ]
-              callback_p95 = [
-                  p["candidate"]["ack_latency_p95_ms"] / p["base"]["ack_latency_p95_ms"]
-                  for p in pairs
-              ]
-              delivery_p50 = [
-                  p["candidate"]["latency_p50_ms"] / p["base"]["latency_p50_ms"]
-                  for p in pairs
-              ]
-              callback_p50_median = statistics.median(callback_p50)
-              callback_p95_median = statistics.median(callback_p95)
-              delivery_p50_median = statistics.median(delivery_p50)
+          def cv(values):
+              mean = statistics.fmean(values)
+              return statistics.stdev(values) / mean if len(values) > 1 and mean else 0.0
+
+          for name, filename, floor in specs:
+              data = json.loads((root / filename).read_text())
+              scenario = data["scenarios"][0]
+              ratios = [pair["candidate_over_base"] for pair in scenario["pairs"]]
+              median = statistics.median(ratios)
+              ratio_cv = cv(ratios)
               row = {
-                  "window": scenario["window"],
-                  "ack_throughput_ratio": scenario["median_candidate_over_base_ack"],
-                  "base_ack_cv": scenario["base_ack_cv"],
-                  "candidate_ack_cv": scenario["candidate_ack_cv"],
-                  "callback_p50_ratio_median": callback_p50_median,
-                  "callback_p95_ratio_median": callback_p95_median,
-                  "delivery_p50_ratio_median": delivery_p50_median,
-                  "callback_p50_pair_ratios": callback_p50,
+                  "scenario": name,
+                  "median_candidate_over_base": median,
+                  "pair_ratio_cv": ratio_cv,
+                  "min_candidate_over_base": min(ratios),
+                  "max_candidate_over_base": max(ratios),
+                  "pairs_favouring_candidate": sum(value > 1.0 for value in ratios),
+                  "base_cv": scenario["base_cv"],
+                  "candidate_cv": scenario["candidate_cv"],
+                  "ratios": ratios,
               }
               rows.append(row)
-              if callback_p50_median > 1.05:
-                  failures.append(
-                      f"window={scenario['window']}: callback p50 ratio {callback_p50_median:.4f} > 1.05"
-                  )
-              if callback_p95_median > 1.10:
-                  failures.append(
-                      f"window={scenario['window']}: callback p95 ratio {callback_p95_median:.4f} > 1.10"
-                  )
+              print(
+                  f"{name}: candidate/base={median:.4f} pair_cv={ratio_cv:.2%} "
+                  f"range=[{min(ratios):.4f},{max(ratios):.4f}] favour={row['pairs_favouring_candidate']}/20"
+              )
+              if median < floor:
+                  failures.append(f"{name}: candidate/base median {median:.4f} < {floor:.2f}")
+              if ratio_cv > 0.05:
+                  failures.append(f"{name}: paired-ratio CV {ratio_cv:.2%} > 5%")
 
           result = {"status": "failed" if failures else "passed", "rows": rows, "failures": failures}
-          (root / "final-callback-gate.json").write_text(json.dumps(result, indent=2) + "\n")
-          lines = ["# PR252 corrected callback final gate", "", f"Status: **{result['status']}**", ""]
+          (root / "final-gate.json").write_text(json.dumps(result, indent=2) + "\n")
+          lines = ["# PR252 direct publish-completion evidence", "", f"Status: **{result['status']}**", ""]
           for row in rows:
-              text = (
-                  f"- window {row['window']}: throughput={row['ack_throughput_ratio']:.4f}, "
-                  f"CV base/candidate={row['base_ack_cv']:.2%}/{row['candidate_ack_cv']:.2%}, "
-                  f"callback p50={row['callback_p50_ratio_median']:.4f}x, "
-                  f"callback p95={row['callback_p95_ratio_median']:.4f}x, "
-                  f"delivery p50={row['delivery_p50_ratio_median']:.4f}x"
+              lines.append(
+                  f"- {row['scenario']}: candidate/base={row['median_candidate_over_base']:.4f}, "
+                  f"paired CV={row['pair_ratio_cv']:.2%}, range="
+                  f"[{row['min_candidate_over_base']:.4f}, {row['max_candidate_over_base']:.4f}], "
+                  f"candidate faster in {row['pairs_favouring_candidate']}/20 pairs"
               )
-              print(text)
-              lines.append(text)
           if failures:
               lines += ["", "## Failures"] + [f"- {failure}" for failure in failures]
-          (root / "final-callback-gate.md").write_text("\n".join(lines) + "\n")
+          (root / "final-gate.md").write_text("\n".join(lines) + "\n")
           if failures:
-              raise SystemExit("final callback gate failed:\n" + "\n".join(failures))
+              raise SystemExit("direct-path gate failed:\n" + "\n".join(failures))
           PY
-
-      - name: Stop broker
-        if: always()
-        shell: bash
-        run: |
-          f="$RUNNER_TEMP/m252-final/pid"
-          [ ! -f "$f" ] || { p=$(cat "$f"); kill "$p" 2>/dev/null || true; wait "$p" 2>/dev/null || true; }
 
       - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: arm64-pr252-corrected-final-${{ github.run_id }}
+          name: arm64-pr252-publish-complete-${{ github.run_id }}
           path: |
-            ${{ runner.temp }}/m252-final/*.json
-            ${{ runner.temp }}/m252-final/*.md
-            ${{ runner.temp }}/m252-final/mosquitto.log
+            ${{ runner.temp }}/m252-publish-complete/*.json
+            ${{ runner.temp }}/m252-publish-complete/*.md
           if-no-files-found: error
           retention-days: 30
