@@ -1,0 +1,240 @@
+name: PR256 Network Proof
+
+on:
+  push:
+    branches:
+      - agent/pr256-network-proof
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr256-network-proof
+  cancel-in-progress: true
+
+jobs:
+  network-proof:
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 45
+    env:
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      BASE_SHA: 0999d8abfe44a568209209403d7f215b18cc4eb7
+      CANDIDATE_SHA: 21798a7e8a2dbb3f1c1d6fe3890de42b5310798d
+
+    steps:
+      - name: Check out repaired harness
+        uses: actions/checkout@v7
+        with:
+          path: harness
+          persist-credentials: false
+
+      - name: Check out pre-252 baseline
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.BASE_SHA }}
+          path: base
+          persist-credentials: false
+
+      - name: Check out post-252 main
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+          path: candidate
+          persist-credentials: false
+
+      - name: Verify exact endpoints and dedicated runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C base rev-parse HEAD)" = "$BASE_SHA"
+          test "$(git -C candidate rev-parse HEAD)" = "$CANDIDATE_SHA"
+          test "$(uname -m)" = "aarch64"
+          command -v python3
+          command -v mosquitto
+          command -v mosquitto_sub
+          command -v taskset
+          command -v timeout
+          if pgrep -a mosquitto; then
+            echo "pre-existing Mosquitto would contaminate benchmark evidence" >&2
+            exit 1
+          fi
+
+      - name: Create isolated virtual environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          venv="$RUNNER_TEMP/pr256-network-venv"
+          rm -rf "$venv"
+          python3 -m venv "$venv"
+          echo "$venv/bin" >> "$GITHUB_PATH"
+
+      - name: Install probe dependency
+        run: python -m pip install "psutil>=6,<8"
+
+      - name: Strict runner preflight
+        working-directory: harness
+        run: |
+          python benchmarks/runner_probe.py \
+            --output "$RUNNER_TEMP/pr256-runner.json" \
+            --require-temperature \
+            --enforce
+
+      - name: Start isolated broker on CPU 0
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/pr256-network"
+          mkdir -p "$root"
+          cat > "$root/mosquitto.conf" <<'EOF'
+          persistence false
+          allow_anonymous true
+          max_inflight_messages 1000
+          max_queued_messages 100000
+          max_queued_bytes 0
+          connection_messages false
+          log_type error
+          listener 11883 127.0.0.1
+          EOF
+          taskset -c 0 mosquitto -c "$root/mosquitto.conf" > "$root/mosquitto.log" 2>&1 &
+          echo "$!" > "$root/mosquitto.pid"
+          for _ in $(seq 1 50); do
+            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            if ! kill -0 "$(cat "$root/mosquitto.pid")" 2>/dev/null; then
+              cat "$root/mosquitto.log"
+              exit 1
+            fi
+            sleep 0.2
+          done
+          cat "$root/mosquitto.log"
+          exit 1
+
+      - name: Pre-252 A/A network control
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=5s 900s \
+            python harness/benchmarks/paired_network.py \
+              --base-root base --candidate-root base \
+              --protocols 311 --payloads 64 --windows 1,8,64 \
+              --completions callback --repeat 6 \
+              --count-small 6000 --max-count 6000 --target-sample-seconds 0.1 \
+              --timeout 60 --cpu 2 --policy strict \
+              --preflight-report "$RUNNER_TEMP/pr256-runner.json" \
+              --output "$RUNNER_TEMP/pr256-network/base-aa.json" \
+              --summary-output "$RUNNER_TEMP/pr256-network/base-aa.md"
+
+      - name: Post-252 A/A network control
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=5s 900s \
+            python harness/benchmarks/paired_network.py \
+              --base-root candidate --candidate-root candidate \
+              --protocols 311 --payloads 64 --windows 1,8,64 \
+              --completions callback --repeat 6 \
+              --count-small 6000 --max-count 6000 --target-sample-seconds 0.1 \
+              --timeout 60 --cpu 2 --policy strict \
+              --preflight-report "$RUNNER_TEMP/pr256-runner.json" \
+              --output "$RUNNER_TEMP/pr256-network/candidate-aa.json" \
+              --summary-output "$RUNNER_TEMP/pr256-network/candidate-aa.md"
+
+      - name: Enforce A/A paired controls
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, pathlib, statistics
+          root = pathlib.Path("$RUNNER_TEMP/pr256-network")
+          for name in ("base-aa", "candidate-aa"):
+              data = json.loads((root / f"{name}.json").read_text())
+              if data["status"] != "passed":
+                  raise SystemExit(f"{name}: harness status={data['status']}")
+              for scenario in data["scenarios"]:
+                  ratios = [p["candidate_over_base_ack"] for p in scenario["pairs"]]
+                  med = statistics.median(ratios)
+                  mean = statistics.fmean(ratios)
+                  cv = statistics.stdev(ratios) / mean if len(ratios) > 1 and mean else 0.0
+                  label = f"{name} window={scenario['window']}"
+                  print(f"{label}: median={med:.4f} pair_cv={cv:.2%}")
+                  if not 0.98 <= med <= 1.02:
+                      raise SystemExit(f"{label}: A/A ratio outside 2%: {med:.4f}")
+                  if cv > 0.05:
+                      raise SystemExit(f"{label}: paired-ratio CV {cv:.2%} > 5%")
+          PY
+
+      - name: Pre-252 versus post-252 network A/B
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=5s 900s \
+            python harness/benchmarks/paired_network.py \
+              --base-root base --candidate-root candidate \
+              --protocols 311 --payloads 64 --windows 1,8,64 \
+              --completions callback --repeat 6 \
+              --count-small 6000 --max-count 6000 --target-sample-seconds 0.1 \
+              --timeout 60 --cpu 2 --policy strict \
+              --preflight-report "$RUNNER_TEMP/pr256-runner.json" \
+              --output "$RUNNER_TEMP/pr256-network/ab.json" \
+              --summary-output "$RUNNER_TEMP/pr256-network/ab.md"
+
+      - name: Network no-regression gate
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, pathlib, statistics
+          path = pathlib.Path("$RUNNER_TEMP/pr256-network/ab.json")
+          data = json.loads(path.read_text())
+          if data["status"] != "passed":
+              raise SystemExit(f"A/B harness status={data['status']}")
+          lines = []
+          for scenario in data["scenarios"]:
+              pairs = scenario["pairs"]
+              ack_ratios = [p["candidate_over_base_ack"] for p in pairs]
+              callback_p50_ratios = [
+                  p["candidate"]["ack_latency_p50_ms"] / p["base"]["ack_latency_p50_ms"]
+                  for p in pairs
+              ]
+              delivery_p50_ratios = [
+                  p["candidate"]["latency_p50_ms"] / p["base"]["latency_p50_ms"]
+                  for p in pairs
+              ]
+              ack = statistics.median(ack_ratios)
+              cb = statistics.median(callback_p50_ratios)
+              delivery = statistics.median(delivery_p50_ratios)
+              window = scenario["window"]
+              line = f"window={window}: throughput={ack:.4f} callback_p50={cb:.4f} delivery_p50={delivery:.4f}"
+              print(line)
+              lines.append(line)
+              if ack < 0.95:
+                  raise SystemExit(f"window={window}: throughput regression {ack:.4f}")
+              if cb > 1.10:
+                  raise SystemExit(f"window={window}: callback p50 regression {cb:.4f}")
+              if delivery > 1.10:
+                  raise SystemExit(f"window={window}: delivery p50 regression {delivery:.4f}")
+          (path.parent / "gate.txt").write_text("\n".join(lines) + "\n")
+          PY
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pr256-network-proof-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/pr256-network/*.json
+            ${{ runner.temp }}/pr256-network/*.md
+            ${{ runner.temp }}/pr256-network/*.txt
+            ${{ runner.temp }}/pr256-network/mosquitto.log
+            ${{ runner.temp }}/pr256-runner.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Stop isolated broker
+        if: always()
+        shell: bash
+        run: |
+          pidfile="$RUNNER_TEMP/pr256-network/mosquitto.pid"
+          if [ -f "$pidfile" ]; then
+            pid="$(cat "$pidfile")"
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+          fi
