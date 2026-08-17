@@ -1,4 +1,4 @@
-name: ARM64 Simplification Surgical Reversion
+name: ARM64 Simplification Engine Rollback
 
 on:
   push:
@@ -9,15 +9,14 @@ permissions:
   contents: read
 
 jobs:
-  isolate:
+  validate:
     runs-on: [self-hosted, linux, ARM64]
-    timeout-minutes: 40
+    timeout-minutes: 45
     env:
       PYTHONUNBUFFERED: "1"
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
       MAIN_SHA: 0999d8abfe44a568209209403d7f215b18cc4eb7
       FINAL_SHA: 3ee2a3c5a78b0ea487ddbdf7927665b519fddd45
-      HOTPATH_SHA: 832f808e413dd47fd922469110316751ba205906
 
     steps:
       - name: Verify clean performance host
@@ -32,113 +31,61 @@ jobs:
           test "$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor | sort -u)" = "performance"
           if pgrep -a mosquitto; then exit 1; fi
 
-      - name: Check out current main harness
+      - name: Check out exact current main
         uses: actions/checkout@v7
         with:
           ref: ${{ env.MAIN_SHA }}
           path: base
           persist-credentials: false
 
-      - name: Check out full final history
+      - name: Check out exact final PR 252
         uses: actions/checkout@v7
         with:
           ref: ${{ env.FINAL_SHA }}
-          path: history
-          fetch-depth: 0
+          path: candidate
           persist-credentials: false
 
-      - name: Construct exact surgical variants
+      - name: Apply exact engine-only rollback in candidate checkout
         shell: bash
         run: |
           set -euo pipefail
-          root="$RUNNER_TEMP/mqttium-252-surgical"
-          rm -rf "$root"
-          mkdir -p "$root/results"
-          git -C history config user.name yoch
-          git -C history config user.email yoch.melka@gmail.com
-
-          build_reverted() {
-            local name="$1"
-            local dir="$root/$name"
-            git -C history worktree add --detach "$dir" "$FINAL_SHA" >/dev/null
-            git -C "$dir" config user.name yoch
-            git -C "$dir" config user.email yoch.melka@gmail.com
-            set +e
-            GIT_EDITOR=true git -C "$dir" revert --no-commit "$HOTPATH_SHA" >/tmp/${name}-revert.log 2>&1
-            rc=$?
-            set -e
-            if [ "$rc" -ne 0 ]; then
-              mapfile -t conflicts < <(git -C "$dir" diff --name-only --diff-filter=U)
-              if [ "${#conflicts[@]}" -ne 1 ] || [ "${conflicts[0]}" != "src/mqttium/protocol/inbound.py" ]; then
-                cat /tmp/${name}-revert.log >&2
-                printf 'unexpected conflicts for %s: %s\n' "$name" "${conflicts[*]}" >&2
-                exit 1
-              fi
-              # Later QoS1-ingress specialization depends on the inbound half of
-              # the compound commit. Retain the final inbound file; this study is
-              # intentionally about writer/engine/outbound hotpaths only.
-              git -C "$dir" checkout --ours -- src/mqttium/protocol/inbound.py
-              git -C "$dir" add src/mqttium/protocol/inbound.py
-              GIT_EDITOR=true git -C "$dir" revert --continue >/dev/null
-            fi
-            # The test added for the reverted outbound launch substitution is not
-            # runtime code; keep the final test tree identical for every variant.
-            git -C "$dir" checkout "$FINAL_SHA" -- tests/unit/test_outbound_transaction.py
-          }
-
-          build_reverted engine
-          build_reverted engine_outbound
-          build_reverted all3
-
-          # engine-only: restore final writer + outbound.
-          git -C "$root/engine" checkout "$FINAL_SHA" -- \
-            src/mqttium/api/_writer.py src/mqttium/protocol/outbound.py
-          # engine+outbound: restore final writer only.
-          git -C "$root/engine_outbound" checkout "$FINAL_SHA" -- src/mqttium/api/_writer.py
-          # all3 keeps writer+engine+outbound reverted.
-
           python - <<'PY'
-          import os, subprocess
           from pathlib import Path
-          root = Path(os.environ['RUNNER_TEMP']) / 'mqttium-252-surgical'
-          expected = {
-              'engine': {'src/mqttium/protocol/engine.py'},
-              'engine_outbound': {'src/mqttium/protocol/engine.py', 'src/mqttium/protocol/outbound.py'},
-              'all3': {'src/mqttium/api/_writer.py', 'src/mqttium/protocol/engine.py', 'src/mqttium/protocol/outbound.py'},
-          }
-          final = os.environ['FINAL_SHA']
-          for name, paths in expected.items():
-              out = subprocess.check_output(
-                  ['git', '-C', str(root / name), 'diff', '--name-only', final], text=True
-              ).splitlines()
-              assert set(out) == paths, (name, out)
-              text = (root / name / 'src/mqttium/protocol/inbound.py').read_text()
-              assert '_is_v5' in text
+          path = Path('candidate/src/mqttium/protocol/engine.py')
+          text = path.read_text()
+          old = '''        self._effects.append(\n            EngineEffect(kind, data, requires_delivery_mark, decoded_property_wire_size)\n        )\n\n    def _send(self, packet: WriteItem) -> None:\n        # Appends directly rather than delegating to _emit: SEND is the most\n        # frequent effect and this is one Python frame per outbound packet.\n        self._effects.append(EngineEffect(EffectKind.SEND, packet, False, None))\n'''
+          new = '''        self._effects.append(\n            EngineEffect(\n                kind=kind,\n                data=data,\n                requires_delivery_mark=requires_delivery_mark,\n                decoded_property_wire_size=decoded_property_wire_size,\n            )\n        )\n\n    def _send(self, packet: WriteItem) -> None:\n        self._emit(EffectKind.SEND, packet)\n'''
+          assert text.count(old) == 1, 'unexpected engine hotpath shape'
+          path.write_text(text.replace(old, new))
           PY
+          git -C candidate diff --check
+          test "$(git -C candidate diff --name-only)" = "src/mqttium/protocol/engine.py"
+          grep -q 'self._emit(EffectKind.SEND, packet)' candidate/src/mqttium/protocol/engine.py
+          grep -q 'self._eager_armed' candidate/src/mqttium/api/_writer.py
 
-      - name: Create venv and preflight
+      - name: Create isolated benchmark venv
         shell: bash
         run: |
           set -euo pipefail
-          venv="$RUNNER_TEMP/mqttium-252-surgical-venv"
+          venv="$RUNNER_TEMP/mqttium-252-engine-rollback-venv"
           rm -rf "$venv"
           python3 -m venv "$venv"
           echo "$venv/bin" >> "$GITHUB_PATH"
 
       - run: python -m pip install "psutil>=6,<8"
 
-      - name: Strict runner preflight
+      - name: Enforce strict runner preflight
         working-directory: base
         run: |
-          python benchmarks/runner_probe.py \
-            --output "$RUNNER_TEMP/mqttium-252-surgical/runner.json" \
-            --require-temperature --enforce
+          root="$RUNNER_TEMP/mqttium-252-engine-rollback"
+          rm -rf "$root" && mkdir -p "$root"
+          python benchmarks/runner_probe.py --output "$root/runner.json" --require-temperature --enforce
 
       - name: Start isolated broker pinned to CPU 0
         shell: bash
         run: |
           set -euo pipefail
-          root="$RUNNER_TEMP/mqttium-252-surgical"
+          root="$RUNNER_TEMP/mqttium-252-engine-rollback"
           cat > "$root/mosquitto.conf" <<'EOF'
           persistence false
           allow_anonymous true
@@ -158,53 +105,58 @@ jobs:
           done
           exit 1
 
-      - name: Measure surgical variants at both acceptance rates
+      - name: Strict latency A/A control
         shell: bash
         run: |
           set -euo pipefail
-          root="$RUNNER_TEMP/mqttium-252-surgical"
-          printf 'variant,rate,p50_ratio,base_p50_ms,candidate_p50_ms,completed_ratio,loop_lag_ratio,cpu_ratio\n' > "$root/surgical.csv"
-          for variant in engine engine_outbound all3; do
-            out="$root/results/${variant}.json"
+          root="$RUNNER_TEMP/mqttium-252-engine-rollback"
+          control() {
+            local attempt="$1" report="$2"
             python base/benchmarks/paired_open_loop.py \
-              --base-root base --candidate-root "$root/$variant" \
+              --base-root base --candidate-root base \
               --protocols 311 --payloads 256 --windows 64 \
               --target-rates 2500,10000 --completions callback \
-              --repeat 4 --count-small 4000 --timeout 120 --cpu 2 \
-              --policy advisory --preflight-report "$root/runner.json" --output "$out" >/dev/null
-            VARIANT="$variant" OUT="$out" python - <<'PY' >> "$root/surgical.csv"
-          import csv, json, os, statistics, sys
-          for s in json.load(open(os.environ['OUT']))['scenarios']:
-              pairs = s['pairs']
-              ratio = lambda key: statistics.median(float(p['candidate'][key]) / max(float(p['base'][key]), 1e-9) for p in pairs)
-              med = lambda side, key: statistics.median(float(p[side][key]) for p in pairs)
-              csv.writer(sys.stdout).writerow([
-                  os.environ['VARIANT'], int(s['target_rate']), f"{ratio('ack_latency_p50_ms'):.6f}",
-                  f"{med('base','ack_latency_p50_ms'):.6f}", f"{med('candidate','ack_latency_p50_ms'):.6f}",
-                  f"{ratio('completed_rate'):.6f}", f"{ratio('loop_lag_p95_ms'):.6f}", f"{ratio('cpu_seconds'):.6f}"
-              ])
-          PY
-          done
-          cat "$root/surgical.csv"
+              --repeat 8 --count-small 4000 --timeout 120 --cpu 2 \
+              --policy strict --preflight-report "$report" \
+              --output "$root/aa-${attempt}.json" --summary-output "$root/aa-${attempt}.md"
+          }
+          set +e; control 1 "$root/runner.json"; rc=$?; set -e
+          if [ "$rc" -eq 0 ]; then exit 0; fi
+          if [ "$rc" -ne 2 ]; then exit "$rc"; fi
+          python base/benchmarks/runner_probe.py --output "$root/runner-retry.json" --require-temperature --enforce
+          control 2 "$root/runner-retry.json"
 
-      - name: Upload surgical evidence
+      - name: Strict latency A/B current main vs engine-rollback candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/mqttium-252-engine-rollback"
+          report="$root/runner.json"; [ ! -f "$root/runner-retry.json" ] || report="$root/runner-retry.json"
+          python base/benchmarks/paired_open_loop.py \
+            --base-root base --candidate-root candidate \
+            --protocols 311 --payloads 256 --windows 64 \
+            --target-rates 2500,10000 --completions callback \
+            --repeat 8 --count-small 4000 --timeout 120 --cpu 2 \
+            --policy strict --preflight-report "$report" \
+            --output "$root/ab.json" --summary-output "$root/ab.md"
+
+      - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: arm64-pr252-surgical-${{ github.run_id }}
+          name: arm64-pr252-engine-rollback-${{ github.run_id }}
           path: |
-            ${{ runner.temp }}/mqttium-252-surgical/surgical.csv
-            ${{ runner.temp }}/mqttium-252-surgical/results/*.json
-            ${{ runner.temp }}/mqttium-252-surgical/runner.json
-            ${{ runner.temp }}/mqttium-252-surgical/mosquitto.log
-          if-no-files-found: warn
+            ${{ runner.temp }}/mqttium-252-engine-rollback/*.json
+            ${{ runner.temp }}/mqttium-252-engine-rollback/*.md
+            ${{ runner.temp }}/mqttium-252-engine-rollback/mosquitto.log
+          if-no-files-found: error
           retention-days: 30
 
       - name: Stop isolated broker
         if: always()
         shell: bash
         run: |
-          pidfile="$RUNNER_TEMP/mqttium-252-surgical/mosquitto.pid"
+          pidfile="$RUNNER_TEMP/mqttium-252-engine-rollback/mosquitto.pid"
           if [ -f "$pidfile" ]; then
             pid="$(cat "$pidfile")"; kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
           fi
