@@ -27,6 +27,7 @@ from mqttium.enums import (
     QoS,
 )
 from mqttium.errors import (
+    MandatoryResponseTooLargeError,
     FlowControlError,
     NotConnectedError,
     PacketTooLargeError,
@@ -581,6 +582,14 @@ class OutboundSession:
         self.packet_ids.release(mid)
         self.drain()
 
+    def _require_pubrel_capacity(self, size: int) -> None:
+        """Fail locally when a mandatory PUBREL cannot fit the peer limit."""
+        limit = self._engine.negotiated.maximum_packet_size
+        if limit is not None and size > limit:
+            raise MandatoryResponseTooLargeError(
+                f"Mandatory PUBREL size {size} exceeds broker maximum_packet_size {limit}"
+            )
+
     def on_pubrec(self, raw: RawPacket) -> None:
         mid, reason_code, properties = self._decode_pubrec(raw.remaining)
         if properties is not None:
@@ -595,6 +604,22 @@ class OutboundSession:
             self._fail_after_pubrec(mid, reason_code)
             return
         transitions = self._transitions
+        limit = self._engine.negotiated.maximum_packet_size
+        if limit is not None and limit < 4:
+            # The success PUBREL cannot fit. Inspect state only on this rare
+            # connection so an unrelated/duplicate PUBREC that would emit
+            # nothing keeps its historical behavior, while a real WAIT_PUBREC
+            # exchange fails before any durable transition/compaction.
+            record = (
+                transitions.out_meta(mid) if transitions is not None else self.store.get_out(mid)
+            )
+            if record is None:
+                self._send_orphan_pubrel(mid)
+                return
+            if record.state is not OutboundQoSState.WAIT_PUBREC:
+                return
+            self._require_pubrel_capacity(4)
+            return
         if transitions is not None:
             changed = transitions.transition_out(
                 mid,
@@ -628,7 +653,9 @@ class OutboundSession:
     def _send_orphan_pubrel(self, mid: int) -> None:
         """Answer a PUBREC with no matching record: PUBREL, 0x92 when MQTT 5."""
         reason = 0x92 if self._engine.codec.is_mqtt5 else 0
-        self._engine._send(self._encode_pubrel(mid, reason))
+        wire = self._encode_pubrel(mid, reason)
+        self._require_pubrel_capacity(len(wire))
+        self._engine._send(wire)
 
     def _fail_after_pubrec(self, mid: int, reason_code: int) -> None:
         if not self._settle(mid, OutboundQoSState.WAIT_PUBREC):
