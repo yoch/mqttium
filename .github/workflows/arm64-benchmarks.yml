@@ -39,6 +39,10 @@ jobs:
           command -v mosquitto
           command -v mosquitto_sub
           command -v openssl
+          if pgrep -a mosquitto; then
+            echo "A pre-existing Mosquitto process would contaminate benchmark evidence." >&2
+            exit 1
+          fi
 
       - name: Create isolated virtual environment
         shell: bash
