@@ -8,7 +8,7 @@ keeps its existing hot path byte-for-byte.
 
 from __future__ import annotations
 
-from typing import NoReturn
+from typing import Never
 
 from mqttium.codec.buffer import RawPacket
 from mqttium.enums import InboundQoSState, PacketType, QoS
@@ -104,7 +104,7 @@ class TinyPacketLimitInbound:
             session._protocol_disconnect(0x97)
             raise ProtocolError("Pending inbound byte limit reached")
 
-    def _raise_too_large(self, packet_name: str) -> NoReturn:
+    def _raise_too_large(self, packet_name: str) -> Never:
         limit = self._session._engine.negotiated.maximum_packet_size
         assert limit is not None and limit < 4
         raise MandatoryResponseTooLargeError(
