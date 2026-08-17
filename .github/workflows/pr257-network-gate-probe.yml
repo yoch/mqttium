@@ -13,16 +13,16 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  same-code-gate:
+  window20-diagnostic:
     runs-on: [self-hosted, linux, ARM64]
-    timeout-minutes: 45
+    timeout-minutes: 20
     env:
       PYTHONUNBUFFERED: "1"
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
       RUNTIME_SHA: 4677e5500fb33da6b087616e960086e586d96ac7
 
     steps:
-      - name: Fetch exact harness and runtime without marketplace actions
+      - name: Fetch exact harness and runtime
         shell: bash
         run: |
           set -euo pipefail
@@ -47,7 +47,7 @@ jobs:
           command -v taskset
           test "$(nproc)" -ge 4
           if pgrep -a mosquitto; then
-            echo "pre-existing Mosquitto would contaminate benchmark evidence" >&2
+            echo "pre-existing Mosquitto would contaminate diagnostic" >&2
             exit 1
           fi
 
@@ -55,7 +55,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          venv="$RUNNER_TEMP/pr257-network-gate-venv"
+          venv="$RUNNER_TEMP/pr257-window20-venv"
           rm -rf "$venv"
           python3 -m venv "$venv"
           echo "$venv/bin" >> "$GITHUB_PATH"
@@ -63,13 +63,20 @@ jobs:
       - name: Install probe dependency
         run: python -m pip install "psutil>=6,<8"
 
+      - name: Strict preflight
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/pr257-window20"
+          python harness/benchmarks/runner_probe.py \
+            --output "$RUNNER_TEMP/pr257-window20/preflight.json" \
+            --require-temperature \
+            --enforce
+
       - name: Start isolated broker on CPU 0
         shell: bash
         run: |
           set -euo pipefail
-          root="$RUNNER_TEMP/pr257-network-gate"
-          rm -rf "$root"
-          mkdir -p "$root"
+          root="$RUNNER_TEMP/pr257-window20"
           cat > "$root/mosquitto.conf" <<'EOF'
           persistence false
           allow_anonymous true
@@ -95,49 +102,73 @@ jobs:
           cat "$root/mosquitto.log"
           exit 1
 
-      - name: Same-code release-gate validation
+      - name: Same-code window-20 raw diagnostic
         shell: bash
         run: |
           set -euo pipefail
-          # Broker CPU 0; observer/gate CPUs 1,3; publisher CPU 2.
-          # Defaults: windows 1/20/64, 12 pairs, ~2 s samples and deterministic
-          # 60 s quiet periods between phases.
-          taskset -c 1,3 python harness/benchmarks/network_release_gate.py \
+          taskset -c 1,3 python harness/benchmarks/paired_network.py \
             --base-root runtime \
             --candidate-root runtime \
-            --engine harness/benchmarks/paired_network.py \
-            --runner-probe harness/benchmarks/runner_probe.py \
+            --protocols 311 \
+            --completions callback \
+            --payloads 64 \
+            --windows 20 \
+            --repeat 12 \
+            --target-sample-seconds 2.0 \
+            --max-count 60000 \
+            --timeout 60 \
             --cpu 2 \
-            --policy strict \
-            --output "$RUNNER_TEMP/pr257-network-gate/same-code.json"
+            --policy advisory \
+            --max-baseline-cv 10.0 \
+            --min-ack-ratio 0.0 \
+            --preflight-report "$RUNNER_TEMP/pr257-window20/preflight.json" \
+            --output "$RUNNER_TEMP/pr257-window20/raw.json" \
+            --summary-output "$RUNNER_TEMP/pr257-window20/raw.md"
 
-      - name: Print evidence
+      - name: Print pair-level diagnostic
         if: always()
         shell: bash
         run: |
-          root="$RUNNER_TEMP/pr257-network-gate"
-          echo "===== broker log ====="
-          cat "$root/mosquitto.log" 2>/dev/null || true
-          echo "===== top-level JSON ====="
-          cat "$root/same-code.json" 2>/dev/null || true
-          echo "===== phase summaries ====="
-          for file in "$root"/same-code-raw/*.md; do
-            [ -f "$file" ] || continue
-            echo "--- $file ---"
-            cat "$file"
-          done
-          echo "===== preflights ====="
-          for file in "$root"/same-code-raw/*-preflight.json; do
-            [ -f "$file" ] || continue
-            echo "--- $file ---"
-            cat "$file"
-          done
+          python - <<'PY'
+          import json, os, pathlib, statistics
+          root = pathlib.Path(os.environ["RUNNER_TEMP"]) / "pr257-window20"
+          path = root / "raw.json"
+          print("===== preflight =====")
+          print((root / "preflight.json").read_text() if (root / "preflight.json").exists() else "missing")
+          if not path.exists():
+              raise SystemExit("raw diagnostic JSON missing")
+          data = json.loads(path.read_text())
+          print("===== pair-level window 20 =====")
+          scenario = data["scenarios"][0]
+          ratios = []
+          for index, pair in enumerate(scenario["pairs"], 1):
+              b, c = pair["base"], pair["candidate"]
+              ratio = c["publisher_ack_msg_s"] / b["publisher_ack_msg_s"]
+              ratios.append(ratio)
+              print(
+                  f"pair={index:02d} order={'/'.join(pair['order'])} "
+                  f"base_rate={b['publisher_ack_msg_s']:.2f} cand_rate={c['publisher_ack_msg_s']:.2f} "
+                  f"ratio={ratio:.5f} "
+                  f"base_cpu={b.get('cpu_seconds', float('nan')):.4f} "
+                  f"cand_cpu={c.get('cpu_seconds', float('nan')):.4f} "
+                  f"base_elapsed={b.get('publisher_elapsed_s', b.get('elapsed_s', float('nan'))):.4f} "
+                  f"cand_elapsed={c.get('publisher_elapsed_s', c.get('elapsed_s', float('nan'))):.4f} "
+                  f"base_ack_p50={b['ack_latency_p50_ms']:.5f} "
+                  f"cand_ack_p50={c['ack_latency_p50_ms']:.5f}"
+              )
+          forward = [ratios[i] for i in range(0, len(ratios), 2)]
+          reverse = [ratios[i] for i in range(1, len(ratios), 2)]
+          print(f"median_all={statistics.median(ratios):.5f}")
+          print(f"mean_forward={statistics.fmean(forward):.5f} mean_reverse={statistics.fmean(reverse):.5f}")
+          print("===== raw JSON =====")
+          print(json.dumps(data, indent=2))
+          PY
 
       - name: Stop isolated broker
         if: always()
         shell: bash
         run: |
-          pidfile="$RUNNER_TEMP/pr257-network-gate/mosquitto.pid"
+          pidfile="$RUNNER_TEMP/pr257-window20/mosquitto.pid"
           if [ -f "$pidfile" ]; then
             pid="$(cat "$pidfile")"
             kill "$pid" 2>/dev/null || true
