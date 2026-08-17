@@ -1,0 +1,147 @@
+name: PR252 Eager Writer Diagnostic
+
+on:
+  push:
+    branches: [agent/pr252-eager-diagnostic]
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 25
+    env:
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      BASE_SHA: 0999d8abfe44a568209209403d7f215b18cc4eb7
+      CANDIDATE_SHA: b0bbdfb21baeb7fb15f1428cf26d25ab492f731a
+    steps:
+      - name: Verify clean performance host
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          command -v python3; command -v mosquitto; command -v mosquitto_sub; command -v taskset
+          test "$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor | sort -u)" = performance
+          if pgrep -a mosquitto; then exit 1; fi
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.BASE_SHA }}
+          path: base
+          persist-credentials: false
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+          path: candidate
+          persist-credentials: false
+
+      - name: Verify exact endpoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C base rev-parse HEAD)" = "$BASE_SHA"
+          test "$(git -C candidate rev-parse HEAD)" = "$CANDIDATE_SHA"
+          test "$(git -C candidate merge-base "$BASE_SHA" "$CANDIDATE_SHA")" = "$BASE_SHA"
+
+      - name: Instrument benchmark copy with writer counters
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp base/benchmarks/paired_open_loop.py base/benchmarks/diag_open_loop.py
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('base/benchmarks/diag_open_loop.py')
+          t = p.read_text()
+          old = '''    effect_inline: int\n    effect_enqueued: int\n    effect_suspensions: int\n'''
+          new = old + '''    writer_eager_writes: int\n    writer_batches: int\n    writer_batched_items: int\n'''
+          assert t.count(old) == 1
+          t = t.replace(old, new)
+          old = '''        effects = client.stats().effects\n        return OpenLoopResult(\n'''
+          new = '''        stats = client.stats()\n        effects = stats.effects\n        writer = stats.writer\n        return OpenLoopResult(\n'''
+          assert t.count(old) == 1
+          t = t.replace(old, new)
+          old = '''            effect_inline=effects.inline_effects,\n            effect_enqueued=effects.enqueued,\n            effect_suspensions=effects.apply_suspensions,\n'''
+          new = old + '''            writer_eager_writes=writer.eager_writes,\n            writer_batches=writer.batches,\n            writer_batched_items=writer.batched_items,\n'''
+          assert t.count(old) == 1
+          t = t.replace(old, new)
+          p.write_text(t)
+          PY
+
+      - name: Create benchmark venv
+        shell: bash
+        run: |
+          v="$RUNNER_TEMP/pr252-eager-v"; rm -rf "$v"; python3 -m venv "$v"; echo "$v/bin" >> "$GITHUB_PATH"
+
+      - run: python -m pip install "psutil>=6,<8"
+
+      - name: Strict host preflight
+        working-directory: base
+        run: |
+          r="$RUNNER_TEMP/pr252-eager"; rm -rf "$r"; mkdir -p "$r"
+          python benchmarks/runner_probe.py --output "$r/runner.json" --require-temperature --enforce
+
+      - name: Start isolated broker pinned to CPU 0
+        shell: bash
+        run: |
+          set -euo pipefail
+          r="$RUNNER_TEMP/pr252-eager"
+          cat >"$r/mosquitto.conf" <<'EOF'
+          persistence false
+          allow_anonymous true
+          max_inflight_messages 1000
+          max_queued_messages 100000
+          max_queued_bytes 0
+          connection_messages false
+          log_type error
+          listener 11883 127.0.0.1
+          EOF
+          taskset -c 0 mosquitto -c "$r/mosquitto.conf" >"$r/mosquitto.log" 2>&1 & echo $! >"$r/pid"
+          for _ in $(seq 1 50); do
+            (echo >/dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            kill -0 "$(cat "$r/pid")" 2>/dev/null || exit 1
+            sleep .1
+          done
+          exit 1
+
+      - name: Paired 2500/s writer-counter diagnostic
+        shell: bash
+        run: |
+          set -euo pipefail
+          r="$RUNNER_TEMP/pr252-eager"
+          python base/benchmarks/diag_open_loop.py --base-root base --candidate-root candidate \
+            --protocols 311 --payloads 256 --windows 64 --target-rates 2500 --completions callback \
+            --repeat 8 --count-small 4000 --target-sample-seconds 1.5 --max-count 4000 \
+            --timeout 120 --cpu 2 --policy advisory --preflight-report "$r/runner.json" \
+            --output "$r/diag.json" --summary-output "$r/diag.md"
+          ROOT="$r" python - <<'PY'
+          import json, os, statistics
+          from pathlib import Path
+          d=json.loads((Path(os.environ['ROOT'])/'diag.json').read_text())
+          pairs=d['scenarios'][0]['pairs']
+          for side in ('base','candidate'):
+              eager=[int(p[side]['writer_eager_writes']) for p in pairs]
+              batches=[int(p[side]['writer_batches']) for p in pairs]
+              items=[int(p[side]['writer_batched_items']) for p in pairs]
+              p50=[float(p[side]['ack_latency_p50_ms']) for p in pairs]
+              print(side, 'eager_med=', statistics.median(eager), 'eager=', eager,
+                    'batches_med=', statistics.median(batches), 'items_med=', statistics.median(items),
+                    'p50_med=', statistics.median(p50))
+          PY
+
+      - name: Upload diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pr252-eager-diagnostic-${{ github.run_id }}
+          path: ${{ runner.temp }}/pr252-eager/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Stop broker
+        if: always()
+        shell: bash
+        run: |
+          f="$RUNNER_TEMP/pr252-eager/pid"; [ ! -f "$f" ] || { p=$(cat "$f"); kill "$p" 2>/dev/null || true; wait "$p" 2>/dev/null || true; }
