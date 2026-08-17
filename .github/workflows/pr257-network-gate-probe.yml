@@ -18,7 +18,6 @@ jobs:
     timeout-minutes: 20
     env:
       PYTHONUNBUFFERED: "1"
-      PYTHONHASHSEED: "0"
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
       RUNTIME_SHA: 4677e5500fb33da6b087616e960086e586d96ac7
 
@@ -42,7 +41,6 @@ jobs:
         run: |
           set -euo pipefail
           test "$(uname -m)" = "aarch64"
-          test "$PYTHONHASHSEED" = "0"
           command -v python3
           command -v mosquitto
           command -v mosquitto_sub
@@ -109,32 +107,33 @@ jobs:
           cat "$root/mosquitto.log"
           exit 1
 
-      - name: Same-code fixed-hash diagnostic
+      - name: Compare random and fixed hash seeds on same-code window 20
         shell: bash
         run: |
           set -euo pipefail
           root="$RUNNER_TEMP/pr257-hash-seed"
-          taskset -c 1,3 python harness/benchmarks/paired_network.py \
-            --base-root runtime \
-            --candidate-root runtime \
-            --protocols 311 \
-            --completions callback \
-            --payloads 64 \
-            --windows 8,20 \
-            --repeat 12 \
-            --count-small 6000 \
-            --target-sample-seconds 2.0 \
-            --max-count 60000 \
-            --timeout 60 \
-            --cpu 2 \
-            --policy advisory \
-            --max-baseline-cv 10.0 \
-            --min-ack-ratio 0.0 \
-            --preflight-report "$root/preflight.json" \
-            --output "$root/raw.json" \
-            --summary-output "$root/raw.md"
+          for mode in random 0 1 2; do
+            echo "===== measuring hash seed $mode ====="
+            if [ "$mode" = random ]; then
+              env -u PYTHONHASHSEED taskset -c 1,3 python harness/benchmarks/paired_network.py \
+                --base-root runtime --candidate-root runtime \
+                --protocols 311 --completions callback --payloads 64 --windows 20 \
+                --repeat 8 --count-small 6000 --target-sample-seconds 2.0 --max-count 60000 \
+                --timeout 60 --cpu 2 --policy advisory --max-baseline-cv 10.0 --min-ack-ratio 0.0 \
+                --preflight-report "$root/preflight.json" \
+                --output "$root/raw-$mode.json" --summary-output "$root/raw-$mode.md"
+            else
+              PYTHONHASHSEED="$mode" taskset -c 1,3 python harness/benchmarks/paired_network.py \
+                --base-root runtime --candidate-root runtime \
+                --protocols 311 --completions callback --payloads 64 --windows 20 \
+                --repeat 8 --count-small 6000 --target-sample-seconds 2.0 --max-count 60000 \
+                --timeout 60 --cpu 2 --policy advisory --max-baseline-cv 10.0 --min-ack-ratio 0.0 \
+                --preflight-report "$root/preflight.json" \
+                --output "$root/raw-$mode.json" --summary-output "$root/raw-$mode.md"
+            fi
+          done
 
-      - name: Print paired-estimator diagnostic
+      - name: Print seed comparison
         if: always()
         shell: bash
         run: |
@@ -143,42 +142,40 @@ jobs:
           from benchmarks.network_release_gate import paired_ratio_estimate
 
           root = pathlib.Path(os.environ["RUNNER_TEMP"]) / "pr257-hash-seed"
-          print("PYTHONHASHSEED=", os.environ.get("PYTHONHASHSEED"))
           print("===== preflight =====")
           print((root / "preflight.json").read_text() if (root / "preflight.json").exists() else "missing")
-          path = root / "raw.json"
-          if not path.exists():
-              raise SystemExit("raw diagnostic JSON missing")
-          data = json.loads(path.read_text())
-          for scenario in data["scenarios"]:
+          for mode in ("random", "0", "1", "2"):
+              path = root / f"raw-{mode}.json"
+              if not path.exists():
+                  print(f"seed={mode}: missing")
+                  continue
+              data = json.loads(path.read_text())
+              scenario = data["scenarios"][0]
               ratios = []
               ack_ratios = []
               orders = []
-              rates = []
+              base_rates = []
+              candidate_rates = []
               for pair in scenario["pairs"]:
                   b, c = pair["base"], pair["candidate"]
                   ratios.append(c["publisher_ack_msg_s"] / b["publisher_ack_msg_s"])
                   ack_ratios.append(c["ack_latency_p50_ms"] / b["ack_latency_p50_ms"])
                   orders.append(pair["order"])
-                  rates.extend((b["publisher_ack_msg_s"], c["publisher_ack_msg_s"]))
+                  base_rates.append(b["publisher_ack_msg_s"])
+                  candidate_rates.append(c["publisher_ack_msg_s"])
               throughput = paired_ratio_estimate(ratios, orders)
               ack = paired_ratio_estimate(ack_ratios, orders)
+              all_rates = base_rates + candidate_rates
               print(
-                  f"window={scenario['window']} count={scenario['count']} "
+                  f"seed={mode} count={scenario['count']} "
                   f"raw_cv={scenario['base_ack_cv']:.2%}/{scenario['candidate_ack_cv']:.2%} "
-                  f"median_pair={statistics.median(ratios):.5f} "
+                  f"pair_cv={throughput.pair_ratio_cv:.2%} median={statistics.median(ratios):.5f} "
                   f"throughput={throughput.geometric_mean:.5f} "
                   f"ci=[{throughput.lower_95:.5f},{throughput.upper_95:.5f}] "
                   f"ack={ack.geometric_mean:.5f} ci=[{ack.lower_95:.5f},{ack.upper_95:.5f}] "
-                  f"rate_range=[{min(rates):.1f},{max(rates):.1f}]"
+                  f"rate_mean={statistics.fmean(all_rates):.1f} "
+                  f"range=[{min(all_rates):.1f},{max(all_rates):.1f}]"
               )
-              for index, (pair, ratio) in enumerate(zip(scenario["pairs"], ratios, strict=True), 1):
-                  b, c = pair["base"], pair["candidate"]
-                  print(
-                      f"  pair={index:02d} order={'/'.join(pair['order'])} ratio={ratio:.5f} "
-                      f"base={b['publisher_ack_msg_s']:.1f}/{b['cpu_seconds']:.4f}sCPU "
-                      f"cand={c['publisher_ack_msg_s']:.1f}/{c['cpu_seconds']:.4f}sCPU"
-                  )
           PY
 
       - name: Stop isolated broker
