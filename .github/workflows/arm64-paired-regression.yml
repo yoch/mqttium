@@ -4,12 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       base_ref:
-        description: Baseline commit, branch, or tag
+        description: Trusted baseline commit, branch, or tag
         required: true
-        default: v0.2.0b2
+        default: v1.0.0rc5
         type: string
       candidate_ref:
-        description: Candidate commit, branch, or tag
+        description: Trusted candidate commit, branch, or tag
         required: true
         default: main
         type: string
@@ -24,7 +24,7 @@ concurrency:
 jobs:
   paired:
     runs-on: [self-hosted, linux, ARM64]
-    timeout-minutes: 45
+    timeout-minutes: 60
     env:
       PYTHONUNBUFFERED: "1"
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
@@ -51,15 +51,17 @@ jobs:
           path: base
           persist-credentials: false
 
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.13"
-
       - name: Verify dedicated runner prerequisites
         shell: bash
         run: |
           set -euo pipefail
           test "$(uname -m)" = "aarch64"
+          command -v python3
+          python3 - <<'PY'
+          import sys
+          if sys.version_info[:2] != (3, 13):
+              raise SystemExit(f"expected system Python 3.13, got {sys.version}")
+          PY
           command -v mosquitto
           command -v mosquitto_sub
 
@@ -69,10 +71,10 @@ jobs:
           set -euo pipefail
           venv="$RUNNER_TEMP/mqttium-paired-venv"
           rm -rf "$venv"
-          python -m venv "$venv"
+          python3 -m venv "$venv"
           echo "$venv/bin" >> "$GITHUB_PATH"
 
-      - run: python -m pip install "psutil>=6"
+      - run: python -m pip install "psutil>=6,<8"
 
       - name: Enforce dedicated-runner preflight
         working-directory: harness
@@ -144,6 +146,25 @@ jobs:
             --payloads 64 --completions receipt,callback \
             --count-small 5000 \
             --output "$RUNNER_TEMP/mqttium-paired/qos1-completion.json"
+
+      - name: Strict closed-loop writer capacity when candidate provides the gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          script="candidate/benchmarks/paired_writer_capacity.py"
+          if [ ! -f "$script" ]; then
+            echo "candidate does not provide paired_writer_capacity.py; skipping writer-capacity gate"
+            exit 0
+          fi
+          python "$script" \
+            --base-root base --candidate-root candidate \
+            --protocol 311 --qos-values 0,1 --payload-bytes 256 \
+            --inflight 20 --outstanding 64 --max-queued 200 \
+            --warmup-count 5000 --repeat 8 \
+            --count-qos0 100000 --count-qos1 40000 \
+            --policy strict \
+            --preflight-report "$RUNNER_TEMP/mqttium-paired/runner.json" \
+            --output "$RUNNER_TEMP/mqttium-paired/writer-capacity.json"
 
       - name: Upload paired measurements
         if: always()
