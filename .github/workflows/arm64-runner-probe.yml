@@ -1,4 +1,4 @@
-name: ARM64 254 Direct Structural Comparison
+name: ARM64 Final 254 and 255 Validation
 
 on:
   push:
@@ -9,90 +9,106 @@ permissions:
   contents: read
 
 jobs:
-  direct-comparison:
+  validate:
     runs-on: [self-hosted, linux, ARM64]
-    timeout-minutes: 25
+    timeout-minutes: 60
     env:
       PYTHONUNBUFFERED: "1"
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
     steps:
-      - name: Verify strict-performance host
+      - name: Verify dedicated host
         shell: bash
         run: |
           set -euo pipefail
           test "$(uname -m)" = "aarch64"
           command -v python3
+          command -v openssl
           command -v mosquitto
           command -v mosquitto_sub
           command -v taskset
+          python3 - <<'PY'
+          import sys
+          if sys.version_info[:2] != (3, 13):
+              raise SystemExit(f"expected system Python 3.13, got {sys.version}")
+          PY
           governors="$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor | sort -u)"
+          printf 'governors=%s\n' "$governors"
           test "$governors" = "performance"
+          printf 'temperature='; cat /sys/class/thermal/thermal_zone0/temp
+          uptime
           if pgrep -a mosquitto; then
-            echo 'A pre-existing mosquitto process is running; refusing benchmark host.' >&2
+            echo 'A pre-existing Mosquitto process would contaminate validation.' >&2
             exit 1
           fi
 
-      - name: Check out exact current 254 HEAD
+      - name: Check out exact 255 infrastructure HEAD
         uses: actions/checkout@v7
         with:
-          ref: dd64ed16dfb48e2b1cd1b50ac0d5290547627916
-          path: current
+          ref: 05e50b56899b67a622967190afb6774ecec8266f
+          path: infra
           persist-credentials: false
 
-      - name: Check out experiment tree
+      - name: Check out exact 254 final HEAD
         uses: actions/checkout@v7
         with:
-          ref: dd64ed16dfb48e2b1cd1b50ac0d5290547627916
-          path: variant
+          ref: 8cabd28d8747ec417f5658865bf5ef8e391736ff
+          path: candidate
           persist-credentials: false
 
-      - name: Apply delayed idle rearm variant
+      - name: Check out rc5 capacity baseline
+        uses: actions/checkout@v7
+        with:
+          ref: v1.0.0rc5
+          path: base
+          persist-credentials: false
+
+      - name: Check out pre-eager latency baseline
+        uses: actions/checkout@v7
+        with:
+          ref: 3962f328331b8414a755332aefc3b3d7c261dc6f
+          path: latency-base
+          persist-credentials: false
+
+      - name: Create strict benchmark venv
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-          path = Path("variant/src/mqttium/api/_writer.py")
-          text = path.read_text()
-          old = """                # Reaching the idle queue wait is an independent re-arm point:\n                # it covers a batch that just drained even when no eager write\n                # scheduled the producer-side next-turn callback.\n                if queue.empty() and self._write_nowait is not None:\n                    self._eager_armed = True\n                first = await queue.get()\n"""
-          new = """                # After a batch drains, defer eager re-arming by one loop turn.\n                # Already-runnable producers therefore stay on the batching path;\n                # genuine idle time restores eager before the next paced write.\n                if (\n                    queue.empty()\n                    and self._write_nowait is not None\n                    and not self._eager_armed\n                ):\n                    generation = self._eager_generation\n                    asyncio.get_running_loop().call_soon(\n                        self._rearm_eager_if_idle, generation\n                    )\n                first = await queue.get()\n"""
-          if old not in text:
-              raise SystemExit("expected writer block not found")
-          path.write_text(text.replace(old, new, 1))
-          PY
-          git -C variant diff --check
-
-      - name: Create isolated benchmark venv
-        shell: bash
-        run: |
-          set -euo pipefail
-          venv="$RUNNER_TEMP/mqttium-direct-variant-venv"
+          venv="$RUNNER_TEMP/mqttium-final-paired-venv"
           rm -rf "$venv"
           python3 -m venv "$venv"
           echo "$venv/bin" >> "$GITHUB_PATH"
 
-      - name: Install preflight dependency
+      - name: Install benchmark dependency
         run: python -m pip install "psutil>=6,<8"
 
-      - name: Strict runner preflight
-        working-directory: current
+      - name: Verify paired CLI contract
         shell: bash
         run: |
           set -euo pipefail
-          root="$RUNNER_TEMP/mqttium-direct-variant"
+          python infra/benchmarks/paired_network.py --help | grep -q -- '--summary-output'
+          python infra/benchmarks/paired_network.py --help | grep -q -- '--cpu'
+          python infra/benchmarks/paired_open_loop.py --help | grep -q -- '--target-rates'
+          python candidate/benchmarks/paired_writer_capacity.py --help | grep -q -- '--summary-output'
+
+      - name: Strict runner preflight from exact 255 harness
+        working-directory: infra
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/mqttium-final-paired"
           rm -rf "$root"
           mkdir -p "$root"
           python benchmarks/runner_probe.py \
-            --output "$root/preflight.json" \
+            --output "$root/runner.json" \
             --require-temperature \
             --enforce
 
-      - name: Start isolated Mosquitto pinned to CPU 0
+      - name: Start isolated broker pinned to CPU 0
         shell: bash
         run: |
           set -euo pipefail
-          root="$RUNNER_TEMP/mqttium-direct-variant"
+          root="$RUNNER_TEMP/mqttium-final-paired"
           cat > "$root/mosquitto.conf" <<'EOF'
           persistence false
           allow_anonymous true
@@ -116,40 +132,140 @@ jobs:
           cat "$root/mosquitto.log"
           exit 1
 
-      - name: Compare current 254 with structural variant
+      - name: Strict writer capacity A/A
         shell: bash
         run: |
           set -euo pipefail
-          root="$RUNNER_TEMP/mqttium-direct-variant"
-          python current/benchmarks/paired_writer_capacity.py \
-            --base-root current --candidate-root variant \
+          root="$RUNNER_TEMP/mqttium-final-paired"
+          python candidate/benchmarks/paired_writer_capacity.py \
+            --base-root base --candidate-root base \
             --protocol 311 --qos-values 0,1 --payload-bytes 256 \
             --inflight 20 --outstanding 64 --max-queued 200 \
             --warmup-count 5000 --repeat 8 \
             --count-qos0 100000 --count-qos1 40000 \
             --timeout 120 --cpu 2 \
-            --policy strict --preflight-report "$root/preflight.json" \
-            --output "$root/direct.json" \
-            --summary-output "$root/direct.md"
+            --policy strict --preflight-report "$root/runner.json" \
+            --output "$root/writer-capacity-aa.json" \
+            --summary-output "$root/writer-capacity-aa.md"
 
-      - name: Upload direct comparison
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: arm64-direct-variant-${{ github.run_id }}
-          path: |
-            ${{ runner.temp }}/mqttium-direct-variant/direct.json
-            ${{ runner.temp }}/mqttium-direct-variant/direct.md
-            ${{ runner.temp }}/mqttium-direct-variant/preflight.json
-            ${{ runner.temp }}/mqttium-direct-variant/mosquitto.log
-          if-no-files-found: error
-          retention-days: 30
+      - name: Strict writer capacity A/B
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/mqttium-final-paired"
+          python candidate/benchmarks/paired_writer_capacity.py \
+            --base-root base --candidate-root candidate \
+            --protocol 311 --qos-values 0,1 --payload-bytes 256 \
+            --inflight 20 --outstanding 64 --max-queued 200 \
+            --warmup-count 5000 --repeat 8 \
+            --count-qos0 100000 --count-qos1 40000 \
+            --timeout 120 --cpu 2 \
+            --policy strict --preflight-report "$root/runner.json" \
+            --output "$root/writer-capacity-ab.json" \
+            --summary-output "$root/writer-capacity-ab.md"
 
-      - name: Stop isolated Mosquitto
+      - name: Strict writer latency A/A
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/mqttium-final-paired"
+          python infra/benchmarks/paired_open_loop.py \
+            --base-root latency-base --candidate-root latency-base \
+            --protocols 311 --payloads 256 --windows 64 \
+            --target-rates 2500,10000 --completions callback \
+            --repeat 8 --count-small 4000 --timeout 120 --cpu 2 \
+            --policy strict --preflight-report "$root/runner.json" \
+            --output "$root/writer-latency-aa.json" \
+            --summary-output "$root/writer-latency-aa.md"
+
+      - name: Strict writer latency A/B
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/mqttium-final-paired"
+          python infra/benchmarks/paired_open_loop.py \
+            --base-root latency-base --candidate-root candidate \
+            --protocols 311 --payloads 256 --windows 64 \
+            --target-rates 2500,10000 --completions callback \
+            --repeat 8 --count-small 4000 --timeout 120 --cpu 2 \
+            --policy strict --preflight-report "$root/runner.json" \
+            --output "$root/writer-latency-ab.json" \
+            --summary-output "$root/writer-latency-ab.md"
+
+      - name: Stop strict broker before functional validation
         if: always()
         shell: bash
         run: |
-          pidfile="$RUNNER_TEMP/mqttium-direct-variant/mosquitto.pid"
+          pidfile="$RUNNER_TEMP/mqttium-final-paired/mosquitto.pid"
+          if [ -f "$pidfile" ]; then
+            pid="$(cat "$pidfile")"
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+          fi
+
+      - name: Upload strict final evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: arm64-final-254-255-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/mqttium-final-paired/*.json
+            ${{ runner.temp }}/mqttium-final-paired/*.md
+            ${{ runner.temp }}/mqttium-final-paired/mosquitto.log
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Create isolated ARM64 CI venv
+        shell: bash
+        run: |
+          set -euo pipefail
+          venv="$RUNNER_TEMP/mqttium-final-ci-venv"
+          rm -rf "$venv"
+          python3 -m venv "$venv"
+          echo "$venv/bin" >> "$GITHUB_PATH"
+
+      - name: Install exact 255 test dependencies
+        working-directory: infra
+        run: python -m pip install -e ".[dev]"
+
+      - name: Exact 255 unit tests on ARM64
+        working-directory: infra
+        run: python -m pytest -q -ra tests/unit
+
+      - name: Start functional Mosquitto
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/mqttium-final-ci-mosquitto"
+          rm -rf "$root"
+          mkdir -p "$root"
+          cat > "$root/mosquitto.conf" <<'EOF'
+          listener 11883 127.0.0.1
+          allow_anonymous true
+          persistence false
+          EOF
+          mosquitto -c "$root/mosquitto.conf" > "$root/mosquitto.log" 2>&1 &
+          echo "$!" > "$root/mosquitto.pid"
+          for _ in $(seq 1 50); do
+            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            if ! kill -0 "$(cat "$root/mosquitto.pid")" 2>/dev/null; then
+              cat "$root/mosquitto.log"
+              exit 1
+            fi
+            sleep 0.2
+          done
+          cat "$root/mosquitto.log"
+          exit 1
+
+      - name: Exact 255 integration tests on ARM64
+        working-directory: infra
+        run: python -m pytest -q -ra tests/integration
+
+      - name: Stop functional Mosquitto
+        if: always()
+        shell: bash
+        run: |
+          pidfile="$RUNNER_TEMP/mqttium-final-ci-mosquitto/mosquitto.pid"
           if [ -f "$pidfile" ]; then
             pid="$(cat "$pidfile")"
             kill "$pid" 2>/dev/null || true
