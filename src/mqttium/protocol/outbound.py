@@ -468,8 +468,9 @@ class OutboundSession:
             # this re-reads neither, and never attempts a doomed acquire.
             # A raise inside _launch unwinds through the shared _rollback below,
             # whose `inflight_start` snapshot releases the slot acquired here.
-            if topic_bytes is not None and self.flow.try_acquire():
-                self._launch(msg, _property_bytes=property_bytes, _topic_bytes=topic_bytes)
+            if self._engine.state == ConnectionState.CONNECTED and self._try_launch(
+                msg, _property_bytes=property_bytes, _topic_bytes=topic_bytes
+            ):
                 return PublishHandle(mid=mid, qos=qos)
 
             self.store.put_out(msg)
@@ -716,6 +717,22 @@ class OutboundSession:
             msg.encoded_publish = retained
             self.store.put_out(msg)
         self._engine._send(wire)
+
+    def _try_launch(
+        self,
+        msg: OutboundMessage,
+        *,
+        _property_bytes: bytes | None = None,
+        _topic_bytes: bytes | None = None,
+    ) -> bool:
+        if not self.flow.try_acquire():
+            return False
+        try:
+            self._launch(msg, _property_bytes=_property_bytes, _topic_bytes=_topic_bytes)
+        except Exception:
+            self.flow.release()
+            raise
+        return True
 
     def _retransmit(self, msg: OutboundMessage) -> None:
         if msg.state in (

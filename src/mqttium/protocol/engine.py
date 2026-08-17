@@ -258,13 +258,16 @@ class ProtocolEngine:
         decoded_property_wire_size: int | None = None,
     ) -> None:
         self._effects.append(
-            EngineEffect(kind, data, requires_delivery_mark, decoded_property_wire_size)
+            EngineEffect(
+                kind=kind,
+                data=data,
+                requires_delivery_mark=requires_delivery_mark,
+                decoded_property_wire_size=decoded_property_wire_size,
+            )
         )
 
     def _send(self, packet: WriteItem) -> None:
-        # Appends directly rather than delegating to _emit: SEND is the most
-        # frequent effect and this is one Python frame per outbound packet.
-        self._effects.append(EngineEffect(EffectKind.SEND, packet, False, None))
+        self._emit(EffectKind.SEND, packet)
 
     def begin_connect(self) -> bytes:
         if self.state in (ConnectionState.CONNECTED, ConnectionState.CONNECTING):
