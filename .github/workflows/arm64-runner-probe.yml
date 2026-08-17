@@ -1,4 +1,4 @@
-name: ARM64 Runner Probe
+name: ARM64 Writer Capacity Evidence
 
 on:
   push:
@@ -9,21 +9,22 @@ permissions:
   contents: read
 
 jobs:
-  probe:
+  capacity:
     runs-on: [self-hosted, linux, ARM64]
-    timeout-minutes: 10
+    timeout-minutes: 45
+    env:
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
     steps:
-      - name: Verify prepared host
+      - name: Verify strict-performance host
         shell: bash
         run: |
           set -euo pipefail
           test "$(uname -m)" = "aarch64"
           command -v python3
           command -v mosquitto
-          command -v mosquitto_sub
-          command -v openssl
-          python3 --version
-          mosquitto -h 2>&1 | head -n 2
+          command -v taskset
           governors="$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor | sort -u)"
           printf 'governors=%s\n' "$governors"
           test "$governors" = "performance"
@@ -34,18 +35,32 @@ jobs:
             exit 1
           fi
 
-      - name: Check out exact benchmark harness
+      - name: Check out exact #254 benchmark harness
         uses: actions/checkout@v7
         with:
           ref: 5008d69a889d9100f7f3fb2623e6b08a72126524
           path: harness
           persist-credentials: false
 
+      - name: Check out rc5 baseline
+        uses: actions/checkout@v7
+        with:
+          ref: v1.0.0rc5
+          path: base
+          persist-credentials: false
+
+      - name: Check out exact #254 candidate
+        uses: actions/checkout@v7
+        with:
+          ref: 5008d69a889d9100f7f3fb2623e6b08a72126524
+          path: candidate
+          persist-credentials: false
+
       - name: Create isolated benchmark venv
         shell: bash
         run: |
           set -euo pipefail
-          venv="$RUNNER_TEMP/mqttium-perf-probe-venv"
+          venv="$RUNNER_TEMP/mqttium-writer-capacity-venv"
           rm -rf "$venv"
           python3 -m venv "$venv"
           echo "$venv/bin" >> "$GITHUB_PATH"
@@ -53,20 +68,116 @@ jobs:
       - name: Install preflight dependency
         run: python -m pip install "psutil>=6,<8"
 
-      - name: Strict benchmark preflight
+      - name: Strict runner preflight
         working-directory: harness
+        shell: bash
         run: |
-          mkdir -p "$RUNNER_TEMP/mqttium-perf-probe"
+          set -euo pipefail
+          root="$RUNNER_TEMP/mqttium-writer-capacity"
+          rm -rf "$root"
+          mkdir -p "$root"
           python benchmarks/runner_probe.py \
-            --output "$RUNNER_TEMP/mqttium-perf-probe/preflight.json" \
+            --output "$root/preflight.json" \
             --require-temperature \
             --enforce
 
-      - name: Upload preflight
+      - name: Start isolated Mosquitto pinned to CPU 0
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/mqttium-writer-capacity"
+          cat > "$root/mosquitto.conf" <<'EOF'
+          persistence false
+          allow_anonymous true
+          max_inflight_messages 1000
+          max_queued_messages 100000
+          max_queued_bytes 0
+          connection_messages false
+          log_type error
+          listener 11883 127.0.0.1
+          EOF
+          taskset -c 0 mosquitto -c "$root/mosquitto.conf" > "$root/mosquitto.log" 2>&1 &
+          echo "$!" > "$root/mosquitto.pid"
+          for _ in $(seq 1 50); do
+            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            if ! kill -0 "$(cat "$root/mosquitto.pid")" 2>/dev/null; then
+              cat "$root/mosquitto.log"
+              exit 1
+            fi
+            sleep 0.1
+          done
+          cat "$root/mosquitto.log"
+          exit 1
+
+      - name: Run strict A/A then A/B writer-capacity evidence
+        id: capacity
+        shell: bash
+        run: |
+          set -uo pipefail
+          root="$RUNNER_TEMP/mqttium-writer-capacity"
+          common=(
+            --protocol 311
+            --qos-values 0,1
+            --payload-bytes 256
+            --inflight 20
+            --outstanding 64
+            --max-queued 200
+            --warmup-count 5000
+            --repeat 8
+            --count-qos0 100000
+            --count-qos1 40000
+            --timeout 120
+            --cpu 2
+            --policy strict
+            --preflight-report "$root/preflight.json"
+          )
+
+          echo '=== A/A: v1.0.0rc5 versus itself ==='
+          python harness/benchmarks/paired_writer_capacity.py \
+            --base-root base --candidate-root base \
+            "${common[@]}" \
+            --output "$root/aa.json" \
+            --summary-output "$root/aa.md"
+          aa_status=$?
+          echo "A/A exit=$aa_status"
+
+          echo '=== A/B: v1.0.0rc5 versus #254 exact HEAD ==='
+          python harness/benchmarks/paired_writer_capacity.py \
+            --base-root base --candidate-root candidate \
+            "${common[@]}" \
+            --output "$root/ab.json" \
+            --summary-output "$root/ab.md"
+          ab_status=$?
+          echo "A/B exit=$ab_status"
+
+          printf 'aa_status=%s\nab_status=%s\n' "$aa_status" "$ab_status" | tee "$root/status.txt"
+          if [ "$aa_status" -ne 0 ] || [ "$ab_status" -ne 0 ]; then
+            exit 1
+          fi
+
+      - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: arm64-perf-preflight-${{ github.run_id }}
-          path: ${{ runner.temp }}/mqttium-perf-probe/preflight.json
+          name: arm64-writer-capacity-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/mqttium-writer-capacity/preflight.json
+            ${{ runner.temp }}/mqttium-writer-capacity/aa.json
+            ${{ runner.temp }}/mqttium-writer-capacity/aa.md
+            ${{ runner.temp }}/mqttium-writer-capacity/ab.json
+            ${{ runner.temp }}/mqttium-writer-capacity/ab.md
+            ${{ runner.temp }}/mqttium-writer-capacity/status.txt
+            ${{ runner.temp }}/mqttium-writer-capacity/mosquitto.log
           if-no-files-found: warn
-          retention-days: 7
+          retention-days: 30
+
+      - name: Stop isolated Mosquitto
+        if: always()
+        shell: bash
+        run: |
+          pidfile="$RUNNER_TEMP/mqttium-writer-capacity/mosquitto.pid"
+          if [ -f "$pidfile" ]; then
+            pid="$(cat "$pidfile")"
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+          fi
