@@ -5,8 +5,9 @@ Property table follows IMPLEMENTATION-GUIDE.md §2.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
+from collections.abc import Callable
 from typing import Any
 
 from mqttium.codec.primitives import (
@@ -81,6 +82,21 @@ class PropertySpec:
     nonzero: bool = False
     # Extra constraint: BYTE value must be 0 or 1.
     zero_one: bool = False
+    # Extra constraint: the value is a topic name, so it must reject wildcards.
+    # A declared flag rather than a `name == "response_topic"` string compare
+    # per property, matching how nonzero/zero_one are already expressed.
+    topic_value: bool = False
+    # Extra constraint: repeatable in general, single-valued on SUBSCRIBE.
+    subscribe_singleton: bool = False
+    # The value codec for `type`, attached once at import (see below). Held on
+    # the spec rather than looked up in a dict keyed by PropType: PropType is an
+    # Enum and Enum.__hash__ is a Python-level call, so an enum-keyed lookup
+    # costs two extra calls per property -- measurably worse than the if-chain
+    # it would replace.
+    encode: Callable[[Any], bytes] = field(init=False, repr=False, compare=False)
+    decode: Callable[[bytes | bytearray, int], tuple[Any, int]] = field(
+        init=False, repr=False, compare=False
+    )
 
 
 _SPECS: tuple[PropertySpec, ...] = (
@@ -89,7 +105,9 @@ _SPECS: tuple[PropertySpec, ...] = (
     ),
     PropertySpec(0x02, "message_expiry_interval", PropType.U32, frozenset({PUBLISH, WILL})),
     PropertySpec(0x03, "content_type", PropType.STRING, frozenset({PUBLISH, WILL})),
-    PropertySpec(0x08, "response_topic", PropType.STRING, frozenset({PUBLISH, WILL})),
+    PropertySpec(
+        0x08, "response_topic", PropType.STRING, frozenset({PUBLISH, WILL}), topic_value=True
+    ),
     PropertySpec(0x09, "correlation_data", PropType.BINARY, frozenset({PUBLISH, WILL})),
     PropertySpec(
         0x0B,
@@ -98,6 +116,7 @@ _SPECS: tuple[PropertySpec, ...] = (
         frozenset({PUBLISH, SUBSCRIBE}),
         multiple=True,  # multiple only on PUBLISH; SUBSCRIBE checked at encode/decode
         nonzero=True,
+        subscribe_singleton=True,
     ),
     PropertySpec(
         0x11,
@@ -192,61 +211,91 @@ BY_ID: dict[int, PropertySpec] = {s.id: s for s in _SPECS}
 BY_NAME: dict[str, PropertySpec] = {s.name: s for s in _SPECS}
 
 
-def _encode_value(ptype: PropType, value: Any) -> bytes:  # noqa: C901
-    if ptype is PropType.BYTE:
-        if not isinstance(value, int) or not 0 <= value <= 255:
-            raise ProtocolError(f"Invalid byte property value: {value!r}")
-        return bytes((value,))
-    if ptype is PropType.U16:
-        if not isinstance(value, int) or not 0 <= value <= 65535:
-            raise ProtocolError(f"Invalid uint16 property value: {value!r}")
-        return pack_u16(value)
-    if ptype is PropType.U32:
-        if not isinstance(value, int) or not 0 <= value <= 0xFFFFFFFF:
-            raise ProtocolError(f"Invalid uint32 property value: {value!r}")
-        return pack_u32(value)
-    if ptype is PropType.VBI:
-        if not isinstance(value, int) or not 0 <= value <= 268_435_455:
-            raise ProtocolError(f"Invalid VBI property value: {value!r}")
-        return encode_vbi(value)
-    if ptype is PropType.STRING:
-        if not isinstance(value, str):
-            raise ProtocolError(f"Invalid string property value: {value!r}")
-        return pack_utf8(value)
-    if ptype is PropType.STRING_PAIR:
-        if not (isinstance(value, tuple) and len(value) == 2):
-            raise ProtocolError(f"Invalid string-pair property value: {value!r}")
-        return pack_utf8(value[0]) + pack_utf8(value[1])
-    if ptype is PropType.BINARY:
-        if not isinstance(value, (bytes, bytearray)):
-            raise ProtocolError(f"Invalid binary property value: {value!r}")
-        try:
-            return pack_binary(bytes(value))
-        except ValueError as exc:
-            raise ProtocolError(f"Invalid binary property value: {exc}") from exc
-    raise ProtocolError(f"Unknown property type {ptype}")
+def _encode_byte(value: Any) -> bytes:
+    if not isinstance(value, int) or not 0 <= value <= 255:
+        raise ProtocolError(f"Invalid byte property value: {value!r}")
+    return bytes((value,))
 
 
-def _decode_value(ptype: PropType, buf: bytes | bytearray, offset: int) -> tuple[Any, int]:
-    if ptype is PropType.BYTE:
-        if offset >= len(buf):
-            raise MalformedPacketError("Incomplete byte property")
-        return buf[offset], offset + 1
-    if ptype is PropType.U16:
-        return unpack_u16(buf, offset)
-    if ptype is PropType.U32:
-        return unpack_u32(buf, offset)
-    if ptype is PropType.VBI:
-        return decode_vbi(buf, offset)
-    if ptype is PropType.STRING:
-        return unpack_utf8(buf, offset)
-    if ptype is PropType.STRING_PAIR:
-        k, pos = unpack_utf8(buf, offset)
-        v, pos = unpack_utf8(buf, pos)
-        return (k, v), pos
-    if ptype is PropType.BINARY:
-        return unpack_binary(buf, offset)
-    raise MalformedPacketError(f"Unknown property type {ptype}")
+def _encode_u16(value: Any) -> bytes:
+    if not isinstance(value, int) or not 0 <= value <= 65535:
+        raise ProtocolError(f"Invalid uint16 property value: {value!r}")
+    return pack_u16(value)
+
+
+def _encode_u32(value: Any) -> bytes:
+    if not isinstance(value, int) or not 0 <= value <= 0xFFFFFFFF:
+        raise ProtocolError(f"Invalid uint32 property value: {value!r}")
+    return pack_u32(value)
+
+
+def _encode_vbi_value(value: Any) -> bytes:
+    if not isinstance(value, int) or not 0 <= value <= 268_435_455:
+        raise ProtocolError(f"Invalid VBI property value: {value!r}")
+    return encode_vbi(value)
+
+
+def _encode_string(value: Any) -> bytes:
+    if not isinstance(value, str):
+        raise ProtocolError(f"Invalid string property value: {value!r}")
+    return pack_utf8(value)
+
+
+def _encode_string_pair(value: Any) -> bytes:
+    if not (isinstance(value, tuple) and len(value) == 2):
+        raise ProtocolError(f"Invalid string-pair property value: {value!r}")
+    return pack_utf8(value[0]) + pack_utf8(value[1])
+
+
+def _encode_binary(value: Any) -> bytes:
+    if not isinstance(value, (bytes, bytearray)):
+        raise ProtocolError(f"Invalid binary property value: {value!r}")
+    try:
+        return pack_binary(bytes(value))
+    except ValueError as exc:
+        raise ProtocolError(f"Invalid binary property value: {exc}") from exc
+
+
+def _decode_byte(buf: bytes | bytearray, offset: int) -> tuple[Any, int]:
+    if offset >= len(buf):
+        raise MalformedPacketError("Incomplete byte property")
+    return buf[offset], offset + 1
+
+
+def _decode_string_pair(buf: bytes | bytearray, offset: int) -> tuple[Any, int]:
+    key, pos = unpack_utf8(buf, offset)
+    value, pos = unpack_utf8(buf, pos)
+    return (key, value), pos
+
+
+# Replaces two seven-branch `is` chains re-walked per property. Five of the
+# seven decoders are now the primitive itself, so those lose a frame as well.
+_ENCODERS: dict[PropType, Callable[[Any], bytes]] = {
+    PropType.BYTE: _encode_byte,
+    PropType.U16: _encode_u16,
+    PropType.U32: _encode_u32,
+    PropType.VBI: _encode_vbi_value,
+    PropType.STRING: _encode_string,
+    PropType.STRING_PAIR: _encode_string_pair,
+    PropType.BINARY: _encode_binary,
+}
+
+_DECODERS: dict[PropType, Callable[[bytes | bytearray, int], tuple[Any, int]]] = {
+    PropType.BYTE: _decode_byte,
+    PropType.U16: unpack_u16,
+    PropType.U32: unpack_u32,
+    PropType.VBI: decode_vbi,
+    PropType.STRING: unpack_utf8,
+    PropType.STRING_PAIR: _decode_string_pair,
+    PropType.BINARY: unpack_binary,
+}
+
+# A missing entry is an import-time failure, not a runtime branch.
+assert set(_ENCODERS) == set(PropType) == set(_DECODERS)
+
+for _spec in _SPECS:
+    object.__setattr__(_spec, "encode", _ENCODERS[_spec.type])
+    object.__setattr__(_spec, "decode", _DECODERS[_spec.type])
 
 
 def _validate_response_topic(value: Any, error_type: type[MQTTError]) -> None:
@@ -269,7 +318,7 @@ def _encode_properties_uncached(props: Properties, packet: str) -> bytes:
 
         values: list[Any]
         if spec.multiple:
-            if name == "subscription_identifier" and packet == SUBSCRIBE:
+            if spec.subscribe_singleton and packet == SUBSCRIBE:
                 # SUBSCRIBE: single value only (guide §2).
                 if isinstance(value, list):
                     if len(value) != 1:
@@ -291,10 +340,10 @@ def _encode_properties_uncached(props: Properties, packet: str) -> bytes:
                 raise ProtocolError(f"Property {name!r} must not be zero")
             if spec.zero_one and item not in (0, 1):
                 raise ProtocolError(f"Property {name!r} must be 0 or 1")
-            if name == "response_topic":
+            if spec.topic_value:
                 _validate_response_topic(item, ProtocolError)
             body.append(spec.id)
-            body.extend(_encode_value(spec.type, item))
+            body.extend(spec.encode(item))
 
     return encode_vbi(len(body)) + bytes(body)
 
@@ -355,16 +404,16 @@ def decode_properties(
             raise MalformedPacketError(f"Unknown property id 0x{prop_id:02x}")
         if packet not in spec.packets:
             raise MalformedPacketError(f"Property {spec.name} not allowed on {packet}")
-        value, pos = _decode_value(spec.type, buf, pos)
+        value, pos = spec.decode(buf, pos)
         if spec.nonzero and value == 0:
             raise MalformedPacketError(f"Property {spec.name} must not be zero")
         if spec.zero_one and value not in (0, 1):
             raise MalformedPacketError(f"Property {spec.name} must be 0 or 1")
-        if spec.name == "response_topic":
+        if spec.topic_value:
             _validate_response_topic(value, MalformedPacketError)
 
         if spec.multiple:
-            if spec.name == "subscription_identifier" and packet == SUBSCRIBE:
+            if spec.subscribe_singleton and packet == SUBSCRIBE:
                 if spec.name in seen:
                     raise MalformedPacketError("Duplicate subscription_identifier on SUBSCRIBE")
                 result.set(spec.name, value)

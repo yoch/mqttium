@@ -12,14 +12,17 @@ from mqttium.types import Message, Properties
 
 def test_delivery_logical_size_reuses_cached_mqtt5_property_body(monkeypatch) -> None:
     calls = 0
-    original = properties_module._encode_value
+    # Count whole-table encodes rather than per-value ones: that is the contract
+    # ("the cached body is reused"), and it does not move when the per-value
+    # codecs do.
+    original = properties_module._encode_properties_uncached
 
-    def counting(prop_type: object, value: object) -> bytes:
+    def counting(props: object, packet: object) -> bytes:
         nonlocal calls
         calls += 1
-        return original(prop_type, value)
+        return original(props, packet)
 
-    monkeypatch.setattr(properties_module, "_encode_value", counting)
+    monkeypatch.setattr(properties_module, "_encode_properties_uncached", counting)
     properties = Properties()
     properties.add_user_property("source", "delivery")
     message = Message(topic="cache/topic", payload=b"payload", properties=properties)

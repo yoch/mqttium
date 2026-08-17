@@ -82,14 +82,17 @@ def test_connected_qos1_launch_reuses_cached_property_body(monkeypatch: pytest.M
     from mqttium.enums import ConnectionState
 
     calls = 0
-    original = properties_module._encode_value
+    # Count whole-table encodes rather than per-value ones: that is the contract
+    # ("the cached body is reused"), and it does not move when the per-value
+    # codecs do.
+    original = properties_module._encode_properties_uncached
 
-    def counting(prop_type: object, value: object) -> bytes:
+    def counting(props: object, packet: object) -> bytes:
         nonlocal calls
         calls += 1
-        return original(prop_type, value)
+        return original(props, packet)
 
-    monkeypatch.setattr(properties_module, "_encode_value", counting)
+    monkeypatch.setattr(properties_module, "_encode_properties_uncached", counting)
     properties = Properties()
     properties.add_user_property("source", "contract")
     properties.set("content_type", "application/octet-stream")
@@ -97,8 +100,13 @@ def test_connected_qos1_launch_reuses_cached_property_body(monkeypatch: pytest.M
     engine.state = ConnectionState.CONNECTED
 
     engine.queue_publish("contract/topic", b"payload", qos=1, properties=properties)
+    engine.queue_publish("contract/topic", b"payload", qos=1, properties=properties)
 
-    assert calls == 2
+    # One table encode across both publishes. Within a publish, admission sizes
+    # the table and hands the bytes to the launch encoder; across publishes the
+    # cache on Properties is what avoids the second encode -- which is why this
+    # publishes twice, so disabling the cache is actually observable here.
+    assert calls == 1
 
 
 async def test_nowait_publish_encodes_properties_once(monkeypatch) -> None:
