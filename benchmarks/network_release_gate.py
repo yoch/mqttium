@@ -1,7 +1,9 @@
 """Release-grade statistical gate for paired MQTT network measurements.
 
-``paired_network.py`` remains the acquisition engine. This module orchestrates
-same-code controls and evaluates paired A/B ratios with confidence intervals.
+``paired_network.py`` remains the low-level acquisition engine. This module
+adds the release decision layer: deterministic same-code controls, hash-seed
+blocked ABBA cycles, and confidence-bound A/B evaluation.
+
 Raw per-arm variability is retained as diagnostic evidence but is not, by
 itself, a reason to discard an otherwise precise paired estimator.
 """
@@ -11,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import statistics
 import subprocess
 import sys
@@ -207,6 +210,14 @@ def _pair_estimates(scenario: dict[str, Any]) -> tuple[PairEstimate, PairEstimat
     )
 
 
+def _raw_ack_cvs(scenario: dict[str, Any]) -> tuple[float, float]:
+    base_values = [float(pair["base"]["publisher_ack_msg_s"]) for pair in scenario["pairs"]]
+    candidate_values = [
+        float(pair["candidate"]["publisher_ack_msg_s"]) for pair in scenario["pairs"]
+    ]
+    return coefficient_of_variation(base_values), coefficient_of_variation(candidate_values)
+
+
 def evaluate_control_payload(
     payload: dict[str, Any],
     *,
@@ -222,6 +233,7 @@ def evaluate_control_payload(
     evaluations: list[ScenarioEvaluation] = []
     for scenario in payload["scenarios"]:
         throughput, ack_p50, delivery_p50 = _pair_estimates(scenario)
+        base_ack_cv, candidate_ack_cv = _raw_ack_cvs(scenario)
         key = _scenario_key(scenario)
         failures = control_failures(
             f"{key} throughput",
@@ -247,8 +259,8 @@ def evaluate_control_payload(
                 throughput=throughput,
                 ack_p50=ack_p50,
                 delivery_p50=delivery_p50,
-                base_ack_cv=float(scenario["base_ack_cv"]),
-                candidate_ack_cv=float(scenario["candidate_ack_cv"]),
+                base_ack_cv=base_ack_cv,
+                candidate_ack_cv=candidate_ack_cv,
                 failures=tuple(failures),
             )
         )
@@ -264,6 +276,7 @@ def evaluate_ab_payload(
     evaluations: list[ScenarioEvaluation] = []
     for scenario in payload["scenarios"]:
         throughput, ack_p50, delivery_p50 = _pair_estimates(scenario)
+        base_ack_cv, candidate_ack_cv = _raw_ack_cvs(scenario)
         key = _scenario_key(scenario)
         failures = regression_failures(
             key,
@@ -278,8 +291,8 @@ def evaluate_ab_payload(
                 throughput=throughput,
                 ack_p50=ack_p50,
                 delivery_p50=delivery_p50,
-                base_ack_cv=float(scenario["base_ack_cv"]),
-                candidate_ack_cv=float(scenario["candidate_ack_cv"]),
+                base_ack_cv=base_ack_cv,
+                candidate_ack_cv=candidate_ack_cv,
                 failures=tuple(failures),
             )
         )
@@ -304,6 +317,8 @@ def _engine_command(
     output: Path,
     preflight_report: Path,
 ) -> list[str]:
+    # One acquisition invocation is exactly one complete ABBA cycle: two
+    # opposite-order pairs under one deterministic Python hash seed.
     command = [
         sys.executable,
         str(args.engine),
@@ -324,7 +339,7 @@ def _engine_command(
         "--completions",
         args.completions,
         "--repeat",
-        str(args.repeat),
+        "2",
         "--count-small",
         str(args.count_small),
         "--count-large",
@@ -360,7 +375,7 @@ def _fresh_preflight(
     quiet_seconds: float,
 ) -> Path:
     if quiet_seconds > 0:
-        print(f"{label}: fixed inter-phase quiet period {quiet_seconds:.0f}s")
+        print(f"{label}: fixed inter-block quiet period {quiet_seconds:.0f}s")
         time.sleep(quiet_seconds)
     output = raw_dir / f"{label}-preflight.json"
     command = [
@@ -377,22 +392,17 @@ def _fresh_preflight(
     return output
 
 
-def _run_engine(
+def _run_engine_cycle(
     args: argparse.Namespace,
     *,
     label: str,
     base_root: Path,
     candidate_root: Path,
     raw_dir: Path,
-    quiet_seconds: float,
+    preflight_report: Path,
+    hash_seed: int,
 ) -> dict[str, Any]:
     output = raw_dir / f"{label}.json"
-    preflight_report = _fresh_preflight(
-        args,
-        label=label,
-        raw_dir=raw_dir,
-        quiet_seconds=quiet_seconds,
-    )
     command = _engine_command(
         args,
         base_root=base_root,
@@ -400,7 +410,9 @@ def _run_engine(
         output=output,
         preflight_report=preflight_report,
     )
-    completed = subprocess.run(command, check=False)
+    env = os.environ.copy()
+    env["PYTHONHASHSEED"] = str(hash_seed)
+    completed = subprocess.run(command, check=False, env=env)
     if completed.returncode:
         raise RuntimeError(f"measurement engine exited {completed.returncode}: {' '.join(command)}")
     try:
@@ -412,7 +424,98 @@ def _run_engine(
         raise RuntimeError(f"{label}: runner preflight is not eligible")
     if payload.get("status") == "invalid":
         raise RuntimeError(f"{label}: acquisition invalid: {payload.get('failures', [])}")
+    scenarios = payload.get("scenarios")
+    if not isinstance(scenarios, list) or not scenarios:
+        raise RuntimeError(f"{label}: acquisition returned no scenarios")
+    for scenario in scenarios:
+        if not isinstance(scenario, dict) or len(scenario.get("pairs", [])) != 2:
+            raise RuntimeError(f"{label}: each seeded acquisition must contain one ABBA cycle")
     return payload
+
+
+def _combine_phase_payloads(
+    cycle_payloads: list[tuple[int, int, dict[str, Any]]],
+) -> dict[str, Any]:
+    if not cycle_payloads:
+        raise RuntimeError("phase contains no cycle payloads")
+
+    first_scenarios = cycle_payloads[0][2].get("scenarios")
+    if not isinstance(first_scenarios, list) or not first_scenarios:
+        raise RuntimeError("phase first cycle contains no scenarios")
+
+    scenario_order = [_scenario_key(scenario) for scenario in first_scenarios]
+    combined: dict[str, dict[str, Any]] = {}
+    for scenario in first_scenarios:
+        key = _scenario_key(scenario)
+        combined[key] = {
+            "protocol": scenario["protocol"],
+            "completion": scenario["completion"],
+            "payload_bytes": scenario["payload_bytes"],
+            "window": scenario["window"],
+            "pairs": [],
+        }
+
+    for block, hash_seed, payload in cycle_payloads:
+        scenarios = payload.get("scenarios")
+        if not isinstance(scenarios, list):
+            raise RuntimeError("cycle payload has invalid scenarios")
+        if [_scenario_key(scenario) for scenario in scenarios] != scenario_order:
+            raise RuntimeError("cycle payload scenario set/order changed within phase")
+        for scenario in scenarios:
+            key = _scenario_key(scenario)
+            pairs = scenario.get("pairs")
+            if not isinstance(pairs, list) or len(pairs) != 2:
+                raise RuntimeError(f"{key}: seeded cycle does not contain exactly two pairs")
+            for pair in pairs:
+                annotated = dict(pair)
+                annotated["block"] = block
+                annotated["hash_seed"] = hash_seed
+                combined[key]["pairs"].append(annotated)
+
+    # Validate ABBA completeness/order before any statistical interpretation.
+    for scenario in combined.values():
+        orders = [list(pair["order"]) for pair in scenario["pairs"]]
+        abba_cycle_ratios([1.0] * len(orders), orders)
+
+    return {
+        "status": "passed",
+        "scenarios": [combined[key] for key in scenario_order],
+    }
+
+
+def _run_phase(
+    args: argparse.Namespace,
+    *,
+    label: str,
+    base_root: Path,
+    candidate_root: Path,
+    raw_dir: Path,
+    initial_quiet_seconds: float,
+) -> dict[str, Any]:
+    cycle_payloads: list[tuple[int, int, dict[str, Any]]] = []
+    for block in range(2):
+        quiet_seconds = initial_quiet_seconds if block == 0 else args.inter_phase_quiet_seconds
+        block_label = f"{label}-block-{block + 1}"
+        preflight_report = _fresh_preflight(
+            args,
+            label=block_label,
+            raw_dir=raw_dir,
+            quiet_seconds=quiet_seconds,
+        )
+        for hash_seed in args.cycle_seeds:
+            cycle_label = f"{block_label}-seed-{hash_seed}"
+            print(f"{cycle_label}: acquiring one complete ABBA cycle")
+            payload = _run_engine_cycle(
+                args,
+                label=cycle_label,
+                base_root=base_root,
+                candidate_root=candidate_root,
+                raw_dir=raw_dir,
+                preflight_report=preflight_report,
+                hash_seed=hash_seed,
+            )
+            cycle_payloads.append((block + 1, hash_seed, payload))
+    return _combine_phase_payloads(cycle_payloads)
 
 
 def _evaluation_dict(evaluation: ScenarioEvaluation) -> dict[str, Any]:
@@ -422,13 +525,16 @@ def _evaluation_dict(evaluation: ScenarioEvaluation) -> dict[str, Any]:
 def _write_result(output: Path, payload: dict[str, Any]) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    sampling = payload["sampling"]
     lines = [
         "# Network release gate",
         "",
         f"- Status: **{payload['status']}**",
         f"- Base: `{payload['base_sha']}`",
         f"- Candidate: `{payload['candidate_sha']}`",
-        f"- Pairs per scenario: `{payload['repeat']}`",
+        f"- ABBA cycles per scenario: `{sampling['cycles_per_scenario']}`",
+        f"- Paired samples per scenario: `{sampling['pairs_per_scenario']}`",
+        f"- Hash-seed schedule per block: `{','.join(map(str, sampling['cycle_seeds']))}`",
         "",
     ]
     failures = payload.get("failures", [])
@@ -475,12 +581,19 @@ def parent(args: argparse.Namespace) -> int:
     candidate_root = args.candidate_root.resolve()
     raw_dir = args.output.parent / f"{args.output.stem}-raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
+    cycles_per_scenario = 2 * len(args.cycle_seeds)
     result: dict[str, Any] = {
         "status": "running",
         "policy": args.policy,
         "base_sha": _git_sha(base_root),
         "candidate_sha": _git_sha(candidate_root),
-        "repeat": args.repeat,
+        "sampling": {
+            "blocks": 2,
+            "cycle_seeds": args.cycle_seeds,
+            "cycles_per_scenario": cycles_per_scenario,
+            "pairs_per_scenario": 2 * cycles_per_scenario,
+            "engine_pairs_per_seed": 2,
+        },
         "thresholds": {
             "control_throughput_bias": [
                 args.control_throughput_bias_floor,
@@ -501,7 +614,7 @@ def parent(args: argparse.Namespace) -> int:
             "min_throughput": args.min_throughput,
             "max_ack_p50": args.max_ack_p50,
             "confidence": 0.95,
-            "inter_phase_quiet_seconds": args.inter_phase_quiet_seconds,
+            "inter_block_quiet_seconds": args.inter_phase_quiet_seconds,
         },
         "raw_arm_cv": "diagnostic_only",
         "base_control": [],
@@ -510,13 +623,13 @@ def parent(args: argparse.Namespace) -> int:
         "failures": [],
     }
     try:
-        base_control_payload = _run_engine(
+        base_control_payload = _run_phase(
             args,
             label="base-aa",
             base_root=base_root,
             candidate_root=base_root,
             raw_dir=raw_dir,
-            quiet_seconds=0.0,
+            initial_quiet_seconds=0.0,
         )
         base_control = _control_evaluations(args, base_control_payload)
         result["base_control"] = [_evaluation_dict(item) for item in base_control]
@@ -527,13 +640,13 @@ def parent(args: argparse.Namespace) -> int:
             _write_result(args.output, result)
             return 2 if args.policy == "strict" else 0
 
-        candidate_control_payload = _run_engine(
+        candidate_control_payload = _run_phase(
             args,
             label="candidate-aa",
             base_root=candidate_root,
             candidate_root=candidate_root,
             raw_dir=raw_dir,
-            quiet_seconds=args.inter_phase_quiet_seconds,
+            initial_quiet_seconds=args.inter_phase_quiet_seconds,
         )
         candidate_control = _control_evaluations(args, candidate_control_payload)
         result["candidate_control"] = [_evaluation_dict(item) for item in candidate_control]
@@ -544,13 +657,13 @@ def parent(args: argparse.Namespace) -> int:
             _write_result(args.output, result)
             return 2 if args.policy == "strict" else 0
 
-        ab_payload = _run_engine(
+        ab_payload = _run_phase(
             args,
             label="ab",
             base_root=base_root,
             candidate_root=candidate_root,
             raw_dir=raw_dir,
-            quiet_seconds=args.inter_phase_quiet_seconds,
+            initial_quiet_seconds=args.inter_phase_quiet_seconds,
         )
         ab = evaluate_ab_payload(
             ab_payload,
@@ -565,12 +678,34 @@ def parent(args: argparse.Namespace) -> int:
         if failures and args.policy == "strict":
             return 1
         return 0
-    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
         result["status"] = "invalid"
         result["failures"] = [str(exc)]
         _write_result(args.output, result)
         print(f"network release gate invalid: {exc}", file=sys.stderr)
         return 2 if args.policy == "strict" else 0
+
+
+def _parse_cycle_seeds(value: str) -> list[int]:
+    raw = [item.strip() for item in value.split(",") if item.strip()]
+    if not raw:
+        raise argparse.ArgumentTypeError("cycle seed schedule cannot be empty")
+    seeds: list[int] = []
+    for item in raw:
+        try:
+            seed = int(item)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(f"invalid deterministic hash seed: {item!r}") from exc
+        if not 0 <= seed <= 4_294_967_295:
+            raise argparse.ArgumentTypeError(
+                "hash seeds must fit PYTHONHASHSEED range 0..4294967295"
+            )
+        seeds.append(seed)
+    if len(seeds) < 6:
+        raise argparse.ArgumentTypeError("release gate requires at least six cycle seeds per block")
+    if len(set(seeds)) != len(seeds):
+        raise argparse.ArgumentTypeError("cycle seed schedule must not contain duplicates")
+    return seeds
 
 
 def parse_args() -> argparse.Namespace:
@@ -583,8 +718,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--protocols", default="311")
     parser.add_argument("--completions", default="callback")
     parser.add_argument("--payloads", default="64")
-    parser.add_argument("--windows", default="1,20,64")
-    parser.add_argument("--repeat", type=int, default=12)
+    parser.add_argument("--windows", default="1,8,64")
+    parser.add_argument(
+        "--cycle-seeds",
+        type=_parse_cycle_seeds,
+        default=_parse_cycle_seeds("0,1,2,3,4,5"),
+    )
     parser.add_argument("--count-small", type=int, default=6_000)
     parser.add_argument("--count-large", type=int, default=3_000)
     parser.add_argument("--target-sample-seconds", type=float, default=2.0)
@@ -606,8 +745,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--policy", choices=("advisory", "strict"), default="advisory")
     parser.add_argument("--output", type=Path, default=Path("/tmp/network-release-gate.json"))
     args = parser.parse_args()
-    if args.repeat < 6 or args.repeat % 2:
-        parser.error("--repeat must be an even count of at least 6")
     if args.target_sample_seconds <= 0:
         parser.error("--target-sample-seconds must be positive")
     if args.inter_phase_quiet_seconds < 0:
