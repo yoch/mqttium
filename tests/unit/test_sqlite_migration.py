@@ -210,8 +210,10 @@ def test_interrupted_migration_leaves_the_v1_database_intact(tmp_path: Path) -> 
     write_v1_database(path)
 
     class Interrupted(SqliteInflightStore):
-        def _migrate_to_v2(self) -> None:
-            super()._migrate_to_v2()
+        # First rebuild a schema-1 database performs; crashing after it proves
+        # the whole upgrade is one transaction, not that a particular step is.
+        def _rebuild_outbound(self) -> None:
+            super()._rebuild_outbound()
             raise RuntimeError("simulated crash mid-migration")
 
     with pytest.raises(RuntimeError, match="simulated crash"):

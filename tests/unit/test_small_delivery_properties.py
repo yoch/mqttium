@@ -171,7 +171,8 @@ def test_inbound_logical_size_reuses_fresh_decoded_table(monkeypatch) -> None:
     def fail_encode(*_args: object, **_kwargs: object) -> bytes:
         raise AssertionError("fresh inbound sizing must reuse the decoded table size")
 
-    monkeypatch.setattr("mqttium.protocol.inbound.encode_properties", fail_encode)
+    # The formula moved to protocol/_sizing.py, shared with OutboundSession.
+    monkeypatch.setattr("mqttium.protocol._sizing.encode_properties", fail_encode)
     size = engine.inbound.logical_size(
         message.topic, message.payload, message.properties, property_wire_size
     )

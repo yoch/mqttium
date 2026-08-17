@@ -329,47 +329,69 @@ class ApplicationDelivery:
             return self._accept_iterator_fast(message, None)
         return self._accept_callback_fast(message, callback)
 
+    async def _accept_small(
+        self,
+        message: Message,
+        callback: Callable[[Message], Any] | None,
+        iterator_delivery: bool,
+    ) -> None:
+        """Enqueue a message small enough to ride the unaccounted budget.
+
+        No reservation is taken, so there is nothing to roll back: a failure
+        here leaves only whatever the queues already accepted.
+        """
+        if iterator_delivery:
+            try:
+                self.messages_queue.put_nowait(message)
+            except asyncio.QueueFull:
+                await self.put_message(message)
+            else:
+                self.message_ready.set()
+        if callback is not None:
+            self.ensure_callback_worker()
+            job: CallbackJob = (callback, (message,), None)
+            try:
+                self.callback_queue.put_nowait(job)
+            except asyncio.QueueFull:
+                await self.enqueue_callback_job_slow(job)
+
     async def accept(
         self,
         message: Message,
         callback: Callable[[Message], Any] | None,
+        property_wire_size: int | None = None,
     ) -> None:
-        """Accept one message using one controller boundary on the hot path."""
+        """Accept one message using one controller boundary on the hot path.
+
+        `property_wire_size` is the exact MQTT 5 property-table size observed
+        while decoding a fresh PUBLISH; `None` means no trusted size is
+        available and the table has to be re-encoded to size it. That is the
+        only difference between the two entry points, so they share this body:
+        the enqueue steps and the rollback below must not drift apart. Both are
+        slow-path entries — `acceptor()` / `decoded_acceptor()` hand the common
+        case to the specialised `_accept_*` acceptors.
+        """
         callback_delivery = callback is not None and self.callback_mode
         iterator_delivery = self.iterator_mode or (self.auto_mode and callback is None)
         references = int(iterator_delivery) + int(callback_delivery)
-        small_limit = self.small_message_limit
-        small_delivery = references and (
-            small_limit is None
-            or (
-                small_limit > 0
-                and not message.properties
-                and len(message.payload) + 4 * len(message.topic) <= small_limit
+        if property_wire_size is None:
+            small_delivery = bool(references and self._is_small(message))
+        else:
+            small_delivery = bool(
+                references
+                and _fits_small_limit(message, self.small_message_limit, property_wire_size)
             )
-        )
         if small_delivery:
-            if iterator_delivery:
-                try:
-                    self.messages_queue.put_nowait(message)
-                except asyncio.QueueFull:
-                    await self.put_message(message)
-                else:
-                    self.message_ready.set()
-            if callback_delivery:
-                assert callback is not None
-                self.ensure_callback_worker()
-                job: CallbackJob = (callback, (message,), None)
-                try:
-                    self.callback_queue.put_nowait(job)
-                except asyncio.QueueFull:
-                    await self.enqueue_callback_job_slow(job)
+            await self._accept_small(
+                message, callback if callback_delivery else None, iterator_delivery
+            )
             return
 
         token: DeliveryToken = None
         iterator_enqueued = False
         callback_enqueued = False
         if references:
-            logical_bytes = self._reservable_size(message)
+            logical_bytes = self._reservable_size(message, property_wire_size)
             token = self.try_reserve(logical_bytes, references)
             if token is None:
                 token = await self.reserve_slow(logical_bytes, references)
@@ -408,65 +430,7 @@ class ApplicationDelivery:
         property_wire_size: int,
     ) -> None:
         """Accept one fresh decoded MQTT 5 message using its trusted table size."""
-        callback_delivery = callback is not None and self.callback_mode
-        iterator_delivery = self.iterator_mode or (self.auto_mode and callback is None)
-        references = int(iterator_delivery) + int(callback_delivery)
-        small_delivery = bool(
-            references and _fits_small_limit(message, self.small_message_limit, property_wire_size)
-        )
-        if small_delivery:
-            if iterator_delivery:
-                try:
-                    self.messages_queue.put_nowait(message)
-                except asyncio.QueueFull:
-                    await self.put_message(message)
-                else:
-                    self.message_ready.set()
-            if callback_delivery:
-                assert callback is not None
-                self.ensure_callback_worker()
-                job: CallbackJob = (callback, (message,), None)
-                try:
-                    self.callback_queue.put_nowait(job)
-                except asyncio.QueueFull:
-                    await self.enqueue_callback_job_slow(job)
-            return
-
-        token: DeliveryToken = None
-        iterator_enqueued = False
-        callback_enqueued = False
-        if references:
-            logical_bytes = self._decoded_reservable_size(message, property_wire_size)
-            token = self.try_reserve(logical_bytes, references)
-            if token is None:
-                token = await self.reserve_slow(logical_bytes, references)
-        try:
-            if iterator_delivery:
-                item: IteratorQueueItem = (message, token) if token is not None else message
-                try:
-                    self.messages_queue.put_nowait(item)
-                except asyncio.QueueFull:
-                    await self.put_message(item)
-                else:
-                    self.message_ready.set()
-                iterator_enqueued = True
-            if callback_delivery:
-                assert callback is not None
-                self.ensure_callback_worker()
-                job = (callback, (message,), token)
-                try:
-                    self.callback_queue.put_nowait(job)
-                except asyncio.QueueFull:
-                    await self.enqueue_callback_job_slow(job)
-                callback_enqueued = True
-        except BaseException:
-            self._release_unqueued(
-                token,
-                references=references,
-                iterator_enqueued=iterator_enqueued,
-                callback_enqueued=callback_enqueued,
-            )
-            raise
+        await self.accept(message, callback, property_wire_size)
 
     def _release_unqueued(
         self,
@@ -504,30 +468,23 @@ class ApplicationDelivery:
         self.message_ready.set()
 
     def _modes(self, callback: Callable[[Message], Any] | None) -> tuple[bool, bool]:
-        callback_delivery = callback is not None and self.mode in ("auto", "callback", "both")
-        iterator_delivery = self.mode in ("iterator", "both") or (
-            self.mode == "auto" and callback is None
-        )
+        """Resolve the two delivery destinations from the modes cached at init."""
+        callback_delivery = callback is not None and self.callback_mode
+        iterator_delivery = self.iterator_mode or (self.auto_mode and callback is None)
         return callback_delivery, iterator_delivery
 
-    def _is_small(self, message: Message, references: int) -> bool:
+    def _is_small(self, message: Message) -> bool:
         limit = self.small_message_limit
-        return bool(
-            references
-            and (
-                limit is None
-                or (
-                    limit > 0
-                    and not message.properties
-                    and len(message.payload) + 4 * len(message.topic) <= limit
-                )
-            )
+        if limit is None:
+            return True
+        return (
+            limit > 0
+            and not message.properties
+            and len(message.payload) + 4 * len(message.topic) <= limit
         )
 
-    def _is_small_decoded(self, message: Message, references: int, property_wire_size: int) -> bool:
-        return bool(
-            references and _fits_small_limit(message, self.small_message_limit, property_wire_size)
-        )
+    def _is_small_decoded(self, message: Message, property_wire_size: int) -> bool:
+        return _fits_small_limit(message, self.small_message_limit, property_wire_size)
 
     def deliver_batch_inline(
         self,
@@ -537,13 +494,16 @@ class ApplicationDelivery:
         callback_delivery, iterator_delivery = self._modes(callback)
         if not callback_delivery and not iterator_delivery:
             return 0
+        # Bind the callback once instead of re-testing `callback_delivery` and
+        # asserting non-None per message; `cb is not None` carries both facts.
+        cb = callback if callback_delivery else None
         callback_worker_ready = False
         applied = 0
         for effect in effects:
             if effect.kind is not EffectKind.MESSAGE:
                 break
             message: Message = effect.data
-            if effect.requires_delivery_mark is not False or not self._is_small(message, 1):
+            if effect.requires_delivery_mark is not False or not self._is_small(message):
                 break
             if iterator_delivery and self.messages_queue.full():
                 break
@@ -551,12 +511,11 @@ class ApplicationDelivery:
                 break
             if iterator_delivery:
                 self.messages_queue.put_nowait(message)
-            if callback_delivery:
-                assert callback is not None
+            if cb is not None:
                 if not callback_worker_ready:
                     self.ensure_callback_worker()
                     callback_worker_ready = True
-                self.callback_queue.put_nowait((callback, (message,), None))
+                self.callback_queue.put_nowait((cb, (message,), None))
             applied += 1
         if applied and iterator_delivery:
             self.message_ready.set()
@@ -570,6 +529,9 @@ class ApplicationDelivery:
         callback_delivery, iterator_delivery = self._modes(callback)
         if not callback_delivery and not iterator_delivery:
             return 0
+        # Bind the callback once instead of re-testing `callback_delivery` and
+        # asserting non-None per message; `cb is not None` carries both facts.
+        cb = callback if callback_delivery else None
         callback_worker_ready = False
         applied = 0
         for effect in effects:
@@ -580,7 +542,7 @@ class ApplicationDelivery:
             if (
                 effect.requires_delivery_mark is not False
                 or property_wire_size is None
-                or not self._is_small_decoded(message, 1, property_wire_size)
+                or not self._is_small_decoded(message, property_wire_size)
             ):
                 break
             if iterator_delivery and self.messages_queue.full():
@@ -589,12 +551,11 @@ class ApplicationDelivery:
                 break
             if iterator_delivery:
                 self.messages_queue.put_nowait(message)
-            if callback_delivery:
-                assert callback is not None
+            if cb is not None:
                 if not callback_worker_ready:
                     self.ensure_callback_worker()
                     callback_worker_ready = True
-                self.callback_queue.put_nowait((callback, (message,), None))
+                self.callback_queue.put_nowait((cb, (message,), None))
             applied += 1
         if applied and iterator_delivery:
             self.message_ready.set()
@@ -701,23 +662,23 @@ class ApplicationDelivery:
         )
         return len(message.payload) + topic_bytes + property_bytes
 
-    def _reservable_size(self, message: Message) -> int:
-        logical_bytes = self.logical_size(message)
-        limit = self.accounted_limit
-        if limit is not None and logical_bytes > limit:
-            raise MessageDeliveryError(
-                f"Message requires {logical_bytes} delivery bytes, exceeding limit {limit}"
-            )
-        return logical_bytes
-
     def _decoded_logical_size(self, message: Message, property_wire_size: int) -> int:
         topic_bytes = (
             len(message.topic) if message.topic.isascii() else len(message.topic.encode("utf-8"))
         )
         return len(message.payload) + topic_bytes + property_wire_size
 
-    def _decoded_reservable_size(self, message: Message, property_wire_size: int) -> int:
-        logical_bytes = self._decoded_logical_size(message, property_wire_size)
+    def _reservable_size(self, message: Message, property_wire_size: int | None = None) -> int:
+        """Logical size to reserve, refusing anything the budget can never hold.
+
+        With a trusted decode-time table size, use it; otherwise re-encode the
+        property table through `logical_size` (which is also the test seam).
+        """
+        logical_bytes = (
+            self.logical_size(message)
+            if property_wire_size is None
+            else self._decoded_logical_size(message, property_wire_size)
+        )
         limit = self.accounted_limit
         if limit is not None and logical_bytes > limit:
             raise MessageDeliveryError(

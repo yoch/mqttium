@@ -20,21 +20,6 @@ class TaskStats:
 
 
 @dataclass(slots=True, frozen=True)
-class ProtocolStats:
-    """Deprecated aggregate retained for pre-stable compatibility."""
-
-    pending_outbound_messages: int
-    pending_outbound_bytes: int
-    pending_outbound_high_water_messages: int
-    pending_outbound_high_water_bytes: int
-    queued_outbound_messages: int
-    flow_inflight: int
-    flow_limit: int
-    packet_ids_in_use: int
-    inbound_inflight: int
-
-
-@dataclass(slots=True, frozen=True)
 class EffectStats:
     pending: int
     pending_high_water: int
@@ -120,7 +105,6 @@ class ClientStats:
     connection_epoch: int
     reconnect_attempt: int
     tasks: TaskStats
-    protocol: ProtocolStats
     outbound: OutboundStats
     inbound: InboundStats
     effects: EffectStats
@@ -138,7 +122,6 @@ __all__ = [
     "EffectStats",
     "InboundStats",
     "OutboundStats",
-    "ProtocolStats",
     "ReceiptStats",
     "TaskStats",
     "TransportStats",

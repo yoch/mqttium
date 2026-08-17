@@ -31,8 +31,11 @@ class Properties:
     values: dict[str, Any] = field(default_factory=dict)
     # packet context -> (structural signature, encoded property table).
     # The signature snapshots mutable values, so direct/in-place mutations remain safe.
-    _encoded: dict[str, tuple[tuple[tuple[str, Any], ...], bytes]] = field(
-        default_factory=dict, init=False, repr=False, compare=False
+    # Created on first encode: every decoded inbound packet builds a Properties
+    # and never encodes it, so allocating the cache eagerly would double the
+    # dict allocations on the ingress path.
+    _encoded: dict[str, tuple[tuple[tuple[str, Any], ...], bytes]] | None = field(
+        default=None, init=False, repr=False, compare=False
     )
 
     def _signature(self) -> tuple[tuple[str, Any], ...]:

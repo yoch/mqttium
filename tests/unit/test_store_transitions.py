@@ -406,3 +406,32 @@ def test_a_store_without_the_extension_completes_inbound_qos1_manual_ack() -> No
     engine.ack(9)
     assert sends(engine) == [PubAckPacket(mid=9).encode()]
     assert store.get_in(9) is None
+
+
+@pytest.mark.parametrize("store_factory", [MemoryInflightStore, PlainInflightStore])
+def test_negative_pubrec_never_answers_with_pubrel(store_factory: type) -> None:
+    """MQTT 5 §4.3.3: reason >= 0x80 ends the exchange, with or without transitions.
+
+    The reason-code test used to live inside the transition branch only, so a
+    store without conditional transitions reached the "no such record" test
+    first and answered an unknown identifier with an orphan PUBREL 0x92. Both
+    store shapes must now stay silent.
+    """
+    engine = connected_engine(store_factory(), protocol=MQTTProtocolVersion.MQTTv5)
+
+    # Unknown identifier: nothing to fail, and nothing may go on the wire.
+    feed_engine(engine, PubRecPacket(mid=4242, reason_code=0x80).encode(MQTTProtocolVersion.MQTTv5))
+    assert sends(engine) == []
+
+    # Known identifier: the publication fails and still sends no PUBREL.
+    handle = engine.queue_publish("a/b", b"payload", qos=2)
+    mid = handle.mid or 0
+    engine.take_effects()
+    feed_engine(engine, PubRecPacket(mid=mid, reason_code=0x87).encode(MQTTProtocolVersion.MQTTv5))
+    effects = engine.take_effects()
+
+    assert [e.kind for e in effects if e.kind is EffectKind.SEND] == []
+    assert any(e.kind is EffectKind.PUBLISH_FAILED for e in effects)
+    assert engine.store.get_out(mid) is None
+    assert not engine.packet_ids.in_use(mid)
+    assert engine.flow.inflight == 0

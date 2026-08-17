@@ -92,5 +92,14 @@ class ReconnectPolicy:
 
 
 def is_terminal_connack(reason_code: int, protocol: MQTTProtocolVersion) -> bool:
-    policy = ReconnectPolicy(enabled=True)
-    return not policy.should_retry(reason_code, protocol)
+    """Whether a CONNACK reason code forbids reconnecting, policy aside.
+
+    Reads the terminal sets directly. Answering this by constructing a default
+    `ReconnectPolicy` and inverting `should_retry` also ran that dataclass's
+    `__post_init__` validation on every call, and tied the answer to policy
+    fields (`max_retries`, `follow_server_reference`) that have nothing to do
+    with whether the reason code itself is terminal.
+    """
+    if protocol == MQTTProtocolVersion.MQTTv5:
+        return reason_code in _V5_TERMINAL
+    return reason_code in _V311_TERMINAL

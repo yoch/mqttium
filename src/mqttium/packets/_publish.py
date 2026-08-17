@@ -90,14 +90,15 @@ def encode_publish_item_v311(
             level = QoS(qos)
         except ValueError as exc:
             raise ProtocolError(f"Invalid PUBLISH QoS {qos!r}") from exc
-    if level and mid is None:
-        raise ProtocolError("QoS > 0 PUBLISH requires a packet identifier")
-    if level == QoS.AT_MOST_ONCE and mid is not None:
-        raise ProtocolError("QoS 0 PUBLISH must not carry a packet identifier")
-    if level == QoS.AT_MOST_ONCE and dup:
-        raise ProtocolError("QoS 0 PUBLISH must not set DUP")
-    if mid is not None:
+    if level:
+        if mid is None:
+            raise ProtocolError("QoS > 0 PUBLISH requires a packet identifier")
         _require_outbound_mid(mid, "PUBLISH")
+    else:
+        if mid is not None:
+            raise ProtocolError("QoS 0 PUBLISH must not carry a packet identifier")
+        if dup:
+            raise ProtocolError("QoS 0 PUBLISH must not set DUP")
 
     flags = (int(level) << 1) | (0x01 if retain else 0) | (0x08 if dup else 0)
     topic_bytes = encode_utf8(topic) if _topic_bytes is None else _topic_bytes
@@ -178,14 +179,15 @@ def encode_publish_item_v5(
             level = QoS(qos)
         except ValueError as exc:
             raise ProtocolError(f"Invalid PUBLISH QoS {qos!r}") from exc
-    if level and mid is None:
-        raise ProtocolError("QoS > 0 PUBLISH requires a packet identifier")
-    if level == QoS.AT_MOST_ONCE and mid is not None:
-        raise ProtocolError("QoS 0 PUBLISH must not carry a packet identifier")
-    if level == QoS.AT_MOST_ONCE and dup:
-        raise ProtocolError("QoS 0 PUBLISH must not set DUP")
-    if mid is not None:
+    if level:
+        if mid is None:
+            raise ProtocolError("QoS > 0 PUBLISH requires a packet identifier")
         _require_outbound_mid(mid, PUBLISH)
+    else:
+        if mid is not None:
+            raise ProtocolError("QoS 0 PUBLISH must not carry a packet identifier")
+        if dup:
+            raise ProtocolError("QoS 0 PUBLISH must not set DUP")
 
     flags = (int(level) << 1) | (0x01 if retain else 0) | (0x08 if dup else 0)
     topic_bytes = encode_utf8(topic) if _topic_bytes is None else _topic_bytes

@@ -464,6 +464,7 @@ def parent(args: argparse.Namespace) -> int:
         base_rates = [_number(item, "completed_rate") for item in samples["base"]]
         candidate_rates = [_number(item, "completed_rate") for item in samples["candidate"]]
         base_latencies = [_number(item, "ack_latency_p50_ms") for item in samples["base"]]
+        candidate_latencies = [_number(item, "ack_latency_p50_ms") for item in samples["candidate"]]
         throughput_ratios = [
             candidate / base for base, candidate in zip(base_rates, candidate_rates, strict=True)
         ]
@@ -472,7 +473,9 @@ def parent(args: argparse.Namespace) -> int:
             for base, candidate in zip(samples["base"], samples["candidate"], strict=True)
         ]
         base_cv = _cv(base_rates)
+        candidate_cv = _cv(candidate_rates)
         base_latency_cv = _cv(base_latencies)
+        candidate_latency_cv = _cv(candidate_latencies)
         completed_ratio = statistics.median(throughput_ratios)
         loop_lag_ratio = statistics.median(lag_ratios)
         latency_wins = sum(
@@ -498,7 +501,9 @@ def parent(args: argparse.Namespace) -> int:
                 ("candidate", protocol, payload_bytes, completion, window)
             ],
             "base_completed_cv": base_cv,
+            "candidate_completed_cv": candidate_cv,
             "base_ack_latency_p50_cv": base_latency_cv,
+            "candidate_ack_latency_p50_cv": candidate_latency_cv,
             "median_candidate_over_base_completed": completed_ratio,
             "median_candidate_over_base_loop_lag_p95": loop_lag_ratio,
             "pairs_favouring_candidate_latency": latency_wins,
@@ -516,8 +521,12 @@ def parent(args: argparse.Namespace) -> int:
         )
         if base_cv > args.max_baseline_cv:
             invalidations.append(f"{label}: baseline completed-rate CV {base_cv:.2%}")
+        if candidate_cv > args.max_baseline_cv:
+            invalidations.append(f"{label}: candidate completed-rate CV {candidate_cv:.2%}")
         if base_latency_cv > args.max_baseline_cv:
             invalidations.append(f"{label}: baseline p50-latency CV {base_latency_cv:.2%}")
+        if candidate_latency_cv > args.max_baseline_cv:
+            invalidations.append(f"{label}: candidate p50-latency CV {candidate_latency_cv:.2%}")
         if aa_control and abs(completed_ratio - 1.0) > args.max_aa_ratio_deviation:
             invalidations.append(
                 f"{label}: A/A completed ratio {completed_ratio:.4f} outside "
