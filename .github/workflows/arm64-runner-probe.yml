@@ -1,4 +1,4 @@
-name: ARM64 Simplification Latency Scan
+name: ARM64 Simplification Component Isolation
 
 on:
   push:
@@ -9,14 +9,15 @@ permissions:
   contents: read
 
 jobs:
-  scan:
+  isolate:
     runs-on: [self-hosted, linux, ARM64]
-    timeout-minutes: 40
+    timeout-minutes: 35
     env:
       PYTHONUNBUFFERED: "1"
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
-      BASE_SHA: 0999d8abfe44a568209209403d7f215b18cc4eb7
-      CANDIDATE_SHA: 3ee2a3c5a78b0ea487ddbdf7927665b519fddd45
+      MAIN_SHA: 0999d8abfe44a568209209403d7f215b18cc4eb7
+      PRE_SHA: e443448981c56709a935332769a9e95216e3f660
+      CHANGE_SHA: 832f808e413dd47fd922469110316751ba205906
 
     steps:
       - name: Verify clean performance host
@@ -35,29 +36,70 @@ jobs:
             exit 1
           fi
 
-      - name: Check out exact base harness
+      - name: Check out current main benchmark harness
         uses: actions/checkout@v7
         with:
-          ref: ${{ env.BASE_SHA }}
-          path: base
+          ref: ${{ env.MAIN_SHA }}
+          path: harness
           persist-credentials: false
 
-      - name: Check out full candidate history
+      - name: Check out candidate history
         uses: actions/checkout@v7
         with:
-          ref: ${{ env.CANDIDATE_SHA }}
-          path: candidate
+          ref: ${{ env.CHANGE_SHA }}
+          path: history
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Verify endpoints and create venv
+      - name: Create source-isolated component variants
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git -C base rev-parse HEAD)" = "$BASE_SHA"
-          test "$(git -C candidate rev-parse HEAD)" = "$CANDIDATE_SHA"
-          test "$(git -C candidate merge-base "$BASE_SHA" "$CANDIDATE_SHA")" = "$BASE_SHA"
-          venv="$RUNNER_TEMP/mqttium-252-scan-venv"
+          root="$RUNNER_TEMP/mqttium-252-isolate"
+          rm -rf "$root"
+          mkdir -p "$root/variants/pre" "$root/results"
+          git -C history archive "$PRE_SHA" | tar -x -C "$root/variants/pre"
+          for name in writer engine inbound outbound full; do
+            cp -a "$root/variants/pre" "$root/variants/$name"
+          done
+          git -C history show "$CHANGE_SHA:src/mqttium/api/_writer.py" > "$root/variants/writer/src/mqttium/api/_writer.py"
+          git -C history show "$CHANGE_SHA:src/mqttium/protocol/engine.py" > "$root/variants/engine/src/mqttium/protocol/engine.py"
+          git -C history show "$CHANGE_SHA:src/mqttium/protocol/inbound.py" > "$root/variants/inbound/src/mqttium/protocol/inbound.py"
+          git -C history show "$CHANGE_SHA:src/mqttium/protocol/outbound.py" > "$root/variants/outbound/src/mqttium/protocol/outbound.py"
+          rm -rf "$root/variants/full"
+          mkdir -p "$root/variants/full"
+          git -C history archive "$CHANGE_SHA" | tar -x -C "$root/variants/full"
+
+          # Prove each single-component variant differs from predecessor only in
+          # the intended source file before measuring it.
+          python - <<'PY'
+          import filecmp, os
+          from pathlib import Path
+          root = Path(os.environ["RUNNER_TEMP"]) / "mqttium-252-isolate" / "variants"
+          expected = {
+              "writer": "src/mqttium/api/_writer.py",
+              "engine": "src/mqttium/protocol/engine.py",
+              "inbound": "src/mqttium/protocol/inbound.py",
+              "outbound": "src/mqttium/protocol/outbound.py",
+          }
+          def files(tree):
+              return {str(p.relative_to(tree)) for p in tree.rglob("*") if p.is_file()}
+          base_files = files(root / "pre")
+          for name, changed in expected.items():
+              other = root / name
+              assert files(other) == base_files
+              different = {
+                  rel for rel in base_files
+                  if not filecmp.cmp(root / "pre" / rel, other / rel, shallow=False)
+              }
+              assert different == {changed}, (name, different)
+          PY
+
+      - name: Create isolated benchmark venv
+        shell: bash
+        run: |
+          set -euo pipefail
+          venv="$RUNNER_TEMP/mqttium-252-isolate-venv"
           rm -rf "$venv"
           python3 -m venv "$venv"
           echo "$venv/bin" >> "$GITHUB_PATH"
@@ -65,22 +107,17 @@ jobs:
       - run: python -m pip install "psutil>=6,<8"
 
       - name: Enforce strict runner preflight
-        working-directory: base
-        shell: bash
+        working-directory: harness
         run: |
-          set -euo pipefail
-          root="$RUNNER_TEMP/mqttium-252-scan"
-          rm -rf "$root"
-          mkdir -p "$root/results"
           python benchmarks/runner_probe.py \
-            --output "$root/runner.json" \
+            --output "$RUNNER_TEMP/mqttium-252-isolate/runner.json" \
             --require-temperature --enforce
 
       - name: Start isolated broker pinned to CPU 0
         shell: bash
         run: |
           set -euo pipefail
-          root="$RUNNER_TEMP/mqttium-252-scan"
+          root="$RUNNER_TEMP/mqttium-252-isolate"
           cat > "$root/mosquitto.conf" <<'EOF'
           persistence false
           allow_anonymous true
@@ -103,37 +140,29 @@ jobs:
           done
           exit 1
 
-      - name: Scan every rebased commit at the discriminating 2500 msg/s point
+      - name: Measure each component independently
         shell: bash
         run: |
           set -euo pipefail
-          root="$RUNNER_TEMP/mqttium-252-scan"
-          printf 'index,sha,subject,p50_ratio,base_p50_ms,candidate_p50_ms,completed_ratio,loop_lag_ratio,cpu_ratio\n' > "$root/scan.csv"
-
-          mapfile -t commits < <(git -C candidate rev-list --reverse "$BASE_SHA..$CANDIDATE_SHA")
-          printf 'scanning %s commits\n' "${#commits[@]}"
-          index=0
-          for sha in "${commits[@]}"; do
-            index=$((index + 1))
-            git -C candidate checkout --detach --quiet "$sha"
-            out="$root/results/$(printf '%02d' "$index")-${sha}.json"
-            python base/benchmarks/paired_open_loop.py \
-              --base-root base --candidate-root candidate \
+          root="$RUNNER_TEMP/mqttium-252-isolate"
+          printf 'variant,p50_ratio,base_p50_ms,candidate_p50_ms,completed_ratio,loop_lag_ratio,cpu_ratio\n' > "$root/isolation.csv"
+          for variant in writer engine inbound outbound full; do
+            out="$root/results/${variant}.json"
+            python harness/benchmarks/paired_open_loop.py \
+              --base-root "$root/variants/pre" \
+              --candidate-root "$root/variants/$variant" \
               --protocols 311 --payloads 256 --windows 64 \
               --target-rates 2500 --completions callback \
-              --repeat 2 --count-small 2000 --target-sample-seconds 0.75 --max-count 2000 \
+              --repeat 4 --count-small 4000 --target-sample-seconds 1.5 --max-count 4000 \
               --timeout 120 --cpu 2 --policy advisory \
               --preflight-report "$root/runner.json" \
               --output "$out" >/dev/null
-            SHA="$sha" INDEX="$index" OUT="$out" python - <<'PY' >> "$root/scan.csv"
-          import csv, json, os, statistics, subprocess, sys
-          sha = os.environ["SHA"]
-          index = int(os.environ["INDEX"])
-          data = json.load(open(os.environ["OUT"]))
-          scenario = data["scenarios"][0]
-          pairs = scenario["pairs"]
-          base_p50 = statistics.median(float(p["base"]["ack_latency_p50_ms"]) for p in pairs)
-          cand_p50 = statistics.median(float(p["candidate"]["ack_latency_p50_ms"]) for p in pairs)
+            VARIANT="$variant" OUT="$out" python - <<'PY' >> "$root/isolation.csv"
+          import csv, json, os, statistics, sys
+          s = json.load(open(os.environ["OUT"]))["scenarios"][0]
+          pairs = s["pairs"]
+          def med(key, side):
+              return statistics.median(float(p[side][key]) for p in pairs)
           p50_ratio = statistics.median(
               float(p["candidate"]["ack_latency_p50_ms"]) / float(p["base"]["ack_latency_p50_ms"])
               for p in pairs
@@ -150,27 +179,25 @@ jobs:
               float(p["candidate"]["cpu_seconds"]) / float(p["base"]["cpu_seconds"])
               for p in pairs
           )
-          subject = subprocess.check_output(
-              ["git", "-C", "candidate", "show", "-s", "--format=%s", sha], text=True
-          ).strip()
           csv.writer(sys.stdout).writerow([
-              index, sha, subject, f"{p50_ratio:.6f}", f"{base_p50:.6f}", f"{cand_p50:.6f}",
-              f"{completed_ratio:.6f}", f"{lag_ratio:.6f}", f"{cpu_ratio:.6f}"
+              os.environ["VARIANT"], f"{p50_ratio:.6f}", f"{med('ack_latency_p50_ms','base'):.6f}",
+              f"{med('ack_latency_p50_ms','candidate'):.6f}", f"{completed_ratio:.6f}",
+              f"{lag_ratio:.6f}", f"{cpu_ratio:.6f}"
           ])
           PY
           done
-          cat "$root/scan.csv"
+          cat "$root/isolation.csv"
 
-      - name: Upload scan
+      - name: Upload component evidence
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: arm64-pr252-latency-scan-${{ github.run_id }}
+          name: arm64-pr252-component-isolation-${{ github.run_id }}
           path: |
-            ${{ runner.temp }}/mqttium-252-scan/scan.csv
-            ${{ runner.temp }}/mqttium-252-scan/results/*.json
-            ${{ runner.temp }}/mqttium-252-scan/runner.json
-            ${{ runner.temp }}/mqttium-252-scan/mosquitto.log
+            ${{ runner.temp }}/mqttium-252-isolate/isolation.csv
+            ${{ runner.temp }}/mqttium-252-isolate/results/*.json
+            ${{ runner.temp }}/mqttium-252-isolate/runner.json
+            ${{ runner.temp }}/mqttium-252-isolate/mosquitto.log
           if-no-files-found: error
           retention-days: 30
 
@@ -178,7 +205,7 @@ jobs:
         if: always()
         shell: bash
         run: |
-          pidfile="$RUNNER_TEMP/mqttium-252-scan/mosquitto.pid"
+          pidfile="$RUNNER_TEMP/mqttium-252-isolate/mosquitto.pid"
           if [ -f "$pidfile" ]; then
             pid="$(cat "$pidfile")"
             kill "$pid" 2>/dev/null || true
