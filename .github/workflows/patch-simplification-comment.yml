@@ -1,0 +1,58 @@
+name: Patch Simplification Launch Comment
+
+on:
+  push:
+    branches: [agent/arm64-runner-probe]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      TARGET_BRANCH: refactor/simplification-audit-2026-08-16
+      EXPECTED_HEAD: 79101ba41e36f4bf36fb4a8f6ee4b14ca36bb19c
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.EXPECTED_HEAD }}
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Patch only stale inline rationale
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "+refs/heads/${TARGET_BRANCH}:refs/remotes/origin/target"
+          test "$(git rev-parse refs/remotes/origin/target)" = "$EXPECTED_HEAD"
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('src/mqttium/protocol/outbound.py')
+          t=p.read_text()
+          old='''            # For QoS > 0, `topic_bytes is not None` *is* the conjunction\n            # `state is CONNECTED and flow.available > 0` recorded during\n            # validation (see _validate_publish_request). Nothing between the two\n            # observations can change either — the engine is synchronous and none\n            # of the intervening steps touch connection state or the window — so\n            # this re-reads neither, and never attempts a doomed acquire.\n            # A raise inside _launch unwinds through the shared _rollback below,\n            # whose `inflight_start` snapshot releases the slot acquired here.\n'''
+          new='''            # `topic_bytes is not None` records that validation observed an\n            # active connection with window available. Keep the explicit state\n            # check and `_try_launch` acquisition here as the launch commit point:\n            # `_try_launch` owns the slot compensation if encoding/persistence\n            # raises, while the outer rollback restores the remaining admission\n            # bookkeeping.\n'''
+          assert t.count(old)==1
+          p.write_text(t.replace(old,new))
+          PY
+          git diff --check
+          test "$(git diff --name-only)" = "src/mqttium/protocol/outbound.py"
+      - uses: actions/setup-python@v7
+        with: {python-version: "3.13"}
+      - name: Validate changed file
+        run: |
+          python -m pip install -e ".[dev]"
+          python -m ruff format --check src/mqttium/protocol/outbound.py
+          python -m ruff check src/mqttium/protocol/outbound.py
+          python -m pytest -q tests/unit/test_outbound_transaction.py tests/unit/test_qos_engine.py
+      - name: Commit and push with lease
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name yoch
+          git config user.email yoch.melka@gmail.com
+          git add src/mqttium/protocol/outbound.py
+          git commit -m "docs: align outbound launch rationale"
+          git fetch --no-tags origin "+refs/heads/${TARGET_BRANCH}:refs/remotes/origin/target-final"
+          test "$(git rev-parse refs/remotes/origin/target-final)" = "$EXPECTED_HEAD"
+          git push --force-with-lease="refs/heads/${TARGET_BRANCH}:${EXPECTED_HEAD}" origin "HEAD:refs/heads/${TARGET_BRANCH}"
