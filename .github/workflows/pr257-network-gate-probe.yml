@@ -22,24 +22,24 @@ jobs:
       RUNTIME_SHA: 4677e5500fb33da6b087616e960086e586d96ac7
 
     steps:
-      - name: Check out gate harness
-        uses: actions/checkout@v7
-        with:
-          path: harness
-          persist-credentials: false
-
-      - name: Check out exact same-code runtime
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ env.RUNTIME_SHA }}
-          path: runtime
-          persist-credentials: false
-
-      - name: Verify exact endpoints and dedicated runner
+      - name: Fetch exact harness and runtime without marketplace actions
         shell: bash
         run: |
           set -euo pipefail
+          rm -rf harness runtime
+          git init -q harness
+          git -C harness fetch -q --depth=1 https://github.com/yoch/mqttium.git "$GITHUB_SHA"
+          git -C harness checkout -q --detach FETCH_HEAD
+          git init -q runtime
+          git -C runtime fetch -q --depth=1 https://github.com/yoch/mqttium.git "$RUNTIME_SHA"
+          git -C runtime checkout -q --detach FETCH_HEAD
+          test "$(git -C harness rev-parse HEAD)" = "$GITHUB_SHA"
           test "$(git -C runtime rev-parse HEAD)" = "$RUNTIME_SHA"
+
+      - name: Verify dedicated runner
+        shell: bash
+        run: |
+          set -euo pipefail
           test "$(uname -m)" = "aarch64"
           command -v python3
           command -v mosquitto
@@ -100,8 +100,8 @@ jobs:
         run: |
           set -euo pipefail
           # Broker CPU 0; observer/gate CPUs 1,3; publisher CPU 2.
-          # The release gate defaults to windows 1/20/64, 12 pairs, ~2 s
-          # samples and deterministic 60 s quiet periods between phases.
+          # Defaults: windows 1/20/64, 12 pairs, ~2 s samples and deterministic
+          # 60 s quiet periods between phases.
           taskset -c 1,3 python harness/benchmarks/network_release_gate.py \
             --base-root runtime \
             --candidate-root runtime \
@@ -111,18 +111,27 @@ jobs:
             --policy strict \
             --output "$RUNNER_TEMP/pr257-network-gate/same-code.json"
 
-      - name: Upload evidence
+      - name: Print evidence
         if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: pr257-network-gate-${{ github.run_id }}
-          path: |
-            ${{ runner.temp }}/pr257-network-gate/*.json
-            ${{ runner.temp }}/pr257-network-gate/*.md
-            ${{ runner.temp }}/pr257-network-gate/*-raw/*
-            ${{ runner.temp }}/pr257-network-gate/mosquitto.log
-          if-no-files-found: warn
-          retention-days: 30
+        shell: bash
+        run: |
+          root="$RUNNER_TEMP/pr257-network-gate"
+          echo "===== broker log ====="
+          cat "$root/mosquitto.log" 2>/dev/null || true
+          echo "===== top-level JSON ====="
+          cat "$root/same-code.json" 2>/dev/null || true
+          echo "===== phase summaries ====="
+          for file in "$root"/same-code-raw/*.md; do
+            [ -f "$file" ] || continue
+            echo "--- $file ---"
+            cat "$file"
+          done
+          echo "===== preflights ====="
+          for file in "$root"/same-code-raw/*-preflight.json; do
+            [ -f "$file" ] || continue
+            echo "--- $file ---"
+            cat "$file"
+          done
 
       - name: Stop isolated broker
         if: always()
