@@ -122,9 +122,7 @@ def paired_ratio_estimate(ratios: list[float], orders: list[list[str]]) -> PairE
     mean_log = statistics.fmean(logs)
     log_sd = statistics.stdev(logs) if len(logs) > 1 else 0.0
     half_width = (
-        _t_critical_95(len(logs) - 1) * log_sd / math.sqrt(len(logs))
-        if len(logs) > 1
-        else 0.0
+        _t_critical_95(len(logs) - 1) * log_sd / math.sqrt(len(logs)) if len(logs) > 1 else 0.0
     )
     return PairEstimate(
         pairs=len(ratios),
@@ -172,13 +170,11 @@ def regression_failures(
     failures: list[str] = []
     if throughput.lower_95 < min_throughput:
         failures.append(
-            f"{label}: throughput lower 95% bound {throughput.lower_95:.4f} "
-            f"< {min_throughput:.4f}"
+            f"{label}: throughput lower 95% bound {throughput.lower_95:.4f} < {min_throughput:.4f}"
         )
     if ack_p50.upper_95 > max_ack_p50:
         failures.append(
-            f"{label}: ACK p50 upper 95% bound {ack_p50.upper_95:.4f} "
-            f"> {max_ack_p50:.4f}"
+            f"{label}: ACK p50 upper 95% bound {ack_p50.upper_95:.4f} > {max_ack_p50:.4f}"
         )
     return failures
 
