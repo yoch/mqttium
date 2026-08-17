@@ -1,4 +1,4 @@
-name: ARM64 Simplification Rebase Validation
+name: ARM64 Simplification Latency Scan
 
 on:
   push:
@@ -9,9 +9,9 @@ permissions:
   contents: read
 
 jobs:
-  writer-regression:
+  scan:
     runs-on: [self-hosted, linux, ARM64]
-    timeout-minutes: 55
+    timeout-minutes: 40
     env:
       PYTHONUNBUFFERED: "1"
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
@@ -19,7 +19,7 @@ jobs:
       CANDIDATE_SHA: 3ee2a3c5a78b0ea487ddbdf7927665b519fddd45
 
     steps:
-      - name: Verify clean dedicated host
+      - name: Verify clean performance host
         shell: bash
         run: |
           set -euo pipefail
@@ -31,40 +31,33 @@ jobs:
           governors="$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor | sort -u)"
           test "$governors" = "performance"
           if pgrep -a mosquitto; then
-            echo "pre-existing Mosquitto would contaminate paired evidence" >&2
+            echo "pre-existing Mosquitto would contaminate evidence" >&2
             exit 1
           fi
 
-      - name: Check out exact current main
+      - name: Check out exact base harness
         uses: actions/checkout@v7
         with:
           ref: ${{ env.BASE_SHA }}
           path: base
           persist-credentials: false
 
-      - name: Check out exact rebased PR 252
+      - name: Check out full candidate history
         uses: actions/checkout@v7
         with:
           ref: ${{ env.CANDIDATE_SHA }}
           path: candidate
+          fetch-depth: 0
           persist-credentials: false
 
-      - name: Verify exact trees and writer invariants
+      - name: Verify endpoints and create venv
         shell: bash
         run: |
           set -euo pipefail
           test "$(git -C base rev-parse HEAD)" = "$BASE_SHA"
           test "$(git -C candidate rev-parse HEAD)" = "$CANDIDATE_SHA"
-          grep -q 'self._eager_armed' candidate/src/mqttium/api/_writer.py
-          grep -q 'self._eager_generation' candidate/src/mqttium/api/_writer.py
-          grep -q 'write_many = getattr(transport, "write_many", None)' candidate/src/mqttium/api/_writer.py
-          grep -q '_write_contiguous(transport, write_many, contiguous)' candidate/src/mqttium/api/_writer.py
-
-      - name: Create isolated benchmark venv
-        shell: bash
-        run: |
-          set -euo pipefail
-          venv="$RUNNER_TEMP/mqttium-252-writer-venv"
+          test "$(git -C candidate merge-base "$BASE_SHA" "$CANDIDATE_SHA")" = "$BASE_SHA"
+          venv="$RUNNER_TEMP/mqttium-252-scan-venv"
           rm -rf "$venv"
           python3 -m venv "$venv"
           echo "$venv/bin" >> "$GITHUB_PATH"
@@ -76,19 +69,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          root="$RUNNER_TEMP/mqttium-252-writer"
+          root="$RUNNER_TEMP/mqttium-252-scan"
           rm -rf "$root"
-          mkdir -p "$root"
+          mkdir -p "$root/results"
           python benchmarks/runner_probe.py \
             --output "$root/runner.json" \
-            --require-temperature \
-            --enforce
+            --require-temperature --enforce
 
       - name: Start isolated broker pinned to CPU 0
         shell: bash
         run: |
           set -euo pipefail
-          root="$RUNNER_TEMP/mqttium-252-writer"
+          root="$RUNNER_TEMP/mqttium-252-scan"
           cat > "$root/mosquitto.conf" <<'EOF'
           persistence false
           allow_anonymous true
@@ -109,100 +101,76 @@ jobs:
             fi
             sleep 0.1
           done
-          cat "$root/mosquitto.log"
           exit 1
 
-      - name: Strict writer capacity A/A
+      - name: Scan every rebased commit at the discriminating 2500 msg/s point
         shell: bash
         run: |
           set -euo pipefail
-          root="$RUNNER_TEMP/mqttium-252-writer"
-          python base/benchmarks/paired_writer_capacity.py \
-            --base-root base --candidate-root base \
-            --protocol 311 --qos-values 0,1 --payload-bytes 256 \
-            --inflight 20 --outstanding 64 --max-queued 200 \
-            --warmup-count 5000 --repeat 8 \
-            --count-qos0 100000 --count-qos1 40000 \
-            --timeout 120 --cpu 2 --policy strict \
-            --preflight-report "$root/runner.json" \
-            --output "$root/capacity-aa.json" \
-            --summary-output "$root/capacity-aa.md"
+          root="$RUNNER_TEMP/mqttium-252-scan"
+          printf 'index,sha,subject,p50_ratio,base_p50_ms,candidate_p50_ms,completed_ratio,loop_lag_ratio,cpu_ratio\n' > "$root/scan.csv"
 
-      - name: Strict writer capacity A/B current main vs PR 252
-        shell: bash
-        run: |
-          set -euo pipefail
-          root="$RUNNER_TEMP/mqttium-252-writer"
-          python base/benchmarks/paired_writer_capacity.py \
-            --base-root base --candidate-root candidate \
-            --protocol 311 --qos-values 0,1 --payload-bytes 256 \
-            --inflight 20 --outstanding 64 --max-queued 200 \
-            --warmup-count 5000 --repeat 8 \
-            --count-qos0 100000 --count-qos1 40000 \
-            --timeout 120 --cpu 2 --policy strict \
-            --preflight-report "$root/runner.json" \
-            --output "$root/capacity-ab.json" \
-            --summary-output "$root/capacity-ab.md"
-
-      - name: Strict writer latency A/A with one invalid-control retry
-        shell: bash
-        run: |
-          set -euo pipefail
-          root="$RUNNER_TEMP/mqttium-252-writer"
-          run_control() {
-            local attempt="$1"
-            local preflight="$2"
+          mapfile -t commits < <(git -C candidate rev-list --reverse "$BASE_SHA..$CANDIDATE_SHA")
+          printf 'scanning %s commits\n' "${#commits[@]}"
+          index=0
+          for sha in "${commits[@]}"; do
+            index=$((index + 1))
+            git -C candidate checkout --detach --quiet "$sha"
+            out="$root/results/$(printf '%02d' "$index")-${sha}.json"
             python base/benchmarks/paired_open_loop.py \
-              --base-root base --candidate-root base \
+              --base-root base --candidate-root candidate \
               --protocols 311 --payloads 256 --windows 64 \
-              --target-rates 2500,10000 --completions callback \
-              --repeat 8 --count-small 4000 --timeout 120 --cpu 2 \
-              --policy strict --preflight-report "$preflight" \
-              --output "$root/latency-aa-${attempt}.json" \
-              --summary-output "$root/latency-aa-${attempt}.md"
-          }
-          set +e
-          run_control 1 "$root/runner.json"
-          rc=$?
-          set -e
-          if [ "$rc" -eq 0 ]; then
-            exit 0
-          fi
-          if [ "$rc" -ne 2 ]; then
-            exit "$rc"
-          fi
-          python base/benchmarks/runner_probe.py \
-            --output "$root/runner-retry.json" \
-            --require-temperature --enforce
-          run_control 2 "$root/runner-retry.json"
+              --target-rates 2500 --completions callback \
+              --repeat 2 --count-small 2000 --target-sample-seconds 0.75 --max-count 2000 \
+              --timeout 120 --cpu 2 --policy advisory \
+              --preflight-report "$root/runner.json" \
+              --output "$out" >/dev/null
+            SHA="$sha" INDEX="$index" OUT="$out" python - <<'PY' >> "$root/scan.csv"
+          import csv, json, os, statistics, subprocess, sys
+          sha = os.environ["SHA"]
+          index = int(os.environ["INDEX"])
+          data = json.load(open(os.environ["OUT"]))
+          scenario = data["scenarios"][0]
+          pairs = scenario["pairs"]
+          base_p50 = statistics.median(float(p["base"]["ack_latency_p50_ms"]) for p in pairs)
+          cand_p50 = statistics.median(float(p["candidate"]["ack_latency_p50_ms"]) for p in pairs)
+          p50_ratio = statistics.median(
+              float(p["candidate"]["ack_latency_p50_ms"]) / float(p["base"]["ack_latency_p50_ms"])
+              for p in pairs
+          )
+          completed_ratio = statistics.median(
+              float(p["candidate"]["completed_rate"]) / float(p["base"]["completed_rate"])
+              for p in pairs
+          )
+          lag_ratio = statistics.median(
+              float(p["candidate"]["loop_lag_p95_ms"]) / max(float(p["base"]["loop_lag_p95_ms"]), 1e-9)
+              for p in pairs
+          )
+          cpu_ratio = statistics.median(
+              float(p["candidate"]["cpu_seconds"]) / float(p["base"]["cpu_seconds"])
+              for p in pairs
+          )
+          subject = subprocess.check_output(
+              ["git", "-C", "candidate", "show", "-s", "--format=%s", sha], text=True
+          ).strip()
+          csv.writer(sys.stdout).writerow([
+              index, sha, subject, f"{p50_ratio:.6f}", f"{base_p50:.6f}", f"{cand_p50:.6f}",
+              f"{completed_ratio:.6f}", f"{lag_ratio:.6f}", f"{cpu_ratio:.6f}"
+          ])
+          PY
+          done
+          cat "$root/scan.csv"
 
-      - name: Strict writer latency A/B current main vs PR 252
-        shell: bash
-        run: |
-          set -euo pipefail
-          root="$RUNNER_TEMP/mqttium-252-writer"
-          preflight="$root/runner.json"
-          if [ -f "$root/runner-retry.json" ]; then
-            preflight="$root/runner-retry.json"
-          fi
-          python base/benchmarks/paired_open_loop.py \
-            --base-root base --candidate-root candidate \
-            --protocols 311 --payloads 256 --windows 64 \
-            --target-rates 2500,10000 --completions callback \
-            --repeat 8 --count-small 4000 --timeout 120 --cpu 2 \
-            --policy strict --preflight-report "$preflight" \
-            --output "$root/latency-ab.json" \
-            --summary-output "$root/latency-ab.md"
-
-      - name: Upload exact-head paired evidence
+      - name: Upload scan
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: arm64-pr252-writer-${{ github.run_id }}
+          name: arm64-pr252-latency-scan-${{ github.run_id }}
           path: |
-            ${{ runner.temp }}/mqttium-252-writer/*.json
-            ${{ runner.temp }}/mqttium-252-writer/*.md
-            ${{ runner.temp }}/mqttium-252-writer/mosquitto.log
+            ${{ runner.temp }}/mqttium-252-scan/scan.csv
+            ${{ runner.temp }}/mqttium-252-scan/results/*.json
+            ${{ runner.temp }}/mqttium-252-scan/runner.json
+            ${{ runner.temp }}/mqttium-252-scan/mosquitto.log
           if-no-files-found: error
           retention-days: 30
 
@@ -210,7 +178,7 @@ jobs:
         if: always()
         shell: bash
         run: |
-          pidfile="$RUNNER_TEMP/mqttium-252-writer/mosquitto.pid"
+          pidfile="$RUNNER_TEMP/mqttium-252-scan/mosquitto.pid"
           if [ -f "$pidfile" ]; then
             pid="$(cat "$pidfile")"
             kill "$pid" 2>/dev/null || true
