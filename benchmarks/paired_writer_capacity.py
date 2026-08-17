@@ -49,7 +49,9 @@ class _PhaseState:
     sync_rejected: int = 0
 
 
-def _configure_completion_tracking(client, *, qos: int, state: _PhaseState, progress: asyncio.Event) -> None:
+def _configure_completion_tracking(
+    client, *, qos: int, state: _PhaseState, progress: asyncio.Event
+) -> None:
     if qos:
 
         def on_publish(mid: int | None, *_unused: object) -> None:
