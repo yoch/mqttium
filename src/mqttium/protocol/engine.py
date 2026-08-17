@@ -563,6 +563,11 @@ class ProtocolEngine:
             handler(raw)
             if self.negotiated.maximum_packet_size is not None:
                 self._validate_new_outbound_effects(effect_start)
+        except AssertionError:
+            # An AssertionError raised by engine/session accounting is a local
+            # invariant failure. Preserve it for the runtime instead of blaming
+            # the peer with a synthetic MQTT protocol error.
+            raise
         except (ProtocolError, MalformedPacketError, PacketTooLargeError) as exc:
             self._emit(EffectKind.PROTOCOL_ERROR, str(exc))
         except Exception as exc:
