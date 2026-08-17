@@ -25,16 +25,13 @@ jobs:
           echo '=== os-release ==='
           cat /etc/os-release
           echo '=== python ==='
-          command -v python3 || true
-          python3 --version || true
-          command -v python || true
-          python --version || true
+          command -v python3
+          python3 --version
           echo '=== broker/tooling ==='
           command -v mosquitto || true
-          mosquitto -h 2>&1 | head -n 2 || true
           command -v mosquitto_sub || true
-          command -v openssl || true
-          openssl version || true
+          command -v openssl
+          openssl version
           echo '=== cpu ==='
           nproc
           grep -m1 -E '^(Model|model name|Hardware)' /proc/cpuinfo || true
@@ -52,15 +49,16 @@ jobs:
           df -h "$RUNNER_TEMP" || true
           uptime || true
 
-      - name: Check setup-python ARM64 availability
-        uses: actions/setup-python@v7
-        with:
-          python-version: '3.13'
-
-      - name: Confirm setup-python result
+      - name: Validate native Python virtualenv
+        shell: bash
         run: |
-          python --version
-          python - <<'PY'
+          set -euo pipefail
+          venv="$RUNNER_TEMP/arm64-probe-venv"
+          rm -rf "$venv"
+          python3 -m venv "$venv"
+          "$venv/bin/python" --version
+          "$venv/bin/python" -m pip --version
+          "$venv/bin/python" - <<'PY'
           import platform, sys
           print(sys.executable)
           print(platform.platform())
