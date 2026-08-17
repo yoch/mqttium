@@ -43,6 +43,7 @@ from mqttium.errors import (
     MQTTError,
     MQTTTimeoutError,
     MalformedPacketError,
+    MandatoryResponseTooLargeError,
     MessageDeliveryError,
     PublishBatchError,
     PacketTooLargeError,
@@ -1318,6 +1319,12 @@ class AsyncClient:
                     await asyncio.sleep(0)
         except asyncio.CancelledError:
             raise
+        except MandatoryResponseTooLargeError as exc:
+            # The broker negotiated a legal limit, but mqttium cannot produce
+            # the mandatory automatic response within it. This is a local
+            # terminal capability failure, not a peer protocol violation.
+            self._disconnect_exc = exc
+            self._fail_pending(exc)
         except (PacketTooLargeError, MalformedPacketError, ProtocolError) as exc:
             # Fatal wire/protocol error: send a normative DISCONNECT (v5) before
             # tearing down, so a strict broker sees *why* we left.
@@ -1380,7 +1387,10 @@ class AsyncClient:
     def _will_reconnect(self) -> bool:
         reason = self._retry_reason()
         return (
-            not isinstance(self._disconnect_exc, MessageDeliveryError)
+            not isinstance(
+                self._disconnect_exc,
+                (MessageDeliveryError, MandatoryResponseTooLargeError, AssertionError),
+            )
             and not self._intentional_disconnect
             and self._reconnect.enabled
             and self._reconnect.should_retry(reason, self._engine.config.protocol)
@@ -1537,6 +1547,11 @@ class AsyncClient:
                     continue
                 except Exception as exc:
                     self._disconnect_exc = exc
+                    if isinstance(exc, AssertionError):
+                        # Never reuse an engine after a proven local invariant
+                        # violation, including one raised during reconnect.
+                        self._fail_pending(exc)
+                        return
                     continue
         except asyncio.CancelledError:
             raise

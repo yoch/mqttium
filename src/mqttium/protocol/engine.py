@@ -42,6 +42,7 @@ from mqttium.protocol.effects import (
 )
 from mqttium.protocol.flow_control import FlowControl
 from mqttium.protocol.inbound import InboundSession
+from mqttium.protocol.tiny_packet_limit import TinyPacketLimitInbound
 from mqttium.protocol.negotiated import NegotiatedSettings
 from mqttium.protocol.outbound import OutboundSession
 from mqttium.protocol.packet_ids import PacketIdPool
@@ -54,6 +55,7 @@ from mqttium.types import (
 )
 from mqttium.errors import (
     MalformedPacketError,
+    MandatoryResponseTooLargeError,
     NotConnectedError,
     PacketTooLargeError,
     ProtocolError,
@@ -270,8 +272,15 @@ class ProtocolEngine:
         self._emit(EffectKind.SEND, packet)
 
     def begin_connect(self) -> bytes:
-        if self.state in (ConnectionState.CONNECTED, ConnectionState.CONNECTING):
-            raise ProtocolError("Already connected or connecting")
+        if self.state in (
+            ConnectionState.CONNECTED,
+            ConnectionState.CONNECTING,
+            ConnectionState.DISCONNECTING,
+        ):
+            # DISCONNECTING included: the final DISCONNECT is still draining to
+            # the transport, so a CONNECT now would race the teardown and flip
+            # the state machine to CONNECTING under a closing connection.
+            raise ProtocolError("Already connected, connecting or disconnecting")
 
         clean_start = self.config.clean_start
         if self._prefer_session_resume:
@@ -538,7 +547,11 @@ class ProtocolEngine:
         # DISCONNECT is the client's final MQTT Control Packet. The peer may still
         # have packets already in flight before the transport actually closes, but
         # dispatching them could emit ACKs or user-visible effects after DISCONNECT.
-        if self.state is ConnectionState.DISCONNECTING:
+        # The same applies to every terminal state: once DISCONNECTED (broker
+        # DISCONNECT, refused CONNACK or local teardown), buffered trailing
+        # packets would otherwise surface as a PROTOCOL_ERROR that masks the
+        # real disconnect reason at the runtime boundary.
+        if self.state in (ConnectionState.DISCONNECTING, ConnectionState.DISCONNECTED):
             return
         try:
             validate_raw_packet(raw)
@@ -552,6 +565,16 @@ class ProtocolEngine:
             handler(raw)
             if self.negotiated.maximum_packet_size is not None:
                 self._validate_new_outbound_effects(effect_start)
+        except MandatoryResponseTooLargeError:
+            # A legal peer packet-size limit can make a mandatory local ACK
+            # impossible. Preserve that local failure for the runtime instead
+            # of manufacturing a peer-attributed PROTOCOL_ERROR.
+            raise
+        except AssertionError:
+            # An AssertionError raised by engine/session accounting is a local
+            # invariant failure. Preserve it for the runtime instead of blaming
+            # the peer with a synthetic MQTT protocol error.
+            raise
         except (ProtocolError, MalformedPacketError, PacketTooLargeError) as exc:
             self._emit(EffectKind.PROTOCOL_ERROR, str(exc))
         except Exception as exc:
@@ -657,6 +680,7 @@ class ProtocolEngine:
             requested_session_expiry=self._sent_session_expiry_interval,
             local_client_id=self.config.client_id,
         )
+        self._configure_inbound_peer_packet_limit()
 
         self._reauth_in_progress = False
         self.state = ConnectionState.CONNECTED
@@ -680,6 +704,23 @@ class ProtocolEngine:
         if connack.session_present:
             self.inbound.replay_session()
         outbound.drain()
+
+    def _configure_inbound_peer_packet_limit(self) -> None:
+        """Specialize only the impossible-ACK MQTT 5 connection.
+
+        Keeping the ordinary handlers installed for every limit >= 4 (and for
+        no advertised limit) means the normal PUBLISH/PUBREL hot paths execute
+        exactly the same Python operations as before this hardening.
+        """
+        handlers = self._handlers_by_state[ConnectionState.CONNECTED]
+        limit = self.negotiated.maximum_packet_size
+        if self.codec.is_mqtt5 and limit is not None and limit < 4:
+            tiny = TinyPacketLimitInbound(self.inbound)
+            handlers[PacketType.PUBLISH] = tiny.handle_publish
+            handlers[PacketType.PUBREL] = tiny.on_pubrel
+            return
+        handlers[PacketType.PUBLISH] = self.inbound.handle_publish
+        handlers[PacketType.PUBREL] = self.inbound.on_pubrel
 
     def continue_inbound_replay(self) -> None:
         """Emit the next bounded batch of restart redeliveries.

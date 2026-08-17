@@ -8,6 +8,21 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Purge flow-blocked retransmissions from the outbound queue when a CONNACK
+  reports Session Present 0. `replay_session()` can leave WAIT_\* records in
+  the queue when the broker's Receive Maximum window cannot admit them; after
+  the server-side session expired, a stale entry made `drain()` re-materialise
+  an already-failed record, double-release its byte reservation (an internal
+  `AssertionError` surfaced as a protocol error) and abort the fresh
+  connection. Every publication is now failed exactly once with
+  `SessionDiscardedError` and the reconnect proceeds.
+- Ignore packets still buffered by the transport after the engine reached a
+  terminal state. A trailing packet after a broker DISCONNECT or refused
+  CONNACK used to surface as a `PROTOCOL_ERROR` that replaced the real
+  disconnect reason in `Client.disconnect_reason`.
+- Reject `begin_connect()` while the engine is DISCONNECTING (the final
+  DISCONNECT is still draining to the transport) instead of silently flipping
+  the state machine to CONNECTING under a closing connection.
 - Answer a PUBREC carrying a Reason Code of 0x80 or greater by ending the QoS 2
   exchange on every store, as MQTT 5 §4.3.3 requires. The check previously sat
   inside the conditional-transition branch, so a third-party `InflightStore`
