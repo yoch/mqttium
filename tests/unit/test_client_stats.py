@@ -226,25 +226,3 @@ def test_an_already_ordered_batch_is_counted_but_not_reordered() -> None:
     effects = client.stats().effects
     assert effects.multi_effect_batches == 1
     assert effects.reordered_batches == 0
-
-
-def test_protocol_stats_compatibility_aggregate_matches_directional_sections() -> None:
-    client = AsyncClient()
-
-    snapshot = client.stats()
-
-    assert snapshot.protocol.pending_outbound_messages == snapshot.outbound.pending_messages
-    assert snapshot.protocol.pending_outbound_bytes == snapshot.outbound.pending_bytes
-    assert (
-        snapshot.protocol.pending_outbound_high_water_messages
-        == snapshot.outbound.pending_high_water_messages
-    )
-    assert (
-        snapshot.protocol.pending_outbound_high_water_bytes
-        == snapshot.outbound.pending_high_water_bytes
-    )
-    assert snapshot.protocol.queued_outbound_messages == snapshot.outbound.queued_messages
-    assert snapshot.protocol.flow_inflight == snapshot.outbound.flow_inflight
-    assert snapshot.protocol.flow_limit == snapshot.outbound.flow_limit
-    assert snapshot.protocol.packet_ids_in_use == snapshot.outbound.packet_ids_in_use
-    assert snapshot.protocol.inbound_inflight == snapshot.inbound.inflight

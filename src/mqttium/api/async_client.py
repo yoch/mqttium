@@ -32,7 +32,6 @@ from mqttium.api.models import (
 from mqttium.api.stats import (
     ClientStats,
     DecoderStats,
-    ProtocolStats,
     ReceiptStats,
     TaskStats,
     TransportStats,
@@ -451,17 +450,6 @@ class AsyncClient:
                 reconnect=running(self._reconnect_task),
                 effect_flush=running(effect_pump.task),
                 callback_worker=running(self._callback_worker_task),
-            ),
-            protocol=ProtocolStats(
-                pending_outbound_messages=outbound_stats.pending_messages,
-                pending_outbound_bytes=outbound_stats.pending_bytes,
-                pending_outbound_high_water_messages=(outbound_stats.pending_high_water_messages),
-                pending_outbound_high_water_bytes=outbound_stats.pending_high_water_bytes,
-                queued_outbound_messages=outbound_stats.queued_messages,
-                flow_inflight=outbound_stats.flow_inflight,
-                flow_limit=outbound_stats.flow_limit,
-                packet_ids_in_use=outbound_stats.packet_ids_in_use,
-                inbound_inflight=inbound_stats.inflight,
             ),
             outbound=outbound_stats,
             inbound=inbound_stats,
@@ -1243,9 +1231,14 @@ class AsyncClient:
             self._unsub_futs.pop(mid, None)
             raise MQTTTimeoutError(f"UNSUBACK timed out for mid={mid}") from exc
 
-    async def messages(self) -> AsyncIterator[Message]:
-        async for message in self._delivery.messages():
-            yield message
+    def messages(self) -> AsyncIterator[Message]:
+        """Iterate delivered messages.
+
+        Returns the delivery controller's iterator rather than re-yielding from
+        it, which would cost one generator resume/suspend per message. `async
+        for` and `anext()` are unaffected; only `inspect.isasyncgenfunction` is.
+        """
+        return self._delivery.messages()
 
     async def ack(self, message: Message) -> None:
         """Acknowledge an inbound QoS>0 message when ``manual_ack=True``.
