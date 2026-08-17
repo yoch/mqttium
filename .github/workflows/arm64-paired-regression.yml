@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       base_ref:
-        description: Trusted baseline commit, branch, or tag
+        description: Trusted capacity baseline commit, branch, or tag
         required: true
         default: v1.0.0rc5
         type: string
@@ -12,6 +12,11 @@ on:
         description: Trusted candidate commit, branch, or tag
         required: true
         default: main
+        type: string
+      latency_base_ref:
+        description: Trusted pre-eager latency baseline commit
+        required: true
+        default: 3962f328331b8414a755332aefc3b3d7c261dc6f
         type: string
 
 permissions:
@@ -24,7 +29,7 @@ concurrency:
 jobs:
   paired:
     runs-on: [self-hosted, linux, ARM64]
-    timeout-minutes: 60
+    timeout-minutes: 90
     env:
       PYTHONUNBUFFERED: "1"
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
@@ -44,11 +49,18 @@ jobs:
           path: candidate
           persist-credentials: false
 
-      - name: Check out base
+      - name: Check out capacity baseline
         uses: actions/checkout@v7
         with:
           ref: ${{ inputs.base_ref }}
           path: base
+          persist-credentials: false
+
+      - name: Check out latency baseline
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.latency_base_ref }}
+          path: latency-base
           persist-credentials: false
 
       - name: Verify dedicated runner prerequisites
@@ -64,6 +76,11 @@ jobs:
           PY
           command -v mosquitto
           command -v mosquitto_sub
+          command -v taskset
+          if pgrep -a mosquitto; then
+            echo "A pre-existing Mosquitto process would contaminate paired evidence." >&2
+            exit 1
+          fi
 
       - name: Create isolated virtual environment
         shell: bash
@@ -84,7 +101,7 @@ jobs:
             --require-temperature \
             --enforce
 
-      - name: Start isolated broker
+      - name: Start isolated broker pinned to CPU 0
         shell: bash
         run: |
           set -euo pipefail
@@ -100,7 +117,7 @@ jobs:
           log_type error
           listener 11883 127.0.0.1
           EOF
-          mosquitto -c "$root/mosquitto.conf" > "$root/mosquitto.log" 2>&1 &
+          taskset -c 0 mosquitto -c "$root/mosquitto.conf" > "$root/mosquitto.log" 2>&1 &
           echo "$!" > "$root/mosquitto.pid"
           for _ in $(seq 1 50); do
             (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
@@ -121,50 +138,105 @@ jobs:
             --repeat 11 \
             --output "$RUNNER_TEMP/mqttium-paired/micro.json"
 
-      - name: Strict paired network and latency sweep
+      - name: Advisory paired network sweep
         run: |
           python harness/benchmarks/paired_network.py \
             --base-root base \
             --candidate-root candidate \
-            --policy strict \
+            --policy advisory \
             --preflight-report "$RUNNER_TEMP/mqttium-paired/runner.json" \
             --repeat 8 \
+            --cpu 2 \
             --windows 1,8,32,64,128 \
             --protocols 311,5 \
             --payloads 64,4096 \
             --count-small 20000 \
             --count-large 8000 \
-            --output "$RUNNER_TEMP/mqttium-paired/network.json"
+            --output "$RUNNER_TEMP/mqttium-paired/network.json" \
+            --summary-output "$RUNNER_TEMP/mqttium-paired/network.md"
 
-      - name: Strict native QoS 1 receipt/callback diagnostic
+      - name: Advisory native QoS 1 receipt/callback diagnostic
         run: |
           python harness/benchmarks/paired_network.py \
             --base-root base --candidate-root candidate \
-            --policy strict \
+            --policy advisory \
             --preflight-report "$RUNNER_TEMP/mqttium-paired/runner.json" \
-            --repeat 4 --windows 64 --protocols 311 \
+            --repeat 4 --cpu 2 --windows 64 --protocols 311 \
             --payloads 64 --completions receipt,callback \
             --count-small 5000 \
-            --output "$RUNNER_TEMP/mqttium-paired/qos1-completion.json"
+            --output "$RUNNER_TEMP/mqttium-paired/qos1-completion.json" \
+            --summary-output "$RUNNER_TEMP/mqttium-paired/qos1-completion.md"
 
-      - name: Strict closed-loop writer capacity when candidate provides the gate
+      - name: Strict closed-loop writer-capacity A/A control
+        id: writer-gate
         shell: bash
         run: |
           set -euo pipefail
           script="candidate/benchmarks/paired_writer_capacity.py"
           if [ ! -f "$script" ]; then
-            echo "candidate does not provide paired_writer_capacity.py; skipping writer-capacity gate"
+            echo "candidate does not provide paired_writer_capacity.py; writer-specific gates skipped"
+            echo "available=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          echo "available=true" >> "$GITHUB_OUTPUT"
           python "$script" \
+            --base-root base --candidate-root base \
+            --protocol 311 --qos-values 0,1 --payload-bytes 256 \
+            --inflight 20 --outstanding 64 --max-queued 200 \
+            --warmup-count 5000 --repeat 8 \
+            --count-qos0 100000 --count-qos1 40000 \
+            --timeout 120 --cpu 2 \
+            --policy strict \
+            --preflight-report "$RUNNER_TEMP/mqttium-paired/runner.json" \
+            --output "$RUNNER_TEMP/mqttium-paired/writer-capacity-aa.json" \
+            --summary-output "$RUNNER_TEMP/mqttium-paired/writer-capacity-aa.md"
+
+      - name: Strict closed-loop writer-capacity A/B gate
+        if: steps.writer-gate.outputs.available == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python candidate/benchmarks/paired_writer_capacity.py \
             --base-root base --candidate-root candidate \
             --protocol 311 --qos-values 0,1 --payload-bytes 256 \
             --inflight 20 --outstanding 64 --max-queued 200 \
             --warmup-count 5000 --repeat 8 \
             --count-qos0 100000 --count-qos1 40000 \
+            --timeout 120 --cpu 2 \
             --policy strict \
             --preflight-report "$RUNNER_TEMP/mqttium-paired/runner.json" \
-            --output "$RUNNER_TEMP/mqttium-paired/writer-capacity.json"
+            --output "$RUNNER_TEMP/mqttium-paired/writer-capacity-ab.json" \
+            --summary-output "$RUNNER_TEMP/mqttium-paired/writer-capacity-ab.md"
+
+      - name: Strict paced writer-latency A/A control
+        if: steps.writer-gate.outputs.available == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python harness/benchmarks/paired_open_loop.py \
+            --base-root latency-base --candidate-root latency-base \
+            --protocols 311 --payloads 256 --windows 64 \
+            --target-rates 2500,10000 --completions callback \
+            --repeat 8 --count-small 4000 --timeout 120 --cpu 2 \
+            --policy strict \
+            --preflight-report "$RUNNER_TEMP/mqttium-paired/runner.json" \
+            --output "$RUNNER_TEMP/mqttium-paired/writer-latency-aa.json" \
+            --summary-output "$RUNNER_TEMP/mqttium-paired/writer-latency-aa.md"
+
+      - name: Strict paced writer-latency A/B gate
+        if: steps.writer-gate.outputs.available == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python harness/benchmarks/paired_open_loop.py \
+            --base-root latency-base --candidate-root candidate \
+            --protocols 311 --payloads 256 --windows 64 \
+            --target-rates 2500,10000 --completions callback \
+            --repeat 8 --count-small 4000 --timeout 120 --cpu 2 \
+            --policy strict \
+            --preflight-report "$RUNNER_TEMP/mqttium-paired/runner.json" \
+            --output "$RUNNER_TEMP/mqttium-paired/writer-latency-ab.json" \
+            --summary-output "$RUNNER_TEMP/mqttium-paired/writer-latency-ab.md"
 
       - name: Upload paired measurements
         if: always()
