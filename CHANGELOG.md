@@ -6,6 +6,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [1.0.0rc7] - 2026-08-18
+
 ### Fixed
 
 - Reject non-empty MQTT 5 `Properties` on MQTT 3.1/3.1.1 CONNECT, Will,
@@ -713,7 +715,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - Pre-spin-out comparative analysis and generated coverage data from the
   published source tree.
 
-[Unreleased]: https://github.com/yoch/mqttium/compare/v1.0.0rc6...HEAD
+[Unreleased]: https://github.com/yoch/mqttium/compare/v1.0.0rc7...HEAD
+[1.0.0rc7]: https://github.com/yoch/mqttium/compare/v1.0.0rc6...v1.0.0rc7
 [1.0.0rc6]: https://github.com/yoch/mqttium/compare/v1.0.0rc5...v1.0.0rc6
 [1.0.0rc5]: https://github.com/yoch/mqttium/compare/v1.0.0rc4...v1.0.0rc5
 [1.0.0rc4]: https://github.com/yoch/mqttium/compare/v1.0.0rc3...v1.0.0rc4
