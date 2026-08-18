@@ -1,0 +1,93 @@
+name: TEMP ARM64 Batch 24/32 Confirmation
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - src/sitecustomize.py
+      - .github/workflows/tmp-arm64-batch24.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tmp-arm64-batch24-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  confirm:
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 8
+    env:
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: candidate
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          ref: v1.0.0rc7
+          path: base
+          persist-credentials: false
+      - name: Start broker
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "aarch64"
+          test -z "$(pgrep mosquitto || true)"
+          out="$RUNNER_TEMP/mqttium-batch24"
+          mkdir -p "$out"
+          cat > "$out/mosquitto.conf" <<'EOF'
+          persistence false
+          allow_anonymous true
+          max_inflight_messages 1000
+          max_queued_messages 100000
+          max_queued_bytes 0
+          connection_messages false
+          log_type error
+          listener 11884 127.0.0.1
+          EOF
+          taskset -c 0 mosquitto -c "$out/mosquitto.conf" > "$out/mosquitto.log" 2>&1 &
+          echo "$!" > "$out/mosquitto.pid"
+          for _ in $(seq 1 50); do
+            (echo > /dev/tcp/127.0.0.1/11884) >/dev/null 2>&1 && exit 0
+            sleep 0.05
+          done
+          exit 1
+      - name: Compare finalists
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/mqttium-batch24"
+          for batch in 24 32; do
+            MQTTIUM_EXPERIMENT_BATCH_ITEMS="$batch" \
+              python3 candidate/benchmarks/paired_network.py \
+                --base-root base --candidate-root candidate \
+                --host 127.0.0.1 --port 11884 \
+                --policy advisory --repeat 4 --cpu 2 \
+                --windows 20,64,128 --protocols 311 --payloads 64,4096 \
+                --count-small 3000 --count-large 1400 \
+                --target-sample-seconds 0.45 --max-count 16000 \
+                --output "$out/batch-$batch.json" \
+                --summary-output "$out/batch-$batch.md"
+            cat "$out/batch-$batch.md" >> "$GITHUB_STEP_SUMMARY"
+          done
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: tmp-arm64-batch24-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/mqttium-batch24/*.json
+            ${{ runner.temp }}/mqttium-batch24/*.md
+          retention-days: 7
+          if-no-files-found: warn
+      - name: Stop broker
+        if: always()
+        shell: bash
+        run: |
+          f="$RUNNER_TEMP/mqttium-batch24/mosquitto.pid"
+          [ ! -f "$f" ] || kill "$(cat "$f")" 2>/dev/null || true
