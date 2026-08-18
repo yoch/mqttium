@@ -127,7 +127,7 @@ def test_unclassified_identified_message_is_not_batched() -> None:
         client._connection_epoch,
     )
 
-    assert unknown.requires_delivery_mark is None
+    assert unknown.requires_delivery_mark is True
     assert applied == 0
     assert client._messages.empty()
 
