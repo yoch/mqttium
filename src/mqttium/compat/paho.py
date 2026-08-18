@@ -214,7 +214,6 @@ class Client:
         self._started = threading.Event()
         self._stopping = threading.Event()
         self._topic_callbacks = TopicMatcher()
-        self._in_callback = False
         self._publish_pending: SimpleQueue[_PendingPublish] = SimpleQueue()
         self._publish_spillover: _PendingPublish | None = None
         self._publish_schedule_lock = threading.Lock()
@@ -1074,17 +1073,8 @@ class Client:
         mid = self._queue_loop_command(lambda: self._async._queue_unsubscribe_on_loop(topic))
         return (0, mid)
 
-    def _on_loop_in_callback(self) -> bool:
-        """True only on the network loop thread, inside a user callback."""
-        return self._in_callback and threading.current_thread() is self._thread
-
     def _safe_callback(self, cb: Callable[..., Any], *args: Any) -> None:
-        # Only the loop thread may flip _in_callback: an off-loop invocation
-        # (e.g. the QoS 0 on_publish fast path) must not clobber the flag the
-        # loop thread relies on to detect re-entrant blocking calls.
         on_loop = threading.current_thread() is self._thread
-        if on_loop:
-            self._in_callback = True
         try:
             cb(*args)
         except Exception as exc:
@@ -1099,9 +1089,6 @@ class Client:
                     loop.call_exception_handler(context)
                 else:
                     loop.call_soon_threadsafe(loop.call_exception_handler, context)
-        finally:
-            if on_loop:
-                self._in_callback = False
 
     def _dispatch_connect(self, connack: ConnAckPacket) -> None:
         cb = self.on_connect
