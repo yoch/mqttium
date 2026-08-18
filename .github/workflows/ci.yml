@@ -19,6 +19,8 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
       - run: python -m pip install -e ".[dev,security]"
       - name: Repository hygiene
         run: |
@@ -43,6 +45,8 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
       - run: python -m pip install -e ".[dev]"
       - name: Require OpenSSL for TLS tests
         run: python -c "import shutil; assert shutil.which('openssl'), 'OpenSSL is required for TLS tests'"
@@ -93,6 +97,8 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
       - run: python -m pip install -e ".[dev]"
       - name: Require OpenSSL for TLS tests
         run: python -c "import shutil; assert shutil.which('openssl'), 'OpenSSL is required for TLS tests'"
@@ -106,6 +112,8 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
       - run: python -m pip install -e ".[fuzz]"
       - name: Seeded fuzzing
         run: |
@@ -121,6 +129,8 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
       - run: python -m pip install ".[release]"
       - run: validate-pyproject pyproject.toml
       - run: python -m build
