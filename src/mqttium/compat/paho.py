@@ -231,9 +231,10 @@ class Client:
         self._last_facade_mid = 0
         self._active_facade_mids: set[int] = set()
         # Receipt identity is the authoritative correlation/lifetime index.
-        # It survives callback toggles and lets the settle hook decide whether
-        # a façade MID can retire or is owned by a queued publish dispatcher.
-        self._facade_receipts: dict[int, tuple[int, int]] = {}
+        # Keep a strong reference while a queued dispatcher owns the façade MID:
+        # `id(receipt)` is unique only for the lifetime of the object, and a user
+        # may discard MQTTMessageInfo before the callback worker consumes it.
+        self._facade_receipts: dict[int, tuple[PublishReceipt, int, int]] = {}
         self._settle_facade_receipt = self._facade_receipt_settled
         # Fast dispatcher index: real packet id -> (receipt identity, façade
         # mid), oldest first. It is loop-confined and only needs to be populated
@@ -281,7 +282,7 @@ class Client:
             return
         # Rebuild the fast index from the authoritative receipt bindings. Dict
         # insertion order preserves FIFO for a wire MID that has been reused.
-        for receipt_id, (real_mid, facade_mid) in self._facade_receipts.items():
+        for receipt_id, (_receipt, real_mid, facade_mid) in self._facade_receipts.items():
             pending = self._facade_mid_map.get(real_mid)
             entry = (receipt_id, facade_mid)
             if pending is None:
@@ -961,7 +962,7 @@ class Client:
             return
         receipt_id = id(receipt)
         entry = (receipt_id, facade_mid)
-        self._facade_receipts[receipt_id] = (real_mid, facade_mid)
+        self._facade_receipts[receipt_id] = (receipt, real_mid, facade_mid)
         if self._async.on_publish is not None:
             pending = self._facade_mid_map.get(real_mid)
             if pending is None:
@@ -986,7 +987,8 @@ class Client:
         binding = self._facade_receipts.get(receipt_id)
         if binding is None:
             return
-        real_mid, facade_mid = binding
+        bound_receipt, real_mid, facade_mid = binding
+        assert bound_receipt is receipt
 
         # Normal completion pops the receipt before settling it. AsyncClient's
         # final bulk-failure path instead settles receipts while they are still
@@ -1025,7 +1027,7 @@ class Client:
         # receipt bindings survive that toggle, so consume the oldest matching
         # binding directly. Dict insertion order preserves reuse FIFO.
         for receipt_id, binding in self._facade_receipts.items():
-            bound_real_mid, facade_mid = binding
+            _receipt, bound_real_mid, facade_mid = binding
             if bound_real_mid == real_mid:
                 del self._facade_receipts[receipt_id]
                 return facade_mid, facade_mid
