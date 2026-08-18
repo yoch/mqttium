@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import cache
 
 from mqttium.enums import MQTTProtocolVersion
 from mqttium.errors import ProtocolError
@@ -56,6 +57,7 @@ class CodecBindings:
     encode_unsubscribe: Callable[..., bytes]
 
 
+@cache
 def bind_codec(protocol: MQTTProtocolVersion) -> CodecBindings:
     """Bind every specialized primitive for *protocol* exactly once."""
     if protocol is MQTTProtocolVersion.MQTTv5:
