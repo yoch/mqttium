@@ -22,7 +22,7 @@ from typing import Any
 from mqttium.api.async_client import AsyncClient
 from mqttium.api._writer import WritePump
 
-_INLINE_BATCH_ITEMS = 8
+_INLINE_BATCH_ITEMS = 4
 _ORIGINAL_PUBLISH = AsyncClient.publish
 
 
