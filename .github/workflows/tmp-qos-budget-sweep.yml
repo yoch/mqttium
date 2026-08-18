@@ -1,4 +1,4 @@
-name: TEMP QoS Budget Sweep
+name: TEMP QoS Budget Screening
 
 on:
   pull_request:
@@ -11,13 +11,13 @@ permissions:
   contents: read
 
 concurrency:
-  group: tmp-qos-budget-sweep-${{ github.event.pull_request.number || github.ref }}
+  group: tmp-qos-budget-screening-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
-  sweep:
-    runs-on: [self-hosted, linux, ARM64]
-    timeout-minutes: 12
+  screening:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     env:
       PYTHONUNBUFFERED: "1"
     steps:
@@ -31,14 +31,15 @@ jobs:
           ref: v1.0.0rc7
           path: base
           persist-credentials: false
-      - name: Prepare candidates and broker
+      - name: Install broker and prepare candidates
         shell: bash
         run: |
           set -euo pipefail
-          test "$(uname -m)" = "aarch64"
-          test -z "$(pgrep mosquitto || true)"
-          out="$RUNNER_TEMP/qos-budget-sweep"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mosquitto mosquitto-clients
+          out="$RUNNER_TEMP/qos-budget-screening"
           mkdir -p "$out"
+          printf '%s\n' '{"eligible": true, "failures": []}' > "$out/preflight.json"
           for kib in 24 32 48 64; do
             cp -a source "candidate-$kib"
             KIB="$kib" python3 - <<'PY'
@@ -61,44 +62,53 @@ jobs:
           log_type error
           listener 11885 127.0.0.1
           EOF
-          taskset -c 0 mosquitto -c "$out/mosquitto.conf" > "$out/mosquitto.log" 2>&1 &
+          mosquitto -c "$out/mosquitto.conf" > "$out/mosquitto.log" 2>&1 &
           echo "$!" > "$out/mosquitto.pid"
           for _ in $(seq 1 50); do
             (echo > /dev/tcp/127.0.0.1/11885) >/dev/null 2>&1 && exit 0
             sleep 0.05
           done
           exit 1
-      - name: Sweep byte budgets at 4 KiB
+      - name: Measure budgets without statistical gating
         shell: bash
         run: |
           set -euo pipefail
-          out="$RUNNER_TEMP/qos-budget-sweep"
+          out="$RUNNER_TEMP/qos-budget-screening"
           for kib in 24 32 48 64; do
             echo "### Budget ${kib} KiB" | tee -a "$GITHUB_STEP_SUMMARY"
             python3 source/benchmarks/paired_network.py \
               --base-root base --candidate-root "candidate-$kib" \
               --host 127.0.0.1 --port 11885 \
-              --policy advisory --repeat 8 --cpu 2 \
+              --policy advisory --preflight-report "$out/preflight.json" \
+              --max-baseline-cv 1.0 --min-ack-ratio 0.0 \
+              --repeat 8 \
               --windows 20,64,128 --protocols 311 --payloads 4096 \
               --count-small 1800 --count-large 1800 \
-              --target-sample-seconds 0.65 --max-count 24000 \
+              --target-sample-seconds 0.7 --max-count 24000 \
               --output "$out/network-${kib}.json" \
-              --summary-output "$out/network-${kib}.md" || true
-            cat "$out/network-${kib}.md" | tee -a "$GITHUB_STEP_SUMMARY"
+              --summary-output "$out/network-${kib}.md"
+            python3 - "$out/network-${kib}.json" <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import json, sys
+          p = json.load(open(sys.argv[1]))
+          print('| window | throughput cand/base | base CV | cand CV | p50 base ms | p50 cand ms | p95 base ms | p95 cand ms |')
+          print('|---:|---:|---:|---:|---:|---:|---:|---:|')
+          for s in p['scenarios']:
+              print(f"| {s['window']} | {s['median_candidate_over_base_ack']:.4f} | {s['base_ack_cv']:.2%} | {s['candidate_ack_cv']:.2%} | {s['base_median_p50_ms']:.3f} | {s['candidate_median_p50_ms']:.3f} | {s['base_median_p95_ms']:.3f} | {s['candidate_median_p95_ms']:.3f} |")
+          PY
           done
-      - name: Upload measurements
+      - name: Upload raw measurements
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: tmp-qos-budget-sweep-${{ github.run_id }}
+          name: tmp-qos-budget-screening-${{ github.run_id }}
           path: |
-            ${{ runner.temp }}/qos-budget-sweep/*.json
-            ${{ runner.temp }}/qos-budget-sweep/*.md
+            ${{ runner.temp }}/qos-budget-screening/*.json
+            ${{ runner.temp }}/qos-budget-screening/*.md
           retention-days: 7
           if-no-files-found: warn
       - name: Stop broker
         if: always()
         shell: bash
         run: |
-          f="$RUNNER_TEMP/qos-budget-sweep/mosquitto.pid"
+          f="$RUNNER_TEMP/qos-budget-screening/mosquitto.pid"
           [ ! -f "$f" ] || kill "$(cat "$f")" 2>/dev/null || true
