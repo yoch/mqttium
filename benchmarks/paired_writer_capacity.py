@@ -297,22 +297,25 @@ def assess_rates(
     aa_control: bool,
     max_aa_ratio_deviation: float,
     label: str,
-) -> tuple[float, float, list[str], list[str]]:
+) -> tuple[float, float, float, list[str], list[str]]:
     """Evaluate one paired cell; split invalid measurement from regression."""
     ratios = [candidate / base for base, candidate in zip(base_rates, candidate_rates, strict=True)]
     ratio = statistics.median(ratios)
     baseline_cv = _cv(base_rates)
+    candidate_cv = _cv(candidate_rates)
     invalidations: list[str] = []
     regressions: list[str] = []
     if baseline_cv > max_baseline_cv:
         invalidations.append(f"{label}: baseline CV {baseline_cv:.2%}")
+    if candidate_cv > max_baseline_cv:
+        invalidations.append(f"{label}: candidate CV {candidate_cv:.2%}")
     if aa_control and abs(ratio - 1.0) > max_aa_ratio_deviation:
         invalidations.append(
             f"{label}: A/A completed ratio {ratio:.4f} outside 1+/-{max_aa_ratio_deviation:.2%}"
         )
     if not aa_control and ratio < min_completed_ratio:
         regressions.append(f"{label}: candidate/base completed ratio {ratio:.4f}")
-    return ratio, baseline_cv, invalidations, regressions
+    return ratio, baseline_cv, candidate_cv, invalidations, regressions
 
 
 def parent(args: argparse.Namespace) -> int:
@@ -407,7 +410,7 @@ def parent(args: argparse.Namespace) -> int:
             f"protocol={args.protocol} qos={qos} payload={args.payload_bytes} "
             f"inflight={args.inflight} outstanding={args.outstanding}"
         )
-        ratio, baseline_cv, cell_invalid, cell_regressions = assess_rates(
+        ratio, baseline_cv, candidate_cv, cell_invalid, cell_regressions = assess_rates(
             base_rates,
             candidate_rates,
             max_baseline_cv=args.max_baseline_cv,
@@ -429,13 +432,15 @@ def parent(args: argparse.Namespace) -> int:
                 "repeat": args.repeat,
                 "median_candidate_over_base_completed": ratio,
                 "base_completed_cv": baseline_cv,
+                "candidate_completed_cv": candidate_cv,
                 "base_median_completed_rate": statistics.median(base_rates),
                 "candidate_median_completed_rate": statistics.median(candidate_rates),
                 "pairs": pairs,
             }
         )
         print(
-            f"{label} candidate/base={ratio:.4f} base_cv={baseline_cv:.2%}",
+            f"{label} candidate/base={ratio:.4f} base_cv={baseline_cv:.2%} "
+            f"candidate_cv={candidate_cv:.2%}",
             flush=True,
         )
 

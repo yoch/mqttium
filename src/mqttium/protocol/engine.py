@@ -42,7 +42,6 @@ from mqttium.protocol.effects import (
 )
 from mqttium.protocol.flow_control import FlowControl
 from mqttium.protocol.inbound import InboundSession
-from mqttium.protocol.tiny_packet_limit import TinyPacketLimitInbound
 from mqttium.protocol.negotiated import NegotiatedSettings
 from mqttium.protocol.outbound import OutboundSession
 from mqttium.protocol.packet_ids import PacketIdPool
@@ -567,10 +566,7 @@ class ProtocolEngine:
                 raise ProtocolError(
                     f"Unexpected {raw.packet_type.name} while state={self.state.name}"
                 )
-            effect_start = len(self._effects)
             handler(raw)
-            if self.negotiated.maximum_packet_size is not None:
-                self._validate_new_outbound_effects(effect_start)
         except MandatoryResponseTooLargeError:
             # A legal peer packet-size limit can make a mandatory local ACK
             # impossible. Preserve that local failure for the runtime instead
@@ -686,7 +682,7 @@ class ProtocolEngine:
             requested_session_expiry=self._sent_session_expiry_interval,
             local_client_id=self.config.client_id,
         )
-        self._configure_inbound_peer_packet_limit()
+        self.inbound.configure_peer_packet_limit(self.negotiated.maximum_packet_size)
 
         self._reauth_in_progress = False
         self.state = ConnectionState.CONNECTED
@@ -710,23 +706,6 @@ class ProtocolEngine:
         if connack.session_present:
             self.inbound.replay_session()
         outbound.drain()
-
-    def _configure_inbound_peer_packet_limit(self) -> None:
-        """Specialize only the impossible-ACK MQTT 5 connection.
-
-        Keeping the ordinary handlers installed for every limit >= 4 (and for
-        no advertised limit) means the normal PUBLISH/PUBREL hot paths execute
-        exactly the same Python operations as before this hardening.
-        """
-        handlers = self._handlers_by_state[ConnectionState.CONNECTED]
-        limit = self.negotiated.maximum_packet_size
-        if self.codec.is_mqtt5 and limit is not None and limit < 4:
-            tiny = TinyPacketLimitInbound(self.inbound)
-            handlers[PacketType.PUBLISH] = tiny.handle_publish
-            handlers[PacketType.PUBREL] = tiny.on_pubrel
-            return
-        handlers[PacketType.PUBLISH] = self.inbound.handle_publish
-        handlers[PacketType.PUBREL] = self.inbound.on_pubrel
 
     def continue_inbound_replay(self) -> None:
         """Emit the next bounded batch of restart redeliveries.
@@ -971,25 +950,6 @@ class ProtocolEngine:
             raise PacketTooLargeError(
                 f"Encoded packet size {size} exceeds broker maximum_packet_size {limit}"
             )
-
-    def _validate_new_outbound_effects(self, start: int) -> None:
-        """Refuse a handler batch if any SEND violates the broker's packet limit.
-
-        Inbound automatic acknowledgements are emitted as effects rather than
-        returned from a public queue_* method. Validate the whole newly-produced
-        batch before exposing any of it so an oversized PUBACK/PUBREC/PUBCOMP
-        cannot escape while its paired MESSAGE remains application-visible.
-
-        `handle_raw` only calls this when the broker negotiated a limit, so the
-        common case costs no call at all.
-        """
-        try:
-            for effect in self._effects[start:]:
-                if effect.kind is EffectKind.SEND:
-                    self._check_outbound_size(effect.data)
-        except PacketTooLargeError:
-            del self._effects[start:]
-            raise
 
     def _check_subscribe_capabilities(
         self,

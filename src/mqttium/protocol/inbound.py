@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, NoReturn
 
 from mqttium.codec.buffer import RawPacket
 from mqttium.enums import InboundQoSState, MQTTProtocolVersion, PacketType, QoS
-from mqttium.errors import MalformedPacketError, ProtocolError
+from mqttium.errors import MalformedPacketError, MandatoryResponseTooLargeError, ProtocolError
 from mqttium.persistence.memory import (
     BoundedInboundReplayStore,
     PagedInflightStore,
@@ -111,6 +111,7 @@ class InboundSession:
         "_replay",
         "_stored_inbound",
         "_session_state_qos2",
+        "_tiny_peer_packet_limit",
         "_transitions",
         "config",
         "handle_publish",
@@ -144,6 +145,7 @@ class InboundSession:
         # Same one-shot binding as the PUBLISH handler above: manual_ack is not
         # runtime-mutable, so the QoS 1 handler does not re-test it per message.
         self._on_qos1 = self._on_qos1_manual if self.config.manual_ack else self._on_qos1_auto
+        self._tiny_peer_packet_limit = False
         self._aliases: dict[int, str] = {}
         self._inflight = 0
         self._autoack_handoff_required = False
@@ -243,6 +245,13 @@ class InboundSession:
         self._aliases.clear()
         self._pending_manual_qos1_acks.clear()
         self.release_pending_auto_qos1()
+
+    def configure_peer_packet_limit(self, limit: int | None) -> None:
+        """Bind the rare automatic-ACK failure path for this connection."""
+        tiny = self._is_v5 and limit is not None and limit < 4
+        self._tiny_peer_packet_limit = tiny
+        if not self.config.manual_ack:
+            self._on_qos1 = self._on_qos1_auto_tiny if tiny else self._on_qos1_auto
 
     def discard_session(self) -> None:
         """Drop inbound state after CONNACK reports no previous session."""
@@ -479,6 +488,8 @@ class InboundSession:
         if existing is not None:
             if existing.state is InboundQoSState.WAIT_PUBACK:
                 self._reject_packet_id_collision(mid, "QoS 2", "QoS 1")
+            if self._tiny_peer_packet_limit:
+                self._raise_mandatory_response_too_large("PUBREC")
             engine._send(_encode_pubrec_success(mid))
             return
         if mid in self._pending_auto_qos1_mids:
@@ -490,6 +501,9 @@ class InboundSession:
             )
 
         logical_size = self.logical_size(topic, payload, properties, decoded_property_wire_size)
+        if self._tiny_peer_packet_limit:
+            self._validate_slot_capacity(logical_size)
+            self._raise_mandatory_response_too_large("PUBREC")
         self._acquire_slot(logical_size)
         inbound = InboundMessage(
             mid=mid,
@@ -562,6 +576,18 @@ class InboundSession:
         self._pending_auto_qos1_mids.add(mid)
         if self._inflight >= self.config.local_receive_maximum:
             self._autoack_handoff_required = True
+
+    def _on_qos1_auto_tiny(self, *, mid: int, **_unused: object) -> None:
+        """Fail an automatic PUBACK before changing inbound state."""
+        existing = self._lookup_stored_inbound(mid)
+        if existing is not None:
+            if existing.state is not InboundQoSState.WAIT_PUBACK:
+                self._reject_packet_id_collision(mid, "QoS 1", "QoS 2")
+            self._raise_mandatory_response_too_large("PUBACK")
+        if mid in self._pending_auto_qos1_mids:
+            self._raise_mandatory_response_too_large("PUBACK")
+        self._validate_slot_capacity()
+        self._raise_mandatory_response_too_large("PUBACK")
 
     def _on_qos1_auto(
         self,
@@ -723,6 +749,8 @@ class InboundSession:
         transitions = self._transitions
         record: InboundMessage | InboundRecordMeta | None = self._lookup_stored_inbound(mid)
         if record is None:
+            if self._tiny_peer_packet_limit:
+                self._raise_mandatory_response_too_large("PUBCOMP")
             engine._send(_encode_pubcomp_success(mid))
             return
         state = record.state
@@ -746,6 +774,8 @@ class InboundSession:
                 record.state = InboundQoSState.WAIT_USER_ACK
                 store.update_in(record)
             return
+        if self._tiny_peer_packet_limit:
+            self._raise_mandatory_response_too_large("PUBCOMP")
         if transitions is not None:
             completed = transitions.complete_in(mid, state)
             if completed is None:
@@ -1009,6 +1039,27 @@ class InboundSession:
             message.properties,
         )
         return message.logical_size
+
+    def _validate_slot_capacity(self, logical_size: int | None = None) -> None:
+        """Validate Receive Maximum/quota without reserving anything."""
+        if self._inflight >= self.config.local_receive_maximum:
+            self._protocol_disconnect(0x93)
+            raise ProtocolError("Receive Maximum exceeded")
+        byte_limit = self.config.max_pending_inbound_bytes
+        if (
+            logical_size is not None
+            and byte_limit is not None
+            and self._pending_bytes + logical_size > byte_limit
+        ):
+            self._protocol_disconnect(0x97)
+            raise ProtocolError("Pending inbound byte limit reached")
+
+    def _raise_mandatory_response_too_large(self, packet_name: str) -> NoReturn:
+        limit = self._engine.negotiated.maximum_packet_size
+        assert limit is not None and limit < 4
+        raise MandatoryResponseTooLargeError(
+            f"Mandatory {packet_name} size 4 exceeds broker maximum_packet_size {limit}"
+        )
 
     def _acquire_slot(self, logical_size: int | None = None) -> None:
         receive_maximum = self.config.local_receive_maximum

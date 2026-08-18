@@ -214,7 +214,6 @@ class Client:
         self._started = threading.Event()
         self._stopping = threading.Event()
         self._topic_callbacks = TopicMatcher()
-        self._in_callback = False
         self._publish_pending: SimpleQueue[_PendingPublish] = SimpleQueue()
         self._publish_spillover: _PendingPublish | None = None
         self._publish_schedule_lock = threading.Lock()
@@ -232,9 +231,10 @@ class Client:
         self._last_facade_mid = 0
         self._active_facade_mids: set[int] = set()
         # Receipt identity is the authoritative correlation/lifetime index.
-        # It survives callback toggles and lets the settle hook decide whether
-        # a façade MID can retire or is owned by a queued publish dispatcher.
-        self._facade_receipts: dict[int, tuple[int, int]] = {}
+        # Keep a strong reference while a queued dispatcher owns the façade MID:
+        # `id(receipt)` is unique only for the lifetime of the object, and a user
+        # may discard MQTTMessageInfo before the callback worker consumes it.
+        self._facade_receipts: dict[int, tuple[PublishReceipt, int, int]] = {}
         self._settle_facade_receipt = self._facade_receipt_settled
         # Fast dispatcher index: real packet id -> (receipt identity, façade
         # mid), oldest first. It is loop-confined and only needs to be populated
@@ -282,7 +282,7 @@ class Client:
             return
         # Rebuild the fast index from the authoritative receipt bindings. Dict
         # insertion order preserves FIFO for a wire MID that has been reused.
-        for receipt_id, (real_mid, facade_mid) in self._facade_receipts.items():
+        for receipt_id, (_receipt, real_mid, facade_mid) in self._facade_receipts.items():
             pending = self._facade_mid_map.get(real_mid)
             entry = (receipt_id, facade_mid)
             if pending is None:
@@ -962,7 +962,7 @@ class Client:
             return
         receipt_id = id(receipt)
         entry = (receipt_id, facade_mid)
-        self._facade_receipts[receipt_id] = (real_mid, facade_mid)
+        self._facade_receipts[receipt_id] = (receipt, real_mid, facade_mid)
         if self._async.on_publish is not None:
             pending = self._facade_mid_map.get(real_mid)
             if pending is None:
@@ -987,7 +987,8 @@ class Client:
         binding = self._facade_receipts.get(receipt_id)
         if binding is None:
             return
-        real_mid, facade_mid = binding
+        bound_receipt, real_mid, facade_mid = binding
+        assert bound_receipt is receipt
 
         # Normal completion pops the receipt before settling it. AsyncClient's
         # final bulk-failure path instead settles receipts while they are still
@@ -1026,7 +1027,7 @@ class Client:
         # receipt bindings survive that toggle, so consume the oldest matching
         # binding directly. Dict insertion order preserves reuse FIFO.
         for receipt_id, binding in self._facade_receipts.items():
-            bound_real_mid, facade_mid = binding
+            _receipt, bound_real_mid, facade_mid = binding
             if bound_real_mid == real_mid:
                 del self._facade_receipts[receipt_id]
                 return facade_mid, facade_mid
@@ -1072,17 +1073,8 @@ class Client:
         mid = self._queue_loop_command(lambda: self._async._queue_unsubscribe_on_loop(topic))
         return (0, mid)
 
-    def _on_loop_in_callback(self) -> bool:
-        """True only on the network loop thread, inside a user callback."""
-        return self._in_callback and threading.current_thread() is self._thread
-
     def _safe_callback(self, cb: Callable[..., Any], *args: Any) -> None:
-        # Only the loop thread may flip _in_callback: an off-loop invocation
-        # (e.g. the QoS 0 on_publish fast path) must not clobber the flag the
-        # loop thread relies on to detect re-entrant blocking calls.
         on_loop = threading.current_thread() is self._thread
-        if on_loop:
-            self._in_callback = True
         try:
             cb(*args)
         except Exception as exc:
@@ -1097,9 +1089,6 @@ class Client:
                     loop.call_exception_handler(context)
                 else:
                     loop.call_soon_threadsafe(loop.call_exception_handler, context)
-        finally:
-            if on_loop:
-                self._in_callback = False
 
     def _dispatch_connect(self, connack: ConnAckPacket) -> None:
         cb = self.on_connect
