@@ -71,6 +71,8 @@ jobs:
           cat /tmp/mqttium-paired/mosquitto.log
           exit 1
       - name: Paired microbenchmarks
+        env:
+          PYTHONPATH: harness/src
         run: |
           python harness/benchmarks/paired_regression.py \
             --base-root base \
