@@ -744,6 +744,13 @@ def run_paho_saturation(spec: ScenarioSpec) -> dict[str, Any]:
     rejected = 0
     for index in range(spec.count):
         info = client.publish(_TOPIC, _payload(index, spec.payload_size), qos=1)
+        # publish() intentionally returns before loop-side admission. This
+        # memory scenario predates that handoff optimization and is meant to
+        # measure the 512-message native queue at saturation, not a transient
+        # producer/loop scheduling backlog. Observe each admission before
+        # classifying its Paho return code so the logical workload stays fixed.
+        assert info._handoff is not None
+        info._handoff.result(timeout=30.0)
         if info.rc == MQTT_ERR_SUCCESS:
             accepted += 1
         elif info.rc == MQTT_ERR_QUEUE_SIZE:
