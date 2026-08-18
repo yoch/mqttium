@@ -16,7 +16,7 @@ from typing import Any
 
 from mqttium.api._writer import WritePump
 
-_INLINE_BATCH_ITEMS = 8
+_INLINE_BATCH_ITEMS = 4
 _ORIGINAL_TRY_ENQUEUE = WritePump.try_enqueue
 
 
