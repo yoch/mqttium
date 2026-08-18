@@ -33,6 +33,7 @@ jobs:
 
   test:
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -47,16 +48,36 @@ jobs:
         run: python -c "import shutil; assert shutil.which('openssl'), 'OpenSSL is required for TLS tests'"
       - name: Unit tests (including TLS, WebSocket, and cancellation)
         run: python -m pytest -q -ra tests/unit
-      - name: Start Mosquitto
+      - name: Install Mosquitto
+        timeout-minutes: 5
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq mosquitto
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          date -u +'apt-get update start %FT%TZ'
+          sudo -E apt-get update
+          date -u +'apt-get install start %FT%TZ'
+          sudo -E apt-get install -y mosquitto
+          date -u +'apt-get install done %FT%TZ'
+          dpkg-query -W mosquitto
+          command -v mosquitto
+      - name: Start Mosquitto
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
           printf 'listener 11883 127.0.0.1\nallow_anonymous true\npersistence false\n' > /tmp/mosq-ci.conf
+          date -u +'mosquitto -d start %FT%TZ'
           mosquitto -c /tmp/mosq-ci.conf -d
+          echo "mosquitto -d exited $?"
+          date -u +'mosquitto -d returned %FT%TZ'
           for i in $(seq 1 30); do
-            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            if (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1; then
+              echo "listener ready after ${i} probe(s)"
+              exit 0
+            fi
             sleep 0.2
           done
+          echo "listener never accepted a connection"
+          pgrep -a mosquitto || true
           exit 1
       - name: Mosquitto integration tests
         run: python -m pytest -q tests/integration
