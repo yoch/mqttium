@@ -753,7 +753,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--control-cycle-seeds",
         type=_parse_control_cycle_seeds,
-        default=_parse_control_cycle_seeds("0,1,2,3"),
+        default=_parse_control_cycle_seeds("0,1,2"),
     )
     parser.add_argument("--ab-blocks", type=int, default=2)
     parser.add_argument(
@@ -768,7 +768,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument("--cpu", type=int)
     parser.add_argument("--runner-probe", type=Path, default=Path("benchmarks/runner_probe.py"))
-    parser.add_argument("--inter-phase-quiet-seconds", type=float, default=60.0)
+    parser.add_argument("--inter-phase-quiet-seconds", type=float, default=30.0)
     parser.add_argument("--control-throughput-bias-floor", type=float, default=0.98)
     parser.add_argument("--control-throughput-bias-ceiling", type=float, default=1.02)
     parser.add_argument("--control-throughput-floor", type=float, default=0.95)

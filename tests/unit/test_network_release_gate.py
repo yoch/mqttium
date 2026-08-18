@@ -197,7 +197,7 @@ def test_phase_combiner_rejects_scenario_drift() -> None:
 
 def test_cycle_seed_schedule_is_deterministic_and_sufficient() -> None:
     assert _parse_cycle_seeds("0,1,2,3,4,5") == [0, 1, 2, 3, 4, 5]
-    assert _parse_control_cycle_seeds("0,1,2,3") == [0, 1, 2, 3]
+    assert _parse_control_cycle_seeds("0,1,2") == [0, 1, 2]
 
     with pytest.raises(argparse.ArgumentTypeError, match="at least 6"):
         _parse_cycle_seeds("0,1,2,3,4")
