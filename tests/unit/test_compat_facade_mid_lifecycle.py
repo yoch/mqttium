@@ -33,7 +33,7 @@ def test_facade_mid_is_retired_without_user_callback_or_waiter() -> None:
 
     receipt = PublishReceipt(mid=7, qos=QoS.AT_LEAST_ONCE)
     client._register_facade_mid(receipt, facade_mid)
-    assert client._facade_receipts[id(receipt)] == (7, facade_mid)
+    assert client._facade_receipts[id(receipt)] == (receipt, 7, facade_mid)
     assert 7 not in client._facade_mid_map
     assert facade_mid in client._active_facade_mids
 
@@ -97,6 +97,30 @@ def test_removing_callback_does_not_drop_already_queued_correlation() -> None:
     assert 29 not in client._facade_mid_map
     assert facade_mid not in client._active_facade_mids
     assert not client._facade_receipts
+
+
+def test_callback_owned_binding_retains_receipt_identity_until_dispatch() -> None:
+    client = Client()
+    client._async._engine.state = ConnectionState.CONNECTED
+    client._install_publish_dispatch(lambda *_args: None)
+    facade_mid, reserved = client._reserve_next_facade_mid()
+    assert reserved
+
+    receipt = PublishReceipt(mid=17, qos=QoS.AT_LEAST_ONCE)
+    receipt_id = id(receipt)
+    client._register_facade_mid(receipt, facade_mid)
+    receipt._settle()
+
+    # The queued dispatcher is now the owner of the façade MID. Keep the receipt
+    # itself alive until that dispatcher consumes the binding: retaining only
+    # id(receipt) would allow CPython to reuse the address for a newer receipt.
+    bound_receipt, real_mid, bound_facade_mid = client._facade_receipts[receipt_id]
+    assert bound_receipt is receipt
+    assert (real_mid, bound_facade_mid) == (17, facade_mid)
+
+    client._dispatch_publish(17, None)
+    assert receipt_id not in client._facade_receipts
+    assert facade_mid not in client._active_facade_mids
 
 
 def test_final_bulk_failure_retires_mid_even_with_publish_callback_installed() -> None:

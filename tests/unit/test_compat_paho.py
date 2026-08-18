@@ -103,7 +103,6 @@ def test_blocking_from_callback_rejected() -> None:
     client = Client(CallbackAPIVersion.VERSION2)
     # Simulate running on the network loop thread inside a user callback.
     client._thread = threading.current_thread()
-    client._in_callback = True
     try:
         coro = _noop()
         try:
@@ -114,7 +113,6 @@ def test_blocking_from_callback_rejected() -> None:
         finally:
             coro.close()  # avoid "never awaited" warning
     finally:
-        client._in_callback = False
         client._thread = None
 
 

@@ -30,7 +30,6 @@ class PublishBatchReceipt:
     __slots__ = (
         "_pending",
         "_failures",
-        "_failure_count",
         "_failure_counts",
         "_max_failure_details",
         "_failure_sink",
@@ -38,7 +37,6 @@ class PublishBatchReceipt:
         "_progress",
         "_sealed",
         "_submitted",
-        "_completed",
         "_fatal",
     )
 
@@ -55,7 +53,6 @@ class PublishBatchReceipt:
         # keyed by the stable zero-based input index stored as the value.
         self._pending: dict[int, int] = {}
         self._failures: dict[int, BaseException] = {}
-        self._failure_count = 0
         self._failure_counts: dict[str, int] = {}
         self._max_failure_details = max_failure_details
         self._failure_sink = failure_sink
@@ -63,7 +60,6 @@ class PublishBatchReceipt:
         self._progress = asyncio.Event()
         self._sealed = False
         self._submitted = 0
-        self._completed = 0
         self._fatal: BaseException | None = None
 
     @property
@@ -72,7 +68,7 @@ class PublishBatchReceipt:
 
     @property
     def completed(self) -> int:
-        return self._completed
+        return self._submitted - len(self._pending)
 
     @property
     def pending_count(self) -> int:
@@ -86,7 +82,7 @@ class PublishBatchReceipt:
     @property
     def failure_count(self) -> int:
         """Total failures, including details omitted by the retention limit."""
-        return self._failure_count
+        return sum(self._failure_counts.values())
 
     @property
     def failure_counts(self) -> Mapping[str, int]:
@@ -101,15 +97,15 @@ class PublishBatchReceipt:
         if self._fatal is not None:
             raise PublishBatchError(
                 self._failures,
-                failure_count=self._failure_count,
+                failure_count=self.failure_count,
                 failure_counts=self._failure_counts,
                 cause=self._fatal,
                 receipt=self,
             ) from self._fatal
-        if self._failure_count:
+        if self._failure_counts:
             raise PublishBatchError(
                 self._failures,
-                failure_count=self._failure_count,
+                failure_count=self.failure_count,
                 failure_counts=self._failure_counts,
                 receipt=self,
             )
@@ -117,16 +113,13 @@ class PublishBatchReceipt:
     def _register(self, mid: int | None) -> None:
         index = self._submitted
         self._submitted += 1
-        if mid is None:
-            self._completed += 1
-        else:
+        if mid is not None:
             self._pending[mid] = index
 
     def _complete(self, mid: int, error: BaseException | None = None) -> None:
         index = self._pending.pop(mid, None)
         if index is None:
             return
-        self._completed += 1
         if error is not None:
             self._record_failure(index, error)
         self._progress.set()
@@ -140,14 +133,12 @@ class PublishBatchReceipt:
         self._fatal = error
         for index in self._pending.values():
             self._record_failure(index, error)
-        self._completed += len(self._pending)
         self._pending.clear()
         self._sealed = True
         self._progress.set()
         self._done.set()
 
     def _record_failure(self, index: int, error: BaseException) -> None:
-        self._failure_count += 1
         name = type(error).__name__
         self._failure_counts[name] = self._failure_counts.get(name, 0) + 1
         limit = self._max_failure_details
