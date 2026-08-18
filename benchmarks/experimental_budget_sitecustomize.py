@@ -2,7 +2,7 @@
 
 Lab only. QoS0, publish_nowait(), publish(..., nowait=True), and WritePump stay rc7.
 Ordinary awaited QoS1/2 publish() may flush an exact short queue as one joined
-write. Batch item count is derived from a 32 KiB target and capped at 24.
+write. Local screening selected a 24 KiB target capped at 28 frames.
 """
 from __future__ import annotations
 
@@ -14,8 +14,8 @@ from mqttium.enums import QoS
 from mqttium.errors import FlowControlError
 from mqttium.types import Properties
 
-_TARGET_BYTES = 32 * 1024
-_MAX_ITEMS = 24
+_TARGET_BYTES = 24 * 1024
+_MAX_ITEMS = 28
 _MIN_ITEMS = 4
 _ESTIMATED_OVERHEAD = 16
 
