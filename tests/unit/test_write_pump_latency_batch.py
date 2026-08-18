@@ -36,26 +36,26 @@ async def test_latency_batch_waits_for_item_or_byte_threshold() -> None:
     writes: list[bytes] = []
     pump = _pump()
     _bind(pump, writes)
-    _queue(pump, *(b"x" * 64 for _ in range(31)))
+    _queue(pump, *(b"x" * 64 for _ in range(15)))
     assert pump._try_flush_latency_batch() is False
-    assert pump.queued_messages == 31
+    assert pump.queued_messages == 15
     assert writes == []
     pump.discard()
 
 
 @pytest.mark.asyncio
-async def test_latency_batch_flushes_at_32_small_frames_in_order() -> None:
+async def test_latency_batch_flushes_at_16_small_frames_in_order() -> None:
     writes: list[bytes] = []
     pump = _pump()
     _bind(pump, writes)
-    parts = [bytes([index]) * 16 for index in range(32)]
+    parts = [bytes([index]) * 16 for index in range(16)]
     _queue(pump, *parts)
     assert pump._try_flush_latency_batch() is True
     assert writes == [b"".join(parts)]
     assert pump.queued_messages == 0
     assert pump.queued_bytes == 0
     assert pump.batches == 1
-    assert pump.batched_items == 32
+    assert pump.batched_items == 16
     assert pump.batched_bytes == sum(map(len, parts))
     await asyncio.wait_for(pump.join(), timeout=0.1)
 
@@ -78,12 +78,12 @@ async def test_latency_batch_transport_refusal_restores_exact_queue_and_join_acc
     writes: list[bytes] = []
     pump = _pump()
     _bind(pump, writes, accept=False)
-    parts = [bytes([index]) * 16 for index in range(32)]
+    parts = [bytes([index]) * 16 for index in range(16)]
     _queue(pump, *parts)
     before_bytes = pump.queued_bytes
     assert pump._try_flush_latency_batch() is False
     assert pump.queued_bytes == before_bytes
-    assert [pump.queue.get_nowait() for _ in range(32)] == parts
+    assert [pump.queue.get_nowait() for _ in range(16)] == parts
     for _ in parts:
         pump.queue.task_done()
     await asyncio.wait_for(pump.join(), timeout=0.1)
