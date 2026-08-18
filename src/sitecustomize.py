@@ -38,9 +38,7 @@ def _handoff_queued_items() -> int:
     try:
         value = int(raw)
     except ValueError as exc:
-        raise RuntimeError(
-            "MQTTIUM_EXPERIMENT_HANDOFF_QUEUED must be an integer"
-        ) from exc
+        raise RuntimeError("MQTTIUM_EXPERIMENT_HANDOFF_QUEUED must be an integer") from exc
     if value <= 0:
         raise RuntimeError("MQTTIUM_EXPERIMENT_HANDOFF_QUEUED must be positive")
     return value
