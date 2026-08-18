@@ -1,4 +1,4 @@
-name: TEMP Threshold 32 40 48 Comparison
+name: TEMP Window Adaptive Batch Frontier
 
 on:
   pull_request:
@@ -12,7 +12,7 @@ permissions:
 jobs:
   compare:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
         with:
@@ -24,31 +24,29 @@ jobs:
           ref: v1.0.0rc7
           path: rc7
           persist-credentials: false
-      - uses: actions/checkout@v7
-        with:
-          ref: v1.0.0rc6
-          path: rc6
-          persist-credentials: false
 
-      - name: Prepare variants and broker
+      - name: Prepare fixed-batch variants and broker
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y -qq mosquitto mosquitto-clients
-          out="$RUNNER_TEMP/threshold-compare"
+          out="$RUNNER_TEMP/window-frontier"
           mkdir -p "$out"
           printf '%s\n' '{"eligible": true, "failures": []}' > "$out/preflight.json"
-          for kib in 32 40 48; do
-            cp -a current "candidate-$kib"
-            KIB="$kib" python3 - <<'PY'
+          for n in 2 4 8 16; do
+            cp -a current "candidate-$n"
+            N="$n" python3 - <<'PY'
           import os
           from pathlib import Path
-          p = Path(f"candidate-{os.environ['KIB']}/src/mqttium/api/_writer.py")
+          n = os.environ['N']
+          p = Path(f"candidate-{n}/src/mqttium/api/_writer.py")
           s = p.read_text()
-          old = "_LATENCY_BATCH_TARGET_BYTES = 48 * 1024"
-          assert s.count(old) == 1
-          p.write_text(s.replace(old, f"_LATENCY_BATCH_TARGET_BYTES = {os.environ['KIB']} * 1024"))
+          s = s.replace("_LATENCY_BATCH_MIN_ITEMS = 4", f"_LATENCY_BATCH_MIN_ITEMS = {n}")
+          s = s.replace("_LATENCY_BATCH_MAX_ITEMS = 16", f"_LATENCY_BATCH_MAX_ITEMS = {n}")
+          assert f"_LATENCY_BATCH_MIN_ITEMS = {n}" in s
+          assert f"_LATENCY_BATCH_MAX_ITEMS = {n}" in s
+          p.write_text(s)
           PY
           done
           cat > "$out/mosquitto.conf" <<'EOF'
@@ -59,62 +57,62 @@ jobs:
           max_queued_bytes 0
           connection_messages false
           log_type error
-          listener 11887 127.0.0.1
+          listener 11888 127.0.0.1
           EOF
           mosquitto -c "$out/mosquitto.conf" > "$out/mosquitto.log" 2>&1 &
           echo "$!" > "$out/mosquitto.pid"
           for _ in $(seq 1 50); do
-            (echo > /dev/tcp/127.0.0.1/11887) >/dev/null 2>&1 && exit 0
+            (echo > /dev/tcp/127.0.0.1/11888) >/dev/null 2>&1 && exit 0
             sleep 0.05
           done
           exit 1
 
-      - name: Measure all thresholds against rc7 and rc6
+      - name: Measure window-adaptive frontier vs rc7
         shell: bash
         run: |
           set -euo pipefail
-          out="$RUNNER_TEMP/threshold-compare"
-          for kib in 32 40 48; do
-            for base in rc7 rc6; do
-              python3 current/benchmarks/paired_network.py \
-                --base-root "$base" --candidate-root "candidate-$kib" \
-                --host 127.0.0.1 --port 11887 \
-                --policy advisory --preflight-report "$out/preflight.json" \
-                --max-baseline-cv 1.0 --min-ack-ratio 0.0 \
-                --repeat 8 \
-                --windows 20,64,128 --protocols 311 --payloads 64,4096 \
-                --count-small 2400 --count-large 2400 \
-                --target-sample-seconds 0.8 --max-count 30000 \
-                --output "$out/${kib}-${base}.json" \
-                --summary-output "$out/${kib}-${base}.md"
-            done
-          done
+          out="$RUNNER_TEMP/window-frontier"
+          run_case() {
+            n="$1"; windows="$2"
+            python3 current/benchmarks/paired_network.py \
+              --base-root rc7 --candidate-root "candidate-$n" \
+              --host 127.0.0.1 --port 11888 \
+              --policy advisory --preflight-report "$out/preflight.json" \
+              --max-baseline-cv 1.0 --min-ack-ratio 0.0 \
+              --repeat 6 \
+              --windows "$windows" --protocols 311 --payloads 64,4096 \
+              --count-small 2000 --count-large 2000 \
+              --target-sample-seconds 0.6 --max-count 24000 \
+              --output "$out/batch${n}.json" \
+              --summary-output "$out/batch${n}.md"
+          }
+          run_case 2 20
+          run_case 4 20,64
+          run_case 8 64,128
+          run_case 16 128
           python3 - "$out" <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
           import json, pathlib, sys
           out = pathlib.Path(sys.argv[1])
-          for kib in (32, 40, 48):
-              print(f"## Threshold {kib} KiB")
-              for base in ("rc7", "rc6"):
-                  p = json.load(open(out / f"{kib}-{base}.json"))
-                  print(f"### vs {base}")
-                  print('| payload | window | throughput | p50 base | p50 candidate | p95 base | p95 candidate | base CV | cand CV |')
-                  print('|---:|---:|---:|---:|---:|---:|---:|---:|---:|')
-                  for s in p['scenarios']:
-                      print(f"| {s['payload_bytes']} | {s['window']} | {s['median_candidate_over_base_ack']:.4f} | {s['base_median_p50_ms']:.3f} | {s['candidate_median_p50_ms']:.3f} | {s['base_median_p95_ms']:.3f} | {s['candidate_median_p95_ms']:.3f} | {s['base_ack_cv']:.2%} | {s['candidate_ack_cv']:.2%} |")
-                  print()
+          print('## Window-adaptive fixed-batch frontier vs rc7')
+          print('| batch | payload | window | throughput | p50 rc7 | p50 cand | p95 rc7 | p95 cand | base CV | cand CV |')
+          print('|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|')
+          for n in (2, 4, 8, 16):
+              p = json.load(open(out / f'batch{n}.json'))
+              for s in p['scenarios']:
+                  print(f"| {n} | {s['payload_bytes']} | {s['window']} | {s['median_candidate_over_base_ack']:.4f} | {s['base_median_p50_ms']:.3f} | {s['candidate_median_p50_ms']:.3f} | {s['base_median_p95_ms']:.3f} | {s['candidate_median_p95_ms']:.3f} | {s['base_ack_cv']:.2%} | {s['candidate_ack_cv']:.2%} |")
           PY
 
       - name: Upload raw measurements
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: tmp-threshold-32-40-48-${{ github.run_id }}
-          path: ${{ runner.temp }}/threshold-compare/*
+          name: tmp-window-adaptive-frontier-${{ github.run_id }}
+          path: ${{ runner.temp }}/window-frontier/*
           retention-days: 3
 
       - name: Stop broker
         if: always()
         shell: bash
         run: |
-          f="$RUNNER_TEMP/threshold-compare/mosquitto.pid"
+          f="$RUNNER_TEMP/window-frontier/mosquitto.pid"
           [ ! -f "$f" ] || kill "$(cat "$f")" 2>/dev/null || true
