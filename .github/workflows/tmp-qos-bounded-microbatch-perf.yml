@@ -1,0 +1,107 @@
+name: TEMP QoS Bounded Microbatch Perf
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - src/mqttium/api/_writer.py
+      - src/mqttium/api/async_client.py
+      - .github/workflows/tmp-qos-bounded-microbatch-perf.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tmp-qos-bounded-microbatch-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  perf:
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 9
+    env:
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: candidate
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          ref: v1.0.0rc7
+          path: base
+          persist-credentials: false
+      - name: Verify runner and start broker
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "aarch64"
+          test -z "$(pgrep mosquitto || true)"
+          out="$RUNNER_TEMP/qos-bounded-microbatch"
+          mkdir -p "$out"
+          cat > "$out/mosquitto.conf" <<'EOF'
+          persistence false
+          allow_anonymous true
+          max_inflight_messages 1000
+          max_queued_messages 100000
+          max_queued_bytes 0
+          connection_messages false
+          log_type error
+          listener 11884 127.0.0.1
+          EOF
+          taskset -c 0 mosquitto -c "$out/mosquitto.conf" > "$out/mosquitto.log" 2>&1 &
+          echo "$!" > "$out/mosquitto.pid"
+          for _ in $(seq 1 50); do
+            (echo > /dev/tcp/127.0.0.1/11884) >/dev/null 2>&1 && exit 0
+            sleep 0.05
+          done
+          exit 1
+      - name: Short writer capacity A/B
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/qos-bounded-microbatch"
+          python3 candidate/benchmarks/paired_writer_capacity.py \
+            --base-root base --candidate-root candidate \
+            --host 127.0.0.1 --port 11884 \
+            --protocol 311 --qos-values 0,1 --payload-bytes 256 \
+            --inflight 20 --outstanding 64 --max-queued 200 \
+            --warmup-count 2500 --repeat 6 \
+            --count-qos0 50000 --count-qos1 20000 \
+            --timeout 90 --cpu 2 --policy advisory \
+            --output "$out/capacity.json" \
+            --summary-output "$out/capacity.md"
+          cat "$out/capacity.md" >> "$GITHUB_STEP_SUMMARY"
+      - name: Focused network A/B
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/qos-bounded-microbatch"
+          python3 candidate/benchmarks/paired_network.py \
+            --base-root base --candidate-root candidate \
+            --host 127.0.0.1 --port 11884 \
+            --policy advisory --repeat 6 --cpu 2 \
+            --windows 20,64,128 --protocols 311 --payloads 64,4096 \
+            --count-small 4000 --count-large 1800 \
+            --target-sample-seconds 0.55 --max-count 20000 \
+            --output "$out/network.json" \
+            --summary-output "$out/network.md"
+          cat "$out/network.md" >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload measurements
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: tmp-qos-bounded-microbatch-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/qos-bounded-microbatch/*.json
+            ${{ runner.temp }}/qos-bounded-microbatch/*.md
+          retention-days: 7
+          if-no-files-found: warn
+      - name: Stop broker
+        if: always()
+        shell: bash
+        run: |
+          f="$RUNNER_TEMP/qos-bounded-microbatch/mosquitto.pid"
+          [ ! -f "$f" ] || kill "$(cat "$f")" 2>/dev/null || true
