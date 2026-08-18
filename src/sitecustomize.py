@@ -16,7 +16,7 @@ from typing import Any
 
 from mqttium.api._writer import WritePump
 
-_INLINE_BATCH_ITEMS = 4
+_INLINE_BATCH_ITEMS = 2
 _ORIGINAL_TRY_ENQUEUE = WritePump.try_enqueue
 
 
@@ -34,14 +34,14 @@ def _try_inline_microbatch(pump: WritePump) -> bool:
 
     The producer-side path is deliberately narrow:
 
-    * exactly four queued frames, so a failed speculative flush can be restored
-      without moving them behind older work;
+    * exactly the configured queued-frame group, so a failed speculative flush
+      can be restored without moving it behind older work;
     * only contiguous ``bytes`` frames, never segmented writes;
     * no writer batch in flight and no producer waiting for queue space;
-    * one existing ``write_nowait`` call for the *combined* bytes, not four
+    * one existing ``write_nowait`` call for the combined bytes, not multiple
       individual eager writes.
 
-    A tight burst therefore becomes ``1 eager + groups of 4 + writer tail``.
+    A tight burst therefore becomes ``1 eager + microbatches + writer tail``.
     A paced producer remains unchanged: its first frame still takes the normal
     zero-hop eager path.
     """
@@ -55,13 +55,10 @@ def _try_inline_microbatch(pump: WritePump) -> bool:
     ):
         return False
 
-    # The writer may not get a chance to observe this short-lived depth before
-    # the producer drains it, so preserve the queue telemetry first.
     pump._sample_high_water()  # noqa: SLF001 - intentional experiment
 
     raw: list[Any] = [queue.get_nowait() for _ in range(_INLINE_BATCH_ITEMS)]
     if any(not isinstance(item, bytes) for item in raw):
-        # qsize was exactly the batch size, so reinsertion preserves FIFO order.
         for _ in raw:
             queue.task_done()
         for item in raw:
