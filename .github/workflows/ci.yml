@@ -53,8 +53,6 @@ jobs:
         run: |
           set -euo pipefail
           export DEBIAN_FRONTEND=noninteractive
-          date -u +'apt-get update start %FT%TZ'
-          sudo -E apt-get update
           date -u +'apt-get install start %FT%TZ'
           sudo -E apt-get install -y mosquitto
           date -u +'apt-get install done %FT%TZ'
