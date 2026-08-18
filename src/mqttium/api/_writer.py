@@ -441,6 +441,13 @@ class WritePump:
                 self.enqueue_suspensions += 1
                 try:
                     await self.space.wait()
+                except asyncio.CancelledError:
+                    # notify(n) is consumed by whoever is waiting. A waiter
+                    # cancelled after being selected must hand the wakeup on,
+                    # or the remaining producers stay parked with free slots.
+                    if self.waiters > 1:
+                        self.space.notify(1)
+                    raise
                 finally:
                     self.waiters -= 1
             if epoch != self.epoch:
@@ -518,7 +525,12 @@ class WritePump:
                     async with self.space:
                         self.queued_bytes = max(0, self.queued_bytes - released)
                         if self.waiters:
-                            self.space.notify_all()
+                            # Wake at most as many waiters as items this batch
+                            # just freed. notify_all() would make every parked
+                            # producer runnable even though only len(batch)
+                            # slots exist. Lifecycle still uses notify_all()
+                            # via wake_waiters() / advance_epoch().
+                            self.space.notify(min(self.waiters, len(batch)))
         except asyncio.CancelledError:
             raise
         except Exception as exc:

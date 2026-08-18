@@ -25,6 +25,10 @@ be committed.
   and yields/retries on synchronous backpressure, matching the scheduling shape
   used by the external native capacity harness. Its primary metric is the
   candidate/base completed-rate ratio, not an absolute cross-machine rate.
+- `paired_writer_waiter_contention.py` isolates `WritePump.enqueue()` waiters
+  against a tight writer message window. It is the contention harness for the
+  targeted-wake experiment; default concurrency is 1/4/16 (64/256 are opt-in).
+  It does not replace `paired_writer_capacity.py`.
 - `application_stress.py` exercises callbacks, iterators, backpressure, memory,
   and SQLite persistence.
 - `memory_profile.py` enforces versioned tracemalloc and logical-counter limits.
