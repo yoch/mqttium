@@ -121,9 +121,7 @@ async def _measure(host: str, port: int) -> dict[str, object]:
                 parts_list = list(parts_tuple)
                 iterations = _iterations(part_bytes * part_count, 4 * 1024 * 1024)
                 for mode in modes:
-                    result = await _run_case(
-                        writer, mode, parts_list, parts_tuple, iterations
-                    )
+                    result = await _run_case(writer, mode, parts_list, parts_tuple, iterations)
                     result["family"] = "tiny_batch"
                     tiny.append(result)
                     await asyncio.sleep(0.005)
@@ -135,13 +133,9 @@ async def _measure(host: str, port: int) -> dict[str, object]:
             payload = b"p" * payload_bytes
             parts_tuple = (header, payload)
             parts_list = list(parts_tuple)
-            iterations = _iterations(
-                len(header) + payload_bytes, 32 * 1024 * 1024, minimum=32
-            )
+            iterations = _iterations(len(header) + payload_bytes, 32 * 1024 * 1024, minimum=32)
             for mode in modes:
-                result = await _run_case(
-                    writer, mode, parts_list, parts_tuple, iterations
-                )
+                result = await _run_case(writer, mode, parts_list, parts_tuple, iterations)
                 result["family"] = "segmented"
                 result["payload_bytes"] = payload_bytes
                 segmented.append(result)
@@ -187,8 +181,7 @@ def _markdown(payload: dict[str, object]) -> str:
             group = [
                 item
                 for item in tiny
-                if int(item["part_bytes"]) == part_bytes
-                and int(item["part_count"]) == part_count
+                if int(item["part_bytes"]) == part_bytes and int(item["part_count"]) == part_count
             ]
             best = max(group, key=lambda item: float(item["mib_per_second"]))
             lines.append(
@@ -208,9 +201,7 @@ def _markdown(payload: dict[str, object]) -> str:
         ]
     )
     for payload_bytes in (128 * 1024, 256 * 1024, 1024 * 1024):
-        group = [
-            item for item in segmented if int(item["payload_bytes"]) == payload_bytes
-        ]
+        group = [item for item in segmented if int(item["payload_bytes"]) == payload_bytes]
         best = max(group, key=lambda item: float(item["mib_per_second"]))
         lines.append(
             f"| {payload_bytes // 1024} KiB | {best['mode']} "
