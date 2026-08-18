@@ -10,6 +10,7 @@ import pytest
 
 from benchmarks.network_release_gate import (
     _combine_phase_payloads,
+    _parse_control_cycle_seeds,
     _parse_cycle_seeds,
     _run_engine_cycle,
     abba_cycle_ratios,
@@ -196,9 +197,12 @@ def test_phase_combiner_rejects_scenario_drift() -> None:
 
 def test_cycle_seed_schedule_is_deterministic_and_sufficient() -> None:
     assert _parse_cycle_seeds("0,1,2,3,4,5") == [0, 1, 2, 3, 4, 5]
+    assert _parse_control_cycle_seeds("0,1,2,3") == [0, 1, 2, 3]
 
-    with pytest.raises(argparse.ArgumentTypeError, match="at least six"):
+    with pytest.raises(argparse.ArgumentTypeError, match="at least 6"):
         _parse_cycle_seeds("0,1,2,3,4")
+    with pytest.raises(argparse.ArgumentTypeError, match="at least 2"):
+        _parse_control_cycle_seeds("0")
     with pytest.raises(argparse.ArgumentTypeError, match="duplicates"):
         _parse_cycle_seeds("0,1,2,3,4,4")
     with pytest.raises(argparse.ArgumentTypeError, match="invalid deterministic"):

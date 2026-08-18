@@ -11,8 +11,9 @@ silently redefine release criteria.
 ## Intended use and cost
 
 This is a **deep, manual release/audit gate**, not routine CI. On the dedicated
-Raspberry Pi 5 ARM64 runner, the complete three-phase protocol takes roughly
-20-30 minutes. Do not add it to push, pull-request or normal `main` workflows.
+Raspberry Pi 5 ARM64 runner, the protocol takes roughly 12-18 minutes: a short
+same-code smoke for each tree, then the full A/B. Do not add it to push,
+pull-request or normal `main` workflows.
 
 GitHub provides `.github/workflows/arm64-network-release-gate.yml` as an explicit
 `workflow_dispatch` entry point. It runs only when a maintainer deliberately
@@ -26,11 +27,16 @@ microbenchmarks instead.
 A release-grade run is fail-closed and executes these phases in order:
 
 1. fresh dedicated-runner preflight;
-2. baseline same-code A/A;
+2. baseline same-code A/A **smoke** (one block, four ABBA cycles);
 3. fixed 60-second quiet period and fresh preflight;
-4. candidate same-code A/A;
+4. candidate same-code A/A **smoke** (one block, four ABBA cycles);
 5. fixed 60-second quiet period and fresh preflight;
-6. baseline-versus-candidate A/B, only if both controls passed.
+6. baseline-versus-candidate A/B, only if both controls passed (two blocks,
+   six seeds, twelve ABBA cycles).
+
+Same-code controls exist to catch a drunk host or a broken acquisition chain.
+They keep the same bias and equivalence numeric bands as A/B, but they do not
+repeat the full 12-cycle schedule. The no-regression decision is the A/B phase.
 
 The quiet periods are deterministic. The gate never retries preflight until the
 host happens to look eligible. `runner_probe.py` uses the one-minute load average,
@@ -43,7 +49,7 @@ precision.
 
 ## Calibrated default cell
 
-The validated default release cell is:
+The validated default **A/B** cell is:
 
 - MQTT 3.1.1;
 - callback completion;
@@ -54,7 +60,12 @@ The validated default release cell is:
 - one complete ABBA cycle per seed and block;
 - therefore **12 complete ABBA cycles / 24 paired samples per scenario**;
 - approximately two seconds target duration per low-level sample;
-- 60-second fixed quiet periods between blocks/phases.
+- 60-second fixed quiet periods between A/B blocks and between phases.
+
+Same-code A/A controls use the same cells, thresholds and sample duration, but
+only **one block** and seeds `0,1,2,3` (four ABBA cycles). That is enough to
+reject a biased or broken host without spending two-thirds of the wall clock on
+same-code repetition.
 
 On the four-core ARM64 runner, use:
 
@@ -170,6 +181,9 @@ taskset -c 1,3 python benchmarks/network_release_gate.py \
   --completions callback \
   --payloads 64 \
   --windows 1,20,64 \
+  --control-blocks 1 \
+  --control-cycle-seeds 0,1,2,3 \
+  --ab-blocks 2 \
   --cycle-seeds 0,1,2,3,4,5 \
   --target-sample-seconds 2.0 \
   --cpu 2 \

@@ -25,6 +25,9 @@ def test_release_gate_defaults_to_validated_network_cells(
     args = parse_args()
 
     assert args.windows == "1,20,64"
+    assert args.control_blocks == 1
+    assert args.control_cycle_seeds == [0, 1, 2, 3]
+    assert args.ab_blocks == 2
     assert args.cycle_seeds == [0, 1, 2, 3, 4, 5]
     assert args.target_sample_seconds == 2.0
     assert args.inter_phase_quiet_seconds == 60.0
