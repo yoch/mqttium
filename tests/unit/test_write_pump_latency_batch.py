@@ -42,6 +42,15 @@ async def test_latency_batch_waits_for_item_or_byte_threshold() -> None:
     assert writes == []
     pump.discard()
 
+    writes = []
+    pump = _pump()
+    _bind(pump, writes)
+    _queue(pump, *(b"x" * 4096 for _ in range(11)))
+    assert pump._try_flush_latency_batch() is False
+    assert pump.queued_messages == 11
+    assert writes == []
+    pump.discard()
+
 
 @pytest.mark.asyncio
 async def test_latency_batch_flushes_at_16_small_frames_in_order() -> None:
@@ -65,7 +74,7 @@ async def test_latency_batch_flushes_on_byte_budget_before_item_cap() -> None:
     writes: list[bytes] = []
     pump = _pump()
     _bind(pump, writes)
-    parts = [b"x" * 4096 for _ in range(6)]
+    parts = [b"x" * 4096 for _ in range(12)]
     _queue(pump, *parts)
     assert pump._try_flush_latency_batch() is True
     assert writes == [b"".join(parts)]
@@ -94,7 +103,7 @@ async def test_latency_batch_segmented_item_restores_order_and_accounting() -> N
     writes: list[bytes] = []
     pump = _pump()
     _bind(pump, writes)
-    items: list[bytes | tuple[bytes, bytes]] = [b"a" * 4096] * 5 + [(b"h", b"p" * 4096)]
+    items: list[bytes | tuple[bytes, bytes]] = [b"a" * 4096] * 11 + [(b"h", b"p" * 4096)]
     _queue(pump, *items)
     before_bytes = pump.queued_bytes
     assert pump._try_flush_latency_batch() is False
@@ -111,12 +120,12 @@ async def test_latency_batch_is_disabled_while_writer_or_waiter_owns_ordering() 
         writes: list[bytes] = []
         pump = _pump()
         _bind(pump, writes)
-        _queue(pump, *(b"x" * 4096 for _ in range(6)))
+        _queue(pump, *(b"x" * 4096 for _ in range(12)))
         if state == "writing":
             pump._writing = True
         else:
             pump.waiters = 1
         assert pump._try_flush_latency_batch() is False
-        assert pump.queued_messages == 6
+        assert pump.queued_messages == 12
         assert writes == []
         pump.discard()
