@@ -1,8 +1,9 @@
 name: TEMP Current vs rc6 rc7
 
 on:
-  push:
-    branches: [bench/current-vs-rc6-rc7-temp]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
