@@ -1,4 +1,4 @@
-name: TEMP Fixed Batch Sweet Spot
+name: TEMP Adaptive 4 8 14 Validation
 
 on:
   pull_request:
@@ -24,30 +24,46 @@ jobs:
           ref: v1.0.0rc7
           path: rc7
           persist-credentials: false
-      - name: Prepare candidates and broker
+      - uses: actions/checkout@v7
+        with:
+          ref: v1.0.0rc6
+          path: rc6
+          persist-credentials: false
+
+      - name: Prepare adaptive candidate and broker
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y -qq mosquitto mosquitto-clients
-          out="$RUNNER_TEMP/sweet-spot"
+          cp -a current candidate
+          python3 - <<'PY'
+          from pathlib import Path
+
+          writer = Path('candidate/src/mqttium/api/_writer.py')
+          s = writer.read_text()
+          s = s.replace('_LATENCY_BATCH_TARGET_BYTES = 48 * 1024', '_LATENCY_BATCH_TARGET_BYTES = 56 * 1024')
+          old = '    def _try_flush_latency_batch(self) -> bool:\n'
+          new = '    def _try_flush_latency_batch(self, *, max_items: int | None = None) -> bool:\n'
+          assert s.count(old) == 1
+          s = s.replace(old, new)
+          old = '''        queued = self.queue.qsize()\n        if (\n            queued < _LATENCY_BATCH_MIN_ITEMS\n            or queued > _LATENCY_BATCH_MAX_ITEMS\n            or (\n                queued < _LATENCY_BATCH_MAX_ITEMS\n                and self.queued_bytes < _LATENCY_BATCH_TARGET_BYTES\n            )\n        ):\n'''
+          new = '''        queued = self.queue.qsize()\n        batch_max = _LATENCY_BATCH_MAX_ITEMS if max_items is None else max_items\n        if (\n            queued < _LATENCY_BATCH_MIN_ITEMS\n            or queued > batch_max\n            or (\n                queued < batch_max\n                and self.queued_bytes < _LATENCY_BATCH_TARGET_BYTES\n            )\n        ):\n'''
+          assert s.count(old) == 1
+          s = s.replace(old, new)
+          writer.write_text(s)
+
+          client = Path('candidate/src/mqttium/api/async_client.py')
+          s = client.read_text()
+          old = '                    self._write_pump._try_flush_latency_batch()\n'
+          new = '''                    flow_limit = self._engine.flow.limit\n                    if flow_limit <= 32:\n                        latency_batch_max = 4\n                    elif flow_limit <= 96:\n                        latency_batch_max = 8\n                    else:\n                        latency_batch_max = 14\n                    self._write_pump._try_flush_latency_batch(\n                        max_items=latency_batch_max\n                    )\n'''
+          assert s.count(old) == 1
+          client.write_text(s.replace(old, new))
+          PY
+
+          out="$RUNNER_TEMP/adaptive"
           mkdir -p "$out"
           printf '%s\n' '{"eligible": true, "failures": []}' > "$out/preflight.json"
-          for n in 3 4 5 6 7 8 10 12 14 16; do
-            cp -a current "candidate-$n"
-            N="$n" python3 - <<'PY'
-          import os
-          from pathlib import Path
-          n = os.environ['N']
-          p = Path(f"candidate-{n}/src/mqttium/api/_writer.py")
-          s = p.read_text()
-          s = s.replace("_LATENCY_BATCH_MIN_ITEMS = 4", f"_LATENCY_BATCH_MIN_ITEMS = {n}")
-          s = s.replace("_LATENCY_BATCH_MAX_ITEMS = 16", f"_LATENCY_BATCH_MAX_ITEMS = {n}")
-          assert f"_LATENCY_BATCH_MIN_ITEMS = {n}" in s
-          assert f"_LATENCY_BATCH_MAX_ITEMS = {n}" in s
-          p.write_text(s)
-          PY
-          done
           cat > "$out/mosquitto.conf" <<'EOF'
           persistence false
           allow_anonymous true
@@ -56,60 +72,56 @@ jobs:
           max_queued_bytes 0
           connection_messages false
           log_type error
-          listener 11889 127.0.0.1
+          listener 11890 127.0.0.1
           EOF
           mosquitto -c "$out/mosquitto.conf" > "$out/mosquitto.log" 2>&1 &
           echo "$!" > "$out/mosquitto.pid"
           for _ in $(seq 1 50); do
-            (echo > /dev/tcp/127.0.0.1/11889) >/dev/null 2>&1 && exit 0
+            (echo > /dev/tcp/127.0.0.1/11890) >/dev/null 2>&1 && exit 0
             sleep 0.05
           done
           exit 1
-      - name: Measure refined frontier vs rc7
+
+      - name: Compare adaptive candidate to rc7 and rc6
         shell: bash
         run: |
           set -euo pipefail
-          out="$RUNNER_TEMP/sweet-spot"
-          run_case() {
-            n="$1"; window="$2"
+          out="$RUNNER_TEMP/adaptive"
+          for base in rc7 rc6; do
             python3 current/benchmarks/paired_network.py \
-              --base-root rc7 --candidate-root "candidate-$n" \
-              --host 127.0.0.1 --port 11889 \
+              --base-root "$base" --candidate-root candidate \
+              --host 127.0.0.1 --port 11890 \
               --policy advisory --preflight-report "$out/preflight.json" \
               --max-baseline-cv 1.0 --min-ack-ratio 0.0 \
-              --repeat 4 \
-              --windows "$window" --protocols 311 --payloads 64,4096 \
-              --count-small 1600 --count-large 1600 \
-              --target-sample-seconds 0.5 --max-count 20000 \
-              --output "$out/b${n}-w${window}.json" \
-              --summary-output "$out/b${n}-w${window}.md"
-          }
-          run_case 3 20
-          run_case 4 20
-          for n in 5 6 7 8; do run_case "$n" 64; done
-          for n in 10 12 14 16; do run_case "$n" 128; done
+              --repeat 8 \
+              --windows 20,64,128 --protocols 311 --payloads 64,4096 \
+              --count-small 2400 --count-large 2400 \
+              --target-sample-seconds 0.8 --max-count 30000 \
+              --output "$out/${base}.json" --summary-output "$out/${base}.md"
+          done
           python3 - "$out" <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
           import json, pathlib, sys
           out = pathlib.Path(sys.argv[1])
-          print('## Refined fixed-batch sweet spots vs rc7')
-          print('| window | batch | payload | throughput | p50 rc7 | p50 cand | p95 rc7 | p95 cand | base CV | cand CV |')
-          print('|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|')
-          for w, ns in ((20,(3,4)), (64,(5,6,7,8)), (128,(10,12,14,16))):
-              for n in ns:
-                  p = json.load(open(out / f'b{n}-w{w}.json'))
-                  for s in p['scenarios']:
-                      print(f"| {w} | {n} | {s['payload_bytes']} | {s['median_candidate_over_base_ack']:.4f} | {s['base_median_p50_ms']:.3f} | {s['candidate_median_p50_ms']:.3f} | {s['base_median_p95_ms']:.3f} | {s['candidate_median_p95_ms']:.3f} | {s['base_ack_cv']:.2%} | {s['candidate_ack_cv']:.2%} |")
+          for base in ('rc7','rc6'):
+              p = json.load(open(out / f'{base}.json'))
+              print(f'## Adaptive 4/8/14 vs {base}')
+              print('| payload | window | throughput | p50 base | p50 cand | p95 base | p95 cand | base CV | cand CV |')
+              print('|---:|---:|---:|---:|---:|---:|---:|---:|---:|')
+              for s in p['scenarios']:
+                  print(f"| {s['payload_bytes']} | {s['window']} | {s['median_candidate_over_base_ack']:.4f} | {s['base_median_p50_ms']:.3f} | {s['candidate_median_p50_ms']:.3f} | {s['base_median_p95_ms']:.3f} | {s['candidate_median_p95_ms']:.3f} | {s['base_ack_cv']:.2%} | {s['candidate_ack_cv']:.2%} |")
+              print()
           PY
+
       - name: Upload raw measurements
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: tmp-fixed-batch-sweet-spot-${{ github.run_id }}
-          path: ${{ runner.temp }}/sweet-spot/*
+          name: tmp-adaptive-4-8-14-${{ github.run_id }}
+          path: ${{ runner.temp }}/adaptive/*
           retention-days: 3
       - name: Stop broker
         if: always()
         shell: bash
         run: |
-          f="$RUNNER_TEMP/sweet-spot/mosquitto.pid"
+          f="$RUNNER_TEMP/adaptive/mosquitto.pid"
           [ ! -f "$f" ] || kill "$(cat "$f")" 2>/dev/null || true
