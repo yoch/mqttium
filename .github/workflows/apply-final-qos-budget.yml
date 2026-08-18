@@ -1,0 +1,38 @@
+name: TEMP Apply final QoS budget
+
+on:
+  push:
+    branches: [fix/qos-bounded-microbatch]
+    paths:
+      - .github/workflows/apply-final-qos-budget.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: fix/qos-bounded-microbatch
+          fetch-depth: 0
+      - name: Apply final budget and remove this workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('src/mqttium/api/_writer.py')
+          s = p.read_text()
+          old = '_LATENCY_BATCH_TARGET_BYTES = 24 * 1024'
+          assert s.count(old) == 1
+          p.write_text(s.replace(old, '_LATENCY_BATCH_TARGET_BYTES = 48 * 1024'))
+          PY
+          rm .github/workflows/apply-final-qos-budget.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/mqttium/api/_writer.py .github/workflows/apply-final-qos-budget.yml
+          git commit -m "fix(writer): use 48 KiB QoS latency budget"
+          git push origin HEAD:fix/qos-bounded-microbatch
