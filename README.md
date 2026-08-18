@@ -15,7 +15,7 @@ sustained traffic, delivery confirmation or controlled resource use matter. If
 an application only sends an occasional QoS 0 message, a smaller client may be
 all it needs.
 
-> **Status:** release candidate (`1.0.0rc6`). The native Stable API is frozen
+> **Status:** release candidate (`1.0.0rc7`). The native Stable API is frozen
 > for 1.0. Provisional extension points may still evolve under their documented
 > compatibility policy.
 
