@@ -21,7 +21,7 @@ WriterFailureHandler = Callable[[BaseException], Awaitable[None]]
 
 _LATENCY_BATCH_MIN_ITEMS = 4
 _LATENCY_BATCH_MAX_ITEMS = 16
-_LATENCY_BATCH_TARGET_BYTES = 24 * 1024
+_LATENCY_BATCH_TARGET_BYTES = 48 * 1024
 
 
 class WritePump:
