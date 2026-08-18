@@ -1,4 +1,4 @@
-name: TEMP Window Adaptive Batch Frontier
+name: TEMP Fixed Batch Sweet Spot
 
 on:
   pull_request:
@@ -24,17 +24,16 @@ jobs:
           ref: v1.0.0rc7
           path: rc7
           persist-credentials: false
-
-      - name: Prepare fixed-batch variants and broker
+      - name: Prepare candidates and broker
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y -qq mosquitto mosquitto-clients
-          out="$RUNNER_TEMP/window-frontier"
+          out="$RUNNER_TEMP/sweet-spot"
           mkdir -p "$out"
           printf '%s\n' '{"eligible": true, "failures": []}' > "$out/preflight.json"
-          for n in 2 4 8 16; do
+          for n in 3 4 5 6 7 8 10 12 14 16; do
             cp -a current "candidate-$n"
             N="$n" python3 - <<'PY'
           import os
@@ -57,62 +56,60 @@ jobs:
           max_queued_bytes 0
           connection_messages false
           log_type error
-          listener 11888 127.0.0.1
+          listener 11889 127.0.0.1
           EOF
           mosquitto -c "$out/mosquitto.conf" > "$out/mosquitto.log" 2>&1 &
           echo "$!" > "$out/mosquitto.pid"
           for _ in $(seq 1 50); do
-            (echo > /dev/tcp/127.0.0.1/11888) >/dev/null 2>&1 && exit 0
+            (echo > /dev/tcp/127.0.0.1/11889) >/dev/null 2>&1 && exit 0
             sleep 0.05
           done
           exit 1
-
-      - name: Measure window-adaptive frontier vs rc7
+      - name: Measure refined frontier vs rc7
         shell: bash
         run: |
           set -euo pipefail
-          out="$RUNNER_TEMP/window-frontier"
+          out="$RUNNER_TEMP/sweet-spot"
           run_case() {
-            n="$1"; windows="$2"
+            n="$1"; window="$2"
             python3 current/benchmarks/paired_network.py \
               --base-root rc7 --candidate-root "candidate-$n" \
-              --host 127.0.0.1 --port 11888 \
+              --host 127.0.0.1 --port 11889 \
               --policy advisory --preflight-report "$out/preflight.json" \
               --max-baseline-cv 1.0 --min-ack-ratio 0.0 \
-              --repeat 6 \
-              --windows "$windows" --protocols 311 --payloads 64,4096 \
-              --count-small 2000 --count-large 2000 \
-              --target-sample-seconds 0.6 --max-count 24000 \
-              --output "$out/batch${n}.json" \
-              --summary-output "$out/batch${n}.md"
+              --repeat 4 \
+              --windows "$window" --protocols 311 --payloads 64,4096 \
+              --count-small 1600 --count-large 1600 \
+              --target-sample-seconds 0.5 --max-count 20000 \
+              --output "$out/b${n}-w${window}.json" \
+              --summary-output "$out/b${n}-w${window}.md"
           }
-          run_case 2 20
-          run_case 4 20,64
-          run_case 8 64,128
-          run_case 16 128
+          run_case 3 20
+          run_case 4 20
+          for n in 5 6 7 8; do run_case "$n" 64; done
+          for n in 10 12 14 16; do run_case "$n" 128; done
           python3 - "$out" <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
           import json, pathlib, sys
           out = pathlib.Path(sys.argv[1])
-          print('## Window-adaptive fixed-batch frontier vs rc7')
-          print('| batch | payload | window | throughput | p50 rc7 | p50 cand | p95 rc7 | p95 cand | base CV | cand CV |')
+          print('## Refined fixed-batch sweet spots vs rc7')
+          print('| window | batch | payload | throughput | p50 rc7 | p50 cand | p95 rc7 | p95 cand | base CV | cand CV |')
           print('|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|')
-          for n in (2, 4, 8, 16):
-              p = json.load(open(out / f'batch{n}.json'))
-              for s in p['scenarios']:
-                  print(f"| {n} | {s['payload_bytes']} | {s['window']} | {s['median_candidate_over_base_ack']:.4f} | {s['base_median_p50_ms']:.3f} | {s['candidate_median_p50_ms']:.3f} | {s['base_median_p95_ms']:.3f} | {s['candidate_median_p95_ms']:.3f} | {s['base_ack_cv']:.2%} | {s['candidate_ack_cv']:.2%} |")
+          for w, ns in ((20,(3,4)), (64,(5,6,7,8)), (128,(10,12,14,16))):
+              for n in ns:
+                  p = json.load(open(out / f'b{n}-w{w}.json'))
+                  for s in p['scenarios']:
+                      print(f"| {w} | {n} | {s['payload_bytes']} | {s['median_candidate_over_base_ack']:.4f} | {s['base_median_p50_ms']:.3f} | {s['candidate_median_p50_ms']:.3f} | {s['base_median_p95_ms']:.3f} | {s['candidate_median_p95_ms']:.3f} | {s['base_ack_cv']:.2%} | {s['candidate_ack_cv']:.2%} |")
           PY
-
       - name: Upload raw measurements
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: tmp-window-adaptive-frontier-${{ github.run_id }}
-          path: ${{ runner.temp }}/window-frontier/*
+          name: tmp-fixed-batch-sweet-spot-${{ github.run_id }}
+          path: ${{ runner.temp }}/sweet-spot/*
           retention-days: 3
-
       - name: Stop broker
         if: always()
         shell: bash
         run: |
-          f="$RUNNER_TEMP/window-frontier/mosquitto.pid"
+          f="$RUNNER_TEMP/sweet-spot/mosquitto.pid"
           [ ! -f "$f" ] || kill "$(cat "$f")" 2>/dev/null || true
