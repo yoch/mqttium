@@ -560,10 +560,7 @@ class ProtocolEngine:
                 raise ProtocolError(
                     f"Unexpected {raw.packet_type.name} while state={self.state.name}"
                 )
-            effect_start = len(self._effects)
             handler(raw)
-            if self.negotiated.maximum_packet_size is not None:
-                self._validate_new_outbound_effects(effect_start)
         except MandatoryResponseTooLargeError:
             # A legal peer packet-size limit can make a mandatory local ACK
             # impossible. Preserve that local failure for the runtime instead
@@ -947,25 +944,6 @@ class ProtocolEngine:
             raise PacketTooLargeError(
                 f"Encoded packet size {size} exceeds broker maximum_packet_size {limit}"
             )
-
-    def _validate_new_outbound_effects(self, start: int) -> None:
-        """Refuse a handler batch if any SEND violates the broker's packet limit.
-
-        Inbound automatic acknowledgements are emitted as effects rather than
-        returned from a public queue_* method. Validate the whole newly-produced
-        batch before exposing any of it so an oversized PUBACK/PUBREC/PUBCOMP
-        cannot escape while its paired MESSAGE remains application-visible.
-
-        `handle_raw` only calls this when the broker negotiated a limit, so the
-        common case costs no call at all.
-        """
-        try:
-            for effect in self._effects[start:]:
-                if effect.kind is EffectKind.SEND:
-                    self._check_outbound_size(effect.data)
-        except PacketTooLargeError:
-            del self._effects[start:]
-            raise
 
     def _check_subscribe_capabilities(
         self,
