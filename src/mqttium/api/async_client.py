@@ -1037,6 +1037,8 @@ class AsyncClient:
                         self._schedule_effect_flush()
                     else:
                         await self._drain_effects()
+                if not nowait and receipt.qos != QoS.AT_MOST_ONCE:
+                    self._write_pump._try_flush_latency_batch()
                 return receipt
             try:
                 await self._publish_space.wait()

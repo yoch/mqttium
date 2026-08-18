@@ -19,6 +19,10 @@ from mqttium.transport.writes import WriteItem, item_size
 
 WriterFailureHandler = Callable[[BaseException], Awaitable[None]]
 
+_LATENCY_BATCH_MIN_ITEMS = 4
+_LATENCY_BATCH_MAX_ITEMS = 32
+_LATENCY_BATCH_TARGET_BYTES = 24 * 1024
+
 
 class WritePump:
     """Serialize transport writes and own their bounded queue invariant."""
@@ -310,6 +314,63 @@ class WritePump:
             return True
         self.queue.put_nowait(item)
         self.queued_bytes += size
+        return True
+
+    def _try_flush_latency_batch(self) -> bool:
+        """Flush one short queued burst without waiting for the writer task.
+
+        This is a latency shortcut for already-admitted QoS 1/2 publishes. It
+        deliberately lives in the queue owner so byte accounting, task_done(),
+        and restoration stay atomic with respect to the event loop. The caller
+        decides *when* latency-sensitive traffic may use it; QoS 0 and nowait
+        paths never call this method.
+
+        Only the whole current queue is considered. That makes a declined
+        ``write_nowait`` exactly restorable without moving earlier frames behind
+        later ones. Segmented items are left to the writer task because joining
+        them would defeat their copy-avoidance contract.
+        """
+        queued = self.queue.qsize()
+        if (
+            queued < _LATENCY_BATCH_MIN_ITEMS
+            or queued > _LATENCY_BATCH_MAX_ITEMS
+            or (
+                queued < _LATENCY_BATCH_MAX_ITEMS
+                and self.queued_bytes < _LATENCY_BATCH_TARGET_BYTES
+            )
+        ):
+            return False
+        write_nowait = self._write_nowait
+        if write_nowait is None or self._writing or self.waiters:
+            return False
+
+        self._sample_high_water(queued)
+        items = [self.queue.get_nowait() for _ in range(queued)]
+        if any(isinstance(item, tuple) for item in items):
+            for _ in items:
+                self.queue.task_done()
+            for item in items:
+                self.queue.put_nowait(item)
+            return False
+
+        parts = [item for item in items if isinstance(item, bytes)]
+        combined = b"".join(parts)
+        if not write_nowait(combined):
+            for _ in items:
+                self.queue.task_done()
+            for item in items:
+                self.queue.put_nowait(item)
+            return False
+
+        for _ in items:
+            self.queue.task_done()
+        self.queued_bytes -= len(combined)
+        if self.queued_bytes != 0:
+            raise AssertionError("writer queued-byte accounting mismatch after latency batch")
+        self.batches += 1
+        self.batched_items += queued
+        self.batched_bytes += len(combined)
+        self.last_outbound = time.monotonic()
         return True
 
     def try_enqueue_many(
