@@ -2,7 +2,7 @@
 
 Lab only. QoS0, publish_nowait(), publish(..., nowait=True), and WritePump stay rc7.
 Ordinary awaited QoS1/2 publish() may flush an exact short queue as one joined
-write. Local screening selected a 24 KiB target capped at 28 frames.
+write. The final screening candidate uses a 24 KiB target capped at 32 frames.
 """
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from mqttium.errors import FlowControlError
 from mqttium.types import Properties
 
 _TARGET_BYTES = 24 * 1024
-_MAX_ITEMS = 28
+_MAX_ITEMS = 32
 _MIN_ITEMS = 4
 _ESTIMATED_OVERHEAD = 16
 
