@@ -141,20 +141,3 @@ A hard-killed job can still bypass cleanup. If a later job reports a
 pre-existing runner-owned Mosquitto process, inspect and terminate it before
 retrying. Do not weaken the preflight to make the benchmark proceed on a dirty
 host.
-
-## ChatGPT Persistent Workbench
-
-The pull-request controller smoke runs on `ubuntu-24.04`, because it imports
-controller code from the pull request and must not execute that code directly
-on a self-hosted machine.
-
-The actual workbench remains a separate trusted self-hosted workload. Its
-runner selector is configurable with:
-
-- `CGW_RUNNER_ARCH` (default: `x64`);
-- `CGW_RUNNER_LABEL` (default: `cgw`).
-
-The workbench needs Docker and a persistent workspace. Docker access is
-effectively host-root-equivalent, so do not point it at the Raspberry Pi merely
-to reuse the ARM64 CI runner. Only do so if the Pi is intentionally isolated
-for that trust level and the required ARM64 container images are available.

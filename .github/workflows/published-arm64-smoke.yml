@@ -66,8 +66,22 @@ jobs:
           rm -rf "$root"
           mkdir -p "$root/tls"
 
+          # Debian 13 OpenSSL rejects a CA without keyUsage
+          # (ssl.SSLCertVerificationError: CA cert does not include key usage extension).
+          cat > "$root/tls/ca.cnf" <<'EOF'
+          [req]
+          distinguished_name = dn
+          x509_extensions = v3_ca
+          prompt = no
+          [dn]
+          CN = MQTTium ARM64 Test CA
+          [v3_ca]
+          basicConstraints = critical,CA:TRUE
+          keyUsage = critical,keyCertSign,cRLSign
+          subjectKeyIdentifier = hash
+          EOF
           openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
-            -subj '/CN=MQTTium ARM64 Test CA' \
+            -config "$root/tls/ca.cnf" \
             -keyout "$root/tls/ca.key" \
             -out "$root/tls/ca.crt"
           openssl req -newkey rsa:2048 -nodes \

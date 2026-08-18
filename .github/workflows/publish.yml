@@ -194,7 +194,22 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq mosquitto openssl
           mkdir -p /tmp/mqttium-release-tls
-          openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj '/CN=MQTTium Release Test CA' -keyout /tmp/mqttium-release-tls/ca.key -out /tmp/mqttium-release-tls/ca.crt
+          cat > /tmp/mqttium-release-tls/ca.cnf <<'EOF'
+          [req]
+          distinguished_name = dn
+          x509_extensions = v3_ca
+          prompt = no
+          [dn]
+          CN = MQTTium Release Test CA
+          [v3_ca]
+          basicConstraints = critical,CA:TRUE
+          keyUsage = critical,keyCertSign,cRLSign
+          subjectKeyIdentifier = hash
+          EOF
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+            -config /tmp/mqttium-release-tls/ca.cnf \
+            -keyout /tmp/mqttium-release-tls/ca.key \
+            -out /tmp/mqttium-release-tls/ca.crt
           openssl req -newkey rsa:2048 -nodes -subj '/CN=localhost' -keyout /tmp/mqttium-release-tls/server.key -out /tmp/mqttium-release-tls/server.csr
           printf 'subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n' > /tmp/mqttium-release-tls/server.ext
           openssl x509 -req -days 1 -in /tmp/mqttium-release-tls/server.csr -CA /tmp/mqttium-release-tls/ca.crt -CAkey /tmp/mqttium-release-tls/ca.key -CAcreateserial -extfile /tmp/mqttium-release-tls/server.ext -out /tmp/mqttium-release-tls/server.crt

@@ -41,8 +41,20 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq mosquitto openssl
           mkdir -p /tmp/mqttium-beta-tls
+          cat > /tmp/mqttium-beta-tls/ca.cnf <<'EOF'
+          [req]
+          distinguished_name = dn
+          x509_extensions = v3_ca
+          prompt = no
+          [dn]
+          CN = MQTTium Beta Test CA
+          [v3_ca]
+          basicConstraints = critical,CA:TRUE
+          keyUsage = critical,keyCertSign,cRLSign
+          subjectKeyIdentifier = hash
+          EOF
           openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
-            -subj '/CN=MQTTium Beta Test CA' \
+            -config /tmp/mqttium-beta-tls/ca.cnf \
             -keyout /tmp/mqttium-beta-tls/ca.key \
             -out /tmp/mqttium-beta-tls/ca.crt
           openssl req -newkey rsa:2048 -nodes \
