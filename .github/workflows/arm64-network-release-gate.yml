@@ -136,7 +136,7 @@ jobs:
             --max-count 60000 \
             --timeout 60 \
             --cpu 2 \
-            --inter-phase-quiet-seconds 30 \
+            --inter-phase-quiet-seconds 60 \
             --policy strict \
             --output "$RUNNER_TEMP/mqttium-network-release/result.json"
 
