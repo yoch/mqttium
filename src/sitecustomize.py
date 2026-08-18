@@ -1,30 +1,19 @@
-"""Experiment-only cooperative QoS writer handoff for ARM64 measurement.
+"""Experiment-only awaited QoS microbatch lab.
 
 Loaded through PYTHONPATH/sitecustomize by benchmark workers only.
 
-Policy under test:
-- preserve rc7's synchronous publish_nowait path exactly;
-- preserve rc7's WritePump/eager/batching policy exactly;
-- for ordinary awaited QoS 1/2 publish(), yield one event-loop turn after a
-  small bounded queue has accumulated behind the first eager write;
-- the existing writer then drains that short group through write_many() ->
-  StreamWriter.writelines(), keeping scatter/gather in the writer task where
-  it can be amortized and preserving producer-side admission capacity.
+The experiment preserves rc7's WritePump, publish_nowait(), QoS 0 path and
+publish(..., nowait=True) path. Only ordinary awaited QoS 1/2 publish() may
+flush an exact short queue as one joined write. The batch size is selected by
+MQTTIUM_EXPERIMENT_BATCH_ITEMS so the temporary labs can sweep nearby points.
 
-The default is seven queued frames (roughly eight publications in the common
-case because rc7 sends the first frame eagerly).  The temporary ARM64 lab may
-override it with MQTTIUM_EXPERIMENT_HANDOFF_QUEUED to compare nearby fixed
-handoff points without creating one branch per threshold.
-
-Do not ship this monkeypatch or the environment knob. A surviving policy must
-be implemented normally with ordering, lifecycle, fairness and backpressure
-tests.
+Do not ship this monkeypatch or environment knob.
 """
 
 from __future__ import annotations
 
-import asyncio
 import os
+import time
 
 from mqttium.api.async_client import AsyncClient
 from mqttium.api.models import PublishReceipt
@@ -33,21 +22,56 @@ from mqttium.errors import FlowControlError
 from mqttium.types import Properties
 
 
-def _handoff_queued_items() -> int:
-    raw = os.environ.get("MQTTIUM_EXPERIMENT_HANDOFF_QUEUED", "7")
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise RuntimeError("MQTTIUM_EXPERIMENT_HANDOFF_QUEUED must be an integer") from exc
-    if value <= 0:
-        raise RuntimeError("MQTTIUM_EXPERIMENT_HANDOFF_QUEUED must be positive")
+def _batch_items() -> int:
+    value = int(os.environ.get("MQTTIUM_EXPERIMENT_BATCH_ITEMS", "4"))
+    if value < 2:
+        raise RuntimeError("MQTTIUM_EXPERIMENT_BATCH_ITEMS must be >= 2")
     return value
 
 
-_HANDOFF_QUEUED_ITEMS = _handoff_queued_items()
+_BATCH_ITEMS = _batch_items()
 
 
-async def _publish_cooperative_handoff(
+def _try_flush_awaited_qos_batch(client: AsyncClient) -> bool:
+    pump = client._write_pump  # noqa: SLF001 - experiment
+    queue = pump.queue
+    if queue.qsize() != _BATCH_ITEMS:
+        return False
+
+    write_nowait = pump._write_nowait  # noqa: SLF001 - experiment
+    if write_nowait is None or pump._writing or pump.waiters:  # noqa: SLF001
+        return False
+
+    pump._sample_high_water()  # noqa: SLF001 - experiment
+    raw = [queue.get_nowait() for _ in range(_BATCH_ITEMS)]
+    if any(not isinstance(item, bytes) for item in raw):
+        for _ in raw:
+            queue.task_done()
+        for item in raw:
+            queue.put_nowait(item)
+        return False
+
+    combined = b"".join(raw)
+    if not write_nowait(combined):
+        for _ in raw:
+            queue.task_done()
+        for item in raw:
+            queue.put_nowait(item)
+        return False
+
+    for _ in raw:
+        queue.task_done()
+    pump.queued_bytes -= len(combined)
+    if pump.queued_bytes < 0:
+        raise AssertionError("writer queued-byte accounting underflow")
+    pump.batches += 1
+    pump.batched_items += len(raw)
+    pump.batched_bytes += len(combined)
+    pump.last_outbound = time.monotonic()
+    return True
+
+
+async def _publish_awaited_microbatch(
     self: AsyncClient,
     topic: str,
     payload: bytes | str = b"",
@@ -57,12 +81,11 @@ async def _publish_cooperative_handoff(
     properties: Properties | None = None,
     nowait: bool = False,
 ) -> PublishReceipt:
-    # rc7 AsyncClient.publish(), with one cooperative handoff before the
-    # successful return for ordinary awaited QoS 1/2 publications.
+    # rc7 AsyncClient.publish(), with one experiment-only QoS1/2 flush.
     data = payload.encode("utf-8") if isinstance(payload, str) else payload
     while True:
         wait_for_space = False
-        async with self._engine_lock:  # noqa: SLF001 - copied rc7 method body
+        async with self._engine_lock:  # noqa: SLF001
             try:
                 direct = self._try_direct_qos0_publish(  # noqa: SLF001
                     topic,
@@ -116,16 +139,10 @@ async def _publish_cooperative_handoff(
                 else:
                     await self._drain_effects()  # noqa: SLF001
 
-            if (
-                not nowait
-                and receipt.qos != QoS.AT_MOST_ONCE
-                and self._write_pump.queue.qsize() >= _HANDOFF_QUEUED_ITEMS  # noqa: SLF001
-            ):
-                # Let the already-awake rc7 writer consume the queued group.
-                # Unlike producer-side micro-flushes this performs no transport
-                # syscall/copy here; StreamTransport.write_many() retains the
-                # existing writelines/scatter-gather path.
-                await asyncio.sleep(0)
+            if not nowait and receipt.qos != QoS.AT_MOST_ONCE:
+                pump = self._write_pump  # noqa: SLF001
+                if pump.queue.qsize() == _BATCH_ITEMS:
+                    _try_flush_awaited_qos_batch(self)
             return receipt
         try:
             await self._publish_space.wait()  # noqa: SLF001
@@ -133,4 +150,4 @@ async def _publish_cooperative_handoff(
             self._publish_waiters -= 1  # noqa: SLF001
 
 
-AsyncClient.publish = _publish_cooperative_handoff  # type: ignore[method-assign]
+AsyncClient.publish = _publish_awaited_microbatch  # type: ignore[method-assign]
