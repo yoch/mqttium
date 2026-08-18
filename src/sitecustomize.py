@@ -5,24 +5,26 @@ Loaded through PYTHONPATH/sitecustomize by benchmark workers only.
 Policy under test:
 - preserve rc7's synchronous publish_nowait path exactly;
 - preserve rc7's WritePump/eager/batching policy exactly;
-- for ordinary awaited QoS 1/2 publish(), when seven frames have accumulated
-  behind the first eager write, yield one event-loop turn instead of writing
-  from the producer;
+- for ordinary awaited QoS 1/2 publish(), yield one event-loop turn after a
+  small bounded queue has accumulated behind the first eager write;
 - the existing writer then drains that short group through write_many() ->
   StreamWriter.writelines(), keeping scatter/gather in the writer task where
   it can be amortized and preserving producer-side admission capacity.
 
-Seven queued frames correspond to roughly eight publications in the common
-case because rc7 sends the first frame eagerly.  This is intentionally a simple
-fixed handoff point, not a timing heuristic.
+The default is seven queued frames (roughly eight publications in the common
+case because rc7 sends the first frame eagerly).  The temporary ARM64 lab may
+override it with MQTTIUM_EXPERIMENT_HANDOFF_QUEUED to compare nearby fixed
+handoff points without creating one branch per threshold.
 
-Do not ship this monkeypatch. A surviving policy must be implemented normally
-with ordering, lifecycle, fairness and backpressure tests.
+Do not ship this monkeypatch or the environment knob. A surviving policy must
+be implemented normally with ordering, lifecycle, fairness and backpressure
+tests.
 """
 
 from __future__ import annotations
 
 import asyncio
+import os
 
 from mqttium.api.async_client import AsyncClient
 from mqttium.api.models import PublishReceipt
@@ -30,7 +32,21 @@ from mqttium.enums import QoS
 from mqttium.errors import FlowControlError
 from mqttium.types import Properties
 
-_HANDOFF_QUEUED_ITEMS = 7
+
+def _handoff_queued_items() -> int:
+    raw = os.environ.get("MQTTIUM_EXPERIMENT_HANDOFF_QUEUED", "7")
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(
+            "MQTTIUM_EXPERIMENT_HANDOFF_QUEUED must be an integer"
+        ) from exc
+    if value <= 0:
+        raise RuntimeError("MQTTIUM_EXPERIMENT_HANDOFF_QUEUED must be positive")
+    return value
+
+
+_HANDOFF_QUEUED_ITEMS = _handoff_queued_items()
 
 
 async def _publish_cooperative_handoff(
