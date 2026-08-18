@@ -1,0 +1,104 @@
+name: TEMP QoS Budget Sweep
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/tmp-qos-budget-sweep.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tmp-qos-budget-sweep-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sweep:
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 12
+    env:
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: source
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          ref: v1.0.0rc7
+          path: base
+          persist-credentials: false
+      - name: Prepare candidates and broker
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "aarch64"
+          test -z "$(pgrep mosquitto || true)"
+          out="$RUNNER_TEMP/qos-budget-sweep"
+          mkdir -p "$out"
+          for kib in 24 32 48 64; do
+            cp -a source "candidate-$kib"
+            KIB="$kib" python3 - <<'PY'
+          import os
+          from pathlib import Path
+          p = Path(f"candidate-{os.environ['KIB']}/src/mqttium/api/_writer.py")
+          s = p.read_text()
+          old = "_LATENCY_BATCH_TARGET_BYTES = 24 * 1024"
+          assert s.count(old) == 1
+          p.write_text(s.replace(old, f"_LATENCY_BATCH_TARGET_BYTES = {os.environ['KIB']} * 1024"))
+          PY
+          done
+          cat > "$out/mosquitto.conf" <<'EOF'
+          persistence false
+          allow_anonymous true
+          max_inflight_messages 1000
+          max_queued_messages 100000
+          max_queued_bytes 0
+          connection_messages false
+          log_type error
+          listener 11885 127.0.0.1
+          EOF
+          taskset -c 0 mosquitto -c "$out/mosquitto.conf" > "$out/mosquitto.log" 2>&1 &
+          echo "$!" > "$out/mosquitto.pid"
+          for _ in $(seq 1 50); do
+            (echo > /dev/tcp/127.0.0.1/11885) >/dev/null 2>&1 && exit 0
+            sleep 0.05
+          done
+          exit 1
+      - name: Sweep byte budgets at 4 KiB
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/qos-budget-sweep"
+          for kib in 24 32 48 64; do
+            echo "### Budget ${kib} KiB" | tee -a "$GITHUB_STEP_SUMMARY"
+            python3 source/benchmarks/paired_network.py \
+              --base-root base --candidate-root "candidate-$kib" \
+              --host 127.0.0.1 --port 11885 \
+              --policy advisory --repeat 8 --cpu 2 \
+              --windows 20,64,128 --protocols 311 --payloads 4096 \
+              --count-small 1800 --count-large 1800 \
+              --target-sample-seconds 0.65 --max-count 24000 \
+              --output "$out/network-${kib}.json" \
+              --summary-output "$out/network-${kib}.md" || true
+            cat "$out/network-${kib}.md" | tee -a "$GITHUB_STEP_SUMMARY"
+          done
+      - name: Upload measurements
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: tmp-qos-budget-sweep-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/qos-budget-sweep/*.json
+            ${{ runner.temp }}/qos-budget-sweep/*.md
+          retention-days: 7
+          if-no-files-found: warn
+      - name: Stop broker
+        if: always()
+        shell: bash
+        run: |
+          f="$RUNNER_TEMP/qos-budget-sweep/mosquitto.pid"
+          [ ! -f "$f" ] || kill "$(cat "$f")" 2>/dev/null || true
