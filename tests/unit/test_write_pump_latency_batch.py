@@ -42,6 +42,7 @@ async def test_latency_batch_waits_for_item_or_byte_threshold() -> None:
     assert writes == []
     pump.discard()
 
+    # Eleven 4 KiB frames stay below the final 48 KiB byte budget.
     writes = []
     pump = _pump()
     _bind(pump, writes)
@@ -74,6 +75,7 @@ async def test_latency_batch_flushes_on_byte_budget_before_item_cap() -> None:
     writes: list[bytes] = []
     pump = _pump()
     _bind(pump, writes)
+    # Twelve 4 KiB frames hit 48 KiB before the 16-frame cap.
     parts = [b"x" * 4096 for _ in range(12)]
     _queue(pump, *parts)
     assert pump._try_flush_latency_batch() is True
