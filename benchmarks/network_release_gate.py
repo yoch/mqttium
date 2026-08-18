@@ -491,9 +491,15 @@ def _run_phase(
     candidate_root: Path,
     raw_dir: Path,
     initial_quiet_seconds: float,
+    blocks: int,
+    cycle_seeds: list[int],
 ) -> dict[str, Any]:
+    if blocks < 1:
+        raise ValueError("phase must acquire at least one block")
+    if not cycle_seeds:
+        raise ValueError("phase must acquire at least one cycle seed")
     cycle_payloads: list[tuple[int, int, dict[str, Any]]] = []
-    for block in range(2):
+    for block in range(blocks):
         quiet_seconds = initial_quiet_seconds if block == 0 else args.inter_phase_quiet_seconds
         block_label = f"{label}-block-{block + 1}"
         preflight_report = _fresh_preflight(
@@ -502,7 +508,7 @@ def _run_phase(
             raw_dir=raw_dir,
             quiet_seconds=quiet_seconds,
         )
-        for hash_seed in args.cycle_seeds:
+        for hash_seed in cycle_seeds:
             cycle_label = f"{block_label}-seed-{hash_seed}"
             print(f"{cycle_label}: acquiring one complete ABBA cycle")
             payload = _run_engine_cycle(
@@ -532,9 +538,13 @@ def _write_result(output: Path, payload: dict[str, Any]) -> None:
         f"- Status: **{payload['status']}**",
         f"- Base: `{payload['base_sha']}`",
         f"- Candidate: `{payload['candidate_sha']}`",
-        f"- ABBA cycles per scenario: `{sampling['cycles_per_scenario']}`",
-        f"- Paired samples per scenario: `{sampling['pairs_per_scenario']}`",
-        f"- Hash-seed schedule per block: `{','.join(map(str, sampling['cycle_seeds']))}`",
+        f"- Control: `{sampling['control_blocks']}` block(s), seeds "
+        f"`{','.join(map(str, sampling['control_cycle_seeds']))}` "
+        f"({sampling['control_cycles_per_scenario']} ABBA cycles)",
+        f"- A/B: `{sampling['ab_blocks']}` block(s), seeds "
+        f"`{','.join(map(str, sampling['cycle_seeds']))}` "
+        f"({sampling['cycles_per_scenario']} ABBA cycles / "
+        f"{sampling['pairs_per_scenario']} paired samples)",
         "",
     ]
     failures = payload.get("failures", [])
@@ -581,17 +591,21 @@ def parent(args: argparse.Namespace) -> int:
     candidate_root = args.candidate_root.resolve()
     raw_dir = args.output.parent / f"{args.output.stem}-raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
-    cycles_per_scenario = 2 * len(args.cycle_seeds)
+    control_cycles = args.control_blocks * len(args.control_cycle_seeds)
+    ab_cycles = args.ab_blocks * len(args.cycle_seeds)
     result: dict[str, Any] = {
         "status": "running",
         "policy": args.policy,
         "base_sha": _git_sha(base_root),
         "candidate_sha": _git_sha(candidate_root),
         "sampling": {
-            "blocks": 2,
+            "control_blocks": args.control_blocks,
+            "control_cycle_seeds": args.control_cycle_seeds,
+            "control_cycles_per_scenario": control_cycles,
+            "ab_blocks": args.ab_blocks,
             "cycle_seeds": args.cycle_seeds,
-            "cycles_per_scenario": cycles_per_scenario,
-            "pairs_per_scenario": 2 * cycles_per_scenario,
+            "cycles_per_scenario": ab_cycles,
+            "pairs_per_scenario": 2 * ab_cycles,
             "engine_pairs_per_seed": 2,
         },
         "thresholds": {
@@ -630,6 +644,8 @@ def parent(args: argparse.Namespace) -> int:
             candidate_root=base_root,
             raw_dir=raw_dir,
             initial_quiet_seconds=0.0,
+            blocks=args.control_blocks,
+            cycle_seeds=args.control_cycle_seeds,
         )
         base_control = _control_evaluations(args, base_control_payload)
         result["base_control"] = [_evaluation_dict(item) for item in base_control]
@@ -647,6 +663,8 @@ def parent(args: argparse.Namespace) -> int:
             candidate_root=candidate_root,
             raw_dir=raw_dir,
             initial_quiet_seconds=args.inter_phase_quiet_seconds,
+            blocks=args.control_blocks,
+            cycle_seeds=args.control_cycle_seeds,
         )
         candidate_control = _control_evaluations(args, candidate_control_payload)
         result["candidate_control"] = [_evaluation_dict(item) for item in candidate_control]
@@ -664,6 +682,8 @@ def parent(args: argparse.Namespace) -> int:
             candidate_root=candidate_root,
             raw_dir=raw_dir,
             initial_quiet_seconds=args.inter_phase_quiet_seconds,
+            blocks=args.ab_blocks,
+            cycle_seeds=args.cycle_seeds,
         )
         ab = evaluate_ab_payload(
             ab_payload,
@@ -686,10 +706,10 @@ def parent(args: argparse.Namespace) -> int:
         return 2 if args.policy == "strict" else 0
 
 
-def _parse_cycle_seeds(value: str) -> list[int]:
+def _parse_seed_schedule(value: str, *, minimum: int, kind: str) -> list[int]:
     raw = [item.strip() for item in value.split(",") if item.strip()]
     if not raw:
-        raise argparse.ArgumentTypeError("cycle seed schedule cannot be empty")
+        raise argparse.ArgumentTypeError(f"{kind} seed schedule cannot be empty")
     seeds: list[int] = []
     for item in raw:
         try:
@@ -701,11 +721,21 @@ def _parse_cycle_seeds(value: str) -> list[int]:
                 "hash seeds must fit PYTHONHASHSEED range 0..4294967295"
             )
         seeds.append(seed)
-    if len(seeds) < 6:
-        raise argparse.ArgumentTypeError("release gate requires at least six cycle seeds per block")
+    if len(seeds) < minimum:
+        raise argparse.ArgumentTypeError(
+            f"{kind} requires at least {minimum} cycle seed(s) per block"
+        )
     if len(set(seeds)) != len(seeds):
         raise argparse.ArgumentTypeError("cycle seed schedule must not contain duplicates")
     return seeds
+
+
+def _parse_cycle_seeds(value: str) -> list[int]:
+    return _parse_seed_schedule(value, minimum=6, kind="A/B phase")
+
+
+def _parse_control_cycle_seeds(value: str) -> list[int]:
+    return _parse_seed_schedule(value, minimum=2, kind="same-code control")
 
 
 def parse_args() -> argparse.Namespace:
@@ -719,6 +749,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--completions", default="callback")
     parser.add_argument("--payloads", default="64")
     parser.add_argument("--windows", default="1,20,64")
+    parser.add_argument("--control-blocks", type=int, default=1)
+    parser.add_argument(
+        "--control-cycle-seeds",
+        type=_parse_control_cycle_seeds,
+        default=_parse_control_cycle_seeds("0,1,2"),
+    )
+    parser.add_argument("--ab-blocks", type=int, default=2)
     parser.add_argument(
         "--cycle-seeds",
         type=_parse_cycle_seeds,
@@ -731,7 +768,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument("--cpu", type=int)
     parser.add_argument("--runner-probe", type=Path, default=Path("benchmarks/runner_probe.py"))
-    parser.add_argument("--inter-phase-quiet-seconds", type=float, default=60.0)
+    parser.add_argument("--inter-phase-quiet-seconds", type=float, default=30.0)
     parser.add_argument("--control-throughput-bias-floor", type=float, default=0.98)
     parser.add_argument("--control-throughput-bias-ceiling", type=float, default=1.02)
     parser.add_argument("--control-throughput-floor", type=float, default=0.95)
@@ -747,6 +784,10 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.target_sample_seconds <= 0:
         parser.error("--target-sample-seconds must be positive")
+    if args.control_blocks < 1:
+        parser.error("--control-blocks must be at least 1")
+    if args.ab_blocks < 1:
+        parser.error("--ab-blocks must be at least 1")
     if args.inter_phase_quiet_seconds < 0:
         parser.error("--inter-phase-quiet-seconds must be non-negative")
     if not 0 < args.control_throughput_floor < 1 < args.control_throughput_ceiling:
