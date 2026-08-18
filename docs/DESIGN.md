@@ -66,6 +66,11 @@ the direct path cannot split a batch across the two paths.
 and message budgets, wake-up condition, batching, and writer task. Wire order is
 therefore the same as engine effect order.
 
+The writer task builds a FIFO batch of at most 256 items and 64 KiB, always
+admitting the first item even when it exceeds the byte cap. A leftover that
+would cross the quantum is held for the next batch rather than re-queued, because
+`asyncio.Queue` cannot put an item back at the head.
+
 Large payloads may be written in segments, but only the writer controls the
 stream. Capacity is returned after the corresponding queued data is drained.
 

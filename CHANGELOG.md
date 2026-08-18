@@ -6,6 +6,13 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Changed
+
+- Writer-task batches are now also capped at 64 KiB in addition to 256 items, so
+  a burst of large frames cannot monopolize the writer for as long as 256 of
+  them previously could. The first item of a batch is always admitted even if it
+  exceeds 64 KiB. FIFO order is unchanged.
+
 ## [1.0.0rc7] - 2026-08-18
 
 ### Fixed

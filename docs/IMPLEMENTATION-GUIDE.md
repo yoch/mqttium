@@ -8,12 +8,14 @@ this guide takes precedence over the higher-level description in `DESIGN.md`.
 
 1. **One writer.** Only `WritePump` writes to a transport, and at most one write
    is in flight at a time. FIFO effect order is wire order. The write need not
-   happen on the writer *task*: when nothing is queued, no write is in flight
-   and no producer is waiting for queue space, `WritePump` may buffer a
-   non-segmented frame straight through the transport's optional
-   `write_nowait`, which saves the event-loop turn the writer task would
-   otherwise cost. A segmented frame is never written that way, because it is
-   two consecutive writes and nothing may land between them.
+   happen on the writer *task*: when nothing is queued, no leftover item is held
+   for the next byte-capped batch, no write is in flight and no producer is
+   waiting for queue space, `WritePump` may buffer a non-segmented frame
+   straight through the transport's optional `write_nowait`, which saves the
+   event-loop turn the writer task would otherwise cost. A segmented frame is
+   never written that way, because it is two consecutive writes and nothing may
+   land between them. The writer task itself drains at most 256 items and 64 KiB
+   per batch (the first item is always admitted even if it is larger than 64 KiB).
 2. **One effect stream.** Engine sessions emit through `ProtocolEngine`; no
    component keeps a second effect list.
 3. **Register completion before sending.** A receipt or SUBACK/UNSUBACK future

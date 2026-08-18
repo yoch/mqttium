@@ -22,6 +22,11 @@ WriterFailureHandler = Callable[[BaseException], Awaitable[None]]
 _LATENCY_BATCH_MIN_ITEMS = 4
 _LATENCY_BATCH_MAX_ITEMS = 16
 _LATENCY_BATCH_TARGET_BYTES = 48 * 1024
+# Writer-task quantum. Distinct from the latency-microbatch target above: that
+# path flushes an already-queued QoS 1/2 burst through write_nowait; this cap
+# only bounds how much the writer task will take from the queue in one turn.
+_WRITER_BATCH_MAX_ITEMS = 256
+_WRITER_BATCH_MAX_BYTES = 64 * 1024
 
 
 class WritePump:
@@ -75,14 +80,20 @@ class WritePump:
         # invalidate it so a callback from an old transport can never arm a new
         # connection.
         self._eager_generation = 0
+        # Item that did not fit the current writer batch. asyncio.Queue has no
+        # peek/putleft: putting it back would append at the tail and break FIFO,
+        # so the pump holds it as the first item of the next batch.
+        self._held: WriteItem | None = None
 
     @property
     def queued_messages(self) -> int:
-        return self.queue.qsize()
+        # qsize() undercounts by one while a byte-quantum leftover is held: that
+        # item was already get()'d, but it is still owed to the wire.
+        return self.queue.qsize() + (1 if self._held is not None else 0)
 
     def stats(self) -> WriterStats:
         """Snapshot the queue and the batching decisions taken so far."""
-        queued_messages = self.queue.qsize()
+        queued_messages = self.queued_messages
         return WriterStats(
             queued_messages=queued_messages,
             queued_bytes=self.queued_bytes,
@@ -102,7 +113,7 @@ class WritePump:
         )
 
     def _sample_high_water(self, queued_messages: int | None = None) -> None:
-        messages = self.queue.qsize() if queued_messages is None else queued_messages
+        messages = self.queued_messages if queued_messages is None else queued_messages
         if messages > self.high_water_messages:
             self.high_water_messages = messages
         if self.queued_bytes > self.high_water_bytes:
@@ -118,6 +129,7 @@ class WritePump:
             generation == self._eager_generation
             and self._write_nowait is not None
             and not self._writing
+            and self._held is None
             and self.queue.empty()
         ):
             self._eager_armed = True
@@ -125,6 +137,10 @@ class WritePump:
     def reset(self) -> None:
         """Start a new transport epoch with an empty queue."""
         self._sample_high_water()
+        # Abandon the leftover with the old queue: join() waiters of the
+        # previous epoch are not transferred, matching items still sitting in
+        # the replaced queue.
+        self._held = None
         self.queue = asyncio.Queue()
         self.queued_bytes = 0
         # The next start() rebinds it. Until then there is no transport this
@@ -179,6 +195,11 @@ class WritePump:
         self._sample_high_water()
         self._drop_eager_binding()
         self._writing = False
+        held = self._held
+        self._held = None
+        if held is not None:
+            # Already get()'d, so join() still owes a task_done.
+            self.queue.task_done()
         while True:
             try:
                 self.queue.get_nowait()
@@ -195,7 +216,7 @@ class WritePump:
         queued_messages: int | None = None,
         queued_bytes: int | None = None,
     ) -> bool:
-        messages = self.queue.qsize() if queued_messages is None else queued_messages
+        messages = self.queued_messages if queued_messages is None else queued_messages
         bytes_used = self.queued_bytes if queued_bytes is None else queued_bytes
         if messages >= self.max_messages:
             return False
@@ -219,7 +240,7 @@ class WritePump:
         against running totals rather than against the live queue, so the two
         must be told the same state or this names the wrong bound.
         """
-        messages = self.queue.qsize() if queued_messages is None else queued_messages
+        messages = self.queued_messages if queued_messages is None else queued_messages
         bytes_used = self.queued_bytes if queued_bytes is None else queued_bytes
         if messages >= self.max_messages:
             return (
@@ -239,7 +260,7 @@ class WritePump:
         reported bound is the one that stopped the batch rather than whatever
         the live queue happens to show.
         """
-        messages = self.queue.qsize()
+        messages = self.queued_messages
         bytes_used = self.queued_bytes
         for item in items:
             size = item_size(item)
@@ -265,7 +286,7 @@ class WritePump:
         on its second frame and lets the existing batch path do the throughput
         work, while a paced producer can still take the zero-hop path each time.
 
-        Wire order is preserved because the five original conditions still hold
+        Wire order is preserved because the original conditions still hold
         together, and each one is load-bearing:
 
         * ``_write_nowait`` is absent unless the transport's write is a plain
@@ -276,6 +297,8 @@ class WritePump:
         * an empty queue is what makes this ordered: ``put_nowait`` leaves the
           item visible until the writer pops it, so a non-empty queue always
           means an earlier frame is still owed;
+        * a leftover ``_held`` item is an earlier frame already taken from the
+          queue for the next byte-capped batch, so it must not be overtaken;
         * a producer suspended in :meth:`enqueue` must not be overtaken;
         * segmented items are never written eagerly, for the reason above.
 
@@ -287,6 +310,7 @@ class WritePump:
             not self._eager_armed
             or write_nowait is None
             or self._writing
+            or self._held is not None
             or self.waiters
             or isinstance(item, tuple)
             or not self.queue.empty()
@@ -330,9 +354,10 @@ class WritePump:
         later ones. Segmented items are left to the writer task because joining
         them would defeat their copy-avoidance contract.
         """
-        queued = self.queue.qsize()
+        queued = self.queued_messages
         if (
-            queued < _LATENCY_BATCH_MIN_ITEMS
+            self._held is not None
+            or queued < _LATENCY_BATCH_MIN_ITEMS
             or queued > _LATENCY_BATCH_MAX_ITEMS
             or (
                 queued < _LATENCY_BATCH_MAX_ITEMS
@@ -388,7 +413,7 @@ class WritePump:
         if not items:
             return True
 
-        messages = self.queue.qsize()
+        messages = self.queued_messages
         bytes_used = self.queued_bytes
         for item in items:
             size = item_size(item)
@@ -425,17 +450,17 @@ class WritePump:
             while True:
                 if epoch != self.epoch:
                     raise StaleConnectionEffect
-                messages_full = self.queue.qsize() >= self.max_messages
+                messages_full = self.queued_messages >= self.max_messages
                 # Allow a single oversized item into an empty queue (segmented
                 # payloads can exceed max_bytes by the MQTT header).
                 bytes_blocked = self.queued_bytes + size > self.max_bytes and not (
-                    self.queued_bytes == 0 and self.queue.empty()
+                    self.queued_bytes == 0 and self.queued_messages == 0
                 )
                 if not messages_full and not bytes_blocked:
                     break
                 # Escape hatch: if the writer is idle but space accounting is
                 # wedged, do not block protocol forever.
-                if self.queue.empty() and self.queued_bytes == 0:
+                if self.queued_messages == 0 and self.queued_bytes == 0:
                     break
                 self.waiters += 1
                 self.enqueue_suspensions += 1
@@ -477,17 +502,31 @@ class WritePump:
                 # Reaching the idle queue wait is an independent re-arm point:
                 # it covers a batch that just drained even when no eager write
                 # scheduled the producer-side next-turn callback.
-                if queue.empty() and self._write_nowait is not None:
-                    self._eager_armed = True
-                first = await queue.get()
+                held = self._held
+                if held is not None:
+                    self._held = None
+                    first = held
+                else:
+                    if queue.empty() and self._write_nowait is not None:
+                        self._eager_armed = True
+                    first = await queue.get()
                 self._eager_armed = False
-                self._sample_high_water(queue.qsize() + 1)
+                self._sample_high_water(self.queued_messages + 1)
                 batch: list[WriteItem] = [first]
-                while len(batch) < 256:
+                batch_bytes = item_size(first)
+                while len(batch) < _WRITER_BATCH_MAX_ITEMS:
                     try:
-                        batch.append(queue.get_nowait())
+                        item = queue.get_nowait()
                     except asyncio.QueueEmpty:
                         break
+                    size = item_size(item)
+                    if batch_bytes + size > _WRITER_BATCH_MAX_BYTES:
+                        # Already get()'d; putting it back would append at the
+                        # tail. Hold it as the first item of the next batch.
+                        self._held = item
+                        break
+                    batch.append(item)
+                    batch_bytes += size
                 self.batches += 1
                 self.batched_items += len(batch)
                 # Set before the first await and held across the whole batch:

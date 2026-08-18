@@ -138,12 +138,14 @@ surfaces as a confusing failure elsewhere:
 1. **Single writer.** `WritePump` is the only component that writes to the transport, and at most
    one write is in flight at a time. Wire order == the order of engine `SEND` effects. Nothing
    outside `WritePump` calls `transport.write`. The writing *task* is not fixed: when the queue is
-   empty, no write is in flight and nobody is waiting on `enqueue()`, `try_enqueue` buffers a
+   empty, no leftover `_held` item is waiting for the next byte-capped batch, no write is in flight
+   and nobody is waiting on `enqueue()`, `try_enqueue` buffers a
    non-segmented frame straight through the transport's optional `write_nowait` and skips the
    writer-task wakeup (one event-loop turn per outbound packet, PUBACKs included). The `_writing`
    flag is what makes that safe — a segmented `(header, payload)` item is two consecutive writes,
    and a frame landing between them would corrupt the packet — so never take the eager path for a
-   tuple item, and never clear `_writing` before the whole batch has been written.
+   tuple item, and never clear `_writing` before the whole batch has been written. The writer task
+   drains at most 256 items and 64 KiB per batch; the first item is always admitted.
 2. **Receipts before wire.** A future/receipt keyed by a packet id is registered *before* the packet
    can leave; the ACK may land during the very next `await`.
 3. **Owned bytes.** The engine only ever receives owned `bytes`; `IncrementalDecoder` copies at the
