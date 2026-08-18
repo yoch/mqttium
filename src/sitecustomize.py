@@ -1,27 +1,32 @@
-"""Experiment-only writer microbatch patch for ARM64 paired measurements.
+"""Experiment-only async-publish microbatch patch for ARM64 measurements.
 
-This file is intentionally outside the ``mqttium`` package.  Python imports
-``sitecustomize`` at interpreter startup when the candidate ``src`` directory
-is on ``PYTHONPATH``, which lets the existing paired harness measure an exact
-runtime hypothesis without changing the baseline tree or release-gate policy.
+This file is intentionally outside the ``mqttium`` package.  It is loaded only
+when an experimental candidate ``src`` directory is placed on ``PYTHONPATH`` by
+the existing paired benchmark workers.  The release baseline is untouched.
 
-Do not ship this file.  If the hypothesis survives the release-grade gates, the
-mechanism must be implemented normally inside ``WritePump`` with focused tests.
+The experiment keeps ``WritePump.try_enqueue`` and ``publish_nowait`` exactly as
+shipped in rc7.  Only ``AsyncClient.publish`` gets a post-admission opportunistic
+flush, testing whether bounded queue residence can recover async network latency
+without giving back the synchronous capacity fix from #254.
+
+Do not ship this file.  A surviving hypothesis must be implemented normally in
+``WritePump``/``AsyncClient`` with focused tests.
 """
 
 from __future__ import annotations
 
 import time
+from functools import wraps
 from typing import Any
 
+from mqttium.api.async_client import AsyncClient
 from mqttium.api._writer import WritePump
 
-_INLINE_BATCH_ITEMS = 4
-_ORIGINAL_TRY_ENQUEUE = WritePump.try_enqueue
+_INLINE_BATCH_ITEMS = 2
+_ORIGINAL_PUBLISH = AsyncClient.publish
 
 
 def _restore_batch(pump: WritePump, items: list[bytes]) -> None:
-    """Restore a speculative whole-queue batch without changing join accounting."""
     queue = pump.queue
     for _ in items:
         queue.task_done()
@@ -29,22 +34,8 @@ def _restore_batch(pump: WritePump, items: list[bytes]) -> None:
         queue.put_nowait(item)
 
 
-def _try_inline_microbatch(pump: WritePump) -> bool:
-    """Flush one exact small burst group without waiting for the writer task.
-
-    The producer-side path is deliberately narrow:
-
-    * exactly the configured queued-frame group, so a failed speculative flush
-      can be restored without moving it behind older work;
-    * only contiguous ``bytes`` frames, never segmented writes;
-    * no writer batch in flight and no producer waiting for queue space;
-    * one existing ``write_nowait`` call for the combined bytes, not multiple
-      individual eager writes.
-
-    A tight burst therefore becomes ``1 eager + microbatches + writer tail``.
-    A paced producer remains unchanged: its first frame still takes the normal
-    zero-hop eager path.
-    """
+def _try_flush_async_publish_batch(pump: WritePump) -> bool:
+    """Flush one exact contiguous group without changing the base writer policy."""
     write_nowait = pump._write_nowait  # noqa: SLF001 - intentional experiment
     queue = pump.queue
     if (
@@ -56,7 +47,6 @@ def _try_inline_microbatch(pump: WritePump) -> bool:
         return False
 
     pump._sample_high_water()  # noqa: SLF001 - intentional experiment
-
     raw: list[Any] = [queue.get_nowait() for _ in range(_INLINE_BATCH_ITEMS)]
     if any(not isinstance(item, bytes) for item in raw):
         for _ in raw:
@@ -84,18 +74,15 @@ def _try_inline_microbatch(pump: WritePump) -> bool:
     return True
 
 
-def _try_enqueue_with_inline_microbatch(
-    pump: WritePump,
-    item: Any,
-    *,
-    epoch: int | None = None,
-) -> bool:
-    eager_before = pump.eager_writes
-    accepted = _ORIGINAL_TRY_ENQUEUE(pump, item, epoch=epoch)
-    if not accepted or pump.eager_writes != eager_before:
-        return accepted
-    _try_inline_microbatch(pump)
-    return accepted
+@wraps(_ORIGINAL_PUBLISH)
+async def _publish_with_async_microbatch(
+    client: AsyncClient,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    receipt = await _ORIGINAL_PUBLISH(client, *args, **kwargs)
+    _try_flush_async_publish_batch(client._write_pump)  # noqa: SLF001
+    return receipt
 
 
-WritePump.try_enqueue = _try_enqueue_with_inline_microbatch  # type: ignore[method-assign]
+AsyncClient.publish = _publish_with_async_microbatch  # type: ignore[method-assign]
