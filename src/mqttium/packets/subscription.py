@@ -62,6 +62,8 @@ class SubscribePacket:
     def encode(self, protocol: MQTTProtocolVersion = MQTTProtocolVersion.MQTTv311) -> bytes:
         if protocol is MQTTProtocolVersion.MQTTv5:
             return encode_subscribe_v5(self.mid, self.subscriptions, self.properties)
+        if self.properties is not None and self.properties.values:
+            raise ProtocolError("SUBSCRIBE properties require MQTT 5")
         return encode_subscribe_v311(self.mid, self.subscriptions, self.properties)
 
 
@@ -93,6 +95,8 @@ class UnsubscribePacket:
     def encode(self, protocol: MQTTProtocolVersion = MQTTProtocolVersion.MQTTv311) -> bytes:
         if protocol is MQTTProtocolVersion.MQTTv5:
             return encode_unsubscribe_v5(self.mid, self.topics, self.properties)
+        if self.properties is not None and self.properties.values:
+            raise ProtocolError("UNSUBSCRIBE properties require MQTT 5")
         return encode_unsubscribe_v311(self.mid, self.topics, self.properties)
 
 

@@ -37,6 +37,11 @@ def _validate_connect(
     """Check the wire contract before any byte is assembled, and resolve Will QoS."""
     if not 0 <= keepalive <= 65535:
         raise ProtocolError("keepalive must be in 0..65535")
+    if not v5:
+        if properties is not None and properties.values:
+            raise ProtocolError("CONNECT properties require MQTT 5")
+        if will_properties is not None and will_properties.values:
+            raise ProtocolError("Will properties require MQTT 5")
     try:
         encoded_will_qos = QoS(will_qos)
     except ValueError as exc:

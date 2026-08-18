@@ -14,7 +14,7 @@ from mqttium.types import Properties
 
 
 def _properties(protocol: MQTTProtocolVersion, rich: bool) -> Properties | None:
-    if protocol is MQTTProtocolVersion.MQTTv311 or not rich:
+    if protocol is not MQTTProtocolVersion.MQTTv5 or not rich:
         return None
     properties = Properties()
     properties.add_user_property("source", "nowait-wire-size")

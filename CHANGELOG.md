@@ -8,6 +8,10 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Reject non-empty MQTT 5 `Properties` on MQTT 3.1/3.1.1 CONNECT, Will,
+  PUBLISH, SUBSCRIBE and UNSUBSCRIBE encodings instead of silently dropping
+  fields that cannot exist on the selected wire protocol. Empty `Properties()`
+  remains wire-equivalent to no properties.
 - Purge flow-blocked retransmissions from the outbound queue when a CONNACK
   reports Session Present 0. `replay_session()` can leave WAIT_\* records in
   the queue when the broker's Receive Maximum window cannot admit them; after

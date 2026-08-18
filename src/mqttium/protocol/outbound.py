@@ -319,18 +319,17 @@ class OutboundSession:
             topic_size = validate_publish_topic(topic)
             topic_bytes = None
 
-        if (
-            properties is not None
-            and self._is_v5
-            and properties.get("subscription_identifier") is not None
-        ):
-            # [MQTT-3.3.4-6]: a PUBLISH sent from a Client to a Server MUST NOT
-            # contain a Subscription Identifier. The property table cannot catch
-            # this, because it is legal on the inbound PUBLISH the broker sends
-            # us — the restriction is on the direction, not on the packet type.
-            raise ProtocolError(
-                "subscription_identifier is not allowed on an outbound PUBLISH [MQTT-3.3.4-6]"
-            )
+        if properties is not None:
+            if not self._is_v5 and properties.values:
+                raise ProtocolError("PUBLISH properties require MQTT 5")
+            if self._is_v5 and properties.get("subscription_identifier") is not None:
+                # [MQTT-3.3.4-6]: a PUBLISH sent from a Client to a Server MUST NOT
+                # contain a Subscription Identifier. The property table cannot catch
+                # this, because it is legal on the inbound PUBLISH the broker sends
+                # us — the restriction is on the direction, not on the packet type.
+                raise ProtocolError(
+                    "subscription_identifier is not allowed on an outbound PUBLISH [MQTT-3.3.4-6]"
+                )
 
         if engine.state == ConnectionState.CONNECTED:
             negotiated = engine.negotiated
