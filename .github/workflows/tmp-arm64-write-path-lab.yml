@@ -1,12 +1,12 @@
 name: TEMP ARM64 Write Path Lab
 
 on:
-  push:
-    branches:
-      - agent/qos-cooperative-handoff8
+  pull_request:
+    branches: [main]
     paths:
       - src/sitecustomize.py
       - benchmarks/experimental_write_paths.py
+      - .github/workflows/tmp-linux-write-path-lab.yml
       - .github/workflows/tmp-arm64-write-path-lab.yml
   workflow_dispatch:
 
@@ -14,7 +14,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: tmp-arm64-write-path-lab
+  group: tmp-arm64-write-path-lab-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -29,7 +29,7 @@ jobs:
       - name: Check out experimental candidate
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           path: candidate
           persist-credentials: false
 
