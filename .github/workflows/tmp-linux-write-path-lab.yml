@@ -42,7 +42,6 @@ jobs:
           mkdir -p "$RUNNER_TEMP/mqttium-linux-write-lab"
           cat > "$RUNNER_TEMP/mqttium-linux-write-lab/sink.py" <<'PY'
           import socket
-
           with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
               server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
               server.bind(("127.0.0.1", 11885))
@@ -80,7 +79,6 @@ jobs:
           path: |
             ${{ runner.temp }}/mqttium-linux-write-lab/*.json
             ${{ runner.temp }}/mqttium-linux-write-lab/*.md
-            ${{ runner.temp }}/mqttium-linux-write-lab/*.log
           retention-days: 7
           if-no-files-found: warn
 
@@ -93,7 +91,7 @@ jobs:
             kill "$(cat "$pidfile")" 2>/dev/null || true
           fi
 
-  handoff:
+  microbatch:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -117,11 +115,7 @@ jobs:
 
       - name: Install Mosquitto
         timeout-minutes: 3
-        shell: bash
-        run: |
-          set -euo pipefail
-          export DEBIAN_FRONTEND=noninteractive
-          sudo -E apt-get install -y mosquitto mosquitto-clients
+        run: sudo apt-get install -y mosquitto mosquitto-clients
 
       - name: Start isolated Mosquitto
         shell: bash
@@ -145,50 +139,43 @@ jobs:
             (echo > /dev/tcp/127.0.0.1/11884) >/dev/null 2>&1 && exit 0
             sleep 0.05
           done
-          cat "$out/mosquitto.log"
           exit 1
 
-      - name: Short cooperative-handoff sweep
+      - name: Short awaited-microbatch sweep
         shell: bash
         run: |
           set -euo pipefail
           out="$RUNNER_TEMP/mqttium-linux-write-lab"
-          for threshold in 3 7 15 31; do
-            echo "=== queued threshold $threshold ==="
-            MQTTIUM_EXPERIMENT_HANDOFF_QUEUED="$threshold" \
+          for batch in 2 4 8 16; do
+            echo "=== batch $batch ==="
+            MQTTIUM_EXPERIMENT_BATCH_ITEMS="$batch" \
               python candidate/benchmarks/paired_network.py \
                 --base-root base --candidate-root candidate \
                 --host 127.0.0.1 --port 11884 \
                 --policy advisory --repeat 4 \
-                --windows 64,128 --protocols 311 --payloads 64,4096 \
+                --windows 32,64,128 --protocols 311 --payloads 64,4096 \
                 --count-small 2500 --count-large 1200 \
                 --target-sample-seconds 0.35 --max-count 12000 \
-                --output "$out/handoff-$threshold.json" \
-                --summary-output "$out/handoff-$threshold.md"
+                --output "$out/batch-$batch.json" \
+                --summary-output "$out/batch-$batch.md"
           done
 
-      - name: Summarize hosted handoff sweep
+      - name: Summarize hosted microbatch sweep
         shell: bash
         run: |
-          set -euo pipefail
           python - "$RUNNER_TEMP/mqttium-linux-write-lab" >> "$GITHUB_STEP_SUMMARY" <<'PY'
-          import json
-          import sys
+          import json, sys
           from pathlib import Path
-
           root = Path(sys.argv[1])
-          print("\n## Hosted Linux cooperative handoff sweep\n")
-          print("| queued threshold | payload | window | throughput vs rc7 | delivery p50 vs rc7 | delivery p95 vs rc7 |")
+          print("\n## Hosted Linux awaited microbatch sweep\n")
+          print("| batch | payload | window | throughput vs rc7 | delivery p50 vs rc7 | delivery p95 vs rc7 |")
           print("|---:|---:|---:|---:|---:|---:|")
-          for threshold in (3, 7, 15, 31):
-              payload = json.loads((root / f"handoff-{threshold}.json").read_text())
+          for batch in (2, 4, 8, 16):
+              payload = json.loads((root / f"batch-{batch}.json").read_text())
               for scenario in payload["scenarios"]:
                   p50 = scenario["candidate_median_p50_ms"] / scenario["base_median_p50_ms"]
                   p95 = scenario["candidate_median_p95_ms"] / scenario["base_median_p95_ms"]
-                  print(
-                      f"| {threshold} | {scenario['payload_bytes']} | {scenario['window']} | "
-                      f"{scenario['median_candidate_over_base_ack']:.4f}× | {p50:.4f}× | {p95:.4f}× |"
-                  )
+                  print(f"| {batch} | {scenario['payload_bytes']} | {scenario['window']} | {scenario['median_candidate_over_base_ack']:.4f}× | {p50:.4f}× | {p95:.4f}× |")
           PY
 
       - name: Upload hosted measurements
@@ -199,7 +186,6 @@ jobs:
           path: |
             ${{ runner.temp }}/mqttium-linux-write-lab/*.json
             ${{ runner.temp }}/mqttium-linux-write-lab/*.md
-            ${{ runner.temp }}/mqttium-linux-write-lab/*.log
           retention-days: 7
           if-no-files-found: warn
 
