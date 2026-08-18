@@ -108,8 +108,7 @@ async def test_cancellation_while_waiting_leaves_no_publication_state() -> None:
 async def test_nowait_writer_rejection_is_atomic_for_qos0() -> None:
     client = AsyncClient(max_outbound_messages=1, max_outbound_bytes=1024)
     client._engine.state = ConnectionState.CONNECTED
-    client._outbound.put_nowait(b"occupied")
-    client._outbound_bytes = len(b"occupied")
+    assert client._write_pump.try_enqueue(b"occupied") is True
 
     with pytest.raises(FlowControlError):
         await client.publish("admission/writer", b"payload", qos=0, nowait=True)
@@ -123,8 +122,7 @@ async def test_nowait_writer_rejection_is_atomic_for_qos0() -> None:
 async def test_nowait_writer_rejection_is_atomic_for_qos1() -> None:
     client = AsyncClient(max_outbound_messages=1, max_outbound_bytes=1024)
     client._engine.state = ConnectionState.CONNECTED
-    client._outbound.put_nowait(b"occupied")
-    client._outbound_bytes = len(b"occupied")
+    assert client._write_pump.try_enqueue(b"occupied") is True
     before_ids = len(client._engine.packet_ids)
     before_records = list(client._engine.store.out_items())
 
@@ -141,8 +139,7 @@ async def test_nowait_writer_rejection_is_atomic_for_qos1() -> None:
 async def test_nowait_batch_writer_rejection_is_atomic() -> None:
     client = AsyncClient(max_outbound_messages=1, max_outbound_bytes=1024)
     client._engine.state = ConnectionState.CONNECTED
-    client._outbound.put_nowait(b"occupied")
-    client._outbound_bytes = len(b"occupied")
+    assert client._write_pump.try_enqueue(b"occupied") is True
 
     with pytest.raises(PublishBatchError) as exc_info:
         await client.publish_many(

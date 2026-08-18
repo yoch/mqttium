@@ -167,7 +167,8 @@ have rolled back individual rows.
 
 Writer, outbound inflight, inbound persistence, ingress, and application
 delivery budgets are independent. Do not reuse one counter as a proxy for
-another lifetime.
+another lifetime. `max_outbound_messages` bounds writer-resident admitted
+frames, including the writer's active batch, not only `queue.qsize()`.
 
 `can_ever_admit_publish()` considers configured limits, not current occupancy.
 It distinguishes work that should wait from work that can never fit.

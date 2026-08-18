@@ -176,7 +176,7 @@ async def test_intentional_disconnect_callback_receives_none() -> None:
 async def test_disconnect_does_not_wait_for_space_in_saturated_writer_queue() -> None:
     client = AsyncClient(
         client_id="bounded-disconnect",
-        max_outbound_messages=1,
+        max_outbound_messages=2,
         max_outbound_bytes=1024,
     )
     transport = _BlockedWriterTransport()
@@ -197,6 +197,9 @@ async def test_disconnect_does_not_wait_for_space_in_saturated_writer_queue() ->
     await asyncio.wait_for(transport.write_started.wait(), timeout=1.0)
     await client.publish("blocked/queued", b"2")
     assert client._write_pump.queued_messages == 1
+    assert client._write_pump.resident_messages == 2
+
+    await asyncio.wait_for(client.disconnect(), timeout=0.5)
 
     await asyncio.wait_for(client.disconnect(), timeout=0.5)
 

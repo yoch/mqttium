@@ -41,3 +41,23 @@ Because the target benefit is a stricter invariant rather than raw speed:
 - code complexity must stay small enough that the invariant is directly auditable.
 
 Do not merge from this experiment until the benchmark artefacts and a complexity/risk assessment are attached to the PR discussion.
+
+## Outcome
+
+Candidate implemented in this worktree: one `_resident_messages` counter,
+incremented only after an item is actually queued and decremented only when
+the item has completed or is discarded. Eager writes do not consume it; batch
+extraction does not reduce it. `queued_messages` remains `queue.qsize()`.
+`can_enqueue_size` / `enqueue` / `try_enqueue_many` / nowait preflight admit
+against the resident count. Correctness tests are in
+`tests/unit/test_write_pump_resident.py`.
+
+Performance evidence is still pending an eligible-runner A/A + A/B
+(`benchmarks/paired_writer_capacity.py` and the rest of the contract above).
+This VM is not a release runner; hosted/cloud numbers are not merge-quality.
+
+Complexity/risk: the change is one integer plus two one-line helpers on paths
+that already mutate `queued_bytes`. The main risk is a leak if a new completion
+path forgets `_release_resident`; `reset`/`discard` and `_run`'s existing
+`finally` cover epoch transitions and mid-batch cancel. No extra scheduler
+machinery. Do not merge until the eligible-runner artefacts exist.

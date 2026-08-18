@@ -6,6 +6,13 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- `max_outbound_messages` now counts writer-resident admitted frames, including
+  the writer's active batch, rather than only `queue.qsize()`. Extracting a
+  batch no longer opens a window that could admit more resident frames than
+  configured. `WriterStats.queued_messages` is still the live queue size.
+
 ## [1.0.0rc7] - 2026-08-18
 
 ### Fixed
