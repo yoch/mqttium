@@ -1,0 +1,215 @@
+name: TEMP ARM64 Write Path Lab
+
+on:
+  push:
+    branches:
+      - agent/qos-cooperative-handoff8
+    paths:
+      - src/sitecustomize.py
+      - benchmarks/experimental_write_paths.py
+      - .github/workflows/tmp-arm64-write-path-lab.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tmp-arm64-write-path-lab
+  cancel-in-progress: true
+
+jobs:
+  lab:
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 15
+    env:
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+    steps:
+      - name: Check out experimental candidate
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          path: candidate
+          persist-credentials: false
+
+      - name: Check out rc7 baseline
+        uses: actions/checkout@v7
+        with:
+          ref: v1.0.0rc7
+          path: base
+          persist-credentials: false
+
+      - name: Verify dedicated ARM64 runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "aarch64"
+          python3 - <<'PY'
+          import sys
+          if sys.version_info[:2] != (3, 13):
+              raise SystemExit(f"expected Python 3.13, got {sys.version}")
+          PY
+          command -v taskset
+          command -v mosquitto
+          command -v mosquitto_sub
+          if pgrep -a mosquitto; then
+            echo "pre-existing Mosquitto would contaminate measurements" >&2
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/mqttium-write-lab"
+
+      - name: Start raw TCP sink on CPU 0
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/mqttium-write-lab"
+          cat > "$out/sink.py" <<'PY'
+          import socket
+
+          with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+              server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+              server.bind(("127.0.0.1", 11885))
+              server.listen()
+              while True:
+                  conn, _ = server.accept()
+                  with conn:
+                      while conn.recv(1024 * 1024):
+                          pass
+          PY
+          taskset -c 0 python3 -u "$out/sink.py" > "$out/sink.log" 2>&1 &
+          echo "$!" > "$out/sink.pid"
+          for _ in $(seq 1 50); do
+            (echo > /dev/tcp/127.0.0.1/11885) >/dev/null 2>&1 && exit 0
+            sleep 0.05
+          done
+          cat "$out/sink.log"
+          exit 1
+
+      - name: Compare write, join and writelines primitives
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/mqttium-write-lab"
+          taskset -c 2 python3 candidate/benchmarks/experimental_write_paths.py \
+            --host 127.0.0.1 --port 11885 \
+            --output "$out/write-paths.json" \
+            --summary-output "$out/write-paths.md"
+          cat "$out/write-paths.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Stop raw TCP sink
+        if: always()
+        shell: bash
+        run: |
+          pidfile="$RUNNER_TEMP/mqttium-write-lab/sink.pid"
+          if [ -f "$pidfile" ]; then
+            kill "$(cat "$pidfile")" 2>/dev/null || true
+          fi
+
+      - name: Start isolated Mosquitto on CPU 0
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/mqttium-write-lab"
+          cat > "$out/mosquitto.conf" <<'EOF'
+          persistence false
+          allow_anonymous true
+          max_inflight_messages 1000
+          max_queued_messages 100000
+          max_queued_bytes 0
+          connection_messages false
+          log_type error
+          listener 11884 127.0.0.1
+          EOF
+          taskset -c 0 mosquitto -c "$out/mosquitto.conf" > "$out/mosquitto.log" 2>&1 &
+          echo "$!" > "$out/mosquitto.pid"
+          for _ in $(seq 1 50); do
+            (echo > /dev/tcp/127.0.0.1/11884) >/dev/null 2>&1 && exit 0
+            if ! kill -0 "$(cat "$out/mosquitto.pid")" 2>/dev/null; then
+              cat "$out/mosquitto.log"
+              exit 1
+            fi
+            sleep 0.05
+          done
+          cat "$out/mosquitto.log"
+          exit 1
+
+      - name: Sweep cooperative handoff thresholds
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/mqttium-write-lab"
+          for threshold in 3 7 15 31; do
+            echo "=== queued threshold $threshold ==="
+            MQTTIUM_EXPERIMENT_HANDOFF_QUEUED="$threshold" \
+              python3 candidate/benchmarks/paired_network.py \
+                --base-root base --candidate-root candidate \
+                --host 127.0.0.1 --port 11884 \
+                --policy advisory --repeat 4 --cpu 2 \
+                --windows 32,64,128 --protocols 311 --payloads 64,4096 \
+                --count-small 3000 --count-large 1500 \
+                --target-sample-seconds 0.5 --max-count 20000 \
+                --output "$out/handoff-$threshold.json" \
+                --summary-output "$out/handoff-$threshold.md"
+
+            MQTTIUM_EXPERIMENT_HANDOFF_QUEUED="$threshold" \
+              python3 candidate/benchmarks/paired_network.py \
+                --base-root base --candidate-root candidate \
+                --host 127.0.0.1 --port 11884 \
+                --policy advisory --repeat 4 --cpu 2 \
+                --windows 64 --protocols 311 --payloads 64 \
+                --completions callback --count-small 3000 \
+                --target-sample-seconds 0.5 --max-count 20000 \
+                --output "$out/handoff-$threshold-callback.json" \
+                --summary-output "$out/handoff-$threshold-callback.md"
+          done
+
+      - name: Summarize handoff sweep
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/mqttium-write-lab"
+          python3 - "$out" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          root = Path(sys.argv[1])
+          print("\n## Cooperative handoff sweep\n")
+          print("| queued threshold | completion | payload | window | throughput vs rc7 | delivery p50 vs rc7 | delivery p95 vs rc7 |")
+          print("|---:|---|---:|---:|---:|---:|---:|")
+          for threshold in (3, 7, 15, 31):
+              for suffix in ("", "-callback"):
+                  payload = json.loads((root / f"handoff-{threshold}{suffix}.json").read_text())
+                  for scenario in payload["scenarios"]:
+                      p50 = scenario["candidate_median_p50_ms"] / scenario["base_median_p50_ms"]
+                      p95 = scenario["candidate_median_p95_ms"] / scenario["base_median_p95_ms"]
+                      print(
+                          f"| {threshold} | {scenario['completion']} | {scenario['payload_bytes']} | "
+                          f"{scenario['window']} | {scenario['median_candidate_over_base_ack']:.4f}× | "
+                          f"{p50:.4f}× | {p95:.4f}× |"
+                      )
+          PY
+
+      - name: Upload temporary measurements
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: tmp-arm64-write-path-lab-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/mqttium-write-lab/*.json
+            ${{ runner.temp }}/mqttium-write-lab/*.md
+            ${{ runner.temp }}/mqttium-write-lab/*.log
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Stop isolated Mosquitto
+        if: always()
+        shell: bash
+        run: |
+          pidfile="$RUNNER_TEMP/mqttium-write-lab/mosquitto.pid"
+          if [ -f "$pidfile" ]; then
+            pid="$(cat "$pidfile")"
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+          fi
