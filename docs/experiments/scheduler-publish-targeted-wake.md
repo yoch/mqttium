@@ -33,4 +33,20 @@ Replace wake-all admission with the smallest mechanism that wakes only the numbe
 - No starvation/fairness regression and no terminal-wakeup regressions.
 - Any explicit FIFO/weighted waiter queue must justify its extra state with stronger evidence than a simple targeted wake.
 
-Do not merge until benchmark artefacts and the complexity/risk assessment are attached to the PR discussion.
+## Outcome
+
+Candidate 1 (this change) replaces the shared `asyncio.Event` with a deque of
+waiter futures. `_settle_publish` wakes one waiter per acknowledgement;
+`_notify_publish_space` still wakes every waiter on terminal teardown. Engine
+and writer remain the only sources of admission truth: a woken producer always
+retries `queue_publish` / `queue_publish_many` under `_engine_lock`.
+
+Correctness coverage is in `tests/unit/test_publish_targeted_wake.py` (and the
+pre-existing `tests/unit/test_async_publish_admission.py`). The paired harness
+is `benchmarks/paired_publish_admission_contention.py`. The performance campaign
+and acceptance gate are **not** closed by this change: run the harness on an
+eligible host, with A/A before A/B, before treating targeted wake as mergeable.
+Weighted/FIFO admission state was not added.
+
+See [`docs/reports/SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-18.md`](../reports/SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-18.md).
+

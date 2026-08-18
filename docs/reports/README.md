@@ -111,6 +111,16 @@ outcome live here.
 | 2026-08-04 | [`MEMORY-RESULTS.md`](MEMORY-RESULTS.md) | After-state for the same scenarios, once admission, delivery-budget, pagination and lazy-hydration corrections landed. |
 | 2026-08-04 | [`MEMORY-PROFILE-FOLLOW-UP.md`](MEMORY-PROFILE-FOLLOW-UP.md) | How each audit recommendation was closed, and which ones got a numeric regression guard. |
 
+## Scheduler experiments
+
+In-progress or correctness-only notes. They do not outrank a measured hot-path
+decision, and they are not merge evidence until the experiment's own gate is
+met.
+
+| Date | Report | Records |
+| --- | --- | --- |
+| 2026-08-18 | [`SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-18.md`](SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-18.md) | Candidate 1 of the targeted publish-admission wake experiment: deque of waiter futures, one ACK wakes one producer. Correctness tests and a paired harness; performance campaign still open. |
+
 ## Hot-path decisions
 
 Each answers one question with a measurement, and the answer is already
