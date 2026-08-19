@@ -9,8 +9,8 @@ Records the first candidate of
 | Experiment | Writer-task batch byte cap (`WritePump._run`) |
 | Selected quantum | **64 KiB** (`mqttium.api._writer._WRITER_BATCH_MAX_BYTES`) |
 | Item ceiling | unchanged 256 (`_WRITER_BATCH_MAX_ITEMS`) |
-| Host / preflight | not run; no eligible-runner measurement in this change |
-| Verdict | **Correctness candidate only.** Network screening is still required before merge. |
+| Host / preflight | ineligible cloud VM (governor unavailable), 2026-08-19 diagnostic |
+| Verdict | **Diagnostic keep for 64 KiB.** Eligible-runner `network_release_gate.py` still required. |
 
 ## Question
 
@@ -44,13 +44,23 @@ runtime value.
 
 | Quantum | Status |
 | --- | --- |
-| 32 KiB | Not yet measured on an eligible runner; not a code path |
-| **64 KiB** | Initial candidate (middle of the screen; distinct from 48 KiB latency microbatch) |
-| 128 KiB | Not yet measured on an eligible runner; not a code path |
-| 256 KiB | Not yet measured on an eligible runner; not a code path |
+| 32 KiB | Diagnostic screen only: splits 10×10 KiB into 4 batches; more cuts than 64 KiB |
+| **64 KiB** | Selected: splits 40 KiB pairs and mixed 32 KiB+control; keeps 256×64 B as one batch |
+| 128 KiB | Diagnostic screen: all mixes in this set fit in one batch (no mixed-tail cut) |
+| 256 KiB | Same as 128 KiB on this mix set |
 
-`benchmarks/writer_byte_quantum_screen.py` can monkeypatch the constant for a
-local diagnostic. Do not commit its JSON.
+Local screen (`benchmarks/writer_byte_quantum_screen.py`) plus paired
+diagnostics on an ineligible 4-CPU cloud VM, 2026-08-19 (advisory, repeat 4):
+
+- Writer-capacity: QoS 0 **0.980** (inside the −3% floor), QoS 1 **1.012**.
+- Open-loop 311/callback/window 20: completed 0.992–1.000, lag 0.998–1.005.
+- Null-transport mixed drain (2000 × 32 KiB+64 B): 16 batches / 2.43 ms → 2000
+  batches / 5.21 ms. More, smaller turns; expected.
+- ABBA mixed QoS 1 tail under a 32 KiB QoS 0 flood (4 pairs, 200 probes):
+  main p50/p99 **9.47 / 9.82 ms**, candidate **7.46 / 7.60 ms** (~21% faster).
+
+64 KiB is the interesting screening point: 128/256 KiB do not split this mixed
+traffic. Confirm with `network_release_gate.py` on an eligible runner.
 
 ## Correctness
 
@@ -85,7 +95,8 @@ hurting writer-capacity floors.
 
 ## Outcome
 
-Implement the 64 KiB candidate so the hypothesis can be measured. Do not treat
-this report as a merge decision: A/A, `paired_writer_capacity.py`,
-`paired_open_loop.py`, mixed-load PUBACK/control tails, and
-`network_release_gate.py` (or the calibrated equivalent) are still required.
+Implement the 64 KiB candidate so the hypothesis can be measured. Diagnostic
+A/B on an ineligible cloud VM shows no writer-capacity/open-loop regression and
+a ~21% mixed QoS 1 tail cut under a 32 KiB flood. Do not merge until
+`network_release_gate.py` (or the calibrated equivalent) runs on an eligible
+host.

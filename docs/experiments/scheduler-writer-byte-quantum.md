@@ -55,7 +55,7 @@ Do not merge until the selected quantum, rejected screening points, raw benchmar
 
 ## Outcome
 
-Correctness candidate implemented: one named 64 KiB ceiling beside the existing 256-item cap, with a leftover slot so FIFO is preserved. Network screening, A/A, paired writer-capacity, open-loop, and mixed-load tail-latency evidence are **not yet attached**; 32/128/256 KiB remain unmeasured alternatives.
+Correctness candidate implemented: one named 64 KiB ceiling beside the existing 256-item cap, with a leftover slot so FIFO is preserved. Diagnostic campaign 2026-08-19 (ineligible cloud VM): writer-capacity 0.980 / 1.012, open-loop completed/lag ~1.00, mixed QoS 1 tail p50 9.47 → 7.46 ms under a 32 KiB flood. 32/128/256 KiB remain screen-only. Eligible `network_release_gate.py` still required.
 
 ## Complexity and risk
 
