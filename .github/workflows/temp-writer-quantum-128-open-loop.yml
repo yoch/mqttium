@@ -1,0 +1,81 @@
+name: TEMP writer quantum 128 KiB open-loop guard
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: temp-writer-quantum-128-open-loop-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  BASE_SHA: 7d20fc5200e868df61391d00c21e5d7b0d63c78a
+  QUANTUM_BYTES: "131072"
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  open-loop:
+    name: Open-loop guards with client tools
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout study support
+        uses: actions/checkout@v7
+        with:
+          path: support
+          persist-credentials: false
+      - name: Checkout immutable baseline
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.BASE_SHA }}
+          path: base
+          persist-credentials: false
+      - name: Checkout immutable candidate root
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.BASE_SHA }}
+          path: candidate
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Install dependencies, broker and client tools
+        run: |
+          python -m pip install -e "candidate[dev]"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mosquitto mosquitto-clients
+      - name: Apply 128 KiB candidate
+        run: python support/benchmarks/temp_apply_writer_quantum_128.py candidate --quantum "$QUANTUM_BYTES"
+      - name: Start isolated broker
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo systemctl stop mosquitto 2>/dev/null || true
+          sudo pkill -x mosquitto 2>/dev/null || true
+          printf 'persistence false\nallow_anonymous true\nmax_inflight_messages 1000\nmax_queued_messages 100000\nlistener 11883 127.0.0.1\n' >/tmp/mosq-open.conf
+          mosquitto -c /tmp/mosq-open.conf >/tmp/mosq-open.log 2>&1 &
+          for _ in $(seq 1 50); do
+            (echo >/dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            sleep .1
+          done
+          cat /tmp/mosq-open.log
+          exit 1
+      - name: Paired open-loop guards
+        run: |
+          python candidate/benchmarks/paired_open_loop.py \
+            --base-root base --candidate-root candidate \
+            --host 127.0.0.1 --port 11883 \
+            --protocols 311 --payloads 64,4096 \
+            --completions receipt,callback \
+            --target-rates 2500,7500 --windows 20 \
+            --target-sample-seconds 1.5 --max-count 30000 \
+            --repeat 4 --timeout 150 --cpu 1 --policy advisory \
+            --output /tmp/open-loop.json
+      - name: Upload open-loop evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: quantum128-open-loop-fixed
+          path: /tmp/open-loop.json
