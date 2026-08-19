@@ -1,4 +1,4 @@
-name: TEMP combined ARM64 validation 283-285
+name: TEMP ARM64 isolate QoS1 writer-capacity regression
 
 on:
   pull_request:
@@ -19,15 +19,15 @@ env:
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
 jobs:
-  arm64:
+  isolate:
     runs-on: [self-hosted, linux, ARM64]
-    timeout-minutes: 180
+    timeout-minutes: 120
     steps:
       - name: Define evidence root
         shell: bash
-        run: echo "ROOT=$RUNNER_TEMP/combined-283-285" >> "$GITHUB_ENV"
+        run: echo "ROOT=$RUNNER_TEMP/qos1-isolation" >> "$GITHUB_ENV"
 
-      - name: Checkout immutable base
+      - name: Checkout baseline
         uses: actions/checkout@v7
         with:
           ref: ${{ env.BASE_SHA }}
@@ -35,49 +35,52 @@ jobs:
           path: base
           persist-credentials: false
 
-      - name: Checkout immutable base into stack workspace
+      - name: Checkout single candidates
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.PR283_SHA }}
+          path: pr283
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.PR284_SHA }}
+          path: pr284
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.PR285_SHA }}
+          path: pr285
+          persist-credentials: false
+
+      - name: Checkout baseline workspaces for pairs
         uses: actions/checkout@v7
         with:
           ref: ${{ env.BASE_SHA }}
           fetch-depth: 0
-          path: stack
+          path: p283284
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.BASE_SHA }}
+          fetch-depth: 0
+          path: p283285
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.BASE_SHA }}
+          fetch-depth: 0
+          path: p284285
           persist-credentials: false
 
-      - name: Compose exact accepted heads with audited writer resolution
+      - name: Build pair 283+284 with audited writer resolution
         shell: bash
-        working-directory: stack
+        working-directory: p283284
         run: |
           set -euo pipefail
-          git config user.name stack-probe
-          git config user.email stack-probe@example.invalid
-
-          union_report_index() {
-            python - <<'PY'
-          from pathlib import Path
-          import subprocess
-          path = 'docs/reports/README.md'
-          ours = subprocess.check_output(['git', 'show', f':2:{path}'], text=True)
-          theirs = subprocess.check_output(['git', 'show', f':3:{path}'], text=True)
-          lines = ours.splitlines()
-          incoming = [
-              line for line in theirs.splitlines()
-              if line.startswith('| 2026-08-') and 'SCHEDULER-' in line and line not in lines
-          ]
-          if not incoming:
-              raise SystemExit('no unique incoming scheduler report rows')
-          heading = lines.index('## Hot-path decisions')
-          insert_at = heading
-          while insert_at > 0 and lines[insert_at - 1] == '':
-              insert_at -= 1
-          lines[insert_at:insert_at] = incoming
-          Path(path).write_text('\n'.join(lines) + '\n')
-          PY
-          }
-
-          test "$(git rev-parse HEAD)" = "$BASE_SHA"
+          git config user.name pair-probe
+          git config user.email pair-probe@example.invalid
           git fetch --no-tags origin "$PR283_SHA"
           git merge --no-ff --no-edit "$PR283_SHA"
-
           git fetch --no-tags origin "$PR284_SHA"
           set +e
           git merge --no-ff --no-edit "$PR284_SHA"
@@ -88,85 +91,65 @@ jobs:
           test "${#conflicts[@]}" -eq 2
           test "${conflicts[0]}" = "docs/reports/README.md"
           test "${conflicts[1]}" = "src/mqttium/api/_writer.py"
-          union_report_index
-
+          python - <<'PY'
+          from pathlib import Path
+          import subprocess
+          path='docs/reports/README.md'
+          ours=subprocess.check_output(['git','show',f':2:{path}'],text=True)
+          theirs=subprocess.check_output(['git','show',f':3:{path}'],text=True)
+          lines=ours.splitlines()
+          incoming=[l for l in theirs.splitlines() if l.startswith('| 2026-08-') and 'SCHEDULER-' in l and l not in lines]
+          heading=lines.index('## Hot-path decisions')
+          i=heading
+          while i>0 and lines[i-1]=='': i-=1
+          lines[i:i]=incoming
+          Path(path).write_text('\n'.join(lines)+'\n')
+          PY
           git checkout --ours src/mqttium/api/_writer.py
           python - <<'PY'
           from pathlib import Path
-          path = Path('src/mqttium/api/_writer.py')
-          text = path.read_text()
-          def replace_once(old: str, new: str) -> None:
+          p=Path('src/mqttium/api/_writer.py')
+          text=p.read_text()
+          def one(old,new):
               global text
-              count = text.count(old)
-              if count != 1:
-                  raise SystemExit(f'writer resolution expected one match, got {count}: {old!r}')
-              text = text.replace(old, new)
-          replace_once(
-              '                self.enqueue_suspensions += 1\n'
-              '                try:\n'
-              '                    await self.space.wait()\n'
-              '                finally:\n'
-              '                    self.waiters -= 1\n',
-              '                self.enqueue_suspensions += 1\n'
-              '                try:\n'
-              '                    await self.space.wait()\n'
-              '                except asyncio.CancelledError:\n'
-              '                    # notify(n) is consumed by whoever is waiting. A waiter\n'
-              '                    # cancelled after being selected must hand the wakeup on,\n'
-              '                    # or the remaining producers stay parked with free slots.\n'
-              '                    if self.waiters > 1:\n'
-              '                        self.space.notify(1)\n'
-              '                    raise\n'
-              '                finally:\n'
-              '                    self.waiters -= 1\n',
+              n=text.count(old)
+              if n!=1: raise SystemExit(f'expected 1 match, got {n}: {old!r}')
+              text=text.replace(old,new)
+          one(
+              '                self.enqueue_suspensions += 1\n                try:\n                    await self.space.wait()\n                finally:\n                    self.waiters -= 1\n',
+              '                self.enqueue_suspensions += 1\n                try:\n                    await self.space.wait()\n                except asyncio.CancelledError:\n                    # notify(n) is consumed by whoever is waiting. A waiter\n                    # cancelled after being selected must hand the wakeup on,\n                    # or the remaining producers stay parked with free slots.\n                    if self.waiters > 1:\n                        self.space.notify(1)\n                    raise\n                finally:\n                    self.waiters -= 1\n',
           )
-          replace_once(
-              '        transport = self.transport\n'
-              '        if transport is None:\n'
-              '            raise RuntimeError("WritePump started without a transport")\n'
-              '        # Resolved once per writer task rather than per batch. The local dies\n',
-              '        transport = self.transport\n'
-              '        if transport is None:\n'
-              '            raise RuntimeError("WritePump started without a transport")\n'
-              '        writer_task = asyncio.current_task()\n'
-              '        assert writer_task is not None\n'
-              '        # Resolved once per writer task rather than per batch. The local dies\n',
+          one(
+              '        transport = self.transport\n        if transport is None:\n            raise RuntimeError("WritePump started without a transport")\n        # Resolved once per writer task rather than per batch. The local dies\n',
+              '        transport = self.transport\n        if transport is None:\n            raise RuntimeError("WritePump started without a transport")\n        writer_task = asyncio.current_task()\n        assert writer_task is not None\n        # Resolved once per writer task rather than per batch. The local dies\n',
           )
-          replace_once(
-              '                self._writing = True\n'
-              '                try:\n'
-              '                    # Coalesce contiguous small frames into one writelines call.\n',
-              '                self._writing = True\n'
-              '                batch_completed = False\n'
-              '                try:\n'
-              '                    # Coalesce contiguous small frames into one writelines call.\n',
+          one(
+              '                self._writing = True\n                try:\n                    # Coalesce contiguous small frames into one writelines call.\n',
+              '                self._writing = True\n                batch_completed = False\n                try:\n                    # Coalesce contiguous small frames into one writelines call.\n',
           )
-          replace_once(
-              '                    await self._write_contiguous(transport, write_many, contiguous)\n'
-              '                    self.last_outbound = time.monotonic()\n'
-              '                finally:\n',
-              '                    await self._write_contiguous(transport, write_many, contiguous)\n'
-              '                    self.last_outbound = time.monotonic()\n'
-              '                    batch_completed = True\n'
-              '                finally:\n',
+          one(
+              '                    await self._write_contiguous(transport, write_many, contiguous)\n                    self.last_outbound = time.monotonic()\n                finally:\n',
+              '                    await self._write_contiguous(transport, write_many, contiguous)\n                    self.last_outbound = time.monotonic()\n                    batch_completed = True\n                finally:\n',
           )
-          replace_once(
-              '                        self._release_resident(n_batch)\n'
-              '                        if self.waiters:\n'
-              '                            self.space.notify_all()\n',
-              '                        self._release_resident(n_batch)\n'
-              '                        if batch_completed and self.waiters and not writer_task.cancelling():\n'
-              '                            # Resident accounting is released even on lifecycle\n'
-              '                            # cancellation/failure, but only a successfully written\n'
-              '                            # batch releases usable admission capacity.\n'
-              '                            self.space.notify(min(self.waiters, n_batch))\n',
+          one(
+              '                        self._release_resident(n_batch)\n                        if self.waiters:\n                            self.space.notify_all()\n',
+              '                        self._release_resident(n_batch)\n                        if batch_completed and self.waiters and not writer_task.cancelling():\n                            self.space.notify(min(self.waiters, n_batch))\n',
           )
-          path.write_text(text)
+          p.write_text(text)
           PY
           git add docs/reports/README.md src/mqttium/api/_writer.py
           git diff --check
           git commit --no-edit
 
+      - name: Build pair 283+285
+        shell: bash
+        working-directory: p283285
+        run: |
+          set -euo pipefail
+          git config user.name pair-probe
+          git config user.email pair-probe@example.invalid
+          git fetch --no-tags origin "$PR283_SHA"
+          git merge --no-ff --no-edit "$PR283_SHA"
           git fetch --no-tags origin "$PR285_SHA"
           set +e
           git merge --no-ff --no-edit "$PR285_SHA"
@@ -176,77 +159,86 @@ jobs:
             mapfile -t conflicts < <(git diff --name-only --diff-filter=U)
             test "${#conflicts[@]}" -eq 1
             test "${conflicts[0]}" = "docs/reports/README.md"
-            union_report_index
+            python - <<'PY'
+          from pathlib import Path
+          import subprocess
+          path='docs/reports/README.md'
+          ours=subprocess.check_output(['git','show',f':2:{path}'],text=True)
+          theirs=subprocess.check_output(['git','show',f':3:{path}'],text=True)
+          lines=ours.splitlines()
+          incoming=[l for l in theirs.splitlines() if l.startswith('| 2026-08-') and 'SCHEDULER-' in l and l not in lines]
+          heading=lines.index('## Hot-path decisions')
+          i=heading
+          while i>0 and lines[i-1]=='': i-=1
+          lines[i:i]=incoming
+          Path(path).write_text('\n'.join(lines)+'\n')
+          PY
             git add docs/reports/README.md
             git diff --check
             git commit --no-edit
           fi
           test -z "$(git diff --name-only --diff-filter=U)"
-          git diff --check "$BASE_SHA"..HEAD
-          git rev-parse HEAD | tee /tmp/combined-head.txt
 
-      - name: Verify ARM64 runtime and clean broker state
+      - name: Build pair 284+285
+        shell: bash
+        working-directory: p284285
+        run: |
+          set -euo pipefail
+          git config user.name pair-probe
+          git config user.email pair-probe@example.invalid
+          git fetch --no-tags origin "$PR284_SHA"
+          git merge --no-ff --no-edit "$PR284_SHA"
+          git fetch --no-tags origin "$PR285_SHA"
+          set +e
+          git merge --no-ff --no-edit "$PR285_SHA"
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            mapfile -t conflicts < <(git diff --name-only --diff-filter=U)
+            test "${#conflicts[@]}" -eq 1
+            test "${conflicts[0]}" = "docs/reports/README.md"
+            python - <<'PY'
+          from pathlib import Path
+          import subprocess
+          path='docs/reports/README.md'
+          ours=subprocess.check_output(['git','show',f':2:{path}'],text=True)
+          theirs=subprocess.check_output(['git','show',f':3:{path}'],text=True)
+          lines=ours.splitlines()
+          incoming=[l for l in theirs.splitlines() if l.startswith('| 2026-08-') and 'SCHEDULER-' in l and l not in lines]
+          heading=lines.index('## Hot-path decisions')
+          i=heading
+          while i>0 and lines[i-1]=='': i-=1
+          lines[i:i]=incoming
+          Path(path).write_text('\n'.join(lines)+'\n')
+          PY
+            git add docs/reports/README.md
+            git diff --check
+            git commit --no-edit
+          fi
+          test -z "$(git diff --name-only --diff-filter=U)"
+
+      - name: Prepare Python environment and strict preflight
         shell: bash
         run: |
           set -euo pipefail
           test "$(uname -m)" = aarch64
-          python3 - <<'PY'
-          import sys
-          if sys.version_info[:2] != (3, 13):
-              raise SystemExit(f'expected Python 3.13, got {sys.version}')
-          PY
           mkdir -p "$ROOT"
+          rm -rf "$RUNNER_TEMP/qos1-isolation-venv"
+          python3 -m venv "$RUNNER_TEMP/qos1-isolation-venv"
+          echo "$RUNNER_TEMP/qos1-isolation-venv/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/qos1-isolation-venv/bin/python" -m pip install -e "pr284[dev]" "psutil>=6,<8"
           sudo systemctl stop mosquitto 2>/dev/null || true
           sudo pkill -x mosquitto 2>/dev/null || true
           sleep 1
-          ! pgrep -a mosquitto
-
-      - name: Prepare combined Python environment
-        shell: bash
-        run: |
-          set -euo pipefail
-          rm -rf "$RUNNER_TEMP/combined-283-285-venv"
-          python3 -m venv "$RUNNER_TEMP/combined-283-285-venv"
-          echo "$RUNNER_TEMP/combined-283-285-venv/bin" >> "$GITHUB_PATH"
-          "$RUNNER_TEMP/combined-283-285-venv/bin/python" -m pip install -e "stack[dev]" "psutil>=6,<8"
-
-      - name: Strict initial preflight
-        shell: bash
-        run: |
-          set -euo pipefail
           for attempt in $(seq 1 24); do
-            if python base/benchmarks/runner_probe.py --output "$ROOT/preflight-initial.json" --require-temperature --enforce; then
+            if python base/benchmarks/runner_probe.py --output "$ROOT/preflight.json" --require-temperature --enforce; then
               exit 0
             fi
             sleep 15
           done
           exit 1
 
-      - name: Combined focused correctness
-        shell: bash
-        run: |
-          set -euo pipefail
-          PYTHONPATH=stack/src python -m pytest -q \
-            stack/tests/unit/test_write_pump_resident.py \
-            stack/tests/unit/test_write_pump_targeted_wake.py \
-            stack/tests/unit/test_write_pump.py \
-            stack/tests/unit/test_write_pump_eager.py \
-            stack/tests/unit/test_publish_targeted_wake.py \
-            stack/tests/unit/test_async_publish_admission.py
-
-      - name: Writer targeted-wake combined A/B
-        shell: bash
-        run: |
-          python stack/benchmarks/paired_writer_waiter_contention.py \
-            --base-root base --candidate-root stack \
-            --producer-values 1,4,64,256 --max-messages 8 --payload-bytes 64 \
-            --warmup-count 2000 --count 16000 --repeat 8 --cpu 1 \
-            --policy strict --preflight-report "$ROOT/preflight-initial.json" \
-            --max-baseline-cv .05 --min-completed-ratio .97 \
-            --output "$ROOT/writer-target.json" \
-            --summary-output "$ROOT/writer-target.md"
-
-      - name: Start isolated Mosquitto
+      - name: Start isolated broker
         shell: bash
         run: |
           set -euo pipefail
@@ -266,92 +258,64 @@ jobs:
             (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
             sleep .2
           done
-          cat "$ROOT/mosquitto.log"
           exit 1
 
-      - name: Corrected publish true-completion A/A
-        shell: bash
-        run: |
-          python stack/benchmarks/paired_publish_admission_contention.py \
-            --base-root base --candidate-root base --host 127.0.0.1 --port 11883 \
-            --protocol 311 --qos 1 --payload-bytes 64 \
-            --publisher-values 16,32,64 --inflight-values 1,4 \
-            --warmup-count 200 --count 4000 --repeat 6 --timeout 120 --cpu 1 \
-            --policy strict --preflight-report "$ROOT/preflight-initial.json" \
-            --max-baseline-cv .05 --max-aa-ratio-deviation .02 \
-            --output "$ROOT/publish-aa.json" \
-            --summary-output "$ROOT/publish-aa.md"
-
-      - name: Combined publish true-completion A/B
-        shell: bash
-        run: |
-          python stack/benchmarks/paired_publish_admission_contention.py \
-            --base-root base --candidate-root stack --host 127.0.0.1 --port 11883 \
-            --protocol 311 --qos 1 --payload-bytes 64 \
-            --publisher-values 16,32,64 --inflight-values 1,4 \
-            --warmup-count 200 --count 4000 --repeat 6 --timeout 120 --cpu 1 \
-            --policy strict --preflight-report "$ROOT/preflight-initial.json" \
-            --max-baseline-cv .05 --min-completed-ratio .97 \
-            --output "$ROOT/publish-ab.json" \
-            --summary-output "$ROOT/publish-ab.md"
-
-      - name: Refresh strict preflight before non-targeted guards
+      - name: Run all QoS1 isolation cells
         shell: bash
         run: |
           set -euo pipefail
-          for attempt in $(seq 1 24); do
-            if python base/benchmarks/runner_probe.py --output "$ROOT/preflight-guards.json" --require-temperature --enforce; then
-              exit 0
-            fi
-            sleep 15
+          variants=(pr283 pr284 pr285 p283284 p283285 p284285)
+          for variant in "${variants[@]}"; do
+            echo "=== $variant ==="
+            set +e
+            python base/benchmarks/paired_writer_capacity.py \
+              --base-root base --candidate-root "$variant" --host 127.0.0.1 --port 11883 \
+              --protocol 311 --qos-values 1 --payload-bytes 64 \
+              --inflight 20 --outstanding 20 --max-queued 200 \
+              --warmup-count 5000 --count-qos1 40000 --repeat 8 --cpu 1 \
+              --policy strict --preflight-report "$ROOT/preflight.json" \
+              --max-baseline-cv .05 --min-completed-ratio .97 \
+              --output "$ROOT/$variant.json" --summary-output "$ROOT/$variant.md" \
+              >"$ROOT/$variant.stdout.log" 2>"$ROOT/$variant.stderr.log"
+            rc=$?
+            set -e
+            echo "$rc" > "$ROOT/$variant.rc"
+            cat "$ROOT/$variant.stdout.log"
+            cat "$ROOT/$variant.stderr.log" >&2
           done
-          exit 1
 
-      - name: Combined writer-capacity guard
+      - name: Summarize isolation matrix
         shell: bash
         run: |
-          python base/benchmarks/paired_writer_capacity.py \
-            --base-root base --candidate-root stack --host 127.0.0.1 --port 11883 \
-            --protocol 311 --qos-values 0,1 --payload-bytes 64 \
-            --inflight 20 --outstanding 20 --max-queued 200 \
-            --warmup-count 5000 --count-qos0 100000 --count-qos1 40000 \
-            --repeat 6 --cpu 1 --policy strict \
-            --preflight-report "$ROOT/preflight-guards.json" \
-            --max-baseline-cv .05 --min-completed-ratio .97 \
-            --output "$ROOT/writer-capacity.json" \
-            --summary-output "$ROOT/writer-capacity.md"
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          root=Path(os.environ['ROOT'])
+          variants=['pr283','pr284','pr285','p283284','p283285','p284285']
+          rows=[]
+          for v in variants:
+              d=json.loads((root/f'{v}.json').read_text())
+              s=d['scenarios'][0]
+              rows.append({
+                  'variant':v,
+                  'status':d['status'],
+                  'ratio':s['median_candidate_over_base_completed'],
+                  'base_cv':s['base_completed_cv'],
+                  'candidate_cv':s['candidate_completed_cv'],
+                  'base_rate':s['base_median_completed_rate'],
+                  'candidate_rate':s['candidate_median_completed_rate'],
+                  'regressions':d.get('regressions'),
+                  'invalidations':d.get('invalidations'),
+              })
+          print(json.dumps(rows, indent=2))
+          (root/'isolation-summary.json').write_text(json.dumps(rows, indent=2)+'\n')
+          PY
 
-      - name: Combined stable open-loop guard
-        shell: bash
-        run: |
-          python base/benchmarks/paired_open_loop.py \
-            --base-root base --candidate-root stack \
-            --protocols 311 --payloads 64 --completions callback --windows 20 \
-            --target-rates 5000,7500 --count-small 5000 --repeat 6 --cpu 1 \
-            --policy strict --preflight-report "$ROOT/preflight-guards.json" \
-            --max-baseline-cv .05 --min-completed-ratio .97 --max-loop-lag-ratio 1.05 \
-            --output "$ROOT/open-loop.json" \
-            --summary-output "$ROOT/open-loop.md"
-
-      - name: Combined network guard
-        shell: bash
-        run: |
-          python base/benchmarks/paired_network.py \
-            --base-root base --candidate-root stack --host 127.0.0.1 --port 11883 \
-            --protocols 311 --completions receipt --payloads 64,4096 --windows 20,64 \
-            --repeat 6 --count-small 1500 --count-large 750 --cpu 1 \
-            --policy strict --preflight-report "$ROOT/preflight-guards.json" \
-            --max-baseline-cv .05 --min-ack-ratio .97 \
-            --output "$ROOT/network.json" \
-            --summary-output "$ROOT/network.md"
-
-      - name: Final strict eligibility check
+      - name: Final strict preflight and cleanup broker
         shell: bash
         run: |
           set -euo pipefail
-          if [ -f "$ROOT/mosquitto.pid" ]; then
-            kill "$(cat "$ROOT/mosquitto.pid")" 2>/dev/null || true
-          fi
+          kill "$(cat "$ROOT/mosquitto.pid")" 2>/dev/null || true
           sudo pkill -x mosquitto 2>/dev/null || true
           sleep 1
           for attempt in $(seq 1 24); do
@@ -362,16 +326,16 @@ jobs:
           done
           exit 1
 
-      - name: Upload combined evidence
+      - name: Upload isolation evidence
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: combined-283-285-${{ github.run_id }}
+          name: qos1-isolation-${{ github.run_id }}
           path: |
-            ${{ runner.temp }}/combined-283-285/**/*.json
-            ${{ runner.temp }}/combined-283-285/**/*.md
-            ${{ runner.temp }}/combined-283-285/**/*.log
-            ${{ runner.temp }}/combined-283-285/*.conf
-            /tmp/combined-head.txt
+            ${{ runner.temp }}/qos1-isolation/**/*.json
+            ${{ runner.temp }}/qos1-isolation/**/*.md
+            ${{ runner.temp }}/qos1-isolation/**/*.log
+            ${{ runner.temp }}/qos1-isolation/**/*.rc
+            ${{ runner.temp }}/qos1-isolation/*.conf
           if-no-files-found: warn
           retention-days: 30
