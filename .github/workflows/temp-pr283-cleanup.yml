@@ -1,0 +1,38 @@
+name: TEMP PR283 cleanup
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out temporary branch with write credentials
+        uses: actions/checkout@v7
+        with:
+          ref: bench/tmp-pr283-resident-budget-20260819-evidence
+          fetch-depth: 1
+          persist-credentials: true
+
+      - name: Allow controller to close temporary PR
+        run: sleep 20
+
+      - name: Delete temporary benchmark refs
+        shell: bash
+        run: |
+          set -euo pipefail
+          git push origin --delete \
+            bench/tmp-pr283-resident-budget-20260819 \
+            bench/tmp-pr283-resident-budget-20260819-active \
+            bench/tmp-pr283-resident-budget-20260819-final \
+            bench/tmp-pr283-resident-budget-20260819-run \
+            bench/tmp-pr283-resident-budget-20260819-run2 \
+            bench/tmp-pr283-resident-budget-20260819-use \
+            bench/tmp-pr283-resident-budget-20260819-workflow
+          git push origin --delete bench/tmp-pr283-resident-budget-20260819-evidence
