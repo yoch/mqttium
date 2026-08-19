@@ -71,8 +71,9 @@ from `max_outbound_bytes` that payloads above the bound are rejected.
 Use `client.stats().writer` together with transport and protocol state. Useful
 fields include:
 
-- `queued_bytes` and `high_water_bytes` for current and peak queued encoded
-  bytes;
+- `queued_bytes` and `high_water_bytes` for current and peak charged encoded
+  bytes owned by the writer; `queued_bytes` remains charged while a batch is
+  active;
 - `queued_messages` and `high_water_messages` for the live asyncio queue;
 - `batches`, `batched_items` and `batched_bytes` for batching behaviour;
 - `enqueue_suspensions` and `waiters` for producer-side writer pressure;
@@ -109,6 +110,13 @@ exists when the sample begins:
 Both are valid service behaviours, but they answer different questions. Report
 them separately when a workload can alternate between the two states.
 
+For supported application-level instrumentation, snapshot
+`client.stats().writer.queued_bytes` immediately before the operation being
+measured. A non-zero value means earlier encoded work is still charged to the
+writer, including work in an active extracted batch. Repo-local diagnostic
+harnesses may additionally inspect exact internal resident state when they need
+to attribute queue ownership more precisely.
+
 In particular, do not start a large synchronous flood and then describe the
 first small probe's percentile as generic steady-state latency without stating
 that the probe began behind the flood. A burst-start head-of-line measurement is
@@ -119,10 +127,8 @@ probes. Backlog duration depends on payload size, configured writer bounds,
 broker speed and host scheduling; "drop the first two samples" can be correct
 for one cell and wrong for another.
 
-When a repo-local diagnostic harness needs exact attribution, it may inspect
-internal writer-resident state. Public applications should use supported
-snapshots and their own workload boundaries rather than depending on private
-attributes.
+Public applications should use supported snapshots and their own workload
+boundaries rather than depending on private attributes.
 
 ## Benchmark identity includes writer bounds
 
