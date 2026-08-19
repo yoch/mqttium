@@ -474,6 +474,8 @@ class WritePump:
         transport = self.transport
         if transport is None:
             raise RuntimeError("WritePump started without a transport")
+        writer_task = asyncio.current_task()
+        assert writer_task is not None
         # Resolved once per writer task rather than per batch. The local dies
         # with the task, so unlike `_write_nowait` it needs no explicit
         # clearing: it can never outlive the transport it was resolved from.
@@ -501,6 +503,7 @@ class WritePump:
                 # this is what stops an eager write from landing between the two
                 # halves of a segmented item.
                 self._writing = True
+                batch_completed = False
                 try:
                     # Coalesce contiguous small frames into one writelines call.
                     # Never await drain() after the batch (deadlocks vs reader ACK).
@@ -515,6 +518,7 @@ class WritePump:
                             contiguous.append(data)
                     await self._write_contiguous(transport, write_many, contiguous)
                     self.last_outbound = time.monotonic()
+                    batch_completed = True
                 finally:
                     self._writing = False
                     released = 0
@@ -524,12 +528,11 @@ class WritePump:
                     self.batched_bytes += released
                     async with self.space:
                         self.queued_bytes = max(0, self.queued_bytes - released)
-                        if self.waiters:
-                            # Wake at most as many waiters as items this batch
-                            # just freed. notify_all() would make every parked
-                            # producer runnable even though only len(batch)
-                            # slots exist. Lifecycle still uses notify_all()
-                            # via wake_waiters() / advance_epoch().
+                        if batch_completed and self.waiters and not writer_task.cancelling():
+                            # Only a successfully written batch releases usable
+                            # writer capacity. Cancellation/failure is lifecycle:
+                            # waking here can admit old-epoch writes onto a dead
+                            # writer before advance_epoch() broadcasts staleness.
                             self.space.notify(min(self.waiters, len(batch)))
         except asyncio.CancelledError:
             raise

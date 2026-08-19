@@ -222,15 +222,16 @@ async def test_discard_and_wake_unblocks_waiters() -> None:
 
 @pytest.mark.asyncio
 async def test_stop_then_epoch_advance_does_not_strand_waiters() -> None:
-    pump = _pump(max_messages=1)
+    # Bytes stay charged while the first write is in flight, so this
+    # reproduces the cancellation race independently of message-count
+    # accounting (including the stricter resident budget experiment).
+    pump = _pump(max_bytes=len(b"inflight"), max_messages=8)
     transport = _GatedTransport()
     pump.start(transport)
     try:
         await pump.enqueue(b"inflight")
         await asyncio.wait_for(transport.entered.wait(), timeout=1.0)
-        pump.try_enqueue(b"hold")
-        assert pump.try_enqueue(b"overflow") is False
-        waiters = await _park_waiters(pump, [b"a", b"b"])
+        waiters = await _park_waiters(pump, [b"aaaaaaaa", b"bbbbbbbb"])
         await pump.stop()
         await pump.advance_epoch(pump.epoch + 1)
         results = await asyncio.gather(*waiters, return_exceptions=True)
