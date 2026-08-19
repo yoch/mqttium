@@ -48,4 +48,3 @@ on an ineligible cloud VM (2026-08-19): +29% / +127% / +57% at 4×inf1, 16×inf1
 confirm on an eligible runner. Weighted/FIFO admission state was not added.
 
 See [`docs/reports/SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-19.md`](../reports/SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-19.md).
-
