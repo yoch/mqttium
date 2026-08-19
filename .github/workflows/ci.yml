@@ -1,206 +1,301 @@
-name: CI
+name: TEMP PR284-285 wake policy screening v2
 
 on:
-  push:
-    branches: [main]
   pull_request:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: temp-pr284-285-wake-screening-v2
+  cancel-in-progress: true
 
 jobs:
-  quality:
+  screening:
     runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      PR284_SHA: 8d37248831b372004074acfa0018f34da51b54df
+      PR285_SHA: 505c385c59670b2fb095728b5095f5039c53d675
+      SUPPORT_REF: 50122fc2012a326409733207297b9c775311ee01
+      PYTHONUNBUFFERED: "1"
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.PR284_SHA }}
+          path: pr284
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.PR285_SHA }}
+          path: pr285
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.SUPPORT_REF }}
+          path: support
+          persist-credentials: false
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: pyproject.toml
-      - run: python -m pip install -e ".[dev,security]"
-      - name: Repository hygiene
+          python-version: "3.13"
+      - run: python -m pip install -e "pr284[dev]" "psutil>=6,<8"
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq mosquitto
+
+      - name: Build runtime-only policy variants
+        shell: bash
         run: |
           set -euo pipefail
-          test -z "$(git ls-files | grep -E '(^|/)(__pycache__|\.pytest_cache|\.mypy_cache|\.ruff_cache|dist|build|.*\.egg-info)(/|$)|(^|/)\.coverage($|\.)|\.py[co]$|\.(patch|diff)$' || true)"
-          test -z "$(grep -RIl --exclude-dir=.git -E 'mqttnext|MQTTNext|MQTTNEXT' src tests examples benchmarks || true)"
-      - run: ruff format --check src tests benchmarks
-      - run: ruff check src tests benchmarks
-      - run: mypy src/mqttium
-      - run: bandit -q -ll -r src
-      - run: python -m pytest -q tests/unit --cov=mqttium --cov-report=term-missing --cov-fail-under=80
-
-  test:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.11", "3.12", "3.13", "3.14"]
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: ${{ matrix.python-version }}
-          cache: pip
-          cache-dependency-path: pyproject.toml
-      - run: python -m pip install -e ".[dev]"
-      - name: Require OpenSSL for TLS tests
-        run: python -c "import shutil; assert shutil.which('openssl'), 'OpenSSL is required for TLS tests'"
-      - name: Unit tests (including TLS, WebSocket, and cancellation)
-        run: python -m pytest -q -ra tests/unit
-      - name: Install Mosquitto
-        timeout-minutes: 5
-        run: |
-          set -euo pipefail
-          export DEBIAN_FRONTEND=noninteractive
-          date -u +'apt-get install start %FT%TZ'
-          sudo -E apt-get install -y mosquitto
-          date -u +'apt-get install done %FT%TZ'
-          dpkg-query -W mosquitto
-          command -v mosquitto
-      - name: Start Mosquitto
-        timeout-minutes: 2
-        run: |
-          set -euo pipefail
-          printf 'listener 11883 127.0.0.1\nallow_anonymous true\npersistence false\n' > /tmp/mosq-ci.conf
-          date -u +'mosquitto -d start %FT%TZ'
-          mosquitto -c /tmp/mosq-ci.conf -d
-          echo "mosquitto -d exited $?"
-          date -u +'mosquitto -d returned %FT%TZ'
-          for i in $(seq 1 30); do
-            if (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1; then
-              echo "listener ready after ${i} probe(s)"
-              exit 0
-            fi
-            sleep 0.2
-          done
-          echo "listener never accepted a connection"
-          pgrep -a mosquitto || true
-          exit 1
-      - name: Mosquitto integration tests
-        run: python -m pytest -q tests/integration
-
-  cross-platform:
-    name: Cross-platform (${{ matrix.os }}, Python ${{ matrix.python-version }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-15, windows-2025]
-        python-version: ["3.11", "3.14"]
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: ${{ matrix.python-version }}
-          cache: pip
-          cache-dependency-path: pyproject.toml
-      - run: python -m pip install -e ".[dev]"
-      - name: Require OpenSSL for TLS tests
-        run: python -c "import shutil; assert shutil.which('openssl'), 'OpenSSL is required for TLS tests'"
-      - name: Unit tests (including TLS, WebSocket, and cancellation)
-        run: python -m pytest -q -ra tests/unit
-
-  fuzz:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: pyproject.toml
-      - run: python -m pip install -e ".[fuzz]"
-      - name: Seeded fuzzing
-        run: |
-          for seed in 1 2 3; do
-            PYTHONPATH=src python tests/fuzz/fuzz.py --seed "$seed" --iterations 20000
-          done
-      - run: PYTHONPATH=src python -m pytest -q tests/fuzz/test_hypothesis_fuzz.py
-
-  package:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: pyproject.toml
-      - run: python -m pip install ".[release]"
-      - run: validate-pyproject pyproject.toml
-      - run: python -m build
-      - run: twine check --strict dist/*
-      - run: check-wheel-contents dist/*.whl
-      - name: Validate distribution contents
-        run: |
+          cp -a pr284 pr284-spare1
+          cp -a pr284 pr284-antibarge
+          cp -a pr285 pr285-spare1
+          cp -a pr285 pr285-antibarge
           python - <<'PY'
           from pathlib import Path
-          from zipfile import ZipFile
-          import ast
-          import email
-          import tarfile
 
-          source = ast.parse(Path("src/mqttium/__init__.py").read_text(encoding="utf-8"))
-          expected_version = next(
-              node.value.value
-              for node in source.body
-              if isinstance(node, ast.Assign)
-              and any(isinstance(target, ast.Name) and target.id == "__version__" for target in node.targets)
-              and isinstance(node.value, ast.Constant)
-              and isinstance(node.value.value, str)
-          )
-          wheel = next(Path("dist").glob("*.whl"))
-          sdist = next(Path("dist").glob("*.tar.gz"))
+          def repl(path, old, new):
+              p = Path(path)
+              text = p.read_text()
+              assert text.count(old) == 1, (path, text.count(old), old[:80])
+              p.write_text(text.replace(old, new))
 
-          with ZipFile(wheel) as archive:
-              names = archive.namelist()
-              metadata_name = next(name for name in names if name.endswith(".dist-info/METADATA"))
-              metadata = email.message_from_bytes(archive.read(metadata_name))
-              assert metadata["Name"] == "mqttium"
-              assert metadata["Version"] == expected_version
-              assert metadata["Requires-Python"] == ">=3.11"
-              assert metadata["License-Expression"] == "Apache-2.0"
-              assert "mqttium/py.typed" in names
-              assert any(name.endswith(".dist-info/licenses/LICENSE") for name in names)
-              assert any(name.endswith(".dist-info/licenses/NOTICE") for name in names)
+          repl('pr284-spare1/src/mqttium/api/_writer.py',
+               'self.space.notify(min(self.waiters, len(batch)))',
+               'self.space.notify(min(self.waiters, len(batch) + 1))')
+          repl('pr285-spare1/src/mqttium/api/async_client.py',
+               'self._wake_publish_waiters(1)\n\n    def _register_publish_waiter',
+               'self._wake_publish_waiters(2)\n\n    def _register_publish_waiter')
 
-          with tarfile.open(sdist, "r:gz") as archive:
-              names = archive.getnames()
-              for filename in (
-                  "LICENSE",
-                  "NOTICE",
-                  "README.md",
-                  "CHANGELOG.md",
-                  "PROVENANCE.md",
-                  "SECURITY.md",
-              ):
-                  assert any(name.endswith("/" + filename) for name in names), filename
+          # Diagnostic writer anti-barging policy: new admissions cannot claim
+          # a slot while an older blocking enqueue is parked; a blocking
+          # newcomer joins the Condition queue before it may claim capacity.
+          repl('pr284-antibarge/src/mqttium/api/_writer.py',
+               '        size = item_size(item)\n        if not self.can_enqueue_size(size):\n            return False\n',
+               '        size = item_size(item)\n        if self.waiters or not self.can_enqueue_size(size):\n            return False\n')
+          repl('pr284-antibarge/src/mqttium/api/_writer.py',
+               '        async with self.space:\n            while True:\n                if epoch != self.epoch:\n',
+               '        must_queue_behind_waiters = self.waiters > 0\n        async with self.space:\n            while True:\n                if epoch != self.epoch:\n')
+          repl('pr284-antibarge/src/mqttium/api/_writer.py',
+               '                if not messages_full and not bytes_blocked:\n                    break\n',
+               '                if not must_queue_behind_waiters and not messages_full and not bytes_blocked:\n                    break\n')
+          repl('pr284-antibarge/src/mqttium/api/_writer.py',
+               '                    await self.space.wait()\n                except asyncio.CancelledError:\n',
+               '                    await self.space.wait()\n                    must_queue_behind_waiters = False\n                except asyncio.CancelledError:\n')
+
+          # Diagnostic single-publish anti-barging policy. This deliberately
+          # leaves publish_many unchanged: the goal is causal screening, not a
+          # production patch. A newcomer joins the waiter deque when an older
+          # publisher is parked; a woken publisher receives one privileged try.
+          p = Path('pr285-antibarge/src/mqttium/api/async_client.py')
+          text = p.read_text()
+          old = '''        data = payload.encode("utf-8") if isinstance(payload, str) else payload
+        while True:
+            waiter: asyncio.Future[None] | None = None
+            async with self._engine_lock:
+                try:
+                    direct = self._try_direct_qos0_publish(
+                        topic,
+                        data,
+                        qos=qos,
+                        retain=retain,
+                        properties=properties,
+                        nowait=nowait,
+                    )
+                    if direct is not None:
+                        return direct
+                    if nowait:
+                        self._check_nowait_publish_capacity(topic, data, qos, retain, properties)
+                    # Keep the native async hot path inline. Routing these
+                    # operations through the adapter boundary measured 2.36% slower.
+                    handle = self._engine.outbound.queue_publish(
+                        topic,
+                        data,
+                        qos=qos,
+                        retain=retain,
+                        properties=properties,
+                    )
+                    if handle.qos == QoS.AT_MOST_ONCE:
+                        receipt = PublishReceipt(mid=None, qos=handle.qos)
+                    else:
+                        assert handle.mid is not None
+                        receipt = PublishReceipt(mid=handle.mid, qos=handle.qos)
+                        self._register_publish_receipt(handle.mid, receipt)
+                except FlowControlError as flow_exc:
+                    if (
+                        nowait
+                        or self._publish_backpressure == "error"
+                        or not self._engine.can_ever_admit_publish(topic, data, qos, properties)
+                    ):
+                        raise
+                    terminal = self._publish_wait_failure()
+                    if terminal is not None:
+                        raise terminal from flow_exc
+                    waiter = self._register_publish_waiter()
+                else:
+                    self._collect_effects_locked()
+                    self._drain_effects_inline()
+            if waiter is None:
+                if self._effect_pump.pending:
+                    if nowait:
+                        self._schedule_effect_flush()
+                    else:
+                        await self._drain_effects()
+                if not nowait and receipt.qos != QoS.AT_MOST_ONCE:
+                    self._write_pump._try_flush_latency_batch()
+                return receipt
+            await self._wait_publish_space(waiter)
+'''
+          new = '''        data = payload.encode("utf-8") if isinstance(payload, str) else payload
+        has_turn = False
+        while True:
+            waiter: asyncio.Future[None] | None = None
+            async with self._engine_lock:
+                if not nowait and not has_turn and self._publish_waiters:
+                    terminal = self._publish_wait_failure()
+                    if terminal is not None:
+                        raise terminal
+                    waiter = self._register_publish_waiter()
+                else:
+                    has_turn = False
+                    try:
+                        direct = self._try_direct_qos0_publish(
+                            topic,
+                            data,
+                            qos=qos,
+                            retain=retain,
+                            properties=properties,
+                            nowait=nowait,
+                        )
+                        if direct is not None:
+                            return direct
+                        if nowait:
+                            self._check_nowait_publish_capacity(topic, data, qos, retain, properties)
+                        handle = self._engine.outbound.queue_publish(
+                            topic,
+                            data,
+                            qos=qos,
+                            retain=retain,
+                            properties=properties,
+                        )
+                        if handle.qos == QoS.AT_MOST_ONCE:
+                            receipt = PublishReceipt(mid=None, qos=handle.qos)
+                        else:
+                            assert handle.mid is not None
+                            receipt = PublishReceipt(mid=handle.mid, qos=handle.qos)
+                            self._register_publish_receipt(handle.mid, receipt)
+                    except FlowControlError as flow_exc:
+                        if (
+                            nowait
+                            or self._publish_backpressure == "error"
+                            or not self._engine.can_ever_admit_publish(topic, data, qos, properties)
+                        ):
+                            raise
+                        terminal = self._publish_wait_failure()
+                        if terminal is not None:
+                            raise terminal from flow_exc
+                        waiter = self._register_publish_waiter()
+                    else:
+                        self._collect_effects_locked()
+                        self._drain_effects_inline()
+            if waiter is None:
+                if self._effect_pump.pending:
+                    if nowait:
+                        self._schedule_effect_flush()
+                    else:
+                        await self._drain_effects()
+                if not nowait and receipt.qos != QoS.AT_MOST_ONCE:
+                    self._write_pump._try_flush_latency_batch()
+                return receipt
+            await self._wait_publish_space(waiter)
+            has_turn = True
+'''
+          assert text.count(old) == 1, text.count(old)
+          p.write_text(text.replace(old, new))
           PY
-      - name: Install and import the built wheel
+          python -m compileall -q pr284-spare1/src pr284-antibarge/src pr285-spare1/src pr285-antibarge/src
+
+      - name: Prove diagnostic anti-barging policies
+        shell: bash
         run: |
-          python -m venv /tmp/mqttium-wheel
-          /tmp/mqttium-wheel/bin/python -m pip install --no-deps dist/*.whl
-          cd /tmp
-          /tmp/mqttium-wheel/bin/python -I - <<'PY'
-          import importlib
-          import importlib.metadata
-          import pkgutil
-          import mqttium
-
-          assert mqttium.__version__ == importlib.metadata.version("mqttium")
-          for module in pkgutil.walk_packages(mqttium.__path__, mqttium.__name__ + "."):
-              importlib.import_module(module.name)
+          set -euo pipefail
+          PYTHONPATH=pr284-antibarge/src python - <<'PY'
+          import asyncio
+          from mqttium.api._writer import WritePump
+          class Gate:
+              def __init__(self): self.entered=asyncio.Event(); self.release=asyncio.Event()
+              async def write(self,data): self.entered.set(); await self.release.wait()
+              async def write_many(self,parts): await self.write(b''.join(parts))
+              async def read(self,n=65536): return b''
+              async def close(self): pass
+              def is_closing(self): return False
+          async def fail(exc): raise AssertionError(exc)
+          async def main():
+              p=WritePump(max_bytes=1<<20,max_messages=1,on_failure=fail)
+              assert p.try_enqueue(b'held')
+              parked=asyncio.create_task(p.enqueue(b'parked'))
+              while p.waiters != 1: await asyncio.sleep(0)
+              t=Gate(); p.start(t); await t.entered.wait()
+              assert p.try_enqueue(b'sneak') is False
+              t.release.set(); await parked; await p.join(); await p.stop()
+          asyncio.run(main())
           PY
-          /tmp/mqttium-wheel/bin/python -m pip check
-      - name: Upload distributions
+          PYTHONPATH=pr285-antibarge/src python - <<'PY'
+          import asyncio
+          from mqttium.api.async_client import AsyncClient
+          from mqttium.protocol.engine import EffectKind, EngineEffect
+          async def complete(c, mid):
+              stored=c._engine.store.get_out(mid); assert stored is not None
+              c._engine.outbound.complete_record(mid, stored); c._engine.packet_ids.release(mid)
+              await c._apply_effect(EngineEffect(kind=EffectKind.PUBLISH_COMPLETE,data=mid),nowait=False)
+          async def main():
+              c=AsyncClient(max_pending_outbound_messages=1,max_pending_outbound_bytes=None)
+              first=await c.publish('a',b'a',qos=1); assert first.mid is not None
+              parked=asyncio.create_task(c.publish('b',b'b',qos=1))
+              while c._publish_waiters != 1: await asyncio.sleep(0)
+              await complete(c,first.mid)
+              sneak=asyncio.create_task(c.publish('c',b'c',qos=1))
+              await asyncio.sleep(0)
+              assert parked.done() and not sneak.done(), (parked.done(),sneak.done(),c._publish_waiters)
+              admitted=parked.result(); assert admitted.mid is not None
+              await complete(c,admitted.mid)
+              await asyncio.wait_for(sneak,1)
+          asyncio.run(main())
+          PY
+
+      - name: Start isolated broker
+        shell: bash
+        run: |
+          cat >/tmp/mosq-screen.conf <<'EOF'
+          persistence false
+          allow_anonymous true
+          max_inflight_messages 1000
+          max_queued_messages 100000
+          connection_messages false
+          log_type error
+          listener 11883 127.0.0.1
+          EOF
+          mosquitto -c /tmp/mosq-screen.conf >/tmp/mosq-screen.log 2>&1 &
+          echo $! >/tmp/mosq-screen.pid
+          for _ in $(seq 1 50); do (echo >/dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0; sleep .1; done
+          cat /tmp/mosq-screen.log; exit 1
+
+      - name: Writer current vs spare1
+        run: python support/benchmarks/temp_scheduler_supplement.py writer-hetero-parent --base-root pr284 --candidate-root pr284-spare1 --producer-values 8,12,16,20,32,64 --repeat 4 --count 6000 --max-messages 8 --max-bytes 16384 --small-bytes 64 --large-bytes 4096 --output /tmp/writer-spare1.json
+      - name: Writer current vs anti-barge
+        run: python support/benchmarks/temp_scheduler_supplement.py writer-hetero-parent --base-root pr284 --candidate-root pr284-antibarge --producer-values 8,12,16,20,32,64 --repeat 4 --count 6000 --max-messages 8 --max-bytes 16384 --small-bytes 64 --large-bytes 4096 --output /tmp/writer-antibarge.json
+      - name: Publish current vs spare1
+        run: python support/benchmarks/temp_scheduler_supplement.py publish-parent --base-root pr285 --candidate-root pr285-spare1 --host 127.0.0.1 --port 11883 --publisher-values 8,12,16,20,32,64 --inflight-values 4,20 --count 1600 --repeat 4 --timeout 120 --output /tmp/publish-spare1.json
+      - name: Publish current vs anti-barge
+        run: python support/benchmarks/temp_scheduler_supplement.py publish-parent --base-root pr285 --candidate-root pr285-antibarge --host 127.0.0.1 --port 11883 --publisher-values 8,12,16,20,32,64 --inflight-values 4,20 --count 1600 --repeat 4 --timeout 120 --output /tmp/publish-antibarge.json
+      - name: Upload evidence
+        if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: distributions-${{ github.sha }}
-          path: dist/*
-          if-no-files-found: error
+          name: wake-screening-v2-${{ github.run_id }}
+          path: |
+            /tmp/writer-spare1.json
+            /tmp/writer-antibarge.json
+            /tmp/publish-spare1.json
+            /tmp/publish-antibarge.json
+            /tmp/mosq-screen.log
+          if-no-files-found: warn
+          retention-days: 7
