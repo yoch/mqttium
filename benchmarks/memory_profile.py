@@ -931,8 +931,7 @@ async def _run_reconnect_epoch_cleanup(spec: ScenarioSpec) -> dict[str, Any]:
     )
     payloads = [_payload(index, spec.payload_size) for index in range(spec.count)]
     for payload in payloads:
-        client._outbound.put_nowait(payload)
-        client._outbound_bytes += len(payload)
+        assert client._try_enqueue_outbound(payload)
     client._effect_pump.pending.extend(
         EngineEffect(kind=EffectKind.SEND, data=payload) for payload in payloads
     )
