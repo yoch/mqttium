@@ -1,4 +1,4 @@
-name: TEMP PR284-285 wake policy screening
+name: TEMP PR284-285 wake policy screening v2
 
 on:
   pull_request:
@@ -7,33 +7,30 @@ permissions:
   contents: read
 
 concurrency:
-  group: temp-pr284-285-wake-screening
+  group: temp-pr284-285-wake-screening-v2
   cancel-in-progress: true
 
 jobs:
   screening:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 35
     env:
       PR284_SHA: 8d37248831b372004074acfa0018f34da51b54df
       PR285_SHA: 505c385c59670b2fb095728b5095f5039c53d675
       SUPPORT_REF: 50122fc2012a326409733207297b9c775311ee01
       PYTHONUNBUFFERED: "1"
     steps:
-      - name: Checkout PR284
-        uses: actions/checkout@v7
+      - uses: actions/checkout@v7
         with:
           ref: ${{ env.PR284_SHA }}
           path: pr284
           persist-credentials: false
-      - name: Checkout PR285
-        uses: actions/checkout@v7
+      - uses: actions/checkout@v7
         with:
           ref: ${{ env.PR285_SHA }}
           path: pr285
           persist-credentials: false
-      - name: Checkout benchmark support
-        uses: actions/checkout@v7
+      - uses: actions/checkout@v7
         with:
           ref: ${{ env.SUPPORT_REF }}
           path: support
@@ -42,79 +39,9 @@ jobs:
         with:
           python-version: "3.13"
       - run: python -m pip install -e "pr284[dev]" "psutil>=6,<8"
-      - name: Install Mosquitto
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq mosquitto
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq mosquitto
 
-      - name: Prove current barging deterministically
-        shell: bash
-        run: |
-          set -euo pipefail
-          PYTHONPATH=pr284/src python - <<'PY'
-          import asyncio
-          from mqttium.api._writer import WritePump
-
-          class Gate:
-              def __init__(self):
-                  self.entered = asyncio.Event()
-                  self.release = asyncio.Event()
-              async def write(self, data):
-                  self.entered.set()
-                  await self.release.wait()
-              async def write_many(self, parts):
-                  await self.write(b''.join(parts))
-              async def read(self, n=65536): return b''
-              async def close(self): pass
-              def is_closing(self): return False
-
-          async def fail(exc): raise AssertionError(exc)
-
-          async def main():
-              p = WritePump(max_bytes=1 << 20, max_messages=1, on_failure=fail)
-              assert p.try_enqueue(b'held')
-              parked = asyncio.create_task(p.enqueue(b'parked'))
-              while p.waiters != 1:
-                  await asyncio.sleep(0)
-              t = Gate(); p.start(t)
-              await asyncio.wait_for(t.entered.wait(), 1)
-              barged = p.try_enqueue(b'new-arrival')
-              print({'writer_barged': barged, 'waiters': p.waiters, 'queued': p.queued_messages})
-              assert barged is True and not parked.done()
-              t.release.set(); await asyncio.wait_for(parked, 1)
-              await asyncio.wait_for(p.join(), 1); await p.stop()
-          asyncio.run(main())
-          PY
-
-          PYTHONPATH=pr285/src python - <<'PY'
-          import asyncio
-          from mqttium.api.async_client import AsyncClient
-          from mqttium.protocol.engine import EffectKind, EngineEffect
-
-          async def complete(client, mid):
-              stored = client._engine.store.get_out(mid)
-              assert stored is not None
-              client._engine.outbound.complete_record(mid, stored)
-              client._engine.packet_ids.release(mid)
-              await client._apply_effect(EngineEffect(kind=EffectKind.PUBLISH_COMPLETE, data=mid), nowait=False)
-
-          async def main():
-              c = AsyncClient(max_pending_outbound_messages=1, max_pending_outbound_bytes=None)
-              first = await c.publish('barging/held', b'a', qos=1)
-              assert first.mid is not None
-              parked = asyncio.create_task(c.publish('barging/parked', b'b', qos=1))
-              while c._publish_waiters != 1:
-                  await asyncio.sleep(0)
-              await complete(c, first.mid)
-              sneak = await c.publish('barging/new-arrival', b'c', qos=1)
-              assert sneak.mid is not None
-              await asyncio.sleep(0)
-              print({'publish_barged': not parked.done(), 'waiters': c._publish_waiters})
-              assert not parked.done()
-              await complete(c, sneak.mid)
-              await asyncio.wait_for(parked, 1)
-          asyncio.run(main())
-          PY
-
-      - name: Create causal policy variants
+      - name: Build runtime-only policy variants
         shell: bash
         run: |
           set -euo pipefail
@@ -128,7 +55,7 @@ jobs:
           def repl(path, old, new):
               p = Path(path)
               text = p.read_text()
-              assert text.count(old) == 1, (path, text.count(old), old)
+              assert text.count(old) == 1, (path, text.count(old), old[:80])
               p.write_text(text.replace(old, new))
 
           repl('pr284-spare1/src/mqttium/api/_writer.py',
@@ -138,8 +65,9 @@ jobs:
                'self._wake_publish_waiters(1)\n\n    def _register_publish_waiter',
                'self._wake_publish_waiters(2)\n\n    def _register_publish_waiter')
 
-          # Causal writer anti-barging variant. This is diagnostic only: it also
-          # makes try_enqueue respect parked waiters and is not yet an API-ready fix.
+          # Diagnostic writer anti-barging policy: new admissions cannot claim
+          # a slot while an older blocking enqueue is parked; a blocking
+          # newcomer joins the Condition queue before it may claim capacity.
           repl('pr284-antibarge/src/mqttium/api/_writer.py',
                '        size = item_size(item)\n        if not self.can_enqueue_size(size):\n            return False\n',
                '        size = item_size(item)\n        if self.waiters or not self.can_enqueue_size(size):\n            return False\n')
@@ -153,34 +81,142 @@ jobs:
                '                    await self.space.wait()\n                except asyncio.CancelledError:\n',
                '                    await self.space.wait()\n                    must_queue_behind_waiters = False\n                except asyncio.CancelledError:\n')
 
-          # Causal publish anti-barging variant for single publish(). A newcomer
-          # joins the waiter deque while an older publisher is parked; a woken
-          # publisher gets one privileged retry. publish_many is deliberately
-          # not altered in this diagnostic screen.
+          # Diagnostic single-publish anti-barging policy. This deliberately
+          # leaves publish_many unchanged: the goal is causal screening, not a
+          # production patch. A newcomer joins the waiter deque when an older
+          # publisher is parked; a woken publisher receives one privileged try.
           p = Path('pr285-antibarge/src/mqttium/api/async_client.py')
           text = p.read_text()
-          old = '''        data = payload.encode("utf-8") if isinstance(payload, str) else payload\n        while True:\n            waiter: asyncio.Future[None] | None = None\n            async with self._engine_lock:\n                try:\n                    direct = self._try_direct_qos0_publish(\n'''
-          new = '''        data = payload.encode("utf-8") if isinstance(payload, str) else payload\n        has_turn = False\n        while True:\n            waiter: asyncio.Future[None] | None = None\n            async with self._engine_lock:\n                if not nowait and not has_turn and self._publish_waiters:\n                    terminal = self._publish_wait_failure()\n                    if terminal is not None:\n                        raise terminal\n                    waiter = self._register_publish_waiter()\n                else:\n                    has_turn = False\n                    try:\n                        direct = self._try_direct_qos0_publish(\n'''
-          assert text.count(old) == 1
-          text = text.replace(old, new)
-          start = text.index('                    try:\n                        direct = self._try_direct_qos0_publish(')
-          boundary = text.index('            if waiter is None:\n', start)
-          block = text[start:boundary]
-          lines = block.splitlines(True)
-          adjusted = lines[0] + ''.join('    ' + line if line.strip() else line for line in lines[1:])
-          text = text[:start] + adjusted + text[boundary:]
-          text = text.replace(
-              '            await self._wait_publish_space(waiter)\n\n    async def _admit_publish_many',
-              '            await self._wait_publish_space(waiter)\n            has_turn = True\n\n    async def _admit_publish_many',
-              1,
-          )
-          p.write_text(text)
+          old = '''        data = payload.encode("utf-8") if isinstance(payload, str) else payload
+        while True:
+            waiter: asyncio.Future[None] | None = None
+            async with self._engine_lock:
+                try:
+                    direct = self._try_direct_qos0_publish(
+                        topic,
+                        data,
+                        qos=qos,
+                        retain=retain,
+                        properties=properties,
+                        nowait=nowait,
+                    )
+                    if direct is not None:
+                        return direct
+                    if nowait:
+                        self._check_nowait_publish_capacity(topic, data, qos, retain, properties)
+                    # Keep the native async hot path inline. Routing these
+                    # operations through the adapter boundary measured 2.36% slower.
+                    handle = self._engine.outbound.queue_publish(
+                        topic,
+                        data,
+                        qos=qos,
+                        retain=retain,
+                        properties=properties,
+                    )
+                    if handle.qos == QoS.AT_MOST_ONCE:
+                        receipt = PublishReceipt(mid=None, qos=handle.qos)
+                    else:
+                        assert handle.mid is not None
+                        receipt = PublishReceipt(mid=handle.mid, qos=handle.qos)
+                        self._register_publish_receipt(handle.mid, receipt)
+                except FlowControlError as flow_exc:
+                    if (
+                        nowait
+                        or self._publish_backpressure == "error"
+                        or not self._engine.can_ever_admit_publish(topic, data, qos, properties)
+                    ):
+                        raise
+                    terminal = self._publish_wait_failure()
+                    if terminal is not None:
+                        raise terminal from flow_exc
+                    waiter = self._register_publish_waiter()
+                else:
+                    self._collect_effects_locked()
+                    self._drain_effects_inline()
+            if waiter is None:
+                if self._effect_pump.pending:
+                    if nowait:
+                        self._schedule_effect_flush()
+                    else:
+                        await self._drain_effects()
+                if not nowait and receipt.qos != QoS.AT_MOST_ONCE:
+                    self._write_pump._try_flush_latency_batch()
+                return receipt
+            await self._wait_publish_space(waiter)
+'''
+          new = '''        data = payload.encode("utf-8") if isinstance(payload, str) else payload
+        has_turn = False
+        while True:
+            waiter: asyncio.Future[None] | None = None
+            async with self._engine_lock:
+                if not nowait and not has_turn and self._publish_waiters:
+                    terminal = self._publish_wait_failure()
+                    if terminal is not None:
+                        raise terminal
+                    waiter = self._register_publish_waiter()
+                else:
+                    has_turn = False
+                    try:
+                        direct = self._try_direct_qos0_publish(
+                            topic,
+                            data,
+                            qos=qos,
+                            retain=retain,
+                            properties=properties,
+                            nowait=nowait,
+                        )
+                        if direct is not None:
+                            return direct
+                        if nowait:
+                            self._check_nowait_publish_capacity(topic, data, qos, retain, properties)
+                        handle = self._engine.outbound.queue_publish(
+                            topic,
+                            data,
+                            qos=qos,
+                            retain=retain,
+                            properties=properties,
+                        )
+                        if handle.qos == QoS.AT_MOST_ONCE:
+                            receipt = PublishReceipt(mid=None, qos=handle.qos)
+                        else:
+                            assert handle.mid is not None
+                            receipt = PublishReceipt(mid=handle.mid, qos=handle.qos)
+                            self._register_publish_receipt(handle.mid, receipt)
+                    except FlowControlError as flow_exc:
+                        if (
+                            nowait
+                            or self._publish_backpressure == "error"
+                            or not self._engine.can_ever_admit_publish(topic, data, qos, properties)
+                        ):
+                            raise
+                        terminal = self._publish_wait_failure()
+                        if terminal is not None:
+                            raise terminal from flow_exc
+                        waiter = self._register_publish_waiter()
+                    else:
+                        self._collect_effects_locked()
+                        self._drain_effects_inline()
+            if waiter is None:
+                if self._effect_pump.pending:
+                    if nowait:
+                        self._schedule_effect_flush()
+                    else:
+                        await self._drain_effects()
+                if not nowait and receipt.qos != QoS.AT_MOST_ONCE:
+                    self._write_pump._try_flush_latency_batch()
+                return receipt
+            await self._wait_publish_space(waiter)
+            has_turn = True
+'''
+          assert text.count(old) == 1, text.count(old)
+          p.write_text(text.replace(old, new))
           PY
           python -m compileall -q pr284-spare1/src pr284-antibarge/src pr285-spare1/src pr285-antibarge/src
 
-      - name: Prove writer anti-barging variant
+      - name: Prove diagnostic anti-barging policies
         shell: bash
         run: |
+          set -euo pipefail
           PYTHONPATH=pr284-antibarge/src python - <<'PY'
           import asyncio
           from mqttium.api._writer import WritePump
@@ -200,6 +236,28 @@ jobs:
               t=Gate(); p.start(t); await t.entered.wait()
               assert p.try_enqueue(b'sneak') is False
               t.release.set(); await parked; await p.join(); await p.stop()
+          asyncio.run(main())
+          PY
+          PYTHONPATH=pr285-antibarge/src python - <<'PY'
+          import asyncio
+          from mqttium.api.async_client import AsyncClient
+          from mqttium.protocol.engine import EffectKind, EngineEffect
+          async def complete(c, mid):
+              stored=c._engine.store.get_out(mid); assert stored is not None
+              c._engine.outbound.complete_record(mid, stored); c._engine.packet_ids.release(mid)
+              await c._apply_effect(EngineEffect(kind=EffectKind.PUBLISH_COMPLETE,data=mid),nowait=False)
+          async def main():
+              c=AsyncClient(max_pending_outbound_messages=1,max_pending_outbound_bytes=None)
+              first=await c.publish('a',b'a',qos=1); assert first.mid is not None
+              parked=asyncio.create_task(c.publish('b',b'b',qos=1))
+              while c._publish_waiters != 1: await asyncio.sleep(0)
+              await complete(c,first.mid)
+              sneak=asyncio.create_task(c.publish('c',b'c',qos=1))
+              await asyncio.sleep(0)
+              assert parked.done() and not sneak.done(), (parked.done(),sneak.done(),c._publish_waiters)
+              admitted=parked.result(); assert admitted.mid is not None
+              await complete(c,admitted.mid)
+              await asyncio.wait_for(sneak,1)
           asyncio.run(main())
           PY
 
@@ -228,29 +286,11 @@ jobs:
         run: python support/benchmarks/temp_scheduler_supplement.py publish-parent --base-root pr285 --candidate-root pr285-spare1 --host 127.0.0.1 --port 11883 --publisher-values 8,12,16,20,32,64 --inflight-values 4,20 --count 1600 --repeat 4 --timeout 120 --output /tmp/publish-spare1.json
       - name: Publish current vs anti-barge
         run: python support/benchmarks/temp_scheduler_supplement.py publish-parent --base-root pr285 --candidate-root pr285-antibarge --host 127.0.0.1 --port 11883 --publisher-values 8,12,16,20,32,64 --inflight-values 4,20 --count 1600 --repeat 4 --timeout 120 --output /tmp/publish-antibarge.json
-
-      - name: Summarize screening
-        if: always()
-        shell: bash
-        run: |
-          python - <<'PY'
-          import json
-          from pathlib import Path
-          for name in ('writer-spare1','writer-antibarge','publish-spare1','publish-antibarge'):
-              p=Path('/tmp')/(name+'.json')
-              print('\n###',name)
-              if not p.exists(): print('MISSING'); continue
-              d=json.loads(p.read_text())
-              rows=d.get('scenarios', d.get('rows', []))
-              for r in rows:
-                  chosen={k:v for k,v in r.items() if k in {'producers','publishers','inflight'} or k.endswith('_ratio')}
-                  print(chosen)
-          PY
-      - name: Upload screening evidence
+      - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: wake-screening-${{ github.run_id }}
+          name: wake-screening-v2-${{ github.run_id }}
           path: |
             /tmp/writer-spare1.json
             /tmp/writer-antibarge.json
