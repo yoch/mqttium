@@ -126,8 +126,7 @@ async def test_eager_write_is_declined_while_the_queue_is_not_empty() -> None:
     # No writer task: nothing drains the queue, so it stays non-empty.
     pump._write_nowait = transport.write_nowait
     try:
-        pump.queue.put_nowait(b"queued")
-        pump.queued_bytes = len(b"queued")
+        assert pump.try_enqueue(b"queued") is True
         assert pump.try_enqueue(b"later") is True
         assert transport.written == []
         assert pump.queued_messages == 2
