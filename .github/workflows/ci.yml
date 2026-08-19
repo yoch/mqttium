@@ -88,11 +88,7 @@ jobs:
               '                            # slots exist. Lifecycle still uses notify_all()\n'
               '                            # via wake_waiters() / advance_epoch().\n'
               '                            self.space.notify(min(self.waiters, len(batch)))\n',
-              '                        if (\n'
-              '                            batch_completed\n'
-              '                            and self.waiters\n'
-              '                            and not writer_task.cancelling()\n'
-              '                        ):\n'
+              '                        if batch_completed and self.waiters and not writer_task.cancelling():\n'
               '                            # Only a successfully written batch releases usable\n'
               '                            # writer capacity. Cancellation/failure is lifecycle:\n'
               '                            # waking here can admit old-epoch writes onto a dead\n'
