@@ -1,4 +1,4 @@
-name: TEMP ARM64 isolate QoS1 writer-capacity regression
+name: TEMP ARM64 replicate full scheduler stack
 
 on:
   pull_request:
@@ -19,72 +19,64 @@ env:
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
 jobs:
-  isolate:
+  replicate:
     runs-on: [self-hosted, linux, ARM64]
     timeout-minutes: 120
     steps:
-      - name: Define evidence root and venv
+      - name: Define paths
         shell: bash
         run: |
-          echo "ROOT=$RUNNER_TEMP/qos1-isolation" >> "$GITHUB_ENV"
-          echo "VENV=$RUNNER_TEMP/qos1-isolation-venv" >> "$GITHUB_ENV"
+          echo "ROOT=$RUNNER_TEMP/full-stack-replicate" >> "$GITHUB_ENV"
+          echo "VENV=$RUNNER_TEMP/full-stack-replicate-venv" >> "$GITHUB_ENV"
 
-      - name: Checkout baseline
+      - name: Checkout immutable base
         uses: actions/checkout@v7
         with:
           ref: ${{ env.BASE_SHA }}
           fetch-depth: 0
           path: base
           persist-credentials: false
-      - name: Checkout PR 283
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ env.PR283_SHA }}
-          path: pr283
-          persist-credentials: false
-      - name: Checkout PR 284
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ env.PR284_SHA }}
-          path: pr284
-          persist-credentials: false
-      - name: Checkout PR 285
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ env.PR285_SHA }}
-          path: pr285
-          persist-credentials: false
-      - name: Checkout pair 283+284 workspace
+
+      - name: Checkout immutable base into stack workspace
         uses: actions/checkout@v7
         with:
           ref: ${{ env.BASE_SHA }}
           fetch-depth: 0
-          path: p283284
-          persist-credentials: false
-      - name: Checkout pair 283+285 workspace
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ env.BASE_SHA }}
-          fetch-depth: 0
-          path: p283285
-          persist-credentials: false
-      - name: Checkout pair 284+285 workspace
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ env.BASE_SHA }}
-          fetch-depth: 0
-          path: p284285
+          path: stack
           persist-credentials: false
 
-      - name: Build pair 283+284 with audited writer resolution
-        working-directory: p283284
+      - name: Compose exact heads with audited conflict resolution
+        working-directory: stack
         shell: bash
         run: |
           set -euo pipefail
-          git config user.name pair-probe
-          git config user.email pair-probe@example.invalid
+          git config user.name stack-probe
+          git config user.email stack-probe@example.invalid
+
+          union_report_index() {
+            python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+          path='docs/reports/README.md'
+          ours=subprocess.check_output(['git','show',f':2:{path}'],text=True)
+          theirs=subprocess.check_output(['git','show',f':3:{path}'],text=True)
+          lines=ours.splitlines()
+          incoming=[line for line in theirs.splitlines() if line.startswith('| 2026-08-') and 'SCHEDULER-' in line and line not in lines]
+          if not incoming:
+              raise SystemExit('no unique incoming scheduler rows')
+          heading=lines.index('## Hot-path decisions')
+          insert_at=heading
+          while insert_at>0 and lines[insert_at-1]=='':
+              insert_at-=1
+          lines[insert_at:insert_at]=incoming
+          Path(path).write_text('\n'.join(lines)+'\n')
+          PY
+          }
+
+          test "$(git rev-parse HEAD)" = "$BASE_SHA"
           git fetch --no-tags origin "$PR283_SHA"
           git merge --no-ff --no-edit "$PR283_SHA"
+
           git fetch --no-tags origin "$PR284_SHA"
           set +e
           git merge --no-ff --no-edit "$PR284_SHA"
@@ -95,7 +87,8 @@ jobs:
           test "${#conflicts[@]}" -eq 2
           test "${conflicts[0]}" = "docs/reports/README.md"
           test "${conflicts[1]}" = "src/mqttium/api/_writer.py"
-          git checkout --ours docs/reports/README.md src/mqttium/api/_writer.py
+          union_report_index
+          git checkout --ours src/mqttium/api/_writer.py
           python3 - <<'PY'
           from pathlib import Path
           p=Path('src/mqttium/api/_writer.py')
@@ -104,7 +97,7 @@ jobs:
               global text
               n=text.count(old)
               if n != 1:
-                  raise SystemExit(f'expected 1 match, got {n}: {old!r}')
+                  raise SystemExit(f'expected one writer match, got {n}: {old!r}')
               text=text.replace(old,new)
           one(
               '                self.enqueue_suspensions += 1\n                try:\n                    await self.space.wait()\n                finally:\n                    self.waiters -= 1\n',
@@ -124,7 +117,7 @@ jobs:
           )
           one(
               '                        self._release_resident(n_batch)\n                        if self.waiters:\n                            self.space.notify_all()\n',
-              '                        self._release_resident(n_batch)\n                        if batch_completed and self.waiters and not writer_task.cancelling():\n                            self.space.notify(min(self.waiters, n_batch))\n',
+              '                        self._release_resident(n_batch)\n                        if batch_completed and self.waiters and not writer_task.cancelling():\n                            # Resident accounting is released on every exit, but only\n                            # a successfully written batch releases usable capacity.\n                            self.space.notify(min(self.waiters, n_batch))\n',
           )
           p.write_text(text)
           PY
@@ -132,15 +125,6 @@ jobs:
           git diff --check
           git commit --no-edit
 
-      - name: Build pair 283+285
-        working-directory: p283285
-        shell: bash
-        run: |
-          set -euo pipefail
-          git config user.name pair-probe
-          git config user.email pair-probe@example.invalid
-          git fetch --no-tags origin "$PR283_SHA"
-          git merge --no-ff --no-edit "$PR283_SHA"
           git fetch --no-tags origin "$PR285_SHA"
           set +e
           git merge --no-ff --no-edit "$PR285_SHA"
@@ -150,39 +134,16 @@ jobs:
             mapfile -t conflicts < <(git diff --name-only --diff-filter=U)
             test "${#conflicts[@]}" -eq 1
             test "${conflicts[0]}" = "docs/reports/README.md"
-            git checkout --ours docs/reports/README.md
+            union_report_index
             git add docs/reports/README.md
+            git diff --check
             git commit --no-edit
           fi
           test -z "$(git diff --name-only --diff-filter=U)"
-          git diff --check
+          git diff --check "$BASE_SHA"..HEAD
+          git rev-parse HEAD | tee "$RUNNER_TEMP/full-stack-head.txt"
 
-      - name: Build pair 284+285
-        working-directory: p284285
-        shell: bash
-        run: |
-          set -euo pipefail
-          git config user.name pair-probe
-          git config user.email pair-probe@example.invalid
-          git fetch --no-tags origin "$PR284_SHA"
-          git merge --no-ff --no-edit "$PR284_SHA"
-          git fetch --no-tags origin "$PR285_SHA"
-          set +e
-          git merge --no-ff --no-edit "$PR285_SHA"
-          rc=$?
-          set -e
-          if [ "$rc" -ne 0 ]; then
-            mapfile -t conflicts < <(git diff --name-only --diff-filter=U)
-            test "${#conflicts[@]}" -eq 1
-            test "${conflicts[0]}" = "docs/reports/README.md"
-            git checkout --ours docs/reports/README.md
-            git add docs/reports/README.md
-            git commit --no-edit
-          fi
-          test -z "$(git diff --name-only --diff-filter=U)"
-          git diff --check
-
-      - name: Prepare environment and strict preflight
+      - name: Prepare ARM64 environment
         shell: bash
         run: |
           set -euo pipefail
@@ -190,23 +151,26 @@ jobs:
           rm -rf "$ROOT" "$VENV"
           mkdir -p "$ROOT"
           python3 -m venv "$VENV"
-          "$VENV/bin/python" -m pip install -e "pr284[dev]" "psutil>=6,<8"
+          "$VENV/bin/python" -m pip install -e "stack[dev]" "psutil>=6,<8"
           sudo systemctl stop mosquitto 2>/dev/null || true
           sudo pkill -x mosquitto 2>/dev/null || true
           sleep 1
-          for attempt in $(seq 1 12); do
-            probe="$ROOT/preflight-attempt-$attempt.json"
+
+      - name: Strict preflight before A/A
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 18); do
+            probe="$ROOT/preflight-aa-$attempt.json"
             if "$VENV/bin/python" base/benchmarks/runner_probe.py --output "$probe" --require-temperature --enforce; then
-              cp "$probe" "$ROOT/preflight.json"
-              echo "strict eligibility reached on attempt $attempt"
+              cp "$probe" "$ROOT/preflight-aa.json"
               exit 0
             fi
             sleep 10
           done
-          cat "$ROOT/preflight-attempt-12.json" >&2
           exit 1
 
-      - name: Start isolated broker
+      - name: Start isolated Mosquitto
         shell: bash
         run: |
           set -euo pipefail
@@ -223,85 +187,154 @@ jobs:
           mosquitto -c "$ROOT/mosquitto.conf" > "$ROOT/mosquitto.log" 2>&1 &
           echo $! > "$ROOT/mosquitto.pid"
           for _ in $(seq 1 50); do
-            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            (echo >/dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
             sleep .2
           done
           cat "$ROOT/mosquitto.log"
           exit 1
 
-      - name: Run QoS1 isolation matrix
+      - name: QoS1 A/A stability gate
+        shell: bash
+        run: |
+          "$VENV/bin/python" base/benchmarks/paired_writer_capacity.py \
+            --base-root base --candidate-root base --host 127.0.0.1 --port 11883 \
+            --protocol 311 --qos-values 1 --payload-bytes 64 \
+            --inflight 20 --outstanding 20 --max-queued 200 \
+            --warmup-count 5000 --count-qos1 40000 --repeat 8 --cpu 1 \
+            --policy strict --preflight-report "$ROOT/preflight-aa.json" \
+            --max-baseline-cv .05 --min-completed-ratio .97 \
+            --output "$ROOT/qos1-aa.json" --summary-output "$ROOT/qos1-aa.md"
+
+      - name: Requalify before A/B replicate 1
         shell: bash
         run: |
           set -euo pipefail
-          variants=(pr283 pr284 pr285 p283284 p283285 p284285)
-          for variant in "${variants[@]}"; do
-            echo "=== $variant ==="
-            set +e
-            "$VENV/bin/python" base/benchmarks/paired_writer_capacity.py \
-              --base-root base --candidate-root "$variant" --host 127.0.0.1 --port 11883 \
-              --protocol 311 --qos-values 1 --payload-bytes 64 \
-              --inflight 20 --outstanding 20 --max-queued 200 \
-              --warmup-count 5000 --count-qos1 40000 --repeat 8 --cpu 1 \
-              --policy strict --preflight-report "$ROOT/preflight.json" \
-              --max-baseline-cv .05 --min-completed-ratio .97 \
-              --output "$ROOT/$variant.json" --summary-output "$ROOT/$variant.md" \
-              >"$ROOT/$variant.stdout.log" 2>"$ROOT/$variant.stderr.log"
-            rc=$?
-            set -e
-            echo "$rc" > "$ROOT/$variant.rc"
-            cat "$ROOT/$variant.stdout.log"
-            cat "$ROOT/$variant.stderr.log" >&2
+          for attempt in $(seq 1 18); do
+            probe="$ROOT/preflight-ab1-$attempt.json"
+            if "$VENV/bin/python" base/benchmarks/runner_probe.py --output "$probe" --require-temperature --enforce; then
+              cp "$probe" "$ROOT/preflight-ab1.json"
+              exit 0
+            fi
+            sleep 10
           done
+          exit 1
 
-      - name: Summarize isolation matrix
+      - name: QoS1 full-stack A/B replicate 1
         shell: bash
         run: |
-          "$VENV/bin/python" - <<'PY'
-          import json, os
-          from pathlib import Path
-          root=Path(os.environ['ROOT'])
-          variants=['pr283','pr284','pr285','p283284','p283285','p284285']
-          rows=[]
-          for v in variants:
-              d=json.loads((root/f'{v}.json').read_text())
-              s=d['scenarios'][0]
-              rows.append({
-                  'variant':v,
-                  'status':d['status'],
-                  'ratio':s['median_candidate_over_base_completed'],
-                  'base_cv':s['base_completed_cv'],
-                  'candidate_cv':s['candidate_completed_cv'],
-                  'base_rate':s['base_median_completed_rate'],
-                  'candidate_rate':s['candidate_median_completed_rate'],
-                  'regressions':d.get('regressions'),
-                  'invalidations':d.get('invalidations'),
-              })
-          print(json.dumps(rows, indent=2))
-          (root/'isolation-summary.json').write_text(json.dumps(rows, indent=2)+'\n')
-          PY
+          "$VENV/bin/python" base/benchmarks/paired_writer_capacity.py \
+            --base-root base --candidate-root stack --host 127.0.0.1 --port 11883 \
+            --protocol 311 --qos-values 1 --payload-bytes 64 \
+            --inflight 20 --outstanding 20 --max-queued 200 \
+            --warmup-count 5000 --count-qos1 40000 --repeat 8 --cpu 1 \
+            --policy strict --preflight-report "$ROOT/preflight-ab1.json" \
+            --max-baseline-cv .05 --min-completed-ratio .97 \
+            --output "$ROOT/qos1-ab1.json" --summary-output "$ROOT/qos1-ab1.md"
 
-      - name: Final strict preflight and cleanup broker
+      - name: Requalify before A/B replicate 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 18); do
+            probe="$ROOT/preflight-ab2-$attempt.json"
+            if "$VENV/bin/python" base/benchmarks/runner_probe.py --output "$probe" --require-temperature --enforce; then
+              cp "$probe" "$ROOT/preflight-ab2.json"
+              exit 0
+            fi
+            sleep 10
+          done
+          exit 1
+
+      - name: QoS1 full-stack A/B replicate 2
+        shell: bash
+        run: |
+          "$VENV/bin/python" base/benchmarks/paired_writer_capacity.py \
+            --base-root base --candidate-root stack --host 127.0.0.1 --port 11883 \
+            --protocol 311 --qos-values 1 --payload-bytes 64 \
+            --inflight 20 --outstanding 20 --max-queued 200 \
+            --warmup-count 5000 --count-qos1 40000 --repeat 8 --cpu 1 \
+            --policy strict --preflight-report "$ROOT/preflight-ab2.json" \
+            --max-baseline-cv .05 --min-completed-ratio .97 \
+            --output "$ROOT/qos1-ab2.json" --summary-output "$ROOT/qos1-ab2.md"
+
+      - name: Requalify before final guards
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 18); do
+            probe="$ROOT/preflight-guards-$attempt.json"
+            if "$VENV/bin/python" base/benchmarks/runner_probe.py --output "$probe" --require-temperature --enforce; then
+              cp "$probe" "$ROOT/preflight-guards.json"
+              exit 0
+            fi
+            sleep 10
+          done
+          exit 1
+
+      - name: Final writer-capacity guard QoS0+QoS1
+        shell: bash
+        run: |
+          "$VENV/bin/python" base/benchmarks/paired_writer_capacity.py \
+            --base-root base --candidate-root stack --host 127.0.0.1 --port 11883 \
+            --protocol 311 --qos-values 0,1 --payload-bytes 64 \
+            --inflight 20 --outstanding 20 --max-queued 200 \
+            --warmup-count 5000 --count-qos0 100000 --count-qos1 40000 \
+            --repeat 6 --cpu 1 --policy strict \
+            --preflight-report "$ROOT/preflight-guards.json" \
+            --max-baseline-cv .05 --min-completed-ratio .97 \
+            --output "$ROOT/writer-capacity-final.json" \
+            --summary-output "$ROOT/writer-capacity-final.md"
+
+      - name: Stable open-loop guard
+        shell: bash
+        run: |
+          "$VENV/bin/python" base/benchmarks/paired_open_loop.py \
+            --base-root base --candidate-root stack \
+            --protocols 311 --payloads 64 --completions callback --windows 20 \
+            --target-rates 5000,7500 --count-small 5000 --repeat 6 --cpu 1 \
+            --policy strict --preflight-report "$ROOT/preflight-guards.json" \
+            --max-baseline-cv .05 --min-completed-ratio .97 --max-loop-lag-ratio 1.05 \
+            --output "$ROOT/open-loop.json" --summary-output "$ROOT/open-loop.md"
+
+      - name: Network guard
+        shell: bash
+        run: |
+          "$VENV/bin/python" base/benchmarks/paired_network.py \
+            --base-root base --candidate-root stack --host 127.0.0.1 --port 11883 \
+            --protocols 311 --completions receipt --payloads 64,4096 --windows 20,64 \
+            --repeat 6 --count-small 1500 --count-large 750 --cpu 1 \
+            --policy strict --preflight-report "$ROOT/preflight-guards.json" \
+            --max-baseline-cv .05 --min-ack-ratio .97 \
+            --output "$ROOT/network.json" --summary-output "$ROOT/network.md"
+
+      - name: Final cooldown and strict eligibility
         if: always()
         shell: bash
         run: |
           set -euo pipefail
           if [ -f "$ROOT/mosquitto.pid" ]; then kill "$(cat "$ROOT/mosquitto.pid")" 2>/dev/null || true; fi
           sudo pkill -x mosquitto 2>/dev/null || true
-          sleep 1
-          if [ -x "$VENV/bin/python" ]; then
-            "$VENV/bin/python" base/benchmarks/runner_probe.py --output "$ROOT/preflight-final.json" --require-temperature --enforce
-          fi
+          sleep 2
+          for attempt in $(seq 1 24); do
+            probe="$ROOT/preflight-final-$attempt.json"
+            if [ -x "$VENV/bin/python" ] && "$VENV/bin/python" base/benchmarks/runner_probe.py --output "$probe" --require-temperature --enforce; then
+              cp "$probe" "$ROOT/preflight-final.json"
+              exit 0
+            fi
+            sleep 10
+          done
+          exit 1
 
-      - name: Upload isolation evidence
+      - name: Upload full-stack evidence
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: qos1-isolation-${{ github.run_id }}
+          name: full-stack-replicate-${{ github.run_id }}
           path: |
-            ${{ runner.temp }}/qos1-isolation/*.json
-            ${{ runner.temp }}/qos1-isolation/*.md
-            ${{ runner.temp }}/qos1-isolation/*.log
-            ${{ runner.temp }}/qos1-isolation/*.rc
-            ${{ runner.temp }}/qos1-isolation/*.conf
+            ${{ runner.temp }}/full-stack-replicate/*.json
+            ${{ runner.temp }}/full-stack-replicate/*.md
+            ${{ runner.temp }}/full-stack-replicate/*.log
+            ${{ runner.temp }}/full-stack-replicate/*.conf
+            ${{ runner.temp }}/full-stack-head.txt
           if-no-files-found: warn
           retention-days: 30
