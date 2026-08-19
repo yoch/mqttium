@@ -1,5 +1,10 @@
 # Scheduler experiment: targeted publish admission wake — 2026-08-18
 
+> **Superseded** by
+> [`SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-19.md`](SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-19.md),
+> which names the feat commit and records the 2026-08-19 diagnostic campaign.
+> This file is the implementation note as written on 2026-08-18.
+
 Records candidate 1 of
 [`../experiments/scheduler-publish-targeted-wake.md`](../experiments/scheduler-publish-targeted-wake.md).
 This is an implementation note plus a diagnostic (ineligible-host) campaign.

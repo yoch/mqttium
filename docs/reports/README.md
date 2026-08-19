@@ -113,13 +113,14 @@ outcome live here.
 
 ## Scheduler experiments
 
-In-progress or correctness-only notes. They do not outrank a measured hot-path
+Open scheduler-hypothesis records. They do not outrank a measured hot-path
 decision, and they are not merge evidence until the experiment's own gate is
-met.
+met on an eligible runner.
 
 | Date | Report | Records |
 | --- | --- | --- |
-| 2026-08-18 | [`SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-18.md`](SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-18.md) | Candidate 1 of the targeted publish-admission wake experiment: deque of waiter futures, one ACK wakes one producer. Correctness tests and a paired harness; performance campaign still open. |
+| 2026-08-19 | [`SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-19.md`](SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-19.md) | Diagnostic campaign for targeted publish-admission wake at `acc427a`: +29% / +127% / +57% at 4×inf1, 16×inf1, 16×inf4; single-publisher neutral. **Keep; not mergeable** until an eligible runner repeats the gate. |
+| 2026-08-18 | [`SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-18.md`](SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-18.md) | Implementation note for the waiter-future deque. Superseded by the 2026-08-19 campaign. |
 
 ## Hot-path decisions
 

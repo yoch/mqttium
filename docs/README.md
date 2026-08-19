@@ -77,7 +77,8 @@ Dated audits, experiments and release evidence live in
 commit; they are historical records, not current API contracts. Start with the
 [report index](reports/README.md), the
 [1.0.0rc1 release report](reports/RELEASE-CANDIDATE-1.0.0rc1.md) and the
-[RC performance report](reports/PERFORMANCE-1.0.0rc1.md).
+[RC performance report](reports/PERFORMANCE-1.0.0rc1.md). Open scheduler
+experiment contracts on this branch live in [`experiments/`](experiments/).
 
 Repository automation notes for maintainers live in
 [`CHATGPT-USAGE.md`](CHATGPT-USAGE.md).
