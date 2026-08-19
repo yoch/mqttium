@@ -1,206 +1,281 @@
-name: CI
+name: TEMP hosted QoS1 isolation 283-285
 
 on:
-  push:
-    branches: [main]
   pull_request:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: temp-hosted-qos1-isolation-283-285
+  cancel-in-progress: true
+
+env:
+  BASE_SHA: e80618154bacefed5626d9eb9ba46edf560b54e7
+  PR283_SHA: b603337e96a869f266f85e89a5c04a2c238c8ba2
+  PR284_SHA: 440c45487ce4ab7212581d49b8073416c899a82b
+  PR285_SHA: fbd11e1f71c623919c5029ec512dfb0e05f85307
+  PYTHONUNBUFFERED: "1"
 
 jobs:
-  quality:
+  isolate:
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
         with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: pyproject.toml
-      - run: python -m pip install -e ".[dev,security]"
-      - name: Repository hygiene
+          ref: ${{ env.BASE_SHA }}
+          fetch-depth: 0
+          path: base
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.PR283_SHA }}
+          path: pr283
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.PR284_SHA }}
+          path: pr284
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.PR285_SHA }}
+          path: pr285
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.BASE_SHA }}
+          fetch-depth: 0
+          path: p283284
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.BASE_SHA }}
+          fetch-depth: 0
+          path: p283285
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.BASE_SHA }}
+          fetch-depth: 0
+          path: p284285
+          persist-credentials: false
+
+      - name: Build pair 283+284
+        shell: bash
+        working-directory: p283284
         run: |
           set -euo pipefail
-          test -z "$(git ls-files | grep -E '(^|/)(__pycache__|\.pytest_cache|\.mypy_cache|\.ruff_cache|dist|build|.*\.egg-info)(/|$)|(^|/)\.coverage($|\.)|\.py[co]$|\.(patch|diff)$' || true)"
-          test -z "$(grep -RIl --exclude-dir=.git -E 'mqttnext|MQTTNext|MQTTNEXT' src tests examples benchmarks || true)"
-      - run: ruff format --check src tests benchmarks
-      - run: ruff check src tests benchmarks
-      - run: mypy src/mqttium
-      - run: bandit -q -ll -r src
-      - run: python -m pytest -q tests/unit --cov=mqttium --cov-report=term-missing --cov-fail-under=80
-
-  test:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.11", "3.12", "3.13", "3.14"]
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: ${{ matrix.python-version }}
-          cache: pip
-          cache-dependency-path: pyproject.toml
-      - run: python -m pip install -e ".[dev]"
-      - name: Require OpenSSL for TLS tests
-        run: python -c "import shutil; assert shutil.which('openssl'), 'OpenSSL is required for TLS tests'"
-      - name: Unit tests (including TLS, WebSocket, and cancellation)
-        run: python -m pytest -q -ra tests/unit
-      - name: Install Mosquitto
-        timeout-minutes: 5
-        run: |
-          set -euo pipefail
-          export DEBIAN_FRONTEND=noninteractive
-          date -u +'apt-get install start %FT%TZ'
-          sudo -E apt-get install -y mosquitto
-          date -u +'apt-get install done %FT%TZ'
-          dpkg-query -W mosquitto
-          command -v mosquitto
-      - name: Start Mosquitto
-        timeout-minutes: 2
-        run: |
-          set -euo pipefail
-          printf 'listener 11883 127.0.0.1\nallow_anonymous true\npersistence false\n' > /tmp/mosq-ci.conf
-          date -u +'mosquitto -d start %FT%TZ'
-          mosquitto -c /tmp/mosq-ci.conf -d
-          echo "mosquitto -d exited $?"
-          date -u +'mosquitto -d returned %FT%TZ'
-          for i in $(seq 1 30); do
-            if (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1; then
-              echo "listener ready after ${i} probe(s)"
-              exit 0
-            fi
-            sleep 0.2
-          done
-          echo "listener never accepted a connection"
-          pgrep -a mosquitto || true
-          exit 1
-      - name: Mosquitto integration tests
-        run: python -m pytest -q tests/integration
-
-  cross-platform:
-    name: Cross-platform (${{ matrix.os }}, Python ${{ matrix.python-version }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-15, windows-2025]
-        python-version: ["3.11", "3.14"]
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: ${{ matrix.python-version }}
-          cache: pip
-          cache-dependency-path: pyproject.toml
-      - run: python -m pip install -e ".[dev]"
-      - name: Require OpenSSL for TLS tests
-        run: python -c "import shutil; assert shutil.which('openssl'), 'OpenSSL is required for TLS tests'"
-      - name: Unit tests (including TLS, WebSocket, and cancellation)
-        run: python -m pytest -q -ra tests/unit
-
-  fuzz:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: pyproject.toml
-      - run: python -m pip install -e ".[fuzz]"
-      - name: Seeded fuzzing
-        run: |
-          for seed in 1 2 3; do
-            PYTHONPATH=src python tests/fuzz/fuzz.py --seed "$seed" --iterations 20000
-          done
-      - run: PYTHONPATH=src python -m pytest -q tests/fuzz/test_hypothesis_fuzz.py
-
-  package:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: pyproject.toml
-      - run: python -m pip install ".[release]"
-      - run: validate-pyproject pyproject.toml
-      - run: python -m build
-      - run: twine check --strict dist/*
-      - run: check-wheel-contents dist/*.whl
-      - name: Validate distribution contents
-        run: |
+          git config user.name pair-probe
+          git config user.email pair-probe@example.invalid
+          git fetch --no-tags origin "$PR283_SHA"
+          git merge --no-ff --no-edit "$PR283_SHA"
+          git fetch --no-tags origin "$PR284_SHA"
+          set +e
+          git merge --no-ff --no-edit "$PR284_SHA"
+          rc=$?
+          set -e
+          test "$rc" -ne 0
+          mapfile -t conflicts < <(git diff --name-only --diff-filter=U | sort)
+          test "${#conflicts[@]}" -eq 2
+          test "${conflicts[0]}" = "docs/reports/README.md"
+          test "${conflicts[1]}" = "src/mqttium/api/_writer.py"
           python - <<'PY'
           from pathlib import Path
-          from zipfile import ZipFile
-          import ast
-          import email
-          import tarfile
-
-          source = ast.parse(Path("src/mqttium/__init__.py").read_text(encoding="utf-8"))
-          expected_version = next(
-              node.value.value
-              for node in source.body
-              if isinstance(node, ast.Assign)
-              and any(isinstance(target, ast.Name) and target.id == "__version__" for target in node.targets)
-              and isinstance(node.value, ast.Constant)
-              and isinstance(node.value.value, str)
+          import subprocess
+          path='docs/reports/README.md'
+          ours=subprocess.check_output(['git','show',f':2:{path}'],text=True)
+          theirs=subprocess.check_output(['git','show',f':3:{path}'],text=True)
+          lines=ours.splitlines()
+          incoming=[l for l in theirs.splitlines() if l.startswith('| 2026-08-') and 'SCHEDULER-' in l and l not in lines]
+          heading=lines.index('## Hot-path decisions')
+          i=heading
+          while i>0 and lines[i-1]=='': i-=1
+          lines[i:i]=incoming
+          Path(path).write_text('\n'.join(lines)+'\n')
+          PY
+          git checkout --ours src/mqttium/api/_writer.py
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('src/mqttium/api/_writer.py')
+          text=p.read_text()
+          def one(old,new):
+              global text
+              n=text.count(old)
+              if n!=1: raise SystemExit(f'expected 1 match, got {n}: {old!r}')
+              text=text.replace(old,new)
+          one(
+              '                self.enqueue_suspensions += 1\n                try:\n                    await self.space.wait()\n                finally:\n                    self.waiters -= 1\n',
+              '                self.enqueue_suspensions += 1\n                try:\n                    await self.space.wait()\n                except asyncio.CancelledError:\n                    # notify(n) is consumed by whoever is waiting. A waiter\n                    # cancelled after being selected must hand the wakeup on,\n                    # or the remaining producers stay parked with free slots.\n                    if self.waiters > 1:\n                        self.space.notify(1)\n                    raise\n                finally:\n                    self.waiters -= 1\n',
           )
-          wheel = next(Path("dist").glob("*.whl"))
-          sdist = next(Path("dist").glob("*.tar.gz"))
-
-          with ZipFile(wheel) as archive:
-              names = archive.namelist()
-              metadata_name = next(name for name in names if name.endswith(".dist-info/METADATA"))
-              metadata = email.message_from_bytes(archive.read(metadata_name))
-              assert metadata["Name"] == "mqttium"
-              assert metadata["Version"] == expected_version
-              assert metadata["Requires-Python"] == ">=3.11"
-              assert metadata["License-Expression"] == "Apache-2.0"
-              assert "mqttium/py.typed" in names
-              assert any(name.endswith(".dist-info/licenses/LICENSE") for name in names)
-              assert any(name.endswith(".dist-info/licenses/NOTICE") for name in names)
-
-          with tarfile.open(sdist, "r:gz") as archive:
-              names = archive.getnames()
-              for filename in (
-                  "LICENSE",
-                  "NOTICE",
-                  "README.md",
-                  "CHANGELOG.md",
-                  "PROVENANCE.md",
-                  "SECURITY.md",
-              ):
-                  assert any(name.endswith("/" + filename) for name in names), filename
+          one(
+              '        transport = self.transport\n        if transport is None:\n            raise RuntimeError("WritePump started without a transport")\n        # Resolved once per writer task rather than per batch. The local dies\n',
+              '        transport = self.transport\n        if transport is None:\n            raise RuntimeError("WritePump started without a transport")\n        writer_task = asyncio.current_task()\n        assert writer_task is not None\n        # Resolved once per writer task rather than per batch. The local dies\n',
+          )
+          one(
+              '                self._writing = True\n                try:\n                    # Coalesce contiguous small frames into one writelines call.\n',
+              '                self._writing = True\n                batch_completed = False\n                try:\n                    # Coalesce contiguous small frames into one writelines call.\n',
+          )
+          one(
+              '                    await self._write_contiguous(transport, write_many, contiguous)\n                    self.last_outbound = time.monotonic()\n                finally:\n',
+              '                    await self._write_contiguous(transport, write_many, contiguous)\n                    self.last_outbound = time.monotonic()\n                    batch_completed = True\n                finally:\n',
+          )
+          one(
+              '                        self._release_resident(n_batch)\n                        if self.waiters:\n                            self.space.notify_all()\n',
+              '                        self._release_resident(n_batch)\n                        if batch_completed and self.waiters and not writer_task.cancelling():\n                            self.space.notify(min(self.waiters, n_batch))\n',
+          )
+          p.write_text(text)
           PY
-      - name: Install and import the built wheel
+          git add docs/reports/README.md src/mqttium/api/_writer.py
+          git diff --check
+          git commit --no-edit
+
+      - name: Build pair 283+285
+        shell: bash
+        working-directory: p283285
         run: |
-          python -m venv /tmp/mqttium-wheel
-          /tmp/mqttium-wheel/bin/python -m pip install --no-deps dist/*.whl
-          cd /tmp
-          /tmp/mqttium-wheel/bin/python -I - <<'PY'
-          import importlib
-          import importlib.metadata
-          import pkgutil
-          import mqttium
-
-          assert mqttium.__version__ == importlib.metadata.version("mqttium")
-          for module in pkgutil.walk_packages(mqttium.__path__, mqttium.__name__ + "."):
-              importlib.import_module(module.name)
+          set -euo pipefail
+          git config user.name pair-probe
+          git config user.email pair-probe@example.invalid
+          git fetch --no-tags origin "$PR283_SHA"
+          git merge --no-ff --no-edit "$PR283_SHA"
+          git fetch --no-tags origin "$PR285_SHA"
+          set +e
+          git merge --no-ff --no-edit "$PR285_SHA"
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            mapfile -t conflicts < <(git diff --name-only --diff-filter=U)
+            test "${#conflicts[@]}" -eq 1
+            test "${conflicts[0]}" = "docs/reports/README.md"
+            python - <<'PY'
+          from pathlib import Path
+          import subprocess
+          path='docs/reports/README.md'
+          ours=subprocess.check_output(['git','show',f':2:{path}'],text=True)
+          theirs=subprocess.check_output(['git','show',f':3:{path}'],text=True)
+          lines=ours.splitlines()
+          incoming=[l for l in theirs.splitlines() if l.startswith('| 2026-08-') and 'SCHEDULER-' in l and l not in lines]
+          heading=lines.index('## Hot-path decisions')
+          i=heading
+          while i>0 and lines[i-1]=='': i-=1
+          lines[i:i]=incoming
+          Path(path).write_text('\n'.join(lines)+'\n')
           PY
-          /tmp/mqttium-wheel/bin/python -m pip check
-      - name: Upload distributions
+            git add docs/reports/README.md
+            git commit --no-edit
+          fi
+
+      - name: Build pair 284+285
+        shell: bash
+        working-directory: p284285
+        run: |
+          set -euo pipefail
+          git config user.name pair-probe
+          git config user.email pair-probe@example.invalid
+          git fetch --no-tags origin "$PR284_SHA"
+          git merge --no-ff --no-edit "$PR284_SHA"
+          git fetch --no-tags origin "$PR285_SHA"
+          set +e
+          git merge --no-ff --no-edit "$PR285_SHA"
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            mapfile -t conflicts < <(git diff --name-only --diff-filter=U)
+            test "${#conflicts[@]}" -eq 1
+            test "${conflicts[0]}" = "docs/reports/README.md"
+            python - <<'PY'
+          from pathlib import Path
+          import subprocess
+          path='docs/reports/README.md'
+          ours=subprocess.check_output(['git','show',f':2:{path}'],text=True)
+          theirs=subprocess.check_output(['git','show',f':3:{path}'],text=True)
+          lines=ours.splitlines()
+          incoming=[l for l in theirs.splitlines() if l.startswith('| 2026-08-') and 'SCHEDULER-' in l and l not in lines]
+          heading=lines.index('## Hot-path decisions')
+          i=heading
+          while i>0 and lines[i-1]=='': i-=1
+          lines[i:i]=incoming
+          Path(path).write_text('\n'.join(lines)+'\n')
+          PY
+            git add docs/reports/README.md
+            git commit --no-edit
+          fi
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Install dependencies and Mosquitto
+        shell: bash
+        run: |
+          python -m pip install -e "pr284[dev]"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mosquitto
+          sudo systemctl stop mosquitto 2>/dev/null || true
+          sudo pkill -x mosquitto 2>/dev/null || true
+          cat >/tmp/mosq-hosted-isolation.conf <<'MOSQ'
+          persistence false
+          allow_anonymous true
+          max_inflight_messages 1000
+          max_queued_messages 100000
+          max_queued_bytes 0
+          connection_messages false
+          log_type error
+          listener 11883 127.0.0.1
+          MOSQ
+          mosquitto -c /tmp/mosq-hosted-isolation.conf >/tmp/mosq-hosted-isolation.log 2>&1 &
+          echo $! >/tmp/mosq-hosted-isolation.pid
+          for _ in $(seq 1 50); do
+            (echo >/dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            sleep .1
+          done
+          exit 1
+
+      - name: Run hosted diagnostic matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/qos1-hosted
+          variants=(pr283 pr284 pr285 p283284 p283285 p284285)
+          for variant in "${variants[@]}"; do
+            python base/benchmarks/paired_writer_capacity.py \
+              --base-root base --candidate-root "$variant" --host 127.0.0.1 --port 11883 \
+              --protocol 311 --qos-values 1 --payload-bytes 64 \
+              --inflight 20 --outstanding 20 --max-queued 200 \
+              --warmup-count 5000 --count-qos1 40000 --repeat 6 \
+              --policy advisory --max-baseline-cv 1.0 --min-completed-ratio 0.0 \
+              --output "/tmp/qos1-hosted/$variant.json" \
+              --summary-output "/tmp/qos1-hosted/$variant.md"
+          done
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          root=Path('/tmp/qos1-hosted')
+          rows=[]
+          for v in ['pr283','pr284','pr285','p283284','p283285','p284285']:
+              d=json.loads((root/f'{v}.json').read_text())
+              s=d['scenarios'][0]
+              rows.append({
+                  'variant': v,
+                  'ratio': s['median_candidate_over_base_completed'],
+                  'base_cv': s['base_completed_cv'],
+                  'candidate_cv': s['candidate_completed_cv'],
+                  'base_rate': s['base_median_completed_rate'],
+                  'candidate_rate': s['candidate_median_completed_rate'],
+              })
+          print(json.dumps(rows, indent=2))
+          (root/'summary.json').write_text(json.dumps(rows, indent=2)+'\n')
+          PY
+
+      - name: Upload diagnostic matrix
+        if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: distributions-${{ github.sha }}
-          path: dist/*
-          if-no-files-found: error
+          name: qos1-hosted-isolation-${{ github.run_id }}
+          path: |
+            /tmp/qos1-hosted/*.json
+            /tmp/qos1-hosted/*.md
+            /tmp/mosq-hosted-isolation.log
+          if-no-files-found: warn
+          retention-days: 7
