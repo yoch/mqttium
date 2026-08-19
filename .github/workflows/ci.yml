@@ -26,6 +26,17 @@ jobs:
       SUPPORT_REF: bench/tmp-scheduler-284-286-20260819
       ROOT: ${{ runner.temp }}/wake-frontier
     steps:
+      - name: Announce exact ARM64 run
+        uses: actions/github-script@v8
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: 289,
+              body: `ARM64 wake-frontier started: run **${context.runId}**, head \`${context.sha}\`.`,
+            });
+
       - name: Checkout baseline
         uses: actions/checkout@v7
         with:
@@ -246,21 +257,19 @@ jobs:
           print("\n".join(out))
           PY
 
-      - name: Publish run identity and summary to temp PR
+      - name: Publish final summary to temp PR
         if: always()
         uses: actions/github-script@v8
-        env:
-          TEMP_PR: "289"
         with:
           script: |
             const fs = require('fs');
             const path = `${process.env.ROOT}/summary.md`;
             const summary = fs.existsSync(path) ? fs.readFileSync(path, 'utf8') : 'summary missing';
-            const body = `ARM64 wake-frontier run **${context.runId}**, conclusion visible in Actions.\n\n${summary}`;
+            const body = `ARM64 wake-frontier finished: run **${context.runId}**.\n\n${summary}`;
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: Number(process.env.TEMP_PR),
+              issue_number: 289,
               body,
             });
 
