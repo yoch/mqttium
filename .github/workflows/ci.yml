@@ -1,4 +1,4 @@
-name: TEMP stack merge probe 283-285
+name: TEMP combined validation 283-285
 
 on:
   pull_request:
@@ -6,44 +6,342 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: temp-combined-283-285
+  cancel-in-progress: true
+
+env:
+  BASE_SHA: e80618154bacefed5626d9eb9ba46edf560b54e7
+  PR283_SHA: b603337e96a869f266f85e89a5c04a2c238c8ba2
+  PR284_SHA: 8d37248831b372004074acfa0018f34da51b54df
+  PR285_SHA: b76feedc8832e8a4662c61d342c51c79f4be50d4
+  PYTHONUNBUFFERED: "1"
+
 jobs:
-  merge-probe:
+  hosted:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    env:
-      BASE_SHA: e80618154bacefed5626d9eb9ba46edf560b54e7
-      PR283_SHA: b603337e96a869f266f85e89a5c04a2c238c8ba2
-      PR284_SHA: 8d37248831b372004074acfa0018f34da51b54df
-      PR285_SHA: b76feedc8832e8a4662c61d342c51c79f4be50d4
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - name: Checkout immutable base into stack workspace
+        uses: actions/checkout@v7
         with:
           ref: ${{ env.BASE_SHA }}
           fetch-depth: 0
+          path: stack
           persist-credentials: false
-      - name: Merge exact accepted heads in proposed order
+
+      - name: Merge accepted heads with controlled report-index union
         shell: bash
+        working-directory: stack
         run: |
           set -euo pipefail
           git config user.name stack-probe
           git config user.email stack-probe@example.invalid
           test "$(git rev-parse HEAD)" = "$BASE_SHA"
-          for sha in "$PR283_SHA" "$PR284_SHA" "$PR285_SHA"; do
+
+          merge_one() {
+            local sha="$1"
             git fetch --no-tags origin "$sha"
             echo "=== merging $sha ==="
             set +e
-            git merge --no-ff --no-edit "$sha" > /tmp/merge.out 2>&1
-            rc=$?
+            git merge --no-ff --no-edit "$sha"
+            local rc=$?
             set -e
-            cat /tmp/merge.out
-            if [ "$rc" -ne 0 ]; then
-              echo "UNMERGED FILES:"
-              git diff --name-only --diff-filter=U | tee /tmp/unmerged.txt
-              echo "CONFLICT DIFF:"
-              git diff --cc || true
-              exit "$rc"
+            if [ "$rc" -eq 0 ]; then
+              return 0
             fi
-          done
-          echo "STACK_HEAD=$(git rev-parse HEAD)"
-          git log --oneline --decorate -8
+            mapfile -t conflicts < <(git diff --name-only --diff-filter=U)
+            printf 'conflicts: %s\n' "${conflicts[*]}"
+            if [ "${#conflicts[@]}" -ne 1 ] || [ "${conflicts[0]}" != "docs/reports/README.md" ]; then
+              git diff --cc || true
+              return "$rc"
+            fi
+            python - <<'PY'
+          from pathlib import Path
+          import subprocess
+
+          path = 'docs/reports/README.md'
+          ours = subprocess.check_output(['git', 'show', f':2:{path}'], text=True)
+          theirs = subprocess.check_output(['git', 'show', f':3:{path}'], text=True)
+          lines = ours.splitlines()
+          incoming = [
+              line for line in theirs.splitlines()
+              if line.startswith('| 2026-08-') and 'SCHEDULER-' in line and line not in lines
+          ]
+          if not incoming:
+              raise SystemExit('report-index conflict had no unique incoming scheduler rows')
+          try:
+              heading = lines.index('## Hot-path decisions')
+          except ValueError as exc:
+              raise SystemExit('Hot-path decisions heading not found') from exc
+          insert_at = heading
+          while insert_at > 0 and lines[insert_at - 1] == '':
+              insert_at -= 1
+          lines[insert_at:insert_at] = incoming
+          Path(path).write_text('\n'.join(lines) + '\n')
+          print('unioned report rows:', *incoming, sep='\n')
+          PY
+            git add docs/reports/README.md
+            git diff --check
+            git commit --no-edit
+          }
+
+          merge_one "$PR283_SHA"
+          merge_one "$PR284_SHA"
+          merge_one "$PR285_SHA"
+
+          test -z "$(git diff --name-only --diff-filter=U)"
           git diff --check "$BASE_SHA"..HEAD
+          echo "combined head: $(git rev-parse HEAD)"
+          git log --oneline --decorate -10
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Install combined tree
+        working-directory: stack
+        run: python -m pip install -e ".[dev,security]"
+
+      - name: Full hosted quality and unit validation
+        working-directory: stack
+        shell: bash
+        run: |
+          set -euo pipefail
+          ruff format --check src tests benchmarks
+          ruff check src tests benchmarks
+          mypy src/mqttium
+          bandit -q -ll -r src
+          python -m pytest -q tests/unit --cov=mqttium --cov-report=term-missing --cov-fail-under=80
+
+  arm64:
+    needs: hosted
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 180
+    steps:
+      - name: Checkout immutable base
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.BASE_SHA }}
+          fetch-depth: 0
+          path: base
+          persist-credentials: false
+      - name: Checkout immutable base into stack workspace
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.BASE_SHA }}
+          fetch-depth: 0
+          path: stack
+          persist-credentials: false
+
+      - name: Build exact combined tree
+        shell: bash
+        working-directory: stack
+        run: |
+          set -euo pipefail
+          git config user.name stack-probe
+          git config user.email stack-probe@example.invalid
+          merge_one() {
+            local sha="$1"
+            git fetch --no-tags origin "$sha"
+            set +e
+            git merge --no-ff --no-edit "$sha"
+            local rc=$?
+            set -e
+            if [ "$rc" -eq 0 ]; then return 0; fi
+            mapfile -t conflicts < <(git diff --name-only --diff-filter=U)
+            if [ "${#conflicts[@]}" -ne 1 ] || [ "${conflicts[0]}" != "docs/reports/README.md" ]; then
+              git diff --cc || true
+              return "$rc"
+            fi
+            python - <<'PY'
+          from pathlib import Path
+          import subprocess
+          path = 'docs/reports/README.md'
+          ours = subprocess.check_output(['git', 'show', f':2:{path}'], text=True)
+          theirs = subprocess.check_output(['git', 'show', f':3:{path}'], text=True)
+          lines = ours.splitlines()
+          incoming = [line for line in theirs.splitlines() if line.startswith('| 2026-08-') and 'SCHEDULER-' in line and line not in lines]
+          if not incoming:
+              raise SystemExit('no unique incoming scheduler report rows')
+          heading = lines.index('## Hot-path decisions')
+          insert_at = heading
+          while insert_at > 0 and lines[insert_at - 1] == '': insert_at -= 1
+          lines[insert_at:insert_at] = incoming
+          Path(path).write_text('\n'.join(lines) + '\n')
+          PY
+            git add docs/reports/README.md
+            git diff --check
+            git commit --no-edit
+          }
+          merge_one "$PR283_SHA"
+          merge_one "$PR284_SHA"
+          merge_one "$PR285_SHA"
+          test -z "$(git diff --name-only --diff-filter=U)"
+          git diff --check "$BASE_SHA"..HEAD
+          git rev-parse HEAD | tee /tmp/combined-head.txt
+
+      - name: Prepare Python environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/combined-283-285-venv"
+          python3 -m venv "$RUNNER_TEMP/combined-283-285-venv"
+          echo "$RUNNER_TEMP/combined-283-285-venv/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/combined-283-285-venv/bin/python" -m pip install -e "stack[dev]" "psutil>=6,<8"
+
+      - name: Strict ARM64 preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/combined-evidence"
+          for attempt in $(seq 1 24); do
+            if python base/benchmarks/runner_probe.py --output "$RUNNER_TEMP/combined-evidence/preflight.json" --require-temperature --enforce; then
+              exit 0
+            fi
+            sleep 15
+          done
+          exit 1
+
+      - name: Combined focused invariants and cancellation tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH=stack/src python -m pytest -q \
+            stack/tests/unit/test_write_pump_resident.py \
+            stack/tests/unit/test_write_pump_targeted_wake.py \
+            stack/tests/unit/test_publish_targeted_wake.py \
+            stack/tests/unit/test_async_publish_admission.py \
+            stack/tests/unit/test_write_pump_eager.py
+
+      - name: Start isolated Mosquitto
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo systemctl stop mosquitto 2>/dev/null || true
+          sudo pkill -x mosquitto 2>/dev/null || true
+          cat > "$RUNNER_TEMP/combined-evidence/mosquitto.conf" <<'MOSQ'
+          persistence false
+          allow_anonymous true
+          max_inflight_messages 1000
+          max_queued_messages 100000
+          max_queued_bytes 0
+          connection_messages false
+          log_type error
+          listener 11883 127.0.0.1
+          MOSQ
+          mosquitto -c "$RUNNER_TEMP/combined-evidence/mosquitto.conf" > "$RUNNER_TEMP/combined-evidence/mosquitto.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/combined-evidence/mosquitto.pid"
+          for _ in $(seq 1 50); do
+            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            sleep .2
+          done
+          cat "$RUNNER_TEMP/combined-evidence/mosquitto.log"
+          exit 1
+
+      - name: Combined writer targeted-wake gate
+        shell: bash
+        run: |
+          python stack/benchmarks/paired_writer_waiter_contention.py \
+            --base-root base --candidate-root stack \
+            --producer-values 1,4,64,256 --max-messages 8 --payload-bytes 64 \
+            --warmup-count 2000 --count 16000 --repeat 8 --cpu 1 \
+            --policy strict --preflight-report "$RUNNER_TEMP/combined-evidence/preflight.json" \
+            --max-baseline-cv .05 --min-completed-ratio .97 \
+            --output "$RUNNER_TEMP/combined-evidence/writer-target.json" \
+            --summary-output "$RUNNER_TEMP/combined-evidence/writer-target.md"
+
+      - name: Corrected publish true-completion A/A control
+        shell: bash
+        run: |
+          python stack/benchmarks/paired_publish_admission_contention.py \
+            --base-root base --candidate-root base --host 127.0.0.1 --port 11883 \
+            --protocol 311 --qos 1 --payload-bytes 64 \
+            --publisher-values 16,32,64 --inflight-values 1,4 \
+            --warmup-count 200 --count 4000 --repeat 6 --timeout 120 --cpu 1 \
+            --policy strict --preflight-report "$RUNNER_TEMP/combined-evidence/preflight.json" \
+            --max-baseline-cv .05 --max-aa-ratio-deviation .02 \
+            --output "$RUNNER_TEMP/combined-evidence/publish-aa.json" \
+            --summary-output "$RUNNER_TEMP/combined-evidence/publish-aa.md"
+
+      - name: Combined publish true-completion gate
+        shell: bash
+        run: |
+          python stack/benchmarks/paired_publish_admission_contention.py \
+            --base-root base --candidate-root stack --host 127.0.0.1 --port 11883 \
+            --protocol 311 --qos 1 --payload-bytes 64 \
+            --publisher-values 16,32,64 --inflight-values 1,4 \
+            --warmup-count 200 --count 4000 --repeat 6 --timeout 120 --cpu 1 \
+            --policy strict --preflight-report "$RUNNER_TEMP/combined-evidence/preflight.json" \
+            --max-baseline-cv .05 --min-completed-ratio .97 \
+            --output "$RUNNER_TEMP/combined-evidence/publish-ab.json" \
+            --summary-output "$RUNNER_TEMP/combined-evidence/publish-ab.md"
+
+      - name: Combined writer-capacity guard
+        shell: bash
+        run: |
+          python base/benchmarks/paired_writer_capacity.py \
+            --base-root base --candidate-root stack --host 127.0.0.1 --port 11883 \
+            --protocol 311 --qos-values 0,1 --payload-bytes 64 \
+            --inflight 20 --outstanding 20 --max-queued 200 \
+            --warmup-count 5000 --count-qos0 100000 --count-qos1 40000 \
+            --repeat 6 --cpu 1 --policy strict \
+            --preflight-report "$RUNNER_TEMP/combined-evidence/preflight.json" \
+            --max-baseline-cv .05 --min-completed-ratio .97 \
+            --output "$RUNNER_TEMP/combined-evidence/writer-capacity.json" \
+            --summary-output "$RUNNER_TEMP/combined-evidence/writer-capacity.md"
+
+      - name: Combined stable open-loop guard
+        shell: bash
+        run: |
+          python base/benchmarks/paired_open_loop.py \
+            --base-root base --candidate-root stack \
+            --protocols 311 --payloads 64 --completions callback --windows 20 \
+            --target-rates 5000,7500 --count-small 5000 --repeat 6 --cpu 1 \
+            --policy strict --preflight-report "$RUNNER_TEMP/combined-evidence/preflight.json" \
+            --max-baseline-cv .05 --min-completed-ratio .97 --max-loop-lag-ratio 1.05 \
+            --output "$RUNNER_TEMP/combined-evidence/open-loop.json" \
+            --summary-output "$RUNNER_TEMP/combined-evidence/open-loop.md"
+
+      - name: Combined network guard
+        shell: bash
+        run: |
+          python base/benchmarks/paired_network.py \
+            --base-root base --candidate-root stack --host 127.0.0.1 --port 11883 \
+            --protocols 311 --completions receipt --payloads 64,4096 --windows 20,64 \
+            --repeat 6 --count-small 1500 --count-large 750 --cpu 1 \
+            --policy strict --preflight-report "$RUNNER_TEMP/combined-evidence/preflight.json" \
+            --max-baseline-cv .05 --min-ack-ratio .97 \
+            --output "$RUNNER_TEMP/combined-evidence/network.json" \
+            --summary-output "$RUNNER_TEMP/combined-evidence/network.md"
+
+      - name: Final strict eligibility check
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f "$RUNNER_TEMP/combined-evidence/mosquitto.pid" ]; then
+            kill "$(cat "$RUNNER_TEMP/combined-evidence/mosquitto.pid")" 2>/dev/null || true
+          fi
+          sudo pkill -x mosquitto 2>/dev/null || true
+          sleep 1
+          for attempt in $(seq 1 24); do
+            if python base/benchmarks/runner_probe.py --output "$RUNNER_TEMP/combined-evidence/preflight-final.json" --require-temperature --enforce; then
+              exit 0
+            fi
+            sleep 15
+          done
+          exit 1
+
+      - name: Upload combined ARM64 evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: combined-283-285-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/combined-evidence/**/*.json
+            ${{ runner.temp }}/combined-evidence/**/*.md
+            ${{ runner.temp }}/combined-evidence/**/*.log
+            ${{ runner.temp }}/combined-evidence/*.conf
+            /tmp/combined-head.txt
+          if-no-files-found: warn
+          retention-days: 30
