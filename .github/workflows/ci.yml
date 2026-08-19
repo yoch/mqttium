@@ -21,11 +21,13 @@ env:
 jobs:
   isolate:
     runs-on: [self-hosted, linux, ARM64]
-    timeout-minutes: 180
+    timeout-minutes: 120
     steps:
-      - name: Define evidence root
+      - name: Define evidence root and venv
         shell: bash
-        run: echo "ROOT=$RUNNER_TEMP/qos1-isolation" >> "$GITHUB_ENV"
+        run: |
+          echo "ROOT=$RUNNER_TEMP/qos1-isolation" >> "$GITHUB_ENV"
+          echo "VENV=$RUNNER_TEMP/qos1-isolation-venv" >> "$GITHUB_ENV"
 
       - name: Checkout baseline
         uses: actions/checkout@v7
@@ -34,38 +36,40 @@ jobs:
           fetch-depth: 0
           path: base
           persist-credentials: false
-
-      - name: Checkout single candidates
+      - name: Checkout PR 283
         uses: actions/checkout@v7
         with:
           ref: ${{ env.PR283_SHA }}
           path: pr283
           persist-credentials: false
-      - uses: actions/checkout@v7
+      - name: Checkout PR 284
+        uses: actions/checkout@v7
         with:
           ref: ${{ env.PR284_SHA }}
           path: pr284
           persist-credentials: false
-      - uses: actions/checkout@v7
+      - name: Checkout PR 285
+        uses: actions/checkout@v7
         with:
           ref: ${{ env.PR285_SHA }}
           path: pr285
           persist-credentials: false
-
-      - name: Checkout baseline workspaces for pairs
+      - name: Checkout pair 283+284 workspace
         uses: actions/checkout@v7
         with:
           ref: ${{ env.BASE_SHA }}
           fetch-depth: 0
           path: p283284
           persist-credentials: false
-      - uses: actions/checkout@v7
+      - name: Checkout pair 283+285 workspace
+        uses: actions/checkout@v7
         with:
           ref: ${{ env.BASE_SHA }}
           fetch-depth: 0
           path: p283285
           persist-credentials: false
-      - uses: actions/checkout@v7
+      - name: Checkout pair 284+285 workspace
+        uses: actions/checkout@v7
         with:
           ref: ${{ env.BASE_SHA }}
           fetch-depth: 0
@@ -73,8 +77,8 @@ jobs:
           persist-credentials: false
 
       - name: Build pair 283+284 with audited writer resolution
-        shell: bash
         working-directory: p283284
+        shell: bash
         run: |
           set -euo pipefail
           git config user.name pair-probe
@@ -91,29 +95,16 @@ jobs:
           test "${#conflicts[@]}" -eq 2
           test "${conflicts[0]}" = "docs/reports/README.md"
           test "${conflicts[1]}" = "src/mqttium/api/_writer.py"
-          python - <<'PY'
-          from pathlib import Path
-          import subprocess
-          path='docs/reports/README.md'
-          ours=subprocess.check_output(['git','show',f':2:{path}'],text=True)
-          theirs=subprocess.check_output(['git','show',f':3:{path}'],text=True)
-          lines=ours.splitlines()
-          incoming=[l for l in theirs.splitlines() if l.startswith('| 2026-08-') and 'SCHEDULER-' in l and l not in lines]
-          heading=lines.index('## Hot-path decisions')
-          i=heading
-          while i>0 and lines[i-1]=='': i-=1
-          lines[i:i]=incoming
-          Path(path).write_text('\n'.join(lines)+'\n')
-          PY
-          git checkout --ours src/mqttium/api/_writer.py
-          python - <<'PY'
+          git checkout --ours docs/reports/README.md src/mqttium/api/_writer.py
+          python3 - <<'PY'
           from pathlib import Path
           p=Path('src/mqttium/api/_writer.py')
           text=p.read_text()
           def one(old,new):
               global text
               n=text.count(old)
-              if n!=1: raise SystemExit(f'expected 1 match, got {n}: {old!r}')
+              if n != 1:
+                  raise SystemExit(f'expected 1 match, got {n}: {old!r}')
               text=text.replace(old,new)
           one(
               '                self.enqueue_suspensions += 1\n                try:\n                    await self.space.wait()\n                finally:\n                    self.waiters -= 1\n',
@@ -142,8 +133,8 @@ jobs:
           git commit --no-edit
 
       - name: Build pair 283+285
-        shell: bash
         working-directory: p283285
+        shell: bash
         run: |
           set -euo pipefail
           git config user.name pair-probe
@@ -159,29 +150,16 @@ jobs:
             mapfile -t conflicts < <(git diff --name-only --diff-filter=U)
             test "${#conflicts[@]}" -eq 1
             test "${conflicts[0]}" = "docs/reports/README.md"
-            python - <<'PY'
-          from pathlib import Path
-          import subprocess
-          path='docs/reports/README.md'
-          ours=subprocess.check_output(['git','show',f':2:{path}'],text=True)
-          theirs=subprocess.check_output(['git','show',f':3:{path}'],text=True)
-          lines=ours.splitlines()
-          incoming=[l for l in theirs.splitlines() if l.startswith('| 2026-08-') and 'SCHEDULER-' in l and l not in lines]
-          heading=lines.index('## Hot-path decisions')
-          i=heading
-          while i>0 and lines[i-1]=='': i-=1
-          lines[i:i]=incoming
-          Path(path).write_text('\n'.join(lines)+'\n')
-          PY
+            git checkout --ours docs/reports/README.md
             git add docs/reports/README.md
-            git diff --check
             git commit --no-edit
           fi
           test -z "$(git diff --name-only --diff-filter=U)"
+          git diff --check
 
       - name: Build pair 284+285
-        shell: bash
         working-directory: p284285
+        shell: bash
         run: |
           set -euo pipefail
           git config user.name pair-probe
@@ -197,51 +175,35 @@ jobs:
             mapfile -t conflicts < <(git diff --name-only --diff-filter=U)
             test "${#conflicts[@]}" -eq 1
             test "${conflicts[0]}" = "docs/reports/README.md"
-            python - <<'PY'
-          from pathlib import Path
-          import subprocess
-          path='docs/reports/README.md'
-          ours=subprocess.check_output(['git','show',f':2:{path}'],text=True)
-          theirs=subprocess.check_output(['git','show',f':3:{path}'],text=True)
-          lines=ours.splitlines()
-          incoming=[l for l in theirs.splitlines() if l.startswith('| 2026-08-') and 'SCHEDULER-' in l and l not in lines]
-          heading=lines.index('## Hot-path decisions')
-          i=heading
-          while i>0 and lines[i-1]=='': i-=1
-          lines[i:i]=incoming
-          Path(path).write_text('\n'.join(lines)+'\n')
-          PY
+            git checkout --ours docs/reports/README.md
             git add docs/reports/README.md
-            git diff --check
             git commit --no-edit
           fi
           test -z "$(git diff --name-only --diff-filter=U)"
+          git diff --check
 
-      - name: Prepare Python environment and strict preflight
+      - name: Prepare environment and strict preflight
         shell: bash
         run: |
           set -euo pipefail
           test "$(uname -m)" = aarch64
+          rm -rf "$ROOT" "$VENV"
           mkdir -p "$ROOT"
-          rm -rf "$RUNNER_TEMP/qos1-isolation-venv"
-          python3 -m venv "$RUNNER_TEMP/qos1-isolation-venv"
-          echo "$RUNNER_TEMP/qos1-isolation-venv/bin" >> "$GITHUB_PATH"
-          "$RUNNER_TEMP/qos1-isolation-venv/bin/python" -m pip install -e "pr284[dev]" "psutil>=6,<8"
+          python3 -m venv "$VENV"
+          "$VENV/bin/python" -m pip install -e "pr284[dev]" "psutil>=6,<8"
           sudo systemctl stop mosquitto 2>/dev/null || true
           sudo pkill -x mosquitto 2>/dev/null || true
           sleep 1
-          for attempt in $(seq 1 60); do
+          for attempt in $(seq 1 12); do
             probe="$ROOT/preflight-attempt-$attempt.json"
-            if python base/benchmarks/runner_probe.py --output "$probe" --require-temperature --enforce; then
+            if "$VENV/bin/python" base/benchmarks/runner_probe.py --output "$probe" --require-temperature --enforce; then
               cp "$probe" "$ROOT/preflight.json"
               echo "strict eligibility reached on attempt $attempt"
               exit 0
             fi
-            echo "strict preflight attempt $attempt/60 failed; cooling"
-            sleep 15
+            sleep 10
           done
-          echo "strict eligibility not reached; last probe follows" >&2
-          cat "$ROOT/preflight-attempt-60.json" >&2 || true
+          cat "$ROOT/preflight-attempt-12.json" >&2
           exit 1
 
       - name: Start isolated broker
@@ -264,9 +226,10 @@ jobs:
             (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
             sleep .2
           done
+          cat "$ROOT/mosquitto.log"
           exit 1
 
-      - name: Run all QoS1 isolation cells
+      - name: Run QoS1 isolation matrix
         shell: bash
         run: |
           set -euo pipefail
@@ -274,7 +237,7 @@ jobs:
           for variant in "${variants[@]}"; do
             echo "=== $variant ==="
             set +e
-            python base/benchmarks/paired_writer_capacity.py \
+            "$VENV/bin/python" base/benchmarks/paired_writer_capacity.py \
               --base-root base --candidate-root "$variant" --host 127.0.0.1 --port 11883 \
               --protocol 311 --qos-values 1 --payload-bytes 64 \
               --inflight 20 --outstanding 20 --max-queued 200 \
@@ -293,7 +256,7 @@ jobs:
       - name: Summarize isolation matrix
         shell: bash
         run: |
-          python - <<'PY'
+          "$VENV/bin/python" - <<'PY'
           import json, os
           from pathlib import Path
           root=Path(os.environ['ROOT'])
@@ -318,22 +281,16 @@ jobs:
           PY
 
       - name: Final strict preflight and cleanup broker
+        if: always()
         shell: bash
         run: |
           set -euo pipefail
-          kill "$(cat "$ROOT/mosquitto.pid")" 2>/dev/null || true
+          if [ -f "$ROOT/mosquitto.pid" ]; then kill "$(cat "$ROOT/mosquitto.pid")" 2>/dev/null || true; fi
           sudo pkill -x mosquitto 2>/dev/null || true
           sleep 1
-          for attempt in $(seq 1 60); do
-            probe="$ROOT/preflight-final-attempt-$attempt.json"
-            if python base/benchmarks/runner_probe.py --output "$probe" --require-temperature --enforce; then
-              cp "$probe" "$ROOT/preflight-final.json"
-              exit 0
-            fi
-            sleep 15
-          done
-          cat "$ROOT/preflight-final-attempt-60.json" >&2 || true
-          exit 1
+          if [ -x "$VENV/bin/python" ]; then
+            "$VENV/bin/python" base/benchmarks/runner_probe.py --output "$ROOT/preflight-final.json" --require-temperature --enforce
+          fi
 
       - name: Upload isolation evidence
         if: always()
@@ -341,10 +298,10 @@ jobs:
         with:
           name: qos1-isolation-${{ github.run_id }}
           path: |
-            ${{ runner.temp }}/qos1-isolation/**/*.json
-            ${{ runner.temp }}/qos1-isolation/**/*.md
-            ${{ runner.temp }}/qos1-isolation/**/*.log
-            ${{ runner.temp }}/qos1-isolation/**/*.rc
+            ${{ runner.temp }}/qos1-isolation/*.json
+            ${{ runner.temp }}/qos1-isolation/*.md
+            ${{ runner.temp }}/qos1-isolation/*.log
+            ${{ runner.temp }}/qos1-isolation/*.rc
             ${{ runner.temp }}/qos1-isolation/*.conf
           if-no-files-found: warn
           retention-days: 30
