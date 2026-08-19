@@ -28,7 +28,7 @@ jobs:
       - run: ruff check benchmarks/temp_writer_cooperation_study.py
       - run: python -m py_compile benchmarks/temp_writer_cooperation_study.py
 
-  chunk-sweep:
+  config-frontier:
     if: github.head_ref == 'bench/tmp-writer-cooperation-study-20260820'
     runs-on: ubuntu-24.04
     timeout-minutes: 40
@@ -85,44 +85,32 @@ jobs:
           done
           cat /tmp/mosq-writer-coop.log
           exit 1
-      - name: Base A/A with startup and steady-state split
+      - name: Sweep existing writer byte budget
         shell: bash
         run: |
           set -euo pipefail
-          python study/benchmarks/temp_writer_cooperation_study.py \
-            --root source --mode base \
-            --host 127.0.0.1 --port 11883 \
-            --flood-bytes "${{ matrix.flood-bytes }}" --probe-bytes 64 \
-            --flood-count 1500 --probes 200 --steady-skip 2 --inflight 20 \
-            --max-outbound-bytes 67108864 --max-outbound-messages 100000 \
-            --chunk-bytes 1048576 --repeat 4 --timeout 120 --cpu 1 \
-            --output "/tmp/phase2-${{ matrix.flood-bytes }}-aa.json"
-      - name: Sweep transport burst sizes
-        shell: bash
-        run: |
-          set -euo pipefail
-          for chunk in 262144 524288 1048576 2097152 4194304; do
+          for budget in 1048576 2097152 4194304 8388608 16777216 33554432 67108864; do
             python study/benchmarks/temp_writer_cooperation_study.py \
-              --root source --mode chunk-drain \
+              --root source --mode base \
               --host 127.0.0.1 --port 11883 \
               --flood-bytes "${{ matrix.flood-bytes }}" --probe-bytes 64 \
-              --flood-count 1500 --probes 200 --steady-skip 2 --inflight 20 \
-              --max-outbound-bytes 67108864 --max-outbound-messages 100000 \
-              --chunk-bytes "$chunk" --repeat 4 --timeout 120 --cpu 1 \
-              --output "/tmp/phase2-${{ matrix.flood-bytes }}-${chunk}.json"
+              --flood-count 1500 --probes 200 --inflight 20 \
+              --max-outbound-bytes "$budget" --max-outbound-messages 100000 \
+              --chunk-bytes 2097152 --repeat 4 --timeout 120 --cpu 1 \
+              --output "/tmp/frontier-${{ matrix.flood-bytes }}-${budget}.json"
           done
-      - name: Upload sweep evidence
+      - name: Upload configuration frontier
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: writer-coop-phase2-${{ matrix.flood-bytes }}
-          path: /tmp/phase2-${{ matrix.flood-bytes }}-*.json
+          name: writer-coop-config-frontier-${{ matrix.flood-bytes }}
+          path: /tmp/frontier-${{ matrix.flood-bytes }}-*.json
           if-no-files-found: warn
 
-  default-budget-control:
+  chunk-confirm:
     if: github.head_ref == 'bench/tmp-writer-cooperation-study-20260820'
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
@@ -167,7 +155,7 @@ jobs:
           done
           cat /tmp/mosq-writer-coop.log
           exit 1
-      - name: Default 1 MiB writer-budget controls
+      - name: A/A and narrowed transport burst controls
         shell: bash
         run: |
           set -euo pipefail
@@ -175,96 +163,24 @@ jobs:
             --root source --mode base \
             --host 127.0.0.1 --port 11883 \
             --flood-bytes "${{ matrix.flood-bytes }}" --probe-bytes 64 \
-            --flood-count 1500 --probes 200 --steady-skip 2 --inflight 20 \
-            --max-outbound-bytes 1048576 --max-outbound-messages 10000 \
-            --chunk-bytes 1048576 --repeat 4 --timeout 120 --cpu 1 \
-            --output "/tmp/default-${{ matrix.flood-bytes }}-aa.json"
-          for chunk in 524288 1048576 2097152; do
+            --flood-count 1500 --probes 200 --inflight 20 \
+            --max-outbound-bytes 67108864 --max-outbound-messages 100000 \
+            --chunk-bytes 2097152 --repeat 8 --timeout 120 --cpu 1 \
+            --output "/tmp/chunk-confirm-${{ matrix.flood-bytes }}-aa.json"
+          for chunk in 1048576 2097152 4194304; do
             python study/benchmarks/temp_writer_cooperation_study.py \
               --root source --mode chunk-drain \
               --host 127.0.0.1 --port 11883 \
               --flood-bytes "${{ matrix.flood-bytes }}" --probe-bytes 64 \
-              --flood-count 1500 --probes 200 --steady-skip 2 --inflight 20 \
-              --max-outbound-bytes 1048576 --max-outbound-messages 10000 \
-              --chunk-bytes "$chunk" --repeat 4 --timeout 120 --cpu 1 \
-              --output "/tmp/default-${{ matrix.flood-bytes }}-${chunk}.json"
+              --flood-count 1500 --probes 200 --inflight 20 \
+              --max-outbound-bytes 67108864 --max-outbound-messages 100000 \
+              --chunk-bytes "$chunk" --repeat 8 --timeout 120 --cpu 1 \
+              --output "/tmp/chunk-confirm-${{ matrix.flood-bytes }}-${chunk}.json"
           done
-      - name: Upload default-budget evidence
+      - name: Upload narrowed chunk evidence
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: writer-coop-phase2-default-${{ matrix.flood-bytes }}
-          path: /tmp/default-${{ matrix.flood-bytes }}-*.json
-          if-no-files-found: warn
-
-  segmented-control:
-    if: github.head_ref == 'bench/tmp-writer-cooperation-study-20260820'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - name: Checkout study harness
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          path: study
-          persist-credentials: false
-      - name: Checkout immutable runtime
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ env.BASE_SHA }}
-          path: source
-          persist-credentials: false
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.13"
-      - name: Verify and install
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "$(git -C source rev-parse HEAD)" = "$BASE_SHA"
-          test "$(git -C study rev-parse HEAD)" = "${{ github.event.pull_request.head.sha }}"
-          python -m py_compile study/benchmarks/temp_writer_cooperation_study.py
-          python -m pip install -e "source[dev]"
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq mosquitto
-      - name: Start isolated broker
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo systemctl stop mosquitto 2>/dev/null || true
-          sudo pkill -x mosquitto 2>/dev/null || true
-          printf 'persistence false\nallow_anonymous true\nconnection_messages false\nlog_type error\nlistener 11883 127.0.0.1\n' >/tmp/mosq-writer-coop.conf
-          mosquitto -c /tmp/mosq-writer-coop.conf >/tmp/mosq-writer-coop.log 2>&1 &
-          for _ in $(seq 1 50); do
-            (echo >/dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
-            sleep .1
-          done
-          cat /tmp/mosq-writer-coop.log
-          exit 1
-      - name: Segmented 128 KiB negative control
-        shell: bash
-        run: |
-          set -euo pipefail
-          python study/benchmarks/temp_writer_cooperation_study.py \
-            --root source --mode base \
-            --host 127.0.0.1 --port 11883 \
-            --flood-bytes 131072 --probe-bytes 64 \
-            --flood-count 1000 --probes 200 --steady-skip 2 --inflight 20 \
-            --max-outbound-bytes 67108864 --max-outbound-messages 100000 \
-            --chunk-bytes 1048576 --repeat 4 --timeout 120 --cpu 1 \
-            --output /tmp/segmented-aa.json
-          python study/benchmarks/temp_writer_cooperation_study.py \
-            --root source --mode chunk-drain \
-            --host 127.0.0.1 --port 11883 \
-            --flood-bytes 131072 --probe-bytes 64 \
-            --flood-count 1000 --probes 200 --steady-skip 2 --inflight 20 \
-            --max-outbound-bytes 67108864 --max-outbound-messages 100000 \
-            --chunk-bytes 1048576 --repeat 4 --timeout 120 --cpu 1 \
-            --output /tmp/segmented-1048576.json
-      - name: Upload segmented evidence
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: writer-coop-phase2-segmented
-          path: /tmp/segmented-*.json
+          name: writer-coop-chunk-confirm-${{ matrix.flood-bytes }}
+          path: /tmp/chunk-confirm-${{ matrix.flood-bytes }}-*.json
           if-no-files-found: warn
