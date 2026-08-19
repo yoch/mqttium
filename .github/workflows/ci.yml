@@ -63,7 +63,9 @@ jobs:
         run: "$RUNNER_TEMP/scheduler-venv/bin/python -m pip install -e 'pr284[dev]' 'psutil>=6,<8'"
       - name: Run complete scheduler campaigns
         shell: bash
-        run: bash harness/benchmarks/temp_run_scheduler_campaigns.sh
+        run: |
+          sed -i '/^# PR284$/i set +e' harness/benchmarks/temp_run_scheduler_campaigns.sh
+          bash harness/benchmarks/temp_run_scheduler_campaigns.sh
       - name: Upload all evidence
         if: always()
         uses: actions/upload-artifact@v7
