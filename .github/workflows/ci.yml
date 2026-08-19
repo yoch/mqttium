@@ -1,206 +1,324 @@
-name: CI
+name: TEMP final ARM64 evidence for PR284-285
 
 on:
-  push:
-    branches: [main]
   pull_request:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: temp-final-arm64-pr284-285
+  cancel-in-progress: true
 
 jobs:
-  quality:
-    runs-on: ubuntu-24.04
+  evidence:
+    runs-on: [self-hosted, linux, ARM64, rpi5]
+    timeout-minutes: 180
+    env:
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      BASE_SHA: e80618154bacefed5626d9eb9ba46edf560b54e7
+      PR284_SHA: 8d37248831b372004074acfa0018f34da51b54df
+      PR285_SHA: 505c385c59670b2fb095728b5095f5039c53d675
+      FAIRNESS_SHA: ac50c07cf070be45fe4d13e67ba16714f6f82a4b
+      ROOT: ${{ runner.temp }}/final-arm64-284-285
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - name: Checkout trigger
+        uses: actions/checkout@v7
         with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: pyproject.toml
-      - run: python -m pip install -e ".[dev,security]"
-      - name: Repository hygiene
-        run: |
-          set -euo pipefail
-          test -z "$(git ls-files | grep -E '(^|/)(__pycache__|\.pytest_cache|\.mypy_cache|\.ruff_cache|dist|build|.*\.egg-info)(/|$)|(^|/)\.coverage($|\.)|\.py[co]$|\.(patch|diff)$' || true)"
-          test -z "$(grep -RIl --exclude-dir=.git -E 'mqttnext|MQTTNext|MQTTNEXT' src tests examples benchmarks || true)"
-      - run: ruff format --check src tests benchmarks
-      - run: ruff check src tests benchmarks
-      - run: mypy src/mqttium
-      - run: bandit -q -ll -r src
-      - run: python -m pytest -q tests/unit --cov=mqttium --cov-report=term-missing --cov-fail-under=80
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: trigger
+          persist-credentials: false
+      - name: Checkout immutable baseline
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.BASE_SHA }}
+          path: base
+          persist-credentials: false
+      - name: Checkout immutable PR284
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.PR284_SHA }}
+          path: pr284
+          persist-credentials: false
+      - name: Checkout immutable PR285
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.PR285_SHA }}
+          path: pr285
+          persist-credentials: false
+      - name: Checkout immutable fairness harness
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.FAIRNESS_SHA }}
+          path: fairness
+          persist-credentials: false
 
-  test:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.11", "3.12", "3.13", "3.14"]
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: ${{ matrix.python-version }}
-          cache: pip
-          cache-dependency-path: pyproject.toml
-      - run: python -m pip install -e ".[dev]"
-      - name: Require OpenSSL for TLS tests
-        run: python -c "import shutil; assert shutil.which('openssl'), 'OpenSSL is required for TLS tests'"
-      - name: Unit tests (including TLS, WebSocket, and cancellation)
-        run: python -m pytest -q -ra tests/unit
-      - name: Install Mosquitto
-        timeout-minutes: 5
+      - name: Verify immutable refs and clean broker state
+        shell: bash
         run: |
           set -euo pipefail
-          export DEBIAN_FRONTEND=noninteractive
-          date -u +'apt-get install start %FT%TZ'
-          sudo -E apt-get install -y mosquitto
-          date -u +'apt-get install done %FT%TZ'
-          dpkg-query -W mosquitto
-          command -v mosquitto
-      - name: Start Mosquitto
-        timeout-minutes: 2
+          test "$(git -C base rev-parse HEAD)" = "$BASE_SHA"
+          test "$(git -C pr284 rev-parse HEAD)" = "$PR284_SHA"
+          test "$(git -C pr285 rev-parse HEAD)" = "$PR285_SHA"
+          test "$(git -C fairness rev-parse HEAD)" = "$FAIRNESS_SHA"
+          test "$(uname -m)" = aarch64
+          python3 - <<'PY'
+          import sys
+          if sys.version_info[:2] != (3, 13):
+              raise SystemExit(f"expected Python 3.13, got {sys.version}")
+          PY
+          mkdir -p "$ROOT"/{pr284,pr285,fairness}
+          pgrep -a mosquitto > "$ROOT/preexisting-mosquitto.txt" || true
+          sudo systemctl stop mosquitto 2>/dev/null || true
+          sudo pkill -x mosquitto 2>/dev/null || true
+          sleep 1
+          if pgrep -a mosquitto; then
+            echo "unable to establish isolated broker state" >&2
+            exit 1
+          fi
+
+      - name: Create venv and dependencies
+        shell: bash
         run: |
           set -euo pipefail
-          printf 'listener 11883 127.0.0.1\nallow_anonymous true\npersistence false\n' > /tmp/mosq-ci.conf
-          date -u +'mosquitto -d start %FT%TZ'
-          mosquitto -c /tmp/mosq-ci.conf -d
-          echo "mosquitto -d exited $?"
-          date -u +'mosquitto -d returned %FT%TZ'
-          for i in $(seq 1 30); do
-            if (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1; then
-              echo "listener ready after ${i} probe(s)"
+          rm -rf "$RUNNER_TEMP/final-arm64-venv"
+          python3 -m venv "$RUNNER_TEMP/final-arm64-venv"
+          echo "$RUNNER_TEMP/final-arm64-venv/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/final-arm64-venv/bin/python" -m pip install -e "pr284[dev]" "psutil>=6,<8"
+
+      - name: Strict initial runner preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 24); do
+            if python base/benchmarks/runner_probe.py --output "$ROOT/preflight-initial.json" --require-temperature --enforce; then
               exit 0
             fi
-            sleep 0.2
+            sleep 15
           done
-          echo "listener never accepted a connection"
-          pgrep -a mosquitto || true
+          echo "rpi5 never reached strict eligibility" >&2
           exit 1
-      - name: Mosquitto integration tests
-        run: python -m pytest -q tests/integration
 
-  cross-platform:
-    name: Cross-platform (${{ matrix.os }}, Python ${{ matrix.python-version }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-15, windows-2025]
-        python-version: ["3.11", "3.14"]
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: ${{ matrix.python-version }}
-          cache: pip
-          cache-dependency-path: pyproject.toml
-      - run: python -m pip install -e ".[dev]"
-      - name: Require OpenSSL for TLS tests
-        run: python -c "import shutil; assert shutil.which('openssl'), 'OpenSSL is required for TLS tests'"
-      - name: Unit tests (including TLS, WebSocket, and cancellation)
-        run: python -m pytest -q -ra tests/unit
-
-  fuzz:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: pyproject.toml
-      - run: python -m pip install -e ".[fuzz]"
-      - name: Seeded fuzzing
+      - name: Focused correctness PR284 and PR285
+        shell: bash
         run: |
-          for seed in 1 2 3; do
-            PYTHONPATH=src python tests/fuzz/fuzz.py --seed "$seed" --iterations 20000
+          set -euo pipefail
+          PYTHONPATH=pr284/src python -m pytest -q pr284/tests/unit/test_write_pump_targeted_wake.py
+          PYTHONPATH=pr285/src python -m pytest -q \
+            pr285/tests/unit/test_publish_targeted_wake.py \
+            pr285/tests/unit/test_async_publish_admission.py
+
+      - name: PR284 stable target contention A/A
+        shell: bash
+        run: |
+          python pr284/benchmarks/paired_writer_waiter_contention.py \
+            --base-root base --candidate-root base \
+            --producer-values 1,4,64,256 --max-messages 8 --payload-bytes 64 \
+            --warmup-count 2000 --count 16000 --repeat 8 --cpu 1 \
+            --policy strict --preflight-report "$ROOT/preflight-initial.json" \
+            --max-baseline-cv .05 --max-aa-ratio-deviation .02 \
+            --output "$ROOT/pr284/target-aa.json" \
+            --summary-output "$ROOT/pr284/target-aa.md"
+      - name: PR284 stable target contention A/B
+        shell: bash
+        run: |
+          python pr284/benchmarks/paired_writer_waiter_contention.py \
+            --base-root base --candidate-root pr284 \
+            --producer-values 1,4,64,256 --max-messages 8 --payload-bytes 64 \
+            --warmup-count 2000 --count 16000 --repeat 8 --cpu 1 \
+            --policy strict --preflight-report "$ROOT/preflight-initial.json" \
+            --max-baseline-cv .05 --min-completed-ratio .97 \
+            --output "$ROOT/pr284/target-ab.json" \
+            --summary-output "$ROOT/pr284/target-ab.md"
+
+      - name: Writer fairness A/A on stable producer cells
+        shell: bash
+        run: |
+          python fairness/benchmarks/temp_fairness_progress.py parent \
+            --kind writer --base-root base --candidate-root base \
+            --producer-values 8,32,64 --ops 120 --repeat 6 \
+            --max-messages 1 --max-bytes 1048576 --payload-bytes 64 \
+            --output "$ROOT/fairness/writer-aa.json"
+      - name: Writer fairness A/B
+        shell: bash
+        run: |
+          python fairness/benchmarks/temp_fairness_progress.py parent \
+            --kind writer --base-root base --candidate-root pr284 \
+            --producer-values 8,32,64 --ops 120 --repeat 6 \
+            --max-messages 1 --max-bytes 1048576 --payload-bytes 64 \
+            --output "$ROOT/fairness/writer-ab.json"
+
+      - name: Cool and refresh strict preflight before network evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 24); do
+            if python base/benchmarks/runner_probe.py --output "$ROOT/preflight-network.json" --require-temperature --enforce; then
+              exit 0
+            fi
+            sleep 15
           done
-      - run: PYTHONPATH=src python -m pytest -q tests/fuzz/test_hypothesis_fuzz.py
+          exit 1
 
-  package:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: pyproject.toml
-      - run: python -m pip install ".[release]"
-      - run: validate-pyproject pyproject.toml
-      - run: python -m build
-      - run: twine check --strict dist/*
-      - run: check-wheel-contents dist/*.whl
-      - name: Validate distribution contents
+      - name: Start isolated Mosquitto
+        shell: bash
         run: |
-          python - <<'PY'
-          from pathlib import Path
-          from zipfile import ZipFile
-          import ast
-          import email
-          import tarfile
+          set -euo pipefail
+          cat > "$ROOT/mosquitto.conf" <<'MOSQ'
+          persistence false
+          allow_anonymous true
+          max_inflight_messages 1000
+          max_queued_messages 100000
+          max_queued_bytes 0
+          connection_messages false
+          log_type error
+          listener 11883 127.0.0.1
+          MOSQ
+          mosquitto -c "$ROOT/mosquitto.conf" > "$ROOT/mosquitto.log" 2>&1 &
+          echo $! > "$ROOT/mosquitto.pid"
+          for _ in $(seq 1 50); do
+            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            sleep .2
+          done
+          cat "$ROOT/mosquitto.log"
+          exit 1
 
-          source = ast.parse(Path("src/mqttium/__init__.py").read_text(encoding="utf-8"))
-          expected_version = next(
-              node.value.value
-              for node in source.body
-              if isinstance(node, ast.Assign)
-              and any(isinstance(target, ast.Name) and target.id == "__version__" for target in node.targets)
-              and isinstance(node.value, ast.Constant)
-              and isinstance(node.value.value, str)
-          )
-          wheel = next(Path("dist").glob("*.whl"))
-          sdist = next(Path("dist").glob("*.tar.gz"))
-
-          with ZipFile(wheel) as archive:
-              names = archive.namelist()
-              metadata_name = next(name for name in names if name.endswith(".dist-info/METADATA"))
-              metadata = email.message_from_bytes(archive.read(metadata_name))
-              assert metadata["Name"] == "mqttium"
-              assert metadata["Version"] == expected_version
-              assert metadata["Requires-Python"] == ">=3.11"
-              assert metadata["License-Expression"] == "Apache-2.0"
-              assert "mqttium/py.typed" in names
-              assert any(name.endswith(".dist-info/licenses/LICENSE") for name in names)
-              assert any(name.endswith(".dist-info/licenses/NOTICE") for name in names)
-
-          with tarfile.open(sdist, "r:gz") as archive:
-              names = archive.getnames()
-              for filename in (
-                  "LICENSE",
-                  "NOTICE",
-                  "README.md",
-                  "CHANGELOG.md",
-                  "PROVENANCE.md",
-                  "SECURITY.md",
-              ):
-                  assert any(name.endswith("/" + filename) for name in names), filename
-          PY
-      - name: Install and import the built wheel
+      - name: Publish fairness A/A true completion
+        shell: bash
         run: |
-          python -m venv /tmp/mqttium-wheel
-          /tmp/mqttium-wheel/bin/python -m pip install --no-deps dist/*.whl
-          cd /tmp
-          /tmp/mqttium-wheel/bin/python -I - <<'PY'
-          import importlib
-          import importlib.metadata
-          import pkgutil
-          import mqttium
+          python fairness/benchmarks/temp_fairness_progress.py parent \
+            --kind publish --base-root base --candidate-root base \
+            --host 127.0.0.1 --port 11883 \
+            --producer-values 16,32,64 --inflight-values 1,4 \
+            --ops 45 --repeat 6 --payload-bytes 64 --timeout 120 \
+            --output "$ROOT/fairness/publish-aa.json"
+      - name: Publish fairness A/B true completion
+        shell: bash
+        run: |
+          python fairness/benchmarks/temp_fairness_progress.py parent \
+            --kind publish --base-root base --candidate-root pr285 \
+            --host 127.0.0.1 --port 11883 \
+            --producer-values 16,32,64 --inflight-values 1,4 \
+            --ops 45 --repeat 6 --payload-bytes 64 --timeout 120 \
+            --output "$ROOT/fairness/publish-ab.json"
 
-          assert mqttium.__version__ == importlib.metadata.version("mqttium")
-          for module in pkgutil.walk_packages(mqttium.__path__, mqttium.__name__ + "."):
-              importlib.import_module(module.name)
-          PY
-          /tmp/mqttium-wheel/bin/python -m pip check
-      - name: Upload distributions
+      - name: PR284 writer-capacity non-regression
+        shell: bash
+        run: |
+          python base/benchmarks/paired_writer_capacity.py \
+            --base-root base --candidate-root pr284 \
+            --protocols 311 --payloads 64 --windows 20 \
+            --count-small 6000 --repeat 8 --cpu 1 \
+            --policy strict --preflight-report "$ROOT/preflight-network.json" \
+            --min-qos0-ratio .97 --min-qos1-ratio .97 \
+            --output "$ROOT/pr284/writer-capacity.json" \
+            --summary-output "$ROOT/pr284/writer-capacity.md"
+      - name: PR284 stable open-loop non-regression
+        shell: bash
+        run: |
+          python base/benchmarks/paired_open_loop.py \
+            --base-root base --candidate-root pr284 \
+            --protocols 311 --payloads 64 --completions callback --windows 20 \
+            --target-rates 5000,7500 --count-small 5000 --repeat 8 --cpu 1 \
+            --policy strict --preflight-report "$ROOT/preflight-network.json" \
+            --max-baseline-cv .05 --min-completed-ratio .97 --max-loop-lag-ratio 1.05 \
+            --output "$ROOT/pr284/open-loop.json" \
+            --summary-output "$ROOT/pr284/open-loop.md"
+      - name: PR284 network non-regression
+        shell: bash
+        run: |
+          python base/benchmarks/paired_network.py \
+            --base-root base --candidate-root pr284 --host 127.0.0.1 --port 11883 \
+            --protocols 311 --completions receipt --payloads 64,4096 --windows 20,64 \
+            --repeat 8 --count-small 1500 --count-large 750 --cpu 1 \
+            --policy strict --preflight-report "$ROOT/preflight-network.json" \
+            --max-baseline-cv .05 --min-ack-ratio .97 \
+            --output "$ROOT/pr284/network.json" \
+            --summary-output "$ROOT/pr284/network.md"
+
+      - name: Cool and refresh strict preflight before PR285 guards
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 24); do
+            if python base/benchmarks/runner_probe.py --output "$ROOT/preflight-pr285.json" --require-temperature --enforce; then
+              exit 0
+            fi
+            sleep 15
+          done
+          exit 1
+
+      - name: PR285 writer-capacity non-regression
+        shell: bash
+        run: |
+          python base/benchmarks/paired_writer_capacity.py \
+            --base-root base --candidate-root pr285 \
+            --protocols 311 --payloads 64 --windows 20 \
+            --count-small 6000 --repeat 8 --cpu 1 \
+            --policy strict --preflight-report "$ROOT/preflight-pr285.json" \
+            --min-qos0-ratio .97 --min-qos1-ratio .97 \
+            --output "$ROOT/pr285/writer-capacity.json" \
+            --summary-output "$ROOT/pr285/writer-capacity.md"
+      - name: PR285 stable open-loop non-regression
+        shell: bash
+        run: |
+          python base/benchmarks/paired_open_loop.py \
+            --base-root base --candidate-root pr285 \
+            --protocols 311 --payloads 64 --completions callback --windows 20 \
+            --target-rates 5000,7500 --count-small 5000 --repeat 8 --cpu 1 \
+            --policy strict --preflight-report "$ROOT/preflight-pr285.json" \
+            --max-baseline-cv .05 --min-completed-ratio .97 --max-loop-lag-ratio 1.05 \
+            --output "$ROOT/pr285/open-loop.json" \
+            --summary-output "$ROOT/pr285/open-loop.md"
+      - name: PR285 network non-regression
+        shell: bash
+        run: |
+          python base/benchmarks/paired_network.py \
+            --base-root base --candidate-root pr285 --host 127.0.0.1 --port 11883 \
+            --protocols 311 --completions receipt --payloads 64,4096 --windows 20,64 \
+            --repeat 8 --count-small 1500 --count-large 750 --cpu 1 \
+            --policy strict --preflight-report "$ROOT/preflight-pr285.json" \
+            --max-baseline-cv .05 --min-ack-ratio .97 \
+            --output "$ROOT/pr285/network.json" \
+            --summary-output "$ROOT/pr285/network.md"
+
+      - name: Final cool-down and eligibility check
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 24); do
+            if python base/benchmarks/runner_probe.py --output "$ROOT/preflight-final.json" --require-temperature --enforce; then
+              exit 0
+            fi
+            sleep 15
+          done
+          exit 1
+
+      - name: Preserve diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          if [ -f "$ROOT/mosquitto.pid" ]; then
+            kill "$(cat "$ROOT/mosquitto.pid")" 2>/dev/null
+          fi
+          find "$ROOT" -maxdepth 3 -type f -print | sort > "$ROOT/files.txt"
+          git -C base rev-parse HEAD > "$ROOT/base-head.txt"
+          git -C pr284 rev-parse HEAD > "$ROOT/pr284-head.txt"
+          git -C pr285 rev-parse HEAD > "$ROOT/pr285-head.txt"
+          git -C fairness rev-parse HEAD > "$ROOT/fairness-head.txt"
+
+      - name: Upload final ARM64 evidence
+        if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: distributions-${{ github.sha }}
-          path: dist/*
+          name: final-arm64-pr284-285-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/final-arm64-284-285/**/*.json
+            ${{ runner.temp }}/final-arm64-284-285/**/*.md
+            ${{ runner.temp }}/final-arm64-284-285/**/*.txt
+            ${{ runner.temp }}/final-arm64-284-285/**/*.log
+            ${{ runner.temp }}/final-arm64-284-285/mosquitto.conf
           if-no-files-found: error
+          retention-days: 30
