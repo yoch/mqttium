@@ -433,8 +433,10 @@ async def test_writer_failure_drops_the_eager_binding() -> None:
     pump = WritePump(max_bytes=1 << 20, max_messages=100, on_failure=record)
     pump.start(transport)
 
-    pump.queue.put_nowait(b"boom")
-    pump.queued_bytes = 4
+    # Force the awaited writer path, but use the pump's admission API so all
+    # owned counters describe the frame the failing transport is about to see.
+    pump._eager_armed = False
+    assert pump.try_enqueue(b"boom") is True
     for _ in range(8):
         await asyncio.sleep(0)
 
