@@ -1,52 +1,48 @@
-name: TEMP ARM64 final cooldown requalification
+name: TEMP cleanup scheduler benchmark infrastructure
 
 on:
   pull_request:
 
 permissions:
-  contents: read
+  contents: write
+  pull-requests: write
 
 concurrency:
   group: temp-combined-283-285
   cancel-in-progress: true
 
 jobs:
-  requalify:
-    runs-on: [self-hosted, linux, ARM64]
-    timeout-minutes: 10
+  cleanup:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: e80618154bacefed5626d9eb9ba46edf560b54e7
-          path: base
-          persist-credentials: false
-      - name: Strict post-campaign runner probe
+      - name: Close temporary PR and delete temporary refs
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          test "$(uname -m)" = aarch64
-          sudo systemctl stop mosquitto 2>/dev/null || true
-          sudo pkill -x mosquitto 2>/dev/null || true
-          VENV="$RUNNER_TEMP/final-requal-venv"
-          ROOT="$RUNNER_TEMP/final-requal"
-          rm -rf "$VENV" "$ROOT"
-          mkdir -p "$ROOT"
-          python3 -m venv "$VENV"
-          "$VENV/bin/python" -m pip install "psutil>=6,<8"
-          for attempt in $(seq 1 24); do
-            out="$ROOT/preflight-final-$attempt.json"
-            if "$VENV/bin/python" base/benchmarks/runner_probe.py --output "$out" --require-temperature --enforce; then
-              cp "$out" "$ROOT/preflight-final.json"
-              exit 0
-            fi
-            sleep 10
+          api="https://api.github.com/repos/${GITHUB_REPOSITORY}"
+          curl -fsS -X PATCH \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "${api}/pulls/300" \
+            -d '{"state":"closed"}' >/tmp/pr300-close.json
+          python3 - <<'PY'
+          import json
+          d=json.load(open('/tmp/pr300-close.json'))
+          assert d['number'] == 300 and d['state'] == 'closed' and not d['merged']
+          print('PR #300 closed unmerged')
+          PY
+
+          remote="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          for branch in \
+            bench/tmp-qos1-isolation-hosted-20260819 \
+            bench/tmp-qos1-singles-mini-broker-20260819
+          do
+            git push "$remote" --delete "$branch"
           done
-          exit 1
-      - name: Upload requalification evidence
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: final-requalification-${{ github.run_id }}
-          path: ${{ runner.temp }}/final-requal/*.json
-          if-no-files-found: warn
-          retention-days: 30
+
+          # Self-delete last: the already-running job continues after ref removal.
+          git push "$remote" --delete bench/tmp-stack-283-285-20260819
