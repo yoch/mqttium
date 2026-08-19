@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - bench/tmp-pr283-resident-budget-20260819-evidence
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: read
