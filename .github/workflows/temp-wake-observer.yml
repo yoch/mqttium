@@ -1,0 +1,24 @@
+name: TEMP wake-frontier observer
+
+on:
+  push:
+    branches:
+      - bench/tmp-wake-frontier-284-285-20260819
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  announce:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/github-script@v8
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: 289,
+              body: `Wake-frontier observer: run **${context.runId}**, sha \`${context.sha}\`.`,
+            });
