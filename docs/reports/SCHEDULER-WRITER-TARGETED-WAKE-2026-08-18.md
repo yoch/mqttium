@@ -1,5 +1,10 @@
 # Targeted writer waiter wakeups — 2026-08-18
 
+> **Superseded** by
+> [`SCHEDULER-WRITER-TARGETED-WAKE-2026-08-19.md`](SCHEDULER-WRITER-TARGETED-WAKE-2026-08-19.md),
+> which names the feat commit and records the 2026-08-19 diagnostic campaign.
+> This file is the implementation note as written on 2026-08-18.
+
 Experiment contract:
 [`../experiments/scheduler-writer-targeted-wake.md`](../experiments/scheduler-writer-targeted-wake.md).
 

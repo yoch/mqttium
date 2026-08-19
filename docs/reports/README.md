@@ -111,6 +111,17 @@ outcome live here.
 | 2026-08-04 | [`MEMORY-RESULTS.md`](MEMORY-RESULTS.md) | After-state for the same scenarios, once admission, delivery-budget, pagination and lazy-hydration corrections landed. |
 | 2026-08-04 | [`MEMORY-PROFILE-FOLLOW-UP.md`](MEMORY-PROFILE-FOLLOW-UP.md) | How each audit recommendation was closed, and which ones got a numeric regression guard. |
 
+## Scheduler experiments
+
+Open scheduler-hypothesis records. They do not outrank a measured hot-path
+decision, and they are not merge evidence until the experiment's own gate is
+met on an eligible runner.
+
+| Date | Report | Records |
+| --- | --- | --- |
+| 2026-08-19 | [`SCHEDULER-WRITER-TARGETED-WAKE-2026-08-19.md`](SCHEDULER-WRITER-TARGETED-WAKE-2026-08-19.md) | Diagnostic campaign for `notify(n)` writer wakeups at `1b5d871`: +9.8% / +143% at 16/64 producers, writer-capacity flat. **Keep; not mergeable** until eligible-runner A/A (especially 16 producers) and A/B exist. |
+| 2026-08-18 | [`SCHEDULER-WRITER-TARGETED-WAKE-2026-08-18.md`](SCHEDULER-WRITER-TARGETED-WAKE-2026-08-18.md) | Implementation note for targeted writer wake. Superseded by the 2026-08-19 campaign. |
+
 ## Hot-path decisions
 
 Each answers one question with a measurement, and the answer is already
@@ -118,7 +129,6 @@ implemented — the report exists so the choice stays falsifiable.
 
 | Date | Report | Question answered |
 | --- | --- | --- |
-| 2026-08-18 | [`SCHEDULER-WRITER-TARGETED-WAKE-2026-08-18.md`](SCHEDULER-WRITER-TARGETED-WAKE-2026-08-18.md) | Can writer capacity-release wake only as many waiters as slots just freed, without a waiter deque and without stranding lifecycle waiters? Candidate implemented; eligible-runner A/A+A/B still required. |
 | 2026-08-14 | [`NATIVE-QOS0-CALLBACK-DIRECT-2026-08-14.md`](NATIVE-QOS0-CALLBACK-DIRECT-2026-08-14.md) | Can native QoS 0 writer admission enqueue an isolated `on_publish` callback directly without weakening queue bounds or batch atomicity? |
 | 2026-08-13 | [`ACK-SPECIALIZED-PRIMITIVES.md`](ACK-SPECIALIZED-PRIMITIVES.md) | Can per-version ACK decode primitives make MQTT 5 three-byte bodies cost the same call count as MQTT 3.1.1 two-byte success? Superseded in scope by the full specialized-codec bind table on the same branch. |
 | 2026-08-13 | [`AUTO-QOS1-MESSAGE-BATCH-DELIVERY.md`](AUTO-QOS1-MESSAGE-BATCH-DELIVERY.md) | Can fresh automatic QoS 1 MESSAGE effects share the small-message inline batch without weakening persisted replay semantics? |

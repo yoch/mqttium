@@ -57,4 +57,5 @@ Lost-wakeup hand-off: if a waiter is cancelled after consuming a `notify(n)` tok
 
 **Diagnostic A/B (ineligible cloud VM, 2026-08-19).** Writer-capacity 1.012 / 1.000. Contention +9.8% at 16 producers and +143% at 64, with CPU 0.168s → 0.069s and suspensions 81264 → 19453. Single-producer −2.2%. Keep; confirm on an eligible runner.
 
-Complexity/risk: [`docs/reports/SCHEDULER-WRITER-TARGETED-WAKE-2026-08-18.md`](../reports/SCHEDULER-WRITER-TARGETED-WAKE-2026-08-18.md).
+Published report:
+[`docs/reports/SCHEDULER-WRITER-TARGETED-WAKE-2026-08-19.md`](../reports/SCHEDULER-WRITER-TARGETED-WAKE-2026-08-19.md).
