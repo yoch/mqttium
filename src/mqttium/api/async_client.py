@@ -270,7 +270,9 @@ class AsyncClient:
         self._shutdown_callback_worker = self._delivery.shutdown_callbacks
         self._invoke = self._delivery.invoke
         self._publish_waiters = 0
-        self._publish_space = asyncio.Event()
+        self._publish_waiter_futs: deque[asyncio.Future[None]] = deque()
+        self._publish_wakeups = 0
+        self._publish_wait_retries = 0
         self._connack_fut: asyncio.Future[ConnAckPacket] | None = None
         self._connect_disconnect_fut: asyncio.Future[int] | None = None
         self._receipts: dict[int, PublishReceipt | deque[PublishReceipt]] = {}
@@ -987,7 +989,7 @@ class AsyncClient:
     ) -> PublishReceipt:
         data = payload.encode("utf-8") if isinstance(payload, str) else payload
         while True:
-            wait_for_space = False
+            waiter: asyncio.Future[None] | None = None
             async with self._engine_lock:
                 try:
                     direct = self._try_direct_qos0_publish(
@@ -1027,13 +1029,11 @@ class AsyncClient:
                     terminal = self._publish_wait_failure()
                     if terminal is not None:
                         raise terminal from flow_exc
-                    self._publish_space.clear()
-                    self._publish_waiters += 1
-                    wait_for_space = True
+                    waiter = self._register_publish_waiter()
                 else:
                     self._collect_effects_locked()
                     self._drain_effects_inline()
-            if not wait_for_space:
+            if waiter is None:
                 if self._effect_pump.pending:
                     if nowait:
                         self._schedule_effect_flush()
@@ -1042,10 +1042,7 @@ class AsyncClient:
                 if not nowait and receipt.qos != QoS.AT_MOST_ONCE:
                     self._write_pump._try_flush_latency_batch()
                 return receipt
-            try:
-                await self._publish_space.wait()
-            finally:
-                self._publish_waiters -= 1
+            await self._wait_publish_space(waiter)
 
     async def _admit_publish_many(
         self,
@@ -1055,7 +1052,7 @@ class AsyncClient:
         nowait: bool,
     ) -> None:
         while True:
-            wait_for_space = False
+            waiter: asyncio.Future[None] | None = None
             async with self._engine_lock:
                 try:
                     if self._try_direct_qos0_many(requests, receipt, nowait=nowait):
@@ -1073,9 +1070,7 @@ class AsyncClient:
                     terminal = self._publish_wait_failure()
                     if terminal is not None:
                         raise terminal from flow_exc
-                    self._publish_space.clear()
-                    self._publish_waiters += 1
-                    wait_for_space = True
+                    waiter = self._register_publish_waiter()
                 else:
                     for handle in handles:
                         receipt._register(handle.mid)
@@ -1084,11 +1079,8 @@ class AsyncClient:
                     self._collect_effects_locked()
                     self._drain_effects_inline()
                     return
-            if wait_for_space:
-                try:
-                    await self._publish_space.wait()
-                finally:
-                    self._publish_waiters -= 1
+            if waiter is not None:
+                await self._wait_publish_space(waiter)
 
     async def publish_many(
         self,
@@ -1813,14 +1805,62 @@ class AsyncClient:
                 batch = self._pop_batch_receipt(mid)
                 if batch is not None:
                     batch._complete(mid, reason)
-        # Inlined: _settle_publish runs per acknowledgement, and the common case
-        # has no waiter at all. The named helper stays for the teardown callers.
+        # Inlined check: _settle_publish runs per acknowledgement, and the
+        # common case has no waiter at all. One completion wakes one waiter;
+        # teardown callers use _notify_publish_space() to wake everyone.
         if self._publish_waiters:
-            self._publish_space.set()
+            self._wake_publish_waiters(1)
+
+    def _register_publish_waiter(self) -> asyncio.Future[None]:
+        """Park one producer. Must run while still holding ``_engine_lock``."""
+        waiter: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._publish_waiter_futs.append(waiter)
+        self._publish_waiters += 1
+        return waiter
+
+    async def _wait_publish_space(self, waiter: asyncio.Future[None]) -> None:
+        try:
+            await waiter
+            self._publish_wait_retries += 1
+        except asyncio.CancelledError:
+            if waiter.done() and not waiter.cancelled():
+                # The wakeup was delivered, but this producer will not retry.
+                self._wake_publish_waiters(1)
+            else:
+                self._discard_publish_waiter(waiter)
+            raise
+        finally:
+            self._publish_waiters -= 1
+
+    def _discard_publish_waiter(self, waiter: asyncio.Future[None]) -> None:
+        if waiter.done() and not waiter.cancelled():
+            return
+        try:
+            self._publish_waiter_futs.remove(waiter)
+        except ValueError:
+            pass
+
+    def _wake_publish_waiters(self, n: int = 1) -> None:
+        """Complete up to ``n`` pending waiter futures (one ACK → one waiter)."""
+        waiters = self._publish_waiter_futs
+        remaining = n
+        while remaining > 0 and waiters:
+            fut = waiters.popleft()
+            if fut.done():
+                continue
+            fut.set_result(None)
+            self._publish_wakeups += 1
+            remaining -= 1
 
     def _notify_publish_space(self) -> None:
-        if self._publish_waiters:
-            self._publish_space.set()
+        """Wake every parked publisher (teardown / reconnect)."""
+        waiters = self._publish_waiter_futs
+        while waiters:
+            fut = waiters.popleft()
+            if fut.done():
+                continue
+            fut.set_result(None)
+            self._publish_wakeups += 1
 
     def _resolve_connack(self, connack: ConnAckPacket) -> None:
         if connack.reason_code != 0:

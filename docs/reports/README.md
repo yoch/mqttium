@@ -123,6 +123,8 @@ met on an eligible runner.
 | 2026-08-18 | [`SCHEDULER-RESIDENT-MESSAGE-BUDGET-2026-08-18.md`](SCHEDULER-RESIDENT-MESSAGE-BUDGET-2026-08-18.md) | Implementation note for `_resident_messages`. Superseded by the 2026-08-19 campaign. |
 | 2026-08-19 | [`SCHEDULER-WRITER-TARGETED-WAKE-2026-08-19.md`](SCHEDULER-WRITER-TARGETED-WAKE-2026-08-19.md) | Diagnostic campaign for `notify(n)` writer wakeups at `1b5d871`: +9.8% / +143% at 16/64 producers, writer-capacity flat. **Keep; not mergeable** until eligible-runner A/A (especially 16 producers) and A/B exist. |
 | 2026-08-18 | [`SCHEDULER-WRITER-TARGETED-WAKE-2026-08-18.md`](SCHEDULER-WRITER-TARGETED-WAKE-2026-08-18.md) | Implementation note for targeted writer wake. Superseded by the 2026-08-19 campaign. |
+| 2026-08-19 | [`SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-19.md`](SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-19.md) | Diagnostic campaign for targeted publish-admission wake at `acc427a`: +29% / +127% / +57% at 4×inf1, 16×inf1, 16×inf4; single-publisher neutral. **Keep; not mergeable** until an eligible runner repeats the gate. |
+| 2026-08-18 | [`SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-18.md`](SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-18.md) | Implementation note for the waiter-future deque. Superseded by the 2026-08-19 campaign. |
 
 ## Hot-path decisions
 
