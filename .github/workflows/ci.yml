@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   evidence:
-    runs-on: [self-hosted, linux, ARM64, rpi5]
+    runs-on: [self-hosted, linux, ARM64]
     timeout-minutes: 180
     env:
       PYTHONUNBUFFERED: "1"
