@@ -1,0 +1,120 @@
+name: TEMP PR284-285 barging probes
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  logic:
+    runs-on: ubuntu-24.04
+    env:
+      PR284_SHA: 8d37248831b372004074acfa0018f34da51b54df
+      PR285_SHA: 505c385c59670b2fb095728b5095f5039c53d675
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.PR284_SHA }}
+          path: pr284
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.PR285_SHA }}
+          path: pr285
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - run: python -m pip install -e "pr284[dev]"
+
+      - name: Prove writer waiter can be barged
+        shell: bash
+        run: |
+          PYTHONPATH=pr284/src python - <<'PY'
+          import asyncio
+          from mqttium.api._writer import WritePump
+
+          class Gate:
+              def __init__(self):
+                  self.entered = asyncio.Event()
+                  self.release = asyncio.Event()
+              async def write(self, data):
+                  self.entered.set()
+                  await self.release.wait()
+              async def write_many(self, parts):
+                  await self.write(b''.join(parts))
+              async def read(self, n=65536): return b''
+              async def close(self): pass
+              def is_closing(self): return False
+
+          async def no_failure(exc):
+              raise AssertionError(exc)
+
+          async def main():
+              pump = WritePump(max_bytes=1 << 20, max_messages=1, on_failure=no_failure)
+              assert pump.try_enqueue(b'held')
+              waiter = asyncio.create_task(pump.enqueue(b'parked'))
+              while pump.waiters != 1:
+                  await asyncio.sleep(0)
+              transport = Gate()
+              pump.start(transport)
+              await asyncio.wait_for(transport.entered.wait(), 1)
+              assert pump.waiters == 1
+              assert pump.queued_messages == 0
+              barged = pump.try_enqueue(b'new-arrival')
+              print({'writer_barged': barged, 'waiters': pump.waiters, 'queued': pump.queued_messages})
+              assert barged is True, 'new arrival should demonstrate current barging behavior'
+              assert not waiter.done()
+              transport.release.set()
+              await asyncio.wait_for(waiter, 1)
+              await asyncio.wait_for(pump.join(), 1)
+              await pump.stop()
+
+          asyncio.run(main())
+          PY
+
+      - name: Prove publish waiter can be barged
+        shell: bash
+        run: |
+          PYTHONPATH=pr285/src python - <<'PY'
+          import asyncio
+          from mqttium.api.async_client import AsyncClient
+          from mqttium.protocol.engine import EffectKind, EngineEffect
+
+          async def complete(client, mid):
+              stored = client._engine.store.get_out(mid)
+              assert stored is not None
+              client._engine.outbound.complete_record(mid, stored)
+              client._engine.packet_ids.release(mid)
+              await client._apply_effect(
+                  EngineEffect(kind=EffectKind.PUBLISH_COMPLETE, data=mid),
+                  nowait=False,
+              )
+
+          async def main():
+              client = AsyncClient(max_pending_outbound_messages=1, max_pending_outbound_bytes=None)
+              first = await client.publish('barging/held', b'a', qos=1)
+              assert first.mid is not None
+              parked = asyncio.create_task(client.publish('barging/parked', b'b', qos=1))
+              while client._publish_waiters != 1:
+                  await asyncio.sleep(0)
+              await complete(client, first.mid)
+              # No yield between release and this new publish. An unlocked asyncio.Lock
+              # can be reacquired by the current task before the woken waiter runs.
+              sneak = await client.publish('barging/new-arrival', b'c', qos=1)
+              assert sneak.mid is not None
+              await asyncio.sleep(0)
+              print({
+                  'publish_barged': not parked.done(),
+                  'waiters': client._publish_waiters,
+                  'pending': client._engine.pending_outbound_messages,
+              })
+              assert not parked.done(), 'parked publisher was barged by a new arrival'
+              assert client._publish_waiters == 1
+              await complete(client, sneak.mid)
+              result = await asyncio.wait_for(parked, 1)
+              assert result.mid is not None
+
+          asyncio.run(main())
+          PY
