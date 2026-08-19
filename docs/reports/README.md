@@ -111,6 +111,17 @@ outcome live here.
 | 2026-08-04 | [`MEMORY-RESULTS.md`](MEMORY-RESULTS.md) | After-state for the same scenarios, once admission, delivery-budget, pagination and lazy-hydration corrections landed. |
 | 2026-08-04 | [`MEMORY-PROFILE-FOLLOW-UP.md`](MEMORY-PROFILE-FOLLOW-UP.md) | How each audit recommendation was closed, and which ones got a numeric regression guard. |
 
+## Scheduler experiments
+
+Open scheduler-hypothesis records. They do not outrank a measured hot-path
+decision, and they are not merge evidence until the experiment's own gate is
+met on an eligible runner.
+
+| Date | Report | Records |
+| --- | --- | --- |
+| 2026-08-19 | [`SCHEDULER-RESIDENT-MESSAGE-BUDGET-2026-08-19.md`](SCHEDULER-RESIDENT-MESSAGE-BUDGET-2026-08-19.md) | Diagnostic campaign for the resident writer message budget at `4e4f75d`: writer-capacity 0.999 / 1.000, open-loop completed/lag ~1.00. **Keep; not mergeable** until an eligible runner repeats the gate. |
+| 2026-08-18 | [`SCHEDULER-RESIDENT-MESSAGE-BUDGET-2026-08-18.md`](SCHEDULER-RESIDENT-MESSAGE-BUDGET-2026-08-18.md) | Implementation note for `_resident_messages`. Superseded by the 2026-08-19 campaign. |
+
 ## Hot-path decisions
 
 Each answers one question with a measurement, and the answer is already

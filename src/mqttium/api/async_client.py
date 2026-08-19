@@ -371,6 +371,8 @@ class AsyncClient:
 
     # Historical private writer views remain for tests and instrumentation.
     # WritePump is the sole state owner; runtime code does not use these views.
+    # `_outbound` is the live asyncio.Queue (`qsize()`, not the resident
+    # admission count). Occupying writer capacity must go through try_enqueue.
     @property
     def _writer_task(self) -> asyncio.Task[None] | None:
         return self._write_pump.task
@@ -1433,11 +1435,13 @@ class AsyncClient:
         )
         if not will_send:
             return
-        # An empty writer queue admits a single item of any size, so its size
-        # cannot change the answer. Sizing it anyway measured the topic and, on
-        # MQTT 5 with properties, encoded the property table a second time --
-        # queue_publish encodes it again immediately afterwards.
-        if not self._write_pump.queued_messages and not self._write_pump.queued_bytes:
+        # An empty writer (no resident frames, no charged bytes) admits a
+        # single item of any size, so its size cannot change the answer.
+        # Sizing it anyway measured the topic and, on MQTT 5 with properties,
+        # encoded the property table a second time -- queue_publish encodes it
+        # again immediately afterwards. qsize()==0 is not enough: an in-flight
+        # writer batch has already left the queue but still occupies the bound.
+        if not self._write_pump.resident_messages and not self._write_pump.queued_bytes:
             return
         size = self._preview_publish_size(topic, payload, level, properties)
         if not self._can_enqueue_outbound_size(size):
@@ -1449,7 +1453,7 @@ class AsyncClient:
     ) -> None:
         if self._engine.state != ConnectionState.CONNECTED:
             return
-        messages = self._write_pump.queued_messages
+        messages = self._write_pump.resident_messages
         bytes_used = self._write_pump.queued_bytes
         flow_available = self._engine.flow.available
         for topic, payload, qos, _retain, properties in requests:
