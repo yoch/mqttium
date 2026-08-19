@@ -1,0 +1,194 @@
+name: TEMP PR284-285 wake policy screening
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  screening:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      PR284_SHA: 8d37248831b372004074acfa0018f34da51b54df
+      PR285_SHA: 505c385c59670b2fb095728b5095f5039c53d675
+      SUPPORT_REF: bench/tmp-scheduler-284-286-20260819
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.PR284_SHA }}
+          path: pr284
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.PR285_SHA }}
+          path: pr285
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.SUPPORT_REF }}
+          path: support
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - run: python -m pip install -e "pr284[dev]" "psutil>=6,<8"
+      - name: Install Mosquitto
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq mosquitto
+
+      - name: Create policy variants
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp -a pr284 pr284-spare1
+          cp -a pr284 pr284-antibarge
+          cp -a pr285 pr285-spare1
+          cp -a pr285 pr285-antibarge
+          python - <<'PY'
+          from pathlib import Path
+
+          def repl(path, old, new):
+              p = Path(path)
+              text = p.read_text()
+              assert text.count(old) == 1, (path, text.count(old), old)
+              p.write_text(text.replace(old, new))
+
+          repl(
+              'pr284-spare1/src/mqttium/api/_writer.py',
+              'self.space.notify(min(self.waiters, len(batch)))',
+              'self.space.notify(min(self.waiters, len(batch) + 1))',
+          )
+          repl(
+              'pr285-spare1/src/mqttium/api/async_client.py',
+              'self._wake_publish_waiters(1)\n\n    def _register_publish_waiter',
+              'self._wake_publish_waiters(2)\n\n    def _register_publish_waiter',
+          )
+
+          # Writer anti-barging: synchronous/new arrivals cannot consume queue
+          # capacity while an older blocking producer is parked. A blocking new
+          # arrival joins the condition once before it may claim capacity.
+          repl(
+              'pr284-antibarge/src/mqttium/api/_writer.py',
+              '        size = item_size(item)\n        if not self.can_enqueue_size(size):\n            return False\n',
+              '        size = item_size(item)\n        if self.waiters or not self.can_enqueue_size(size):\n            return False\n',
+          )
+          repl(
+              'pr284-antibarge/src/mqttium/api/_writer.py',
+              '        messages = self.queue.qsize()\n        bytes_used = self.queued_bytes\n        for item in items:\n',
+              '        if self.waiters:\n            return False\n        messages = self.queue.qsize()\n        bytes_used = self.queued_bytes\n        for item in items:\n',
+          )
+          repl(
+              'pr284-antibarge/src/mqttium/api/_writer.py',
+              '        async with self.space:\n            while True:\n                if epoch != self.epoch:\n',
+              '        must_queue_behind_waiters = self.waiters > 0\n        async with self.space:\n            while True:\n                if epoch != self.epoch:\n',
+          )
+          repl(
+              'pr284-antibarge/src/mqttium/api/_writer.py',
+              '                if not messages_full and not bytes_blocked:\n                    break\n',
+              '                if not must_queue_behind_waiters and not messages_full and not bytes_blocked:\n                    break\n',
+          )
+          repl(
+              'pr284-antibarge/src/mqttium/api/_writer.py',
+              '                    await self.space.wait()\n                except asyncio.CancelledError:\n',
+              '                    await self.space.wait()\n                    must_queue_behind_waiters = False\n                except asyncio.CancelledError:\n',
+          )
+
+          # Publish anti-barging: a blocking newcomer seeing parked producers
+          # takes a ticket before touching protocol admission. A woken producer
+          # receives one privileged retry; if that retry still cannot fit, it
+          # requeues normally. nowait remains opportunistic/non-suspending.
+          p = Path('pr285-antibarge/src/mqttium/api/async_client.py')
+          text = p.read_text()
+          old = '''        data = payload.encode("utf-8") if isinstance(payload, str) else payload\n        while True:\n            waiter: asyncio.Future[None] | None = None\n            async with self._engine_lock:\n                try:\n                    direct = self._try_direct_qos0_publish(\n'''
+          new = '''        data = payload.encode("utf-8") if isinstance(payload, str) else payload\n        has_turn = False\n        while True:\n            waiter: asyncio.Future[None] | None = None\n            async with self._engine_lock:\n                if not nowait and not has_turn and self._publish_waiters:\n                    terminal = self._publish_wait_failure()\n                    if terminal is not None:\n                        raise terminal\n                    waiter = self._register_publish_waiter()\n                else:\n                    has_turn = False\n                    try:\n                        direct = self._try_direct_qos0_publish(\n'''
+          assert text.count(old) == 1
+          text = text.replace(old, new)
+          # Indent the rest of the admission try/except/else block by four
+          # spaces, stopping at the post-lock `if waiter is None:` boundary.
+          start = text.index('                    try:\n                        direct = self._try_direct_qos0_publish(')
+          boundary = text.index('            if waiter is None:\n', start)
+          block = text[start:boundary]
+          lines = block.splitlines(True)
+          # first line is already at desired indent; all original block lines
+          # following it need +4 because the `try` moved under `else`.
+          adjusted = lines[0] + ''.join('    ' + line if line.strip() else line for line in lines[1:])
+          text = text[:start] + adjusted + text[boundary:]
+          text = text.replace(
+              '            await self._wait_publish_space(waiter)\n\n    async def _admit_publish_many',
+              '            await self._wait_publish_space(waiter)\n            has_turn = True\n\n    async def _admit_publish_many',
+              1,
+          )
+          p.write_text(text)
+          PY
+          python -m compileall -q pr284-antibarge/src pr285-antibarge/src
+
+      - name: Prove anti-barging writer behavior
+        shell: bash
+        run: |
+          PYTHONPATH=pr284-antibarge/src python - <<'PY'
+          import asyncio
+          from mqttium.api._writer import WritePump
+          class Gate:
+              def __init__(self): self.entered=asyncio.Event(); self.release=asyncio.Event()
+              async def write(self,data): self.entered.set(); await self.release.wait()
+              async def write_many(self,parts): await self.write(b''.join(parts))
+              async def read(self,n=65536): return b''
+              async def close(self): pass
+              def is_closing(self): return False
+          async def fail(exc): raise AssertionError(exc)
+          async def main():
+              p=WritePump(max_bytes=1<<20,max_messages=1,on_failure=fail)
+              assert p.try_enqueue(b'held')
+              parked=asyncio.create_task(p.enqueue(b'parked'))
+              while p.waiters != 1: await asyncio.sleep(0)
+              t=Gate(); p.start(t); await t.entered.wait()
+              print({'try_enqueue_with_waiter': p.try_enqueue(b'sneak')})
+              assert p.try_enqueue(b'sneak2') is False
+              t.release.set(); await parked; await p.join(); await p.stop()
+          asyncio.run(main())
+          PY
+
+      - name: Start broker
+        shell: bash
+        run: |
+          cat >/tmp/mosq-screen.conf <<'EOF'
+          persistence false
+          allow_anonymous true
+          max_inflight_messages 1000
+          max_queued_messages 100000
+          connection_messages false
+          log_type error
+          listener 11883 127.0.0.1
+          EOF
+          mosquitto -c /tmp/mosq-screen.conf >/tmp/mosq-screen.log 2>&1 &
+          for _ in $(seq 1 50); do (echo >/dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0; sleep .1; done
+          cat /tmp/mosq-screen.log; exit 1
+
+      - name: Writer current vs spare1
+        run: python support/benchmarks/temp_scheduler_supplement.py writer-hetero-parent --base-root pr284 --candidate-root pr284-spare1 --producer-values 8,12,16,20,32,64 --repeat 4 --count 6000 --max-messages 8 --max-bytes 16384 --small-bytes 64 --large-bytes 4096 --output /tmp/writer-spare1.json
+      - name: Writer current vs anti-barge
+        run: python support/benchmarks/temp_scheduler_supplement.py writer-hetero-parent --base-root pr284 --candidate-root pr284-antibarge --producer-values 8,12,16,20,32,64 --repeat 4 --count 6000 --max-messages 8 --max-bytes 16384 --small-bytes 64 --large-bytes 4096 --output /tmp/writer-antibarge.json
+      - name: Publish current vs spare1
+        run: python support/benchmarks/temp_scheduler_supplement.py publish-parent --base-root pr285 --candidate-root pr285-spare1 --host 127.0.0.1 --port 11883 --publisher-values 8,12,16,20,32,64 --inflight-values 4,20 --count 1600 --repeat 4 --timeout 120 --output /tmp/publish-spare1.json
+      - name: Publish current vs anti-barge
+        run: python support/benchmarks/temp_scheduler_supplement.py publish-parent --base-root pr285 --candidate-root pr285-antibarge --host 127.0.0.1 --port 11883 --publisher-values 8,12,16,20,32,64 --inflight-values 4,20 --count 1600 --repeat 4 --timeout 120 --output /tmp/publish-antibarge.json
+
+      - name: Summarize screening
+        if: always()
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          for name in ('writer-spare1','writer-antibarge','publish-spare1','publish-antibarge'):
+              p=Path('/tmp')/(name+'.json')
+              print('\n###',name)
+              if not p.exists(): print('MISSING'); continue
+              d=json.loads(p.read_text())
+              rows=d.get('scenarios', d.get('rows', []))
+              for r in rows:
+                  chosen={k:v for k,v in r.items() if k in {'producers','publishers','inflight'} or k.endswith('_ratio')}
+                  print(chosen)
+          PY
