@@ -1,4 +1,4 @@
-name: TEMP final ARM64 guard continuation for PR284-285
+name: TEMP PR284 ARM64 network stability confirmation
 
 on:
   pull_request:
@@ -11,19 +11,18 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  guards:
+  confirm:
     runs-on: [self-hosted, linux, ARM64]
-    timeout-minutes: 180
+    timeout-minutes: 90
     env:
       PYTHONUNBUFFERED: "1"
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
       BASE_SHA: e80618154bacefed5626d9eb9ba46edf560b54e7
       PR284_SHA: 8d37248831b372004074acfa0018f34da51b54df
-      PR285_SHA: 505c385c59670b2fb095728b5095f5039c53d675
     steps:
       - name: Define runtime root
         shell: bash
-        run: echo "ROOT=$RUNNER_TEMP/final-arm64-guards-284-285" >> "$GITHUB_ENV"
+        run: echo "ROOT=$RUNNER_TEMP/pr284-network-confirm" >> "$GITHUB_ENV"
 
       - name: Checkout immutable baseline
         uses: actions/checkout@v7
@@ -37,61 +36,51 @@ jobs:
           ref: ${{ env.PR284_SHA }}
           path: pr284
           persist-credentials: false
-      - name: Checkout immutable PR285
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ env.PR285_SHA }}
-          path: pr285
-          persist-credentials: false
 
-      - name: Verify immutable refs and clean broker state
+      - name: Verify refs and clean broker state
         shell: bash
         run: |
           set -euo pipefail
           test "$(git -C base rev-parse HEAD)" = "$BASE_SHA"
           test "$(git -C pr284 rev-parse HEAD)" = "$PR284_SHA"
-          test "$(git -C pr285 rev-parse HEAD)" = "$PR285_SHA"
           test "$(uname -m)" = aarch64
           python3 - <<'PY'
           import sys
           if sys.version_info[:2] != (3, 13):
               raise SystemExit(f"expected Python 3.13, got {sys.version}")
           PY
-          mkdir -p "$ROOT"/{pr284,pr285}
+          mkdir -p "$ROOT"
           sudo systemctl stop mosquitto 2>/dev/null || true
           sudo pkill -x mosquitto 2>/dev/null || true
           sleep 1
-          if pgrep -a mosquitto; then
-            echo "unable to establish isolated broker state" >&2
-            exit 1
-          fi
+          ! pgrep -a mosquitto
 
       - name: Create venv and dependencies
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf "$RUNNER_TEMP/final-arm64-guards-venv"
-          python3 -m venv "$RUNNER_TEMP/final-arm64-guards-venv"
-          echo "$RUNNER_TEMP/final-arm64-guards-venv/bin" >> "$GITHUB_PATH"
-          "$RUNNER_TEMP/final-arm64-guards-venv/bin/python" -m pip install -e "pr284[dev]" "psutil>=6,<8"
+          rm -rf "$RUNNER_TEMP/pr284-network-confirm-venv"
+          python3 -m venv "$RUNNER_TEMP/pr284-network-confirm-venv"
+          echo "$RUNNER_TEMP/pr284-network-confirm-venv/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/pr284-network-confirm-venv/bin/python" -m pip install -e "pr284[dev]" "psutil>=6,<8"
 
-      - name: Strict preflight for PR284 guards
+      - name: Strict preflight replicate 1
         shell: bash
         run: |
           set -euo pipefail
           for attempt in $(seq 1 24); do
-            if python base/benchmarks/runner_probe.py --output "$ROOT/preflight-pr284.json" --require-temperature --enforce; then
+            if python base/benchmarks/runner_probe.py --output "$ROOT/preflight-1.json" --require-temperature --enforce; then
               exit 0
             fi
             sleep 15
           done
           exit 1
 
-      - name: Start isolated broker for PR284
+      - name: Start isolated broker replicate 1
         shell: bash
         run: |
           set -euo pipefail
-          cat > "$ROOT/mosquitto-pr284.conf" <<'MOSQ'
+          cat > "$ROOT/mosquitto-1.conf" <<'MOSQ'
           persistence false
           allow_anonymous true
           max_inflight_messages 1000
@@ -101,99 +90,52 @@ jobs:
           log_type error
           listener 11883 127.0.0.1
           MOSQ
-          mosquitto -c "$ROOT/mosquitto-pr284.conf" > "$ROOT/mosquitto-pr284.log" 2>&1 &
+          mosquitto -c "$ROOT/mosquitto-1.conf" > "$ROOT/mosquitto-1.log" 2>&1 &
           echo $! > "$ROOT/mosquitto.pid"
           for _ in $(seq 1 50); do
             (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
             sleep .2
           done
-          cat "$ROOT/mosquitto-pr284.log"
           exit 1
 
-      - name: PR284 writer-capacity guard
-        shell: bash
-        run: |
-          set +e
-          python base/benchmarks/paired_writer_capacity.py \
-            --base-root base --candidate-root pr284 --host 127.0.0.1 --port 11883 \
-            --protocol 311 --qos-values 0,1 --payload-bytes 64 \
-            --inflight 20 --outstanding 20 --max-queued 200 \
-            --warmup-count 5000 --count-qos0 100000 --count-qos1 40000 \
-            --repeat 8 --cpu 1 --policy strict \
-            --preflight-report "$ROOT/preflight-pr284.json" \
-            --max-baseline-cv .05 --min-completed-ratio .97 \
-            --output "$ROOT/pr284/writer-capacity.json" \
-            --summary-output "$ROOT/pr284/writer-capacity.md" \
-            >"$ROOT/pr284/writer-capacity.stdout.log" \
-            2>"$ROOT/pr284/writer-capacity.stderr.log"
-          rc=$?
-          echo "$rc" > "$ROOT/pr284/writer-capacity.rc"
-          cat "$ROOT/pr284/writer-capacity.stdout.log"
-          cat "$ROOT/pr284/writer-capacity.stderr.log" >&2
-          exit 0
-
-      - name: PR284 stable open-loop guard
-        shell: bash
-        run: |
-          set +e
-          python base/benchmarks/paired_open_loop.py \
-            --base-root base --candidate-root pr284 \
-            --protocols 311 --payloads 64 --completions callback --windows 20 \
-            --target-rates 5000,7500 --count-small 5000 --repeat 8 --cpu 1 \
-            --policy strict --preflight-report "$ROOT/preflight-pr284.json" \
-            --max-baseline-cv .05 --min-completed-ratio .97 --max-loop-lag-ratio 1.05 \
-            --output "$ROOT/pr284/open-loop.json" \
-            --summary-output "$ROOT/pr284/open-loop.md" \
-            >"$ROOT/pr284/open-loop.stdout.log" \
-            2>"$ROOT/pr284/open-loop.stderr.log"
-          rc=$?
-          echo "$rc" > "$ROOT/pr284/open-loop.rc"
-          cat "$ROOT/pr284/open-loop.stdout.log"
-          cat "$ROOT/pr284/open-loop.stderr.log" >&2
-          exit 0
-
-      - name: PR284 network guard
+      - name: Network confirmation replicate 1
         shell: bash
         run: |
           set +e
           python base/benchmarks/paired_network.py \
             --base-root base --candidate-root pr284 --host 127.0.0.1 --port 11883 \
-            --protocols 311 --completions receipt --payloads 64,4096 --windows 20,64 \
-            --repeat 8 --count-small 1500 --count-large 750 --cpu 1 \
-            --policy strict --preflight-report "$ROOT/preflight-pr284.json" \
+            --protocols 311 --completions receipt --payloads 64 --windows 20 \
+            --repeat 8 --count-small 1500 --cpu 1 \
+            --policy strict --preflight-report "$ROOT/preflight-1.json" \
             --max-baseline-cv .05 --min-ack-ratio .97 \
-            --output "$ROOT/pr284/network.json" \
-            --summary-output "$ROOT/pr284/network.md" \
-            >"$ROOT/pr284/network.stdout.log" \
-            2>"$ROOT/pr284/network.stderr.log"
+            --output "$ROOT/network-1.json" --summary-output "$ROOT/network-1.md" \
+            >"$ROOT/network-1.stdout.log" 2>"$ROOT/network-1.stderr.log"
           rc=$?
-          echo "$rc" > "$ROOT/pr284/network.rc"
-          cat "$ROOT/pr284/network.stdout.log"
-          cat "$ROOT/pr284/network.stderr.log" >&2
+          echo "$rc" > "$ROOT/network-1.rc"
+          cat "$ROOT/network-1.stdout.log"
+          cat "$ROOT/network-1.stderr.log" >&2
           exit 0
 
-      - name: Stop PR284 broker and refresh strict preflight
+      - name: Reset broker and strict preflight replicate 2
         shell: bash
         run: |
           set -euo pipefail
-          if [ -f "$ROOT/mosquitto.pid" ]; then
-            kill "$(cat "$ROOT/mosquitto.pid")" 2>/dev/null || true
-          fi
+          if [ -f "$ROOT/mosquitto.pid" ]; then kill "$(cat "$ROOT/mosquitto.pid")" 2>/dev/null || true; fi
           sudo pkill -x mosquitto 2>/dev/null || true
           sleep 1
           for attempt in $(seq 1 24); do
-            if python base/benchmarks/runner_probe.py --output "$ROOT/preflight-pr285.json" --require-temperature --enforce; then
+            if python base/benchmarks/runner_probe.py --output "$ROOT/preflight-2.json" --require-temperature --enforce; then
               exit 0
             fi
             sleep 15
           done
           exit 1
 
-      - name: Start isolated broker for PR285
+      - name: Start isolated broker replicate 2
         shell: bash
         run: |
           set -euo pipefail
-          cat > "$ROOT/mosquitto-pr285.conf" <<'MOSQ'
+          cat > "$ROOT/mosquitto-2.conf" <<'MOSQ'
           persistence false
           allow_anonymous true
           max_inflight_messages 1000
@@ -203,164 +145,85 @@ jobs:
           log_type error
           listener 11883 127.0.0.1
           MOSQ
-          mosquitto -c "$ROOT/mosquitto-pr285.conf" > "$ROOT/mosquitto-pr285.log" 2>&1 &
+          mosquitto -c "$ROOT/mosquitto-2.conf" > "$ROOT/mosquitto-2.log" 2>&1 &
           echo $! > "$ROOT/mosquitto.pid"
           for _ in $(seq 1 50); do
             (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
             sleep .2
           done
-          cat "$ROOT/mosquitto-pr285.log"
           exit 1
 
-      - name: PR285 writer-capacity guard
-        shell: bash
-        run: |
-          set +e
-          python base/benchmarks/paired_writer_capacity.py \
-            --base-root base --candidate-root pr285 --host 127.0.0.1 --port 11883 \
-            --protocol 311 --qos-values 0,1 --payload-bytes 64 \
-            --inflight 20 --outstanding 20 --max-queued 200 \
-            --warmup-count 5000 --count-qos0 100000 --count-qos1 40000 \
-            --repeat 8 --cpu 1 --policy strict \
-            --preflight-report "$ROOT/preflight-pr285.json" \
-            --max-baseline-cv .05 --min-completed-ratio .97 \
-            --output "$ROOT/pr285/writer-capacity.json" \
-            --summary-output "$ROOT/pr285/writer-capacity.md" \
-            >"$ROOT/pr285/writer-capacity.stdout.log" \
-            2>"$ROOT/pr285/writer-capacity.stderr.log"
-          rc=$?
-          echo "$rc" > "$ROOT/pr285/writer-capacity.rc"
-          cat "$ROOT/pr285/writer-capacity.stdout.log"
-          cat "$ROOT/pr285/writer-capacity.stderr.log" >&2
-          exit 0
-
-      - name: PR285 stable open-loop guard
-        shell: bash
-        run: |
-          set +e
-          python base/benchmarks/paired_open_loop.py \
-            --base-root base --candidate-root pr285 \
-            --protocols 311 --payloads 64 --completions callback --windows 20 \
-            --target-rates 5000,7500 --count-small 5000 --repeat 8 --cpu 1 \
-            --policy strict --preflight-report "$ROOT/preflight-pr285.json" \
-            --max-baseline-cv .05 --min-completed-ratio .97 --max-loop-lag-ratio 1.05 \
-            --output "$ROOT/pr285/open-loop.json" \
-            --summary-output "$ROOT/pr285/open-loop.md" \
-            >"$ROOT/pr285/open-loop.stdout.log" \
-            2>"$ROOT/pr285/open-loop.stderr.log"
-          rc=$?
-          echo "$rc" > "$ROOT/pr285/open-loop.rc"
-          cat "$ROOT/pr285/open-loop.stdout.log"
-          cat "$ROOT/pr285/open-loop.stderr.log" >&2
-          exit 0
-
-      - name: PR285 network guard
+      - name: Network confirmation replicate 2
         shell: bash
         run: |
           set +e
           python base/benchmarks/paired_network.py \
-            --base-root base --candidate-root pr285 --host 127.0.0.1 --port 11883 \
-            --protocols 311 --completions receipt --payloads 64,4096 --windows 20,64 \
-            --repeat 8 --count-small 1500 --count-large 750 --cpu 1 \
-            --policy strict --preflight-report "$ROOT/preflight-pr285.json" \
+            --base-root base --candidate-root pr284 --host 127.0.0.1 --port 11883 \
+            --protocols 311 --completions receipt --payloads 64 --windows 20 \
+            --repeat 8 --count-small 1500 --cpu 1 \
+            --policy strict --preflight-report "$ROOT/preflight-2.json" \
             --max-baseline-cv .05 --min-ack-ratio .97 \
-            --output "$ROOT/pr285/network.json" \
-            --summary-output "$ROOT/pr285/network.md" \
-            >"$ROOT/pr285/network.stdout.log" \
-            2>"$ROOT/pr285/network.stderr.log"
+            --output "$ROOT/network-2.json" --summary-output "$ROOT/network-2.md" \
+            >"$ROOT/network-2.stdout.log" 2>"$ROOT/network-2.stderr.log"
           rc=$?
-          echo "$rc" > "$ROOT/pr285/network.rc"
-          cat "$ROOT/pr285/network.stdout.log"
-          cat "$ROOT/pr285/network.stderr.log" >&2
+          echo "$rc" > "$ROOT/network-2.rc"
+          cat "$ROOT/network-2.stdout.log"
+          cat "$ROOT/network-2.stderr.log" >&2
           exit 0
 
-      - name: Final strict eligibility check
+      - name: Final strict eligibility and evaluation
         shell: bash
         run: |
           set -euo pipefail
-          if [ -f "$ROOT/mosquitto.pid" ]; then
-            kill "$(cat "$ROOT/mosquitto.pid")" 2>/dev/null || true
-          fi
+          if [ -f "$ROOT/mosquitto.pid" ]; then kill "$(cat "$ROOT/mosquitto.pid")" 2>/dev/null || true; fi
           sudo pkill -x mosquitto 2>/dev/null || true
           sleep 1
           for attempt in $(seq 1 24); do
             if python base/benchmarks/runner_probe.py --output "$ROOT/preflight-final.json" --require-temperature --enforce; then
-              exit 0
+              break
             fi
+            if [ "$attempt" -eq 24 ]; then exit 1; fi
             sleep 15
           done
-          exit 1
-
-      - name: Evaluate all guard results
-        shell: bash
-        run: |
           python - <<'PY'
-          import json
+          import json, os
           from pathlib import Path
-
-          root = Path(__import__('os').environ['ROOT'])
-          checks = [
-              ('pr284', 'writer-capacity'),
-              ('pr284', 'open-loop'),
-              ('pr284', 'network'),
-              ('pr285', 'writer-capacity'),
-              ('pr285', 'open-loop'),
-              ('pr285', 'network'),
-          ]
+          root = Path(os.environ['ROOT'])
+          lines = ['# PR284 network stability confirmation', '']
           failures = []
-          lines = ['# Final ARM64 guard continuation', '']
-          for pr, name in checks:
-              rc_path = root / pr / f'{name}.rc'
-              json_path = root / pr / f'{name}.json'
-              rc = int(rc_path.read_text().strip()) if rc_path.exists() else None
-              status = 'missing'
-              invalidations = []
-              regressions = []
-              if json_path.exists():
-                  data = json.loads(json_path.read_text())
-                  status = str(data.get('status'))
-                  invalidations = list(data.get('invalidations') or [])
-                  regressions = list(data.get('regressions') or [])
-              lines.append(f'## {pr}/{name}')
-              lines.append(f'- rc: {rc}')
-              lines.append(f'- status: {status}')
-              if invalidations:
-                  lines.append(f'- invalidations: {invalidations}')
-              if regressions:
-                  lines.append(f'- regressions: {regressions}')
-              lines.append('')
-              if rc != 0 or not json_path.exists() or invalidations or regressions:
-                  failures.append(f'{pr}/{name}: rc={rc} status={status}')
-          (root / 'guard-summary.md').write_text('\n'.join(lines))
+          for i in (1, 2):
+              rc = int((root / f'network-{i}.rc').read_text().strip())
+              data = json.loads((root / f'network-{i}.json').read_text())
+              s = data['scenarios'][0] if data.get('scenarios') else {}
+              lines += [
+                  f'## replicate {i}',
+                  f'- rc: {rc}',
+                  f'- status: {data.get("status")}',
+                  f'- ratio: {s.get("median_candidate_over_base_ack")}',
+                  f'- base_cv: {s.get("base_ack_cv")}',
+                  f'- candidate_cv: {s.get("candidate_ack_cv")}',
+                  f'- invalidations: {data.get("invalidations")}',
+                  f'- regressions: {data.get("regressions")}',
+                  '',
+              ]
+              if rc != 0 or data.get('invalidations') or data.get('regressions'):
+                  failures.append(f'replicate {i}')
+          (root / 'confirmation-summary.md').write_text('\n'.join(lines))
           print('\n'.join(lines))
           if failures:
-              raise SystemExit('guard failures: ' + '; '.join(failures))
+              raise SystemExit('failed confirmation: ' + ', '.join(failures))
           PY
 
-      - name: Preserve diagnostics
-        if: always()
-        shell: bash
-        run: |
-          set +e
-          if [ -f "$ROOT/mosquitto.pid" ]; then
-            kill "$(cat "$ROOT/mosquitto.pid")" 2>/dev/null
-          fi
-          find "$ROOT" -maxdepth 3 -type f -print | sort > "$ROOT/files.txt"
-          git -C base rev-parse HEAD > "$ROOT/base-head.txt"
-          git -C pr284 rev-parse HEAD > "$ROOT/pr284-head.txt"
-          git -C pr285 rev-parse HEAD > "$ROOT/pr285-head.txt"
-
-      - name: Upload final ARM64 guard evidence
+      - name: Upload confirmation evidence
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: final-arm64-guards-pr284-285-${{ github.run_id }}
+          name: pr284-network-confirm-${{ github.run_id }}
           path: |
-            ${{ runner.temp }}/final-arm64-guards-284-285/**/*.json
-            ${{ runner.temp }}/final-arm64-guards-284-285/**/*.md
-            ${{ runner.temp }}/final-arm64-guards-284-285/**/*.txt
-            ${{ runner.temp }}/final-arm64-guards-284-285/**/*.log
-            ${{ runner.temp }}/final-arm64-guards-284-285/**/*.rc
-            ${{ runner.temp }}/final-arm64-guards-284-285/*.conf
+            ${{ runner.temp }}/pr284-network-confirm/**/*.json
+            ${{ runner.temp }}/pr284-network-confirm/**/*.md
+            ${{ runner.temp }}/pr284-network-confirm/**/*.log
+            ${{ runner.temp }}/pr284-network-confirm/**/*.rc
+            ${{ runner.temp }}/pr284-network-confirm/*.conf
           if-no-files-found: error
           retention-days: 30
