@@ -1,4 +1,4 @@
-name: TEMP QoS1 singles with mini broker
+name: TEMP QoS1 pairs with mini broker
 
 on:
   pull_request:
@@ -7,7 +7,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: temp-qos1-singles-mini-broker
+  group: temp-qos1-pairs-mini-broker
   cancel-in-progress: true
 
 env:
@@ -18,35 +18,146 @@ env:
   PYTHONUNBUFFERED: "1"
 
 jobs:
-  singles:
+  pairs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ env.BASE_SHA }}
+          fetch-depth: 0
           path: base
           persist-credentials: false
       - uses: actions/checkout@v7
         with:
-          ref: ${{ env.PR283_SHA }}
-          path: pr283
+          ref: ${{ env.BASE_SHA }}
+          fetch-depth: 0
+          path: p283284
           persist-credentials: false
       - uses: actions/checkout@v7
         with:
-          ref: ${{ env.PR284_SHA }}
-          path: pr284
+          ref: ${{ env.BASE_SHA }}
+          fetch-depth: 0
+          path: p283285
           persist-credentials: false
       - uses: actions/checkout@v7
         with:
-          ref: ${{ env.PR285_SHA }}
-          path: pr285
+          ref: ${{ env.BASE_SHA }}
+          fetch-depth: 0
+          path: p284285
           persist-credentials: false
+
+      - name: Build pair 283+284
+        working-directory: p283284
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name pair-probe
+          git config user.email pair-probe@example.invalid
+          git fetch --no-tags origin "$PR283_SHA"
+          git merge --no-ff --no-edit "$PR283_SHA"
+          git fetch --no-tags origin "$PR284_SHA"
+          set +e
+          git merge --no-ff --no-edit "$PR284_SHA"
+          rc=$?
+          set -e
+          test "$rc" -ne 0
+          mapfile -t conflicts < <(git diff --name-only --diff-filter=U | sort)
+          test "${#conflicts[@]}" -eq 2
+          test "${conflicts[0]}" = "docs/reports/README.md"
+          test "${conflicts[1]}" = "src/mqttium/api/_writer.py"
+          git checkout --ours docs/reports/README.md src/mqttium/api/_writer.py
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('src/mqttium/api/_writer.py')
+          text=p.read_text()
+          def one(old,new):
+              global text
+              n=text.count(old)
+              if n != 1:
+                  raise SystemExit(f'expected 1 match, got {n}: {old!r}')
+              text=text.replace(old,new)
+          one(
+              '                self.enqueue_suspensions += 1\n                try:\n                    await self.space.wait()\n                finally:\n                    self.waiters -= 1\n',
+              '                self.enqueue_suspensions += 1\n                try:\n                    await self.space.wait()\n                except asyncio.CancelledError:\n                    # notify(n) is consumed by whoever is waiting. A waiter\n                    # cancelled after being selected must hand the wakeup on,\n                    # or the remaining producers stay parked with free slots.\n                    if self.waiters > 1:\n                        self.space.notify(1)\n                    raise\n                finally:\n                    self.waiters -= 1\n',
+          )
+          one(
+              '        transport = self.transport\n        if transport is None:\n            raise RuntimeError("WritePump started without a transport")\n        # Resolved once per writer task rather than per batch. The local dies\n',
+              '        transport = self.transport\n        if transport is None:\n            raise RuntimeError("WritePump started without a transport")\n        writer_task = asyncio.current_task()\n        assert writer_task is not None\n        # Resolved once per writer task rather than per batch. The local dies\n',
+          )
+          one(
+              '                self._writing = True\n                try:\n                    # Coalesce contiguous small frames into one writelines call.\n',
+              '                self._writing = True\n                batch_completed = False\n                try:\n                    # Coalesce contiguous small frames into one writelines call.\n',
+          )
+          one(
+              '                    await self._write_contiguous(transport, write_many, contiguous)\n                    self.last_outbound = time.monotonic()\n                finally:\n',
+              '                    await self._write_contiguous(transport, write_many, contiguous)\n                    self.last_outbound = time.monotonic()\n                    batch_completed = True\n                finally:\n',
+          )
+          one(
+              '                        self._release_resident(n_batch)\n                        if self.waiters:\n                            self.space.notify_all()\n',
+              '                        self._release_resident(n_batch)\n                        if batch_completed and self.waiters and not writer_task.cancelling():\n                            self.space.notify(min(self.waiters, n_batch))\n',
+          )
+          p.write_text(text)
+          PY
+          git add docs/reports/README.md src/mqttium/api/_writer.py
+          git diff --check
+          git commit --no-edit
+
+      - name: Build pair 283+285
+        working-directory: p283285
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name pair-probe
+          git config user.email pair-probe@example.invalid
+          git fetch --no-tags origin "$PR283_SHA"
+          git merge --no-ff --no-edit "$PR283_SHA"
+          git fetch --no-tags origin "$PR285_SHA"
+          set +e
+          git merge --no-ff --no-edit "$PR285_SHA"
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            mapfile -t conflicts < <(git diff --name-only --diff-filter=U)
+            test "${#conflicts[@]}" -eq 1
+            test "${conflicts[0]}" = "docs/reports/README.md"
+            git checkout --ours docs/reports/README.md
+            git add docs/reports/README.md
+            git commit --no-edit
+          fi
+          test -z "$(git diff --name-only --diff-filter=U)"
+          git diff --check
+
+      - name: Build pair 284+285
+        working-directory: p284285
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name pair-probe
+          git config user.email pair-probe@example.invalid
+          git fetch --no-tags origin "$PR284_SHA"
+          git merge --no-ff --no-edit "$PR284_SHA"
+          git fetch --no-tags origin "$PR285_SHA"
+          set +e
+          git merge --no-ff --no-edit "$PR285_SHA"
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            mapfile -t conflicts < <(git diff --name-only --diff-filter=U)
+            test "${#conflicts[@]}" -eq 1
+            test "${conflicts[0]}" = "docs/reports/README.md"
+            git checkout --ours docs/reports/README.md
+            git add docs/reports/README.md
+            git commit --no-edit
+          fi
+          test -z "$(git diff --name-only --diff-filter=U)"
+          git diff --check
+
       - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
       - name: Install Python dependencies only
-        run: python -m pip install -e "pr283[dev]"
+        run: python -m pip install -e "p283284[dev]"
 
       - name: Start minimal MQTT 3.1.1 QoS1 broker on CPU 0
         shell: bash
@@ -72,10 +183,10 @@ jobs:
                       remaining = await read_remaining(reader)
                       body = await reader.readexactly(remaining)
                       packet_type = first >> 4
-                      if packet_type == 1:  # CONNECT
+                      if packet_type == 1:
                           writer.write(b'\x20\x02\x00\x00')
                           await writer.drain()
-                      elif packet_type == 3:  # PUBLISH
+                      elif packet_type == 3:
                           qos = (first >> 1) & 0x03
                           if qos:
                               topic_len = int.from_bytes(body[:2], 'big')
@@ -88,10 +199,10 @@ jobs:
                                   await writer.drain()
                               else:
                                   raise ValueError(f'unsupported qos {qos}')
-                      elif packet_type == 12:  # PINGREQ
+                      elif packet_type == 12:
                           writer.write(b'\xD0\x00')
                           await writer.drain()
-                      elif packet_type == 14:  # DISCONNECT
+                      elif packet_type == 14:
                           break
                       else:
                           raise ValueError(f'unsupported packet type {packet_type}')
@@ -120,12 +231,12 @@ jobs:
           cat /tmp/minibroker.log
           exit 1
 
-      - name: Compare individual candidates
+      - name: Compare candidate pairs
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p /tmp/qos1-singles
-          for variant in pr283 pr284 pr285; do
+          mkdir -p /tmp/qos1-pairs
+          for variant in p283284 p283285 p284285; do
             echo "=== $variant ==="
             python base/benchmarks/paired_writer_capacity.py \
               --base-root base --candidate-root "$variant" --host 127.0.0.1 --port 11883 \
@@ -133,15 +244,15 @@ jobs:
               --inflight 20 --outstanding 20 --max-queued 200 \
               --warmup-count 5000 --count-qos1 40000 --repeat 8 --cpu 1 \
               --policy advisory --max-baseline-cv 1.0 --min-completed-ratio 0.0 \
-              --output "/tmp/qos1-singles/$variant.json" \
-              --summary-output "/tmp/qos1-singles/$variant.md"
+              --output "/tmp/qos1-pairs/$variant.json" \
+              --summary-output "/tmp/qos1-pairs/$variant.md"
           done
           python - <<'PY'
           import json
           from pathlib import Path
-          root=Path('/tmp/qos1-singles')
+          root=Path('/tmp/qos1-pairs')
           rows=[]
-          for v in ('pr283','pr284','pr285'):
+          for v in ('p283284','p283285','p284285'):
               d=json.loads((root/f'{v}.json').read_text())
               s=d['scenarios'][0]
               rows.append({
@@ -156,14 +267,14 @@ jobs:
           (root/'summary.json').write_text(json.dumps(rows, indent=2)+'\n')
           PY
 
-      - name: Upload mini-broker diagnostic
+      - name: Upload mini-broker pair diagnostic
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: qos1-singles-mini-${{ github.run_id }}
+          name: qos1-pairs-mini-${{ github.run_id }}
           path: |
-            /tmp/qos1-singles/*.json
-            /tmp/qos1-singles/*.md
+            /tmp/qos1-pairs/*.json
+            /tmp/qos1-pairs/*.md
             /tmp/minibroker.log
           if-no-files-found: warn
           retention-days: 7
