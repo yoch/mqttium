@@ -1,0 +1,362 @@
+name: TEMP writer quantum 128 KiB deep study
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: temp-writer-quantum-128-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  BASE_SHA: 7d20fc5200e868df61391d00c21e5d7b0d63c78a
+  OLD_286_SHA: 8362d50072ce5a09bbf564fff1368c62a06e88fc
+  QUANTUM_BYTES: "131072"
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  correctness:
+    name: Correctness on current main
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout study support
+        uses: actions/checkout@v7
+        with:
+          path: support
+          persist-credentials: false
+      - name: Checkout current-main candidate root
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.BASE_SHA }}
+          path: candidate
+          persist-credentials: false
+      - name: Checkout historical #286 tests
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.OLD_286_SHA }}
+          path: old286
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Install test dependencies
+        run: python -m pip install -e "candidate[dev]"
+      - name: Apply 128 KiB candidate
+        run: python support/benchmarks/temp_apply_writer_quantum_128.py candidate --quantum "$QUANTUM_BYTES"
+      - name: Reuse byte-quantum invariant suite
+        run: cp old286/tests/unit/test_write_pump_byte_quantum.py candidate/tests/unit/test_write_pump_byte_quantum_temp.py
+      - name: Focused writer invariant tests
+        env:
+          PYTHONPATH: candidate/src
+        run: |
+          python -m pytest -q \
+            candidate/tests/unit/test_write_pump.py \
+            candidate/tests/unit/test_write_pump_eager.py \
+            candidate/tests/unit/test_write_pump_resident.py \
+            candidate/tests/unit/test_write_pump_targeted_wake.py \
+            candidate/tests/unit/test_write_pump_byte_quantum_temp.py
+      - name: Full unit suite
+        env:
+          PYTHONPATH: candidate/src
+        run: python -m pytest -q candidate/tests/unit
+
+  mixed-tail:
+    name: "Mixed tail flood=${{ matrix.flood_kib }} KiB"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        flood_kib: [4, 16, 32, 40, 64, 96, 120, 128]
+    steps:
+      - name: Checkout study support
+        uses: actions/checkout@v7
+        with:
+          path: support
+          persist-credentials: false
+      - name: Checkout immutable baseline
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.BASE_SHA }}
+          path: base
+          persist-credentials: false
+      - name: Checkout immutable candidate root
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.BASE_SHA }}
+          path: candidate
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Install dependencies and broker
+        run: |
+          python -m pip install -e "candidate[dev]"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mosquitto
+      - name: Apply 128 KiB candidate
+        run: python support/benchmarks/temp_apply_writer_quantum_128.py candidate --quantum "$QUANTUM_BYTES"
+      - name: Start isolated broker
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo systemctl stop mosquitto 2>/dev/null || true
+          sudo pkill -x mosquitto 2>/dev/null || true
+          cat >/tmp/mosq-quantum128.conf <<'EOF'
+          persistence false
+          allow_anonymous true
+          max_inflight_messages 1000
+          max_queued_messages 100000
+          max_queued_bytes 0
+          connection_messages false
+          log_type error
+          listener 11883 127.0.0.1
+          EOF
+          mosquitto -c /tmp/mosq-quantum128.conf >/tmp/mosq-quantum128.log 2>&1 &
+          for _ in $(seq 1 50); do
+            (echo >/dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            sleep .1
+          done
+          cat /tmp/mosq-quantum128.log
+          exit 1
+      - name: True-completion ABBA, 64 B probes
+        shell: bash
+        run: |
+          set -euo pipefail
+          bytes=$(( ${{ matrix.flood_kib }} * 1024 ))
+          count=$(( (64 * 1024 * 1024) / bytes ))
+          if [ "$count" -lt 700 ]; then count=700; fi
+          python support/benchmarks/temp_writer_quantum_128_study.py \
+            --base-root base --candidate-root candidate \
+            --host 127.0.0.1 --port 11883 \
+            --flood-bytes "$bytes" --probe-bytes 64 \
+            --flood-count "$count" --probes 240 \
+            --repeat 6 --timeout 150 --cpu 1 \
+            --output "/tmp/mixed-${{ matrix.flood_kib }}k-probe64.json"
+      - name: True-completion ABBA, 4 KiB probes
+        shell: bash
+        run: |
+          set -euo pipefail
+          bytes=$(( ${{ matrix.flood_kib }} * 1024 ))
+          count=$(( (64 * 1024 * 1024) / bytes ))
+          if [ "$count" -lt 700 ]; then count=700; fi
+          python support/benchmarks/temp_writer_quantum_128_study.py \
+            --base-root base --candidate-root candidate \
+            --host 127.0.0.1 --port 11883 \
+            --flood-bytes "$bytes" --probe-bytes 4096 \
+            --flood-count "$count" --probes 240 \
+            --repeat 6 --timeout 150 --cpu 1 \
+            --output "/tmp/mixed-${{ matrix.flood_kib }}k-probe4k.json"
+      - name: Upload mixed-tail evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: quantum128-mixed-${{ matrix.flood_kib }}k
+          path: /tmp/mixed-*.json
+
+  writer-capacity:
+    name: "Writer capacity payload=${{ matrix.payload }}"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        payload: [64, 4096, 32768, 65536, 131072]
+    steps:
+      - name: Checkout study support
+        uses: actions/checkout@v7
+        with:
+          path: support
+          persist-credentials: false
+      - name: Checkout immutable baseline
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.BASE_SHA }}
+          path: base
+          persist-credentials: false
+      - name: Checkout immutable candidate root
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.BASE_SHA }}
+          path: candidate
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Install dependencies and broker
+        run: |
+          python -m pip install -e "candidate[dev]"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mosquitto
+      - name: Apply 128 KiB candidate
+        run: python support/benchmarks/temp_apply_writer_quantum_128.py candidate --quantum "$QUANTUM_BYTES"
+      - name: Start isolated broker
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo systemctl stop mosquitto 2>/dev/null || true
+          sudo pkill -x mosquitto 2>/dev/null || true
+          printf 'persistence false\nallow_anonymous true\nmax_inflight_messages 1000\nmax_queued_messages 100000\nlistener 11883 127.0.0.1\n' >/tmp/mosq-cap.conf
+          mosquitto -c /tmp/mosq-cap.conf >/tmp/mosq-cap.log 2>&1 &
+          for _ in $(seq 1 50); do
+            (echo >/dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            sleep .1
+          done
+          cat /tmp/mosq-cap.log
+          exit 1
+      - name: Paired writer capacity
+        run: |
+          python candidate/benchmarks/paired_writer_capacity.py \
+            --base-root base --candidate-root candidate \
+            --host 127.0.0.1 --port 11883 \
+            --protocol 311 --qos-values 0,1 \
+            --payload-bytes "${{ matrix.payload }}" \
+            --inflight 20 --outstanding 64 --max-queued 200 \
+            --warmup-count 2000 --count-qos0 50000 --count-qos1 20000 \
+            --repeat 4 --timeout 150 --cpu 1 --policy advisory \
+            --output "/tmp/capacity-${{ matrix.payload }}.json"
+      - name: Upload capacity evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: quantum128-capacity-${{ matrix.payload }}
+          path: /tmp/capacity-*.json
+
+  open-loop:
+    name: Open-loop guards
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout study support
+        uses: actions/checkout@v7
+        with:
+          path: support
+          persist-credentials: false
+      - name: Checkout immutable baseline
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.BASE_SHA }}
+          path: base
+          persist-credentials: false
+      - name: Checkout immutable candidate root
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.BASE_SHA }}
+          path: candidate
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Install dependencies and broker
+        run: |
+          python -m pip install -e "candidate[dev]"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mosquitto
+      - name: Apply 128 KiB candidate
+        run: python support/benchmarks/temp_apply_writer_quantum_128.py candidate --quantum "$QUANTUM_BYTES"
+      - name: Start isolated broker
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo systemctl stop mosquitto 2>/dev/null || true
+          sudo pkill -x mosquitto 2>/dev/null || true
+          printf 'persistence false\nallow_anonymous true\nmax_inflight_messages 1000\nmax_queued_messages 100000\nlistener 11883 127.0.0.1\n' >/tmp/mosq-open.conf
+          mosquitto -c /tmp/mosq-open.conf >/tmp/mosq-open.log 2>&1 &
+          for _ in $(seq 1 50); do
+            (echo >/dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            sleep .1
+          done
+          cat /tmp/mosq-open.log
+          exit 1
+      - name: Paired open-loop guards
+        run: |
+          python candidate/benchmarks/paired_open_loop.py \
+            --base-root base --candidate-root candidate \
+            --host 127.0.0.1 --port 11883 \
+            --protocols 311 --payloads 64,4096 \
+            --completions receipt,callback \
+            --target-rates 2500,7500 --windows 20 \
+            --target-sample-seconds 1.5 --max-count 30000 \
+            --repeat 4 --timeout 150 --cpu 1 --policy advisory \
+            --output /tmp/open-loop.json
+      - name: Upload open-loop evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: quantum128-open-loop
+          path: /tmp/open-loop.json
+
+  contention:
+    name: Resident/wakeup contention guards
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout study support
+        uses: actions/checkout@v7
+        with:
+          path: support
+          persist-credentials: false
+      - name: Checkout immutable baseline
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.BASE_SHA }}
+          path: base
+          persist-credentials: false
+      - name: Checkout immutable candidate root
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.BASE_SHA }}
+          path: candidate
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Install dependencies and broker
+        run: |
+          python -m pip install -e "candidate[dev]"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mosquitto
+      - name: Apply 128 KiB candidate
+        run: python support/benchmarks/temp_apply_writer_quantum_128.py candidate --quantum "$QUANTUM_BYTES"
+      - name: Writer waiter contention
+        run: |
+          python candidate/benchmarks/paired_writer_waiter_contention.py \
+            --base-root base --candidate-root candidate \
+            --producer-values 1,4,16 --max-messages 8 \
+            --payload-bytes 32768 --warmup-count 1000 --count 12000 \
+            --repeat 4 --timeout 120 --cpu 1 --policy advisory \
+            --output /tmp/writer-waiter.json
+      - name: Start isolated broker
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo systemctl stop mosquitto 2>/dev/null || true
+          sudo pkill -x mosquitto 2>/dev/null || true
+          printf 'persistence false\nallow_anonymous true\nmax_inflight_messages 1000\nmax_queued_messages 100000\nlistener 11883 127.0.0.1\n' >/tmp/mosq-admit.conf
+          mosquitto -c /tmp/mosq-admit.conf >/tmp/mosq-admit.log 2>&1 &
+          for _ in $(seq 1 50); do
+            (echo >/dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            sleep .1
+          done
+          cat /tmp/mosq-admit.log
+          exit 1
+      - name: Publish admission contention
+        run: |
+          python candidate/benchmarks/paired_publish_admission_contention.py \
+            --base-root base --candidate-root candidate \
+            --host 127.0.0.1 --port 11883 --protocol 311 --qos 1 \
+            --payload-bytes 64 --publisher-values 1,4,16 --inflight-values 1,4,20 \
+            --warmup-count 100 --count 2500 --repeat 4 \
+            --timeout 150 --cpu 1 --policy advisory \
+            --output /tmp/publish-admission.json
+      - name: Upload contention evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: quantum128-contention
+          path: |
+            /tmp/writer-waiter.json
+            /tmp/publish-admission.json
