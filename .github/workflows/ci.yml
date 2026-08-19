@@ -1,10 +1,13 @@
 name: TEMP PR284-285 wake frontier
 
 on:
-  pull_request:
+  push:
+    branches:
+      - bench/tmp-wake-frontier-284-285-20260819
 
 permissions:
   contents: read
+  issues: write
 
 concurrency:
   group: temp-wake-frontier-284-285
@@ -23,12 +26,6 @@ jobs:
       SUPPORT_REF: bench/tmp-scheduler-284-286-20260819
       ROOT: ${{ runner.temp }}/wake-frontier
     steps:
-      - name: Checkout temporary harness
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          path: harness
-          persist-credentials: false
       - name: Checkout baseline
         uses: actions/checkout@v7
         with:
@@ -221,6 +218,7 @@ jobs:
         if: always()
         shell: bash
         run: |
+          mkdir -p "$ROOT"
           python - <<'PY'
           import json
           from pathlib import Path
@@ -247,6 +245,24 @@ jobs:
           (root / "summary.md").write_text("\n".join(out))
           print("\n".join(out))
           PY
+
+      - name: Publish run identity and summary to temp PR
+        if: always()
+        uses: actions/github-script@v8
+        env:
+          TEMP_PR: "289"
+        with:
+          script: |
+            const fs = require('fs');
+            const path = `${process.env.ROOT}/summary.md`;
+            const summary = fs.existsSync(path) ? fs.readFileSync(path, 'utf8') : 'summary missing';
+            const body = `ARM64 wake-frontier run **${context.runId}**, conclusion visible in Actions.\n\n${summary}`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: Number(process.env.TEMP_PR),
+              body,
+            });
 
       - name: Preserve diagnostics
         if: always()
