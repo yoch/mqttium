@@ -92,8 +92,12 @@ class WritePump:
         self._resident_messages += n
 
     def _release_resident(self, n: int = 1) -> None:
-        remaining = self._resident_messages - n
-        self._resident_messages = remaining if remaining > 0 else 0
+        if n < 0 or n > self._resident_messages:
+            raise AssertionError(
+                "writer resident-message accounting mismatch: "
+                f"resident={self._resident_messages}, release={n}"
+            )
+        self._resident_messages -= n
 
     def stats(self) -> WriterStats:
         """Snapshot the queue and the batching decisions taken so far."""
