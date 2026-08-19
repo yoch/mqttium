@@ -57,6 +57,9 @@ Do not merge until the selected quantum, rejected screening points, raw benchmar
 
 Correctness candidate implemented: one named 64 KiB ceiling beside the existing 256-item cap, with a leftover slot so FIFO is preserved. Diagnostic campaign 2026-08-19 (ineligible cloud VM): writer-capacity 0.980 / 1.012, open-loop completed/lag ~1.00, mixed QoS 1 tail p50 9.47 → 7.46 ms under a 32 KiB flood. 32/128/256 KiB remain screen-only. Eligible `network_release_gate.py` still required.
 
+Published report:
+[`docs/reports/SCHEDULER-WRITER-BYTE-QUANTUM-2026-08-19.md`](../reports/SCHEDULER-WRITER-BYTE-QUANTUM-2026-08-19.md).
+
 ## Complexity and risk
 
 Small local extension of the writer batching loop: one constant, one `_held` slot, and honest `queued_messages` / eager / discard / reset accounting. No packet-type priorities, no `drain()`, no adaptive window. Principal risks are FIFO (never `put_nowait` a leftover) and join-counter leaks on discard of a held item; both have unit tests. Throughput and tail-latency impact under mixed traffic is the open measurement question.

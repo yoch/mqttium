@@ -1,5 +1,10 @@
 # Writer-task byte quantum — first candidate 64 KiB — 2026-08-18
 
+> **Superseded** by
+> [`SCHEDULER-WRITER-BYTE-QUANTUM-2026-08-19.md`](SCHEDULER-WRITER-BYTE-QUANTUM-2026-08-19.md),
+> which names the feat commit and records the 2026-08-19 diagnostic campaign.
+> This file is the implementation note as written on 2026-08-18.
+
 Records the first candidate of
 [`../experiments/scheduler-writer-byte-quantum.md`](../experiments/scheduler-writer-byte-quantum.md).
 

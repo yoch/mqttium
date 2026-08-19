@@ -111,6 +111,17 @@ outcome live here.
 | 2026-08-04 | [`MEMORY-RESULTS.md`](MEMORY-RESULTS.md) | After-state for the same scenarios, once admission, delivery-budget, pagination and lazy-hydration corrections landed. |
 | 2026-08-04 | [`MEMORY-PROFILE-FOLLOW-UP.md`](MEMORY-PROFILE-FOLLOW-UP.md) | How each audit recommendation was closed, and which ones got a numeric regression guard. |
 
+## Scheduler experiments
+
+Open scheduler-hypothesis records. They do not outrank a measured hot-path
+decision, and they are not merge evidence until the experiment's own gate is
+met on an eligible runner.
+
+| Date | Report | Records |
+| --- | --- | --- |
+| 2026-08-19 | [`SCHEDULER-WRITER-BYTE-QUANTUM-2026-08-19.md`](SCHEDULER-WRITER-BYTE-QUANTUM-2026-08-19.md) | Diagnostic campaign for the 64 KiB writer-task byte quantum at `70f6535`: writer-capacity 0.980 / 1.012, open-loop ~1.00, mixed QoS 1 tail directional. **Keep 64 KiB; not mergeable** until `network_release_gate.py` on an eligible runner. |
+| 2026-08-18 | [`SCHEDULER-WRITER-BYTE-QUANTUM-2026-08-18.md`](SCHEDULER-WRITER-BYTE-QUANTUM-2026-08-18.md) | Implementation note for `_WRITER_BATCH_MAX_BYTES`. Superseded by the 2026-08-19 campaign. |
+
 ## Hot-path decisions
 
 Each answers one question with a measurement, and the answer is already
@@ -118,7 +129,6 @@ implemented — the report exists so the choice stays falsifiable.
 
 | Date | Report | Question answered |
 | --- | --- | --- |
-| 2026-08-18 | [`SCHEDULER-WRITER-BYTE-QUANTUM-2026-08-18.md`](SCHEDULER-WRITER-BYTE-QUANTUM-2026-08-18.md) | Should `WritePump._run` cap a worker batch by bytes as well as the existing 256-item ceiling? First candidate is a fixed 64 KiB leftover-slot quantum; network screening is still pending. |
 | 2026-08-14 | [`NATIVE-QOS0-CALLBACK-DIRECT-2026-08-14.md`](NATIVE-QOS0-CALLBACK-DIRECT-2026-08-14.md) | Can native QoS 0 writer admission enqueue an isolated `on_publish` callback directly without weakening queue bounds or batch atomicity? |
 | 2026-08-13 | [`ACK-SPECIALIZED-PRIMITIVES.md`](ACK-SPECIALIZED-PRIMITIVES.md) | Can per-version ACK decode primitives make MQTT 5 three-byte bodies cost the same call count as MQTT 3.1.1 two-byte success? Superseded in scope by the full specialized-codec bind table on the same branch. |
 | 2026-08-13 | [`AUTO-QOS1-MESSAGE-BATCH-DELIVERY.md`](AUTO-QOS1-MESSAGE-BATCH-DELIVERY.md) | Can fresh automatic QoS 1 MESSAGE effects share the small-message inline batch without weakening persisted replay semantics? |
