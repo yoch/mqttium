@@ -1,4 +1,4 @@
-name: TEMP ARM64 writer phase stabilization probe
+name: TEMP final canonical ARM64 scheduler stack guards
 
 on:
   pull_request:
@@ -19,15 +19,15 @@ env:
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
 jobs:
-  stabilize:
+  final-guards:
     runs-on: [self-hosted, linux, ARM64]
-    timeout-minutes: 120
+    timeout-minutes: 180
     steps:
       - name: Define paths
         shell: bash
         run: |
-          echo "ROOT=$RUNNER_TEMP/writer-phase-stabilize" >> "$GITHUB_ENV"
-          echo "VENV=$RUNNER_TEMP/writer-phase-stabilize-venv" >> "$GITHUB_ENV"
+          echo "ROOT=$RUNNER_TEMP/final-combined-guards" >> "$GITHUB_ENV"
+          echo "VENV=$RUNNER_TEMP/final-combined-guards-venv" >> "$GITHUB_ENV"
 
       - name: Checkout immutable base
         uses: actions/checkout@v7
@@ -45,15 +45,38 @@ jobs:
           path: stack
           persist-credentials: false
 
-      - name: Compose exact candidate runtime
+      - name: Compose exact candidate heads with audited conflict resolution
         working-directory: stack
         shell: bash
         run: |
           set -euo pipefail
           git config user.name stack-probe
           git config user.email stack-probe@example.invalid
+          test "$(git rev-parse HEAD)" = "$BASE_SHA"
+
+          union_report_index() {
+            python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+          path='docs/reports/README.md'
+          ours=subprocess.check_output(['git','show',f':2:{path}'],text=True)
+          theirs=subprocess.check_output(['git','show',f':3:{path}'],text=True)
+          lines=ours.splitlines()
+          incoming=[line for line in theirs.splitlines() if line.startswith('| 2026-08-') and 'SCHEDULER-' in line and line not in lines]
+          if not incoming:
+              raise SystemExit('no unique incoming scheduler report rows')
+          heading=lines.index('## Hot-path decisions')
+          i=heading
+          while i>0 and lines[i-1]=='':
+              i-=1
+          lines[i:i]=incoming
+          Path(path).write_text('\n'.join(lines)+'\n')
+          PY
+          }
+
           git fetch --no-tags origin "$PR283_SHA"
           git merge --no-ff --no-edit "$PR283_SHA"
+
           git fetch --no-tags origin "$PR284_SHA"
           set +e
           git merge --no-ff --no-edit "$PR284_SHA"
@@ -64,7 +87,8 @@ jobs:
           test "${#conflicts[@]}" -eq 2
           test "${conflicts[0]}" = "docs/reports/README.md"
           test "${conflicts[1]}" = "src/mqttium/api/_writer.py"
-          git checkout --ours docs/reports/README.md src/mqttium/api/_writer.py
+          union_report_index
+          git checkout --ours src/mqttium/api/_writer.py
           python3 - <<'PY'
           from pathlib import Path
           p=Path('src/mqttium/api/_writer.py')
@@ -77,7 +101,7 @@ jobs:
               text=text.replace(old,new)
           one(
               '                self.enqueue_suspensions += 1\n                try:\n                    await self.space.wait()\n                finally:\n                    self.waiters -= 1\n',
-              '                self.enqueue_suspensions += 1\n                try:\n                    await self.space.wait()\n                except asyncio.CancelledError:\n                    if self.waiters > 1:\n                        self.space.notify(1)\n                    raise\n                finally:\n                    self.waiters -= 1\n',
+              '                self.enqueue_suspensions += 1\n                try:\n                    await self.space.wait()\n                except asyncio.CancelledError:\n                    # notify(n) is consumed by whoever is waiting. A waiter\n                    # cancelled after being selected must hand the wakeup on,\n                    # or the remaining producers stay parked with free slots.\n                    if self.waiters > 1:\n                        self.space.notify(1)\n                    raise\n                finally:\n                    self.waiters -= 1\n',
           )
           one(
               '        transport = self.transport\n        if transport is None:\n            raise RuntimeError("WritePump started without a transport")\n        # Resolved once per writer task rather than per batch. The local dies\n',
@@ -93,12 +117,14 @@ jobs:
           )
           one(
               '                        self._release_resident(n_batch)\n                        if self.waiters:\n                            self.space.notify_all()\n',
-              '                        self._release_resident(n_batch)\n                        if batch_completed and self.waiters and not writer_task.cancelling():\n                            self.space.notify(min(self.waiters, n_batch))\n',
+              '                        self._release_resident(n_batch)\n                        if batch_completed and self.waiters and not writer_task.cancelling():\n                            # Resident accounting is released even on lifecycle\n                            # cancellation/failure, but only a successfully written\n                            # batch releases usable admission capacity.\n                            self.space.notify(min(self.waiters, n_batch))\n',
           )
           p.write_text(text)
           PY
           git add docs/reports/README.md src/mqttium/api/_writer.py
+          git diff --check
           git commit --no-edit
+
           git fetch --no-tags origin "$PR285_SHA"
           set +e
           git merge --no-ff --no-edit "$PR285_SHA"
@@ -108,39 +134,33 @@ jobs:
             mapfile -t conflicts < <(git diff --name-only --diff-filter=U)
             test "${#conflicts[@]}" -eq 1
             test "${conflicts[0]}" = "docs/reports/README.md"
-            git checkout --ours docs/reports/README.md
+            union_report_index
             git add docs/reports/README.md
+            git diff --check
             git commit --no-edit
           fi
           test -z "$(git diff --name-only --diff-filter=U)"
           git diff --check "$BASE_SHA"..HEAD
+          git rev-parse HEAD | tee "$RUNNER_TEMP/final-combined-head.txt"
 
-      - name: Patch temporary benchmark with settle modes and writer counters
+      - name: Focused combined correctness
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-          p=Path('base/benchmarks/paired_writer_capacity.py')
-          text=p.read_text()
-          old='''    sync_rejected: int\n    drain_seconds: float\n'''
-          new='''    sync_rejected: int\n    drain_seconds: float\n    writer_batches: int = 0\n    writer_batched_items: int = 0\n    writer_eager_writes: int = 0\n    eager_armed_at_start: bool | None = None\n    writing_at_start: bool | None = None\n    queue_at_start: int | None = None\n'''
-          if text.count(old)!=1: raise SystemExit('dataclass anchor mismatch')
-          text=text.replace(old,new)
+          PYTHONPATH=stack/src python3 -m pytest -q \
+            stack/tests/unit/test_write_pump_resident.py \
+            stack/tests/unit/test_write_pump_targeted_wake.py \
+            stack/tests/unit/test_write_pump.py \
+            stack/tests/unit/test_write_pump_eager.py \
+            stack/tests/unit/test_publish_targeted_wake.py \
+            stack/tests/unit/test_async_publish_admission.py
 
-          old='''        result = await _run_phase(\n            client,\n            topic=topic,\n            payload=payload,\n            qos=args.qos,\n            count=args.count,\n            outstanding=args.outstanding,\n            timeout=args.timeout,\n        )\n        result.protocol = args.protocol\n        result.inflight = args.inflight\n        return result\n'''
-          new='''        pump = client._write_pump\n        mode = os.environ.get("CAPACITY_SETTLE_MODE", "none")\n        if mode == "sleep0":\n            await asyncio.sleep(0)\n        elif mode == "sleep2":\n            await asyncio.sleep(0)\n            await asyncio.sleep(0)\n        elif mode == "idle2":\n            await asyncio.wait_for(pump.join(), timeout=args.timeout)\n            while pump._writing or not pump.queue.empty():\n                await asyncio.sleep(0)\n            await asyncio.sleep(0)\n            await asyncio.sleep(0)\n        elif mode == "sleep1ms":\n            await asyncio.sleep(0.001)\n        elif mode != "none":\n            raise RuntimeError(f"unknown CAPACITY_SETTLE_MODE={mode}")\n\n        before = pump.stats()\n        eager_at_start = pump._eager_armed\n        writing_at_start = pump._writing\n        queue_at_start = pump.queue.qsize()\n        result = await _run_phase(\n            client,\n            topic=topic,\n            payload=payload,\n            qos=args.qos,\n            count=args.count,\n            outstanding=args.outstanding,\n            timeout=args.timeout,\n        )\n        after = pump.stats()\n        result.protocol = args.protocol\n        result.inflight = args.inflight\n        result.writer_batches = after.batches - before.batches\n        result.writer_batched_items = after.batched_items - before.batched_items\n        result.writer_eager_writes = after.eager_writes - before.eager_writes\n        result.eager_armed_at_start = eager_at_start\n        result.writing_at_start = writing_at_start\n        result.queue_at_start = queue_at_start\n        return result\n'''
-          if text.count(old)!=1: raise SystemExit('sample anchor mismatch')
-          text=text.replace(old,new)
-          p.write_text(text)
-          PY
-          python3 -m py_compile base/benchmarks/paired_writer_capacity.py
-
-      - name: Prepare ARM64 runner and pin broker to CPU0
+      - name: Prepare ARM64 runner and isolated broker
         shell: bash
         run: |
           set -euo pipefail
           test "$(uname -m)" = aarch64
+          test "$(nproc)" -ge 4
           rm -rf "$ROOT" "$VENV"
           mkdir -p "$ROOT"
           python3 -m venv "$VENV"
@@ -165,99 +185,89 @@ jobs:
           done
           test "$(awk '/Cpus_allowed_list/ {print $2}' /proc/$(cat "$ROOT/mosquitto.pid")/status)" = 0
 
-      - name: Strict preflight
+      - name: Define strict requalification helper
         shell: bash
         run: |
+          cat > "$ROOT/strict-probe.sh" <<'SH'
           set -euo pipefail
+          label="$1"
           for attempt in $(seq 1 24); do
-            out="$ROOT/preflight-$attempt.json"
+            out="$ROOT/preflight-${label}-${attempt}.json"
             if "$VENV/bin/python" base/benchmarks/runner_probe.py --output "$out" --require-temperature --enforce; then
-              cp "$out" "$ROOT/preflight.json"
+              cp "$out" "$ROOT/preflight-${label}.json"
               exit 0
             fi
             sleep 10
           done
           exit 1
+          SH
+          chmod +x "$ROOT/strict-probe.sh"
 
-      - name: Compare natural warmup-to-measure barriers with A/A
+      - name: Strict preflight before canonical writer A/A
+        shell: bash
+        run: "$ROOT/strict-probe.sh writer-aa"
+
+      - name: Canonical writer-capacity A/A
         shell: bash
         run: |
-          set -euo pipefail
-          for mode in none sleep0 sleep2 idle2 sleep1ms; do
-            echo "=== settle=$mode ==="
-            CAPACITY_SETTLE_MODE="$mode" "$VENV/bin/python" base/benchmarks/paired_writer_capacity.py \
-              --base-root base --candidate-root base --host 127.0.0.1 --port 11883 \
-              --protocol 311 --qos-values 1 --payload-bytes 64 --inflight 20 --outstanding 20 \
-              --max-queued 200 --warmup-count 5000 --count-qos1 40000 --repeat 16 --cpu 1 \
-              --policy advisory --preflight-report "$ROOT/preflight.json" --max-baseline-cv 1.0 \
-              --min-completed-ratio 0.0 --output "$ROOT/aa-$mode.json"
-          done
+          "$VENV/bin/python" base/benchmarks/paired_writer_capacity.py \
+            --base-root base --candidate-root base --host 127.0.0.1 --port 11883 \
+            --protocol 311 --qos-values 0,1 --payload-bytes 256 \
+            --inflight 20 --outstanding 64 --max-queued 200 \
+            --warmup-count 5000 --count-qos0 100000 --count-qos1 40000 \
+            --repeat 8 --cpu 1 --policy strict \
+            --preflight-report "$ROOT/preflight-writer-aa.json" \
+            --max-baseline-cv .05 --min-completed-ratio .97 \
+            --output "$ROOT/writer-aa.json" --summary-output "$ROOT/writer-aa.md"
 
-      - name: Select the most stationary natural barrier
+      - name: Requalify before canonical writer A/B
+        shell: bash
+        run: "$ROOT/strict-probe.sh writer-ab"
+
+      - name: Canonical writer-capacity A/B
         shell: bash
         run: |
-          "$VENV/bin/python" - <<'PY'
-          import json, os, statistics
-          from pathlib import Path
-          root=Path(os.environ['ROOT'])
-          modes=['none','sleep0','sleep2','idle2','sleep1ms']
-          rows=[]
-          for mode in modes:
-              d=json.loads((root/f'aa-{mode}.json').read_text())
-              s=d['scenarios'][0]
-              samples=[]
-              for pair in s['pairs']:
-                  samples.extend((pair['base'],pair['candidate']))
-              abnormal=sum(1 for x in samples if x['writer_batches'] > 3900)
-              not_armed=sum(1 for x in samples if x['eager_armed_at_start'] is not True)
-              rows.append({
-                  'mode':mode,
-                  'ratio':s['median_candidate_over_base_completed'],
-                  'base_cv':s['base_completed_cv'],
-                  'candidate_cv':s['candidate_completed_cv'],
-                  'worst_cv':max(s['base_completed_cv'],s['candidate_completed_cv']),
-                  'abnormal_writer_regimes':abnormal,
-                  'not_eager_armed_at_start':not_armed,
-                  'median_batches':statistics.median(x['writer_batches'] for x in samples),
-                  'median_eager':statistics.median(x['writer_eager_writes'] for x in samples),
-              })
-          rows.sort(key=lambda r:(r['abnormal_writer_regimes'],r['worst_cv']))
-          print(json.dumps(rows,indent=2))
-          (root/'aa-barriers-summary.json').write_text(json.dumps(rows,indent=2)+'\n')
-          best=rows[0]
-          if best['abnormal_writer_regimes'] != 0 or best['worst_cv'] > 0.03:
-              raise SystemExit(f'no sufficiently stationary natural barrier: {best}')
-          with open(os.environ['GITHUB_ENV'],'a') as f:
-              f.write(f"BEST_MODE={best['mode']}\n")
-          PY
-
-      - name: Requalify before exact triple A/B
-        shell: bash
-        run: |
-          set -euo pipefail
-          for attempt in $(seq 1 24); do
-            out="$ROOT/preflight-ab-$attempt.json"
-            if "$VENV/bin/python" base/benchmarks/runner_probe.py --output "$out" --require-temperature --enforce; then
-              cp "$out" "$ROOT/preflight-ab.json"
-              exit 0
-            fi
-            sleep 10
-          done
-          exit 1
-
-      - name: Triple A/B with selected stationary barrier
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "selected settle mode: $BEST_MODE"
-          CAPACITY_SETTLE_MODE="$BEST_MODE" "$VENV/bin/python" base/benchmarks/paired_writer_capacity.py \
+          "$VENV/bin/python" base/benchmarks/paired_writer_capacity.py \
             --base-root base --candidate-root stack --host 127.0.0.1 --port 11883 \
-            --protocol 311 --qos-values 1 --payload-bytes 64 --inflight 20 --outstanding 20 \
-            --max-queued 200 --warmup-count 5000 --count-qos1 40000 --repeat 20 --cpu 1 \
-            --policy strict --preflight-report "$ROOT/preflight-ab.json" --max-baseline-cv .03 \
-            --min-completed-ratio .97 --output "$ROOT/triple-ab.json" --summary-output "$ROOT/triple-ab.md"
+            --protocol 311 --qos-values 0,1 --payload-bytes 256 \
+            --inflight 20 --outstanding 64 --max-queued 200 \
+            --warmup-count 5000 --count-qos0 100000 --count-qos1 40000 \
+            --repeat 8 --cpu 1 --policy strict \
+            --preflight-report "$ROOT/preflight-writer-ab.json" \
+            --max-baseline-cv .05 --min-completed-ratio .97 \
+            --output "$ROOT/writer-ab.json" --summary-output "$ROOT/writer-ab.md"
 
-      - name: Final cooldown and strict preflight
+      - name: Requalify before open-loop guard
+        shell: bash
+        run: "$ROOT/strict-probe.sh open-loop"
+
+      - name: Stable open-loop 64B/window20 guard
+        shell: bash
+        run: |
+          "$VENV/bin/python" base/benchmarks/paired_open_loop.py \
+            --base-root base --candidate-root stack \
+            --protocols 311 --payloads 64 --completions callback --windows 20 \
+            --target-rates 5000,7500 --count-small 5000 --repeat 6 --cpu 1 \
+            --policy strict --preflight-report "$ROOT/preflight-open-loop.json" \
+            --max-baseline-cv .05 --min-completed-ratio .97 --max-loop-lag-ratio 1.05 \
+            --output "$ROOT/open-loop.json" --summary-output "$ROOT/open-loop.md"
+
+      - name: Requalify before network guard
+        shell: bash
+        run: "$ROOT/strict-probe.sh network"
+
+      - name: Network 64/4096B × window20/64 guard
+        shell: bash
+        run: |
+          "$VENV/bin/python" base/benchmarks/paired_network.py \
+            --base-root base --candidate-root stack --host 127.0.0.1 --port 11883 \
+            --protocols 311 --completions receipt --payloads 64,4096 --windows 20,64 \
+            --repeat 8 --count-small 1500 --count-large 750 --cpu 1 \
+            --policy strict --preflight-report "$ROOT/preflight-network.json" \
+            --max-baseline-cv .05 --min-ack-ratio .97 \
+            --output "$ROOT/network.json" --summary-output "$ROOT/network.md"
+
+      - name: Final cooldown and strict eligibility
         if: always()
         shell: bash
         run: |
@@ -265,25 +275,18 @@ jobs:
           if [ -f "$ROOT/mosquitto.pid" ]; then kill "$(cat "$ROOT/mosquitto.pid")" 2>/dev/null || true; fi
           sudo pkill -x mosquitto 2>/dev/null || true
           sleep 2
-          for attempt in $(seq 1 24); do
-            out="$ROOT/preflight-final-$attempt.json"
-            if [ -x "$VENV/bin/python" ] && "$VENV/bin/python" base/benchmarks/runner_probe.py --output "$out" --require-temperature --enforce; then
-              cp "$out" "$ROOT/preflight-final.json"
-              exit 0
-            fi
-            sleep 10
-          done
-          exit 1
+          if [ -x "$ROOT/strict-probe.sh" ]; then "$ROOT/strict-probe.sh final"; fi
 
-      - name: Upload stabilization evidence
+      - name: Upload final combined evidence
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: writer-phase-stabilize-${{ github.run_id }}
+          name: final-combined-guards-${{ github.run_id }}
           path: |
-            ${{ runner.temp }}/writer-phase-stabilize/*.json
-            ${{ runner.temp }}/writer-phase-stabilize/*.md
-            ${{ runner.temp }}/writer-phase-stabilize/*.log
-            ${{ runner.temp }}/writer-phase-stabilize/*.conf
+            ${{ runner.temp }}/final-combined-guards/*.json
+            ${{ runner.temp }}/final-combined-guards/*.md
+            ${{ runner.temp }}/final-combined-guards/*.log
+            ${{ runner.temp }}/final-combined-guards/*.conf
+            ${{ runner.temp }}/final-combined-head.txt
           if-no-files-found: warn
           retention-days: 30
