@@ -48,6 +48,8 @@ jobs:
         run: python support/benchmarks/temp_apply_writer_quantum_128.py candidate --quantum "$QUANTUM_BYTES"
       - name: Reuse byte-quantum invariant suite
         run: cp old286/tests/unit/test_write_pump_byte_quantum.py candidate/tests/unit/test_write_pump_byte_quantum_temp.py
+      - name: Port historical fixture to resident accounting
+        run: python support/benchmarks/temp_port_writer_quantum_tests.py candidate/tests/unit/test_write_pump_byte_quantum_temp.py
       - name: Focused writer invariant tests
         env:
           PYTHONPATH: candidate/src
