@@ -1,206 +1,134 @@
-name: CI
+name: TEMP PR284-285 fairness progress
 
 on:
-  push:
-    branches: [main]
   pull_request:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: temp-pr284-285-fairness-progress
+  cancel-in-progress: true
 
 jobs:
-  quality:
+  fairness:
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      BASE_SHA: e80618154bacefed5626d9eb9ba46edf560b54e7
+      PR284_SHA: 8d37248831b372004074acfa0018f34da51b54df
+      PR285_SHA: 505c385c59670b2fb095728b5095f5039c53d675
+      PYTHONUNBUFFERED: "1"
     steps:
-      - uses: actions/checkout@v7
+      - name: Checkout harness
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: harness
+          persist-credentials: false
+      - name: Checkout baseline
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.BASE_SHA }}
+          path: base
+          persist-credentials: false
+      - name: Checkout PR284
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.PR284_SHA }}
+          path: pr284
+          persist-credentials: false
+      - name: Checkout PR285
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.PR285_SHA }}
+          path: pr285
+          persist-credentials: false
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: pyproject.toml
-      - run: python -m pip install -e ".[dev,security]"
-      - name: Repository hygiene
-        run: |
-          set -euo pipefail
-          test -z "$(git ls-files | grep -E '(^|/)(__pycache__|\.pytest_cache|\.mypy_cache|\.ruff_cache|dist|build|.*\.egg-info)(/|$)|(^|/)\.coverage($|\.)|\.py[co]$|\.(patch|diff)$' || true)"
-          test -z "$(grep -RIl --exclude-dir=.git -E 'mqttnext|MQTTNext|MQTTNEXT' src tests examples benchmarks || true)"
-      - run: ruff format --check src tests benchmarks
-      - run: ruff check src tests benchmarks
-      - run: mypy src/mqttium
-      - run: bandit -q -ll -r src
-      - run: python -m pytest -q tests/unit --cov=mqttium --cov-report=term-missing --cov-fail-under=80
-
-  test:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.11", "3.12", "3.13", "3.14"]
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: ${{ matrix.python-version }}
-          cache: pip
-          cache-dependency-path: pyproject.toml
-      - run: python -m pip install -e ".[dev]"
-      - name: Require OpenSSL for TLS tests
-        run: python -c "import shutil; assert shutil.which('openssl'), 'OpenSSL is required for TLS tests'"
-      - name: Unit tests (including TLS, WebSocket, and cancellation)
-        run: python -m pytest -q -ra tests/unit
+          python-version: "3.13"
+      - run: python -m pip install -e "pr284[dev]"
       - name: Install Mosquitto
-        timeout-minutes: 5
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq mosquitto
+      - name: Start isolated broker
+        shell: bash
         run: |
           set -euo pipefail
-          export DEBIAN_FRONTEND=noninteractive
-          date -u +'apt-get install start %FT%TZ'
-          sudo -E apt-get install -y mosquitto
-          date -u +'apt-get install done %FT%TZ'
-          dpkg-query -W mosquitto
-          command -v mosquitto
-      - name: Start Mosquitto
-        timeout-minutes: 2
-        run: |
-          set -euo pipefail
-          printf 'listener 11883 127.0.0.1\nallow_anonymous true\npersistence false\n' > /tmp/mosq-ci.conf
-          date -u +'mosquitto -d start %FT%TZ'
-          mosquitto -c /tmp/mosq-ci.conf -d
-          echo "mosquitto -d exited $?"
-          date -u +'mosquitto -d returned %FT%TZ'
-          for i in $(seq 1 30); do
-            if (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1; then
-              echo "listener ready after ${i} probe(s)"
-              exit 0
-            fi
-            sleep 0.2
+          cat >/tmp/mosq-fairness.conf <<'EOF'
+          persistence false
+          allow_anonymous true
+          max_inflight_messages 1000
+          max_queued_messages 100000
+          connection_messages false
+          log_type error
+          listener 11883 127.0.0.1
+          EOF
+          mosquitto -c /tmp/mosq-fairness.conf >/tmp/mosq-fairness.log 2>&1 &
+          echo $! >/tmp/mosq-fairness.pid
+          for _ in $(seq 1 50); do
+            (echo >/dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            sleep .1
           done
-          echo "listener never accepted a connection"
-          pgrep -a mosquitto || true
+          cat /tmp/mosq-fairness.log
           exit 1
-      - name: Mosquitto integration tests
-        run: python -m pytest -q tests/integration
 
-  cross-platform:
-    name: Cross-platform (${{ matrix.os }}, Python ${{ matrix.python-version }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-15, windows-2025]
-        python-version: ["3.11", "3.14"]
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: ${{ matrix.python-version }}
-          cache: pip
-          cache-dependency-path: pyproject.toml
-      - run: python -m pip install -e ".[dev]"
-      - name: Require OpenSSL for TLS tests
-        run: python -c "import shutil; assert shutil.which('openssl'), 'OpenSSL is required for TLS tests'"
-      - name: Unit tests (including TLS, WebSocket, and cancellation)
-        run: python -m pytest -q -ra tests/unit
-
-  fuzz:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: pyproject.toml
-      - run: python -m pip install -e ".[fuzz]"
-      - name: Seeded fuzzing
+      - name: Writer fairness A/A
         run: |
-          for seed in 1 2 3; do
-            PYTHONPATH=src python tests/fuzz/fuzz.py --seed "$seed" --iterations 20000
-          done
-      - run: PYTHONPATH=src python -m pytest -q tests/fuzz/test_hypothesis_fuzz.py
+          python harness/benchmarks/temp_fairness_progress.py parent \
+            --kind writer --base-root base --candidate-root base \
+            --producer-values 16,32,64 --ops 150 --repeat 4 \
+            --max-messages 1 --max-bytes 1048576 --payload-bytes 64 \
+            --output /tmp/writer-aa.json
+      - name: Writer fairness A/B
+        run: |
+          python harness/benchmarks/temp_fairness_progress.py parent \
+            --kind writer --base-root base --candidate-root pr284 \
+            --producer-values 16,32,64 --ops 150 --repeat 4 \
+            --max-messages 1 --max-bytes 1048576 --payload-bytes 64 \
+            --output /tmp/writer-ab.json
+      - name: Publish fairness A/A
+        run: |
+          python harness/benchmarks/temp_fairness_progress.py parent \
+            --kind publish --base-root base --candidate-root base \
+            --host 127.0.0.1 --port 11883 \
+            --producer-values 16,32,64 --inflight-values 1,4 \
+            --ops 60 --repeat 4 --payload-bytes 64 --timeout 120 \
+            --output /tmp/publish-aa.json
+      - name: Publish fairness A/B
+        run: |
+          python harness/benchmarks/temp_fairness_progress.py parent \
+            --kind publish --base-root base --candidate-root pr285 \
+            --host 127.0.0.1 --port 11883 \
+            --producer-values 16,32,64 --inflight-values 1,4 \
+            --ops 60 --repeat 4 --payload-bytes 64 --timeout 120 \
+            --output /tmp/publish-ab.json
 
-  package:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: pyproject.toml
-      - run: python -m pip install ".[release]"
-      - run: validate-pyproject pyproject.toml
-      - run: python -m build
-      - run: twine check --strict dist/*
-      - run: check-wheel-contents dist/*.whl
-      - name: Validate distribution contents
+      - name: Summarize fairness evidence
+        if: always()
+        shell: bash
         run: |
           python - <<'PY'
+          import json
           from pathlib import Path
-          from zipfile import ZipFile
-          import ast
-          import email
-          import tarfile
-
-          source = ast.parse(Path("src/mqttium/__init__.py").read_text(encoding="utf-8"))
-          expected_version = next(
-              node.value.value
-              for node in source.body
-              if isinstance(node, ast.Assign)
-              and any(isinstance(target, ast.Name) and target.id == "__version__" for target in node.targets)
-              and isinstance(node.value, ast.Constant)
-              and isinstance(node.value.value, str)
-          )
-          wheel = next(Path("dist").glob("*.whl"))
-          sdist = next(Path("dist").glob("*.tar.gz"))
-
-          with ZipFile(wheel) as archive:
-              names = archive.namelist()
-              metadata_name = next(name for name in names if name.endswith(".dist-info/METADATA"))
-              metadata = email.message_from_bytes(archive.read(metadata_name))
-              assert metadata["Name"] == "mqttium"
-              assert metadata["Version"] == expected_version
-              assert metadata["Requires-Python"] == ">=3.11"
-              assert metadata["License-Expression"] == "Apache-2.0"
-              assert "mqttium/py.typed" in names
-              assert any(name.endswith(".dist-info/licenses/LICENSE") for name in names)
-              assert any(name.endswith(".dist-info/licenses/NOTICE") for name in names)
-
-          with tarfile.open(sdist, "r:gz") as archive:
-              names = archive.getnames()
-              for filename in (
-                  "LICENSE",
-                  "NOTICE",
-                  "README.md",
-                  "CHANGELOG.md",
-                  "PROVENANCE.md",
-                  "SECURITY.md",
-              ):
-                  assert any(name.endswith("/" + filename) for name in names), filename
+          for name in ('writer-aa','writer-ab','publish-aa','publish-ab'):
+              path=Path('/tmp')/(name+'.json')
+              print('\n###',name)
+              if not path.exists():
+                  print('MISSING'); continue
+              data=json.loads(path.read_text())
+              for row in data['rows']:
+                  print({k:v for k,v in row.items() if k != 'pairs'})
           PY
-      - name: Install and import the built wheel
-        run: |
-          python -m venv /tmp/mqttium-wheel
-          /tmp/mqttium-wheel/bin/python -m pip install --no-deps dist/*.whl
-          cd /tmp
-          /tmp/mqttium-wheel/bin/python -I - <<'PY'
-          import importlib
-          import importlib.metadata
-          import pkgutil
-          import mqttium
-
-          assert mqttium.__version__ == importlib.metadata.version("mqttium")
-          for module in pkgutil.walk_packages(mqttium.__path__, mqttium.__name__ + "."):
-              importlib.import_module(module.name)
-          PY
-          /tmp/mqttium-wheel/bin/python -m pip check
-      - name: Upload distributions
+      - name: Upload fairness evidence
+        if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: distributions-${{ github.sha }}
-          path: dist/*
-          if-no-files-found: error
+          name: fairness-progress-${{ github.run_id }}
+          path: |
+            /tmp/writer-aa.json
+            /tmp/writer-ab.json
+            /tmp/publish-aa.json
+            /tmp/publish-ab.json
+            /tmp/mosq-fairness.log
+          if-no-files-found: warn
+          retention-days: 14
