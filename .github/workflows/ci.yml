@@ -1,229 +1,195 @@
-name: TEMP PR284 ARM64 network stability confirmation
+name: TEMP patch PR285 benchmark completion semantics
 
 on:
   pull_request:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
-  group: temp-final-arm64-pr284-285
+  group: temp-pr285-benchmark-fix
   cancel-in-progress: true
 
 jobs:
-  confirm:
-    runs-on: [self-hosted, linux, ARM64]
-    timeout-minutes: 90
+  patch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     env:
+      TARGET_SHA: 505c385c59670b2fb095728b5095f5039c53d675
+      TARGET_BRANCH: agent/scheduler-publish-targeted-wake
       PYTHONUNBUFFERED: "1"
-      PIP_DISABLE_PIP_VERSION_CHECK: "1"
-      BASE_SHA: e80618154bacefed5626d9eb9ba46edf560b54e7
-      PR284_SHA: 8d37248831b372004074acfa0018f34da51b54df
     steps:
-      - name: Define runtime root
-        shell: bash
-        run: echo "ROOT=$RUNNER_TEMP/pr284-network-confirm" >> "$GITHUB_ENV"
-
-      - name: Checkout immutable baseline
+      - name: Checkout exact PR285 branch
         uses: actions/checkout@v7
         with:
-          ref: ${{ env.BASE_SHA }}
-          path: base
-          persist-credentials: false
-      - name: Checkout immutable PR284
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ env.PR284_SHA }}
-          path: pr284
-          persist-credentials: false
-
-      - name: Verify refs and clean broker state
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0
+      - name: Verify exact target head
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git -C base rev-parse HEAD)" = "$BASE_SHA"
-          test "$(git -C pr284 rev-parse HEAD)" = "$PR284_SHA"
-          test "$(uname -m)" = aarch64
-          python3 - <<'PY'
-          import sys
-          if sys.version_info[:2] != (3, 13):
-              raise SystemExit(f"expected Python 3.13, got {sys.version}")
+          test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Patch benchmark semantics and historical note
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: str, old: str, new: str) -> None:
+              p = Path(path)
+              text = p.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"expected one match in {path}, got {count}: {old!r}")
+              p.write_text(text.replace(old, new))
+
+          bench = "benchmarks/paired_publish_admission_contention.py"
+          replace_once(
+              bench,
+              "worker processes in alternating order.\n\nHosted runners are diagnostic only;",
+              "worker processes in alternating order. The primary throughput metric is true\n"
+              "QoS completion; publish-call admission-return rate is retained as a diagnostic.\n\n"
+              "Hosted runners are diagnostic only;",
+          )
+          replace_once(
+              bench,
+              "    count: int\n    elapsed_seconds: float\n    completed_rate: float\n    cpu_seconds: float\n",
+              "    count: int\n    admission_seconds: float\n    admission_rate: float\n"
+              "    elapsed_seconds: float\n    completed_rate: float\n    cpu_seconds: float\n",
+          )
+          replace_once(
+              bench,
+              "    elapsed = time.perf_counter() - started\n"
+              "    cpu_seconds = time.process_time() - cpu_started\n\n"
+              "    write_pump = getattr(client, \"_write_pump\", None)\n",
+              "    admission_elapsed = time.perf_counter() - started\n\n"
+              "    write_pump = getattr(client, \"_write_pump\", None)\n",
+          )
+          replace_once(
+              bench,
+              "        await asyncio.sleep(0)\n\n    return AdmissionResult(\n",
+              "        await asyncio.sleep(0)\n\n"
+              "    elapsed = time.perf_counter() - started\n"
+              "    cpu_seconds = time.process_time() - cpu_started\n\n"
+              "    return AdmissionResult(\n",
+          )
+          replace_once(
+              bench,
+              "        count=count,\n"
+              "        elapsed_seconds=elapsed,\n"
+              "        completed_rate=count / max(elapsed, 1e-9),\n",
+              "        count=count,\n"
+              "        admission_seconds=admission_elapsed,\n"
+              "        admission_rate=count / max(admission_elapsed, 1e-9),\n"
+              "        elapsed_seconds=elapsed,\n"
+              "        completed_rate=count / max(elapsed, 1e-9),\n",
+          )
+          replace_once(
+              bench,
+              "            \"mode\": \"native_async_publish_admission\",\n"
+              "            \"protocol\": args.protocol,\n",
+              "            \"mode\": \"native_async_publish_admission\",\n"
+              "            \"primary_rate\": \"true_qos_completion\",\n"
+              "            \"admission_rate\": \"publish_call_return\",\n"
+              "            \"latency_metric\": \"publish_call_admission\",\n"
+              "            \"protocol\": args.protocol,\n",
+          )
+
+          report = "docs/reports/SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-19.md"
+          replace_once(
+              report,
+              "[`SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-18.md`](SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-18.md).\n\n| | |\n",
+              "[`SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-18.md`](SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-18.md).\n\n"
+              "> **Measurement correction.** The historical contention numbers in this report\n"
+              "> timed the return from `publish()` and therefore measured **admission-return\n"
+              "> rate**, not QoS completion. The benchmark now records both admission and true\n"
+              "> completion and uses true completion as the primary throughput gate. Final\n"
+              "> eligible ARM64 evidence is recorded in the PR discussion; the historical\n"
+              "> table below is retained for traceability.\n\n"
+              "| | |\n",
+          )
           PY
-          mkdir -p "$ROOT"
+          python -m py_compile benchmarks/paired_publish_admission_contention.py
+          git diff --check
+          git diff -- benchmarks/paired_publish_admission_contention.py docs/reports/SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-19.md
+
+      - name: Install project dependencies
+        run: python -m pip install -e ".[dev]"
+      - name: Static and focused correctness checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          ruff format --check benchmarks/paired_publish_admission_contention.py
+          ruff check benchmarks/paired_publish_admission_contention.py
+          python -m pytest -q tests/unit/test_publish_targeted_wake.py tests/unit/test_async_publish_admission.py
+
+      - name: Install and start isolated Mosquitto
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mosquitto
           sudo systemctl stop mosquitto 2>/dev/null || true
           sudo pkill -x mosquitto 2>/dev/null || true
-          sleep 1
-          ! pgrep -a mosquitto
-
-      - name: Create venv and dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-          rm -rf "$RUNNER_TEMP/pr284-network-confirm-venv"
-          python3 -m venv "$RUNNER_TEMP/pr284-network-confirm-venv"
-          echo "$RUNNER_TEMP/pr284-network-confirm-venv/bin" >> "$GITHUB_PATH"
-          "$RUNNER_TEMP/pr284-network-confirm-venv/bin/python" -m pip install -e "pr284[dev]" "psutil>=6,<8"
-
-      - name: Strict preflight replicate 1
-        shell: bash
-        run: |
-          set -euo pipefail
-          for attempt in $(seq 1 24); do
-            if python base/benchmarks/runner_probe.py --output "$ROOT/preflight-1.json" --require-temperature --enforce; then
-              exit 0
-            fi
-            sleep 15
-          done
-          exit 1
-
-      - name: Start isolated broker replicate 1
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat > "$ROOT/mosquitto-1.conf" <<'MOSQ'
+          cat >/tmp/mosq-pr285-bench-fix.conf <<'MOSQ'
           persistence false
           allow_anonymous true
           max_inflight_messages 1000
           max_queued_messages 100000
-          max_queued_bytes 0
           connection_messages false
           log_type error
           listener 11883 127.0.0.1
           MOSQ
-          mosquitto -c "$ROOT/mosquitto-1.conf" > "$ROOT/mosquitto-1.log" 2>&1 &
-          echo $! > "$ROOT/mosquitto.pid"
+          mosquitto -c /tmp/mosq-pr285-bench-fix.conf >/tmp/mosq-pr285-bench-fix.log 2>&1 &
+          echo $! >/tmp/mosq-pr285-bench-fix.pid
           for _ in $(seq 1 50); do
-            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
-            sleep .2
+            (echo >/dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            sleep .1
           done
+          cat /tmp/mosq-pr285-bench-fix.log
           exit 1
 
-      - name: Network confirmation replicate 1
-        shell: bash
-        run: |
-          set +e
-          python base/benchmarks/paired_network.py \
-            --base-root base --candidate-root pr284 --host 127.0.0.1 --port 11883 \
-            --protocols 311 --completions receipt --payloads 64 --windows 20 \
-            --repeat 8 --count-small 1500 --cpu 1 \
-            --policy strict --preflight-report "$ROOT/preflight-1.json" \
-            --max-baseline-cv .05 --min-ack-ratio .97 \
-            --output "$ROOT/network-1.json" --summary-output "$ROOT/network-1.md" \
-            >"$ROOT/network-1.stdout.log" 2>"$ROOT/network-1.stderr.log"
-          rc=$?
-          echo "$rc" > "$ROOT/network-1.rc"
-          cat "$ROOT/network-1.stdout.log"
-          cat "$ROOT/network-1.stderr.log" >&2
-          exit 0
-
-      - name: Reset broker and strict preflight replicate 2
+      - name: A/A semantic smoke for corrected harness
         shell: bash
         run: |
           set -euo pipefail
-          if [ -f "$ROOT/mosquitto.pid" ]; then kill "$(cat "$ROOT/mosquitto.pid")" 2>/dev/null || true; fi
-          sudo pkill -x mosquitto 2>/dev/null || true
-          sleep 1
-          for attempt in $(seq 1 24); do
-            if python base/benchmarks/runner_probe.py --output "$ROOT/preflight-2.json" --require-temperature --enforce; then
-              exit 0
-            fi
-            sleep 15
-          done
-          exit 1
-
-      - name: Start isolated broker replicate 2
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat > "$ROOT/mosquitto-2.conf" <<'MOSQ'
-          persistence false
-          allow_anonymous true
-          max_inflight_messages 1000
-          max_queued_messages 100000
-          max_queued_bytes 0
-          connection_messages false
-          log_type error
-          listener 11883 127.0.0.1
-          MOSQ
-          mosquitto -c "$ROOT/mosquitto-2.conf" > "$ROOT/mosquitto-2.log" 2>&1 &
-          echo $! > "$ROOT/mosquitto.pid"
-          for _ in $(seq 1 50); do
-            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
-            sleep .2
-          done
-          exit 1
-
-      - name: Network confirmation replicate 2
-        shell: bash
-        run: |
-          set +e
-          python base/benchmarks/paired_network.py \
-            --base-root base --candidate-root pr284 --host 127.0.0.1 --port 11883 \
-            --protocols 311 --completions receipt --payloads 64 --windows 20 \
-            --repeat 8 --count-small 1500 --cpu 1 \
-            --policy strict --preflight-report "$ROOT/preflight-2.json" \
-            --max-baseline-cv .05 --min-ack-ratio .97 \
-            --output "$ROOT/network-2.json" --summary-output "$ROOT/network-2.md" \
-            >"$ROOT/network-2.stdout.log" 2>"$ROOT/network-2.stderr.log"
-          rc=$?
-          echo "$rc" > "$ROOT/network-2.rc"
-          cat "$ROOT/network-2.stdout.log"
-          cat "$ROOT/network-2.stderr.log" >&2
-          exit 0
-
-      - name: Final strict eligibility and evaluation
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ -f "$ROOT/mosquitto.pid" ]; then kill "$(cat "$ROOT/mosquitto.pid")" 2>/dev/null || true; fi
-          sudo pkill -x mosquitto 2>/dev/null || true
-          sleep 1
-          for attempt in $(seq 1 24); do
-            if python base/benchmarks/runner_probe.py --output "$ROOT/preflight-final.json" --require-temperature --enforce; then
-              break
-            fi
-            if [ "$attempt" -eq 24 ]; then exit 1; fi
-            sleep 15
-          done
+          python benchmarks/paired_publish_admission_contention.py \
+            --base-root . --candidate-root . --host 127.0.0.1 --port 11883 \
+            --protocol 311 --qos 1 --payload-bytes 64 \
+            --publisher-values 1,4 --inflight-values 1,4 \
+            --warmup-count 40 --count 400 --repeat 2 --timeout 60 \
+            --policy advisory --max-baseline-cv 1.0 --max-aa-ratio-deviation 1.0 \
+            --output /tmp/pr285-benchmark-smoke.json
           python - <<'PY'
-          import json, os
-          from pathlib import Path
-          root = Path(os.environ['ROOT'])
-          lines = ['# PR284 network stability confirmation', '']
-          failures = []
-          for i in (1, 2):
-              rc = int((root / f'network-{i}.rc').read_text().strip())
-              data = json.loads((root / f'network-{i}.json').read_text())
-              s = data['scenarios'][0] if data.get('scenarios') else {}
-              lines += [
-                  f'## replicate {i}',
-                  f'- rc: {rc}',
-                  f'- status: {data.get("status")}',
-                  f'- ratio: {s.get("median_candidate_over_base_ack")}',
-                  f'- base_cv: {s.get("base_ack_cv")}',
-                  f'- candidate_cv: {s.get("candidate_ack_cv")}',
-                  f'- invalidations: {data.get("invalidations")}',
-                  f'- regressions: {data.get("regressions")}',
-                  '',
-              ]
-              if rc != 0 or data.get('invalidations') or data.get('regressions'):
-                  failures.append(f'replicate {i}')
-          (root / 'confirmation-summary.md').write_text('\n'.join(lines))
-          print('\n'.join(lines))
-          if failures:
-              raise SystemExit('failed confirmation: ' + ', '.join(failures))
+          import json
+          data = json.load(open('/tmp/pr285-benchmark-smoke.json'))
+          assert data['harness']['primary_rate'] == 'true_qos_completion'
+          pairs = [p for s in data['scenarios'] for p in s['pairs']]
+          assert pairs
+          for pair in pairs:
+              for variant in ('base', 'candidate'):
+                  row = pair[variant]
+                  assert row['admission_seconds'] > 0
+                  assert row['elapsed_seconds'] >= row['admission_seconds']
+                  assert row['admission_rate'] >= row['completed_rate']
+                  assert row['completed_rate'] > 0
+          print({'semantic_pairs_checked': len(pairs), 'status': data['status']})
           PY
 
-      - name: Upload confirmation evidence
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: pr284-network-confirm-${{ github.run_id }}
-          path: |
-            ${{ runner.temp }}/pr284-network-confirm/**/*.json
-            ${{ runner.temp }}/pr284-network-confirm/**/*.md
-            ${{ runner.temp }}/pr284-network-confirm/**/*.log
-            ${{ runner.temp }}/pr284-network-confirm/**/*.rc
-            ${{ runner.temp }}/pr284-network-confirm/*.conf
-          if-no-files-found: error
-          retention-days: 30
+      - name: Commit and push tested tree to PR285
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add benchmarks/paired_publish_admission_contention.py \
+            docs/reports/SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-19.md
+          git diff --cached --check
+          git commit -m "bench: distinguish admission from publish completion"
+          git push origin "HEAD:$TARGET_BRANCH"
