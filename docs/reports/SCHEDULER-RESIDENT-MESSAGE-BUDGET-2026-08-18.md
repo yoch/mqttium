@@ -9,7 +9,7 @@ Experiment:
 | Baseline | `main@e80618154bacefed5626d9eb9ba46edf560b54e7`; experiment definition `f4dab2191519250557a03bbe729abe1c59fc6395` |
 | Candidate | branch `agent/scheduler-resident-message-budget` |
 | Host | hosted/cloud agent VM — **not** an eligible release runner |
-| Verdict | correctness candidate implemented; **not mergeable** until eligible-runner A/A + A/B artefacts exist |
+| Verdict | diagnostic A/B ~1.000 vs writer-capacity; **not mergeable** until eligible-runner artefacts exist |
 
 ## Invariant
 
@@ -56,10 +56,19 @@ a legal saturation.
 
 ## Performance
 
-Not measured here. The experiment's acceptance gate still requires an eligible
-runner, A/A control on `benchmarks/paired_writer_capacity.py`, A/B for QoS 0
-and QoS 1, and the memory/open-loop advisories listed in the experiment doc.
-Numbers from this host are not merge-quality and were not collected.
+Diagnostic campaign on a 4-CPU KVM cloud VM, 2026-08-19. Preflight
+**unsuitable** (CPU governor unavailable). Advisory, repeat 4, `--cpu 1`,
+mosquitto 2.0.18. Not merge-quality.
+
+Writer-capacity A/A on `main` (MQTT 3.1.1, 256 B, inflight 20, outstanding 64):
+QoS 0 1.005 (CV 1.9%), QoS 1 0.988 (CV 1.5%). A/B vs this candidate: QoS 0
+**0.999** (275554 → 273481 /s), QoS 1 **1.000** (46523 → 46513 /s).
+
+Open-loop 311 / callback / 64 B / window 20: 2500/s completed 1.000 lag 1.002;
+7500/s completed 1.000 lag 0.997. ACK p50 unchanged at ~1.26 ms / ~0.28 ms.
+
+The 97% completed-rate floor and 5% lag ceiling are comfortably met on this
+host. Eligible-runner A/A + A/B is still required before merge.
 
 ## Complexity / risk
 

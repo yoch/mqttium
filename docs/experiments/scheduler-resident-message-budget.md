@@ -52,9 +52,9 @@ extraction does not reduce it. `queued_messages` remains `queue.qsize()`.
 against the resident count. Correctness tests are in
 `tests/unit/test_write_pump_resident.py`.
 
-Performance evidence is still pending an eligible-runner A/A + A/B
-(`benchmarks/paired_writer_capacity.py` and the rest of the contract above).
-This VM is not a release runner; hosted/cloud numbers are not merge-quality.
+Diagnostic A/B on an ineligible cloud VM (2026-08-19): writer-capacity QoS 0/1
+ratios 0.999 / 1.000; open-loop completed/lag ~1.00. Directional: no
+throughput or lag cost. Eligible-runner artefacts are still required to merge.
 
 Complexity/risk: the change is one integer plus two one-line helpers on paths
 that already mutate `queued_bytes`. The main risk is a leak if a new completion
