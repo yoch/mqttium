@@ -126,8 +126,7 @@ async def test_eager_write_is_declined_while_the_queue_is_not_empty() -> None:
     # No writer task: nothing drains the queue, so it stays non-empty.
     pump._write_nowait = transport.write_nowait
     try:
-        pump.queue.put_nowait(b"queued")
-        pump.queued_bytes = len(b"queued")
+        assert pump.try_enqueue(b"queued") is True
         assert pump.try_enqueue(b"later") is True
         assert transport.written == []
         assert pump.queued_messages == 2
@@ -433,8 +432,10 @@ async def test_writer_failure_drops_the_eager_binding() -> None:
     pump = WritePump(max_bytes=1 << 20, max_messages=100, on_failure=record)
     pump.start(transport)
 
-    pump.queue.put_nowait(b"boom")
-    pump.queued_bytes = 4
+    # Force the awaited writer path, but use the pump's admission API so all
+    # owned counters describe the frame the failing transport is about to see.
+    pump._eager_armed = False
+    assert pump.try_enqueue(b"boom") is True
     for _ in range(8):
         await asyncio.sleep(0)
 

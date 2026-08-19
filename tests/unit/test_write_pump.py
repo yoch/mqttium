@@ -49,6 +49,15 @@ def test_write_pump_rejects_stale_epoch() -> None:
         pump.try_enqueue(b"x", epoch=2)
 
 
+def test_write_pump_rejects_resident_accounting_underflow() -> None:
+    pump = WritePump(max_bytes=1024, max_messages=2, on_failure=_no_failure)
+
+    with pytest.raises(AssertionError, match="resident-message accounting mismatch"):
+        pump._release_resident()
+
+    assert pump.resident_messages == 0
+
+
 @pytest.mark.asyncio
 async def test_write_pump_preserves_batch_and_segment_order() -> None:
     transport = _RecordingTransport()

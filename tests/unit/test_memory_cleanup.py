@@ -118,9 +118,9 @@ async def test_force_close_discards_writer_queue_and_decoder_buffer() -> None:
     from mqttium.api import AsyncClient
 
     client = AsyncClient()
-    client._outbound.put_nowait(b"one")
-    client._outbound.put_nowait(b"two")
-    client._outbound_bytes = 6
+    assert client._try_enqueue_outbound(b"one") is True
+    assert client._try_enqueue_outbound(b"two") is True
+    assert client._outbound_bytes == 6
     client._decoder.feed(b"partial")
 
     await client._force_close()

@@ -64,7 +64,9 @@ the direct path cannot split a batch across the two paths.
 
 `WritePump` is the only component that writes to the transport. It owns its byte
 and message budgets, wake-up condition, batching, and writer task. Wire order is
-therefore the same as engine effect order.
+therefore the same as engine effect order. `max_outbound_messages` counts
+writer-resident admitted frames, including the writer's active batch, not only
+`queue.qsize()`. Eager writes do not consume that count.
 
 Large payloads may be written in segments, but only the writer controls the
 stream. Capacity is returned after the corresponding queued data is drained.

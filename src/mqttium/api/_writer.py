@@ -39,6 +39,9 @@ class WritePump:
         self.on_failure = on_failure
         self.queue: asyncio.Queue[WriteItem] = asyncio.Queue()
         self.queued_bytes = 0
+        # Admitted frames still owned by the pump: queued plus the writer's
+        # active batch. Eager writes never touch this; extraction neither.
+        self._resident_messages = 0
         self.high_water_messages = 0
         self.high_water_bytes = 0
         self.space = asyncio.Condition()
@@ -79,6 +82,22 @@ class WritePump:
     @property
     def queued_messages(self) -> int:
         return self.queue.qsize()
+
+    @property
+    def resident_messages(self) -> int:
+        """Admitted frames still owned by the pump, including an in-flight batch."""
+        return self._resident_messages
+
+    def _admit_queued(self, n: int = 1) -> None:
+        self._resident_messages += n
+
+    def _release_resident(self, n: int = 1) -> None:
+        if n < 0 or n > self._resident_messages:
+            raise AssertionError(
+                "writer resident-message accounting mismatch: "
+                f"resident={self._resident_messages}, release={n}"
+            )
+        self._resident_messages -= n
 
     def stats(self) -> WriterStats:
         """Snapshot the queue and the batching decisions taken so far."""
@@ -127,6 +146,7 @@ class WritePump:
         self._sample_high_water()
         self.queue = asyncio.Queue()
         self.queued_bytes = 0
+        self._resident_messages = 0
         # The next start() rebinds it. Until then there is no transport this
         # pump may write to.
         self._drop_eager_binding()
@@ -179,14 +199,17 @@ class WritePump:
         self._sample_high_water()
         self._drop_eager_binding()
         self._writing = False
+        remaining = 0
         while True:
             try:
                 self.queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
             else:
+                remaining += 1
                 self.queue.task_done()
         self.queued_bytes = 0
+        self._release_resident(remaining)
 
     def can_enqueue_size(
         self,
@@ -195,7 +218,10 @@ class WritePump:
         queued_messages: int | None = None,
         queued_bytes: int | None = None,
     ) -> bool:
-        messages = self.queue.qsize() if queued_messages is None else queued_messages
+        # queued_messages is the admission count (resident), including an
+        # in-flight writer batch. Callers that pass a running total (batch
+        # preflight) are counting the same thing.
+        messages = self._resident_messages if queued_messages is None else queued_messages
         bytes_used = self.queued_bytes if queued_bytes is None else queued_bytes
         if messages >= self.max_messages:
             return False
@@ -219,7 +245,7 @@ class WritePump:
         against running totals rather than against the live queue, so the two
         must be told the same state or this names the wrong bound.
         """
-        messages = self.queue.qsize() if queued_messages is None else queued_messages
+        messages = self._resident_messages if queued_messages is None else queued_messages
         bytes_used = self.queued_bytes if queued_bytes is None else queued_bytes
         if messages >= self.max_messages:
             return (
@@ -239,7 +265,7 @@ class WritePump:
         reported bound is the one that stopped the batch rather than whatever
         the live queue happens to show.
         """
-        messages = self.queue.qsize()
+        messages = self._resident_messages
         bytes_used = self.queued_bytes
         for item in items:
             size = item_size(item)
@@ -314,6 +340,7 @@ class WritePump:
             return True
         self.queue.put_nowait(item)
         self.queued_bytes += size
+        self._admit_queued()
         return True
 
     def _try_flush_latency_batch(self) -> bool:
@@ -365,6 +392,7 @@ class WritePump:
         for _ in items:
             self.queue.task_done()
         self.queued_bytes -= len(combined)
+        self._release_resident(queued)
         if self.queued_bytes != 0:
             raise AssertionError("writer queued-byte accounting mismatch after latency batch")
         self.batches += 1
@@ -388,7 +416,7 @@ class WritePump:
         if not items:
             return True
 
-        messages = self.queue.qsize()
+        messages = self._resident_messages
         bytes_used = self.queued_bytes
         for item in items:
             size = item_size(item)
@@ -404,6 +432,7 @@ class WritePump:
         for item in items:
             self.queue.put_nowait(item)
         self.queued_bytes = bytes_used
+        self._admit_queued(len(items))
         return True
 
     async def enqueue(
@@ -425,12 +454,15 @@ class WritePump:
             while True:
                 if epoch != self.epoch:
                     raise StaleConnectionEffect
-                messages_full = self.queue.qsize() >= self.max_messages
-                # Allow a single oversized item into an empty queue (segmented
-                # payloads can exceed max_bytes by the MQTT header).
-                bytes_blocked = self.queued_bytes + size > self.max_bytes and not (
-                    self.queued_bytes == 0 and self.queue.empty()
+                messages_full = self._resident_messages >= self.max_messages
+                # Allow a single oversized item into an empty writer (segmented
+                # payloads can exceed max_bytes by the MQTT header). Empty means
+                # no resident frames and no charged bytes, not merely qsize()==0
+                # while a batch is in flight.
+                empty = (
+                    self._resident_messages == 0 and self.queued_bytes == 0 and self.queue.empty()
                 )
+                bytes_blocked = self.queued_bytes + size > self.max_bytes and not empty
                 if not messages_full and not bytes_blocked:
                     break
                 # Escape hatch: if the writer is idle but space accounting is
@@ -454,6 +486,7 @@ class WritePump:
                 raise StaleConnectionEffect
             self.queue.put_nowait(item)
             self.queued_bytes += size
+            self._admit_queued()
 
     async def _write_contiguous(
         self,
@@ -522,18 +555,19 @@ class WritePump:
                 finally:
                     self._writing = False
                     released = 0
+                    n_batch = len(batch)
                     for data in batch:
                         released += item_size(data)
                         queue.task_done()
                     self.batched_bytes += released
                     async with self.space:
                         self.queued_bytes = max(0, self.queued_bytes - released)
+                        self._release_resident(n_batch)
                         if batch_completed and self.waiters and not writer_task.cancelling():
-                            # Only a successfully written batch releases usable
-                            # writer capacity. Cancellation/failure is lifecycle:
-                            # waking here can admit old-epoch writes onto a dead
-                            # writer before advance_epoch() broadcasts staleness.
-                            self.space.notify(min(self.waiters, len(batch)))
+                            # Resident accounting is released even on lifecycle
+                            # cancellation/failure, but only a successfully written
+                            # batch releases usable admission capacity.
+                            self.space.notify(min(self.waiters, n_batch))
         except asyncio.CancelledError:
             raise
         except Exception as exc:
