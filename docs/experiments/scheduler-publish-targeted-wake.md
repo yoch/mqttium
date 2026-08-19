@@ -42,11 +42,10 @@ and writer remain the only sources of admission truth: a woken producer always
 retries `queue_publish` / `queue_publish_many` under `_engine_lock`.
 
 Correctness coverage is in `tests/unit/test_publish_targeted_wake.py` (and the
-pre-existing `tests/unit/test_async_publish_admission.py`). The paired harness
-is `benchmarks/paired_publish_admission_contention.py`. The performance campaign
-and acceptance gate are **not** closed by this change: run the harness on an
-eligible host, with A/A before A/B, before treating targeted wake as mergeable.
-Weighted/FIFO admission state was not added.
+pre-existing `tests/unit/test_async_publish_admission.py`). Diagnostic A/A + A/B
+on an ineligible cloud VM (2026-08-19): +29% / +127% / +57% at 4×inf1, 16×inf1,
+16×inf4; single-publisher cells neutral; writer-capacity 1.003 / 1.006. Keep;
+confirm on an eligible runner. Weighted/FIFO admission state was not added.
 
 See [`docs/reports/SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-18.md`](../reports/SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-18.md).
 

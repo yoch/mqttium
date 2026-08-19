@@ -2,22 +2,33 @@
 
 Records candidate 1 of
 [`../experiments/scheduler-publish-targeted-wake.md`](../experiments/scheduler-publish-targeted-wake.md).
-This is an implementation and correctness note, not a performance verdict.
+This is an implementation note plus a diagnostic (ineligible-host) campaign.
 
 | | |
 | --- | --- |
 | Date | 2026-08-18 |
 | Tree | `/tmp/mqttium-publish-wake` against `docs/experiments/scheduler-publish-targeted-wake.md` baseline `main@e806181` |
 | Candidate | deque of waiter futures; one ACK wakes one producer |
-| Performance campaign | **not run** — harness only |
+| Performance campaign | diagnostic A/A + A/B on an ineligible cloud VM, 2026-08-19 |
 
 ## Verdict
 
-**Correctness candidate, not merge evidence.** The shared `asyncio.Event` is
-gone. Admission waiters are now individual futures in a deque, so a single
-PUBACK no longer makes every parked `publish()` runnable. Packet-id and flow
-limits stay authoritative. The acceptance gate in the experiment doc still
-requires paired artefacts on an eligible host.
+**Diagnostic keep; not merge evidence.** On an ineligible 4-CPU cloud VM
+(2026-08-19, advisory, repeat 4) the harness A/A was inside ~2% at every cell.
+A/B vs `main` (MQTT 3.1.1 QoS 1, 64 B):
+
+| Publishers | inflight | Rate | base/s | cand/s | CPU s |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 1 | 1.015 | 19030 | 19205 | 0.105 → 0.104 |
+| 1 | 4 | 0.994 | 26292 | 26192 | 0.075 → 0.076 |
+| 4 | 1 | **1.291** | 14898 | 19186 | 0.134 → 0.104 |
+| 4 | 4 | **1.069** | 22621 | 24174 | 0.088 → 0.083 |
+| 16 | 1 | **2.269** | 8529 | 19402 | 0.235 → 0.103 |
+| 16 | 4 | **1.574** | 15307 | 24176 | 0.131 → 0.083 |
+
+Four contention cells beat 5%. Low-contention cells stay within 3%. Writer-capacity
+guard 1.003 / 1.006. Publish-call p99 rises under contention (queueing vs
+stampede); completed rate and CPU are the target. Confirm on an eligible host.
 
 ## What changed
 
@@ -83,15 +94,9 @@ only under contention.
 and `--publisher-values` / `--inflight-values` for 64/256 or window 1/4/20.
 
 It records completed rate, process CPU, publish-call p50/p95/p99, wakeup/retry
-counters when present, and min/max per-producer completions. It does **not**
-close the experiment: no A/A, no eligible-host A/B, no 256-publisher campaign
-was run with this note.
+counters when present, and min/max per-producer completions.
 
 ## What is still open
 
-- Paired A/A then A/B on an eligible runner, including non-targeted guards
-  (`paired_open_loop.py`, `paired_network.py`, `paired_writer_capacity.py`).
-- Whether wakeup reduction meets the isolated-scheduler 2% clause if throughput
-  does not move 5% at two cells.
-- Whether incidental deque FIFO is enough fairness, or a later candidate needs
-  an explicit queue.
+- Eligible-runner A/A then A/B (this VM has no CPU governor).
+- Open-loop/network as non-targeted guards on that host.
