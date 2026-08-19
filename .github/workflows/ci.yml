@@ -21,7 +21,7 @@ env:
 jobs:
   isolate:
     runs-on: [self-hosted, linux, ARM64]
-    timeout-minutes: 120
+    timeout-minutes: 180
     steps:
       - name: Define evidence root
         shell: bash
@@ -230,12 +230,18 @@ jobs:
           sudo systemctl stop mosquitto 2>/dev/null || true
           sudo pkill -x mosquitto 2>/dev/null || true
           sleep 1
-          for attempt in $(seq 1 24); do
-            if python base/benchmarks/runner_probe.py --output "$ROOT/preflight.json" --require-temperature --enforce; then
+          for attempt in $(seq 1 60); do
+            probe="$ROOT/preflight-attempt-$attempt.json"
+            if python base/benchmarks/runner_probe.py --output "$probe" --require-temperature --enforce; then
+              cp "$probe" "$ROOT/preflight.json"
+              echo "strict eligibility reached on attempt $attempt"
               exit 0
             fi
+            echo "strict preflight attempt $attempt/60 failed; cooling"
             sleep 15
           done
+          echo "strict eligibility not reached; last probe follows" >&2
+          cat "$ROOT/preflight-attempt-60.json" >&2 || true
           exit 1
 
       - name: Start isolated broker
@@ -318,12 +324,15 @@ jobs:
           kill "$(cat "$ROOT/mosquitto.pid")" 2>/dev/null || true
           sudo pkill -x mosquitto 2>/dev/null || true
           sleep 1
-          for attempt in $(seq 1 24); do
-            if python base/benchmarks/runner_probe.py --output "$ROOT/preflight-final.json" --require-temperature --enforce; then
+          for attempt in $(seq 1 60); do
+            probe="$ROOT/preflight-final-attempt-$attempt.json"
+            if python base/benchmarks/runner_probe.py --output "$probe" --require-temperature --enforce; then
+              cp "$probe" "$ROOT/preflight-final.json"
               exit 0
             fi
             sleep 15
           done
+          cat "$ROOT/preflight-final-attempt-60.json" >&2 || true
           exit 1
 
       - name: Upload isolation evidence
