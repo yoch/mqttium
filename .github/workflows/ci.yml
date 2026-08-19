@@ -1,195 +1,55 @@
-name: TEMP patch PR285 benchmark completion semantics
+name: TEMP cleanup scheduler experiment branches
 
 on:
   pull_request:
+    types: [opened, reopened, synchronize]
 
 permissions:
   contents: write
-
-concurrency:
-  group: temp-pr285-benchmark-fix
-  cancel-in-progress: true
+  pull-requests: write
 
 jobs:
-  patch:
+  cleanup:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    env:
-      TARGET_SHA: 505c385c59670b2fb095728b5095f5039c53d675
-      TARGET_BRANCH: agent/scheduler-publish-targeted-wake
-      PYTHONUNBUFFERED: "1"
+    timeout-minutes: 10
     steps:
-      - name: Checkout exact PR285 branch
-        uses: actions/checkout@v7
+      - uses: actions/checkout@v7
         with:
-          ref: ${{ env.TARGET_BRANCH }}
-          fetch-depth: 0
-      - name: Verify exact target head
+          fetch-depth: 1
+      - name: Delete temporary branches except current
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$TARGET_SHA"
-
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.13"
-
-      - name: Patch benchmark semantics and historical note
-        shell: bash
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-
-          def replace_once(path: str, old: str, new: str) -> None:
-              p = Path(path)
-              text = p.read_text()
-              count = text.count(old)
-              if count != 1:
-                  raise SystemExit(f"expected one match in {path}, got {count}: {old!r}")
-              p.write_text(text.replace(old, new))
-
-          bench = "benchmarks/paired_publish_admission_contention.py"
-          replace_once(
-              bench,
-              "worker processes in alternating order.\n\nHosted runners are diagnostic only;",
-              "worker processes in alternating order. The primary throughput metric is true\n"
-              "QoS completion; publish-call admission-return rate is retained as a diagnostic.\n\n"
-              "Hosted runners are diagnostic only;",
+          branches=(
+            bench/tmp-final-arm64-284-285-20260819
+            bench/tmp-final-arm64-284-285-run2-20260819
+            bench/tmp-final-arm64-284-285-run3-20260819
+            bench/tmp-quantum-screen-286-20260819
+            bench/tmp-scheduler-284-286-20260819
+            bench/tmp-wake-fairness-run-20260819
+            bench/tmp-wake-frontier-284-285-20260819
+            bench/tmp-wake-screening-run-20260819
+            bench/tmp-wake-screening-v2-run-20260819
+            bench/tmp-wake-screening-v3-run-20260819
+            bench/tmp-wake-screening-v4-run-20260819
+            bench/tmp-wake-spare1-screen-run-20260819
           )
-          replace_once(
-              bench,
-              "    count: int\n    elapsed_seconds: float\n    completed_rate: float\n    cpu_seconds: float\n",
-              "    count: int\n    admission_seconds: float\n    admission_rate: float\n"
-              "    elapsed_seconds: float\n    completed_rate: float\n    cpu_seconds: float\n",
-          )
-          replace_once(
-              bench,
-              "    elapsed = time.perf_counter() - started\n"
-              "    cpu_seconds = time.process_time() - cpu_started\n\n"
-              "    write_pump = getattr(client, \"_write_pump\", None)\n",
-              "    admission_elapsed = time.perf_counter() - started\n\n"
-              "    write_pump = getattr(client, \"_write_pump\", None)\n",
-          )
-          replace_once(
-              bench,
-              "        await asyncio.sleep(0)\n\n    return AdmissionResult(\n",
-              "        await asyncio.sleep(0)\n\n"
-              "    elapsed = time.perf_counter() - started\n"
-              "    cpu_seconds = time.process_time() - cpu_started\n\n"
-              "    return AdmissionResult(\n",
-          )
-          replace_once(
-              bench,
-              "        count=count,\n"
-              "        elapsed_seconds=elapsed,\n"
-              "        completed_rate=count / max(elapsed, 1e-9),\n",
-              "        count=count,\n"
-              "        admission_seconds=admission_elapsed,\n"
-              "        admission_rate=count / max(admission_elapsed, 1e-9),\n"
-              "        elapsed_seconds=elapsed,\n"
-              "        completed_rate=count / max(elapsed, 1e-9),\n",
-          )
-          replace_once(
-              bench,
-              "            \"mode\": \"native_async_publish_admission\",\n"
-              "            \"protocol\": args.protocol,\n",
-              "            \"mode\": \"native_async_publish_admission\",\n"
-              "            \"primary_rate\": \"true_qos_completion\",\n"
-              "            \"admission_rate\": \"publish_call_return\",\n"
-              "            \"latency_metric\": \"publish_call_admission\",\n"
-              "            \"protocol\": args.protocol,\n",
-          )
-
-          report = "docs/reports/SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-19.md"
-          replace_once(
-              report,
-              "[`SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-18.md`](SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-18.md).\n\n| | |\n",
-              "[`SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-18.md`](SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-18.md).\n\n"
-              "> **Measurement correction.** The historical contention numbers in this report\n"
-              "> timed the return from `publish()` and therefore measured **admission-return\n"
-              "> rate**, not QoS completion. The benchmark now records both admission and true\n"
-              "> completion and uses true completion as the primary throughput gate. Final\n"
-              "> eligible ARM64 evidence is recorded in the PR discussion; the historical\n"
-              "> table below is retained for traceability.\n\n"
-              "| | |\n",
-          )
-          PY
-          python -m py_compile benchmarks/paired_publish_admission_contention.py
-          git diff --check
-          git diff -- benchmarks/paired_publish_admission_contention.py docs/reports/SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-19.md
-
-      - name: Install project dependencies
-        run: python -m pip install -e ".[dev]"
-      - name: Static and focused correctness checks
-        shell: bash
-        run: |
-          set -euo pipefail
-          ruff format --check benchmarks/paired_publish_admission_contention.py
-          ruff check benchmarks/paired_publish_admission_contention.py
-          python -m pytest -q tests/unit/test_publish_targeted_wake.py tests/unit/test_async_publish_admission.py
-
-      - name: Install and start isolated Mosquitto
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq mosquitto
-          sudo systemctl stop mosquitto 2>/dev/null || true
-          sudo pkill -x mosquitto 2>/dev/null || true
-          cat >/tmp/mosq-pr285-bench-fix.conf <<'MOSQ'
-          persistence false
-          allow_anonymous true
-          max_inflight_messages 1000
-          max_queued_messages 100000
-          connection_messages false
-          log_type error
-          listener 11883 127.0.0.1
-          MOSQ
-          mosquitto -c /tmp/mosq-pr285-bench-fix.conf >/tmp/mosq-pr285-bench-fix.log 2>&1 &
-          echo $! >/tmp/mosq-pr285-bench-fix.pid
-          for _ in $(seq 1 50); do
-            (echo >/dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
-            sleep .1
+          for branch in "${branches[@]}"; do
+            if git ls-remote --exit-code --heads origin "refs/heads/$branch" >/dev/null 2>&1; then
+              echo "Deleting $branch"
+              git push origin --delete "$branch"
+            else
+              echo "Already absent: $branch"
+            fi
           done
-          cat /tmp/mosq-pr285-bench-fix.log
-          exit 1
-
-      - name: A/A semantic smoke for corrected harness
+      - name: Close cleanup PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: gh api --method PATCH "repos/${GITHUB_REPOSITORY}/pulls/${{ github.event.pull_request.number }}" -f state=closed >/dev/null
+      - name: Delete own temporary branch last
         shell: bash
         run: |
           set -euo pipefail
-          python benchmarks/paired_publish_admission_contention.py \
-            --base-root . --candidate-root . --host 127.0.0.1 --port 11883 \
-            --protocol 311 --qos 1 --payload-bytes 64 \
-            --publisher-values 1,4 --inflight-values 1,4 \
-            --warmup-count 40 --count 400 --repeat 2 --timeout 60 \
-            --policy advisory --max-baseline-cv 1.0 --max-aa-ratio-deviation 1.0 \
-            --output /tmp/pr285-benchmark-smoke.json
-          python - <<'PY'
-          import json
-          data = json.load(open('/tmp/pr285-benchmark-smoke.json'))
-          assert data['harness']['primary_rate'] == 'true_qos_completion'
-          pairs = [p for s in data['scenarios'] for p in s['pairs']]
-          assert pairs
-          for pair in pairs:
-              for variant in ('base', 'candidate'):
-                  row = pair[variant]
-                  assert row['admission_seconds'] > 0
-                  assert row['elapsed_seconds'] >= row['admission_seconds']
-                  assert row['admission_rate'] >= row['completed_rate']
-                  assert row['completed_rate'] > 0
-          print({'semantic_pairs_checked': len(pairs), 'status': data['status']})
-          PY
-
-      - name: Commit and push tested tree to PR285
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$TARGET_SHA"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add benchmarks/paired_publish_admission_contention.py \
-            docs/reports/SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-19.md
-          git diff --cached --check
-          git commit -m "bench: distinguish admission from publish completion"
-          git push origin "HEAD:$TARGET_BRANCH"
+          test "$GITHUB_HEAD_REF" = "bench/tmp-final-arm64-284-285-run4-20260819"
+          git push origin --delete "$GITHUB_HEAD_REF"
