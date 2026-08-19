@@ -17,6 +17,7 @@ This is primarily an invariant/memory-bound improvement, not a throughput optimi
 - `resident_messages <= max_messages` throughout an active 256-item writer batch.
 - Atomic `try_enqueue_many()` admission against the resident count.
 - Exact decrement on normal write completion, latency microflush, discard/reset, cancellation/failure cleanup, and epoch transitions.
+- A resident over-release must fail as an invariant violation rather than be silently clamped.
 - Existing oversized-single-item semantics remain unchanged.
 - Existing writer statistics remain well defined; if `queued_messages` keeps its current meaning, expose no misleading renamed metric.
 
@@ -35,6 +36,7 @@ Because the target benefit is a stricter invariant rather than raw speed:
 
 - zero public semantic regression;
 - strict resident count demonstrated;
+- impossible resident accounting states fail locally instead of being normalized;
 - candidate completed rate >= 97% of baseline on non-targeted writer cells;
 - loop lag increase <= 5%;
 - memory limits unchanged or improved;
@@ -49,18 +51,31 @@ incremented only after an item is actually queued and decremented only when
 the item has completed or is discarded. Eager writes do not consume it; batch
 extraction does not reduce it. `queued_messages` remains `queue.qsize()`.
 `can_enqueue_size` / `enqueue` / `try_enqueue_many` / nowait preflight admit
-against the resident count. Correctness tests are in
-`tests/unit/test_write_pump_resident.py`.
+against the resident count.
 
-Diagnostic A/B on an ineligible cloud VM (2026-08-19): writer-capacity QoS 0/1
-ratios 0.999 / 1.000; open-loop completed/lag ~1.00. Directional: no
-throughput or lag cost. Eligible-runner artefacts are still required to merge.
+Accounting hardening on 2026-08-19 removed the original saturating release:
+`_release_resident` now raises `AssertionError` if code attempts to release
+more frames than the pump owns. CI exposed test fixtures that had bypassed the
+owner by mutating `queue` / `_outbound` directly; those fixtures now seed work
+through `try_enqueue` / `_try_enqueue_outbound`, preserving the runtime
+invariant while testing the same failure/cleanup behavior. The connection
+lifecycle already invalidates/stops the old writer before reset of a new epoch,
+so cross-epoch underflow is not a legitimate state to normalize.
 
-Complexity/risk: the change is one integer plus two one-line helpers on paths
+Correctness coverage is in `tests/unit/test_write_pump_resident.py`, the core
+writer tests, eager/failure tests, and memory-cleanup lifecycle tests.
+
+Diagnostic A/B on an ineligible cloud VM (2026-08-19), measured before the
+release-assertion hardening: writer-capacity QoS 0/1 ratios 0.999 / 1.000;
+open-loop completed/lag ~1.00. Directional: no throughput or lag cost. The
+current hardened HEAD still requires eligible-runner A/A+A/B before merge.
+
+Complexity/risk: the change remains one integer plus small helpers on paths
 that already mutate `queued_bytes`. The main risk is a leak if a new completion
-path forgets `_release_resident`; `reset`/`discard` and `_run`'s existing
-`finally` cover epoch transitions and mid-batch cancel. No extra scheduler
-machinery. Do not merge until the eligible-runner artefacts exist.
+path forgets `_release_resident`; an over-release is now detected rather than
+hidden. `reset`/`discard` and `_run`'s existing `finally` cover epoch transitions,
+mid-batch cancel, and transport failure. No extra scheduler machinery. Do not
+merge until the eligible-runner artefacts exist.
 
 Published report:
 [`docs/reports/SCHEDULER-RESIDENT-MESSAGE-BUDGET-2026-08-19.md`](../reports/SCHEDULER-RESIDENT-MESSAGE-BUDGET-2026-08-19.md).
