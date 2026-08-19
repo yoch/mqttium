@@ -117,6 +117,13 @@ jobs:
           echo "$RUNNER_TEMP/wake-frontier-venv/bin" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/wake-frontier-venv/bin/python" -m pip install -e "pr284[dev]" "psutil>=6,<8"
 
+      - name: Candidate correctness before policy experiment
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH=pr284/src python -m pytest -q pr284/tests/unit/test_write_pump_targeted_wake.py
+          PYTHONPATH=pr285/src python -m pytest -q pr285/tests/unit/test_publish_targeted_wake.py pr285/tests/unit/test_async_publish_admission.py
+
       - name: Strict eligible-runner preflight
         shell: bash
         run: |
@@ -154,13 +161,6 @@ jobs:
           cat "$ROOT/mosquitto.log"
           exit 1
 
-      - name: PR284 correctness on variants
-        shell: bash
-        run: |
-          set -euo pipefail
-          PYTHONPATH=pr284-spare1/src python -m pytest -q pr284/tests/unit/test_write_pump_targeted_wake.py
-          PYTHONPATH=pr284-spare3/src python -m pytest -q pr284/tests/unit/test_write_pump_targeted_wake.py
-
       - name: PR284 current vs spare1 homogeneous frontier
         shell: bash
         run: |
@@ -189,14 +189,7 @@ jobs:
             --count 12000 --max-messages 8 --max-bytes 16384 --small-bytes 64 --large-bytes 4096 \
             --cpu 1 --output "$ROOT/pr284/hetero-spare1.json"
 
-      - name: PR285 correctness on variants
-        shell: bash
-        run: |
-          set -euo pipefail
-          PYTHONPATH=pr285-spare1/src python -m pytest -q pr285/tests/unit/test_publish_targeted_wake.py pr285/tests/unit/test_async_publish_admission.py
-          PYTHONPATH=pr285-spare3/src python -m pytest -q pr285/tests/unit/test_publish_targeted_wake.py pr285/tests/unit/test_async_publish_admission.py
-
-      - name: Refresh strict preflight
+      - name: Refresh strict preflight before network campaign
         shell: bash
         run: |
           set -euo pipefail
@@ -243,16 +236,12 @@ jobs:
               p = root / rel
               out.append(f"## {rel}")
               if not p.exists():
-                  out.append("missing")
-                  out.append("")
+                  out += ["missing", ""]
                   continue
               data = json.loads(p.read_text())
               rows = data.get("scenarios", data.get("rows", []))
               for row in rows:
-                  keys = [
-                      k for k in row
-                      if k.endswith("_ratio") or k in {"producers", "publishers", "inflight"}
-                  ]
+                  keys = [k for k in row if k.endswith("_ratio") or k in {"producers", "publishers", "inflight"}]
                   out.append("- " + ", ".join(f"{k}={row[k]}" for k in keys))
               out.append("")
           (root / "summary.md").write_text("\n".join(out))
