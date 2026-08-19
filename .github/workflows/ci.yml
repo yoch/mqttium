@@ -1,4 +1,4 @@
-name: TEMP combined hosted validation 283-285
+name: TEMP combined ARM64 validation 283-285
 
 on:
   pull_request:
@@ -16,20 +16,34 @@ env:
   PR284_SHA: 440c45487ce4ab7212581d49b8073416c899a82b
   PR285_SHA: fbd11e1f71c623919c5029ec512dfb0e05f85307
   PYTHONUNBUFFERED: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
 jobs:
-  hosted:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 35
+  arm64:
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 180
     steps:
-      - uses: actions/checkout@v7
+      - name: Define evidence root
+        shell: bash
+        run: echo "ROOT=$RUNNER_TEMP/combined-283-285" >> "$GITHUB_ENV"
+
+      - name: Checkout immutable base
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.BASE_SHA }}
+          fetch-depth: 0
+          path: base
+          persist-credentials: false
+
+      - name: Checkout immutable base into stack workspace
+        uses: actions/checkout@v7
         with:
           ref: ${{ env.BASE_SHA }}
           fetch-depth: 0
           path: stack
           persist-credentials: false
 
-      - name: Compose exact accepted heads with audited conflict resolution
+      - name: Compose exact accepted heads with audited writer resolution
         shell: bash
         working-directory: stack
         run: |
@@ -57,12 +71,10 @@ jobs:
               insert_at -= 1
           lines[insert_at:insert_at] = incoming
           Path(path).write_text('\n'.join(lines) + '\n')
-          print('unioned report rows:', *incoming, sep='\n')
           PY
           }
 
           test "$(git rev-parse HEAD)" = "$BASE_SHA"
-
           git fetch --no-tags origin "$PR283_SHA"
           git merge --no-ff --no-edit "$PR283_SHA"
 
@@ -73,27 +85,22 @@ jobs:
           set -e
           test "$rc" -ne 0
           mapfile -t conflicts < <(git diff --name-only --diff-filter=U | sort)
-          printf 'PR284 conflicts: %s\n' "${conflicts[*]}"
           test "${#conflicts[@]}" -eq 2
           test "${conflicts[0]}" = "docs/reports/README.md"
           test "${conflicts[1]}" = "src/mqttium/api/_writer.py"
-
           union_report_index
 
           git checkout --ours src/mqttium/api/_writer.py
           python - <<'PY'
           from pathlib import Path
-
           path = Path('src/mqttium/api/_writer.py')
           text = path.read_text()
-
           def replace_once(old: str, new: str) -> None:
               global text
               count = text.count(old)
               if count != 1:
                   raise SystemExit(f'writer resolution expected one match, got {count}: {old!r}')
               text = text.replace(old, new)
-
           replace_once(
               '                self.enqueue_suspensions += 1\n'
               '                try:\n'
@@ -156,7 +163,6 @@ jobs:
           )
           path.write_text(text)
           PY
-
           git add docs/reports/README.md src/mqttium/api/_writer.py
           git diff --check
           git commit --no-edit
@@ -168,7 +174,6 @@ jobs:
           set -e
           if [ "$rc" -ne 0 ]; then
             mapfile -t conflicts < <(git diff --name-only --diff-filter=U)
-            printf 'PR285 conflicts: %s\n' "${conflicts[*]}"
             test "${#conflicts[@]}" -eq 1
             test "${conflicts[0]}" = "docs/reports/README.md"
             union_report_index
@@ -176,27 +181,197 @@ jobs:
             git diff --check
             git commit --no-edit
           fi
-
           test -z "$(git diff --name-only --diff-filter=U)"
           git diff --check "$BASE_SHA"..HEAD
-          echo "combined head: $(git rev-parse HEAD)"
-          git log --oneline --decorate -12
+          git rev-parse HEAD | tee /tmp/combined-head.txt
 
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.13"
-
-      - name: Install combined tree
-        working-directory: stack
-        run: python -m pip install -e ".[dev,security]"
-
-      - name: Full quality and unit suite
-        working-directory: stack
+      - name: Verify ARM64 runtime and clean broker state
         shell: bash
         run: |
           set -euo pipefail
-          ruff format --check src tests benchmarks
-          ruff check src tests benchmarks
-          mypy src/mqttium
-          bandit -q -ll -r src
-          python -m pytest -q tests/unit --cov=mqttium --cov-report=term-missing --cov-fail-under=80
+          test "$(uname -m)" = aarch64
+          python3 - <<'PY'
+          import sys
+          if sys.version_info[:2] != (3, 13):
+              raise SystemExit(f'expected Python 3.13, got {sys.version}')
+          PY
+          mkdir -p "$ROOT"
+          sudo systemctl stop mosquitto 2>/dev/null || true
+          sudo pkill -x mosquitto 2>/dev/null || true
+          sleep 1
+          ! pgrep -a mosquitto
+
+      - name: Prepare combined Python environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/combined-283-285-venv"
+          python3 -m venv "$RUNNER_TEMP/combined-283-285-venv"
+          echo "$RUNNER_TEMP/combined-283-285-venv/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/combined-283-285-venv/bin/python" -m pip install -e "stack[dev]" "psutil>=6,<8"
+
+      - name: Strict initial preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 24); do
+            if python base/benchmarks/runner_probe.py --output "$ROOT/preflight-initial.json" --require-temperature --enforce; then
+              exit 0
+            fi
+            sleep 15
+          done
+          exit 1
+
+      - name: Combined focused correctness
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH=stack/src python -m pytest -q \
+            stack/tests/unit/test_write_pump_resident.py \
+            stack/tests/unit/test_write_pump_targeted_wake.py \
+            stack/tests/unit/test_write_pump.py \
+            stack/tests/unit/test_write_pump_eager.py \
+            stack/tests/unit/test_publish_targeted_wake.py \
+            stack/tests/unit/test_async_publish_admission.py
+
+      - name: Writer targeted-wake combined A/B
+        shell: bash
+        run: |
+          python stack/benchmarks/paired_writer_waiter_contention.py \
+            --base-root base --candidate-root stack \
+            --producer-values 1,4,64,256 --max-messages 8 --payload-bytes 64 \
+            --warmup-count 2000 --count 16000 --repeat 8 --cpu 1 \
+            --policy strict --preflight-report "$ROOT/preflight-initial.json" \
+            --max-baseline-cv .05 --min-completed-ratio .97 \
+            --output "$ROOT/writer-target.json" \
+            --summary-output "$ROOT/writer-target.md"
+
+      - name: Start isolated Mosquitto
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$ROOT/mosquitto.conf" <<'MOSQ'
+          persistence false
+          allow_anonymous true
+          max_inflight_messages 1000
+          max_queued_messages 100000
+          max_queued_bytes 0
+          connection_messages false
+          log_type error
+          listener 11883 127.0.0.1
+          MOSQ
+          mosquitto -c "$ROOT/mosquitto.conf" > "$ROOT/mosquitto.log" 2>&1 &
+          echo $! > "$ROOT/mosquitto.pid"
+          for _ in $(seq 1 50); do
+            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            sleep .2
+          done
+          cat "$ROOT/mosquitto.log"
+          exit 1
+
+      - name: Corrected publish true-completion A/A
+        shell: bash
+        run: |
+          python stack/benchmarks/paired_publish_admission_contention.py \
+            --base-root base --candidate-root base --host 127.0.0.1 --port 11883 \
+            --protocol 311 --qos 1 --payload-bytes 64 \
+            --publisher-values 16,32,64 --inflight-values 1,4 \
+            --warmup-count 200 --count 4000 --repeat 6 --timeout 120 --cpu 1 \
+            --policy strict --preflight-report "$ROOT/preflight-initial.json" \
+            --max-baseline-cv .05 --max-aa-ratio-deviation .02 \
+            --output "$ROOT/publish-aa.json" \
+            --summary-output "$ROOT/publish-aa.md"
+
+      - name: Combined publish true-completion A/B
+        shell: bash
+        run: |
+          python stack/benchmarks/paired_publish_admission_contention.py \
+            --base-root base --candidate-root stack --host 127.0.0.1 --port 11883 \
+            --protocol 311 --qos 1 --payload-bytes 64 \
+            --publisher-values 16,32,64 --inflight-values 1,4 \
+            --warmup-count 200 --count 4000 --repeat 6 --timeout 120 --cpu 1 \
+            --policy strict --preflight-report "$ROOT/preflight-initial.json" \
+            --max-baseline-cv .05 --min-completed-ratio .97 \
+            --output "$ROOT/publish-ab.json" \
+            --summary-output "$ROOT/publish-ab.md"
+
+      - name: Refresh strict preflight before non-targeted guards
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 24); do
+            if python base/benchmarks/runner_probe.py --output "$ROOT/preflight-guards.json" --require-temperature --enforce; then
+              exit 0
+            fi
+            sleep 15
+          done
+          exit 1
+
+      - name: Combined writer-capacity guard
+        shell: bash
+        run: |
+          python base/benchmarks/paired_writer_capacity.py \
+            --base-root base --candidate-root stack --host 127.0.0.1 --port 11883 \
+            --protocol 311 --qos-values 0,1 --payload-bytes 64 \
+            --inflight 20 --outstanding 20 --max-queued 200 \
+            --warmup-count 5000 --count-qos0 100000 --count-qos1 40000 \
+            --repeat 6 --cpu 1 --policy strict \
+            --preflight-report "$ROOT/preflight-guards.json" \
+            --max-baseline-cv .05 --min-completed-ratio .97 \
+            --output "$ROOT/writer-capacity.json" \
+            --summary-output "$ROOT/writer-capacity.md"
+
+      - name: Combined stable open-loop guard
+        shell: bash
+        run: |
+          python base/benchmarks/paired_open_loop.py \
+            --base-root base --candidate-root stack \
+            --protocols 311 --payloads 64 --completions callback --windows 20 \
+            --target-rates 5000,7500 --count-small 5000 --repeat 6 --cpu 1 \
+            --policy strict --preflight-report "$ROOT/preflight-guards.json" \
+            --max-baseline-cv .05 --min-completed-ratio .97 --max-loop-lag-ratio 1.05 \
+            --output "$ROOT/open-loop.json" \
+            --summary-output "$ROOT/open-loop.md"
+
+      - name: Combined network guard
+        shell: bash
+        run: |
+          python base/benchmarks/paired_network.py \
+            --base-root base --candidate-root stack --host 127.0.0.1 --port 11883 \
+            --protocols 311 --completions receipt --payloads 64,4096 --windows 20,64 \
+            --repeat 6 --count-small 1500 --count-large 750 --cpu 1 \
+            --policy strict --preflight-report "$ROOT/preflight-guards.json" \
+            --max-baseline-cv .05 --min-ack-ratio .97 \
+            --output "$ROOT/network.json" \
+            --summary-output "$ROOT/network.md"
+
+      - name: Final strict eligibility check
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f "$ROOT/mosquitto.pid" ]; then
+            kill "$(cat "$ROOT/mosquitto.pid")" 2>/dev/null || true
+          fi
+          sudo pkill -x mosquitto 2>/dev/null || true
+          sleep 1
+          for attempt in $(seq 1 24); do
+            if python base/benchmarks/runner_probe.py --output "$ROOT/preflight-final.json" --require-temperature --enforce; then
+              exit 0
+            fi
+            sleep 15
+          done
+          exit 1
+
+      - name: Upload combined evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: combined-283-285-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/combined-283-285/**/*.json
+            ${{ runner.temp }}/combined-283-285/**/*.md
+            ${{ runner.temp }}/combined-283-285/**/*.log
+            ${{ runner.temp }}/combined-283-285/*.conf
+            /tmp/combined-head.txt
+          if-no-files-found: warn
+          retention-days: 30
