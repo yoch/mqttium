@@ -1,0 +1,235 @@
+name: TEMP PR284-285 ARM64 wake campaign
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: temp-pr284-285-arm64-campaign
+  cancel-in-progress: true
+
+jobs:
+  campaign:
+    runs-on: [self-hosted, linux, ARM64, rpi5]
+    timeout-minutes: 180
+    env:
+      BASE_SHA: e80618154bacefed5626d9eb9ba46edf560b54e7
+      PR284_SHA: 8d37248831b372004074acfa0018f34da51b54df
+      PR285_SHA: 505c385c59670b2fb095728b5095f5039c53d675
+      SUPPORT_REF: bench/tmp-scheduler-284-286-20260819
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    steps:
+      - name: Define runtime path
+        shell: bash
+        run: echo "ROOT=$RUNNER_TEMP/wake-frontier" >> "$GITHUB_ENV"
+
+      - name: Checkout baseline
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.BASE_SHA }}
+          path: base
+          persist-credentials: false
+      - name: Checkout PR284
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.PR284_SHA }}
+          path: pr284
+          persist-credentials: false
+      - name: Checkout PR285
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.PR285_SHA }}
+          path: pr285
+          persist-credentials: false
+      - name: Checkout benchmark support
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.SUPPORT_REF }}
+          path: support
+          persist-credentials: false
+
+      - name: Verify immutable inputs and runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C base rev-parse HEAD)" = "$BASE_SHA"
+          test "$(git -C pr284 rev-parse HEAD)" = "$PR284_SHA"
+          test "$(git -C pr285 rev-parse HEAD)" = "$PR285_SHA"
+          test "$(uname -m)" = aarch64
+          python3 - <<'PY'
+          import sys
+          assert sys.version_info[:2] == (3, 13), sys.version
+          PY
+          command -v mosquitto
+          if pgrep -a mosquitto; then
+            echo "pre-existing Mosquitto contaminates evidence" >&2
+            exit 1
+          fi
+
+      - name: Create runtime-only spare-wake variants
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp -a pr284 pr284-spare1
+          cp -a pr284 pr284-spare3
+          cp -a pr285 pr285-spare1
+          cp -a pr285 pr285-spare3
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace(path, old, new):
+              p = Path(path)
+              text = p.read_text()
+              assert text.count(old) == 1, (path, old)
+              p.write_text(text.replace(old, new))
+
+          for root, spare in (("pr284-spare1", 1), ("pr284-spare3", 3)):
+              replace(
+                  f"{root}/src/mqttium/api/_writer.py",
+                  "self.space.notify(min(self.waiters, len(batch)))",
+                  f"self.space.notify(min(self.waiters, len(batch) + {spare}))",
+              )
+          for root, spare in (("pr285-spare1", 1), ("pr285-spare3", 3)):
+              replace(
+                  f"{root}/src/mqttium/api/async_client.py",
+                  "self._wake_publish_waiters(1)\n\n    def _register_publish_waiter",
+                  f"self._wake_publish_waiters(1 + {spare})\n\n    def _register_publish_waiter",
+              )
+          PY
+          python3 -m compileall -q pr284-spare1/src pr284-spare3/src pr285-spare1/src pr285-spare3/src
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/wake-frontier-venv"
+          python3 -m venv "$RUNNER_TEMP/wake-frontier-venv"
+          echo "$RUNNER_TEMP/wake-frontier-venv/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/wake-frontier-venv/bin/python" -m pip install -e "pr284[dev]" "psutil>=6,<8"
+
+      - name: Exact candidate policy tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH=pr284/src python -m pytest -q pr284/tests/unit/test_write_pump_targeted_wake.py
+          PYTHONPATH=pr285/src python -m pytest -q pr285/tests/unit/test_publish_targeted_wake.py pr285/tests/unit/test_async_publish_admission.py
+
+      - name: Strict eligible preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$ROOT/pr284" "$ROOT/pr285"
+          for attempt in $(seq 1 24); do
+            if python base/benchmarks/runner_probe.py --output "$ROOT/preflight.json" --require-temperature --enforce; then
+              exit 0
+            fi
+            sleep 15
+          done
+          exit 1
+
+      - name: Start isolated Mosquitto
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$ROOT/mosquitto.conf" <<'MOSQ'
+          persistence false
+          allow_anonymous true
+          max_inflight_messages 1000
+          max_queued_messages 100000
+          max_queued_bytes 0
+          connection_messages false
+          log_type error
+          listener 11883 127.0.0.1
+          MOSQ
+          mosquitto -c "$ROOT/mosquitto.conf" > "$ROOT/mosquitto.log" 2>&1 &
+          echo $! > "$ROOT/mosquitto.pid"
+          for _ in $(seq 1 50); do
+            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            sleep .2
+          done
+          exit 1
+
+      - name: PR284 current vs spare1 homogeneous
+        shell: bash
+        run: |
+          python pr284/benchmarks/paired_writer_waiter_contention.py \
+            --base-root pr284 --candidate-root pr284-spare1 \
+            --producer-values 12,16,20,32,64 --max-messages 1 --payload-bytes 64 \
+            --warmup-count 600 --count 8000 --repeat 6 --cpu 1 \
+            --policy strict --preflight-report "$ROOT/preflight.json" \
+            --max-baseline-cv .06 --min-completed-ratio .90 \
+            --output "$ROOT/pr284/homo-spare1.json" --summary-output "$ROOT/pr284/homo-spare1.md"
+
+      - name: PR284 current vs spare3 homogeneous
+        shell: bash
+        run: |
+          python pr284/benchmarks/paired_writer_waiter_contention.py \
+            --base-root pr284 --candidate-root pr284-spare3 \
+            --producer-values 12,16,20,32,64 --max-messages 1 --payload-bytes 64 \
+            --warmup-count 600 --count 8000 --repeat 6 --cpu 1 \
+            --policy strict --preflight-report "$ROOT/preflight.json" \
+            --max-baseline-cv .06 --min-completed-ratio .90 \
+            --output "$ROOT/pr284/homo-spare3.json" --summary-output "$ROOT/pr284/homo-spare3.md"
+
+      - name: PR284 current vs spare1 heterogeneous
+        shell: bash
+        run: |
+          python support/benchmarks/temp_scheduler_supplement.py writer-hetero-parent \
+            --base-root pr284 --candidate-root pr284-spare1 \
+            --producer-values 16,32,64 --repeat 6 --count 8000 \
+            --max-messages 8 --max-bytes 16384 --small-bytes 64 --large-bytes 4096 \
+            --cpu 1 --output "$ROOT/pr284/hetero-spare1.json"
+
+      - name: Refresh strict preflight for network work
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 24); do
+            if python base/benchmarks/runner_probe.py --output "$ROOT/preflight-network.json" --require-temperature --enforce; then
+              exit 0
+            fi
+            sleep 15
+          done
+          exit 1
+
+      - name: PR285 current vs spare1 true completion
+        shell: bash
+        run: |
+          python support/benchmarks/temp_scheduler_supplement.py publish-parent \
+            --base-root pr285 --candidate-root pr285-spare1 \
+            --host 127.0.0.1 --port 11883 --publisher-values 12,16,20,32,64 \
+            --inflight-values 4,20 --count 2200 --repeat 6 --cpu 1 --timeout 120 \
+            --output "$ROOT/pr285/true-spare1.json"
+
+      - name: PR285 current vs spare3 true completion
+        shell: bash
+        run: |
+          python support/benchmarks/temp_scheduler_supplement.py publish-parent \
+            --base-root pr285 --candidate-root pr285-spare3 \
+            --host 127.0.0.1 --port 11883 --publisher-values 12,16,20,32,64 \
+            --inflight-values 4,20 --count 2200 --repeat 6 --cpu 1 --timeout 120 \
+            --output "$ROOT/pr285/true-spare3.json"
+
+      - name: Preserve diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          if [ -f "$ROOT/mosquitto.pid" ]; then kill "$(cat "$ROOT/mosquitto.pid")" 2>/dev/null; fi
+          find "$ROOT" -maxdepth 3 -type f -print | sort > "$ROOT/files.txt"
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: wake-frontier-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/wake-frontier/**/*.json
+            ${{ runner.temp }}/wake-frontier/**/*.md
+            ${{ runner.temp }}/wake-frontier/**/*.log
+            ${{ runner.temp }}/wake-frontier/files.txt
+          if-no-files-found: warn
+          retention-days: 30
