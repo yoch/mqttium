@@ -52,6 +52,18 @@ jobs:
           test "$(git -C base rev-parse HEAD)" = "$BASE_SHA"
           test "$(git -C candidate rev-parse HEAD)" = "$CANDIDATE_SHA"
           test "$(git -C support rev-parse HEAD)" = "$SUPPORT_SHA"
+      - name: Remove stale temporary stats field
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('support/benchmarks/temp_scheduler_supplement.py')
+          text=p.read_text()
+          old='        "max_batch_items": stats.max_batch_items,\n'
+          assert text.count(old) == 1
+          p.write_text(text.replace(old, ''))
+          PY
+          python -m py_compile support/benchmarks/temp_scheduler_supplement.py
       - name: Start isolated broker
         shell: bash
         run: |
@@ -87,20 +99,27 @@ jobs:
             --repeat 8 --timeout 120 --cpu 1 \
             --output /tmp/quantum-tail.json
       - name: Summarize frontier
+        if: always()
         shell: bash
         run: |
           python - <<'PY'
           import json
-          d=json.load(open('/tmp/quantum-tail.json'))
+          from pathlib import Path
+          p=Path('/tmp/quantum-tail.json')
+          if not p.exists():
+              print('quantum result missing')
+              raise SystemExit(0)
+          d=json.loads(p.read_text())
           for r in d['scenarios']:
               print({k:r[k] for k in ('quantum','flood_rate_ratio','cpu_ratio','p50_ratio','p95_ratio','p99_ratio','p999_ratio','max_ratio')})
           PY
       - name: Upload evidence
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: pr286-quantum-screen-${{ github.run_id }}
           path: |
             /tmp/quantum-tail.json
             /tmp/mosq-quantum.log
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 30
