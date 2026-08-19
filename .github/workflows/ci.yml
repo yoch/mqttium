@@ -1,4 +1,4 @@
-name: TEMP ARM64 writer regime instrumentation
+name: TEMP ARM64 writer phase stabilization probe
 
 on:
   pull_request:
@@ -19,15 +19,15 @@ env:
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
 jobs:
-  instrument:
+  stabilize:
     runs-on: [self-hosted, linux, ARM64]
     timeout-minutes: 120
     steps:
       - name: Define paths
         shell: bash
         run: |
-          echo "ROOT=$RUNNER_TEMP/writer-regime" >> "$GITHUB_ENV"
-          echo "VENV=$RUNNER_TEMP/writer-regime-venv" >> "$GITHUB_ENV"
+          echo "ROOT=$RUNNER_TEMP/writer-phase-stabilize" >> "$GITHUB_ENV"
+          echo "VENV=$RUNNER_TEMP/writer-phase-stabilize-venv" >> "$GITHUB_ENV"
 
       - name: Checkout immutable base
         uses: actions/checkout@v7
@@ -45,7 +45,7 @@ jobs:
           path: stack
           persist-credentials: false
 
-      - name: Compose exact runtime heads
+      - name: Compose exact candidate runtime
         working-directory: stack
         shell: bash
         run: |
@@ -112,9 +112,10 @@ jobs:
             git add docs/reports/README.md
             git commit --no-edit
           fi
+          test -z "$(git diff --name-only --diff-filter=U)"
           git diff --check "$BASE_SHA"..HEAD
 
-      - name: Patch temporary benchmark with per-worker instrumentation
+      - name: Patch temporary benchmark with settle modes and writer counters
         shell: bash
         run: |
           set -euo pipefail
@@ -123,23 +124,23 @@ jobs:
           p=Path('base/benchmarks/paired_writer_capacity.py')
           text=p.read_text()
           old='''    sync_rejected: int\n    drain_seconds: float\n'''
-          new='''    sync_rejected: int\n    drain_seconds: float\n    writer_batches: int = 0\n    writer_batched_items: int = 0\n    writer_batched_bytes: int = 0\n    writer_eager_writes: int = 0\n    writer_eager_bytes: int = 0\n    writer_enqueue_suspensions: int = 0\n    writer_segmented_writes: int = 0\n    publish_wakeups: int = 0\n    publish_wait_retries: int = 0\n    gc_gen0: int = 0\n    gc_gen1: int = 0\n    gc_gen2: int = 0\n    cpu_freq_start_khz: int | None = None\n    cpu_freq_end_khz: int | None = None\n'''
+          new='''    sync_rejected: int\n    drain_seconds: float\n    writer_batches: int = 0\n    writer_batched_items: int = 0\n    writer_eager_writes: int = 0\n    eager_armed_at_start: bool | None = None\n    writing_at_start: bool | None = None\n    queue_at_start: int | None = None\n'''
           if text.count(old)!=1: raise SystemExit('dataclass anchor mismatch')
           text=text.replace(old,new)
+
           old='''        result = await _run_phase(\n            client,\n            topic=topic,\n            payload=payload,\n            qos=args.qos,\n            count=args.count,\n            outstanding=args.outstanding,\n            timeout=args.timeout,\n        )\n        result.protocol = args.protocol\n        result.inflight = args.inflight\n        return result\n'''
-          new='''        import gc\n\n        writer = client._write_pump\n        before_writer = writer.stats()\n        before_wakeups = getattr(client, "_publish_wakeups", 0)\n        before_retries = getattr(client, "_publish_wait_retries", 0)\n        before_gc = [entry["collections"] for entry in gc.get_stats()]\n\n        def cpu_freq_khz() -> int | None:\n            if args.cpu is None:\n                return None\n            path = Path(f"/sys/devices/system/cpu/cpu{args.cpu}/cpufreq/scaling_cur_freq")\n            try:\n                return int(path.read_text().strip())\n            except (OSError, ValueError):\n                return None\n\n        freq_start = cpu_freq_khz()\n        result = await _run_phase(\n            client,\n            topic=topic,\n            payload=payload,\n            qos=args.qos,\n            count=args.count,\n            outstanding=args.outstanding,\n            timeout=args.timeout,\n        )\n        freq_end = cpu_freq_khz()\n        after_writer = writer.stats()\n        after_gc = [entry["collections"] for entry in gc.get_stats()]\n        result.protocol = args.protocol\n        result.inflight = args.inflight\n        result.writer_batches = after_writer.batches - before_writer.batches\n        result.writer_batched_items = after_writer.batched_items - before_writer.batched_items\n        result.writer_batched_bytes = after_writer.batched_bytes - before_writer.batched_bytes\n        result.writer_eager_writes = after_writer.eager_writes - before_writer.eager_writes\n        result.writer_eager_bytes = after_writer.eager_bytes - before_writer.eager_bytes\n        result.writer_enqueue_suspensions = after_writer.enqueue_suspensions - before_writer.enqueue_suspensions\n        result.writer_segmented_writes = after_writer.segmented_writes - before_writer.segmented_writes\n        result.publish_wakeups = getattr(client, "_publish_wakeups", 0) - before_wakeups\n        result.publish_wait_retries = getattr(client, "_publish_wait_retries", 0) - before_retries\n        result.gc_gen0 = after_gc[0] - before_gc[0]\n        result.gc_gen1 = after_gc[1] - before_gc[1]\n        result.gc_gen2 = after_gc[2] - before_gc[2]\n        result.cpu_freq_start_khz = freq_start\n        result.cpu_freq_end_khz = freq_end\n        return result\n'''
+          new='''        pump = client._write_pump\n        mode = os.environ.get("CAPACITY_SETTLE_MODE", "none")\n        if mode == "sleep0":\n            await asyncio.sleep(0)\n        elif mode == "sleep2":\n            await asyncio.sleep(0)\n            await asyncio.sleep(0)\n        elif mode == "idle2":\n            await asyncio.wait_for(pump.join(), timeout=args.timeout)\n            while pump._writing or not pump.queue.empty():\n                await asyncio.sleep(0)\n            await asyncio.sleep(0)\n            await asyncio.sleep(0)\n        elif mode == "sleep1ms":\n            await asyncio.sleep(0.001)\n        elif mode != "none":\n            raise RuntimeError(f"unknown CAPACITY_SETTLE_MODE={mode}")\n\n        before = pump.stats()\n        eager_at_start = pump._eager_armed\n        writing_at_start = pump._writing\n        queue_at_start = pump.queue.qsize()\n        result = await _run_phase(\n            client,\n            topic=topic,\n            payload=payload,\n            qos=args.qos,\n            count=args.count,\n            outstanding=args.outstanding,\n            timeout=args.timeout,\n        )\n        after = pump.stats()\n        result.protocol = args.protocol\n        result.inflight = args.inflight\n        result.writer_batches = after.batches - before.batches\n        result.writer_batched_items = after.batched_items - before.batched_items\n        result.writer_eager_writes = after.eager_writes - before.eager_writes\n        result.eager_armed_at_start = eager_at_start\n        result.writing_at_start = writing_at_start\n        result.queue_at_start = queue_at_start\n        return result\n'''
           if text.count(old)!=1: raise SystemExit('sample anchor mismatch')
           text=text.replace(old,new)
           p.write_text(text)
           PY
           python3 -m py_compile base/benchmarks/paired_writer_capacity.py
 
-      - name: Prepare runner and isolated broker
+      - name: Prepare ARM64 runner and pin broker to CPU0
         shell: bash
         run: |
           set -euo pipefail
           test "$(uname -m)" = aarch64
-          test "$(nproc)" -ge 4
           rm -rf "$ROOT" "$VENV"
           mkdir -p "$ROOT"
           python3 -m venv "$VENV"
@@ -178,105 +179,83 @@ jobs:
           done
           exit 1
 
-      - name: Default hash seed A/A and A/B instrumentation
+      - name: Compare natural warmup-to-measure barriers with A/A
         shell: bash
         run: |
           set -euo pipefail
-          unset PYTHONHASHSEED || true
-          "$VENV/bin/python" base/benchmarks/paired_writer_capacity.py \
-            --base-root base --candidate-root base --host 127.0.0.1 --port 11883 \
-            --protocol 311 --qos-values 1 --payload-bytes 64 --inflight 20 --outstanding 20 \
-            --max-queued 200 --warmup-count 5000 --count-qos1 40000 --repeat 16 --cpu 1 \
-            --policy advisory --preflight-report "$ROOT/preflight.json" --max-baseline-cv 1.0 \
-            --min-completed-ratio 0.0 --output "$ROOT/default-aa.json"
-          "$VENV/bin/python" base/benchmarks/paired_writer_capacity.py \
-            --base-root base --candidate-root stack --host 127.0.0.1 --port 11883 \
-            --protocol 311 --qos-values 1 --payload-bytes 64 --inflight 20 --outstanding 20 \
-            --max-queued 200 --warmup-count 5000 --count-qos1 40000 --repeat 16 --cpu 1 \
-            --policy advisory --preflight-report "$ROOT/preflight.json" --max-baseline-cv 1.0 \
-            --min-completed-ratio 0.0 --output "$ROOT/default-ab.json"
-
-      - name: Requalify before fixed hash seed
-        shell: bash
-        run: |
-          set -euo pipefail
-          for attempt in $(seq 1 24); do
-            out="$ROOT/preflight-hash0-$attempt.json"
-            if "$VENV/bin/python" base/benchmarks/runner_probe.py --output "$out" --require-temperature --enforce; then
-              cp "$out" "$ROOT/preflight-hash0.json"
-              exit 0
-            fi
-            sleep 10
+          for mode in none sleep0 sleep2 idle2 sleep1ms; do
+            echo "=== settle=$mode ==="
+            CAPACITY_SETTLE_MODE="$mode" "$VENV/bin/python" base/benchmarks/paired_writer_capacity.py \
+              --base-root base --candidate-root base --host 127.0.0.1 --port 11883 \
+              --protocol 311 --qos-values 1 --payload-bytes 64 --inflight 20 --outstanding 20 \
+              --max-queued 200 --warmup-count 5000 --count-qos1 40000 --repeat 16 --cpu 1 \
+              --policy advisory --preflight-report "$ROOT/preflight.json" --max-baseline-cv 1.0 \
+              --min-completed-ratio 0.0 --output "$ROOT/aa-$mode.json"
           done
-          exit 1
 
-      - name: Fixed PYTHONHASHSEED=0 A/A and A/B instrumentation
-        shell: bash
-        env:
-          PYTHONHASHSEED: "0"
-        run: |
-          set -euo pipefail
-          "$VENV/bin/python" base/benchmarks/paired_writer_capacity.py \
-            --base-root base --candidate-root base --host 127.0.0.1 --port 11883 \
-            --protocol 311 --qos-values 1 --payload-bytes 64 --inflight 20 --outstanding 20 \
-            --max-queued 200 --warmup-count 5000 --count-qos1 40000 --repeat 16 --cpu 1 \
-            --policy advisory --preflight-report "$ROOT/preflight-hash0.json" --max-baseline-cv 1.0 \
-            --min-completed-ratio 0.0 --output "$ROOT/hash0-aa.json"
-          "$VENV/bin/python" base/benchmarks/paired_writer_capacity.py \
-            --base-root base --candidate-root stack --host 127.0.0.1 --port 11883 \
-            --protocol 311 --qos-values 1 --payload-bytes 64 --inflight 20 --outstanding 20 \
-            --max-queued 200 --warmup-count 5000 --count-qos1 40000 --repeat 16 --cpu 1 \
-            --policy advisory --preflight-report "$ROOT/preflight-hash0.json" --max-baseline-cv 1.0 \
-            --min-completed-ratio 0.0 --output "$ROOT/hash0-ab.json"
-
-      - name: Analyze regime correlations
+      - name: Select the most stationary natural barrier
         shell: bash
         run: |
           "$VENV/bin/python" - <<'PY'
           import json, os, statistics
           from pathlib import Path
           root=Path(os.environ['ROOT'])
-          fields=[
-              'writer_batches','writer_batched_items','writer_eager_writes','writer_enqueue_suspensions',
-              'publish_wakeups','publish_wait_retries','gc_gen0','gc_gen1','gc_gen2',
-              'cpu_freq_start_khz','cpu_freq_end_khz','cpu_seconds'
-          ]
-          report={}
-          for name in ('default-aa','default-ab','hash0-aa','hash0-ab'):
-              d=json.loads((root/f'{name}.json').read_text())
+          modes=['none','sleep0','sleep2','idle2','sleep1ms']
+          rows=[]
+          for mode in modes:
+              d=json.loads((root/f'aa-{mode}.json').read_text())
               s=d['scenarios'][0]
-              rows=[]
-              for pair_index,pair in enumerate(s['pairs'],1):
-                  for variant in ('base','candidate'):
-                      r=dict(pair[variant])
-                      r['pair']=pair_index
-                      r['variant']=variant
-                      r['order']=pair['order']
-                      rows.append(r)
-              entry={
+              samples=[]
+              for pair in s['pairs']:
+                  samples.extend((pair['base'],pair['candidate']))
+              abnormal=sum(1 for x in samples if x['writer_batches'] > 3900)
+              not_armed=sum(1 for x in samples if x['eager_armed_at_start'] is not True)
+              rows.append({
+                  'mode':mode,
                   'ratio':s['median_candidate_over_base_completed'],
                   'base_cv':s['base_completed_cv'],
                   'candidate_cv':s['candidate_completed_cv'],
-                  'rows':rows,
-                  'correlations':{},
-              }
-              rates=[r['completed_rate'] for r in rows]
-              for field in fields:
-                  vals=[r.get(field) for r in rows]
-                  if all(isinstance(v,(int,float)) for v in vals) and len(set(vals))>1:
-                      try: entry['correlations'][field]=statistics.correlation(rates, vals)
-                      except statistics.StatisticsError: pass
-              report[name]=entry
-          (root/'regime-analysis.json').write_text(json.dumps(report,indent=2)+'\n')
-          for name,e in report.items():
-              print('\n',name,'ratio',round(e['ratio'],5),'CV',round(e['base_cv'],4),round(e['candidate_cv'],4))
-              corrs=sorted(e['correlations'].items(), key=lambda kv: abs(kv[1]), reverse=True)
-              print(' strongest correlations:', [(k,round(v,3)) for k,v in corrs[:8]])
-              slow=sorted(e['rows'],key=lambda r:r['completed_rate'])[:4]
-              fast=sorted(e['rows'],key=lambda r:r['completed_rate'])[-4:]
-              for label,group in [('slow',slow),('fast',fast)]:
-                  print(label,[(r['variant'],round(r['completed_rate']),r['writer_batches'],r['writer_batched_items'],r['writer_eager_writes'],r['gc_gen0'],r['cpu_freq_start_khz'],r['cpu_freq_end_khz']) for r in group])
+                  'worst_cv':max(s['base_completed_cv'],s['candidate_completed_cv']),
+                  'abnormal_writer_regimes':abnormal,
+                  'not_eager_armed_at_start':not_armed,
+                  'median_batches':statistics.median(x['writer_batches'] for x in samples),
+                  'median_eager':statistics.median(x['writer_eager_writes'] for x in samples),
+              })
+          rows.sort(key=lambda r:(r['abnormal_writer_regimes'],r['worst_cv']))
+          print(json.dumps(rows,indent=2))
+          (root/'aa-barriers-summary.json').write_text(json.dumps(rows,indent=2)+'\n')
+          best=rows[0]
+          if best['abnormal_writer_regimes'] != 0 or best['worst_cv'] > 0.03:
+              raise SystemExit(f'no sufficiently stationary natural barrier: {best}')
+          with open(os.environ['GITHUB_ENV'],'a') as f:
+              f.write(f"BEST_MODE={best['mode']}\n")
           PY
+
+      - name: Requalify before exact triple A/B
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 24); do
+            out="$ROOT/preflight-ab-$attempt.json"
+            if "$VENV/bin/python" base/benchmarks/runner_probe.py --output "$out" --require-temperature --enforce; then
+              cp "$out" "$ROOT/preflight-ab.json"
+              exit 0
+            fi
+            sleep 10
+          done
+          exit 1
+
+      - name: Triple A/B with selected stationary barrier
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "selected settle mode: $BEST_MODE"
+          CAPACITY_SETTLE_MODE="$BEST_MODE" "$VENV/bin/python" base/benchmarks/paired_writer_capacity.py \
+            --base-root base --candidate-root stack --host 127.0.0.1 --port 11883 \
+            --protocol 311 --qos-values 1 --payload-bytes 64 --inflight 20 --outstanding 20 \
+            --max-queued 200 --warmup-count 5000 --count-qos1 40000 --repeat 20 --cpu 1 \
+            --policy strict --preflight-report "$ROOT/preflight-ab.json" --max-baseline-cv .03 \
+            --min-completed-ratio .97 --output "$ROOT/triple-ab.json" --summary-output "$ROOT/triple-ab.md"
 
       - name: Final cooldown and strict preflight
         if: always()
@@ -296,14 +275,15 @@ jobs:
           done
           exit 1
 
-      - name: Upload regime evidence
+      - name: Upload stabilization evidence
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: writer-regime-${{ github.run_id }}
+          name: writer-phase-stabilize-${{ github.run_id }}
           path: |
-            ${{ runner.temp }}/writer-regime/*.json
-            ${{ runner.temp }}/writer-regime/*.log
-            ${{ runner.temp }}/writer-regime/*.conf
+            ${{ runner.temp }}/writer-phase-stabilize/*.json
+            ${{ runner.temp }}/writer-phase-stabilize/*.md
+            ${{ runner.temp }}/writer-phase-stabilize/*.log
+            ${{ runner.temp }}/writer-phase-stabilize/*.conf
           if-no-files-found: warn
           retention-days: 30
