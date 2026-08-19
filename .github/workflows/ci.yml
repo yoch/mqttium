@@ -1,206 +1,307 @@
-name: CI
+name: TEMP scheduler PR284-286 ARM64 campaigns
 
 on:
-  push:
-    branches: [main]
   pull_request:
+    branches: [main]
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: temp-scheduler-284-286-arm64
+  cancel-in-progress: true
 
 jobs:
-  quality:
-    runs-on: ubuntu-24.04
+  campaigns:
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 180
+    env:
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      BASE_SHA: e80618154bacefed5626d9eb9ba46edf560b54e7
+      PR284_SHA: 8d37248831b372004074acfa0018f34da51b54df
+      PR285_SHA: 505c385c59670b2fb095728b5095f5039c53d675
+      PR286_SHA: 8362d50072ce5a09bbf564fff1368c62a06e88fc
+      ROOT: ${{ runner.temp }}/scheduler-campaigns
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - name: Checkout temporary harness
+        uses: actions/checkout@v7
         with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: pyproject.toml
-      - run: python -m pip install -e ".[dev,security]"
-      - name: Repository hygiene
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: harness
+          persist-credentials: false
+      - name: Checkout baseline
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.BASE_SHA }}
+          path: base
+          persist-credentials: false
+      - name: Checkout PR284
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.PR284_SHA }}
+          path: pr284
+          persist-credentials: false
+      - name: Checkout PR285
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.PR285_SHA }}
+          path: pr285
+          persist-credentials: false
+      - name: Checkout PR286
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.PR286_SHA }}
+          path: pr286
+          persist-credentials: false
+      - name: Verify immutable refs and runner
+        shell: bash
         run: |
           set -euo pipefail
-          test -z "$(git ls-files | grep -E '(^|/)(__pycache__|\.pytest_cache|\.mypy_cache|\.ruff_cache|dist|build|.*\.egg-info)(/|$)|(^|/)\.coverage($|\.)|\.py[co]$|\.(patch|diff)$' || true)"
-          test -z "$(grep -RIl --exclude-dir=.git -E 'mqttnext|MQTTNext|MQTTNEXT' src tests examples benchmarks || true)"
-      - run: ruff format --check src tests benchmarks
-      - run: ruff check src tests benchmarks
-      - run: mypy src/mqttium
-      - run: bandit -q -ll -r src
-      - run: python -m pytest -q tests/unit --cov=mqttium --cov-report=term-missing --cov-fail-under=80
-
-  test:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.11", "3.12", "3.13", "3.14"]
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: ${{ matrix.python-version }}
-          cache: pip
-          cache-dependency-path: pyproject.toml
-      - run: python -m pip install -e ".[dev]"
-      - name: Require OpenSSL for TLS tests
-        run: python -c "import shutil; assert shutil.which('openssl'), 'OpenSSL is required for TLS tests'"
-      - name: Unit tests (including TLS, WebSocket, and cancellation)
-        run: python -m pytest -q -ra tests/unit
-      - name: Install Mosquitto
-        timeout-minutes: 5
-        run: |
-          set -euo pipefail
-          export DEBIAN_FRONTEND=noninteractive
-          date -u +'apt-get install start %FT%TZ'
-          sudo -E apt-get install -y mosquitto
-          date -u +'apt-get install done %FT%TZ'
-          dpkg-query -W mosquitto
+          test "$(git -C base rev-parse HEAD)" = "$BASE_SHA"
+          test "$(git -C pr284 rev-parse HEAD)" = "$PR284_SHA"
+          test "$(git -C pr285 rev-parse HEAD)" = "$PR285_SHA"
+          test "$(git -C pr286 rev-parse HEAD)" = "$PR286_SHA"
+          test "$(uname -m)" = aarch64
+          python3 - <<'PY'
+          import sys
+          if sys.version_info[:2] != (3, 13):
+              raise SystemExit(f"expected Python 3.13, got {sys.version}")
+          PY
           command -v mosquitto
-      - name: Start Mosquitto
-        timeout-minutes: 2
+          if pgrep -a mosquitto; then
+            echo "pre-existing Mosquitto contaminates evidence" >&2
+            exit 1
+          fi
+      - name: Create venv and dependencies
+        shell: bash
         run: |
           set -euo pipefail
-          printf 'listener 11883 127.0.0.1\nallow_anonymous true\npersistence false\n' > /tmp/mosq-ci.conf
-          date -u +'mosquitto -d start %FT%TZ'
-          mosquitto -c /tmp/mosq-ci.conf -d
-          echo "mosquitto -d exited $?"
-          date -u +'mosquitto -d returned %FT%TZ'
-          for i in $(seq 1 30); do
-            if (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1; then
-              echo "listener ready after ${i} probe(s)"
-              exit 0
-            fi
-            sleep 0.2
+          rm -rf "$RUNNER_TEMP/scheduler-venv"
+          python3 -m venv "$RUNNER_TEMP/scheduler-venv"
+          echo "$RUNNER_TEMP/scheduler-venv/bin" >> "$GITHUB_PATH"
+      - name: Install dev dependencies
+        shell: bash
+        run: |
+          "$RUNNER_TEMP/scheduler-venv/bin/python" -m pip install -e "pr284[dev]" "psutil>=6,<8"
+      - name: Initial eligible-runner preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$ROOT"/{pr284,pr285,pr286}
+          python base/benchmarks/runner_probe.py --output "$ROOT/preflight-initial.json" --require-temperature --enforce
+      - name: Start isolated broker
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$ROOT/mosquitto.conf" <<'MOSQ'
+          persistence false
+          allow_anonymous true
+          max_inflight_messages 1000
+          max_queued_messages 100000
+          max_queued_bytes 0
+          connection_messages false
+          log_type error
+          listener 11883 127.0.0.1
+          MOSQ
+          mosquitto -c "$ROOT/mosquitto.conf" > "$ROOT/mosquitto.log" 2>&1 &
+          echo $! > "$ROOT/mosquitto.pid"
+          for _ in $(seq 1 50); do
+            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            sleep .2
           done
-          echo "listener never accepted a connection"
-          pgrep -a mosquitto || true
-          exit 1
-      - name: Mosquitto integration tests
-        run: python -m pytest -q tests/integration
+          cat "$ROOT/mosquitto.log"; exit 1
 
-  cross-platform:
-    name: Cross-platform (${{ matrix.os }}, Python ${{ matrix.python-version }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-15, windows-2025]
-        python-version: ["3.11", "3.14"]
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: ${{ matrix.python-version }}
-          cache: pip
-          cache-dependency-path: pyproject.toml
-      - run: python -m pip install -e ".[dev]"
-      - name: Require OpenSSL for TLS tests
-        run: python -c "import shutil; assert shutil.which('openssl'), 'OpenSSL is required for TLS tests'"
-      - name: Unit tests (including TLS, WebSocket, and cancellation)
-        run: python -m pytest -q -ra tests/unit
-
-  fuzz:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: pyproject.toml
-      - run: python -m pip install -e ".[fuzz]"
-      - name: Seeded fuzzing
+      - name: PR284 focused correctness
+        shell: bash
         run: |
-          for seed in 1 2 3; do
-            PYTHONPATH=src python tests/fuzz/fuzz.py --seed "$seed" --iterations 20000
-          done
-      - run: PYTHONPATH=src python -m pytest -q tests/fuzz/test_hypothesis_fuzz.py
-
-  package:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: pyproject.toml
-      - run: python -m pip install ".[release]"
-      - run: validate-pyproject pyproject.toml
-      - run: python -m build
-      - run: twine check --strict dist/*
-      - run: check-wheel-contents dist/*.whl
-      - name: Validate distribution contents
+          PYTHONPATH=pr284/src python -m pytest -q pr284/tests/unit/test_write_pump_targeted_wake.py
+      - name: PR284 fresh preflight
+        shell: bash
+        run: python base/benchmarks/runner_probe.py --output "$ROOT/pr284/preflight.json" --require-temperature --enforce
+      - name: PR284 target contention A/A
+        shell: bash
         run: |
-          python - <<'PY'
-          from pathlib import Path
-          from zipfile import ZipFile
-          import ast
-          import email
-          import tarfile
-
-          source = ast.parse(Path("src/mqttium/__init__.py").read_text(encoding="utf-8"))
-          expected_version = next(
-              node.value.value
-              for node in source.body
-              if isinstance(node, ast.Assign)
-              and any(isinstance(target, ast.Name) and target.id == "__version__" for target in node.targets)
-              and isinstance(node.value, ast.Constant)
-              and isinstance(node.value.value, str)
-          )
-          wheel = next(Path("dist").glob("*.whl"))
-          sdist = next(Path("dist").glob("*.tar.gz"))
-
-          with ZipFile(wheel) as archive:
-              names = archive.namelist()
-              metadata_name = next(name for name in names if name.endswith(".dist-info/METADATA"))
-              metadata = email.message_from_bytes(archive.read(metadata_name))
-              assert metadata["Name"] == "mqttium"
-              assert metadata["Version"] == expected_version
-              assert metadata["Requires-Python"] == ">=3.11"
-              assert metadata["License-Expression"] == "Apache-2.0"
-              assert "mqttium/py.typed" in names
-              assert any(name.endswith(".dist-info/licenses/LICENSE") for name in names)
-              assert any(name.endswith(".dist-info/licenses/NOTICE") for name in names)
-
-          with tarfile.open(sdist, "r:gz") as archive:
-              names = archive.getnames()
-              for filename in (
-                  "LICENSE",
-                  "NOTICE",
-                  "README.md",
-                  "CHANGELOG.md",
-                  "PROVENANCE.md",
-                  "SECURITY.md",
-              ):
-                  assert any(name.endswith("/" + filename) for name in names), filename
-          PY
-      - name: Install and import the built wheel
+          python pr284/benchmarks/paired_writer_waiter_contention.py \
+            --base-root base --candidate-root base --producer-values 1,4,16,64,256 \
+            --max-messages 8 --payload-bytes 64 --warmup-count 2000 --count 20000 \
+            --repeat 8 --cpu 1 --policy strict --preflight-report "$ROOT/pr284/preflight.json" \
+            --max-baseline-cv .05 --max-aa-ratio-deviation .02 \
+            --output "$ROOT/pr284/target-aa.json" --summary-output "$ROOT/pr284/target-aa.md"
+      - name: PR284 target contention A/B
+        shell: bash
         run: |
-          python -m venv /tmp/mqttium-wheel
-          /tmp/mqttium-wheel/bin/python -m pip install --no-deps dist/*.whl
-          cd /tmp
-          /tmp/mqttium-wheel/bin/python -I - <<'PY'
-          import importlib
-          import importlib.metadata
-          import pkgutil
-          import mqttium
+          python pr284/benchmarks/paired_writer_waiter_contention.py \
+            --base-root base --candidate-root pr284 --producer-values 1,4,16,64,256 \
+            --max-messages 8 --payload-bytes 64 --warmup-count 2000 --count 20000 \
+            --repeat 8 --cpu 1 --policy strict --preflight-report "$ROOT/pr284/preflight.json" \
+            --max-baseline-cv .05 --min-completed-ratio .97 \
+            --output "$ROOT/pr284/target-ab.json" --summary-output "$ROOT/pr284/target-ab.md"
+      - name: PR284 heterogeneous fairness A/A
+        shell: bash
+        run: |
+          python harness/benchmarks/temp_scheduler_supplement.py writer-hetero-parent \
+            --base-root base --candidate-root base --producer-values 4,16,64,256 --repeat 8 \
+            --count 20000 --max-messages 8 --max-bytes 16384 --small-bytes 64 --large-bytes 4096 \
+            --cpu 1 --output "$ROOT/pr284/hetero-aa.json"
+      - name: PR284 heterogeneous fairness A/B
+        shell: bash
+        run: |
+          python harness/benchmarks/temp_scheduler_supplement.py writer-hetero-parent \
+            --base-root base --candidate-root pr284 --producer-values 4,16,64,256 --repeat 8 \
+            --count 20000 --max-messages 8 --max-bytes 16384 --small-bytes 64 --large-bytes 4096 \
+            --cpu 1 --output "$ROOT/pr284/hetero-ab.json"
+      - name: PR284 writer-capacity guard
+        shell: bash
+        run: |
+          python base/benchmarks/paired_writer_capacity.py --base-root base --candidate-root pr284 \
+            --protocols 311 --payloads 64 --windows 20 --count-small 6000 --repeat 8 --cpu 1 \
+            --policy strict --preflight-report "$ROOT/pr284/preflight.json" \
+            --min-qos0-ratio .97 --min-qos1-ratio .97 --output "$ROOT/pr284/writer-capacity.json" \
+            --summary-output "$ROOT/pr284/writer-capacity.md"
+      - name: PR284 open-loop guard
+        shell: bash
+        run: |
+          python base/benchmarks/paired_open_loop.py --base-root base --candidate-root pr284 \
+            --protocols 311 --payloads 64 --completions callback --windows 20 --target-rates 5000,7500 \
+            --count-small 5000 --repeat 8 --cpu 1 --policy strict --preflight-report "$ROOT/pr284/preflight.json" \
+            --max-baseline-cv .05 --min-completed-ratio .97 --max-loop-lag-ratio 1.05 \
+            --output "$ROOT/pr284/open-loop.json" --summary-output "$ROOT/pr284/open-loop.md"
+      - name: PR284 network guard
+        shell: bash
+        run: |
+          python base/benchmarks/paired_network.py --base-root base --candidate-root pr284 --host 127.0.0.1 --port 11883 \
+            --protocols 311 --completions receipt --payloads 64,4096 --windows 20,64 --repeat 8 \
+            --count-small 1500 --count-large 750 --cpu 1 --policy strict --preflight-report "$ROOT/pr284/preflight.json" \
+            --max-baseline-cv .05 --min-ack-ratio .97 --output "$ROOT/pr284/network.json" --summary-output "$ROOT/pr284/network.md"
 
-          assert mqttium.__version__ == importlib.metadata.version("mqttium")
-          for module in pkgutil.walk_packages(mqttium.__path__, mqttium.__name__ + "."):
-              importlib.import_module(module.name)
-          PY
-          /tmp/mqttium-wheel/bin/python -m pip check
-      - name: Upload distributions
+      - name: PR285 focused correctness
+        shell: bash
+        run: |
+          PYTHONPATH=pr285/src python -m pytest -q pr285/tests/unit/test_publish_targeted_wake.py pr285/tests/unit/test_async_publish_admission.py
+      - name: PR285 fresh preflight
+        shell: bash
+        run: python base/benchmarks/runner_probe.py --output "$ROOT/pr285/preflight.json" --require-temperature --enforce
+      - name: PR285 original admission harness A/A
+        continue-on-error: true
+        shell: bash
+        run: |
+          python pr285/benchmarks/paired_publish_admission_contention.py --base-root base --candidate-root base \
+            --host 127.0.0.1 --port 11883 --publisher-values 1,4,16,64,256 --inflight-values 1,4,20 \
+            --count 4000 --warmup-count 200 --repeat 8 --cpu 1 --policy strict --preflight-report "$ROOT/pr285/preflight.json" \
+            --max-baseline-cv .05 --max-aa-ratio-deviation .02 --output "$ROOT/pr285/original-aa.json" --summary-output "$ROOT/pr285/original-aa.md"
+      - name: PR285 original admission harness A/B
+        continue-on-error: true
+        shell: bash
+        run: |
+          python pr285/benchmarks/paired_publish_admission_contention.py --base-root base --candidate-root pr285 \
+            --host 127.0.0.1 --port 11883 --publisher-values 1,4,16,64,256 --inflight-values 1,4,20 \
+            --count 4000 --warmup-count 200 --repeat 8 --cpu 1 --policy strict --preflight-report "$ROOT/pr285/preflight.json" \
+            --max-baseline-cv .05 --min-completed-ratio .97 --output "$ROOT/pr285/original-ab.json" --summary-output "$ROOT/pr285/original-ab.md"
+      - name: PR285 true-completion A/A
+        shell: bash
+        run: |
+          python harness/benchmarks/temp_scheduler_supplement.py publish-parent --base-root base --candidate-root base \
+            --host 127.0.0.1 --port 11883 --publisher-values 1,4,16,64,256 --inflight-values 1,4,20 \
+            --count 4000 --repeat 8 --cpu 1 --timeout 120 --output "$ROOT/pr285/true-aa.json"
+      - name: PR285 true-completion A/B
+        shell: bash
+        run: |
+          python harness/benchmarks/temp_scheduler_supplement.py publish-parent --base-root base --candidate-root pr285 \
+            --host 127.0.0.1 --port 11883 --publisher-values 1,4,16,64,256 --inflight-values 1,4,20 \
+            --count 4000 --repeat 8 --cpu 1 --timeout 120 --output "$ROOT/pr285/true-ab.json"
+      - name: PR285 writer-capacity guard
+        shell: bash
+        run: |
+          python base/benchmarks/paired_writer_capacity.py --base-root base --candidate-root pr285 \
+            --protocols 311 --payloads 64 --windows 20 --count-small 6000 --repeat 8 --cpu 1 \
+            --policy strict --preflight-report "$ROOT/pr285/preflight.json" \
+            --min-qos0-ratio .97 --min-qos1-ratio .97 --output "$ROOT/pr285/writer-capacity.json" --summary-output "$ROOT/pr285/writer-capacity.md"
+      - name: PR285 open-loop guard
+        shell: bash
+        run: |
+          python base/benchmarks/paired_open_loop.py --base-root base --candidate-root pr285 \
+            --protocols 311 --payloads 64 --completions callback --windows 20 --target-rates 5000,7500 \
+            --count-small 5000 --repeat 8 --cpu 1 --policy strict --preflight-report "$ROOT/pr285/preflight.json" \
+            --max-baseline-cv .05 --min-completed-ratio .97 --max-loop-lag-ratio 1.05 \
+            --output "$ROOT/pr285/open-loop.json" --summary-output "$ROOT/pr285/open-loop.md"
+      - name: PR285 network guard
+        shell: bash
+        run: |
+          python base/benchmarks/paired_network.py --base-root base --candidate-root pr285 --host 127.0.0.1 --port 11883 \
+            --protocols 311 --completions receipt --payloads 64,4096 --windows 20,64 --repeat 8 \
+            --count-small 1500 --count-large 750 --cpu 1 --policy strict --preflight-report "$ROOT/pr285/preflight.json" \
+            --max-baseline-cv .05 --min-ack-ratio .97 --output "$ROOT/pr285/network.json" --summary-output "$ROOT/pr285/network.md"
+
+      - name: PR286 focused correctness
+        shell: bash
+        run: PYTHONPATH=pr286/src python -m pytest -q pr286/tests/unit/test_write_pump_byte_quantum.py
+      - name: PR286 fresh preflight
+        shell: bash
+        run: python base/benchmarks/runner_probe.py --output "$ROOT/pr286/preflight.json" --require-temperature --enforce
+      - name: PR286 writer-capacity A/A
+        shell: bash
+        run: |
+          python base/benchmarks/paired_writer_capacity.py --base-root base --candidate-root base \
+            --protocols 311 --payloads 64 --windows 20 --count-small 6000 --repeat 8 --cpu 1 \
+            --policy strict --preflight-report "$ROOT/pr286/preflight.json" \
+            --min-qos0-ratio .97 --min-qos1-ratio .97 --output "$ROOT/pr286/writer-aa.json" --summary-output "$ROOT/pr286/writer-aa.md"
+      - name: PR286 writer-capacity A/B
+        shell: bash
+        run: |
+          python base/benchmarks/paired_writer_capacity.py --base-root base --candidate-root pr286 \
+            --protocols 311 --payloads 64 --windows 20 --count-small 6000 --repeat 8 --cpu 1 \
+            --policy strict --preflight-report "$ROOT/pr286/preflight.json" \
+            --min-qos0-ratio .97 --min-qos1-ratio .97 --output "$ROOT/pr286/writer-ab.json" --summary-output "$ROOT/pr286/writer-ab.md"
+      - name: PR286 open-loop small-payload guard
+        shell: bash
+        run: |
+          python base/benchmarks/paired_open_loop.py --base-root base --candidate-root pr286 \
+            --protocols 311 --payloads 64 --completions callback --windows 20 --target-rates 5000,7500 \
+            --count-small 5000 --repeat 8 --cpu 1 --policy strict --preflight-report "$ROOT/pr286/preflight.json" \
+            --max-baseline-cv .05 --min-completed-ratio .97 --max-loop-lag-ratio 1.05 \
+            --output "$ROOT/pr286/open-loop-small.json" --summary-output "$ROOT/pr286/open-loop-small.md"
+      - name: PR286 mixed-tail harness A/A
+        shell: bash
+        run: |
+          python harness/benchmarks/temp_scheduler_supplement.py quantum-tail-parent --base-root base --candidate-root base \
+            --host 127.0.0.1 --port 11883 --quantum-values 0 --flood-count 1000 --flood-bytes 32768 --probes 100 \
+            --repeat 8 --cpu 1 --timeout 120 --output "$ROOT/pr286/tail-aa.json"
+      - name: PR286 quantum screening mixed-tail
+        shell: bash
+        run: |
+          python harness/benchmarks/temp_scheduler_supplement.py quantum-tail-parent --base-root base --candidate-root pr286 \
+            --host 127.0.0.1 --port 11883 --quantum-values 32768,65536,131072,262144 \
+            --flood-count 1000 --flood-bytes 32768 --probes 100 --repeat 8 --cpu 1 --timeout 120 \
+            --output "$ROOT/pr286/quantum-tail.json"
+      - name: PR286 fresh preflight before release gate
+        shell: bash
+        run: python base/benchmarks/runner_probe.py --output "$ROOT/pr286/preflight-release.json" --require-temperature --enforce
+      - name: PR286 authoritative network release gate
+        shell: bash
+        run: |
+          python base/benchmarks/network_release_gate.py --base-root base --candidate-root pr286 \
+            --host 127.0.0.1 --port 11883 --protocols 311 --completions receipt --payloads 64,4096 --windows 20,64 \
+            --control-blocks 1 --control-cycle-seeds 0,1,2 --ab-blocks 2 --cycle-seeds 0,1,2,3,4,5 \
+            --count-small 1500 --count-large 750 --target-sample-seconds 1.0 --max-count 20000 --timeout 60 --cpu 1 \
+            --runner-probe base/benchmarks/runner_probe.py --inter-phase-quiet-seconds 10 \
+            --policy strict --min-throughput .97 --max-ack-p50 1.05 --output "$ROOT/pr286/network-release.json"
+
+      - name: Upload all evidence
+        if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: distributions-${{ github.sha }}
-          path: dist/*
-          if-no-files-found: error
+          name: scheduler-pr284-286-arm64-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/scheduler-campaigns/**/*.json
+            ${{ runner.temp }}/scheduler-campaigns/**/*.md
+            ${{ runner.temp }}/scheduler-campaigns/mosquitto.log
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Stop isolated broker
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "$ROOT/mosquitto.pid" ]; then
+            kill "$(cat "$ROOT/mosquitto.pid")" 2>/dev/null || true
+          fi
