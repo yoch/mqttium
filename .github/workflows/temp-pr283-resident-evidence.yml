@@ -20,7 +20,7 @@ jobs:
       PYTHONUNBUFFERED: "1"
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
       BASE_SHA: e80618154bacefed5626d9eb9ba46edf560b54e7
-      CANDIDATE_SHA: ec8b9e8063350d265a3c36431a6dfaeb72363387
+      CANDIDATE_SHA: 2f8536198ef6a7eba4a9975858b1033995c0fd3d
     steps:
       - name: Check out temporary harness
         uses: actions/checkout@v7
@@ -32,7 +32,7 @@ jobs:
       - name: Check out candidate
         uses: actions/checkout@v7
         with:
-          ref: ec8b9e8063350d265a3c36431a6dfaeb72363387
+          ref: 2f8536198ef6a7eba4a9975858b1033995c0fd3d
           path: candidate
           persist-credentials: false
 
@@ -79,8 +79,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/mqttium-pr283"
           python harness/benchmarks/runner_probe.py \
             --output "$RUNNER_TEMP/mqttium-pr283/runner-preflight.json" \
-            --require-temperature \
-            --enforce
+            --require-temperature --enforce
 
       - name: Start isolated broker
         shell: bash
@@ -100,54 +99,54 @@ jobs:
           mosquitto -c "$root/mosquitto.conf" > "$root/mosquitto.log" 2>&1 &
           echo "$!" > "$root/mosquitto.pid"
           for _ in $(seq 1 50); do
-            if (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1; then
-              exit 0
-            fi
+            if (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1; then exit 0; fi
             if ! kill -0 "$(cat "$root/mosquitto.pid")" 2>/dev/null; then
-              cat "$root/mosquitto.log"
-              exit 1
+              cat "$root/mosquitto.log"; exit 1
             fi
             sleep 0.2
           done
-          cat "$root/mosquitto.log"
-          exit 1
+          cat "$root/mosquitto.log"; exit 1
 
-      - name: Strict open-loop guard replicate 1
-        continue-on-error: true
+      - name: Strict writer-capacity A/A control
+        run: |
+          python harness/benchmarks/paired_writer_capacity.py \
+            --base-root base --candidate-root base --policy strict \
+            --preflight-report "$RUNNER_TEMP/mqttium-pr283/runner-preflight.json" \
+            --protocol 311 --qos-values 0,1 --payload-bytes 256 \
+            --inflight 20 --outstanding 64 --max-queued 200 --warmup-count 5000 \
+            --repeat 8 --count-qos0 100000 --count-qos1 40000 --cpu 1 \
+            --max-baseline-cv 0.05 --max-aa-ratio-deviation 0.02 \
+            --output "$RUNNER_TEMP/mqttium-pr283/writer-aa.json"
+
+      - name: Strict writer-capacity A/B gate
+        run: |
+          python harness/benchmarks/paired_writer_capacity.py \
+            --base-root base --candidate-root candidate --policy strict \
+            --preflight-report "$RUNNER_TEMP/mqttium-pr283/runner-preflight.json" \
+            --protocol 311 --qos-values 0,1 --payload-bytes 256 \
+            --inflight 20 --outstanding 64 --max-queued 200 --warmup-count 5000 \
+            --repeat 8 --count-qos0 100000 --count-qos1 40000 --cpu 1 \
+            --max-baseline-cv 0.05 --min-completed-ratio 0.97 \
+            --output "$RUNNER_TEMP/mqttium-pr283/writer-ab.json"
+
+      - name: Strict open-loop stable-load guard
         run: |
           python harness/benchmarks/paired_open_loop.py \
-            --base-root base --candidate-root candidate \
-            --policy strict \
+            --base-root base --candidate-root candidate --policy strict \
             --preflight-report "$RUNNER_TEMP/mqttium-pr283/runner-preflight.json" \
             --protocols 311 --payloads 64 --completions callback --windows 20 \
-            --target-rates 2500,7500 --count-small 5000 \
-            --repeat 8 --cpu 1 \
+            --target-rates 5000,7500 --count-small 5000 --repeat 8 --cpu 1 \
             --max-baseline-cv 0.05 --min-completed-ratio 0.97 --max-loop-lag-ratio 1.05 \
-            --output "$RUNNER_TEMP/mqttium-pr283/open-loop-ab-1.json"
-
-      - name: Strict open-loop guard replicate 2
-        continue-on-error: true
-        run: |
-          python harness/benchmarks/paired_open_loop.py \
-            --base-root base --candidate-root candidate \
-            --policy strict \
-            --preflight-report "$RUNNER_TEMP/mqttium-pr283/runner-preflight.json" \
-            --protocols 311 --payloads 64 --completions callback --windows 20 \
-            --target-rates 2500,7500 --count-small 5000 \
-            --repeat 8 --cpu 1 \
-            --max-baseline-cv 0.05 --min-completed-ratio 0.97 --max-loop-lag-ratio 1.05 \
-            --output "$RUNNER_TEMP/mqttium-pr283/open-loop-ab-2.json"
+            --output "$RUNNER_TEMP/mqttium-pr283/open-loop-stable.json"
 
       - name: Strict network non-regression guard
-        continue-on-error: true
         run: |
           python harness/benchmarks/paired_network.py \
-            --base-root base --candidate-root candidate \
-            --policy strict \
+            --base-root base --candidate-root candidate --policy strict \
             --preflight-report "$RUNNER_TEMP/mqttium-pr283/runner-preflight.json" \
             --repeat 8 --windows 20,64 --protocols 311 --completions receipt \
-            --payloads 64,4096 --count-small 1500 --count-large 750 \
-            --cpu 1 --max-baseline-cv 0.05 --min-ack-ratio 0.97 \
+            --payloads 64,4096 --count-small 1500 --count-large 750 --cpu 1 \
+            --max-baseline-cv 0.05 --min-ack-ratio 0.97 \
             --output "$RUNNER_TEMP/mqttium-pr283/network-ab.json"
 
       - name: Logical resident-bound probe
@@ -155,44 +154,27 @@ jobs:
         run: |
           set -euo pipefail
           cat > "$RUNNER_TEMP/mqttium-pr283/resident_probe.py" <<'PY'
-          import asyncio
-          import json
+          import asyncio, json
           from mqttium.api._writer import WritePump
-
           class HeldTransport:
               def __init__(self):
-                  self.entered = asyncio.Event()
-                  self.hold = asyncio.Event()
-              async def write(self, data):
-                  self.entered.set()
-                  await self.hold.wait()
-              async def write_many(self, parts):
-                  self.entered.set()
-                  await self.hold.wait()
-              async def read(self, n=65536):
-                  return b""
-              async def close(self):
-                  return None
-              def is_closing(self):
-                  return False
-
-          async def no_failure(exc):
-              raise exc
-
+                  self.entered = asyncio.Event(); self.hold = asyncio.Event()
+              async def write(self, data): self.entered.set(); await self.hold.wait()
+              async def write_many(self, parts): self.entered.set(); await self.hold.wait()
+              async def read(self, n=65536): return b""
+              async def close(self): return None
+              def is_closing(self): return False
+          async def no_failure(exc): raise exc
           async def main():
               limit = 1024
               pump = WritePump(max_bytes=8 << 20, max_messages=limit, on_failure=no_failure)
-              for _ in range(limit):
-                  assert pump.try_enqueue(b"x")
-              transport = HeldTransport()
-              pump.start(transport)
+              for _ in range(limit): assert pump.try_enqueue(b"x")
+              transport = HeldTransport(); pump.start(transport)
               await asyncio.wait_for(transport.entered.wait(), 5.0)
-              active_batch = pump.batched_items
-              accepted_extra = 0
+              active_batch = pump.batched_items; accepted_extra = 0
               while pump.try_enqueue(b"y"):
                   accepted_extra += 1
-                  if accepted_extra > 2048:
-                      raise AssertionError("unbounded admission")
+                  if accepted_extra > 2048: raise AssertionError("unbounded admission")
               print(json.dumps({
                   "configured_max_messages": limit,
                   "active_batch_items": active_batch,
@@ -201,29 +183,23 @@ jobs:
                   "logical_writer_owned_messages": active_batch + pump.queued_messages,
                   "resident_messages_property": getattr(pump, "resident_messages", None),
               }))
-              transport.hold.set()
-              await pump.stop()
-
+              transport.hold.set(); await pump.stop()
           asyncio.run(main())
           PY
-          PYTHONPATH=base/src python "$RUNNER_TEMP/mqttium-pr283/resident_probe.py" \
-            > "$RUNNER_TEMP/mqttium-pr283/resident-base.json"
-          PYTHONPATH=candidate/src python "$RUNNER_TEMP/mqttium-pr283/resident_probe.py" \
-            > "$RUNNER_TEMP/mqttium-pr283/resident-candidate.json"
+          PYTHONPATH=base/src python "$RUNNER_TEMP/mqttium-pr283/resident_probe.py" > "$RUNNER_TEMP/mqttium-pr283/resident-base.json"
+          PYTHONPATH=candidate/src python "$RUNNER_TEMP/mqttium-pr283/resident_probe.py" > "$RUNNER_TEMP/mqttium-pr283/resident-candidate.json"
           cat "$RUNNER_TEMP/mqttium-pr283/resident-base.json"
           cat "$RUNNER_TEMP/mqttium-pr283/resident-candidate.json"
 
-      - name: Isolated memory profile baseline
+      - name: Isolated memory profile baseline with common repaired harness
         run: |
-          PYTHONPATH=base/src python harness/benchmarks/memory_profile.py \
-            --label "$BASE_SHA" \
-            --output "$RUNNER_TEMP/mqttium-pr283/memory-base.json"
+          PYTHONPATH=base/src python candidate/benchmarks/memory_profile.py \
+            --label "$BASE_SHA" --output "$RUNNER_TEMP/mqttium-pr283/memory-base.json"
 
-      - name: Isolated memory profile candidate
+      - name: Isolated memory profile candidate with common repaired harness
         run: |
-          PYTHONPATH=candidate/src python harness/benchmarks/memory_profile.py \
-            --label "$CANDIDATE_SHA" \
-            --output "$RUNNER_TEMP/mqttium-pr283/memory-candidate.json"
+          PYTHONPATH=candidate/src python candidate/benchmarks/memory_profile.py \
+            --label "$CANDIDATE_SHA" --output "$RUNNER_TEMP/mqttium-pr283/memory-candidate.json"
 
       - name: Upload evidence
         if: always()
@@ -243,7 +219,5 @@ jobs:
         run: |
           pidfile="$RUNNER_TEMP/mqttium-pr283/mosquitto.pid"
           if [ -f "$pidfile" ]; then
-            pid="$(cat "$pidfile")"
-            kill "$pid" 2>/dev/null || true
-            wait "$pid" 2>/dev/null || true
+            pid="$(cat "$pidfile")"; kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
           fi
