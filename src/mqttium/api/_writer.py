@@ -473,6 +473,13 @@ class WritePump:
                 self.enqueue_suspensions += 1
                 try:
                     await self.space.wait()
+                except asyncio.CancelledError:
+                    # notify(n) is consumed by whoever is waiting. A waiter
+                    # cancelled after being selected must hand the wakeup on,
+                    # or the remaining producers stay parked with free slots.
+                    if self.waiters > 1:
+                        self.space.notify(1)
+                    raise
                 finally:
                     self.waiters -= 1
             if epoch != self.epoch:
@@ -500,6 +507,8 @@ class WritePump:
         transport = self.transport
         if transport is None:
             raise RuntimeError("WritePump started without a transport")
+        writer_task = asyncio.current_task()
+        assert writer_task is not None
         # Resolved once per writer task rather than per batch. The local dies
         # with the task, so unlike `_write_nowait` it needs no explicit
         # clearing: it can never outlive the transport it was resolved from.
@@ -527,6 +536,7 @@ class WritePump:
                 # this is what stops an eager write from landing between the two
                 # halves of a segmented item.
                 self._writing = True
+                batch_completed = False
                 try:
                     # Coalesce contiguous small frames into one writelines call.
                     # Never await drain() after the batch (deadlocks vs reader ACK).
@@ -541,6 +551,7 @@ class WritePump:
                             contiguous.append(data)
                     await self._write_contiguous(transport, write_many, contiguous)
                     self.last_outbound = time.monotonic()
+                    batch_completed = True
                 finally:
                     self._writing = False
                     released = 0
@@ -552,8 +563,11 @@ class WritePump:
                     async with self.space:
                         self.queued_bytes = max(0, self.queued_bytes - released)
                         self._release_resident(n_batch)
-                        if self.waiters:
-                            self.space.notify_all()
+                        if batch_completed and self.waiters and not writer_task.cancelling():
+                            # Resident accounting is released even on lifecycle
+                            # cancellation/failure, but only a successfully written
+                            # batch releases usable admission capacity.
+                            self.space.notify(min(self.waiters, n_batch))
         except asyncio.CancelledError:
             raise
         except Exception as exc:
