@@ -6,73 +6,15 @@ on:
 permissions:
   contents: read
 
+# This file is a disposable placeholder on the temporary benchmark branch.
+# Keep the previous temporary concurrency key so a new PR synchronization
+# cancels any superseded ARM64 campaign still queued/running from this branch.
 concurrency:
   group: temp-scheduler-284-286-arm64
   cancel-in-progress: true
 
 jobs:
-  campaigns:
-    runs-on: [self-hosted, linux, ARM64]
-    timeout-minutes: 180
-    env:
-      PYTHONUNBUFFERED: "1"
-      PIP_DISABLE_PIP_VERSION_CHECK: "1"
-      BASE_SHA: e80618154bacefed5626d9eb9ba46edf560b54e7
-      PR284_SHA: 8d37248831b372004074acfa0018f34da51b54df
-      PR285_SHA: 505c385c59670b2fb095728b5095f5039c53d675
-      PR286_SHA: 8362d50072ce5a09bbf564fff1368c62a06e88fc
+  temporary-placeholder:
+    runs-on: ubuntu-24.04
     steps:
-      - name: Checkout temporary harness
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          path: harness
-          persist-credentials: false
-      - name: Checkout baseline
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ env.BASE_SHA }}
-          path: base
-          persist-credentials: false
-      - name: Checkout PR284
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ env.PR284_SHA }}
-          path: pr284
-          persist-credentials: false
-      - name: Checkout PR285
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ env.PR285_SHA }}
-          path: pr285
-          persist-credentials: false
-      - name: Checkout PR286
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ env.PR286_SHA }}
-          path: pr286
-          persist-credentials: false
-      - name: Create venv
-        shell: bash
-        run: |
-          rm -rf "$RUNNER_TEMP/scheduler-venv"
-          python3 -m venv "$RUNNER_TEMP/scheduler-venv"
-          echo "$RUNNER_TEMP/scheduler-venv/bin" >> "$GITHUB_PATH"
-      - name: Install dependencies
-        shell: bash
-        run: "$RUNNER_TEMP/scheduler-venv/bin/python -m pip install -e 'pr284[dev]' 'psutil>=6,<8'"
-      - name: Run dedicated decision campaigns
-        shell: bash
-        run: bash harness/benchmarks/temp_run_decision_campaigns.sh
-      - name: Upload all decision evidence
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: scheduler-decision-arm64-${{ github.run_id }}
-          path: |
-            ${{ runner.temp }}/scheduler-decision/**/*.json
-            ${{ runner.temp }}/scheduler-decision/**/*.md
-            ${{ runner.temp }}/scheduler-decision/**/*.tsv
-            ${{ runner.temp }}/scheduler-decision/**/mosquitto.log
-          if-no-files-found: warn
-          retention-days: 30
+      - run: echo "ARM64 evidence is produced by temp-scheduler-284-286-arm64.yml"
