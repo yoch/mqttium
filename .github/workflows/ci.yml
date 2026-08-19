@@ -20,7 +20,7 @@ env:
 jobs:
   hosted:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v7
         with:
@@ -29,27 +29,15 @@ jobs:
           path: stack
           persist-credentials: false
 
-      - name: Compose exact accepted heads
+      - name: Compose exact accepted heads with audited conflict resolution
         shell: bash
         working-directory: stack
         run: |
           set -euo pipefail
           git config user.name stack-probe
           git config user.email stack-probe@example.invalid
-          merge_one() {
-            local sha="$1"
-            git fetch --no-tags origin "$sha"
-            set +e
-            git merge --no-ff --no-edit "$sha"
-            local rc=$?
-            set -e
-            if [ "$rc" -eq 0 ]; then return 0; fi
-            mapfile -t conflicts < <(git diff --name-only --diff-filter=U)
-            printf 'conflicts: %s\n' "${conflicts[*]}"
-            if [ "${#conflicts[@]}" -ne 1 ] || [ "${conflicts[0]}" != "docs/reports/README.md" ]; then
-              git diff --cc || true
-              return "$rc"
-            fi
+
+          union_report_index() {
             python - <<'PY'
           from pathlib import Path
           import subprocess
@@ -57,7 +45,10 @@ jobs:
           ours = subprocess.check_output(['git', 'show', f':2:{path}'], text=True)
           theirs = subprocess.check_output(['git', 'show', f':3:{path}'], text=True)
           lines = ours.splitlines()
-          incoming = [line for line in theirs.splitlines() if line.startswith('| 2026-08-') and 'SCHEDULER-' in line and line not in lines]
+          incoming = [
+              line for line in theirs.splitlines()
+              if line.startswith('| 2026-08-') and 'SCHEDULER-' in line and line not in lines
+          ]
           if not incoming:
               raise SystemExit('no unique incoming scheduler report rows')
           heading = lines.index('## Hot-path decisions')
@@ -66,19 +57,130 @@ jobs:
               insert_at -= 1
           lines[insert_at:insert_at] = incoming
           Path(path).write_text('\n'.join(lines) + '\n')
+          print('unioned report rows:', *incoming, sep='\n')
           PY
+          }
+
+          test "$(git rev-parse HEAD)" = "$BASE_SHA"
+
+          git fetch --no-tags origin "$PR283_SHA"
+          git merge --no-ff --no-edit "$PR283_SHA"
+
+          git fetch --no-tags origin "$PR284_SHA"
+          set +e
+          git merge --no-ff --no-edit "$PR284_SHA"
+          rc=$?
+          set -e
+          test "$rc" -ne 0
+          mapfile -t conflicts < <(git diff --name-only --diff-filter=U | sort)
+          printf 'PR284 conflicts: %s\n' "${conflicts[*]}"
+          test "${#conflicts[@]}" -eq 2
+          test "${conflicts[0]}" = "docs/reports/README.md"
+          test "${conflicts[1]}" = "src/mqttium/api/_writer.py"
+
+          union_report_index
+
+          git checkout --ours src/mqttium/api/_writer.py
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('src/mqttium/api/_writer.py')
+          text = path.read_text()
+
+          def replace_once(old: str, new: str) -> None:
+              global text
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'writer resolution expected one match, got {count}: {old!r}')
+              text = text.replace(old, new)
+
+          replace_once(
+              '                self.enqueue_suspensions += 1\n'
+              '                try:\n'
+              '                    await self.space.wait()\n'
+              '                finally:\n'
+              '                    self.waiters -= 1\n',
+              '                self.enqueue_suspensions += 1\n'
+              '                try:\n'
+              '                    await self.space.wait()\n'
+              '                except asyncio.CancelledError:\n'
+              '                    # notify(n) is consumed by whoever is waiting. A waiter\n'
+              '                    # cancelled after being selected must hand the wakeup on,\n'
+              '                    # or the remaining producers stay parked with free slots.\n'
+              '                    if self.waiters > 1:\n'
+              '                        self.space.notify(1)\n'
+              '                    raise\n'
+              '                finally:\n'
+              '                    self.waiters -= 1\n',
+          )
+          replace_once(
+              '        transport = self.transport\n'
+              '        if transport is None:\n'
+              '            raise RuntimeError("WritePump started without a transport")\n'
+              '        # Resolved once per writer task rather than per batch. The local dies\n',
+              '        transport = self.transport\n'
+              '        if transport is None:\n'
+              '            raise RuntimeError("WritePump started without a transport")\n'
+              '        writer_task = asyncio.current_task()\n'
+              '        assert writer_task is not None\n'
+              '        # Resolved once per writer task rather than per batch. The local dies\n',
+          )
+          replace_once(
+              '                self._writing = True\n'
+              '                try:\n'
+              '                    # Coalesce contiguous small frames into one writelines call.\n',
+              '                self._writing = True\n'
+              '                batch_completed = False\n'
+              '                try:\n'
+              '                    # Coalesce contiguous small frames into one writelines call.\n',
+          )
+          replace_once(
+              '                    await self._write_contiguous(transport, write_many, contiguous)\n'
+              '                    self.last_outbound = time.monotonic()\n'
+              '                finally:\n',
+              '                    await self._write_contiguous(transport, write_many, contiguous)\n'
+              '                    self.last_outbound = time.monotonic()\n'
+              '                    batch_completed = True\n'
+              '                finally:\n',
+          )
+          replace_once(
+              '                        self._release_resident(n_batch)\n'
+              '                        if self.waiters:\n'
+              '                            self.space.notify_all()\n',
+              '                        self._release_resident(n_batch)\n'
+              '                        if batch_completed and self.waiters and not writer_task.cancelling():\n'
+              '                            # Resident accounting is released even on lifecycle\n'
+              '                            # cancellation/failure, but only a successfully written\n'
+              '                            # batch releases usable admission capacity.\n'
+              '                            self.space.notify(min(self.waiters, n_batch))\n',
+          )
+          path.write_text(text)
+          PY
+
+          git add docs/reports/README.md src/mqttium/api/_writer.py
+          git diff --check
+          git commit --no-edit
+
+          git fetch --no-tags origin "$PR285_SHA"
+          set +e
+          git merge --no-ff --no-edit "$PR285_SHA"
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            mapfile -t conflicts < <(git diff --name-only --diff-filter=U)
+            printf 'PR285 conflicts: %s\n' "${conflicts[*]}"
+            test "${#conflicts[@]}" -eq 1
+            test "${conflicts[0]}" = "docs/reports/README.md"
+            union_report_index
             git add docs/reports/README.md
             git diff --check
             git commit --no-edit
-          }
-          test "$(git rev-parse HEAD)" = "$BASE_SHA"
-          merge_one "$PR283_SHA"
-          merge_one "$PR284_SHA"
-          merge_one "$PR285_SHA"
+          fi
+
           test -z "$(git diff --name-only --diff-filter=U)"
           git diff --check "$BASE_SHA"..HEAD
           echo "combined head: $(git rev-parse HEAD)"
-          git log --oneline --decorate -10
+          git log --oneline --decorate -12
 
       - uses: actions/setup-python@v7
         with:
