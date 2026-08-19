@@ -1,9 +1,6 @@
 name: TEMP PR283 resident budget evidence
 
 on:
-  push:
-    branches:
-      - bench/tmp-pr283-resident-budget-20260819-evidence
   pull_request:
     branches:
       - main
@@ -13,7 +10,7 @@ permissions:
 
 concurrency:
   group: temp-pr283-resident-budget-arm64
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   evidence:
