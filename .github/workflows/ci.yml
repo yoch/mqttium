@@ -21,8 +21,11 @@ jobs:
       PR284_SHA: 8d37248831b372004074acfa0018f34da51b54df
       PR285_SHA: 505c385c59670b2fb095728b5095f5039c53d675
       FAIRNESS_SHA: ac50c07cf070be45fe4d13e67ba16714f6f82a4b
-      ROOT: ${{ runner.temp }}/final-arm64-284-285
     steps:
+      - name: Define runtime root
+        shell: bash
+        run: echo "ROOT=$RUNNER_TEMP/final-arm64-284-285" >> "$GITHUB_ENV"
+
       - name: Checkout trigger
         uses: actions/checkout@v7
         with:
