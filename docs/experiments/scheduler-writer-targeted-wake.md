@@ -55,4 +55,6 @@ Lost-wakeup hand-off: if a waiter is cancelled after consuming a `notify(n)` tok
 
 **Harness.** `benchmarks/paired_writer_waiter_contention.py` is a fresh-process ABBA microbenchmark of concurrent `WritePump.enqueue()` against a tight `max_messages` window. Default concurrency is 1, 4, 16; 64/256 are CLI options. It records completed ops/s, CPU time, `enqueue_suspensions`, and enqueue-wait p50/p95/p99. Raw JSON stays out of git.
 
-**Still required before merge.** Eligible-runner harness A/A, then A/B against the `notify_all()` baseline; `paired_writer_capacity.py` as the established writer-regime guard; open-loop/network cells so a contention win is not paid for in latency. Complexity/risk: [`docs/reports/SCHEDULER-WRITER-TARGETED-WAKE-2026-08-18.md`](../reports/SCHEDULER-WRITER-TARGETED-WAKE-2026-08-18.md).
+**Diagnostic A/B (ineligible cloud VM, 2026-08-19).** Writer-capacity 1.012 / 1.000. Contention +9.8% at 16 producers and +143% at 64, with CPU 0.168s → 0.069s and suspensions 81264 → 19453. Single-producer −2.2%. Keep; confirm on an eligible runner.
+
+Complexity/risk: [`docs/reports/SCHEDULER-WRITER-TARGETED-WAKE-2026-08-18.md`](../reports/SCHEDULER-WRITER-TARGETED-WAKE-2026-08-18.md).

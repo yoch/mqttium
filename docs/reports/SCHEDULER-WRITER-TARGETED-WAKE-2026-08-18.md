@@ -67,12 +67,34 @@ coverage, which is why those have dedicated tests rather than more machinery.
   order, JSON under `/tmp`. Defaults: producers 1/4/16, `max_messages=8`.
   64/256 are `--producer-values` options. Do not commit raw JSON.
 
+## Diagnostic campaign (2026-08-19)
+
+Ineligible 4-CPU KVM cloud VM (governor unavailable). Advisory, repeat 4,
+`--cpu 1`. Not merge-quality.
+
+Writer-capacity guard vs `main`: QoS 0 **1.012**, QoS 1 **1.000**.
+
+Waiter-contention A/A on this tree (producers 1/4/16/64): 0.996 / 0.998 /
+0.979 / 0.995. The 16-producer A/A is 2.1% off the 2% band — treat A/B at that
+point as directional.
+
+Waiter-contention A/B vs `notify_all()`:
+
+| Producers | Rate | CPU s (base → cand) | Suspensions |
+| --- | --- | --- | --- |
+| 1 | 0.978 | 0.038 → 0.039 | 2499 → 2499 |
+| 4 | 1.010 | 0.046 → 0.045 | 6246 → 6246 |
+| 16 | **1.098** | 0.070 → 0.064 | 21240 → 16476 |
+| 64 | **2.433** | 0.168 → 0.069 | 81264 → 19453 |
+
+Two contention points clear the 5% bar. Single-producer is −2.2% (inside the
+3% guardrail). Enqueue p99 rises at 16/64: waiters queue instead of stampeding.
+CPU and suspension cuts at 64 producers are large.
+
 ## Risks that remain
 
-- **No performance claim yet.** The hypothesis is fewer redundant wakeups under
-  multi-producer backpressure. Eligible-runner A/A of the new harness, then A/B
-  against `notify_all()`, plus `paired_writer_capacity.py` and open-loop
-  latency cells, are still required. Hosted-runner numbers are not evidence.
+- **Eligible-runner confirmation.** Re-run harness A/A (especially 16
+  producers) then A/B, plus open-loop/network, on an eligible host.
 - **Heterogeneous item sizes.** `n` is a message-slot count. A waiter blocked
   on the byte bound can still be woken for a small-item slot, fail admission,
   and wait again. A FIFO/weighted deque is the next candidate only if this
@@ -90,7 +112,7 @@ coverage, which is why those have dedicated tests rather than more machinery.
 
 ## Verdict
 
-The candidate is small enough to keep: it does not add a waiter scheduler, and
-the correctness tests pin the failure modes that would make `notify(n)` worse
-than `notify_all()`. Merge is blocked on measured evidence, not on further
-code.
+Diagnostic signal matches the hypothesis: targeted wake helps where many
+producers wait on a tight writer window, and does not move the closed-loop
+writer-capacity floor. Keep the candidate. Merge is still blocked on an
+eligible runner, not on further code.
