@@ -1,21 +1,20 @@
-"""Temporary causal study of writer cooperation and transport write granularity.
+"""Temporary causal study of TCP writer transport burst granularity.
 
-This harness deliberately keeps the production source tree immutable. Worker
-processes import one exact mqttium checkout, install one process-local experiment
-mode, and run the same mixed QoS0-flood/QoS1-receipt workload in ABBA order.
+The production source tree stays immutable. Fresh worker processes import one
+exact mqttium checkout, install one process-local StreamTransport.write_many
+variant, and run the same mixed QoS0-flood/QoS1-receipt workload in alternating
+ABBA order.
 
-The modes are causal probes, not production policy selections:
+Only two modes remain in this phase:
 
-* base: instrument current StreamTransport.write_many without changing policy;
-* cap-yield: yield once while the writer still owns a full 256-item contiguous
-  group and backlog remains;
-* large-yield: yield after a large contiguous group while backlog remains;
-* chunk-drain: split one logical write_many into transport sub-bursts, checking
-  drain after each, without an explicit scheduler yield;
-* chunk-yield: chunk-drain plus sleep(0) between transport sub-bursts.
+* base: instrument the current StreamTransport.write_many semantics;
+* chunk-drain: preserve the logical WritePump batch and FIFO order, but submit
+  whole MQTT byte strings to the TCP transport in bounded sub-bursts, applying
+  the existing drain predicate between sub-bursts. No explicit scheduler yield
+  is introduced.
 
-Logical WritePump batching, resident accounting, queue order and waiter release
-remain unchanged in every non-base mode.
+The harness reports burst-start probes separately from steady-state probes so a
+single first-probe FIFO head-of-line event cannot masquerade as generic p999.
 """
 
 from __future__ import annotations
@@ -31,7 +30,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-_MODES = ("base", "cap-yield", "large-yield", "chunk-drain", "chunk-yield")
+_MODES = ("base", "chunk-drain")
 _TRACE_LIMIT = 20_000
 _TELEMETRY: dict[str, Any] = {}
 
@@ -46,7 +45,7 @@ def _reset_telemetry() -> None:
         "sync_submit_ms": 0.0,
         "max_pending_before": 0,
         "max_pending_after": 0,
-        "cooperative_yields": 0,
+        "max_subwrite_bytes": 0,
         "events": [],
     }
 
@@ -62,13 +61,16 @@ def _pending_bytes(stream_transport: Any) -> int:
     return 0 if transport is None else int(transport.get_write_buffer_size())
 
 
-async def _submit_parts(stream_transport: Any, parts: list[bytes], *, more: bool, do_yield: bool) -> None:
+async def _submit_parts(stream_transport: Any, parts: list[bytes]) -> None:
     from mqttium.transport._stream import write_buffer_needs_drain
 
     if not parts:
         return
+    byte_count = sum(map(len, parts))
     before = _pending_bytes(stream_transport)
     _TELEMETRY["max_pending_before"] = max(_TELEMETRY["max_pending_before"], before)
+    _TELEMETRY["max_subwrite_bytes"] = max(_TELEMETRY["max_subwrite_bytes"], byte_count)
+
     started = time.perf_counter()
     if len(parts) == 1:
         stream_transport._writer.write(parts[0])
@@ -77,10 +79,11 @@ async def _submit_parts(stream_transport: Any, parts: list[bytes], *, more: bool
     submit_ms = (time.perf_counter() - started) * 1000.0
     _TELEMETRY["sync_submit_ms"] += submit_ms
     _TELEMETRY["transport_subwrites"] += 1
+
     after = _pending_bytes(stream_transport)
     _TELEMETRY["max_pending_after"] = max(_TELEMETRY["max_pending_after"], after)
-    drain_ms = 0.0
     drained = False
+    drain_ms = 0.0
     if write_buffer_needs_drain(stream_transport._writer):
         drained = True
         _TELEMETRY["drain_calls"] += 1
@@ -88,110 +91,54 @@ async def _submit_parts(stream_transport: Any, parts: list[bytes], *, more: bool
         await stream_transport._writer.drain()
         drain_ms = (time.perf_counter() - drain_started) * 1000.0
         _TELEMETRY["drain_block_ms"] += drain_ms
-    yielded = False
-    if do_yield and more:
-        yielded = True
-        _TELEMETRY["cooperative_yields"] += 1
-        await asyncio.sleep(0)
+
     _record_event(
         {
             "kind": "transport-submit",
             "t": time.perf_counter(),
             "items": len(parts),
-            "bytes": sum(map(len, parts)),
+            "bytes": byte_count,
             "pending_before": before,
             "pending_after": after,
             "submit_ms": submit_ms,
             "drained": drained,
             "drain_ms": drain_ms,
-            "yielded": yielded,
         }
     )
 
 
-def _install_mode(mode: str, *, chunk_bytes: int, large_yield_bytes: int) -> None:
-    """Install one experiment mode before constructing AsyncClient."""
+def _install_mode(mode: str, *, chunk_bytes: int) -> None:
+    """Install one transport-only experiment mode before AsyncClient creation."""
     _reset_telemetry()
 
-    from mqttium.api._writer import WritePump
     from mqttium.transport._stream import StreamTransport
-
-    original_write_many = StreamTransport.write_many
 
     async def instrumented_write_many(self: Any, parts: list[bytes]) -> None:
         if not parts:
             return
         _TELEMETRY["write_many_calls"] += 1
-
-        if mode not in ("chunk-drain", "chunk-yield"):
-            await _submit_parts(self, parts, more=False, do_yield=False)
+        if mode == "base":
+            await _submit_parts(self, parts)
             return
 
-        chunks: list[list[bytes]] = []
         current: list[bytes] = []
         current_bytes = 0
         for part in parts:
             size = len(part)
             if current and current_bytes + size > chunk_bytes:
-                chunks.append(current)
+                await _submit_parts(self, current)
                 current = []
                 current_bytes = 0
             current.append(part)
             current_bytes += size
             if current_bytes >= chunk_bytes:
-                chunks.append(current)
+                await _submit_parts(self, current)
                 current = []
                 current_bytes = 0
         if current:
-            chunks.append(current)
-
-        for index, chunk in enumerate(chunks):
-            await _submit_parts(
-                self,
-                chunk,
-                more=index + 1 < len(chunks),
-                do_yield=mode == "chunk-yield",
-            )
+            await _submit_parts(self, current)
 
     StreamTransport.write_many = instrumented_write_many
-
-    if mode in ("cap-yield", "large-yield"):
-        original_write_contiguous = WritePump._write_contiguous
-
-        async def cooperative_write_contiguous(
-            self: Any,
-            transport: Any,
-            write_many: Any,
-            parts: list[bytes],
-        ) -> None:
-            item_count = len(parts)
-            byte_count = sum(map(len, parts))
-            await original_write_contiguous(self, transport, write_many, parts)
-            backlog = not self.queue.empty()
-            should_yield = (
-                mode == "cap-yield" and item_count >= 256 and backlog
-            ) or (
-                mode == "large-yield"
-                and byte_count >= large_yield_bytes
-                and backlog
-            )
-            if should_yield:
-                _TELEMETRY["cooperative_yields"] += 1
-                _record_event(
-                    {
-                        "kind": "writer-yield",
-                        "t": time.perf_counter(),
-                        "items": item_count,
-                        "bytes": byte_count,
-                        "queued_messages": self.queue.qsize(),
-                        "resident_messages": self.resident_messages,
-                    }
-                )
-                await asyncio.sleep(0)
-
-        WritePump._write_contiguous = cooperative_write_contiguous
-
-    _TELEMETRY["_original_write_many_name"] = getattr(original_write_many, "__qualname__", "")
 
 
 def _pct(values: list[float], q: float) -> float:
@@ -222,11 +169,7 @@ async def _worker(args: argparse.Namespace) -> dict[str, Any]:
         except (AttributeError, OSError) as exc:
             raise RuntimeError(f"cannot pin worker to CPU {args.cpu}") from exc
 
-    _install_mode(
-        args.mode,
-        chunk_bytes=args.chunk_bytes,
-        large_yield_bytes=args.large_yield_bytes,
-    )
+    _install_mode(args.mode, chunk_bytes=args.chunk_bytes)
 
     from mqttium.api import AsyncClient
     from mqttium.protocol.reconnect import ReconnectPolicy
@@ -246,21 +189,7 @@ async def _worker(args: argparse.Namespace) -> dict[str, Any]:
     flood_topic = f"bench/writer-coop/flood/{suffix}"
     probe_topic = f"bench/writer-coop/probe/{suffix}"
     gate = asyncio.Event()
-    stop_heartbeat = asyncio.Event()
     probes: list[dict[str, Any]] = []
-    heartbeat_late_ms: list[float] = []
-
-    async def heartbeat() -> None:
-        if not args.heartbeat:
-            return
-        loop = asyncio.get_running_loop()
-        interval = args.heartbeat_interval
-        target = loop.time() + interval
-        while not stop_heartbeat.is_set():
-            await asyncio.sleep(max(0.0, target - loop.time()))
-            now = loop.time()
-            heartbeat_late_ms.append(max(0.0, (now - target) * 1000.0))
-            target += interval
 
     async def flood() -> None:
         await gate.wait()
@@ -300,21 +229,13 @@ async def _worker(args: argparse.Namespace) -> dict[str, Any]:
                 }
             )
 
-    heartbeat_task = asyncio.create_task(heartbeat())
     flood_task = asyncio.create_task(flood())
     probe_task = asyncio.create_task(probe_loop())
     cpu_started = time.process_time()
     wall_started = time.perf_counter()
     gate.set()
-    try:
-        await asyncio.wait_for(
-            asyncio.gather(flood_task, probe_task),
-            timeout=args.timeout,
-        )
-        await asyncio.wait_for(client._write_pump.join(), timeout=args.timeout)
-    finally:
-        stop_heartbeat.set()
-        await heartbeat_task
+    await asyncio.wait_for(asyncio.gather(flood_task, probe_task), timeout=args.timeout)
+    await asyncio.wait_for(client._write_pump.join(), timeout=args.timeout)
     elapsed = time.perf_counter() - wall_started
     cpu_seconds = time.process_time() - cpu_started
 
@@ -333,6 +254,13 @@ async def _worker(args: argparse.Namespace) -> dict[str, Any]:
 
     completion = [row["completion_ms"] for row in probes]
     admission = [row["admission_ms"] for row in probes]
+    startup = probes[: args.steady_skip]
+    steady = probes[args.steady_skip :]
+    startup_completion = [row["completion_ms"] for row in startup]
+    startup_admission = [row["admission_ms"] for row in startup]
+    steady_completion = [row["completion_ms"] for row in steady]
+    steady_admission = [row["admission_ms"] for row in steady]
+
     return {
         "mode": args.mode,
         "flood_bytes": args.flood_bytes,
@@ -347,15 +275,28 @@ async def _worker(args: argparse.Namespace) -> dict[str, Any]:
         "probe_p999_ms": _pct(completion, 0.999),
         "probe_max_ms": max(completion, default=0.0),
         "probe_admit_p95_ms": _pct(admission, 0.95),
-        "heartbeat_p95_ms": _pct(heartbeat_late_ms, 0.95),
-        "heartbeat_p99_ms": _pct(heartbeat_late_ms, 0.99),
-        "heartbeat_max_ms": max(heartbeat_late_ms, default=0.0),
+        "startup_count": len(startup),
+        "startup_max_ms": max(startup_completion, default=0.0),
+        "startup_admit_max_ms": max(startup_admission, default=0.0),
+        "steady_count": len(steady),
+        "steady_p50_ms": _pct(steady_completion, 0.50),
+        "steady_p95_ms": _pct(steady_completion, 0.95),
+        "steady_p99_ms": _pct(steady_completion, 0.99),
+        "steady_p999_ms": _pct(steady_completion, 0.999),
+        "steady_max_ms": max(steady_completion, default=0.0),
+        "steady_admit_p95_ms": _pct(steady_admission, 0.95),
         "writer_batches": stats.batches,
         "writer_batched_items": stats.batched_items,
         "writer_batched_bytes": stats.batched_bytes,
         "writer_enqueue_suspensions": stats.enqueue_suspensions,
         "writer_eager_writes": stats.eager_writes,
-        "telemetry": {k: v for k, v in _TELEMETRY.items() if not k.startswith("_")},
+        "transport_subwrites": _TELEMETRY["transport_subwrites"],
+        "transport_drain_calls": _TELEMETRY["drain_calls"],
+        "transport_drain_block_ms": _TELEMETRY["drain_block_ms"],
+        "transport_sync_submit_ms": _TELEMETRY["sync_submit_ms"],
+        "transport_max_pending_after": _TELEMETRY["max_pending_after"],
+        "transport_max_subwrite_bytes": _TELEMETRY["max_subwrite_bytes"],
+        "telemetry": _TELEMETRY,
         "probes": probes,
     }
 
@@ -388,6 +329,8 @@ def _run_worker(
         str(args.flood_count),
         "--probes",
         str(args.probes),
+        "--steady-skip",
+        str(args.steady_skip),
         "--inflight",
         str(args.inflight),
         "--max-outbound-bytes",
@@ -396,17 +339,11 @@ def _run_worker(
         str(args.max_outbound_messages),
         "--chunk-bytes",
         str(args.chunk_bytes),
-        "--large-yield-bytes",
-        str(args.large_yield_bytes),
         "--timeout",
         str(args.timeout),
-        "--heartbeat-interval",
-        str(args.heartbeat_interval),
     ]
     if args.cpu is not None:
         command.extend(("--cpu", str(args.cpu)))
-    if args.heartbeat:
-        command.append("--heartbeat")
     completed = subprocess.run(
         command,
         env=env,
@@ -417,7 +354,9 @@ def _run_worker(
     )
     if completed.returncode:
         diagnostic = (completed.stderr or completed.stdout or "no output")[-6000:]
-        raise RuntimeError(f"{variant}/{mode} worker failed rc={completed.returncode}: {diagnostic}")
+        raise RuntimeError(
+            f"{variant}/{mode} worker failed rc={completed.returncode}: {diagnostic}"
+        )
     lines = [line for line in completed.stdout.splitlines() if line.strip()]
     if not lines:
         raise RuntimeError(f"{variant}/{mode} worker produced no JSON")
@@ -444,12 +383,22 @@ def _parent(args: argparse.Namespace) -> int:
         "probe_p99_ms",
         "probe_p999_ms",
         "probe_max_ms",
-        "probe_admit_p95_ms",
-        "heartbeat_p95_ms",
-        "heartbeat_p99_ms",
-        "heartbeat_max_ms",
+        "startup_max_ms",
+        "startup_admit_max_ms",
+        "steady_p50_ms",
+        "steady_p95_ms",
+        "steady_p99_ms",
+        "steady_p999_ms",
+        "steady_max_ms",
+        "steady_admit_p95_ms",
         "writer_batches",
         "writer_enqueue_suspensions",
+        "transport_subwrites",
+        "transport_drain_calls",
+        "transport_drain_block_ms",
+        "transport_sync_submit_ms",
+        "transport_max_pending_after",
+        "transport_max_subwrite_bytes",
     )
     result = {
         "mode": args.mode,
@@ -460,19 +409,22 @@ def _parent(args: argparse.Namespace) -> int:
             "probe_bytes": args.probe_bytes,
             "flood_count": args.flood_count,
             "probes": args.probes,
+            "steady_skip": args.steady_skip,
             "inflight": args.inflight,
             "max_outbound_bytes": args.max_outbound_bytes,
             "max_outbound_messages": args.max_outbound_messages,
             "chunk_bytes": args.chunk_bytes,
-            "large_yield_bytes": args.large_yield_bytes,
-            "heartbeat": args.heartbeat,
         },
         "ratios": {key: _median_ratio(pairs, key) for key in ratio_keys},
         "pairs": pairs,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2) + "\n")
-    print(json.dumps({"mode": args.mode, "workload": result["workload"], "ratios": result["ratios"]}))
+    print(
+        json.dumps(
+            {"mode": args.mode, "workload": result["workload"], "ratios": result["ratios"]}
+        )
+    )
     return 0
 
 
@@ -480,31 +432,31 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--worker", action="store_true")
     parser.add_argument("--root", type=Path)
-    parser.add_argument("--mode", choices=_MODES, default="cap-yield")
+    parser.add_argument("--mode", choices=_MODES, default="chunk-drain")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=11883)
     parser.add_argument("--flood-bytes", type=int, default=32 * 1024)
     parser.add_argument("--probe-bytes", type=int, default=64)
     parser.add_argument("--flood-count", type=int, default=1500)
     parser.add_argument("--probes", type=int, default=200)
+    parser.add_argument("--steady-skip", type=int, default=2)
     parser.add_argument("--inflight", type=int, default=20)
     parser.add_argument("--max-outbound-bytes", type=int, default=64 << 20)
     parser.add_argument("--max-outbound-messages", type=int, default=100_000)
-    parser.add_argument("--chunk-bytes", type=int, default=256 * 1024)
-    parser.add_argument("--large-yield-bytes", type=int, default=1 << 20)
-    parser.add_argument("--repeat", type=int, default=6)
+    parser.add_argument("--chunk-bytes", type=int, default=1 << 20)
+    parser.add_argument("--repeat", type=int, default=4)
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--cpu", type=int)
-    parser.add_argument("--heartbeat", action="store_true")
-    parser.add_argument("--heartbeat-interval", type=float, default=0.001)
     parser.add_argument("--output", type=Path, default=Path("/tmp/writer-cooperation.json"))
     args = parser.parse_args()
     if not args.worker and args.root is None:
         parser.error("--root is required")
     if args.repeat <= 0 or args.repeat % 2:
         parser.error("--repeat must be a positive even number")
-    if args.chunk_bytes <= 0 or args.large_yield_bytes <= 0:
-        parser.error("byte thresholds must be positive")
+    if args.chunk_bytes <= 0:
+        parser.error("--chunk-bytes must be positive")
+    if args.steady_skip < 0 or args.steady_skip >= args.probes:
+        parser.error("--steady-skip must leave at least one steady-state probe")
     return args
 
 
