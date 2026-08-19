@@ -5,7 +5,7 @@ exact mqttium checkout, install one process-local StreamTransport.write_many
 variant, and run the same mixed QoS0-flood/QoS1-receipt workload in alternating
 ABBA order.
 
-Only two modes remain in this phase:
+Only two modes remain:
 
 * base: instrument the current StreamTransport.write_many semantics;
 * chunk-drain: preserve the logical WritePump batch and FIFO order, but submit
@@ -13,8 +13,10 @@ Only two modes remain in this phase:
   the existing drain predicate between sub-bursts. No explicit scheduler yield
   is introduced.
 
-The harness reports burst-start probes separately from steady-state probes so a
-single first-probe FIFO head-of-line event cannot masquerade as generic p999.
+Probe results are classified from the writer state observed immediately before
+publish admission: a probe is ``backlogged`` when earlier resident writer work
+exists and ``clear`` otherwise. This avoids an arbitrary fixed number of startup
+samples and directly identifies FIFO head-of-line exposure.
 """
 
 from __future__ import annotations
@@ -152,6 +154,21 @@ def _pct(values: list[float], q: float) -> float:
     return ordered[lo] * (1.0 - frac) + ordered[hi] * frac
 
 
+def _probe_group(prefix: str, rows: list[dict[str, Any]]) -> dict[str, float | int]:
+    completion = [row["completion_ms"] for row in rows]
+    admission = [row["admission_ms"] for row in rows]
+    return {
+        f"{prefix}_count": len(rows),
+        f"{prefix}_p50_ms": _pct(completion, 0.50),
+        f"{prefix}_p95_ms": _pct(completion, 0.95),
+        f"{prefix}_p99_ms": _pct(completion, 0.99),
+        f"{prefix}_p999_ms": _pct(completion, 0.999),
+        f"{prefix}_max_ms": max(completion, default=0.0),
+        f"{prefix}_admit_p95_ms": _pct(admission, 0.95),
+        f"{prefix}_admit_max_ms": max(admission, default=0.0),
+    }
+
+
 def _median_ratio(pairs: list[dict[str, Any]], key: str) -> float:
     ratios = []
     for pair in pairs:
@@ -254,14 +271,18 @@ async def _worker(args: argparse.Namespace) -> dict[str, Any]:
 
     completion = [row["completion_ms"] for row in probes]
     admission = [row["admission_ms"] for row in probes]
-    startup = probes[: args.steady_skip]
-    steady = probes[args.steady_skip :]
-    startup_completion = [row["completion_ms"] for row in startup]
-    startup_admission = [row["admission_ms"] for row in startup]
-    steady_completion = [row["completion_ms"] for row in steady]
-    steady_admission = [row["admission_ms"] for row in steady]
+    backlogged = [
+        row
+        for row in probes
+        if row["before"]["resident"] > 0 or row["before"]["queued_bytes"] > 0
+    ]
+    clear = [
+        row
+        for row in probes
+        if row["before"]["resident"] == 0 and row["before"]["queued_bytes"] == 0
+    ]
 
-    return {
+    result: dict[str, Any] = {
         "mode": args.mode,
         "flood_bytes": args.flood_bytes,
         "probe_bytes": args.probe_bytes,
@@ -275,16 +296,6 @@ async def _worker(args: argparse.Namespace) -> dict[str, Any]:
         "probe_p999_ms": _pct(completion, 0.999),
         "probe_max_ms": max(completion, default=0.0),
         "probe_admit_p95_ms": _pct(admission, 0.95),
-        "startup_count": len(startup),
-        "startup_max_ms": max(startup_completion, default=0.0),
-        "startup_admit_max_ms": max(startup_admission, default=0.0),
-        "steady_count": len(steady),
-        "steady_p50_ms": _pct(steady_completion, 0.50),
-        "steady_p95_ms": _pct(steady_completion, 0.95),
-        "steady_p99_ms": _pct(steady_completion, 0.99),
-        "steady_p999_ms": _pct(steady_completion, 0.999),
-        "steady_max_ms": max(steady_completion, default=0.0),
-        "steady_admit_p95_ms": _pct(steady_admission, 0.95),
         "writer_batches": stats.batches,
         "writer_batched_items": stats.batched_items,
         "writer_batched_bytes": stats.batched_bytes,
@@ -299,6 +310,9 @@ async def _worker(args: argparse.Namespace) -> dict[str, Any]:
         "telemetry": _TELEMETRY,
         "probes": probes,
     }
+    result.update(_probe_group("backlogged", backlogged))
+    result.update(_probe_group("clear", clear))
+    return result
 
 
 def _run_worker(
@@ -329,8 +343,6 @@ def _run_worker(
         str(args.flood_count),
         "--probes",
         str(args.probes),
-        "--steady-skip",
-        str(args.steady_skip),
         "--inflight",
         str(args.inflight),
         "--max-outbound-bytes",
@@ -383,14 +395,20 @@ def _parent(args: argparse.Namespace) -> int:
         "probe_p99_ms",
         "probe_p999_ms",
         "probe_max_ms",
-        "startup_max_ms",
-        "startup_admit_max_ms",
-        "steady_p50_ms",
-        "steady_p95_ms",
-        "steady_p99_ms",
-        "steady_p999_ms",
-        "steady_max_ms",
-        "steady_admit_p95_ms",
+        "backlogged_p50_ms",
+        "backlogged_p95_ms",
+        "backlogged_p99_ms",
+        "backlogged_p999_ms",
+        "backlogged_max_ms",
+        "backlogged_admit_p95_ms",
+        "backlogged_admit_max_ms",
+        "clear_p50_ms",
+        "clear_p95_ms",
+        "clear_p99_ms",
+        "clear_p999_ms",
+        "clear_max_ms",
+        "clear_admit_p95_ms",
+        "clear_admit_max_ms",
         "writer_batches",
         "writer_enqueue_suspensions",
         "transport_subwrites",
@@ -409,7 +427,6 @@ def _parent(args: argparse.Namespace) -> int:
             "probe_bytes": args.probe_bytes,
             "flood_count": args.flood_count,
             "probes": args.probes,
-            "steady_skip": args.steady_skip,
             "inflight": args.inflight,
             "max_outbound_bytes": args.max_outbound_bytes,
             "max_outbound_messages": args.max_outbound_messages,
@@ -420,11 +437,7 @@ def _parent(args: argparse.Namespace) -> int:
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2) + "\n")
-    print(
-        json.dumps(
-            {"mode": args.mode, "workload": result["workload"], "ratios": result["ratios"]}
-        )
-    )
+    print(json.dumps({"mode": args.mode, "workload": result["workload"], "ratios": result["ratios"]}))
     return 0
 
 
@@ -439,12 +452,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--probe-bytes", type=int, default=64)
     parser.add_argument("--flood-count", type=int, default=1500)
     parser.add_argument("--probes", type=int, default=200)
-    parser.add_argument("--steady-skip", type=int, default=2)
     parser.add_argument("--inflight", type=int, default=20)
     parser.add_argument("--max-outbound-bytes", type=int, default=64 << 20)
     parser.add_argument("--max-outbound-messages", type=int, default=100_000)
-    parser.add_argument("--chunk-bytes", type=int, default=1 << 20)
-    parser.add_argument("--repeat", type=int, default=4)
+    parser.add_argument("--chunk-bytes", type=int, default=2 << 20)
+    parser.add_argument("--repeat", type=int, default=8)
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--cpu", type=int)
     parser.add_argument("--output", type=Path, default=Path("/tmp/writer-cooperation.json"))
@@ -455,8 +467,6 @@ def _parse_args() -> argparse.Namespace:
         parser.error("--repeat must be a positive even number")
     if args.chunk_bytes <= 0:
         parser.error("--chunk-bytes must be positive")
-    if args.steady_skip < 0 or args.steady_skip >= args.probes:
-        parser.error("--steady-skip must leave at least one steady-state probe")
     return args
 
 
