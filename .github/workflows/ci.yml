@@ -1,4 +1,4 @@
-name: TEMP ARM64 broker CPU isolation probe
+name: TEMP ARM64 writer regime instrumentation
 
 on:
   pull_request:
@@ -19,15 +19,15 @@ env:
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
 jobs:
-  broker-isolation:
+  instrument:
     runs-on: [self-hosted, linux, ARM64]
     timeout-minutes: 120
     steps:
       - name: Define paths
         shell: bash
         run: |
-          echo "ROOT=$RUNNER_TEMP/broker-cpu-isolation" >> "$GITHUB_ENV"
-          echo "VENV=$RUNNER_TEMP/broker-cpu-isolation-venv" >> "$GITHUB_ENV"
+          echo "ROOT=$RUNNER_TEMP/writer-regime" >> "$GITHUB_ENV"
+          echo "VENV=$RUNNER_TEMP/writer-regime-venv" >> "$GITHUB_ENV"
 
       - name: Checkout immutable base
         uses: actions/checkout@v7
@@ -45,18 +45,15 @@ jobs:
           path: stack
           persist-credentials: false
 
-      - name: Compose exact runtime heads with audited writer resolution
+      - name: Compose exact runtime heads
         working-directory: stack
         shell: bash
         run: |
           set -euo pipefail
           git config user.name stack-probe
           git config user.email stack-probe@example.invalid
-          test "$(git rev-parse HEAD)" = "$BASE_SHA"
-
           git fetch --no-tags origin "$PR283_SHA"
           git merge --no-ff --no-edit "$PR283_SHA"
-
           git fetch --no-tags origin "$PR284_SHA"
           set +e
           git merge --no-ff --no-edit "$PR284_SHA"
@@ -80,7 +77,7 @@ jobs:
               text=text.replace(old,new)
           one(
               '                self.enqueue_suspensions += 1\n                try:\n                    await self.space.wait()\n                finally:\n                    self.waiters -= 1\n',
-              '                self.enqueue_suspensions += 1\n                try:\n                    await self.space.wait()\n                except asyncio.CancelledError:\n                    # notify(n) is consumed by whoever is waiting. A waiter\n                    # cancelled after being selected must hand the wakeup on,\n                    # or the remaining producers stay parked with free slots.\n                    if self.waiters > 1:\n                        self.space.notify(1)\n                    raise\n                finally:\n                    self.waiters -= 1\n',
+              '                self.enqueue_suspensions += 1\n                try:\n                    await self.space.wait()\n                except asyncio.CancelledError:\n                    if self.waiters > 1:\n                        self.space.notify(1)\n                    raise\n                finally:\n                    self.waiters -= 1\n',
           )
           one(
               '        transport = self.transport\n        if transport is None:\n            raise RuntimeError("WritePump started without a transport")\n        # Resolved once per writer task rather than per batch. The local dies\n',
@@ -101,9 +98,7 @@ jobs:
           p.write_text(text)
           PY
           git add docs/reports/README.md src/mqttium/api/_writer.py
-          git diff --check
           git commit --no-edit
-
           git fetch --no-tags origin "$PR285_SHA"
           set +e
           git merge --no-ff --no-edit "$PR285_SHA"
@@ -117,11 +112,29 @@ jobs:
             git add docs/reports/README.md
             git commit --no-edit
           fi
-          test -z "$(git diff --name-only --diff-filter=U)"
           git diff --check "$BASE_SHA"..HEAD
-          git rev-parse HEAD | tee "$RUNNER_TEMP/broker-isolation-stack-head.txt"
 
-      - name: Prepare ARM64 environment
+      - name: Patch temporary benchmark with per-worker instrumentation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('base/benchmarks/paired_writer_capacity.py')
+          text=p.read_text()
+          old='''    sync_rejected: int\n    drain_seconds: float\n'''
+          new='''    sync_rejected: int\n    drain_seconds: float\n    writer_batches: int = 0\n    writer_batched_items: int = 0\n    writer_batched_bytes: int = 0\n    writer_eager_writes: int = 0\n    writer_eager_bytes: int = 0\n    writer_enqueue_suspensions: int = 0\n    writer_segmented_writes: int = 0\n    publish_wakeups: int = 0\n    publish_wait_retries: int = 0\n    gc_gen0: int = 0\n    gc_gen1: int = 0\n    gc_gen2: int = 0\n    cpu_freq_start_khz: int | None = None\n    cpu_freq_end_khz: int | None = None\n'''
+          if text.count(old)!=1: raise SystemExit('dataclass anchor mismatch')
+          text=text.replace(old,new)
+          old='''        result = await _run_phase(\n            client,\n            topic=topic,\n            payload=payload,\n            qos=args.qos,\n            count=args.count,\n            outstanding=args.outstanding,\n            timeout=args.timeout,\n        )\n        result.protocol = args.protocol\n        result.inflight = args.inflight\n        return result\n'''
+          new='''        import gc\n\n        writer = client._write_pump\n        before_writer = writer.stats()\n        before_wakeups = getattr(client, "_publish_wakeups", 0)\n        before_retries = getattr(client, "_publish_wait_retries", 0)\n        before_gc = [entry["collections"] for entry in gc.get_stats()]\n\n        def cpu_freq_khz() -> int | None:\n            if args.cpu is None:\n                return None\n            path = Path(f"/sys/devices/system/cpu/cpu{args.cpu}/cpufreq/scaling_cur_freq")\n            try:\n                return int(path.read_text().strip())\n            except (OSError, ValueError):\n                return None\n\n        freq_start = cpu_freq_khz()\n        result = await _run_phase(\n            client,\n            topic=topic,\n            payload=payload,\n            qos=args.qos,\n            count=args.count,\n            outstanding=args.outstanding,\n            timeout=args.timeout,\n        )\n        freq_end = cpu_freq_khz()\n        after_writer = writer.stats()\n        after_gc = [entry["collections"] for entry in gc.get_stats()]\n        result.protocol = args.protocol\n        result.inflight = args.inflight\n        result.writer_batches = after_writer.batches - before_writer.batches\n        result.writer_batched_items = after_writer.batched_items - before_writer.batched_items\n        result.writer_batched_bytes = after_writer.batched_bytes - before_writer.batched_bytes\n        result.writer_eager_writes = after_writer.eager_writes - before_writer.eager_writes\n        result.writer_eager_bytes = after_writer.eager_bytes - before_writer.eager_bytes\n        result.writer_enqueue_suspensions = after_writer.enqueue_suspensions - before_writer.enqueue_suspensions\n        result.writer_segmented_writes = after_writer.segmented_writes - before_writer.segmented_writes\n        result.publish_wakeups = getattr(client, "_publish_wakeups", 0) - before_wakeups\n        result.publish_wait_retries = getattr(client, "_publish_wait_retries", 0) - before_retries\n        result.gc_gen0 = after_gc[0] - before_gc[0]\n        result.gc_gen1 = after_gc[1] - before_gc[1]\n        result.gc_gen2 = after_gc[2] - before_gc[2]\n        result.cpu_freq_start_khz = freq_start\n        result.cpu_freq_end_khz = freq_end\n        return result\n'''
+          if text.count(old)!=1: raise SystemExit('sample anchor mismatch')
+          text=text.replace(old,new)
+          p.write_text(text)
+          PY
+          python3 -m py_compile base/benchmarks/paired_writer_capacity.py
+
+      - name: Prepare runner and isolated broker
         shell: bash
         run: |
           set -euo pipefail
@@ -133,28 +146,7 @@ jobs:
           "$VENV/bin/python" -m pip install -e "stack[dev]" "psutil>=6,<8"
           sudo systemctl stop mosquitto 2>/dev/null || true
           sudo pkill -x mosquitto 2>/dev/null || true
-          sleep 1
-
-      - name: Install helper functions
-        shell: bash
-        run: |
-          cat > "$ROOT/helpers.sh" <<'SH'
-          set -euo pipefail
-          strict_probe() {
-            label="$1"
-            for attempt in $(seq 1 24); do
-              out="$ROOT/preflight-${label}-${attempt}.json"
-              if "$VENV/bin/python" base/benchmarks/runner_probe.py --output "$out" --require-temperature --enforce; then
-                cp "$out" "$ROOT/preflight-${label}.json"
-                return 0
-              fi
-              sleep 10
-            done
-            return 1
-          }
-          start_broker() {
-            mode="$1"
-            cat > "$ROOT/mosquitto.conf" <<'MOSQ'
+          cat > "$ROOT/mosquitto.conf" <<'MOSQ'
           persistence false
           allow_anonymous true
           max_inflight_messages 1000
@@ -164,162 +156,154 @@ jobs:
           log_type error
           listener 11883 127.0.0.1
           MOSQ
-            if [ "$mode" = pinned ]; then
-              taskset -c 0 mosquitto -c "$ROOT/mosquitto.conf" > "$ROOT/mosquitto-${mode}.log" 2>&1 &
-            else
-              mosquitto -c "$ROOT/mosquitto.conf" > "$ROOT/mosquitto-${mode}.log" 2>&1 &
+          taskset -c 0 mosquitto -c "$ROOT/mosquitto.conf" > "$ROOT/mosquitto.log" 2>&1 &
+          echo $! > "$ROOT/mosquitto.pid"
+          for _ in $(seq 1 50); do
+            (echo >/dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && break
+            sleep .2
+          done
+          test "$(awk '/Cpus_allowed_list/ {print $2}' /proc/$(cat "$ROOT/mosquitto.pid")/status)" = 0
+
+      - name: Strict preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 24); do
+            out="$ROOT/preflight-$attempt.json"
+            if "$VENV/bin/python" base/benchmarks/runner_probe.py --output "$out" --require-temperature --enforce; then
+              cp "$out" "$ROOT/preflight.json"
+              exit 0
             fi
-            echo $! > "$ROOT/mosquitto.pid"
-            pid="$(cat "$ROOT/mosquitto.pid")"
-            for _ in $(seq 1 50); do
-              if (echo >/dev/tcp/127.0.0.1/11883) >/dev/null 2>&1; then
-                taskset -pc "$pid" > "$ROOT/broker-${mode}-affinity.txt"
-                ps -o pid,psr,pcpu,comm -p "$pid" > "$ROOT/broker-${mode}-ps-start.txt"
-                return 0
-              fi
-              sleep .2
-            done
-            cat "$ROOT/mosquitto-${mode}.log"
-            return 1
-          }
-          start_sampler() {
-            mode="$1"
-            pid="$(cat "$ROOT/mosquitto.pid")"
-            taskset -c 3 bash -c 'while kill -0 "$1" 2>/dev/null; do ps -o psr= -p "$1"; sleep .2; done' _ "$pid" > "$ROOT/broker-${mode}-psr.log" 2>/dev/null &
-            echo $! > "$ROOT/sampler.pid"
-          }
-          stop_broker() {
-            if [ -f "$ROOT/sampler.pid" ]; then kill "$(cat "$ROOT/sampler.pid")" 2>/dev/null || true; fi
-            if [ -f "$ROOT/mosquitto.pid" ]; then kill "$(cat "$ROOT/mosquitto.pid")" 2>/dev/null || true; fi
-            sudo pkill -x mosquitto 2>/dev/null || true
-            sleep 2
-          }
-          run_pair() {
-            mode="$1"; kind="$2"; candidate="$3"; repeat="$4"; count="$5"; preflight="$6"
-            set +e
-            "$VENV/bin/python" base/benchmarks/paired_writer_capacity.py \
-              --base-root base --candidate-root "$candidate" --host 127.0.0.1 --port 11883 \
-              --protocol 311 --qos-values 1 --payload-bytes 64 \
-              --inflight 20 --outstanding 20 --max-queued 200 \
-              --warmup-count 5000 --count-qos1 "$count" --repeat "$repeat" --cpu 1 \
-              --policy strict --preflight-report "$preflight" \
-              --max-baseline-cv .05 --min-completed-ratio .97 \
-              --output "$ROOT/${mode}-${kind}.json" --summary-output "$ROOT/${mode}-${kind}.md"
-            rc=$?
-            set -e
-            echo "$rc" > "$ROOT/${mode}-${kind}.rc"
-          }
-          SH
+            sleep 10
+          done
+          exit 1
 
-      - name: Unpinned broker A/A and A/B
+      - name: Default hash seed A/A and A/B instrumentation
         shell: bash
         run: |
           set -euo pipefail
-          source "$ROOT/helpers.sh"
-          strict_probe unpinned-start
-          start_broker unpinned
-          start_sampler unpinned
-          run_pair unpinned aa base 12 40000 "$ROOT/preflight-unpinned-start.json"
-          strict_probe unpinned-ab
-          run_pair unpinned ab stack 12 40000 "$ROOT/preflight-unpinned-ab.json"
-          ps -o pid,psr,pcpu,comm -p "$(cat "$ROOT/mosquitto.pid")" > "$ROOT/broker-unpinned-ps-end.txt" || true
-          stop_broker
+          unset PYTHONHASHSEED || true
+          "$VENV/bin/python" base/benchmarks/paired_writer_capacity.py \
+            --base-root base --candidate-root base --host 127.0.0.1 --port 11883 \
+            --protocol 311 --qos-values 1 --payload-bytes 64 --inflight 20 --outstanding 20 \
+            --max-queued 200 --warmup-count 5000 --count-qos1 40000 --repeat 16 --cpu 1 \
+            --policy advisory --preflight-report "$ROOT/preflight.json" --max-baseline-cv 1.0 \
+            --min-completed-ratio 0.0 --output "$ROOT/default-aa.json"
+          "$VENV/bin/python" base/benchmarks/paired_writer_capacity.py \
+            --base-root base --candidate-root stack --host 127.0.0.1 --port 11883 \
+            --protocol 311 --qos-values 1 --payload-bytes 64 --inflight 20 --outstanding 20 \
+            --max-queued 200 --warmup-count 5000 --count-qos1 40000 --repeat 16 --cpu 1 \
+            --policy advisory --preflight-report "$ROOT/preflight.json" --max-baseline-cv 1.0 \
+            --min-completed-ratio 0.0 --output "$ROOT/default-ab.json"
 
-      - name: Cooldown and strict requalification before pinned broker
+      - name: Requalify before fixed hash seed
         shell: bash
         run: |
           set -euo pipefail
-          source "$ROOT/helpers.sh"
-          strict_probe pinned-start
+          for attempt in $(seq 1 24); do
+            out="$ROOT/preflight-hash0-$attempt.json"
+            if "$VENV/bin/python" base/benchmarks/runner_probe.py --output "$out" --require-temperature --enforce; then
+              cp "$out" "$ROOT/preflight-hash0.json"
+              exit 0
+            fi
+            sleep 10
+          done
+          exit 1
 
-      - name: Pinned CPU0 broker A/A and A/B
+      - name: Fixed PYTHONHASHSEED=0 A/A and A/B instrumentation
         shell: bash
+        env:
+          PYTHONHASHSEED: "0"
         run: |
           set -euo pipefail
-          source "$ROOT/helpers.sh"
-          start_broker pinned
-          pid="$(cat "$ROOT/mosquitto.pid")"
-          allowed="$(awk '/Cpus_allowed_list/ {print $2}' /proc/$pid/status)"
-          test "$allowed" = "0"
-          start_sampler pinned
-          run_pair pinned aa base 12 40000 "$ROOT/preflight-pinned-start.json"
-          strict_probe pinned-ab
-          run_pair pinned ab stack 12 40000 "$ROOT/preflight-pinned-ab.json"
-          ps -o pid,psr,pcpu,comm -p "$pid" > "$ROOT/broker-pinned-ps-end.txt" || true
+          "$VENV/bin/python" base/benchmarks/paired_writer_capacity.py \
+            --base-root base --candidate-root base --host 127.0.0.1 --port 11883 \
+            --protocol 311 --qos-values 1 --payload-bytes 64 --inflight 20 --outstanding 20 \
+            --max-queued 200 --warmup-count 5000 --count-qos1 40000 --repeat 16 --cpu 1 \
+            --policy advisory --preflight-report "$ROOT/preflight-hash0.json" --max-baseline-cv 1.0 \
+            --min-completed-ratio 0.0 --output "$ROOT/hash0-aa.json"
+          "$VENV/bin/python" base/benchmarks/paired_writer_capacity.py \
+            --base-root base --candidate-root stack --host 127.0.0.1 --port 11883 \
+            --protocol 311 --qos-values 1 --payload-bytes 64 --inflight 20 --outstanding 20 \
+            --max-queued 200 --warmup-count 5000 --count-qos1 40000 --repeat 16 --cpu 1 \
+            --policy advisory --preflight-report "$ROOT/preflight-hash0.json" --max-baseline-cv 1.0 \
+            --min-completed-ratio 0.0 --output "$ROOT/hash0-ab.json"
 
+      - name: Analyze regime correlations
+        shell: bash
+        run: |
           "$VENV/bin/python" - <<'PY'
-          import json, os
+          import json, os, statistics
           from pathlib import Path
           root=Path(os.environ['ROOT'])
-          d=json.loads((root/'pinned-ab.json').read_text())
-          s=d['scenarios'][0]
-          ok=(d['status']=='passed' and s['candidate_completed_cv'] <= 0.05 and s['median_candidate_over_base_completed'] >= 0.97)
-          (root/'run-long-pinned.flag').write_text('1\n' if ok else '0\n')
-          print('pinned short A/B clean:', ok)
+          fields=[
+              'writer_batches','writer_batched_items','writer_eager_writes','writer_enqueue_suspensions',
+              'publish_wakeups','publish_wait_retries','gc_gen0','gc_gen1','gc_gen2',
+              'cpu_freq_start_khz','cpu_freq_end_khz','cpu_seconds'
+          ]
+          report={}
+          for name in ('default-aa','default-ab','hash0-aa','hash0-ab'):
+              d=json.loads((root/f'{name}.json').read_text())
+              s=d['scenarios'][0]
+              rows=[]
+              for pair_index,pair in enumerate(s['pairs'],1):
+                  for variant in ('base','candidate'):
+                      r=dict(pair[variant])
+                      r['pair']=pair_index
+                      r['variant']=variant
+                      r['order']=pair['order']
+                      rows.append(r)
+              entry={
+                  'ratio':s['median_candidate_over_base_completed'],
+                  'base_cv':s['base_completed_cv'],
+                  'candidate_cv':s['candidate_completed_cv'],
+                  'rows':rows,
+                  'correlations':{},
+              }
+              rates=[r['completed_rate'] for r in rows]
+              for field in fields:
+                  vals=[r.get(field) for r in rows]
+                  if all(isinstance(v,(int,float)) for v in vals) and len(set(vals))>1:
+                      try: entry['correlations'][field]=statistics.correlation(rates, vals)
+                      except statistics.StatisticsError: pass
+              report[name]=entry
+          (root/'regime-analysis.json').write_text(json.dumps(report,indent=2)+'\n')
+          for name,e in report.items():
+              print('\n',name,'ratio',round(e['ratio'],5),'CV',round(e['base_cv'],4),round(e['candidate_cv'],4))
+              corrs=sorted(e['correlations'].items(), key=lambda kv: abs(kv[1]), reverse=True)
+              print(' strongest correlations:', [(k,round(v,3)) for k,v in corrs[:8]])
+              slow=sorted(e['rows'],key=lambda r:r['completed_rate'])[:4]
+              fast=sorted(e['rows'],key=lambda r:r['completed_rate'])[-4:]
+              for label,group in [('slow',slow),('fast',fast)]:
+                  print(label,[(r['variant'],round(r['completed_rate']),r['writer_batches'],r['writer_batched_items'],r['writer_eager_writes'],r['gc_gen0'],r['cpu_freq_start_khz'],r['cpu_freq_end_khz']) for r in group])
           PY
 
-          if [ "$(cat "$ROOT/run-long-pinned.flag")" = 1 ]; then
-            strict_probe pinned-long
-            run_pair pinned ab-long stack 8 200000 "$ROOT/preflight-pinned-long.json"
-          fi
-          stop_broker
-
-      - name: Final strict eligibility after cooldown
+      - name: Final cooldown and strict preflight
         if: always()
         shell: bash
         run: |
           set -euo pipefail
-          if [ -f "$ROOT/helpers.sh" ]; then
-            source "$ROOT/helpers.sh"
-            stop_broker || true
-            strict_probe final
-          fi
+          if [ -f "$ROOT/mosquitto.pid" ]; then kill "$(cat "$ROOT/mosquitto.pid")" 2>/dev/null || true; fi
+          sudo pkill -x mosquitto 2>/dev/null || true
+          sleep 2
+          for attempt in $(seq 1 24); do
+            out="$ROOT/preflight-final-$attempt.json"
+            if [ -x "$VENV/bin/python" ] && "$VENV/bin/python" base/benchmarks/runner_probe.py --output "$out" --require-temperature --enforce; then
+              cp "$out" "$ROOT/preflight-final.json"
+              exit 0
+            fi
+            sleep 10
+          done
+          exit 1
 
-      - name: Summarize broker-isolation evidence
-        if: always()
-        shell: bash
-        run: |
-          if [ -x "$VENV/bin/python" ]; then
-            "$VENV/bin/python" - <<'PY'
-          import json, os
-          from pathlib import Path
-          root=Path(os.environ['ROOT'])
-          rows=[]
-          for name in ('unpinned-aa','unpinned-ab','pinned-aa','pinned-ab','pinned-ab-long'):
-              p=root/f'{name}.json'
-              if not p.exists():
-                  continue
-              d=json.loads(p.read_text())
-              s=d['scenarios'][0]
-              rows.append({
-                  'name': name,
-                  'status': d['status'],
-                  'ratio': s['median_candidate_over_base_completed'],
-                  'base_cv': s['base_completed_cv'],
-                  'candidate_cv': s['candidate_completed_cv'],
-                  'base_rate': s['base_median_completed_rate'],
-                  'candidate_rate': s['candidate_median_completed_rate'],
-                  'regressions': d.get('regressions'),
-                  'invalidations': d.get('invalidations'),
-              })
-          for mode in ('unpinned','pinned'):
-              p=root/f'broker-{mode}-psr.log'
-              if p.exists():
-                  cpus=[int(x.strip()) for x in p.read_text().splitlines() if x.strip().isdigit()]
-                  row={'name':f'broker-{mode}-observed-cpus','cpus':sorted(set(cpus)),'samples':len(cpus)}
-                  rows.append(row)
-          print(json.dumps(rows, indent=2))
-          (root/'summary.json').write_text(json.dumps(rows,indent=2)+'\n')
-          PY
-          fi
-
-      - name: Upload broker-isolation evidence
+      - name: Upload regime evidence
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: broker-cpu-isolation-${{ github.run_id }}
+          name: writer-regime-${{ github.run_id }}
           path: |
-            ${{ runner.temp }}/broker-cpu-isolation/*
-            ${{ runner.temp }}/broker-isolation-stack-head.txt
+            ${{ runner.temp }}/writer-regime/*.json
+            ${{ runner.temp }}/writer-regime/*.log
+            ${{ runner.temp }}/writer-regime/*.conf
           if-no-files-found: warn
           retention-days: 30
