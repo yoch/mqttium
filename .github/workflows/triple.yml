@@ -1,0 +1,182 @@
+name: TEMP QoS1 triple with mini broker
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: temp-qos1-triple-mini-broker
+  cancel-in-progress: true
+
+env:
+  BASE_SHA: e80618154bacefed5626d9eb9ba46edf560b54e7
+  PR283_SHA: b603337e96a869f266f85e89a5c04a2c238c8ba2
+  PR284_SHA: 440c45487ce4ab7212581d49b8073416c899a82b
+  PR285_SHA: fbd11e1f71c623919c5029ec512dfb0e05f85307
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  triple:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.BASE_SHA }}
+          fetch-depth: 0
+          path: base
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.BASE_SHA }}
+          fetch-depth: 0
+          path: triple
+          persist-credentials: false
+
+      - name: Build audited triple
+        working-directory: triple
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name triple-probe
+          git config user.email triple-probe@example.invalid
+          git fetch --no-tags origin "$PR283_SHA"
+          git merge --no-ff --no-edit "$PR283_SHA"
+          git fetch --no-tags origin "$PR284_SHA"
+          set +e
+          git merge --no-ff --no-edit "$PR284_SHA"
+          rc=$?
+          set -e
+          test "$rc" -ne 0
+          mapfile -t conflicts < <(git diff --name-only --diff-filter=U | sort)
+          test "${#conflicts[@]}" -eq 2
+          test "${conflicts[0]}" = "docs/reports/README.md"
+          test "${conflicts[1]}" = "src/mqttium/api/_writer.py"
+          git checkout --ours docs/reports/README.md src/mqttium/api/_writer.py
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/mqttium/api/_writer.py')
+          text=p.read_text()
+          def one(old,new):
+              global text
+              n=text.count(old)
+              if n != 1:
+                  raise SystemExit(f'expected 1 match, got {n}: {old!r}')
+              text=text.replace(old,new)
+          one(
+              '                self.enqueue_suspensions += 1\n                try:\n                    await self.space.wait()\n                finally:\n                    self.waiters -= 1\n',
+              '                self.enqueue_suspensions += 1\n                try:\n                    await self.space.wait()\n                except asyncio.CancelledError:\n                    # notify(n) is consumed by whoever is waiting. A waiter\n                    # cancelled after being selected must hand the wakeup on,\n                    # or the remaining producers stay parked with free slots.\n                    if self.waiters > 1:\n                        self.space.notify(1)\n                    raise\n                finally:\n                    self.waiters -= 1\n',
+          )
+          one(
+              '        transport = self.transport\n        if transport is None:\n            raise RuntimeError("WritePump started without a transport")\n        # Resolved once per writer task rather than per batch. The local dies\n',
+              '        transport = self.transport\n        if transport is None:\n            raise RuntimeError("WritePump started without a transport")\n        writer_task = asyncio.current_task()\n        assert writer_task is not None\n        # Resolved once per writer task rather than per batch. The local dies\n',
+          )
+          one(
+              '                self._writing = True\n                try:\n                    # Coalesce contiguous small frames into one writelines call.\n',
+              '                self._writing = True\n                batch_completed = False\n                try:\n                    # Coalesce contiguous small frames into one writelines call.\n',
+          )
+          one(
+              '                    await self._write_contiguous(transport, write_many, contiguous)\n                    self.last_outbound = time.monotonic()\n                finally:\n',
+              '                    await self._write_contiguous(transport, write_many, contiguous)\n                    self.last_outbound = time.monotonic()\n                    batch_completed = True\n                finally:\n',
+          )
+          one(
+              '                        self._release_resident(n_batch)\n                        if self.waiters:\n                            self.space.notify_all()\n',
+              '                        self._release_resident(n_batch)\n                        if batch_completed and self.waiters and not writer_task.cancelling():\n                            self.space.notify(min(self.waiters, n_batch))\n',
+          )
+          p.write_text(text)
+          PY
+          git add docs/reports/README.md src/mqttium/api/_writer.py
+          git commit --no-edit
+          git fetch --no-tags origin "$PR285_SHA"
+          set +e
+          git merge --no-ff --no-edit "$PR285_SHA"
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            mapfile -t conflicts < <(git diff --name-only --diff-filter=U)
+            test "${#conflicts[@]}" -eq 1
+            test "${conflicts[0]}" = "docs/reports/README.md"
+            git checkout --ours docs/reports/README.md
+            git add docs/reports/README.md
+            git commit --no-edit
+          fi
+          test -z "$(git diff --name-only --diff-filter=U)"
+          git diff --check
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - run: python -m pip install -e "triple[dev]"
+
+      - name: Start mini broker
+        shell: bash
+        run: |
+          cat >/tmp/minibroker.py <<'PY'
+          import asyncio
+          async def rl(r):
+              m=1; v=0
+              for _ in range(4):
+                  b=(await r.readexactly(1))[0]; v+=(b&127)*m
+                  if not b&128: return v
+                  m*=128
+              raise ValueError
+          async def client(r,w):
+              try:
+                  while True:
+                      first=(await r.readexactly(1))[0]
+                      body=await r.readexactly(await rl(r))
+                      typ=first>>4
+                      if typ==1:
+                          w.write(b'\x20\x02\x00\x00'); await w.drain()
+                      elif typ==3:
+                          qos=(first>>1)&3
+                          if qos==1:
+                              n=int.from_bytes(body[:2],'big'); mid=body[2+n:4+n]
+                              w.write(b'\x40\x02'+mid); await w.drain()
+                          elif qos:
+                              raise ValueError(qos)
+                      elif typ==12:
+                          w.write(b'\xd0\x00'); await w.drain()
+                      elif typ==14:
+                          break
+                      else:
+                          raise ValueError(typ)
+              except (asyncio.IncompleteReadError,ConnectionResetError,BrokenPipeError): pass
+              finally:
+                  w.close()
+                  try: await w.wait_closed()
+                  except Exception: pass
+          async def main():
+              s=await asyncio.start_server(client,'127.0.0.1',11883)
+              async with s: await s.serve_forever()
+          asyncio.run(main())
+          PY
+          taskset -c 0 python /tmp/minibroker.py >/tmp/minibroker.log 2>&1 &
+          for _ in $(seq 1 50); do
+            (echo >/dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            sleep .1
+          done
+          exit 1
+
+      - name: Measure triple
+        shell: bash
+        run: |
+          mkdir -p /tmp/qos1-triple
+          python base/benchmarks/paired_writer_capacity.py \
+            --base-root base --candidate-root triple --host 127.0.0.1 --port 11883 \
+            --protocol 311 --qos-values 1 --payload-bytes 64 \
+            --inflight 20 --outstanding 20 --max-queued 200 \
+            --warmup-count 5000 --count-qos1 40000 --repeat 8 --cpu 1 \
+            --policy advisory --max-baseline-cv 1.0 --min-completed-ratio 0.0 \
+            --output /tmp/qos1-triple/triple.json --summary-output /tmp/qos1-triple/triple.md
+          cat /tmp/qos1-triple/triple.md
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: qos1-triple-mini-${{ github.run_id }}
+          path: /tmp/qos1-triple/*
+          if-no-files-found: warn
+          retention-days: 7
