@@ -61,3 +61,6 @@ that already mutate `queued_bytes`. The main risk is a leak if a new completion
 path forgets `_release_resident`; `reset`/`discard` and `_run`'s existing
 `finally` cover epoch transitions and mid-batch cancel. No extra scheduler
 machinery. Do not merge until the eligible-runner artefacts exist.
+
+Published report:
+[`docs/reports/SCHEDULER-RESIDENT-MESSAGE-BUDGET-2026-08-19.md`](../reports/SCHEDULER-RESIDENT-MESSAGE-BUDGET-2026-08-19.md).

@@ -1,5 +1,10 @@
 # Scheduler resident writer message budget — 2026-08-18
 
+> **Superseded** by
+> [`SCHEDULER-RESIDENT-MESSAGE-BUDGET-2026-08-19.md`](SCHEDULER-RESIDENT-MESSAGE-BUDGET-2026-08-19.md),
+> which names the feat commit and records the 2026-08-19 diagnostic campaign.
+> This file is the implementation note as written on 2026-08-18.
+
 Experiment:
 [`../experiments/scheduler-resident-message-budget.md`](../experiments/scheduler-resident-message-budget.md).
 

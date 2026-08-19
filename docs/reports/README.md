@@ -14,7 +14,6 @@ descriptions of current behaviour are the contracts in
 
 | Date | Report | Records |
 | --- | --- | --- |
-| 2026-08-18 | [`SCHEDULER-RESIDENT-MESSAGE-BUDGET-2026-08-18.md`](SCHEDULER-RESIDENT-MESSAGE-BUDGET-2026-08-18.md) | First candidate of the resident writer message-budget experiment: `_resident_messages` bounds `max_outbound_messages` across the writer's active batch, not only `qsize()`. Correctness tests added; eligible-runner A/A+A/B still pending. Hosted/cloud numbers are not merge-quality. |
 | 2026-08-16 | [`SIMPLIFICATION-AUDIT-2026-08-16.md`](SIMPLIFICATION-AUDIT-2026-08-16.md) | Perf-aware simplification pass over the core at `32e99a4`: 669 lines deleted against 562 added, with calls per operation down 2.9% to 16.7% on sixteen scenarios and no regression on any. Records two `hotpath_profile.py` measurement traps, the duplication that is load-bearing and must not be collapsed, one MQTT 5 §4.3.3 conformance divergence in `on_pubrec`, and a pre-existing red memory gate unrelated to memory. |
 | 2026-08-16 | [`RELEASE-CANDIDATE-1.0.0rc6.md`](RELEASE-CANDIDATE-1.0.0rc6.md) | RC6 release evidence for post-RC5 MQTT 5 protocol/lifecycle hardening, manual-ACK ordering, Paho publish handoff and the ordered eager writer path, with exact release-artifact gates. |
 | 2026-08-16 | [`NATIVE-WRITER-HOP-2026-08-16.md`](NATIVE-WRITER-HOP-2026-08-16.md) | Validates the eager write that removes the writer-task hop, certified twice on independent axes: +16.7% to +27.8% callback p50 at four load points on MQTT 3.1.1 / window 64, and +26.6% / +25.6% on MQTT 5 / window 20, throughput unchanged or better. Also documents why the harness's loop-lag ratio penalises the faster arm inside a transition band. |
@@ -111,6 +110,17 @@ outcome live here.
 | 2026-08-04 | [`MEMORY-BASELINE.md`](MEMORY-BASELINE.md) | Before-state, from benchmark run 22 at commit `1a9fe49`. |
 | 2026-08-04 | [`MEMORY-RESULTS.md`](MEMORY-RESULTS.md) | After-state for the same scenarios, once admission, delivery-budget, pagination and lazy-hydration corrections landed. |
 | 2026-08-04 | [`MEMORY-PROFILE-FOLLOW-UP.md`](MEMORY-PROFILE-FOLLOW-UP.md) | How each audit recommendation was closed, and which ones got a numeric regression guard. |
+
+## Scheduler experiments
+
+Open scheduler-hypothesis records. They do not outrank a measured hot-path
+decision, and they are not merge evidence until the experiment's own gate is
+met on an eligible runner.
+
+| Date | Report | Records |
+| --- | --- | --- |
+| 2026-08-19 | [`SCHEDULER-RESIDENT-MESSAGE-BUDGET-2026-08-19.md`](SCHEDULER-RESIDENT-MESSAGE-BUDGET-2026-08-19.md) | Diagnostic campaign for the resident writer message budget at `4e4f75d`: writer-capacity 0.999 / 1.000, open-loop completed/lag ~1.00. **Keep; not mergeable** until an eligible runner repeats the gate. |
+| 2026-08-18 | [`SCHEDULER-RESIDENT-MESSAGE-BUDGET-2026-08-18.md`](SCHEDULER-RESIDENT-MESSAGE-BUDGET-2026-08-18.md) | Implementation note for `_resident_messages`. Superseded by the 2026-08-19 campaign. |
 
 ## Hot-path decisions
 
