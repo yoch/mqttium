@@ -76,7 +76,6 @@ jobs:
 
           git fetch --no-tags origin "$PR283_SHA"
           git merge --no-ff --no-edit "$PR283_SHA"
-
           git fetch --no-tags origin "$PR284_SHA"
           set +e
           git merge --no-ff --no-edit "$PR284_SHA"
@@ -143,18 +142,6 @@ jobs:
           git diff --check "$BASE_SHA"..HEAD
           git rev-parse HEAD | tee "$RUNNER_TEMP/final-combined-head.txt"
 
-      - name: Focused combined correctness
-        shell: bash
-        run: |
-          set -euo pipefail
-          PYTHONPATH=stack/src python3 -m pytest -q \
-            stack/tests/unit/test_write_pump_resident.py \
-            stack/tests/unit/test_write_pump_targeted_wake.py \
-            stack/tests/unit/test_write_pump.py \
-            stack/tests/unit/test_write_pump_eager.py \
-            stack/tests/unit/test_publish_targeted_wake.py \
-            stack/tests/unit/test_async_publish_admission.py
-
       - name: Prepare ARM64 runner and isolated broker
         shell: bash
         run: |
@@ -184,6 +171,18 @@ jobs:
             sleep .2
           done
           test "$(awk '/Cpus_allowed_list/ {print $2}' /proc/$(cat "$ROOT/mosquitto.pid")/status)" = 0
+
+      - name: Focused combined correctness
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH=stack/src "$VENV/bin/python" -m pytest -q \
+            stack/tests/unit/test_write_pump_resident.py \
+            stack/tests/unit/test_write_pump_targeted_wake.py \
+            stack/tests/unit/test_write_pump.py \
+            stack/tests/unit/test_write_pump_eager.py \
+            stack/tests/unit/test_publish_targeted_wake.py \
+            stack/tests/unit/test_async_publish_admission.py
 
       - name: Define strict requalification helper
         shell: bash
