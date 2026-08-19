@@ -1,153 +1,100 @@
-name: TEMP patch PR284 cancellation wake race
+name: TEMP combined hosted validation 283-285
 
 on:
   pull_request:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: temp-pr284-cancel-wake-fix
+  group: temp-combined-283-285
   cancel-in-progress: true
 
+env:
+  BASE_SHA: e80618154bacefed5626d9eb9ba46edf560b54e7
+  PR283_SHA: b603337e96a869f266f85e89a5c04a2c238c8ba2
+  PR284_SHA: 440c45487ce4ab7212581d49b8073416c899a82b
+  PR285_SHA: fbd11e1f71c623919c5029ec512dfb0e05f85307
+  PYTHONUNBUFFERED: "1"
+
 jobs:
-  patch:
+  hosted:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    env:
-      TARGET_SHA: 3d6c6f91bb5a279a58aaf4863687649cf4ec2f12
-      TARGET_BRANCH: agent/scheduler-writer-targeted-wake
     steps:
-      - name: Checkout exact PR284 branch
-        uses: actions/checkout@v7
+      - uses: actions/checkout@v7
         with:
-          ref: ${{ env.TARGET_BRANCH }}
+          ref: ${{ env.BASE_SHA }}
           fetch-depth: 0
-      - name: Verify exact head
+          path: stack
+          persist-credentials: false
+
+      - name: Compose exact accepted heads
         shell: bash
-        run: test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+        working-directory: stack
+        run: |
+          set -euo pipefail
+          git config user.name stack-probe
+          git config user.email stack-probe@example.invalid
+          merge_one() {
+            local sha="$1"
+            git fetch --no-tags origin "$sha"
+            set +e
+            git merge --no-ff --no-edit "$sha"
+            local rc=$?
+            set -e
+            if [ "$rc" -eq 0 ]; then return 0; fi
+            mapfile -t conflicts < <(git diff --name-only --diff-filter=U)
+            printf 'conflicts: %s\n' "${conflicts[*]}"
+            if [ "${#conflicts[@]}" -ne 1 ] || [ "${conflicts[0]}" != "docs/reports/README.md" ]; then
+              git diff --cc || true
+              return "$rc"
+            fi
+            python - <<'PY'
+          from pathlib import Path
+          import subprocess
+          path = 'docs/reports/README.md'
+          ours = subprocess.check_output(['git', 'show', f':2:{path}'], text=True)
+          theirs = subprocess.check_output(['git', 'show', f':3:{path}'], text=True)
+          lines = ours.splitlines()
+          incoming = [line for line in theirs.splitlines() if line.startswith('| 2026-08-') and 'SCHEDULER-' in line and line not in lines]
+          if not incoming:
+              raise SystemExit('no unique incoming scheduler report rows')
+          heading = lines.index('## Hot-path decisions')
+          insert_at = heading
+          while insert_at > 0 and lines[insert_at - 1] == '':
+              insert_at -= 1
+          lines[insert_at:insert_at] = incoming
+          Path(path).write_text('\n'.join(lines) + '\n')
+          PY
+            git add docs/reports/README.md
+            git diff --check
+            git commit --no-edit
+          }
+          test "$(git rev-parse HEAD)" = "$BASE_SHA"
+          merge_one "$PR283_SHA"
+          merge_one "$PR284_SHA"
+          merge_one "$PR285_SHA"
+          test -z "$(git diff --name-only --diff-filter=U)"
+          git diff --check "$BASE_SHA"..HEAD
+          echo "combined head: $(git rev-parse HEAD)"
+          git log --oneline --decorate -10
 
       - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
 
-      - name: Patch cancellation wake policy and regression test
-        shell: bash
-        run: |
-          python - <<'PY'
-          from pathlib import Path
+      - name: Install combined tree
+        working-directory: stack
+        run: python -m pip install -e ".[dev,security]"
 
-          def replace_once(path: str, old: str, new: str) -> None:
-              p = Path(path)
-              text = p.read_text()
-              n = text.count(old)
-              if n != 1:
-                  raise SystemExit(f'{path}: expected one match, got {n}: {old!r}')
-              p.write_text(text.replace(old, new))
-
-          writer = 'src/mqttium/api/_writer.py'
-          replace_once(
-              writer,
-              '        transport = self.transport\n'
-              '        if transport is None:\n'
-              '            raise RuntimeError("WritePump started without a transport")\n'
-              '        # Resolved once per writer task rather than per batch. The local dies\n',
-              '        transport = self.transport\n'
-              '        if transport is None:\n'
-              '            raise RuntimeError("WritePump started without a transport")\n'
-              '        writer_task = asyncio.current_task()\n'
-              '        assert writer_task is not None\n'
-              '        # Resolved once per writer task rather than per batch. The local dies\n',
-          )
-          replace_once(
-              writer,
-              '                self._writing = True\n'
-              '                try:\n'
-              '                    # Coalesce contiguous small frames into one writelines call.\n',
-              '                self._writing = True\n'
-              '                batch_completed = False\n'
-              '                try:\n'
-              '                    # Coalesce contiguous small frames into one writelines call.\n',
-          )
-          replace_once(
-              writer,
-              '                    await self._write_contiguous(transport, write_many, contiguous)\n'
-              '                    self.last_outbound = time.monotonic()\n'
-              '                finally:\n',
-              '                    await self._write_contiguous(transport, write_many, contiguous)\n'
-              '                    self.last_outbound = time.monotonic()\n'
-              '                    batch_completed = True\n'
-              '                finally:\n',
-          )
-          replace_once(
-              writer,
-              '                        if self.waiters:\n'
-              '                            # Wake at most as many waiters as items this batch\n'
-              '                            # just freed. notify_all() would make every parked\n'
-              '                            # producer runnable even though only len(batch)\n'
-              '                            # slots exist. Lifecycle still uses notify_all()\n'
-              '                            # via wake_waiters() / advance_epoch().\n'
-              '                            self.space.notify(min(self.waiters, len(batch)))\n',
-              '                        if batch_completed and self.waiters and not writer_task.cancelling():\n'
-              '                            # Only a successfully written batch releases usable\n'
-              '                            # writer capacity. Cancellation/failure is lifecycle:\n'
-              '                            # waking here can admit old-epoch writes onto a dead\n'
-              '                            # writer before advance_epoch() broadcasts staleness.\n'
-              '                            self.space.notify(min(self.waiters, len(batch)))\n',
-          )
-
-          test = 'tests/unit/test_write_pump_targeted_wake.py'
-          replace_once(
-              test,
-              'async def test_stop_then_epoch_advance_does_not_strand_waiters() -> None:\n'
-              '    pump = _pump(max_messages=1)\n'
-              '    transport = _GatedTransport()\n'
-              '    pump.start(transport)\n'
-              '    try:\n'
-              '        await pump.enqueue(b"inflight")\n'
-              '        await asyncio.wait_for(transport.entered.wait(), timeout=1.0)\n'
-              '        pump.try_enqueue(b"hold")\n'
-              '        assert pump.try_enqueue(b"overflow") is False\n'
-              '        waiters = await _park_waiters(pump, [b"a", b"b"])\n',
-              'async def test_stop_then_epoch_advance_does_not_strand_waiters() -> None:\n'
-              '    # Bytes stay charged while the first write is in flight, so this\n'
-              '    # reproduces the cancellation race independently of message-count\n'
-              '    # accounting (including the stricter resident budget experiment).\n'
-              '    pump = _pump(max_bytes=len(b"inflight"), max_messages=8)\n'
-              '    transport = _GatedTransport()\n'
-              '    pump.start(transport)\n'
-              '    try:\n'
-              '        await pump.enqueue(b"inflight")\n'
-              '        await asyncio.wait_for(transport.entered.wait(), timeout=1.0)\n'
-              '        waiters = await _park_waiters(pump, [b"aaaaaaaa", b"bbbbbbbb"])\n',
-          )
-          PY
-          python -m py_compile src/mqttium/api/_writer.py tests/unit/test_write_pump_targeted_wake.py
-          git diff --check
-          git diff -- src/mqttium/api/_writer.py tests/unit/test_write_pump_targeted_wake.py
-
-      - name: Install project
-        run: python -m pip install -e ".[dev]"
-
-      - name: Focused writer validation
+      - name: Full quality and unit suite
+        working-directory: stack
         shell: bash
         run: |
           set -euo pipefail
-          ruff format --check src/mqttium/api/_writer.py tests/unit/test_write_pump_targeted_wake.py
-          ruff check src/mqttium/api/_writer.py tests/unit/test_write_pump_targeted_wake.py
-          python -m pytest -q \
-            tests/unit/test_write_pump_targeted_wake.py \
-            tests/unit/test_write_pump.py \
-            tests/unit/test_write_pump_eager.py
-
-      - name: Commit and push tested fix
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$TARGET_SHA"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add src/mqttium/api/_writer.py tests/unit/test_write_pump_targeted_wake.py
-          git diff --cached --check
-          git commit -m "fix(writer): do not wake capacity waiters from cancelled batches"
-          git push origin "HEAD:$TARGET_BRANCH"
+          ruff format --check src tests benchmarks
+          ruff check src tests benchmarks
+          mypy src/mqttium
+          bandit -q -ll -r src
+          python -m pytest -q tests/unit --cov=mqttium --cov-report=term-missing --cov-fail-under=80
