@@ -1,9 +1,7 @@
 name: TEMP wake-frontier observer
 
 on:
-  push:
-    branches:
-      - bench/tmp-wake-frontier-284-285-20260819
+  pull_request:
 
 permissions:
   contents: read
@@ -20,5 +18,5 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: 289,
-              body: `Wake-frontier observer: run **${context.runId}**, sha \`${context.sha}\`.`,
+              body: `Wake-frontier PR observer: run **${context.runId}**, sha \`${context.sha}\`.`,
             });
