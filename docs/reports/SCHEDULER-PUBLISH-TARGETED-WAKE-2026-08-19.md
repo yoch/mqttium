@@ -6,6 +6,13 @@ at the feat commit named below. This file supersedes the 2026-08-18
 implementation note
 [`SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-18.md`](SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-18.md).
 
+> **Measurement correction.** The historical contention numbers in this report
+> timed the return from `publish()` and therefore measured **admission-return
+> rate**, not QoS completion. The benchmark now records both admission and true
+> completion and uses true completion as the primary throughput gate. Final
+> eligible ARM64 evidence is recorded in the PR discussion; the historical
+> table below is retained for traceability.
+
 | | |
 | --- | --- |
 | Date | 2026-08-19 |

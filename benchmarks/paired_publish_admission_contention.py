@@ -3,7 +3,8 @@
 Exercises protocol-admission wait (several producer tasks, a small inflight
 window) rather than the closed-loop ``publish_nowait`` writer-capacity path in
 ``paired_writer_capacity.py``. The parent always compares fresh base/candidate
-worker processes in alternating order.
+worker processes in alternating order. The primary throughput metric is true
+QoS completion; publish-call admission-return rate is retained as a diagnostic.
 
 Hosted runners are diagnostic only; strict evidence additionally needs an
 eligible runner preflight and, for a harness change, a separate A/A control.
@@ -34,6 +35,8 @@ class AdmissionResult:
     inflight: int
     publishers: int
     count: int
+    admission_seconds: float
+    admission_rate: float
     elapsed_seconds: float
     completed_rate: float
     cpu_seconds: float
@@ -86,8 +89,7 @@ async def _run_phase(
         asyncio.gather(*(producer(index) for index in range(publishers))),
         timeout=timeout,
     )
-    elapsed = time.perf_counter() - started
-    cpu_seconds = time.process_time() - cpu_started
+    admission_elapsed = time.perf_counter() - started
 
     write_pump = getattr(client, "_write_pump", None)
     if write_pump is not None:
@@ -100,6 +102,9 @@ async def _run_phase(
             raise TimeoutError("timed out draining QoS receipts after admission")
         await asyncio.sleep(0)
 
+    elapsed = time.perf_counter() - started
+    cpu_seconds = time.process_time() - cpu_started
+
     return AdmissionResult(
         protocol="",
         qos=qos,
@@ -107,6 +112,8 @@ async def _run_phase(
         inflight=0,
         publishers=publishers,
         count=count,
+        admission_seconds=admission_elapsed,
+        admission_rate=count / max(admission_elapsed, 1e-9),
         elapsed_seconds=elapsed,
         completed_rate=count / max(elapsed, 1e-9),
         cpu_seconds=cpu_seconds,
@@ -305,6 +312,9 @@ def parent(args: argparse.Namespace) -> int:
         },
         "harness": {
             "mode": "native_async_publish_admission",
+            "primary_rate": "true_qos_completion",
+            "admission_rate": "publish_call_return",
+            "latency_metric": "publish_call_admission",
             "protocol": args.protocol,
             "qos": args.qos,
             "payload_bytes": args.payload_bytes,
