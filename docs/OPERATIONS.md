@@ -34,6 +34,12 @@ MQTTium keeps separate budgets because each resource has a different lifetime:
 | Retained application-delivery data | `max_pending_delivery_bytes` |
 | Broker-facing QoS concurrency | `local_receive_maximum`, `max_outbound_inflight` and negotiated limits |
 
+`max_outbound_messages` bounds writer-resident admitted frames: items still on
+the asyncio queue **and** the writer's active batch (up to 256 frames extracted
+for one write). `client.stats().writer.queued_messages` remains `queue.qsize()`
+and can be lower than the admission count while a batch is in flight. Eager
+writes do not consume the message bound.
+
 Do not use a message count as a proxy for bytes when payload sizes vary. Passing
 `None` disables an optional bound and should be an explicit capacity decision,
 not a first response to saturation.
@@ -78,10 +84,12 @@ catchable exception to memory exhaustion.
 
 Size `max_outbound_bytes` from the encoded bytes that may accumulate during the
 largest supported burst, not only from the message count. This matters most for
-64 KiB and 1 MiB payloads. To preserve forward progress, an empty writer queue
-admits one item larger than its byte limit; no second item is admitted until
-enough capacity is released. Inspect `client.stats().writer` to distinguish
-local queue pressure from protocol-level unfinished QoS state.
+64 KiB and 1 MiB payloads. To preserve forward progress, an empty writer (no
+resident frames and no charged bytes) admits one item larger than its byte
+limit; no second item is admitted until enough capacity is released. A writer
+batch that has left the asyncio queue but is not yet written still occupies
+both bounds. Inspect `client.stats().writer` to distinguish local queue
+pressure from protocol-level unfinished QoS state.
 
 ## Runtime snapshots
 
