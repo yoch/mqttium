@@ -1,0 +1,258 @@
+name: TEMP writer cooperation causal study
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: temp-writer-cooperation-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  mixed-screen:
+    if: github.head_ref == 'bench/tmp-writer-cooperation-study-20260820'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [base, cap-yield, large-yield, chunk-drain, chunk-yield]
+        flood-bytes: [32768, 65536, 98304, 131072]
+    env:
+      BASE_SHA: 7d20fc5200e868df61391d00c21e5d7b0d63c78a
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - name: Checkout study harness
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: study
+          persist-credentials: false
+
+      - name: Checkout immutable runtime
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.BASE_SHA }}
+          path: source
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Verify immutable inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C source rev-parse HEAD)" = "$BASE_SHA"
+          test "$(git -C study rev-parse HEAD)" = "${{ github.event.pull_request.head.sha }}"
+          python -m py_compile study/benchmarks/temp_writer_cooperation_study.py
+
+      - name: Install runtime and broker
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install -e "source[dev]"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mosquitto
+
+      - name: Start isolated broker
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo systemctl stop mosquitto 2>/dev/null || true
+          sudo pkill -x mosquitto 2>/dev/null || true
+          cat >/tmp/mosq-writer-coop.conf <<'EOF'
+          persistence false
+          allow_anonymous true
+          max_inflight_messages 1000
+          max_queued_messages 100000
+          max_queued_bytes 0
+          connection_messages false
+          log_type error
+          listener 11883 127.0.0.1
+          EOF
+          mosquitto -c /tmp/mosq-writer-coop.conf >/tmp/mosq-writer-coop.log 2>&1 &
+          for _ in $(seq 1 50); do
+            (echo >/dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            sleep .1
+          done
+          cat /tmp/mosq-writer-coop.log
+          exit 1
+
+      - name: ABBA mixed true-completion screen
+        shell: bash
+        run: |
+          set -euo pipefail
+          python study/benchmarks/temp_writer_cooperation_study.py \
+            --root source \
+            --mode "${{ matrix.mode }}" \
+            --host 127.0.0.1 --port 11883 \
+            --flood-bytes "${{ matrix.flood-bytes }}" \
+            --probe-bytes 64 \
+            --flood-count 1500 --probes 200 --inflight 20 \
+            --max-outbound-bytes 67108864 \
+            --max-outbound-messages 100000 \
+            --chunk-bytes 262144 \
+            --large-yield-bytes 1048576 \
+            --repeat 4 --timeout 120 --cpu 1 \
+            --output "/tmp/writer-coop-${{ matrix.mode }}-${{ matrix.flood-bytes }}.json"
+
+      - name: Upload mixed evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: writer-coop-${{ matrix.mode }}-${{ matrix.flood-bytes }}
+          path: /tmp/writer-coop-${{ matrix.mode }}-${{ matrix.flood-bytes }}.json
+          if-no-files-found: warn
+
+  default-buffer-control:
+    if: github.head_ref == 'bench/tmp-writer-cooperation-study-20260820'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [base, cap-yield, chunk-yield]
+        flood-bytes: [32768, 65536]
+    env:
+      BASE_SHA: 7d20fc5200e868df61391d00c21e5d7b0d63c78a
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: study
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.BASE_SHA }}
+          path: source
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Verify and install
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C source rev-parse HEAD)" = "$BASE_SHA"
+          test "$(git -C study rev-parse HEAD)" = "${{ github.event.pull_request.head.sha }}"
+          python -m py_compile study/benchmarks/temp_writer_cooperation_study.py
+          python -m pip install -e "source[dev]"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mosquitto
+      - name: Start isolated broker
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo systemctl stop mosquitto 2>/dev/null || true
+          sudo pkill -x mosquitto 2>/dev/null || true
+          printf 'persistence false\nallow_anonymous true\nconnection_messages false\nlog_type error\nlistener 11883 127.0.0.1\n' >/tmp/mosq-writer-coop.conf
+          mosquitto -c /tmp/mosq-writer-coop.conf >/tmp/mosq-writer-coop.log 2>&1 &
+          for _ in $(seq 1 50); do
+            (echo >/dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            sleep .1
+          done
+          cat /tmp/mosq-writer-coop.log
+          exit 1
+      - name: Default 1 MiB writer byte-budget control
+        shell: bash
+        run: |
+          set -euo pipefail
+          python study/benchmarks/temp_writer_cooperation_study.py \
+            --root source \
+            --mode "${{ matrix.mode }}" \
+            --host 127.0.0.1 --port 11883 \
+            --flood-bytes "${{ matrix.flood-bytes }}" \
+            --probe-bytes 64 \
+            --flood-count 1500 --probes 200 --inflight 20 \
+            --max-outbound-bytes 1048576 \
+            --max-outbound-messages 10000 \
+            --chunk-bytes 262144 \
+            --large-yield-bytes 1048576 \
+            --repeat 4 --timeout 120 --cpu 1 \
+            --output "/tmp/writer-coop-default-${{ matrix.mode }}-${{ matrix.flood-bytes }}.json"
+      - name: Upload default-buffer evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: writer-coop-default-${{ matrix.mode }}-${{ matrix.flood-bytes }}
+          path: /tmp/writer-coop-default-${{ matrix.mode }}-${{ matrix.flood-bytes }}.json
+          if-no-files-found: warn
+
+  causal-heartbeat:
+    if: github.head_ref == 'bench/tmp-writer-cooperation-study-20260820'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [base, cap-yield, chunk-drain, chunk-yield]
+    env:
+      BASE_SHA: 7d20fc5200e868df61391d00c21e5d7b0d63c78a
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: study
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.BASE_SHA }}
+          path: source
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Verify and install
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C source rev-parse HEAD)" = "$BASE_SHA"
+          test "$(git -C study rev-parse HEAD)" = "${{ github.event.pull_request.head.sha }}"
+          python -m py_compile study/benchmarks/temp_writer_cooperation_study.py
+          python -m pip install -e "source[dev]"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mosquitto
+      - name: Start isolated broker
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo systemctl stop mosquitto 2>/dev/null || true
+          sudo pkill -x mosquitto 2>/dev/null || true
+          printf 'persistence false\nallow_anonymous true\nconnection_messages false\nlog_type error\nlistener 11883 127.0.0.1\n' >/tmp/mosq-writer-coop.conf
+          mosquitto -c /tmp/mosq-writer-coop.conf >/tmp/mosq-writer-coop.log 2>&1 &
+          for _ in $(seq 1 50); do
+            (echo >/dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            sleep .1
+          done
+          cat /tmp/mosq-writer-coop.log
+          exit 1
+      - name: Causal trace with low-frequency heartbeat
+        shell: bash
+        run: |
+          set -euo pipefail
+          python study/benchmarks/temp_writer_cooperation_study.py \
+            --root source \
+            --mode "${{ matrix.mode }}" \
+            --host 127.0.0.1 --port 11883 \
+            --flood-bytes 32768 --probe-bytes 64 \
+            --flood-count 1500 --probes 200 --inflight 20 \
+            --max-outbound-bytes 67108864 \
+            --max-outbound-messages 100000 \
+            --chunk-bytes 262144 \
+            --large-yield-bytes 1048576 \
+            --repeat 4 --timeout 120 --cpu 1 \
+            --heartbeat --heartbeat-interval 0.001 \
+            --output "/tmp/writer-coop-heartbeat-${{ matrix.mode }}.json"
+      - name: Upload causal trace
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: writer-coop-heartbeat-${{ matrix.mode }}
+          path: /tmp/writer-coop-heartbeat-${{ matrix.mode }}.json
+          if-no-files-found: warn
