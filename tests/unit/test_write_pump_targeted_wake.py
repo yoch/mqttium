@@ -228,7 +228,8 @@ async def test_stop_then_epoch_advance_does_not_strand_waiters() -> None:
     try:
         await pump.enqueue(b"inflight")
         await asyncio.wait_for(transport.entered.wait(), timeout=1.0)
-        assert pump.try_enqueue(b"hold") is True
+        pump.try_enqueue(b"hold")
+        assert pump.try_enqueue(b"overflow") is False
         waiters = await _park_waiters(pump, [b"a", b"b"])
         await pump.stop()
         await pump.advance_epoch(pump.epoch + 1)
