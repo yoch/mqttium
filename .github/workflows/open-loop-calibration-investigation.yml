@@ -134,75 +134,186 @@ jobs:
           EOF
           chmod +x "$JOB_ROOT/wait-preflight.sh"
 
-      - name: A/A with current 1000-message calibration
+      - name: Balanced A/A capacity calibration
         shell: bash
         run: |
           set -euo pipefail
-          "$JOB_ROOT/wait-preflight.sh" current "$JOB_ROOT"
+          "$JOB_ROOT/wait-preflight.sh" calibration "$JOB_ROOT"
           started=$(date +%s)
-          python benchmarks/paired_open_loop.py \
-            --base-root . --candidate-root . \
-            --protocols 311,5 --payloads 4096 --windows 100 \
-            --completions receipt,callback --fractions 0.90,1.00 \
-            --repeat 4 --count-large 1000 --target-sample-seconds 1.5 \
-            --cpu 2 --policy advisory \
-            --preflight-report "$JOB_ROOT/preflight-current.json" \
-            --output "$JOB_ROOT/current.json" \
-            --summary-output "$JOB_ROOT/current.md"
-          echo $(( $(date +%s) - started )) > "$JOB_ROOT/current-seconds.txt"
+          python - "$JOB_ROOT/calibration.json" <<'PY'
+          import json
+          import math
+          import os
+          import pathlib
+          import statistics
+          import subprocess
+          import sys
+          import time
 
-      - name: A/A with 5000-message calibration
+          output = pathlib.Path(sys.argv[1])
+          env = os.environ.copy()
+          env["PYTHONPATH"] = str(pathlib.Path("src").resolve())
+
+          def one(protocol: str, arm: str, cycle: int, slot: int) -> dict[str, object]:
+              command = [
+                  sys.executable,
+                  "benchmarks/paired_open_loop.py",
+                  "--worker",
+                  "--mode", "calibrate",
+                  "--host", "127.0.0.1",
+                  "--port", "11883",
+                  "--protocol", protocol,
+                  "--payload-bytes", "4096",
+                  "--completion", "receipt",
+                  "--count", "5000",
+                  "--window", "100",
+                  "--target-rate", "0",
+                  "--timeout", "120",
+                  "--cpu", "2",
+              ]
+              started = time.perf_counter()
+              completed = subprocess.run(command, check=True, capture_output=True, text=True, env=env)
+              elapsed = time.perf_counter() - started
+              lines = [line for line in completed.stdout.splitlines() if line.strip()]
+              payload = json.loads(lines[-1])
+              return {
+                  "arm": arm,
+                  "cycle": cycle,
+                  "slot": slot,
+                  "capacity": float(payload["capacity"]),
+                  "worker_elapsed_seconds": elapsed,
+                  "completed_rate": float(payload["completed_rate"]),
+                  "ack_latency_p50_ms": float(payload["ack_latency_p50_ms"]),
+              }
+
+          result: dict[str, object] = {"count": 5000, "cycles": 2, "protocols": {}}
+          for protocol in ("311", "5"):
+              measurements = []
+              for cycle in (1, 2):
+                  for slot, arm in enumerate(("base", "candidate", "candidate", "base"), start=1):
+                      item = one(protocol, arm, cycle, slot)
+                      measurements.append(item)
+                      print(
+                          f"calibration protocol={protocol} cycle={cycle} slot={slot} arm={arm} "
+                          f"capacity={item['capacity']:.1f}",
+                          flush=True,
+                      )
+              by_arm = {
+                  arm: [float(item["capacity"]) for item in measurements if item["arm"] == arm]
+                  for arm in ("base", "candidate")
+              }
+              estimates = {
+                  arm: math.exp(statistics.fmean(math.log(value) for value in values))
+                  for arm, values in by_arm.items()
+              }
+              all_values = [float(item["capacity"]) for item in measurements]
+              cv = statistics.stdev(all_values) / statistics.fmean(all_values)
+              conservative = min(estimates.values())
+              result["protocols"][protocol] = {
+                  "measurements": measurements,
+                  "base_geomean": estimates["base"],
+                  "candidate_geomean": estimates["candidate"],
+                  "candidate_over_base": estimates["candidate"] / estimates["base"],
+                  "all_measurement_cv": cv,
+                  "conservative_capacity": conservative,
+                  "target_rates": {
+                      str(fraction): conservative * fraction
+                      for fraction in (0.50, 0.75, 0.90, 1.00)
+                  },
+              }
+          output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+          PY
+          echo $(( $(date +%s) - started )) > "$JOB_ROOT/calibration-seconds.txt"
+
+      - name: MQTT 3.1.1 receipt load curve
         shell: bash
         run: |
           set -euo pipefail
-          "$JOB_ROOT/wait-preflight.sh" extended "$JOB_ROOT"
+          "$JOB_ROOT/wait-preflight.sh" curve-311 "$JOB_ROOT"
+          rates=$(python - "$JOB_ROOT/calibration.json" <<'PY'
+          import json, sys
+          data = json.load(open(sys.argv[1], encoding="utf-8"))["protocols"]["311"]["target_rates"]
+          print(",".join(str(data[str(value)]) for value in (0.5, 0.75, 0.9, 1.0)))
+          PY
+          )
           started=$(date +%s)
           python benchmarks/paired_open_loop.py \
             --base-root . --candidate-root . \
-            --protocols 311,5 --payloads 4096 --windows 100 \
-            --completions receipt,callback --fractions 0.90,1.00 \
+            --protocols 311 --payloads 4096 --windows 100 \
+            --completions receipt --target-rates "$rates" \
             --repeat 4 --count-large 5000 --target-sample-seconds 1.5 \
             --cpu 2 --policy advisory \
-            --preflight-report "$JOB_ROOT/preflight-extended.json" \
-            --output "$JOB_ROOT/extended.json" \
-            --summary-output "$JOB_ROOT/extended.md"
-          echo $(( $(date +%s) - started )) > "$JOB_ROOT/extended-seconds.txt"
+            --preflight-report "$JOB_ROOT/preflight-curve-311.json" \
+            --output "$JOB_ROOT/curve-311.json" \
+            --summary-output "$JOB_ROOT/curve-311.md"
+          echo $(( $(date +%s) - started )) > "$JOB_ROOT/curve-311-seconds.txt"
 
-      - name: Compare calibration stability
+      - name: MQTT 5 receipt load curve
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$JOB_ROOT/wait-preflight.sh" curve-5 "$JOB_ROOT"
+          rates=$(python - "$JOB_ROOT/calibration.json" <<'PY'
+          import json, sys
+          data = json.load(open(sys.argv[1], encoding="utf-8"))["protocols"]["5"]["target_rates"]
+          print(",".join(str(data[str(value)]) for value in (0.5, 0.75, 0.9, 1.0)))
+          PY
+          )
+          started=$(date +%s)
+          python benchmarks/paired_open_loop.py \
+            --base-root . --candidate-root . \
+            --protocols 5 --payloads 4096 --windows 100 \
+            --completions receipt --target-rates "$rates" \
+            --repeat 4 --count-large 5000 --target-sample-seconds 1.5 \
+            --cpu 2 --policy advisory \
+            --preflight-report "$JOB_ROOT/preflight-curve-5.json" \
+            --output "$JOB_ROOT/curve-5.json" \
+            --summary-output "$JOB_ROOT/curve-5.md"
+          echo $(( $(date +%s) - started )) > "$JOB_ROOT/curve-5-seconds.txt"
+
+      - name: Summarize calibration and latency knee
         shell: bash
         run: |
           set -euo pipefail
           python - "$JOB_ROOT" <<'PY' | tee "$JOB_ROOT/comparison.txt" >> "$GITHUB_STEP_SUMMARY"
-          import json, pathlib, statistics, sys
-          root = pathlib.Path(sys.argv[1])
+          import json
+          import pathlib
+          import statistics
+          import sys
 
-          print("# Open-loop calibration stability")
-          for name in ("current", "extended"):
-              data = json.loads((root / f"{name}.json").read_text())
-              seconds = (root / f"{name}-seconds.txt").read_text().strip()
-              unique = {}
-              for scenario in data["scenarios"]:
-                  key = (scenario["protocol"], scenario["completion"])
-                  unique[key] = (scenario["base_capacity"], scenario["candidate_capacity"])
-              deviations = []
-              print(f"\n## {name} ({seconds}s)")
-              for key, (base, candidate) in sorted(unique.items()):
-                  ratio = candidate / base
-                  deviations.append(abs(ratio - 1.0))
-                  print(f"- {key[0]}/4096/{key[1]} calibration: {base:.1f} vs {candidate:.1f} msg/s, ratio {ratio:.4f}")
-              lag_failures = []
-              invalidations = list(data.get("invalidations", []))
-              for scenario in data["scenarios"]:
-                  ratio = scenario["median_candidate_over_base_loop_lag_p95"]
-                  if ratio > 1.05:
-                      lag_failures.append(
-                          f"{scenario['protocol']}/{scenario['completion']}/{scenario['load_fraction']:.2f}={ratio:.4f}"
-                      )
-              print(f"- max calibration |ratio-1|: {max(deviations):.4f}")
-              print(f"- loop-lag >1.05: {len(lag_failures)}" + (" (" + ", ".join(lag_failures) + ")" if lag_failures else ""))
-              print(f"- invalidations: {len(invalidations)}")
-              counts = sorted({scenario["count"] for scenario in data["scenarios"]})
-              print(f"- sample counts: {counts}")
+          root = pathlib.Path(sys.argv[1])
+          calibration = json.loads((root / "calibration.json").read_text())
+          print("# Balanced calibration and receipt load curve")
+          print(f"\nCalibration wall time: {(root / 'calibration-seconds.txt').read_text().strip()}s")
+          for protocol in ("311", "5"):
+              cal = calibration["protocols"][protocol]
+              print(f"\n## Protocol {protocol} calibration")
+              print(f"- base geomean: {cal['base_geomean']:.1f} msg/s")
+              print(f"- candidate geomean: {cal['candidate_geomean']:.1f} msg/s")
+              print(f"- A/A candidate/base: {cal['candidate_over_base']:.4f}")
+              print(f"- raw calibration CV: {cal['all_measurement_cv']:.2%}")
+              print(f"- conservative capacity: {cal['conservative_capacity']:.1f} msg/s")
+
+              curve = json.loads((root / f"curve-{protocol}.json").read_text())
+              by_rate = {
+                  float(value): float(fraction)
+                  for fraction, value in cal["target_rates"].items()
+              }
+              print(f"- curve wall time: {(root / f'curve-{protocol}-seconds.txt').read_text().strip()}s")
+              print("\n| load | completed ratio | completed CV base/cand | ACK p50 median base/cand ms | ACK p50 CV base/cand | loop-lag ratio |")
+              print("| ---: | ---: | ---: | ---: | ---: | ---: |")
+              for scenario in curve["scenarios"]:
+                  target = float(scenario["target_rate"])
+                  fraction = min(by_rate, key=lambda value: abs(value - target))
+                  base_p50 = [float(pair["base"]["ack_latency_p50_ms"]) for pair in scenario["pairs"]]
+                  cand_p50 = [float(pair["candidate"]["ack_latency_p50_ms"]) for pair in scenario["pairs"]]
+                  print(
+                      f"| {by_rate[fraction]:.0%} | {scenario['median_candidate_over_base_completed']:.4f} | "
+                      f"{scenario['base_completed_cv']:.2%}/{scenario['candidate_completed_cv']:.2%} | "
+                      f"{statistics.median(base_p50):.4f}/{statistics.median(cand_p50):.4f} | "
+                      f"{scenario['base_ack_latency_p50_cv']:.2%}/{scenario['candidate_ack_latency_p50_cv']:.2%} | "
+                      f"{scenario['median_candidate_over_base_loop_lag_p95']:.4f} |"
+                  )
           PY
 
       - name: Upload evidence
