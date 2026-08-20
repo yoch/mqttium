@@ -156,7 +156,9 @@ def _parse_seed_schedule(value: str, *, minimum: int = 1) -> list[int]:
 def abba_cycle_differences(differences: list[float], orders: list[list[str]]) -> list[float]:
     """Collapse opposite-order pairs into additive ABBA cycle estimates."""
     if len(differences) != len(orders) or len(differences) < 4 or len(differences) % 2:
-        raise ValueError("ABBA difference evaluation requires an even number of at least four pairs")
+        raise ValueError(
+            "ABBA difference evaluation requires an even number of at least four pairs"
+        )
     cycles: list[float] = []
     for index in range(0, len(differences), 2):
         if orders[index] != ["base", "candidate"] or orders[index + 1] != [
@@ -179,9 +181,7 @@ def paired_difference_estimate(
     mean = statistics.fmean(cycles)
     sd = statistics.stdev(cycles) if len(cycles) > 1 else 0.0
     half_width = (
-        _t_critical_95(len(cycles) - 1) * sd / math.sqrt(len(cycles))
-        if len(cycles) > 1
-        else 0.0
+        _t_critical_95(len(cycles) - 1) * sd / math.sqrt(len(cycles)) if len(cycles) > 1 else 0.0
     )
     return DifferenceEstimate(
         pairs=len(differences),
@@ -452,9 +452,7 @@ def _pair_ratios(pairs: list[dict[str, Any]], field: str) -> list[float]:
 
 
 def _pair_differences(pairs: list[dict[str, Any]], field: str) -> list[float]:
-    return [
-        _number(pair["candidate"], field) - _number(pair["base"], field) for pair in pairs
-    ]
+    return [_number(pair["candidate"], field) - _number(pair["base"], field) for pair in pairs]
 
 
 def _orders(pairs: list[dict[str, Any]]) -> list[list[str]]:
@@ -695,9 +693,7 @@ def parent(args: argparse.Namespace) -> int:
                     )
 
         suspects = [
-            record
-            for record in records
-            if record["throughput_suspect"] or record["loop_suspect"]
+            record for record in records if record["throughput_suspect"] or record["loop_suspect"]
         ]
         if len(suspects) > args.max_confirmation_scenarios:
             result["status"] = "invalid"
