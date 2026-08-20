@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import pytest
+
 from mqttium.api import AsyncClient
-from mqttium.codec.buffer import IncrementalDecoder
+from mqttium.codec.buffer import IncrementalDecoder, RawPacket
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, PacketType, QoS
+from mqttium.errors import MalformedPacketError
 from mqttium.packets import PublishPacket
 from mqttium.protocol.effects import EffectKind, EngineEffect
 from mqttium.protocol.engine import EngineConfig, ProtocolEngine
 
 
-def _raw(topic: str = "run/topic", payload: bytes = b"x"):
+def _raw(topic: str = "run/topic", payload: bytes = b"x") -> RawPacket:
     decoder = IncrementalDecoder()
     decoder.feed(
         PublishPacket(
@@ -316,3 +319,159 @@ def test_buffered_ingress_batch_promotes_then_restores_handler() -> None:
     assert run.kind is EffectKind.MESSAGE_RUN
     assert [message.topic for message in run.data] == list(topics)
     assert not client._engine._runtime_has_message_run
+
+
+def _raw_qos(topic: str, qos: QoS, *, mid: int) -> RawPacket:
+    decoder = IncrementalDecoder()
+    decoder.feed(
+        PublishPacket(
+            topic=topic,
+            payload=b"x",
+            qos=qos,
+            retain=False,
+            dup=False,
+            mid=mid,
+        ).encode(MQTTProtocolVersion.MQTTv311)
+    )
+    return decoder.drain_packets()[0]
+
+
+def test_runtime_handler_preserves_qos1_and_qos2_paths() -> None:
+    for qos in (QoS.AT_LEAST_ONCE, QoS.EXACTLY_ONCE):
+        engine = _connected_engine()
+        engine._enable_runtime_message_runs()
+
+        engine.handle_raw(_raw_qos(f"qos-{int(qos)}", qos, mid=7))
+
+        effects = engine.take_effects()
+        assert [effect.kind for effect in effects] == [EffectKind.SEND, EffectKind.MESSAGE]
+        assert effects[1].data.qos is qos
+
+
+def test_runtime_handler_rejects_qos3() -> None:
+    decoder = IncrementalDecoder()
+    wire = bytearray(
+        PublishPacket(
+            topic="bad-qos",
+            payload=b"x",
+            qos=QoS.AT_LEAST_ONCE,
+            retain=False,
+            dup=False,
+            mid=7,
+        ).encode(MQTTProtocolVersion.MQTTv311)
+    )
+    wire[0] = (wire[0] & 0xF0) | 0x06
+    decoder.feed(bytes(wire))
+    raw = decoder.drain_packets()[0]
+    engine = _connected_engine()
+
+    with pytest.raises(MalformedPacketError, match="QoS 3"):
+        engine.inbound._on_publish_v311_runtime(raw)
+
+
+def test_compact_mixed_batch_materializes_run_before_effect_pump() -> None:
+    client = AsyncClient(message_delivery="callback")
+    client.on_message = lambda _message: None
+    client._engine.state = ConnectionState.CONNECTED
+    client._decoder.feed(
+        b"".join(
+            (
+                PublishPacket(
+                    topic="one",
+                    payload=b"x",
+                    qos=QoS.AT_MOST_ONCE,
+                    retain=False,
+                    dup=False,
+                ).encode(MQTTProtocolVersion.MQTTv311),
+                PublishPacket(
+                    topic="two",
+                    payload=b"x",
+                    qos=QoS.AT_MOST_ONCE,
+                    retain=False,
+                    dup=False,
+                ).encode(MQTTProtocolVersion.MQTTv311),
+                PublishPacket(
+                    topic="three",
+                    payload=b"x",
+                    qos=QoS.AT_LEAST_ONCE,
+                    retain=False,
+                    dup=False,
+                    mid=9,
+                ).encode(MQTTProtocolVersion.MQTTv311),
+            )
+        )
+    )
+
+    handled, _decoded_bytes, handoff_required = client._process_compact_ingress_batch()
+
+    assert handled == 3
+    assert not handoff_required
+    assert not client._engine._runtime_has_message_run
+    assert [effect.kind for effect in client._engine._effects] == [
+        EffectKind.MESSAGE,
+        EffectKind.MESSAGE,
+        EffectKind.SEND,
+        EffectKind.MESSAGE,
+    ]
+    assert [
+        effect.data.topic
+        for effect in client._engine._effects
+        if effect.kind is EffectKind.MESSAGE
+    ] == ["one", "two", "three"]
+
+
+def test_callback_run_without_callback_is_accepted_without_queueing() -> None:
+    client = AsyncClient(message_delivery="callback")
+    engine = _connected_engine()
+    engine.handle_raw(_raw("one"))
+    decoded = engine.take_effects()[0].data
+
+    assert client._delivery.deliver_callback_run_inline([decoded], None)
+    assert client._callback_queue.empty()
+
+
+def test_callback_run_rejects_message_outside_small_budget() -> None:
+    client = AsyncClient(message_delivery="callback")
+    engine = _connected_engine()
+    engine.handle_raw(_raw("large", payload=b"x" * (1024 * 1024)))
+    decoded = engine.take_effects()[0].data
+
+    assert not client._delivery.deliver_callback_run_inline([decoded], lambda _message: None)
+    assert client._callback_queue.empty()
+
+
+async def test_scheduled_flush_expands_message_run_before_delivery() -> None:
+    client = _runtime_callback_client()
+    client._delivery.ensure_callback_worker = lambda: None  # type: ignore[method-assign]
+    client._engine.handle_raw(_raw("one"))
+    client._engine.handle_raw(_raw("two"))
+    client._collect_effects_locked()
+
+    await client._effect_pump._run_scheduled()
+
+    assert not client._pending_effects
+    job = client._callback_queue.get_nowait()
+    assert [message.topic for message in job[1][0]] == ["one", "two"]
+    client._callback_queue.task_done()
+    client._delivery._release_callback_batch(2)
+
+
+def test_stale_message_run_inline_is_a_noop() -> None:
+    client = _runtime_callback_client()
+    engine = _connected_engine()
+    engine.handle_raw(_raw("one"))
+    message = engine.take_effects()[0].data
+
+    assert client._apply_message_run_inline([message], client._connection_epoch - 1)
+    assert client._callback_queue.empty()
+
+
+async def test_message_run_cannot_escape_effect_pump() -> None:
+    client = _runtime_callback_client()
+    engine = _connected_engine()
+    engine.handle_raw(_raw("one"))
+    message = engine.take_effects()[0].data
+    effect = EngineEffect(EffectKind.MESSAGE_RUN, [message], False, None)
+
+    with pytest.raises(AssertionError, match="escaped EffectPump"):
+        await client._apply_effect(effect, nowait=False, epoch=client._connection_epoch)
