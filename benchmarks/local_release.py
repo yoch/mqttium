@@ -567,15 +567,9 @@ def run_performance(
         timeout=7200,
     )
 
-    open_loop_preflight = recorder.output / "runner-open-loop.json"
-    recorder.run(
-        "runner-preflight-open-loop",
-        _runner_preflight_command(open_loop_preflight),
-        timeout=90,
-    )
     open_loop_command = [
         sys.executable,
-        "benchmarks/paired_open_loop.py",
+        "benchmarks/open_loop_release_gate.py",
         "--base-root",
         str(base),
         "--candidate-root",
@@ -584,15 +578,17 @@ def run_performance(
         str(port),
         "--policy",
         "strict",
-        "--preflight-report",
-        str(open_loop_preflight),
+        "--engine",
+        "benchmarks/paired_open_loop.py",
+        "--runner-probe",
+        "benchmarks/runner_probe.py",
         "--output",
         str(recorder.output / "paired-open-loop.json"),
     ]
     if cpu is not None:
         open_loop_command.extend(("--cpu", str(cpu)))
     recorder.run(
-        "paired-open-loop-strict",
+        "open-loop-release-gate-strict",
         open_loop_command,
         timeout=14400,
     )
@@ -730,6 +726,8 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.network_repeat <= 0 or args.network_repeat % 2:
         parser.error("--network-repeat must be a positive even number")
+    if args.profile in ("performance", "rc") and args.cpu is None:
+        parser.error("--cpu is required for performance and rc release gates")
     return args
 
 
