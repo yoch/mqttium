@@ -6,12 +6,35 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [1.0.0rc8] - 2026-08-20
+
 ### Fixed
 
 - `max_outbound_messages` now counts writer-resident admitted frames, including
   the writer's active batch, rather than only `queue.qsize()`. Extracting a
   batch no longer opens a window that could admit more resident frames than
   configured. `WriterStats.queued_messages` is still the live queue size.
+- Fix the rc7 burst-latency regression for ordinary awaited QoS 1/2 publishing
+  with a bounded latency microbatch: flush the entire already-admitted,
+  non-segmented writer queue only when it contains 4 to 16 frames and reaches
+  48 KiB or the 16-frame cap. QoS 0, `publish_nowait()`, segmented writes, FIFO
+  ordering and the normal writer fallback are unchanged.
+
+### Changed
+
+- Writer-capacity release wakes only as many blocked enqueue waiters as a
+  successfully written batch can plausibly service instead of waking every
+  waiter. Lifecycle and terminal paths still wake all, and cancellation
+  forwards a consumed targeted wake so another waiter can make progress.
+- Publish-admission capacity now wakes blocked publishers proportionally to
+  released slots instead of using one shared wake-all event. `publish_many()`
+  remains one waiter for its chunk and terminal teardown still wakes all.
+
+### Documentation
+
+- Add writer backpressure guidance explaining `max_outbound_bytes` as a
+  burst-buffer, batching and FIFO head-of-line latency trade-off, including how
+  to distinguish backlogged from clear-path latency measurements.
 
 ## [1.0.0rc7] - 2026-08-18
 
@@ -722,7 +745,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - Pre-spin-out comparative analysis and generated coverage data from the
   published source tree.
 
-[Unreleased]: https://github.com/yoch/mqttium/compare/v1.0.0rc7...HEAD
+[Unreleased]: https://github.com/yoch/mqttium/compare/v1.0.0rc8...HEAD
+[1.0.0rc8]: https://github.com/yoch/mqttium/compare/v1.0.0rc7...v1.0.0rc8
 [1.0.0rc7]: https://github.com/yoch/mqttium/compare/v1.0.0rc6...v1.0.0rc7
 [1.0.0rc6]: https://github.com/yoch/mqttium/compare/v1.0.0rc5...v1.0.0rc6
 [1.0.0rc5]: https://github.com/yoch/mqttium/compare/v1.0.0rc4...v1.0.0rc5
