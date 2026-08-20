@@ -28,7 +28,7 @@ def _argument(command: list[str], option: str) -> str:
     return command[command.index(option) + 1]
 
 
-def test_run_performance_requalifies_before_each_major_phase(
+def test_run_performance_requalifies_external_gates_and_uses_open_loop_gate(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
     local_release = _local_release(monkeypatch)
@@ -47,8 +47,7 @@ def test_run_performance_requalifies_before_each_major_phase(
         "paired-micro",
         "runner-preflight-network",
         "paired-network-advisory",
-        "runner-preflight-open-loop",
-        "paired-open-loop-strict",
+        "open-loop-release-gate-strict",
     ]
 
     preflight_calls = [call for call in recorder.calls if call[0].startswith("runner-preflight")]
@@ -57,7 +56,6 @@ def test_run_performance_requalifies_before_each_major_phase(
     ] == [
         "runner.json",
         "runner-network.json",
-        "runner-open-loop.json",
     ]
     for _name, command, timeout in preflight_calls:
         assert "--enforce" in command
@@ -70,7 +68,16 @@ def test_run_performance_requalifies_before_each_major_phase(
         command for name, command, _timeout in recorder.calls if name == "paired-network-advisory"
     )
     open_loop = next(
-        command for name, command, _timeout in recorder.calls if name == "paired-open-loop-strict"
+        command
+        for name, command, _timeout in recorder.calls
+        if name == "open-loop-release-gate-strict"
     )
     assert Path(_argument(network, "--preflight-report")).name == "runner-network.json"
-    assert Path(_argument(open_loop, "--preflight-report")).name == "runner-open-loop.json"
+    assert Path(open_loop[1]).name == "open_loop_release_gate.py"
+    assert "--preflight-report" not in open_loop
+    assert _argument(open_loop, "--engine") == "benchmarks/paired_open_loop.py"
+    assert _argument(open_loop, "--runner-probe") == "benchmarks/runner_probe.py"
+    assert _argument(open_loop, "--policy") == "strict"
+    assert _argument(open_loop, "--port") == "11883"
+    assert _argument(open_loop, "--cpu") == "2"
+    assert Path(_argument(open_loop, "--output")).name == "paired-open-loop.json"
