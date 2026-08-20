@@ -66,11 +66,11 @@ The maintained methodology and thresholds live in
 | Report | Status | Use instead or interpretation |
 | --- | --- | --- |
 | [SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-18](https://github.com/yoch/mqttium/blob/main/docs/reports/SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-18.md) | Superseded | 2026-08-19 campaign |
-| [SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-19](https://github.com/yoch/mqttium/blob/main/docs/reports/SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-19.md) | Current evidence | Open experiment subject to its eligible-runner gate |
+| [SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-19](https://github.com/yoch/mqttium/blob/main/docs/reports/SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-19.md) | Current evidence | Candidate accepted and merged in [#285](https://github.com/yoch/mqttium/pull/285) after eligible-runner gates |
 | [SCHEDULER-RESIDENT-MESSAGE-BUDGET-2026-08-18](https://github.com/yoch/mqttium/blob/main/docs/reports/SCHEDULER-RESIDENT-MESSAGE-BUDGET-2026-08-18.md) | Superseded | 2026-08-19 campaign |
-| [SCHEDULER-RESIDENT-MESSAGE-BUDGET-2026-08-19](https://github.com/yoch/mqttium/blob/main/docs/reports/SCHEDULER-RESIDENT-MESSAGE-BUDGET-2026-08-19.md) | Current evidence | Open experiment subject to its eligible-runner gate |
+| [SCHEDULER-RESIDENT-MESSAGE-BUDGET-2026-08-19](https://github.com/yoch/mqttium/blob/main/docs/reports/SCHEDULER-RESIDENT-MESSAGE-BUDGET-2026-08-19.md) | Current evidence | Candidate accepted and merged in [#283](https://github.com/yoch/mqttium/pull/283) after eligible-runner gates |
 | [SCHEDULER-WRITER-TARGETED-WAKE-2026-08-18](https://github.com/yoch/mqttium/blob/main/docs/reports/SCHEDULER-WRITER-TARGETED-WAKE-2026-08-18.md) | Superseded | 2026-08-19 campaign |
-| [SCHEDULER-WRITER-TARGETED-WAKE-2026-08-19](https://github.com/yoch/mqttium/blob/main/docs/reports/SCHEDULER-WRITER-TARGETED-WAKE-2026-08-19.md) | Current evidence | Open experiment subject to its eligible-runner gate |
+| [SCHEDULER-WRITER-TARGETED-WAKE-2026-08-19](https://github.com/yoch/mqttium/blob/main/docs/reports/SCHEDULER-WRITER-TARGETED-WAKE-2026-08-19.md) | Current evidence | Candidate accepted and merged in [#284](https://github.com/yoch/mqttium/pull/284) after eligible-runner gates |
 
 An experiment marked current is not release evidence until its own A/A and A/B
 validity conditions pass on an eligible runner.

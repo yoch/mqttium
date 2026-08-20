@@ -22,6 +22,9 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - Add a versioned MkDocs Material / Read the Docs site, exhaustive Stable API
   reference, user-oriented guides, curated historical-evidence index, project
   support policy, and a single canonical `AGENTS.md` repository guide.
+- Reconcile the active scheduler experiment statuses with their accepted,
+  eligible-runner evidence and merge decisions while preserving dated report
+  bodies unchanged.
 - Refresh the README, package metadata, community templates, and repository
   discovery metadata for the stable launch. Public comparative benchmark
   claims are deferred to the independent cross-client benchmark repository.
