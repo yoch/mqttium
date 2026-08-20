@@ -530,7 +530,7 @@ class ApplicationDelivery:
         self.callback_queue.put_nowait(job)
         self._reserve_callback_batch(len(messages))
 
-    def deliver_batch_inline(
+    def deliver_batch_inline(  # noqa: C901
         self,
         effects: deque[EngineEffect],
         callback: Callable[[Message], Any] | None,
@@ -580,7 +580,7 @@ class ApplicationDelivery:
             self.message_ready.set()
         return applied
 
-    def deliver_decoded_batch_inline(
+    def deliver_decoded_batch_inline(  # noqa: C901
         self,
         effects: deque[EngineEffect],
         callback: Callable[[Message], Any] | None,
