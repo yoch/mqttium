@@ -257,15 +257,18 @@ jobs:
 
       - name: A/A full matrix without CPU pinning
         shell: bash
-        run: "$JOB_ROOT/run-matrix.sh aa-unpinned candidate candidate"
+        run: |
+          "$JOB_ROOT/run-matrix.sh" aa-unpinned candidate candidate
 
       - name: A/A full matrix pinned to CPU 2
         shell: bash
-        run: "$JOB_ROOT/run-matrix.sh aa-pinned candidate candidate 2"
+        run: |
+          "$JOB_ROOT/run-matrix.sh" aa-pinned candidate candidate 2
 
       - name: A/B rc8 to investigation HEAD pinned to CPU 2
         shell: bash
-        run: "$JOB_ROOT/run-matrix.sh ab-pinned base candidate 2"
+        run: |
+          "$JOB_ROOT/run-matrix.sh" ab-pinned base candidate 2
 
       - name: Immediate and cooled postflight
         continue-on-error: true
