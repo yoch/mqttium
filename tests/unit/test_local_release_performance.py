@@ -13,7 +13,9 @@ class _Recorder:
         self.output = output
         self.calls: list[tuple[str, list[str], float | None]] = []
 
-    def run(self, name: str, command: list[str], *, timeout: float | None = None, **_kwargs: Any) -> None:
+    def run(
+        self, name: str, command: list[str], *, timeout: float | None = None, **_kwargs: Any
+    ) -> None:
         self.calls.append((name, command, timeout))
 
 
@@ -49,10 +51,10 @@ def test_run_performance_requalifies_before_each_major_phase(
         "paired-open-loop-strict",
     ]
 
-    preflight_calls = [
-        call for call in recorder.calls if call[0].startswith("runner-preflight")
-    ]
-    assert [Path(_argument(command, "--output")).name for _name, command, _timeout in preflight_calls] == [
+    preflight_calls = [call for call in recorder.calls if call[0].startswith("runner-preflight")]
+    assert [
+        Path(_argument(command, "--output")).name for _name, command, _timeout in preflight_calls
+    ] == [
         "runner.json",
         "runner-network.json",
         "runner-open-loop.json",
@@ -64,7 +66,11 @@ def test_run_performance_requalifies_before_each_major_phase(
         assert _argument(command, "--consecutive-eligible") == "2"
         assert timeout == 90
 
-    network = next(command for name, command, _timeout in recorder.calls if name == "paired-network-advisory")
-    open_loop = next(command for name, command, _timeout in recorder.calls if name == "paired-open-loop-strict")
+    network = next(
+        command for name, command, _timeout in recorder.calls if name == "paired-network-advisory"
+    )
+    open_loop = next(
+        command for name, command, _timeout in recorder.calls if name == "paired-open-loop-strict"
+    )
     assert Path(_argument(network, "--preflight-report")).name == "runner-network.json"
     assert Path(_argument(open_loop, "--preflight-report")).name == "runner-open-loop.json"
