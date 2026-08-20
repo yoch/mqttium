@@ -129,6 +129,17 @@ class EffectPump:
         if pending > self.pending_high_water:
             self.pending_high_water = pending
 
+    def record_inline_batch(self, count: int) -> None:
+        """Record logical effects delivered without entering the pending deque."""
+        self.batches += 1
+        if count > 1:
+            self.multi_effect_batches += 1
+        self.enqueued += count
+        self.applied += count
+        self.inline_effects += count
+        if self.waiters:
+            self.progress.set()
+
     def stats(self) -> EffectStats:
         """Snapshot the deque and the ordering decisions taken so far."""
         pending = len(self.pending)

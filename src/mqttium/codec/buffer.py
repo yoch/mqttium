@@ -52,6 +52,11 @@ class IncrementalDecoder:
         return len(self._buf) - self._start
 
     @property
+    def next_header_byte(self) -> int | None:
+        """Return the next fixed-header byte without consuming buffered data."""
+        return self._buf[self._start] if self._start < len(self._buf) else None
+
+    @property
     def high_water(self) -> int:
         return self._high_water
 

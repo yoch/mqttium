@@ -37,7 +37,8 @@ from mqttium.api.stats import (
     TransportStats,
 )
 from mqttium.codec.buffer import DEFAULT_MAX_PACKET_SIZE, IncrementalDecoder
-from mqttium.enums import ConnectionState, MQTTProtocolVersion, QoS
+from mqttium.codec.packet_validation import validate_raw_packet
+from mqttium.enums import ConnectionState, MQTTProtocolVersion, PacketType, QoS
 from mqttium.errors import (
     FlowControlError,
     MQTTError,
@@ -63,6 +64,7 @@ from mqttium.protocol.engine import (
     ProtocolEngine,
     PublishFailure,
 )
+from mqttium.packets._publish import decode_qos0_message_v311
 from mqttium.protocol.negotiated import NegotiatedSettings
 from mqttium.protocol.reconnect import ReconnectPolicy
 from mqttium.persistence.memory import InflightStore
@@ -1445,8 +1447,64 @@ class AsyncClient:
                 break
         return count, decoded_bytes, False
 
+    def _process_direct_qos0_batch(self) -> tuple[int, int, bool, list[Message]]:
+        decoder = self._decoder
+        engine = self._engine
+        inbound = engine.inbound
+        captured: list[Message] = []
+        max_bytes = self._max_ingress_batch_bytes
+        count = 0
+        decoded_bytes = 0
+        handoff_required = False
+
+        def materialize_captured() -> None:
+            if not captured:
+                return
+            engine._effects.extend(
+                EngineEffect(EffectKind.MESSAGE, message, False, None) for message in captured
+            )
+            captured.clear()
+
+        for _ in range(256):
+            packet = decoder.next_packet()
+            if packet is None:
+                break
+            is_qos0_publish = (
+                engine.state is ConnectionState.CONNECTED
+                and packet.packet_type is PacketType.PUBLISH
+                and ((packet.flags >> 1) & 0x03) == 0
+            )
+            if is_qos0_publish:
+                # The regular v3.1.1 QoS 0 handler is exactly validate → decode
+                # → emit MESSAGE. Elide only that final EngineEffect; on any
+                # exceptional packet, replay it through the engine so its error
+                # translation remains the single source of truth.
+                try:
+                    validate_raw_packet(packet)
+                    captured.append(decode_qos0_message_v311(packet))
+                except Exception:
+                    materialize_captured()
+                    engine.handle_raw(packet)
+            else:
+                materialize_captured()
+                engine.handle_raw(packet)
+            count += 1
+            decoded_bytes += len(packet.remaining) + 5
+            if inbound._autoack_handoff_required:
+                handoff_required = True
+                break
+            if decoded_bytes >= max_bytes:
+                break
+        if engine._effects:
+            materialize_captured()
+        return count, decoded_bytes, handoff_required, captured
+
     async def _read_loop(self) -> None:  # noqa: C901
         assert self._transport is not None
+        direct_qos0_delivery = (
+            self._delivery.mode == "callback"
+            and self._engine.config.protocol is MQTTProtocolVersion.MQTTv311
+        )
         try:
             while not self._transport.is_closing():
                 data = await self._transport.read(256 * 1024)
@@ -1458,9 +1516,35 @@ class AsyncClient:
                 # byte backpressure all the way to transport.read().
                 while True:
                     async with self._engine_lock:
+                        captured: list[Message] = []
                         with self._engine.store.batch():
-                            handled, handled_bytes, handoff_required = self._process_ingress_batch()
-                        if handled:
+                            header = getattr(self._decoder, "next_header_byte", None)
+                            if (
+                                direct_qos0_delivery
+                                and not self._effect_pump.pending
+                                and self._engine.state is ConnectionState.CONNECTED
+                                and header is not None
+                                and (header & 0xF0) == PacketType.PUBLISH
+                                and ((header >> 1) & 0x03) == 0
+                            ):
+                                handled, handled_bytes, handoff_required, captured = (
+                                    self._process_direct_qos0_batch()
+                                )
+                            else:
+                                handled, handled_bytes, handoff_required = (
+                                    self._process_ingress_batch()
+                                )
+                        if captured:
+                            if self._delivery.deliver_callback_messages_inline(
+                                captured, self.on_message
+                            ):
+                                self._effect_pump.record_inline_batch(len(captured))
+                            else:
+                                self._engine._effects.extend(
+                                    EngineEffect(EffectKind.MESSAGE, message, False, None)
+                                    for message in captured
+                                )
+                        if handled and self._engine.has_pending_effects:
                             self._collect_effects_locked()
                     if self._effect_pump.pending:
                         await self._drain_effects()
