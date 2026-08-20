@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Iterator
+from itertools import chain
 from typing import TYPE_CHECKING, NoReturn
 
 from mqttium.codec.buffer import RawPacket
@@ -54,18 +55,12 @@ REPLAY_BATCH_BYTES = 1 << 20
 
 
 class InboundReplayCursor:
-    """Position inside a paged inbound replay.
+    """Lazy replay iterator with one-message pushback for byte-budget boundaries."""
 
-    Holding a page iterator instead of a materialised list is the whole point:
-    only the current page of messages is alive at any time.
-    """
-
-    __slots__ = ("_pages", "_page", "_offset", "_pending")
+    __slots__ = ("_messages", "_pending")
 
     def __init__(self, pages: Iterator[tuple[InboundMessage, ...]]) -> None:
-        self._pages = pages
-        self._page: tuple[InboundMessage, ...] = ()
-        self._offset = 0
+        self._messages = chain.from_iterable(pages)
         self._pending: InboundMessage | None = None
 
     def next_message(self) -> InboundMessage | None:
@@ -73,15 +68,7 @@ class InboundReplayCursor:
             message = self._pending
             self._pending = None
             return message
-        while self._offset >= len(self._page):
-            page = next(self._pages, None)
-            if page is None:
-                return None
-            self._page = page
-            self._offset = 0
-        message = self._page[self._offset]
-        self._offset += 1
-        return message
+        return next(self._messages, None)
 
     def push_back(self, message: InboundMessage) -> None:
         if self._pending is not None:
