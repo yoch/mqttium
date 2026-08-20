@@ -139,7 +139,7 @@ jobs:
               expected_seen = TOTAL_FEEDS * PACKETS_PER_FEED
               if seen != expected_seen:
                   raise RuntimeError(f"callback count mismatch: {seen} != {expected_seen}")
-              stats = client.effect_stats()
+              stats = client._effect_pump.stats()
               await client._shutdown_callback_worker(drain=False)
               print(
                   json.dumps(
