@@ -114,6 +114,7 @@ async def test_shutdown_releases_reserved_batch_capacity() -> None:
     assert client._callback_queue.maxsize == 8
     assert client.stats().delivery.callback_queued == 0
 
+
 async def test_active_async_batch_keeps_remaining_callbacks_reserved() -> None:
     import asyncio
 
@@ -151,4 +152,3 @@ async def test_active_async_batch_keeps_remaining_callbacks_reserved() -> None:
     assert client.stats().delivery.callback_queued == 0
     assert client._callback_queue.maxsize == 3
     await client._shutdown_callback_worker(drain=False)
-
