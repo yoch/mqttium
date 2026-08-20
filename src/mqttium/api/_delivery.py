@@ -550,9 +550,7 @@ class ApplicationDelivery:
                     break
                 messages.append(message)
             if len(messages) > 1:
-                self._enqueue_message_batch(
-                    callback, messages, iterator_delivery=iterator_delivery
-                )
+                self._enqueue_message_batch(callback, messages, iterator_delivery=iterator_delivery)
                 return len(messages)
 
         # Bind the callback once instead of re-testing `callback_delivery` and
@@ -607,9 +605,7 @@ class ApplicationDelivery:
                     break
                 messages.append(message)
             if len(messages) > 1:
-                self._enqueue_message_batch(
-                    callback, messages, iterator_delivery=iterator_delivery
-                )
+                self._enqueue_message_batch(callback, messages, iterator_delivery=iterator_delivery)
                 return len(messages)
 
         # Bind the callback once instead of re-testing `callback_delivery` and
