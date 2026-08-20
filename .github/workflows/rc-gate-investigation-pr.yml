@@ -73,7 +73,7 @@ jobs:
           python3 -m venv "$VENV_ROOT"
           echo "$VENV_ROOT/bin" >> "$GITHUB_PATH"
 
-      - name: Temporarily force performance governor
+      - name: Verify persistent performance governor
         shell: bash
         run: |
           set -euo pipefail
@@ -86,21 +86,14 @@ jobs:
             echo "No CPU scaling governor controls found." >&2
             exit 1
           fi
-          : > "$JOB_ROOT/governor-before.txt"
-          for path in "${governors[@]}"; do
-            before="$(cat "$path")"
-            printf '%s\t%s\n' "$path" "$before" >> "$JOB_ROOT/governor-before.txt"
-            if [ -w "$path" ]; then
-              printf '%s\n' performance > "$path"
-            else
-              printf '%s\n' performance | sudo -n tee "$path" >/dev/null
-            fi
-          done
-          sleep 1
+          : > "$JOB_ROOT/governor-active.txt"
           for path in "${governors[@]}"; do
             current="$(cat "$path")"
             printf '%s\t%s\n' "$path" "$current" | tee -a "$JOB_ROOT/governor-active.txt"
-            test "$current" = performance
+            if [ "$current" != performance ]; then
+              echo "Expected persistent performance governor at $path, got $current." >&2
+              exit 1
+            fi
           done
 
       - name: Install investigation dependencies
@@ -298,8 +291,6 @@ jobs:
             echo
             echo "## Governor"
             echo '```text'
-            cat "$JOB_ROOT/governor-before.txt" 2>/dev/null || true
-            echo '->'
             cat "$JOB_ROOT/governor-active.txt" 2>/dev/null || true
             echo '```'
             echo
@@ -339,7 +330,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
-      - name: Cleanup and restore governor
+      - name: Cleanup
         if: always()
         shell: bash
         run: |
@@ -349,15 +340,5 @@ jobs:
             pid="$(cat "$pidfile")"
             kill "$pid" 2>/dev/null || true
             wait "$pid" 2>/dev/null || true
-          fi
-          if [ -f "$JOB_ROOT/governor-before.txt" ]; then
-            while IFS=$'\t' read -r path value; do
-              [ -n "$path" ] || continue
-              if [ -w "$path" ]; then
-                printf '%s\n' "$value" > "$path"
-              else
-                printf '%s\n' "$value" | sudo -n tee "$path" >/dev/null
-              fi
-            done < "$JOB_ROOT/governor-before.txt"
           fi
           rm -rf "$JOB_ROOT" "$VENV_ROOT"
