@@ -73,6 +73,36 @@ jobs:
           python3 -m venv "$VENV_ROOT"
           echo "$VENV_ROOT/bin" >> "$GITHUB_PATH"
 
+      - name: Temporarily force performance governor
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          governors=(/sys/devices/system/cpu/cpufreq/policy*/scaling_governor)
+          if [ "${#governors[@]}" -eq 0 ]; then
+            governors=(/sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor)
+          fi
+          if [ "${#governors[@]}" -eq 0 ]; then
+            echo "No CPU scaling governor controls found." >&2
+            exit 1
+          fi
+          : > "$JOB_ROOT/governor-before.txt"
+          for path in "${governors[@]}"; do
+            before="$(cat "$path")"
+            printf '%s\t%s\n' "$path" "$before" >> "$JOB_ROOT/governor-before.txt"
+            if [ -w "$path" ]; then
+              printf '%s\n' performance > "$path"
+            else
+              printf '%s\n' performance | sudo -n tee "$path" >/dev/null
+            fi
+          done
+          sleep 1
+          for path in "${governors[@]}"; do
+            current="$(cat "$path")"
+            printf '%s\t%s\n' "$path" "$current" | tee -a "$JOB_ROOT/governor-active.txt"
+            test "$current" = performance
+          done
+
       - name: Install investigation dependencies
         run: python -m pip install -e "candidate[dev,security]" "psutil>=6,<8"
 
@@ -107,7 +137,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python candidate/benchmarks/runner_probe.py --output "$JOB_ROOT/preflight-cold.json" --require-temperature
+          python candidate/benchmarks/runner_probe.py \
+            --output "$JOB_ROOT/preflight-cold.json" \
+            --require-temperature
 
       - name: Reproduce exact RC quality phase
         working-directory: candidate
@@ -118,7 +150,11 @@ jobs:
           import os
           from pathlib import Path
           from benchmarks.local_release import Recorder, run_quality
-          recorder = Recorder(Path(os.environ["JOB_ROOT"]) / "quality", "rc-gate-investigation-quality")
+
+          recorder = Recorder(
+              Path(os.environ["JOB_ROOT"]) / "quality",
+              "rc-gate-investigation-quality",
+          )
           run_quality(recorder, 11883)
           PY
 
@@ -138,7 +174,8 @@ jobs:
           print(
               f"attempt={int(sys.argv[1]):02d} wall={time.time():.3f} eligible={report['eligible']} "
               f"cpu={sample['cpu_percent']:.1f}% load1/cpu={sample['load_1m_per_cpu']:.4f} "
-              f"load5={sample['load_5m']:.4f} temp={sample.get('max_temperature_c')}"
+              f"load5={sample['load_5m']:.4f} temp={sample.get('max_temperature_c')} "
+              f"governors={sample.get('cpu_governors')}"
           )
           PY
             if python - "$report" <<'PY'
@@ -156,7 +193,7 @@ jobs:
             sleep 10
           done
 
-      - name: Define fresh-preflight helper
+      - name: Define investigation helpers
         shell: bash
         run: |
           cat > "$JOB_ROOT/wait-preflight.sh" <<'EOF'
@@ -179,69 +216,72 @@ jobs:
             sleep 15
           done
           echo "runner never became eligible for $label" >&2
-          exit 2
+          return_code=2
+          exit "$return_code"
           EOF
           chmod +x "$JOB_ROOT/wait-preflight.sh"
 
-      - name: A/A full matrix without CPU pinning
-        shell: bash
-        run: |
+          cat > "$JOB_ROOT/run-matrix.sh" <<'EOF'
+          #!/usr/bin/env bash
           set -euo pipefail
-          "$JOB_ROOT/wait-preflight.sh" aa-unpinned "$JOB_ROOT"
+          name="$1"
+          base_root="$2"
+          candidate_root="$3"
+          cpu="${4:-}"
+          root="$JOB_ROOT"
+
+          if ! "$root/wait-preflight.sh" "$name" "$root"; then
+            echo 2 > "$root/$name.preflight-exit-code"
+            echo "preflight failed for $name; measurement skipped" | tee "$root/$name-diagnostic.txt"
+            exit 0
+          fi
+
+          args=(
+            --base-root "$base_root"
+            --candidate-root "$candidate_root"
+            --policy strict
+            --preflight-report "$root/preflight-$name.json"
+            --repeat 8
+            --output "$root/$name.json"
+            --summary-output "$root/$name.md"
+          )
+          if [ -n "$cpu" ]; then
+            args+=(--cpu "$cpu")
+          fi
+
           set +e
-          python candidate/benchmarks/paired_open_loop.py \
-            --base-root candidate --candidate-root candidate \
-            --policy strict --preflight-report "$JOB_ROOT/preflight-aa-unpinned.json" \
-            --repeat 8 --output "$JOB_ROOT/aa-unpinned.json" --summary-output "$JOB_ROOT/aa-unpinned.md"
+          python candidate/benchmarks/paired_open_loop.py "${args[@]}"
           rc=$?
           set -e
-          echo "$rc" > "$JOB_ROOT/aa-unpinned.exit-code"
-          if [ -f "$JOB_ROOT/aa-unpinned.json" ]; then
-            python candidate/benchmarks/open_loop_report.py "$JOB_ROOT/aa-unpinned.json" --all \
-              --output "$JOB_ROOT/aa-unpinned-diagnostic.json" | tee "$JOB_ROOT/aa-unpinned-diagnostic.txt"
+          echo "$rc" > "$root/$name.exit-code"
+          if [ -f "$root/$name.json" ]; then
+            python candidate/benchmarks/open_loop_report.py "$root/$name.json" --all \
+              --output "$root/$name-diagnostic.json" | tee "$root/$name-diagnostic.txt"
           fi
+          exit 0
+          EOF
+          chmod +x "$JOB_ROOT/run-matrix.sh"
+
+      - name: A/A full matrix without CPU pinning
+        shell: bash
+        run: "$JOB_ROOT/run-matrix.sh aa-unpinned candidate candidate"
 
       - name: A/A full matrix pinned to CPU 2
         shell: bash
-        run: |
-          set -euo pipefail
-          "$JOB_ROOT/wait-preflight.sh" aa-pinned "$JOB_ROOT"
-          set +e
-          python candidate/benchmarks/paired_open_loop.py \
-            --base-root candidate --candidate-root candidate \
-            --policy strict --preflight-report "$JOB_ROOT/preflight-aa-pinned.json" \
-            --repeat 8 --cpu 2 --output "$JOB_ROOT/aa-pinned.json" --summary-output "$JOB_ROOT/aa-pinned.md"
-          rc=$?
-          set -e
-          echo "$rc" > "$JOB_ROOT/aa-pinned.exit-code"
-          if [ -f "$JOB_ROOT/aa-pinned.json" ]; then
-            python candidate/benchmarks/open_loop_report.py "$JOB_ROOT/aa-pinned.json" --all \
-              --output "$JOB_ROOT/aa-pinned-diagnostic.json" | tee "$JOB_ROOT/aa-pinned-diagnostic.txt"
-          fi
+        run: "$JOB_ROOT/run-matrix.sh aa-pinned candidate candidate 2"
 
       - name: A/B rc8 to investigation HEAD pinned to CPU 2
         shell: bash
-        run: |
-          set -euo pipefail
-          "$JOB_ROOT/wait-preflight.sh" ab-pinned "$JOB_ROOT"
-          set +e
-          python candidate/benchmarks/paired_open_loop.py \
-            --base-root base --candidate-root candidate \
-            --policy strict --preflight-report "$JOB_ROOT/preflight-ab-pinned.json" \
-            --repeat 8 --cpu 2 --output "$JOB_ROOT/ab-pinned.json" --summary-output "$JOB_ROOT/ab-pinned.md"
-          rc=$?
-          set -e
-          echo "$rc" > "$JOB_ROOT/ab-pinned.exit-code"
-          if [ -f "$JOB_ROOT/ab-pinned.json" ]; then
-            python candidate/benchmarks/open_loop_report.py "$JOB_ROOT/ab-pinned.json" --all \
-              --output "$JOB_ROOT/ab-pinned-diagnostic.json" | tee "$JOB_ROOT/ab-pinned-diagnostic.txt"
-          fi
+        run: "$JOB_ROOT/run-matrix.sh ab-pinned base candidate 2"
 
       - name: Immediate and cooled postflight
+        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
-          python candidate/benchmarks/runner_probe.py --output "$JOB_ROOT/postflight-immediate.json" --require-temperature
+          python candidate/benchmarks/runner_probe.py \
+            --output "$JOB_ROOT/postflight-immediate.json" \
+            --require-temperature
           "$JOB_ROOT/wait-preflight.sh" post-cooled "$JOB_ROOT"
 
       - name: Summarize investigation
@@ -256,9 +296,19 @@ jobs:
             echo "- baseline rc8: $RC8_SHA"
             echo "- runner: $RUNNER_NAME"
             echo
+            echo "## Governor"
+            echo '```text'
+            cat "$JOB_ROOT/governor-before.txt" 2>/dev/null || true
+            echo '->'
+            cat "$JOB_ROOT/governor-active.txt" 2>/dev/null || true
+            echo '```'
+            echo
             for name in aa-unpinned aa-pinned ab-pinned; do
               echo "## $name"
-              test -f "$JOB_ROOT/$name.exit-code" && echo "strict exit code: $(cat "$JOB_ROOT/$name.exit-code")"
+              test -f "$JOB_ROOT/$name.preflight-exit-code" && \
+                echo "preflight exit code: $(cat "$JOB_ROOT/$name.preflight-exit-code")"
+              test -f "$JOB_ROOT/$name.exit-code" && \
+                echo "strict exit code: $(cat "$JOB_ROOT/$name.exit-code")"
               if [ -f "$JOB_ROOT/$name-diagnostic.txt" ]; then
                 echo '```text'
                 cat "$JOB_ROOT/$name-diagnostic.txt"
@@ -289,14 +339,25 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
-      - name: Cleanup
+      - name: Cleanup and restore governor
         if: always()
         shell: bash
         run: |
+          set +e
           pidfile="$JOB_ROOT/mosquitto.pid"
           if [ -f "$pidfile" ]; then
             pid="$(cat "$pidfile")"
             kill "$pid" 2>/dev/null || true
             wait "$pid" 2>/dev/null || true
+          fi
+          if [ -f "$JOB_ROOT/governor-before.txt" ]; then
+            while IFS=$'\t' read -r path value; do
+              [ -n "$path" ] || continue
+              if [ -w "$path" ]; then
+                printf '%s\n' "$value" > "$path"
+              else
+                printf '%s\n' "$value" | sudo -n tee "$path" >/dev/null
+              fi
+            done < "$JOB_ROOT/governor-before.txt"
           fi
           rm -rf "$JOB_ROOT" "$VENV_ROOT"
