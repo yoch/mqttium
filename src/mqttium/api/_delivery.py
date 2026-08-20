@@ -530,6 +530,22 @@ class ApplicationDelivery:
         self.callback_queue.put_nowait(job)
         self._reserve_callback_batch(len(messages))
 
+    def deliver_callback_run_inline(
+        self,
+        messages: list[Message],
+        callback: Callable[[Message], Any] | None,
+    ) -> bool:
+        """Accept one compact callback-only QoS 0 run without rebuilding it."""
+        if callback is None:
+            return True
+        if self._callback_batch_capacity(False) < len(messages):
+            return False
+        for message in messages:
+            if not self._is_small(message):
+                return False
+        self._enqueue_message_batch(callback, messages, iterator_delivery=False)
+        return True
+
     def deliver_batch_inline(  # noqa: C901
         self,
         effects: deque[EngineEffect],

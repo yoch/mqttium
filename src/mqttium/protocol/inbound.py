@@ -338,6 +338,35 @@ class InboundSession:
             properties=None,
         )
 
+    def _on_publish_v311_runtime(self, raw: RawPacket) -> None:
+        """MQTT 3.1.1 PUBLISH with adjacent fresh QoS 0 delivery compaction."""
+        engine = self._engine
+        qos_raw = (raw.flags >> 1) & 0x03
+        if qos_raw == int(QoS.AT_MOST_ONCE):
+            engine._emit_runtime_qos0(decode_qos0_message_v311(raw))
+            return
+        if qos_raw == 3:
+            raise MalformedPacketError("Invalid PUBLISH QoS 3")
+        topic, payload, mid, retain, dup = decode_qos12_fields_v311(raw)
+        if qos_raw == int(QoS.AT_LEAST_ONCE):
+            self._on_qos1(
+                topic=topic,
+                payload=payload,
+                mid=mid,
+                retain=retain,
+                dup=dup,
+                properties=None,
+            )
+            return
+        self._on_qos2(
+            topic=topic,
+            payload=payload,
+            mid=mid,
+            retain=retain,
+            dup=dup,
+            properties=None,
+        )
+
     def _on_publish_v5(self, raw: RawPacket) -> None:
         qos_raw = (raw.flags >> 1) & 0x03
         if qos_raw == int(QoS.AT_MOST_ONCE):

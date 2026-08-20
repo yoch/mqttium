@@ -48,6 +48,7 @@ from mqttium.protocol.packet_ids import PacketIdPool
 from mqttium.topics import validate_publish_topic, validate_subscribe_filter
 from mqttium.transport.writes import WriteItem, item_size
 from mqttium.types import (
+    Message,
     OutboundMessage,
     OutboundMessageSummary,
     Properties,
@@ -80,6 +81,7 @@ class ProtocolEngine:
         self.session_present = False
         self.negotiated = NegotiatedSettings()
         self._effects: list[EngineEffect] = []
+        self._runtime_has_message_run = False
         # Specialized codecs are bound once; handlers and sessions never branch
         # on protocol per packet.
         self.codec: CodecBindings = bind_codec(self.config.protocol)
@@ -139,6 +141,34 @@ class ProtocolEngine:
         if inbound._pending_auto_qos1_mids:
             inbound.release_pending_auto_qos1()
         return effects
+
+    def _enable_runtime_message_runs(self) -> None:
+        """Enable compact MQTT 3.1.1 QoS 0 batches for callback delivery."""
+        if self.config.protocol is MQTTProtocolVersion.MQTTv311:
+            self._handlers_by_state[ConnectionState.CONNECTED][PacketType.PUBLISH] = (
+                self.inbound._on_publish_v311_runtime
+            )
+
+    def _disable_runtime_message_runs(self) -> None:
+        """Restore the protocol-bound PUBLISH handler after one ingress batch."""
+        self._handlers_by_state[ConnectionState.CONNECTED][PacketType.PUBLISH] = (
+            self.inbound.handle_publish
+        )
+
+    def _finalize_runtime_message_run(self) -> None:
+        """Keep a pure run compact; materialize it before a mixed effect batch."""
+        self._runtime_has_message_run = False
+        effects = self._effects
+        if len(effects) == 1:
+            return
+        expanded: list[EngineEffect] = []
+        for effect in effects:
+            if effect.kind is EffectKind.MESSAGE_RUN:
+                for message in effect.data:
+                    expanded.append(EngineEffect(EffectKind.MESSAGE, message, False, None))
+            else:
+                expanded.append(effect)
+        self._effects = expanded
 
     @property
     def has_pending_effects(self) -> bool:
@@ -238,6 +268,22 @@ class ProtocolEngine:
         self._effects.append(
             EngineEffect(kind, data, requires_delivery_mark, decoded_property_wire_size)
         )
+
+    def _emit_runtime_qos0(self, message: Message) -> None:
+        """Emit one fresh QoS 0 message, compacting an adjacent runtime run."""
+        effects = self._effects
+        if effects:
+            last = effects[-1]
+            if last.kind is EffectKind.MESSAGE_RUN:
+                last.data.append(message)
+                return
+            if last.kind is EffectKind.MESSAGE and last.data.qos is QoS.AT_MOST_ONCE:
+                effects[-1] = EngineEffect(
+                    EffectKind.MESSAGE_RUN, [last.data, message], False, None
+                )
+                self._runtime_has_message_run = True
+                return
+        effects.append(EngineEffect(EffectKind.MESSAGE, message, False, None))
 
     def _send(self, packet: WriteItem) -> None:
         self._emit(EffectKind.SEND, packet)

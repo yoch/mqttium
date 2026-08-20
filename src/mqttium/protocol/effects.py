@@ -32,6 +32,9 @@ class EffectKind(Enum):
     # batch at a time and asks the runtime to come back for the next one, so
     # delivery backpressure applies between batches instead of after all of them.
     CONTINUE_INBOUND_REPLAY = auto()
+    # Internal runtime-only compaction of adjacent fresh MQTT 3.1.1 QoS 0
+    # deliveries. ProtocolEngine never emits this unless AsyncClient opts in.
+    MESSAGE_RUN = auto()
 
 
 @dataclass(slots=True)

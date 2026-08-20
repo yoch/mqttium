@@ -17,6 +17,7 @@ from mqttium.protocol.effects import EffectKind, EngineEffect
 
 if TYPE_CHECKING:
     from mqttium.protocol.engine import ProtocolEngine
+    from mqttium.types import Message
 
 
 class StaleConnectionEffect(Exception):
@@ -28,6 +29,8 @@ class EffectOwner(Protocol):
     _engine: ProtocolEngine
 
     def _apply_effect_inline(self, effect: EngineEffect, epoch: int) -> bool: ...
+
+    def _apply_message_run_inline(self, messages: list[Message], epoch: int) -> bool: ...
 
     def _apply_message_effect_batch_inline(
         self, effects: deque[EngineEffect], epoch: int
@@ -90,10 +93,15 @@ class EffectPump:
         if self.pending and self.pending_epoch != epoch:
             self.discard_connection_effects()
 
+        logical_count = len(effects)
         if len(effects) == 1 and not self.pending:
-            if self.owner._apply_effect_inline(effects[0], epoch):
+            effect = effects[0]
+            if self.owner._apply_effect_inline(effect, epoch):
                 self.inline_effects += 1
                 return
+            if effect.kind is EffectKind.MESSAGE_RUN:
+                logical_count = len(effect.data)
+                self.multi_effect_batches += 1
 
         if len(effects) > 1:
             self.multi_effect_batches += 1
@@ -124,7 +132,7 @@ class EffectPump:
         if not self.pending:
             self.pending_epoch = epoch
         self.pending.extend(effects)
-        self.enqueued += len(effects)
+        self.enqueued += logical_count
         pending = len(self.pending)
         if pending > self.pending_high_water:
             self.pending_high_water = pending
@@ -145,8 +153,8 @@ class EffectPump:
             apply_suspensions=self.apply_suspensions,
         )
 
-    def _complete(self) -> None:
-        self.applied += 1
+    def _complete(self, count: int = 1) -> None:
+        self.applied += count
         if self.waiters:
             self.progress.set()
 
@@ -169,6 +177,13 @@ class EffectPump:
             self.inline_effects += 1
             self._complete()
         return True
+
+    def _expand_message_run(self, effect: EngineEffect) -> None:
+        assert self.pending and self.pending[0] is effect
+        messages = effect.data
+        self.pending.popleft()
+        for message in reversed(messages):
+            self.pending.appendleft(EngineEffect(EffectKind.MESSAGE, message, False, None))
 
     def drain_inline(self) -> None:
         if self.draining_inline or self.lock.locked():
@@ -195,6 +210,15 @@ class EffectPump:
                     ):
                         continue
                     break
+                if effect.kind is EffectKind.MESSAGE_RUN:
+                    if self.owner._apply_message_run_inline(effect.data, epoch):
+                        count = len(effect.data)
+                        self.pending.popleft()
+                        self.inline_effects += count
+                        self._complete(count)
+                        continue
+                    self._expand_message_run(effect)
+                    continue
                 if not self.owner._apply_effect_inline(effect, epoch):
                     break
                 self.pending.popleft()
@@ -234,6 +258,9 @@ class EffectPump:
                             self.owner._apply_decoded_message_effect_batch_inline, epoch
                         ):
                             continue
+                    elif effect.kind is EffectKind.MESSAGE_RUN:
+                        self._expand_message_run(effect)
+                        continue
                     try:
                         await self.owner._apply_effect(effect, nowait=False, epoch=epoch)
                     except asyncio.CancelledError:
@@ -321,7 +348,7 @@ class EffectPump:
                 EffectKind.PUBLISH_COMPLETE,
                 EffectKind.PUBLISH_FAILED,
             ):
-                discarded += 1
+                discarded += len(effect.data) if effect.kind is EffectKind.MESSAGE_RUN else 1
                 continue
             if not settle_publish:
                 retained.append(effect)

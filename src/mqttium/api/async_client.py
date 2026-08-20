@@ -82,6 +82,8 @@ PublishBackpressure = Literal["wait", "error"]
 
 _GRACEFUL_DISCONNECT_DRAIN_TIMEOUT = 5.0
 _FATAL_DISCONNECT_DRAIN_TIMEOUT = 0.25
+# The handler switch has a fixed cost; keep short reads on the historical path.
+_MESSAGE_RUN_MIN_BUFFERED_BYTES = 16 * 1024
 
 
 def _positive(name: str, value: float) -> None:
@@ -1445,8 +1447,24 @@ class AsyncClient:
                 break
         return count, decoded_bytes, False
 
+    def _process_compact_ingress_batch(self) -> tuple[int, int, bool]:
+        """Process one callback-heavy MQTT 3.1.1 batch with compact QoS 0 delivery."""
+        assert not self._effect_pump.pending
+        engine = self._engine
+        engine._enable_runtime_message_runs()
+        try:
+            return self._process_ingress_batch()
+        finally:
+            engine._disable_runtime_message_runs()
+            if engine._runtime_has_message_run:
+                engine._finalize_runtime_message_run()
+
     async def _read_loop(self) -> None:  # noqa: C901
         assert self._transport is not None
+        compact_message_runs = (
+            self._delivery.mode == "callback"
+            and self._engine.config.protocol is MQTTProtocolVersion.MQTTv311
+        )
         try:
             while not self._transport.is_closing():
                 data = await self._transport.read(256 * 1024)
@@ -1459,7 +1477,18 @@ class AsyncClient:
                 while True:
                     async with self._engine_lock:
                         with self._engine.store.batch():
-                            handled, handled_bytes, handoff_required = self._process_ingress_batch()
+                            if (
+                                compact_message_runs
+                                and not self._effect_pump.pending
+                                and self._decoder.buffered >= _MESSAGE_RUN_MIN_BUFFERED_BYTES
+                            ):
+                                handled, handled_bytes, handoff_required = (
+                                    self._process_compact_ingress_batch()
+                                )
+                            else:
+                                handled, handled_bytes, handoff_required = (
+                                    self._process_ingress_batch()
+                                )
                         if handled:
                             self._collect_effects_locked()
                     if self._effect_pump.pending:
@@ -1772,6 +1801,11 @@ class AsyncClient:
             return True
         return False
 
+    def _apply_message_run_inline(self, messages: list[Message], epoch: int) -> bool:
+        if epoch != self._connection_epoch:
+            return True
+        return self._delivery.deliver_callback_run_inline(messages, self.on_message)
+
     def _apply_message_effect_batch_inline(
         self,
         effects: deque[EngineEffect],
@@ -1918,6 +1952,8 @@ class AsyncClient:
             if self._engine.state is ConnectionState.DISCONNECTED:
                 self._disconnect_exc = error
             raise error
+        elif kind is EffectKind.MESSAGE_RUN:
+            raise AssertionError("compact message run escaped EffectPump")
         else:
             never: Never = kind
             raise MQTTError(f"Unhandled effect {never!r}")
