@@ -17,10 +17,19 @@ jobs:
           ref: perf/direct-qos0-callback-capture
           fetch-depth: 0
           persist-credentials: true
-      - name: Inspect staged patch checksum
+      - name: Apply verified patch and remove staging
         shell: bash
         run: |
           set -euo pipefail
           base64 -d .tmp/direct-qos0.patch.b64 > /tmp/direct-qos0.patch
-          sha256sum /tmp/direct-qos0.patch
-          exit 1
+          echo 'b879f8888b4f99ecd0e926aeb6fe3ea1cc4a0a52976d9caa48871d444252c568  /tmp/direct-qos0.patch' | sha256sum -c -
+          git apply --check /tmp/direct-qos0.patch
+          git apply /tmp/direct-qos0.patch
+          rm -f .tmp/direct-qos0.patch.b64 .github/workflows/apply-direct-qos0-staging.yml
+          rmdir .tmp 2>/dev/null || true
+          git diff --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'Perf: direct QoS0 callback capture'
+          git push origin HEAD:perf/direct-qos0-callback-capture
