@@ -102,9 +102,8 @@ class ApplicationDelivery(_BaseApplicationDelivery):
         if len(messages) == 1:
             self.callback_queue.put_nowait((callback, (messages[0],), None))
             return
-        self.callback_queue.put_nowait(  # type: ignore[arg-type]
-            (callback, (messages,), _CALLBACK_MESSAGE_BATCH)
-        )
+        job: Any = (callback, (messages,), _CALLBACK_MESSAGE_BATCH)
+        self.callback_queue.put_nowait(job)
         self._reserve_batch(len(messages))
 
     def deliver_batch_inline(
