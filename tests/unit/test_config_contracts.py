@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import fields
+
 import pytest
 
 from mqttium.api.async_client import AsyncClient
@@ -11,6 +13,31 @@ from mqttium.enums import MQTTProtocolVersion
 from mqttium.protocol.engine import EngineConfig, ProtocolEngine
 from mqttium.protocol.negotiated import NegotiatedSettings
 from mqttium.protocol.reconnect import ReconnectPolicy
+
+
+# Every public constructor field is classified deliberately. Adding a field to
+# EngineConfig must update this table instead of silently inheriting either
+# runtime-mutability policy.
+_ENGINE_CONFIG_RUNTIME_MUTABILITY = {
+    "client_id": False,
+    "protocol": False,
+    "clean_start": False,
+    "keepalive": True,
+    "username": True,
+    "password": True,
+    "local_receive_maximum": False,
+    "max_outbound_inflight": False,
+    "max_pending_outbound_messages": True,
+    "max_pending_outbound_bytes": True,
+    "max_pending_inbound_bytes": True,
+    "connect_properties": False,
+    "will": True,
+    "will_properties": True,
+    "maximum_packet_size": False,
+    "topic_alias_maximum": False,
+    "manual_ack": False,
+    "accept_auth": True,
+}
 
 
 @pytest.mark.parametrize(
@@ -30,6 +57,23 @@ from mqttium.protocol.reconnect import ReconnectPolicy
 def test_engine_config_rejects_invalid_ranges(field: str, value: int) -> None:
     with pytest.raises(ValueError):
         EngineConfig(**{field: value})
+
+
+def test_engine_config_runtime_mutability_is_explicit_and_exhaustive() -> None:
+    config_fields = {field.name for field in fields(EngineConfig) if field.init}
+    assert config_fields == set(_ENGINE_CONFIG_RUNTIME_MUTABILITY)
+
+    config = EngineConfig()
+    ProtocolEngine(config)
+    assert config._attached
+
+    for name, runtime_mutable in _ENGINE_CONFIG_RUNTIME_MUTABILITY.items():
+        current = getattr(config, name)
+        if runtime_mutable:
+            config.update(**{name: current})
+        else:
+            with pytest.raises(AttributeError, match="require a new ProtocolEngine"):
+                config.update(**{name: current})
 
 
 @pytest.mark.parametrize(
