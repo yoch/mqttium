@@ -64,10 +64,10 @@ jobs:
           from mqttium.enums import ConnectionState, MQTTProtocolVersion, QoS
           from mqttium.packets import PublishPacket
 
-          BATCH = 256
-          WARMUP_BATCHES = 64
-          MEASURED_BATCHES = 1200
-          TOTAL_BATCHES = WARMUP_BATCHES + MEASURED_BATCHES
+          PACKETS_PER_FEED = 256
+          WARMUP_FEEDS = 64
+          MEASURED_FEEDS = 1200
+          TOTAL_FEEDS = WARMUP_FEEDS + MEASURED_FEEDS
           PAYLOAD = b"x" * 256
           WIRE = PublishPacket(
               topic="bench/sensors/temp",
@@ -76,7 +76,7 @@ jobs:
               retain=False,
               dup=False,
           ).encode(MQTTProtocolVersion.MQTTv311)
-          WIRE_BATCH = WIRE * BATCH
+          WIRE_BATCH = WIRE * PACKETS_PER_FEED
 
 
           async def main() -> None:
@@ -89,6 +89,7 @@ jobs:
               )
               client._engine.state = ConnectionState.CONNECTED
               seen = 0
+              ingress_batches = 0
 
               def on_message(_message: object) -> None:
                   nonlocal seen
@@ -97,28 +98,45 @@ jobs:
               client.on_message = on_message
               started_wall = 0.0
               started_cpu = 0.0
-              for index in range(TOTAL_BATCHES):
-                  if index == WARMUP_BATCHES:
+              measured_ingress_batches_start = 0
+              for feed_index in range(TOTAL_FEEDS):
+                  if feed_index == WARMUP_FEEDS:
                       started_wall = time.perf_counter()
                       started_cpu = time.process_time()
+                      measured_ingress_batches_start = ingress_batches
                   client._decoder.feed(WIRE_BATCH)
-                  async with client._engine_lock:
-                      with client._engine.store.batch():
-                          handled, handled_bytes, handoff_required = client._process_ingress_batch()
-                      if handled != BATCH or handoff_required:
-                          raise RuntimeError(
-                              f"unexpected ingress boundary handled={handled} "
-                              f"bytes={handled_bytes} handoff={handoff_required}"
-                          )
-                      client._collect_effects_locked()
-                  await client._drain_effects()
+                  handled_total = 0
+                  while handled_total < PACKETS_PER_FEED:
+                      async with client._engine_lock:
+                          with client._engine.store.batch():
+                              handled, handled_bytes, handoff_required = (
+                                  client._process_ingress_batch()
+                              )
+                          if handled <= 0 or handoff_required:
+                              raise RuntimeError(
+                                  f"unexpected ingress boundary handled={handled} "
+                                  f"bytes={handled_bytes} handoff={handoff_required}"
+                              )
+                          handled_total += handled
+                          if handled_total > PACKETS_PER_FEED:
+                              raise RuntimeError(
+                                  f"decoded beyond injected feed: {handled_total}"
+                              )
+                          ingress_batches += 1
+                          client._collect_effects_locked()
+                      await client._drain_effects()
+                  if handled_total != PACKETS_PER_FEED:
+                      raise RuntimeError(
+                          f"feed count mismatch: {handled_total} != {PACKETS_PER_FEED}"
+                      )
 
               elapsed_wall = time.perf_counter() - started_wall
               elapsed_cpu = time.process_time() - started_cpu
-              measured_messages = MEASURED_BATCHES * BATCH
+              measured_messages = MEASURED_FEEDS * PACKETS_PER_FEED
+              measured_ingress_batches = ingress_batches - measured_ingress_batches_start
               queued_jobs = client._callback_queue.qsize()
               await asyncio.wait_for(client._callback_queue.join(), timeout=30.0)
-              expected_seen = TOTAL_BATCHES * BATCH
+              expected_seen = TOTAL_FEEDS * PACKETS_PER_FEED
               if seen != expected_seen:
                   raise RuntimeError(f"callback count mismatch: {seen} != {expected_seen}")
               stats = client.effect_stats()
@@ -127,6 +145,7 @@ jobs:
                   json.dumps(
                       {
                           "messages": measured_messages,
+                          "ingress_batches": measured_ingress_batches,
                           "wall_s": elapsed_wall,
                           "cpu_s": elapsed_cpu,
                           "messages_per_s": measured_messages / elapsed_wall,
@@ -161,13 +180,19 @@ jobs:
           def run(variant: str) -> dict[str, float | int]:
               env = os.environ.copy()
               env["PYTHONPATH"] = str((ROOTS[variant] / "src").resolve())
-              proc = subprocess.run(
-                  [sys.executable, str(WORKER)],
-                  check=True,
-                  capture_output=True,
-                  text=True,
-                  env=env,
-              )
+              try:
+                  proc = subprocess.run(
+                      [sys.executable, str(WORKER)],
+                      check=True,
+                      capture_output=True,
+                      text=True,
+                      env=env,
+                  )
+              except subprocess.CalledProcessError as exc:
+                  print(f"worker {variant} failed", file=sys.stderr)
+                  print(exc.stdout, file=sys.stderr)
+                  print(exc.stderr, file=sys.stderr)
+                  raise
               lines = [line for line in proc.stdout.splitlines() if line.strip()]
               return json.loads(lines[-1])
 
