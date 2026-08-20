@@ -65,7 +65,7 @@ class ApplicationDelivery(_BaseApplicationDelivery):
         if extra <= 0:
             return
         self._callback_batch_reserved += extra
-        self.callback_queue._maxsize -= extra
+        self.callback_queue._maxsize -= extra  # type: ignore[attr-defined]
 
     def _release_batch(self, count: int) -> None:
         extra = count - 1
@@ -73,10 +73,10 @@ class ApplicationDelivery(_BaseApplicationDelivery):
             return
         assert self._callback_batch_reserved >= extra
         self._callback_batch_reserved -= extra
-        self.callback_queue._maxsize += extra
-        putters = self.callback_queue._putters
+        self.callback_queue._maxsize += extra  # type: ignore[attr-defined]
+        putters = self.callback_queue._putters  # type: ignore[attr-defined]
         for _ in range(min(extra, len(putters))):
-            self.callback_queue._wakeup_next(putters)
+            self.callback_queue._wakeup_next(putters)  # type: ignore[attr-defined]
 
     def _callback_capacity(self, iterator_delivery: bool) -> int:
         capacity = self.callback_queue.maxsize - self.callback_queue.qsize()
@@ -102,7 +102,9 @@ class ApplicationDelivery(_BaseApplicationDelivery):
         if len(messages) == 1:
             self.callback_queue.put_nowait((callback, (messages[0],), None))
             return
-        self.callback_queue.put_nowait((callback, (messages,), _CALLBACK_MESSAGE_BATCH))
+        self.callback_queue.put_nowait(  # type: ignore[arg-type]
+            (callback, (messages,), _CALLBACK_MESSAGE_BATCH)
+        )
         self._reserve_batch(len(messages))
 
     def deliver_batch_inline(
