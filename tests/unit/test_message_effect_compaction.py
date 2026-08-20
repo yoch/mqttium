@@ -4,7 +4,7 @@ from collections import deque
 
 import pytest
 
-from mqttium.api._effects import EffectPump, _MessageEffectBatch
+from mqttium.api._effects import EffectPump, _MESSAGE_BATCH_KIND, _MessageEffectBatch
 from mqttium.protocol.effects import EffectKind, EngineEffect
 
 
@@ -32,6 +32,8 @@ class _Owner:
     def _apply_message_effect_batch_inline(self, effects: deque[EngineEffect], _epoch: int) -> int:
         consumed = 0
         for effect in effects:
+            if effect.kind is not EffectKind.MESSAGE:
+                break
             if self.batch_limit is not None and consumed >= self.batch_limit:
                 break
             self.batch_seen.append(effect.data)
@@ -75,7 +77,7 @@ def test_collect_compacts_safe_messages_but_counts_logical_effects() -> None:
 
     assert len(pump.pending) == 1
     effect = pump.pending[0]
-    assert effect.kind is EffectKind.MESSAGE
+    assert effect.kind is _MESSAGE_BATCH_KIND
     assert isinstance(effect.data, _MessageEffectBatch)
     assert effect.data.messages == ["m0", "m1", "m2", "m3", "m4"]
     stats = pump.stats()
@@ -110,7 +112,7 @@ def test_compaction_never_crosses_send_marked_or_decoded_boundaries() -> None:
         EffectKind.MESSAGE,
         EffectKind.MESSAGE,
         EffectKind.DECODED_MESSAGE,
-        EffectKind.MESSAGE,
+        _MESSAGE_BATCH_KIND,
     ]
     assert pump.pending[1].data == "before-send"
     assert pump.pending[2].data == "after-send"
@@ -121,6 +123,38 @@ def test_compaction_never_crosses_send_marked_or_decoded_boundaries() -> None:
     assert batch.messages == ["tail-0", "tail-1"]
     assert pump.stats().pending == 8
     assert pump.reordered_batches == 1
+
+
+def test_send_reorder_keeps_compact_batch_out_of_generic_message_delivery() -> None:
+    owner = _Owner(
+        [
+            _message("before-send"),
+            EngineEffect(EffectKind.SEND, b"wire"),
+            _message("after-send-0"),
+            _message("after-send-1"),
+        ]
+    )
+    pump = EffectPump(owner)
+    pump.collect_from_engine()
+
+    assert [effect.kind for effect in pump.pending] == [
+        EffectKind.SEND,
+        EffectKind.MESSAGE,
+        _MESSAGE_BATCH_KIND,
+    ]
+
+    send = pump.pending.popleft()
+    assert send.kind is EffectKind.SEND
+    pump._complete()
+
+    assert pump._consume_batch(owner._apply_message_effect_batch_inline, owner._connection_epoch)
+    assert owner.batch_seen == ["before-send"]
+    assert pump.pending[0].kind is _MESSAGE_BATCH_KIND
+
+    assert pump._consume_message_batch(owner._connection_epoch)
+    assert owner.batch_seen == ["before-send", "after-send-0", "after-send-1"]
+    assert not pump.pending
+    assert pump.applied == pump.enqueued == 4
 
 
 def test_compact_batch_can_be_consumed_partially_without_splitting() -> None:
