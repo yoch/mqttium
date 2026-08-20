@@ -80,7 +80,9 @@ def test_acquire_preflight_fails_closed_after_wait_budget(monkeypatch: Any) -> N
     monkeypatch.setattr(runner_probe, "sample_runner", lambda **_kwargs: _sample(load=0.5))
     now = [0.0]
     monkeypatch.setattr(runner_probe.time, "monotonic", lambda: now[0])
-    monkeypatch.setattr(runner_probe.time, "sleep", lambda seconds: now.__setitem__(0, now[0] + seconds))
+    monkeypatch.setattr(
+        runner_probe.time, "sleep", lambda seconds: now.__setitem__(0, now[0] + seconds)
+    )
 
     report = runner_probe.acquire_preflight(
         runner_probe.PreflightLimits(),
