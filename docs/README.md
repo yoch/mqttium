@@ -16,6 +16,7 @@ documentation site or generator.
 | [`GETTING-STARTED.md`](GETTING-STARTED.md) | You are installing the library, connecting to a broker, publishing, subscribing or choosing a delivery style. |
 | [`SESSIONS-AND-PERSISTENCE.md`](SESSIONS-AND-PERSISTENCE.md) | You need reconnects, broker sessions, SQLite-backed inflight state or restart recovery. |
 | [`OPERATIONS.md`](OPERATIONS.md) | You need queue sizing, backpressure, statistics, timeouts, shutdown or failure diagnosis. |
+| [`WRITER-BACKPRESSURE.md`](WRITER-BACKPRESSURE.md) | You need to size the encoded writer burst budget or interpret FIFO head-of-line latency under mixed traffic. |
 
 Runnable counterparts live in [`../examples/`](../examples/): native pub/sub,
 durable sessions, Paho VERSION2 migration and runtime statistics.
@@ -94,6 +95,7 @@ not exist.
 - **Getting started** — installation, broker connection, pub/sub and lifecycle.
 - **Sessions and persistence** — MQTT 3.1.1/5 sessions, reconnect and SQLite.
 - **Operations** — observability, sizing, backpressure, timeouts and shutdown.
+- **Writer backpressure** — encoded burst sizing and FIFO head-of-line latency trade-offs.
 - **Paho migration and compatibility** — staged adoption and exact VERSION2 scope.
 - **Architecture, protocol and stability contracts** — maintained alongside code.
 
