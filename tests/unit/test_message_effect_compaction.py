@@ -29,9 +29,7 @@ class _Owner:
     def _apply_effect_inline(self, _effect: EngineEffect, _epoch: int) -> bool:
         return False
 
-    def _apply_message_effect_batch_inline(
-        self, effects: deque[EngineEffect], _epoch: int
-    ) -> int:
+    def _apply_message_effect_batch_inline(self, effects: deque[EngineEffect], _epoch: int) -> int:
         consumed = 0
         for effect in effects:
             if self.batch_limit is not None and consumed >= self.batch_limit:
