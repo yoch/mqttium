@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import importlib
+import sys
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -81,3 +84,13 @@ def test_run_performance_requalifies_external_gates_and_uses_open_loop_gate(
     assert _argument(open_loop, "--port") == "11883"
     assert _argument(open_loop, "--cpu") == "2"
     assert Path(_argument(open_loop, "--output")).name == "paired-open-loop.json"
+
+
+def test_parse_args_requires_cpu_for_performance_profiles(monkeypatch: Any) -> None:
+    local_release = _local_release(monkeypatch)
+    monkeypatch.setattr(sys, "argv", ["local_release.py", "performance"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        local_release.parse_args()
+
+    assert exc_info.value.code == 2
