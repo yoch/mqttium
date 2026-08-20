@@ -146,7 +146,7 @@ class EffectPump:
         self.inline_effects = 0
         self.apply_suspensions = 0
 
-    def collect_from_engine(self) -> None:
+    def collect_from_engine(self) -> None:  # noqa: C901
         effects = self.owner._engine.take_effects()
         if not effects:
             return
