@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from mqttium.enums import MQTTProtocolVersion, PacketType
+from mqttium.enums import ConnectionState, MQTTProtocolVersion, PacketType
 from mqttium.packets import _ack, _publish
 from mqttium.protocol.config import EngineConfig
 from mqttium.protocol.engine import ProtocolEngine
@@ -24,9 +24,10 @@ def test_publish_and_pubrel_dispatch_directly_to_inbound_session(
     publish_handler,
 ) -> None:
     engine = ProtocolEngine(EngineConfig(protocol=protocol))
+    connected_handlers = engine._handlers_by_state[ConnectionState.CONNECTED]
 
-    publish = engine._handlers[PacketType.PUBLISH]
-    pubrel = engine._handlers[PacketType.PUBREL]
+    publish = connected_handlers[PacketType.PUBLISH]
+    pubrel = connected_handlers[PacketType.PUBREL]
 
     assert publish.__self__ is engine.inbound
     assert publish.__func__ is publish_handler
