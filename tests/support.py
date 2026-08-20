@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
 
 from mqttium.codec.buffer import IncrementalDecoder, RawPacket
 from mqttium.codec.primitives import pack_u16
@@ -122,19 +121,6 @@ def transport_factory(transport: QueueTransport):
         return transport
 
     return factory
-
-
-async def wait_until(
-    predicate: Callable[[], bool],
-    *,
-    attempts: int = 100,
-) -> None:
-    """Yield until a deterministic asynchronous condition becomes true."""
-    for _ in range(attempts):
-        if predicate():
-            return
-        await asyncio.sleep(0)
-    raise AssertionError("asynchronous condition was not reached")
 
 
 def feed_engine(engine: object, wire: bytes) -> None:

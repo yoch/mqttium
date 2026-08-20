@@ -9,7 +9,8 @@ import pytest
 from mqttium.helpers import publish as publish_helper
 from mqttium.helpers import subscribe as subscribe_helper
 from mqttium.packets import PublishPacket
-from tests.support import ScriptedBrokerTransport, wait_until
+from mqttium.types import Message
+from tests.support import ScriptedBrokerTransport
 
 
 @pytest.mark.parametrize("msg_count", [0, -1])
@@ -97,25 +98,35 @@ async def test_subscribe_simple_collects_multiple_and_filters_retained(
 async def test_subscribe_callback_disconnects_when_cancelled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    transport = ScriptedBrokerTransport()
+    class ControlledClient:
+        def __init__(self) -> None:
+            self.on_message = None
+            self.subscribed = asyncio.Event()
+            self.disconnected = asyncio.Event()
 
-    async def factory(host: str, port: int, *, ssl=None):
-        return transport
+        async def connect(self, hostname: str, port: int, *, ssl=None) -> None:
+            assert hostname == "fake"
+            assert port == 1883
 
-    from mqttium.api import async_client as ac
+        async def subscribe(self, topic: str, *, qos: int) -> None:
+            assert topic == "events/#"
+            assert qos == 0
+            assert self.on_message is not None
+            self.on_message(Message(topic="events/1", payload=b"event"))
+            self.subscribed.set()
 
-    monkeypatch.setattr(ac.TcpTransport, "connect", staticmethod(factory))
-    seen = []
+        async def disconnect(self) -> None:
+            self.disconnected.set()
+
+    client = ControlledClient()
+    monkeypatch.setattr(subscribe_helper, "create_client", lambda **_kwargs: client)
+    seen: list[Message] = []
     task = asyncio.create_task(subscribe_helper.callback(seen.append, "events/#", hostname="fake"))
-    await wait_until(lambda: any(frame[0] >> 4 == 8 for frame in transport.written))
+    await asyncio.wait_for(client.subscribed.wait(), timeout=1.0)
 
-    transport.push_rx(
-        PublishPacket(topic="events/1", payload=b"event", qos=0, retain=False, dup=False).encode()
-    )
-    await wait_until(lambda: len(seen) == 1)
+    assert [message.topic for message in seen] == ["events/1"]
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await task
+        await asyncio.wait_for(task, timeout=1.0)
 
-    assert seen[0].topic == "events/1"
-    assert transport.is_closing()
+    assert client.disconnected.is_set()

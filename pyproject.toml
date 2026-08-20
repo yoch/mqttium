@@ -72,6 +72,7 @@ docs = [
 fuzz = [
     "hypothesis>=6.100",
     "pytest>=8",
+    "pytest-asyncio>=0.24",
     "pytest-timeout>=2.4",
 ]
 security = [

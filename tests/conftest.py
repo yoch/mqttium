@@ -6,8 +6,11 @@ import os
 import random
 import threading
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
+
+from mqttium.persistence.sqlite import SqliteInflightStore
 
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
@@ -44,3 +47,29 @@ def no_mqttium_thread_leaks() -> Iterator[None]:
         if thread.ident not in baseline and thread.is_alive() and thread.name.startswith("mqttium-")
     ]
     assert not leaked, f"MQTTium threads survived the test session: {[t.name for t in leaked]}"
+
+
+@pytest.fixture(autouse=True)
+def close_test_sqlite_stores() -> Iterator[None]:
+    """Give every test-created SQLite store deterministic ownership.
+
+    Python 3.13+ warns when a ``sqlite3.Connection`` reaches its finalizer
+    without being closed.  Tests that pass a store into ``ProtocolEngine`` do
+    not otherwise retain a convenient owner, so garbage-collection timing can
+    report that leak against an unrelated later test.  Keep each store alive
+    for the current test and close it during fixture teardown instead.
+    """
+    stores: list[SqliteInflightStore] = []
+    original_init = SqliteInflightStore.__init__
+
+    def tracked_init(self: SqliteInflightStore, path: str | Path) -> None:
+        original_init(self, path)
+        stores.append(self)
+
+    SqliteInflightStore.__init__ = tracked_init
+    try:
+        yield
+    finally:
+        SqliteInflightStore.__init__ = original_init
+        for store in reversed(stores):
+            store.close()
