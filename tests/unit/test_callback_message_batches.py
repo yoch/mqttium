@@ -152,3 +152,52 @@ async def test_active_async_batch_keeps_remaining_callbacks_reserved() -> None:
     assert client.stats().delivery.callback_queued == 0
     assert client._callback_queue.maxsize == 3
     await client._shutdown_callback_worker(drain=False)
+
+
+def _decoded_effect(i: int) -> EngineEffect:
+    return EngineEffect(
+        EffectKind.DECODED_MESSAGE,
+        Message(topic="batch/test", payload=str(i).encode()),
+        requires_delivery_mark=False,
+        decoded_property_wire_size=0,
+    )
+
+
+async def test_decoded_message_callbacks_batch_as_one_physical_job() -> None:
+    client = AsyncClient(message_delivery="callback", max_pending_callbacks=8)
+    seen: list[bytes] = []
+    client.on_message = lambda message: seen.append(message.payload)
+
+    applied = client._apply_decoded_message_effect_batch_inline(
+        deque(_decoded_effect(i) for i in range(4)), client._connection_epoch
+    )
+
+    assert applied == 4
+    assert len(client._callback_queue._queue) == 1  # type: ignore[attr-defined]
+    assert client.stats().delivery.callback_queued == 4
+    await client._callback_queue.join()
+    assert seen == [b"0", b"1", b"2", b"3"]
+    await client._shutdown_callback_worker(drain=False)
+
+
+async def test_both_mode_batch_reserves_callback_and_iterator_capacity() -> None:
+    client = AsyncClient(
+        message_delivery="both",
+        max_pending_callbacks=8,
+        max_pending_messages=8,
+    )
+    seen: list[bytes] = []
+    client.on_message = lambda message: seen.append(message.payload)
+
+    applied = client._apply_message_effect_batch_inline(
+        deque(_effect(i) for i in range(3)), client._connection_epoch
+    )
+
+    assert applied == 3
+    assert client._delivery.messages_queue.qsize() == 3
+    assert client.stats().delivery.callback_queued == 3
+    await client._callback_queue.join()
+    assert seen == [b"0", b"1", b"2"]
+    queued = [client._delivery.messages_queue.get_nowait() for _ in range(3)]
+    assert [message.payload for message in queued] == [b"0", b"1", b"2"]
+    await client._shutdown_callback_worker(drain=False)
