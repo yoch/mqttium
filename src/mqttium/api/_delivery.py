@@ -41,9 +41,7 @@ class ApplicationDelivery(_BaseApplicationDelivery):
         if self.protocol == MQTTProtocolVersion.MQTTv5 and message.properties:
             property_bytes = len(encode_properties(message.properties, PUBLISH))
         topic_bytes = (
-            len(message.topic)
-            if message.topic.isascii()
-            else len(message.topic.encode("utf-8"))
+            len(message.topic) if message.topic.isascii() else len(message.topic.encode("utf-8"))
         )
         return len(message.payload) + topic_bytes + property_bytes
 
