@@ -167,7 +167,7 @@ class EffectPump:
             # Partition SEND-first in one pass, and let that same pass answer
             # whether the batch needed it. The same pass also compacts adjacent
             # non-persisted MESSAGE effects; no second scan is added to ingress.
-            # MESSAGE_BATCH is runtime-only and never escapes EffectPump.
+            # The compact payload is runtime-private and never escapes EffectPump.
             sends: list[EngineEffect] = []
             others: list[EngineEffect] = []
             out_of_order = False
@@ -193,14 +193,16 @@ class EffectPump:
                         previous.kind is EffectKind.MESSAGE
                         and not previous.requires_delivery_mark
                         and previous.decoded_property_wire_size is None
+                        and not isinstance(previous.data, _MessageEffectBatch)
                     ):
-                        previous.kind = EffectKind.MESSAGE_BATCH
                         previous.data = _MessageEffectBatch(previous.data, effect.data)
                         compacted = True
                         continue
-                    if previous.kind is EffectKind.MESSAGE_BATCH:
-                        batch: _MessageEffectBatch = previous.data
-                        batch.messages.append(effect.data)
+                    if (
+                        previous.kind is EffectKind.MESSAGE
+                        and isinstance(previous.data, _MessageEffectBatch)
+                    ):
+                        previous.data.messages.append(effect.data)
                         compacted = True
                         continue
                 others.append(effect)
@@ -282,9 +284,11 @@ class EffectPump:
         return True
 
     def _slow_effect(self, effect: EngineEffect) -> EngineEffect:
-        if effect.kind is not EffectKind.MESSAGE_BATCH:
+        if effect.kind is not EffectKind.MESSAGE or not isinstance(
+            effect.data, _MessageEffectBatch
+        ):
             return effect
-        batch: _MessageEffectBatch = effect.data
+        batch = effect.data
         proxy = self._message_batch_slow_effect
         proxy.data = batch.messages[batch.offset]
         return proxy
@@ -292,8 +296,8 @@ class EffectPump:
     def _advance_head(self, effect: EngineEffect) -> None:
         if not self.pending or self.pending[0] is not effect:
             return
-        if effect.kind is EffectKind.MESSAGE_BATCH:
-            batch: _MessageEffectBatch = effect.data
+        if effect.kind is EffectKind.MESSAGE and isinstance(effect.data, _MessageEffectBatch):
+            batch = effect.data
             batch.offset += 1
             if batch.offset < len(batch.messages):
                 self._complete()
@@ -316,7 +320,9 @@ class EffectPump:
         try:
             while self.pending:
                 effect = self.pending[0]
-                if effect.kind is EffectKind.MESSAGE_BATCH:
+                if effect.kind is EffectKind.MESSAGE and isinstance(
+                    effect.data, _MessageEffectBatch
+                ):
                     if self._consume_message_batch(epoch):
                         continue
                     break
@@ -359,7 +365,9 @@ class EffectPump:
                     if epoch != self.owner._connection_epoch:
                         self.discard_connection_effects()
                         continue
-                    if effect.kind is EffectKind.MESSAGE_BATCH:
+                    if effect.kind is EffectKind.MESSAGE and isinstance(
+                        effect.data, _MessageEffectBatch
+                    ):
                         if self._consume_message_batch(epoch):
                             continue
                     elif effect.kind is EffectKind.MESSAGE:
@@ -454,8 +462,10 @@ class EffectPump:
                 EffectKind.PUBLISH_COMPLETE,
                 EffectKind.PUBLISH_FAILED,
             ):
-                if effect.kind is EffectKind.MESSAGE_BATCH:
-                    batch: _MessageEffectBatch = effect.data
+                if effect.kind is EffectKind.MESSAGE and isinstance(
+                    effect.data, _MessageEffectBatch
+                ):
+                    batch = effect.data
                     discarded += len(batch.messages) - batch.offset
                 else:
                     discarded += 1
