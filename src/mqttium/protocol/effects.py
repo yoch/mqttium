@@ -32,10 +32,6 @@ class EffectKind(Enum):
     # batch at a time and asks the runtime to come back for the next one, so
     # delivery backpressure applies between batches instead of after all of them.
     CONTINUE_INBOUND_REPLAY = auto()
-    # Runtime-only compact representation. ProtocolEngine never emits this kind;
-    # EffectPump may replace an adjacent run of safe MESSAGE effects with one
-    # physical batch while preserving logical effect accounting and ordering.
-    MESSAGE_BATCH = auto()
 
 
 @dataclass(slots=True)
