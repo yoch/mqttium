@@ -270,7 +270,7 @@ class ApplicationDelivery:
             not _fits_small_limit(message, self.small_message_limit, property_wire_size)
             or self.messages_queue.full()
         ):
-            return self.accept_decoded(message, None, property_wire_size)
+            return self.accept(message, None, property_wire_size)
         self.messages_queue.put_nowait(message)
         self.message_ready.set()
         return None
@@ -287,7 +287,7 @@ class ApplicationDelivery:
             not _fits_small_limit(message, self.small_message_limit, property_wire_size)
             or self.callback_queue.full()
         ):
-            return self.accept_decoded(message, callback, property_wire_size)
+            return self.accept(message, callback, property_wire_size)
         self.ensure_callback_worker()
         self.callback_queue.put_nowait((callback, (message,), None))
         return None
@@ -299,13 +299,13 @@ class ApplicationDelivery:
         property_wire_size: int,
     ) -> Awaitable[None] | None:
         if callback is None:
-            return self.accept_decoded(message, callback, property_wire_size)
+            return self.accept(message, callback, property_wire_size)
         if (
             not _fits_small_limit(message, self.small_message_limit, property_wire_size)
             or self.messages_queue.full()
             or self.callback_queue.full()
         ):
-            return self.accept_decoded(message, callback, property_wire_size)
+            return self.accept(message, callback, property_wire_size)
         self.messages_queue.put_nowait(message)
         self.message_ready.set()
         self.ensure_callback_worker()
@@ -422,15 +422,6 @@ class ApplicationDelivery:
                 callback_enqueued=callback_enqueued,
             )
             raise
-
-    async def accept_decoded(
-        self,
-        message: Message,
-        callback: Callable[[Message], Any] | None,
-        property_wire_size: int,
-    ) -> None:
-        """Accept one fresh decoded MQTT 5 message using its trusted table size."""
-        await self.accept(message, callback, property_wire_size)
 
     def _release_unqueued(
         self,
