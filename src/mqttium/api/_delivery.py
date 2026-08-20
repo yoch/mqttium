@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from mqttium.api.stats import DeliveryStats
 from mqttium.codec.properties import PUBLISH, encode_properties
@@ -35,7 +35,15 @@ class _SharedDeliveryReservation:
 
 AccountedDeliveryToken = int | _SharedDeliveryReservation
 DeliveryToken = AccountedDeliveryToken | None
-CallbackJob = tuple[Callable[..., Any], tuple[Any, ...], DeliveryToken]
+
+
+class _CallbackMessageBatchToken:
+    __slots__ = ()
+
+
+_CALLBACK_MESSAGE_BATCH = _CallbackMessageBatchToken()
+CallbackQueueToken = DeliveryToken | _CallbackMessageBatchToken
+CallbackJob = tuple[Callable[..., Any], tuple[Any, ...], CallbackQueueToken]
 TrackedIteratorMessage = tuple[Message, AccountedDeliveryToken]
 IteratorQueueItem = Message | TrackedIteratorMessage
 MessageAcceptor = Callable[[Message, Callable[[Message], Any] | None], Awaitable[None] | None]
@@ -127,6 +135,8 @@ class ApplicationDelivery:
         self.callback_queue: asyncio.Queue[CallbackJob] = asyncio.Queue(
             maxsize=max_pending_callbacks
         )
+        self._callback_limit = max_pending_callbacks
+        self._callback_batch_reserved = 0
         self.message_ready = asyncio.Event()
         self.closed = asyncio.Event()
         self.callback_task: asyncio.Task[None] | None = None
@@ -441,8 +451,8 @@ class ApplicationDelivery:
         return DeliveryStats(
             iterator_queued=self.messages_queue.qsize(),
             iterator_limit=self.messages_queue.maxsize,
-            callback_queued=self.callback_queue.qsize(),
-            callback_limit=self.callback_queue.maxsize,
+            callback_queued=self.callback_queue.qsize() + self._callback_batch_reserved,
+            callback_limit=self._callback_limit,
             pending_bytes=self.pending_bytes,
             pending_high_water_bytes=self.pending_high_water_bytes,
             accounted_limit=self.accounted_limit,
@@ -477,7 +487,50 @@ class ApplicationDelivery:
     def _is_small_decoded(self, message: Message, property_wire_size: int) -> bool:
         return _fits_small_limit(message, self.small_message_limit, property_wire_size)
 
-    def deliver_batch_inline(
+    def _reserve_callback_batch(self, count: int) -> None:
+        extra = count - 1
+        if extra <= 0:
+            return
+        self._callback_batch_reserved += extra
+        self.callback_queue._maxsize -= extra  # type: ignore[attr-defined]
+
+    def _release_callback_batch(self, count: int) -> None:
+        extra = count - 1
+        if extra <= 0:
+            return
+        assert self._callback_batch_reserved >= extra
+        self._callback_batch_reserved -= extra
+        self.callback_queue._maxsize += extra  # type: ignore[attr-defined]
+        putters = self.callback_queue._putters  # type: ignore[attr-defined]
+        for _ in range(min(extra, len(putters))):
+            self.callback_queue._wakeup_next(putters)  # type: ignore[attr-defined]
+
+    def _callback_batch_capacity(self, iterator_delivery: bool) -> int:
+        capacity = self.callback_queue.maxsize - self.callback_queue.qsize()
+        if iterator_delivery:
+            capacity = min(
+                capacity,
+                self.messages_queue.maxsize - self.messages_queue.qsize(),
+            )
+        return max(0, capacity)
+
+    def _enqueue_message_batch(
+        self,
+        callback: Callable[[Message], Any],
+        messages: list[Message],
+        *,
+        iterator_delivery: bool,
+    ) -> None:
+        if iterator_delivery:
+            for message in messages:
+                self.messages_queue.put_nowait(message)
+            self.message_ready.set()
+        self.ensure_callback_worker()
+        job: Any = (callback, (messages,), _CALLBACK_MESSAGE_BATCH)
+        self.callback_queue.put_nowait(job)
+        self._reserve_callback_batch(len(messages))
+
+    def deliver_batch_inline(  # noqa: C901
         self,
         effects: deque[EngineEffect],
         callback: Callable[[Message], Any] | None,
@@ -485,6 +538,21 @@ class ApplicationDelivery:
         callback_delivery, iterator_delivery = self._modes(callback)
         if not callback_delivery and not iterator_delivery:
             return 0
+        if callback_delivery and len(effects) > 1:
+            assert callback is not None
+            capacity = self._callback_batch_capacity(iterator_delivery)
+            messages: list[Message] = []
+            for effect in effects:
+                if len(messages) >= capacity or effect.kind is not EffectKind.MESSAGE:
+                    break
+                message: Message = effect.data
+                if effect.requires_delivery_mark or not self._is_small(message):
+                    break
+                messages.append(message)
+            if len(messages) > 1:
+                self._enqueue_message_batch(callback, messages, iterator_delivery=iterator_delivery)
+                return len(messages)
+
         # Bind the callback once instead of re-testing `callback_delivery` and
         # asserting non-None per message; `cb is not None` carries both facts.
         cb = callback if callback_delivery else None
@@ -493,7 +561,7 @@ class ApplicationDelivery:
         for effect in effects:
             if effect.kind is not EffectKind.MESSAGE:
                 break
-            message: Message = effect.data
+            message = effect.data
             if effect.requires_delivery_mark or not self._is_small(message):
                 break
             if iterator_delivery and self.messages_queue.full():
@@ -512,7 +580,7 @@ class ApplicationDelivery:
             self.message_ready.set()
         return applied
 
-    def deliver_decoded_batch_inline(
+    def deliver_decoded_batch_inline(  # noqa: C901
         self,
         effects: deque[EngineEffect],
         callback: Callable[[Message], Any] | None,
@@ -520,6 +588,26 @@ class ApplicationDelivery:
         callback_delivery, iterator_delivery = self._modes(callback)
         if not callback_delivery and not iterator_delivery:
             return 0
+        if callback_delivery and len(effects) > 1:
+            assert callback is not None
+            capacity = self._callback_batch_capacity(iterator_delivery)
+            messages: list[Message] = []
+            for effect in effects:
+                if len(messages) >= capacity or effect.kind is not EffectKind.DECODED_MESSAGE:
+                    break
+                message: Message = effect.data
+                property_wire_size = effect.decoded_property_wire_size
+                if (
+                    effect.requires_delivery_mark
+                    or property_wire_size is None
+                    or not self._is_small_decoded(message, property_wire_size)
+                ):
+                    break
+                messages.append(message)
+            if len(messages) > 1:
+                self._enqueue_message_batch(callback, messages, iterator_delivery=iterator_delivery)
+                return len(messages)
+
         # Bind the callback once instead of re-testing `callback_delivery` and
         # asserting non-None per message; `cb is not None` carries both facts.
         cb = callback if callback_delivery else None
@@ -528,7 +616,7 @@ class ApplicationDelivery:
         for effect in effects:
             if effect.kind is not EffectKind.DECODED_MESSAGE:
                 break
-            message: Message = effect.data
+            message = effect.data
             property_wire_size = effect.decoded_property_wire_size
             if (
                 effect.requires_delivery_mark
@@ -745,14 +833,29 @@ class ApplicationDelivery:
         while True:
             callback, args, token = await self.callback_queue.get()
             try:
-                await self.invoke(callback, *args)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                self.report_callback_error(callback, exc)
+                if token is _CALLBACK_MESSAGE_BATCH:
+                    messages = args[0]
+                    try:
+                        for message in messages:
+                            try:
+                                await self.invoke(callback, message)
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception as exc:
+                                self.report_callback_error(callback, exc)
+                    finally:
+                        self._release_callback_batch(len(messages))
+                    continue
+                try:
+                    await self.invoke(callback, *args)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self.report_callback_error(callback, exc)
+                finally:
+                    if token is not None:
+                        self.release_nowait(cast(AccountedDeliveryToken, token))
             finally:
-                if token is not None:
-                    self.release_nowait(token)
                 self.callback_queue.task_done()
 
     @staticmethod
@@ -797,9 +900,11 @@ class ApplicationDelivery:
         self.callback_task = None
         while True:
             try:
-                _callback, _args, token = self.callback_queue.get_nowait()
+                _callback, args, token = self.callback_queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
-            if token is not None:
-                self.release_nowait(token)
+            if token is _CALLBACK_MESSAGE_BATCH:
+                self._release_callback_batch(len(args[0]))
+            elif token is not None:
+                self.release_nowait(cast(AccountedDeliveryToken, token))
             self.callback_queue.task_done()
