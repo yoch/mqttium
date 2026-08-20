@@ -1,0 +1,232 @@
+name: Open-loop Calibration Investigation
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mqttium-arm64-runner
+  cancel-in-progress: false
+
+jobs:
+  investigate:
+    if: github.head_ref == 'investigate/open-loop-calibration-stability'
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 20
+    env:
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+
+    steps:
+      - name: Check out exact investigation HEAD
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Verify dedicated runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "aarch64"
+          test "$EXPECTED_HEAD" = "$(git rev-parse HEAD)"
+          python3 - <<'PY'
+          import sys
+          if sys.version_info[:2] != (3, 13):
+              raise SystemExit(f"expected Python 3.13, got {sys.version}")
+          PY
+          command -v mosquitto
+          command -v taskset
+          if pgrep -a mosquitto; then
+            echo "pre-existing Mosquitto would contaminate evidence" >&2
+            exit 1
+          fi
+          shopt -s nullglob
+          governors=(/sys/devices/system/cpu/cpufreq/policy*/scaling_governor)
+          test "${#governors[@]}" -gt 0
+          for path in "${governors[@]}"; do
+            test "$(cat "$path")" = performance
+          done
+
+      - name: Prepare isolated environment and broker
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "JOB_ROOT=$RUNNER_TEMP/mqttium-calibration-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_ENV"
+          echo "VENV_ROOT=$RUNNER_TEMP/mqttium-calibration-venv-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_ENV"
+
+      - name: Install probe dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$JOB_ROOT" "$VENV_ROOT"
+          mkdir -p "$JOB_ROOT"
+          python3 -m venv "$VENV_ROOT"
+          echo "$VENV_ROOT/bin" >> "$GITHUB_PATH"
+          "$VENV_ROOT/bin/python" -m pip install "psutil>=6,<8"
+
+      - name: Start isolated broker pinned to CPU 0
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$JOB_ROOT/mosquitto.conf" <<'EOF'
+          persistence false
+          allow_anonymous true
+          max_inflight_messages 1000
+          max_queued_messages 100000
+          max_queued_bytes 0
+          connection_messages false
+          log_type error
+          listener 11883 127.0.0.1
+          EOF
+          taskset -c 0 mosquitto -c "$JOB_ROOT/mosquitto.conf" > "$JOB_ROOT/mosquitto.log" 2>&1 &
+          echo "$!" > "$JOB_ROOT/mosquitto.pid"
+          for _ in $(seq 1 50); do
+            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            kill -0 "$(cat "$JOB_ROOT/mosquitto.pid")" 2>/dev/null || { cat "$JOB_ROOT/mosquitto.log"; exit 1; }
+            sleep 0.2
+          done
+          cat "$JOB_ROOT/mosquitto.log"
+          exit 1
+
+      - name: Define adaptive preflight helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$JOB_ROOT/wait-preflight.sh" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          label="$1"
+          root="$2"
+          mkdir -p "$root/preflight-$label-attempts"
+          consecutive=0
+          for attempt in $(seq 1 16); do
+            report="$root/preflight-$label-attempts/$(printf '%02d' "$attempt").json"
+            python benchmarks/runner_probe.py --output "$report" --require-temperature
+            if python - "$report" <<'PY'
+          import json, sys
+          report = json.load(open(sys.argv[1], encoding="utf-8"))
+          sample = report["sample"]
+          print(
+              f"eligible={report['eligible']} cpu={sample['cpu_percent']:.1f}% "
+              f"load1/cpu={sample['load_1m_per_cpu']:.4f} temp={sample.get('max_temperature_c')}"
+          )
+          raise SystemExit(0 if report["eligible"] else 1)
+          PY
+            then
+              consecutive=$((consecutive + 1))
+              if [ "$consecutive" -ge 2 ]; then
+                cp "$report" "$root/preflight-$label.json"
+                exit 0
+              fi
+            else
+              consecutive=0
+            fi
+            sleep 5
+          done
+          echo "runner did not become stably eligible for $label" >&2
+          exit 2
+          EOF
+          chmod +x "$JOB_ROOT/wait-preflight.sh"
+
+      - name: A/A with current 1000-message calibration
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$JOB_ROOT/wait-preflight.sh" current "$JOB_ROOT"
+          started=$(date +%s)
+          python benchmarks/paired_open_loop.py \
+            --base-root . --candidate-root . \
+            --protocols 311,5 --payloads 4096 --windows 100 \
+            --completions receipt,callback --fractions 0.90,1.00 \
+            --repeat 4 --count-large 1000 --target-sample-seconds 1.5 \
+            --cpu 2 --policy advisory \
+            --preflight-report "$JOB_ROOT/preflight-current.json" \
+            --output "$JOB_ROOT/current.json" \
+            --summary-output "$JOB_ROOT/current.md"
+          echo $(( $(date +%s) - started )) > "$JOB_ROOT/current-seconds.txt"
+
+      - name: A/A with 5000-message calibration
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$JOB_ROOT/wait-preflight.sh" extended "$JOB_ROOT"
+          started=$(date +%s)
+          python benchmarks/paired_open_loop.py \
+            --base-root . --candidate-root . \
+            --protocols 311,5 --payloads 4096 --windows 100 \
+            --completions receipt,callback --fractions 0.90,1.00 \
+            --repeat 4 --count-large 5000 --target-sample-seconds 1.5 \
+            --cpu 2 --policy advisory \
+            --preflight-report "$JOB_ROOT/preflight-extended.json" \
+            --output "$JOB_ROOT/extended.json" \
+            --summary-output "$JOB_ROOT/extended.md"
+          echo $(( $(date +%s) - started )) > "$JOB_ROOT/extended-seconds.txt"
+
+      - name: Compare calibration stability
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - "$JOB_ROOT" <<'PY' | tee "$JOB_ROOT/comparison.txt" >> "$GITHUB_STEP_SUMMARY"
+          import json, pathlib, statistics, sys
+          root = pathlib.Path(sys.argv[1])
+
+          print("# Open-loop calibration stability")
+          for name in ("current", "extended"):
+              data = json.loads((root / f"{name}.json").read_text())
+              seconds = (root / f"{name}-seconds.txt").read_text().strip()
+              unique = {}
+              for scenario in data["scenarios"]:
+                  key = (scenario["protocol"], scenario["completion"])
+                  unique[key] = (scenario["base_capacity"], scenario["candidate_capacity"])
+              deviations = []
+              print(f"\n## {name} ({seconds}s)")
+              for key, (base, candidate) in sorted(unique.items()):
+                  ratio = candidate / base
+                  deviations.append(abs(ratio - 1.0))
+                  print(f"- {key[0]}/4096/{key[1]} calibration: {base:.1f} vs {candidate:.1f} msg/s, ratio {ratio:.4f}")
+              lag_failures = []
+              invalidations = list(data.get("invalidations", []))
+              for scenario in data["scenarios"]:
+                  ratio = scenario["median_candidate_over_base_loop_lag_p95"]
+                  if ratio > 1.05:
+                      lag_failures.append(
+                          f"{scenario['protocol']}/{scenario['completion']}/{scenario['load_fraction']:.2f}={ratio:.4f}"
+                      )
+              print(f"- max calibration |ratio-1|: {max(deviations):.4f}")
+              print(f"- loop-lag >1.05: {len(lag_failures)}" + (" (" + ", ".join(lag_failures) + ")" if lag_failures else ""))
+              print(f"- invalidations: {len(invalidations)}")
+              counts = sorted({scenario["count"] for scenario in data["scenarios"]})
+              print(f"- sample counts: {counts}")
+          PY
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: open-loop-calibration-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/mqttium-calibration-${{ github.run_id }}-${{ github.run_attempt }}/*.json
+            ${{ runner.temp }}/mqttium-calibration-${{ github.run_id }}-${{ github.run_attempt }}/*.md
+            ${{ runner.temp }}/mqttium-calibration-${{ github.run_id }}-${{ github.run_attempt }}/*.txt
+            ${{ runner.temp }}/mqttium-calibration-${{ github.run_id }}-${{ github.run_attempt }}/preflight-*-attempts/*.json
+            ${{ runner.temp }}/mqttium-calibration-${{ github.run_id }}-${{ github.run_attempt }}/mosquitto.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Cleanup
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          if [ -f "$JOB_ROOT/mosquitto.pid" ]; then
+            pid="$(cat "$JOB_ROOT/mosquitto.pid")"
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+          fi
+          rm -rf "$JOB_ROOT" "$VENV_ROOT"
