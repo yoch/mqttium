@@ -10,6 +10,7 @@ from typing import Any, cast
 from mqttium.api._delivery_base import (
     AccountedDeliveryToken,
     ApplicationDelivery as _BaseApplicationDelivery,
+    MessageDelivery as MessageDelivery,
 )
 from mqttium.api.stats import DeliveryStats
 from mqttium.codec.properties import PUBLISH, encode_properties
