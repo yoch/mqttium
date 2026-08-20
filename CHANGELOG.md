@@ -27,7 +27,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   bodies unchanged.
 - Generate canonical and AI-facing documentation links from the active Read the
   Docs build URL so `latest`, stable releases, and pull-request previews remain
-  self-contained.
+  self-contained, and render the Material navigation cues on the documentation
+  home page.
 - Refresh the README, package metadata, community templates, and repository
   discovery metadata for the stable launch. Public comparative benchmark
   claims are deferred to the independent cross-client benchmark repository.
