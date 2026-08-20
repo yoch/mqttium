@@ -82,9 +82,7 @@ def diagnose(report: dict[str, Any]) -> dict[str, Any]:
         "source_status": report.get("status"),
         "max_loop_lag_ratio": threshold,
         "scenario_count": len(diagnostics),
-        "relative_loop_lag_failures": sum(
-            bool(item["relative_failure"]) for item in diagnostics
-        ),
+        "relative_loop_lag_failures": sum(bool(item["relative_failure"]) for item in diagnostics),
         "invalidations": report.get("invalidations", []),
         "regressions": report.get("regressions", []),
         "scenarios": diagnostics,
