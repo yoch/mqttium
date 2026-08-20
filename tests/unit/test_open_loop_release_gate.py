@@ -80,7 +80,10 @@ def test_fractional_target_is_anchored_only_to_baseline_capacity(gate) -> None:
         baseline_samples=(9_900.0, 10_000.0, 10_100.0),
     )
 
-    assert gate.target_rate(calibration, gate.LoadPoint("baseline_capacity_fraction", 0.9)) == 9_000.0
+    assert (
+        gate.target_rate(calibration, gate.LoadPoint("baseline_capacity_fraction", 0.9))
+        == 9_000.0
+    )
     assert gate.target_rate(calibration, gate.LoadPoint("absolute_rate", 7_500.0)) == 7_500.0
 
 
