@@ -1,0 +1,239 @@
+name: Temporary message-effect compaction benchmark
+
+on:
+  push:
+    branches:
+      - perf/message-effect-compaction
+    paths:
+      - .github/workflows/tmp-message-effect-compaction-bench.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tmp-message-effect-compaction-bench
+  cancel-in-progress: true
+
+jobs:
+  paired:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      PYTHONUNBUFFERED: "1"
+      BASE_REF: 5d100b96c22ff4456f5f82f1bad6ced73ae1855d
+      CANDIDATE_REF: fe6bccb6e4613de2854d08f2a197ce9137bbb467
+    steps:
+      - name: Check out base
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ env.BASE_REF }}
+          path: base
+          persist-credentials: false
+      - name: Check out candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ env.CANDIDATE_REF }}
+          path: candidate
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.13"
+      - name: Runner facts
+        run: |
+          set -euo pipefail
+          python -VV
+          uname -a
+          lscpu | sed -n '1,24p'
+      - name: Paired batched ingress benchmark
+        run: |
+          set -euo pipefail
+          cat > /tmp/message_effect_worker.py <<'PY'
+          from __future__ import annotations
+
+          import asyncio
+          import json
+          import os
+          import time
+
+          if hasattr(os, "sched_getaffinity") and hasattr(os, "sched_setaffinity"):
+              allowed = os.sched_getaffinity(0)
+              if allowed:
+                  os.sched_setaffinity(0, {min(allowed)})
+
+          from mqttium.api import AsyncClient
+          from mqttium.enums import ConnectionState, MQTTProtocolVersion, QoS
+          from mqttium.packets import PublishPacket
+
+          BATCH = 256
+          WARMUP_BATCHES = 64
+          MEASURED_BATCHES = 1200
+          TOTAL_BATCHES = WARMUP_BATCHES + MEASURED_BATCHES
+          PAYLOAD = b"x" * 256
+          WIRE = PublishPacket(
+              topic="bench/sensors/temp",
+              payload=PAYLOAD,
+              qos=QoS.AT_MOST_ONCE,
+              retain=False,
+              dup=False,
+          ).encode(MQTTProtocolVersion.MQTTv311)
+          WIRE_BATCH = WIRE * BATCH
+
+
+          async def main() -> None:
+              client = AsyncClient(
+                  client_id="paired-message-effect",
+                  protocol=MQTTProtocolVersion.MQTTv311,
+                  message_delivery="callback",
+                  max_pending_callbacks=1_000_000,
+                  max_pending_delivery_bytes=None,
+              )
+              client._engine.state = ConnectionState.CONNECTED
+              seen = 0
+
+              def on_message(_message: object) -> None:
+                  nonlocal seen
+                  seen += 1
+
+              client.on_message = on_message
+              started_wall = 0.0
+              started_cpu = 0.0
+              for index in range(TOTAL_BATCHES):
+                  if index == WARMUP_BATCHES:
+                      started_wall = time.perf_counter()
+                      started_cpu = time.process_time()
+                  client._decoder.feed(WIRE_BATCH)
+                  async with client._engine_lock:
+                      with client._engine.store.batch():
+                          handled, handled_bytes, handoff_required = client._process_ingress_batch()
+                      if handled != BATCH or handoff_required:
+                          raise RuntimeError(
+                              f"unexpected ingress boundary handled={handled} "
+                              f"bytes={handled_bytes} handoff={handoff_required}"
+                          )
+                      client._collect_effects_locked()
+                  await client._drain_effects()
+
+              elapsed_wall = time.perf_counter() - started_wall
+              elapsed_cpu = time.process_time() - started_cpu
+              measured_messages = MEASURED_BATCHES * BATCH
+              queued_jobs = client._callback_queue.qsize()
+              await asyncio.wait_for(client._callback_queue.join(), timeout=30.0)
+              expected_seen = TOTAL_BATCHES * BATCH
+              if seen != expected_seen:
+                  raise RuntimeError(f"callback count mismatch: {seen} != {expected_seen}")
+              stats = client.effect_stats()
+              await client._shutdown_callback_worker(drain=False)
+              print(
+                  json.dumps(
+                      {
+                          "messages": measured_messages,
+                          "wall_s": elapsed_wall,
+                          "cpu_s": elapsed_cpu,
+                          "messages_per_s": measured_messages / elapsed_wall,
+                          "cpu_us_per_message": elapsed_cpu * 1e6 / measured_messages,
+                          "callback_jobs_before_join": queued_jobs,
+                          "effect_enqueued": stats.enqueued,
+                          "effect_applied": stats.applied,
+                          "effect_pending_high_water": stats.pending_high_water,
+                      }
+                  )
+              )
+
+
+          asyncio.run(main())
+          PY
+
+          cat > /tmp/message_effect_pairs.py <<'PY'
+          from __future__ import annotations
+
+          import json
+          import os
+          import statistics
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          REPEAT = 11
+          ROOTS = {"base": Path("base"), "candidate": Path("candidate")}
+          WORKER = Path("/tmp/message_effect_worker.py")
+
+
+          def run(variant: str) -> dict[str, float | int]:
+              env = os.environ.copy()
+              env["PYTHONPATH"] = str((ROOTS[variant] / "src").resolve())
+              proc = subprocess.run(
+                  [sys.executable, str(WORKER)],
+                  check=True,
+                  capture_output=True,
+                  text=True,
+                  env=env,
+              )
+              lines = [line for line in proc.stdout.splitlines() if line.strip()]
+              return json.loads(lines[-1])
+
+
+          def cv(values: list[float]) -> float:
+              mean = statistics.fmean(values)
+              return statistics.stdev(values) / mean if len(values) > 1 and mean else 0.0
+
+
+          pairs: list[dict[str, object]] = []
+          ratios: list[float] = []
+          base_rates: list[float] = []
+          candidate_rates: list[float] = []
+          base_cpu: list[float] = []
+          candidate_cpu: list[float] = []
+          for index in range(REPEAT):
+              order = ("base", "candidate") if index % 2 == 0 else ("candidate", "base")
+              measured = {variant: run(variant) for variant in order}
+              base_rate = float(measured["base"]["messages_per_s"])
+              candidate_rate = float(measured["candidate"]["messages_per_s"])
+              ratio = candidate_rate / base_rate
+              base_rates.append(base_rate)
+              candidate_rates.append(candidate_rate)
+              base_cpu.append(float(measured["base"]["cpu_us_per_message"]))
+              candidate_cpu.append(float(measured["candidate"]["cpu_us_per_message"]))
+              ratios.append(ratio)
+              pairs.append(
+                  {
+                      "order": list(order),
+                      "base": measured["base"],
+                      "candidate": measured["candidate"],
+                      "candidate_over_base": ratio,
+                  }
+              )
+              print(
+                  f"pair {index + 1:02d} {order[0]}->{order[1]} "
+                  f"ratio={ratio:.4f} base={base_rate:.0f} candidate={candidate_rate:.0f}"
+              )
+
+          result = {
+              "base_ref": os.environ["BASE_REF"],
+              "candidate_ref": os.environ["CANDIDATE_REF"],
+              "repeat": REPEAT,
+              "median_candidate_over_base": statistics.median(ratios),
+              "min_candidate_over_base": min(ratios),
+              "max_candidate_over_base": max(ratios),
+              "pairs_favouring_candidate": sum(ratio > 1.0 for ratio in ratios),
+              "base_rate_median": statistics.median(base_rates),
+              "candidate_rate_median": statistics.median(candidate_rates),
+              "base_rate_cv": cv(base_rates),
+              "candidate_rate_cv": cv(candidate_rates),
+              "base_cpu_us_per_message_median": statistics.median(base_cpu),
+              "candidate_cpu_us_per_message_median": statistics.median(candidate_cpu),
+              "pairs": pairs,
+          }
+          output = Path("/tmp/message-effect-compaction.json")
+          output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+          print(json.dumps({key: value for key, value in result.items() if key != "pairs"}, indent=2))
+          PY
+
+          python /tmp/message_effect_pairs.py
+      - name: Upload paired evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: tmp-message-effect-compaction-${{ github.run_id }}
+          path: /tmp/message-effect-compaction.json
+          if-no-files-found: warn
+          retention-days: 7
