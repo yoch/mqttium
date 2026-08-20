@@ -1,0 +1,317 @@
+name: RC Gate Investigation
+
+on:
+  push:
+    branches:
+      - investigate/rc-release-gate-stability
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mqttium-arm64-runner
+  cancel-in-progress: false
+
+jobs:
+  investigate:
+    if: github.repository == 'yoch/mqttium' && github.ref == 'refs/heads/investigate/rc-release-gate-stability'
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 120
+    env:
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      RC8_SHA: 5818b63f2226bdac0a4d700be1cad9b75a84c4d5
+
+    steps:
+      - name: Check out investigation HEAD
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          path: candidate
+          persist-credentials: false
+
+      - name: Check out immutable rc8 baseline
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ env.RC8_SHA }}
+          path: base
+          persist-credentials: false
+
+      - name: Set run-specific workspace
+        run: echo "JOB_ROOT=$RUNNER_TEMP/mqttium-rc-gate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_ENV"
+
+      - name: Verify dedicated runner prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "aarch64"
+          command -v python3
+          python3 - <<'PY'
+          import sys
+          if sys.version_info[:2] != (3, 13):
+              raise SystemExit(f"expected system Python 3.13, got {sys.version}")
+          PY
+          command -v mosquitto
+          command -v mosquitto_sub
+          command -v taskset
+          if pgrep -a mosquitto; then
+            echo "A pre-existing Mosquitto process would contaminate evidence." >&2
+            exit 1
+          fi
+          test "$GITHUB_SHA" = "$(git -C candidate rev-parse HEAD)"
+          test "$RC8_SHA" = "$(git -C base rev-parse HEAD)"
+
+      - name: Create isolated virtual environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$JOB_ROOT"
+          mkdir -p "$JOB_ROOT"
+          python3 -m venv "$JOB_ROOT/venv"
+          echo "$JOB_ROOT/venv/bin" >> "$GITHUB_PATH"
+
+      - name: Install investigation dependencies
+        run: python -m pip install -e "candidate[dev,security]"
+
+      - name: Start isolated broker pinned to CPU 0
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$JOB_ROOT/mosquitto.conf" <<'EOF'
+          persistence false
+          allow_anonymous true
+          max_inflight_messages 1000
+          max_queued_messages 100000
+          max_queued_bytes 0
+          connection_messages false
+          log_type error
+          listener 11883 127.0.0.1
+          EOF
+          taskset -c 0 mosquitto -c "$JOB_ROOT/mosquitto.conf" > "$JOB_ROOT/mosquitto.log" 2>&1 &
+          echo "$!" > "$JOB_ROOT/mosquitto.pid"
+          for _ in $(seq 1 50); do
+            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            if ! kill -0 "$(cat "$JOB_ROOT/mosquitto.pid")" 2>/dev/null; then
+              cat "$JOB_ROOT/mosquitto.log"
+              exit 1
+            fi
+            sleep 0.2
+          done
+          cat "$JOB_ROOT/mosquitto.log"
+          exit 1
+
+      - name: Record cold preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          python candidate/benchmarks/runner_probe.py \
+            --output "$JOB_ROOT/preflight-cold.json" \
+            --require-temperature
+
+      - name: Reproduce the RC quality phase
+        working-directory: candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          from benchmarks.local_release import Recorder, run_quality
+
+          root = Path(os.environ["JOB_ROOT"]) / "quality"
+          recorder = Recorder(root, "rc-gate-investigation-quality")
+          run_quality(recorder, 11883)
+          PY
+
+      - name: Measure post-quality preflight carryover
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$JOB_ROOT/carryover"
+          consecutive=0
+          for attempt in $(seq 1 25); do
+            report="$JOB_ROOT/carryover/sample-$(printf '%02d' "$attempt").json"
+            python candidate/benchmarks/runner_probe.py \
+              --output "$report" \
+              --require-temperature
+            eligible="$(python - "$report" <<'PY'
+          import json, sys
+          print("true" if json.load(open(sys.argv[1], encoding="utf-8"))["eligible"] else "false")
+          PY
+          )"
+            python - "$attempt" "$report" <<'PY' | tee -a "$JOB_ROOT/carryover.txt"
+          import json, sys, time
+          attempt = int(sys.argv[1])
+          report = json.load(open(sys.argv[2], encoding="utf-8"))
+          sample = report["sample"]
+          print(
+              f"attempt={attempt:02d} wall={time.time():.3f} eligible={report['eligible']} "
+              f"cpu={sample['cpu_percent']:.1f}% load1/cpu={sample['load_1m_per_cpu']:.4f} "
+              f"load5={sample['load_5m']:.4f} temp={sample.get('max_temperature_c')}"
+          )
+          PY
+            if [ "$eligible" = true ]; then
+              consecutive=$((consecutive + 1))
+            else
+              consecutive=0
+            fi
+            if [ "$consecutive" -ge 2 ]; then
+              break
+            fi
+            sleep 10
+          done
+
+      - name: Define preflight helper
+        shell: bash
+        run: |
+          cat > "$JOB_ROOT/wait-preflight.sh" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          label="$1"
+          root="$2"
+          mkdir -p "$root/preflight-$label-attempts"
+          for attempt in $(seq 1 20); do
+            report="$root/preflight-$label-attempts/$(printf '%02d' "$attempt").json"
+            python candidate/benchmarks/runner_probe.py --output "$report" --require-temperature
+            if python - "$report" <<'PY'
+          import json, sys
+          raise SystemExit(0 if json.load(open(sys.argv[1], encoding="utf-8"))["eligible"] else 1)
+          PY
+            then
+              cp "$report" "$root/preflight-$label.json"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "runner never became eligible for $label" >&2
+          exit 2
+          EOF
+          chmod +x "$JOB_ROOT/wait-preflight.sh"
+
+      - name: A/A open-loop control without CPU pinning
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$JOB_ROOT/wait-preflight.sh" aa-unpinned "$JOB_ROOT"
+          set +e
+          python candidate/benchmarks/paired_open_loop.py \
+            --base-root candidate --candidate-root candidate \
+            --policy strict \
+            --preflight-report "$JOB_ROOT/preflight-aa-unpinned.json" \
+            --repeat 8 \
+            --output "$JOB_ROOT/aa-unpinned.json" \
+            --summary-output "$JOB_ROOT/aa-unpinned.md"
+          rc=$?
+          set -e
+          echo "$rc" > "$JOB_ROOT/aa-unpinned.exit-code"
+          python candidate/benchmarks/open_loop_report.py \
+            "$JOB_ROOT/aa-unpinned.json" --all \
+            --output "$JOB_ROOT/aa-unpinned-diagnostic.json" \
+            | tee "$JOB_ROOT/aa-unpinned-diagnostic.txt"
+
+      - name: A/A open-loop control pinned to CPU 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$JOB_ROOT/wait-preflight.sh" aa-pinned "$JOB_ROOT"
+          set +e
+          python candidate/benchmarks/paired_open_loop.py \
+            --base-root candidate --candidate-root candidate \
+            --policy strict \
+            --preflight-report "$JOB_ROOT/preflight-aa-pinned.json" \
+            --repeat 8 --cpu 2 \
+            --output "$JOB_ROOT/aa-pinned.json" \
+            --summary-output "$JOB_ROOT/aa-pinned.md"
+          rc=$?
+          set -e
+          echo "$rc" > "$JOB_ROOT/aa-pinned.exit-code"
+          python candidate/benchmarks/open_loop_report.py \
+            "$JOB_ROOT/aa-pinned.json" --all \
+            --output "$JOB_ROOT/aa-pinned-diagnostic.json" \
+            | tee "$JOB_ROOT/aa-pinned-diagnostic.txt"
+
+      - name: A/B rc8 to investigation HEAD pinned to CPU 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$JOB_ROOT/wait-preflight.sh" ab-pinned "$JOB_ROOT"
+          set +e
+          python candidate/benchmarks/paired_open_loop.py \
+            --base-root base --candidate-root candidate \
+            --policy strict \
+            --preflight-report "$JOB_ROOT/preflight-ab-pinned.json" \
+            --repeat 8 --cpu 2 \
+            --output "$JOB_ROOT/ab-pinned.json" \
+            --summary-output "$JOB_ROOT/ab-pinned.md"
+          rc=$?
+          set -e
+          echo "$rc" > "$JOB_ROOT/ab-pinned.exit-code"
+          python candidate/benchmarks/open_loop_report.py \
+            "$JOB_ROOT/ab-pinned.json" --all \
+            --output "$JOB_ROOT/ab-pinned-diagnostic.json" \
+            | tee "$JOB_ROOT/ab-pinned-diagnostic.txt"
+
+      - name: Immediate post-campaign requalification
+        shell: bash
+        run: |
+          set -euo pipefail
+          python candidate/benchmarks/runner_probe.py \
+            --output "$JOB_ROOT/postflight-immediate.json" \
+            --require-temperature
+          "$JOB_ROOT/wait-preflight.sh" post-cooled "$JOB_ROOT"
+
+      - name: Summarize investigation
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          {
+            echo "# RC gate investigation"
+            echo
+            echo "- candidate: $GITHUB_SHA"
+            echo "- baseline rc8: $RC8_SHA"
+            echo "- runner: $RUNNER_NAME"
+            echo
+            for name in aa-unpinned aa-pinned ab-pinned; do
+              echo "## $name"
+              if [ -f "$JOB_ROOT/$name.exit-code" ]; then
+                echo "strict exit code: $(cat "$JOB_ROOT/$name.exit-code")"
+              fi
+              if [ -f "$JOB_ROOT/$name-diagnostic.txt" ]; then
+                echo '```text'
+                cat "$JOB_ROOT/$name-diagnostic.txt"
+                echo '```'
+              fi
+              echo
+            done
+            echo "## Post-quality carryover"
+            echo '```text'
+            cat "$JOB_ROOT/carryover.txt" 2>/dev/null || true
+            echo '```'
+          } | tee "$JOB_ROOT/investigation-summary.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload investigation evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: rc-gate-investigation-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/mqttium-rc-gate-${{ github.run_id }}-${{ github.run_attempt }}/**/*.json
+            ${{ runner.temp }}/mqttium-rc-gate-${{ github.run_id }}-${{ github.run_attempt }}/**/*.md
+            ${{ runner.temp }}/mqttium-rc-gate-${{ github.run_id }}-${{ github.run_attempt }}/**/*.txt
+            ${{ runner.temp }}/mqttium-rc-gate-${{ github.run_id }}-${{ github.run_attempt }}/**/*.exit-code
+            ${{ runner.temp }}/mqttium-rc-gate-${{ github.run_id }}-${{ github.run_attempt }}/mosquitto.log
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Stop isolated Mosquitto
+        if: always()
+        shell: bash
+        run: |
+          pidfile="$JOB_ROOT/mosquitto.pid"
+          if [ -f "$pidfile" ]; then
+            pid="$(cat "$pidfile")"
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+          fi
+          rm -rf "$JOB_ROOT"
