@@ -58,7 +58,6 @@ def test_write_pump_rejects_resident_accounting_underflow() -> None:
     assert pump.resident_messages == 0
 
 
-@pytest.mark.asyncio
 async def test_write_pump_preserves_batch_and_segment_order() -> None:
     transport = _RecordingTransport()
     pump = WritePump(max_bytes=1024, max_messages=8, on_failure=_no_failure)

@@ -1,4 +1,4 @@
-"""Exercise TLS and SQLite restart paths from an installed beta artifact."""
+"""Exercise TLS and SQLite restart paths from an installed artifact."""
 
 from __future__ import annotations
 
@@ -16,13 +16,13 @@ from mqttium.types import OutboundMessage, Properties
 
 _RECORD = OutboundMessage(
     mid=17,
-    topic="mqttium/beta-persistence",
-    payload=b"persisted-beta-payload",
+    topic="mqttium/distribution-persistence",
+    payload=b"persisted-distribution-payload",
     qos=QoS.AT_LEAST_ONCE,
     retain=False,
     state=OutboundQoSState.WAIT_PUBACK,
     dup=True,
-    properties=Properties({"user_property": [("campaign", "beta")]}),
+    properties=Properties({"user_property": [("campaign", "distribution")]}),
     logical_size=4096,
 )
 
@@ -38,11 +38,11 @@ async def _tls_protocol_roundtrip(
     context: ssl.SSLContext,
     protocol: MQTTProtocolVersion,
 ) -> None:
-    topic = f"mqttium/beta-tls/{int(protocol)}"
+    topic = f"mqttium/distribution-tls/{int(protocol)}"
     payload = f"tls-{int(protocol)}".encode()
     received: asyncio.Future[bytes] = asyncio.get_running_loop().create_future()
-    subscriber = AsyncClient(f"beta-tls-sub-{int(protocol)}", protocol=protocol)
-    publisher = AsyncClient(f"beta-tls-pub-{int(protocol)}", protocol=protocol)
+    subscriber = AsyncClient(f"dist-tls-sub-{int(protocol)}", protocol=protocol)
+    publisher = AsyncClient(f"dist-tls-pub-{int(protocol)}", protocol=protocol)
 
     def on_message(message: Message) -> None:
         if message.topic == topic and not received.done():

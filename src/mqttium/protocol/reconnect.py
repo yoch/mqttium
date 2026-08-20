@@ -1,4 +1,4 @@
-"""Reconnect policy (IMPLEMENTATION-GUIDE.md §5)."""
+"""Reconnect policy (implementation-guide.md §5)."""
 
 from __future__ import annotations
 
@@ -32,6 +32,23 @@ _V5_TERMINAL = frozenset(
 
 @dataclass(slots=True)
 class ReconnectPolicy:
+    """Exponential-backoff and terminal-reason policy for reconnection.
+
+    Args:
+        enabled: Whether unexpected disconnects may schedule reconnection.
+        initial_delay: Base delay before the first retry, in seconds.
+        multiplier: Factor applied after each retry.
+        max_delay: Maximum base delay before jitter.
+        max_retries: Maximum attempts, or ``None`` for no count limit.
+        stable_after: Connected duration after which attempt state resets.
+        connect_timeout: Deadline for each transport and CONNACK attempt.
+        follow_server_reference: Whether MQTT 5 ``Use another server`` may be
+            retried when a server reference is available.
+
+    Delays use full bounded jitter in the range 50–100% of the current base.
+    Terminal authentication, protocol, and capability failures are not retried.
+    """
+
     enabled: bool = True
     initial_delay: float = 1.0
     multiplier: float = 2.0
@@ -60,6 +77,7 @@ class ReconnectPolicy:
         self._current_delay = self.initial_delay
 
     def reset(self) -> None:
+        """Reset attempt count and delay to the initial state."""
         self._attempt = 0
         self._current_delay = self.initial_delay
 
@@ -72,6 +90,7 @@ class ReconnectPolicy:
         return delay
 
     def should_retry(self, reason_code: int | None, protocol: MQTTProtocolVersion) -> bool:
+        """Return whether the next attempt is allowed for a disconnect reason."""
         if not self.enabled:
             return False
         if self.max_retries is not None and self._attempt >= self.max_retries:
@@ -88,6 +107,7 @@ class ReconnectPolicy:
 
     @property
     def attempt(self) -> int:
+        """Number of retry delays issued since the last reset."""
         return self._attempt
 
 

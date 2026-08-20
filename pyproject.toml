@@ -13,7 +13,18 @@ license-files = ["LICENSE", "NOTICE"]
 authors = [
     { name = "Yoch Melka", email = "795960+yoch@users.noreply.github.com" },
 ]
-keywords = ["mqtt", "asyncio", "iot", "messaging"]
+keywords = [
+    "mqtt",
+    "mqtt-client",
+    "mqtt5",
+    "mqtt311",
+    "asyncio",
+    "iot",
+    "messaging",
+    "backpressure",
+    "persistence",
+    "websocket",
+]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Framework :: AsyncIO",
@@ -33,28 +44,41 @@ dependencies = []
 
 [project.urls]
 Homepage = "https://github.com/yoch/mqttium"
+Documentation = "https://mqttium.readthedocs.io"
 Repository = "https://github.com/yoch/mqttium"
 Issues = "https://github.com/yoch/mqttium/issues"
+Discussions = "https://github.com/yoch/mqttium/discussions"
 Changelog = "https://github.com/yoch/mqttium/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 dev = [
+    "actionlint-py>=1.7.12.24",
     "mypy>=1.17",
     "pytest>=8",
     "pytest-asyncio>=0.24",
     "pytest-cov>=6",
+    "pytest-timeout>=2.4",
+    "py-spy>=0.4.2",
     "ruff>=0.16",
+    "shellcheck-py>=0.11.0.1",
+    "zizmor>=1.29",
+]
+docs = [
+    "mkdocs-material>=9.6",
+    "mkdocs-llmstxt>=0.5",
+    "mkdocs-redirects>=1.2",
+    "mkdocstrings[python]>=1.0",
 ]
 fuzz = [
     "hypothesis>=6.100",
     "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "pytest-timeout>=2.4",
 ]
 security = [
     "bandit>=1.8",
 ]
 benchmark = [
-    "gmqtt==0.7.0",
-    "paho-mqtt==2.1.0",
     "psutil>=6",
 ]
 release = [
@@ -85,14 +109,33 @@ include = [
     "/NOTICE",
     "/PROVENANCE.md",
     "/SECURITY.md",
+    "/SUPPORT.md",
+    "/mkdocs.yml",
+    "/.readthedocs.yaml",
     "/pyproject.toml",
 ]
 
 [tool.pytest.ini_options]
+addopts = [
+    "--strict-config",
+    "--strict-markers",
+    "-W",
+    "error",
+    "--timeout=30",
+]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 pythonpath = ["src"]
+
+[tool.coverage.run]
+branch = true
+
+[tool.coverage.report]
+fail_under = 89.0
+precision = 2
+show_missing = true
+skip_empty = true
 
 [tool.ruff]
 line-length = 100

@@ -2,7 +2,7 @@
 
 Owns the transport + IncrementalDecoder + ProtocolEngine loop.
 
-Concurrency invariants (see docs/IMPLEMENTATION-GUIDE.md §1):
+Concurrency invariants (see docs/implementation-guide.md §1):
 - A single writer task drains the outbound queue.
 - Publish receipts / SUBACK futures are registered *before* bytes can reach
   the wire.
@@ -124,6 +124,45 @@ def _validate_client_arguments(
 
 
 class AsyncClient:
+    """Asyncio-native MQTT 3.1.1 and MQTT 5 client.
+
+    The client owns one event loop, one protocol engine, and at most one active
+    transport. It provides bounded outbound, inbound, writer, callback, and
+    delivery queues; limits can be tuned explicitly through the constructor.
+
+    Instances are loop-confined and are not thread-safe. Use the native async
+    methods from the owning loop. The Provisional Paho compatibility façade is
+    available for synchronous migration code that requires a thread handoff.
+
+    Args:
+        client_id: MQTT client identifier. An empty identifier lets an MQTT 5
+            broker assign one when the connection settings allow it.
+        protocol: MQTT protocol version used for encoding and negotiation.
+        clean_start: Whether to start without a previous broker session.
+        keepalive: Keep-alive interval in seconds; zero disables keep-alive.
+        username: Optional CONNECT username.
+        password: Optional CONNECT password. Strings are encoded as UTF-8.
+        local_receive_maximum: Maximum concurrent inbound QoS 1/2 exchanges.
+        max_outbound_inflight: Optional local cap on concurrent outbound QoS
+            1/2 exchanges, additionally bounded by broker negotiation.
+        publish_backpressure: ``"wait"`` to suspend producers or ``"error"``
+            to raise :class:`~mqttium.FlowControlError` at logical capacity.
+        reconnect: Reconnection policy. The default disables reconnection.
+        message_delivery: ``"iterator"``, ``"callback"``, ``"both"``, or
+            ``"auto"`` delivery selection.
+        manual_ack: Defer terminal acknowledgement of inbound QoS messages
+            until :meth:`ack` is called.
+        store: Optional inflight store used for durable QoS state.
+        auth_handler: Optional MQTT 5 enhanced-authentication callback.
+
+    Raises:
+        ValueError: If a limit or constructor option is invalid.
+
+    Note:
+        Remaining ``max_*`` arguments are explicit memory and queue bounds.
+        See the configuration guide for sizing rules and interactions.
+    """
+
     def __init__(
         self,
         client_id: str = "",
@@ -478,18 +517,22 @@ class AsyncClient:
 
     @property
     def state(self) -> ConnectionState:
+        """Current protocol connection state."""
         return self._engine.state
 
     @property
     def is_connected(self) -> bool:
+        """Whether a successful CONNACK established the current connection."""
         return self._engine.state == ConnectionState.CONNECTED
 
     @property
     def negotiated(self) -> NegotiatedSettings:
+        """Settings negotiated for the active or most recent connection."""
         return self._engine.negotiated
 
     @property
     def effective_client_id(self) -> str:
+        """Configured client id, or the broker-assigned id when one was supplied."""
         return self.negotiated.effective_client_id(self._engine.config.client_id)
 
     @property
@@ -679,6 +722,27 @@ class AsyncClient:
         ssl: ssl.SSLContext | bool | None = None,
         timeout: float | None = None,
     ) -> ConnAckPacket:
+        """Connect to an MQTT broker over TCP or TLS.
+
+        Args:
+            host: Broker hostname or IP address.
+            port: Broker TCP port.
+            ssl: TLS context, ``True`` for a default context, or ``None`` for
+                clear-text TCP.
+            timeout: Transport and CONNACK deadline. The reconnect policy's
+                connection timeout is used when omitted.
+
+        Returns:
+            The successful CONNACK packet and its negotiated properties.
+
+        Raises:
+            MQTTTimeoutError: If transport setup or CONNACK exceeds the deadline.
+            ProtocolError: If the client is already connecting/connected or the
+                broker refuses or violates the protocol.
+            MQTTError: If :meth:`disconnect` cancels connection setup.
+            OSError: If TCP or TLS transport setup fails.
+            asyncio.CancelledError: If the calling task is cancelled.
+        """
         async with self._lifecycle_lock:
             await self._reset_message_stream()
             self._host = host
@@ -701,7 +765,21 @@ class AsyncClient:
         *,
         timeout: float | None = None,
     ) -> ConnAckPacket:
-        """Connect over a Unix domain socket (AF_UNIX)."""
+        """Connect over a Unix domain socket.
+
+        Args:
+            path: Filesystem path of the broker's AF_UNIX socket.
+            timeout: Transport and CONNACK deadline.
+
+        Returns:
+            The successful CONNACK packet.
+
+        Raises:
+            MQTTTimeoutError: If connection or CONNACK exceeds the deadline.
+            ProtocolError: If the broker refuses or violates the protocol.
+            OSError: If the Unix socket connection fails.
+            asyncio.CancelledError: If the calling task is cancelled.
+        """
         async with self._lifecycle_lock:
             await self._reset_message_stream()
             self._unix_path = path
@@ -733,7 +811,24 @@ class AsyncClient:
         extra_headers: dict[str, str] | None = None,
         timeout: float | None = None,
     ) -> ConnAckPacket:
-        """Connect over MQTT-over-WebSocket (``ws://`` / ``wss://``)."""
+        """Connect over MQTT-over-WebSocket.
+
+        Args:
+            url: ``ws://`` or ``wss://`` broker endpoint, including its path.
+            ssl: TLS context or default-context selector for ``wss://``.
+            extra_headers: Additional HTTP headers for the upgrade request.
+            timeout: Transport and CONNACK deadline.
+
+        Returns:
+            The successful CONNACK packet.
+
+        Raises:
+            MQTTTimeoutError: If connection or CONNACK exceeds the deadline.
+            ProtocolError: If the broker refuses or violates the MQTT protocol.
+            ConnectionError: If the WebSocket upgrade or transport fails.
+            ValueError: If the URL or WebSocket options are invalid.
+            asyncio.CancelledError: If the calling task is cancelled.
+        """
         async with self._lifecycle_lock:
             await self._reset_message_stream()
             self._ws_url = url
@@ -882,6 +977,19 @@ class AsyncClient:
         await self._flush_terminal_packet(packet, _GRACEFUL_DISCONNECT_DRAIN_TIMEOUT)
 
     async def disconnect(self, reason_code: int = 0) -> None:
+        """Disconnect gracefully and stop connection-scoped tasks.
+
+        The method is idempotent when no transport exists. A legal MQTT
+        DISCONNECT is sent when possible; shutdown remains bounded when the
+        writer is congested or the peer's packet limit cannot admit it.
+
+        Args:
+            reason_code: MQTT 5 DISCONNECT reason code. MQTT 3 clients must use
+                the success value.
+
+        Raises:
+            ProtocolError: If the reason code is invalid for the protocol.
+        """
         self._intentional_disconnect = True
         connect_disconnect_fut = self._connect_disconnect_fut
         disconnecting_connect = (
@@ -987,6 +1095,30 @@ class AsyncClient:
         properties: Properties | None = None,
         nowait: bool = False,
     ) -> PublishReceipt:
+        """Publish one application message.
+
+        Args:
+            topic: MQTT topic name.
+            payload: Bytes or UTF-8 text payload.
+            qos: Requested QoS 0, 1, or 2. MQTTium never silently downgrades it.
+            retain: Set the MQTT RETAIN flag.
+            properties: MQTT 5 PUBLISH properties.
+            nowait: Reject immediately instead of waiting for logical or writer
+                capacity.
+
+        Returns:
+            A receipt. QoS 0 receipts are complete on successful handoff; QoS
+            1/2 receipts complete after the protocol exchange. Await
+            :meth:`PublishReceipt.wait` when acknowledgement is required.
+
+        Raises:
+            FlowControlError: If capacity is unavailable in non-waiting mode,
+                or the request can never fit configured bounds.
+            NotConnectedError: If publication is unavailable in the current state.
+            ProtocolError: If the request violates protocol or negotiated limits.
+            asyncio.CancelledError: If a waiting producer is cancelled; no new
+                publication state is retained for the cancelled request.
+        """
         data = payload.encode("utf-8") if isinstance(payload, str) else payload
         while True:
             waiter: asyncio.Future[None] | None = None
@@ -1186,6 +1318,23 @@ class AsyncClient:
         properties: Properties | None = None,
         timeout: float | None = None,
     ) -> SubscribeResult:
+        """Subscribe to one or more topic filters and wait for SUBACK.
+
+        Args:
+            topics: One filter, an iterable of filters, or filter/options pairs.
+            qos: Default maximum QoS for plain string filters.
+            properties: MQTT 5 SUBSCRIBE properties.
+            timeout: SUBACK deadline; ``ack_timeout`` is used when omitted.
+
+        Returns:
+            Packet identifier and broker reason codes in request order.
+
+        Raises:
+            MQTTTimeoutError: If SUBACK does not arrive before the deadline.
+            ProtocolError: If a filter, option, property, or negotiated limit is
+                invalid.
+            NotConnectedError: If the client cannot submit the request.
+        """
         loop = asyncio.get_running_loop()
         async with self._engine_lock:
             mid = self._engine.queue_subscribe(
@@ -1211,6 +1360,21 @@ class AsyncClient:
         *,
         timeout: float | None = None,
     ) -> UnsubscribeResult:
+        """Unsubscribe from one or more topic filters and wait for UNSUBACK.
+
+        Args:
+            topics: One topic filter or an iterable of filters.
+            timeout: UNSUBACK deadline; ``ack_timeout`` is used when omitted.
+
+        Returns:
+            Packet identifier and MQTT 5 reason codes. MQTT 3.1.1 returns an
+            empty reason-code tuple.
+
+        Raises:
+            MQTTTimeoutError: If UNSUBACK does not arrive before the deadline.
+            ProtocolError: If a filter is invalid.
+            NotConnectedError: If the client cannot submit the request.
+        """
         loop = asyncio.get_running_loop()
         async with self._engine_lock:
             mid = self._engine.queue_unsubscribe(topics)

@@ -4,6 +4,11 @@ from __future__ import annotations
 
 import asyncio
 
+from mqttium.codec.buffer import IncrementalDecoder, RawPacket
+from mqttium.codec.primitives import pack_u16
+from mqttium.enums import MQTTProtocolVersion, PacketType, QoS
+from mqttium.packets import PubAckPacket, PublishPacket, encode_frame, encode_pingresp
+
 
 class QueueTransport:
     """Queue-backed transport with thread-safe inbound injection."""
@@ -40,6 +45,82 @@ class QueueTransport:
 
     def is_closing(self) -> bool:
         return self._closing
+
+
+class ScriptedBrokerTransport(QueueTransport):
+    """Small packet-aware broker used by API-level unit tests.
+
+    The default script completes CONNECT, QoS 1 PUBLISH, and SUBSCRIBE. Tests
+    that need hostile ordering or fault injection should keep a focused local
+    double instead of adding scenario-specific switches here.
+    """
+
+    def __init__(
+        self,
+        *,
+        protocol: MQTTProtocolVersion = MQTTProtocolVersion.MQTTv311,
+        suback_reason: int = 0,
+        publish_after_subscribe: bytes | None = None,
+        auto_pingresp: bool = True,
+    ) -> None:
+        super().__init__()
+        self.protocol = protocol
+        self.suback_reason = suback_reason
+        self.publish_after_subscribe = publish_after_subscribe
+        self.auto_pingresp = auto_pingresp
+        self.decoder = IncrementalDecoder()
+        self.written: list[bytes] = []
+        self.publishes: list[PublishPacket] = []
+        self.pingreqs = 0
+
+    async def write(self, data: bytes) -> None:
+        self.written.append(data)
+        self.decoder.feed(data)
+        for raw in self.decoder.drain_packets():
+            self.handle_packet(raw)
+
+    async def write_many(self, parts: list[bytes]) -> None:
+        await self.write(b"".join(parts))
+
+    def handle_packet(self, raw: RawPacket) -> None:
+        """Apply the default broker response for one complete packet."""
+        if raw.packet_type is PacketType.CONNECT:
+            body = b"\x00\x00"
+            if self.protocol is MQTTProtocolVersion.MQTTv5:
+                body += b"\x00"
+            self.push_rx(encode_frame(PacketType.CONNACK, 0, body))
+        elif raw.packet_type is PacketType.PUBLISH:
+            publish = PublishPacket.decode(raw.flags, raw.remaining, self.protocol)
+            self.publishes.append(publish)
+            if publish.qos is QoS.AT_LEAST_ONCE:
+                assert publish.mid is not None
+                self.push_rx(PubAckPacket(mid=publish.mid).encode(self.protocol))
+        elif raw.packet_type is PacketType.SUBSCRIBE:
+            mid = int.from_bytes(raw.remaining[:2], "big")
+            properties = b"\x00" if self.protocol is MQTTProtocolVersion.MQTTv5 else b""
+            self.push_rx(
+                encode_frame(
+                    PacketType.SUBACK,
+                    0,
+                    pack_u16(mid) + properties + bytes((self.suback_reason,)),
+                )
+            )
+            if self.publish_after_subscribe is not None:
+                self.push_rx(self.publish_after_subscribe)
+        elif raw.packet_type is PacketType.PINGREQ:
+            self.pingreqs += 1
+            if self.auto_pingresp:
+                self.push_rx(encode_pingresp())
+
+
+def transport_factory(transport: QueueTransport):
+    """Return an AsyncClient-compatible factory for a fixed test transport."""
+
+    async def factory(host: str, port: int, *, ssl: object = None) -> QueueTransport:
+        del host, port, ssl
+        return transport
+
+    return factory
 
 
 def feed_engine(engine: object, wire: bytes) -> None:

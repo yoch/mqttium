@@ -1,14 +1,6 @@
 name: Long fuzz campaigns
 
 on:
-  pull_request:
-    paths:
-      - .github/workflows/fuzz-campaign.yml
-      - tests/fuzz/**
-      - tests/unit/test_fuzz_*.py
-      - src/mqttium/codec/**
-      - src/mqttium/protocol/**
-      - src/mqttium/transport/websocket.py
   schedule:
     - cron: "41 2 * * *"
   workflow_dispatch:
@@ -31,30 +23,32 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: fuzz-campaign-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   fuzz:
-    name: ${{ github.event_name == 'pull_request' && 'PR smoke' || inputs.campaign || 'nightly' }} (shard ${{ matrix.shard }})
+    name: ${{ inputs.campaign || 'nightly' }} (shard ${{ matrix.shard }})
     runs-on: ubuntu-24.04
-    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && inputs.campaign == 'rc-24-cpu-hours' && 300 || 35 }}
+    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && inputs.campaign == 'rc-24-cpu-hours' && 300 || 40 }}
     strategy:
       fail-fast: false
       matrix:
-        shard: ${{ fromJSON(github.event_name == 'pull_request' && '[0]' || github.event_name == 'workflow_dispatch' && inputs.campaign == 'rc-24-cpu-hours' && '[0,1,2,3,4]' || '[0,1,2]') }}
+        shard: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.campaign == 'rc-24-cpu-hours' && '[0,1,2,3,4]' || '[0,1,2]') }}
     env:
       PYTHONUNBUFFERED: "1"
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
       SHARD: ${{ matrix.shard }}
       BASE_SEED: ${{ github.event_name == 'workflow_dispatch' && inputs.base_seed || github.run_number }}
-      CAMPAIGN: ${{ github.event_name == 'pull_request' && 'pr-smoke' || inputs.campaign || 'nightly' }}
-      DURATION_MINUTES: ${{ github.event_name == 'pull_request' && '1' || github.event_name == 'workflow_dispatch' && inputs.campaign == 'rc-24-cpu-hours' && '288' || '20' }}
-      HYPOTHESIS_PROFILE: ${{ github.event_name == 'pull_request' && 'ci' || 'aggressive' }}
-      BATCH_ITERATIONS: ${{ github.event_name == 'pull_request' && '20000' || '100000' }}
+      CAMPAIGN: ${{ inputs.campaign || 'nightly' }}
+      DURATION_MINUTES: ${{ github.event_name == 'workflow_dispatch' && inputs.campaign == 'rc-24-cpu-hours' && '288' || '20' }}
+      HYPOTHESIS_PROFILE: aggressive
+      BATCH_ITERATIONS: "100000"
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.13"
       - run: python -m pip install -e ".[fuzz]"
@@ -104,8 +98,14 @@ jobs:
           {
             echo "campaign=$CAMPAIGN shard=$SHARD seed=$shard_seed duration=${DURATION_MINUTES}m"
             echo "Hypothesis profile=$HYPOTHESIS_PROFILE seed=$shard_seed"
-            PYTHONPATH=src python -m pytest -q tests/fuzz/test_hypothesis_fuzz.py \
+            PYTHONPATH=src python -m pytest -q -W error --strict-config --strict-markers \
+              tests/fuzz/test_hypothesis_fuzz.py \
               --hypothesis-seed="$shard_seed"
+            if [ "$SHARD" = 0 ]; then
+              MQTTIUM_FUZZ_SEEDS=24 MQTTIUM_FUZZ_STEPS=500 \
+                PYTHONPATH=src python -m pytest -q -W error --strict-config --strict-markers \
+                  tests/fuzz/test_stateful_invariants.py
+            fi
 
             batch=0
             while (( $(date +%s) < deadline_epoch )); do
@@ -129,7 +129,7 @@ jobs:
           } 2>&1 | tee "$artifact_root/campaign.log"
       - name: Upload corpus, failures, metadata, and logs
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: fuzz-${{ env.CAMPAIGN }}-shard-${{ matrix.shard }}-${{ github.run_id }}
           path: ${{ runner.temp }}/mqttium-fuzz/shard-${{ matrix.shard }}

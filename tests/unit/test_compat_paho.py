@@ -2,56 +2,18 @@
 
 from __future__ import annotations
 
-import asyncio
 import threading
 
 import pytest
 
-from mqttium.codec.buffer import IncrementalDecoder
-from mqttium.codec.primitives import pack_u16
 from mqttium.compat.paho import CallbackAPIVersion, Client
-from mqttium.enums import PacketType, QoS
-from mqttium.packets import PubAckPacket, PublishPacket, encode_frame
-
-
-class FakeBrokerTransport:
-    def __init__(self) -> None:
-        self._rx: asyncio.Queue[bytes] = asyncio.Queue()
-        self._decoder = IncrementalDecoder()
-        self._closing = False
-
-    async def write(self, data: bytes) -> None:
-        self._decoder.feed(data)
-        for raw in self._decoder.drain_packets():
-            if raw.packet_type is PacketType.CONNECT:
-                self._rx.put_nowait(encode_frame(PacketType.CONNACK, 0, b"\x00\x00"))
-            elif raw.packet_type is PacketType.PUBLISH:
-                pub = PublishPacket.decode(raw.flags, raw.remaining)
-                if pub.qos == QoS.AT_LEAST_ONCE and pub.mid is not None:
-                    self._rx.put_nowait(PubAckPacket(mid=pub.mid).encode())
-            elif raw.packet_type is PacketType.SUBSCRIBE:
-                mid = int.from_bytes(raw.remaining[:2], "big")
-                self._rx.put_nowait(encode_frame(PacketType.SUBACK, 0, pack_u16(mid) + bytes([0])))
-
-    async def read(self, n: int = 65536) -> bytes:
-        return await self._rx.get()
-
-    async def close(self) -> None:
-        self._closing = True
-        self._rx.put_nowait(b"")
-
-    def is_closing(self) -> bool:
-        return self._closing
+from tests.support import ScriptedBrokerTransport, transport_factory
 
 
 def test_compat_connect_publish_qos1() -> None:
     client = Client(CallbackAPIVersion.VERSION2, client_id="compat", userdata={"u": 1})
-    fake = FakeBrokerTransport()
-
-    async def factory(host: str, port: int, *, ssl: object = None) -> FakeBrokerTransport:
-        return fake
-
-    client._async._transport_factory = factory
+    fake = ScriptedBrokerTransport()
+    client._async._transport_factory = transport_factory(fake)
     connected = []
     topic_hits = []
 
@@ -120,12 +82,8 @@ def test_off_loop_qos0_on_publish_keeps_handoff_path() -> None:
     """QoS 0 on_publish fires on the caller thread; blocking calls made from it
     must use the loop handoff, not the on-loop callback fast path."""
     client = Client(CallbackAPIVersion.VERSION2, client_id="compat-race")
-    fake = FakeBrokerTransport()
-
-    async def factory(host: str, port: int, *, ssl: object = None) -> FakeBrokerTransport:
-        return fake
-
-    client._async._transport_factory = factory
+    fake = ScriptedBrokerTransport()
+    client._async._transport_factory = transport_factory(fake)
     subscribed = threading.Event()
     errors: list[BaseException] = []
 

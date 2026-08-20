@@ -1,0 +1,56 @@
+name: Internal performance health
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 2 * * 0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: performance-health
+  cancel-in-progress: false
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install -e ".[dev]" "psutil>=6,<8"
+      - name: Record runner preflight
+        run: python benchmarks/runner_probe.py --output "$RUNNER_TEMP/mqttium-bench/runner-preflight.json"
+      - name: Native hot-path profile
+        run: python benchmarks/hotpath_profile.py --output "$RUNNER_TEMP/mqttium-bench/hotpath-profile.json"
+      - name: QoS 1 and pre-PUBREC frame policy
+        run: python benchmarks/qos1_frame_policy.py --repeat 5 --output "$RUNNER_TEMP/mqttium-bench/qos1-frame-policy.json"
+      - name: Packet identifier pool A/B
+        run: python benchmarks/packet_id_pool_ab.py --count 30000 --repeat 7 --output "$RUNNER_TEMP/mqttium-bench/packet-id-pool.json"
+      - name: Application delivery and persistence stress
+        run: python benchmarks/application_stress.py --output "$RUNNER_TEMP/mqttium-bench/application-stress.json"
+      - name: Isolated memory profile and thresholds
+        run: |
+          set -euo pipefail
+          python benchmarks/memory_profile.py --label "$GITHUB_SHA" --output "$RUNNER_TEMP/mqttium-bench/memory-profile.json"
+          python benchmarks/check_memory_thresholds.py --profile "$RUNNER_TEMP/mqttium-bench/memory-profile.json"
+      - name: Upload measurements
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: mqttium-performance-health-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/mqttium-bench/*.json
+          if-no-files-found: warn
+          retention-days: 30

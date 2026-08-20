@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import asyncio
 
-import pytest
-
 from mqttium.api.async_client import AsyncClient
 from mqttium.codec.buffer import IncrementalDecoder, RawPacket
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, PacketType
@@ -82,7 +80,6 @@ def test_engine_emits_auth_when_accepted() -> None:
     assert auth.reason_code == 0x18
 
 
-@pytest.mark.asyncio
 async def test_async_client_auth_handler_exchange() -> None:
     class FakeTransport:
         def __init__(self) -> None:

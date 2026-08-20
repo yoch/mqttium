@@ -50,7 +50,6 @@ class Recorder:
             "check-wheel-contents",
             "hypothesis",
             "mypy",
-            "paho-mqtt",
             "psutil",
             "pytest",
             "pytest-cov",
@@ -712,7 +711,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     revision = _capture(["git", "rev-parse", "--short", "HEAD"], cwd=ROOT)
-    output = args.output_dir or Path("/tmp") / "mqttium-rc1" / revision / args.profile
+    output = args.output_dir or Path("/tmp") / "mqttium-release" / revision / args.profile
     recorder = Recorder(output.resolve(), args.profile)
     try:
         with managed_mosquitto(recorder.output, args.port):

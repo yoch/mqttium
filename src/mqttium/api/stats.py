@@ -11,6 +11,8 @@ from mqttium.transport.stats import TransportStats
 
 @dataclass(slots=True, frozen=True)
 class TaskStats:
+    """Running state of each client-owned background task."""
+
     reader: bool
     writer: bool
     keepalive: bool
@@ -21,6 +23,8 @@ class TaskStats:
 
 @dataclass(slots=True, frozen=True)
 class EffectStats:
+    """Effect-pump queue, high-water, and scheduling counters."""
+
     pending: int
     pending_high_water: int
     enqueued: int
@@ -38,6 +42,8 @@ class EffectStats:
 
 @dataclass(slots=True, frozen=True)
 class WriterStats:
+    """Writer queue bounds, high-water values, and batching counters."""
+
     queued_messages: int
     queued_bytes: int
     high_water_messages: int
@@ -61,6 +67,8 @@ class WriterStats:
 
 @dataclass(slots=True, frozen=True)
 class DecoderStats:
+    """Incremental-decoder occupancy and configured ingress limits."""
+
     buffered_bytes: int
     high_water_bytes: int
     max_packet_size: int
@@ -69,6 +77,8 @@ class DecoderStats:
 
 @dataclass(slots=True, frozen=True)
 class DeliveryStats:
+    """Application-delivery queue occupancy, limits, and high-water values."""
+
     iterator_queued: int
     iterator_limit: int
     callback_queued: int
@@ -83,6 +93,8 @@ class DeliveryStats:
 
 @dataclass(slots=True, frozen=True)
 class ReceiptStats:
+    """Outstanding public operation receipts and parked publishers."""
+
     publish: int
     publish_batches: int
     subscribe: int

@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640">
+  <title>MQTTium — async-native MQTT for Python</title>
+  <rect width="1280" height="640" fill="#f6f8fa"/>
+  <rect x="0" y="0" width="18" height="640" fill="#0099a2"/>
+
+  <g transform="translate(82 90) scale(.80)">
+    <rect x="0" y="0" width="565" height="565" rx="69" fill="#202629"/>
+    <path fill="#ffffff" d="M88,102 L201,232 L314,102 L314,356 L280,356 L280,198
+      L201,288 L122,198 L122,356 L88,356 Z"/>
+    <circle cx="412.5" cy="279.5" r="61.5" fill="none" stroke="#ffffff" stroke-width="34"/>
+    <rect x="457" y="279.5" width="34" height="136.5" fill="#ffffff"/>
+    <rect x="336" y="451" width="33" height="34" rx="9" fill="#0099a2"/>
+    <rect x="396" y="451" width="33" height="34" rx="9" fill="#92aac1"/>
+    <rect x="457" y="451" width="34" height="34" rx="9" fill="#ffffff"/>
+  </g>
+
+  <g font-family="DejaVu Sans, Arial, sans-serif">
+    <text x="590" y="245" font-size="104" font-weight="700" letter-spacing="-4" fill="#202629">
+      MQTT<tspan fill="#0099a2">ium</tspan>
+    </text>
+    <text x="598" y="325" font-size="34" font-weight="600" fill="#334155">
+      Async-native MQTT for Python
+    </text>
+    <text x="598" y="382" font-size="25" fill="#52616b">
+      MQTT 3.1.1 and MQTT 5.0
+    </text>
+    <text x="598" y="423" font-size="25" fill="#52616b">
+      Explicit backpressure · Durable sessions
+    </text>
+    <text x="598" y="464" font-size="25" fill="#52616b">
+      Dependency-free runtime
+    </text>
+  </g>
+</svg>

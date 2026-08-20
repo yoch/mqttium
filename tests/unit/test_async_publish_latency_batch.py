@@ -7,7 +7,6 @@ from mqttium.api.async_client import AsyncClient
 from mqttium.enums import ConnectionState
 
 
-@pytest.mark.asyncio
 async def test_latency_batch_trigger_is_awaited_qos_only(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[WritePump] = []
 

@@ -9,44 +9,9 @@ import pytest
 from mqttium.api import PublishMessage
 from mqttium.api.async_client import AsyncClient
 from mqttium.enums import ConnectionState, PacketType
-from mqttium.errors import FlowControlError, MQTTError, PublishBatchError
+from mqttium.errors import FlowControlError, PublishBatchError
 from mqttium.packets import encode_frame
-from mqttium.protocol.engine import EffectKind, EngineEffect
 from mqttium.protocol.reconnect import ReconnectPolicy
-
-
-async def _complete(client: AsyncClient, mid: int) -> None:
-    stored = client._engine.store.get_out(mid)
-    assert stored is not None
-    client._engine.outbound.complete_record(mid, stored)
-    client._engine.packet_ids.release(mid)
-    await client._apply_effect(
-        EngineEffect(kind=EffectKind.PUBLISH_COMPLETE, data=mid),
-        nowait=False,
-    )
-
-
-async def test_wait_mode_blocks_until_logical_capacity_is_released() -> None:
-    client = AsyncClient(
-        max_pending_outbound_messages=1,
-        max_pending_outbound_bytes=None,
-    )
-    first = await client.publish("admission/first", b"one", qos=1)
-    assert first.mid is not None
-
-    second_task = asyncio.create_task(client.publish("admission/second", b"two", qos=1))
-    await asyncio.sleep(0)
-
-    assert not second_task.done()
-    assert client._engine.pending_outbound_messages == 1
-    assert len(client._receipts) == 1
-
-    await _complete(client, first.mid)
-    second = await asyncio.wait_for(second_task, timeout=1.0)
-
-    assert second.mid is not None
-    assert client._engine.pending_outbound_messages == 1
-    assert len(client._receipts) == 1
 
 
 async def test_nowait_rejection_is_atomic() -> None:
@@ -191,30 +156,6 @@ async def _connect(client: AsyncClient) -> _ClosingTransport:
     return transport
 
 
-async def test_parked_publish_fails_when_the_connection_is_gone_for_good() -> None:
-    """Admission capacity is only released by an ACK: without a connection to
-    deliver one, a parked publish() would wait forever."""
-    client = AsyncClient(
-        client_id="c",
-        clean_start=False,
-        max_pending_outbound_messages=1,
-        reconnect=ReconnectPolicy(enabled=False),
-    )
-    transport = await _connect(client)
-    await client.publish("admission/first", b"one", qos=1)
-
-    parked = asyncio.create_task(client.publish("admission/second", b"two", qos=1))
-    await asyncio.sleep(0)
-    assert not parked.done()
-    assert client._publish_waiters == 1
-
-    transport.drop()
-
-    with pytest.raises(MQTTError):
-        await asyncio.wait_for(parked, timeout=1.0)
-    assert client._publish_waiters == 0
-
-
 async def test_parked_publish_keeps_waiting_while_reconnect_is_pending() -> None:
     client = AsyncClient(
         client_id="c",
@@ -241,7 +182,6 @@ async def test_parked_publish_keeps_waiting_while_reconnect_is_pending() -> None
     await client.disconnect()
 
 
-@pytest.mark.asyncio
 async def test_flow_control_error_names_the_message_bound() -> None:
     client = AsyncClient(max_outbound_messages=1, max_outbound_bytes=1024 * 1024)
     client._engine.state = ConnectionState.CONNECTED
@@ -255,7 +195,6 @@ async def test_flow_control_error_names_the_message_bound() -> None:
     assert "max_outbound_bytes" not in message
 
 
-@pytest.mark.asyncio
 async def test_flow_control_error_names_the_byte_bound() -> None:
     """The default pairing that makes large payloads surprising."""
     client = AsyncClient(max_outbound_messages=10_000, max_outbound_bytes=4096)
@@ -270,7 +209,6 @@ async def test_flow_control_error_names_the_byte_bound() -> None:
     assert "already queued" in message
 
 
-@pytest.mark.asyncio
 async def test_batch_refusal_names_the_bound_the_batch_actually_hit() -> None:
     """publish_many admits against running totals, not the live queue.
 

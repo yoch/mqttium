@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import asyncio
 
-import pytest
-
 from mqttium.api._writer import WritePump
 
 
@@ -100,7 +98,6 @@ async def _hold_after_fill(pump: WritePump, n: int) -> _HeldWriteTransport:
     return transport
 
 
-@pytest.mark.asyncio
 async def test_resident_stays_at_cap_throughout_an_active_256_item_batch() -> None:
     pump = _pump(max_messages=256)
     transport = await _hold_after_fill(pump, 256)
@@ -123,7 +120,6 @@ async def test_resident_stays_at_cap_throughout_an_active_256_item_batch() -> No
         await pump.stop()
 
 
-@pytest.mark.asyncio
 async def test_qsize_drops_during_batch_but_resident_keeps_the_message_bound() -> None:
     pump = _pump(max_messages=300)
     transport = await _hold_after_fill(pump, 300)
@@ -140,7 +136,6 @@ async def test_qsize_drops_during_batch_but_resident_keeps_the_message_bound() -
         await pump.stop()
 
 
-@pytest.mark.asyncio
 async def test_try_enqueue_many_is_atomic_against_resident_while_batch_in_flight() -> None:
     pump = _pump(max_messages=10)
     transport = await _hold_after_fill(pump, 8)
@@ -162,7 +157,6 @@ async def test_try_enqueue_many_is_atomic_against_resident_while_batch_in_flight
         await pump.stop()
 
 
-@pytest.mark.asyncio
 async def test_normal_write_completion_releases_resident_by_batch_len() -> None:
     pump = _pump(max_messages=16)
     for _ in range(5):
@@ -183,7 +177,6 @@ async def test_normal_write_completion_releases_resident_by_batch_len() -> None:
     await pump.stop()
 
 
-@pytest.mark.asyncio
 async def test_latency_microflush_success_releases_resident() -> None:
     writes: list[bytes] = []
     pump = _pump()
@@ -227,7 +220,6 @@ def test_reset_zeros_resident_on_epoch_transition() -> None:
     assert pump.queued_bytes == 0
 
 
-@pytest.mark.asyncio
 async def test_discard_keeps_in_flight_resident_until_writer_finally() -> None:
     pump = _pump(max_messages=16)
     transport = await _hold_after_fill(pump, 10)
@@ -244,7 +236,6 @@ async def test_discard_keeps_in_flight_resident_until_writer_finally() -> None:
     assert pump.resident_messages == 0
 
 
-@pytest.mark.asyncio
 async def test_writer_cancel_mid_batch_releases_in_flight_resident() -> None:
     pump = _pump(max_messages=32)
     transport = await _hold_after_fill(pump, 8)
@@ -256,7 +247,6 @@ async def test_writer_cancel_mid_batch_releases_in_flight_resident() -> None:
     transport.hold.set()
 
 
-@pytest.mark.asyncio
 async def test_writer_cancel_releases_in_flight_and_leaves_unextracted_queued() -> None:
     pump = _pump(max_messages=400)
     transport = await _hold_after_fill(pump, 300)
@@ -271,7 +261,6 @@ async def test_writer_cancel_releases_in_flight_and_leaves_unextracted_queued() 
     transport.hold.set()
 
 
-@pytest.mark.asyncio
 async def test_writer_failure_releases_in_flight_resident() -> None:
     failures: list[BaseException] = []
 
@@ -302,7 +291,6 @@ def test_oversized_single_item_only_when_resident_is_empty() -> None:
     assert pump.try_enqueue(b"still-oversized") is True
 
 
-@pytest.mark.asyncio
 async def test_oversized_item_refused_while_a_batch_is_in_flight() -> None:
     pump = WritePump(max_bytes=8, max_messages=8, on_failure=_no_failure)
     transport = await _hold_after_fill(pump, 4)
@@ -318,7 +306,6 @@ async def test_oversized_item_refused_while_a_batch_is_in_flight() -> None:
     assert pump.try_enqueue(b"way-too-big-for-the-byte-budget") is True
 
 
-@pytest.mark.asyncio
 async def test_eager_write_does_not_consume_resident_budget() -> None:
     transport = _EagerTransport()
     pump = _pump(max_messages=2)

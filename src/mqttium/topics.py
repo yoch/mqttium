@@ -1,4 +1,4 @@
-"""Topic and filter validation (IMPLEMENTATION-GUIDE.md §7)."""
+"""Topic and filter validation (implementation-guide.md §7)."""
 
 from __future__ import annotations
 

@@ -6,6 +6,26 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Changed
+
+- Reframe the project documentation around the native `AsyncClient` for
+  production asyncio services, gateways, and IoT systems. The Paho VERSION2
+  compatibility façade remains tested and Provisional as a migration aid, but
+  is no longer presented as a co-equal product surface.
+- Rationalize the test and GitHub Actions architecture, including
+  branch-inclusive coverage, mandatory broker integration, deterministic fuzz
+  coverage, consolidated release validation, and explicit self-hosted runner
+  trust boundaries.
+
+### Documentation
+
+- Add a versioned MkDocs Material / Read the Docs site, exhaustive Stable API
+  reference, user-oriented guides, curated historical-evidence index, project
+  support policy, and a single canonical `AGENTS.md` repository guide.
+- Refresh the README, package metadata, community templates, and repository
+  discovery metadata for the stable launch. Public comparative benchmark
+  claims are deferred to the independent cross-client benchmark repository.
+
 ## [1.0.0rc8] - 2026-08-20
 
 ### Fixed
@@ -133,7 +153,7 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - `mqttium.compat.paho`: `MQTTMessageInfo.mid` for QoS 1/2 is now a façade
   correlation identifier wrapping over `1..65535`, not the wire packet
   identifier. `on_publish` reports the same value `publish()` returned. Packet
-  identifiers remain owned by the network loop (`docs/COMPAT.md` §8).
+  identifiers remain owned by the network loop (`docs/paho-compatibility.md` §8).
 - `mqttium.compat.paho`: an admission refusal that happens after `publish()`
   returned is reported as `rc = MQTT_ERR_QUEUE_SIZE` on the returned handle
   rather than synchronously. `wait_for_publish()` and `is_published()` re-check
@@ -356,7 +376,7 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 - `docs/spec/` vendors numbered MQTT 3.1.1 and MQTT 5.0 conformance statements
   from reproducible OASIS archives, with provenance/regeneration tooling and
-  executable checks linked from `docs/CONFORMANCE.md`.
+  executable checks linked from `docs/conformance.md`.
 
 ### Documentation
 
@@ -489,7 +509,7 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   `AsyncClient` signatures: messages, MQTT 5 properties, connection packets,
   subscribe options, negotiated settings, reconnect policy and configuration
   literals. The root package also exposes the operational exception hierarchy
-  and `ConnectionState`. `docs/API-STABILITY.md` classifies Stable, Provisional
+  and `ConnectionState`. `docs/api-stability.md` classifies Stable, Provisional
   and Internal surfaces independently of Python importability or `__all__`.
 
 ### Changed

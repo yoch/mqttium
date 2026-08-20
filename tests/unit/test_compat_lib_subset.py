@@ -1,8 +1,8 @@
-"""Jalon D — sous-ensemble comportemental des tests/lib Paho via compat VERSION2.
+"""Behavioral subset of Paho's tests/lib exercised through VERSION2 compatibility.
 
-Ces tests ne rejouent pas le broker-simulator C de Paho ; ils couvrent la
-surface API VERSION2 documentée dans ``docs/COMPAT.md`` avec un transport
-factice, en miroir des scénarios ``tests/lib`` suivants :
+These tests do not replay Paho's C broker simulator. They cover the VERSION2
+surface documented in ``docs/paho-compatibility.md`` with an in-memory transport,
+mirroring these ``tests/lib`` scenarios:
 
 - ``01-unpwd-set`` / will / clean session
 - ``02-subscribe-qos0/1/2``

@@ -25,7 +25,12 @@ class PublishMessage:
 
 
 class PublishBatchReceipt:
-    """Aggregate completion handle without one task/event per publication."""
+    """Aggregate completion handle returned by ``publish_many``.
+
+    The receipt retains bounded failure details while counting every failure.
+    Completion covers the entire submitted iterable; no task or event is
+    allocated per publication.
+    """
 
     __slots__ = (
         "_pending",
@@ -64,14 +69,17 @@ class PublishBatchReceipt:
 
     @property
     def submitted(self) -> int:
+        """Number of messages successfully admitted to the batch."""
         return self._submitted
 
     @property
     def completed(self) -> int:
+        """Number of admitted messages that reached terminal completion."""
         return self._submitted - len(self._pending)
 
     @property
     def pending_count(self) -> int:
+        """Number of admitted QoS 1/2 messages still awaiting completion."""
         return len(self._pending)
 
     @property
@@ -90,9 +98,17 @@ class PublishBatchReceipt:
         return MappingProxyType(self._failure_counts)
 
     def is_done(self) -> bool:
+        """Whether submission is sealed and all admitted messages settled."""
         return self._done.is_set()
 
     async def wait(self) -> None:
+        """Wait for aggregate completion and raise on any failure.
+
+        Raises:
+            PublishBatchError: If admission failed fatally or one or more
+                admitted publications completed with an error. The exception
+                references this receipt and its bounded failure details.
+        """
         await self._done.wait()
         if self._fatal is not None:
             raise PublishBatchError(
@@ -203,6 +219,11 @@ class PublishReceipt:
             future.set_result(None)
 
     async def wait(self) -> None:
+        """Wait for protocol completion and re-raise its terminal error.
+
+        QoS 0 is already complete when the receipt is returned. Cancelling one
+        waiter does not cancel the shared receipt or other waiters.
+        """
         if self.qos != QoS.AT_MOST_ONCE and not self._settled:
             future = self._future
             if future is None:
@@ -213,26 +234,42 @@ class PublishReceipt:
             raise self._error
 
     def is_done(self) -> bool:
+        """Whether the publication reached its completion boundary."""
         return self.qos == QoS.AT_MOST_ONCE or self._settled
 
 
 @dataclass(slots=True)
 class SubscribeResult:
+    """Broker acknowledgement for one subscribe request.
+
+    Attributes:
+        mid: MQTT packet identifier used by the request.
+        reason_codes: One broker reason code for every requested filter.
+    """
+
     mid: int
     reason_codes: tuple[int, ...]
 
     @classmethod
     def from_packet(cls, packet: SubAckPacket) -> SubscribeResult:
+        """Build a public result from a decoded SUBACK packet."""
         return cls(mid=packet.mid, reason_codes=packet.reason_codes)
 
 
 @dataclass(slots=True)
 class UnsubscribeResult:
+    """Broker acknowledgement for one unsubscribe request.
+
+    MQTT 3.1.1 acknowledgements have no per-filter reason codes and therefore
+    expose an empty ``reason_codes`` tuple.
+    """
+
     mid: int
     reason_codes: tuple[int, ...]
 
     @classmethod
     def from_packet(cls, packet: UnsubAckPacket) -> UnsubscribeResult:
+        """Build a public result from a decoded UNSUBACK packet."""
         return cls(mid=packet.mid, reason_codes=packet.reason_codes)
 
 

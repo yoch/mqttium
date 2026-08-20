@@ -1,153 +1,103 @@
-# Reports
+# Historical evidence
 
-Dated records of a measurement, an audit or a design decision. Each was true of
-the commit it names, on the day it was written.
+This directory preserves dated measurements, audits, experiments, and release
+campaigns. A report describes the commit and environment it names; it is not a
+current API contract and its body is never rewritten to match later code.
 
-Read them for rationale — why a hot path is shaped the way it is, what was
-measured before a policy was chosen, what a release campaign actually ran.
-Never cite one as current behaviour, and do not edit one to match new code: a
-superseded report is replaced by a newer report, not rewritten. The maintained
-descriptions of current behaviour are the contracts in
-[`../`](../README.md).
+Use current guides and contracts for supported behaviour. Use this index to
+understand why a decision was made and whether later evidence superseded it.
+Every tracked report body appears exactly once below.
+
+Status meanings:
+
+- **Current evidence** — still useful evidence for an implemented decision or
+  an open, explicitly bounded experiment; it does not become a product promise.
+- **Superseded** — retained for chronology; use the named newer report or
+  current contract instead.
+- **Retracted** — a method or conclusion is unsuitable for current citation.
 
 ## Release and quality campaigns
 
-| Date | Report | Records |
+| Report | Status | Use instead or interpretation |
 | --- | --- | --- |
-| 2026-08-16 | [`SIMPLIFICATION-AUDIT-2026-08-16.md`](SIMPLIFICATION-AUDIT-2026-08-16.md) | Perf-aware simplification pass over the core at `32e99a4`: 669 lines deleted against 562 added, with calls per operation down 2.9% to 16.7% on sixteen scenarios and no regression on any. Records two `hotpath_profile.py` measurement traps, the duplication that is load-bearing and must not be collapsed, one MQTT 5 §4.3.3 conformance divergence in `on_pubrec`, and a pre-existing red memory gate unrelated to memory. |
-| 2026-08-16 | [`RELEASE-CANDIDATE-1.0.0rc6.md`](RELEASE-CANDIDATE-1.0.0rc6.md) | RC6 release evidence for post-RC5 MQTT 5 protocol/lifecycle hardening, manual-ACK ordering, Paho publish handoff and the ordered eager writer path, with exact release-artifact gates. |
-| 2026-08-16 | [`NATIVE-WRITER-HOP-2026-08-16.md`](NATIVE-WRITER-HOP-2026-08-16.md) | Validates the eager write that removes the writer-task hop, certified twice on independent axes: +16.7% to +27.8% callback p50 at four load points on MQTT 3.1.1 / window 64, and +26.6% / +25.6% on MQTT 5 / window 20, throughput unchanged or better. Also documents why the harness's loop-lag ratio penalises the faster arm inside a transition band. |
-| 2026-08-16 | [`NATIVE-PUBACK-ATTRIBUTION-2026-08-16.md`](NATIVE-PUBACK-ATTRIBUTION-2026-08-16.md) | Diagnostic-only attribution for Gap B of the floors plan, on an ineligible host: the isolated callback worker is the faster of the two completion disciplines, so the inline-on_publish experiment is not justified; the writer-task hop is exactly one event-loop turn on every outbound packet. No code changed. |
-| 2026-08-16 | [`COMPAT-PUBLISH-HANDOFF-2026-08-16.md`](COMPAT-PUBLISH-HANDOFF-2026-08-16.md) | Answers Gaps A, C and D of the floors plan: the compat QoS 1/2 publish handoff stopped blocking the producer thread (measured single-producer drain batch 1.00 to 203.50), QoS 0 moved to the writer-direct path (2 effects per message to 0), and why the proposed thread-safe PacketIdPool was rejected. |
-| 2026-08-16 | [`FLOORS-NOT-CEILINGS-2026-08-16.md`](FLOORS-NOT-CEILINGS-2026-08-16.md) | Work plan: treat Paho QoS 1 throughput and awscrt/paho equal-offer PUBACK latency as attainable floors. No code change; experiments are to be run in this repository. |
-| 2026-08-16 | [`RELEASE-CANDIDATE-1.0.0rc5.md`](RELEASE-CANDIDATE-1.0.0rc5.md) | RC5 release evidence for the post-RC4 callback/delivery and MQTT 5 hot-path improvements, repository-wide Bugbot reconciliation, and exact artifact gates. |
-| 2026-08-14 | [`SINGLE-MESSAGE-INLINE-DELIVERY-2026-08-14.md`](SINGLE-MESSAGE-INLINE-DELIVERY-2026-08-14.md) | Removes the conservative two-effect threshold from the existing bounded inline MESSAGE admission after source-isolated scheduler-path validation. |
-| 2026-08-14 | [`INDEPENDENT-QOS0-LATENCY-AUDIT-2026-08-14.md`](INDEPENDENT-QOS0-LATENCY-AUDIT-2026-08-14.md) | Independent native audit of QoS 0 completion/backpressure and direct latency diagnosis: callback scheduling was the bottleneck; a bounded fast admission path was retained after eligible-host A/A and A/B validation. |
-| 2026-08-13 | [`RELEASE-CANDIDATE-1.0.0rc4.md`](RELEASE-CANDIDATE-1.0.0rc4.md) | RC4 release evidence for the reviewed protocol-engine rationalisation, the resumed-session validation reduction, clean local quick/package gates, and the strict runner-preflight limitation. |
-| 2026-08-13 | [`RELEASE-CANDIDATE-1.0.0rc3.md`](RELEASE-CANDIDATE-1.0.0rc3.md) | RC3 release evidence, including the Receive Maximum regression found after #216, its bounded-ingress fix, local quick/package validation, and the runner-preflight limitation. |
-| 2026-08-10 | [`PERFORMANCE-AUDIT-0.2.0b4.md`](PERFORMANCE-AUDIT-0.2.0b4.md) | Re-reads the cross-client record against `4bdcdb3`, and records the per-message work removed before the `0.2.0b4` tag — with the reasons no throughput figure is attached to it. |
-| 2026-08-10 | [`QUALITY-AUDIT-0.2.0b4.md`](QUALITY-AUDIT-0.2.0b4.md) | Frozen quality inventory for the `0.2.0b4` work — module sizes, complexity signals, coverage — at commit `dc13866`. |
-| 2026-08-09 | [`CROSS-CLIENT-BENCHMARK-2026-08-09.md`](CROSS-CLIENT-BENCHMARK-2026-08-09.md) | MQTTium `0.2.0b2` against seven other Python MQTT clients, measured by an external harness on a pinned host: fastest at QoS 0 in both identities, mid-pack at QoS 1. |
-| 2026-08-05 | [`STABLE-RELEASE-EVIDENCE-2026-08-05.md`](STABLE-RELEASE-EVIDENCE-2026-08-05.md) | Retained CI, finalisation-campaign and benchmark runs backing the stable-release assessment at commit `0006198`. |
+| [STABLE-RELEASE-EVIDENCE-2026-08-05](https://github.com/yoch/mqttium/blob/main/docs/reports/STABLE-RELEASE-EVIDENCE-2026-08-05.md) | Superseded | Early campaign evidence; require a final-release report for the exact release commit |
+| [RELEASE-CANDIDATE-1.0.0rc1](https://github.com/yoch/mqttium/blob/main/docs/reports/RELEASE-CANDIDATE-1.0.0rc1.md) | Superseded | Later release candidates and final release evidence |
+| [RELEASE-CANDIDATE-1.0.0rc3](https://github.com/yoch/mqttium/blob/main/docs/reports/RELEASE-CANDIDATE-1.0.0rc3.md) | Superseded | Later release candidates and final release evidence |
+| [RELEASE-CANDIDATE-1.0.0rc4](https://github.com/yoch/mqttium/blob/main/docs/reports/RELEASE-CANDIDATE-1.0.0rc4.md) | Superseded | Later release candidates and final release evidence |
+| [RELEASE-CANDIDATE-1.0.0rc5](https://github.com/yoch/mqttium/blob/main/docs/reports/RELEASE-CANDIDATE-1.0.0rc5.md) | Superseded | Later release candidates and final release evidence |
+| [RELEASE-CANDIDATE-1.0.0rc6](https://github.com/yoch/mqttium/blob/main/docs/reports/RELEASE-CANDIDATE-1.0.0rc6.md) | Superseded | Final release evidence for the exact release commit |
+| [QUALITY-AUDIT-0.2.0b4](https://github.com/yoch/mqttium/blob/main/docs/reports/QUALITY-AUDIT-0.2.0b4.md) | Superseded | Later engine-quality audits and current quality gates |
+| [QUALITY-AUDIT-1.0.0rc2](https://github.com/yoch/mqttium/blob/main/docs/reports/QUALITY-AUDIT-1.0.0rc2.md) | Superseded | Later engine-quality audits and current quality gates |
+| [ENGINE-QUALITY-AUDIT-2026-08-17](https://github.com/yoch/mqttium/blob/main/docs/reports/ENGINE-QUALITY-AUDIT-2026-08-17.md) | Superseded | Closure and independent review below |
+| [ENGINE-QUALITY-AUDIT-INDEPENDENT-REVIEW-2026-08-17](https://github.com/yoch/mqttium/blob/main/docs/reports/ENGINE-QUALITY-AUDIT-INDEPENDENT-REVIEW-2026-08-17.md) | Current evidence | Independent review of the same bounded audit |
+| [ENGINE-QUALITY-AUDIT-CLOSURE-2026-08-17](https://github.com/yoch/mqttium/blob/main/docs/reports/ENGINE-QUALITY-AUDIT-CLOSURE-2026-08-17.md) | Current evidence | Closure record for the engine-quality findings |
+| [ISSUE-253-ARM64-VALIDATION-2026-08-17](https://github.com/yoch/mqttium/blob/main/docs/reports/ISSUE-253-ARM64-VALIDATION-2026-08-17.md) | Current evidence | ARM64 validation for the issue and source it names |
+| [SIMPLIFICATION-AUDIT-2026-08-16](https://github.com/yoch/mqttium/blob/main/docs/reports/SIMPLIFICATION-AUDIT-2026-08-16.md) | Current evidence | Reviewed simplification decisions at the named commit |
+| [SIMPLIFICATION-ARM64-REVALIDATION-2026-08-17](https://github.com/yoch/mqttium/blob/main/docs/reports/SIMPLIFICATION-ARM64-REVALIDATION-2026-08-17.md) | Current evidence | Independent-architecture revalidation of that campaign |
 
-The 2026-08-09 cross-client record describes `0.2.0b2`. On the points internal to MQTTium it is
-superseded by the 2026-08-10 performance audit, which gives a verdict on each of its claims. Its
-cross-client rankings are not restated anywhere as current: they were produced by an external
-harness on a pinned host and have not been reproduced in this repository.
+## Cross-client and performance program
 
-Read the audit's verdict table before quoting the record. One of its conclusions — that the
-`on_publish is None` inline settle "does not pay off under load" — **is known to be wrong**: the
-experiment behind it varied the benchmark adapter's completion discipline at the same time, so it
-cannot attribute anything to that branch, and its author agrees. The record is left as written
-because a report states what was believed on its date; the correction lives in the audit. Its QoS 1
-latency measurement, by contrast, is **retracted by its author**, and the retraction is the more
-useful of the two corrections.
-
-The record framed MQTTium's PUBACK latency as a fixed floor, 2.95x gmqtt at a matched offered rate.
-Its author re-tested that on 2026-08-12 and it does not hold. Driving both clients at the *same
-absolute* rate rather than at the same fraction of each one's own capacity:
-
-| offered | MQTTium | gmqtt | ratio |
-| --- | --- | --- | --- |
-| 2,105 msgs/s | 0.318 ms | 0.256 ms | 1.24x |
-| 6,246 msgs/s | 1.32 ms | 0.45 ms | 2.94x |
-
-Latency falls fourfold when the offered rate falls threefold, so it is load-dependent queueing and
-not a constant delay — the opposite of what the record claimed.
-
-The root cause is a method error, not a defect on either side. That harness paced each client at a
-fraction of its *own* calibrated capacity, so a faster client was offered a higher absolute rate and
-sat further along its own latency-versus-load curve. Reading the resulting table across clients
-penalises whichever client has the most headroom, which was MQTTium. Its author has since added a
-fixed-rate scenario for cross-client comparison and marked the fraction-paced one as unsuitable for
-it.
-
-One contributing cause is quantified: that harness suspends a coroutine for the whole round trip on
-MQTTium while returning immediately and correlating the ack in a callback on gmqtt. Driving MQTTium
-the second way is worth 11-34%, growing with load. It has been reverted there rather than kept,
-because it would trade one asymmetry for another.
-
-Measured in this repository against the same containerised broker, publisher pinned to one physical
-core as that harness pins it, MQTTium is 1.18x gmqtt at 6,246 msgs/s (1.13x unpinned), with a
-four-point breakdown putting 71 us of library — 45 us to the wire, 26 us to settle — inside a 207 us
-round trip. The same figures hold on the `v1.0.0rc1` tag that was measured externally, so nothing
-here was fixed after the fact.
-
-Two hypotheses were tested here and did **not** hold, and are recorded so they are not re-run:
-single-physical-core pinning does not amplify MQTTium's scheduling hops (1.18x pinned against 1.13x
-unpinned, breakdown unchanged), and the knee that harness later reported between 2,500 and 5,000
-msgs/s does not reproduce (0.270-0.284 ms against 0.251-0.301 ms over six alternated samples per
-point, on both the awaited and `publish_nowait` paths).
-
-One question is open rather than answered. That harness calibrates MQTTium's ceiling at 12,492
-msgs/s; a tight in-process loop here reaches about 17,960 under that harness's own broker and
-publisher pinning, so the environment accounts for none of the difference. That does not establish
-how much of it is adapter overhead, because a ceiling measured without a pacer or per-message
-bookkeeping is not like-for-like with a calibrator's discipline. It matters because that calibration
-sets the offered rate for every open-loop point.
-
-Do not treat the cross-client latency column as a statement about MQTTium until that harness can
-defend it.
-
-The 2026-08-16 external campaign (`1.0.0rc5`) is summarised as floors — not as a glass ceiling —
-in [`FLOORS-NOT-CEILINGS-2026-08-16.md`](FLOORS-NOT-CEILINGS-2026-08-16.md). Equal-offer PUBACK
-and sync-peer QoS 1 remain the comparisons that matter; native QoS 0/1/2 capacity already leads.
-
-[`COMPAT-PUBLISH-HANDOFF-2026-08-16.md`](COMPAT-PUBLISH-HANDOFF-2026-08-16.md) closes the compat
-half of that plan and supersedes its Gap A proposal: the packet-identifier namespace is owned by
-the façade rather than shared with a locked `PacketIdPool`, so `COMPAT.md` §8 is unchanged. It also
-records four harnesses that failed their own A/A control, so no local timing claim is made for the
-QoS 0 drain change. Gap B remains open.
-
-## Memory campaign
-
-Four documents from one audit: methodology lives in the
-[`MEMORY-BENCHMARK.md`](../MEMORY-BENCHMARK.md) contract, the numbers and the
-outcome live here.
-
-| Date | Report | Records |
+| Report | Status | Use instead or interpretation |
 | --- | --- | --- |
-| 2026-08-04 | [`MEMORY-BASELINE.md`](MEMORY-BASELINE.md) | Before-state, from benchmark run 22 at commit `1a9fe49`. |
-| 2026-08-04 | [`MEMORY-RESULTS.md`](MEMORY-RESULTS.md) | After-state for the same scenarios, once admission, delivery-budget, pagination and lazy-hydration corrections landed. |
-| 2026-08-04 | [`MEMORY-PROFILE-FOLLOW-UP.md`](MEMORY-PROFILE-FOLLOW-UP.md) | How each audit recommendation was closed, and which ones got a numeric regression guard. |
+| [CROSS-CLIENT-BENCHMARK-2026-08-09](https://github.com/yoch/mqttium/blob/main/docs/reports/CROSS-CLIENT-BENCHMARK-2026-08-09.md) | Retracted | Do not cite its latency column or old-version rankings as current; await reviewed independent results |
+| [PERFORMANCE-AUDIT-0.2.0b4](https://github.com/yoch/mqttium/blob/main/docs/reports/PERFORMANCE-AUDIT-0.2.0b4.md) | Superseded | Later native hot-path evidence and the current benchmarking contract |
+| [PERFORMANCE-1.0.0rc1](https://github.com/yoch/mqttium/blob/main/docs/reports/PERFORMANCE-1.0.0rc1.md) | Superseded | Later per-decision reports; not a current cross-client claim |
+| [FLOORS-NOT-CEILINGS-2026-08-16](https://github.com/yoch/mqttium/blob/main/docs/reports/FLOORS-NOT-CEILINGS-2026-08-16.md) | Superseded | Later compatibility handoff and native writer evidence |
+| [COMPAT-PUBLISH-HANDOFF-2026-08-16](https://github.com/yoch/mqttium/blob/main/docs/reports/COMPAT-PUBLISH-HANDOFF-2026-08-16.md) | Current evidence | Architectural handoff decision only; no public parity promise |
+| [NATIVE-PUBACK-ATTRIBUTION-2026-08-16](https://github.com/yoch/mqttium/blob/main/docs/reports/NATIVE-PUBACK-ATTRIBUTION-2026-08-16.md) | Superseded | Diagnostic attribution followed by the writer-hop decision |
+| [NATIVE-WRITER-HOP-2026-08-16](https://github.com/yoch/mqttium/blob/main/docs/reports/NATIVE-WRITER-HOP-2026-08-16.md) | Current evidence | Native eager-writer decision under its recorded conditions |
+| [INDEPENDENT-QOS0-LATENCY-AUDIT-2026-08-14](https://github.com/yoch/mqttium/blob/main/docs/reports/INDEPENDENT-QOS0-LATENCY-AUDIT-2026-08-14.md) | Current evidence | Bounded native QoS 0 latency audit |
+| [NATIVE-QOS0-CALLBACK-DIRECT-2026-08-14](https://github.com/yoch/mqttium/blob/main/docs/reports/NATIVE-QOS0-CALLBACK-DIRECT-2026-08-14.md) | Current evidence | Direct callback-admission decision |
+| [SINGLE-MESSAGE-INLINE-DELIVERY-2026-08-14](https://github.com/yoch/mqttium/blob/main/docs/reports/SINGLE-MESSAGE-INLINE-DELIVERY-2026-08-14.md) | Current evidence | Inline delivery threshold decision |
+
+## Memory evidence
+
+| Report | Status | Use instead or interpretation |
+| --- | --- | --- |
+| [MEMORY-BASELINE](https://github.com/yoch/mqttium/blob/main/docs/reports/MEMORY-BASELINE.md) | Superseded | Memory results and follow-up below |
+| [MEMORY-RESULTS](https://github.com/yoch/mqttium/blob/main/docs/reports/MEMORY-RESULTS.md) | Current evidence | Result for its fixed scenario set and commit |
+| [MEMORY-PROFILE-FOLLOW-UP](https://github.com/yoch/mqttium/blob/main/docs/reports/MEMORY-PROFILE-FOLLOW-UP.md) | Current evidence | Closure and regression-guard mapping |
+
+The maintained methodology and thresholds live in
+[Memory Benchmark Methodology](../memory-benchmark.md).
 
 ## Scheduler experiments
 
-Open scheduler-hypothesis records. They do not outrank a measured hot-path
-decision, and they are not merge evidence until the experiment's own gate is
-met on an eligible runner.
-
-| Date | Report | Records |
+| Report | Status | Use instead or interpretation |
 | --- | --- | --- |
-| 2026-08-19 | [`SCHEDULER-RESIDENT-MESSAGE-BUDGET-2026-08-19.md`](SCHEDULER-RESIDENT-MESSAGE-BUDGET-2026-08-19.md) | Diagnostic campaign for the resident writer message budget at `4e4f75d`: writer-capacity 0.999 / 1.000, open-loop completed/lag ~1.00. **Keep; not mergeable** until an eligible runner repeats the gate. |
-| 2026-08-18 | [`SCHEDULER-RESIDENT-MESSAGE-BUDGET-2026-08-18.md`](SCHEDULER-RESIDENT-MESSAGE-BUDGET-2026-08-18.md) | Implementation note for `_resident_messages`. Superseded by the 2026-08-19 campaign. |
-| 2026-08-19 | [`SCHEDULER-WRITER-TARGETED-WAKE-2026-08-19.md`](SCHEDULER-WRITER-TARGETED-WAKE-2026-08-19.md) | Diagnostic campaign for `notify(n)` writer wakeups at `1b5d871`: +9.8% / +143% at 16/64 producers, writer-capacity flat. **Keep; not mergeable** until eligible-runner A/A (especially 16 producers) and A/B exist. |
-| 2026-08-18 | [`SCHEDULER-WRITER-TARGETED-WAKE-2026-08-18.md`](SCHEDULER-WRITER-TARGETED-WAKE-2026-08-18.md) | Implementation note for targeted writer wake. Superseded by the 2026-08-19 campaign. |
-| 2026-08-19 | [`SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-19.md`](SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-19.md) | Diagnostic campaign for targeted publish-admission wake at `acc427a`: +29% / +127% / +57% at 4×inf1, 16×inf1, 16×inf4; single-publisher neutral. **Keep; not mergeable** until an eligible runner repeats the gate. |
-| 2026-08-18 | [`SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-18.md`](SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-18.md) | Implementation note for the waiter-future deque. Superseded by the 2026-08-19 campaign. |
+| [SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-18](https://github.com/yoch/mqttium/blob/main/docs/reports/SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-18.md) | Superseded | 2026-08-19 campaign |
+| [SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-19](https://github.com/yoch/mqttium/blob/main/docs/reports/SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-19.md) | Current evidence | Open experiment subject to its eligible-runner gate |
+| [SCHEDULER-RESIDENT-MESSAGE-BUDGET-2026-08-18](https://github.com/yoch/mqttium/blob/main/docs/reports/SCHEDULER-RESIDENT-MESSAGE-BUDGET-2026-08-18.md) | Superseded | 2026-08-19 campaign |
+| [SCHEDULER-RESIDENT-MESSAGE-BUDGET-2026-08-19](https://github.com/yoch/mqttium/blob/main/docs/reports/SCHEDULER-RESIDENT-MESSAGE-BUDGET-2026-08-19.md) | Current evidence | Open experiment subject to its eligible-runner gate |
+| [SCHEDULER-WRITER-TARGETED-WAKE-2026-08-18](https://github.com/yoch/mqttium/blob/main/docs/reports/SCHEDULER-WRITER-TARGETED-WAKE-2026-08-18.md) | Superseded | 2026-08-19 campaign |
+| [SCHEDULER-WRITER-TARGETED-WAKE-2026-08-19](https://github.com/yoch/mqttium/blob/main/docs/reports/SCHEDULER-WRITER-TARGETED-WAKE-2026-08-19.md) | Current evidence | Open experiment subject to its eligible-runner gate |
 
-## Hot-path decisions
+An experiment marked current is not release evidence until its own A/A and A/B
+validity conditions pass on an eligible runner.
 
-Each answers one question with a measurement, and the answer is already
-implemented — the report exists so the choice stays falsifiable.
+## Implemented hot-path decisions
 
-| Date | Report | Question answered |
+| Report | Status | Decision recorded |
 | --- | --- | --- |
-| 2026-08-14 | [`NATIVE-QOS0-CALLBACK-DIRECT-2026-08-14.md`](NATIVE-QOS0-CALLBACK-DIRECT-2026-08-14.md) | Can native QoS 0 writer admission enqueue an isolated `on_publish` callback directly without weakening queue bounds or batch atomicity? |
-| 2026-08-13 | [`ACK-SPECIALIZED-PRIMITIVES.md`](ACK-SPECIALIZED-PRIMITIVES.md) | Can per-version ACK decode primitives make MQTT 5 three-byte bodies cost the same call count as MQTT 3.1.1 two-byte success? Superseded in scope by the full specialized-codec bind table on the same branch. |
-| 2026-08-13 | [`AUTO-QOS1-MESSAGE-BATCH-DELIVERY.md`](AUTO-QOS1-MESSAGE-BATCH-DELIVERY.md) | Can fresh automatic QoS 1 MESSAGE effects share the small-message inline batch without weakening persisted replay semantics? |
-| 2026-08-13 | [`RM-SLOT-UNTIL-HANDOFF.md`](RM-SLOT-UNTIL-HANDOFF.md) | Should auto-ACK QoS 1 keep the Receive Maximum slot until `take_effects()` instead of reconstructing occupancy with a second decode? |
-| 2026-08-12 | [`QOS2-V311-DECODE.md`](QOS2-V311-DECODE.md) | Should inbound MQTT 3.1.1 QoS 2 PUBLISH use the same field decoder as QoS 1? |
-| 2026-08-12 | [`ACK-SUCCESS-FASTPATH.md`](ACK-SUCCESS-FASTPATH.md) | Can common success/no-properties acknowledgement frames bypass transient packet objects without weakening long-form MQTT 5 validation? |
-| 2026-08-12 | [`QOS12-LAUNCH-ENCODE.md`](QOS12-LAUNCH-ENCODE.md) | Should stored outbound QoS 1/2 launches call the functional PUBLISH encoder directly instead of constructing a transient packet object? |
-| 2026-08-06 | [`QOS0-V311-DECODE.md`](QOS0-V311-DECODE.md) | Should inbound MQTT 3.1.1 QoS 0 PUBLISH decode straight into the delivered `Message`? |
-| 2026-08-06 | [`QOS1-V311-DECODE.md`](QOS1-V311-DECODE.md) | Same question for MQTT 3.1.1 QoS 1, ahead of the acknowledgement state machine. |
-| 2026-08-06 | [`QOS0-MESSAGE-BATCH-DELIVERY.md`](QOS0-MESSAGE-BATCH-DELIVERY.md) | Can consecutive small QoS 0 `MESSAGE` effects be transferred to the bounded queues in one pass? |
-| 2026-08-06 | [`NOWAIT-WIRE-SIZE.md`](NOWAIT-WIRE-SIZE.md) | Can `publish_nowait()` admission compute the exact wire size instead of encoding a disposable preview frame? |
-| 2026-08-05 | [`QOS1-FRAME-POLICY.md`](QOS1-FRAME-POLICY.md) | Should a QoS 1 / pre-PUBREC record retain its encoded PUBLISH frame, re-encode on replay, or choose by size? |
-| 2026-08-05 | [`PUBLISH-DECODE-PROFILE.md`](PUBLISH-DECODE-PROFILE.md) | Would parsing PUBLISH directly off the decoder's reusable buffer justify a second ingress path? |
-| 2026-08-04 | [`PACKET-ID-POOL-PERFORMANCE.md`](PACKET-ID-POOL-PERFORMANCE.md) | What allocator should back the `1..65535` outbound packet-identifier pool? |
+| [PACKET-ID-POOL-PERFORMANCE](https://github.com/yoch/mqttium/blob/main/docs/reports/PACKET-ID-POOL-PERFORMANCE.md) | Current evidence | Outbound packet-identifier allocator |
+| [PUBLISH-DECODE-PROFILE](https://github.com/yoch/mqttium/blob/main/docs/reports/PUBLISH-DECODE-PROFILE.md) | Current evidence | Rejected direct-buffer decode expansion |
+| [QOS1-FRAME-POLICY](https://github.com/yoch/mqttium/blob/main/docs/reports/QOS1-FRAME-POLICY.md) | Current evidence | QoS 1 encoded-frame retention policy |
+| [NOWAIT-WIRE-SIZE](https://github.com/yoch/mqttium/blob/main/docs/reports/NOWAIT-WIRE-SIZE.md) | Current evidence | Exact wire-size admission for `publish_nowait()` |
+| [QOS0-MESSAGE-BATCH-DELIVERY](https://github.com/yoch/mqttium/blob/main/docs/reports/QOS0-MESSAGE-BATCH-DELIVERY.md) | Current evidence | Small-message delivery batching |
+| [QOS0-V311-DECODE](https://github.com/yoch/mqttium/blob/main/docs/reports/QOS0-V311-DECODE.md) | Current evidence | MQTT 3.1.1 QoS 0 decode path |
+| [QOS1-V311-DECODE](https://github.com/yoch/mqttium/blob/main/docs/reports/QOS1-V311-DECODE.md) | Current evidence | MQTT 3.1.1 QoS 1 decode path |
+| [QOS2-V311-DECODE](https://github.com/yoch/mqttium/blob/main/docs/reports/QOS2-V311-DECODE.md) | Current evidence | MQTT 3.1.1 QoS 2 decode path |
+| [QOS12-LAUNCH-ENCODE](https://github.com/yoch/mqttium/blob/main/docs/reports/QOS12-LAUNCH-ENCODE.md) | Current evidence | Stored QoS 1/2 launch encoding |
+| [ACK-SUCCESS-FASTPATH](https://github.com/yoch/mqttium/blob/main/docs/reports/ACK-SUCCESS-FASTPATH.md) | Current evidence | Common successful acknowledgement decode |
+| [ACK-SPECIALIZED-PRIMITIVES](https://github.com/yoch/mqttium/blob/main/docs/reports/ACK-SPECIALIZED-PRIMITIVES.md) | Superseded | Broader specialized codec bind-table implementation |
+| [RM-SLOT-UNTIL-HANDOFF](https://github.com/yoch/mqttium/blob/main/docs/reports/RM-SLOT-UNTIL-HANDOFF.md) | Current evidence | Inbound Receive Maximum ownership until effect handoff |
+| [AUTO-QOS1-MESSAGE-BATCH-DELIVERY](https://github.com/yoch/mqttium/blob/main/docs/reports/AUTO-QOS1-MESSAGE-BATCH-DELIVERY.md) | Current evidence | Automatic QoS 1 delivery batching |
 
-Dates are the day each report was added to the repository. Changelog entries
-published before 2026-08-10 refer to these files by their former top-level
-`docs/` path.
+## Adding evidence
+
+1. Put methodology and maintained guarantees in a current contract, not a
+   dated report.
+2. Give the report a date, exact commit, environment, commands, and limitations.
+3. Never commit generated benchmark output as source documentation.
+4. Add the new body here exactly once and update the status of anything it
+   supersedes or retracts.

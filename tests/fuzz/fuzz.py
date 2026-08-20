@@ -1,6 +1,6 @@
 """Dependency-free, seed-reproducible fuzzer for mqttium.
 
-Targets (jalon E):
+Targets:
   1. codec/properties/packets — mutated wire bytes
   2. engine — stateful protocol sequences (CONNACK/PUBLISH/ACK/alias storms)
   3. WebSocket frame parser — bounded-memory invariants
@@ -10,8 +10,8 @@ no unbounded buffer growth, engine invariants hold (mids consistent, flow
 bounded, no negative counters).
 
 Run:
-  PYTHONPATH=mqttium/src python3 mqttium/tests/fuzz/fuzz.py --seed 1 --iterations 5000
-  PYTHONPATH=mqttium/src python3 mqttium/tests/fuzz/fuzz.py --target engine --iterations 20000
+  PYTHONPATH=src python tests/fuzz/fuzz.py --seed 1 --iterations 5000
+  PYTHONPATH=src python tests/fuzz/fuzz.py --target engine --iterations 20000
 """
 
 from __future__ import annotations

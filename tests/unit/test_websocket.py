@@ -48,7 +48,6 @@ def _decode_client_batch(batch: list[bytes], max_frame_size: int = 1 << 20) -> b
     return parsed[2]
 
 
-@pytest.mark.asyncio
 async def test_websocket_binary_roundtrip_and_immediate_pong() -> None:
     loop = asyncio.get_running_loop()
     got_mqtt = loop.create_future()
@@ -189,7 +188,6 @@ def test_reassembles_binary_fragmentation_with_interleaved_pong() -> None:
     assert transport._try_extract_application_payload() == b"part-1part-2"
 
 
-@pytest.mark.asyncio
 async def test_invalid_extra_headers_are_rejected_before_connect(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -209,7 +207,6 @@ async def test_invalid_extra_headers_are_rejected_before_connect(
     assert opened is False
 
 
-@pytest.mark.asyncio
 async def test_failed_handshake_closes_stream() -> None:
     peer_closed = asyncio.Event()
 

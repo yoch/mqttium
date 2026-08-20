@@ -4,30 +4,33 @@ on:
   workflow_dispatch:
     inputs:
       base_ref:
-        description: Trusted capacity baseline commit, branch, or tag
+        description: Exact reviewed capacity-baseline commit SHA
         required: true
-        default: v1.0.0rc5
         type: string
       candidate_ref:
-        description: Trusted candidate commit, branch, or tag
+        description: Exact reviewed candidate commit SHA
         required: true
-        default: main
         type: string
       latency_base_ref:
-        description: Trusted pre-eager latency baseline commit
+        description: Exact reviewed latency-baseline commit SHA
         required: true
-        default: 3962f328331b8414a755332aefc3b3d7c261dc6f
         type: string
+      confirm_trusted_code:
+        description: I confirm that every input commit was reviewed and is trusted on the persistent runner
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: read
 
 concurrency:
-  group: arm64-paired-regression
+  group: mqttium-arm64-runner
   cancel-in-progress: false
 
 jobs:
   paired:
+    if: inputs.confirm_trusted_code && github.ref == 'refs/heads/main'
     runs-on: [self-hosted, linux, ARM64]
     timeout-minutes: 90
     env:
@@ -36,28 +39,40 @@ jobs:
 
     steps:
       - name: Check out benchmark harness
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.sha }}
+          ref: main
           path: harness
           persist-credentials: false
+      - name: Set run-specific workspace
+        run: echo "JOB_ROOT=$RUNNER_TEMP/mqttium-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+      - name: Validate immutable trusted commits
+        env:
+          BASE_REF: ${{ inputs.base_ref }}
+          CANDIDATE_REF: ${{ inputs.candidate_ref }}
+          LATENCY_BASE_REF: ${{ inputs.latency_base_ref }}
+        run: |
+          set -euo pipefail
+          for value in "$BASE_REF" "$CANDIDATE_REF" "$LATENCY_BASE_REF"; do
+            [[ "$value" =~ ^[0-9a-fA-F]{40}$ ]] || { echo "all refs must be exact commit SHAs" >&2; exit 2; }
+          done
 
       - name: Check out candidate
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ inputs.candidate_ref }}
           path: candidate
           persist-credentials: false
 
       - name: Check out capacity baseline
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ inputs.base_ref }}
           path: base
           persist-credentials: false
 
       - name: Check out latency baseline
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ inputs.latency_base_ref }}
           path: latency-base
@@ -86,10 +101,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          venv="$RUNNER_TEMP/mqttium-paired-venv"
-          rm -rf "$venv"
-          python3 -m venv "$venv"
-          echo "$venv/bin" >> "$GITHUB_PATH"
+          rm -rf "$JOB_ROOT"
+          mkdir -p "$JOB_ROOT"
+          python3 -m venv "$JOB_ROOT/venv"
+          echo "$JOB_ROOT/venv/bin" >> "$GITHUB_PATH"
 
       - run: python -m pip install "psutil>=6,<8"
 
@@ -97,7 +112,7 @@ jobs:
         working-directory: harness
         run: |
           python benchmarks/runner_probe.py \
-            --output "$RUNNER_TEMP/mqttium-paired/runner.json" \
+            --output "$JOB_ROOT/runner.json" \
             --require-temperature \
             --enforce
 
@@ -105,7 +120,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          root="$RUNNER_TEMP/mqttium-paired"
+          root="$JOB_ROOT"
           mkdir -p "$root"
           cat > "$root/mosquitto.conf" <<'EOF'
           persistence false
@@ -138,7 +153,7 @@ jobs:
             --base-root base \
             --candidate-root candidate \
             --repeat 11 \
-            --output "$RUNNER_TEMP/mqttium-paired/micro.json"
+            --output "$JOB_ROOT/micro.json"
 
       - name: Advisory paired network sweep
         run: |
@@ -146,7 +161,7 @@ jobs:
             --base-root base \
             --candidate-root candidate \
             --policy advisory \
-            --preflight-report "$RUNNER_TEMP/mqttium-paired/runner.json" \
+            --preflight-report "$JOB_ROOT/runner.json" \
             --repeat 8 \
             --cpu 2 \
             --windows 1,8,32,64,128 \
@@ -154,20 +169,20 @@ jobs:
             --payloads 64,4096 \
             --count-small 20000 \
             --count-large 8000 \
-            --output "$RUNNER_TEMP/mqttium-paired/network.json" \
-            --summary-output "$RUNNER_TEMP/mqttium-paired/network.md"
+            --output "$JOB_ROOT/network.json" \
+            --summary-output "$JOB_ROOT/network.md"
 
       - name: Advisory native QoS 1 receipt/callback diagnostic
         run: |
           python harness/benchmarks/paired_network.py \
             --base-root base --candidate-root candidate \
             --policy advisory \
-            --preflight-report "$RUNNER_TEMP/mqttium-paired/runner.json" \
+            --preflight-report "$JOB_ROOT/runner.json" \
             --repeat 4 --cpu 2 --windows 64 --protocols 311 \
             --payloads 64 --completions receipt,callback \
             --count-small 5000 \
-            --output "$RUNNER_TEMP/mqttium-paired/qos1-completion.json" \
-            --summary-output "$RUNNER_TEMP/mqttium-paired/qos1-completion.md"
+            --output "$JOB_ROOT/qos1-completion.json" \
+            --summary-output "$JOB_ROOT/qos1-completion.md"
 
       - name: Strict closed-loop writer-capacity A/A control
         id: writer_gate
@@ -189,9 +204,9 @@ jobs:
             --count-qos0 100000 --count-qos1 40000 \
             --timeout 120 --cpu 2 \
             --policy strict \
-            --preflight-report "$RUNNER_TEMP/mqttium-paired/runner.json" \
-            --output "$RUNNER_TEMP/mqttium-paired/writer-capacity-aa.json" \
-            --summary-output "$RUNNER_TEMP/mqttium-paired/writer-capacity-aa.md"
+            --preflight-report "$JOB_ROOT/runner.json" \
+            --output "$JOB_ROOT/writer-capacity-aa.json" \
+            --summary-output "$JOB_ROOT/writer-capacity-aa.md"
 
       - name: Strict closed-loop writer-capacity A/B gate
         if: steps.writer_gate.outputs.available == 'true'
@@ -206,16 +221,16 @@ jobs:
             --count-qos0 100000 --count-qos1 40000 \
             --timeout 120 --cpu 2 \
             --policy strict \
-            --preflight-report "$RUNNER_TEMP/mqttium-paired/runner.json" \
-            --output "$RUNNER_TEMP/mqttium-paired/writer-capacity-ab.json" \
-            --summary-output "$RUNNER_TEMP/mqttium-paired/writer-capacity-ab.md"
+            --preflight-report "$JOB_ROOT/runner.json" \
+            --output "$JOB_ROOT/writer-capacity-ab.json" \
+            --summary-output "$JOB_ROOT/writer-capacity-ab.md"
 
       - name: Strict paced writer-latency A/A control
         if: steps.writer_gate.outputs.available == 'true'
         shell: bash
         run: |
           set -euo pipefail
-          root="$RUNNER_TEMP/mqttium-paired"
+          root="$JOB_ROOT"
           run_control() {
             local attempt="$1"
             python harness/benchmarks/paired_open_loop.py \
@@ -261,9 +276,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          preflight="$RUNNER_TEMP/mqttium-paired/runner.json"
-          if [ -f "$RUNNER_TEMP/mqttium-paired/runner-latency-retry.json" ]; then
-            preflight="$RUNNER_TEMP/mqttium-paired/runner-latency-retry.json"
+          preflight="$JOB_ROOT/runner.json"
+          if [ -f "$JOB_ROOT/runner-latency-retry.json" ]; then
+            preflight="$JOB_ROOT/runner-latency-retry.json"
           fi
           python harness/benchmarks/paired_open_loop.py \
             --base-root latency-base --candidate-root candidate \
@@ -272,18 +287,18 @@ jobs:
             --repeat 8 --count-small 4000 --timeout 120 --cpu 2 \
             --policy strict \
             --preflight-report "$preflight" \
-            --output "$RUNNER_TEMP/mqttium-paired/writer-latency-ab.json" \
-            --summary-output "$RUNNER_TEMP/mqttium-paired/writer-latency-ab.md"
+            --output "$JOB_ROOT/writer-latency-ab.json" \
+            --summary-output "$JOB_ROOT/writer-latency-ab.md"
 
       - name: Upload paired measurements
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: arm64-paired-regression-${{ github.run_id }}
           path: |
-            ${{ runner.temp }}/mqttium-paired/*.json
-            ${{ runner.temp }}/mqttium-paired/*.md
-            ${{ runner.temp }}/mqttium-paired/mosquitto.log
+            ${{ runner.temp }}/mqttium-${{ github.run_id }}-${{ github.run_attempt }}/*.json
+            ${{ runner.temp }}/mqttium-${{ github.run_id }}-${{ github.run_attempt }}/*.md
+            ${{ runner.temp }}/mqttium-${{ github.run_id }}-${{ github.run_attempt }}/mosquitto.log
           if-no-files-found: warn
           retention-days: 30
 
@@ -291,9 +306,10 @@ jobs:
         if: always()
         shell: bash
         run: |
-          pidfile="$RUNNER_TEMP/mqttium-paired/mosquitto.pid"
+          pidfile="$JOB_ROOT/mosquitto.pid"
           if [ -f "$pidfile" ]; then
             pid="$(cat "$pidfile")"
             kill "$pid" 2>/dev/null || true
             wait "$pid" 2>/dev/null || true
           fi
+          rm -rf "$JOB_ROOT"

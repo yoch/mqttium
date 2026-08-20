@@ -116,7 +116,6 @@ class _RecordingTransport:
         return False
 
 
-@pytest.mark.asyncio
 async def test_writer_worker_records_lifetime_high_water_without_enqueue_overhead() -> None:
     client = AsyncClient(max_outbound_messages=4, max_outbound_bytes=1024)
     transport = _RecordingTransport()
@@ -165,7 +164,6 @@ def test_transport_without_a_stats_method_reports_unavailable() -> None:
     assert snapshot.transport.pending_write_bytes == 0
 
 
-@pytest.mark.asyncio
 async def test_writer_decision_counters_describe_the_batches_it_wrote() -> None:
     client = AsyncClient(max_outbound_messages=8, max_outbound_bytes=4096)
     transport = _RecordingTransport()

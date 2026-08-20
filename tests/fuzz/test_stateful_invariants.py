@@ -4,7 +4,7 @@ Two harnesses, both seed-reproducible and both cheap enough to run in CI:
 
 * ``test_engine_invariants_hold`` drives a ``ProtocolEngine`` through random
   publish / acknowledge / reconnect / drop sequences and re-checks the
-  invariants documented in ``CLAUDE.md`` after *every* step. It is a regression
+  invariants documented in ``AGENTS.md`` after *every* step. It is a regression
   net for the accounting that ``OutboundSession`` and ``InboundSession`` own:
   budgets, packet identifiers and the flow window must always agree with the
   durable store, whatever order the operations arrived in.
@@ -16,8 +16,8 @@ Two harnesses, both seed-reproducible and both cheap enough to run in CI:
 
 Scale with ``MQTTIUM_FUZZ_SEEDS`` / ``MQTTIUM_FUZZ_STEPS`` for longer campaigns.
 
-The known divergence on ``update_out``/``update_in`` is deliberately excluded
-here and pinned instead by ``tests/unit/test_rc_regressions.py``.
+The deliberately narrow ``update_out``/``update_in`` contract is excluded here
+and pinned by focused persistence transition tests.
 """
 
 from __future__ import annotations
@@ -321,7 +321,8 @@ def _store_operations(rng: random.Random) -> tuple[str, Callable[[Any], object]]
     ``update_out``/``update_in`` are excluded: they only guarantee the mutable
     state fields, and ``SqliteInflightStore`` deliberately narrows the write to
     them, so the two stores legitimately differ on everything else. That
-    guaranteed part is compared in ``tests/unit/test_rc_regressions.py``.
+    guaranteed part is compared in
+    ``tests/unit/test_packet_id_and_store_consistency.py``.
     """
     mid = rng.randint(1, 12)
     page_size = rng.choice([1, 2, 5])

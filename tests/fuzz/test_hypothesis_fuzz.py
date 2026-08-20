@@ -1,13 +1,13 @@
-"""Property-based fuzzing with hypothesis (jalon E, guided + shrinking).
+"""Property-based fuzzing with Hypothesis generation and shrinking.
 
-Complements the seed-reproducible ``tests/fuzz/fuzz.py`` with coverage-guided
+Complements the seed-reproducible ``tests/fuzz/fuzz.py`` with property-based
 generation and automatic shrinking of failing inputs.
 
 Run (default profile):
-  PYTHONPATH=mqttium/src python3 -m pytest mqttium/tests/fuzz/test_hypothesis_fuzz.py -q
+  python -m pytest tests/fuzz/test_hypothesis_fuzz.py -q
 
 Aggressive profile (more examples):
-  cd mqttium && HYPOTHESIS_PROFILE=aggressive python3 -m pytest tests/fuzz/test_hypothesis_fuzz.py
+  HYPOTHESIS_PROFILE=aggressive python -m pytest tests/fuzz/test_hypothesis_fuzz.py
 """
 
 from __future__ import annotations
@@ -17,20 +17,18 @@ import os
 import pytest
 
 hypothesis = pytest.importorskip("hypothesis")
-from hypothesis import HealthCheck, given, settings, strategies as st
+from hypothesis import given, settings, strategies as st
 from hypothesis import assume
 
 # Register an aggressive profile for long/CI runs.
 settings.register_profile(
     "aggressive",
     max_examples=3000,
-    suppress_health_check=list(HealthCheck),
     deadline=None,
 )
 settings.register_profile(
     "ci",
     max_examples=800,
-    suppress_health_check=list(HealthCheck),
     deadline=None,
 )
 settings.load_profile(os.environ.get("HYPOTHESIS_PROFILE", "ci"))
@@ -125,7 +123,7 @@ def _build_publish(topic: str, payload: bytes, qos: int, mid: int | None, props)
     mutations=st.integers(min_value=0, max_value=6),
     seed=st.integers(min_value=0, max_value=2**31 - 1),
 )
-@settings(suppress_health_check=list(HealthCheck), deadline=None)
+@settings(deadline=None)
 def test_publish_frame_roundtrip_or_clean_error(topic, payload, qos, mid, mutations, seed):
     import random
 
@@ -165,7 +163,7 @@ def test_publish_frame_roundtrip_or_clean_error(topic, payload, qos, mid, mutati
 
 
 @given(blob=st.binary(max_size=128))
-@settings(suppress_health_check=list(HealthCheck), deadline=None)
+@settings(deadline=None)
 def test_decode_properties_never_crashes(blob):
     try:
         decode_properties(blob, 0, PUBLISH)
@@ -219,7 +217,7 @@ def _engine_invariants(engine: ProtocolEngine) -> None:
     ),
     proto=st.sampled_from([MQTTProtocolVersion.MQTTv311, V5]),
 )
-@settings(suppress_health_check=list(HealthCheck), deadline=None)
+@settings(deadline=None)
 def test_engine_sequence_invariants(ops, proto):
     engine = ProtocolEngine(
         EngineConfig(
@@ -275,7 +273,7 @@ def test_engine_sequence_invariants(ops, proto):
 
 
 @given(header=st.binary(min_size=2, max_size=14), tail=st.binary(max_size=64))
-@settings(suppress_health_check=list(HealthCheck), deadline=None)
+@settings(deadline=None)
 def test_ws_frame_parser_bounded(header, tail):
     from mqttium.transport.websocket import _parse_frame
 

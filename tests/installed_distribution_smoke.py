@@ -78,12 +78,12 @@ _STABLE_IMPORTS = (
 
 async def _roundtrip(host: str, port: int, protocol: MQTTProtocolVersion) -> None:
     suffix = f"{int(protocol)}-{id(asyncio.current_task())}"
-    topic = f"mqttium/beta-smoke/{suffix}"
+    topic = f"mqttium/distribution-smoke/{suffix}"
     payload = f"installed-artifact-{int(protocol)}".encode()
     received: asyncio.Future[bytes] = asyncio.get_running_loop().create_future()
 
-    subscriber = AsyncClient(f"mqttium-beta-sub-{suffix}", protocol=protocol)
-    publisher = AsyncClient(f"mqttium-beta-pub-{suffix}", protocol=protocol)
+    subscriber = AsyncClient(f"mqttium-dist-sub-{suffix}", protocol=protocol)
+    publisher = AsyncClient(f"mqttium-dist-pub-{suffix}", protocol=protocol)
 
     def on_message(message: Message) -> None:
         if message.topic == topic and not received.done():

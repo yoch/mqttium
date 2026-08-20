@@ -43,7 +43,6 @@ class _AuthChallengeTransport:
         return self._closing
 
 
-@pytest.mark.asyncio
 async def test_auth_handler_exception_propagates_from_connect() -> None:
     transport = _AuthChallengeTransport()
 

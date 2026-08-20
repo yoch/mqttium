@@ -1,4 +1,4 @@
-"""Negotiated settings from CONNACK (IMPLEMENTATION-GUIDE.md §3)."""
+"""Negotiated settings from CONNACK (implementation-guide.md §3)."""
 
 from __future__ import annotations
 
@@ -9,6 +9,13 @@ from mqttium.types import Properties
 
 @dataclass(frozen=True, slots=True)
 class NegotiatedSettings:
+    """Immutable effective broker capabilities derived from CONNACK.
+
+    Defaults represent MQTT protocol maxima or feature availability when the
+    broker omits an MQTT 5 property. These values constrain publication,
+    subscription, packet sizing, keep-alive, aliases, and reconnect behavior.
+    """
+
     receive_maximum: int = 65535
     maximum_packet_size: int | None = None  # None = unlimited
     maximum_qos: int = 2
@@ -62,4 +69,5 @@ class NegotiatedSettings:
         return self.server_keep_alive
 
     def effective_client_id(self, local: str) -> str:
+        """Return the broker-assigned identifier or the configured fallback."""
         return self.assigned_client_identifier or local

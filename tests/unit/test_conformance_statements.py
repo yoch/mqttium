@@ -6,7 +6,7 @@ official OASIS archives. ``test_quoted_statements_match_the_vendored_specificati
 then verifies those quotes are still accurate, so a docstring cannot drift away
 from the text it claims to enforce.
 
-This is a sample, not a proof of full conformance — see ``docs/CONFORMANCE.md``
+This is a sample, not a proof of full conformance — see ``docs/conformance.md``
 for what is and is not covered.
 """
 

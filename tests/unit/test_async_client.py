@@ -10,55 +10,15 @@ from __future__ import annotations
 import asyncio
 
 from mqttium.api.async_client import AsyncClient
-from mqttium.codec.buffer import IncrementalDecoder
-from mqttium.codec.primitives import pack_u16
-from mqttium.enums import PacketType, QoS
-from mqttium.packets import PubAckPacket, PublishPacket, encode_frame
+from mqttium.enums import QoS
+from mqttium.packets import PublishPacket
+from tests.support import ScriptedBrokerTransport, transport_factory
 
 
-class FakeBrokerTransport:
-    """In-memory transport that acks CONNECT/PUBLISH/SUBSCRIBE instantly."""
-
-    def __init__(self) -> None:
-        self._rx: asyncio.Queue[bytes] = asyncio.Queue()
-        self._decoder = IncrementalDecoder()
-        self._closing = False
-        self.written: list[bytes] = []
-
-    async def write(self, data: bytes) -> None:
-        self.written.append(data)
-        self._decoder.feed(data)
-        for raw in self._decoder.drain_packets():
-            if raw.packet_type is PacketType.CONNECT:
-                self._rx.put_nowait(encode_frame(PacketType.CONNACK, 0, b"\x00\x00"))
-            elif raw.packet_type is PacketType.PUBLISH:
-                pub = PublishPacket.decode(raw.flags, raw.remaining)
-                if pub.qos == QoS.AT_LEAST_ONCE:
-                    assert pub.mid is not None
-                    self._rx.put_nowait(PubAckPacket(mid=pub.mid).encode())
-            elif raw.packet_type is PacketType.SUBSCRIBE:
-                mid = int.from_bytes(raw.remaining[:2], "big")
-                self._rx.put_nowait(encode_frame(PacketType.SUBACK, 0, pack_u16(mid) + bytes([1])))
-
-    async def read(self, n: int = 65536) -> bytes:
-        return await self._rx.get()
-
-    async def close(self) -> None:
-        self._closing = True
-        self._rx.put_nowait(b"")
-
-    def is_closing(self) -> bool:
-        return self._closing
-
-
-def _client_with_fake() -> tuple[AsyncClient, FakeBrokerTransport]:
+def _client_with_fake() -> tuple[AsyncClient, ScriptedBrokerTransport]:
     client = AsyncClient(client_id="test")
-    fake = FakeBrokerTransport()
-
-    async def factory(host: str, port: int, *, ssl: object = None) -> FakeBrokerTransport:
-        return fake
-
-    client._transport_factory = factory
+    fake = ScriptedBrokerTransport(suback_reason=1)
+    client._transport_factory = transport_factory(fake)
     return client, fake
 
 
@@ -103,12 +63,8 @@ async def test_qos0_receipt_immediate() -> None:
 async def test_full_message_queue_close_loses_nothing() -> None:
     """P1.7: the end-of-stream sentinel must never evict a queued message."""
     client = AsyncClient(client_id="test", max_pending_messages=4, message_delivery="iterator")
-    fake = FakeBrokerTransport()
-
-    async def factory(host: str, port: int, *, ssl: object = None) -> FakeBrokerTransport:
-        return fake
-
-    client._transport_factory = factory
+    fake = ScriptedBrokerTransport()
+    client._transport_factory = transport_factory(fake)
     await client.connect("fake", 1883, timeout=2.0)
 
     for i in range(4):

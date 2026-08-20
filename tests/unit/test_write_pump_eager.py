@@ -88,7 +88,6 @@ def _pump(**kwargs: int) -> WritePump:
     )
 
 
-@pytest.mark.asyncio
 async def test_eager_write_reaches_the_transport_without_a_loop_turn() -> None:
     transport = _EagerTransport()
     pump = _pump()
@@ -105,7 +104,6 @@ async def test_eager_write_reaches_the_transport_without_a_loop_turn() -> None:
         await pump.stop()
 
 
-@pytest.mark.asyncio
 async def test_eager_write_updates_last_outbound_for_keepalive() -> None:
     transport = _EagerTransport()
     pump = _pump()
@@ -118,7 +116,6 @@ async def test_eager_write_updates_last_outbound_for_keepalive() -> None:
         await pump.stop()
 
 
-@pytest.mark.asyncio
 async def test_eager_write_is_declined_while_the_queue_is_not_empty() -> None:
     """A queued frame is always owed first, so order forbids overtaking it."""
     transport = _EagerTransport()
@@ -135,7 +132,6 @@ async def test_eager_write_is_declined_while_the_queue_is_not_empty() -> None:
         pump.discard()
 
 
-@pytest.mark.asyncio
 async def test_eager_write_is_declined_while_a_write_is_in_flight() -> None:
     transport = _EagerTransport()
     pump = _pump()
@@ -147,7 +143,6 @@ async def test_eager_write_is_declined_while_a_write_is_in_flight() -> None:
     assert pump.eager_writes == 0
 
 
-@pytest.mark.asyncio
 async def test_eager_write_is_declined_while_a_producer_is_waiting() -> None:
     """A producer suspended for queue space must not be overtaken."""
     transport = _EagerTransport()
@@ -159,7 +154,6 @@ async def test_eager_write_is_declined_while_a_producer_is_waiting() -> None:
     assert pump.eager_writes == 0
 
 
-@pytest.mark.asyncio
 async def test_segmented_items_are_never_written_eagerly() -> None:
     transport = _EagerTransport()
     pump = _pump()
@@ -170,7 +164,6 @@ async def test_segmented_items_are_never_written_eagerly() -> None:
     assert pump.eager_writes == 0
 
 
-@pytest.mark.asyncio
 async def test_transport_without_write_nowait_never_takes_the_eager_path() -> None:
     transport = _PlainTransport()
     pump = _pump()
@@ -185,7 +178,6 @@ async def test_transport_without_write_nowait_never_takes_the_eager_path() -> No
         await pump.stop()
 
 
-@pytest.mark.asyncio
 async def test_transport_declining_the_eager_write_falls_back_to_the_queue() -> None:
     """A drain is due, so the frame goes back to the task that can await one."""
     transport = _EagerTransport(accept_eager=False)
@@ -202,7 +194,6 @@ async def test_transport_declining_the_eager_write_falls_back_to_the_queue() -> 
         await pump.stop()
 
 
-@pytest.mark.asyncio
 async def test_wire_order_is_preserved_across_eager_and_queued_frames() -> None:
     transport = _EagerTransport()
     pump = _pump()
@@ -224,7 +215,6 @@ async def test_wire_order_is_preserved_across_eager_and_queued_frames() -> None:
         await pump.stop()
 
 
-@pytest.mark.asyncio
 async def test_eager_write_cannot_land_inside_a_segmented_write() -> None:
     """The `_writing` flag exists for exactly this case.
 
@@ -252,7 +242,6 @@ async def test_eager_write_cannot_land_inside_a_segmented_write() -> None:
         await pump.stop()
 
 
-@pytest.mark.asyncio
 async def test_only_first_write_of_a_synchronous_burst_is_eager() -> None:
     """A tight producer seeds once, then wakes the writer's batching path."""
     transport = _EagerTransport()
@@ -277,7 +266,6 @@ async def test_only_first_write_of_a_synchronous_burst_is_eager() -> None:
         await pump.stop()
 
 
-@pytest.mark.asyncio
 async def test_synchronous_burst_respects_queue_capacity_after_first_eager() -> None:
     """Eager is not an escape hatch from normal burst backpressure."""
     transport = _EagerTransport()
@@ -300,7 +288,6 @@ async def test_synchronous_burst_respects_queue_capacity_after_first_eager() -> 
         await pump.stop()
 
 
-@pytest.mark.asyncio
 async def test_paced_writes_rearm_eager_on_the_next_loop_turn() -> None:
     """Yielding between writes keeps the latency win that eager was added for."""
     transport = _EagerTransport()
@@ -321,7 +308,6 @@ async def test_paced_writes_rearm_eager_on_the_next_loop_turn() -> None:
         await pump.stop()
 
 
-@pytest.mark.asyncio
 async def test_stale_rearm_cannot_arm_a_new_transport_generation() -> None:
     old = _EagerTransport()
     pump = _pump()
@@ -345,7 +331,6 @@ async def test_stale_rearm_cannot_arm_a_new_transport_generation() -> None:
         await pump.stop()
 
 
-@pytest.mark.asyncio
 async def test_eager_path_still_refuses_a_stale_epoch() -> None:
     transport = _EagerTransport()
     pump = _pump()
@@ -359,7 +344,6 @@ async def test_eager_path_still_refuses_a_stale_epoch() -> None:
         await pump.stop()
 
 
-@pytest.mark.asyncio
 async def test_stopping_drops_the_eager_path_with_its_transport() -> None:
     """A frame must never reach a transport this pump no longer owns."""
     transport = _EagerTransport()
@@ -373,7 +357,6 @@ async def test_stopping_drops_the_eager_path_with_its_transport() -> None:
     assert pump.queued_messages == 1
 
 
-@pytest.mark.asyncio
 async def test_batched_frames_are_not_counted_as_eager() -> None:
     """try_enqueue_many keeps its atomic all-or-nothing queue admission."""
     transport = _EagerTransport()
@@ -413,7 +396,6 @@ class _FailingTransport(_EagerTransport):
         return self.closed
 
 
-@pytest.mark.asyncio
 async def test_writer_failure_drops_the_eager_binding() -> None:
     """A dead transport must not stay reachable through the eager path.
 
@@ -450,7 +432,6 @@ async def test_writer_failure_drops_the_eager_binding() -> None:
     assert pump.queued_messages == 1
 
 
-@pytest.mark.asyncio
 async def test_reset_drops_the_eager_binding_until_the_next_start() -> None:
     old = _EagerTransport()
     pump = _pump()
@@ -475,7 +456,6 @@ async def test_reset_drops_the_eager_binding_until_the_next_start() -> None:
         await pump.stop()
 
 
-@pytest.mark.asyncio
 async def test_discard_drops_the_eager_binding() -> None:
     transport = _EagerTransport()
     pump = _pump()
@@ -489,7 +469,6 @@ async def test_discard_drops_the_eager_binding() -> None:
     await pump.stop()
 
 
-@pytest.mark.asyncio
 async def test_large_payloads_fall_back_to_the_queued_path() -> None:
     """Payloads past SEGMENT_THRESHOLD keep exactly their pre-eager behaviour.
 

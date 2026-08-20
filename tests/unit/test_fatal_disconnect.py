@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import asyncio
 
-import pytest
-
 from mqttium.api.async_client import AsyncClient
 from mqttium.enums import MQTTProtocolVersion, PacketType
 from mqttium.packets import encode_frame
@@ -102,7 +100,6 @@ class _BlockedFatalTransport(_FatalTransport):
         self._rx.put_nowait(bytes(big))
 
 
-@pytest.mark.asyncio
 async def test_fatal_oversize_sends_disconnect_0x95_v5() -> None:
     client = AsyncClient(client_id="c", protocol=MQTTProtocolVersion.MQTTv5)
     fake = _FatalTransport(MQTTProtocolVersion.MQTTv5)
@@ -121,7 +118,6 @@ async def test_fatal_oversize_sends_disconnect_0x95_v5() -> None:
     assert disconnects[-1][2] == 0x95  # reason code byte
 
 
-@pytest.mark.asyncio
 async def test_fatal_oversize_no_disconnect_v311() -> None:
     client = AsyncClient(client_id="c", protocol=MQTTProtocolVersion.MQTTv311)
     fake = _FatalTransport(MQTTProtocolVersion.MQTTv311)
@@ -138,7 +134,6 @@ async def test_fatal_oversize_no_disconnect_v311() -> None:
     assert not disconnects
 
 
-@pytest.mark.asyncio
 async def test_fatal_disconnect_never_writes_concurrently_with_write_pump() -> None:
     client = AsyncClient(client_id="single-writer", protocol=MQTTProtocolVersion.MQTTv5)
     fake = _BlockedFatalTransport()

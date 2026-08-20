@@ -30,7 +30,7 @@ The target is contention, so single-producer throughput is a guardrail rather th
 ## Acceptance gate
 
 - Target contention benchmark improves by >= 5% at at least two meaningful concurrency points, or removes a demonstrably large number of redundant wakes with >= 2% CPU/latency gain in a directly isolated microbenchmark.
-- Candidate wins the majority required by `docs/BENCHMARKING.md` and the harness A/A control passes.
+- Candidate wins the majority required by `docs/benchmarking.md` and the harness A/A control passes.
 - Single/few-producer throughput does not regress by > 3%.
 - Loop lag does not regress by > 5%.
 - No fairness/starvation regression in focused tests.

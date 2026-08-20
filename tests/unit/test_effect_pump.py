@@ -152,7 +152,6 @@ async def test_full_callback_queue_retains_async_completion_backpressure() -> No
     await client._shutdown_callback_worker(drain=False)
 
 
-@pytest.mark.asyncio
 async def test_single_send_effect_bypasses_queue_and_accounting() -> None:
     client = AsyncClient(client_id="effect-fast-path")
     client._engine._emit(EffectKind.SEND, b"payload")
@@ -166,7 +165,6 @@ async def test_single_send_effect_bypasses_queue_and_accounting() -> None:
     client._outbound.task_done()
 
 
-@pytest.mark.asyncio
 async def test_discard_preserves_terminal_publish_order() -> None:
     client = AsyncClient(client_id="effect-discard")
     client._connection_epoch = 2

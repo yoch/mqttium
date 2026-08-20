@@ -1,6 +1,6 @@
 """Paho VERSION2 compatibility.
 
-See ``docs/COMPAT.md`` for the detailed policy.
+See ``docs/paho-compatibility.md`` for the detailed policy.
 """
 
 from mqttium.compat.paho import (

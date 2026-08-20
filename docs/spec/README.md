@@ -9,7 +9,7 @@ version, label and quote instead of a recollection.
 | [`mqtt-v3.1.1-statements.json`](mqtt-v3.1.1-statements.json) | 139 |
 | [`mqtt-v5.0-statements.json`](mqtt-v5.0-statements.json) | 251 |
 
-`docs/CONFORMANCE.md` is the audit that maps these onto the implementation.
+`docs/conformance.md` is the audit that maps these onto the implementation.
 This directory is only the source material.
 
 ## Provenance
@@ -70,7 +70,7 @@ python tools/extract_spec_statements.py --from-archive V311_ZIP V5_ZIP
 ```
 
 The indexes are generated. Fix `tools/extract_spec_statements.py` and re-run
-rather than editing the JSON, and re-run the audit in `docs/CONFORMANCE.md`
+rather than editing the JSON, and re-run the audit in `docs/conformance.md`
 whenever the statement set changes.
 
 ## Copyright

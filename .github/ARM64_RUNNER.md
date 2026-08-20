@@ -11,19 +11,24 @@ separate threat model explicitly makes that safe. A pull request can contain
 arbitrary code, so running it directly on a persistent machine would give that
 code access to the runner account and whatever the host can reach.
 
-The ARM64 workflows therefore run only from trusted default-branch code:
+The ARM64 workflows therefore run only from trusted default-branch workflow
+definitions and share one non-cancelling concurrency group:
 
 - `ARM64 CI`: push to `main` or manual dispatch;
-- `ARM64 Benchmarks`: weekly schedule or manual dispatch;
 - `ARM64 Paired Regression`: manual dispatch;
-- `ARM64 Finalization Soak`: manual dispatch;
+- `ARM64 Network Release Gate`: manual dispatch;
 - `Published ARM64 Smoke`: manual dispatch of an exact published version.
 
-`ARM64 Paired Regression` necessarily executes the selected base/candidate
-source trees. Treat that workflow as a privileged maintainer operation: use
-only refs or exact SHAs whose code has already been reviewed and intentionally
-trusted for execution on the persistent runner. Never point it at an arbitrary
-external pull-request head merely to obtain a performance number.
+Manual source and published-package jobs refuse to run unless the dispatch ref
+is `main`. Performance gates additionally require exact 40-character commit
+SHAs and an explicit confirmation that every selected commit has been reviewed
+and is trusted. Moving branches and tags are not accepted as performance inputs.
+
+`ARM64 Paired Regression` and `ARM64 Network Release Gate` necessarily execute
+the selected base/candidate source trees. Treat them as privileged maintainer
+operations. An exact SHA makes evidence reproducible, but does not make code
+trustworthy: review it before dispatch. Never use an arbitrary external
+pull-request head merely to obtain a performance number.
 
 The existing GitHub-hosted PR, release, fuzz, macOS, and Windows workflows
 remain the primary portability/version gates.
@@ -121,10 +126,9 @@ controls still fail the workflow, and A/B never runs unless a control passes.
 This avoids accepting noisy evidence without silently turning the thresholds
 into a best-of-N search.
 
-Defaults are intentionally reviewable historical anchors rather than moving
-branches: capacity starts from `v1.0.0rc5` and latency from exact pre-eager commit
-`3962f328331b8414a755332aefc3b3d7c261dc6f`. A maintainer may override them at
-manual dispatch only with other reviewed/trusted refs.
+The workflow has no historical default refs. Every campaign records explicit,
+reviewed baseline and candidate SHAs so old release-candidate assumptions cannot
+silently survive into a stable-release decision.
 
 ## Persistent-runner hygiene
 
@@ -132,6 +136,7 @@ Unlike GitHub-hosted runners, this machine survives between jobs. ARM64
 workflows therefore:
 
 - create a fresh virtual environment below `RUNNER_TEMP`;
+- use a run/attempt-specific working root and serialize every ARM64 workflow;
 - use isolated Mosquitto configuration and data paths;
 - record and terminate the broker PID in an `always()` cleanup step;
 - disable persisted checkout credentials;

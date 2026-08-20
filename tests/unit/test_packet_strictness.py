@@ -53,6 +53,8 @@ def test_puback_rejects_invalid_v5_reason_code() -> None:
 
 
 def test_suback_requires_nonzero_mid_and_valid_reason_codes() -> None:
+    with pytest.raises(MalformedPacketError, match="too short"):
+        SubAckPacket.decode(b"\x00\x01", V311)
     with pytest.raises(MalformedPacketError, match="must not be 0"):
         SubAckPacket.decode(b"\x00\x00\x00", V311)
     with pytest.raises(MalformedPacketError, match="reason code"):
@@ -61,9 +63,31 @@ def test_suback_requires_nonzero_mid_and_valid_reason_codes() -> None:
         SubAckPacket.decode(b"\x00\x01\x00", V5)
 
 
+def test_suback_decodes_all_valid_reason_codes() -> None:
+    v311 = SubAckPacket.decode(b"\x00\x07\x00\x01\x02\x80", V311)
+    assert v311.mid == 7
+    assert v311.reason_codes == (0, 1, 2, 0x80)
+
+    v5 = SubAckPacket.decode(b"\x00\x08\x00\x00\x01\x02\x91", V5)
+    assert v5.mid == 8
+    assert v5.reason_codes == (0, 1, 2, 0x91)
+
+
 def test_unsuback_v5_requires_reason_payload() -> None:
+    with pytest.raises(MalformedPacketError, match="too short"):
+        UnsubAckPacket.decode(b"\x00", V311)
+    with pytest.raises(MalformedPacketError, match="trailing"):
+        UnsubAckPacket.decode(b"\x00\x01\x00", V311)
     with pytest.raises(MalformedPacketError, match="missing reason"):
         UnsubAckPacket.decode(b"\x00\x01\x00", V5)
+    with pytest.raises(MalformedPacketError, match="reason code"):
+        UnsubAckPacket.decode(b"\x00\x01\x00\x7f", V5)
+
+
+def test_unsuback_decodes_valid_mqtt5_reasons() -> None:
+    packet = UnsubAckPacket.decode(b"\x00\x09\x00\x00\x11\x80", V5)
+    assert packet.mid == 9
+    assert packet.reason_codes == (0, 0x11, 0x80)
 
 
 def test_disconnect_mqtt311_rejects_body() -> None:

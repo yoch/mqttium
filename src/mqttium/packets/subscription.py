@@ -23,6 +23,14 @@ from mqttium.types import Properties
 
 @dataclass(slots=True, frozen=True)
 class SubscribeOptions:
+    """Per-filter MQTT subscription options.
+
+    ``no_local``, ``retain_as_published``, and ``retain_handling`` are MQTT 5
+    features and raise :class:`~mqttium.ProtocolError` with earlier protocols.
+    ``retain_handling`` accepts 0 (send retained messages), 1 (only for a new
+    subscription), or 2 (never send them).
+    """
+
     qos: QoS = QoS.AT_MOST_ONCE
     no_local: bool = False
     retain_as_published: bool = False

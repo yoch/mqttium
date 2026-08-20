@@ -44,12 +44,15 @@ class Properties:
         )
 
     def get(self, name: str, default: Any = None) -> Any:
+        """Return a property value or ``default`` when it is absent."""
         return self.values.get(name, default)
 
     def set(self, name: str, value: Any) -> None:
+        """Set or replace a singleton property value."""
         self.values[name] = value
 
     def add_user_property(self, key: str, value: str) -> None:
+        """Append one ordered MQTT 5 user-property pair."""
         items = self.values.setdefault("user_property", [])
         items.append((key, value))
 
@@ -59,6 +62,18 @@ class Properties:
 
 @dataclass(slots=True, frozen=True)
 class Message:
+    """Immutable application message delivered by :class:`AsyncClient`.
+
+    Attributes:
+        topic: Decoded MQTT topic name.
+        payload: Owned payload bytes.
+        qos: Delivery QoS.
+        retain: Whether the broker marked the delivery as retained.
+        dup: Whether the MQTT PUBLISH carried the DUP flag.
+        mid: Packet identifier for QoS 1/2, otherwise ``None``.
+        properties: MQTT 5 PUBLISH properties, otherwise ``None``.
+    """
+
     topic: str
     payload: bytes
     qos: QoS = QoS.AT_MOST_ONCE

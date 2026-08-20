@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import random
+
 import pytest
 
 from mqttium.codec.buffer import IncrementalDecoder
-from mqttium.errors import MalformedPacketError, PacketTooLargeError
+from mqttium.errors import MQTTError, PacketTooLargeError
 
 
 @pytest.mark.parametrize(
@@ -25,7 +27,7 @@ def test_malformed_does_not_crash(blob: bytes) -> None:
             pkt = dec.next_packet()
             if pkt is None:
                 break
-    except (MalformedPacketError, PacketTooLargeError, ValueError):
+    except MQTTError:
         pass
 
 
@@ -40,14 +42,13 @@ def test_oversized_packet_rejected() -> None:
         dec2.next_packet()
 
 
-def test_random_noise_stable() -> None:
-    import os
-
+def test_seeded_noise_stable() -> None:
+    rng = random.Random(20260820)
     dec = IncrementalDecoder(max_packet_size=4096)
     for _ in range(100):
-        dec.feed(os.urandom(64))
+        dec.feed(rng.randbytes(64))
         try:
             while dec.next_packet() is not None:
                 pass
-        except (MalformedPacketError, PacketTooLargeError, ValueError):
+        except MQTTError:
             dec.clear()
