@@ -172,11 +172,13 @@ class EffectPump:
             others: list[EngineEffect] = []
             out_of_order = False
             compacted = False
+            message_boundary = False
             for effect in effects:
                 if effect.kind is EffectKind.SEND:
                     if others:
                         out_of_order = True
                     sends.append(effect)
+                    message_boundary = True
                     continue
 
                 if (
@@ -184,6 +186,7 @@ class EffectPump:
                     and not effect.requires_delivery_mark
                     and effect.decoded_property_wire_size is None
                     and others
+                    and not message_boundary
                 ):
                     previous = others[-1]
                     if (
@@ -201,6 +204,7 @@ class EffectPump:
                         compacted = True
                         continue
                 others.append(effect)
+                message_boundary = False
 
             if out_of_order:
                 self.reordered_batches += 1
