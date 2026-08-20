@@ -110,12 +110,14 @@ def test_compaction_never_crosses_send_marked_or_decoded_boundaries() -> None:
         EffectKind.MESSAGE,
         EffectKind.MESSAGE,
         EffectKind.MESSAGE,
+        EffectKind.MESSAGE,
         EffectKind.DECODED_MESSAGE,
         EffectKind.MESSAGE_BATCH,
     ]
     assert pump.pending[1].data == "before-send"
     assert pump.pending[2].data == "after-send"
     assert pump.pending[3].data == "marked"
+    assert pump.pending[4].data == "decoded-neighbor"
     batch = pump.pending[-1].data
     assert isinstance(batch, _MessageEffectBatch)
     assert batch.messages == ["tail-0", "tail-1"]
