@@ -1,0 +1,166 @@
+--- a/src/mqttium/api/_delivery.py
++++ b/src/mqttium/api/_delivery.py
+@@ -530,6 +530,20 @@
+         self.callback_queue.put_nowait(job)
+         self._reserve_callback_batch(len(messages))
+ 
++    def deliver_callback_run_inline(
++        self,
++        messages: list[Message],
++        callback: Callable[[Message], Any] | None,
++    ) -> bool:
++        if callback is None:
++            return True
++        if self._callback_batch_capacity(False) < len(messages):
++            return False
++        if any(not self._is_small(message) for message in messages):
++            return False
++        self._enqueue_message_batch(callback, messages, iterator_delivery=False)
++        return True
++
+     def deliver_batch_inline(  # noqa: C901
+         self,
+         effects: deque[EngineEffect],
+--- a/src/mqttium/api/_effects.py
++++ b/src/mqttium/api/_effects.py
+@@ -128,6 +128,15 @@
+         pending = len(self.pending)
+         if pending > self.pending_high_water:
+             self.pending_high_water = pending
++
++    def record_inline_batch(self, count: int) -> None:
++        self.batches += 1
++        self.multi_effect_batches += count > 1
++        self.enqueued += count
++        self.applied += count
++        self.inline_effects += count
++        if self.waiters:
++            self.progress.set()
+ 
+     def stats(self) -> EffectStats:
+         """Snapshot the deque and the ordering decisions taken so far."""
+--- a/src/mqttium/api/async_client.py
++++ b/src/mqttium/api/async_client.py
+@@ -36,8 +36,8 @@
+     TaskStats,
+     TransportStats,
+ )
+-from mqttium.codec.buffer import DEFAULT_MAX_PACKET_SIZE, IncrementalDecoder
+-from mqttium.enums import ConnectionState, MQTTProtocolVersion, QoS
++from mqttium.codec.buffer import DEFAULT_MAX_PACKET_SIZE, IncrementalDecoder, RawPacket
++from mqttium.enums import ConnectionState, MQTTProtocolVersion, PacketType, QoS
+ from mqttium.errors import (
+     FlowControlError,
+     MQTTError,
+@@ -63,6 +63,7 @@
+     ProtocolEngine,
+     PublishFailure,
+ )
++from mqttium.protocol.inbound import decode_qos0_message_v311
+ from mqttium.protocol.negotiated import NegotiatedSettings
+ from mqttium.protocol.reconnect import ReconnectPolicy
+ from mqttium.persistence.memory import InflightStore
+@@ -82,6 +83,7 @@
+ 
+ _GRACEFUL_DISCONNECT_DRAIN_TIMEOUT = 5.0
+ _FATAL_DISCONNECT_DRAIN_TIMEOUT = 0.25
++_MESSAGE_CAPTURE_MIN_BUFFERED_BYTES = 16 * 1024
+ 
+ 
+ def _positive(name: str, value: float) -> None:
+@@ -1445,8 +1447,63 @@
+                 break
+         return count, decoded_bytes, False
+ 
++    def _process_captured_ingress_batch(self) -> tuple[int, int, bool, list[Message]]:
++        engine = self._engine
++        handlers = engine._handlers_by_state[ConnectionState.CONNECTED]
++        original_publish = handlers[PacketType.PUBLISH]
++        captured: list[Message] = []
++
++        def capture_publish(raw: RawPacket) -> None:
++            if ((raw.flags >> 1) & 0x03) == 0:
++                captured.append(decode_qos0_message_v311(raw))
++            else:
++                original_publish(raw)
++
++        def materialize_captured() -> None:
++            if not captured:
++                return
++            engine._effects.extend(
++                EngineEffect(EffectKind.MESSAGE, message, False, None) for message in captured
++            )
++            captured.clear()
++
++        handlers[PacketType.PUBLISH] = capture_publish
++        try:
++            decoder = self._decoder
++            inbound = engine.inbound
++            max_bytes = self._max_ingress_batch_bytes
++            count = 0
++            decoded_bytes = 0
++            handoff_required = False
++            for _ in range(256):
++                packet = decoder.next_packet()
++                if packet is None:
++                    break
++                if captured and (
++                    packet.packet_type is not PacketType.PUBLISH
++                    or ((packet.flags >> 1) & 0x03) != 0
++                ):
++                    materialize_captured()
++                engine.handle_raw(packet)
++                count += 1
++                decoded_bytes += len(packet.remaining) + 5
++                if inbound._autoack_handoff_required:
++                    handoff_required = True
++                    break
++                if decoded_bytes >= max_bytes:
++                    break
++        finally:
++            handlers[PacketType.PUBLISH] = original_publish
++        if engine._effects:
++            materialize_captured()
++        return count, decoded_bytes, handoff_required, captured
++
+     async def _read_loop(self) -> None:  # noqa: C901
+         assert self._transport is not None
++        capture_messages = (
++            self._delivery.mode == "callback"
++            and self._engine.config.protocol is MQTTProtocolVersion.MQTTv311
++        )
+         try:
+             while not self._transport.is_closing():
+                 data = await self._transport.read(256 * 1024)
+@@ -1458,9 +1515,29 @@
+                 # byte backpressure all the way to transport.read().
+                 while True:
+                     async with self._engine_lock:
++                        captured: list[Message] = []
+                         with self._engine.store.batch():
+-                            handled, handled_bytes, handoff_required = self._process_ingress_batch()
+-                        if handled:
++                            if (
++                                capture_messages
++                                and not self._effect_pump.pending
++                                and self._decoder.buffered >= _MESSAGE_CAPTURE_MIN_BUFFERED_BYTES
++                            ):
++                                handled, handled_bytes, handoff_required, captured = (
++                                    self._process_captured_ingress_batch()
++                                )
++                            else:
++                                handled, handled_bytes, handoff_required = (
++                                    self._process_ingress_batch()
++                                )
++                        if captured:
++                            if self._delivery.deliver_callback_run_inline(captured, self.on_message):
++                                self._effect_pump.record_inline_batch(len(captured))
++                            else:
++                                self._engine._effects.extend(
++                                    EngineEffect(EffectKind.MESSAGE, message, False, None)
++                                    for message in captured
++                                )
++                        if handled and self._engine.has_pending_effects:
+                             self._collect_effects_locked()
+                     if self._effect_pump.pending:
+                         await self._drain_effects()
