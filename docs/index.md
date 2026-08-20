@@ -1,7 +1,7 @@
 # MQTTium documentation
 
 <p align="center">
-  <img src="assets/mqttium-logo.svg" alt="MQTTium logo" width="240">
+  <img src="assets/mqttium-logo.svg" alt="MQTTium logo" width="180">
 </p>
 
 MQTTium is a dependency-free, async-native MQTT 3.1.1 and MQTT 5 client for
