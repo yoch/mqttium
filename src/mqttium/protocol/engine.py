@@ -64,29 +64,6 @@ from mqttium.errors import (
 # MQTT 5 Table 3-11: 0x00 (Success) is sent by the Server only.
 _CLIENT_AUTH_REASON_CODES = frozenset({0x18, 0x19})
 
-_ALLOWED_PACKETS_BY_STATE: dict[ConnectionState, frozenset[PacketType]] = {
-    ConnectionState.CONNECTING: frozenset(
-        {
-            PacketType.CONNACK,
-            PacketType.AUTH,
-        }
-    ),
-    ConnectionState.CONNECTED: frozenset(
-        {
-            PacketType.PUBLISH,
-            PacketType.PUBACK,
-            PacketType.PUBREC,
-            PacketType.PUBREL,
-            PacketType.PUBCOMP,
-            PacketType.SUBACK,
-            PacketType.UNSUBACK,
-            PacketType.PINGRESP,
-            PacketType.DISCONNECT,
-            PacketType.AUTH,
-        }
-    ),
-}
-
 
 class ProtocolEngine:
     """Pure MQTT session/QoS state machine."""
@@ -121,25 +98,26 @@ class ProtocolEngine:
         # Server's terminal AUTH Success (0x00). Initial enhanced authentication
         # is represented by CONNECTING and completes with CONNACK instead.
         self._reauth_in_progress = False
-        self._handlers = {
-            PacketType.CONNACK: self._on_connack,
-            PacketType.PUBLISH: self.inbound.handle_publish,
-            PacketType.PUBACK: self.outbound.on_puback,
-            PacketType.PUBREC: self.outbound.on_pubrec,
-            PacketType.PUBREL: self.inbound.on_pubrel,
-            PacketType.PUBCOMP: self.outbound.on_pubcomp,
-            PacketType.SUBACK: self._on_suback,
-            PacketType.UNSUBACK: self._on_unsuback,
-            PacketType.PINGRESP: self._on_pingresp,
-            PacketType.DISCONNECT: self._on_disconnect,
-            PacketType.AUTH: self._on_auth,
-        }
         # What a state accepts and what handles it are one table, so `handle_raw`
         # resolves both in a single lookup and adding a packet type is one edit.
         # Anything absent is refused — PINGREQ included.
         self._handlers_by_state = {
-            state: {ptype: self._handlers[ptype] for ptype in allowed}
-            for state, allowed in _ALLOWED_PACKETS_BY_STATE.items()
+            ConnectionState.CONNECTING: {
+                PacketType.CONNACK: self._on_connack,
+                PacketType.AUTH: self._on_auth,
+            },
+            ConnectionState.CONNECTED: {
+                PacketType.PUBLISH: self.inbound.handle_publish,
+                PacketType.PUBACK: self.outbound.on_puback,
+                PacketType.PUBREC: self.outbound.on_pubrec,
+                PacketType.PUBREL: self.inbound.on_pubrel,
+                PacketType.PUBCOMP: self.outbound.on_pubcomp,
+                PacketType.SUBACK: self._on_suback,
+                PacketType.UNSUBACK: self._on_unsuback,
+                PacketType.PINGRESP: self._on_pingresp,
+                PacketType.DISCONNECT: self._on_disconnect,
+                PacketType.AUTH: self._on_auth,
+            },
         }
         # Hydrate packet ids + offline queue from a durable store (restart).
         self.outbound.hydrate()
