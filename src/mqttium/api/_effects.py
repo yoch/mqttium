@@ -10,13 +10,19 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from collections.abc import Callable, Iterator
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, cast
 
 from mqttium.api.stats import EffectStats
 from mqttium.protocol.effects import EffectKind, EngineEffect
 
 if TYPE_CHECKING:
     from mqttium.protocol.engine import ProtocolEngine
+
+
+# Runtime-private physical marker. It is intentionally not an EffectKind member:
+# ProtocolEngine and AsyncClient retain their closed/exhaustive protocol effect
+# vocabulary, while generic MESSAGE delivery still sees this as a hard boundary.
+_MESSAGE_BATCH_KIND = cast(EffectKind, object())
 
 
 class _MessageEffectBatch:
@@ -167,7 +173,7 @@ class EffectPump:
             # Partition SEND-first in one pass, and let that same pass answer
             # whether the batch needed it. The same pass also compacts adjacent
             # non-persisted MESSAGE effects; no second scan is added to ingress.
-            # The compact payload is runtime-private and never escapes EffectPump.
+            # A private marker keeps compact runs opaque to generic delivery.
             sends: list[EngineEffect] = []
             others: list[EngineEffect] = []
             out_of_order = False
@@ -193,15 +199,14 @@ class EffectPump:
                         previous.kind is EffectKind.MESSAGE
                         and not previous.requires_delivery_mark
                         and previous.decoded_property_wire_size is None
-                        and not isinstance(previous.data, _MessageEffectBatch)
                     ):
+                        previous.kind = _MESSAGE_BATCH_KIND
                         previous.data = _MessageEffectBatch(previous.data, effect.data)
                         compacted = True
                         continue
-                    if previous.kind is EffectKind.MESSAGE and isinstance(
-                        previous.data, _MessageEffectBatch
-                    ):
-                        previous.data.messages.append(effect.data)
+                    if previous.kind is _MESSAGE_BATCH_KIND:
+                        batch: _MessageEffectBatch = previous.data
+                        batch.messages.append(effect.data)
                         compacted = True
                         continue
                 others.append(effect)
@@ -283,11 +288,9 @@ class EffectPump:
         return True
 
     def _slow_effect(self, effect: EngineEffect) -> EngineEffect:
-        if effect.kind is not EffectKind.MESSAGE or not isinstance(
-            effect.data, _MessageEffectBatch
-        ):
+        if effect.kind is not _MESSAGE_BATCH_KIND:
             return effect
-        batch = effect.data
+        batch: _MessageEffectBatch = effect.data
         proxy = self._message_batch_slow_effect
         proxy.data = batch.messages[batch.offset]
         return proxy
@@ -295,8 +298,8 @@ class EffectPump:
     def _advance_head(self, effect: EngineEffect) -> None:
         if not self.pending or self.pending[0] is not effect:
             return
-        if effect.kind is EffectKind.MESSAGE and isinstance(effect.data, _MessageEffectBatch):
-            batch = effect.data
+        if effect.kind is _MESSAGE_BATCH_KIND:
+            batch: _MessageEffectBatch = effect.data
             batch.offset += 1
             if batch.offset < len(batch.messages):
                 self._complete()
@@ -319,9 +322,7 @@ class EffectPump:
         try:
             while self.pending:
                 effect = self.pending[0]
-                if effect.kind is EffectKind.MESSAGE and isinstance(
-                    effect.data, _MessageEffectBatch
-                ):
+                if effect.kind is _MESSAGE_BATCH_KIND:
                     if self._consume_message_batch(epoch):
                         continue
                     break
@@ -364,9 +365,7 @@ class EffectPump:
                     if epoch != self.owner._connection_epoch:
                         self.discard_connection_effects()
                         continue
-                    if effect.kind is EffectKind.MESSAGE and isinstance(
-                        effect.data, _MessageEffectBatch
-                    ):
+                    if effect.kind is _MESSAGE_BATCH_KIND:
                         if self._consume_message_batch(epoch):
                             continue
                     elif effect.kind is EffectKind.MESSAGE:
@@ -461,10 +460,8 @@ class EffectPump:
                 EffectKind.PUBLISH_COMPLETE,
                 EffectKind.PUBLISH_FAILED,
             ):
-                if effect.kind is EffectKind.MESSAGE and isinstance(
-                    effect.data, _MessageEffectBatch
-                ):
-                    batch = effect.data
+                if effect.kind is _MESSAGE_BATCH_KIND:
+                    batch: _MessageEffectBatch = effect.data
                     discarded += len(batch.messages) - batch.offset
                 else:
                     discarded += 1
