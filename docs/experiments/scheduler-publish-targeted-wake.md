@@ -2,6 +2,11 @@
 
 Baseline: `main@e80618154bacefed5626d9eb9ba46edf560b54e7`.
 
+Status: **Accepted and merged in
+[#285](https://github.com/yoch/mqttium/pull/285)** after eligible ARM64
+true-completion, fairness, non-regression, and integration gates passed. The
+dated reports remain unchanged records of the earlier diagnostic state.
+
 ## Hypothesis
 
 All `publish()` callers blocked by protocol admission currently wait on one `asyncio.Event`. A single ACK can set that event and make every blocked publisher runnable even when only one or a few protocol slots became available. Under high producer concurrency this can create a thundering herd around `_engine_lock` and inflate CPU and tail latency.
@@ -42,9 +47,10 @@ and writer remain the only sources of admission truth: a woken producer always
 retries `queue_publish` / `queue_publish_many` under `_engine_lock`.
 
 Correctness coverage is in `tests/unit/test_publish_targeted_wake.py` (and the
-pre-existing `tests/unit/test_async_publish_admission.py`). Diagnostic A/A + A/B
-on an ineligible cloud VM (2026-08-19): +29% / +127% / +57% at 4×inf1, 16×inf1,
-16×inf4; single-publisher cells neutral; writer-capacity 1.003 / 1.006. Keep;
-confirm on an eligible runner. Weighted/FIFO admission state was not added.
+pre-existing `tests/unit/test_async_publish_admission.py`). Initial diagnostic
+A/A + A/B on an ineligible cloud VM (2026-08-19) motivated the eligible ARM64
+campaign. PR #285 records the accepted true-completion, fairness,
+non-regression, and composed-integration evidence. Weighted/FIFO admission
+state was not added.
 
 See [`docs/reports/SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-19.md`](../reports/SCHEDULER-PUBLISH-TARGETED-WAKE-2026-08-19.md).

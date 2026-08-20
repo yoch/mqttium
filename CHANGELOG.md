@@ -22,6 +22,14 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - Add a versioned MkDocs Material / Read the Docs site, exhaustive Stable API
   reference, user-oriented guides, curated historical-evidence index, project
   support policy, and a single canonical `AGENTS.md` repository guide.
+- Reconcile the active scheduler experiment statuses with their accepted,
+  eligible-runner evidence and merge decisions while preserving dated report
+  bodies unchanged.
+- Generate canonical and AI-facing documentation links from the active Read the
+  Docs build URL so `latest`, stable releases, and pull-request previews remain
+  self-contained, and render the Material navigation cues on the documentation
+  home page. Keep the installable documentation extra on the same bounded tool
+  major versions used by hosted builds.
 - Refresh the README, package metadata, community templates, and repository
   discovery metadata for the stable launch. Public comparative benchmark
   claims are deferred to the independent cross-client benchmark repository.

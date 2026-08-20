@@ -2,6 +2,11 @@
 
 Baseline: `main@e80618154bacefed5626d9eb9ba46edf560b54e7`.
 
+Status: **Accepted and merged in
+[#284](https://github.com/yoch/mqttium/pull/284)** after eligible ARM64
+contention, fairness, non-regression, and integration gates passed. The dated
+reports remain unchanged records of the earlier diagnostic state.
+
 ## Hypothesis
 
 `WritePump` currently calls `Condition.notify_all()` whenever a completed batch releases writer capacity. With many blocked producers, one capacity release can make every waiter runnable even though only a subset can be admitted, causing avoidable event-loop wakeups and lock contention.
@@ -55,7 +60,11 @@ Lost-wakeup hand-off: if a waiter is cancelled after consuming a `notify(n)` tok
 
 **Harness.** `benchmarks/paired_writer_waiter_contention.py` is a fresh-process ABBA microbenchmark of concurrent `WritePump.enqueue()` against a tight `max_messages` window. Default concurrency is 1, 4, 16; 64/256 are CLI options. It records completed ops/s, CPU time, `enqueue_suspensions`, and enqueue-wait p50/p95/p99. Raw JSON stays out of git.
 
-**Diagnostic A/B (ineligible cloud VM, 2026-08-19).** Writer-capacity 1.012 / 1.000. Contention +9.8% at 16 producers and +143% at 64, with CPU 0.168s → 0.069s and suspensions 81264 → 19453. Single-producer −2.2%. Keep; confirm on an eligible runner.
+**Diagnostic A/B (ineligible cloud VM, 2026-08-19).** Writer-capacity 1.012 /
+1.000. Contention +9.8% at 16 producers and +143% at 64, with CPU 0.168s →
+0.069s and suspensions 81264 → 19453. Single-producer −2.2%. These figures were
+directional only; PR #284 records the later accepted eligible ARM64 contention,
+fairness, non-regression, and composed-integration evidence.
 
 Published report:
 [`docs/reports/SCHEDULER-WRITER-TARGETED-WAKE-2026-08-19.md`](../reports/SCHEDULER-WRITER-TARGETED-WAKE-2026-08-19.md).

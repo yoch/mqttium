@@ -2,6 +2,11 @@
 
 Baseline: `main@e80618154bacefed5626d9eb9ba46edf560b54e7`.
 
+Status: **Accepted and merged in
+[#283](https://github.com/yoch/mqttium/pull/283)** after the eligible ARM64
+correctness, performance, memory, and integration gates passed. The dated
+reports remain unchanged records of the earlier diagnostic state.
+
 ## Hypothesis
 
 `WritePump.max_messages` currently gates `queue.qsize()`, while the writer can remove up to 256 items into its active batch before those items are written. The byte budget remains charged during that interval, but the message-count budget can temporarily admit more resident frames than configured.
@@ -67,15 +72,17 @@ writer tests, eager/failure tests, and memory-cleanup lifecycle tests.
 
 Diagnostic A/B on an ineligible cloud VM (2026-08-19), measured before the
 release-assertion hardening: writer-capacity QoS 0/1 ratios 0.999 / 1.000;
-open-loop completed/lag ~1.00. Directional: no throughput or lag cost. The
-current hardened HEAD still requires eligible-runner A/A+A/B before merge.
+open-loop completed/lag ~1.00. Those figures were directional only. The later
+eligible ARM64 campaign recorded on PR #283 passed the A/A, A/B, open-loop,
+network, memory, and composed-integration gates before merge.
 
 Complexity/risk: the change remains one integer plus small helpers on paths
 that already mutate `queued_bytes`. The main risk is a leak if a new completion
 path forgets `_release_resident`; an over-release is now detected rather than
 hidden. `reset`/`discard` and `_run`'s existing `finally` cover epoch transitions,
-mid-batch cancel, and transport failure. No extra scheduler machinery. Do not
-merge until the eligible-runner artefacts exist.
+mid-batch cancel, and transport failure. No extra scheduler machinery was
+introduced. Eligible-runner evidence and the maintainer decision are linked
+from PR #283.
 
 Published report:
 [`docs/reports/SCHEDULER-RESIDENT-MESSAGE-BUDGET-2026-08-19.md`](../reports/SCHEDULER-RESIDENT-MESSAGE-BUDGET-2026-08-19.md).
