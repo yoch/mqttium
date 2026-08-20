@@ -1,9 +1,9 @@
 name: Temporary message-effect compaction benchmark
 
 on:
-  push:
+  pull_request:
     branches:
-      - perf/message-effect-compaction
+      - main
     paths:
       - .github/workflows/tmp-message-effect-compaction-bench.yml
 
