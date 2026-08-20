@@ -141,7 +141,8 @@ client = AsyncClient(
 
 `SqliteInflightStore` persists unfinished outbound QoS 1/2 exchanges and
 inbound QoS 2 protocol state. It does not persist arbitrary application work,
-delivered callback/iterator queues, or subscription intent.
+delivered callback/iterator queues, or subscription intent. The application
+owns the store and must close it after the client has shut down.
 
 ## Paho migration
 
@@ -149,8 +150,8 @@ New async applications should use `AsyncClient`. MQTTium also ships a
 **Provisional**, Paho-shaped `CallbackAPIVersion.VERSION2` facade for existing
 synchronous applications that need an incremental migration path. It is tested
 and bounded, but it is not a drop-in promise, a performance-parity promise, or
-a second native API. See [Migrating from Paho](docs/migration.md) and the
-[exact compatibility matrix](docs/paho-compatibility.md).
+a second native API. See [Migrating from Paho](https://mqttium.readthedocs.io/en/stable/migration/)
+and the [exact compatibility matrix](https://mqttium.readthedocs.io/en/stable/paho-compatibility/).
 
 ## Documentation
 
@@ -159,14 +160,14 @@ The complete documentation is available on
 
 | Start here | Use it for |
 | --- | --- |
-| [Getting started](docs/getting-started.md) | Installation, lifecycle, publishing, subscribing, and delivery |
-| [Configuration and sizing](docs/configuration-and-sizing.md) | Choosing queue, byte, inflight, timeout, and reconnect settings |
-| [Sessions and persistence](docs/sessions-and-persistence.md) | Broker sessions, reconnect, SQLite, and restart recovery |
-| [Transports and security](docs/transports-and-tls.md) | TCP, TLS, WebSocket, Unix sockets, and credential handling |
-| [MQTT 5](docs/mqtt-5.md) | Properties, authentication, topic aliases, and negotiated limits |
-| [Operations](docs/operations.md) | Runtime snapshots, pressure diagnosis, and graceful shutdown |
-| [Stable API reference](docs/reference/index.md) | Supported imports, signatures, defaults, and exceptions |
-| [Compatibility matrix](docs/compatibility.md) | Python, platform, broker, protocol, and transport validation |
+| [Getting started](https://mqttium.readthedocs.io/en/stable/getting-started/) | Installation, lifecycle, publishing, subscribing, and delivery |
+| [Configuration and sizing](https://mqttium.readthedocs.io/en/stable/configuration-and-sizing/) | Choosing queue, byte, inflight, timeout, and reconnect settings |
+| [Sessions and persistence](https://mqttium.readthedocs.io/en/stable/sessions-and-persistence/) | Broker sessions, reconnect, SQLite, and restart recovery |
+| [Transports and security](https://mqttium.readthedocs.io/en/stable/transports-and-tls/) | TCP, TLS, WebSocket, Unix sockets, and credential handling |
+| [MQTT 5](https://mqttium.readthedocs.io/en/stable/mqtt-5/) | Properties, authentication, topic aliases, and negotiated limits |
+| [Operations](https://mqttium.readthedocs.io/en/stable/operations/) | Runtime snapshots, pressure diagnosis, and graceful shutdown |
+| [Stable API reference](https://mqttium.readthedocs.io/en/stable/reference/) | Supported imports, signatures, defaults, and exceptions |
+| [Compatibility matrix](https://mqttium.readthedocs.io/en/stable/compatibility/) | Python, platform, broker, protocol, and transport validation |
 
 Architecture, conformance, stability tiers, benchmarking methodology, and
 release evidence are documented separately so current contracts are not mixed
@@ -176,7 +177,8 @@ with historical reports.
 
 Performance is treated as an evidence discipline, not a slogan. Changes must
 preserve MQTT semantics, bounded memory, backpressure, and event-loop fairness.
-The [benchmarking contract](docs/benchmarking.md) defines valid comparisons.
+The [benchmarking contract](https://mqttium.readthedocs.io/en/stable/benchmarking/)
+defines valid comparisons.
 Cross-client results will be linked only after the independent benchmark
 repository publishes reviewed MQTTium, Paho, and gmqtt runs with exact versions,
 environment details, raw artifacts, comparable completion semantics, and stated
@@ -184,11 +186,11 @@ limitations.
 
 ## Support and contributing
 
-- Read [SUPPORT.md](SUPPORT.md) before requesting usage help.
+- Read the [support policy](https://github.com/yoch/mqttium/blob/main/SUPPORT.md) before requesting usage help.
 - Use the structured issue form for reproducible bugs.
-- Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
-- See [CONTRIBUTING.md](CONTRIBUTING.md) for development and validation commands.
+- Report vulnerabilities privately as described in the [security policy](https://github.com/yoch/mqttium/blob/main/SECURITY.md).
+- See the [contribution guide](https://github.com/yoch/mqttium/blob/main/CONTRIBUTING.md) for development and validation commands.
 
-MQTTium is original software licensed under [Apache-2.0](LICENSE). Paho and
+MQTTium is original software licensed under [Apache-2.0](https://github.com/yoch/mqttium/blob/main/LICENSE). Paho and
 gmqtt are referenced only for migration, interoperability, and independent
 comparison.

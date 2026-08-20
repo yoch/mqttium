@@ -739,7 +739,9 @@ class AsyncClient:
             MQTTTimeoutError: If transport setup or CONNACK exceeds the deadline.
             ProtocolError: If the client is already connecting/connected or the
                 broker refuses or violates the protocol.
-            MQTTError: If connection setup is cancelled or transport setup fails.
+            MQTTError: If :meth:`disconnect` cancels connection setup.
+            OSError: If TCP or TLS transport setup fails.
+            asyncio.CancelledError: If the calling task is cancelled.
         """
         async with self._lifecycle_lock:
             await self._reset_message_stream()
@@ -774,7 +776,9 @@ class AsyncClient:
 
         Raises:
             MQTTTimeoutError: If connection or CONNACK exceeds the deadline.
-            MQTTError: If the socket or MQTT handshake fails.
+            ProtocolError: If the broker refuses or violates the protocol.
+            OSError: If the Unix socket connection fails.
+            asyncio.CancelledError: If the calling task is cancelled.
         """
         async with self._lifecycle_lock:
             await self._reset_message_stream()
@@ -820,7 +824,10 @@ class AsyncClient:
 
         Raises:
             MQTTTimeoutError: If connection or CONNACK exceeds the deadline.
-            MQTTError: If the upgrade, transport, or MQTT handshake fails.
+            ProtocolError: If the broker refuses or violates the MQTT protocol.
+            ConnectionError: If the WebSocket upgrade or transport fails.
+            ValueError: If the URL or WebSocket options are invalid.
+            asyncio.CancelledError: If the calling task is cancelled.
         """
         async with self._lifecycle_lock:
             await self._reset_message_stream()
@@ -981,7 +988,7 @@ class AsyncClient:
                 the success value.
 
         Raises:
-            ValueError: If the reason code is invalid.
+            ProtocolError: If the reason code is invalid for the protocol.
         """
         self._intentional_disconnect = True
         connect_disconnect_fut = self._connect_disconnect_fut
