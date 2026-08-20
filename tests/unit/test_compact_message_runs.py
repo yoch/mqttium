@@ -414,9 +414,7 @@ def test_compact_mixed_batch_materializes_run_before_effect_pump() -> None:
         EffectKind.MESSAGE,
     ]
     assert [
-        effect.data.topic
-        for effect in client._engine._effects
-        if effect.kind is EffectKind.MESSAGE
+        effect.data.topic for effect in client._engine._effects if effect.kind is EffectKind.MESSAGE
     ] == ["one", "two", "three"]
 
 
