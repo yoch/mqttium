@@ -10,6 +10,7 @@
   <a href="https://pypi.org/project/mqttium/"><img alt="PyPI" src="https://img.shields.io/pypi/v/mqttium.svg"></a>
   <a href="https://pypi.org/project/mqttium/"><img alt="Python versions" src="https://img.shields.io/pypi/pyversions/mqttium.svg"></a>
   <a href="https://github.com/yoch/mqttium/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/yoch/mqttium/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://codecov.io/gh/yoch/mqttium"><img alt="Coverage" src="https://codecov.io/gh/yoch/mqttium/branch/main/graph/badge.svg"></a>
   <a href="https://mqttium.readthedocs.io/en/stable/"><img alt="Documentation" src="https://readthedocs.org/projects/mqttium/badge/?version=stable"></a>
   <a href="https://github.com/yoch/mqttium/blob/main/LICENSE"><img alt="Apache-2.0 license" src="https://img.shields.io/pypi/l/mqttium.svg"></a>
 </p>

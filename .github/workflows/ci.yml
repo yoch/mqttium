@@ -51,7 +51,38 @@ jobs:
           actionlint -color
           zizmor .
       - name: Unit coverage
-        run: python -m pytest -q -W error --strict-config --strict-markers tests/unit tests/project --cov=mqttium --cov-branch --cov-report=term-missing --cov-fail-under=89
+        run: python -m pytest -q -W error --strict-config --strict-markers tests/unit tests/project --cov=mqttium --cov-branch --cov-report=term-missing --cov-report=xml:coverage.xml --cov-fail-under=89
+      - name: Retain coverage report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: coverage-${{ github.sha }}
+          path: coverage.xml
+          if-no-files-found: error
+          retention-days: 1
+
+  coverage-report:
+    name: Coverage report (Codecov)
+    needs: quality
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: coverage-${{ github.sha }}
+      - name: Publish coverage to Codecov
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        with:
+          disable_search: true
+          fail_ci_if_error: true
+          files: ./coverage.xml
+          use_oidc: true
+          version: v11.3.1
 
   # Keep the generated contexts test (3.11) ... test (3.14) during migration.
   test:
