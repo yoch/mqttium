@@ -202,6 +202,8 @@ def calibration_count(
 ) -> int:
     if not math.isfinite(pilot_capacity) or pilot_capacity <= 0:
         raise ValueError("pilot capacity must be positive and finite")
+    if pilot_count > max_count:
+        raise ValueError("pilot count cannot exceed maximum count")
     requested = math.ceil(pilot_capacity * target_seconds)
     return max(pilot_count, min(max_count, requested))
 
@@ -414,6 +416,30 @@ def _calibrate_one(
     )
 
 
+def _calibrate_all(
+    args: argparse.Namespace,
+    *,
+    specs: list[ScenarioSpec],
+    base_root: Path,
+    candidate_root: Path,
+) -> dict[ScenarioSpec, Calibration]:
+    calibrations: dict[ScenarioSpec, Calibration] = {}
+    for spec in specs:
+        calibration = _calibrate_one(
+            args,
+            spec=spec,
+            base_root=base_root,
+            candidate_root=candidate_root,
+        )
+        calibrations[spec] = calibration
+        print(
+            f"{spec.key}: baseline capacity {calibration.baseline_capacity:.1f} msg/s; "
+            f"candidate diagnostic {calibration.candidate_capacity:.1f} msg/s",
+            flush=True,
+        )
+    return calibrations
+
+
 def _acquire_cycle(
     args: argparse.Namespace,
     *,
@@ -439,6 +465,32 @@ def _acquire_cycle(
                 hash_seed=hash_seed,
             )
         pairs.append({"order": list(order), **results, "hash_seed": hash_seed})
+    return pairs
+
+
+def _acquire_cycles(
+    args: argparse.Namespace,
+    *,
+    spec: ScenarioSpec,
+    base_root: Path,
+    candidate_root: Path,
+    count: int,
+    target: float,
+    seeds: list[int],
+) -> list[dict[str, Any]]:
+    pairs: list[dict[str, Any]] = []
+    for seed in seeds:
+        pairs.extend(
+            _acquire_cycle(
+                args,
+                spec=spec,
+                base_root=base_root,
+                candidate_root=candidate_root,
+                count=count,
+                target=target,
+                hash_seed=seed,
+            )
+        )
     return pairs
 
 
@@ -533,6 +585,269 @@ def _metrics_dict(value: Metrics) -> dict[str, Any]:
     return asdict(value)
 
 
+def _initial_record(
+    args: argparse.Namespace,
+    *,
+    spec: ScenarioSpec,
+    point: LoadPoint,
+    calibration: Calibration,
+    base_root: Path,
+    candidate_root: Path,
+) -> dict[str, Any]:
+    target = target_rate(calibration, point)
+    requested_count = args.count_small if spec.payload_bytes <= 256 else args.count_large
+    count = calibrated_sample_count(
+        requested_count,
+        [target],
+        args.target_sample_seconds,
+        args.max_count,
+    )
+    pairs = _acquire_cycles(
+        args,
+        spec=spec,
+        base_root=base_root,
+        candidate_root=candidate_root,
+        count=count,
+        target=target,
+        seeds=args.initial_cycle_seeds,
+    )
+    initial = metrics(pairs)
+    record: dict[str, Any] = {
+        "label": _scenario_label(spec, point),
+        "protocol": spec.protocol,
+        "payload_bytes": spec.payload_bytes,
+        "completion": spec.completion,
+        "window": spec.window,
+        "load_mode": point.mode,
+        "load_fraction": point.value if point.mode == "baseline_capacity_fraction" else None,
+        "requested_target_rate": point.value if point.mode == "absolute_rate" else None,
+        "baseline_capacity": calibration.baseline_capacity,
+        "candidate_capacity_diagnostic": calibration.candidate_capacity,
+        "target_rate": target,
+        "count": count,
+        "initial_metrics": _metrics_dict(initial),
+        "initial_pairs": pairs,
+        "confirmation": None,
+        "final_metrics": _metrics_dict(initial),
+        "throughput_suspect": initial.throughput_median < args.min_completed_ratio,
+        "loop_suspect": initial.loop_lag_median_ratio > args.max_loop_lag_ratio,
+    }
+    print(
+        f"{record['label']}: throughput={initial.throughput_median:.4f} "
+        f"loop={initial.loop_lag_median_ratio:.4f}",
+        flush=True,
+    )
+    return record
+
+
+def _run_initial_matrix(
+    args: argparse.Namespace,
+    *,
+    specs: list[ScenarioSpec],
+    load_points: list[LoadPoint],
+    calibrations: dict[ScenarioSpec, Calibration],
+    base_root: Path,
+    candidate_root: Path,
+    raw_dir: Path,
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for protocol in _csv_strings(args.protocols):
+        _fresh_preflight(args, label=f"ab-{protocol}", raw_dir=raw_dir)
+        protocol_specs = (item for item in specs if item.protocol == protocol)
+        for spec in protocol_specs:
+            for point in load_points:
+                records.append(
+                    _initial_record(
+                        args,
+                        spec=spec,
+                        point=point,
+                        calibration=calibrations[spec],
+                        base_root=base_root,
+                        candidate_root=candidate_root,
+                    )
+                )
+    return records
+
+
+def _same_code_controls(
+    args: argparse.Namespace,
+    *,
+    spec: ScenarioSpec,
+    base_root: Path,
+    candidate_root: Path,
+    count: int,
+    target: float,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    base_control = _acquire_cycles(
+        args,
+        spec=spec,
+        base_root=base_root,
+        candidate_root=base_root,
+        count=count,
+        target=target,
+        seeds=args.control_cycle_seeds,
+    )
+    candidate_control = _acquire_cycles(
+        args,
+        spec=spec,
+        base_root=candidate_root,
+        candidate_root=candidate_root,
+        count=count,
+        target=target,
+        seeds=args.control_cycle_seeds,
+    )
+    return base_control, candidate_control
+
+
+def _record_control_validity(
+    args: argparse.Namespace,
+    *,
+    label: str,
+    base_control: list[dict[str, Any]],
+    candidate_control: list[dict[str, Any]],
+    invalidations: list[str],
+) -> None:
+    if not control_is_valid(
+        base_control,
+        max_throughput_deviation=args.control_max_throughput_deviation,
+    ):
+        invalidations.append(
+            f"{label}: baseline A/A throughput control exceeds "
+            f"{args.control_max_throughput_deviation:.2%} bias budget"
+        )
+    if not control_is_valid(
+        candidate_control,
+        max_throughput_deviation=args.control_max_throughput_deviation,
+    ):
+        invalidations.append(
+            f"{label}: candidate A/A throughput control exceeds "
+            f"{args.control_max_throughput_deviation:.2%} bias budget"
+        )
+
+
+def _confirm_record(
+    args: argparse.Namespace,
+    *,
+    record: dict[str, Any],
+    index: int,
+    base_root: Path,
+    candidate_root: Path,
+    raw_dir: Path,
+) -> tuple[list[str], list[str]]:
+    failures: list[str] = []
+    invalidations: list[str] = []
+    spec = ScenarioSpec(
+        protocol=record["protocol"],
+        payload_bytes=record["payload_bytes"],
+        completion=record["completion"],
+        window=record["window"],
+    )
+    _fresh_preflight(args, label=f"confirm-{index}", raw_dir=raw_dir)
+    ab_pairs = list(record["initial_pairs"])
+    ab_pairs.extend(
+        _acquire_cycles(
+            args,
+            spec=spec,
+            base_root=base_root,
+            candidate_root=candidate_root,
+            count=record["count"],
+            target=record["target_rate"],
+            seeds=args.confirmation_cycle_seeds,
+        )
+    )
+    final = metrics(ab_pairs)
+    confirmation: dict[str, Any] = {
+        "status": "confirmed_samples",
+        "ab_pairs": ab_pairs,
+        "metrics": _metrics_dict(final),
+        "base_control": None,
+        "candidate_control": None,
+        "same_code_noise_floor_ms": None,
+    }
+
+    if record["throughput_suspect"] and final.throughput_median < args.min_completed_ratio:
+        failures.append(
+            f"{record['label']}: completed ratio {final.throughput_median:.4f} "
+            f"< {args.min_completed_ratio:.4f} after confirmation"
+        )
+
+    persistent_loop_signal = (
+        record["loop_suspect"] and final.loop_lag_median_ratio > args.max_loop_lag_ratio
+    )
+    if persistent_loop_signal:
+        base_control, candidate_control = _same_code_controls(
+            args,
+            spec=spec,
+            base_root=base_root,
+            candidate_root=candidate_root,
+            count=record["count"],
+            target=record["target_rate"],
+        )
+        confirmation["base_control"] = {
+            "pairs": base_control,
+            "metrics": _metrics_dict(metrics(base_control)),
+        }
+        confirmation["candidate_control"] = {
+            "pairs": candidate_control,
+            "metrics": _metrics_dict(metrics(candidate_control)),
+        }
+        _record_control_validity(
+            args,
+            label=record["label"],
+            base_control=base_control,
+            candidate_control=candidate_control,
+            invalidations=invalidations,
+        )
+        confirmed, noise_floor = confirmed_loop_regression(
+            ab_pairs,
+            base_control_pairs=base_control,
+            candidate_control_pairs=candidate_control,
+            max_loop_lag_ratio=args.max_loop_lag_ratio,
+        )
+        confirmation["same_code_noise_floor_ms"] = noise_floor
+        confirmation["loop_confirmed"] = confirmed
+        if confirmed:
+            failures.append(
+                f"{record['label']}: loop-lag ratio "
+                f"{final.loop_lag_ratio.geometric_mean:.4f} with additive lower 95% "
+                f"bound {final.loop_lag_delta.lower_95_ms:.6f}ms above same-code "
+                f"noise floor {noise_floor:.6f}ms"
+            )
+
+    confirmation["status"] = "invalid_control" if invalidations else "completed"
+    record["confirmation"] = confirmation
+    record["final_metrics"] = _metrics_dict(final)
+    return failures, invalidations
+
+
+def _confirm_suspects(
+    args: argparse.Namespace,
+    *,
+    suspects: list[dict[str, Any]],
+    base_root: Path,
+    candidate_root: Path,
+    raw_dir: Path,
+) -> tuple[list[str], list[str]]:
+    failures: list[str] = []
+    invalidations: list[str] = []
+    for index, record in enumerate(suspects, start=1):
+        record_failures, record_invalidations = _confirm_record(
+            args,
+            record=record,
+            index=index,
+            base_root=base_root,
+            candidate_root=candidate_root,
+            raw_dir=raw_dir,
+        )
+        failures.extend(record_failures)
+        invalidations.extend(record_invalidations)
+    return failures, invalidations
+
+
+def _metrics_dict(value: Metrics) -> dict[str, Any]:
+    return asdict(value)
+
+
 def _write_result(output: Path, payload: dict[str, Any]) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
@@ -568,14 +883,13 @@ def _write_result(output: Path, payload: dict[str, Any]) -> None:
     output.with_suffix(".md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def parent(args: argparse.Namespace) -> int:
-    base_root = args.base_root.resolve()
-    candidate_root = args.candidate_root.resolve()
-    raw_dir = args.output.parent / f"{args.output.stem}-raw"
-    raw_dir.mkdir(parents=True, exist_ok=True)
-    specs = _scenario_specs(args)
-    load_points = _load_points(args.fractions, args.target_rates)
-    result: dict[str, Any] = {
+def _result_template(
+    args: argparse.Namespace,
+    *,
+    base_root: Path,
+    candidate_root: Path,
+) -> dict[str, Any]:
+    return {
         "status": "running",
         "policy": args.policy,
         "base_sha": _git_sha(base_root),
@@ -603,235 +917,92 @@ def parent(args: argparse.Namespace) -> int:
         "failures": [],
         "invalidations": [],
     }
+
+
+def _evaluate_records(
+    args: argparse.Namespace,
+    *,
+    records: list[dict[str, Any]],
+    result: dict[str, Any],
+    base_root: Path,
+    candidate_root: Path,
+    raw_dir: Path,
+) -> int:
+    suspects = [
+        record for record in records if record["throughput_suspect"] or record["loop_suspect"]
+    ]
+    if len(suspects) > args.max_confirmation_scenarios:
+        result["status"] = "invalid"
+        result["invalidations"] = [
+            f"{len(suspects)} cells require confirmation; bounded maximum is "
+            f"{args.max_confirmation_scenarios}"
+        ]
+        return 2
+
+    failures, invalidations = _confirm_suspects(
+        args,
+        suspects=suspects,
+        base_root=base_root,
+        candidate_root=candidate_root,
+        raw_dir=raw_dir,
+    )
+    result["failures"] = failures
+    result["invalidations"] = invalidations
+    if invalidations:
+        result["status"] = "invalid"
+        return 2
+    if failures:
+        result["status"] = "failed"
+        return 1
+    result["status"] = "passed"
+    return 0
+
+
+def parent(args: argparse.Namespace) -> int:
+    base_root = args.base_root.resolve()
+    candidate_root = args.candidate_root.resolve()
+    raw_dir = args.output.parent / f"{args.output.stem}-raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    result = _result_template(args, base_root=base_root, candidate_root=candidate_root)
     if args.policy == "strict" and args.cpu is None:
         result["status"] = "invalid"
         result["invalidations"] = ["strict open-loop release evidence requires --cpu pinning"]
         _write_result(args.output, result)
         return 2
+
     try:
+        specs = _scenario_specs(args)
+        load_points = _load_points(args.fractions, args.target_rates)
         _fresh_preflight(args, label="calibration", raw_dir=raw_dir)
-        calibrations: dict[ScenarioSpec, Calibration] = {}
-        calibration_output = result["calibration"]
-        assert isinstance(calibration_output, dict)
-        for spec in specs:
-            calibration = _calibrate_one(
-                args,
-                spec=spec,
-                base_root=base_root,
-                candidate_root=candidate_root,
-            )
-            calibrations[spec] = calibration
-            calibration_output[spec.key] = asdict(calibration)
-            print(
-                f"{spec.key}: baseline capacity {calibration.baseline_capacity:.1f} msg/s; "
-                f"candidate diagnostic {calibration.candidate_capacity:.1f} msg/s",
-                flush=True,
-            )
-
-        records: list[dict[str, Any]] = []
-        scenarios_output = result["scenarios"]
-        assert isinstance(scenarios_output, list)
-        for protocol in _csv_strings(args.protocols):
-            _fresh_preflight(args, label=f"ab-{protocol}", raw_dir=raw_dir)
-            for spec in (item for item in specs if item.protocol == protocol):
-                calibration = calibrations[spec]
-                for point in load_points:
-                    target = target_rate(calibration, point)
-                    requested_count = (
-                        args.count_small if spec.payload_bytes <= 256 else args.count_large
-                    )
-                    count = calibrated_sample_count(
-                        requested_count,
-                        [target],
-                        args.target_sample_seconds,
-                        args.max_count,
-                    )
-                    pairs: list[dict[str, Any]] = []
-                    for seed in args.initial_cycle_seeds:
-                        pairs.extend(
-                            _acquire_cycle(
-                                args,
-                                spec=spec,
-                                base_root=base_root,
-                                candidate_root=candidate_root,
-                                count=count,
-                                target=target,
-                                hash_seed=seed,
-                            )
-                        )
-                    initial = metrics(pairs)
-                    record: dict[str, Any] = {
-                        "label": _scenario_label(spec, point),
-                        "protocol": spec.protocol,
-                        "payload_bytes": spec.payload_bytes,
-                        "completion": spec.completion,
-                        "window": spec.window,
-                        "load_mode": point.mode,
-                        "load_fraction": (
-                            point.value if point.mode == "baseline_capacity_fraction" else None
-                        ),
-                        "requested_target_rate": (
-                            point.value if point.mode == "absolute_rate" else None
-                        ),
-                        "baseline_capacity": calibration.baseline_capacity,
-                        "candidate_capacity_diagnostic": calibration.candidate_capacity,
-                        "target_rate": target,
-                        "count": count,
-                        "initial_metrics": _metrics_dict(initial),
-                        "initial_pairs": pairs,
-                        "confirmation": None,
-                        "final_metrics": _metrics_dict(initial),
-                        "throughput_suspect": initial.throughput_median < args.min_completed_ratio,
-                        "loop_suspect": initial.loop_lag_median_ratio > args.max_loop_lag_ratio,
-                    }
-                    records.append(record)
-                    scenarios_output.append(record)
-                    print(
-                        f"{record['label']}: throughput={initial.throughput_median:.4f} "
-                        f"loop={initial.loop_lag_median_ratio:.4f}",
-                        flush=True,
-                    )
-
-        suspects = [
-            record for record in records if record["throughput_suspect"] or record["loop_suspect"]
-        ]
-        if len(suspects) > args.max_confirmation_scenarios:
-            result["status"] = "invalid"
-            result["invalidations"] = [
-                f"{len(suspects)} cells require confirmation; bounded maximum is "
-                f"{args.max_confirmation_scenarios}"
-            ]
-            _write_result(args.output, result)
-            return 2 if args.policy == "strict" else 0
-
-        failures: list[str] = []
-        invalidations: list[str] = []
-        for index, record in enumerate(suspects, start=1):
-            spec = ScenarioSpec(
-                protocol=record["protocol"],
-                payload_bytes=record["payload_bytes"],
-                completion=record["completion"],
-                window=record["window"],
-            )
-            _fresh_preflight(args, label=f"confirm-{index}", raw_dir=raw_dir)
-            ab_pairs = list(record["initial_pairs"])
-            for seed in args.confirmation_cycle_seeds:
-                ab_pairs.extend(
-                    _acquire_cycle(
-                        args,
-                        spec=spec,
-                        base_root=base_root,
-                        candidate_root=candidate_root,
-                        count=record["count"],
-                        target=record["target_rate"],
-                        hash_seed=seed,
-                    )
-                )
-            final = metrics(ab_pairs)
-            confirmation: dict[str, Any] = {
-                "status": "confirmed_samples",
-                "ab_pairs": ab_pairs,
-                "metrics": _metrics_dict(final),
-                "base_control": None,
-                "candidate_control": None,
-                "same_code_noise_floor_ms": None,
-            }
-
-            if record["throughput_suspect"] and final.throughput_median < args.min_completed_ratio:
-                failures.append(
-                    f"{record['label']}: completed ratio {final.throughput_median:.4f} "
-                    f"< {args.min_completed_ratio:.4f} after confirmation"
-                )
-
-            if record["loop_suspect"] and final.loop_lag_median_ratio > args.max_loop_lag_ratio:
-                base_control: list[dict[str, Any]] = []
-                candidate_control: list[dict[str, Any]] = []
-                for seed in args.control_cycle_seeds:
-                    base_control.extend(
-                        _acquire_cycle(
-                            args,
-                            spec=spec,
-                            base_root=base_root,
-                            candidate_root=base_root,
-                            count=record["count"],
-                            target=record["target_rate"],
-                            hash_seed=seed,
-                        )
-                    )
-                    candidate_control.extend(
-                        _acquire_cycle(
-                            args,
-                            spec=spec,
-                            base_root=candidate_root,
-                            candidate_root=candidate_root,
-                            count=record["count"],
-                            target=record["target_rate"],
-                            hash_seed=seed,
-                        )
-                    )
-                confirmation["base_control"] = {
-                    "pairs": base_control,
-                    "metrics": _metrics_dict(metrics(base_control)),
-                }
-                confirmation["candidate_control"] = {
-                    "pairs": candidate_control,
-                    "metrics": _metrics_dict(metrics(candidate_control)),
-                }
-                if not control_is_valid(
-                    base_control,
-                    max_throughput_deviation=args.control_max_throughput_deviation,
-                ):
-                    invalidations.append(
-                        f"{record['label']}: baseline A/A throughput control exceeds "
-                        f"{args.control_max_throughput_deviation:.2%} bias budget"
-                    )
-                if not control_is_valid(
-                    candidate_control,
-                    max_throughput_deviation=args.control_max_throughput_deviation,
-                ):
-                    invalidations.append(
-                        f"{record['label']}: candidate A/A throughput control exceeds "
-                        f"{args.control_max_throughput_deviation:.2%} bias budget"
-                    )
-                confirmed, noise_floor = confirmed_loop_regression(
-                    ab_pairs,
-                    base_control_pairs=base_control,
-                    candidate_control_pairs=candidate_control,
-                    max_loop_lag_ratio=args.max_loop_lag_ratio,
-                )
-                confirmation["same_code_noise_floor_ms"] = noise_floor
-                confirmation["loop_confirmed"] = confirmed
-                if confirmed:
-                    failures.append(
-                        f"{record['label']}: loop-lag ratio "
-                        f"{final.loop_lag_ratio.geometric_mean:.4f} with additive lower 95% "
-                        f"bound {final.loop_lag_delta.lower_95_ms:.6f}ms above same-code "
-                        f"noise floor {noise_floor:.6f}ms"
-                    )
-
-            confirmation["status"] = (
-                "invalid_control"
-                if any(record["label"] in item for item in invalidations)
-                else "completed"
-            )
-            record["confirmation"] = confirmation
-            record["final_metrics"] = _metrics_dict(final)
-
-        result["failures"] = failures
-        result["invalidations"] = invalidations
-        if invalidations:
-            result["status"] = "invalid"
-            exit_code = 2
-        elif failures:
-            result["status"] = "failed"
-            exit_code = 1
-        else:
-            result["status"] = "passed"
-            exit_code = 0
+        calibrations = _calibrate_all(
+            args,
+            specs=specs,
+            base_root=base_root,
+            candidate_root=candidate_root,
+        )
+        result["calibration"] = {
+            spec.key: asdict(calibration) for spec, calibration in calibrations.items()
+        }
+        records = _run_initial_matrix(
+            args,
+            specs=specs,
+            load_points=load_points,
+            calibrations=calibrations,
+            base_root=base_root,
+            candidate_root=candidate_root,
+            raw_dir=raw_dir,
+        )
+        result["scenarios"] = records
+        exit_code = _evaluate_records(
+            args,
+            records=records,
+            result=result,
+            base_root=base_root,
+            candidate_root=candidate_root,
+            raw_dir=raw_dir,
+        )
         _write_result(args.output, result)
-        if args.policy == "strict":
-            return exit_code
-        return 0
+        return exit_code if args.policy == "strict" else 0
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
         result["status"] = "invalid"
         result["invalidations"] = [str(exc)]
@@ -896,6 +1067,8 @@ def parse_args() -> argparse.Namespace:
 
     if args.count_small <= 0 or args.count_large <= 0 or args.max_count <= 0:
         parser.error("sample counts must be positive")
+    if args.count_small > args.max_count or args.count_large > args.max_count:
+        parser.error("sample counts cannot exceed --max-count")
     if args.target_sample_seconds <= 0 or args.calibration_seconds <= 0:
         parser.error("sample and calibration durations must be positive")
     if args.calibration_repeats < 3:
