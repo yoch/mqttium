@@ -198,9 +198,8 @@ class EffectPump:
                         previous.data = _MessageEffectBatch(previous.data, effect.data)
                         compacted = True
                         continue
-                    if (
-                        previous.kind is EffectKind.MESSAGE
-                        and isinstance(previous.data, _MessageEffectBatch)
+                    if previous.kind is EffectKind.MESSAGE and isinstance(
+                        previous.data, _MessageEffectBatch
                     ):
                         previous.data.messages.append(effect.data)
                         compacted = True
