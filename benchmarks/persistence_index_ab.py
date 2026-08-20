@@ -9,7 +9,7 @@ the reconnect replay the indices exist for.
 
 Each variant is measured in the same process on the same store shape, with the
 variant order rotated between repeats and medians reported, per
-`docs/BENCHMARKING.md`. Results are build artefacts: do not commit them.
+`docs/benchmarking.md`. Results are build artefacts: do not commit them.
 """
 
 from __future__ import annotations

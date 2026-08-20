@@ -24,7 +24,6 @@ def _effect(
     )
 
 
-@pytest.mark.asyncio
 async def test_small_qos0_callback_messages_apply_as_one_synchronous_batch() -> None:
     client = AsyncClient(message_delivery="callback")
     seen: list[Message] = []
@@ -39,7 +38,6 @@ async def test_small_qos0_callback_messages_apply_as_one_synchronous_batch() -> 
     await client._shutdown_callback_worker(drain=False)
 
 
-@pytest.mark.asyncio
 async def test_small_auto_qos1_callback_messages_share_the_batch() -> None:
     client = AsyncClient(message_delivery="callback")
     seen: list[Message] = []
@@ -218,7 +216,6 @@ def test_drain_inline_applies_one_eligible_message_without_scheduling() -> None:
     assert client._messages.qsize() == 1
 
 
-@pytest.mark.asyncio
 async def test_auto_qos1_single_effect_skips_absent_delivery_mark() -> None:
     client = AsyncClient(message_delivery="iterator")
     marked: list[int] = []
@@ -234,7 +231,6 @@ async def test_auto_qos1_single_effect_skips_absent_delivery_mark() -> None:
     assert client._messages.qsize() == 1
 
 
-@pytest.mark.asyncio
 async def test_replayed_persisted_qos1_marks_even_when_current_mode_is_auto_ack() -> None:
     store = MemoryInflightStore()
     store.put_in(

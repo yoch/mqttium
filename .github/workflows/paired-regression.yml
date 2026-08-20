@@ -4,47 +4,56 @@ on:
   workflow_dispatch:
     inputs:
       base_ref:
-        description: Baseline commit, branch, or tag
+        description: Exact 40-character baseline commit SHA
         required: true
-        default: v0.2.0b2
         type: string
       candidate_ref:
-        description: Candidate commit, branch, or tag
+        description: Exact 40-character candidate commit SHA
         required: true
-        default: main
         type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: paired-regression
   cancel-in-progress: false
 
 jobs:
   paired:
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 45
     env:
       PYTHONUNBUFFERED: "1"
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
     steps:
       - name: Check out benchmark harness
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.sha }}
+          ref: main
           path: harness
+          persist-credentials: false
+      - name: Validate immutable input commits
+        env:
+          BASE_REF: ${{ inputs.base_ref }}
+          CANDIDATE_REF: ${{ inputs.candidate_ref }}
+        run: |
+          set -euo pipefail
+          [[ "$BASE_REF" =~ ^[0-9a-fA-F]{40}$ ]] || { echo "base_ref must be an exact commit SHA" >&2; exit 2; }
+          [[ "$CANDIDATE_REF" =~ ^[0-9a-fA-F]{40}$ ]] || { echo "candidate_ref must be an exact commit SHA" >&2; exit 2; }
       - name: Check out candidate
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ inputs.candidate_ref }}
           path: candidate
+          persist-credentials: false
       - name: Check out base
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ inputs.base_ref }}
           path: base
-      - uses: actions/setup-python@v7
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.13"
       - name: Install benchmark support
@@ -66,12 +75,7 @@ jobs:
           MOSQ
           mosquitto -c /tmp/mqttium-paired/mosquitto.conf \
             > /tmp/mqttium-paired/mosquitto.log 2>&1 &
-          for i in $(seq 1 50); do
-            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
-            sleep 0.2
-          done
-          cat /tmp/mqttium-paired/mosquitto.log
-          exit 1
+          python harness/tools/ci/wait_for_endpoints.py --tcp 127.0.0.1:11883
       - name: Paired microbenchmarks
         env:
           PYTHONPATH: harness/src
@@ -122,7 +126,7 @@ jobs:
             --output /tmp/mqttium-paired/writer-capacity.json
       - name: Upload paired measurements
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: paired-regression-${{ github.run_id }}
           path: |

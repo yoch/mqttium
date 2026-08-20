@@ -56,6 +56,14 @@ class ConnectPacket:
 
 @dataclass(slots=True, frozen=True)
 class ConnAckPacket:
+    """Decoded broker acknowledgement for a CONNECT request.
+
+    Attributes:
+        session_present: Whether the broker resumed stored session state.
+        reason_code: MQTT connection result code; zero means success.
+        properties: MQTT 5 CONNACK properties, otherwise ``None``.
+    """
+
     session_present: bool
     reason_code: int
     properties: Properties | None = None

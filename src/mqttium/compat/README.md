@@ -6,6 +6,6 @@ new async code should use `mqttium.api.AsyncClient`.
 
 - Start with the runnable
   [`examples/paho_compat.py`](../../../examples/paho_compat.py).
-- Follow the staged [`migration guide`](../../../docs/MIGRATION.md).
-- Check the exact [`compatibility matrix`](../../../docs/COMPAT.md), including
+- Follow the staged [`migration guide`](../../../docs/migration.md).
+- Check the exact [`compatibility matrix`](../../../docs/paho-compatibility.md), including
   intentional differences and unsupported behaviour.

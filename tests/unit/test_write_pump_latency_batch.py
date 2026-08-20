@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import asyncio
 
-import pytest
-
 from mqttium.api._writer import WritePump
 
 
@@ -31,7 +29,6 @@ def _queue(pump: WritePump, *items: bytes | tuple[bytes, bytes]) -> None:
         assert pump.try_enqueue(item)
 
 
-@pytest.mark.asyncio
 async def test_latency_batch_waits_for_item_or_byte_threshold() -> None:
     writes: list[bytes] = []
     pump = _pump()
@@ -53,7 +50,6 @@ async def test_latency_batch_waits_for_item_or_byte_threshold() -> None:
     pump.discard()
 
 
-@pytest.mark.asyncio
 async def test_latency_batch_flushes_at_16_small_frames_in_order() -> None:
     writes: list[bytes] = []
     pump = _pump()
@@ -70,7 +66,6 @@ async def test_latency_batch_flushes_at_16_small_frames_in_order() -> None:
     await asyncio.wait_for(pump.join(), timeout=0.1)
 
 
-@pytest.mark.asyncio
 async def test_latency_batch_flushes_on_byte_budget_before_item_cap() -> None:
     writes: list[bytes] = []
     pump = _pump()
@@ -84,7 +79,6 @@ async def test_latency_batch_flushes_on_byte_budget_before_item_cap() -> None:
     await asyncio.wait_for(pump.join(), timeout=0.1)
 
 
-@pytest.mark.asyncio
 async def test_latency_batch_transport_refusal_restores_exact_queue_and_join_accounting() -> None:
     writes: list[bytes] = []
     pump = _pump()
@@ -100,7 +94,6 @@ async def test_latency_batch_transport_refusal_restores_exact_queue_and_join_acc
     await asyncio.wait_for(pump.join(), timeout=0.1)
 
 
-@pytest.mark.asyncio
 async def test_latency_batch_segmented_item_restores_order_and_accounting() -> None:
     writes: list[bytes] = []
     pump = _pump()
@@ -116,7 +109,6 @@ async def test_latency_batch_segmented_item_restores_order_and_accounting() -> N
     await asyncio.wait_for(pump.join(), timeout=0.1)
 
 
-@pytest.mark.asyncio
 async def test_latency_batch_is_disabled_while_writer_or_waiter_owns_ordering() -> None:
     for state in ("writing", "waiter"):
         writes: list[bytes] = []

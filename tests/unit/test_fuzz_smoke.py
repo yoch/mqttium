@@ -1,4 +1,4 @@
-"""Pytest wrapper: run a bounded fuzz pass as a smoke test (jalon E).
+"""Pytest wrapper for a bounded, deterministic fuzz smoke pass.
 
 The full fuzzer is ``tests/fuzz/fuzz.py`` (seed-reproducible). This keeps a
 fast, deterministic slice in the unit suite so regressions are caught by the

@@ -8,6 +8,8 @@ from mqttium.errors import MalformedPacketError
 
 
 class MQTTProtocolVersion(IntEnum):
+    """MQTT wire-protocol level used for a client connection."""
+
     MQTTv31 = 3
     MQTTv311 = 4
     MQTTv5 = 5
@@ -59,6 +61,8 @@ _PACKET_TYPES_BY_NIBBLE: tuple[PacketType | None, ...] = (
 
 
 class QoS(IntEnum):
+    """MQTT publication and subscription quality-of-service level."""
+
     AT_MOST_ONCE = 0
     AT_LEAST_ONCE = 1
     EXACTLY_ONCE = 2
@@ -84,6 +88,8 @@ class InboundQoSState(IntEnum):
 
 
 class ConnectionState(IntEnum):
+    """Observable lifecycle state of an :class:`mqttium.api.AsyncClient`."""
+
     NEW = 1
     CONNECTING = 2
     CONNECTED = 3

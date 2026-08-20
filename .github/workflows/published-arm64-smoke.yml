@@ -12,20 +12,24 @@ permissions:
   contents: read
 
 concurrency:
-  group: published-arm64-smoke-${{ inputs.version }}
+  group: mqttium-arm64-runner
   cancel-in-progress: false
 
 jobs:
   smoke:
+    if: github.ref == 'refs/heads/main'
     runs-on: [self-hosted, linux, ARM64]
     timeout-minutes: 30
     env:
       MQTTIUM_VERSION: ${{ inputs.version }}
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: main
           persist-credentials: false
+      - name: Set run-specific workspace
+        run: echo "JOB_ROOT=$RUNNER_TEMP/mqttium-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
 
       - name: Verify ARM64 host prerequisites
         shell: bash
@@ -40,15 +44,19 @@ jobs:
           PY
           command -v mosquitto
           command -v openssl
+          if pgrep -a mosquitto; then
+            echo "A pre-existing Mosquitto process makes the runner unsafe for this job." >&2
+            exit 1
+          fi
 
       - name: Create isolated virtual environment
         shell: bash
         run: |
           set -euo pipefail
-          venv="$RUNNER_TEMP/mqttium-published-venv"
-          rm -rf "$venv"
-          python3 -m venv "$venv"
-          echo "$venv/bin" >> "$GITHUB_PATH"
+          rm -rf "$JOB_ROOT"
+          mkdir -p "$JOB_ROOT"
+          python3 -m venv "$JOB_ROOT/venv"
+          echo "$JOB_ROOT/venv/bin" >> "$GITHUB_PATH"
 
       - name: Install exact published wheel
         run: |
@@ -62,43 +70,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          root="$RUNNER_TEMP/mqttium-published"
-          rm -rf "$root"
-          mkdir -p "$root/tls"
-
-          # Debian 13 OpenSSL rejects a CA without keyUsage
-          # (ssl.SSLCertVerificationError: CA cert does not include key usage extension).
-          cat > "$root/tls/ca.cnf" <<'EOF'
-          [req]
-          distinguished_name = dn
-          x509_extensions = v3_ca
-          prompt = no
-          [dn]
-          CN = MQTTium ARM64 Test CA
-          [v3_ca]
-          basicConstraints = critical,CA:TRUE
-          keyUsage = critical,keyCertSign,cRLSign
-          subjectKeyIdentifier = hash
-          EOF
-          openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
-            -config "$root/tls/ca.cnf" \
-            -keyout "$root/tls/ca.key" \
-            -out "$root/tls/ca.crt"
-          openssl req -newkey rsa:2048 -nodes \
-            -subj '/CN=localhost' \
-            -keyout "$root/tls/server.key" \
-            -out "$root/tls/server.csr"
-          printf 'subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n' \
-            > "$root/tls/server.ext"
-          openssl x509 -req -days 1 \
-            -in "$root/tls/server.csr" \
-            -CA "$root/tls/ca.crt" \
-            -CAkey "$root/tls/ca.key" \
-            -CAcreateserial \
-            -extfile "$root/tls/server.ext" \
-            -out "$root/tls/server.crt"
-          chmod 0600 "$root/tls/ca.key" "$root/tls/server.key"
-          chmod 0644 "$root/tls/ca.crt" "$root/tls/server.crt"
+          root="$JOB_ROOT"
+          python tools/ci/generate_test_tls.py "$root/tls" --label "MQTTium ARM64"
 
           cat > "$root/mosquitto.conf" <<EOF
           persistence false
@@ -126,26 +99,9 @@ jobs:
 
           mosquitto -c "$root/mosquitto.conf" > "$root/mosquitto.log" 2>&1 &
           echo "$!" > "$root/mosquitto.pid"
-          for _ in $(seq 1 60); do
-            tcp=0
-            ws=0
-            tls=0
-            unix=0
-            (echo > /dev/tcp/127.0.0.1/11886) >/dev/null 2>&1 && tcp=1
-            (echo > /dev/tcp/127.0.0.1/18083) >/dev/null 2>&1 && ws=1
-            (echo > /dev/tcp/127.0.0.1/18884) >/dev/null 2>&1 && tls=1
-            [ -S "$root/mqttium.sock" ] && unix=1
-            if [ "$tcp" = 1 ] && [ "$ws" = 1 ] && [ "$tls" = 1 ] && [ "$unix" = 1 ]; then
-              exit 0
-            fi
-            if ! kill -0 "$(cat "$root/mosquitto.pid")" 2>/dev/null; then
-              cat "$root/mosquitto.log"
-              exit 1
-            fi
-            sleep 0.2
-          done
-          cat "$root/mosquitto.log"
-          exit 1
+          python tools/ci/wait_for_endpoints.py \
+            --tcp 127.0.0.1:11886 --tcp 127.0.0.1:18083 --tcp 127.0.0.1:18884 \
+            --unix "$root/mqttium.sock"
 
       - name: Exercise installed Stable API
         run: |
@@ -155,7 +111,7 @@ jobs:
 
       - name: Exercise TLS and SQLite restart
         run: |
-          root="$RUNNER_TEMP/mqttium-published"
+          root="$JOB_ROOT"
           python -I tests/installed_distribution_resilience_smoke.py tls \
             --expected-version "$MQTTIUM_VERSION" \
             --host localhost --port 18884 --ca-file "$root/tls/ca.crt"
@@ -168,7 +124,7 @@ jobs:
 
       - name: Exercise transports, Paho migration, cancellation, and shutdown
         run: |
-          root="$RUNNER_TEMP/mqttium-published"
+          root="$JOB_ROOT"
           python -I tests/installed_distribution_extended_smoke.py websocket \
             --expected-version "$MQTTIUM_VERSION" \
             --url ws://127.0.0.1:18083/mqtt
@@ -186,9 +142,10 @@ jobs:
         if: always()
         shell: bash
         run: |
-          pidfile="$RUNNER_TEMP/mqttium-published/mosquitto.pid"
+          pidfile="$JOB_ROOT/mosquitto.pid"
           if [ -f "$pidfile" ]; then
             pid="$(cat "$pidfile")"
             kill "$pid" 2>/dev/null || true
             wait "$pid" 2>/dev/null || true
           fi
+          rm -rf "$JOB_ROOT"

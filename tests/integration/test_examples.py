@@ -3,35 +3,15 @@
 from __future__ import annotations
 
 import os
-import socket
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
-
 ROOT = Path(__file__).resolve().parents[2]
 BROKER_HOST = "127.0.0.1"
 BROKER_PORT = 11883
-
-
-def _broker_up() -> bool:
-    try:
-        with socket.create_connection((BROKER_HOST, BROKER_PORT), timeout=0.5):
-            return True
-    except OSError:
-        return False
-
-
-_BROKER_AVAILABLE = _broker_up()
-if os.environ.get("MQTTIUM_REQUIRE_BROKER") == "1" and not _BROKER_AVAILABLE:
-    raise RuntimeError(f"MQTTIUM_REQUIRE_BROKER=1 but Mosquitto is not listening on :{BROKER_PORT}")
-
-pytestmark = pytest.mark.skipif(
-    not _BROKER_AVAILABLE,
-    reason=f"Mosquitto not on :{BROKER_PORT}",
-)
 
 
 def _run_example(script: str, *arguments: str) -> subprocess.CompletedProcess[str]:

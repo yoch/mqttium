@@ -27,7 +27,7 @@ Replace wake-all admission with the smallest mechanism that wakes only the numbe
 
 ## Acceptance gate
 
-- >= 5% reproducible gain at at least two contention/load points, or >= 2% isolated scheduler gain with a large demonstrated reduction in redundant wakeups, following `docs/BENCHMARKING.md`.
+- >= 5% reproducible gain at at least two contention/load points, or >= 2% isolated scheduler gain with a large demonstrated reduction in redundant wakeups, following `docs/benchmarking.md`.
 - No throughput regression > 3% in low-contention/non-targeted cells.
 - Loop lag regression <= 5% where the metric is in a comparable pacing regime.
 - No starvation/fairness regression and no terminal-wakeup regressions.

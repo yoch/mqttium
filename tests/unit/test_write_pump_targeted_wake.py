@@ -130,7 +130,6 @@ async def _park_waiters(pump: WritePump, payloads: list[bytes]) -> list[asyncio.
     return tasks
 
 
-@pytest.mark.asyncio
 async def test_single_waiter_proceeds_when_capacity_is_released() -> None:
     pump = _pump(max_messages=1)
     assert pump.try_enqueue(b"hold") is True
@@ -148,7 +147,6 @@ async def test_single_waiter_proceeds_when_capacity_is_released() -> None:
     assert pump.queued_messages == 0
 
 
-@pytest.mark.asyncio
 async def test_many_waiters_all_complete_while_writer_drains() -> None:
     pump = _pump(max_messages=2)
     assert pump.try_enqueue(b"a") is True
@@ -166,7 +164,6 @@ async def test_many_waiters_all_complete_while_writer_drains() -> None:
     assert pump.queued_messages == 0
 
 
-@pytest.mark.asyncio
 async def test_capacity_release_notifies_at_most_the_freed_slots() -> None:
     pump = _pump(max_messages=2)
     assert pump.try_enqueue_many([b"a", b"b"]) is True
@@ -193,7 +190,6 @@ async def test_capacity_release_notifies_at_most_the_freed_slots() -> None:
     assert all(n <= 2 for n in notifies)
 
 
-@pytest.mark.asyncio
 async def test_epoch_advance_wakes_all_waiters() -> None:
     pump = _pump(max_messages=1)
     assert pump.try_enqueue(b"hold") is True
@@ -206,7 +202,6 @@ async def test_epoch_advance_wakes_all_waiters() -> None:
     assert pump.waiters == 0
 
 
-@pytest.mark.asyncio
 async def test_discard_and_wake_unblocks_waiters() -> None:
     pump = _pump(max_messages=2)
     assert pump.try_enqueue_many([b"hold-a", b"hold-b"]) is True
@@ -220,7 +215,6 @@ async def test_discard_and_wake_unblocks_waiters() -> None:
     assert pump.queued_messages == 2
 
 
-@pytest.mark.asyncio
 async def test_stop_then_epoch_advance_does_not_strand_waiters() -> None:
     # Bytes stay charged while the first write is in flight, so this
     # reproduces the cancellation race independently of message-count
@@ -242,7 +236,6 @@ async def test_stop_then_epoch_advance_does_not_strand_waiters() -> None:
         await pump.stop()
 
 
-@pytest.mark.asyncio
 async def test_transport_failure_epoch_wake_does_not_strand_waiters() -> None:
     failures: list[BaseException] = []
     pump = WritePump(max_bytes=1024, max_messages=1, on_failure=_no_failure)
@@ -266,7 +259,6 @@ async def test_transport_failure_epoch_wake_does_not_strand_waiters() -> None:
         await pump.stop()
 
 
-@pytest.mark.asyncio
 async def test_cancelled_waiter_does_not_consume_the_only_wakeup() -> None:
     pump = _pump(max_messages=1)
     transport = _CallbackTransport()
@@ -292,7 +284,6 @@ async def test_cancelled_waiter_does_not_consume_the_only_wakeup() -> None:
     assert b"b" in transport.written
 
 
-@pytest.mark.asyncio
 async def test_cancelled_waiter_while_still_parked_does_not_strand_peer() -> None:
     pump = _pump(max_messages=1)
     assert pump.try_enqueue(b"hold") is True
@@ -316,7 +307,6 @@ async def test_cancelled_waiter_while_still_parked_does_not_strand_peer() -> Non
     assert pump.waiters == 0
 
 
-@pytest.mark.asyncio
 async def test_no_waiter_starves_while_capacity_keeps_being_released() -> None:
     pump = _pump(max_messages=2)
     assert pump.try_enqueue_many([b"a", b"b"]) is True
@@ -334,7 +324,6 @@ async def test_no_waiter_starves_while_capacity_keeps_being_released() -> None:
     assert pump.enqueue_suspensions >= 16
 
 
-@pytest.mark.asyncio
 async def test_eager_writes_stay_disabled_while_waiters_exist() -> None:
     pump = _pump(max_messages=1)
     transport = _CallbackTransport()

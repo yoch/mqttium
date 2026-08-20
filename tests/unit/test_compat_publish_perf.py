@@ -101,7 +101,6 @@ def test_publish_receipts_remain_fifo_across_multiple_mid_reuses() -> None:
     assert 7 not in client._receipts
 
 
-@pytest.mark.asyncio
 async def test_old_completion_cannot_settle_reused_mid() -> None:
     client = AsyncClient()
     client.on_publish = lambda *_args: None
@@ -130,7 +129,6 @@ async def test_old_completion_cannot_settle_reused_mid() -> None:
     await client._shutdown_callback_worker(drain=True)
 
 
-@pytest.mark.asyncio
 async def test_old_failure_cannot_fail_reused_mid() -> None:
     client = AsyncClient()
     client.on_publish = lambda *_args: None
@@ -811,7 +809,6 @@ def test_loop_stop_fails_queued_qos1_publish() -> None:
             client.loop_stop()
 
 
-@pytest.mark.asyncio
 async def test_batch_receipt_settles_fifo_across_three_registrations() -> None:
     """Reusing one mid must settle its batch receipts in submission order."""
     client = AsyncClient()
@@ -830,7 +827,6 @@ async def test_batch_receipt_settles_fifo_across_three_registrations() -> None:
     assert mid not in client._batch_receipts
 
 
-@pytest.mark.asyncio
 async def test_batch_and_plain_receipts_share_a_reused_mid() -> None:
     client = AsyncClient()
     mid = 22
@@ -848,7 +844,6 @@ async def test_batch_and_plain_receipts_share_a_reused_mid() -> None:
     assert not client._receipts
 
 
-@pytest.mark.asyncio
 async def test_settling_skips_the_batch_table_when_no_batch_is_outstanding() -> None:
     """A client that never calls publish_many must not hash acked mids twice."""
     client = AsyncClient()

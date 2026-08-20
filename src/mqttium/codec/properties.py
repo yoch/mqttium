@@ -1,6 +1,6 @@
 """MQTT 5 property encode/decode with per-packet validation.
 
-Property table follows IMPLEMENTATION-GUIDE.md §2.
+Property table follows implementation-guide.md §2.
 """
 
 from __future__ import annotations

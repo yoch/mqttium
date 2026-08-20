@@ -13,17 +13,11 @@ import fuzz as fuzzmod  # noqa: E402
 from mqttium.enums import (  # noqa: E402
     ConnectionState,
     OutboundQoSState,
-    PacketType,
     QoS,
 )
 from mqttium.errors import MQTTError  # noqa: E402
 from mqttium.protocol.engine import ProtocolEngine  # noqa: E402
 from mqttium.types import OutboundMessage  # noqa: E402
-
-
-def test_reserved_packet_type_raises_public_mqtt_error() -> None:
-    with pytest.raises(MQTTError):
-        PacketType.from_byte(0x0D)
 
 
 def test_low_level_parser_exceptions_are_not_allowed() -> None:

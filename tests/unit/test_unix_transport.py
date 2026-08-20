@@ -19,7 +19,6 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest.mark.asyncio
 async def test_unix_socket_roundtrip() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         path = str(Path(tmp) / "mqtt.sock")

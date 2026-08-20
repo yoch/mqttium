@@ -1,6 +1,6 @@
 """Paho-compatible sync façade over AsyncClient.
 
-Only ``CallbackAPIVersion.VERSION2`` is supported. See ``docs/COMPAT.md`` for
+Only ``CallbackAPIVersion.VERSION2`` is supported. See ``docs/paho-compatibility.md`` for
 the supported surface, intentional divergences, and rejected features.
 """
 
@@ -37,7 +37,7 @@ MQTT_ERR_QUEUE_SIZE = 15
 _LOOP_HANDOFF_TIMEOUT = 5.0
 # Façade correlation identifiers wrap like Paho's, so an application that
 # already treats `mid` as a 16-bit value keeps working. They are NOT the wire
-# packet identifiers: see the `mid` row in docs/COMPAT.md.
+# packet identifiers: see the `mid` row in docs/paho-compatibility.md.
 _MAX_FACADE_MID = 65_535
 _PUBLISH_BATCH_MAX_MESSAGES = 256
 _PUBLISH_BATCH_MAX_BYTES = 1 * 1024 * 1024
@@ -693,7 +693,7 @@ class Client:
             # whenever effects are already pending — which is exactly the case
             # after a QoS 1/2 commit earlier in this batch, whose SEND is not
             # flushed until _finalize_publish_effects(). That is what keeps
-            # ordering across QoS levels (COMPAT.md).
+            # ordering across QoS levels (paho-compatibility.md).
             #
             # nowait=False deliberately: a full writer queue must fall back to
             # the effect path, which defers the SEND rather than refusing it.

@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import asyncio
 
-import pytest
-
 from mqttium.api.async_client import AsyncClient
 from mqttium.codec.buffer import IncrementalDecoder
 from mqttium.enums import PacketType, QoS
@@ -48,7 +46,6 @@ class Brokerside:
         return self._closing
 
 
-@pytest.mark.asyncio
 async def test_receipt_survives_and_completes_after_reconnect() -> None:
     brokers: list[Brokerside] = []
     client = AsyncClient(

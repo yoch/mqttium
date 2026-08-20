@@ -1,0 +1,195 @@
+name: Soak and broker interoperability
+
+on:
+  schedule:
+    - cron: "19 3 * * 2"
+  workflow_dispatch:
+    inputs:
+      cycles:
+        description: Reconnect/publish cycles per protocol
+        required: false
+        default: "20"
+        type: string
+      messages_per_cycle:
+        description: QoS 1 messages per cycle
+        required: false
+        default: "500"
+        type: string
+  pull_request:
+    paths:
+      - benchmarks/soak.py
+      - src/mqttium/**
+      - .github/workflows/soak.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: soak-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PYTHONUNBUFFERED: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  SOAK_CYCLES: ${{ github.event_name == 'pull_request' && '3' || inputs.cycles || '20' }}
+  SOAK_MESSAGES: ${{ github.event_name == 'pull_request' && '100' || inputs.messages_per_cycle || '500' }}
+
+jobs:
+  scheduled-resilience:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        seed: [101, 202, 303]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e ".[dev]"
+      - name: Repeat resilience with deterministic order and hash seeds
+        env:
+          MQTTIUM_TEST_ORDER_SEED: ${{ matrix.seed }}
+          PYTHONHASHSEED: ${{ matrix.seed }}
+        run: |
+          set -euo pipefail
+          for iteration in 1 2 3; do
+            echo "resilience iteration=$iteration seed=${{ matrix.seed }}"
+            python -m pytest -q tests/resilience
+          done
+
+  linux-soak:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        protocol: ["311", "5"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e ".[benchmark]"
+      - name: Start Mosquitto
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mosquitto
+          printf 'listener 11883 127.0.0.1\nallow_anonymous true\npersistence false\n' > "$RUNNER_TEMP/mosquitto.conf"
+          mosquitto -c "$RUNNER_TEMP/mosquitto.conf" > "$RUNNER_TEMP/mosquitto.log" 2>&1 &
+          python tools/ci/wait_for_endpoints.py --tcp 127.0.0.1:11883
+      - name: Run reconnect and backpressure soak
+        run: |
+          python benchmarks/soak.py \
+            --port 11883 \
+            --protocol "${{ matrix.protocol }}" \
+            --cycles "$SOAK_CYCLES" \
+            --messages-per-cycle "$SOAK_MESSAGES" \
+            --output "$RUNNER_TEMP/soak-mosquitto-${{ matrix.protocol }}.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: soak-mosquitto-${{ matrix.protocol }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/soak-mosquitto-${{ matrix.protocol }}.json
+          if-no-files-found: warn
+          retention-days: 30
+
+  macos-soak:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: macos-15
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        protocol: ["311", "5"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e ".[benchmark]"
+      - name: Start Mosquitto
+        run: |
+          set -euo pipefail
+          brew install mosquitto
+          printf 'listener 11883 127.0.0.1\nallow_anonymous true\npersistence false\n' > "$RUNNER_TEMP/mosquitto.conf"
+          mosquitto -c "$RUNNER_TEMP/mosquitto.conf" > "$RUNNER_TEMP/mosquitto.log" 2>&1 &
+          python tools/ci/wait_for_endpoints.py --tcp 127.0.0.1:11883
+      - name: Run reconnect and backpressure soak
+        run: |
+          python benchmarks/soak.py \
+            --port 11883 \
+            --protocol "${{ matrix.protocol }}" \
+            --cycles "$SOAK_CYCLES" \
+            --messages-per-cycle "$SOAK_MESSAGES" \
+            --output "$RUNNER_TEMP/soak-macos-${{ matrix.protocol }}.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: soak-macos-${{ matrix.protocol }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/soak-macos-${{ matrix.protocol }}.json
+          if-no-files-found: warn
+          retention-days: 30
+
+  interoperability:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - broker: emqx-5.8.9
+            image: emqx/emqx@sha256:35b46f7aa7a0d51f3959e4344221ac5ec7f948b03e43099286b6c40a07bb393b
+            ready_log: EMQX 5.8.9 is running now!
+          - broker: hivemq-2026.5
+            image: hivemq/hivemq-ce@sha256:bac6d4d1d815bffe4bc9a7fca8d06ea12b32d34f84ef2f1851ff4548560ee67b
+            ready_log: Started HiveMQ in
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e ".[benchmark]"
+      - name: Start broker container
+        run: |
+          set -euo pipefail
+          docker run -d --name mqttium-broker -p 11883:1883 "${{ matrix.image }}"
+          for _ in $(seq 1 240); do
+            docker logs mqttium-broker 2>&1 | grep -Fq "${{ matrix.ready_log }}" && exit 0
+            sleep 0.5
+          done
+          docker logs mqttium-broker
+          exit 1
+      - name: Run MQTT interoperability soak
+        run: |
+          set -euo pipefail
+          for protocol in 311 5; do
+            python benchmarks/soak.py \
+              --port 11883 \
+              --protocol "$protocol" \
+              --cycles "$SOAK_CYCLES" \
+              --messages-per-cycle "$SOAK_MESSAGES" \
+              --output "$RUNNER_TEMP/soak-${{ matrix.broker }}-$protocol.json"
+          done
+      - name: Broker logs
+        if: always()
+        run: docker logs mqttium-broker || true
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: soak-${{ matrix.broker }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/soak-${{ matrix.broker }}-*.json
+          if-no-files-found: warn
+          retention-days: 30

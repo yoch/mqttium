@@ -1,0 +1,80 @@
+name: ARM64 CI
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mqttium-arm64-runner
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: ARM64 / system Python 3.13
+    if: github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 35
+    env:
+      MQTTIUM_REQUIRE_BROKER: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Set run-specific workspace
+        run: echo "JOB_ROOT=$RUNNER_TEMP/mqttium-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+      - name: Verify ARM64 host prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "aarch64"
+          command -v python3
+          python3 - <<'PY'
+          import sys
+          if sys.version_info[:2] != (3, 13):
+              raise SystemExit(f"expected system Python 3.13, got {sys.version}")
+          PY
+          command -v openssl
+          command -v mosquitto
+          if pgrep -a mosquitto; then
+            echo "A pre-existing Mosquitto process makes the runner unsafe for this job." >&2
+            exit 1
+          fi
+      - name: Create isolated virtual environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$JOB_ROOT"
+          mkdir -p "$JOB_ROOT"
+          python3 -m venv "$JOB_ROOT/venv"
+          echo "$JOB_ROOT/venv/bin" >> "$GITHUB_PATH"
+      - run: python -m pip install -e ".[dev]"
+      - name: Unit tests
+        run: python -m pytest -q -W error --strict-config --strict-markers tests/unit
+      - name: Resilience tests
+        run: python -m pytest -q -W error --strict-config --strict-markers tests/resilience
+      - name: Start isolated Mosquitto
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'listener 11883 127.0.0.1\nallow_anonymous true\npersistence false\n' > "$JOB_ROOT/mosquitto.conf"
+          mosquitto -c "$JOB_ROOT/mosquitto.conf" > "$JOB_ROOT/mosquitto.log" 2>&1 &
+          echo "$!" > "$JOB_ROOT/mosquitto.pid"
+          python tools/ci/wait_for_endpoints.py --tcp 127.0.0.1:11883
+      - name: Mandatory integration tests
+        run: python -m pytest -q -W error --strict-config --strict-markers tests/integration
+      - name: Stop isolated Mosquitto
+        if: always()
+        shell: bash
+        run: |
+          pidfile="$JOB_ROOT/mosquitto.pid"
+          if [ -f "$pidfile" ]; then
+            pid="$(cat "$pidfile")"
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+          fi
+          rm -rf "$JOB_ROOT"

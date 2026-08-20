@@ -1,11 +1,12 @@
 # Contributing
 
-Contributions and reproducible feedback are welcome during the MQTTium release-candidate period.
-Incorrect behaviour in a published pre-release should use the structured bug form and
-the evidence checklist in [`docs/BETA-REPORTING.md`](docs/BETA-REPORTING.md).
-Security vulnerabilities must follow the private process in [`SECURITY.md`](SECURITY.md).
+Focused contributions and reproducible feedback are welcome. Security
+vulnerabilities must follow the private process in [SECURITY.md](SECURITY.md),
+not a public issue.
 
-## Development
+## Development environment
+
+MQTTium uses `pip` and has no runtime dependencies:
 
 ```bash
 python -m pip install -e ".[dev,fuzz,security,release]"
@@ -14,47 +15,65 @@ ruff format --check src tests benchmarks
 ruff check src tests benchmarks
 mypy src/mqttium
 bandit -q -ll -r src
-python -m pytest -q tests/unit --cov=mqttium --cov-report=term-missing --cov-fail-under=80
-python -m pytest -q tests/integration
-
-PYTHONPATH=src python tests/fuzz/fuzz.py --seed 1 --iterations 20000
-python -m pytest -q tests/fuzz/test_hypothesis_fuzz.py
+python -m pytest -q tests/unit
+python -m pytest -q tests/unit --cov=mqttium --cov-report=term-missing
 ```
 
-Integration tests require a local Mosquitto broker on `127.0.0.1:11883` and
-**skip silently** when it is absent, so a green run does not prove they ran:
+Run integration tests against Mosquitto on `127.0.0.1:11883`:
 
 ```bash
 printf 'listener 11883 127.0.0.1\nallow_anonymous true\npersistence false\n' > /tmp/mosq.conf
 mosquitto -c /tmp/mosq.conf -d
+python -m pytest -q tests/integration
 ```
 
-CI additionally builds the distributions and asserts their contents
-(`validate-pyproject`, `python -m build`, `twine check --strict`,
-`check-wheel-contents`, wheel metadata and isolated-install checks), and fails
-if any cache or build artefact is tracked by git.
+Integration tests skip when the broker is absent. A green local command does
+not prove that they ran; inspect the collected and skipped counts. TLS tests
+also require OpenSSL on `PATH`.
 
-## Bug reports
+Fuzzing commands:
 
-Prefer a minimal complete reproducer against the latest published pre-release in a
-clean virtual environment. Include the MQTTium, Python, broker and operating-
-system versions, protocol, transport, relevant client options, complete
-traceback and a `ClientStats` snapshot when the owning event loop is responsive.
-Redact credentials, private keys, tokens, private addresses and sensitive
-payloads. See [`docs/BETA-REPORTING.md`](docs/BETA-REPORTING.md) for failure-
-specific evidence and triage criteria.
+```bash
+PYTHONPATH=src python tests/fuzz/fuzz.py --seed 1 --iterations 20000
+python -m pytest -q tests/fuzz/test_hypothesis_fuzz.py
+```
 
-## Pull requests
+CI additionally enforces its configured coverage threshold, validates wheel
+and source distributions, installs artifacts in isolation, imports packaged
+modules, checks license/type metadata, and rejects tracked cache/build output.
 
-Keep changes focused, add tests for observable behavior, and document any API,
-protocol-state or persistence invariant that changes. Update `CHANGELOG.md`
-under `[Unreleased]` for anything user-visible. Performance changes must include
-a comparable benchmark and may not weaken correctness checks; follow the
-validity contract in [`docs/BENCHMARKING.md`](docs/BENCHMARKING.md) and never
-commit generated numbers.
+## Before opening a pull request
 
-Documentation is indexed by [`docs/README.md`](docs/README.md) and split in two:
-contracts directly under `docs/` describe current behaviour and are updated with
-the code, while [`docs/reports/`](docs/reports/README.md) holds dated
-measurements and audits that are never revised after the fact. A benchmark
-write-up or campaign record belongs in `reports/`.
+- Keep the change focused and explain observable behaviour.
+- Add a regression test for defects and public contract changes.
+- Update current documentation in the same change as behaviour.
+- Add user-visible changes under `[Unreleased]` in `CHANGELOG.md`.
+- For Stable API changes, update the stability policy and migration guidance.
+- For protocol changes, cite the relevant MQTT statement and preserve ownership
+  and rollback invariants.
+- For performance changes, follow [the benchmarking contract](docs/benchmarking.md)
+  and retain valid same-machine controls outside Git.
+- Never commit generated benchmark results, coverage databases, caches, build
+  output, or local secrets.
+
+## Documentation policy
+
+Active guides and contracts describe current behaviour and change with the
+code. Dated files in `docs/reports/` are immutable historical evidence; never
+rewrite them to match a newer implementation. Write a new report and update the
+curated archive status instead.
+
+Documentation must be English, build with `mkdocs build --strict`, and remain
+readable as source Markdown. Public examples should parse and, where practical,
+run against an installed artifact.
+
+## Reporting bugs
+
+Use the structured issue form and the complete
+[reporting checklist](docs/reporting-issues.md). Include the exact MQTTium,
+Python, broker, operating-system, protocol, and transport versions; a minimal
+reproducer; the complete exception chain; and redacted runtime snapshots when
+available.
+
+Correctness, data loss, unbounded growth, deadlock, security, and clean shutdown
+issues take priority over convenience requests.

@@ -6,51 +6,21 @@ import asyncio
 
 import pytest
 
-from mqttium.codec.buffer import IncrementalDecoder
-from mqttium.codec.primitives import pack_u16
-from mqttium.enums import PacketType, QoS
 from mqttium.helpers import publish as publish_helper
 from mqttium.helpers import subscribe as subscribe_helper
-from mqttium.packets import PubAckPacket, PublishPacket, encode_frame
+from mqttium.packets import PublishPacket
+from tests.support import ScriptedBrokerTransport, wait_until
 
 
-class FakeBrokerTransport:
-    def __init__(self, *, push_publish: bytes | None = None) -> None:
-        self._rx: asyncio.Queue[bytes] = asyncio.Queue()
-        self._decoder = IncrementalDecoder()
-        self._closing = False
-        self._push_publish = push_publish
-
-    async def write(self, data: bytes) -> None:
-        self._decoder.feed(data)
-        for raw in self._decoder.drain_packets():
-            if raw.packet_type is PacketType.CONNECT:
-                self._rx.put_nowait(encode_frame(PacketType.CONNACK, 0, b"\x00\x00"))
-            elif raw.packet_type is PacketType.PUBLISH:
-                pub = PublishPacket.decode(raw.flags, raw.remaining)
-                if pub.qos == QoS.AT_LEAST_ONCE and pub.mid is not None:
-                    self._rx.put_nowait(PubAckPacket(mid=pub.mid).encode())
-            elif raw.packet_type is PacketType.SUBSCRIBE:
-                mid = int.from_bytes(raw.remaining[:2], "big")
-                self._rx.put_nowait(encode_frame(PacketType.SUBACK, 0, pack_u16(mid) + bytes([0])))
-                if self._push_publish is not None:
-                    self._rx.put_nowait(self._push_publish)
-
-    async def read(self, n: int = 65536) -> bytes:
-        return await self._rx.get()
-
-    async def close(self) -> None:
-        self._closing = True
-        self._rx.put_nowait(b"")
-
-    def is_closing(self) -> bool:
-        return self._closing
+@pytest.mark.parametrize("msg_count", [0, -1])
+async def test_subscribe_simple_rejects_non_positive_message_count(msg_count: int) -> None:
+    with pytest.raises(ValueError, match="msg_count must be greater than 0"):
+        await subscribe_helper.simple("topic", msg_count=msg_count)
 
 
-@pytest.mark.asyncio
 async def test_publish_single_and_multiple(monkeypatch: pytest.MonkeyPatch) -> None:
     async def factory(host: str, port: int, *, ssl=None):
-        return FakeBrokerTransport()
+        return ScriptedBrokerTransport()
 
     from mqttium.api import async_client as ac
 
@@ -67,12 +37,11 @@ async def test_publish_single_and_multiple(monkeypatch: pytest.MonkeyPatch) -> N
     )
 
 
-@pytest.mark.asyncio
 async def test_subscribe_simple(monkeypatch: pytest.MonkeyPatch) -> None:
     inbound = PublishPacket(topic="news/1", payload=b"hi", qos=0, retain=False, dup=False).encode()
 
     async def factory(host: str, port: int, *, ssl=None):
-        return FakeBrokerTransport(push_publish=inbound)
+        return ScriptedBrokerTransport(publish_after_subscribe=inbound)
 
     from mqttium.api import async_client as ac
 
@@ -82,3 +51,71 @@ async def test_subscribe_simple(monkeypatch: pytest.MonkeyPatch) -> None:
     assert not isinstance(msg, list)
     assert msg.topic == "news/1"
     assert msg.payload == b"hi"
+
+
+async def test_subscribe_simple_collects_multiple_and_filters_retained(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    retained = PublishPacket(
+        topic="news/retained",
+        payload=b"old",
+        qos=0,
+        retain=True,
+        dup=False,
+    ).encode()
+    fresh = [
+        PublishPacket(
+            topic=f"news/{index}",
+            payload=str(index).encode(),
+            qos=0,
+            retain=False,
+            dup=False,
+        ).encode()
+        for index in range(2)
+    ]
+
+    async def factory(host: str, port: int, *, ssl=None):
+        return ScriptedBrokerTransport(
+            publish_after_subscribe=retained + b"".join(fresh),
+        )
+
+    from mqttium.api import async_client as ac
+
+    monkeypatch.setattr(ac.TcpTransport, "connect", staticmethod(factory))
+
+    messages = await subscribe_helper.simple(
+        "news/#",
+        msg_count=2,
+        retained=False,
+        hostname="fake",
+        timeout=2.0,
+    )
+    assert isinstance(messages, list)
+    assert [message.topic for message in messages] == ["news/0", "news/1"]
+
+
+async def test_subscribe_callback_disconnects_when_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = ScriptedBrokerTransport()
+
+    async def factory(host: str, port: int, *, ssl=None):
+        return transport
+
+    from mqttium.api import async_client as ac
+
+    monkeypatch.setattr(ac.TcpTransport, "connect", staticmethod(factory))
+    seen = []
+    task = asyncio.create_task(subscribe_helper.callback(seen.append, "events/#", hostname="fake"))
+    await wait_until(lambda: any(frame[0] >> 4 == 8 for frame in transport.written))
+
+    transport.push_rx(
+        PublishPacket(topic="events/1", payload=b"event", qos=0, retain=False, dup=False).encode()
+    )
+    await wait_until(lambda: len(seen) == 1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert seen[0].topic == "events/1"
+    assert transport.is_closing()

@@ -28,11 +28,11 @@ async def _native_roundtrip(
     protocol: MQTTProtocolVersion,
     transport: str,
 ) -> None:
-    topic = f"mqttium/beta-extended/{transport}/{int(protocol)}"
+    topic = f"mqttium/distribution-extended/{transport}/{int(protocol)}"
     payload = f"{transport}-{int(protocol)}".encode()
     received: asyncio.Future[bytes] = asyncio.get_running_loop().create_future()
-    subscriber = AsyncClient(f"beta-{transport}-sub-{int(protocol)}", protocol=protocol)
-    publisher = AsyncClient(f"beta-{transport}-pub-{int(protocol)}", protocol=protocol)
+    subscriber = AsyncClient(f"dist-{transport}-sub-{int(protocol)}", protocol=protocol)
+    publisher = AsyncClient(f"dist-{transport}-pub-{int(protocol)}", protocol=protocol)
 
     def on_message(message: Message) -> None:
         if message.topic == topic and not received.done():
@@ -73,7 +73,7 @@ async def _unix_smoke(path: Path) -> None:
 
 
 def _paho_smoke(host: str, port: int) -> None:
-    topic = f"mqttium/beta-extended/paho/{uuid.uuid4().hex}"
+    topic = f"mqttium/distribution-extended/paho/{uuid.uuid4().hex}"
     payload = b"paho-version2-migration"
     connected = threading.Event()
     published = threading.Event()
@@ -81,11 +81,11 @@ def _paho_smoke(host: str, port: int) -> None:
     received_payload: list[bytes] = []
     subscriber = Client(
         CallbackAPIVersion.VERSION2,
-        client_id="beta-paho-subscriber",
+        client_id="dist-paho-subscriber",
     )
     publisher = Client(
         CallbackAPIVersion.VERSION2,
-        client_id="beta-paho-publisher",
+        client_id="dist-paho-publisher",
     )
 
     def on_connect(
@@ -145,7 +145,7 @@ def _paho_smoke(host: str, port: int) -> None:
 
 
 async def _cancellation_and_shutdown_smoke(host: str, port: int) -> None:
-    client = AsyncClient("beta-clean-shutdown", message_delivery="iterator")
+    client = AsyncClient("dist-clean-shutdown", message_delivery="iterator")
     await client.connect(host, port, timeout=5)
     iterator = client.messages()
     waiting = asyncio.create_task(anext(iterator))
@@ -185,7 +185,7 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=11886)
     parser.add_argument("--url", default="ws://127.0.0.1:18083/mqtt")
-    parser.add_argument("--socket", type=Path, default=Path("/tmp/mqttium-beta.sock"))
+    parser.add_argument("--socket", type=Path, default=Path("/tmp/mqttium-dist.sock"))
     args = parser.parse_args()
 
     _verify_version(args.expected_version)
