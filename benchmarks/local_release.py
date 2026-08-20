@@ -726,6 +726,8 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.network_repeat <= 0 or args.network_repeat % 2:
         parser.error("--network-repeat must be a positive even number")
+    if args.profile in ("performance", "rc") and args.cpu is None:
+        parser.error("--cpu is required for performance and rc release gates")
     return args
 
 
