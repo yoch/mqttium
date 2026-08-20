@@ -25,6 +25,9 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - Reconcile the active scheduler experiment statuses with their accepted,
   eligible-runner evidence and merge decisions while preserving dated report
   bodies unchanged.
+- Generate canonical and AI-facing documentation links from the active Read the
+  Docs build URL so `latest`, stable releases, and pull-request previews remain
+  self-contained.
 - Refresh the README, package metadata, community templates, and repository
   discovery metadata for the stable launch. Public comparative benchmark
   claims are deferred to the independent cross-client benchmark repository.
