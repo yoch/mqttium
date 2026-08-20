@@ -1,0 +1,251 @@
+name: Temporary engine-effect cost probe v2
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/tmp-engine-effect-cost-probe-v2.yml
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: 5d100b96c22ff4456f5f82f1bad6ced73ae1855d
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.13"
+      - name: Runner facts
+        run: |
+          python -VV
+          lscpu | sed -n '1,18p'
+      - name: Probe engine emission costs
+        env:
+          PYTHONPATH: ${{ github.workspace }}/src
+        run: |
+          set -euo pipefail
+          cat > /tmp/engine_effect_worker.py <<'PY'
+          from __future__ import annotations
+
+          import json
+          import os
+          import sys
+          import time
+          from types import MethodType
+
+          if hasattr(os, "sched_getaffinity") and hasattr(os, "sched_setaffinity"):
+              allowed = os.sched_getaffinity(0)
+              if allowed:
+                  os.sched_setaffinity(0, {min(allowed)})
+
+          from mqttium.codec.buffer import IncrementalDecoder
+          from mqttium.enums import ConnectionState, MQTTProtocolVersion, PacketType, QoS
+          from mqttium.packets import PublishPacket
+          from mqttium.packets._publish import decode_qos0_message_v311
+          from mqttium.protocol.effects import EffectKind, EngineEffect
+          from mqttium.protocol.engine import EngineConfig, ProtocolEngine
+
+          variant = sys.argv[1]
+          shape = sys.argv[2]
+          packet = PublishPacket(
+              topic="bench/sensors/temp",
+              payload=b'{"t":21.5,"h":40}',
+              qos=QoS.AT_MOST_ONCE,
+              retain=False,
+              dup=False,
+          )
+          decoder = IncrementalDecoder()
+          decoder.feed(packet.encode(MQTTProtocolVersion.MQTTv311))
+          raw = decoder.drain_packets()[0]
+          engine = ProtocolEngine(
+              EngineConfig(client_id="engine-effect-probe", protocol=MQTTProtocolVersion.MQTTv311)
+          )
+          engine.state = ConnectionState.CONNECTED
+
+          if variant == "positional":
+              def emit_positional(
+                  self: ProtocolEngine,
+                  kind: EffectKind,
+                  data: object = None,
+                  *,
+                  requires_delivery_mark: bool = False,
+                  decoded_property_wire_size: int | None = None,
+              ) -> None:
+                  self._effects.append(
+                      EngineEffect(kind, data, requires_delivery_mark, decoded_property_wire_size)
+                  )
+              engine._emit = MethodType(emit_positional, engine)
+
+          elif variant == "direct_effect":
+              def handle_direct_effect(packet_raw: object) -> None:
+                  if ((packet_raw.flags >> 1) & 0x03) != 0:  # type: ignore[attr-defined]
+                      raise RuntimeError("probe saw non-QoS0 PUBLISH")
+                  engine._effects.append(
+                      EngineEffect(
+                          EffectKind.MESSAGE,
+                          decode_qos0_message_v311(packet_raw),  # type: ignore[arg-type]
+                          False,
+                          None,
+                      )
+                  )
+              engine._handlers_by_state[ConnectionState.CONNECTED][PacketType.PUBLISH] = handle_direct_effect
+
+          elif variant == "raw_message":
+              def emit_raw(
+                  self: ProtocolEngine,
+                  kind: EffectKind,
+                  data: object = None,
+                  *,
+                  requires_delivery_mark: bool = False,
+                  decoded_property_wire_size: int | None = None,
+              ) -> None:
+                  if kind is not EffectKind.MESSAGE or requires_delivery_mark or decoded_property_wire_size is not None:
+                      raise RuntimeError("probe saw a non-fresh QoS0 effect")
+                  self._effects.append(data)  # type: ignore[arg-type]
+              engine._emit = MethodType(emit_raw, engine)
+
+          elif variant == "direct_message":
+              def handle_direct_message(packet_raw: object) -> None:
+                  if ((packet_raw.flags >> 1) & 0x03) != 0:  # type: ignore[attr-defined]
+                      raise RuntimeError("probe saw non-QoS0 PUBLISH")
+                  engine._effects.append(decode_qos0_message_v311(packet_raw))  # type: ignore[arg-type]
+              engine._handlers_by_state[ConnectionState.CONNECTED][PacketType.PUBLISH] = handle_direct_message
+
+          elif variant != "base":
+              raise RuntimeError(f"unknown variant {variant}")
+
+          if shape == "single":
+              logical_per_iteration = 1
+              warmup_iterations = 8_000
+              measured_iterations = 180_000
+          elif shape == "batch256":
+              logical_per_iteration = 256
+              warmup_iterations = 32
+              measured_iterations = 800
+          else:
+              raise RuntimeError(f"unknown shape {shape}")
+
+          def one_iteration() -> None:
+              for _ in range(logical_per_iteration):
+                  engine.handle_raw(raw)
+              effects = engine.take_effects()
+              if len(effects) != logical_per_iteration:
+                  raise RuntimeError(
+                      f"unexpected output count {len(effects)} != {logical_per_iteration}"
+                  )
+
+          for _ in range(warmup_iterations):
+              one_iteration()
+          started_wall = time.perf_counter()
+          started_cpu = time.process_time()
+          for _ in range(measured_iterations):
+              one_iteration()
+          elapsed_wall = time.perf_counter() - started_wall
+          elapsed_cpu = time.process_time() - started_cpu
+          logical_operations = measured_iterations * logical_per_iteration
+          print(json.dumps({
+              "variant": variant,
+              "shape": shape,
+              "operations": logical_operations,
+              "wall_s": elapsed_wall,
+              "cpu_s": elapsed_cpu,
+              "ops_per_s": logical_operations / elapsed_wall,
+              "cpu_us_per_op": elapsed_cpu * 1e6 / logical_operations,
+          }))
+          PY
+
+          cat > /tmp/engine_effect_pairs.py <<'PY'
+          from __future__ import annotations
+
+          import json
+          import os
+          import statistics
+          import subprocess
+          import sys
+
+          CANDIDATES = ("positional", "direct_effect", "raw_message", "direct_message")
+          SHAPES = ("single", "batch256")
+          REPEAT = 11
+
+          def run(variant: str, shape: str) -> dict[str, float | int | str]:
+              try:
+                  proc = subprocess.run(
+                      [sys.executable, "/tmp/engine_effect_worker.py", variant, shape],
+                      check=True,
+                      capture_output=True,
+                      text=True,
+                      env=os.environ.copy(),
+                  )
+              except subprocess.CalledProcessError as exc:
+                  print(f"worker failed: {variant=} {shape=}", file=sys.stderr)
+                  print(exc.stdout, file=sys.stderr)
+                  print(exc.stderr, file=sys.stderr)
+                  raise
+              return json.loads([line for line in proc.stdout.splitlines() if line.strip()][-1])
+
+          results: dict[str, object] = {}
+          for shape in SHAPES:
+              for candidate in CANDIDATES:
+                  key = f"{shape}:{candidate}"
+                  pairs = []
+                  ratios = []
+                  cpu_ratios = []
+                  base_rates = []
+                  candidate_rates = []
+                  base_cpu = []
+                  candidate_cpu = []
+                  for index in range(REPEAT):
+                      order = ("base", candidate) if index % 2 == 0 else (candidate, "base")
+                      measured = {variant: run(variant, shape) for variant in order}
+                      br = float(measured["base"]["ops_per_s"])
+                      cr = float(measured[candidate]["ops_per_s"])
+                      bc = float(measured["base"]["cpu_us_per_op"])
+                      cc = float(measured[candidate]["cpu_us_per_op"])
+                      ratio = cr / br
+                      cpu_ratio = cc / bc
+                      ratios.append(ratio)
+                      cpu_ratios.append(cpu_ratio)
+                      base_rates.append(br)
+                      candidate_rates.append(cr)
+                      base_cpu.append(bc)
+                      candidate_cpu.append(cc)
+                      pairs.append({"order": list(order), "ratio": ratio, "cpu_ratio": cpu_ratio, **measured})
+                      print(f"{key} pair {index + 1:02d} throughput={ratio:.4f} cpu={cpu_ratio:.4f}")
+                  results[key] = {
+                      "median_candidate_over_base": statistics.median(ratios),
+                      "min_candidate_over_base": min(ratios),
+                      "max_candidate_over_base": max(ratios),
+                      "pairs_favouring_candidate": sum(r > 1.0 for r in ratios),
+                      "median_cpu_candidate_over_base": statistics.median(cpu_ratios),
+                      "base_rate_median": statistics.median(base_rates),
+                      "candidate_rate_median": statistics.median(candidate_rates),
+                      "base_cpu_us_per_op_median": statistics.median(base_cpu),
+                      "candidate_cpu_us_per_op_median": statistics.median(candidate_cpu),
+                      "pairs": pairs,
+                  }
+          with open("/tmp/engine-effect-cost-probe-v2.json", "w", encoding="utf-8") as fh:
+              json.dump(results, fh, indent=2)
+              fh.write("\n")
+          print(json.dumps({
+              k: {kk: vv for kk, vv in v.items() if kk != "pairs"}
+              for k, v in results.items()
+          }, indent=2))
+          PY
+
+          python /tmp/engine_effect_pairs.py
+      - name: Upload probe evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: tmp-engine-effect-cost-probe-v2-${{ github.run_id }}
+          path: /tmp/engine-effect-cost-probe-v2.json
+          if-no-files-found: warn
+          retention-days: 7
