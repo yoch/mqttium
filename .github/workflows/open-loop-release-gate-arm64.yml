@@ -65,6 +65,9 @@ jobs:
           fi
           test "$CANDIDATE_SHA" = "$(git -C candidate rev-parse HEAD)"
           test "$RC8_SHA" = "$(git -C base rev-parse HEAD)"
+          test -f candidate/benchmarks/open_loop_release_gate.py
+          test -f candidate/benchmarks/paired_open_loop.py
+          test -f candidate/benchmarks/runner_probe.py
 
       - name: Verify persistent performance governor
         shell: bash
@@ -131,6 +134,8 @@ jobs:
           set +e
           started=$(date +%s)
           python candidate/benchmarks/open_loop_release_gate.py \
+            --engine candidate/benchmarks/paired_open_loop.py \
+            --runner-probe candidate/benchmarks/runner_probe.py \
             --base-root candidate \
             --candidate-root candidate \
             --protocols 311,5 \
@@ -155,6 +160,8 @@ jobs:
           set +e
           started=$(date +%s)
           python candidate/benchmarks/open_loop_release_gate.py \
+            --engine candidate/benchmarks/paired_open_loop.py \
+            --runner-probe candidate/benchmarks/runner_probe.py \
             --base-root base \
             --candidate-root candidate \
             --cpu 2 \
