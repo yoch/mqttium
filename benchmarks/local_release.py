@@ -485,6 +485,22 @@ def run_robustness(recorder: Recorder, *, port: int) -> None:
         )
 
 
+def _runner_preflight_command(output: Path) -> list[str]:
+    return [
+        sys.executable,
+        "benchmarks/runner_probe.py",
+        "--enforce",
+        "--wait-seconds",
+        "60",
+        "--poll-seconds",
+        "5",
+        "--consecutive-eligible",
+        "2",
+        "--output",
+        str(output),
+    ]
+
+
 def run_performance(
     recorder: Recorder,
     *,
@@ -493,16 +509,11 @@ def run_performance(
     network_repeat: int,
     cpu: int | None,
 ) -> None:
-    preflight = recorder.output / "runner.json"
+    micro_preflight = recorder.output / "runner.json"
     recorder.run(
         "runner-preflight",
-        [
-            sys.executable,
-            "benchmarks/runner_probe.py",
-            "--enforce",
-            "--output",
-            str(preflight),
-        ],
+        _runner_preflight_command(micro_preflight),
+        timeout=90,
     )
     micro_command = [
         sys.executable,
@@ -523,6 +534,13 @@ def run_performance(
         micro_command,
         timeout=1800,
     )
+
+    network_preflight = recorder.output / "runner-network.json"
+    recorder.run(
+        "runner-preflight-network",
+        _runner_preflight_command(network_preflight),
+        timeout=90,
+    )
     network_command = [
         sys.executable,
         "benchmarks/paired_network.py",
@@ -535,7 +553,7 @@ def run_performance(
         "--policy",
         "advisory",
         "--preflight-report",
-        str(preflight),
+        str(network_preflight),
         "--repeat",
         str(network_repeat),
         "--output",
@@ -547,6 +565,13 @@ def run_performance(
         "paired-network-advisory",
         network_command,
         timeout=7200,
+    )
+
+    open_loop_preflight = recorder.output / "runner-open-loop.json"
+    recorder.run(
+        "runner-preflight-open-loop",
+        _runner_preflight_command(open_loop_preflight),
+        timeout=90,
     )
     open_loop_command = [
         sys.executable,
@@ -560,7 +585,7 @@ def run_performance(
         "--policy",
         "strict",
         "--preflight-report",
-        str(preflight),
+        str(open_loop_preflight),
         "--output",
         str(recorder.output / "paired-open-loop.json"),
     ]
