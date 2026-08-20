@@ -17,12 +17,15 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   coverage, consolidated release validation, and explicit self-hosted runner
   trust boundaries.
 - Publish the existing branch-inclusive coverage report to Codecov using OIDC.
-  Codecov starts as an informational review aid; the repository's local 89%
-  coverage gate remains authoritative.
+  Codecov is an informational, base-relative review aid because its treatment
+  of partially covered branch lines differs from coverage.py; the repository's
+  local branch-inclusive 89% coverage gate remains authoritative.
 
 ### Documentation
 
 - Display the MQTTium logo prominently on the documentation home page.
+- Document the test taxonomy, local release-equivalent commands, reliability
+  rules, and the distinction between coverage.py and Codecov percentages.
 - Add a versioned MkDocs Material / Read the Docs site, exhaustive Stable API
   reference, user-oriented guides, curated historical-evidence index, project
   support policy, and a single canonical `AGENTS.md` repository guide.
