@@ -107,6 +107,56 @@ Re-run the major performance gates with an immediately preceding strict prefligh
 
 If eligibility changes during the campaign, the affected performance evidence is invalid and must not be counted as a pass.
 
+## Controlled ARM64 outcome
+
+Authoritative measurement run: Actions run `32390529664` on `rpi5`, candidate `4ba41baca55ffac8a71e8070268b75807280ea0d`, immutable baseline `v1.0.0rc8@5818b63f2226bdac0a4d700be1cad9b75a84c4d5`. The runner was verified as `aarch64`, Python 3.13, governor `performance`; Mosquitto was pinned to CPU 0. Each matrix used `repeat=8`, and pinned matrices used publisher CPU 2.
+
+### Quality carryover
+
+The cold preflight was eligible (`cpu=3.5%`, `load1/cpu=0.0620`). Immediately after reproducing the exact RC quality phase, both sampled preflights were already eligible:
+
+- first sample: `cpu=1.5%`, `load1/cpu=0.1475`;
+- second sample: `cpu=0.0%`, `load1/cpu=0.1248`.
+
+This controlled run therefore does **not** reproduce deterministic self-rejection caused by the quality phase. The earlier local failures remain evidence that such carryover can occur under some runner states, but quality itself is not sufficient to trigger it here.
+
+### Open-loop controls and A/B
+
+| Matrix | Strict status | completed-rate ratio range | median completed ratio | loop-ratio failures | largest failing ratio |
+| --- | --- | --- | --- | --- | --- |
+| A/A unpinned | invalid / exit 2 | `0.98698..1.01315` | `1.00009` | 3 | `1.1375` |
+| A/A pinned CPU 2 | invalid / exit 2 | `0.98766..1.00534` | `1.00003` | 2 | `1.1032` |
+| A/B rc8 -> candidate, CPU 2 | invalid / exit 2 | `0.99548..1.00146` | `0.99935` | 2 | `1.0935` |
+
+No scenario in any campaign breached the `0.97` completed-rate ratio floor. The two pinned A/B loop-ratio failures are not distinguishable from the pinned A/A noise envelope:
+
+- MQTT 3.1.1, 4096-byte, receipt, 0.90 load: A/B `1.0935`, `0.1387 -> 0.1516 ms`, `+0.0130 ms`; pinned A/A on the same cell already failed at `1.0668`, `0.1398 -> 0.1542 ms`, `+0.0144 ms`.
+- MQTT 5, 4096-byte, receipt, 0.90 load: A/B `1.0590`, `0.1462 -> 0.1723 ms`, `+0.0260 ms`; pinned A/A failed more strongly at `1.1032`, `0.2943 -> 0.3293 ms`, `+0.0351 ms`.
+
+The ratio-only `1.05` loop-lag rule therefore produces strict failures on identical-code A/A runs under an otherwise qualified, pinned runner. This is direct evidence of a gate-calibration defect. It is **not** evidence for simply increasing the ratio ceiling; a production rule should combine relative degradation with absolute materiality and be calibrated against A/A noise.
+
+The current ACK p50 latency CV guard also invalidated scenarios in A/A (six unpinned scenario-level violations and three pinned scenarios with at least one arm above 5%). That instability should be treated separately from throughput and from the loop-lag ratio rule; it is additional evidence that high-load scenario variance must be characterized before calling an A/B runtime regression.
+
+### Eligibility lifetime
+
+Fresh preflight checks between matrices were necessary even though instantaneous CPU had already returned to low values:
+
+- before pinned A/A: `load1/cpu=0.3375` (ineligible), then `0.2626` (ineligible), then `0.2042` (eligible);
+- before pinned A/B: `0.3390` (ineligible), then `0.2426` (eligible);
+- immediate postflight: `0.2830` (ineligible), followed by cooled `0.2201` (eligible).
+
+This confirms a runner-orchestration defect for long performance campaigns: one preflight cannot be reused as evidence of eligibility for later gates. `local_release.py` currently creates one `runner.json` before `paired-micro`, then passes that same report to the later network and strict open-loop stages. Production orchestration should requalify immediately before each major performance gate and fail closed if the runner does not return to eligibility.
+
+### Classification
+
+The controlled evidence supports:
+
+1. **no demonstrated mqttium runtime throughput regression**;
+2. **gate calibration defect**: the `1.05` loop-lag ratio rule false-positives in A/A, including pinned A/A;
+3. **runner orchestration defect**: `load1` carryover from one performance matrix invalidates eligibility for the next unless a fresh requalification/cooldown occurs;
+4. **quality self-pollution not reproduced deterministically** in this run;
+5. **latency-CV instability remains a separate calibration question** at high-load receipt scenarios.
+
 ## Decision rules
 
 ### Runtime regression
