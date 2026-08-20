@@ -136,6 +136,7 @@ plugins:
           - conformance.md
           - observability.md
         Maintainers:
+          - testing.md
           - reporting-issues.md
           - benchmarking.md
           - network-release-gate.md
@@ -198,6 +199,7 @@ nav:
       - Protocol conformance: conformance.md
       - Logging and observability: observability.md
   - Maintainers:
+      - Testing and coverage: testing.md
       - Reporting issues: reporting-issues.md
       - Benchmarking contract: benchmarking.md
       - Network release gate: network-release-gate.md

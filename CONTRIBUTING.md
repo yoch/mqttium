@@ -9,14 +9,15 @@ not a public issue.
 MQTTium uses `pip` and has no runtime dependencies:
 
 ```bash
-python -m pip install -e ".[dev,fuzz,security,release]"
+python -m pip install -e ".[dev,fuzz,security,release,docs]"
 
 ruff format --check src tests benchmarks
 ruff check src tests benchmarks
 mypy src/mqttium
 bandit -q -ll -r src
-python -m pytest -q tests/unit
-python -m pytest -q tests/unit --cov=mqttium --cov-report=term-missing
+python -m pytest -q tests/unit tests/project
+python -m pytest -q tests/unit tests/project --cov=mqttium --cov-branch
+mkdocs build --strict
 ```
 
 Run integration tests against Mosquitto on `127.0.0.1:11883`:
@@ -24,21 +25,24 @@ Run integration tests against Mosquitto on `127.0.0.1:11883`:
 ```bash
 printf 'listener 11883 127.0.0.1\nallow_anonymous true\npersistence false\n' > /tmp/mosq.conf
 mosquitto -c /tmp/mosq.conf -d
-python -m pytest -q tests/integration
+MQTTIUM_REQUIRE_BROKER=1 python -m pytest -q tests/integration
 ```
 
-Integration tests skip when the broker is absent. A green local command does
-not prove that they ran; inspect the collected and skipped counts. TLS tests
-also require OpenSSL on `PATH`.
+Without `MQTTIUM_REQUIRE_BROKER=1`, integration tests skip when the broker is
+absent. Use the guard above for release evidence. TLS tests also require
+OpenSSL on `PATH`.
 
 Fuzzing commands:
 
 ```bash
 PYTHONPATH=src python tests/fuzz/fuzz.py --seed 1 --iterations 20000
 python -m pytest -q tests/fuzz/test_hypothesis_fuzz.py
+python -m pytest -q tests/fuzz/test_stateful_invariants.py
 ```
 
-CI additionally enforces its configured coverage threshold, validates wheel
+See the [testing and coverage guide](docs/testing.md) for the suite taxonomy,
+resilience commands, coverage semantics, and reliability rules. CI additionally
+enforces its configured coverage threshold, validates wheel
 and source distributions, installs artifacts in isolation, imports packaged
 modules, checks license/type metadata, and rejects tracked cache/build output.
 
