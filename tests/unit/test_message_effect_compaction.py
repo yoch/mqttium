@@ -75,7 +75,7 @@ def test_collect_compacts_safe_messages_but_counts_logical_effects() -> None:
 
     assert len(pump.pending) == 1
     effect = pump.pending[0]
-    assert effect.kind is EffectKind.MESSAGE_BATCH
+    assert effect.kind is EffectKind.MESSAGE
     assert isinstance(effect.data, _MessageEffectBatch)
     assert effect.data.messages == ["m0", "m1", "m2", "m3", "m4"]
     stats = pump.stats()
@@ -110,7 +110,7 @@ def test_compaction_never_crosses_send_marked_or_decoded_boundaries() -> None:
         EffectKind.MESSAGE,
         EffectKind.MESSAGE,
         EffectKind.DECODED_MESSAGE,
-        EffectKind.MESSAGE_BATCH,
+        EffectKind.MESSAGE,
     ]
     assert pump.pending[1].data == "before-send"
     assert pump.pending[2].data == "after-send"
