@@ -1,0 +1,96 @@
+name: PR333 ARM64 Observable Validation
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mqttium-arm64-runner
+  cancel-in-progress: false
+
+jobs:
+  paired:
+    if: github.head_ref == 'validation/pr333-arm64'
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 60
+    env:
+      BASE_REF: f43d6b11f29306eab1f055f89f0ae26edde5e2bf
+      CANDIDATE_REF: ad5b64ec0714b398fbd19bfc0cc12953295021a9
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+    steps:
+      - name: Check out validation harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: harness
+          persist-credentials: false
+
+      - name: Check out exact baseline
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ env.BASE_REF }}
+          path: base
+          persist-credentials: false
+
+      - name: Check out exact candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ env.CANDIDATE_REF }}
+          path: candidate
+          persist-credentials: false
+
+      - name: Verify dedicated runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "aarch64"
+          command -v taskset
+          python3 - <<'PY'
+          import sys
+          if sys.version_info[:2] != (3, 13):
+              raise SystemExit(f"expected Python 3.13, got {sys.version}")
+          PY
+          echo "JOB_ROOT=$RUNNER_TEMP/pr333-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+
+      - name: Prepare isolated environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$JOB_ROOT"
+          mkdir -p "$JOB_ROOT"
+          python3 -m venv "$JOB_ROOT/venv"
+          "$JOB_ROOT/venv/bin/python" -m pip install "psutil>=6,<8"
+
+      - name: Strict runner preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$JOB_ROOT/venv/bin/python" base/benchmarks/runner_probe.py \
+            --output "$JOB_ROOT/runner.json" \
+            --require-temperature \
+            --enforce
+
+      - name: Run paired subscriber matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$JOB_ROOT/venv/bin/python" harness/benchmarks/pr333_arm64_validation.py matrix \
+            --base base \
+            --candidate candidate \
+            --python "$JOB_ROOT/venv/bin/python" \
+            --output-dir "$JOB_ROOT"
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4
+        with:
+          name: pr333-arm64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.JOB_ROOT }}/*.json
+            ${{ env.JOB_ROOT }}/summary.txt
+          if-no-files-found: warn
