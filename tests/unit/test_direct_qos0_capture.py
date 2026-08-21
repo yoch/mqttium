@@ -47,9 +47,7 @@ def test_pure_qos0_batch_stays_captured() -> None:
 def test_mixed_qos1_batch_materializes_in_original_order() -> None:
     client = _client()
     client._decoder.feed(
-        _publish("one")
-        + _publish("two", qos=QoS.AT_LEAST_ONCE, mid=7)
-        + _publish("three")
+        _publish("one") + _publish("two", qos=QoS.AT_LEAST_ONCE, mid=7) + _publish("three")
     )
 
     handled, _, _, captured = client._process_direct_qos0_batch()
@@ -63,18 +61,14 @@ def test_mixed_qos1_batch_materializes_in_original_order() -> None:
         EffectKind.MESSAGE,
     ]
     assert [
-        effect.data.topic
-        for effect in client._engine._effects
-        if effect.kind is EffectKind.MESSAGE
+        effect.data.topic for effect in client._engine._effects if effect.kind is EffectKind.MESSAGE
     ] == ["one", "two", "three"]
 
 
 def test_non_publish_control_packet_materializes_prefix_before_effect() -> None:
     client = _client()
     client._decoder.feed(
-        _publish("one")
-        + encode_frame(PacketType.DISCONNECT, 0, b"")
-        + _publish("ignored")
+        _publish("one") + encode_frame(PacketType.DISCONNECT, 0, b"") + _publish("ignored")
     )
 
     handled, _, _, captured = client._process_direct_qos0_batch()
