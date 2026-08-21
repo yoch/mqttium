@@ -501,20 +501,25 @@ class ProtocolEngine:
                 "shutdown ungraceful and publish a configured Will"
             )
 
+    def _release_pending_subscription_requests(self) -> None:
+        """Release connection-scoped SUBSCRIBE/UNSUBSCRIBE packet identifiers."""
+        if not self._pending_sub_requests:
+            return
+        if self.outbound.pending_messages == 0:
+            # No publish MID survives this connection: reset in constant time.
+            self.outbound.packet_ids.clear()
+        else:
+            for mid in self._pending_sub_requests:
+                self.outbound.packet_ids.release(mid)
+        self._pending_sub_requests.clear()
+
     def notify_transport_closed(self) -> None:
         was = self.state
         self.state = ConnectionState.DISCONNECTED
         self.inbound.transport_closed()
         self._reauth_in_progress = False
         # Release sub/unsub MIDs still in flight — no ACK will arrive now.
-        if self._pending_sub_requests:
-            if self.outbound.pending_messages == 0:
-                # No publish MID survives this transport: reset in constant time.
-                self.outbound.packet_ids.clear()
-            else:
-                for mid in self._pending_sub_requests:
-                    self.outbound.packet_ids.release(mid)
-            self._pending_sub_requests.clear()
+        self._release_pending_subscription_requests()
         if was != ConnectionState.DISCONNECTED:
             self._emit(EffectKind.DISCONNECTED, DisconnectInfo(from_broker=False))
 
@@ -774,6 +779,7 @@ class ProtocolEngine:
         reason_code, properties = self.codec.decode_disconnect(raw.remaining)
         self._reauth_in_progress = False
         self.state = ConnectionState.DISCONNECTED
+        self._release_pending_subscription_requests()
         self._emit(
             EffectKind.DISCONNECTED,
             DisconnectInfo(
@@ -860,6 +866,7 @@ class ProtocolEngine:
                 self._send(packet)
         self._reauth_in_progress = False
         self.state = ConnectionState.DISCONNECTED
+        self._release_pending_subscription_requests()
         self._emit(
             EffectKind.DISCONNECTED,
             DisconnectInfo(reason_code=reason_code, from_broker=False),
