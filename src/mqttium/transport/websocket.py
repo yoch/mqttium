@@ -229,7 +229,7 @@ class WebSocketTransport:
         if write_buffer_needs_drain(self._writer):
             await self._writer.drain()
 
-    def _try_extract_application_payload(self) -> bytes | None:
+    def _try_extract_application_payload(self) -> bytes | None:  # noqa: C901
         """Extract the next binary MQTT payload and process control frames."""
         while True:
             parsed = _parse_frame(
