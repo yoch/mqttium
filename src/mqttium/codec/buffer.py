@@ -56,6 +56,58 @@ class IncrementalDecoder:
         """Return the next fixed-header byte without consuming buffered data."""
         return self._buf[self._start] if self._start < len(self._buf) else None
 
+    def peek_packet_bounds(self) -> tuple[int, int, int] | None:
+        """Return ``(header, body_start, body_end)`` for the next complete frame.
+
+        The frame is not consumed and the reusable buffer is not exposed. This
+        internal hot-path primitive deliberately mirrors ``next_packet`` framing
+        so the generic decoder does not pay an extra Python call per packet.
+        """
+        buf = self._buf
+        start = self._start
+        available = len(buf) - start
+        if available < 2:
+            return None
+
+        header = buf[start]
+        first = buf[start + 1]
+        if first < 0x80:
+            remaining_length = first
+            rl_end = start + 2
+        elif available >= 3 and buf[start + 2] < 0x80:
+            remaining_length = (first & 0x7F) | (buf[start + 2] << 7)
+            if remaining_length < 128:
+                raise MalformedPacketError("Non-canonical Variable Byte Integer")
+            rl_end = start + 3
+        else:
+            try:
+                remaining_length, rl_end = decode_vbi(buf, start + 1)
+            except MalformedPacketError:
+                if available >= 5:
+                    raise
+                if all(buf[start + i] & 0x80 for i in range(1, available)):
+                    return None
+                raise
+
+        fixed_header_len = rl_end - start
+        total = fixed_header_len + remaining_length
+        if total > self._max_packet_size:
+            raise PacketTooLargeError(
+                f"Packet size {total} exceeds maximum {self._max_packet_size}"
+            )
+        if available < total:
+            return None
+        body_start = start + fixed_header_len
+        return header, body_start, start + total
+
+    def consume_peeked_packet(self, body_end: int) -> None:
+        """Commit a frame previously returned by :meth:`peek_packet_bounds`."""
+        assert self._start < body_end <= len(self._buf)
+        self._start = body_end
+        if self._start == len(self._buf):
+            self._buf.clear()
+            self._start = 0
+
     @property
     def high_water(self) -> int:
         return self._high_water

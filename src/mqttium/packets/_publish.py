@@ -60,6 +60,117 @@ def decode_qos0_message_v5(raw: RawPacket) -> tuple[Message, int]:
     )
 
 
+def decode_qos0_message_v311_borrowed(
+    buf: bytearray, body_start: int, body_end: int, flags: int
+) -> Message:
+    """Decode QoS 0 from the decoder buffer, copying only owned application fields."""
+    if flags & 0x08:
+        raise MalformedPacketError("QoS 0 PUBLISH must not set DUP")
+    if body_start + 2 > body_end:
+        raise MalformedPacketError("Incomplete uint16")
+    topic_len = (buf[body_start] << 8) | buf[body_start + 1]
+    topic_start = body_start + 2
+    payload_pos = topic_start + topic_len
+    if payload_pos > body_end:
+        raise MalformedPacketError("Incomplete UTF-8 string")
+    try:
+        topic = buf[topic_start:payload_pos].decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise MalformedPacketError("Invalid UTF-8 data") from exc
+    if "\x00" in topic:
+        raise MalformedPacketError("[MQTT-1.5.4-2] Null in UTF-8 data")
+    if not topic:
+        raise MalformedPacketError("PUBLISH topic must not be empty")
+    validate_received_publish_topic(topic, utf8_validated=True)
+    return Message(
+        topic,
+        bytes(buf[payload_pos:body_end]),
+        QoS.AT_MOST_ONCE,
+        bool(flags & 0x01),
+        False,
+        None,
+        None,
+    )
+
+
+def _decode_bounded_vbi(buf: bytearray, offset: int, end: int) -> tuple[int, int]:
+    if offset >= end:
+        raise MalformedPacketError("Incomplete Variable Byte Integer")
+    value = 0
+    multiplier = 1
+    pos = offset
+    count = 0
+    while True:
+        if pos >= end:
+            raise MalformedPacketError("Incomplete Variable Byte Integer")
+        byte = buf[pos]
+        pos += 1
+        count += 1
+        if count > 4:
+            raise MalformedPacketError("Malformed Variable Byte Integer (too long)")
+        value += (byte & 0x7F) * multiplier
+        if byte & 0x80 == 0:
+            break
+        multiplier *= 128
+    if count != (1 if value < 128 else 2 if value < 16_384 else 3 if value < 2_097_152 else 4):
+        raise MalformedPacketError("Non-canonical Variable Byte Integer")
+    return value, pos
+
+
+def decode_qos0_message_v5_borrowed(
+    buf: bytearray, body_start: int, body_end: int, flags: int
+) -> tuple[Message, int]:
+    """Decode MQTT 5 QoS 0 without materialising an owned RawPacket body."""
+    if flags & 0x08:
+        raise MalformedPacketError("QoS 0 PUBLISH must not set DUP")
+    if body_start + 2 > body_end:
+        raise MalformedPacketError("Incomplete uint16")
+    topic_len = (buf[body_start] << 8) | buf[body_start + 1]
+    topic_start = body_start + 2
+    pos = topic_start + topic_len
+    if pos > body_end:
+        raise MalformedPacketError("Incomplete UTF-8 string")
+    try:
+        topic = buf[topic_start:pos].decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise MalformedPacketError("Invalid UTF-8 data") from exc
+    if "\x00" in topic:
+        raise MalformedPacketError("[MQTT-1.5.4-2] Null in UTF-8 data")
+    validate_received_publish_topic(topic, utf8_validated=True)
+    if pos >= body_end:
+        raise MalformedPacketError("Missing properties length")
+
+    properties_pos = pos
+    if buf[pos] == 0:
+        properties = Properties()
+        pos += 1
+    else:
+        props_len, props_data_pos = _decode_bounded_vbi(buf, pos, body_end)
+        props_end = props_data_pos + props_len
+        if props_end > body_end:
+            raise MalformedPacketError("Properties length exceeds remaining data")
+        # Property tables are typically small. For these sizes, copying the
+        # bytearray slice and converting it to bytes is measurably cheaper than
+        # creating a transient memoryview, while still avoiding a payload copy.
+        prefix = bytes(buf[body_start:props_end])
+        relative_pos = properties_pos - body_start
+        properties, relative_end = decode_properties(prefix, relative_pos, PUBLISH)
+        pos = body_start + relative_end
+    property_wire_size = pos - properties_pos
+    return (
+        Message(
+            topic,
+            bytes(buf[pos:body_end]),
+            QoS.AT_MOST_ONCE,
+            bool(flags & 0x01),
+            False,
+            None,
+            properties,
+        ),
+        property_wire_size,
+    )
+
+
 def decode_qos12_fields_v311(raw: RawPacket) -> tuple[str, bytes, int, bool, bool]:
     """Decode MQTT 3.1.1 QoS 1/2 PUBLISH fields (identical wire layout)."""
     topic, pos = unpack_utf8(raw.remaining)
