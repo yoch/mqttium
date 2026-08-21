@@ -1453,7 +1453,7 @@ class AsyncClient:
                 break
         return count, decoded_bytes, False
 
-    def _process_direct_qos0_batch(
+    def _process_direct_qos0_batch(  # noqa: C901
         self,
     ) -> tuple[int, int, bool, list[Message], list[int | None] | None]:
         decoder = self._decoder
