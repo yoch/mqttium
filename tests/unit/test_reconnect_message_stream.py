@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from contextlib import suppress
 
 import pytest
@@ -64,7 +65,10 @@ async def _wait_for_connection(
     raise AssertionError(f"client did not establish connection #{count}")
 
 
-async def _wait_for_retry_exhaustion(client: AsyncClient, attempts: callable) -> None:
+async def _wait_for_retry_exhaustion(
+    client: AsyncClient,
+    attempts: Callable[[], int],
+) -> None:
     for _ in range(200):
         if attempts() >= 2 and client._reconnect_task is None:
             return
@@ -74,12 +78,15 @@ async def _wait_for_retry_exhaustion(client: AsyncClient, attempts: callable) ->
 
 async def _cleanup(client: AsyncClient, *tasks: asyncio.Task[object] | None) -> None:
     for task in tasks:
-        if task is not None and not task.done():
-            task.cancel()
-    for task in tasks:
-        if task is not None:
-            with suppress(asyncio.CancelledError, StopAsyncIteration):
-                await task
+        if task is None:
+            continue
+        if task.done():
+            with suppress(asyncio.CancelledError):
+                task.exception()
+            continue
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
     with suppress(Exception, asyncio.CancelledError):
         await client.disconnect()
 
