@@ -1,0 +1,1 @@
+Trigger the PR333 coverage finalizer after the workflow definition exists.
