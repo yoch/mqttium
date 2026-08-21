@@ -23,9 +23,7 @@ from mqttium.types import Properties
         (b"\x00\x00", 0, "PUBLISH topic must not be empty"),
     ],
 )
-def test_borrowed_v311_rejects_malformed_fields(
-    body: bytes, flags: int, error_text: str
-) -> None:
+def test_borrowed_v311_rejects_malformed_fields(body: bytes, flags: int, error_text: str) -> None:
     with pytest.raises(MalformedPacketError) as error:
         decode_qos0_message_v311_borrowed(bytearray(body), 0, len(body), flags)
     assert error_text in str(error.value)
@@ -45,9 +43,7 @@ def test_borrowed_v311_rejects_malformed_fields(
         (b"\x00\x01a\xff\xff\xff\xff\x01", 0, "Malformed Variable Byte Integer"),
     ],
 )
-def test_borrowed_v5_rejects_malformed_fields(
-    body: bytes, flags: int, error_text: str
-) -> None:
+def test_borrowed_v5_rejects_malformed_fields(body: bytes, flags: int, error_text: str) -> None:
     with pytest.raises(MalformedPacketError) as error:
         decode_qos0_message_v5_borrowed(bytearray(body), 0, len(body), flags)
     assert error_text in str(error.value)
@@ -91,9 +87,7 @@ def test_decoded_empty_properties_respect_small_message_limit() -> None:
     _, _, _, captured, sizes = client._process_direct_qos0_batch()
 
     assert sizes == [None]
-    assert not client._delivery.deliver_callback_messages_inline(
-        captured, client.on_message, sizes
-    )
+    assert not client._delivery.deliver_callback_messages_inline(captured, client.on_message, sizes)
 
 
 def test_decoded_nonempty_properties_respect_small_message_limit() -> None:
@@ -105,6 +99,4 @@ def test_decoded_nonempty_properties_respect_small_message_limit() -> None:
     _, _, _, captured, sizes = client._process_direct_qos0_batch()
 
     assert sizes is not None and sizes[0] is not None
-    assert not client._delivery.deliver_callback_messages_inline(
-        captured, client.on_message, sizes
-    )
+    assert not client._delivery.deliver_callback_messages_inline(captured, client.on_message, sizes)
