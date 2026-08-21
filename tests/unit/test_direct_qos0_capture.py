@@ -5,7 +5,6 @@ import asyncio
 import pytest
 
 from mqttium.api import AsyncClient
-from mqttium.codec.buffer import RawPacket
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, PacketType, QoS
 from mqttium.packets import PublishPacket, encode_frame
 from mqttium.protocol.effects import EffectKind, EngineEffect
