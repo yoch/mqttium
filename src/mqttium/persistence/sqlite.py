@@ -231,6 +231,14 @@ class SqliteInflightStore:
                 raise RuntimeError(
                     f"{self._path} has schema version {version} but is missing table(s): {names}"
                 )
+            for table in ("outbound", "inbound"):
+                missing_columns = self._missing_required_columns(table)
+                if missing_columns:
+                    names = ", ".join(missing_columns)
+                    raise RuntimeError(
+                        f"{self._path} has schema version {version} but table {table} "
+                        f"is missing required column(s): {names}"
+                    )
             return
         # A pre-versioning database reports 0 while already holding tables; a
         # genuinely empty file reports 0 with nothing in sqlite_master.
@@ -294,6 +302,37 @@ class SqliteInflightStore:
         properties TEXT,
         payload BLOB NOT NULL
     """
+    _REQUIRED_COLUMNS = {
+        "outbound": (
+            "mid",
+            "seq",
+            "qos",
+            "retain",
+            "state",
+            "dup",
+            "logical_size",
+            "topic",
+            "properties",
+            "payload",
+        ),
+        "inbound": (
+            "mid",
+            "seq",
+            "qos",
+            "retain",
+            "state",
+            "delivered",
+            "user_acked",
+            "logical_size",
+            "topic",
+            "properties",
+            "payload",
+        ),
+    }
+    _TABLE_INFO_SQL = {
+        "outbound": "PRAGMA table_info(outbound)",
+        "inbound": "PRAGMA table_info(inbound)",
+    }
 
     def _create_schema(self) -> None:
         conn = self._conn
@@ -373,6 +412,12 @@ class SqliteInflightStore:
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
         ).fetchone()
         return row is not None
+
+    def _missing_required_columns(self, table: str) -> tuple[str, ...]:
+        """Required current-schema columns absent from one known table."""
+        rows = self._conn.execute(self._TABLE_INFO_SQL[table]).fetchall()
+        present = {str(row["name"]) for row in rows}
+        return tuple(name for name in self._REQUIRED_COLUMNS[table] if name not in present)
 
     # Complete, literal SQL selected by table. Nothing in this module builds a
     # statement out of a runtime value: the only text ever appended to a query
