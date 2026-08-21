@@ -934,7 +934,9 @@ class AsyncClient:
             if self._connack_fut is not None and not self._connack_fut.done():
                 self._connack_fut.cancel()
             try:
-                await self._force_close()
+                # A failed attempt inside an active retry loop is transient:
+                # keep the application stream and callback worker alive.
+                await self._force_close(preserve_reconnect=reconnect_attempt)
             except BaseException:
                 pass
             if self._engine.state not in (
@@ -1022,6 +1024,14 @@ class AsyncClient:
             if disconnecting_connect:
                 return
             if self._transport is None:
+                # No live transport (e.g. called inside a reconnect gap): the
+                # intentional shutdown is still terminal for receipts and the
+                # application stream, which the reconnect loop would otherwise
+                # keep alive.
+                if not self._will_reconnect():
+                    self._fail_pending(self._disconnect_exc or MQTTError("Disconnected"))
+                    await self._shutdown_callback_worker(drain=True)
+                    self._delivery.close()
                 return
             # Preserve validation semantics: an invalid reason code must fail
             # before teardown, just as it did before shutdown became bounded.
@@ -1690,7 +1700,10 @@ class AsyncClient:
                         await self._transport.close()
                     except Exception:
                         pass
-            self._delivery.close()
+            if not will_reconnect:
+                # A reconnectable loss must not terminate the application
+                # message stream: the same iterator resumes after reconnect.
+                self._delivery.close()
             try:
                 callback_error = None if clean_disconnect else self._disconnect_exc
                 await self._invoke(self.on_disconnect, callback_error)
@@ -1730,7 +1743,10 @@ class AsyncClient:
             self._engine.notify_transport_closed()
             self._collect_effects_locked()
         await self._drain_effects()
-        self._delivery.close()
+        if not self._will_reconnect():
+            # A reconnectable loss must not terminate the application
+            # message stream: the same iterator resumes after reconnect.
+            self._delivery.close()
         # Close transport so the reader unblocks and runs shared cleanup.
         if self._transport is not None:
             await self._transport.close()
@@ -1811,8 +1827,19 @@ class AsyncClient:
                 now = time.monotonic()
                 if self._ping_pending:
                     if now >= self._ping_deadline:
+                        # Close only the connection: keep the reconnect task
+                        # alive so the reader's shared teardown classifies the
+                        # loss and the retry loop can re-establish the session.
                         self._disconnect_exc = MQTTTimeoutError("PINGRESP timed out")
-                        await self._force_close()
+                        await self._force_close(preserve_reconnect=True)
+                        if self._will_reconnect():
+                            # The reader normally spawns this from its shared
+                            # teardown, but it was just cancelled: do it here.
+                            if self._reconnect_task is None or self._reconnect_task.done():
+                                self._reconnect_task = asyncio.create_task(
+                                    self._reconnect_loop(), name="mqttium-reconnect"
+                                )
+                            await self._invoke(self.on_disconnect, self._disconnect_exc)
                         return
                     await asyncio.sleep(min(0.5, self._ping_deadline - now))
                     continue
@@ -1849,7 +1876,13 @@ class AsyncClient:
             while self._reconnect.enabled and not self._intentional_disconnect:
                 reason = self._retry_reason()
                 if not self._reconnect.should_retry(reason, self._engine.config.protocol):
+                    # Retry budget exhausted: the stream must terminate, not
+                    # park forever now that transient paths keep it open.
                     self._fail_pending(self._disconnect_exc or MQTTError("Reconnect exhausted"))
+                    self._teardown_final = True
+                    self._notify_publish_space()
+                    await self._shutdown_callback_worker(drain=True)
+                    self._delivery.close()
                     return
                 delay = self._reconnect.next_delay()
                 await asyncio.sleep(delay)
@@ -1878,6 +1911,10 @@ class AsyncClient:
                         # Never reuse an engine after a proven local invariant
                         # violation, including one raised during reconnect.
                         self._fail_pending(exc)
+                        self._teardown_final = True
+                        self._notify_publish_space()
+                        await self._shutdown_callback_worker(drain=True)
+                        self._delivery.close()
                         return
                     continue
         except asyncio.CancelledError:
@@ -2366,8 +2403,11 @@ class AsyncClient:
         self._write_pump.discard()
         self._decoder.clear()
         await self._write_pump.wake_waiters()
-        self._teardown_final = True
-        self._notify_publish_space()
+        if not preserve_reconnect:
+            # A reconnectable loss must not terminate the application
+            # message stream: the same iterator resumes after reconnect.
+            self._teardown_final = True
+            self._notify_publish_space()
         if self._reader_task is not current:
             self._reader_task = None
         if self._keepalive_task is not current:
@@ -2386,4 +2426,5 @@ class AsyncClient:
             self._transport = None
         if not preserve_reconnect:
             await self._shutdown_callback_worker(drain=True)
-        self._delivery.close()
+            # Only the really-terminal teardown closes the application stream.
+            self._delivery.close()

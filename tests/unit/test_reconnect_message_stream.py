@@ -218,3 +218,51 @@ async def test_messages_iterator_closes_when_reconnect_is_exhausted() -> None:
             await asyncio.wait_for(pending, timeout=1.0)
     finally:
         await _cleanup(client, pending)
+
+
+async def test_disconnect_inside_reconnect_gap_closes_stream() -> None:
+    brokers: list[_Broker] = []
+    client = AsyncClient(
+        "stream-gap-disconnect",
+        reconnect=_policy(),
+        message_delivery="iterator",
+    )
+
+    async def factory(host: str, port: int, *, ssl=None):
+        nonlocal attempts
+        attempts += 1
+        if attempts > 1:
+            # Hang until the connect timeout so the client stays inside the
+            # reconnect gap deterministically while the test disconnects.
+            await asyncio.sleep(10.0)
+            raise OSError("broker remains unreachable")
+        broker = _Broker()
+        brokers.append(broker)
+        return broker
+
+    attempts = 0
+    client._transport_factory = factory
+    pending: asyncio.Task[object] | None = None
+    try:
+        await client.connect("fake", 1, timeout=1.0)
+        stream = client.messages()
+        pending = asyncio.create_task(anext(stream))
+        await asyncio.sleep(0)
+
+        await brokers[0].close()
+        # Wait until the client is inside the reconnect gap: the reader's
+        # shared teardown finished and no transport exists.
+        for _ in range(200):
+            if (
+                client._reader_task is None or client._reader_task.done()
+            ) and client._transport is None:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("client never entered a reconnect gap")
+
+        await client.disconnect()
+        with pytest.raises(StopAsyncIteration):
+            await asyncio.wait_for(pending, timeout=1.0)
+    finally:
+        await _cleanup(client, pending)
