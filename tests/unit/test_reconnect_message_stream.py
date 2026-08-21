@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 
 import pytest
 
@@ -63,6 +64,26 @@ async def _wait_for_connection(
     raise AssertionError(f"client did not establish connection #{count}")
 
 
+async def _wait_for_retry_exhaustion(client: AsyncClient, attempts: callable) -> None:
+    for _ in range(200):
+        if attempts() >= 2 and client._reconnect_task is None:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("reconnect policy did not exhaust")
+
+
+async def _cleanup(client: AsyncClient, *tasks: asyncio.Task[object] | None) -> None:
+    for task in tasks:
+        if task is not None and not task.done():
+            task.cancel()
+    for task in tasks:
+        if task is not None:
+            with suppress(asyncio.CancelledError, StopAsyncIteration):
+                await task
+    with suppress(Exception, asyncio.CancelledError):
+        await client.disconnect()
+
+
 def _policy(*, max_retries: int | None = 4) -> ReconnectPolicy:
     return ReconnectPolicy(
         enabled=True,
@@ -88,31 +109,36 @@ async def test_messages_iterator_survives_unexpected_reconnect() -> None:
         return broker
 
     client._transport_factory = factory
-    await client.connect("fake", 1, timeout=1.0)
-    first = brokers[0]
-    stream = client.messages()
+    pending: asyncio.Task[object] | None = None
+    terminal: asyncio.Task[object] | None = None
+    try:
+        await client.connect("fake", 1, timeout=1.0)
+        first = brokers[0]
+        stream = client.messages()
 
-    first.publish("before", b"1")
-    before = await asyncio.wait_for(anext(stream), timeout=1.0)
-    assert before.topic == "before"
+        first.publish("before", b"1")
+        before = await asyncio.wait_for(anext(stream), timeout=1.0)
+        assert before.topic == "before"
 
-    # Keep the same iterator suspended while the transport drops. This is the
-    # production `async for` shape: the next __anext__ is already waiting when
-    # the reader enters reconnect teardown.
-    pending = asyncio.create_task(anext(stream))
-    await asyncio.sleep(0)
-    await first.close()
+        # Keep the same iterator suspended while the transport drops. This is the
+        # production `async for` shape: the next __anext__ is already waiting when
+        # the reader enters reconnect teardown.
+        pending = asyncio.create_task(anext(stream))
+        await asyncio.sleep(0)
+        await first.close()
 
-    second = await _wait_for_connection(client, brokers, count=2)
-    second.publish("after", b"2")
-    after = await asyncio.wait_for(pending, timeout=1.0)
-    assert after.topic == "after"
+        second = await _wait_for_connection(client, brokers, count=2)
+        second.publish("after", b"2")
+        after = await asyncio.wait_for(pending, timeout=1.0)
+        assert after.topic == "after"
 
-    terminal = asyncio.create_task(anext(stream))
-    await asyncio.sleep(0)
-    await client.disconnect()
-    with pytest.raises(StopAsyncIteration):
-        await asyncio.wait_for(terminal, timeout=1.0)
+        terminal = asyncio.create_task(anext(stream))
+        await asyncio.sleep(0)
+        await client.disconnect()
+        with pytest.raises(StopAsyncIteration):
+            await asyncio.wait_for(terminal, timeout=1.0)
+    finally:
+        await _cleanup(client, pending, terminal)
 
 
 async def test_messages_iterator_survives_failed_reconnect_attempt() -> None:
@@ -134,19 +160,22 @@ async def test_messages_iterator_survives_failed_reconnect_attempt() -> None:
         return broker
 
     client._transport_factory = factory
-    await client.connect("fake", 1, timeout=1.0)
-    stream = client.messages()
-    pending = asyncio.create_task(anext(stream))
-    await asyncio.sleep(0)
+    pending: asyncio.Task[object] | None = None
+    try:
+        await client.connect("fake", 1, timeout=1.0)
+        stream = client.messages()
+        pending = asyncio.create_task(anext(stream))
+        await asyncio.sleep(0)
 
-    await brokers[0].close()
-    second = await _wait_for_connection(client, brokers, count=2)
-    assert attempts >= 3
-    second.publish("after-retry", b"ok")
+        await brokers[0].close()
+        second = await _wait_for_connection(client, brokers, count=2)
+        assert attempts >= 3
+        second.publish("after-retry", b"ok")
 
-    message = await asyncio.wait_for(pending, timeout=1.0)
-    assert message.topic == "after-retry"
-    await client.disconnect()
+        message = await asyncio.wait_for(pending, timeout=1.0)
+        assert message.topic == "after-retry"
+    finally:
+        await _cleanup(client, pending)
 
 
 async def test_messages_iterator_closes_when_reconnect_is_exhausted() -> None:
@@ -168,12 +197,17 @@ async def test_messages_iterator_closes_when_reconnect_is_exhausted() -> None:
         return broker
 
     client._transport_factory = factory
-    await client.connect("fake", 1, timeout=1.0)
-    stream = client.messages()
-    pending = asyncio.create_task(anext(stream))
-    await asyncio.sleep(0)
+    pending: asyncio.Task[object] | None = None
+    try:
+        await client.connect("fake", 1, timeout=1.0)
+        stream = client.messages()
+        pending = asyncio.create_task(anext(stream))
+        await asyncio.sleep(0)
 
-    await brokers[0].close()
-    with pytest.raises(StopAsyncIteration):
-        await asyncio.wait_for(pending, timeout=1.0)
-    assert attempts == 2
+        await brokers[0].close()
+        await _wait_for_retry_exhaustion(client, lambda: attempts)
+        assert attempts == 2
+        with pytest.raises(StopAsyncIteration):
+            await asyncio.wait_for(pending, timeout=1.0)
+    finally:
+        await _cleanup(client, pending)
