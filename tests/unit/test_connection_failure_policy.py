@@ -110,7 +110,7 @@ def test_connack_auth_mismatch_finishes_engine_teardown() -> None:
     assert any(effect.kind is EffectKind.PROTOCOL_ERROR for effect in effects)
 
 
-def test_request_problem_information_zero_rejects_suback_diagnostics_before_settle() -> None:
+def test_request_problem_information_zero_rejects_suback_without_settling() -> None:
     engine = ProtocolEngine(
         EngineConfig(
             client_id="rc2-rpi",
@@ -128,7 +128,9 @@ def test_request_problem_information_zero_rejects_suback_diagnostics_before_sett
     effects = engine.take_effects()
 
     assert engine.state is ConnectionState.DISCONNECTED
-    assert mid in engine._pending_sub_mids
+    assert mid not in engine._pending_sub_mids
+    assert not engine.outbound.packet_ids.in_use(mid)
+    assert not any(effect.kind is EffectKind.SUBACK for effect in effects)
     assert any(effect.kind is EffectKind.DISCONNECTED for effect in effects)
     assert any(effect.kind is EffectKind.PROTOCOL_ERROR for effect in effects)
 
