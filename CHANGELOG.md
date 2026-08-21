@@ -8,6 +8,7 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Changed
 
+- Reduce high-rate QoS 0 subscriber overhead by decoding eligible MQTT 3.1.1 and MQTT 5 callback deliveries directly from the bounded ingress buffer into owned `Message` values. Stateful MQTT 5 Topic Alias traffic and all mixed, QoS 1/2, control, error, and backpressure paths retain the historical protocol-engine path.
 - Reframe the project documentation around the native `AsyncClient` for
   production asyncio services, gateways, and IoT systems. The Paho VERSION2
   compatibility façade remains tested and Provisional as a migration aid, but
