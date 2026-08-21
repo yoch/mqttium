@@ -37,7 +37,6 @@ from mqttium.api.stats import (
     TransportStats,
 )
 from mqttium.codec.buffer import DEFAULT_MAX_PACKET_SIZE, IncrementalDecoder
-from mqttium.codec.packet_validation import validate_raw_packet
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, PacketType, QoS
 from mqttium.errors import (
     FlowControlError,
@@ -56,6 +55,10 @@ from mqttium.packets import (
     SubscribeOptions,
     encode_disconnect,
 )
+from mqttium.packets._publish import (
+    decode_qos0_message_v311_borrowed,
+    decode_qos0_message_v5_borrowed,
+)
 from mqttium.protocol.engine import (
     DisconnectInfo,
     EffectKind,
@@ -64,7 +67,6 @@ from mqttium.protocol.engine import (
     ProtocolEngine,
     PublishFailure,
 )
-from mqttium.packets._publish import decode_qos0_message_v311
 from mqttium.protocol.negotiated import NegotiatedSettings
 from mqttium.protocol.reconnect import ReconnectPolicy
 from mqttium.persistence.memory import InflightStore
@@ -123,6 +125,10 @@ def _validate_client_arguments(
         raise ValueError("username must be a string or None")
     if password is not None and not isinstance(password, (bytes, str)):
         raise ValueError("password must be bytes, str, or None")
+
+
+class _DirectQos0Fallback(Exception):
+    """Use the historical engine path for a valid stateful QoS0 packet."""
 
 
 class AsyncClient:
@@ -1447,11 +1453,20 @@ class AsyncClient:
                 break
         return count, decoded_bytes, False
 
-    def _process_direct_qos0_batch(self) -> tuple[int, int, bool, list[Message]]:
+    def _process_direct_qos0_batch(  # noqa: C901
+        self,
+    ) -> tuple[int, int, bool, list[Message], list[int | None] | None]:
         decoder = self._decoder
+        peek_packet_bounds = decoder.peek_packet_bounds
+        consume_peeked_packet = decoder.consume_peeked_packet
+        decoder_buffer = decoder._buf
         engine = self._engine
         inbound = engine.inbound
+        protocol = engine.config.protocol
         captured: list[Message] = []
+        captured_property_sizes: list[int | None] | None = (
+            [] if protocol is MQTTProtocolVersion.MQTTv5 else None
+        )
         max_bytes = self._max_ingress_batch_bytes
         count = 0
         decoded_bytes = 0
@@ -1460,36 +1475,76 @@ class AsyncClient:
         def materialize_captured() -> None:
             if not captured:
                 return
-            engine._effects.extend(
-                EngineEffect(EffectKind.MESSAGE, message, False, None) for message in captured
-            )
+            if captured_property_sizes is None:
+                engine._effects.extend(
+                    EngineEffect(EffectKind.MESSAGE, message, False, None) for message in captured
+                )
+            else:
+                engine._effects.extend(
+                    EngineEffect(
+                        EffectKind.DECODED_MESSAGE if wire_size is not None else EffectKind.MESSAGE,
+                        message,
+                        False,
+                        wire_size,
+                    )
+                    for message, wire_size in zip(captured, captured_property_sizes, strict=True)
+                )
+                captured_property_sizes.clear()
             captured.clear()
 
         for _ in range(256):
-            packet = decoder.next_packet()
-            if packet is None:
+            try:
+                bounds = peek_packet_bounds()
+            except (MalformedPacketError, PacketTooLargeError):
+                materialize_captured()
+                raise
+            if bounds is None:
                 break
-            is_qos0_publish = (
-                engine.state is ConnectionState.CONNECTED
-                and packet.packet_type is PacketType.PUBLISH
-                and ((packet.flags >> 1) & 0x03) == 0
-            )
-            if is_qos0_publish:
-                # The regular v3.1.1 QoS 0 handler is exactly validate → decode
-                # → emit MESSAGE. Elide only that final EngineEffect; on any
-                # exceptional packet, replay it through the engine so its error
-                # translation remains the single source of truth.
+            header, body_start, body_end = bounds
+            is_qos0_publish = (header & 0xF0) == PacketType.PUBLISH and ((header >> 1) & 0x03) == 0
+            if is_qos0_publish and engine.state is ConnectionState.CONNECTED:
+                flags = header & 0x0F
+                body_size = body_end - body_start
                 try:
-                    validate_raw_packet(packet)
-                    captured.append(decode_qos0_message_v311(packet))
-                except Exception:
+                    if protocol is MQTTProtocolVersion.MQTTv311:
+                        message = decode_qos0_message_v311_borrowed(
+                            decoder_buffer, body_start, body_end, flags
+                        )
+                        wire_size = None
+                    else:
+                        message, property_wire_size = decode_qos0_message_v5_borrowed(
+                            decoder_buffer, body_start, body_end, flags
+                        )
+                        properties = message.properties
+                        assert properties is not None
+                        if not message.topic or "topic_alias" in properties.values:
+                            raise _DirectQos0Fallback
+                        wire_size = property_wire_size if properties.values else None
+                except _DirectQos0Fallback:
                     materialize_captured()
+                    packet = decoder.next_packet()
+                    assert packet is not None
                     engine.handle_raw(packet)
+                except MalformedPacketError:
+                    materialize_captured()
+                    packet = decoder.next_packet()
+                    assert packet is not None
+                    engine.handle_raw(packet)
+                else:
+                    consume_peeked_packet(body_end)
+                    captured.append(message)
+                    if captured_property_sizes is not None:
+                        captured_property_sizes.append(wire_size)
+                count += 1
+                decoded_bytes += body_size + 5
             else:
                 materialize_captured()
+                packet = decoder.next_packet()
+                if packet is None:
+                    break
                 engine.handle_raw(packet)
-            count += 1
-            decoded_bytes += len(packet.remaining) + 5
+                count += 1
+                decoded_bytes += len(packet.remaining) + 5
             if inbound._autoack_handoff_required:
                 handoff_required = True
                 break
@@ -1497,13 +1552,16 @@ class AsyncClient:
                 break
         if engine._effects:
             materialize_captured()
-        return count, decoded_bytes, handoff_required, captured
+        return count, decoded_bytes, handoff_required, captured, captured_property_sizes
 
     async def _read_loop(self) -> None:  # noqa: C901
         assert self._transport is not None
-        direct_qos0_delivery = (
-            self._delivery.mode == "callback"
-            and self._engine.config.protocol is MQTTProtocolVersion.MQTTv311
+        direct_qos0_mode = self._delivery.mode in (
+            "auto",
+            "callback",
+        ) and self._engine.config.protocol in (
+            MQTTProtocolVersion.MQTTv311,
+            MQTTProtocolVersion.MQTTv5,
         )
         try:
             while not self._transport.is_closing():
@@ -1517,33 +1575,58 @@ class AsyncClient:
                 while True:
                     async with self._engine_lock:
                         captured: list[Message] = []
+                        captured_property_sizes: list[int | None] | None = None
                         with self._engine.store.batch():
                             header = getattr(self._decoder, "next_header_byte", None)
                             if (
-                                direct_qos0_delivery
+                                direct_qos0_mode
+                                and (
+                                    self._delivery.mode == "callback" or self.on_message is not None
+                                )
                                 and not self._effect_pump.pending
                                 and self._engine.state is ConnectionState.CONNECTED
                                 and header is not None
                                 and (header & 0xF0) == PacketType.PUBLISH
                                 and ((header >> 1) & 0x03) == 0
                             ):
-                                handled, handled_bytes, handoff_required, captured = (
-                                    self._process_direct_qos0_batch()
-                                )
+                                (
+                                    handled,
+                                    handled_bytes,
+                                    handoff_required,
+                                    captured,
+                                    captured_property_sizes,
+                                ) = self._process_direct_qos0_batch()
                             else:
                                 handled, handled_bytes, handoff_required = (
                                     self._process_ingress_batch()
                                 )
                         if captured:
                             if self._delivery.deliver_callback_messages_inline(
-                                captured, self.on_message
+                                captured, self.on_message, captured_property_sizes
                             ):
                                 self._effect_pump.record_inline_batch(len(captured))
                             else:
-                                self._engine._effects.extend(
-                                    EngineEffect(EffectKind.MESSAGE, message, False, None)
-                                    for message in captured
-                                )
+                                if captured_property_sizes is None:
+                                    self._engine._effects.extend(
+                                        EngineEffect(EffectKind.MESSAGE, message, False, None)
+                                        for message in captured
+                                    )
+                                else:
+                                    self._engine._effects.extend(
+                                        EngineEffect(
+                                            (
+                                                EffectKind.DECODED_MESSAGE
+                                                if wire_size is not None
+                                                else EffectKind.MESSAGE
+                                            ),
+                                            message,
+                                            False,
+                                            wire_size,
+                                        )
+                                        for message, wire_size in zip(
+                                            captured, captured_property_sizes, strict=True
+                                        )
+                                    )
                         if handled and self._engine.has_pending_effects:
                             self._collect_effects_locked()
                     if self._effect_pump.pending:

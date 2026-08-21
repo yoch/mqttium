@@ -534,14 +534,25 @@ class ApplicationDelivery:
         self,
         messages: list[Message],
         callback: Callable[[Message], Any] | None,
+        decoded_property_wire_sizes: list[int | None] | None = None,
     ) -> bool:
         if callback is None:
             return True
         if self._callback_batch_capacity(False) < len(messages):
             return False
-        for message in messages:
-            if not self._is_small(message):
-                return False
+        if decoded_property_wire_sizes is None:
+            for message in messages:
+                if not self._is_small(message):
+                    return False
+        else:
+            if len(decoded_property_wire_sizes) != len(messages):
+                raise AssertionError("decoded property sizes must align with messages")
+            for message, wire_size in zip(messages, decoded_property_wire_sizes, strict=True):
+                if wire_size is None:
+                    if not self._is_small(message):
+                        return False
+                elif not self._is_small_decoded(message, wire_size):
+                    return False
         self._enqueue_message_batch(callback, messages, iterator_delivery=False)
         return True
 
