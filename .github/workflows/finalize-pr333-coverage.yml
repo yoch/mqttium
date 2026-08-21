@@ -1,0 +1,133 @@
+name: Finalize PR333 coverage
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  coverage:
+    if: github.head_ref == 'validation/pr333-arm64'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out exact final runtime tree
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: validation/pr333-coverage-tree
+          fetch-depth: 0
+      - name: Verify base and install test environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "88f95b17d984ab775b9583ef9700d468af73a4d9"
+          python -m pip install -e ".[dev]"
+      - name: Add direct-path coverage guards
+        shell: bash
+        run: |
+          cat >> tests/unit/test_direct_qos0_capture.py <<'PY'
+
+
+@pytest.mark.parametrize(
+    ("body", "flags", "error_text"),
+    [
+        (b"\x00\x01ax", 0x08, "QoS 0 PUBLISH must not set DUP"),
+        (b"\x00", 0, "Incomplete uint16"),
+        (b"\x00\x02a", 0, "Incomplete UTF-8 string"),
+        (b"\x00\x01\xff", 0, "Invalid UTF-8 data"),
+        (b"\x00\x00", 0, "PUBLISH topic must not be empty"),
+    ],
+)
+def test_borrowed_v311_rejects_malformed_fields(
+    body: bytes, flags: int, error_text: str
+) -> None:
+    from mqttium.errors import MalformedPacketError
+    from mqttium.packets._publish import decode_qos0_message_v311_borrowed
+
+    with pytest.raises(MalformedPacketError) as error:
+        decode_qos0_message_v311_borrowed(bytearray(body), 0, len(body), flags)
+    assert error_text in str(error.value)
+
+
+@pytest.mark.parametrize(
+    ("body", "flags", "error_text"),
+    [
+        (b"\x00\x01a\x00", 0x08, "QoS 0 PUBLISH must not set DUP"),
+        (b"\x00", 0, "Incomplete uint16"),
+        (b"\x00\x02a", 0, "Incomplete UTF-8 string"),
+        (b"\x00\x01\xff\x00", 0, "Invalid UTF-8 data"),
+        (b"\x00\x01\x00\x00", 0, "Null in UTF-8 data"),
+        (b"\x00\x01a", 0, "Missing properties length"),
+        (b"\x00\x01a\x80", 0, "Incomplete Variable Byte Integer"),
+        (b"\x00\x01a\x80\x00", 0, "Non-canonical Variable Byte Integer"),
+        (b"\x00\x01a\xff\xff\xff\xff\x01", 0, "Malformed Variable Byte Integer"),
+    ],
+)
+def test_borrowed_v5_rejects_malformed_fields(
+    body: bytes, flags: int, error_text: str
+) -> None:
+    from mqttium.errors import MalformedPacketError
+    from mqttium.packets._publish import decode_qos0_message_v5_borrowed
+
+    with pytest.raises(MalformedPacketError) as error:
+        decode_qos0_message_v5_borrowed(bytearray(body), 0, len(body), flags)
+    assert error_text in str(error.value)
+
+
+def test_decoded_property_sizes_must_align_with_messages() -> None:
+    client = _client_v5()
+    client._decoder.feed(_publish_v5("one"))
+    _, _, _, captured, _ = client._process_direct_qos0_batch()
+
+    with pytest.raises(AssertionError, match="decoded property sizes must align"):
+        client._delivery.deliver_callback_messages_inline(captured, client.on_message, [])
+
+
+def test_decoded_empty_properties_respect_small_message_limit() -> None:
+    client = _client_v5()
+    client._delivery.small_message_limit = 0
+    client._decoder.feed(_publish_v5("one"))
+    _, _, _, captured, sizes = client._process_direct_qos0_batch()
+
+    assert sizes == [None]
+    assert not client._delivery.deliver_callback_messages_inline(
+        captured, client.on_message, sizes
+    )
+
+
+def test_decoded_nonempty_properties_respect_small_message_limit() -> None:
+    from mqttium.types import Properties
+
+    props = Properties()
+    props.set("content_type", "application/json")
+    client = _client_v5()
+    client._delivery.small_message_limit = 0
+    client._decoder.feed(_publish_v5("one", properties=props))
+    _, _, _, captured, sizes = client._process_direct_qos0_batch()
+
+    assert sizes is not None and sizes[0] is not None
+    assert not client._delivery.deliver_callback_messages_inline(
+        captured, client.on_message, sizes
+    )
+PY
+          ruff format tests/unit/test_direct_qos0_capture.py
+          ruff check tests/unit/test_direct_qos0_capture.py
+          git diff --check
+      - name: Validate targeted and repository coverage
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pytest -q tests/unit/test_direct_qos0_capture.py
+          python -m pytest -q -W error --strict-config --strict-markers tests/unit tests/project \
+            --cov=mqttium --cov-branch --cov-report=term-missing --cov-fail-under=89
+      - name: Commit validated coverage tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add tests/unit/test_direct_qos0_capture.py
+          git commit -m "Cover borrowed QoS0 ingress guard branches"
+          git push origin HEAD:validation/pr333-coverage-tree
