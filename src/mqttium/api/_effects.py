@@ -13,6 +13,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Protocol
 
 from mqttium.api.stats import EffectStats
+from mqttium.enums import ConnectionState
 from mqttium.protocol.effects import EffectKind, EngineEffect
 
 if TYPE_CHECKING:
@@ -25,6 +26,7 @@ class StaleConnectionEffect(Exception):
 
 class EffectOwner(Protocol):
     _connection_epoch: int
+    _disconnect_exc: BaseException | None
     _engine: ProtocolEngine
 
     def _apply_effect_inline(self, effect: EngineEffect, epoch: int) -> bool: ...
@@ -44,6 +46,8 @@ class EffectOwner(Protocol):
         nowait: bool,
         epoch: int | None = None,
     ) -> None: ...
+
+    async def _close_transport_after_connection_failure(self) -> None: ...
 
     def _settle_terminal_effect(self, effect: EngineEffect) -> None: ...
 
@@ -67,6 +71,9 @@ class EffectPump:
         self.progress = asyncio.Event()
         self.waiters = 0
         self.error: BaseException | None = None
+        self._next_waiter_id = 0
+        self._waiter_targets: dict[int, int] = {}
+        self._error_waiters: set[int] = set()
         self.task: asyncio.Task[None] | None = None
         self.flush_requested = False
         self.draining_inline = False
@@ -257,13 +264,38 @@ class EffectPump:
                         if self.pending and self.pending[0] is effect:
                             self.pending.popleft()
                             self._complete()
-                        self.error = exc
+                        connection_fatal = not (
+                            effect.kind is EffectKind.PROTOCOL_ERROR
+                            and self.owner._engine.state is not ConnectionState.DISCONNECTED
+                        )
+                        if not connection_fatal:
+                            # Ingress PROTOCOL_ERROR effects may be diagnostic
+                            # while the engine remains connected. They must not
+                            # poison the reader's internal drain() or a later
+                            # unrelated operation; preserve the historical loop
+                            # diagnostic instead.
+                            raise
+
+                        failure_at = self.applied
+                        owners = {
+                            waiter_id
+                            for waiter_id, target in self._waiter_targets.items()
+                            if target >= failure_at
+                        }
+                        if owners:
+                            self.error = exc
+                            self._error_waiters = owners
+                            self.progress.set()
                         connack_fut = getattr(self.owner, "_connack_fut", None)
                         if connack_fut is not None and not connack_fut.done():
                             connack_fut.set_exception(exc)
-                        if self.waiters:
-                            self.progress.set()
-                        raise
+
+                        # Connection health always belongs to AsyncClient's
+                        # reader-owned lifecycle. Active drain() calls still
+                        # receive the same original exception below.
+                        self.owner._disconnect_exc = exc
+                        await self.owner._close_transport_after_connection_failure()
+                        return
                     else:
                         if self.pending and self.pending[0] is effect:
                             self.pending.popleft()
@@ -279,16 +311,9 @@ class EffectPump:
         except asyncio.CancelledError:
             return
         except Exception as exc:
-            if not self.pending:
-                # `self.error` exists to unblock a caller whose effects the
-                # flush task failed to apply. The failing effect is popped and
-                # counted before the raise, so an empty deque means applied has
-                # caught up with enqueued: every waiter's target is already met
-                # and no future drain() can be blocked by this failure. The
-                # exception has no owner, and retaining it would hand a failure
-                # caused by the peer to the next unrelated call that suspends in
-                # drain(). A non-empty deque is the opposite case — work really
-                # is stuck, so the error stays for whoever is waiting on it.
+            if not self.pending and not self._error_waiters:
+                # No current drain() owns a failure anymore. Do not retain an
+                # unowned exception for a later unrelated operation.
                 self.error = None
             asyncio.get_running_loop().call_exception_handler(
                 {
@@ -307,21 +332,33 @@ class EffectPump:
         target = self.enqueued
         if self.applied >= target:
             return
+
+        waiter_id = self._next_waiter_id
+        self._next_waiter_id += 1
+        self._waiter_targets[waiter_id] = target
         self.waiters += 1
         self.apply_suspensions += 1
         try:
-            while self.applied < target:
-                if self.error is not None:
-                    error = self.error
-                    self.error = None
-                    raise error
+            while True:
+                if waiter_id in self._error_waiters:
+                    assert self.error is not None
+                    raise self.error
+                if self.applied >= target:
+                    return
                 self.progress.clear()
                 self.schedule()
+                if waiter_id in self._error_waiters:
+                    assert self.error is not None
+                    raise self.error
                 if self.applied >= target:
-                    break
+                    return
                 await asyncio.shield(self.progress.wait())
         finally:
+            self._waiter_targets.pop(waiter_id, None)
+            self._error_waiters.discard(waiter_id)
             self.waiters -= 1
+            if self.error is not None and not self._error_waiters:
+                self.error = None
 
     def discard_connection_effects(self, *, settle_publish: bool = False) -> None:
         """Drop transport effects and preserve or settle terminal publishes."""
