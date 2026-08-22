@@ -46,9 +46,7 @@ class _Owner:
         del effect, epoch
         return False
 
-    def _apply_message_effect_batch_inline(
-        self, effects: deque[EngineEffect], epoch: int
-    ) -> int:
+    def _apply_message_effect_batch_inline(self, effects: deque[EngineEffect], epoch: int) -> int:
         del effects, epoch
         return 0
 
@@ -141,6 +139,7 @@ async def test_two_concurrent_drains_receive_same_original_failure() -> None:
         failure,
         block_first=release,
     )
+
     # Block the failing apply explicitly so both drain() calls register first.
     async def blocked_failure(
         effect: EngineEffect, *, nowait: bool, epoch: int | None = None
