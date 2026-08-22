@@ -1734,8 +1734,28 @@ class AsyncClient:
             and self._reconnect.should_retry(reason, self._engine.config.protocol)
         )
 
+    async def _close_transport_after_connection_failure(self) -> None:
+        """Unblock the reader without letting teardown errors replace the cause."""
+        transport = self._transport
+        if transport is None:
+            return
+        try:
+            await transport.close()
+        except Exception:
+            # Some transports may fail while closing before read() is released.
+            # The reader owns connection teardown, so cancellation is the safe
+            # fallback. Never await it here: the reader can in turn stop the
+            # writer task that is executing this failure handler.
+            reader = self._reader_task
+            if (
+                reader is not None
+                and reader is not asyncio.current_task()
+                and not reader.done()
+            ):
+                reader.cancel()
+
     async def _writer_failed(self, exc: BaseException) -> None:
-        """Apply AsyncClient's connection policy after a writer failure."""
+        """Hand a writer failure to the reader-owned connection lifecycle."""
         self._disconnect_exc = exc
         if not self._will_reconnect():
             self._fail_pending(exc)
@@ -1743,13 +1763,7 @@ class AsyncClient:
             self._engine.notify_transport_closed()
             self._collect_effects_locked()
         await self._drain_effects()
-        if not self._will_reconnect():
-            # A reconnectable loss must not terminate the application
-            # message stream: the same iterator resumes after reconnect.
-            self._delivery.close()
-        # Close transport so the reader unblocks and runs shared cleanup.
-        if self._transport is not None:
-            await self._transport.close()
+        await self._close_transport_after_connection_failure()
 
     def _preview_publish_size(
         self,
@@ -1827,19 +1841,11 @@ class AsyncClient:
                 now = time.monotonic()
                 if self._ping_pending:
                     if now >= self._ping_deadline:
-                        # Close only the connection: keep the reconnect task
-                        # alive so the reader's shared teardown classifies the
-                        # loss and the retry loop can re-establish the session.
                         self._disconnect_exc = MQTTTimeoutError("PINGRESP timed out")
-                        await self._force_close(preserve_reconnect=True)
-                        if self._will_reconnect():
-                            # The reader normally spawns this from its shared
-                            # teardown, but it was just cancelled: do it here.
-                            if self._reconnect_task is None or self._reconnect_task.done():
-                                self._reconnect_task = asyncio.create_task(
-                                    self._reconnect_loop(), name="mqttium-reconnect"
-                                )
-                            await self._invoke(self.on_disconnect, self._disconnect_exc)
+                        # The reader is the single owner of connection teardown:
+                        # it emits on_disconnect once and decides reconnect vs
+                        # terminal delivery shutdown after the transport breaks.
+                        await self._close_transport_after_connection_failure()
                         return
                     await asyncio.sleep(min(0.5, self._ping_deadline - now))
                     continue
