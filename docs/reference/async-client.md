@@ -69,3 +69,16 @@ finally:
 
 Keep `disconnect()` in `finally`. An application-owned persistence store is
 closed after the client.
+
+## Message iterator lifecycle
+
+A `messages()` iterator belongs to one application-delivery generation. An
+unexpected connection loss followed by automatic reconnect keeps that generation
+alive, so an `async for` loop or suspended `anext()` continues on the replacement
+transport.
+
+A terminal disconnect ends the current generation. A later explicit `connect()`,
+`connect_unix()`, or `connect_ws()` starts a new generation. Iterators created for
+the previous generation stay terminal and cannot consume messages delivered by
+the new connection; call `messages()` again after the explicit connect to consume
+the replacement generation.
