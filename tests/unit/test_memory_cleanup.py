@@ -78,6 +78,50 @@ def test_memory_store_releases_inbound_hash_capacity_when_empty() -> None:
     assert store._in is not original
 
 
+def test_memory_store_outbound_iteration_is_a_membership_snapshot() -> None:
+    store = MemoryInflightStore()
+    messages = [
+        OutboundMessage(
+            mid=mid,
+            topic=f"memory/out/{mid}",
+            payload=b"payload",
+            qos=QoS.AT_LEAST_ONCE,
+            retain=False,
+            state=OutboundQoSState.WAIT_PUBACK,
+        )
+        for mid in (1, 2)
+    ]
+    for message in messages:
+        store.put_out(message)
+
+    items = store.out_items()
+    store.delete_out(1)
+
+    assert list(items) == messages
+
+
+def test_memory_store_inbound_iteration_is_a_membership_snapshot() -> None:
+    store = MemoryInflightStore()
+    messages = [
+        InboundMessage(
+            mid=mid,
+            topic=f"memory/in/{mid}",
+            payload=b"payload",
+            qos=QoS.EXACTLY_ONCE,
+            retain=False,
+            state=InboundQoSState.WAIT_PUBREL,
+        )
+        for mid in (1, 2)
+    ]
+    for message in messages:
+        store.put_in(message)
+
+    items = store.in_items()
+    store.pop_in(1)
+
+    assert list(items) == messages
+
+
 class _FakeWriter:
     def __init__(self) -> None:
         self.written: list[bytes] = []

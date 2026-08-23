@@ -38,7 +38,7 @@ Protocol conformance evidence is indexed in [Protocol Conformance](conformance.m
 | Transport | Native `AsyncClient` | Paho facade |
 | --- | :---: | :---: |
 | TCP | Yes | Yes |
-| TLS | Yes | Yes |
+| TLS | Yes | No |
 | WebSocket | Yes | No |
 | Unix-domain socket | Yes | No |
 

@@ -120,7 +120,11 @@ evidence justifies a change:
 - **No silent degradation.** Unsupported QoS or negotiated-limit violations
   raise before state changes; they are never silently downgraded.
 - Validate topics, properties, sizes, and negotiated limits before mutation.
-- All public errors derive from `MQTTError` and avoid builtin names.
+- MQTTium-defined Stable client errors derive from `MQTTError` and avoid
+  builtin names. Documented system and cancellation exceptions may cross a
+  Stable boundary (`OSError` from transport setup, for example). Provisional
+  `SqliteInflightStore` follows Python's DB-API boundary and may raise
+  `sqlite3.Error` or `RuntimeError` as documented.
 - Keep a reference to every created asyncio task; Ruff's `RUF006` enforces it.
 - Generated benchmark data, coverage files, caches, and build artifacts are
   never committed.
