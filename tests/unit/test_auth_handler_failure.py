@@ -151,10 +151,14 @@ async def test_connect_cancellation_stops_blocked_auth_handler_promptly() -> Non
     transport = _AuthChallengeTransport()
     handler_entered = asyncio.Event()
     handler_release = asyncio.Event()
+    handler_stopped = asyncio.Event()
 
     async def blocking_auth(_packet: AuthPacket) -> None:
         handler_entered.set()
-        await handler_release.wait()
+        try:
+            await handler_release.wait()
+        finally:
+            handler_stopped.set()
 
     props = Properties({"authentication_method": "demo"})
     client = AsyncClient(
@@ -186,5 +190,10 @@ async def test_connect_cancellation_stops_blocked_auth_handler_promptly() -> Non
         await connecting
 
     assert prompt, "connect cancellation waited for the AUTH handler timeout"
+    assert handler_stopped.is_set()
     assert client.state is ConnectionState.DISCONNECTED
     assert client._transport is None
+    assert client._effect_flush_task is None
+    assert not client._effect_pump.pending
+    assert client._effect_pump.applied == client._effect_pump.enqueued
+    assert client._effect_pump.waiters == 0
