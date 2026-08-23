@@ -8,6 +8,9 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Reject corrupted SQLite rows whose storage classes or scalar values do not
+  match MQTTium's durable schema instead of coercing them into different MQTT
+  topics, payloads, flags, or sizes during session replay.
 - Preserve an active `messages()` iterator across automatic reconnects, while
   binding iterators to explicit connection generations so an old iterator
   cannot consume messages from a later explicit connection.

@@ -15,6 +15,7 @@ silently reinterpreted.
 from __future__ import annotations
 
 import base64
+import binascii
 import json
 import sqlite3
 import threading
@@ -96,9 +97,18 @@ def _json_sanitize(value: Any) -> Any:
 def _json_revive(value: Any) -> Any:
     if isinstance(value, dict):
         if "__mqttium_bytes__" in value and len(value) == 1:
-            return base64.b64decode(value["__mqttium_bytes__"].encode("ascii"))
+            encoded = value["__mqttium_bytes__"]
+            if not isinstance(encoded, str):
+                raise ValueError("Invalid persisted properties byte marker")
+            try:
+                return base64.b64decode(encoded.encode("ascii"), validate=True)
+            except (UnicodeEncodeError, binascii.Error) as exc:
+                raise ValueError("Invalid persisted properties byte marker") from exc
         if "__mqttium_tuple__" in value and len(value) == 1:
-            return tuple(_json_revive(v) for v in value["__mqttium_tuple__"])
+            items = value["__mqttium_tuple__"]
+            if not isinstance(items, list):
+                raise ValueError("Invalid persisted properties tuple marker")
+            return tuple(_json_revive(v) for v in items)
         return {k: _json_revive(v) for k, v in value.items()}
     if isinstance(value, list):
         revived = [_json_revive(v) for v in value]
@@ -127,58 +137,90 @@ def _props_from_json(raw: str | None) -> Properties | None:
     return Properties(values=values)
 
 
+def _stored(row: sqlite3.Row, column: str, expected: type[_RecordT]) -> _RecordT:
+    value = row[column]
+    if type(value) is not expected:
+        raise ValueError(
+            f"Invalid persisted {column}: expected {expected.__name__}, got {type(value).__name__}"
+        )
+    return value
+
+
+def _stored_optional_text(row: sqlite3.Row, column: str) -> str | None:
+    value = row[column]
+    if value is not None and type(value) is not str:
+        raise ValueError(
+            f"Invalid persisted {column}: expected str or None, got {type(value).__name__}"
+        )
+    return value
+
+
+def _stored_bool(row: sqlite3.Row, column: str) -> bool:
+    value = _stored(row, column, int)
+    if value not in (0, 1):
+        raise ValueError(f"Invalid persisted {column}: expected 0 or 1, got {value}")
+    return bool(value)
+
+
+def _stored_non_negative(row: sqlite3.Row, column: str) -> int:
+    value = _stored(row, column, int)
+    if value < 0:
+        raise ValueError(f"Invalid persisted {column}: expected a non-negative integer")
+    return value
+
+
 def _row_to_out(row: sqlite3.Row) -> OutboundMessage:
     return OutboundMessage(
-        mid=int(row["mid"]),
-        topic=str(row["topic"]),
-        payload=bytes(row["payload"]),
-        qos=QoS(int(row["qos"])),
-        retain=bool(row["retain"]),
-        state=OutboundQoSState(int(row["state"])),
-        dup=bool(row["dup"]),
-        properties=_props_from_json(row["properties"]),
+        mid=_stored(row, "mid", int),
+        topic=_stored(row, "topic", str),
+        payload=_stored(row, "payload", bytes),
+        qos=QoS(_stored(row, "qos", int)),
+        retain=_stored_bool(row, "retain"),
+        state=OutboundQoSState(_stored(row, "state", int)),
+        dup=_stored_bool(row, "dup"),
+        properties=_props_from_json(_stored_optional_text(row, "properties")),
         # Rows migrated from schema 1 carry 0, which the outbound session reads
         # as "unknown" and recomputes once, exactly as it did before the column
         # existed.
-        logical_size=int(row["logical_size"]),
+        logical_size=_stored_non_negative(row, "logical_size"),
     )
 
 
 def _row_to_out_summary(row: sqlite3.Row) -> OutboundMessageSummary:
     return OutboundMessageSummary(
-        mid=int(row["mid"]),
-        topic=str(row["topic"]),
-        payload_size=int(row["payload_size"]),
-        qos=QoS(int(row["qos"])),
-        retain=bool(row["retain"]),
-        state=OutboundQoSState(int(row["state"])),
-        dup=bool(row["dup"]),
-        properties=_props_from_json(row["properties"]),
-        logical_size=int(row["logical_size"]),
+        mid=_stored(row, "mid", int),
+        topic=_stored(row, "topic", str),
+        payload_size=_stored_non_negative(row, "payload_size"),
+        qos=QoS(_stored(row, "qos", int)),
+        retain=_stored_bool(row, "retain"),
+        state=OutboundQoSState(_stored(row, "state", int)),
+        dup=_stored_bool(row, "dup"),
+        properties=_props_from_json(_stored_optional_text(row, "properties")),
+        logical_size=_stored_non_negative(row, "logical_size"),
     )
 
 
 def _row_to_in_meta(row: sqlite3.Row) -> InboundRecordMeta:
     return InboundRecordMeta(
-        mid=int(row["mid"]),
-        state=InboundQoSState(int(row["state"])),
-        user_acked=bool(row["user_acked"]),
-        logical_size=int(row["logical_size"]),
+        mid=_stored(row, "mid", int),
+        state=InboundQoSState(_stored(row, "state", int)),
+        user_acked=_stored_bool(row, "user_acked"),
+        logical_size=_stored_non_negative(row, "logical_size"),
     )
 
 
 def _row_to_in(row: sqlite3.Row) -> InboundMessage:
     return InboundMessage(
-        mid=int(row["mid"]),
-        topic=str(row["topic"]),
-        payload=bytes(row["payload"]),
-        qos=QoS(int(row["qos"])),
-        retain=bool(row["retain"]),
-        state=InboundQoSState(int(row["state"])),
-        delivered=bool(row["delivered"]),
-        properties=_props_from_json(row["properties"]),
-        user_acked=bool(row["user_acked"]),
-        logical_size=int(row["logical_size"]),
+        mid=_stored(row, "mid", int),
+        topic=_stored(row, "topic", str),
+        payload=_stored(row, "payload", bytes),
+        qos=QoS(_stored(row, "qos", int)),
+        retain=_stored_bool(row, "retain"),
+        state=InboundQoSState(_stored(row, "state", int)),
+        delivered=_stored_bool(row, "delivered"),
+        properties=_props_from_json(_stored_optional_text(row, "properties")),
+        user_acked=_stored_bool(row, "user_acked"),
+        logical_size=_stored_non_negative(row, "logical_size"),
     )
 
 
