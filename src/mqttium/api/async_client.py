@@ -1753,6 +1753,9 @@ class AsyncClient:
     async def _writer_failed(self, exc: BaseException) -> None:
         """Hand a writer failure to the reader-owned connection lifecycle."""
         self._disconnect_exc = exc
+        connack_fut = self._connack_fut
+        if connack_fut is not None and not connack_fut.done():
+            connack_fut.set_exception(exc)
         await self._close_transport_after_connection_failure()
 
     def _preview_publish_size(
