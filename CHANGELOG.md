@@ -8,6 +8,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Wait for automatic reconnect to leave its stability window before the soak
+  harness samples task counts, avoiding schedule-dependent false leak reports.
 - Preserve an active `messages()` iterator across automatic reconnects, while
   binding iterators to explicit connection generations so an old iterator
   cannot consume messages from a later explicit connection.
