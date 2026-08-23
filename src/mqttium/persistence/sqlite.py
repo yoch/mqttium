@@ -176,6 +176,11 @@ def _stored_mid(row: sqlite3.Row) -> int:
     return value
 
 
+def _stored_ordered_mid(row: sqlite3.Row) -> int:
+    _stored_non_negative(row, "seq")
+    return _stored_mid(row)
+
+
 def _stored_out_transition(
     row: sqlite3.Row,
 ) -> tuple[OutboundQoSState, int, int]:
@@ -494,8 +499,8 @@ class SqliteInflightStore:
     # is a run of `?` placeholders (see `_pages`), so every value still travels
     # as a bound parameter.
     _ORDERED_MIDS_SQL = {
-        "outbound": "SELECT mid FROM outbound ORDER BY seq",
-        "inbound": "SELECT mid FROM inbound ORDER BY seq",
+        "outbound": "SELECT mid, seq FROM outbound ORDER BY seq",
+        "inbound": "SELECT mid, seq FROM inbound ORDER BY seq",
     }
 
     def _ordered_mids(self, table: str) -> array[int]:
@@ -513,7 +518,7 @@ class SqliteInflightStore:
             # Fed straight from the cursor: fetchall() would materialise a Row
             # object per record before the array is built, which on a full
             # session replay is the allocation this method exists to avoid.
-            return array("q", (_stored_mid(row) for row in cursor))
+            return array("q", (_stored_ordered_mid(row) for row in cursor))
 
     def _pages(
         self,

@@ -15,9 +15,9 @@ from mqttium.protocol.engine import EngineConfig, ProtocolEngine
 from mqttium.types import InboundMessage, OutboundMessage, Properties
 
 
-def _out() -> OutboundMessage:
+def _out(mid: int = 1) -> OutboundMessage:
     return OutboundMessage(
-        mid=1,
+        mid=mid,
         topic="original",
         payload=b"original",
         qos=QoS.AT_LEAST_ONCE,
@@ -27,9 +27,9 @@ def _out() -> OutboundMessage:
     )
 
 
-def _in() -> InboundMessage:
+def _in(mid: int = 1) -> InboundMessage:
     return InboundMessage(
-        mid=1,
+        mid=mid,
         topic="original",
         payload=b"original",
         qos=QoS.EXACTLY_ONCE,
@@ -182,3 +182,33 @@ def test_reopen_rejects_coercible_sequence(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="max_seq"):
         SqliteInflightStore(path)
+
+
+@pytest.mark.parametrize("seq", [-1, 1.5])
+@pytest.mark.parametrize("table", ["outbound", "inbound"])
+def test_paged_replay_rejects_corrupted_nonmax_sequence(
+    tmp_path: Path,
+    table: str,
+    seq: object,
+) -> None:
+    store = SqliteInflightStore(tmp_path / "sequence.sqlite3")
+    try:
+        if table == "outbound":
+            store.put_out(_out(1))
+            store.put_out(_out(2))
+            pages = store.out_pages()
+        else:
+            store.put_in(_in(1))
+            store.put_in(_in(2))
+            pages = store.in_pages()
+        # The fixed table names are test parameters, never application input.
+        store._conn.execute(  # noqa: SLF001 - intentional durable corruption
+            f"UPDATE {table} SET seq=? WHERE mid=1",
+            (seq,),
+        )
+        store._conn.commit()  # noqa: SLF001 - intentional durable corruption
+
+        with pytest.raises(ValueError, match="seq"):
+            next(pages)
+    finally:
+        store.close()
