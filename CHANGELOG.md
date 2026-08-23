@@ -8,6 +8,9 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Reject corrupted SQLite rows whose storage classes or scalar values do not
+  match MQTTium's durable schema instead of coercing them into different MQTT
+  topics, payloads, flags, or sizes during session replay.
 - Cancel deferred effect work before awaiting reader teardown so cancelling
   `connect()` during AUTH does not wait for the AUTH callback timeout.
 - Treat an AUTH callback that cancels itself as a callback failure while
