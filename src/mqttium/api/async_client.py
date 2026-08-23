@@ -2408,14 +2408,11 @@ class AsyncClient:
         # waits for the same EffectPump. Terminal publish results remain queued
         # for settlement after the task owners have stopped.
         self._discard_connection_effects()
-        effect_task = self._effect_flush_task
-        if effect_task is not None and effect_task is not current:
-            effect_task.cancel()
-            try:
-                await effect_task
-            except (asyncio.CancelledError, Exception):
-                pass
-        tasks_to_stop = [task for task in tasks if task is not None and task is not current]
+        tasks_to_stop = [
+            task
+            for task in (self._effect_flush_task, *tasks)
+            if task is not None and task is not current
+        ]
         for task in tasks_to_stop:
             task.cancel()
         for task in tasks_to_stop:

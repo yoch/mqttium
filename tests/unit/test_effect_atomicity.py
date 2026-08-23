@@ -85,6 +85,37 @@ async def test_force_close_stops_callback_worker() -> None:
     assert client._callback_worker_task is None
 
 
+async def test_force_close_requests_all_task_cancellations_before_awaiting() -> None:
+    client = AsyncClient(client_id="connection-task-order")
+    effect_cancelled = asyncio.Event()
+    effect_release = asyncio.Event()
+
+    async def slow_effect() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            effect_cancelled.set()
+            await effect_release.wait()
+            raise
+
+    async def reader() -> None:
+        await asyncio.Event().wait()
+
+    effect_task = asyncio.create_task(slow_effect())
+    reader_task = asyncio.create_task(reader())
+    client._effect_pump.task = effect_task
+    client._reader_task = reader_task
+    await asyncio.sleep(0)
+
+    closing = asyncio.create_task(client._force_close())
+    await effect_cancelled.wait()
+    reader_cancel_requested = reader_task.cancelling() > 0
+    effect_release.set()
+    await closing
+
+    assert reader_cancel_requested
+
+
 async def test_scheduled_flush_records_wakeup_while_active() -> None:
     client = AsyncClient(client_id="flush-wakeup")
     started = asyncio.Event()
