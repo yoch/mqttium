@@ -117,6 +117,14 @@ The database uses WAL mode. Its schema is versioned with SQLite
 database written by a newer MQTTium schema is refused rather than interpreted
 unsafely.
 
+`SqliteInflightStore` follows Python's synchronous DB-API boundary. Opening or
+operating on the database can raise `sqlite3.Error`; an unsupported or
+structurally inconsistent MQTTium schema, or invalid store lifecycle use,
+raises `RuntimeError`. These Provisional persistence exceptions are separate
+from the Stable asynchronous client's `MQTTError` hierarchy. Catch only the
+specific failure that the application can recover from; do not retry schema
+incompatibility as a transient broker failure.
+
 ## Incremental replay and memory
 
 Both shipped stores implement paged replay. SQLite first reads ordered,

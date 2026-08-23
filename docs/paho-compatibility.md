@@ -43,6 +43,7 @@ the complete connect, subscribe, publish, callback and shutdown lifecycle. See
 | `Client(CallbackAPIVersion.VERSION2, …)` | Supported | Only callback API version supported |
 | `loop_start` / `loop_stop` | Supported | Dedicated thread and event loop |
 | `connect` / `disconnect` / `reconnect` | Supported | Synchronous and blocking |
+| `tls_set` / `tls_set_context` | Not supported | Use native `AsyncClient.connect(..., ssl=...)`; façade connections are clear-text |
 | `publish` → `MQTTMessageInfo` | Supported | `wait_for_publish` propagates errors |
 | `subscribe` / `unsubscribe` | Supported | Simple `(rc, mid)` form |
 | `on_connect(client, userdata, flags, reason_code, properties)` | Partial | Uses `ConnectFlags.session_present`; reason code remains an integer rather than Paho's `ReasonCode` object |
@@ -68,6 +69,7 @@ For one-shot helpers, prefer the async-native `mqttium.helpers` API instead of
 | Callback API VERSION1 | Supported | **Rejected** | Obsolete API with ambiguous MQTT v3/v5 signatures |
 | `loop_forever` / `loop(timeout)` | Supported | Not supported | `loop_start` is sufficient; avoid exposing a second event-loop model |
 | `connect_async` | Supported | Not supported | Use `AsyncClient` for native asynchronous operation |
+| TLS configuration | `tls_set` / `tls_set_context` | Not supported by the façade | Keep security-sensitive transport configuration explicit in the native API |
 | Non-compliant QoS > 0 republish with a clean session | Historically ambiguous | **Strict MQTT behavior** | Correctness takes precedence over bug compatibility |
 | MID for QoS 0 | Allocated | `None` | QoS 0 has no protocol packet identifier |
 | `MQTTMessageInfo.mid` for QoS 1/2 | The wire packet identifier | A façade correlation identifier, wrapping over `1..65535` and reserved through completion delivery | `publish()` returns before loop-side admission, so no packet identifier exists yet. Packet identifiers stay loop-owned (§8); the façade binds its own value to the real one and translates back when `on_publish` is dispatched. If no callback is due, the MID retires when the native receipt settles; if a dispatcher is already due, it stays reserved until that dispatch finishes. A wrap collision with an active façade MID is refused with `MQTT_ERR_QUEUE_SIZE` instead of aliasing two live/completing publications |

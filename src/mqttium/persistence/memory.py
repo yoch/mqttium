@@ -222,7 +222,7 @@ class MemoryInflightStore:
         self._out[msg.mid] = msg
 
     def out_items(self) -> Iterator[OutboundMessage]:
-        return iter(self._out.values())
+        return iter(tuple(self._out.values()))
 
     @staticmethod
     def _pages(
@@ -321,7 +321,7 @@ class MemoryInflightStore:
         self._in[msg.mid] = msg
 
     def in_items(self) -> Iterator[InboundMessage]:
-        return iter(self._in.values())
+        return iter(tuple(self._in.values()))
 
     def in_pages(self, page_size: int = 256) -> Iterator[tuple[InboundMessage, ...]]:
         return self._pages(self._in, page_size)

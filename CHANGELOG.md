@@ -6,6 +6,23 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserve an active `messages()` iterator across automatic reconnects, while
+  binding iterators to explicit connection generations so an old iterator
+  cannot consume messages from a later explicit connection.
+- Route writer-close and deferred-effect failures through one reader-owned
+  connection teardown path, preserving the original error for active callers
+  and disconnect/reconnect observability without poisoning later operations.
+- Treat an empty WebSocket binary message as valid data rather than transport
+  EOF.
+- Validate required SQLite tables and columns even when `user_version` already
+  names the current schema.
+- Release connection-scoped SUBSCRIBE and UNSUBSCRIBE packet identifiers on
+  broker and protocol terminal transitions.
+- Snapshot `MemoryInflightStore` iterator membership so deleting records during
+  replay cannot raise `RuntimeError: dictionary changed size during iteration`.
+
 ### Changed
 
 - Reduce high-rate QoS 0 subscriber overhead by decoding eligible MQTT 3.1.1 and MQTT 5 callback deliveries directly from the bounded ingress buffer into owned `Message` values. Stateful MQTT 5 Topic Alias traffic and all mixed, QoS 1/2, control, error, and backpressure paths retain the historical protocol-engine path.
@@ -24,6 +41,10 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Documentation
 
+- Correct the Provisional Paho compatibility matrix: its synchronous façade
+  does not expose TLS configuration; use the native `AsyncClient` TLS surface.
+- Define the persistence and transport exception boundaries without wrapping
+  Python system exceptions in an artificial MQTT-specific hierarchy.
 - Display the MQTTium logo prominently on the documentation home page.
 - Document the test taxonomy, local release-equivalent commands, reliability
   rules, and the distinction between coverage.py and Codecov percentages.
