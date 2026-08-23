@@ -614,8 +614,8 @@ class SqliteInflightStore:
                     msg.topic,
                     # sqlite3 binds bytes as a BLOB and IntEnum/bool as an
                     # integer, so neither sqlite3.Binary (which is memoryview)
-                    # nor int() buys anything on this per-publish write. Every
-                    # reader coerces on the way out (_row_to_out).
+                    # nor int() buys anything on this per-publish write. Row
+                    # hydration validates the resulting storage classes.
                     msg.payload,
                     msg.qos,
                     msg.retain,
