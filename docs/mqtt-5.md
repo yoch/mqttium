@@ -104,7 +104,9 @@ client.set_auth_handler(on_auth)
 
 The application must verify the authentication method and protect challenge
 data. Re-authentication can be initiated with `await client.auth(...)` after
-connection.
+connection. If the handler raises `asyncio.CancelledError`, MQTTium treats it
+as an authentication failure and applies the configured connection lifecycle;
+cancellation requested on MQTTium's owning task still propagates normally.
 
 ## Server references
 
