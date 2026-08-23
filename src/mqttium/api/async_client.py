@@ -1289,9 +1289,8 @@ class AsyncClient:
                 ``max_failure_details`` is negative.
             TypeError: If ``messages`` is not iterable.
             PublishBatchError: If iterating or admitting the batch fails. Its
-                ``cause`` is the original validation, connection, protocol, or
-                flow-control exception, and ``receipt`` describes work admitted
-                before that failure.
+                ``cause`` is the original exception, and ``receipt`` describes
+                work admitted before that failure.
             asyncio.CancelledError: If submission is cancelled. Publications
                 already admitted remain active and are not rolled back.
         """
