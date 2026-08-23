@@ -123,8 +123,8 @@ evidence justifies a change:
 - MQTTium-defined Stable client errors derive from `MQTTError` and avoid
   builtin names. Documented system and cancellation exceptions may cross a
   Stable boundary (`OSError` from transport setup, for example). Provisional
-  `SqliteInflightStore` follows Python's DB-API boundary and may raise
-  `sqlite3.Error` or `RuntimeError` as documented.
+  `SqliteInflightStore` follows Python's filesystem, DB-API, and data-conversion
+  boundaries; preserve the explicit exception table in the persistence guide.
 - Keep a reference to every created asyncio task; Ruff's `RUF006` enforces it.
 - Generated benchmark data, coverage files, caches, and build artifacts are
   never committed.

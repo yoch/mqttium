@@ -117,13 +117,27 @@ The database uses WAL mode. Its schema is versioned with SQLite
 database written by a newer MQTTium schema is refused rather than interpreted
 unsafely.
 
-`SqliteInflightStore` follows Python's synchronous DB-API boundary. Opening or
-operating on the database can raise `sqlite3.Error`; an unsupported or
-structurally inconsistent MQTTium schema, or invalid store lifecycle use,
-raises `RuntimeError`. These Provisional persistence exceptions are separate
-from the Stable asynchronous client's `MQTTError` hierarchy. Catch only the
-specific failure that the application can recover from; do not retry schema
-incompatibility as a transient broker failure.
+`SqliteInflightStore` follows Python's synchronous filesystem, DB-API, and data
+conversion boundaries. It does not wrap them in a second MQTTium exception
+hierarchy:
+
+| Failure boundary | Exception exposed |
+| --- | --- |
+| Creating the database's parent directory | `OSError`, including `PermissionError` |
+| Opening, locking, querying, committing, or using a closed SQLite connection | the relevant `sqlite3.Error` subclass |
+| A future or structurally inconsistent MQTTium schema; invalid batch/close lifecycle | `RuntimeError` |
+| Hydrating externally corrupted rows or properties | the underlying Python conversion error, such as `json.JSONDecodeError`, `ValueError`, `TypeError`, or `AttributeError` |
+| Updating an outbound or inbound record that is absent | `KeyError` |
+| A non-positive page, message, or byte bound | `ValueError` |
+
+Page and replay iterators execute SQL and hydrate rows lazily, so these failures
+may be raised by `next()` rather than when the iterator is created. Invalid
+record values supplied by the application can likewise fail during JSON
+serialization or SQLite parameter binding. These Provisional persistence
+exceptions are separate from the Stable asynchronous client's `MQTTError`
+hierarchy. Catch only the specific failure the application can recover from;
+do not retry schema incompatibility, data corruption, or `ProgrammingError` as
+a transient lock or broker failure.
 
 ## Incremental replay and memory
 
