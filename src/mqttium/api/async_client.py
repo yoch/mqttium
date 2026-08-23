@@ -748,7 +748,7 @@ class AsyncClient:
             ProtocolError: If the client is already connecting/connected or the
                 broker refuses or violates the protocol.
             MQTTError: If :meth:`disconnect` cancels connection setup.
-            OSError: If TCP or TLS transport setup fails.
+            OSError: If TCP/TLS setup or the initial MQTT CONNECT write fails.
             asyncio.CancelledError: If the calling task is cancelled.
         """
         async with self._lifecycle_lock:
@@ -785,7 +785,7 @@ class AsyncClient:
         Raises:
             MQTTTimeoutError: If connection or CONNACK exceeds the deadline.
             ProtocolError: If the broker refuses or violates the protocol.
-            OSError: If the Unix socket connection fails.
+            OSError: If Unix socket setup or the initial MQTT CONNECT write fails.
             asyncio.CancelledError: If the calling task is cancelled.
         """
         async with self._lifecycle_lock:
@@ -833,7 +833,8 @@ class AsyncClient:
         Raises:
             MQTTTimeoutError: If connection or CONNACK exceeds the deadline.
             ProtocolError: If the broker refuses or violates the MQTT protocol.
-            ConnectionError: If the WebSocket upgrade or transport fails.
+            ConnectionError: If the WebSocket upgrade, transport, or initial
+                MQTT CONNECT write fails.
             ValueError: If the URL or WebSocket options are invalid.
             asyncio.CancelledError: If the calling task is cancelled.
         """
@@ -1753,6 +1754,9 @@ class AsyncClient:
     async def _writer_failed(self, exc: BaseException) -> None:
         """Hand a writer failure to the reader-owned connection lifecycle."""
         self._disconnect_exc = exc
+        connack_fut = self._connack_fut
+        if connack_fut is not None and not connack_fut.done():
+            connack_fut.set_exception(exc)
         await self._close_transport_after_connection_failure()
 
     def _preview_publish_size(
