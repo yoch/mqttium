@@ -7,11 +7,11 @@ from pathlib import Path
 import pytest
 
 from mqttium.codec.buffer import RawPacket
-from mqttium.enums import OutboundQoSState, PacketType, QoS
+from mqttium.enums import InboundQoSState, OutboundQoSState, PacketType, QoS
 from mqttium.persistence import SqliteInflightStore
 from mqttium.protocol.effects import EffectKind, PublishFailure
 from mqttium.protocol.engine import EngineConfig, ProtocolEngine
-from mqttium.types import OutboundMessage, Properties
+from mqttium.types import InboundMessage, OutboundMessage, Properties
 
 
 def _out() -> OutboundMessage:
@@ -23,6 +23,17 @@ def _out() -> OutboundMessage:
         retain=False,
         state=OutboundQoSState.WAIT_PUBACK,
         properties=Properties({"content_type": "application/octet-stream"}),
+    )
+
+
+def _in() -> InboundMessage:
+    return InboundMessage(
+        mid=1,
+        topic="original",
+        payload=b"original",
+        qos=QoS.EXACTLY_ONCE,
+        retain=False,
+        state=InboundQoSState.WAIT_PUBREL,
     )
 
 
@@ -108,3 +119,53 @@ def test_corrupted_payload_is_rejected_before_publish_replay(tmp_path: Path) -> 
         assert not [effect for effect in effects if effect.kind is EffectKind.SEND]
     finally:
         store.close()
+
+
+def test_outbound_metadata_rejects_coercible_state(tmp_path: Path) -> None:
+    store = SqliteInflightStore(tmp_path / "metadata.sqlite3")
+    try:
+        store.put_out(_out())
+        _corrupt(store, "state", b"1")
+
+        with pytest.raises(ValueError, match="state"):
+            store.out_meta(1)
+    finally:
+        store.close()
+
+
+def test_outbound_transition_rejects_coercible_sequence(tmp_path: Path) -> None:
+    store = SqliteInflightStore(tmp_path / "transition.sqlite3")
+    try:
+        store.put_out(_out())
+        _corrupt(store, "seq", b"1")
+
+        with pytest.raises(ValueError, match="seq"):
+            store.complete_out(1, OutboundQoSState.WAIT_PUBACK)
+    finally:
+        store.close()
+
+
+def test_inbound_metadata_rejects_non_boolean_ack(tmp_path: Path) -> None:
+    store = SqliteInflightStore(tmp_path / "metadata.sqlite3")
+    try:
+        store.put_in(_in())
+        store._conn.execute(  # noqa: SLF001 - intentional durable corruption
+            "UPDATE inbound SET user_acked=2 WHERE mid=1"
+        )
+        store._conn.commit()  # noqa: SLF001 - intentional durable corruption
+
+        with pytest.raises(ValueError, match="user_acked"):
+            store.in_meta(1)
+    finally:
+        store.close()
+
+
+def test_reopen_rejects_coercible_sequence(tmp_path: Path) -> None:
+    path = tmp_path / "sequence.sqlite3"
+    store = SqliteInflightStore(path)
+    store.put_out(_out())
+    _corrupt(store, "seq", b"1")
+    store.close()
+
+    with pytest.raises(ValueError, match="max_seq"):
+        SqliteInflightStore(path)

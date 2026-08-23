@@ -169,9 +169,37 @@ def _stored_non_negative(row: sqlite3.Row, column: str) -> int:
     return value
 
 
+def _stored_mid(row: sqlite3.Row) -> int:
+    value = _stored(row, "mid", int)
+    if not 1 <= value <= 65_535:
+        raise ValueError(f"Invalid persisted mid: expected 1..65535, got {value}")
+    return value
+
+
+def _stored_out_transition(
+    row: sqlite3.Row,
+) -> tuple[OutboundQoSState, int, int]:
+    return (
+        OutboundQoSState(_stored(row, "state", int)),
+        _stored_non_negative(row, "logical_size"),
+        _stored_non_negative(row, "seq"),
+    )
+
+
+def _stored_in_transition(
+    row: sqlite3.Row,
+) -> tuple[InboundQoSState, bool, int, int]:
+    return (
+        InboundQoSState(_stored(row, "state", int)),
+        _stored_bool(row, "user_acked"),
+        _stored_non_negative(row, "logical_size"),
+        _stored_non_negative(row, "seq"),
+    )
+
+
 def _row_to_out(row: sqlite3.Row) -> OutboundMessage:
     return OutboundMessage(
-        mid=_stored(row, "mid", int),
+        mid=_stored_mid(row),
         topic=_stored(row, "topic", str),
         payload=_stored(row, "payload", bytes),
         qos=QoS(_stored(row, "qos", int)),
@@ -188,7 +216,7 @@ def _row_to_out(row: sqlite3.Row) -> OutboundMessage:
 
 def _row_to_out_summary(row: sqlite3.Row) -> OutboundMessageSummary:
     return OutboundMessageSummary(
-        mid=_stored(row, "mid", int),
+        mid=_stored_mid(row),
         topic=_stored(row, "topic", str),
         payload_size=_stored_non_negative(row, "payload_size"),
         qos=QoS(_stored(row, "qos", int)),
@@ -202,7 +230,7 @@ def _row_to_out_summary(row: sqlite3.Row) -> OutboundMessageSummary:
 
 def _row_to_in_meta(row: sqlite3.Row) -> InboundRecordMeta:
     return InboundRecordMeta(
-        mid=_stored(row, "mid", int),
+        mid=_stored_mid(row),
         state=InboundQoSState(_stored(row, "state", int)),
         user_acked=_stored_bool(row, "user_acked"),
         logical_size=_stored_non_negative(row, "logical_size"),
@@ -211,7 +239,7 @@ def _row_to_in_meta(row: sqlite3.Row) -> InboundRecordMeta:
 
 def _row_to_in(row: sqlite3.Row) -> InboundMessage:
     return InboundMessage(
-        mid=_stored(row, "mid", int),
+        mid=_stored_mid(row),
         topic=_stored(row, "topic", str),
         payload=_stored(row, "payload", bytes),
         qos=QoS(_stored(row, "qos", int)),
@@ -485,7 +513,7 @@ class SqliteInflightStore:
             # Fed straight from the cursor: fetchall() would materialise a Row
             # object per record before the array is built, which on a full
             # session replay is the allocation this method exists to avoid.
-            return array("q", (int(row[0]) for row in cursor))
+            return array("q", (_stored_mid(row) for row in cursor))
 
     def _pages(
         self,
@@ -508,15 +536,15 @@ class SqliteInflightStore:
                 yield page
 
     _MAX_SEQ_SQL = {
-        "outbound": "SELECT COALESCE(MAX(seq), 0) FROM outbound",
-        "inbound": "SELECT COALESCE(MAX(seq), 0) FROM inbound",
+        "outbound": "SELECT COALESCE(MAX(seq), 0) AS max_seq FROM outbound",
+        "inbound": "SELECT COALESCE(MAX(seq), 0) AS max_seq FROM inbound",
     }
 
     def _max_seq(self, table: Literal["outbound", "inbound"]) -> int:
         row = self._conn.execute(self._MAX_SEQ_SQL[table]).fetchone()
         if row is None:
             raise RuntimeError(f"Failed to read maximum sequence from {table}")
-        return int(row[0])
+        return _stored_non_negative(row, "max_seq")
 
     @contextmanager
     def batch(self) -> Iterator[None]:
@@ -698,10 +726,11 @@ class SqliteInflightStore:
             row = self._out_transition_row(mid)
         if row is None:
             return None
+        state, logical_size, _ = _stored_out_transition(row)
         return OutboundRecordMeta(
             mid=mid,
-            state=OutboundQoSState(int(row["state"])),
-            logical_size=int(row["logical_size"]),
+            state=state,
+            logical_size=logical_size,
         )
 
     def complete_out(
@@ -711,12 +740,15 @@ class SqliteInflightStore:
     ) -> OutboundRecordMeta | None:
         with self._lock:
             row = self._out_transition_row(mid)
-            if row is None or int(row["state"]) != int(expected_state):
+            if row is None:
+                return None
+            state, logical_size, seq = _stored_out_transition(row)
+            if state is not expected_state:
                 return None
             self._ensure_write_transaction()
             cursor = self._conn.execute(
                 "DELETE FROM outbound WHERE mid=? AND state=? AND seq=?",
-                (mid, int(expected_state), int(row["seq"])),
+                (mid, int(expected_state), seq),
             )
             if cursor.rowcount == 0:
                 self._commit_if_needed()
@@ -725,7 +757,7 @@ class SqliteInflightStore:
             return OutboundRecordMeta(
                 mid=mid,
                 state=expected_state,
-                logical_size=int(row["logical_size"]),
+                logical_size=logical_size,
             )
 
     def transition_out(
@@ -738,7 +770,10 @@ class SqliteInflightStore:
     ) -> OutboundRecordMeta | None:
         with self._lock:
             row = self._out_transition_row(mid)
-            if row is None or int(row["state"]) != int(expected_state):
+            if row is None:
+                return None
+            state, logical_size, seq = _stored_out_transition(row)
+            if state is not expected_state:
                 return None
             self._ensure_write_transaction()
             if compact:
@@ -748,12 +783,12 @@ class SqliteInflightStore:
                     SET state=?, topic='', properties=NULL, payload=X''
                     WHERE mid=? AND state=? AND seq=?
                     """,
-                    (int(new_state), mid, int(expected_state), int(row["seq"])),
+                    (int(new_state), mid, int(expected_state), seq),
                 )
             else:
                 cursor = self._conn.execute(
                     "UPDATE outbound SET state=? WHERE mid=? AND state=? AND seq=?",
-                    (int(new_state), mid, int(expected_state), int(row["seq"])),
+                    (int(new_state), mid, int(expected_state), seq),
                 )
             if cursor.rowcount == 0:
                 self._commit_if_needed()
@@ -762,7 +797,7 @@ class SqliteInflightStore:
             return OutboundRecordMeta(
                 mid=mid,
                 state=new_state,
-                logical_size=int(row["logical_size"]),
+                logical_size=logical_size,
             )
 
     def put_in(self, msg: InboundMessage) -> None:
@@ -870,7 +905,7 @@ class SqliteInflightStore:
             placeholders = ",".join("?" * len(sub))
             with self._lock:
                 rows = self._conn.execute(f"{select_prefix} ({placeholders})", sub).fetchall()
-            by_mid.update((int(row["mid"]), row) for row in rows)
+            by_mid.update((_stored_mid(row), row) for row in rows)
         return tuple(build(row) for mid in mids if (row := by_mid.get(mid)) is not None)
 
     def _in_messages_for_mids(self, mids: tuple[int, ...]) -> tuple[InboundMessage, ...]:
@@ -889,8 +924,8 @@ class SqliteInflightStore:
         index_sizes = array("q")
         with self._lock:
             for row in self._conn.execute(_IN_REPLAY_INDEX_SQL):
-                index_mids.append(int(row["mid"]))
-                index_sizes.append(int(row["replay_size"] or 0))
+                index_mids.append(_stored_mid(row))
+                index_sizes.append(_stored_non_negative(row, "replay_size"))
         mids: list[int] = []
         hydrated_bytes = 0
         for mid, message_bytes in zip(index_mids, index_sizes, strict=True):
@@ -946,11 +981,12 @@ class SqliteInflightStore:
             row = self._in_transition_row(mid)
         if row is None:
             return None
+        state, user_acked, logical_size, _ = _stored_in_transition(row)
         return InboundRecordMeta(
             mid=mid,
-            state=InboundQoSState(int(row["state"])),
-            user_acked=bool(row["user_acked"]),
-            logical_size=int(row["logical_size"]),
+            state=state,
+            user_acked=user_acked,
+            logical_size=logical_size,
         )
 
     def in_index_pages(self, page_size: int = 256) -> Iterator[tuple[InboundRecordMeta, ...]]:
@@ -975,9 +1011,11 @@ class SqliteInflightStore:
     ) -> InboundRecordMeta | None:
         with self._lock:
             row = self._in_transition_row(mid)
-            if row is None or int(row["state"]) != int(expected_state):
+            if row is None:
                 return None
-            old_user_acked = int(row["user_acked"])
+            state, old_user_acked, logical_size, seq = _stored_in_transition(row)
+            if state is not expected_state:
+                return None
             self._ensure_write_transaction()
             if user_acked is None:
                 cursor = self._conn.execute(
@@ -989,8 +1027,8 @@ class SqliteInflightStore:
                         int(new_state),
                         mid,
                         int(expected_state),
-                        old_user_acked,
-                        int(row["seq"]),
+                        int(old_user_acked),
+                        seq,
                     ),
                 )
                 resulting_user_acked = bool(old_user_acked)
@@ -1005,8 +1043,8 @@ class SqliteInflightStore:
                         int(user_acked),
                         mid,
                         int(expected_state),
-                        old_user_acked,
-                        int(row["seq"]),
+                        int(old_user_acked),
+                        seq,
                     ),
                 )
                 resulting_user_acked = user_acked
@@ -1018,7 +1056,7 @@ class SqliteInflightStore:
                 mid=mid,
                 state=new_state,
                 user_acked=resulting_user_acked,
-                logical_size=int(row["logical_size"]),
+                logical_size=logical_size,
             )
 
     def complete_in(
@@ -1028,16 +1066,18 @@ class SqliteInflightStore:
     ) -> InboundRecordMeta | None:
         with self._lock:
             row = self._in_transition_row(mid)
-            if row is None or int(row["state"]) != int(expected_state):
+            if row is None:
                 return None
-            old_user_acked = int(row["user_acked"])
+            state, old_user_acked, logical_size, seq = _stored_in_transition(row)
+            if state is not expected_state:
+                return None
             self._ensure_write_transaction()
             cursor = self._conn.execute(
                 """
                 DELETE FROM inbound
                 WHERE mid=? AND state=? AND user_acked=? AND seq=?
                 """,
-                (mid, int(expected_state), old_user_acked, int(row["seq"])),
+                (mid, int(expected_state), int(old_user_acked), seq),
             )
             if cursor.rowcount == 0:
                 self._commit_if_needed()
@@ -1046,6 +1086,6 @@ class SqliteInflightStore:
             return InboundRecordMeta(
                 mid=mid,
                 state=expected_state,
-                user_acked=bool(old_user_acked),
-                logical_size=int(row["logical_size"]),
+                user_acked=old_user_acked,
+                logical_size=logical_size,
             )
