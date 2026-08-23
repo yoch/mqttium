@@ -54,6 +54,29 @@ class _Broker:
         )
 
 
+class _FailingConnectWriter:
+    """Fail CONNECT writing and then fail the best-effort transport close."""
+
+    def __init__(self, primary: OSError, secondary: OSError) -> None:
+        self.primary = primary
+        self.secondary = secondary
+
+    async def write(self, data: bytes) -> None:
+        del data
+        raise self.primary
+
+    async def read(self, n: int = 65536) -> bytes:
+        del n
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    async def close(self) -> None:
+        raise self.secondary
+
+    def is_closing(self) -> bool:
+        return False
+
+
 def _policy() -> ReconnectPolicy:
     return ReconnectPolicy(
         enabled=True,
@@ -199,3 +222,21 @@ async def test_writer_failure_keeps_primary_error_when_transport_close_raises() 
     finally:
         broker.raise_on_close = False
         await _cleanup(client, pending)
+
+
+async def test_connect_exposes_writer_error_when_transport_close_also_raises() -> None:
+    primary = OSError("primary CONNECT write failure")
+    secondary = OSError("secondary transport close failure")
+    transport = _FailingConnectWriter(primary, secondary)
+    client = AsyncClient("connecting-writer-owner")
+
+    async def factory(host: str, port: int, *, ssl=None):
+        return transport
+
+    client._transport_factory = factory
+
+    with pytest.raises(OSError) as caught:
+        await client.connect("fake", 1, timeout=1.0)
+
+    assert caught.value is primary
+    assert client._transport is None
