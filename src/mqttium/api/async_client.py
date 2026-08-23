@@ -161,7 +161,10 @@ class AsyncClient:
         manual_ack: Defer terminal acknowledgement of inbound QoS messages
             until :meth:`ack` is called.
         store: Optional inflight store used for durable QoS state.
-        auth_handler: Optional MQTT 5 enhanced-authentication callback.
+        auth_handler: Optional MQTT 5 enhanced-authentication callback. A
+            callback-raised :class:`asyncio.CancelledError` is treated as an
+            authentication failure; cancellation requested on MQTTium's
+            owning task still propagates normally.
 
     Raises:
         ValueError: If a limit or constructor option is invalid.
@@ -1325,7 +1328,12 @@ class AsyncClient:
         await self._drain_effects()
 
     def set_auth_handler(self, handler: OnAuth | None) -> None:
-        """Register or clear the enhanced-authentication handler."""
+        """Register or clear the enhanced-authentication handler.
+
+        A handler-raised :class:`asyncio.CancelledError` is treated as an
+        authentication failure. Cancellation requested on MQTTium's owning
+        task still propagates normally.
+        """
         self.auth_handler = handler
         self._engine.reconfigure(accept_auth=handler is not None)
 
@@ -2038,9 +2046,15 @@ class AsyncClient:
                     epoch=epoch,
                 )
                 return
-            response = await asyncio.wait_for(
-                self._invoke(self.auth_handler, challenge), timeout=10.0
-            )
+            try:
+                response = await asyncio.wait_for(
+                    self._invoke(self.auth_handler, challenge), timeout=10.0
+                )
+            except asyncio.CancelledError as exc:
+                task = asyncio.current_task()
+                if task is None or task.cancelling():
+                    raise
+                raise MQTTError("AUTH handler cancelled") from exc
             if isinstance(response, AuthPacket):
                 async with self._engine_lock:
                     self._engine.queue_auth(

@@ -8,6 +8,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Treat an AUTH callback that cancels itself as a callback failure while
+  preserving true task cancellation, so teardown and reconnect still run.
 - Settle remaining same-connection deferred effects after the first effect
   failure so a later `drain()` cannot wait indefinitely on abandoned work.
 - Preserve an immediate writer failure while sending CONNECT, even if closing
