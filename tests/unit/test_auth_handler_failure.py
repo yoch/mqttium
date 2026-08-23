@@ -145,3 +145,55 @@ async def test_self_cancelled_reauth_handler_is_a_reconnectable_failure() -> Non
         assert not client._effect_pump.pending
     finally:
         await client.disconnect()
+
+
+async def test_connect_cancellation_stops_blocked_auth_handler_promptly() -> None:
+    transport = _AuthChallengeTransport()
+    handler_entered = asyncio.Event()
+    handler_release = asyncio.Event()
+    handler_stopped = asyncio.Event()
+
+    async def blocking_auth(_packet: AuthPacket) -> None:
+        handler_entered.set()
+        try:
+            await handler_release.wait()
+        finally:
+            handler_stopped.set()
+
+    props = Properties({"authentication_method": "demo"})
+    client = AsyncClient(
+        client_id="auth-cancellation",
+        protocol=MQTTProtocolVersion.MQTTv5,
+        connect_properties=props,
+        auth_handler=blocking_auth,
+    )
+
+    async def factory(
+        host: str,
+        port: int,
+        *,
+        ssl: object = None,
+    ) -> _AuthChallengeTransport:
+        return transport
+
+    client._transport_factory = factory
+    connecting = asyncio.create_task(client.connect("fake", timeout=30.0))
+    await handler_entered.wait()
+    connecting.cancel()
+    done, _ = await asyncio.wait((connecting,), timeout=0.2)
+    prompt = connecting in done
+    if not prompt:
+        # Keep the failing implementation from leaking its blocked AUTH task.
+        handler_release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await connecting
+
+    assert prompt, "connect cancellation waited for the AUTH handler timeout"
+    assert handler_stopped.is_set()
+    assert client.state is ConnectionState.DISCONNECTED
+    assert client._transport is None
+    assert client._effect_flush_task is None
+    assert not client._effect_pump.pending
+    assert client._effect_pump.applied == client._effect_pump.enqueued
+    assert client._effect_pump.waiters == 0

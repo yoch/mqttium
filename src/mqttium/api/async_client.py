@@ -2401,17 +2401,25 @@ class AsyncClient:
         tasks = [
             self._reader_task,
             self._keepalive_task,
-            self._effect_flush_task,
         ]
         if not preserve_reconnect:
             tasks.append(self._reconnect_task)
-        for task in tasks:
-            if task is not None and task is not current:
-                task.cancel()
-                try:
-                    await task
-                except (asyncio.CancelledError, Exception):
-                    pass
+        # Quiesce suspended work before the reader enters its finally block and
+        # waits for the same EffectPump. Terminal publish results remain queued
+        # for settlement after the task owners have stopped.
+        self._discard_connection_effects()
+        tasks_to_stop = [
+            task
+            for task in (self._effect_flush_task, *tasks)
+            if task is not None and task is not current
+        ]
+        for task in tasks_to_stop:
+            task.cancel()
+        for task in tasks_to_stop:
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
         await self._write_pump.stop()
         self._discard_connection_effects(settle_publish=True)
         self._write_pump.discard()
