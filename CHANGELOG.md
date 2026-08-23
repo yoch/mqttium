@@ -10,6 +10,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 - Settle remaining same-connection deferred effects after the first effect
   failure so a later `drain()` cannot wait indefinitely on abandoned work.
+- Preserve an immediate writer failure while sending CONNECT, even if closing
+  the transport also fails, instead of reporting a later CONNACK timeout.
 - Preserve an active `messages()` iterator across automatic reconnects, while
   binding iterators to explicit connection generations so an old iterator
   cannot consume messages from a later explicit connection.
