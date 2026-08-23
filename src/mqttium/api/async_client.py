@@ -1747,22 +1747,12 @@ class AsyncClient:
             # fallback. Never await it here: the reader can in turn stop the
             # writer task that is executing this failure handler.
             reader = self._reader_task
-            if (
-                reader is not None
-                and reader is not asyncio.current_task()
-                and not reader.done()
-            ):
+            if reader is not None and reader is not asyncio.current_task() and not reader.done():
                 reader.cancel()
 
     async def _writer_failed(self, exc: BaseException) -> None:
         """Hand a writer failure to the reader-owned connection lifecycle."""
         self._disconnect_exc = exc
-        if not self._will_reconnect():
-            self._fail_pending(exc)
-        async with self._engine_lock:
-            self._engine.notify_transport_closed()
-            self._collect_effects_locked()
-        await self._drain_effects()
         await self._close_transport_after_connection_failure()
 
     def _preview_publish_size(
