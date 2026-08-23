@@ -139,6 +139,7 @@ class ApplicationDelivery:
         self._callback_batch_reserved = 0
         self.message_ready = asyncio.Event()
         self.closed = asyncio.Event()
+        self._stream_generation = 0
         self.callback_task: asyncio.Task[None] | None = None
         self.delivery_timeout = delivery_timeout
         self.callback_shutdown_timeout = callback_shutdown_timeout
@@ -667,7 +668,10 @@ class ApplicationDelivery:
         return applied
 
     async def messages(self) -> AsyncIterator[Message]:
+        generation = self._stream_generation
         while True:
+            if generation != self._stream_generation:
+                return
             try:
                 item = self.messages_queue.get_nowait()
                 if isinstance(item, tuple):
@@ -688,6 +692,7 @@ class ApplicationDelivery:
     def reset_stream(self) -> None:
         if not self.closed.is_set():
             return
+        self._stream_generation += 1
         while True:
             try:
                 item = self.messages_queue.get_nowait()
