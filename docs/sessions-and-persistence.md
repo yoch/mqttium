@@ -126,7 +126,7 @@ hierarchy:
 | Creating the database's parent directory | `OSError`, including `PermissionError` |
 | Opening, locking, querying, committing, or using a closed SQLite connection | the relevant `sqlite3.Error` subclass |
 | A future or structurally inconsistent MQTTium schema; invalid batch/close lifecycle | `RuntimeError` |
-| Hydrating externally corrupted rows or properties | the underlying Python conversion error, such as `json.JSONDecodeError`, `ValueError`, `TypeError`, or `AttributeError` |
+| Invalid persisted storage classes, enum/flag/size values, JSON syntax, or MQTTium JSON markers | `ValueError` (including `json.JSONDecodeError`) |
 | Updating an outbound or inbound record that is absent | `KeyError` |
 | A non-positive page, message, or byte bound | `ValueError` |
 
