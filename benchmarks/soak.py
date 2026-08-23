@@ -134,9 +134,13 @@ async def _force_reconnect(client: AsyncClient, *, cycle: int, timeout: float) -
         raise RuntimeError("publisher transport disappeared before forced reconnect")
     await transport.close()
     await _wait_until(
-        lambda: client.is_connected and client.stats().connection_epoch > previous_epoch,
+        lambda: (
+            client.is_connected
+            and (stats := client.stats()).connection_epoch > previous_epoch
+            and not stats.tasks.reconnect
+        ),
         timeout=timeout,
-        description=f"automatic reconnect after cycle {cycle}",
+        description=f"settled automatic reconnect after cycle {cycle}",
     )
 
 

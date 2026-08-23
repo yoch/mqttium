@@ -161,7 +161,10 @@ class AsyncClient:
         manual_ack: Defer terminal acknowledgement of inbound QoS messages
             until :meth:`ack` is called.
         store: Optional inflight store used for durable QoS state.
-        auth_handler: Optional MQTT 5 enhanced-authentication callback.
+        auth_handler: Optional MQTT 5 enhanced-authentication callback. A
+            callback-raised :class:`asyncio.CancelledError` is treated as an
+            authentication failure; cancellation requested on MQTTium's
+            owning task still propagates normally.
 
     Raises:
         ValueError: If a limit or constructor option is invalid.
@@ -748,7 +751,7 @@ class AsyncClient:
             ProtocolError: If the client is already connecting/connected or the
                 broker refuses or violates the protocol.
             MQTTError: If :meth:`disconnect` cancels connection setup.
-            OSError: If TCP or TLS transport setup fails.
+            OSError: If TCP/TLS setup or the initial MQTT CONNECT write fails.
             asyncio.CancelledError: If the calling task is cancelled.
         """
         async with self._lifecycle_lock:
@@ -785,7 +788,7 @@ class AsyncClient:
         Raises:
             MQTTTimeoutError: If connection or CONNACK exceeds the deadline.
             ProtocolError: If the broker refuses or violates the protocol.
-            OSError: If the Unix socket connection fails.
+            OSError: If Unix socket setup or the initial MQTT CONNECT write fails.
             asyncio.CancelledError: If the calling task is cancelled.
         """
         async with self._lifecycle_lock:
@@ -833,7 +836,8 @@ class AsyncClient:
         Raises:
             MQTTTimeoutError: If connection or CONNACK exceeds the deadline.
             ProtocolError: If the broker refuses or violates the MQTT protocol.
-            ConnectionError: If the WebSocket upgrade or transport fails.
+            ConnectionError: If the WebSocket upgrade, transport, or initial
+                MQTT CONNECT write fails.
             ValueError: If the URL or WebSocket options are invalid.
             asyncio.CancelledError: If the calling task is cancelled.
         """
@@ -1371,7 +1375,12 @@ class AsyncClient:
         await self._drain_effects()
 
     def set_auth_handler(self, handler: OnAuth | None) -> None:
-        """Register or clear the enhanced-authentication handler."""
+        """Register or clear the enhanced-authentication handler.
+
+        A handler-raised :class:`asyncio.CancelledError` is treated as an
+        authentication failure. Cancellation requested on MQTTium's owning
+        task still propagates normally.
+        """
         self.auth_handler = handler
         self._engine.reconfigure(accept_auth=handler is not None)
 
@@ -1820,6 +1829,9 @@ class AsyncClient:
     async def _writer_failed(self, exc: BaseException) -> None:
         """Hand a writer failure to the reader-owned connection lifecycle."""
         self._disconnect_exc = exc
+        connack_fut = self._connack_fut
+        if connack_fut is not None and not connack_fut.done():
+            connack_fut.set_exception(exc)
         await self._close_transport_after_connection_failure()
 
     def _preview_publish_size(
@@ -2101,9 +2113,15 @@ class AsyncClient:
                     epoch=epoch,
                 )
                 return
-            response = await asyncio.wait_for(
-                self._invoke(self.auth_handler, challenge), timeout=10.0
-            )
+            try:
+                response = await asyncio.wait_for(
+                    self._invoke(self.auth_handler, challenge), timeout=10.0
+                )
+            except asyncio.CancelledError as exc:
+                task = asyncio.current_task()
+                if task is None or task.cancelling():
+                    raise
+                raise MQTTError("AUTH handler cancelled") from exc
             if isinstance(response, AuthPacket):
                 async with self._engine_lock:
                     self._engine.queue_auth(
@@ -2450,17 +2468,25 @@ class AsyncClient:
         tasks = [
             self._reader_task,
             self._keepalive_task,
-            self._effect_flush_task,
         ]
         if not preserve_reconnect:
             tasks.append(self._reconnect_task)
-        for task in tasks:
-            if task is not None and task is not current:
-                task.cancel()
-                try:
-                    await task
-                except (asyncio.CancelledError, Exception):
-                    pass
+        # Quiesce suspended work before the reader enters its finally block and
+        # waits for the same EffectPump. Terminal publish results remain queued
+        # for settlement after the task owners have stopped.
+        self._discard_connection_effects()
+        tasks_to_stop = [
+            task
+            for task in (self._effect_flush_task, *tasks)
+            if task is not None and task is not current
+        ]
+        for task in tasks_to_stop:
+            task.cancel()
+        for task in tasks_to_stop:
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
         await self._write_pump.stop()
         self._discard_connection_effects(settle_publish=True)
         self._write_pump.discard()

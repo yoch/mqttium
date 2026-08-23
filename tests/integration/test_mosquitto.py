@@ -8,6 +8,7 @@ import pytest
 
 from mqttium.api import AsyncClient
 from mqttium.enums import MQTTProtocolVersion
+from mqttium.types import Properties
 
 
 @pytest.mark.parametrize("protocol", [MQTTProtocolVersion.MQTTv311, MQTTProtocolVersion.MQTTv5])
@@ -37,3 +38,22 @@ async def test_pubsub_roundtrip(protocol: MQTTProtocolVersion, qos: int) -> None
     finally:
         await pub.disconnect()
         await sub.disconnect()
+
+
+async def test_subscribe_only_durable_session_resumes() -> None:
+    client = AsyncClient(
+        "mqttium-it-subscribe-only-resume",
+        protocol=MQTTProtocolVersion.MQTTv5,
+        clean_start=True,
+        connect_properties=Properties({"session_expiry_interval": 3600}),
+    )
+    try:
+        first = await client.connect("127.0.0.1", 11883, timeout=5)
+        assert first.session_present is False
+        await client.subscribe("mqttium/it/subscribe-only-resume", qos=1)
+        await client.disconnect()
+
+        resumed = await client.connect("127.0.0.1", 11883, timeout=5)
+        assert resumed.session_present is True
+    finally:
+        await client.disconnect()
