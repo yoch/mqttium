@@ -94,6 +94,15 @@ engine boundary with stable ownership.
 Ingress work is drained in bounded batches so a large read cannot starve
 outbound acknowledgements or application delivery.
 
+### Connection lifecycle
+
+The reader task is the single owner of teardown for a live connection. A writer,
+keepalive, or deferred-effect failure records its primary cause and breaks the
+transport; the reader then performs the ordered cleanup and decides whether the
+outcome is terminal or enters reconnect policy. Secondary errors while closing
+the transport never replace that primary cause. Connection epochs prevent a
+late task from an older transport from closing or poisoning its replacement.
+
 ## Protocol ownership
 
 `OutboundSession` is the sole owner of outbound QoS publication state:
