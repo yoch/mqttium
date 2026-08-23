@@ -22,6 +22,7 @@ from mqttium.protocol.config import EngineConfig
 from mqttium.protocol.effects import EffectKind
 from mqttium.protocol.engine import ProtocolEngine
 from mqttium.types import InboundMessage, OutboundMessage
+from mqttium.types import Properties
 
 
 def _connack(*, present: bool, protocol: MQTTProtocolVersion) -> bytes:
@@ -53,6 +54,28 @@ def test_mqtt5_session_present_rejected_with_empty_client_session() -> None:
     effects = _feed(engine, _connack(present=True, protocol=MQTTProtocolVersion.MQTTv5))
     assert engine.state is ConnectionState.DISCONNECTED
     assert any(effect.kind is EffectKind.PROTOCOL_ERROR for effect in effects)
+
+
+def test_known_empty_durable_session_accepts_session_present() -> None:
+    engine = ProtocolEngine(
+        EngineConfig(
+            client_id="known-durable",
+            protocol=MQTTProtocolVersion.MQTTv5,
+            clean_start=True,
+            connect_properties=Properties({"session_expiry_interval": 3600}),
+        )
+    )
+    engine.begin_connect()
+    _feed(engine, _connack(present=False, protocol=MQTTProtocolVersion.MQTTv5))
+    assert engine._prefer_session_resume is True
+    engine.notify_transport_closed()
+    engine.take_effects()
+
+    engine.begin_connect()
+    effects = _feed(engine, _connack(present=True, protocol=MQTTProtocolVersion.MQTTv5))
+
+    assert engine.state is ConnectionState.CONNECTED
+    assert not any(effect.kind is EffectKind.PROTOCOL_ERROR for effect in effects)
 
 
 def test_mqtt311_session_present_with_empty_client_state_remains_accepted() -> None:

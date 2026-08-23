@@ -10,6 +10,20 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 - Wait for automatic reconnect to leave its stability window before the soak
   harness samples task counts, avoiding schedule-dependent false leak reports.
+- Accept MQTT 5 Session Present when the same client instance knowingly resumes
+  a durable session whose local QoS exchange state is empty, while still
+  rejecting the value for a fresh client with no session evidence.
+- Reject corrupted SQLite rows whose storage classes or scalar values do not
+  match MQTTium's durable schema instead of coercing them into different MQTT
+  topics, payloads, flags, or sizes during session replay.
+- Cancel deferred effect work before awaiting reader teardown so cancelling
+  `connect()` during AUTH does not wait for the AUTH callback timeout.
+- Treat an AUTH callback that cancels itself as a callback failure while
+  preserving true task cancellation, so teardown and reconnect still run.
+- Settle remaining same-connection deferred effects after the first effect
+  failure so a later `drain()` cannot wait indefinitely on abandoned work.
+- Preserve an immediate writer failure while sending CONNECT, even if closing
+  the transport also fails, instead of reporting a later CONNACK timeout.
 - Preserve an active `messages()` iterator across automatic reconnects, while
   binding iterators to explicit connection generations so an old iterator
   cannot consume messages from a later explicit connection.

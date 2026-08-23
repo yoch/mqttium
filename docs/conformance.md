@@ -111,6 +111,12 @@ State concept from publication rows alone, although broker-side subscriptions
 are also Session State and cannot be discovered through that store. Resume tests
 now request a non-clean connection explicitly.
 
+MQTTium also retains local knowledge of a durable Session established by the
+current client instance. A subscribe-only client can accept Session Present on
+its next connection even with no incomplete local QoS exchange. A fresh client
+with neither that marker nor persisted Client Session State still rejects an
+unexpected Session Present value as required by `[MQTT-3.2.2-4]`.
+
 **`[MQTT-3.1.2-22]` (MQTT 3.1.1)** — *"If the User Name Flag is set to 0, the
 Password Flag MUST be set to 0."*
 
