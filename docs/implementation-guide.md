@@ -204,6 +204,13 @@ page may be shorter when records were acknowledged after the ordered snapshot;
 callers must continue until the iterator ends rather than assuming fixed page
 length.
 
+The built-in memory store's eager ``out_items()`` and ``in_items()`` iterators
+snapshot membership when they are created, while retaining references to the
+record objects rather than deep-copying them. Paged iterators in both built-in
+stores snapshot ordered identifiers when iteration starts and look up each page
+when it is consumed, so records deleted before that lookup are omitted. Runtime
+replay uses the paged interface for both built-in stores.
+
 ## API completion and errors
 
 - QoS 0 receipts complete at writer admission. When callback capacity is

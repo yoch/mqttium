@@ -41,6 +41,9 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Documentation
 
+- Complete the generated Stable API contracts for batch and non-waiting
+  publication, message-stream generations, and manual acknowledgement, and
+  record reader-owned connection teardown and persistence iterator snapshots.
 - Correct the Provisional Paho compatibility matrix: its synchronous façade
   does not expose TLS configuration; use the native `AsyncClient` TLS surface.
 - Define the persistence and transport exception boundaries without wrapping

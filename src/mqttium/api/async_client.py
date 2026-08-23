@@ -1069,6 +1069,28 @@ class AsyncClient:
         immediately when either bound is full. Like ``asyncio.Queue.put_nowait()``,
         it is loop-bound rather than thread-safe; cross-thread producers need an
         adapter that hands work to the owning loop.
+
+        Args:
+            topic: MQTT topic name.
+            payload: Bytes or UTF-8 text payload.
+            qos: Requested QoS 0, 1, or 2. MQTTium never silently downgrades it.
+            retain: Set the MQTT RETAIN flag.
+            properties: MQTT 5 PUBLISH properties.
+
+        Returns:
+            A receipt with the same completion semantics as :meth:`publish`.
+
+        Raises:
+            RuntimeError: If called without a running event loop or from an
+                event loop other than the client's owning loop.
+            FlowControlError: If logical or writer capacity is unavailable.
+            NotConnectedError: If the publication is unavailable in the current
+                connection state.
+            PacketTooLargeError: If the encoded PUBLISH exceeds a local or
+                negotiated packet-size limit.
+            ProtocolError: If the topic, properties, or request violates MQTT or
+                negotiated broker capabilities.
+            ValueError: If ``qos`` is not 0, 1, or 2.
         """
         try:
             loop = asyncio.get_running_loop()
@@ -1246,6 +1268,32 @@ class AsyncClient:
         QoS 0 avoids one lock/effect flush per message. QoS 1/2 use one shared
         receipt and continuously refill the negotiated inflight window without
         creating waiter tasks for individual packet identifiers.
+
+        Args:
+            messages: Iterable of :class:`PublishMessage` values.
+            chunk_size: Maximum number of input entries admitted as one atomic
+                chunk.
+            nowait: Reject a chunk immediately instead of waiting for capacity.
+            max_failure_details: Maximum individual completion failures retained
+                by the receipt, or ``None`` for no limit.
+            failure_sink: Optional synchronous observer called for every
+                completion failure with its zero-based input index.
+
+        Returns:
+            A bounded aggregate receipt after the input iterable has been
+            consumed and admitted. Await :meth:`PublishBatchReceipt.wait` for
+            protocol completion.
+
+        Raises:
+            ValueError: If ``chunk_size`` is not positive or
+                ``max_failure_details`` is negative.
+            TypeError: If ``messages`` is not iterable.
+            PublishBatchError: If iterating or admitting the batch fails. Its
+                ``cause`` is the original validation, connection, protocol, or
+                flow-control exception, and ``receipt`` describes work admitted
+                before that failure.
+            asyncio.CancelledError: If submission is cancelled. Publications
+                already admitted remain active and are not rolled back.
         """
         if chunk_size <= 0:
             raise ValueError("chunk_size must be greater than 0")
@@ -1409,11 +1457,16 @@ class AsyncClient:
             raise MQTTTimeoutError(f"UNSUBACK timed out for mid={mid}") from exc
 
     def messages(self) -> AsyncIterator[Message]:
-        """Iterate delivered messages.
+        """Return the delivered-message iterator for the current generation.
 
-        Returns the delivery controller's iterator rather than re-yielding from
-        it, which would cost one generator resume/suspend per message. `async
-        for` and `anext()` are unaffected; only `inspect.isasyncgenfunction` is.
+        Automatic reconnect keeps the current iterator alive on the replacement
+        transport. A terminal disconnect ends it. A later explicit
+        :meth:`connect`, :meth:`connect_unix`, or :meth:`connect_ws` starts a new
+        generation; an iterator from the previous generation remains terminal,
+        so call ``messages()`` again after that explicit connection.
+
+        The delivery controller's iterator is returned directly rather than
+        re-yielded, avoiding one generator resume and suspend per message.
         """
         return self._delivery.messages()
 
@@ -1421,6 +1474,21 @@ class AsyncClient:
         """Acknowledge an inbound QoS>0 message when ``manual_ack=True``.
 
         Defers PUBACK (QoS 1) or PUBCOMP (QoS 2). PUBREC is always immediate.
+
+        Args:
+            message: Message previously delivered by this client's current
+                session. A QoS 0 message has no packet identifier and is a no-op.
+
+        Raises:
+            NotConnectedError: If a message with a packet identifier is
+                acknowledged without an active connection.
+            ProtocolError: If manual acknowledgement is disabled or the packet
+                identifier is not awaiting application acknowledgement.
+            PacketTooLargeError: If the broker's negotiated packet limit cannot
+                carry the mandatory acknowledgement. The connection is closed.
+            asyncio.CancelledError: If the caller is cancelled while effects are
+                flushing; already accepted acknowledgement state is not rolled
+                back.
         """
         if message.mid is None:
             return
