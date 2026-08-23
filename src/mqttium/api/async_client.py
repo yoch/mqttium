@@ -2034,9 +2034,15 @@ class AsyncClient:
                     epoch=epoch,
                 )
                 return
-            response = await asyncio.wait_for(
-                self._invoke(self.auth_handler, challenge), timeout=10.0
-            )
+            try:
+                response = await asyncio.wait_for(
+                    self._invoke(self.auth_handler, challenge), timeout=10.0
+                )
+            except asyncio.CancelledError as exc:
+                task = asyncio.current_task()
+                if task is None or task.cancelling():
+                    raise
+                raise MQTTError("AUTH handler cancelled") from exc
             if isinstance(response, AuthPacket):
                 async with self._engine_lock:
                     self._engine.queue_auth(
