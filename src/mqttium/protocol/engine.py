@@ -642,6 +642,11 @@ class ProtocolEngine:
         if (
             self.codec.is_mqtt5
             and connack.session_present
+            # A successful earlier connection with a durable expiry is local
+            # knowledge of this Session even when no QoS exchange is currently
+            # incomplete. A fresh engine has no such marker and must still
+            # reject an otherwise-unexpected Session Present value.
+            and not self._prefer_session_resume
             and not self.outbound.has_client_session_state()
             and not self.inbound.has_client_session_state()
         ):
