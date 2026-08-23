@@ -229,7 +229,7 @@ class WebSocketTransport:
         if write_buffer_needs_drain(self._writer):
             await self._writer.drain()
 
-    def _try_extract_application_payload(self) -> bytes | None:
+    def _try_extract_application_payload(self) -> bytes | None:  # noqa: C901
         """Extract the next binary MQTT payload and process control frames."""
         while True:
             parsed = _parse_frame(
@@ -258,6 +258,8 @@ class WebSocketTransport:
                 if not fin:
                     self._fragment = bytearray(raw)
                     continue
+                if not raw:
+                    continue
                 return raw
             if opcode == 0x0:  # continuation
                 if self._fragment is None:
@@ -268,6 +270,8 @@ class WebSocketTransport:
                 if fin:
                     payload = bytes(self._fragment)
                     self._fragment = None
+                    if not payload:
+                        continue
                     return payload
                 continue
             # _parse_frame rejects every non-MQTT application opcode.
