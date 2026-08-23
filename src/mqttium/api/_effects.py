@@ -281,6 +281,7 @@ class EffectPump:
                         # reader-owned lifecycle. Active drain() calls still
                         # receive the same original exception below.
                         self.owner._disconnect_exc = exc
+                        self.discard_connection_effects(settle_publish=True)
                         await self.owner._close_transport_after_connection_failure()
                         return
                     else:

@@ -162,6 +162,95 @@ async def test_two_concurrent_drains_receive_same_original_failure() -> None:
     assert pump.waiters == 0
 
 
+@pytest.mark.parametrize("cancel_after_progress", [False, True])
+async def test_cancelled_drain_does_not_steal_failure_from_other_waiters(
+    cancel_after_progress: bool,
+) -> None:
+    failure = RuntimeError("shared deferred failure")
+    apply_release = asyncio.Event()
+    close_entered = asyncio.Event()
+    close_release = asyncio.Event()
+    owner = _Owner([EngineEffect(EffectKind.SEND, b"fail")], failure)
+
+    async def blocked_failure(
+        effect: EngineEffect, *, nowait: bool, epoch: int | None = None
+    ) -> None:
+        del effect, nowait, epoch
+        await apply_release.wait()
+        raise failure
+
+    async def blocked_close() -> None:
+        owner.closed += 1
+        close_entered.set()
+        await close_release.wait()
+
+    owner._apply_effect = blocked_failure  # type: ignore[method-assign]
+    owner._close_transport_after_connection_failure = blocked_close  # type: ignore[method-assign]
+    pump = EffectPump(owner)  # type: ignore[arg-type]
+    pump.collect_from_engine()
+    drains = [asyncio.create_task(pump.drain()) for _ in range(3)]
+    await _wait_for_waiters(pump, 3)
+
+    if cancel_after_progress:
+        apply_release.set()
+        await close_entered.wait()
+    drains[0].cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await drains[0]
+    if not cancel_after_progress:
+        apply_release.set()
+        await close_entered.wait()
+
+    results = await asyncio.gather(*drains[1:], return_exceptions=True)
+    close_release.set()
+    await _wait_idle(pump)
+
+    assert results == [failure, failure]
+    assert owner.closed == 1
+    assert pump.error is None
+    assert pump.waiters == 0
+
+
+async def test_failure_quiesces_trailing_effects_before_transport_close() -> None:
+    failure = RuntimeError("first effect failed")
+    close_entered = asyncio.Event()
+    close_release = asyncio.Event()
+    owner = _Owner(
+        [
+            EngineEffect(EffectKind.SEND, b"fail"),
+            EngineEffect(EffectKind.SEND, b"must-not-run"),
+        ],
+        failure,
+    )
+
+    async def blocked_close() -> None:
+        owner.closed += 1
+        close_entered.set()
+        await close_release.wait()
+
+    owner._close_transport_after_connection_failure = blocked_close  # type: ignore[method-assign]
+    pump = EffectPump(owner)  # type: ignore[arg-type]
+    pump.collect_from_engine()
+    failing_drain = asyncio.create_task(pump.drain())
+
+    await close_entered.wait()
+    with pytest.raises(RuntimeError) as caught:
+        await failing_drain
+    assert caught.value is failure
+
+    # A caller arriving during the close handoff sees a quiescent epoch instead
+    # of parking behind a flush task that is about to return.
+    await asyncio.wait_for(pump.drain(), timeout=0.1)
+    close_release.set()
+    await _wait_idle(pump)
+
+    assert owner.applies == 1
+    assert owner.closed == 1
+    assert not pump.pending
+    assert pump.applied == pump.enqueued == 2
+    assert pump.waiters == 0
+
+
 async def test_waiter_before_failing_effect_is_not_poisoned() -> None:
     failure = RuntimeError("second effect failed")
     release = asyncio.Event()
