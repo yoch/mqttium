@@ -8,6 +8,9 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Accept MQTT 5 Session Present when the same client instance knowingly resumes
+  a durable session whose local QoS exchange state is empty, while still
+  rejecting the value for a fresh client with no session evidence.
 - Reject corrupted SQLite rows whose storage classes or scalar values do not
   match MQTTium's durable schema instead of coercing them into different MQTT
   topics, payloads, flags, or sizes during session replay.
