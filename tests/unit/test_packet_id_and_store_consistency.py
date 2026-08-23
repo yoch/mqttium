@@ -11,6 +11,7 @@ import asyncio
 
 import pytest
 
+from mqttium import ProtocolError
 from mqttium.api.async_client import AsyncClient
 from mqttium.codec.buffer import IncrementalDecoder
 from mqttium.enums import (
@@ -287,7 +288,7 @@ class _RudeBrokerTransport:
         return self._closing
 
 
-async def test_protocol_error_is_not_reported_against_a_later_unrelated_publish() -> None:
+async def test_unowned_protocol_error_terminates_the_active_connection() -> None:
     transport = _RudeBrokerTransport()
     client = AsyncClient(client_id="rc-stale")
     # on_publish pushes PUBLISH_COMPLETE onto the async slow path, so publish()
@@ -298,23 +299,28 @@ async def test_protocol_error_is_not_reported_against_a_later_unrelated_publish(
         return transport
 
     client._transport_factory = factory  # type: ignore[assignment]
+    disconnected = asyncio.Event()
+    disconnect_errors: list[BaseException | None] = []
+
+    def on_disconnect(error: BaseException | None) -> None:
+        disconnect_errors.append(error)
+        disconnected.set()
+
+    client.on_disconnect = on_disconnect
     await client.connect("broker", 1883, timeout=5)
 
     receipt = await client.publish("rc/first", b"one", qos=1)
     await asyncio.wait_for(receipt.wait(), timeout=5)
 
-    # A protocol error arrives while no caller is waiting on the effect pump.
+    # A second CONNACK violates MQTT-3.2.0-2. Even when no caller is waiting on
+    # the effect pump, the failure belongs to the active connection lifecycle.
     transport.inject_second_connack()
-    await asyncio.sleep(0.1)
-    assert client.is_connected, "the rude CONNACK must not take the session down"
-    assert client._effect_pump.error is None, "an unowned failure must not be retained"
+    await asyncio.wait_for(disconnected.wait(), timeout=5)
 
-    try:
-        for index in range(3):
-            receipt = await client.publish(f"rc/later-{index}", b"two", qos=1)
-            await asyncio.wait_for(receipt.wait(), timeout=5)
-    finally:
-        await client.disconnect()
+    assert not client.is_connected
+    assert len(disconnect_errors) == 1
+    assert isinstance(disconnect_errors[0], ProtocolError)
+    assert client._effect_pump.error is None, "an unowned failure must not be retained"
 
 
 @pytest.mark.parametrize("has_pending_work", [True, False])
