@@ -9,14 +9,12 @@ from typing import Any
 import pytest
 
 from mqttium.api._effects import EffectPump
-from mqttium.enums import ConnectionState
 from mqttium.protocol.effects import EffectKind, EngineEffect
 
 
 class _Engine:
-    def __init__(self, effects: list[EngineEffect], *, state: ConnectionState) -> None:
+    def __init__(self, effects: list[EngineEffect]) -> None:
         self.effects = effects
-        self.state = state
 
     def take_effects(self) -> list[EngineEffect]:
         effects = self.effects
@@ -30,12 +28,11 @@ class _Owner:
         effects: list[EngineEffect],
         failure: BaseException,
         *,
-        state: ConnectionState = ConnectionState.CONNECTED,
         block_first: asyncio.Event | None = None,
     ) -> None:
         self._connection_epoch = 7
         self._disconnect_exc: BaseException | None = None
-        self._engine = _Engine(effects, state=state)
+        self._engine = _Engine(effects)
         self._connack_fut = None
         self.failure = failure
         self.block_first = block_first
@@ -195,12 +192,11 @@ async def test_waiter_before_failing_effect_is_not_poisoned() -> None:
     await asyncio.wait_for(pump.drain(), timeout=1.0)
 
 
-async def test_unobserved_nonterminal_protocol_error_keeps_historical_diagnostic() -> None:
+async def test_unobserved_protocol_error_routes_to_connection_owner() -> None:
     failure = RuntimeError("peer protocol diagnostic")
     owner = _Owner(
         [EngineEffect(EffectKind.PROTOCOL_ERROR, "rude peer")],
         failure,
-        state=ConnectionState.CONNECTED,
     )
     pump = EffectPump(owner)  # type: ignore[arg-type]
     loop = asyncio.get_running_loop()
@@ -214,8 +210,7 @@ async def test_unobserved_nonterminal_protocol_error_keeps_historical_diagnostic
     finally:
         loop.set_exception_handler(previous_handler)
 
-    assert owner._disconnect_exc is None
-    assert owner.closed == 0
-    assert len(contexts) == 1
-    assert contexts[0]["exception"] is failure
+    assert owner._disconnect_exc is failure
+    assert owner.closed == 1
+    assert contexts == []
     assert pump.error is None

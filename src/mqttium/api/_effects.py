@@ -13,7 +13,6 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Protocol
 
 from mqttium.api.stats import EffectStats
-from mqttium.enums import ConnectionState
 from mqttium.protocol.effects import EffectKind, EngineEffect
 
 if TYPE_CHECKING:
@@ -260,22 +259,10 @@ class EffectPump:
                         if self.pending and self.pending[0] is effect:
                             self.pending.popleft()
                             self._complete()
-                    except BaseException as exc:
+                    except Exception as exc:
                         if self.pending and self.pending[0] is effect:
                             self.pending.popleft()
                             self._complete()
-                        connection_fatal = not (
-                            effect.kind is EffectKind.PROTOCOL_ERROR
-                            and self.owner._engine.state is not ConnectionState.DISCONNECTED
-                        )
-                        if not connection_fatal:
-                            # Ingress PROTOCOL_ERROR effects may be diagnostic
-                            # while the engine remains connected. They must not
-                            # poison the reader's internal drain() or a later
-                            # unrelated operation; preserve the historical loop
-                            # diagnostic instead.
-                            raise
-
                         failure_at = self.applied
                         owners = {
                             waiter_id
