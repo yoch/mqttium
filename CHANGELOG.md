@@ -8,6 +8,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Treat an AUTH callback that cancels itself as a callback failure while
+  preserving true task cancellation, so teardown and reconnect still run.
 - Preserve an active `messages()` iterator across automatic reconnects, while
   binding iterators to explicit connection generations so an old iterator
   cannot consume messages from a later explicit connection.
