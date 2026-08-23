@@ -8,6 +8,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Cancel deferred effect work before awaiting reader teardown so cancelling
+  `connect()` during AUTH does not wait for the AUTH callback timeout.
 - Treat an AUTH callback that cancels itself as a callback failure while
   preserving true task cancellation, so teardown and reconnect still run.
 - Settle remaining same-connection deferred effects after the first effect
