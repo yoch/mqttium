@@ -292,12 +292,13 @@ class EffectPump:
                     return
 
     def _done(self, task: asyncio.Task[None]) -> None:
-        if self.task is task:
+        owned = self.task is task
+        if owned:
             self.task = None
         try:
             task.result()
         except asyncio.CancelledError:
-            return
+            pass
         except Exception as exc:
             if not self.pending and not self._error_waiters:
                 # No current drain() owns a failure anymore. Do not retain an
@@ -310,6 +311,8 @@ class EffectPump:
                     "task": task,
                 }
             )
+        if owned and self.flush_requested and self.pending:
+            self.schedule()
 
     async def drain(self, *, nowait: bool = False) -> None:
         self.drain_inline()

@@ -152,6 +152,44 @@ async def test_full_callback_queue_retains_async_completion_backpressure() -> No
     await client._shutdown_callback_worker(drain=False)
 
 
+async def test_cancelled_flush_honours_a_deferred_reschedule() -> None:
+    client = AsyncClient(client_id="effect-cancelled-reschedule")
+    cancellation_started = asyncio.Event()
+    cancellation_release = asyncio.Event()
+    applied = asyncio.Event()
+
+    async def old_flush() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancellation_started.set()
+            await cancellation_release.wait()
+            raise
+
+    async def apply(effect, *, nowait: bool, epoch: int | None = None) -> None:
+        applied.set()
+
+    client._apply_effect = apply  # type: ignore[method-assign]
+    old_task = asyncio.create_task(old_flush())
+    client._effect_pump.task = old_task
+    old_task.add_done_callback(client._effect_pump._done)
+    await asyncio.sleep(0)
+    old_task.cancel()
+    await cancellation_started.wait()
+
+    client._pending_effects.append(EngineEffect(EffectKind.PINGRESP, None))
+    client._effect_pump.enqueued = 1
+    client._schedule_effect_flush()
+    cancellation_release.set()
+
+    await asyncio.wait_for(applied.wait(), timeout=1.0)
+    flush_task = client._effect_flush_task
+    if flush_task is not None:
+        await flush_task
+    assert not client._pending_effects
+    assert client._effect_pump.applied == client._effect_pump.enqueued
+
+
 async def test_single_send_effect_bypasses_queue_and_accounting() -> None:
     client = AsyncClient(client_id="effect-fast-path")
     client._engine._emit(EffectKind.SEND, b"payload")
