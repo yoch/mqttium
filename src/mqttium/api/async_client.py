@@ -748,7 +748,7 @@ class AsyncClient:
             ProtocolError: If the client is already connecting/connected or the
                 broker refuses or violates the protocol.
             MQTTError: If :meth:`disconnect` cancels connection setup.
-            OSError: If TCP or TLS transport setup fails.
+            OSError: If TCP/TLS setup or the initial MQTT CONNECT write fails.
             asyncio.CancelledError: If the calling task is cancelled.
         """
         async with self._lifecycle_lock:
@@ -785,7 +785,7 @@ class AsyncClient:
         Raises:
             MQTTTimeoutError: If connection or CONNACK exceeds the deadline.
             ProtocolError: If the broker refuses or violates the protocol.
-            OSError: If the Unix socket connection fails.
+            OSError: If Unix socket setup or the initial MQTT CONNECT write fails.
             asyncio.CancelledError: If the calling task is cancelled.
         """
         async with self._lifecycle_lock:
@@ -833,7 +833,8 @@ class AsyncClient:
         Raises:
             MQTTTimeoutError: If connection or CONNACK exceeds the deadline.
             ProtocolError: If the broker refuses or violates the MQTT protocol.
-            ConnectionError: If the WebSocket upgrade or transport fails.
+            ConnectionError: If the WebSocket upgrade, transport, or initial
+                MQTT CONNECT write fails.
             ValueError: If the URL or WebSocket options are invalid.
             asyncio.CancelledError: If the calling task is cancelled.
         """
