@@ -129,7 +129,7 @@ def _props_to_json(props: Properties | None) -> str | None:
 
 
 def _props_from_json(raw: str | None) -> Properties | None:
-    if not raw:
+    if raw is None:
         return None
     values = _json_revive(json.loads(raw))
     if not isinstance(values, dict):

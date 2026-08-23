@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -75,6 +76,18 @@ def test_public_hydration_rejects_wrong_storage_values(
         _corrupt(store, column, value)
 
         with pytest.raises(ValueError, match=column):
+            store.get_out(1)
+    finally:
+        store.close()
+
+
+def test_public_hydration_rejects_empty_properties_json(tmp_path: Path) -> None:
+    store = SqliteInflightStore(tmp_path / "corrupt.sqlite3")
+    try:
+        store.put_out(_out())
+        _corrupt(store, "properties", "")
+
+        with pytest.raises(json.JSONDecodeError):
             store.get_out(1)
     finally:
         store.close()
