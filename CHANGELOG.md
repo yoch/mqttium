@@ -34,6 +34,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - Strip connection-scoped Topic Alias properties and retained alias frames from
   QoS 1/2 replay, so a resumed session is independent of the new broker's Topic
   Alias Maximum while retaining the canonical durable topic.
+- Hydrate built-in inbound replay at effect-batch boundaries, preserving stale
+  replay protection without a metadata lookup for every redelivered message.
 
 ### Changed
 

@@ -198,8 +198,10 @@ Replay snapshots ordered identifiers once and loads bounded pages by primary
 key, avoiding repeated full-table sorts.
 
 Incoming replay first restores accounting from metadata and then emits bounded
-batches. A continuation effect carries the connection epoch, so disconnecting
-mid-replay safely abandons the old cursor.
+batches. Built-in stores hydrate one fresh page per effect batch; legacy paged
+stores revalidate payload-free metadata before emission when a larger page can
+span continuations. A continuation effect carries the connection epoch, so
+disconnecting mid-replay safely abandons the old cursor.
 
 ## Reconnect and sessions
 

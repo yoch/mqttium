@@ -93,7 +93,7 @@ def test_continuations_replay_every_record_exactly_once() -> None:
     assert engine.inbound.replay_pending is False
 
 
-def test_replay_reuses_one_bounded_page_across_effect_batches(tmp_path: Path) -> None:
+def test_replay_hydrates_one_fresh_page_per_effect_batch(tmp_path: Path) -> None:
     class CountingStore(SqliteInflightStore):
         pages_fetched = 0
 
@@ -115,8 +115,45 @@ def test_replay_reuses_one_bounded_page_across_effect_batches(tmp_path: Path) ->
 
     engine.continue_inbound_replay()
     engine.take_effects()
-    assert CountingStore.pages_fetched == 1  # still inside the first bounded page
+    assert CountingStore.pages_fetched == 2
     store.close()
+
+
+@pytest.mark.parametrize("kind", ["memory", "sqlite"])
+def test_bounded_replay_does_not_probe_metadata_per_message(kind: str, tmp_path: Path) -> None:
+    class CountingMemoryStore(MemoryInflightStore):
+        meta_reads = 0
+
+        def in_meta(self, mid: int):  # type: ignore[override]
+            CountingMemoryStore.meta_reads += 1
+            return super().in_meta(mid)
+
+    class CountingSqliteStore(SqliteInflightStore):
+        meta_reads = 0
+
+        def in_meta(self, mid: int):  # type: ignore[override]
+            CountingSqliteStore.meta_reads += 1
+            return super().in_meta(mid)
+
+    store = (
+        CountingMemoryStore()
+        if kind == "memory"
+        else CountingSqliteStore(tmp_path / "metadata-probes.db")
+    )
+    fill(store, 500)
+    engine = ProtocolEngine(
+        EngineConfig(client_id="metadata-probes", clean_start=False),
+        store=store,
+    )
+
+    resume_effects(engine)
+    while engine.inbound.replay_pending:
+        engine.continue_inbound_replay()
+        engine.take_effects()
+
+    assert store.meta_reads == 0
+    if isinstance(store, SqliteInflightStore):
+        store.close()
 
 
 def test_recovered_identifiers_are_loaded_without_reading_payloads(tmp_path: Path) -> None:

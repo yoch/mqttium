@@ -176,6 +176,12 @@ class OutboundSession:
     def pending_high_water_bytes(self) -> int:
         return self._pending_high_water_bytes
 
+    def _resolved_alias_topic_for_sizing(self, properties: Properties) -> str:
+        alias = properties.get("topic_alias")
+        if alias is None:
+            return ""
+        return self._topic_aliases.get(int(alias), "")
+
     def can_ever_admit(
         self,
         topic: str,
@@ -190,9 +196,7 @@ class OutboundSession:
             return False
         byte_limit = self.config.max_pending_outbound_bytes
         if not topic and properties is not None:
-            alias = properties.get("topic_alias")
-            if alias is not None:
-                topic = self._topic_aliases.get(int(alias), topic)
+            topic = self._resolved_alias_topic_for_sizing(properties)
         logical_size = self.logical_size(topic, payload, properties)
         return byte_limit is None or logical_size <= byte_limit
 
@@ -207,9 +211,7 @@ class OutboundSession:
                 continue
             pending_count += 1
             if not topic and properties is not None:
-                alias = properties.get("topic_alias")
-                if alias is not None:
-                    topic = self._topic_aliases.get(int(alias), topic)
+                topic = self._resolved_alias_topic_for_sizing(properties)
             pending_bytes += self.logical_size(topic, payload, properties)
         message_limit = self.config.max_pending_outbound_messages
         if message_limit is not None and pending_count > message_limit:

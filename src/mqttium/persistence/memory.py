@@ -339,36 +339,36 @@ class MemoryInflightStore:
             raise ValueError("max_messages must be positive")
         if max_bytes <= 0:
             raise ValueError("max_bytes must be positive")
-        messages: list[InboundMessage] = []
+        index = tuple(self._in.values())
+        mids: list[int] = []
         hydrated_bytes = 0
-        for mid in tuple(self._in):
-            message = self._in.get(mid)
-            if message is None:
-                continue
-            # logical_size is maintained by the inbound session (and backfilled
-            # at hydration), so replay does not encode every topic to size it.
-            message_bytes = message.logical_size or (
-                len(message.payload)
+        for indexed_message in index:
+            message_bytes = indexed_message.logical_size or (
+                len(indexed_message.payload)
                 + (
-                    len(message.topic)
-                    if message.topic.isascii()
-                    else len(message.topic.encode("utf-8"))
+                    len(indexed_message.topic)
+                    if indexed_message.topic.isascii()
+                    else len(indexed_message.topic.encode("utf-8"))
                 )
             )
-            if messages and (
-                len(messages) >= max_messages or hydrated_bytes + message_bytes > max_bytes
-            ):
-                yield tuple(messages)
-                messages = []
+            if mids and (len(mids) >= max_messages or hydrated_bytes + message_bytes > max_bytes):
+                page = tuple(current for saved_mid in mids if (current := self._in.get(saved_mid)))
+                if page:
+                    yield page
+                mids = []
                 hydrated_bytes = 0
-            messages.append(message)
+            mids.append(indexed_message.mid)
             hydrated_bytes += message_bytes
-            if len(messages) >= max_messages or hydrated_bytes >= max_bytes:
-                yield tuple(messages)
-                messages = []
+            if len(mids) >= max_messages or hydrated_bytes >= max_bytes:
+                page = tuple(current for saved_mid in mids if (current := self._in.get(saved_mid)))
+                if page:
+                    yield page
+                mids = []
                 hydrated_bytes = 0
-        if messages:
-            yield tuple(messages)
+        if mids:
+            page = tuple(current for mid in mids if (current := self._in.get(mid)))
+            if page:
+                yield page
 
     def clear_in(self) -> None:
         old = self._in

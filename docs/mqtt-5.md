@@ -90,8 +90,8 @@ await client.publish("", b"next", properties=alias)
 Alias zero, an alias above the broker's negotiated Topic Alias Maximum, and an
 empty Topic Name with an unknown mapping are rejected before publication state
 changes. QoS 1/2 persistence retains the canonical Topic Name, not the
-connection-specific omission. Replay therefore sends the full topic and may
-explicitly re-establish the requested alias on the replacement connection.
+connection-specific omission. Replay therefore sends the full topic and does
+not carry the previous connection's alias onto the replacement connection.
 
 ## Last Will
 

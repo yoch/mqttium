@@ -57,11 +57,39 @@ REPLAY_BATCH_BYTES = 1 << 20
 class InboundReplayCursor:
     """Lazy replay iterator with one-message pushback for byte-budget boundaries."""
 
-    __slots__ = ("_messages", "_pending")
+    __slots__ = ("_messages", "_page_messages", "_pages", "_pending")
 
     def __init__(self, pages: Iterator[tuple[InboundMessage, ...]]) -> None:
+        self._pages = pages
         self._messages = chain.from_iterable(pages)
+        self._page_messages: deque[InboundMessage] | None = None
         self._pending: InboundMessage | None = None
+
+    def begin_page(self) -> bool:
+        """Hydrate one store page, retaining any guarded suffix from the prior call."""
+        if self._pending is not None or self._page_messages is not None:
+            return True
+        page = next(self._pages, None)
+        if page is None:
+            return False
+        self._page_messages = deque(page)
+        return True
+
+    def next_page_message(self) -> InboundMessage | None:
+        if self._pending is not None:
+            message = self._pending
+            self._pending = None
+            return message
+        messages = self._page_messages
+        if messages is None:
+            return None
+        if not messages:
+            self._page_messages = None
+            return None
+        message = messages.popleft()
+        if not messages:
+            self._page_messages = None
+        return message
 
     def next_message(self) -> InboundMessage | None:
         if self._pending is not None:
@@ -908,7 +936,7 @@ class InboundSession:
         if bounded is not None:
             persisted = bounded.in_count()
             pages = bounded.in_replay_pages(
-                REPLAY_SCAN_LIMIT,
+                REPLAY_BATCH_MESSAGES,
                 REPLAY_BATCH_BYTES,
             )
         else:
@@ -935,6 +963,33 @@ class InboundSession:
             return
         transitions = self._transitions
         assert transitions is not None
+        if self._bounded_replay_store is not None:
+            # Built-in stores hydrate pages at the effect-batch boundary. The
+            # engine is synchronous, so that page cannot become stale before
+            # this method emits it, and no per-record metadata probe is needed.
+            if not cursor.begin_page():
+                self._replay = None
+                self._recovered_mids.clear()
+                return
+            emitted = 0
+            emitted_bytes = 0
+            while emitted < REPLAY_BATCH_MESSAGES and emitted_bytes < REPLAY_BATCH_BYTES:
+                bounded_message = cursor.next_page_message()
+                if bounded_message is None:
+                    break
+                if not self._should_redeliver(bounded_message):
+                    continue
+                message_bytes = len(bounded_message.payload) + len(
+                    bounded_message.topic.encode("utf-8")
+                )
+                if emitted and emitted_bytes + message_bytes > REPLAY_BATCH_BYTES:
+                    cursor.push_back(bounded_message)
+                    break
+                self._emit_message(bounded_message, dup=True)
+                emitted += 1
+                emitted_bytes += message_bytes
+            self._engine._emit(EffectKind.CONTINUE_INBOUND_REPLAY, None)
+            return
         scanned = 0
         emitted = 0
         emitted_bytes = 0
@@ -948,9 +1003,8 @@ class InboundSession:
                 self._replay = None
                 self._recovered_mids.clear()
                 return
-            # A hydrated replay page can survive across effect batches. Refresh
-            # payload-free metadata before emission so an intervening PUBREL,
-            # manual ACK, or delivery handoff cannot leak its stale copy.
+            # A legacy paged store may retain a larger page across effect
+            # batches, so refresh payload-free metadata before emission.
             current = transitions.in_meta(inbound.mid)
             if current is None or not self._should_redeliver(inbound, current):
                 scanned += 1
