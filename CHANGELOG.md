@@ -51,6 +51,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   replay, and metadata-transition capabilities of legacy and built-in stores.
 - Record the reproduction, standards/specification review, and disposition of
   the five pre-refactor fuzz and concurrency draft PRs.
+- Record paired Memory/SQLite inbound replay timings and allocation evidence for
+  the effect-batch hydration decision.
 
 ## [1.0.0rc9] - 2026-08-23
 

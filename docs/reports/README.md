@@ -47,6 +47,7 @@ Status meanings:
 | [COMPAT-PUBLISH-HANDOFF-2026-08-16](https://github.com/yoch/mqttium/blob/main/docs/reports/COMPAT-PUBLISH-HANDOFF-2026-08-16.md) | Current evidence | Architectural handoff decision only; no public parity promise |
 | [NATIVE-PUBACK-ATTRIBUTION-2026-08-16](https://github.com/yoch/mqttium/blob/main/docs/reports/NATIVE-PUBACK-ATTRIBUTION-2026-08-16.md) | Superseded | Diagnostic attribution followed by the writer-hop decision |
 | [NATIVE-WRITER-HOP-2026-08-16](https://github.com/yoch/mqttium/blob/main/docs/reports/NATIVE-WRITER-HOP-2026-08-16.md) | Current evidence | Native eager-writer decision under its recorded conditions |
+| [INBOUND-REPLAY-PERFORMANCE-2026-08-24](https://github.com/yoch/mqttium/blob/main/docs/reports/INBOUND-REPLAY-PERFORMANCE-2026-08-24.md) | Current evidence | Local paired evidence for effect-batch hydration and stale replay validation cost |
 | [INDEPENDENT-QOS0-LATENCY-AUDIT-2026-08-14](https://github.com/yoch/mqttium/blob/main/docs/reports/INDEPENDENT-QOS0-LATENCY-AUDIT-2026-08-14.md) | Current evidence | Bounded native QoS 0 latency audit |
 | [NATIVE-QOS0-CALLBACK-DIRECT-2026-08-14](https://github.com/yoch/mqttium/blob/main/docs/reports/NATIVE-QOS0-CALLBACK-DIRECT-2026-08-14.md) | Current evidence | Direct callback-admission decision |
 | [SINGLE-MESSAGE-INLINE-DELIVERY-2026-08-14](https://github.com/yoch/mqttium/blob/main/docs/reports/SINGLE-MESSAGE-INLINE-DELIVERY-2026-08-14.md) | Current evidence | Inline delivery threshold decision |
