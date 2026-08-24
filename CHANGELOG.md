@@ -15,9 +15,15 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   authentication handler invocation.
 - Extend deterministic fuzzing across enhanced AUTH, outbound Topic Alias
   state, and payload-free replay interleavings with Memory/SQLite equivalence.
+- Add a deterministic `AsyncClient` runtime schedule fuzzer with test-only
+  writer/callback gates, exact owner oracles, replayable JSON failure artifacts,
+  and qualification against four mechanically injected concurrency bugs.
 
 ### Fixed
 
+- Stop and clear the connection-scoped keepalive task when broker EOF or a
+  reader-side failure ends the connection, preventing a terminal task leak or
+  an unowned old task after reconnect replaces its reference.
 - Reject client-initiated re-authentication when no runtime authentication
   handler can service the broker's response, instead of enabling an exchange
   that could not be completed.

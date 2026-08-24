@@ -224,6 +224,34 @@ async def test_writer_failure_keeps_primary_error_when_transport_close_raises() 
         await _cleanup(client, pending)
 
 
+async def test_terminal_broker_eof_stops_connection_keepalive_task() -> None:
+    broker = _Broker()
+    client = AsyncClient(
+        "eof-keepalive-owner",
+        keepalive=0,
+        reconnect=ReconnectPolicy(enabled=False),
+    )
+
+    async def factory(host: str, port: int, *, ssl=None):
+        return broker
+
+    client._transport_factory = factory
+    try:
+        await client.connect("fake", 1, timeout=1.0)
+        reader = client._reader_task
+        keepalive = client._keepalive_task
+        assert reader is not None
+        assert keepalive is not None and not keepalive.done()
+
+        await broker.close()
+        await asyncio.wait_for(reader, timeout=1.0)
+
+        assert keepalive.done()
+        assert client._keepalive_task is None
+    finally:
+        await _cleanup(client)
+
+
 async def test_connect_exposes_writer_error_when_transport_close_also_raises() -> None:
     primary = OSError("primary CONNECT write failure")
     secondary = OSError("secondary transport close failure")

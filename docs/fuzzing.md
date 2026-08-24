@@ -10,6 +10,7 @@ protocol invariants rather than treating every parser exception as a failure.
 | `engine` | stateful connection, acknowledgement, inbound/outbound alias, enhanced AUTH, reconnect, replay, and manual-ack sequences | bounded flow, canonical durable topics, consistent packet identifiers and byte/message ledgers |
 | `websocket` | lengths, control frames, and fragmentation | bounded buffering and deterministic rejection |
 | replay interleavings | page hydration followed by PUBREL, delivery handoff, close, continuation, and reconnect | Memory/SQLite equivalence; no completed, delivered, or stale-epoch emission |
+| `runtime` | external MQTT events plus explicit releases at writer, lifecycle, and callback boundaries | owner accounting, effect settlement, epoch isolation, and terminal liveness |
 
 `tests/fuzz/fuzz.py` is dependency-free and driven by an explicit seed.
 `tests/fuzz/test_hypothesis_fuzz.py` adds property-based generation, shrinking,
@@ -30,7 +31,79 @@ python -m pytest tests/fuzz/test_hypothesis_fuzz.py -q
 # More aggressive local search
 HYPOTHESIS_PROFILE=aggressive \
   python -m pytest tests/fuzz/test_hypothesis_fuzz.py -q
+
+# Real AsyncClient runtime schedules (the PR smoke uses 12 seeds)
+PYTHONPATH=src python tests/fuzz/runtime_fuzzer.py \
+  --seed 1 --seeds 12 --steps 24 \
+  --artifacts-dir /tmp/mqttium-runtime-fuzz
 ```
+
+## Runtime schedule target
+
+`tests/fuzz/runtime_fuzzer.py` is a small MQTTium-specific scheduler, not an
+asyncio simulator. Each seed builds a short operation history and runs it
+through the real `AsyncClient`, `WritePump`, `EffectPump`, and
+`ApplicationDelivery`. Its only fake is a packet-aware transport/broker with an
+explicit write gate, injected write failure, broker ingress queue, and EOF.
+There are no production hooks and no changes to runtime hot paths.
+
+The first grammar deliberately concentrates on three ownership boundaries:
+
+- writer admission while an active write fails and the reader is admitting a
+  mandatory PUBACK;
+- callback self-cancellation while the callback worker owns later delivery;
+- terminal EOF followed by an explicit replacement connection.
+
+Seeds also insert ordinary QoS 1 round trips before those boundaries so packet
+identifiers and event-loop history vary without making failures hard to replay.
+After each operation the target checks exact writer resident/byte accounting,
+effect progress, outbound flow/packet-id/receipt agreement, inbound Receive
+Maximum, callback-worker ownership, and connection epochs. Terminal
+checkpoints additionally require every connection-scoped waiter, queued byte,
+effect, and receipt to settle. A checkpoint that cannot be reached is reported
+as a liveness failure; it is never treated as a successful timeout.
+
+### Failure artifacts and replay
+
+Every failing seed can write `runtime-seed<seed>.json` with schema
+`mqttium-runtime-fuzz-v1`. It contains the seed, ordered operations, reached
+checkpoints, mutation name when qualification is active, owner snapshots, wire
+packet history per transport generation, and the exception or invariant. The
+same `--seed` and `--steps` values reconstruct the schedule exactly. Histories
+are intentionally short; deletion-based shrinking is deferred until the
+target produces enough real findings to justify it.
+
+### Qualification by mutation
+
+`tests/fuzz/test_runtime_fuzzer.py` mechanically breaks four runtime contracts
+inside the test harness only:
+
+- writer failure advances its epoch without waking admission waiters;
+- connection setup/teardown does not invalidate the epoch;
+- an applied effect does not advance its settlement target;
+- callback self-cancellation terminates the callback worker.
+
+A 12-seed qualification campaign must detect each class in at least the seeds
+that exercise its ownership boundary. The unmodified target is also run twice
+for the same seed and must produce identical operations and final owner state.
+
+### Campaign levels
+
+1. **PR smoke:** 12 fixed seeds, 24 operations maximum, plus the four mutation
+   qualification tests. This is intentionally sub-second on a normal developer
+   machine.
+2. **Nightly candidate:** shard a monotonically recorded seed range and retain
+   JSON failures and logs. Start with hundreds of schedules per shard; promote
+   only after local/PR artifacts have remained deterministic.
+3. **Long/manual release candidate:** spend the requested CPU budget on disjoint
+   seed ranges, retain artifacts for the release evidence window, and report
+   schedules per ownership motif. Do not add schedule shrinking or a second
+   broker model merely to consume the budget.
+
+The nightly and long campaign wiring is intentionally not enabled yet. The PR
+target has demonstrated mutant sensitivity locally, but the operation grammar
+should first earn broader CI time by producing actionable findings or by adding
+another independently qualified ownership boundary.
 
 The local release runner can orchestrate multiple deterministic shards:
 
@@ -70,6 +143,9 @@ The deterministic fuzzer writes parseable progress to standard error:
 Use `--progress-every` to change reporting frequency, `--artifacts-dir` to
 choose where failing inputs are written, and `--quiet` to suppress live progress.
 An invariant violation or crash returns exit code 1.
+
+Runtime failures use JSON rather than binary input because the generated value
+is an ordered schedule and owner snapshot, not a packet corpus.
 
 Long campaigns are release evidence, not a requirement for every development
 iteration. Their outputs belong under `/tmp` or another external artefact

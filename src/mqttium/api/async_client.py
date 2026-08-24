@@ -1774,6 +1774,20 @@ class AsyncClient:
                 and self._disconnect_exc is None
             )
             await self._invalidate_connection_epoch()
+            # The keepalive loop belongs to this reader's transport epoch. An
+            # EOF or reader-side failure can end the reader without entering
+            # _force_close(), so retire the task here before a reconnect can
+            # replace its reference with a new epoch's keepalive owner.
+            keepalive = self._keepalive_task
+            if keepalive is not None and keepalive is not asyncio.current_task():
+                if not keepalive.done():
+                    keepalive.cancel()
+                try:
+                    await keepalive
+                except (asyncio.CancelledError, Exception):
+                    pass
+                if self._keepalive_task is keepalive:
+                    self._keepalive_task = None
             async with self._engine_lock:
                 self._engine.notify_transport_closed()
                 self._collect_effects_locked()

@@ -113,6 +113,9 @@ writer and starts a PINGRESP deadline. Any ordinary incoming packet does not
 stand in for PINGRESP. Missing the deadline closes the transport with
 `MQTTTimeoutError` and enters reconnect policy.
 
+The keepalive task is connection-scoped. Reader teardown cancels and joins it
+before automatic or explicit reconnect may install the next connection's task.
+
 ## Reconnect
 
 Each attempt creates a new transport and clears decoder and connection-local

@@ -106,6 +106,8 @@ late task from an older transport from closing or poisoning its replacement.
 The lifecycle preserves these generation invariants:
 
 - only the reader performs application-visible teardown for a live generation;
+- the reader retires that generation's keepalive task before reconnect can
+  install a replacement task reference;
 - every deferred effect and writer admission is tagged with that generation's
   epoch and is discarded or rejected after an epoch advance;
 - terminal teardown settles each receipt at most once and wakes every producer
