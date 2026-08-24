@@ -93,6 +93,12 @@ validity conditions pass on an eligible runner.
 | [RM-SLOT-UNTIL-HANDOFF](https://github.com/yoch/mqttium/blob/main/docs/reports/RM-SLOT-UNTIL-HANDOFF.md) | Current evidence | Inbound Receive Maximum ownership until effect handoff |
 | [AUTO-QOS1-MESSAGE-BATCH-DELIVERY](https://github.com/yoch/mqttium/blob/main/docs/reports/AUTO-QOS1-MESSAGE-BATCH-DELIVERY.md) | Current evidence | Automatic QoS 1 delivery batching |
 
+## Persistence and lifecycle concurrency
+
+| Report | Status | Use instead or interpretation |
+| --- | --- | --- |
+| [PERSISTENCE-LIFECYCLE-RACES-2026-08-24](https://github.com/yoch/mqttium/blob/main/docs/reports/PERSISTENCE-LIFECYCLE-RACES-2026-08-24.md) | Current evidence | Adversarial schedules at persistence/lifecycle boundaries; store vs runtime split. Does not replace the sequential stateful fuzzer |
+
 ## Adding evidence
 
 1. Put methodology and maintained guarantees in a current contract, not a
