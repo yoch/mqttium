@@ -83,6 +83,8 @@ class InboundReplayCursor:
         if page is None:
             return False
         self._page_messages = deque(page)
+        if self._remaining is not None:
+            self._remaining -= len(page)
         return True
 
     def next_page_message(self) -> InboundMessage | None:
@@ -97,8 +99,6 @@ class InboundReplayCursor:
             self._page_messages = None
             return None
         message = messages.popleft()
-        if self._remaining is not None:
-            self._remaining -= 1
         if not messages:
             self._page_messages = None
         return message
