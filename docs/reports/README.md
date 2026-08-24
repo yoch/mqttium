@@ -31,6 +31,7 @@ Status meanings:
 | [ENGINE-QUALITY-AUDIT-2026-08-17](https://github.com/yoch/mqttium/blob/main/docs/reports/ENGINE-QUALITY-AUDIT-2026-08-17.md) | Superseded | Closure and independent review below |
 | [ENGINE-QUALITY-AUDIT-INDEPENDENT-REVIEW-2026-08-17](https://github.com/yoch/mqttium/blob/main/docs/reports/ENGINE-QUALITY-AUDIT-INDEPENDENT-REVIEW-2026-08-17.md) | Current evidence | Independent review of the same bounded audit |
 | [ENGINE-QUALITY-AUDIT-CLOSURE-2026-08-17](https://github.com/yoch/mqttium/blob/main/docs/reports/ENGINE-QUALITY-AUDIT-CLOSURE-2026-08-17.md) | Current evidence | Closure record for the engine-quality findings |
+| [PUMP-CONCURRENCY-REDTEAM-2026-08-24](https://github.com/yoch/mqttium/blob/main/docs/reports/PUMP-CONCURRENCY-REDTEAM-2026-08-24.md) | Current evidence | EffectPump/WritePump cancellation and failure liveness at the named commit |
 | [ISSUE-253-ARM64-VALIDATION-2026-08-17](https://github.com/yoch/mqttium/blob/main/docs/reports/ISSUE-253-ARM64-VALIDATION-2026-08-17.md) | Current evidence | ARM64 validation for the issue and source it names |
 | [SIMPLIFICATION-AUDIT-2026-08-16](https://github.com/yoch/mqttium/blob/main/docs/reports/SIMPLIFICATION-AUDIT-2026-08-16.md) | Current evidence | Reviewed simplification decisions at the named commit |
 | [SIMPLIFICATION-ARM64-REVALIDATION-2026-08-17](https://github.com/yoch/mqttium/blob/main/docs/reports/SIMPLIFICATION-ARM64-REVALIDATION-2026-08-17.md) | Current evidence | Independent-architecture revalidation of that campaign |
