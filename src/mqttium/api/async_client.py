@@ -2381,9 +2381,11 @@ class AsyncClient:
             and reconnect_task is not asyncio.current_task()
             and not reconnect_task.done()
         )
+        transport_closing = self._transport is not None and self._transport.is_closing()
         if (
             self._engine.state in (ConnectionState.CONNECTED, ConnectionState.CONNECTING)
             and not automatic_generation
+            and not transport_closing
         ):
             return
         replacing = (
