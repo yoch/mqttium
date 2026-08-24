@@ -18,12 +18,22 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - Add a deterministic `AsyncClient` runtime schedule fuzzer with test-only
   writer/callback gates, exact owner oracles, replayable JSON failure artifacts,
   and qualification against four mechanically injected concurrency bugs.
+- Extend the runtime target with a state-aware step grammar for automatic
+  reconnect, callback/lifecycle, and EffectPump failure windows; whole-schedule
+  liveness and task/loop-error oracles; campaign diversity/coverage reporting;
+  and two interleaving-dependent mutations.
 
 ### Fixed
 
 - Stop and clear the connection-scoped keepalive task when broker EOF or a
   reader-side failure ends the connection, preventing a terminal task leak or
   an unowned old task after reconnect replaces its reference.
+- Avoid a keepalive/reader teardown ownership cycle when MQTT 5 Maximum Packet
+  Size makes PINGREQ impossible by letting the keepalive close only its
+  transport and leaving connection-visible teardown to the reader.
+- Let an explicit `connect()` already waiting behind an automatic reconnect
+  factory replace the automatically established generation, including any
+  successor reconnect task created while the old reader is joined.
 - Reject client-initiated re-authentication when no runtime authentication
   handler can service the broker's response, instead of enabling an exchange
   that could not be completed.

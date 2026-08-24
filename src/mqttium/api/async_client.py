@@ -1970,7 +1970,7 @@ class AsyncClient:
                         # conforming keepalive packet to send.
                         self._disconnect_exc = exc
                         self._intentional_disconnect = True
-                        await self._force_close_after_local_packet_failure()
+                        await self._close_transport_after_connection_failure()
                         return
                     # A lost PINGREQ beats a wedged keepalive under backpressure.
                     try:
@@ -2371,7 +2371,16 @@ class AsyncClient:
 
     async def _prepare_explicit_connect(self) -> None:
         """Replace any automatic-reconnect generation before explicit connect."""
-        if self._engine.state in (ConnectionState.CONNECTED, ConnectionState.CONNECTING):
+        reconnect_task = self._reconnect_task
+        automatic_generation = (
+            reconnect_task is not None
+            and reconnect_task is not asyncio.current_task()
+            and not reconnect_task.done()
+        )
+        if (
+            self._engine.state in (ConnectionState.CONNECTED, ConnectionState.CONNECTING)
+            and not automatic_generation
+        ):
             return
         replacing = (
             self._reconnect_task is not None
@@ -2381,6 +2390,10 @@ class AsyncClient:
         )
         await self._cancel_automatic_reconnect()
         await self._force_close(preserve_reconnect=True)
+        # Joining the automatically established reader can run its reconnect
+        # decision before the explicit caller regains ownership. Cancel that
+        # successor as part of the same takeover boundary as well.
+        await self._cancel_automatic_reconnect()
         if replacing:
             await self._reset_message_stream()
 

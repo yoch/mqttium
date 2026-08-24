@@ -10,23 +10,27 @@ import pytest
 
 from mqttium.api.async_client import AsyncClient
 from mqttium.codec.buffer import IncrementalDecoder
-from mqttium.enums import PacketType, QoS
+from mqttium.codec.properties import CONNACK, encode_properties
+from mqttium.enums import MQTTProtocolVersion, PacketType, QoS
+from mqttium.errors import PacketTooLargeError
 from mqttium.packets import PublishPacket, encode_frame
 from mqttium.protocol.reconnect import ReconnectPolicy
+from mqttium.types import Properties
 
 
 class _Broker:
-    def __init__(self) -> None:
+    def __init__(self, *, connack: bytes | None = None) -> None:
         self._rx: asyncio.Queue[bytes] = asyncio.Queue()
         self._decoder = IncrementalDecoder()
         self._closing = False
         self.raise_on_close = False
+        self.connack = connack or encode_frame(PacketType.CONNACK, 0, b"\x00\x00")
 
     async def write(self, data: bytes) -> None:
         self._decoder.feed(data)
         for raw in self._decoder.drain_packets():
             if raw.packet_type is PacketType.CONNECT:
-                self._rx.put_nowait(encode_frame(PacketType.CONNACK, 0, b"\x00\x00"))
+                self._rx.put_nowait(self.connack)
 
     async def read(self, n: int = 65536) -> bytes:
         return await self._rx.get()
@@ -248,6 +252,59 @@ async def test_terminal_broker_eof_stops_connection_keepalive_task() -> None:
 
         assert keepalive.done()
         assert client._keepalive_task is None
+    finally:
+        await _cleanup(client)
+
+
+async def test_impossible_pingreq_teardown_does_not_cycle_reader_and_keepalive() -> None:
+    properties = Properties()
+    properties.set("maximum_packet_size", 1)
+    connack = encode_frame(
+        PacketType.CONNACK,
+        0,
+        b"\x00\x00" + encode_properties(properties, CONNACK),
+    )
+    broker = _Broker(connack=connack)
+    client = AsyncClient(
+        "tiny-ping-owner",
+        protocol=MQTTProtocolVersion.MQTTv5,
+        keepalive=1,
+        reconnect=ReconnectPolicy(enabled=False),
+    )
+
+    async def factory(host: str, port: int, *, ssl=None):
+        return broker
+
+    client._transport_factory = factory
+    try:
+        await client.connect("fake", 1, timeout=1.0)
+        reader = client._reader_task
+        keepalive = client._keepalive_task
+        assert reader is not None and not reader.done()
+        assert keepalive is not None and not keepalive.done()
+
+        client._write_pump.last_outbound = time.monotonic() - 2.0
+        await asyncio.wait_for(asyncio.gather(keepalive, reader), timeout=1.0)
+
+        stats = client.stats()
+        assert isinstance(client._disconnect_exc, PacketTooLargeError)
+        assert not any(
+            (
+                stats.tasks.reader,
+                stats.tasks.writer,
+                stats.tasks.keepalive,
+                stats.tasks.reconnect,
+                stats.tasks.effect_flush,
+                stats.tasks.callback_worker,
+            )
+        )
+        assert stats.writer.waiters == 0
+        assert stats.effects.waiters == 0
+        assert stats.delivery.waiters == 0
+        assert stats.writer.queued_messages == 0
+        assert stats.writer.queued_bytes == 0
+        assert stats.effects.pending == 0
+        assert stats.receipts.publish == 0
     finally:
         await _cleanup(client)
 

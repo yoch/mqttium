@@ -115,7 +115,9 @@ The lifecycle preserves these generation invariants:
 - reconnectable loss keeps the application message stream open, while terminal
   reconnect exhaustion closes delivery and callback resources;
 - intentional disconnect remains distinct from the primary failure cause and
-  cannot be reversed by an in-progress reconnect attempt.
+  cannot be reversed by an in-progress reconnect attempt;
+- an explicit connect already waiting behind an automatic attempt replaces
+  that generation even if the automatic attempt reaches CONNECTED first.
 
 ## Protocol ownership
 

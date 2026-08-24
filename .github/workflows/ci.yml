@@ -193,7 +193,7 @@ jobs:
       - name: AsyncClient runtime schedule smoke and mutation qualification
         run: |
           PYTHONPATH=src python tests/fuzz/runtime_fuzzer.py \
-            --seed 1 --seeds 12 --steps 24 \
+            --seed 0 --seeds 12 --steps 24 \
             --artifacts-dir "$RUNNER_TEMP/runtime-fuzz"
           python -m pytest -q -W error --strict-config --strict-markers \
             tests/fuzz/test_runtime_fuzzer.py

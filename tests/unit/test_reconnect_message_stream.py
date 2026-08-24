@@ -330,6 +330,53 @@ async def test_explicit_connect_replaces_automatic_reconnect_generation(
         await _cleanup(client, old_pending)
 
 
+async def test_explicit_connect_waiting_on_reconnect_factory_still_takes_over() -> None:
+    brokers: list[_Broker] = []
+    reconnect_factory_entered = asyncio.Event()
+    release_reconnect_factory = asyncio.Event()
+    client = AsyncClient(
+        "explicit-connect-waits-for-reconnect",
+        reconnect=ReconnectPolicy(
+            enabled=True,
+            initial_delay=0,
+            max_delay=0,
+            max_retries=4,
+            stable_after=10,
+            connect_timeout=1,
+        ),
+        message_delivery="iterator",
+    )
+
+    async def factory(host: str, port: int, *, ssl=None):
+        del host, port, ssl
+        if len(brokers) == 1:
+            reconnect_factory_entered.set()
+            await release_reconnect_factory.wait()
+        broker = _Broker()
+        brokers.append(broker)
+        return broker
+
+    client._transport_factory = factory
+    takeover: asyncio.Task[object] | None = None
+    try:
+        await client.connect("fake", timeout=1)
+        await brokers[0].close()
+        await asyncio.wait_for(reconnect_factory_entered.wait(), timeout=1)
+
+        takeover = asyncio.create_task(client.connect("fake", timeout=1))
+        await asyncio.sleep(0)
+        release_reconnect_factory.set()
+        await asyncio.wait_for(takeover, timeout=1)
+
+        assert len(brokers) == 3
+        assert client._transport is brokers[2]
+        assert client.is_connected
+        assert client._reconnect_task is None or client._reconnect_task.done()
+    finally:
+        release_reconnect_factory.set()
+        await _cleanup(client, takeover)
+
+
 async def test_on_disconnect_explicit_connect_owns_replacement_connection() -> None:
     brokers: list[_Broker] = []
     replacement_connected = asyncio.Event()

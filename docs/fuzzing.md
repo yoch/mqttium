@@ -34,31 +34,47 @@ HYPOTHESIS_PROFILE=aggressive \
 
 # Real AsyncClient runtime schedules (the PR smoke uses 12 seeds)
 PYTHONPATH=src python tests/fuzz/runtime_fuzzer.py \
-  --seed 1 --seeds 12 --steps 24 \
+  --seed 0 --seeds 12 --steps 24 \
   --artifacts-dir /tmp/mqttium-runtime-fuzz
 ```
 
 ## Runtime schedule target
 
-`tests/fuzz/runtime_fuzzer.py` is a small MQTTium-specific scheduler, not an
-asyncio simulator. Each seed builds a short operation history and runs it
+`tests/fuzz/runtime_fuzzer.py` is a small MQTTium-specific schedule fuzzer, not
+an asyncio simulator. Each seed builds a short operation history and runs it
 through the real `AsyncClient`, `WritePump`, `EffectPump`, and
 `ApplicationDelivery`. Its only fake is a packet-aware transport/broker with an
-explicit write gate, injected write failure, broker ingress queue, and EOF.
-There are no production hooks and no changes to runtime hot paths.
+ingress queue and explicit gates for transport writes/close, reconnect factory,
+callbacks, and test-wrapped effect application. There are no production
+scheduling hooks and no changes to runtime hot paths.
 
-The first grammar deliberately concentrates on three ownership boundaries:
+The original three ownership motifs remain fixed regression anchors:
 
 - writer admission while an active write fails and the reader is admitting a
   mandatory PUBACK;
 - callback self-cancellation while the callback worker owns later delivery;
 - terminal EOF followed by an explicit replacement connection.
 
-Seeds also insert ordinary QoS 1 round trips before those boundaries so packet
-identifiers and event-loop history vary without making failures hard to replay.
+A state-aware grammar now spends every `--steps` entry. From the current model
+state it chooses only legal outbound/inbound actions or release decisions, then
+returns to a connected boundary before entering one of three additional motif
+families:
+
+- automatic reconnect with successful, failed, or blocked factories, including
+  disconnect and explicit takeover while the factory owns the lifecycle lock;
+- blocked callback delivery, release ordering, callback disconnect/connect,
+  and cancellation of an application lifecycle operation;
+- blocked EffectPump application, concurrent drains, injected failure, and an
+  effect collected while the failing close is deliberately held.
+
+Seeds also choose QoS 0/1 inbound and outbound work, writer/callback gate
+episodes, and bounded event-loop yields before those boundaries. Invalid API
+operations are not generated and `--steps` is an exact exploration budget.
 After each operation the target checks exact writer resident/byte accounting,
 effect progress, outbound flow/packet-id/receipt agreement, inbound Receive
-Maximum, callback-worker ownership, and connection epochs. Terminal
+Maximum, callback-worker ownership, completed-write epochs, application task
+outcomes, and event-loop exception contexts. A two-second whole-schedule
+watchdog catches liveness failures outside checkpoint polling. Terminal
 checkpoints additionally require every connection-scoped waiter, queued byte,
 effect, and receipt to settle. A checkpoint that cannot be reached is reported
 as a liveness failure; it is never treated as a successful timeout.
@@ -67,43 +83,48 @@ as a liveness failure; it is never treated as a successful timeout.
 
 Every failing seed can write `runtime-seed<seed>.json` with schema
 `mqttium-runtime-fuzz-v1`. It contains the seed, ordered operations, reached
-checkpoints, mutation name when qualification is active, owner snapshots, wire
-packet history per transport generation, and the exception or invariant. The
-same `--seed` and `--steps` values reconstruct the schedule exactly. Histories
+checkpoints, mutation name when qualification is active, owner snapshots,
+attempted and completed packet history per transport generation, and the
+exception or invariant. The same `--seed` and `--steps` values reconstruct the
+schedule exactly. Histories
 are intentionally short; deletion-based shrinking is deferred until the
 target produces enough real findings to justify it.
 
 ### Qualification by mutation
 
-`tests/fuzz/test_runtime_fuzzer.py` mechanically breaks four runtime contracts
+`tests/fuzz/test_runtime_fuzzer.py` mechanically breaks six runtime contracts
 inside the test harness only:
 
 - writer failure advances its epoch without waking admission waiters;
 - connection setup/teardown does not invalidate the epoch;
 - an applied effect does not advance its settlement target;
-- callback self-cancellation terminates the callback worker.
+- callback self-cancellation terminates the callback worker;
+- an effect collected during the failing-close window is not settled;
+- an automatically established connection defeats an already-waiting explicit
+  user takeover.
 
-A 12-seed qualification campaign must detect each class in at least the seeds
+A 24-seed qualification campaign must detect each class in at least the seeds
 that exercise its ownership boundary. The unmodified target is also run twice
 for the same seed and must produce identical operations and final owner state.
+Campaign output reports seeds, failures, unique full operation traces, unique
+scheduling/release traces, and coverage counts for every operation/checkpoint.
 
 ### Campaign levels
 
-1. **PR smoke:** 12 fixed seeds, 24 operations maximum, plus the four mutation
-   qualification tests. This is intentionally sub-second on a normal developer
-   machine.
-2. **Nightly candidate:** shard a monotonically recorded seed range and retain
-   JSON failures and logs. Start with hundreds of schedules per shard; promote
-   only after local/PR artifacts have remained deterministic.
-3. **Long/manual release candidate:** spend the requested CPU budget on disjoint
-   seed ranges, retain artifacts for the release evidence window, and report
-   schedules per ownership motif. Do not add schedule shrinking or a second
-   broker model merely to consume the budget.
+1. **PR smoke:** 12 fixed healthy seeds at 24 steps, plus bounded 24-seed
+   qualification of all six mutations in pytest.
+2. **Nightly proposal (not enabled):** 50,000 seeds at 32 steps, split into ten
+   disjoint 5,000-seed shards, retaining JSON failures and the coverage line.
+3. **Long/manual release proposal:** at least 1,000,000 seeds at 48 steps across
+   disjoint recorded ranges, with artifacts retained outside the repository.
+   Do not add schedule shrinking or a second broker model merely to consume the
+   budget.
 
-The nightly and long campaign wiring is intentionally not enabled yet. The PR
-target has demonstrated mutant sensitivity locally, but the operation grammar
-should first earn broader CI time by producing actionable findings or by adding
-another independently qualified ownership boundary.
+The nightly and long campaign wiring is intentionally not enabled. A local
+2,000-seed, 32-step reference campaign produced 1,994 operation traces and
+1,993 scheduling traces with zero failures. Six 600-seed mutation campaigns
+detected respectively 100/600, 600/600, 600/600, 100/600, 100/600, and 25/600
+seeds. These are qualification measurements, not production defect rates.
 
 The local release runner can orchestrate multiple deterministic shards:
 

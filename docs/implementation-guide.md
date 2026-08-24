@@ -115,12 +115,20 @@ stand in for PINGRESP. Missing the deadline closes the transport with
 
 The keepalive task is connection-scoped. Reader teardown cancels and joins it
 before automatic or explicit reconnect may install the next connection's task.
+If a negotiated Maximum Packet Size makes the two-byte PINGREQ impossible, the
+keepalive records the terminal error and closes only the transport; the reader
+still owns connection-visible teardown.
 
 ## Reconnect
 
 Each attempt creates a new transport and clears decoder and connection-local
 alias state. Backoff is bounded and jittered, and resets after a sufficiently
 stable connection.
+
+An explicit `connect()` is a user takeover of a live automatic reconnect task.
+It replaces that automatic generation even when it had already connected while
+the explicit caller waited for the lifecycle lock, and cancels any successor
+retry created while the automatic reader is joined.
 
 Permanent authentication, authorisation, and protocol errors stop retrying.
 Temporary broker-unavailable errors and network failures may retry. Pending

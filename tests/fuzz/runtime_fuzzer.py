@@ -11,7 +11,7 @@ import argparse
 import asyncio
 import json
 import random
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Coroutine, Iterable, Sequence
 from contextlib import suppress
 from dataclasses import asdict, dataclass
 from enum import StrEnum
@@ -19,10 +19,11 @@ from pathlib import Path
 from types import MethodType
 from typing import Any
 
-from mqttium.api import AsyncClient
+from mqttium.api import AsyncClient, PublishReceipt
 from mqttium.codec.buffer import IncrementalDecoder, RawPacket
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, PacketType, QoS
 from mqttium.packets import PubAckPacket, PublishPacket, encode_frame
+from mqttium.protocol.effects import EffectKind, EngineEffect
 from mqttium.protocol.reconnect import ReconnectPolicy
 from mqttium.transport.writes import WriteItem, item_size
 
@@ -34,6 +35,8 @@ class RuntimeMutation(StrEnum):
     EPOCH_NOT_INVALIDATED = "epoch_not_invalidated"
     EFFECT_NOT_SETTLED = "effect_not_settled"
     CALLBACK_CANCEL_STOPS_WORKER = "callback_cancel_stops_worker"
+    LATE_EFFECT_ABANDONED = "late_effect_abandoned"
+    USER_TAKEOVER_LOSES = "user_takeover_loses"
 
 
 @dataclass(slots=True, frozen=True)
@@ -51,6 +54,7 @@ class RuntimeOperation:
 class RuntimeSchedule:
     seed: int
     operations: tuple[RuntimeOperation, ...]
+    auto_reconnect: bool = False
 
 
 @dataclass(slots=True)
@@ -106,35 +110,62 @@ class CampaignResult:
     completed: int
     failures: int
     failing_seeds: tuple[int, ...]
+    unique_operation_traces: int
+    unique_scheduling_traces: int
+    coverage: dict[str, int]
+
+
+@dataclass(slots=True)
+class _ApplicationTask:
+    task: asyncio.Task[Any]
+    label: str
+    expected_exceptions: tuple[type[BaseException], ...] = ()
+    expect_cancelled: bool = False
+    allow_cancelled: bool = False
+    observed: bool = False
+    cleanup_cancelled: bool = False
 
 
 class _ScheduleTransport:
     """Packet-aware transport with one explicit write gate and failure switch."""
 
-    def __init__(self, generation: int, owner_epoch: int) -> None:
+    def __init__(
+        self,
+        generation: int,
+        owner_epoch: int,
+        current_epoch: Callable[[], int],
+    ) -> None:
         self.generation = generation
         self.owner_epoch = owner_epoch
+        self._current_epoch = current_epoch
         self._rx: asyncio.Queue[bytes] = asyncio.Queue()
         self._decoder = IncrementalDecoder()
         self._closing = False
         self.write_gate = asyncio.Event()
         self.write_gate.set()
         self.write_entered = asyncio.Event()
+        self.close_gate = asyncio.Event()
+        self.close_gate.set()
+        self.close_entered = asyncio.Event()
         self.fail_active_write = False
         self.active_payload: bytes | None = None
-        self.written: list[RawPacket] = []
+        self.attempted: list[RawPacket] = []
+        self.completed: list[tuple[RawPacket, int]] = []
 
     async def write(self, data: WriteItem) -> None:
         payload = b"".join(data) if isinstance(data, tuple) else data
         self.active_payload = payload
         self._decoder.feed(payload)
-        self.written.extend(self._decoder.drain_packets())
+        attempted = list(self._decoder.drain_packets())
+        self.attempted.extend(attempted)
         self.write_entered.set()
         try:
             await self.write_gate.wait()
             if self.fail_active_write:
                 self.fail_active_write = False
                 raise ConnectionResetError("runtime fuzzer injected write failure")
+            completion_epoch = self._current_epoch()
+            self.completed.extend((packet, completion_epoch) for packet in attempted)
         finally:
             self.active_payload = None
 
@@ -145,6 +176,8 @@ class _ScheduleTransport:
     async def close(self) -> None:
         if not self._closing:
             self._closing = True
+            self.close_entered.set()
+            await self.close_gate.wait()
             self._rx.put_nowait(b"")
 
     def is_closing(self) -> bool:
@@ -161,12 +194,23 @@ class _ScheduleTransport:
     def release_writes(self) -> None:
         self.write_gate.set()
 
+    def hold_close(self) -> None:
+        self.close_entered.clear()
+        self.close_gate.clear()
+
+    def release_close(self) -> None:
+        self.close_gate.set()
+
     def count(self, packet_type: PacketType) -> int:
-        return sum(packet.packet_type is packet_type for packet in self.written)
+        return sum(packet.packet_type is packet_type for packet, _epoch in self.completed)
 
     def last(self, packet_type: PacketType) -> RawPacket | None:
         return next(
-            (packet for packet in reversed(self.written) if packet.packet_type is packet_type),
+            (
+                packet
+                for packet, _epoch in reversed(self.completed)
+                if packet.packet_type is packet_type
+            ),
             None,
         )
 
@@ -175,38 +219,15 @@ def _op(actor: str, action: str, value: str | int | None = None) -> RuntimeOpera
     return RuntimeOperation(actor, action, value)
 
 
-def generate_schedule(seed: int, steps: int = 24) -> RuntimeSchedule:
-    """Generate one short adversarial schedule from a stable seed.
-
-    The three motifs target ownership boundaries, while neutral QoS 1 round
-    trips vary packet identifiers and event-loop history before the boundary.
-    """
-
-    if steps < 12:
-        raise ValueError("runtime schedules require at least 12 steps")
-    rng = random.Random(seed)
-    operations = [
-        _op("app", "connect"),
-        _op("checkpoint", "wire", "CONNECT"),
-        _op("broker", "connack"),
-        _op("checkpoint", "connected"),
-    ]
-
-    # Vary the history without letting it dominate the ownership race.
-    neutral_rounds = min(rng.randrange(3), max(0, (steps - 12) // 3))
-    for _ in range(neutral_rounds):
-        operations.extend(
-            (
-                _op("app", "publish", 1),
-                _op("checkpoint", "wire", "PUBLISH"),
-                _op("broker", "puback_last"),
-            )
-        )
-
-    motif = seed % 3
-    if motif == 0:
-        operations.extend(
-            (
+def _anchor_operations(  # noqa: C901
+    family: int,
+    rng: random.Random,
+) -> tuple[list[RuntimeOperation], bool]:
+    """Return one bounded ownership motif and whether it needs auto reconnect."""
+    if family == 0:
+        # Historical writer-failure / reader-admission motif.
+        return (
+            [
                 _op("schedule", "hold_writes"),
                 _op("app", "publish", 0),
                 _op("checkpoint", "writer_active"),
@@ -215,22 +236,26 @@ def generate_schedule(seed: int, steps: int = 24) -> RuntimeSchedule:
                 _op("transport", "fail_active_write"),
                 _op("schedule", "release_writes"),
                 _op("checkpoint", "terminal"),
-            )
+            ],
+            False,
         )
-    elif motif == 1:
-        operations.extend(
-            (
+    if family == 1:
+        # Historical callback CancelledError ownership motif.
+        return (
+            [
                 _op("callback", "cancel_once"),
                 _op("broker", "publish", 0),
                 _op("broker", "publish", 0),
                 _op("checkpoint", "callbacks_drained"),
                 _op("app", "disconnect"),
                 _op("checkpoint", "terminal"),
-            )
+            ],
+            False,
         )
-    else:
-        operations.extend(
-            (
+    if family == 2:
+        # Historical explicit reconnect / epoch-replacement motif.
+        return (
+            [
                 _op("broker", "eof"),
                 _op("checkpoint", "terminal"),
                 _op("app", "connect"),
@@ -239,11 +264,257 @@ def generate_schedule(seed: int, steps: int = 24) -> RuntimeSchedule:
                 _op("checkpoint", "connected"),
                 _op("app", "disconnect"),
                 _op("checkpoint", "terminal"),
-            )
+            ],
+            False,
         )
-    if len(operations) > steps:
-        raise AssertionError("generated runtime schedule exceeded its step budget")
-    return RuntimeSchedule(seed=seed, operations=tuple(operations))
+    if family == 3:
+        reconnect_variant = rng.randrange(4)
+        if reconnect_variant == 0:
+            operations = [
+                _op("factory", "fail_next"),
+                _op("broker", "eof"),
+                _op("checkpoint", "factory_failed"),
+                _op("checkpoint", "wire", "CONNECT"),
+                _op("broker", "connack"),
+                _op("checkpoint", "connected"),
+                _op("app", "disconnect"),
+                _op("checkpoint", "terminal"),
+            ]
+        elif reconnect_variant == 1:
+            operations = [
+                _op("factory", "block_next"),
+                _op("broker", "eof"),
+                _op("checkpoint", "factory_blocked"),
+                _op("schedule", "release_factory"),
+                _op("checkpoint", "wire", "CONNECT"),
+                _op("broker", "connack"),
+                _op("checkpoint", "connected"),
+                _op("app", "disconnect"),
+                _op("checkpoint", "terminal"),
+            ]
+        elif reconnect_variant == 2:
+            operations = [
+                _op("factory", "block_next"),
+                _op("broker", "eof"),
+                _op("checkpoint", "factory_blocked"),
+                _op("app", "disconnect"),
+                _op("schedule", "release_factory"),
+                _op("checkpoint", "terminal"),
+            ]
+        else:
+            operations = [
+                _op("factory", "block_next"),
+                _op("broker", "eof"),
+                _op("checkpoint", "factory_blocked"),
+                _op("app", "connect"),
+                _op("schedule", "release_factory"),
+                _op("checkpoint", "wire", "CONNECT"),
+                _op("broker", "connack"),
+                _op("checkpoint", "wire", "CONNECT"),
+                _op("broker", "connack"),
+                _op("checkpoint", "connected"),
+                _op("app", "disconnect"),
+                _op("checkpoint", "terminal"),
+            ]
+        return operations, True
+    if family == 4:
+        callback_variant = rng.randrange(4)
+        if callback_variant == 0:
+            operations = [
+                _op("callback", "block_once"),
+                _op("broker", "publish", 0),
+                _op("checkpoint", "callback_active"),
+                _op("schedule", "release_callback"),
+                _op("checkpoint", "callbacks_drained"),
+                _op("app", "disconnect"),
+                _op("checkpoint", "terminal"),
+            ]
+            return operations, False
+        if callback_variant == 1:
+            operations = [
+                _op("callback", "block_once"),
+                _op("broker", "publish", 0),
+                _op("checkpoint", "callback_active"),
+                _op("schedule", "hold_close"),
+                _op("app", "disconnect"),
+                _op("app", "cancel_last"),
+                _op("schedule", "release_close"),
+                _op("schedule", "release_callback"),
+                _op("checkpoint", "callbacks_drained"),
+                _op("app", "disconnect"),
+                _op("checkpoint", "terminal"),
+            ]
+            return operations, False
+        if callback_variant == 2:
+            operations = [
+                _op("callback", "disconnect_once"),
+                _op("broker", "publish", 0),
+                _op("checkpoint", "terminal"),
+            ]
+            return operations, False
+        operations = [
+            _op("callback", "on_disconnect_connect_once"),
+            _op("broker", "eof"),
+            _op("checkpoint", "wire", "CONNECT"),
+            _op("broker", "connack"),
+            _op("checkpoint", "connected"),
+            _op("checkpoint", "takeover_stable"),
+            _op("app", "disconnect"),
+            _op("checkpoint", "terminal"),
+        ]
+        return operations, True
+
+    # EffectPump apply/failure/late-collection interleaving. Vary which drain
+    # already owns the target and where writer capacity is released relative to
+    # effect failure and close settlement.
+    operations = [
+        _op("schedule", "hold_writes"),
+        _op("app", "publish", 0),
+        _op("checkpoint", "writer_active"),
+        _op("effect", "block_next"),
+        _op("schedule", "hold_close"),
+        _op("broker", "publish", 1),
+        _op("checkpoint", "effect_active"),
+    ]
+    drains = [_op("effect", "drain_failure") for _ in range(1 + rng.randrange(2))]
+    if rng.randrange(2):
+        operations.append(_op("effect", "fail_on_release"))
+        operations.extend(drains)
+    else:
+        operations.extend(drains)
+        operations.append(_op("effect", "fail_on_release"))
+    release_position = rng.randrange(3)
+    if release_position == 0:
+        operations.append(_op("schedule", "release_writes"))
+    operations.extend(
+        (
+            _op("schedule", "release_effect"),
+            _op("checkpoint", "effect_failing_close"),
+            _op("effect", "collect_late"),
+        )
+    )
+    if release_position == 1:
+        operations.append(_op("schedule", "release_writes"))
+    operations.append(_op("schedule", "release_close"))
+    if release_position == 2:
+        operations.append(_op("schedule", "release_writes"))
+    operations.append(_op("checkpoint", "terminal"))
+    return operations, False
+
+
+def generate_schedule(seed: int, steps: int = 24) -> RuntimeSchedule:  # noqa: C901
+    """Generate one state-valid schedule whose operation count is ``steps``.
+
+    A tiny grammar varies legal connected-state work and explicit release
+    decisions before one of six ownership motifs. It models only the seams the
+    target controls; the real event loop and AsyncClient still execute every
+    transition.
+    """
+
+    if steps < 12:
+        raise ValueError("runtime schedules require at least 12 steps")
+    rng = random.Random(seed)
+    family = seed % 6
+    anchor, auto_reconnect = _anchor_operations(family, rng)
+    if len(anchor) + 4 > steps:
+        # The original motifs are the compact fallback for small custom budgets.
+        anchor, auto_reconnect = _anchor_operations(seed % 3, rng)
+    operations: list[RuntimeOperation] = [
+        _op("app", "connect"),
+        _op("checkpoint", "wire", "CONNECT"),
+        _op("broker", "connack"),
+        _op("checkpoint", "connected"),
+    ]
+    remaining = steps - len(operations) - len(anchor)
+    state = "connected"
+    qos = 0
+    while remaining:
+        if state == "connected":
+            legal: list[tuple[str, int]] = [("yield", 1)]
+            if remaining >= 2:
+                legal.extend((("outbound0", 2), ("inbound0", 2)))
+            if remaining >= 3:
+                legal.extend((("outbound1", 3), ("inbound1", 3)))
+            if remaining >= 5:
+                legal.extend((("writer_gate", 5), ("callback_gate", 5)))
+            choice, _cost = rng.choice(legal)
+            if choice == "yield":
+                operations.append(_op("schedule", "yield", rng.randrange(1, 6)))
+                remaining -= 1
+            elif choice.startswith("outbound"):
+                qos = int(choice[-1])
+                operations.append(_op("app", "publish", qos))
+                remaining -= 1
+                state = "outbound_wire"
+            elif choice.startswith("inbound"):
+                qos = int(choice[-1])
+                operations.append(_op("broker", "publish", qos))
+                remaining -= 1
+                state = "inbound_wire" if qos else "inbound_callback"
+            elif choice == "writer_gate":
+                operations.append(_op("schedule", "hold_writes"))
+                remaining -= 1
+                state = "writer_publish"
+            else:
+                operations.append(_op("callback", "block_once"))
+                remaining -= 1
+                state = "callback_publish"
+        elif state == "outbound_wire":
+            operations.append(_op("checkpoint", "wire", "PUBLISH"))
+            remaining -= 1
+            state = "outbound_ack" if qos else "connected"
+        elif state == "outbound_ack":
+            operations.append(_op("broker", "puback_last"))
+            remaining -= 1
+            state = "connected"
+        elif state == "inbound_wire":
+            operations.append(_op("checkpoint", "wire", "PUBACK"))
+            remaining -= 1
+            state = "inbound_callback"
+        elif state == "inbound_callback":
+            operations.append(_op("checkpoint", "callbacks_drained"))
+            remaining -= 1
+            state = "connected"
+        elif state == "writer_publish":
+            operations.append(_op("app", "publish", 0))
+            remaining -= 1
+            state = "writer_active"
+        elif state == "writer_active":
+            operations.append(_op("checkpoint", "writer_active"))
+            remaining -= 1
+            state = "writer_release"
+        elif state == "writer_release":
+            operations.append(_op("schedule", "release_writes"))
+            remaining -= 1
+            state = "writer_wire"
+        elif state == "writer_wire":
+            operations.append(_op("checkpoint", "wire", "PUBLISH"))
+            remaining -= 1
+            state = "connected"
+        elif state == "callback_publish":
+            operations.append(_op("broker", "publish", 0))
+            remaining -= 1
+            state = "callback_active"
+        elif state == "callback_active":
+            operations.append(_op("checkpoint", "callback_active"))
+            remaining -= 1
+            state = "callback_release"
+        elif state == "callback_release":
+            operations.append(_op("schedule", "release_callback"))
+            remaining -= 1
+            state = "callback_drained"
+        else:
+            operations.append(_op("checkpoint", "callbacks_drained"))
+            remaining -= 1
+            state = "connected"
+    assert state == "connected"
+    operations.extend(anchor)
+    assert len(operations) == steps
+    return RuntimeSchedule(
+        seed=seed,
+        operations=tuple(operations),
+        auto_reconnect=auto_reconnect,
+    )
 
 
 class _RuntimeHarness:
@@ -251,19 +522,50 @@ class _RuntimeHarness:
         self.schedule = schedule
         self.mutation = mutation
         self.transports: list[_ScheduleTransport] = []
-        self.tasks: list[asyncio.Task[Any]] = []
+        self.tasks: list[_ApplicationTask] = []
         self.operations: list[str] = []
         self.checkpoints: list[str] = []
         self.callback_expected = 0
         self.callback_attempted = 0
+        self.callback_epoch: int | None = None
         self.cancel_callback_once = False
+        self.raise_callback_once = False
+        self.block_callback_once = False
+        self.disconnect_callback_once = False
+        self.connect_callback_once = False
+        self.disconnect_callback_connect_once = False
+        self.callback_gate = asyncio.Event()
+        self.callback_gate.set()
+        self.callback_entered = asyncio.Event()
+        self.effect_gate = asyncio.Event()
+        self.effect_gate.set()
+        self.effect_entered = asyncio.Event()
+        self.block_effect_once = False
+        self.fail_effect_once = False
+        self.factory_gate = asyncio.Event()
+        self.factory_gate.set()
+        self.factory_entered = asyncio.Event()
+        self.factory_failed = asyncio.Event()
+        self.block_factory_once = False
+        self.fail_factory_once = False
+        self.factory_attempts = 0
+        self.receipt_settlements: dict[int, int] = {}
         self.loop_contexts: list[dict[str, Any]] = []
+        self._checked_loop_contexts = 0
+        self._expected_loop_cancellations = 0
         self._mutation_restores: list[tuple[object, str, object]] = []
-        self._wire_targets: dict[tuple[int, PacketType], int] = {}
+        self._wire_targets: dict[PacketType, int] = {}
         self.client = AsyncClient(
             client_id=f"runtime-fuzz-{schedule.seed}",
             protocol=MQTTProtocolVersion.MQTTv5,
-            reconnect=ReconnectPolicy(enabled=False),
+            reconnect=ReconnectPolicy(
+                enabled=schedule.auto_reconnect,
+                initial_delay=0,
+                max_delay=0,
+                max_retries=3,
+                stable_after=0.05,
+                connect_timeout=0.5,
+            ),
             max_outbound_messages=1,
             max_outbound_bytes=4096,
             max_pending_callbacks=4,
@@ -272,6 +574,9 @@ class _RuntimeHarness:
         )
         self.client._transport_factory = self._factory
         self.client.on_message = self._on_message
+        self.client.on_disconnect = self._on_disconnect
+        self._install_receipt_oracle()
+        self._install_effect_gate()
         self._install_mutation()
 
     @property
@@ -284,18 +589,86 @@ class _RuntimeHarness:
         self, host: str, port: int, *, ssl: object | None = None
     ) -> _ScheduleTransport:
         del host, port, ssl
+        self.factory_attempts += 1
+        if self.fail_factory_once:
+            self.fail_factory_once = False
+            self.factory_failed.set()
+            raise ConnectionRefusedError("runtime fuzzer reconnect factory failure")
+        if self.block_factory_once:
+            self.block_factory_once = False
+            self.factory_entered.set()
+            await self.factory_gate.wait()
         transport = _ScheduleTransport(
             len(self.transports) + 1,
             self.client._connection_epoch,
+            lambda: self.client._connection_epoch,
         )
         self.transports.append(transport)
         return transport
 
     async def _on_message(self, _message: object) -> None:
         self.callback_attempted += 1
+        self.callback_epoch = self.client._connection_epoch
+        if self.block_callback_once:
+            self.block_callback_once = False
+            self.callback_entered.set()
+            await self.callback_gate.wait()
         if self.cancel_callback_once:
             self.cancel_callback_once = False
             raise asyncio.CancelledError("runtime fuzzer callback self-cancellation")
+        if self.raise_callback_once:
+            self.raise_callback_once = False
+            raise RuntimeError("runtime fuzzer callback failure")
+        if self.disconnect_callback_once:
+            self.disconnect_callback_once = False
+            await self.client.disconnect()
+        if self.connect_callback_once:
+            self.connect_callback_once = False
+            await self.client.connect("runtime.invalid", timeout=0.5)
+
+    async def _on_disconnect(self, _error: BaseException | None) -> None:
+        if not self.disconnect_callback_connect_once:
+            return
+        self.disconnect_callback_connect_once = False
+        await self.client.connect("runtime.invalid", timeout=0.5)
+
+    def _install_receipt_oracle(self) -> None:
+        original = PublishReceipt._settle
+
+        def tracked_settle(receipt: PublishReceipt) -> None:
+            key = id(receipt)
+            count = self.receipt_settlements.get(key, 0) + 1
+            self.receipt_settlements[key] = count
+            if count > 1:
+                raise AssertionError("publish receipt settled more than once")
+            original(receipt)
+
+        self._replace(PublishReceipt, "_settle", tracked_settle)
+
+    def _install_effect_gate(self) -> None:
+        original = self.client._apply_effect
+
+        async def gated_apply(
+            _client: AsyncClient,
+            effect: EngineEffect,
+            *,
+            nowait: bool,
+            epoch: int | None = None,
+        ) -> None:
+            if self.block_effect_once:
+                self.block_effect_once = False
+                self.effect_entered.set()
+                await self.effect_gate.wait()
+            if self.fail_effect_once:
+                self.fail_effect_once = False
+                raise RuntimeError("runtime fuzzer injected effect failure")
+            await original(effect, nowait=nowait, epoch=epoch)
+
+        self._replace(
+            self.client,
+            "_apply_effect",
+            MethodType(gated_apply, self.client),
+        )
 
     def _install_mutation(self) -> None:
         if self.mutation is RuntimeMutation.WRITER_FAILURE_NO_WAKE:
@@ -342,6 +715,36 @@ class _RuntimeHarness:
                 "_propagate_callback_cancellation",
                 MethodType(kill_worker, self.client._delivery),
             )
+        elif self.mutation is RuntimeMutation.LATE_EFFECT_ABANDONED:
+            pump = self.client._effect_pump
+            original = pump.discard_connection_effects
+
+            def abandon_late_effects(_pump: object, *, settle_publish: bool = False) -> None:
+                if pump._failing_close and pump.pending:
+                    return
+                original(settle_publish=settle_publish)
+
+            self._replace(
+                pump,
+                "discard_connection_effects",
+                MethodType(abandon_late_effects, pump),
+            )
+        elif self.mutation is RuntimeMutation.USER_TAKEOVER_LOSES:
+            original = self.client._prepare_explicit_connect
+
+            async def connected_auto_generation_wins(client: AsyncClient) -> None:
+                if client._engine.state in (
+                    ConnectionState.CONNECTED,
+                    ConnectionState.CONNECTING,
+                ):
+                    return
+                await original()
+
+            self._replace(
+                self.client,
+                "_prepare_explicit_connect",
+                MethodType(connected_auto_generation_wins, self.client),
+            )
 
     def _replace(self, owner: object, name: str, replacement: object) -> None:
         self._mutation_restores.append((owner, name, getattr(owner, name)))
@@ -352,40 +755,110 @@ class _RuntimeHarness:
             owner, name, original = self._mutation_restores.pop()
             setattr(owner, name, original)
 
+    def _spawn_application_task(
+        self,
+        coroutine: Coroutine[Any, Any, Any],
+        *,
+        label: str,
+        expected_exceptions: tuple[type[BaseException], ...] = (),
+        expect_cancelled: bool = False,
+    ) -> _ApplicationTask:
+        tracked = _ApplicationTask(
+            asyncio.create_task(coroutine, name=f"runtime-fuzz-{label}"),
+            label,
+            expected_exceptions,
+            expect_cancelled,
+        )
+        self.tasks.append(tracked)
+        return tracked
+
+    def _check_application_tasks(self, *, final: bool = False) -> None:
+        for tracked in self.tasks:
+            task = tracked.task
+            if not task.done():
+                if final:
+                    raise AssertionError(f"application task did not settle: {tracked.label}")
+                continue
+            if tracked.observed:
+                continue
+            tracked.observed = True
+            if task.cancelled():
+                if not (tracked.expect_cancelled or tracked.allow_cancelled):
+                    raise AssertionError(
+                        f"unexpected application task cancellation: {tracked.label}"
+                    )
+                continue
+            exception = task.exception()
+            if exception is None:
+                if tracked.expect_cancelled:
+                    raise AssertionError(
+                        f"application task unexpectedly completed: {tracked.label}"
+                    )
+                continue
+            if not isinstance(exception, tracked.expected_exceptions):
+                raise AssertionError(
+                    "unexpected application task exception: "
+                    f"{tracked.label}: {type(exception).__name__}: {exception}"
+                )
+
+    def _check_loop_contexts(self, *, final: bool = False) -> None:
+        while self._checked_loop_contexts < len(self.loop_contexts):
+            context = self.loop_contexts[self._checked_loop_contexts]
+            self._checked_loop_contexts += 1
+            message = str(context.get("message", ""))
+            exception = context.get("exception")
+            if (
+                self._expected_loop_cancellations
+                and message == "mqttium user callback failed"
+                and isinstance(exception, asyncio.CancelledError)
+            ):
+                self._expected_loop_cancellations -= 1
+                continue
+            name = type(exception).__name__ if exception is not None else "none"
+            raise AssertionError(f"unexpected event-loop exception: {message}: {name}: {exception}")
+        if final and self._expected_loop_cancellations:
+            raise AssertionError(
+                "expected callback cancellation was not reported to the event loop"
+            )
+
     async def execute(self, operation: RuntimeOperation) -> None:  # noqa: C901
         rendered = operation.render()
         self.operations.append(rendered)
         actor, action, value = operation.actor, operation.action, operation.value
         if (actor, action) == ("app", "connect"):
-            self.tasks.append(
-                asyncio.create_task(
-                    self.client.connect("runtime.invalid", timeout=10),
-                    name="runtime-fuzz-connect",
-                )
+            self._spawn_application_task(
+                self.client.connect("runtime.invalid", timeout=10),
+                label="connect",
             )
         elif (actor, action) == ("app", "publish"):
             qos = QoS(int(value))
             index = len(self.tasks)
-            self.tasks.append(
-                asyncio.create_task(
-                    self.client.publish(
-                        f"runtime/out/{index}",
-                        f"payload-{index}".encode(),
-                        qos=qos,
-                    ),
-                    name=f"runtime-fuzz-publish-qos{int(qos)}",
-                )
+            self._spawn_application_task(
+                self.client.publish(
+                    f"runtime/out/{index}",
+                    f"payload-{index}".encode(),
+                    qos=qos,
+                ),
+                label=f"publish-qos{int(qos)}",
             )
         elif (actor, action) == ("app", "disconnect"):
             # Lifecycle operations are schedule participants.  Never await one
             # inline: a mutant may deadlock it, which the terminal checkpoint
             # must classify as a liveness failure and preserve in the artifact.
-            self.tasks.append(
-                asyncio.create_task(
-                    self.client.disconnect(),
-                    name="runtime-fuzz-disconnect",
-                )
+            self._spawn_application_task(
+                self.client.disconnect(),
+                label="disconnect",
             )
+        elif (actor, action) == ("app", "cancel_last"):
+            tracked = next(
+                (tracked for tracked in reversed(self.tasks) if not tracked.task.done()),
+                None,
+            )
+            if tracked is None:
+                raise AssertionError("no pending application task to cancel")
+            tracked.expect_cancelled = False
+            tracked.allow_cancelled = True
+            tracked.task.cancel()
         elif (actor, action) == ("broker", "connack"):
             self.transport.push(encode_frame(PacketType.CONNACK, 0, b"\x00\x00\x00"))
         elif (actor, action) == ("broker", "publish"):
@@ -416,15 +889,70 @@ class _RuntimeHarness:
             self.transport.hold_writes()
         elif (actor, action) == ("schedule", "release_writes"):
             self.transport.release_writes()
+        elif (actor, action) == ("schedule", "hold_close"):
+            self.transport.hold_close()
+        elif (actor, action) == ("schedule", "release_close"):
+            self.transport.release_close()
+        elif (actor, action) == ("schedule", "release_factory"):
+            self.factory_gate.set()
+        elif (actor, action) == ("schedule", "release_callback"):
+            self.callback_gate.set()
+        elif (actor, action) == ("schedule", "release_effect"):
+            self.effect_gate.set()
+        elif (actor, action) == ("schedule", "yield"):
+            await self._turns(int(value))
         elif (actor, action) == ("transport", "fail_active_write"):
             self.transport.fail_active_write = True
+        elif (actor, action) == ("factory", "block_next"):
+            self.block_factory_once = True
+            self.factory_entered.clear()
+            self.factory_gate.clear()
+        elif (actor, action) == ("factory", "fail_next"):
+            self.fail_factory_once = True
+            self.factory_failed.clear()
         elif (actor, action) == ("callback", "cancel_once"):
             self.cancel_callback_once = True
+            self._expected_loop_cancellations += 1
+        elif (actor, action) == ("callback", "raise_once"):
+            self.raise_callback_once = True
+        elif (actor, action) == ("callback", "block_once"):
+            self.block_callback_once = True
+            self.callback_entered.clear()
+            self.callback_gate.clear()
+        elif (actor, action) == ("callback", "disconnect_once"):
+            self.disconnect_callback_once = True
+        elif (actor, action) == ("callback", "connect_once"):
+            self.connect_callback_once = True
+        elif (actor, action) == ("callback", "on_disconnect_connect_once"):
+            self.disconnect_callback_connect_once = True
+        elif (actor, action) == ("effect", "block_next"):
+            self.block_effect_once = True
+            self.effect_entered.clear()
+            self.effect_gate.clear()
+        elif (actor, action) == ("effect", "fail_on_release"):
+            self.fail_effect_once = True
+        elif (actor, action) == ("effect", "drain_failure"):
+            self._spawn_application_task(
+                self.client._drain_effects(),
+                label="effect-drain",
+                expected_exceptions=(RuntimeError,),
+            )
+        elif (actor, action) == ("effect", "collect_late"):
+            async with self.client._engine_lock:
+                self.client._engine._effects.append(
+                    EngineEffect(
+                        EffectKind.SEND,
+                        encode_frame(PacketType.PINGREQ, 0, b""),
+                    )
+                )
+                self.client._collect_effects_locked()
         elif actor == "checkpoint":
             await self._checkpoint(action, value)
         else:
             raise AssertionError(f"unknown runtime operation: {rendered}")
         await self._turns(4)
+        self._check_application_tasks()
+        self._check_loop_contexts()
         self._check_oracles()
 
     async def _checkpoint(self, action: str, value: str | int | None) -> None:
@@ -432,11 +960,12 @@ class _RuntimeHarness:
         self.checkpoints.append(label)
         if action == "wire":
             packet_type = PacketType[str(value)]
-            key = (self.transport.generation, packet_type)
-            target = self._wire_targets.get(key, 0) + 1
-            self._wire_targets[key] = target
+            target = self._wire_targets.get(packet_type, 0) + 1
+            self._wire_targets[packet_type] = target
             await self._wait_until(
-                lambda: self.transport.count(packet_type) >= target,
+                lambda: (
+                    sum(transport.count(packet_type) for transport in self.transports) >= target
+                ),
                 f"transport write checkpoint {packet_type.name} was not reached",
             )
         elif action == "connected":
@@ -453,6 +982,44 @@ class _RuntimeHarness:
             await self._wait_until(
                 lambda: self.client.stats().writer.waiters > 0,
                 "reader never blocked on writer admission",
+            )
+        elif action == "factory_blocked":
+            await self._wait_until(
+                lambda: self.factory_entered.is_set() and not self.factory_gate.is_set(),
+                "reconnect transport factory did not block",
+            )
+        elif action == "factory_failed":
+            await self._wait_until(
+                self.factory_failed.is_set,
+                "reconnect transport factory failure was not exercised",
+            )
+        elif action == "callback_active":
+            await self._wait_until(
+                lambda: self.callback_entered.is_set() and not self.callback_gate.is_set(),
+                "callback did not enter its blocked window",
+            )
+        elif action == "effect_active":
+            await self._wait_until(
+                lambda: self.effect_entered.is_set() and not self.effect_gate.is_set(),
+                "effect application did not enter its blocked window",
+            )
+        elif action == "effect_failing_close":
+            await self._wait_until(
+                lambda: (
+                    self.client._effect_pump._failing_close
+                    and self.transport.close_entered.is_set()
+                    and not self.transport.close_gate.is_set()
+                ),
+                "effect failure did not reach its blocked close window",
+            )
+        elif action == "takeover_stable":
+            await self._turns(40)
+            assert len(self.transports) == 2, (
+                "automatic reconnect replaced the user-owned callback connection"
+            )
+            reconnect = self.client._reconnect_task
+            assert reconnect is None or reconnect.done(), (
+                "automatic reconnect survived explicit callback takeover"
             )
         elif action == "callbacks_drained":
             await self._wait_until(
@@ -509,6 +1076,10 @@ class _RuntimeHarness:
         assert stats.effects.pending == stats.effects.enqueued - stats.effects.applied, (
             "effect pump settlement counters cannot reach their drain target"
         )
+        if self.client._effect_pump._failing_close:
+            assert stats.effects.pending == 0, (
+                "effect collected during failing-close was left without an owner"
+            )
 
         outbound = stats.outbound
         assert 0 <= outbound.flow_inflight <= outbound.flow_limit
@@ -518,12 +1089,17 @@ class _RuntimeHarness:
         assert 0 <= stats.inbound.inflight <= stats.inbound.receive_maximum
         assert stats.delivery.pending_bytes >= 0
         callback_task = self.client._callback_worker_task
-        if self.callback_attempted and self.client.is_connected:
+        if self.callback_epoch == stats.connection_epoch and self.client.is_connected:
             assert callback_task is not None and not callback_task.done(), (
                 "callback self-cancellation terminated the connection callback worker"
             )
 
         if self.transports:
+            assert all(
+                completion_epoch == transport.owner_epoch
+                for transport in self.transports
+                for _packet, completion_epoch in transport.completed
+            ), "transport completed a write after its connection epoch was retired"
             transport_epochs = [transport.owner_epoch for transport in self.transports]
             assert all(
                 newer > older
@@ -565,6 +1141,7 @@ class _RuntimeHarness:
             },
             "effects": {
                 "pending_epoch": self.client._effect_pump.pending_epoch,
+                "failing_close": self.client._effect_pump._failing_close,
                 "failure_owner": type(self.client._effect_pump.error).__name__
                 if self.client._effect_pump.error is not None
                 else None,
@@ -575,7 +1152,13 @@ class _RuntimeHarness:
                     "owner_epoch": transport.owner_epoch,
                     "closing": transport.is_closing(),
                     "active_write": transport.active_payload is not None,
-                    "packets": [packet.packet_type.name for packet in transport.written],
+                    "attempted_packets": [
+                        packet.packet_type.name for packet in transport.attempted
+                    ],
+                    "completed_packets": [
+                        packet.packet_type.name for packet, _epoch in transport.completed
+                    ],
+                    "completed_epochs": [epoch for _packet, epoch in transport.completed],
                 }
                 for transport in self.transports
             ],
@@ -583,6 +1166,26 @@ class _RuntimeHarness:
                 "expected": self.callback_expected,
                 "attempted": self.callback_attempted,
             },
+            "factory": {
+                "attempts": self.factory_attempts,
+                "blocked": self.factory_entered.is_set() and not self.factory_gate.is_set(),
+                "failed": self.factory_failed.is_set(),
+            },
+            "receipt_settlements": sorted(self.receipt_settlements.values()),
+            "application_tasks": [
+                {
+                    "label": tracked.label,
+                    "done": tracked.task.done(),
+                    "cancelled": tracked.task.cancelled(),
+                    "observed": tracked.observed,
+                    "expected_exceptions": [
+                        exception.__name__ for exception in tracked.expected_exceptions
+                    ],
+                    "expect_cancelled": tracked.expect_cancelled,
+                    "allow_cancelled": tracked.allow_cancelled,
+                }
+                for tracked in self.tasks
+            ],
             "loop_exceptions": [
                 {
                     "message": str(context.get("message", "")),
@@ -596,8 +1199,16 @@ class _RuntimeHarness:
 
     async def cleanup(self) -> None:
         self._restore_mutations()
+        # Cleanup is terminal even for schedules that enabled reconnect. Set
+        # intent before cancelling a reader so its finally block cannot create
+        # a successor reconnect owner behind the cleanup pass.
+        self.client._intentional_disconnect = True
         for transport in self.transports:
             transport.release_writes()
+            transport.release_close()
+        self.factory_gate.set()
+        self.callback_gate.set()
+        self.effect_gate.set()
         # A settlement mutant may have deliberately made an already-removed
         # effect's drain target impossible. Repair only the test harness after
         # the failure snapshot has been captured, then let normal teardown run.
@@ -607,11 +1218,40 @@ class _RuntimeHarness:
         await self.client._write_pump.wake_waiters()
         with suppress(Exception):
             await asyncio.wait_for(self.client._force_close(), timeout=0.25)
-        for task in self.tasks:
+        connection_tasks = {
+            task
+            for task in (
+                self.client._reader_task,
+                self.client._keepalive_task,
+                self.client._reconnect_task,
+                self.client._effect_pump.task,
+                self.client._write_pump.task,
+                self.client._callback_worker_task,
+            )
+            if task is not None and task is not asyncio.current_task()
+        }
+        for task in connection_tasks:
             if not task.done():
                 task.cancel()
+        if connection_tasks:
+            await asyncio.gather(*connection_tasks, return_exceptions=True)
+        for tracked in self.tasks:
+            if not tracked.task.done():
+                tracked.cleanup_cancelled = True
+                tracked.task.cancel()
         if self.tasks:
-            await asyncio.gather(*self.tasks, return_exceptions=True)
+            results = await asyncio.gather(
+                *(tracked.task for tracked in self.tasks),
+                return_exceptions=True,
+            )
+            for tracked, result in zip(self.tasks, results, strict=True):
+                if isinstance(result, BaseException) and not (
+                    tracked.cleanup_cancelled and isinstance(result, asyncio.CancelledError)
+                ):
+                    # Results reached here only after the schedule's failure
+                    # snapshot. Mark them consumed explicitly; normal schedule
+                    # results are always checked by _check_application_tasks().
+                    tracked.observed = True
 
 
 async def run_schedule(
@@ -619,6 +1259,7 @@ async def run_schedule(
     *,
     mutation: RuntimeMutation | None = None,
     artifacts_dir: Path | None = None,
+    watchdog_seconds: float = 2.0,
 ) -> RuntimeRun:
     harness = _RuntimeHarness(schedule, mutation)
     loop = asyncio.get_running_loop()
@@ -626,15 +1267,35 @@ async def run_schedule(
     loop.set_exception_handler(lambda _loop, context: harness.loop_contexts.append(context))
     failure: BaseException | None = None
     owners: dict[str, Any] = {}
-    try:
+
+    async def execute_schedule() -> None:
         for operation in schedule.operations:
             await harness.execute(operation)
+        harness._check_application_tasks(final=True)
+        harness._check_loop_contexts(final=True)
+
+    try:
+        await asyncio.wait_for(execute_schedule(), timeout=watchdog_seconds)
+        owners = harness.owner_snapshot()
+    except TimeoutError:
+        failure = AssertionError(
+            f"whole-schedule liveness watchdog expired after {watchdog_seconds:.3f}s"
+        )
         owners = harness.owner_snapshot()
     except Exception as exc:
         failure = exc
         owners = harness.owner_snapshot()
     finally:
-        await harness.cleanup()
+        try:
+            await harness.cleanup()
+        except Exception as exc:
+            if failure is None:
+                failure = AssertionError(f"schedule cleanup failed: {type(exc).__name__}: {exc}")
+        if failure is None:
+            try:
+                harness._check_loop_contexts(final=True)
+            except Exception as exc:
+                failure = exc
         loop.set_exception_handler(previous_handler)
 
     if failure is not None:
@@ -669,29 +1330,63 @@ async def run_campaign(
 ) -> CampaignResult:
     completed = 0
     failures: list[int] = []
+    operation_traces: set[tuple[str, ...]] = set()
+    scheduling_traces: set[tuple[str, ...]] = set()
+    coverage: dict[str, int] = {}
     for seed in seeds:
+        schedule = generate_schedule(seed, steps)
+        rendered = tuple(operation.render() for operation in schedule.operations)
+        operation_traces.add(rendered)
+        scheduling_traces.add(
+            tuple(
+                operation.render()
+                for operation in schedule.operations
+                if operation.actor in {"checkpoint", "schedule", "factory", "effect"}
+                or (operation.actor, operation.action)
+                in {
+                    ("callback", "block_once"),
+                    ("callback", "cancel_once"),
+                    ("transport", "fail_active_write"),
+                    ("app", "cancel_last"),
+                }
+            )
+        )
+        for operation in schedule.operations:
+            key = f"{operation.actor}.{operation.action}"
+            coverage[key] = coverage.get(key, 0) + 1
         try:
             await run_schedule(
-                generate_schedule(seed, steps),
+                schedule,
                 mutation=mutation,
                 artifacts_dir=artifacts_dir,
             )
         except RuntimeFuzzFailure:
             failures.append(seed)
         completed += 1
-    return CampaignResult(completed, len(failures), tuple(failures))
+    return CampaignResult(
+        completed,
+        len(failures),
+        tuple(failures),
+        len(operation_traces),
+        len(scheduling_traces),
+        coverage,
+    )
 
 
 async def _main_async(args: argparse.Namespace) -> int:
     result = await run_campaign(
         seeds=range(args.seed, args.seed + args.seeds),
         steps=args.steps,
+        mutation=RuntimeMutation(args.mutation) if args.mutation is not None else None,
         artifacts_dir=args.artifacts_dir,
     )
     print(
         f"[DONE] target=runtime seeds={result.completed} failures={result.failures} "
+        f"operation_traces={result.unique_operation_traces} "
+        f"scheduling_traces={result.unique_scheduling_traces} "
         f"seed_start={args.seed} steps={args.steps}"
     )
+    print(f"[COVERAGE] {json.dumps(result.coverage, sort_keys=True)}")
     return int(bool(result.failures))
 
 
@@ -700,6 +1395,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--seeds", type=int, default=6)
     parser.add_argument("--steps", type=int, default=24)
+    parser.add_argument("--mutation", choices=tuple(RuntimeMutation), default=None)
     parser.add_argument(
         "--artifacts-dir",
         type=Path,
