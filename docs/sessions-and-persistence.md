@@ -156,6 +156,22 @@ optional paged and transition protocols avoids eager replay and payload reads on
 acknowledgement; the minimum store protocol remains correct but may use more
 memory.
 
+The runtime capability matrix is deliberately additive rather than a second
+store hierarchy:
+
+| Contract | Required guarantee | Operational consequence |
+| --- | --- | --- |
+| `InflightStore` | atomic `batch()` mutations and ordered whole-record iteration | correctness and third-party compatibility; replay may materialise the store |
+| `PagedInflightStore` | ordered pages and payload-free outbound summaries | outbound recovery memory proportional to one page |
+| `BoundedInboundReplayStore` | metadata count plus message/byte-bounded hydration | inbound replay memory bounded by one batch, including large sessions |
+| `TransitionInflightStore` | conditional atomic state changes and metadata-only lookup | acknowledgements avoid payload reads; QoS 2 phase-two compaction is durable |
+
+Both shipped stores implement every extension, and sessions resolve those
+capabilities once when the engine is constructed. A legacy third-party store
+therefore keeps the base correctness semantics with eager replay and
+best-effort phase-two compaction; it does not silently acquire atomic
+conditional-transition guarantees from a read/update fallback.
+
 ## Reconnect policy
 
 The native client does not reconnect unless a `ReconnectPolicy` is supplied.

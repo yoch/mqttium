@@ -165,6 +165,8 @@ class AsyncClient:
             callback-raised :class:`asyncio.CancelledError` is treated as an
             authentication failure; cancellation requested on MQTTium's
             owning task still propagates normally.
+        auth_timeout: Maximum seconds allowed for one enhanced-authentication
+            callback invocation.
 
     Raises:
         ValueError: If a limit or constructor option is invalid.
@@ -209,6 +211,7 @@ class AsyncClient:
         manual_ack: bool = False,
         store: InflightStore | None = None,
         auth_handler: OnAuth | None = None,
+        auth_timeout: float = 10.0,
     ) -> None:
         _validate_client_arguments(
             client_id=client_id,
@@ -231,6 +234,7 @@ class AsyncClient:
                 ("max_outbound_bytes", max_outbound_bytes),
                 ("max_ingress_batch_bytes", max_ingress_batch_bytes),
                 ("ack_timeout", ack_timeout),
+                ("auth_timeout", auth_timeout),
             ),
             ping_timeout=ping_timeout,
         )
@@ -344,6 +348,7 @@ class AsyncClient:
         self._reconnect = reconnect if reconnect is not None else ReconnectPolicy(enabled=False)
         self._ping_timeout = ping_timeout
         self._ack_timeout = ack_timeout
+        self._auth_timeout = auth_timeout
         self._intentional_disconnect = False
         self._transport_factory: Callable[..., Awaitable[AsyncTransport]] = TcpTransport.connect
         self._last_disconnect: DisconnectInfo | None = None
@@ -627,6 +632,8 @@ class AsyncClient:
             if nowait:
                 raise FlowControlError(self._write_pump.refusal(item_size(item)))
             return None
+        if properties is not None and properties.get("topic_alias") is not None:
+            self._engine.outbound.commit_topic_alias(topic, properties)
         if callback is not None:
             self._enqueue_callback_repeated_nowait(callback, (None, None), 1)
         return PublishReceipt(mid=None, qos=QoS.AT_MOST_ONCE)
@@ -642,6 +649,11 @@ class AsyncClient:
             return False
         for _topic, _payload, qos, _retain, _properties in requests:
             if qos != QoS.AT_MOST_ONCE:
+                return False
+            if _properties is not None and _properties.get("topic_alias") is not None:
+                # Alias mappings are established in request order. Reuse the
+                # ordinary atomic engine batch rather than staging a second
+                # connection-scoped mapping beside OutboundSession's owner.
                 return False
 
         items: list[WriteItem] = []
@@ -1369,7 +1381,8 @@ class AsyncClient:
     ) -> None:
         """Send a client AUTH packet (MQTT 5 continue / re-authenticate)."""
         async with self._engine_lock:
-            self._engine.reconfigure(accept_auth=True)
+            if self.auth_handler is None:
+                raise MQTTError("auth() requires an auth_handler")
             self._engine.queue_auth(reason_code=reason_code, properties=properties)
             self._collect_effects_locked()
         await self._drain_effects()
@@ -2091,32 +2104,18 @@ class AsyncClient:
                 await self._enqueue_callback(self.on_connect, connack)
         elif kind is EffectKind.AUTH:
             challenge: AuthPacket = effect.data
-            if self.auth_handler is None:
-                packet = encode_disconnect(0x82, self._engine.config.protocol)
-                try:
-                    self._engine._check_outbound_size(packet)
-                except PacketTooLargeError as exc:
-                    # The broker limit makes the protocol-error DISCONNECT
-                    # impossible to send. Close the transport so the connection
-                    # cannot remain active after this terminal condition.
-                    self._disconnect_exc = exc
-                    self._intentional_disconnect = True
-                    if self._transport is not None:
-                        try:
-                            await self._transport.close()
-                        except Exception:
-                            pass
-                    return
-                await self._enqueue_outbound(
-                    packet,
-                    nowait=nowait,
-                    epoch=epoch,
-                )
-                return
+            handler = self.auth_handler
+            if handler is None:
+                # set_auth_handler(None) updates EngineConfig, so the engine no
+                # longer emits AUTH. Direct attribute mutation can still race an
+                # already-produced effect; surface that as an application failure.
+                raise MQTTError("AUTH handler is no longer available")
             try:
                 response = await asyncio.wait_for(
-                    self._invoke(self.auth_handler, challenge), timeout=10.0
+                    self._invoke(handler, challenge), timeout=self._auth_timeout
                 )
+            except TimeoutError as exc:
+                raise MQTTTimeoutError("AUTH handler timed out") from exc
             except asyncio.CancelledError as exc:
                 task = asyncio.current_task()
                 if task is None or task.cancelling():

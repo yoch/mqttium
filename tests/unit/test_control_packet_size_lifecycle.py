@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from mqttium.api.async_client import AsyncClient
 from mqttium.enums import ConnectionState, MQTTProtocolVersion
-from mqttium.errors import PacketTooLargeError, ProtocolError
+from mqttium.errors import MQTTError, ProtocolError
 from mqttium.packets import AuthPacket
 from mqttium.protocol.effects import EffectKind
 from mqttium.protocol.negotiated import NegotiatedSettings
@@ -75,7 +77,7 @@ async def test_disconnect_packet_size_fallback_still_reports_clean_callback() ->
     assert errors == [None]
 
 
-async def test_auth_disconnect_size_failure_closes_active_connection() -> None:
+async def test_missing_auth_handler_effect_failure_closes_active_connection() -> None:
     client = AsyncClient(
         protocol=MQTTProtocolVersion.MQTTv5,
         auth_handler=lambda challenge: challenge,
@@ -90,14 +92,15 @@ async def test_auth_disconnect_size_failure_closes_active_connection() -> None:
 
     client._engine._emit(EffectKind.AUTH, AuthPacket(reason_code=0x18))
     client._collect_effects_locked()
-    await client._drain_effects()
+    with pytest.raises(MQTTError, match="no longer available"):
+        await client._drain_effects()
     reader = client._reader_task
     if reader is not None:
         await asyncio.wait_for(reader, timeout=1.0)
 
     assert transport.closed
     assert client.state is ConnectionState.DISCONNECTED
-    assert isinstance(client._disconnect_exc, PacketTooLargeError)
+    assert isinstance(client._disconnect_exc, MQTTError)
     assert client._write_pump.queued_messages == 0
 
 

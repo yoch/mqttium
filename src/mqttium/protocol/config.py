@@ -49,8 +49,8 @@ class EngineConfig:
     maximum_packet_size: int | None = None
     topic_alias_maximum: int = 0  # announced to broker for inbound aliases
     manual_ack: bool = False  # defer PUBACK (QoS1) / PUBCOMP (QoS2) until ack()
-    # When False, inbound AUTH is rejected with DISCONNECT 0x8C (legacy stub).
-    # AsyncClient sets this True when an auth_handler is registered.
+    # When False, inbound AUTH is rejected with DISCONNECT 0x82. AsyncClient
+    # derives this capability from whether an auth_handler is registered.
     accept_auth: bool = False
     _attached: bool = field(default=False, init=False, repr=False, compare=False)
 

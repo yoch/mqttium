@@ -354,6 +354,7 @@ class ProtocolEngine:
             0 if request_response_information is None else int(request_response_information)
         )
         self.state = ConnectionState.CONNECTING
+        self.outbound.start_connection()
         self.inbound.start_connection()
         # Negotiated capabilities are connection-scoped. Queued messages are
         # validated against the new values only after the next CONNACK.
@@ -516,6 +517,7 @@ class ProtocolEngine:
     def notify_transport_closed(self) -> None:
         was = self.state
         self.state = ConnectionState.DISCONNECTED
+        self.outbound.transport_closed()
         self.inbound.transport_closed()
         self._reauth_in_progress = False
         # Release sub/unsub MIDs still in flight — no ACK will arrive now.

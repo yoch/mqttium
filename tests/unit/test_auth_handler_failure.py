@@ -10,7 +10,7 @@ from mqttium.api.async_client import AsyncClient
 from mqttium.codec.buffer import IncrementalDecoder
 from mqttium.codec.properties import encode_properties
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, PacketType
-from mqttium.errors import MQTTError
+from mqttium.errors import MQTTError, MQTTTimeoutError
 from mqttium.packets import AuthPacket, encode_frame
 from mqttium.protocol.reconnect import ReconnectPolicy
 from mqttium.types import Properties
@@ -197,3 +197,45 @@ async def test_connect_cancellation_stops_blocked_auth_handler_promptly() -> Non
     assert not client._effect_pump.pending
     assert client._effect_pump.applied == client._effect_pump.enqueued
     assert client._effect_pump.waiters == 0
+
+
+async def test_auth_handler_timeout_is_configurable_and_terminal() -> None:
+    transport = _AuthChallengeTransport()
+    handler_stopped = asyncio.Event()
+
+    async def blocked_auth(_packet: AuthPacket) -> None:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            handler_stopped.set()
+
+    client = AsyncClient(
+        client_id="auth-timeout",
+        protocol=MQTTProtocolVersion.MQTTv5,
+        connect_properties=Properties({"authentication_method": "demo"}),
+        auth_handler=blocked_auth,
+        auth_timeout=0.01,
+    )
+    client._transport_factory = lambda *args, **kwargs: asyncio.sleep(0, result=transport)
+
+    with pytest.raises(MQTTTimeoutError, match="AUTH handler timed out"):
+        await client.connect("fake", timeout=0.5)
+
+    assert handler_stopped.is_set()
+    assert transport.is_closing()
+
+
+async def test_reauthenticate_requires_a_runtime_handler() -> None:
+    client = AsyncClient(
+        client_id="auth-without-handler",
+        protocol=MQTTProtocolVersion.MQTTv5,
+        connect_properties=Properties({"authentication_method": "demo"}),
+    )
+    client._engine.state = ConnectionState.CONNECTED
+    client._engine._auth_method = "demo"
+
+    with pytest.raises(MQTTError, match="auth_handler"):
+        await client.auth()
+
+    assert client._engine.take_effects() == []
+    assert client._engine._reauth_in_progress is False

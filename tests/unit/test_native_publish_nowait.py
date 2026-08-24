@@ -13,9 +13,10 @@ from mqttium.api import AsyncClient
 from mqttium.api.models import PublishMessage
 from mqttium.codec.buffer import IncrementalDecoder
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, PacketType, QoS
-from mqttium.errors import FlowControlError
+from mqttium.errors import FlowControlError, ProtocolError
 from mqttium.packets import PublishPacket
 from mqttium.protocol.effects import EffectKind, EngineEffect
+from mqttium.protocol.negotiated import NegotiatedSettings
 from mqttium.types import Properties
 
 
@@ -135,6 +136,51 @@ async def test_await_publish_qos0_uses_the_direct_path() -> None:
     assert client._effect_pump.enqueued == 0
     assert not client._engine.has_pending_effects
     assert isinstance(client._outbound.get_nowait(), bytes)
+
+
+async def test_direct_qos0_path_commits_outbound_alias_after_writer_admission() -> None:
+    client = AsyncClient(protocol=MQTTProtocolVersion.MQTTv5, max_outbound_messages=8)
+    client._engine.state = ConnectionState.CONNECTED
+    client._engine.negotiated = NegotiatedSettings(topic_alias_maximum=2)
+    properties = Properties({"topic_alias": 1})
+
+    await client.publish("canonical/topic", b"seed", properties=properties)
+    await client.publish("", b"reuse", properties=properties)
+
+    decoder = IncrementalDecoder()
+    decoder.feed(client._outbound.get_nowait())
+    decoder.feed(client._outbound.get_nowait())
+    publishes = [
+        PublishPacket.decode(raw.flags, raw.remaining, MQTTProtocolVersion.MQTTv5)
+        for raw in decoder.drain_packets()
+    ]
+    assert [publish.topic for publish in publishes] == ["canonical/topic", ""]
+
+
+async def test_refused_direct_qos0_write_does_not_establish_alias() -> None:
+    client = AsyncClient(
+        protocol=MQTTProtocolVersion.MQTTv5,
+        max_outbound_messages=1,
+        max_outbound_bytes=1024,
+    )
+    client._engine.state = ConnectionState.CONNECTED
+    client._engine.negotiated = NegotiatedSettings(topic_alias_maximum=2)
+    client._outbound.put_nowait(b"occupied")
+    client._write_pump.queued_bytes = len(b"occupied")
+    client._write_pump._admit_queued()
+    properties = Properties({"topic_alias": 1})
+
+    with pytest.raises(FlowControlError):
+        await client.publish(
+            "canonical/topic",
+            b"seed",
+            properties=properties,
+            nowait=True,
+        )
+
+    client._write_pump.discard()
+    with pytest.raises(ProtocolError, match="Unknown outbound topic alias"):
+        await client.publish("", b"reuse", properties=properties)
 
 
 async def test_await_publish_qos0_callback_keeps_the_direct_path() -> None:

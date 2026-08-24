@@ -73,6 +73,7 @@ until capacity returns.
 | `ping_timeout` | derived | PINGRESP deadline; derived from keepalive when omitted |
 | `ack_timeout` | `30.0` | Default SUBACK and UNSUBACK deadline |
 | `auth_handler` | `None` | MQTT 5 enhanced-authentication callback |
+| `auth_timeout` | `10.0` | Deadline for each enhanced-authentication callback invocation |
 
 ## A sizing method
 

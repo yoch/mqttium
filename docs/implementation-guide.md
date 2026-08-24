@@ -94,9 +94,13 @@ engine follows the protocol maximum. `AsyncClient` intentionally defaults to
 100 to provide an operationally bounded application client. This difference is
 part of the Stable API contract.
 
-Inbound topic aliases reset on every network connection. Alias zero, an alias
-above the advertised maximum, or an unknown alias with an empty topic produces
-MQTT 5 reason `0x94`. MQTTium does not assign outbound aliases automatically.
+Inbound and outbound topic aliases reset on every network connection. Alias
+zero, an inbound alias above the advertised maximum, or an unknown inbound
+alias with an empty topic produces MQTT 5 reason `0x94`. Outbound aliases are
+explicit: a non-empty Topic Name establishes or replaces the mapping, and a
+later empty Topic Name may reuse it only on that same connection. Durable
+outbound records retain the canonical Topic Name so replay never depends on an
+old connection. MQTTium does not assign outbound aliases automatically.
 
 ## Keepalive
 

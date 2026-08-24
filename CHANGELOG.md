@@ -6,6 +6,31 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Added
+
+- Complete stateful outbound MQTT 5 Topic Alias support for explicit
+  application mappings, including empty Topic Name reuse, replacement,
+  connection-scoped reset, and canonical-topic persistence/replay for QoS 1/2.
+- Add the Stable `auth_timeout` constructor setting for bounding each enhanced
+  authentication handler invocation.
+
+### Fixed
+
+- Reject client-initiated re-authentication when no runtime authentication
+  handler can service the broker's response, instead of enabling an exchange
+  that could not be completed.
+
+### Changed
+
+- Keep unsupported inbound AUTH handling and its protocol DISCONNECT in the
+  protocol engine; the asyncio runtime no longer carries a second DISCONNECT
+  construction path.
+
+### Documentation
+
+- Record lifecycle-generation invariants and the exact correctness, bounded
+  replay, and metadata-transition capabilities of legacy and built-in stores.
+
 ## [1.0.0rc9] - 2026-08-23
 
 ### Fixed

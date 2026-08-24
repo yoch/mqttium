@@ -41,6 +41,24 @@ def test_auth_handler_requires_method_in_connect() -> None:
     assert engine.state is ConnectionState.NEW
 
 
+def test_engine_owns_missing_auth_capability_disconnect() -> None:
+    engine = ProtocolEngine(
+        EngineConfig(
+            protocol=MQTTProtocolVersion.MQTTv5,
+            accept_auth=False,
+            connect_properties=_props(),
+        )
+    )
+    engine.begin_connect()
+
+    engine.handle_raw(_raw_auth(0x18, "demo"))
+    effects = engine.take_effects()
+
+    assert not any(effect.kind is EffectKind.AUTH for effect in effects)
+    disconnected = next(effect.data for effect in effects if effect.kind is EffectKind.DISCONNECTED)
+    assert disconnected.reason_code == 0x82
+
+
 def test_inbound_auth_method_mismatch_disconnects_with_protocol_error() -> None:
     engine = ProtocolEngine(
         EngineConfig(
