@@ -6,6 +6,24 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- Treat a user callback that raises `CancelledError` as a callback failure
+  unless the callback worker itself is being cancelled, so already-queued
+  deliveries still run.
+- Allow `disconnect()` from `on_connect` / `on_message` / `on_publish` without
+  deadlocking the callback worker that is running that callback.
+- Cancel leftover automatic reconnect, stop a writer kept alive across a
+  reconnect gap, and start a new `messages()` generation on an explicit
+  `connect()`, `connect_unix()`, or `connect_ws()`.
+- Join the reader outside the lifecycle lock during `disconnect()`, and leave a
+  replacement connection started from `on_disconnect` intact.
+
+### Documentation
+
+- Record the delivery × reconnect lifecycle race campaign and the callback
+  re-entry and stream-generation rules it confirmed.
+
 ## [1.0.0rc9] - 2026-08-23
 
 ### Fixed

@@ -43,6 +43,14 @@ Callbacks execute outside protocol-engine critical sections. Synchronous
 callbacks must not block the event loop. Callback failures go to the event
 loop's exception handler without silently changing protocol state.
 
+`on_connect`, `on_message`, and `on_publish` run on the callback worker, so they
+may call `disconnect()` without deadlocking that worker. `on_disconnect` runs on
+the reader during teardown. It may call `connect()` or `disconnect()`; an
+`on_disconnect` that reconnects should return immediately when
+`disconnect()` already requested a terminal shutdown, otherwise it fights the
+application's own stop path. A user callback that raises `CancelledError` is a
+callback failure and does not stop later queued callbacks.
+
 ## Loop confinement
 
 `publish_nowait()` and `stats()` are synchronous but must run on the owning
@@ -78,7 +86,13 @@ alive, so an `async for` loop or suspended `anext()` continues on the replacemen
 transport.
 
 A terminal disconnect ends the current generation. A later explicit `connect()`,
-`connect_unix()`, or `connect_ws()` starts a new generation. Iterators created for
+`connect_unix()`, or `connect_ws()` starts a new generation, including when that
+explicit connect happens during an automatic reconnect gap. Iterators created for
 the previous generation stay terminal and cannot consume messages delivered by
 the new connection; call `messages()` again after the explicit connect to consume
 the replacement generation.
+
+Cancelling a task blocked in `anext()` closes that async generator, which is
+Python's iterator contract rather than a new mqttium generation. Automatic
+reconnect keeps the generation; call `messages()` again to bind a fresh iterator
+to it.
