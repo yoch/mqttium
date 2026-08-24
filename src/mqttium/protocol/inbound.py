@@ -57,13 +57,23 @@ REPLAY_BATCH_BYTES = 1 << 20
 class InboundReplayCursor:
     """Lazy replay iterator with one-message pushback for byte-budget boundaries."""
 
-    __slots__ = ("_messages", "_page_messages", "_pages", "_pending")
+    __slots__ = ("_messages", "_page_messages", "_pages", "_pending", "_remaining")
 
-    def __init__(self, pages: Iterator[tuple[InboundMessage, ...]]) -> None:
+    def __init__(
+        self,
+        pages: Iterator[tuple[InboundMessage, ...]],
+        *,
+        remaining: int | None = None,
+    ) -> None:
         self._pages = pages
         self._messages = chain.from_iterable(pages)
         self._page_messages: deque[InboundMessage] | None = None
         self._pending: InboundMessage | None = None
+        self._remaining = remaining
+
+    @property
+    def bounded_complete(self) -> bool:
+        return self._remaining == 0 and self._pending is None and self._page_messages is None
 
     def begin_page(self) -> bool:
         """Hydrate one store page, retaining any guarded suffix from the prior call."""
@@ -87,6 +97,8 @@ class InboundReplayCursor:
             self._page_messages = None
             return None
         message = messages.popleft()
+        if self._remaining is not None:
+            self._remaining -= 1
         if not messages:
             self._page_messages = None
         return message
@@ -949,7 +961,10 @@ class InboundSession:
         if persisted == 0:
             self._recovered_mids.clear()
             return
-        self._replay = InboundReplayCursor(iter(pages))
+        self._replay = InboundReplayCursor(
+            iter(pages),
+            remaining=persisted if bounded is not None else None,
+        )
         self.drain_replay()
 
     def drain_replay(self) -> None:
@@ -988,6 +1003,10 @@ class InboundSession:
                 self._emit_message(bounded_message, dup=True)
                 emitted += 1
                 emitted_bytes += message_bytes
+            if cursor.bounded_complete:
+                self._replay = None
+                self._recovered_mids.clear()
+                return
             self._engine._emit(EffectKind.CONTINUE_INBOUND_REPLAY, None)
             return
         scanned = 0
