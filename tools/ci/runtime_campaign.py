@@ -70,10 +70,13 @@ def _ram_bytes() -> int | None:
 
 
 def _cpu_model() -> str:
-    for prefix in ("model name", "Model"):
-        value = _read_first(f"{prefix}\t:", Path("/proc/cpuinfo"))
-        if value:
-            return value
+    try:
+        for line in Path("/proc/cpuinfo").read_text(encoding="utf-8").splitlines():
+            key, separator, value = line.partition(":")
+            if separator and key.strip() in {"model name", "Model", "Hardware"}:
+                return value.strip()
+    except OSError:
+        pass
     return platform.processor() or "unknown"
 
 
