@@ -106,6 +106,8 @@ late task from an older transport from closing or poisoning its replacement.
 The lifecycle preserves these generation invariants:
 
 - only the reader performs application-visible teardown for a live generation;
+- the reader retires that generation's keepalive task before reconnect can
+  install a replacement task reference;
 - every deferred effect and writer admission is tagged with that generation's
   epoch and is discarded or rejected after an epoch advance;
 - terminal teardown settles each receipt at most once and wakes every producer
@@ -113,7 +115,9 @@ The lifecycle preserves these generation invariants:
 - reconnectable loss keeps the application message stream open, while terminal
   reconnect exhaustion closes delivery and callback resources;
 - intentional disconnect remains distinct from the primary failure cause and
-  cannot be reversed by an in-progress reconnect attempt.
+  cannot be reversed by an in-progress reconnect attempt;
+- an explicit connect already waiting behind an automatic attempt replaces
+  that generation even if the automatic attempt reaches CONNECTED first.
 
 ## Protocol ownership
 

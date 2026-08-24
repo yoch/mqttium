@@ -1774,9 +1774,27 @@ class AsyncClient:
                 and self._disconnect_exc is None
             )
             await self._invalidate_connection_epoch()
+            # Retire protocol-visible ownership before joining any child task.
+            # Keepalive cancellation can suspend, and while it does callers
+            # must not observe the dead transport's engine as CONNECTED and
+            # admit work that a following clean reconnect will discard.
             async with self._engine_lock:
                 self._engine.notify_transport_closed()
                 self._collect_effects_locked()
+            # The keepalive loop belongs to this reader's transport epoch. An
+            # EOF or reader-side failure can end the reader without entering
+            # _force_close(), so retire the task here before a reconnect can
+            # replace its reference with a new epoch's keepalive owner.
+            keepalive = self._keepalive_task
+            if keepalive is not None and keepalive is not asyncio.current_task():
+                if not keepalive.done():
+                    keepalive.cancel()
+                try:
+                    await keepalive
+                except (asyncio.CancelledError, Exception):
+                    pass
+                if self._keepalive_task is keepalive:
+                    self._keepalive_task = None
             try:
                 await self._drain_effects()
             except (Exception, asyncio.CancelledError):
@@ -1956,7 +1974,7 @@ class AsyncClient:
                         # conforming keepalive packet to send.
                         self._disconnect_exc = exc
                         self._intentional_disconnect = True
-                        await self._force_close_after_local_packet_failure()
+                        await self._close_transport_after_connection_failure()
                         return
                     # A lost PINGREQ beats a wedged keepalive under backpressure.
                     try:
@@ -2357,7 +2375,16 @@ class AsyncClient:
 
     async def _prepare_explicit_connect(self) -> None:
         """Replace any automatic-reconnect generation before explicit connect."""
-        if self._engine.state in (ConnectionState.CONNECTED, ConnectionState.CONNECTING):
+        reconnect_task = self._reconnect_task
+        automatic_generation = (
+            reconnect_task is not None
+            and reconnect_task is not asyncio.current_task()
+            and not reconnect_task.done()
+        )
+        if (
+            self._engine.state in (ConnectionState.CONNECTED, ConnectionState.CONNECTING)
+            and not automatic_generation
+        ):
             return
         replacing = (
             self._reconnect_task is not None
@@ -2367,6 +2394,10 @@ class AsyncClient:
         )
         await self._cancel_automatic_reconnect()
         await self._force_close(preserve_reconnect=True)
+        # Joining the automatically established reader can run its reconnect
+        # decision before the explicit caller regains ownership. Cancel that
+        # successor as part of the same takeover boundary as well.
+        await self._cancel_automatic_reconnect()
         if replacing:
             await self._reset_message_stream()
 

@@ -35,6 +35,8 @@ Status meanings:
 | [SIMPLIFICATION-AUDIT-2026-08-16](https://github.com/yoch/mqttium/blob/main/docs/reports/SIMPLIFICATION-AUDIT-2026-08-16.md) | Current evidence | Reviewed simplification decisions at the named commit |
 | [SIMPLIFICATION-ARM64-REVALIDATION-2026-08-17](https://github.com/yoch/mqttium/blob/main/docs/reports/SIMPLIFICATION-ARM64-REVALIDATION-2026-08-17.md) | Current evidence | Independent-architecture revalidation of that campaign |
 | [PRE-REFACTOR-FUZZ-PR-REEVALUATION-2026-08-24](https://github.com/yoch/mqttium/blob/main/docs/reports/PRE-REFACTOR-FUZZ-PR-REEVALUATION-2026-08-24.md) | Current evidence | Reproduction and disposition of draft PRs #372–#376 against the post-consolidation baseline |
+| [RUNTIME-FUZZER-KEEPALIVE-FINDING-2026-08-24](https://github.com/yoch/mqttium/blob/main/docs/reports/RUNTIME-FUZZER-KEEPALIVE-FINDING-2026-08-24.md) | Current evidence | Runtime schedule reproduction, ownership analysis, and correction of the terminal-EOF keepalive task leak |
+| [RUNTIME-FUZZER-GENERATIVE-QUALIFICATION-2026-08-24](https://github.com/yoch/mqttium/blob/main/docs/reports/RUNTIME-FUZZER-GENERATIVE-QUALIFICATION-2026-08-24.md) | Current evidence | State-aware runtime schedule generation, six-mutant qualification, keepalive-cycle validation, explicit-takeover finding, and 2,000-seed reference campaign |
 
 ## Cross-client and performance program
 
