@@ -6,6 +6,12 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Added
+
+- Deterministic runtime soak / quiescence harness with logical-ownership
+  oracles, seed-reproducible schedules, prefix/greedy reduction, and CI/local
+  /nightly/release profiles (`benchmarks/runtime_soak.py`).
+
 ## [1.0.0rc9] - 2026-08-23
 
 ### Fixed

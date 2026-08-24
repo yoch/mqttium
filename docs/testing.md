@@ -14,6 +14,9 @@ while developing, then run every affected layer before requesting review.
 | `tests/integration` | Behavior against a live Mosquitto broker |
 | `tests/fuzz` | Seeded fuzzing, Hypothesis properties, and state-machine invariants |
 
+`benchmarks/runtime_soak.py` is a longer lifecycle search, not a unit-test
+replacement. See [Runtime soak and quiescence](runtime-soak.md).
+
 Installed-distribution smoke programs are release assets. They validate the
 built wheel and source distribution rather than the source checkout.
 

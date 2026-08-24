@@ -142,6 +142,7 @@ plugins:
           - network-release-gate.md
           - memory-benchmark.md
           - fuzzing.md
+          - runtime-soak.md
           - stability.md
           - release-process.md
           - roadmap.md
@@ -205,6 +206,7 @@ nav:
       - Network release gate: network-release-gate.md
       - Memory methodology: memory-benchmark.md
       - Fuzzing: fuzzing.md
+      - Runtime soak: runtime-soak.md
       - Stability campaign: stability.md
       - Release procedure: release-process.md
       - Roadmap: roadmap.md

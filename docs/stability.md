@@ -17,6 +17,11 @@ cycle:
 5. closes the publisher transport and confirms automatic reconnection before
    the next cycle.
 
+[Runtime soak and quiescence](runtime-soak.md) is the complementary fake-broker
+search: mixed connect/subscribe/publish/reconnect/shutdown schedules with
+logical-ownership checkpoints. Use `benchmarks/runtime_soak.py` for leak and
+deadlock hunting; keep `benchmarks/soak.py` for live-broker reconnect evidence.
+
 The harness writes a JSON result containing workload totals, elapsed time,
 forced reconnect count, RSS/USS/PSS and tracemalloc samples, tasks, threads,
 descriptors, delivery queues, high-water statistics and the final drained
