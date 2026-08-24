@@ -2,7 +2,8 @@
 
 These schedules sit next to already-fixed races (eager unbind on writer
 failure, EffectPump drain/failure ownership, cancelled-waiter wakeup
-handoff). They are expected to fail until the liveness holes are closed.
+handoff). They pin the adjacent liveness holes closed by the 2026-08-24
+red-team: waiter wakeup on writer failure, and collect-during-failing-close.
 """
 
 from __future__ import annotations

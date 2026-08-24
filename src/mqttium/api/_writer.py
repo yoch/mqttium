@@ -578,4 +578,9 @@ class WritePump:
             # write straight into the dead transport.
             self._drop_eager_binding()
             self._writing = False
+            # The failed batch released resident capacity without notifying
+            # waiters (`batch_completed` is false). Capacity on a dead writer
+            # must not admit new work: bump the epoch and wake everyone so
+            # parked producers fail fast instead of hanging or enqueueing.
+            await self.advance_epoch(self.epoch + 1)
             await self.on_failure(exc)

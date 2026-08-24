@@ -6,6 +6,15 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- Wake WritePump enqueue waiters and invalidate the writer epoch when a
+  transport write fails, so producers — including a reader parked on an
+  inbound PUBACK SEND — cannot hang after the writer task exits.
+- Discard effects collected while EffectPump is awaiting transport close
+  after a deferred-effect failure, so a later `drain()` cannot wait on
+  work the failing flush will never apply.
+
 ## [1.0.0rc9] - 2026-08-23
 
 ### Fixed
