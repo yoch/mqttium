@@ -755,7 +755,7 @@ class AsyncClient:
             asyncio.CancelledError: If the calling task is cancelled.
         """
         async with self._lifecycle_lock:
-            await self._reset_message_stream()
+            await self._prepare_explicit_connect()
             self._host = host
             self._port = port
             self._ssl = ssl
@@ -792,7 +792,7 @@ class AsyncClient:
             asyncio.CancelledError: If the calling task is cancelled.
         """
         async with self._lifecycle_lock:
-            await self._reset_message_stream()
+            await self._prepare_explicit_connect()
             self._unix_path = path
             self._ws_url = None
             self._ws_headers = None
@@ -842,7 +842,7 @@ class AsyncClient:
             asyncio.CancelledError: If the calling task is cancelled.
         """
         async with self._lifecycle_lock:
-            await self._reset_message_stream()
+            await self._prepare_explicit_connect()
             self._ws_url = url
             self._ws_headers = extra_headers
             self._unix_path = None
@@ -1024,6 +1024,8 @@ class AsyncClient:
                 except asyncio.CancelledError:
                     pass
                 self._reconnect_task = None
+        should_close = False
+        packet_failure = False
         async with self._lifecycle_lock:
             if disconnecting_connect:
                 return
@@ -1044,9 +1046,9 @@ class AsyncClient:
             except PacketTooLargeError:
                 # The peer's packet limit makes a legal DISCONNECT impossible.
                 # Closing the transport is the only conforming shutdown left.
-                await self._force_close_after_local_packet_failure()
-                return
-            try:
+                packet_failure = True
+            else:
+                should_close = True
                 if packet is not None:
                     try:
                         await self._flush_terminal_packet(
@@ -1054,8 +1056,13 @@ class AsyncClient:
                         )
                     except StaleConnectionEffect:
                         pass
-            finally:
-                await self._force_close()
+        if packet_failure:
+            await self._force_close_after_local_packet_failure()
+            return
+        if should_close:
+            # Join the reader outside the lifecycle lock. on_disconnect may call
+            # connect() or disconnect() and those operations need this lock.
+            await self._force_close()
 
     def publish_nowait(
         self,
@@ -1785,12 +1792,20 @@ class AsyncClient:
                 await self._invoke(self.on_disconnect, callback_error)
             except Exception as exc:
                 self._report_callback_error(self.on_disconnect, exc)
-            if not will_reconnect:
-                await self._shutdown_callback_worker(drain=True)
-            if will_reconnect and (self._reconnect_task is None or self._reconnect_task.done()):
-                self._reconnect_task = asyncio.create_task(
-                    self._reconnect_loop(), name="mqttium-reconnect"
-                )
+            # on_disconnect may call disconnect() or an explicit connect().
+            # The snapshot taken before the callback cannot start reconnect
+            # against a connection the application already replaced, and must
+            # not shut down a replacement connection's callback worker.
+            user_took_over = self._intentional_disconnect or (
+                self.is_connected and self._reader_task is not asyncio.current_task()
+            )
+            if not user_took_over:
+                if not will_reconnect:
+                    await self._shutdown_callback_worker(drain=True)
+                if will_reconnect and (self._reconnect_task is None or self._reconnect_task.done()):
+                    self._reconnect_task = asyncio.create_task(
+                        self._reconnect_loop(), name="mqttium-reconnect"
+                    )
 
     def _retry_reason(self) -> int | None:
         """The reason code the reconnect policy judges: broker DISCONNECT, else CONNACK."""
@@ -2331,7 +2346,39 @@ class AsyncClient:
             return None
         return self._disconnect_exc or MQTTError("Connection closed")
 
+    async def _cancel_automatic_reconnect(self) -> None:
+        reconnect_task = self._reconnect_task
+        if reconnect_task is None or reconnect_task is asyncio.current_task():
+            return
+        reconnect_task.cancel()
+        try:
+            await reconnect_task
+        except asyncio.CancelledError:
+            pass
+        self._reconnect_task = None
+
+    async def _prepare_explicit_connect(self) -> None:
+        """Take over leftover reconnect state before an application connect().
+
+        Automatic reconnect keeps the writer and message-stream generation
+        alive. An explicit ``connect()`` replaces that generation and must not
+        start a second writer against the previous pump.
+        """
+        if self._engine.state in (ConnectionState.CONNECTED, ConnectionState.CONNECTING):
+            return
+        replacing = (
+            self._reconnect_task is not None
+            or self._transport is not None
+            or self._delivery.closed.is_set()
+            or (self._write_pump.task is not None and not self._write_pump.task.done())
+        )
+        await self._cancel_automatic_reconnect()
+        await self._force_close(preserve_reconnect=True)
+        if replacing:
+            await self._reset_message_stream()
+
     async def _reset_message_stream(self) -> None:
+        self._delivery.close()
         self._delivery.reset_stream()
 
     async def _invalidate_connection_epoch(self) -> None:
@@ -2465,6 +2512,7 @@ class AsyncClient:
     async def _force_close(self, *, preserve_reconnect: bool = False) -> None:
         await self._invalidate_connection_epoch()
         current = asyncio.current_task()
+        old_reader = self._reader_task
         tasks = [
             self._reader_task,
             self._keepalive_task,
@@ -2487,6 +2535,14 @@ class AsyncClient:
                 await task
             except (asyncio.CancelledError, Exception):
                 pass
+        if (
+            old_reader is not None
+            and old_reader is not current
+            and self._reader_task is not None
+            and self._reader_task is not old_reader
+        ):
+            # on_disconnect started a replacement connection. Leave it alone.
+            return
         await self._write_pump.stop()
         self._discard_connection_effects(settle_publish=True)
         self._write_pump.discard()
