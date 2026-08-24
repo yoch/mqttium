@@ -57,11 +57,51 @@ REPLAY_BATCH_BYTES = 1 << 20
 class InboundReplayCursor:
     """Lazy replay iterator with one-message pushback for byte-budget boundaries."""
 
-    __slots__ = ("_messages", "_pending")
+    __slots__ = ("_messages", "_page_messages", "_pages", "_pending", "_remaining")
 
-    def __init__(self, pages: Iterator[tuple[InboundMessage, ...]]) -> None:
+    def __init__(
+        self,
+        pages: Iterator[tuple[InboundMessage, ...]],
+        *,
+        remaining: int | None = None,
+    ) -> None:
+        self._pages = pages
         self._messages = chain.from_iterable(pages)
+        self._page_messages: deque[InboundMessage] | None = None
         self._pending: InboundMessage | None = None
+        self._remaining = remaining
+
+    @property
+    def bounded_complete(self) -> bool:
+        return self._remaining == 0 and self._pending is None and self._page_messages is None
+
+    def begin_page(self) -> bool:
+        """Hydrate one store page, retaining any guarded suffix from the prior call."""
+        if self._pending is not None or self._page_messages is not None:
+            return True
+        page = next(self._pages, None)
+        if page is None:
+            return False
+        self._page_messages = deque(page)
+        if self._remaining is not None:
+            self._remaining -= len(page)
+        return True
+
+    def next_page_message(self) -> InboundMessage | None:
+        if self._pending is not None:
+            message = self._pending
+            self._pending = None
+            return message
+        messages = self._page_messages
+        if messages is None:
+            return None
+        if not messages:
+            self._page_messages = None
+            return None
+        message = messages.popleft()
+        if not messages:
+            self._page_messages = None
+        return message
 
     def next_message(self) -> InboundMessage | None:
         if self._pending is not None:
@@ -232,6 +272,10 @@ class InboundSession:
         self._aliases.clear()
         self._pending_manual_qos1_acks.clear()
         self.release_pending_auto_qos1()
+        # A continuation is scoped to the connection that created its cursor.
+        # Direct engine consumers have no runtime epoch filter, so invalidate it
+        # here as well as during the next start_connection().
+        self._replay = None
 
     def configure_peer_packet_limit(self, limit: int | None) -> None:
         """Bind the rare automatic-ACK failure path for this connection."""
@@ -904,7 +948,7 @@ class InboundSession:
         if bounded is not None:
             persisted = bounded.in_count()
             pages = bounded.in_replay_pages(
-                REPLAY_SCAN_LIMIT,
+                REPLAY_BATCH_MESSAGES,
                 REPLAY_BATCH_BYTES,
             )
         else:
@@ -917,7 +961,10 @@ class InboundSession:
         if persisted == 0:
             self._recovered_mids.clear()
             return
-        self._replay = InboundReplayCursor(iter(pages))
+        self._replay = InboundReplayCursor(
+            iter(pages),
+            remaining=persisted if bounded is not None else None,
+        )
         self.drain_replay()
 
     def drain_replay(self) -> None:
@@ -928,6 +975,39 @@ class InboundSession:
         """
         cursor = self._replay
         if cursor is None:
+            return
+        transitions = self._transitions
+        assert transitions is not None
+        if self._bounded_replay_store is not None:
+            # Built-in stores hydrate pages at the effect-batch boundary. The
+            # engine is synchronous, so that page cannot become stale before
+            # this method emits it, and no per-record metadata probe is needed.
+            if not cursor.begin_page():
+                self._replay = None
+                self._recovered_mids.clear()
+                return
+            emitted = 0
+            emitted_bytes = 0
+            while emitted < REPLAY_BATCH_MESSAGES and emitted_bytes < REPLAY_BATCH_BYTES:
+                bounded_message = cursor.next_page_message()
+                if bounded_message is None:
+                    break
+                if not self._should_redeliver(bounded_message):
+                    continue
+                message_bytes = len(bounded_message.payload) + len(
+                    bounded_message.topic.encode("utf-8")
+                )
+                if emitted and emitted_bytes + message_bytes > REPLAY_BATCH_BYTES:
+                    cursor.push_back(bounded_message)
+                    break
+                self._emit_message(bounded_message, dup=True)
+                emitted += 1
+                emitted_bytes += message_bytes
+            if cursor.bounded_complete:
+                self._replay = None
+                self._recovered_mids.clear()
+                return
+            self._engine._emit(EffectKind.CONTINUE_INBOUND_REPLAY, None)
             return
         scanned = 0
         emitted = 0
@@ -942,7 +1022,10 @@ class InboundSession:
                 self._replay = None
                 self._recovered_mids.clear()
                 return
-            if not self._should_redeliver(inbound):
+            # A legacy paged store may retain a larger page across effect
+            # batches, so refresh payload-free metadata before emission.
+            current = transitions.in_meta(inbound.mid)
+            if current is None or not self._should_redeliver(inbound, current):
                 scanned += 1
                 continue
             message_bytes = len(inbound.payload) + len(inbound.topic.encode("utf-8"))
@@ -955,17 +1038,24 @@ class InboundSession:
             emitted_bytes += message_bytes
         self._engine._emit(EffectKind.CONTINUE_INBOUND_REPLAY, None)
 
-    def _should_redeliver(self, inbound: InboundMessage) -> bool:
-        if not inbound.delivered:
+    def _should_redeliver(
+        self,
+        inbound: InboundMessage,
+        current: InboundRecordMeta | None = None,
+    ) -> bool:
+        delivered = inbound.delivered if current is None else current.delivered
+        state = inbound.state if current is None else current.state
+        user_acked = inbound.user_acked if current is None else current.user_acked
+        if not delivered:
             return True
         if inbound.mid not in self._recovered_mids or not self.config.manual_ack:
             return False
-        if inbound.state in (
+        if state in (
             InboundQoSState.WAIT_PUBACK,
             InboundQoSState.WAIT_USER_ACK,
         ):
             return True
-        return inbound.state is InboundQoSState.WAIT_PUBREL and not inbound.user_acked
+        return state is InboundQoSState.WAIT_PUBREL and not user_acked
 
     def _emit_message(self, inbound: InboundMessage, *, dup: bool) -> None:
         self._engine._emit(

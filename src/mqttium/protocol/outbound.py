@@ -82,6 +82,7 @@ class OutboundSession:
         "_pending_high_water_bytes",
         "_pending_high_water_messages",
         "_pending_messages",
+        "_topic_aliases",
         "config",
         "flow",
         "packet_ids",
@@ -118,6 +119,35 @@ class OutboundSession:
         self._pending_bytes = 0
         self._pending_high_water_messages = 0
         self._pending_high_water_bytes = 0
+        # Topic Alias mappings are Network Connection state, never MQTT
+        # Session state. Durable records retain canonical Topic Names instead.
+        self._topic_aliases: dict[int, str] = {}
+
+    # --- connection-scoped Topic Alias state -------------------------------
+
+    def start_connection(self) -> None:
+        """Forget every mapping before a new CONNECT is sent."""
+        self._topic_aliases.clear()
+
+    def transport_closed(self) -> None:
+        """A resumed MQTT Session never resumes Topic Alias mappings."""
+        self._topic_aliases.clear()
+
+    def commit_topic_alias(self, topic: str, properties: Properties | None) -> None:
+        """Record an explicit mapping after its PUBLISH has writer admission."""
+        if topic and properties is not None:
+            alias = properties.get("topic_alias")
+            if alias is not None:
+                self._topic_aliases[int(alias)] = topic
+
+    @staticmethod
+    def _properties_without_topic_alias(properties: Properties | None) -> Properties | None:
+        """Return replay-safe properties without connection-scoped alias state."""
+        if properties is None or properties.get("topic_alias") is None:
+            return properties
+        values = dict(properties.values)
+        values.pop("topic_alias", None)
+        return Properties(values=values)
 
     # --- effect emission ---------------------------------------------------
     # Always routed through the engine, never into a cached list: take_effects()
@@ -146,6 +176,12 @@ class OutboundSession:
     def pending_high_water_bytes(self) -> int:
         return self._pending_high_water_bytes
 
+    def _resolved_alias_topic_for_sizing(self, properties: Properties) -> str:
+        alias = properties.get("topic_alias")
+        if alias is None:
+            return ""
+        return self._topic_aliases.get(int(alias), "")
+
     def can_ever_admit(
         self,
         topic: str,
@@ -159,6 +195,8 @@ class OutboundSession:
         if message_limit is not None and message_limit < 1:
             return False
         byte_limit = self.config.max_pending_outbound_bytes
+        if not topic and properties is not None:
+            topic = self._resolved_alias_topic_for_sizing(properties)
         logical_size = self.logical_size(topic, payload, properties)
         return byte_limit is None or logical_size <= byte_limit
 
@@ -172,6 +210,8 @@ class OutboundSession:
             if QoS(qos) == QoS.AT_MOST_ONCE:
                 continue
             pending_count += 1
+            if not topic and properties is not None:
+                topic = self._resolved_alias_topic_for_sizing(properties)
             pending_bytes += self.logical_size(topic, payload, properties)
         message_limit = self.config.max_pending_outbound_messages
         if message_limit is not None and pending_count > message_limit:
@@ -285,13 +325,35 @@ class OutboundSession:
 
     # --- queueing ----------------------------------------------------------
 
+    def _resolve_outbound_alias(
+        self,
+        topic: str,
+        alias: int,
+    ) -> str:
+        """Validate and resolve the uncommon MQTT 5 Topic Alias path."""
+        if alias == 0:
+            raise ProtocolError("topic_alias 0 is invalid")
+        if topic:
+            return topic
+
+        engine = self._engine
+        if engine.state is not ConnectionState.CONNECTED:
+            raise ProtocolError(f"Unknown outbound topic alias {alias} on this connection")
+        maximum = engine.negotiated.topic_alias_maximum
+        if alias > maximum:
+            raise ProtocolError(f"topic_alias {alias} exceeds broker topic_alias_maximum {maximum}")
+        canonical_topic = self._topic_aliases.get(alias, "")
+        if not canonical_topic:
+            raise ProtocolError(f"Unknown outbound topic alias {alias} on this connection")
+        return canonical_topic
+
     def _validate_publish_request(
         self,
         topic: str,
         qos: QoS | int,
         retain: bool,
         properties: Properties | None,
-    ) -> tuple[QoS, bytes | None, int]:
+    ) -> tuple[QoS, bytes | None, int, str]:
         """Validate one outbound PUBLISH and retain Topic Name bytes when launching.
 
         QoS 0 always encodes immediately. QoS 1/2 encode when the session is
@@ -300,25 +362,8 @@ class OutboundSession:
         """
 
         level = QoS(qos)
-        # An empty Topic Name is legal only after this client has established
-        # the Topic Alias on the current Network Connection. OutboundSession
-        # does not yet own authoritative alias-establishment state across all
-        # send paths, so accepting omission here would guess at connection state
-        # and can make durable QoS replay depend on an alias lost at reconnect.
-        # Keep the generic validator's allow_empty primitive for a future
-        # stateful alias implementation, but do not use it from outbound API
-        # admission until that state exists.
         engine = self._engine
-        topic_bytes: bytes | None
-        if level is QoS.AT_MOST_ONCE or (
-            engine.state == ConnectionState.CONNECTED and self.flow.available > 0
-        ):
-            topic_bytes = encode_validated_publish_topic(topic)
-            topic_size = len(topic_bytes)
-        else:
-            topic_size = validate_publish_topic(topic)
-            topic_bytes = None
-
+        alias: int | None = None
         if properties is not None:
             if not self._is_v5 and properties.values:
                 raise ProtocolError("PUBLISH properties require MQTT 5")
@@ -330,6 +375,33 @@ class OutboundSession:
                 raise ProtocolError(
                     "subscription_identifier is not allowed on an outbound PUBLISH [MQTT-3.3.4-6]"
                 )
+            alias_value = properties.get("topic_alias") if self._is_v5 else None
+            if alias_value is not None:
+                alias = int(alias_value)
+                canonical_topic = self._resolve_outbound_alias(topic, alias)
+            else:
+                canonical_topic = topic
+        else:
+            canonical_topic = topic
+
+        allow_empty = alias is not None and not topic
+        topic_bytes: bytes | None
+        if level is QoS.AT_MOST_ONCE or (
+            engine.state == ConnectionState.CONNECTED and self.flow.available > 0
+        ):
+            topic_bytes = (
+                encode_validated_publish_topic(topic, allow_empty=True)
+                if allow_empty
+                else encode_validated_publish_topic(topic)
+            )
+            topic_size = len(topic_bytes)
+        else:
+            topic_size = (
+                validate_publish_topic(topic, allow_empty=True)
+                if allow_empty
+                else validate_publish_topic(topic)
+            )
+            topic_bytes = None
 
         if engine.state == ConnectionState.CONNECTED:
             negotiated = engine.negotiated
@@ -339,8 +411,7 @@ class OutboundSession:
                 )
             if retain and not negotiated.retain_available:
                 raise ProtocolError("Broker does not support retain")
-            if properties and properties.get("topic_alias") is not None:
-                alias = int(properties.get("topic_alias"))
+            if alias is not None:
                 if alias > negotiated.topic_alias_maximum:
                     raise ProtocolError(
                         f"topic_alias {alias} exceeds broker topic_alias_maximum "
@@ -349,7 +420,7 @@ class OutboundSession:
 
         if engine.state != ConnectionState.CONNECTED and level == QoS.AT_MOST_ONCE:
             raise NotConnectedError("Cannot publish QoS 0 while disconnected")
-        return level, topic_bytes, topic_size
+        return level, topic_bytes, topic_size, canonical_topic
 
     def _prepare_qos0_validated(
         self,
@@ -383,7 +454,7 @@ class OutboundSession:
     ) -> WriteItem:
         """Prepare a mutation-free QoS 0 publication for the native runtime."""
 
-        _qos, topic_bytes, _topic_size = self._validate_publish_request(
+        _qos, topic_bytes, _topic_size, _canonical_topic = self._validate_publish_request(
             topic, QoS.AT_MOST_ONCE, retain, properties
         )
         assert topic_bytes is not None
@@ -406,7 +477,7 @@ class OutboundSession:
     ) -> PublishHandle:
         if self._engine.state is ConnectionState.DISCONNECTING:
             raise NotConnectedError("publish is not allowed while disconnecting")
-        qos, topic_bytes, topic_size = self._validate_publish_request(
+        qos, topic_bytes, topic_size, canonical_topic = self._validate_publish_request(
             topic, qos, retain, properties
         )
 
@@ -420,6 +491,8 @@ class OutboundSession:
                 topic_bytes=topic_bytes,
             )
             self._engine._send(item)
+            if properties is not None and properties.get("topic_alias") is not None:
+                self.commit_topic_alias(topic, properties)
             # Completion follows SEND so compatibility on_publish cannot run
             # before the outbound queue has accepted the frame.
             self._engine._emit(EffectKind.PUBLISH_COMPLETE, None)
@@ -434,7 +507,14 @@ class OutboundSession:
         )
         # Validate packet size before reserving local memory or a packet id.
         self._check_publish_wire_size(topic_size, wire_property_bytes, len(payload), qos)
-        logical_size = len(payload) + topic_size + logical_property_bytes
+        logical_topic_size = topic_size
+        if canonical_topic != topic:
+            logical_topic_size = (
+                len(canonical_topic)
+                if canonical_topic.isascii()
+                else len(canonical_topic.encode("utf-8"))
+            )
+        logical_size = len(payload) + logical_topic_size + logical_property_bytes
         # Snapshot before the first acquisition. Three local reads is all the
         # success path pays for a shared rollback; _rollback itself is a call
         # only taken on failure. This path is the hottest in the library and
@@ -448,7 +528,7 @@ class OutboundSession:
             mid = self.packet_ids.allocate()
             msg = OutboundMessage(
                 mid=mid,
-                topic=topic,
+                topic=canonical_topic,
                 payload=payload,
                 qos=qos,
                 retain=retain,
@@ -467,7 +547,10 @@ class OutboundSession:
             # raises, while the outer rollback restores the remaining admission
             # bookkeeping.
             if self._engine.state == ConnectionState.CONNECTED and self._try_launch(
-                msg, _property_bytes=property_bytes, _topic_bytes=topic_bytes
+                msg,
+                _property_bytes=property_bytes,
+                _topic_bytes=topic_bytes,
+                _wire_topic=topic,
             ):
                 return PublishHandle(mid=mid, qos=qos)
 
@@ -517,6 +600,12 @@ class OutboundSession:
         queued_start = len(self._queued)
         inflight_start = self.flow.inflight
         packet_ids_empty_start = len(self.packet_ids) == 0
+        alias_snapshot: dict[int, str] | None = None
+        if self._is_v5:
+            for _topic, _payload, _qos, _retain, properties in batch:
+                if properties is not None and properties.get("topic_alias") is not None:
+                    alias_snapshot = self._topic_aliases.copy()
+                    break
         handles: list[PublishHandle] = []
         try:
             with self.store.batch():
@@ -540,6 +629,9 @@ class OutboundSession:
                 queued_start=queued_start,
                 packet_ids_empty_start=packet_ids_empty_start,
             )
+            if alias_snapshot is not None:
+                self._topic_aliases.clear()
+                self._topic_aliases.update(alias_snapshot)
             raise
         return handles
 
@@ -687,11 +779,13 @@ class OutboundSession:
         persisted: bool = False,
         _property_bytes: bytes | None = None,
         _topic_bytes: bytes | None = None,
+        _wire_topic: str | None = None,
     ) -> None:
+        wire_topic = msg.topic if _wire_topic is None else _wire_topic
         wire = msg.encoded_publish
         if wire is None:
             wire = self._encode_publish(
-                msg.topic,
+                wire_topic,
                 msg.payload,
                 qos=msg.qos,
                 retain=msg.retain,
@@ -710,7 +804,10 @@ class OutboundSession:
         # A contiguous frame owns another payload-sized bytes object and replay
         # re-encodes it anyway. A segmented item owns only its small header; its
         # payload is the application bytes already retained by the record.
-        retained = _retain_publish_item(wire)
+        # An alias-only wire form is valid for this connection only. Persisting
+        # it would make reconnect replay omit the canonical Topic Name before
+        # the replacement connection has learned the mapping.
+        retained = _retain_publish_item(wire) if wire_topic == msg.topic else None
         if persisted:
             transitions = self._transitions
             if transitions is not None:
@@ -741,6 +838,9 @@ class OutboundSession:
             msg.encoded_publish = retained
             self.store.put_out(msg)
         self._engine._send(wire)
+        properties = msg.properties
+        if properties is not None and properties.get("topic_alias") is not None:
+            self.commit_topic_alias(wire_topic, properties)
 
     def _try_launch(
         self,
@@ -748,11 +848,17 @@ class OutboundSession:
         *,
         _property_bytes: bytes | None = None,
         _topic_bytes: bytes | None = None,
+        _wire_topic: str | None = None,
     ) -> bool:
         if not self.flow.try_acquire():
             return False
         try:
-            self._launch(msg, _property_bytes=_property_bytes, _topic_bytes=_topic_bytes)
+            self._launch(
+                msg,
+                _property_bytes=_property_bytes,
+                _topic_bytes=_topic_bytes,
+                _wire_topic=_wire_topic,
+            )
         except Exception:
             self.flow.release()
             raise
@@ -764,6 +870,13 @@ class OutboundSession:
             OutboundQoSState.WAIT_PUBREC,
         ):
             msg.dup = True
+            replay_properties = self._properties_without_topic_alias(msg.properties)
+            if replay_properties is not msg.properties:
+                # Both the mapping and a retained frame that encoded it belong
+                # to the dead connection. Replay sends the canonical stored
+                # topic with replay-safe properties.
+                msg.properties = replay_properties
+                msg.encoded_publish = None
             retained = msg.encoded_publish
             if retained is None:
                 wire = self._encode_publish(
@@ -785,6 +898,9 @@ class OutboundSession:
             msg.encoded_publish = _retain_publish_item(wire)
             self.store.update_out(msg)
             self._engine._send(wire)
+            properties = msg.properties
+            if properties is not None and properties.get("topic_alias") is not None:
+                self.commit_topic_alias(msg.topic, properties)
             return
         if msg.state is OutboundQoSState.WAIT_PUBCOMP:
             if msg.encoded_pubrel is None:
@@ -1099,21 +1215,32 @@ class OutboundSession:
             )
         if msg.retain and not negotiated.retain_available:
             raise ProtocolError("Broker does not support retain")
-        if msg.properties and msg.properties.get("topic_alias") is not None:
-            alias = int(msg.properties.get("topic_alias"))
-            if alias > negotiated.topic_alias_maximum:
+        replaying_publish = msg.state in (
+            OutboundQoSState.WAIT_PUBACK,
+            OutboundQoSState.WAIT_PUBREC,
+        )
+        properties = (
+            self._properties_without_topic_alias(msg.properties)
+            if replaying_publish
+            else msg.properties
+        )
+        if properties and properties.get("topic_alias") is not None:
+            alias = int(properties.get("topic_alias"))
+            if alias == 0 or alias > negotiated.topic_alias_maximum:
                 raise ProtocolError(
                     f"topic_alias {alias} exceeds broker topic_alias_maximum "
                     f"{negotiated.topic_alias_maximum}"
                 )
         encoded_publish = msg.encoded_publish if isinstance(msg, OutboundMessage) else None
+        if properties is not msg.properties:
+            encoded_publish = None
         if encoded_publish is not None:
             engine._check_outbound_size(encoded_publish)
         else:
             payload_size = (
                 len(msg.payload) if isinstance(msg, OutboundMessage) else msg.payload_size
             )
-            self._check_publish_size(msg.topic, payload_size, msg.qos, msg.properties)
+            self._check_publish_size(msg.topic, payload_size, msg.qos, properties)
 
     def fail_queued_violating_negotiation(self) -> None:
         kept: deque[OutboundMessage | OutboundMessageSummary] = deque()

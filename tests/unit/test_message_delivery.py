@@ -39,6 +39,35 @@ async def test_auto_callback_does_not_fill_iterator_queue() -> None:
     await client._shutdown_callback_worker(drain=False)
 
 
+async def test_callback_self_cancellation_does_not_stop_worker() -> None:
+    client = AsyncClient(message_delivery="callback", max_pending_callbacks=4)
+    received: list[bytes] = []
+    reported: list[dict[str, object]] = []
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: reported.append(context))
+
+    def on_message(message: Message) -> None:
+        if message.payload == b"cancel-self":
+            raise asyncio.CancelledError("user callback cancellation")
+        received.append(message.payload)
+
+    client.on_message = on_message
+    try:
+        await _deliver(client, b"cancel-self")
+        await _deliver(client, b"after")
+        await asyncio.wait_for(client._callback_queue.join(), timeout=1)
+
+        assert received == [b"after"]
+        assert client._delivery.callback_task is not None
+        assert not client._delivery.callback_task.done()
+        assert len(reported) == 1
+        assert isinstance(reported[0].get("exception"), asyncio.CancelledError)
+    finally:
+        loop.set_exception_handler(previous_handler)
+        await client._shutdown_callback_worker(drain=False)
+
+
 async def test_unaccounted_auto_strategy_selects_current_consumer() -> None:
     iterator_client = AsyncClient(max_pending_delivery_bytes=None)
     await _deliver(iterator_client, b"iterator")

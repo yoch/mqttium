@@ -103,6 +103,18 @@ outcome is terminal or enters reconnect policy. Secondary errors while closing
 the transport never replace that primary cause. Connection epochs prevent a
 late task from an older transport from closing or poisoning its replacement.
 
+The lifecycle preserves these generation invariants:
+
+- only the reader performs application-visible teardown for a live generation;
+- every deferred effect and writer admission is tagged with that generation's
+  epoch and is discarded or rejected after an epoch advance;
+- terminal teardown settles each receipt at most once and wakes every producer
+  blocked on protocol or writer capacity;
+- reconnectable loss keeps the application message stream open, while terminal
+  reconnect exhaustion closes delivery and callback resources;
+- intentional disconnect remains distinct from the primary failure cause and
+  cannot be reversed by an in-progress reconnect attempt.
+
 ## Protocol ownership
 
 `OutboundSession` is the sole owner of outbound QoS publication state:
@@ -111,7 +123,8 @@ late task from an older transport from closing or poisoning its replacement.
 - the negotiated inflight window;
 - logical message and byte admission;
 - queued and persisted outbound records;
-- replay and terminal release.
+- replay and terminal release;
+- connection-scoped outbound Topic Alias mappings.
 
 `InboundSession` symmetrically owns incoming PUBLISH state:
 
@@ -185,14 +198,18 @@ Replay snapshots ordered identifiers once and loads bounded pages by primary
 key, avoiding repeated full-table sorts.
 
 Incoming replay first restores accounting from metadata and then emits bounded
-batches. A continuation effect carries the connection epoch, so disconnecting
-mid-replay safely abandons the old cursor.
+batches. Built-in stores hydrate one fresh page per effect batch; legacy paged
+stores revalidate payload-free metadata before emission when a larger page can
+span continuations. A continuation effect carries the connection epoch, so
+disconnecting mid-replay safely abandons the old cursor.
 
 ## Reconnect and sessions
 
-A reconnect creates a new transport and decoder state. Topic aliases are reset
-for every network connection. Protocol inflight state survives only when the
-broker confirms the session.
+A reconnect creates a new transport and decoder state. Inbound and outbound
+Topic Alias mappings are reset for every network connection. Protocol inflight
+state survives only when the broker confirms the session. Durable outbound
+records always retain their canonical Topic Name, so replay never depends on a
+mapping from the dead connection.
 
 If `session_present` is false, stale persisted work is failed and released. If
 it is true, outbound and inbound state is replayed in order and under the same

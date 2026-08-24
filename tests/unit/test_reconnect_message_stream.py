@@ -20,12 +20,14 @@ class _Broker:
         self._rx: asyncio.Queue[bytes] = asyncio.Queue()
         self._decoder = IncrementalDecoder()
         self._closing = False
+        self.connected = asyncio.Event()
 
     async def write(self, data: bytes) -> None:
         self._decoder.feed(data)
         for raw in self._decoder.drain_packets():
             if raw.packet_type is PacketType.CONNECT:
                 self._rx.put_nowait(encode_frame(PacketType.CONNACK, 0, b"\x00\x00"))
+                self.connected.set()
 
     async def read(self, n: int = 65536) -> bytes:
         return await self._rx.get()
@@ -266,3 +268,102 @@ async def test_disconnect_inside_reconnect_gap_closes_stream() -> None:
             await asyncio.wait_for(pending, timeout=1.0)
     finally:
         await _cleanup(client, pending)
+
+
+async def test_explicit_connect_replaces_automatic_reconnect_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    brokers: list[_Broker] = []
+    reconnect_sleep = asyncio.Event()
+    release_reconnect = asyncio.Event()
+    client = AsyncClient(
+        "explicit-reconnect-takeover",
+        reconnect=ReconnectPolicy(
+            enabled=True,
+            initial_delay=1,
+            max_delay=1,
+            max_retries=4,
+            stable_after=0,
+            connect_timeout=1,
+        ),
+        message_delivery="iterator",
+    )
+    real_sleep = asyncio.sleep
+
+    async def gated_sleep(delay: float) -> None:
+        task = asyncio.current_task()
+        if task is not None and task.get_name() == "mqttium-reconnect":
+            reconnect_sleep.set()
+            await release_reconnect.wait()
+            return
+        await real_sleep(delay)
+
+    monkeypatch.setattr("mqttium.api.async_client.asyncio.sleep", gated_sleep)
+
+    async def factory(host: str, port: int, *, ssl=None):
+        del host, port, ssl
+        broker = _Broker()
+        brokers.append(broker)
+        return broker
+
+    client._transport_factory = factory
+    old_pending: asyncio.Task[object] | None = None
+    try:
+        await client.connect("fake", timeout=1)
+        old_stream = client.messages()
+        old_pending = asyncio.create_task(anext(old_stream))
+        await brokers[0].close()
+        await asyncio.wait_for(reconnect_sleep.wait(), timeout=1)
+
+        await client.connect("fake", timeout=1)
+        assert len(brokers) == 2
+        assert client.is_connected
+        with pytest.raises(StopAsyncIteration):
+            await asyncio.wait_for(old_pending, timeout=1)
+
+        release_reconnect.set()
+        await real_sleep(0)
+        assert client.is_connected
+        assert client._reconnect_task is None or client._reconnect_task.done()
+    finally:
+        release_reconnect.set()
+        await _cleanup(client, old_pending)
+
+
+async def test_on_disconnect_explicit_connect_owns_replacement_connection() -> None:
+    brokers: list[_Broker] = []
+    replacement_connected = asyncio.Event()
+    client = AsyncClient(
+        "callback-reconnect-takeover",
+        reconnect=_policy(),
+        message_delivery="iterator",
+    )
+
+    async def factory(host: str, port: int, *, ssl=None):
+        del host, port, ssl
+        broker = _Broker()
+        brokers.append(broker)
+        return broker
+
+    async def on_disconnect(exc: BaseException | None) -> None:
+        del exc
+        if len(brokers) == 1:
+            await client.connect("fake", timeout=1)
+            replacement_connected.set()
+
+    client._transport_factory = factory
+    client.on_disconnect = on_disconnect
+    try:
+        await client.connect("fake", timeout=1)
+        await brokers[0].close()
+        await asyncio.wait_for(replacement_connected.wait(), timeout=1)
+
+        replacement_reader = client._reader_task
+        assert len(brokers) == 2
+        assert client.is_connected
+        assert replacement_reader is not None and not replacement_reader.done()
+        await asyncio.sleep(0)
+        assert client._reader_task is replacement_reader
+        assert client._reconnect_task is None or client._reconnect_task.done()
+    finally:
+        await _cleanup(client)

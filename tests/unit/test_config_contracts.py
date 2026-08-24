@@ -84,6 +84,7 @@ def test_engine_config_runtime_mutability_is_explicit_and_exhaustive() -> None:
         {"max_pending_messages": 0},
         {"max_pending_inbound_bytes": -1},
         {"ack_timeout": 0},
+        {"auth_timeout": 0},
         {"ping_timeout": 0},
         {"client_id": b"bad"},
         {"username": b"bad"},

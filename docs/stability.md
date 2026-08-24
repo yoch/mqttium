@@ -12,8 +12,9 @@ cycle:
 1. publishes a bounded QoS 1 batch;
 2. waits for every receipt;
 3. confirms subscriber delivery;
-4. waits for protocol admission, flow slots, writer bytes/messages, pending
-   effects and receipts to return to zero;
+4. waits for protocol admission and packet identifiers, inbound replay and byte
+   accounting, delivery/writer/effect waiters, queues, flow slots, and every
+   receipt class to return to zero;
 5. closes the publisher transport and confirms automatic reconnection before
    the next cycle.
 

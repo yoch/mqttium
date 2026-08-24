@@ -251,6 +251,40 @@ async def test_failure_quiesces_trailing_effects_before_transport_close() -> Non
     assert pump.waiters == 0
 
 
+async def test_effect_collected_during_failing_close_is_settled() -> None:
+    failure = RuntimeError("first effect failed")
+    close_entered = asyncio.Event()
+    close_release = asyncio.Event()
+    owner = _Owner([EngineEffect(EffectKind.SEND, b"fail")], failure)
+
+    async def blocked_close() -> None:
+        owner.closed += 1
+        close_entered.set()
+        await close_release.wait()
+
+    owner._close_transport_after_connection_failure = blocked_close  # type: ignore[method-assign]
+    pump = EffectPump(owner)  # type: ignore[arg-type]
+    pump.collect_from_engine()
+    failing = asyncio.create_task(pump.drain())
+    await asyncio.wait_for(close_entered.wait(), timeout=1)
+
+    owner._engine.effects = [EngineEffect(EffectKind.SEND, b"late")]
+    pump.collect_from_engine()
+    await asyncio.wait_for(pump.drain(), timeout=1)
+
+    with pytest.raises(RuntimeError) as caught:
+        await failing
+    assert caught.value is failure
+    close_release.set()
+    await _wait_idle(pump)
+
+    assert owner.applies == 1
+    assert owner.closed == 1
+    assert not pump.pending
+    assert pump.applied == pump.enqueued == 2
+    assert pump.waiters == 0
+
+
 async def test_waiter_before_failing_effect_is_not_poisoned() -> None:
     failure = RuntimeError("second effect failed")
     release = asyncio.Event()

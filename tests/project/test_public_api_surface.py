@@ -140,6 +140,7 @@ def test_async_client_constructor_keywords_and_defaults() -> None:
         "manual_ack": False,
         "store": None,
         "auth_handler": None,
+        "auth_timeout": 10.0,
     }
     parameters = inspect.signature(AsyncClient).parameters
 

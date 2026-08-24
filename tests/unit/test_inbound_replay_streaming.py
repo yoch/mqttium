@@ -7,6 +7,8 @@ import tracemalloc
 from collections.abc import Iterator
 from pathlib import Path
 
+import pytest
+
 from mqttium.api.async_client import AsyncClient
 from mqttium.enums import InboundQoSState, PacketType, QoS
 from mqttium.codec.buffer import RawPacket
@@ -14,11 +16,13 @@ from mqttium.persistence.memory import MemoryInflightStore
 from mqttium.persistence.sqlite import SqliteInflightStore
 from mqttium.protocol.effects import EffectKind
 from mqttium.protocol.engine import EngineConfig, ProtocolEngine
+from mqttium.packets import PubRelPacket
 from mqttium.protocol.inbound import (
     REPLAY_BATCH_MESSAGES,
     REPLAY_PAGE_SIZE,
 )
 from mqttium.types import InboundMessage
+from tests.support import feed_engine
 
 
 def inbound(mid: int, payload: bytes = b"body") -> InboundMessage:
@@ -89,7 +93,7 @@ def test_continuations_replay_every_record_exactly_once() -> None:
     assert engine.inbound.replay_pending is False
 
 
-def test_replay_reuses_one_bounded_page_across_effect_batches(tmp_path: Path) -> None:
+def test_replay_hydrates_one_fresh_page_per_effect_batch(tmp_path: Path) -> None:
     class CountingStore(SqliteInflightStore):
         pages_fetched = 0
 
@@ -111,8 +115,45 @@ def test_replay_reuses_one_bounded_page_across_effect_batches(tmp_path: Path) ->
 
     engine.continue_inbound_replay()
     engine.take_effects()
-    assert CountingStore.pages_fetched == 1  # still inside the first bounded page
+    assert CountingStore.pages_fetched == 2
     store.close()
+
+
+@pytest.mark.parametrize("kind", ["memory", "sqlite"])
+def test_bounded_replay_does_not_probe_metadata_per_message(kind: str, tmp_path: Path) -> None:
+    class CountingMemoryStore(MemoryInflightStore):
+        meta_reads = 0
+
+        def in_meta(self, mid: int):  # type: ignore[override]
+            CountingMemoryStore.meta_reads += 1
+            return super().in_meta(mid)
+
+    class CountingSqliteStore(SqliteInflightStore):
+        meta_reads = 0
+
+        def in_meta(self, mid: int):  # type: ignore[override]
+            CountingSqliteStore.meta_reads += 1
+            return super().in_meta(mid)
+
+    store = (
+        CountingMemoryStore()
+        if kind == "memory"
+        else CountingSqliteStore(tmp_path / "metadata-probes.db")
+    )
+    fill(store, 500)
+    engine = ProtocolEngine(
+        EngineConfig(client_id="metadata-probes", clean_start=False),
+        store=store,
+    )
+
+    resume_effects(engine)
+    while engine.inbound.replay_pending:
+        engine.continue_inbound_replay()
+        engine.take_effects()
+
+    assert store.meta_reads == 0
+    if isinstance(store, SqliteInflightStore):
+        store.close()
 
 
 def test_recovered_identifiers_are_loaded_without_reading_payloads(tmp_path: Path) -> None:
@@ -148,6 +189,78 @@ def test_a_dropped_connection_abandons_the_replay_cursor() -> None:
     engine.begin_connect()  # the next connection attempt resets connection state
 
     assert engine.inbound.replay_pending is False
+
+
+def test_continue_after_transport_close_cannot_drain_stale_replay() -> None:
+    store = MemoryInflightStore()
+    fill(store, 500)
+    engine = ProtocolEngine(EngineConfig(client_id="closed-replay", clean_start=False), store=store)
+    resume_effects(engine)
+    assert engine.inbound.replay_pending is True
+
+    engine.notify_transport_closed()
+    engine.take_effects()
+    engine.continue_inbound_replay()
+
+    assert message_mids(engine.take_effects()) == []
+    assert engine.inbound.replay_pending is False
+
+
+@pytest.mark.parametrize("kind", ["memory", "sqlite"])
+def test_completed_cursor_held_record_is_not_redelivered(
+    kind: str,
+    tmp_path: Path,
+) -> None:
+    store = (
+        MemoryInflightStore()
+        if kind == "memory"
+        else SqliteInflightStore(tmp_path / "completed-replay.db")
+    )
+    fill(store, 100)
+    engine = ProtocolEngine(
+        EngineConfig(client_id="completed-replay", clean_start=False), store=store
+    )
+    resume_effects(engine)
+
+    feed_engine(engine, PubRelPacket(mid=70).encode())
+    engine.take_effects()
+    assert store.get_in(70) is None
+
+    later: list[int] = []
+    while engine.inbound.replay_pending:
+        engine.continue_inbound_replay()
+        later.extend(message_mids(engine.take_effects()))
+
+    assert 70 not in later
+    if isinstance(store, SqliteInflightStore):
+        store.close()
+
+
+@pytest.mark.parametrize("kind", ["memory", "sqlite"])
+def test_delivered_cursor_held_record_is_consistent_across_stores(
+    kind: str,
+    tmp_path: Path,
+) -> None:
+    store = (
+        MemoryInflightStore()
+        if kind == "memory"
+        else SqliteInflightStore(tmp_path / "delivered-replay.db")
+    )
+    fill(store, 100)
+    engine = ProtocolEngine(
+        EngineConfig(client_id="delivered-replay", clean_start=False), store=store
+    )
+    resume_effects(engine)
+    engine.mark_inbound_delivered(70)
+
+    later: list[int] = []
+    while engine.inbound.replay_pending:
+        engine.continue_inbound_replay()
+        later.extend(message_mids(engine.take_effects()))
+
+    assert 70 not in later
+    if isinstance(store, SqliteInflightStore):
+        store.close()
 
 
 def test_a_store_without_paging_keeps_the_eager_replay() -> None:

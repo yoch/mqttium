@@ -1,13 +1,15 @@
 # Fuzzing
 
-MQTTium uses two complementary fuzz harnesses. Both are reproducible and check
+MQTTium uses complementary deterministic and property-based fuzz harnesses. They are
+reproducible and check
 protocol invariants rather than treating every parser exception as a failure.
 
 | Target | Inputs | Main oracle |
 | --- | --- | --- |
 | `codec` | properties, PUBLISH packets, and mutated typed frames | only documented parse errors escape |
-| `engine` | stateful connection, acknowledgement, alias, reconnect, and manual-ack sequences | bounded flow, consistent packet identifiers, non-negative counters |
+| `engine` | stateful connection, acknowledgement, inbound/outbound alias, enhanced AUTH, reconnect, replay, and manual-ack sequences | bounded flow, canonical durable topics, consistent packet identifiers and byte/message ledgers |
 | `websocket` | lengths, control frames, and fragmentation | bounded buffering and deterministic rejection |
+| replay interleavings | page hydration followed by PUBREL, delivery handoff, close, continuation, and reconnect | Memory/SQLite equivalence; no completed, delivered, or stale-epoch emission |
 
 `tests/fuzz/fuzz.py` is dependency-free and driven by an explicit seed.
 `tests/fuzz/test_hypothesis_fuzz.py` adds property-based generation, shrinking,
@@ -36,12 +38,22 @@ The local release runner can orchestrate multiple deterministic shards:
 python benchmarks/fuzz_campaign.py \
   --shards 5 \
   --duration-minutes 288 \
-  --output-dir /tmp/mqttium-fuzz
+  --output /tmp/mqttium-fuzz
 ```
 
 The seed for every shard and batch is written to `metadata.json` and
 `campaign.log`. Failure inputs are stored as binary artefacts, so a failure can
 be replayed without relying on the original machine.
+
+The engine seed also reproduces API-side operations that have no wire corpus,
+including outbound Topic Alias replacement/reuse and enhanced AUTH exchanges.
+The stateful pytest campaign additionally compares Memory and SQLite after each
+replay interleaving:
+
+```bash
+MQTTIUM_FUZZ_SEEDS=24 MQTTIUM_FUZZ_STEPS=500 \
+  python -m pytest tests/fuzz/test_stateful_invariants.py -q
+```
 
 ## Failure output
 

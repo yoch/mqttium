@@ -77,8 +77,21 @@ downgraded.
 ## Topic aliases
 
 Topic aliases are explicit and connection-scoped. Their mappings reset on every
-new network connection, including reconnect. Do not persist an alias or assume
-that an earlier connection's mapping remains valid.
+new network connection, including reconnect. MQTTium does not assign aliases
+automatically. Establish or replace one by publishing a non-empty topic, then
+reuse it with an empty Topic Name on the same connection:
+
+```python
+alias = Properties({"topic_alias": 1})
+await client.publish("telemetry/device-1", b"first", properties=alias)
+await client.publish("", b"next", properties=alias)
+```
+
+Alias zero, an alias above the broker's negotiated Topic Alias Maximum, and an
+empty Topic Name with an unknown mapping are rejected before publication state
+changes. QoS 1/2 persistence retains the canonical Topic Name, not the
+connection-specific omission. Replay therefore sends the full topic and does
+not carry the previous connection's alias onto the replacement connection.
 
 ## Last Will
 
@@ -104,9 +117,11 @@ client.set_auth_handler(on_auth)
 
 The application must verify the authentication method and protect challenge
 data. Re-authentication can be initiated with `await client.auth(...)` after
-connection. If the handler raises `asyncio.CancelledError`, MQTTium treats it
-as an authentication failure and applies the configured connection lifecycle;
-cancellation requested on MQTTium's owning task still propagates normally.
+connection, but requires a registered handler because the broker can continue
+the exchange. Each handler call is bounded by `auth_timeout` (10 seconds by
+default). Timeout, handler failure, and handler self-cancellation enter the
+configured connection lifecycle; cancellation requested on MQTTium's owning
+task still propagates normally.
 
 ## Server references
 

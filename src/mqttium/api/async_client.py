@@ -165,6 +165,8 @@ class AsyncClient:
             callback-raised :class:`asyncio.CancelledError` is treated as an
             authentication failure; cancellation requested on MQTTium's
             owning task still propagates normally.
+        auth_timeout: Maximum seconds allowed for one enhanced-authentication
+            callback invocation.
 
     Raises:
         ValueError: If a limit or constructor option is invalid.
@@ -209,6 +211,7 @@ class AsyncClient:
         manual_ack: bool = False,
         store: InflightStore | None = None,
         auth_handler: OnAuth | None = None,
+        auth_timeout: float = 10.0,
     ) -> None:
         _validate_client_arguments(
             client_id=client_id,
@@ -231,6 +234,7 @@ class AsyncClient:
                 ("max_outbound_bytes", max_outbound_bytes),
                 ("max_ingress_batch_bytes", max_ingress_batch_bytes),
                 ("ack_timeout", ack_timeout),
+                ("auth_timeout", auth_timeout),
             ),
             ping_timeout=ping_timeout,
         )
@@ -344,6 +348,7 @@ class AsyncClient:
         self._reconnect = reconnect if reconnect is not None else ReconnectPolicy(enabled=False)
         self._ping_timeout = ping_timeout
         self._ack_timeout = ack_timeout
+        self._auth_timeout = auth_timeout
         self._intentional_disconnect = False
         self._transport_factory: Callable[..., Awaitable[AsyncTransport]] = TcpTransport.connect
         self._last_disconnect: DisconnectInfo | None = None
@@ -627,6 +632,8 @@ class AsyncClient:
             if nowait:
                 raise FlowControlError(self._write_pump.refusal(item_size(item)))
             return None
+        if properties is not None and properties.get("topic_alias") is not None:
+            self._engine.outbound.commit_topic_alias(topic, properties)
         if callback is not None:
             self._enqueue_callback_repeated_nowait(callback, (None, None), 1)
         return PublishReceipt(mid=None, qos=QoS.AT_MOST_ONCE)
@@ -642,6 +649,11 @@ class AsyncClient:
             return False
         for _topic, _payload, qos, _retain, _properties in requests:
             if qos != QoS.AT_MOST_ONCE:
+                return False
+            if _properties is not None and _properties.get("topic_alias") is not None:
+                # Alias mappings are established in request order. Reuse the
+                # ordinary atomic engine batch rather than staging a second
+                # connection-scoped mapping beside OutboundSession's owner.
                 return False
 
         items: list[WriteItem] = []
@@ -755,7 +767,7 @@ class AsyncClient:
             asyncio.CancelledError: If the calling task is cancelled.
         """
         async with self._lifecycle_lock:
-            await self._reset_message_stream()
+            await self._prepare_explicit_connect()
             self._host = host
             self._port = port
             self._ssl = ssl
@@ -792,7 +804,7 @@ class AsyncClient:
             asyncio.CancelledError: If the calling task is cancelled.
         """
         async with self._lifecycle_lock:
-            await self._reset_message_stream()
+            await self._prepare_explicit_connect()
             self._unix_path = path
             self._ws_url = None
             self._ws_headers = None
@@ -842,7 +854,7 @@ class AsyncClient:
             asyncio.CancelledError: If the calling task is cancelled.
         """
         async with self._lifecycle_lock:
-            await self._reset_message_stream()
+            await self._prepare_explicit_connect()
             self._ws_url = url
             self._ws_headers = extra_headers
             self._unix_path = None
@@ -1024,6 +1036,8 @@ class AsyncClient:
                 except asyncio.CancelledError:
                     pass
                 self._reconnect_task = None
+        should_close = False
+        packet_failure = False
         async with self._lifecycle_lock:
             if disconnecting_connect:
                 return
@@ -1044,9 +1058,9 @@ class AsyncClient:
             except PacketTooLargeError:
                 # The peer's packet limit makes a legal DISCONNECT impossible.
                 # Closing the transport is the only conforming shutdown left.
-                await self._force_close_after_local_packet_failure()
-                return
-            try:
+                packet_failure = True
+            else:
+                should_close = True
                 if packet is not None:
                     try:
                         await self._flush_terminal_packet(
@@ -1054,8 +1068,13 @@ class AsyncClient:
                         )
                     except StaleConnectionEffect:
                         pass
-            finally:
-                await self._force_close()
+        if packet_failure:
+            await self._force_close_after_local_packet_failure()
+            return
+        if should_close:
+            # The reader invokes on_disconnect while it terminates. Joining it
+            # under the lifecycle lock would deadlock callbacks that reconnect.
+            await self._force_close()
 
     def publish_nowait(
         self,
@@ -1369,7 +1388,8 @@ class AsyncClient:
     ) -> None:
         """Send a client AUTH packet (MQTT 5 continue / re-authenticate)."""
         async with self._engine_lock:
-            self._engine.reconfigure(accept_auth=True)
+            if self.auth_handler is None:
+                raise MQTTError("auth() requires an auth_handler")
             self._engine.queue_auth(reason_code=reason_code, properties=properties)
             self._collect_effects_locked()
         await self._drain_effects()
@@ -1785,12 +1805,19 @@ class AsyncClient:
                 await self._invoke(self.on_disconnect, callback_error)
             except Exception as exc:
                 self._report_callback_error(self.on_disconnect, exc)
-            if not will_reconnect:
-                await self._shutdown_callback_worker(drain=True)
-            if will_reconnect and (self._reconnect_task is None or self._reconnect_task.done()):
-                self._reconnect_task = asyncio.create_task(
-                    self._reconnect_loop(), name="mqttium-reconnect"
-                )
+            # The callback may have disconnected or installed an explicit
+            # replacement connection. Do not apply the pre-callback reconnect
+            # decision to state now owned by the application.
+            user_took_over = self._intentional_disconnect or (
+                self.is_connected and self._reader_task is not asyncio.current_task()
+            )
+            if not user_took_over:
+                if not will_reconnect:
+                    await self._shutdown_callback_worker(drain=True)
+                if will_reconnect and (self._reconnect_task is None or self._reconnect_task.done()):
+                    self._reconnect_task = asyncio.create_task(
+                        self._reconnect_loop(), name="mqttium-reconnect"
+                    )
 
     def _retry_reason(self) -> int | None:
         """The reason code the reconnect policy judges: broker DISCONNECT, else CONNACK."""
@@ -2091,32 +2118,18 @@ class AsyncClient:
                 await self._enqueue_callback(self.on_connect, connack)
         elif kind is EffectKind.AUTH:
             challenge: AuthPacket = effect.data
-            if self.auth_handler is None:
-                packet = encode_disconnect(0x82, self._engine.config.protocol)
-                try:
-                    self._engine._check_outbound_size(packet)
-                except PacketTooLargeError as exc:
-                    # The broker limit makes the protocol-error DISCONNECT
-                    # impossible to send. Close the transport so the connection
-                    # cannot remain active after this terminal condition.
-                    self._disconnect_exc = exc
-                    self._intentional_disconnect = True
-                    if self._transport is not None:
-                        try:
-                            await self._transport.close()
-                        except Exception:
-                            pass
-                    return
-                await self._enqueue_outbound(
-                    packet,
-                    nowait=nowait,
-                    epoch=epoch,
-                )
-                return
+            handler = self.auth_handler
+            if handler is None:
+                # set_auth_handler(None) updates EngineConfig, so the engine no
+                # longer emits AUTH. Direct attribute mutation can still race an
+                # already-produced effect; surface that as an application failure.
+                raise MQTTError("AUTH handler is no longer available")
             try:
                 response = await asyncio.wait_for(
-                    self._invoke(self.auth_handler, challenge), timeout=10.0
+                    self._invoke(handler, challenge), timeout=self._auth_timeout
                 )
+            except TimeoutError as exc:
+                raise MQTTTimeoutError("AUTH handler timed out") from exc
             except asyncio.CancelledError as exc:
                 task = asyncio.current_task()
                 if task is None or task.cancelling():
@@ -2331,7 +2344,34 @@ class AsyncClient:
             return None
         return self._disconnect_exc or MQTTError("Connection closed")
 
+    async def _cancel_automatic_reconnect(self) -> None:
+        reconnect_task = self._reconnect_task
+        if reconnect_task is None or reconnect_task is asyncio.current_task():
+            return
+        reconnect_task.cancel()
+        try:
+            await reconnect_task
+        except asyncio.CancelledError:
+            pass
+        self._reconnect_task = None
+
+    async def _prepare_explicit_connect(self) -> None:
+        """Replace any automatic-reconnect generation before explicit connect."""
+        if self._engine.state in (ConnectionState.CONNECTED, ConnectionState.CONNECTING):
+            return
+        replacing = (
+            self._reconnect_task is not None
+            or self._transport is not None
+            or self._delivery.closed.is_set()
+            or (self._write_pump.task is not None and not self._write_pump.task.done())
+        )
+        await self._cancel_automatic_reconnect()
+        await self._force_close(preserve_reconnect=True)
+        if replacing:
+            await self._reset_message_stream()
+
     async def _reset_message_stream(self) -> None:
+        self._delivery.close()
         self._delivery.reset_stream()
 
     async def _invalidate_connection_epoch(self) -> None:
@@ -2465,6 +2505,7 @@ class AsyncClient:
     async def _force_close(self, *, preserve_reconnect: bool = False) -> None:
         await self._invalidate_connection_epoch()
         current = asyncio.current_task()
+        old_reader = self._reader_task
         tasks = [
             self._reader_task,
             self._keepalive_task,
@@ -2487,6 +2528,15 @@ class AsyncClient:
                 await task
             except (asyncio.CancelledError, Exception):
                 pass
+        if (
+            old_reader is not None
+            and old_reader is not current
+            and self._reader_task is not None
+            and self._reader_task is not old_reader
+        ):
+            # on_disconnect established a replacement while the old reader was
+            # being joined. Its writer and transport belong to the new epoch.
+            return
         await self._write_pump.stop()
         self._discard_connection_effects(settle_publish=True)
         self._write_pump.discard()

@@ -21,14 +21,14 @@ def validate_publish_topic(topic: str, *, allow_empty: bool = False) -> int:
     return size
 
 
-def encode_validated_publish_topic(topic: str) -> bytes:
+def encode_validated_publish_topic(topic: str, *, allow_empty: bool = False) -> bytes:
     """Validate an outbound PUBLISH topic and return its MQTT UTF-8 bytes.
 
     Companion to :func:`validate_publish_topic` for callers that encode
     immediately (QoS 0, and connected QoS 1/2 launch). Retaining the validated
     bytes avoids scanning/encoding the Topic Name a second time.
     """
-    if not topic:
+    if not topic and not allow_empty:
         raise ProtocolError("PUBLISH topic must not be empty")
     try:
         encoded = encode_utf8(topic)

@@ -113,7 +113,8 @@ class TransitionInflightStore(InflightStore, Protocol):
     The store does not own the state machine. ``expected_state`` and
     ``new_state`` always come from the session; the store only guarantees that
     the durable mutation is atomic and conditional, returning ``None`` when the
-    record is absent or no longer in the expected state. A store that does not
+    record is absent or no longer in the expected state. If a transition raises,
+    its mutation must remain unapplied. A store that does not
     implement this protocol keeps working through the whole-object path.
     """
 
@@ -338,36 +339,36 @@ class MemoryInflightStore:
             raise ValueError("max_messages must be positive")
         if max_bytes <= 0:
             raise ValueError("max_bytes must be positive")
-        messages: list[InboundMessage] = []
+        index = tuple(self._in.values())
+        mids: list[int] = []
         hydrated_bytes = 0
-        for mid in tuple(self._in):
-            message = self._in.get(mid)
-            if message is None:
-                continue
-            # logical_size is maintained by the inbound session (and backfilled
-            # at hydration), so replay does not encode every topic to size it.
-            message_bytes = message.logical_size or (
-                len(message.payload)
+        for indexed_message in index:
+            message_bytes = indexed_message.logical_size or (
+                len(indexed_message.payload)
                 + (
-                    len(message.topic)
-                    if message.topic.isascii()
-                    else len(message.topic.encode("utf-8"))
+                    len(indexed_message.topic)
+                    if indexed_message.topic.isascii()
+                    else len(indexed_message.topic.encode("utf-8"))
                 )
             )
-            if messages and (
-                len(messages) >= max_messages or hydrated_bytes + message_bytes > max_bytes
-            ):
-                yield tuple(messages)
-                messages = []
+            if mids and (len(mids) >= max_messages or hydrated_bytes + message_bytes > max_bytes):
+                page = tuple(current for saved_mid in mids if (current := self._in.get(saved_mid)))
+                if page:
+                    yield page
+                mids = []
                 hydrated_bytes = 0
-            messages.append(message)
+            mids.append(indexed_message.mid)
             hydrated_bytes += message_bytes
-            if len(messages) >= max_messages or hydrated_bytes >= max_bytes:
-                yield tuple(messages)
-                messages = []
+            if len(mids) >= max_messages or hydrated_bytes >= max_bytes:
+                page = tuple(current for saved_mid in mids if (current := self._in.get(saved_mid)))
+                if page:
+                    yield page
+                mids = []
                 hydrated_bytes = 0
-        if messages:
-            yield tuple(messages)
+        if mids:
+            page = tuple(current for mid in mids if (current := self._in.get(mid)))
+            if page:
+                yield page
 
     def clear_in(self) -> None:
         old = self._in
@@ -394,6 +395,7 @@ class MemoryInflightStore:
             mid=mid,
             state=msg.state,
             user_acked=msg.user_acked,
+            delivered=msg.delivered,
             logical_size=msg.logical_size,
         )
 
@@ -407,6 +409,7 @@ class MemoryInflightStore:
                     mid=mid,
                     state=message.state,
                     user_acked=message.user_acked,
+                    delivered=message.delivered,
                     logical_size=message.logical_size,
                 )
                 for mid in page
@@ -440,6 +443,7 @@ class MemoryInflightStore:
             mid=mid,
             state=new_state,
             user_acked=msg.user_acked,
+            delivered=msg.delivered,
             logical_size=msg.logical_size,
         )
 
@@ -456,5 +460,6 @@ class MemoryInflightStore:
             mid=mid,
             state=msg.state,
             user_acked=msg.user_acked,
+            delivered=msg.delivered,
             logical_size=msg.logical_size,
         )

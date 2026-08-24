@@ -13,7 +13,7 @@ from mqttium.persistence.memory import MemoryInflightStore
 from mqttium.persistence.sqlite import SqliteInflightStore
 from mqttium.protocol.effects import EffectKind
 from mqttium.protocol.engine import EngineConfig, ProtocolEngine
-from mqttium.protocol.inbound import REPLAY_BATCH_BYTES, REPLAY_SCAN_LIMIT
+from mqttium.protocol.inbound import REPLAY_BATCH_BYTES, REPLAY_BATCH_MESSAGES
 from mqttium.types import InboundMessage, InboundRecordMeta
 
 
@@ -113,7 +113,7 @@ def test_engine_never_emits_two_700k_messages_in_one_replay_batch() -> None:
     assert len(second_messages) == 1
 
 
-def test_engine_requests_scan_sized_pages_under_the_byte_limit() -> None:
+def test_engine_requests_effect_batch_sized_pages_under_the_byte_limit() -> None:
     class RecordingStore(MemoryInflightStore):
         requested_limits: list[tuple[int, int]] = []
 
@@ -134,7 +134,7 @@ def test_engine_requests_scan_sized_pages_under_the_byte_limit() -> None:
 
     resume_effects(engine)
 
-    assert RecordingStore.requested_limits == [(REPLAY_SCAN_LIMIT, REPLAY_BATCH_BYTES)]
+    assert RecordingStore.requested_limits == [(REPLAY_BATCH_MESSAGES, REPLAY_BATCH_BYTES)]
 
 
 def test_disconnect_discards_a_message_pushed_back_by_the_emission_guard() -> None:
