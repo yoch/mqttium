@@ -78,3 +78,75 @@ jobs:
             wait "$pid" 2>/dev/null || true
           fi
           rm -rf "$JOB_ROOT"
+
+  runtime-calibration:
+    name: Runtime fuzz calibration / ARM64 / 50k x 32
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/codex/runtime-concurrency-campaign-control'
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 45
+    env:
+      BASELINE_SHA: 6ea649fdeb8a8358af75d5869e4ab7f2f79dd613
+      CAMPAIGN_ID: calibration-20260824-arm64-50k-32
+      RUNNER_LABELS: self-hosted,linux,ARM64,rpi5
+    steps:
+      - name: Check out campaign control plane
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: codex/runtime-concurrency-campaign-control
+          path: control
+          persist-credentials: false
+      - name: Check out immutable runtime-fuzzer baseline
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: 6ea649fdeb8a8358af75d5869e4ab7f2f79dd613
+          path: baseline
+          persist-credentials: false
+      - name: Set run-specific workspace
+        run: echo "JOB_ROOT=$RUNNER_TEMP/mqttium-runtime-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+      - name: Verify ARM64 host and immutable baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "aarch64"
+          test "$(git -C baseline rev-parse HEAD)" = "$BASELINE_SHA"
+          test -z "$(git -C baseline status --porcelain)"
+          command -v /usr/bin/time
+          command -v python3
+      - name: Create isolated environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$JOB_ROOT"
+          mkdir -p "$JOB_ROOT"
+          python3 -m venv "$JOB_ROOT/venv"
+          echo "$JOB_ROOT/venv/bin" >> "$GITHUB_PATH"
+      - name: Install fuzz dependencies from baseline
+        working-directory: baseline
+        run: python -m pip install -e ".[fuzz]"
+      - name: Run instrumented 50k x 32 calibration
+        run: >-
+          python control/tools/ci/runtime_campaign.py
+          --repo baseline
+          --output "$JOB_ROOT/artifacts/$CAMPAIGN_ID"
+          --campaign-id "$CAMPAIGN_ID"
+          --seed-start 0
+          --seeds 50000
+          --steps 32
+          --shard-size 5000
+          --parallelism 4
+          --runner-kind github-self-hosted
+          --expected-sha "$BASELINE_SHA"
+      - name: Upload calibration manifest and failures
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: runtime-calibration-arm64-${{ github.run_id }}
+          path: ${{ env.JOB_ROOT }}/artifacts
+          if-no-files-found: error
+          retention-days: 30
+      - name: Clean run-specific workspace
+        if: always()
+        shell: bash
+        run: rm -rf "$JOB_ROOT"
