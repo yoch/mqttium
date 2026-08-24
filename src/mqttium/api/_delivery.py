@@ -141,6 +141,7 @@ class ApplicationDelivery:
         self.closed = asyncio.Event()
         self._stream_generation = 0
         self.callback_task: asyncio.Task[None] | None = None
+        self._callback_stop = False
         self.delivery_timeout = delivery_timeout
         self.callback_shutdown_timeout = callback_shutdown_timeout
 
@@ -798,6 +799,7 @@ class ApplicationDelivery:
 
     def ensure_callback_worker(self) -> None:
         if self.callback_task is None or self.callback_task.done():
+            self._callback_stop = False
             self.callback_task = asyncio.create_task(
                 self._callback_worker(), name="mqttium-callback-worker"
             )
@@ -860,8 +862,36 @@ class ApplicationDelivery:
                 f"Callback delivery queue remained full for {self.delivery_timeout:.3f}s"
             ) from exc
 
-    async def _callback_worker(self) -> None:
+    def _propagate_callback_cancellation(
+        self,
+        callback: Callable[..., Any] | None,
+        exc: asyncio.CancelledError,
+    ) -> None:
+        """Exit only when this worker task is itself being cancelled.
+
+        A user callback that raises ``CancelledError`` is a callback failure,
+        matching AUTH-handler self-cancellation: the worker must keep draining
+        already-queued jobs.
+        """
+        task = asyncio.current_task()
+        if task is None or task.cancelling():
+            raise exc
+        self.report_callback_error(callback, exc)
+
+    def _discard_callback_queue(self) -> None:
         while True:
+            try:
+                _callback, args, token = self.callback_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if token is _CALLBACK_MESSAGE_BATCH:
+                self._release_callback_batch(len(args[0]))
+            elif token is not None:
+                self.release_nowait(cast(AccountedDeliveryToken, token))
+            self.callback_queue.task_done()
+
+    async def _callback_worker(self) -> None:
+        while not self._callback_stop:
             callback, args, token = await self.callback_queue.get()
             try:
                 if token is _CALLBACK_MESSAGE_BATCH:
@@ -870,8 +900,8 @@ class ApplicationDelivery:
                         for message in messages:
                             try:
                                 await self.invoke(callback, message)
-                            except asyncio.CancelledError:
-                                raise
+                            except asyncio.CancelledError as exc:
+                                self._propagate_callback_cancellation(callback, exc)
                             except Exception as exc:
                                 self.report_callback_error(callback, exc)
                     finally:
@@ -879,8 +909,8 @@ class ApplicationDelivery:
                     continue
                 try:
                     await self.invoke(callback, *args)
-                except asyncio.CancelledError:
-                    raise
+                except asyncio.CancelledError as exc:
+                    self._propagate_callback_cancellation(callback, exc)
                 except Exception as exc:
                     self.report_callback_error(callback, exc)
                 finally:
@@ -888,6 +918,7 @@ class ApplicationDelivery:
                         self.release_nowait(cast(AccountedDeliveryToken, token))
             finally:
                 self.callback_queue.task_done()
+        self._discard_callback_queue()
 
     @staticmethod
     async def invoke(callback: Callable[..., Any] | None, *args: Any) -> Any:
@@ -915,6 +946,11 @@ class ApplicationDelivery:
         task = self.callback_task
         if task is None:
             return
+        if task is asyncio.current_task():
+            # on_connect/on_publish/on_message may call disconnect(). Joining or
+            # cancelling this worker from inside the current job deadlocks.
+            self._callback_stop = True
+            return
         if drain and not task.done():
             try:
                 await asyncio.wait_for(
@@ -929,13 +965,4 @@ class ApplicationDelivery:
             except asyncio.CancelledError:
                 pass
         self.callback_task = None
-        while True:
-            try:
-                _callback, args, token = self.callback_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            if token is _CALLBACK_MESSAGE_BATCH:
-                self._release_callback_batch(len(args[0]))
-            elif token is not None:
-                self.release_nowait(cast(AccountedDeliveryToken, token))
-            self.callback_queue.task_done()
+        self._discard_callback_queue()
