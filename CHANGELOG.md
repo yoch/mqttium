@@ -6,6 +6,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [1.0.0rc9] - 2026-08-23
+
 ### Fixed
 
 - Wait for automatic reconnect to leave its stability window before the soak
@@ -821,7 +823,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - Pre-spin-out comparative analysis and generated coverage data from the
   published source tree.
 
-[Unreleased]: https://github.com/yoch/mqttium/compare/v1.0.0rc8...HEAD
+[Unreleased]: https://github.com/yoch/mqttium/compare/v1.0.0rc9...HEAD
+[1.0.0rc9]: https://github.com/yoch/mqttium/compare/v1.0.0rc8...v1.0.0rc9
 [1.0.0rc8]: https://github.com/yoch/mqttium/compare/v1.0.0rc7...v1.0.0rc8
 [1.0.0rc7]: https://github.com/yoch/mqttium/compare/v1.0.0rc6...v1.0.0rc7
 [1.0.0rc6]: https://github.com/yoch/mqttium/compare/v1.0.0rc5...v1.0.0rc6
