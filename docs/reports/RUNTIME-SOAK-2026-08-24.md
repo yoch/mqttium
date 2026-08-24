@@ -7,7 +7,7 @@ guide is [Runtime soak and quiescence](../runtime-soak.md).
 ## Environment
 
 - Repository: `yoch/mqttium`
-- Branch: `research/runtime-soak`
+- Branch: `research/runtime-soak` at `75a36ab`
 - Base: `origin/main` at `a336f83` (1.0.0rc9)
 - Python: 3.12, in-tree install `pip install -e ".[dev]"`
 - Backend: in-memory packet-aware broker (`benchmarks/runtime_soak_lib/broker.py`)
