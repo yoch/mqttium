@@ -235,7 +235,7 @@ class CooperativeScheduler:
         *,
         enabled: frozenset[str] | set[str] | None = None,
         timeout: float = 2.0,
-        idle_timeout: float = 0.4,
+        idle_timeout: float = 0.15,
         max_steps: int = 200,
     ) -> None:
         self.enabled = frozenset(enabled) if enabled is not None else None
@@ -368,12 +368,21 @@ class CooperativeScheduler:
     def _actors_done(self) -> bool:
         return all(task.done() for task in self._actor_tasks.values())
 
+    def _has_park(self) -> bool:
+        return any(not item.future.done() for item in self.parked)
+
     async def _wait_for_decision_or_idle(self) -> str:
-        idle_deadline = asyncio.get_running_loop().time() + self.idle_timeout
+        """Wait until a task parks, or until a quiet period elapses.
+
+        Actor completion is not itself quiescence: the writer or effect
+        flusher may still be about to hit an enabled checkpoint.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.idle_timeout
         while True:
-            if self.parked or self._actors_done():
+            if self._has_park():
                 return "ready"
-            remaining = idle_deadline - asyncio.get_running_loop().time()
+            remaining = deadline - loop.time()
             if remaining <= 0:
                 return "idle"
             self._activity.clear()
@@ -381,42 +390,49 @@ class CooperativeScheduler:
                 await asyncio.wait_for(self._activity.wait(), timeout=remaining)
             except TimeoutError:
                 return "idle"
+            if self._has_park():
+                return "ready"
+            if not self._actors_done():
+                deadline = loop.time() + self.idle_timeout
 
     async def _drive(self, chooser: Chooser) -> None:
         recorded: list[Step] = []
         try:
             while True:
                 state = await self._wait_for_decision_or_idle()
-                if self._actors_done() and not self.parked:
+                if self._has_park():
+                    await self._apply_decision(chooser, recorded)
+                    continue
+                if self._actors_done():
                     return
-                options = self._legal_decisions()
-                if not options:
-                    if self._actors_done():
-                        return
-                    raise DeadlockError(
-                        "no parked checkpoint and no remaining adversary action; "
-                        f"actors still running: {self._running_actors()}"
-                    )
-                if state == "idle" and not self.parked:
-                    raise DeadlockError(
-                        "idle timeout with no parked checkpoint; "
-                        f"running={self._running_actors()} events={self._event_tail()}"
-                    )
-                if len(recorded) >= self.max_steps:
-                    raise DeadlockError(
-                        f"exceeded max_steps={self.max_steps}; last steps:\n"
-                        + "\n".join(step.format() for step in recorded[-8:])
-                    )
-                decision = chooser.choose(options)
-                recorded.append(decision.to_step())
-                if decision.kind == "resume":
-                    self._resume(decision)
-                else:
-                    assert decision.action is not None
-                    await self._perform_action(decision.action)
-                await asyncio.sleep(0)
+                raise DeadlockError(
+                    "idle timeout with no parked checkpoint; "
+                    f"running={self._running_actors()} events={self._event_tail()} "
+                    f"state={state}"
+                )
         finally:
             self._recorded_steps = tuple(recorded)
+
+    async def _apply_decision(self, chooser: Chooser, recorded: list[Step]) -> None:
+        options = self._legal_decisions()
+        if not options:
+            raise DeadlockError(
+                "no parked checkpoint and no remaining adversary action; "
+                f"actors still running: {self._running_actors()}"
+            )
+        if len(recorded) >= self.max_steps:
+            raise DeadlockError(
+                f"exceeded max_steps={self.max_steps}; last steps:\n"
+                + "\n".join(step.format() for step in recorded[-8:])
+            )
+        decision = chooser.choose(options)
+        recorded.append(decision.to_step())
+        if decision.kind == "resume":
+            self._resume(decision)
+        else:
+            assert decision.action is not None
+            await self._perform_action(decision.action)
+        await asyncio.sleep(0)
 
     def _running_actors(self) -> str:
         running = [name for name, task in self._actor_tasks.items() if not task.done()]
@@ -456,45 +472,14 @@ class CooperativeScheduler:
         driver = asyncio.create_task(self._drive(chooser), name="concurrency-scheduler")
         self._driver = driver
         result = RunResult(schedule=Schedule(policy=policy, seed=seed))
+        gathered = asyncio.gather(
+            *self._actor_tasks.values(),
+            return_exceptions=True,
+        )
         try:
-            gathered = asyncio.gather(
-                *self._actor_tasks.values(),
-                return_exceptions=True,
-            )
-            try:
-                actor_values = await asyncio.wait_for(gathered, timeout=self.timeout)
-            except TimeoutError:
-                result.timed_out = True
-                result.error = TimeoutError(
-                    "scenario exceeded timeout "
-                    f"{self.timeout:.3f}s; schedule so far:\n{self._partial_schedule(policy, seed)}"
-                )
-                await self._cancel_all()
-                return result
-            names = list(self._actor_tasks)
-            for name, value in zip(names, actor_values, strict=True):
-                result.actor_results[name] = value
-                if isinstance(value, BaseException) and not isinstance(
-                    value, asyncio.CancelledError
-                ):
-                    result.error = value
+            await self._await_actors_and_driver(result, driver, gathered, policy, seed)
         finally:
-            self._stopping = True
-            self.armed = False
-            self._release_all_parks()
-            if not driver.done():
-                driver.cancel()
-                try:
-                    await driver
-                except (asyncio.CancelledError, Exception):
-                    pass
-            elif not result.timed_out:
-                drive_error = driver.exception() if not driver.cancelled() else None
-                if isinstance(drive_error, DeadlockError):
-                    result.deadlock = True
-                    result.error = drive_error
-                elif drive_error is not None:
-                    result.error = drive_error
+            await self._shutdown_driver(result, driver)
             self._driver = None
 
         result.events = list(self.events)
@@ -505,6 +490,91 @@ class CooperativeScheduler:
         )
         result.steps = len(result.schedule.steps)
         return result
+
+    def _record_actor_values(self, result: RunResult, values: Sequence[Any]) -> None:
+        names = list(self._actor_tasks)
+        for name, value in zip(names, values, strict=True):
+            result.actor_results[name] = value
+            if isinstance(value, BaseException) and not isinstance(value, asyncio.CancelledError):
+                if result.error is None:
+                    result.error = value
+
+    def _record_driver_error(self, result: RunResult, driver: asyncio.Task[Any]) -> None:
+        if not driver.done() or driver.cancelled():
+            return
+        error = driver.exception()
+        if error is None:
+            return
+        result.error = error
+        result.deadlock = isinstance(error, DeadlockError)
+
+    def _timeout_error(self, policy: str, seed: int | None) -> TimeoutError:
+        return TimeoutError(
+            "scenario exceeded timeout "
+            f"{self.timeout:.3f}s; schedule so far:\n{self._partial_schedule(policy, seed)}"
+        )
+
+    async def _await_actors_and_driver(
+        self,
+        result: RunResult,
+        driver: asyncio.Task[Any],
+        gathered: asyncio.Future[Any],
+        policy: str,
+        seed: int | None,
+    ) -> None:
+        done, _pending = await asyncio.wait(
+            {driver, gathered},
+            timeout=self.timeout,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if not done:
+            result.timed_out = True
+            result.error = self._timeout_error(policy, seed)
+            await self._cancel_all()
+            if not driver.done():
+                driver.cancel()
+                await asyncio.gather(driver, return_exceptions=True)
+            return
+        if driver in done:
+            self._record_driver_error(result, driver)
+            if result.error is not None:
+                if not gathered.done():
+                    await self._cancel_all()
+                    gathered.cancel()
+                    await asyncio.gather(gathered, return_exceptions=True)
+                else:
+                    self._record_actor_values(result, gathered.result())
+                return
+            if not gathered.done():
+                try:
+                    await asyncio.wait_for(gathered, timeout=self.timeout)
+                except TimeoutError:
+                    result.timed_out = True
+                    result.error = self._timeout_error(policy, seed)
+                    await self._cancel_all()
+                    return
+            self._record_actor_values(result, gathered.result())
+            return
+        self._record_actor_values(result, gathered.result())
+        if not driver.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(driver), timeout=self.timeout)
+            except TimeoutError:
+                result.timed_out = True
+                result.error = self._timeout_error(policy, seed)
+                await self._cancel_all()
+                return
+        self._record_driver_error(result, driver)
+
+    async def _shutdown_driver(self, result: RunResult, driver: asyncio.Task[Any]) -> None:
+        self._stopping = True
+        self.armed = False
+        self._release_all_parks()
+        if not driver.done():
+            driver.cancel()
+            await asyncio.gather(driver, return_exceptions=True)
+        elif result.error is None:
+            self._record_driver_error(result, driver)
 
     def _partial_schedule(self, policy: str, seed: int | None) -> str:
         recorded = getattr(self, "_recorded_steps", ())

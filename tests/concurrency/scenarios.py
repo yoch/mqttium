@@ -91,7 +91,7 @@ async def run_connected_scenario(
     schedule: Schedule | None = None,
     chooser: Chooser | None = None,
     timeout: float = 2.0,
-    idle_timeout: float = 0.4,
+    idle_timeout: float = 0.15,
     auto_ack: bool = True,
     extra_actions: Callable[[MqttHarness], dict[str, ActionFn]] | None = None,
     reconnect: ReconnectPolicy | None = None,

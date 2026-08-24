@@ -38,22 +38,59 @@ PYTHONPATH=. python tests/concurrency/explore.py --policy dfs --max-schedules 24
 PYTHONPATH=. python tests/concurrency/explore.py --policy random --seed 7 --max-schedules 6
 ```
 
+Host for the numbers below: the Cloud Agent workspace that ran this prototype
+(`python 3.12.3`, in-memory broker, no Mosquitto). Unique schedules count
+distinct printable `Schedule.format()` strings, not raw DFS queue nodes.
+
 ## Measurements
 
-Filled from the prototype run on this branch after the tests below. Unique
-schedules count distinct printable `Schedule.format()` strings, not raw DFS
-queue nodes.
+| Campaign | Budget | Unique schedules | Timeouts | Deadlocks | Unexpected errors | Elapsed |
+| --- | --- | --- | --- | --- | --- | --- |
+| DFS write-boundary, one QoS 1 admit | 24 runs, depth 3 | 16 | 0 | 0 | 0 | ~3.6 s (pytest) |
+| DFS write-boundary, one QoS 1 admit | 80 runs, depth 5 | 43 | 0 | 0 | 0 | 12.1 s |
+| DFS enqueue+write, one QoS 1 admit | 40 runs, depth 4 | 24 | 0 | 0 | 0 | 6.0 s |
+| Random seed 7, write-boundary | 6 runs | 5 | 0 | 0 | 0 | ~1.8 s (pytest pair) |
+| Random seed 1, write-boundary | 20 runs | 15 | 0 | 0 | 0 | included in 12 s batch |
 
-| Campaign | Budget | Unique schedules | Timeouts | Deadlocks | Unexpected errors |
-| --- | --- | --- | --- | --- | --- |
-| DFS write-boundary, one QoS 1 admit | 24 runs, depth 3 | (pending) | (pending) | (pending) | (pending) |
-| Random seed 7, same scenario | 6 runs | (pending) | (pending) | (pending) | (pending) |
+Mean branching on the depth-3 write-boundary tree was **3.86**. That is
+roughly "resume the parked writer, or fire one of the remaining one-shot
+actions". Depth 5 still grew (16 → 43 unique under a 80-run cap), so the tree
+is not collapsed; it is just small enough to finish in seconds when the
+enabled set is one or two named boundaries.
 
-Practical reading: one publisher, one enabled write checkpoint, and four
-one-shot adversary actions already produces a branching factor around "resume
-plus remaining actions". Depth 3 is enough to show the tree is finite and
-small; enabling `writer.enqueue.*`, `effect.apply.*`, and
-`delivery.callback.*` together is not a PR-CI activity.
+Practical reading:
+
+- A focused replay of 1–6 checkpoints is a normal pytest (this tree's 13 tests
+  ran in 8.05 s after shrinking the idle budget to 150 ms).
+- A nightly campaign of a few hundred schedules is cheap.
+- Enabling `writer.enqueue.*`, `effect.apply.*`, `delivery.callback.*`, and
+  `epoch.invalidate.*` together is not a PR-CI activity. Naive DFS is not
+  DPOR; branching is `parked tasks + remaining actions` at every step.
+
+No product invariant failure was reduced from this first campaign. Close,
+failed write, and late ACK are treated as expected `MQTTError` /
+`ConnectionError` outcomes unless the run times out, deadlocks, or raises
+`AssertionError`.
+
+## Sample schedules
+
+Canonical QoS 1 drain, `FirstChooser`, only `transport.write.before` enabled:
+
+```text
+# policy=explicit
+resume mqttium-writer @ transport.write.before #1
+```
+
+The same publisher, suspend-then-fail-transport prefix:
+
+```text
+# policy=explicit
+action close_transport
+resume mqttium-writer @ transport.write.before #1
+```
+
+Both prefixes replayed identically in
+`tests/concurrency/test_demo_scenarios.py`.
 
 ## Demonstration scenarios
 
