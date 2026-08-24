@@ -1774,6 +1774,13 @@ class AsyncClient:
                 and self._disconnect_exc is None
             )
             await self._invalidate_connection_epoch()
+            # Retire protocol-visible ownership before joining any child task.
+            # Keepalive cancellation can suspend, and while it does callers
+            # must not observe the dead transport's engine as CONNECTED and
+            # admit work that a following clean reconnect will discard.
+            async with self._engine_lock:
+                self._engine.notify_transport_closed()
+                self._collect_effects_locked()
             # The keepalive loop belongs to this reader's transport epoch. An
             # EOF or reader-side failure can end the reader without entering
             # _force_close(), so retire the task here before a reconnect can
@@ -1788,9 +1795,6 @@ class AsyncClient:
                     pass
                 if self._keepalive_task is keepalive:
                     self._keepalive_task = None
-            async with self._engine_lock:
-                self._engine.notify_transport_closed()
-                self._collect_effects_locked()
             try:
                 await self._drain_effects()
             except (Exception, asyncio.CancelledError):
