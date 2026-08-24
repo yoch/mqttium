@@ -8,9 +8,9 @@ import pytest
 
 from mqttium.api import AsyncClient
 from mqttium.codec.buffer import IncrementalDecoder, RawPacket
-from mqttium.enums import MQTTProtocolVersion, PacketType
+from mqttium.enums import MQTTProtocolVersion, PacketType, QoS
 from mqttium.errors import MQTTError
-from mqttium.packets import encode_frame
+from mqttium.packets import PublishPacket, encode_frame
 from mqttium.protocol.reconnect import ReconnectPolicy
 
 from tests.support import QueueTransport, transport_factory, write_item_bytes
@@ -117,6 +117,48 @@ async def test_terminal_disconnect_wakes_publish_blocked_on_logical_backpressure
     with pytest.raises(MQTTError):
         await first.wait()
     assert client._publish_waiters == 0
+
+
+async def test_writer_failure_wakes_reader_blocked_on_puback_admission() -> None:
+    transport = _ControlledTransport()
+    client = AsyncClient(
+        client_id="reader-puback-writer-failure",
+        protocol=MQTTProtocolVersion.MQTTv5,
+        max_outbound_messages=1,
+        max_outbound_bytes=1024,
+        reconnect=ReconnectPolicy(enabled=False),
+    )
+    client._transport_factory = transport_factory(transport)
+    disconnected = asyncio.Event()
+    client.on_disconnect = lambda _exc: disconnected.set()
+
+    await client.connect("fake", timeout=1)
+    published = asyncio.create_task(client.publish("out/q0", b"hold"))
+    await asyncio.wait_for(transport.publish_write_entered.wait(), timeout=1)
+    transport.push_rx(
+        PublishPacket(
+            topic="in/q1",
+            payload=b"needs-puback",
+            qos=QoS.AT_LEAST_ONCE,
+            retain=False,
+            dup=False,
+            mid=7,
+        ).encode(MQTTProtocolVersion.MQTTv5)
+    )
+    for _ in range(100):
+        if client._write_pump.waiters:
+            break
+        await asyncio.sleep(0)
+    assert client._write_pump.waiters == 1
+
+    transport.fail_publish_write = True
+    transport.release_publish_write.set()
+    await asyncio.wait_for(disconnected.wait(), timeout=1)
+    await asyncio.wait_for(published, timeout=1)
+
+    assert client._write_pump.waiters == 0
+    assert client._reader_task is not None and client._reader_task.done()
+    await client.disconnect()
 
 
 async def test_user_disconnect_cancels_reconnect_during_transport_setup() -> None:

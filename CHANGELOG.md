@@ -13,23 +13,42 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   connection-scoped reset, and canonical-topic persistence/replay for QoS 1/2.
 - Add the Stable `auth_timeout` constructor setting for bounding each enhanced
   authentication handler invocation.
+- Extend deterministic fuzzing across enhanced AUTH, outbound Topic Alias
+  state, and payload-free replay interleavings with Memory/SQLite equivalence.
 
 ### Fixed
 
 - Reject client-initiated re-authentication when no runtime authentication
   handler can service the broker's response, instead of enabling an exchange
   that could not be completed.
+- Wake writer admission waiters and invalidate the dead writer generation when
+  a transport write fails, including a reader blocked while sending an ACK.
+- Settle effects collected while a deferred-effect failure is closing its
+  connection, so later drains cannot wait on abandoned work.
+- Keep the callback worker alive when user callbacks raise `CancelledError`,
+  and allow lifecycle callbacks to disconnect or reconnect without self-join,
+  lifecycle-lock, or stale automatic-reconnect races.
+- Revalidate payload-free inbound metadata before each replay emission and
+  discard replay cursors on transport close, preventing completed or already
+  delivered records from leaking out of stale replay pages.
+- Strip connection-scoped Topic Alias properties and retained alias frames from
+  QoS 1/2 replay, so a resumed session is independent of the new broker's Topic
+  Alias Maximum while retaining the canonical durable topic.
 
 ### Changed
 
 - Keep unsupported inbound AUTH handling and its protocol DISCONNECT in the
   protocol engine; the asyncio runtime no longer carries a second DISCONNECT
   construction path.
+- Strengthen soak quiescence checks to include packet identifiers, replay and
+  inbound bytes, all pump/delivery waiters, and every receipt class.
 
 ### Documentation
 
 - Record lifecycle-generation invariants and the exact correctness, bounded
   replay, and metadata-transition capabilities of legacy and built-in stores.
+- Record the reproduction, standards/specification review, and disposition of
+  the five pre-refactor fuzz and concurrency draft PRs.
 
 ## [1.0.0rc9] - 2026-08-23
 

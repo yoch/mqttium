@@ -173,6 +173,33 @@ async def test_intentional_disconnect_callback_receives_none() -> None:
     assert errors == [None]
 
 
+async def test_on_connect_can_disconnect_without_joining_its_callback_worker() -> None:
+    client = AsyncClient(client_id="on-connect-disconnect")
+    transport = _Transport(connack=True)
+    callback_finished = asyncio.Event()
+
+    async def factory(host: str, port: int, *, ssl: object = None) -> _Transport:
+        del host, port, ssl
+        return transport
+
+    async def on_connect(connack: object) -> None:
+        del connack
+        await client.disconnect()
+        callback_finished.set()
+
+    client._transport_factory = factory
+    client.on_connect = on_connect
+
+    await asyncio.wait_for(client.connect("fake", timeout=1), timeout=1)
+    await asyncio.wait_for(callback_finished.wait(), timeout=1)
+    worker = client._delivery.callback_task
+    if worker is not None:
+        await asyncio.wait_for(worker, timeout=1)
+
+    assert not client.is_connected
+    assert client._transport is None
+
+
 async def test_disconnect_does_not_wait_for_space_in_saturated_writer_queue() -> None:
     client = AsyncClient(
         client_id="bounded-disconnect",

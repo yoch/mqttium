@@ -232,6 +232,10 @@ class InboundSession:
         self._aliases.clear()
         self._pending_manual_qos1_acks.clear()
         self.release_pending_auto_qos1()
+        # A continuation is scoped to the connection that created its cursor.
+        # Direct engine consumers have no runtime epoch filter, so invalidate it
+        # here as well as during the next start_connection().
+        self._replay = None
 
     def configure_peer_packet_limit(self, limit: int | None) -> None:
         """Bind the rare automatic-ACK failure path for this connection."""
@@ -929,6 +933,8 @@ class InboundSession:
         cursor = self._replay
         if cursor is None:
             return
+        transitions = self._transitions
+        assert transitions is not None
         scanned = 0
         emitted = 0
         emitted_bytes = 0
@@ -942,7 +948,11 @@ class InboundSession:
                 self._replay = None
                 self._recovered_mids.clear()
                 return
-            if not self._should_redeliver(inbound):
+            # A hydrated replay page can survive across effect batches. Refresh
+            # payload-free metadata before emission so an intervening PUBREL,
+            # manual ACK, or delivery handoff cannot leak its stale copy.
+            current = transitions.in_meta(inbound.mid)
+            if current is None or not self._should_redeliver(inbound, current):
                 scanned += 1
                 continue
             message_bytes = len(inbound.payload) + len(inbound.topic.encode("utf-8"))
@@ -955,17 +965,24 @@ class InboundSession:
             emitted_bytes += message_bytes
         self._engine._emit(EffectKind.CONTINUE_INBOUND_REPLAY, None)
 
-    def _should_redeliver(self, inbound: InboundMessage) -> bool:
-        if not inbound.delivered:
+    def _should_redeliver(
+        self,
+        inbound: InboundMessage,
+        current: InboundRecordMeta | None = None,
+    ) -> bool:
+        delivered = inbound.delivered if current is None else current.delivered
+        state = inbound.state if current is None else current.state
+        user_acked = inbound.user_acked if current is None else current.user_acked
+        if not delivered:
             return True
         if inbound.mid not in self._recovered_mids or not self.config.manual_ack:
             return False
-        if inbound.state in (
+        if state in (
             InboundQoSState.WAIT_PUBACK,
             InboundQoSState.WAIT_USER_ACK,
         ):
             return True
-        return inbound.state is InboundQoSState.WAIT_PUBREL and not inbound.user_acked
+        return state is InboundQoSState.WAIT_PUBREL and not user_acked
 
     def _emit_message(self, inbound: InboundMessage, *, dup: bool) -> None:
         self._engine._emit(

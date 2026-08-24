@@ -34,6 +34,7 @@ Status meanings:
 | [ISSUE-253-ARM64-VALIDATION-2026-08-17](https://github.com/yoch/mqttium/blob/main/docs/reports/ISSUE-253-ARM64-VALIDATION-2026-08-17.md) | Current evidence | ARM64 validation for the issue and source it names |
 | [SIMPLIFICATION-AUDIT-2026-08-16](https://github.com/yoch/mqttium/blob/main/docs/reports/SIMPLIFICATION-AUDIT-2026-08-16.md) | Current evidence | Reviewed simplification decisions at the named commit |
 | [SIMPLIFICATION-ARM64-REVALIDATION-2026-08-17](https://github.com/yoch/mqttium/blob/main/docs/reports/SIMPLIFICATION-ARM64-REVALIDATION-2026-08-17.md) | Current evidence | Independent-architecture revalidation of that campaign |
+| [PRE-REFACTOR-FUZZ-PR-REEVALUATION-2026-08-24](https://github.com/yoch/mqttium/blob/main/docs/reports/PRE-REFACTOR-FUZZ-PR-REEVALUATION-2026-08-24.md) | Current evidence | Reproduction and disposition of draft PRs #372–#376 against the post-consolidation baseline |
 
 ## Cross-client and performance program
 

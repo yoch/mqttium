@@ -198,10 +198,16 @@ def test_alias_only_durable_replay_always_sends_full_canonical_topic() -> None:
     assert replay.mid == handle.mid
     assert replay.topic == "canonical/topic"
     assert replay.dup is True
+    assert replay.properties is None or replay.properties.get("topic_alias") is None
 
 
 @pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
-def test_process_restart_replay_never_depends_on_old_alias(store_kind: str, tmp_path) -> None:
+@pytest.mark.parametrize("qos", [1, 2])
+def test_process_restart_replay_ignores_lower_new_alias_maximum(
+    store_kind: str,
+    qos: int,
+    tmp_path,
+) -> None:
     store = (
         MemoryInflightStore()
         if store_kind == "memory"
@@ -218,7 +224,7 @@ def test_process_restart_replay_never_depends_on_old_alias(store_kind: str, tmp_
     first.take_effects()
     first.queue_publish("canonical/topic", qos=0, properties=_alias(1))
     _sent_publish(first)
-    handle = first.queue_publish("", b"durable", qos=1, properties=_alias(1))
+    handle = first.queue_publish("", b"durable", qos=qos, properties=_alias(1))
     assert _sent_publish(first).topic == ""
     first.notify_transport_closed()
     first.take_effects()
@@ -232,11 +238,68 @@ def test_process_restart_replay_never_depends_on_old_alias(store_kind: str, tmp_
         store,
     )
     second.begin_connect()
-    feed_engine(second, _connack(session_present=True))
+    feed_engine(second, _connack(alias_maximum=0, session_present=True))
     replay = _sent_publish(second)
 
     assert replay.mid == handle.mid
     assert replay.topic == "canonical/topic"
+    assert replay.properties is None or replay.properties.get("topic_alias") is None
+    if isinstance(store, SqliteInflightStore):
+        store.close()
+
+
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+def test_reconnect_discards_retained_frame_with_old_alias(store_kind: str, tmp_path) -> None:
+    store = (
+        MemoryInflightStore()
+        if store_kind == "memory"
+        else SqliteInflightStore(tmp_path / "retained-alias.db")
+    )
+    first = ProtocolEngine(
+        EngineConfig(
+            client_id="retained-alias",
+            protocol=MQTTProtocolVersion.MQTTv5,
+            clean_start=False,
+        ),
+        store,
+    )
+    first.begin_connect()
+    feed_engine(first, _connack(alias_maximum=2))
+    first.take_effects()
+    properties = _alias(2)
+    properties.set("content_type", "application/octet-stream")
+    handle = first.queue_publish(
+        "canonical/topic",
+        b"x" * (256 * 1024),
+        qos=1,
+        properties=properties,
+    )
+    initial = _sent_publish(first)
+    assert initial.properties is not None and initial.properties.get("topic_alias") == 2
+    stored = store.get_out(handle.mid or 0)
+    assert stored is not None
+    if isinstance(store, MemoryInflightStore):
+        assert stored.encoded_publish is not None
+    first.notify_transport_closed()
+    first.take_effects()
+
+    second = ProtocolEngine(
+        EngineConfig(
+            client_id="retained-alias",
+            protocol=MQTTProtocolVersion.MQTTv5,
+            clean_start=False,
+        ),
+        store,
+    )
+    second.begin_connect()
+    feed_engine(second, _connack(alias_maximum=0, session_present=True))
+    replay = _sent_publish(second)
+
+    assert replay.topic == "canonical/topic"
+    assert replay.dup is True
+    assert replay.properties is None or replay.properties.get("topic_alias") is None
+    assert replay.properties is not None
+    assert replay.properties.get("content_type") == "application/octet-stream"
     if isinstance(store, SqliteInflightStore):
         store.close()
 

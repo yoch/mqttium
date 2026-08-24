@@ -578,4 +578,9 @@ class WritePump:
             # write straight into the dead transport.
             self._drop_eager_binding()
             self._writing = False
+            # The failed batch released resident accounting without making
+            # capacity usable. Invalidate this writer generation and wake all
+            # parked producers so they fail instead of waiting on a task that
+            # has already exited.
+            await self.advance_epoch(self.epoch + 1)
             await self.on_failure(exc)

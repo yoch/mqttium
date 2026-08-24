@@ -62,7 +62,9 @@ _IN_PAGE_SQL = (
     " topic, properties, payload"
     " FROM inbound WHERE mid IN"
 )
-_IN_INDEX_PAGE_SQL = "SELECT mid, state, user_acked, logical_size FROM inbound WHERE mid IN"
+_IN_INDEX_PAGE_SQL = (
+    "SELECT mid, state, user_acked, delivered, logical_size FROM inbound WHERE mid IN"
+)
 _IN_REPLAY_INDEX_SQL = (
     "SELECT mid, length(payload) + length(CAST(topic AS BLOB)) AS replay_size"
     " FROM inbound ORDER BY seq"
@@ -193,10 +195,11 @@ def _stored_out_transition(
 
 def _stored_in_transition(
     row: sqlite3.Row,
-) -> tuple[InboundQoSState, bool, int, int]:
+) -> tuple[InboundQoSState, bool, bool, int, int]:
     return (
         InboundQoSState(_stored(row, "state", int)),
         _stored_bool(row, "user_acked"),
+        _stored_bool(row, "delivered"),
         _stored_non_negative(row, "logical_size"),
         _stored_non_negative(row, "seq"),
     )
@@ -238,6 +241,7 @@ def _row_to_in_meta(row: sqlite3.Row) -> InboundRecordMeta:
         mid=_stored_mid(row),
         state=InboundQoSState(_stored(row, "state", int)),
         user_acked=_stored_bool(row, "user_acked"),
+        delivered=_stored_bool(row, "delivered"),
         logical_size=_stored_non_negative(row, "logical_size"),
     )
 
@@ -963,7 +967,8 @@ class SqliteInflightStore:
 
     def _in_transition_row(self, mid: int) -> sqlite3.Row | None:
         return self._conn.execute(
-            "SELECT state, user_acked, logical_size, seq FROM inbound WHERE mid=?", (mid,)
+            "SELECT state, user_acked, delivered, logical_size, seq FROM inbound WHERE mid=?",
+            (mid,),
         ).fetchone()
 
     def contains_in(self, mid: int) -> bool:
@@ -986,11 +991,12 @@ class SqliteInflightStore:
             row = self._in_transition_row(mid)
         if row is None:
             return None
-        state, user_acked, logical_size, _ = _stored_in_transition(row)
+        state, user_acked, delivered, logical_size, _ = _stored_in_transition(row)
         return InboundRecordMeta(
             mid=mid,
             state=state,
             user_acked=user_acked,
+            delivered=delivered,
             logical_size=logical_size,
         )
 
@@ -1018,7 +1024,7 @@ class SqliteInflightStore:
             row = self._in_transition_row(mid)
             if row is None:
                 return None
-            state, old_user_acked, logical_size, seq = _stored_in_transition(row)
+            state, old_user_acked, delivered, logical_size, seq = _stored_in_transition(row)
             if state is not expected_state:
                 return None
             self._ensure_write_transaction()
@@ -1061,6 +1067,7 @@ class SqliteInflightStore:
                 mid=mid,
                 state=new_state,
                 user_acked=resulting_user_acked,
+                delivered=delivered,
                 logical_size=logical_size,
             )
 
@@ -1073,7 +1080,7 @@ class SqliteInflightStore:
             row = self._in_transition_row(mid)
             if row is None:
                 return None
-            state, old_user_acked, logical_size, seq = _stored_in_transition(row)
+            state, old_user_acked, delivered, logical_size, seq = _stored_in_transition(row)
             if state is not expected_state:
                 return None
             self._ensure_write_transaction()
@@ -1092,5 +1099,6 @@ class SqliteInflightStore:
                 mid=mid,
                 state=expected_state,
                 user_acked=old_user_acked,
+                delivered=delivered,
                 logical_size=logical_size,
             )

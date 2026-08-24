@@ -25,8 +25,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from mqttium.codec.buffer import DEFAULT_MAX_PACKET_SIZE, IncrementalDecoder, RawPacket
-from mqttium.codec.properties import PUBLISH, decode_properties, encode_properties
-from mqttium.enums import MQTTProtocolVersion, OutboundQoSState, PacketType, QoS
+from mqttium.codec.properties import CONNACK, PUBLISH, decode_properties, encode_properties
+from mqttium.enums import ConnectionState, MQTTProtocolVersion, OutboundQoSState, PacketType, QoS
 from mqttium.errors import MQTTError
 from mqttium.packets import (
     AuthPacket,
@@ -266,6 +266,13 @@ def fuzz_engine(  # noqa: C901
 ) -> FuzzResult:
     result = FuzzResult("engine", iterations, 0, 0)
     proto = rng.choice([MQTTProtocolVersion.MQTTv311, MQTTProtocolVersion.MQTTv5])
+    connect_properties = None
+    auth_method = None
+    if proto is MQTTProtocolVersion.MQTTv5:
+        connect_properties = Properties()
+        if rng.random() < 0.5:
+            auth_method = "fuzz-auth"
+            connect_properties.set("authentication_method", auth_method)
     engine = ProtocolEngine(
         EngineConfig(
             client_id="fuzz",
@@ -273,6 +280,8 @@ def fuzz_engine(  # noqa: C901
             local_receive_maximum=rng.choice([1, 4, 100]),
             topic_alias_maximum=rng.choice([0, 2]),
             manual_ack=bool(rng.random() < 0.5),
+            connect_properties=connect_properties,
+            accept_auth=auth_method is not None,
         )
     )
     dec = IncrementalDecoder(max_packet_size=DEFAULT_MAX_PACKET_SIZE)
@@ -300,13 +309,17 @@ def fuzz_engine(  # noqa: C901
     if logger:
         logger.start()
     for i in range(iterations):
-        op = rng.randrange(10)
+        op = rng.randrange(13)
         try:
             if op == 0:
                 # CONNACK (sometimes duplicate / out of state)
                 body = bytes([rng.randrange(2), rng.choice([0, 0, 0, 5, 135])])
                 if proto == MQTTProtocolVersion.MQTTv5:
-                    body += b"\x00"
+                    properties = Properties()
+                    properties.set("topic_alias_maximum", 2)
+                    if auth_method is not None:
+                        properties.set("authentication_method", auth_method)
+                    body += encode_properties(properties, CONNACK)
                 feed(encode_frame(PacketType.CONNACK, 0, body))
             elif op in (1, 2, 3):
                 wire = _rand_publish_frame(rng, proto)
@@ -344,6 +357,7 @@ def fuzz_engine(  # noqa: C901
                 # Transport close + reconnect cycle
                 engine.notify_transport_closed()
                 engine.take_effects()
+                assert not engine.inbound.replay_pending
                 try:
                     engine.begin_connect()
                     engine.take_effects()
@@ -356,10 +370,43 @@ def fuzz_engine(  # noqa: C901
                 except ALLOWED:
                     pass
                 engine.take_effects()
-            else:
+            elif op == 9:
                 # PINGRESP / DISCONNECT / AUTH
                 t = rng.choice([PacketType.PINGRESP, PacketType.DISCONNECT, PacketType.AUTH])
                 feed(encode_frame(t, 0, b"\x00" if t is not PacketType.PINGRESP else b""))
+            elif op == 10:
+                # Runtime backpressure re-enters the engine at this boundary.
+                engine.continue_inbound_replay()
+                engine.take_effects()
+            elif op == 11:
+                # Delivery handoff can race a cursor-held replay record.
+                inbound = list(engine.store.in_items())
+                if inbound:
+                    engine.mark_inbound_delivered(rng.choice(inbound).mid)
+                engine.take_effects()
+            else:
+                if proto is MQTTProtocolVersion.MQTTv5 and rng.random() < 0.7:
+                    properties = Properties()
+                    properties.set("topic_alias", rng.randrange(0, 4))
+                    engine.queue_publish(
+                        rng.choice(["", "alias/a", "alias/b"]),
+                        b"alias-payload",
+                        qos=QoS(rng.choice([0, 1, 2])),
+                        properties=properties,
+                    )
+                    engine.take_effects()
+                elif proto is MQTTProtocolVersion.MQTTv5 and auth_method is not None:
+                    if engine.state is ConnectionState.CONNECTED and rng.random() < 0.5:
+                        engine.queue_auth(0x19)
+                        engine.take_effects()
+                    else:
+                        properties = Properties()
+                        properties.set(
+                            "authentication_method",
+                            auth_method if rng.random() < 0.8 else "wrong-method",
+                        )
+                        reason = rng.choice([0x00, 0x18, 0x19])
+                        feed(AuthPacket(reason_code=reason, properties=properties).encode(proto))
         except ALLOWED:
             pass
         except Exception as exc:  # noqa: BLE001
@@ -397,6 +444,7 @@ def _check_engine_invariants(engine: ProtocolEngine) -> None:
     assert engine._inbound_inflight >= 0, "negative inbound inflight"
 
     outbound = list(engine.store.out_items())
+    assert all(message.topic for message in outbound), "durable alias record lost canonical topic"
     outbound_mids = {msg.mid for msg in outbound}
     expected_mids = outbound_mids | set(engine._pending_sub_mids)
     actual_mids = set(engine.packet_ids._used)
@@ -413,6 +461,14 @@ def _check_engine_invariants(engine: ProtocolEngine) -> None:
     assert engine.flow.inflight == expected_flow, (
         f"flow mismatch: actual={engine.flow.inflight} expected={expected_flow}"
     )
+    assert engine.outbound.pending_messages == len(outbound), "outbound message budget mismatch"
+    assert engine.outbound.pending_bytes == sum(
+        engine.outbound.stored_logical_size(message) for message in outbound
+    ), "outbound byte budget mismatch"
+    inbound = list(engine.store.in_items())
+    assert engine.inbound._pending_bytes == sum(
+        engine.inbound.stored_logical_size(message) for message in inbound
+    ), "inbound byte budget mismatch"
 
 
 # ---------------------------------------------------------------------------

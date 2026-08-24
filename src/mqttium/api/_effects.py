@@ -76,6 +76,7 @@ class EffectPump:
         self.task: asyncio.Task[None] | None = None
         self.flush_requested = False
         self.draining_inline = False
+        self._failing_close = False
         # Decision counters. The SEND-first partition protects an ordering that
         # is easy to break and hard to debug, so before changing how batches are
         # represented it has to be clear how often several effects even arrive
@@ -95,6 +96,19 @@ class EffectPump:
 
         if self.pending and self.pending_epoch != epoch:
             self.discard_connection_effects()
+
+        if self._failing_close:
+            # A failing flush still owns the pump lock while connection close
+            # is awaited. Effects collected in that window belong to the dead
+            # connection and can never be applied; settle them immediately so
+            # a later drain cannot wait for impossible progress.
+            if not self.pending:
+                self.pending_epoch = epoch
+            self.pending.extend(effects)
+            self.enqueued += len(effects)
+            self.pending_high_water = max(self.pending_high_water, len(self.pending))
+            self.discard_connection_effects(settle_publish=True)
+            return
 
         if len(effects) == 1 and not self.pending:
             if self.owner._apply_effect_inline(effects[0], epoch):
@@ -281,9 +295,15 @@ class EffectPump:
                         # reader-owned lifecycle. Active drain() calls still
                         # receive the same original exception below.
                         self.owner._disconnect_exc = exc
-                        self.discard_connection_effects(settle_publish=True)
-                        await self.owner._close_transport_after_connection_failure()
-                        return
+                        self._failing_close = True
+                        try:
+                            self.discard_connection_effects(settle_publish=True)
+                            await self.owner._close_transport_after_connection_failure()
+                            return
+                        finally:
+                            if self.pending:
+                                self.discard_connection_effects(settle_publish=True)
+                            self._failing_close = False
                     else:
                         if self.pending and self.pending[0] is effect:
                             self.pending.popleft()

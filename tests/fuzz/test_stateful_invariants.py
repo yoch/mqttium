@@ -50,6 +50,7 @@ from mqttium.packets import (
 from mqttium.persistence.memory import MemoryInflightStore
 from mqttium.persistence.sqlite import SqliteInflightStore
 from mqttium.protocol.config import EngineConfig
+from mqttium.protocol.effects import EffectKind
 from mqttium.protocol.engine import ProtocolEngine
 from mqttium.types import InboundMessage, OutboundMessage, Properties
 
@@ -275,7 +276,10 @@ def _norm_meta(meta: object | None) -> tuple | None:
         return None
     base = (meta.mid, meta.state, meta.logical_size)  # type: ignore[attr-defined]
     user_acked = getattr(meta, "user_acked", None)
-    return base if user_acked is None else base + (user_acked,)
+    delivered = getattr(meta, "delivered", None)
+    if user_acked is None:
+        return base
+    return base + (user_acked, delivered)
 
 
 def _make_out(rng: random.Random, mid: int) -> OutboundMessage:
@@ -439,5 +443,99 @@ def test_store_implementations_agree(seed: int, tmp_path) -> None:  # noqa: ANN0
                 "inbound contents after the step",
                 step,
             )
+    finally:
+        sqlite.close()
+
+
+@pytest.mark.parametrize("seed", range(SEEDS))
+def test_replay_interleavings_agree_and_never_emit_stale_rows(  # noqa: ANN001, C901
+    seed: int, tmp_path
+) -> None:
+    """Exercise the yield boundary between replay batches against both stores."""
+    rng = random.Random(seed)
+    memory = MemoryInflightStore()
+    sqlite = SqliteInflightStore(tmp_path / f"replay-seed{seed}.db")
+    for store in (memory, sqlite):
+        with store.batch():
+            for mid in range(1, 301):
+                topic = f"replay/{mid}"
+                store.put_in(
+                    InboundMessage(
+                        mid=mid,
+                        topic=topic,
+                        payload=b"body",
+                        qos=QoS.EXACTLY_ONCE,
+                        retain=False,
+                        state=InboundQoSState.WAIT_PUBREL,
+                        logical_size=len(topic) + 4,
+                    )
+                )
+    engines = [
+        ProtocolEngine(EngineConfig(client_id="replay-fuzz", clean_start=False), store=memory),
+        ProtocolEngine(EngineConfig(client_id="replay-fuzz", clean_start=False), store=sqlite),
+    ]
+
+    def resume_pair() -> tuple[list[int], list[int]]:
+        outputs: list[list[int]] = []
+        for engine in engines:
+            if engine.state in (ConnectionState.CONNECTED, ConnectionState.CONNECTING):
+                engine.notify_transport_closed()
+                engine.take_effects()
+            engine.begin_connect()
+            _connack(engine, session_present=True)
+            outputs.append(
+                [e.data.mid for e in engine.take_effects() if e.kind is EffectKind.MESSAGE]
+            )
+        return outputs[0], outputs[1]
+
+    suppressed: set[int] = set()
+    try:
+        assert resume_pair() == (list(range(1, 65)), list(range(1, 65)))
+        for step in range(STEPS):
+            operation = rng.choices(
+                ["complete", "delivered", "continue", "close", "reconnect"],
+                weights=[24, 20, 38, 6, 12],
+            )[0]
+            mid = rng.randint(65, 300)
+            outputs: list[list[int]] = []
+            for engine in engines:
+                if operation == "complete" and engine.state is ConnectionState.CONNECTED:
+                    _feed(engine, PubRelPacket(mid=mid).encode(engine.config.protocol))
+                    engine.take_effects()
+                elif operation == "delivered":
+                    engine.mark_inbound_delivered(mid)
+                    engine.take_effects()
+                elif operation == "continue":
+                    engine.continue_inbound_replay()
+                    outputs.append(
+                        [e.data.mid for e in engine.take_effects() if e.kind is EffectKind.MESSAGE]
+                    )
+                elif operation == "close":
+                    engine.notify_transport_closed()
+                    engine.take_effects()
+                    engine.continue_inbound_replay()
+                    outputs.append(
+                        [e.data.mid for e in engine.take_effects() if e.kind is EffectKind.MESSAGE]
+                    )
+                elif operation == "reconnect":
+                    # Applied below once for the pair so the output comparison
+                    # stays explicit.
+                    pass
+
+            if operation in {"complete", "delivered"}:
+                current = (memory.get_in(mid), sqlite.get_in(mid))
+                if all(record is None or record.delivered for record in current):
+                    suppressed.add(mid)
+            elif operation == "reconnect":
+                left, right = resume_pair()
+                outputs = [left, right]
+            if outputs:
+                assert outputs[0] == outputs[1], (step, operation, outputs)
+                assert suppressed.isdisjoint(outputs[0]), (step, operation, suppressed, outputs[0])
+            _check_invariants(engines[0], step, [operation])
+            _check_invariants(engines[1], step, [operation])
+            assert [_norm_in(m) for m in memory.in_items()] == [
+                _norm_in(m) for m in sqlite.in_items()
+            ]
     finally:
         sqlite.close()

@@ -140,6 +140,15 @@ class OutboundSession:
             if alias is not None:
                 self._topic_aliases[int(alias)] = topic
 
+    @staticmethod
+    def _properties_without_topic_alias(properties: Properties | None) -> Properties | None:
+        """Return replay-safe properties without connection-scoped alias state."""
+        if properties is None or properties.get("topic_alias") is None:
+            return properties
+        values = dict(properties.values)
+        values.pop("topic_alias", None)
+        return Properties(values=values)
+
     # --- effect emission ---------------------------------------------------
     # Always routed through the engine, never into a cached list: take_effects()
     # rebinds the list, so the engine's `_effects` is the one sink. Emission
@@ -859,6 +868,13 @@ class OutboundSession:
             OutboundQoSState.WAIT_PUBREC,
         ):
             msg.dup = True
+            replay_properties = self._properties_without_topic_alias(msg.properties)
+            if replay_properties is not msg.properties:
+                # Both the mapping and a retained frame that encoded it belong
+                # to the dead connection. Replay sends the canonical stored
+                # topic with replay-safe properties.
+                msg.properties = replay_properties
+                msg.encoded_publish = None
             retained = msg.encoded_publish
             if retained is None:
                 wire = self._encode_publish(
@@ -1197,21 +1213,32 @@ class OutboundSession:
             )
         if msg.retain and not negotiated.retain_available:
             raise ProtocolError("Broker does not support retain")
-        if msg.properties and msg.properties.get("topic_alias") is not None:
-            alias = int(msg.properties.get("topic_alias"))
+        replaying_publish = msg.state in (
+            OutboundQoSState.WAIT_PUBACK,
+            OutboundQoSState.WAIT_PUBREC,
+        )
+        properties = (
+            self._properties_without_topic_alias(msg.properties)
+            if replaying_publish
+            else msg.properties
+        )
+        if properties and properties.get("topic_alias") is not None:
+            alias = int(properties.get("topic_alias"))
             if alias == 0 or alias > negotiated.topic_alias_maximum:
                 raise ProtocolError(
                     f"topic_alias {alias} exceeds broker topic_alias_maximum "
                     f"{negotiated.topic_alias_maximum}"
                 )
         encoded_publish = msg.encoded_publish if isinstance(msg, OutboundMessage) else None
+        if properties is not msg.properties:
+            encoded_publish = None
         if encoded_publish is not None:
             engine._check_outbound_size(encoded_publish)
         else:
             payload_size = (
                 len(msg.payload) if isinstance(msg, OutboundMessage) else msg.payload_size
             )
-            self._check_publish_size(msg.topic, payload_size, msg.qos, msg.properties)
+            self._check_publish_size(msg.topic, payload_size, msg.qos, properties)
 
     def fail_queued_violating_negotiation(self) -> None:
         kept: deque[OutboundMessage | OutboundMessageSummary] = deque()

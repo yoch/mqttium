@@ -113,7 +113,8 @@ class TransitionInflightStore(InflightStore, Protocol):
     The store does not own the state machine. ``expected_state`` and
     ``new_state`` always come from the session; the store only guarantees that
     the durable mutation is atomic and conditional, returning ``None`` when the
-    record is absent or no longer in the expected state. A store that does not
+    record is absent or no longer in the expected state. If a transition raises,
+    its mutation must remain unapplied. A store that does not
     implement this protocol keeps working through the whole-object path.
     """
 
@@ -394,6 +395,7 @@ class MemoryInflightStore:
             mid=mid,
             state=msg.state,
             user_acked=msg.user_acked,
+            delivered=msg.delivered,
             logical_size=msg.logical_size,
         )
 
@@ -407,6 +409,7 @@ class MemoryInflightStore:
                     mid=mid,
                     state=message.state,
                     user_acked=message.user_acked,
+                    delivered=message.delivered,
                     logical_size=message.logical_size,
                 )
                 for mid in page
@@ -440,6 +443,7 @@ class MemoryInflightStore:
             mid=mid,
             state=new_state,
             user_acked=msg.user_acked,
+            delivered=msg.delivered,
             logical_size=msg.logical_size,
         )
 
@@ -456,5 +460,6 @@ class MemoryInflightStore:
             mid=mid,
             state=msg.state,
             user_acked=msg.user_acked,
+            delivered=msg.delivered,
             logical_size=msg.logical_size,
         )

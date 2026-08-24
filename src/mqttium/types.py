@@ -147,6 +147,7 @@ class InboundRecordMeta:
     mid: int
     state: InboundQoSState
     user_acked: bool
+    delivered: bool = False
     logical_size: int = 0
 
 
