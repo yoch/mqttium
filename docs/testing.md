@@ -10,6 +10,7 @@ while developing, then run every affected layer before requesting review.
 | --- | --- |
 | `tests/unit` | Deterministic behavior without real network sockets |
 | `tests/project` | Public API, documentation, packaging, release, and repository contracts |
+| `tests/concurrency` | Cooperative checkpoint scheduler, compact schedule replay, and bounded interleaving exploration |
 | `tests/resilience` | Loopback hostile-peer, race, timing, shutdown, and leak scenarios |
 | `tests/integration` | Behavior against a live Mosquitto broker |
 | `tests/fuzz` | Seeded fuzzing, Hypothesis properties, and state-machine invariants |
@@ -32,10 +33,12 @@ python -m pytest -q tests/unit tests/project
 python -m pytest -q tests/unit tests/project --cov=mqttium --cov-branch
 ```
 
-Run resilience and fuzz checks separately:
+Run resilience, concurrency-replay, and fuzz checks separately:
 
 ```bash
 python -m pytest -q tests/resilience
+python -m pytest -q tests/concurrency
+PYTHONPATH=. python tests/concurrency/explore.py --seed 1 --max-schedules 40
 PYTHONPATH=src python tests/fuzz/fuzz.py --seed 1 --iterations 20000
 python -m pytest -q \
   tests/fuzz/test_hypothesis_fuzz.py \
@@ -79,6 +82,9 @@ produce or upload the report still fails CI; only coverage.py owns the absolute
 - Integration runs require a broker and permit no silent skips.
 - Failed tests are never rerun automatically.
 - Race campaigns use explicit seeds so failures can be reproduced.
+- Cooperative concurrency exploration uses compact printable schedules;
+  replay those schedules as ordinary pytest cases. Bounded DFS/random
+  campaigns belong next to resilience and fuzz, not in the 30 second unit job.
 - Throughput thresholds belong in benchmark or scheduled diagnostic campaigns,
   not correctness tests.
 - A discovered engine defect needs a regression test and direct fix, or a

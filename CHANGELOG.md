@@ -6,6 +6,12 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Documentation
+
+- Add a test-only cooperative concurrency scheduler, compact schedule replay,
+  and a dated prototype note for exploring asyncio interleavings in the client
+  runtime without changing production hot paths.
+
 ## [1.0.0rc9] - 2026-08-23
 
 ### Fixed

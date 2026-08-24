@@ -75,6 +75,12 @@ The maintained methodology and thresholds live in
 An experiment marked current is not release evidence until its own A/A and A/B
 validity conditions pass on an eligible runner.
 
+## Concurrency exploration
+
+| Report | Status | Use instead or interpretation |
+| --- | --- | --- |
+| [CONCURRENCY-SCHEDULER-2026-08-24](https://github.com/yoch/mqttium/blob/main/docs/reports/CONCURRENCY-SCHEDULER-2026-08-24.md) | Current evidence | Prototype cooperative checkpoint scheduler; not a CI gate |
+
 ## Implemented hot-path decisions
 
 | Report | Status | Decision recorded |
