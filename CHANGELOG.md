@@ -25,9 +25,16 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - Install the qualified V1 runtime schedule fuzzer as a non-required ARM64
   nightly with monotonic 50,000-seed rotation, recorded shards, compact coverage
   and performance manifests, and 30-day failure-artifact retention.
+- Add a separate V2 runtime-composition target that overlaps at most two
+  callback, writer, EffectPump, reconnect, or reader-teardown ownership windows,
+  measures pair and release-order coverage, and qualifies four
+  composition-dependent behavioral mutations without changing V1.
 
 ### Fixed
 
+- Let an explicit callback `connect()` replace a connection whose transport is
+  already closing under keepalive ownership but whose reader has not yet
+  retired the engine's connected state.
 - Stop and clear the connection-scoped keepalive task when broker EOF or a
   reader-side failure ends the connection, preventing a terminal task leak or
   an unowned old task after reconnect replaces its reference.

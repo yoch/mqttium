@@ -81,6 +81,23 @@ class _FailingConnectWriter:
         return False
 
 
+class _BlockedCloseBroker(_Broker):
+    """Expose a transport-close window before EOF reaches the real reader."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.close_entered = asyncio.Event()
+        self.release_close = asyncio.Event()
+
+    async def close(self) -> None:
+        if self._closing:
+            return
+        self._closing = True
+        self.close_entered.set()
+        await self.release_close.wait()
+        self._rx.put_nowait(b"")
+
+
 def _policy() -> ReconnectPolicy:
     return ReconnectPolicy(
         enabled=True,
@@ -157,6 +174,70 @@ async def test_ping_timeout_reconnect_emits_one_disconnect_and_preserves_stream(
         assert message.topic == "after-ping-timeout"
     finally:
         await _cleanup(client, pending)
+
+
+async def test_callback_connect_takes_over_keepalive_close_before_reader_finally() -> None:
+    brokers: list[_Broker] = []
+    first = _BlockedCloseBroker()
+    callback_entered = asyncio.Event()
+    release_callback = asyncio.Event()
+    callback_done = asyncio.Event()
+    callback_errors: list[BaseException] = []
+    client = AsyncClient(
+        "keepalive-callback-takeover",
+        keepalive=1,
+        reconnect=_policy(),
+    )
+
+    async def factory(host: str, port: int, *, ssl=None):
+        del host, port, ssl
+        broker = first if not brokers else _Broker()
+        brokers.append(broker)
+        return broker
+
+    async def on_message(message: object) -> None:
+        del message
+        callback_entered.set()
+        await release_callback.wait()
+        try:
+            await client.connect("fake", timeout=1.0)
+        except BaseException as exc:
+            callback_errors.append(exc)
+        finally:
+            callback_done.set()
+
+    client._transport_factory = factory
+    client.on_message = on_message
+    try:
+        await client.connect("fake", timeout=1.0)
+        first.publish("trigger", b"callback")
+        await asyncio.wait_for(callback_entered.wait(), timeout=1.0)
+
+        keepalive = client._keepalive_task
+        assert keepalive is not None
+        keepalive.cancel()
+        with suppress(asyncio.CancelledError):
+            await keepalive
+        client._ping_pending = True
+        client._ping_deadline = time.monotonic() - 1.0
+        keepalive = asyncio.create_task(client._keepalive_loop())
+        client._keepalive_task = keepalive
+        await asyncio.wait_for(first.close_entered.wait(), timeout=1.0)
+
+        release_callback.set()
+        await asyncio.sleep(0)
+        first.release_close.set()
+        await asyncio.wait_for(callback_done.wait(), timeout=1.0)
+
+        assert callback_errors == []
+        assert len(brokers) == 2
+        assert client._transport is brokers[1]
+        assert client.is_connected
+        assert client._reconnect_task is None or client._reconnect_task.done()
+    finally:
+        release_callback.set()
+        first.release_close.set()
+        await _cleanup(client)
 
 
 async def test_disconnect_in_reconnect_gap_wakes_logical_publish_waiter() -> None:

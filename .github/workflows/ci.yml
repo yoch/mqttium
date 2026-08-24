@@ -195,8 +195,12 @@ jobs:
           PYTHONPATH=src python tests/fuzz/runtime_fuzzer.py \
             --seed 0 --seeds 12 --steps 24 \
             --artifacts-dir "$RUNNER_TEMP/runtime-fuzz"
+          PYTHONPATH=src python -m tests.fuzz.runtime_composition_fuzzer \
+            --seed 0 --seeds 12 --steps 48 \
+            --artifacts-dir "$RUNNER_TEMP/runtime-fuzz/composition"
           python -m pytest -q -W error --strict-config --strict-markers \
-            tests/fuzz/test_runtime_fuzzer.py
+            tests/fuzz/test_runtime_fuzzer.py \
+            tests/fuzz/test_runtime_composition_fuzzer.py
       - name: Retain runtime schedule failures
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
