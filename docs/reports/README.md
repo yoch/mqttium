@@ -37,6 +37,7 @@ Status meanings:
 | [PRE-REFACTOR-FUZZ-PR-REEVALUATION-2026-08-24](https://github.com/yoch/mqttium/blob/main/docs/reports/PRE-REFACTOR-FUZZ-PR-REEVALUATION-2026-08-24.md) | Current evidence | Reproduction and disposition of draft PRs #372–#376 against the post-consolidation baseline |
 | [RUNTIME-FUZZER-KEEPALIVE-FINDING-2026-08-24](https://github.com/yoch/mqttium/blob/main/docs/reports/RUNTIME-FUZZER-KEEPALIVE-FINDING-2026-08-24.md) | Current evidence | Runtime schedule reproduction, ownership analysis, and correction of the terminal-EOF keepalive task leak |
 | [RUNTIME-FUZZER-GENERATIVE-QUALIFICATION-2026-08-24](https://github.com/yoch/mqttium/blob/main/docs/reports/RUNTIME-FUZZER-GENERATIVE-QUALIFICATION-2026-08-24.md) | Current evidence | State-aware runtime schedule generation, six-mutant qualification, keepalive-cycle validation, explicit-takeover finding, and 2,000-seed reference campaign |
+| [RUNTIME-FUZZER-COMPOSITION-QUALIFICATION-2026-08-24](https://github.com/yoch/mqttium/blob/main/docs/reports/RUNTIME-FUZZER-COMPOSITION-QUALIFICATION-2026-08-24.md) | Current evidence | Two-window lifecycle composition, four behavioral-mutant qualifications, closing-transport takeover finding, and 50,000-seed decision-gate campaign |
 
 ## Cross-client and performance program
 
