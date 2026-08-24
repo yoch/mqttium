@@ -22,6 +22,9 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   reconnect, callback/lifecycle, and EffectPump failure windows; whole-schedule
   liveness and task/loop-error oracles; campaign diversity/coverage reporting;
   and two interleaving-dependent mutations.
+- Install the qualified V1 runtime schedule fuzzer as a non-required ARM64
+  nightly with monotonic 50,000-seed rotation, recorded shards, compact coverage
+  and performance manifests, and 30-day failure-artifact retention.
 
 ### Fixed
 

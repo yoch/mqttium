@@ -113,18 +113,23 @@ scheduling/release traces, and coverage counts for every operation/checkpoint.
 
 1. **PR smoke:** 12 fixed healthy seeds at 24 steps, plus bounded 24-seed
    qualification of all six mutations in pytest.
-2. **Nightly proposal (not enabled):** 50,000 seeds at 32 steps, split into ten
-   disjoint 5,000-seed shards, retaining JSON failures and the coverage line.
+2. **ARM64 nightly:** 50,000 seeds at 32 steps, split into ten disjoint
+   5,000-seed shards. The workflow run number advances a monotonic seed range
+   from 2,000,000; rerunning the same workflow run deliberately replays the same
+   range.
 3. **Long/manual release proposal:** at least 1,000,000 seeds at 48 steps across
    disjoint recorded ranges, with artifacts retained outside the repository.
    Do not add schedule shrinking or a second broker model merely to consume the
    budget.
 
-The nightly and long campaign wiring is intentionally not enabled. A local
-2,000-seed, 32-step reference campaign produced 1,994 operation traces and
-1,993 scheduling traces with zero failures. Six 600-seed mutation campaigns
-detected respectively 100/600, 600/600, 600/600, 100/600, 100/600, and 25/600
-seeds. These are qualification measurements, not production defect rates.
+The permanent nightly runs only from trusted `main` on the serialized ARM64
+self-hosted runner; it is not a pull-request check. Its 30-day artifact contains
+the exact SHA and environment, ten recorded ranges, per-family and per-operation
+coverage, trace diversity, CPU/wall/RSS summaries, and every JSON failure with
+campaign context. Healthy seeds emit only shard and campaign summaries. The V1
+long campaign completed 1,000,000 schedules at 48 steps with zero failures and
+99.98% unique scheduling traces; V1 is now a stable safety net rather than an
+area for further grammar expansion.
 
 The local release runner can orchestrate multiple deterministic shards:
 

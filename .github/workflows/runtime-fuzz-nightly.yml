@@ -1,0 +1,83 @@
+name: Runtime fuzz nightly
+
+on:
+  schedule:
+    - cron: "13 1 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mqttium-arm64-runner
+  cancel-in-progress: false
+
+jobs:
+  runtime-nightly:
+    name: V1 runtime schedules / ARM64 / 50k x 32
+    if: github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 30
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PYTHONUNBUFFERED: "1"
+      RUNNER_LABELS: self-hosted,linux,ARM64,rpi5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Set run identity and isolated workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "JOB_ROOT=$RUNNER_TEMP/mqttium-runtime-nightly-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+          echo "CAMPAIGN_ID=nightly-v1-run-$GITHUB_RUN_NUMBER-$GITHUB_RUN_ID-arm64" >> "$GITHUB_ENV"
+      - name: Verify trusted ARM64 baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "aarch64"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain)"
+          command -v nice
+          command -v python3
+          python3 - <<'PY'
+          import sys
+          if sys.version_info[:2] != (3, 13):
+              raise SystemExit(f"expected system Python 3.13, got {sys.version}")
+          PY
+      - name: Create isolated environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$JOB_ROOT"
+          mkdir -p "$JOB_ROOT"
+          python3 -m venv "$JOB_ROOT/venv"
+          echo "$JOB_ROOT/venv/bin" >> "$GITHUB_PATH"
+      - name: Install V1 fuzz dependencies
+        run: python -m pip install -e ".[fuzz]"
+      - name: Run ten recorded 5k ranges
+        run: >-
+          nice -n 5 python tools/ci/runtime_campaign.py
+          --repo .
+          --output "$JOB_ROOT/artifacts/$CAMPAIGN_ID"
+          --campaign-id "$CAMPAIGN_ID"
+          --nightly-rotation-index "$GITHUB_RUN_NUMBER"
+          --seeds 50000
+          --steps 32
+          --shard-size 5000
+          --parallelism 4
+          --runner-kind github-self-hosted
+          --expected-sha "$GITHUB_SHA"
+      - name: Retain manifest, shard summaries, and failures
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: runtime-nightly-v1-arm64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.JOB_ROOT }}/artifacts
+          if-no-files-found: error
+          retention-days: 30
+      - name: Clean run-specific workspace
+        if: always()
+        shell: bash
+        run: rm -rf "$JOB_ROOT"
