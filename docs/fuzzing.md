@@ -11,6 +11,7 @@ protocol invariants rather than treating every parser exception as a failure.
 | `websocket` | lengths, control frames, and fragmentation | bounded buffering and deterministic rejection |
 | replay interleavings | page hydration followed by PUBREL, delivery handoff, close, continuation, and reconnect | Memory/SQLite equivalence; no completed, delivered, or stale-epoch emission |
 | `runtime` | external MQTT events plus explicit releases at writer, lifecycle, and callback boundaries | owner accounting, effect settlement, epoch isolation, and terminal liveness |
+| `runtime-composition` | legal history plus two simultaneously open MQTTium ownership windows | V1 oracles plus release-order, takeover, and cross-generation ownership |
 
 `tests/fuzz/fuzz.py` is dependency-free and driven by an explicit seed.
 `tests/fuzz/test_hypothesis_fuzz.py` adds property-based generation, shrinking,
@@ -36,6 +37,11 @@ HYPOTHESIS_PROFILE=aggressive \
 PYTHONPATH=src python tests/fuzz/runtime_fuzzer.py \
   --seed 0 --seeds 12 --steps 24 \
   --artifacts-dir /tmp/mqttium-runtime-fuzz
+
+# Two-window lifecycle composition (V2)
+PYTHONPATH=src python -m tests.fuzz.runtime_composition_fuzzer \
+  --seed 0 --seeds 24 --steps 48 \
+  --artifacts-dir /tmp/mqttium-runtime-composition-fuzz
 ```
 
 ## Runtime schedule target
@@ -109,14 +115,45 @@ for the same seed and must produce identical operations and final owner state.
 Campaign output reports seeds, failures, unique full operation traces, unique
 scheduling/release traces, and coverage counts for every operation/checkpoint.
 
+## Runtime composition target
+
+`tests/fuzz/runtime_composition_fuzzer.py` is a bounded V2 extension over the
+unchanged V1 harness. It still runs the real `AsyncClient` and event loop. A
+state-valid connected history is followed by one of six ownership pairs:
+
+- callback × reconnect factory;
+- old writer × replacement generation;
+- deferred effect × reconnect;
+- callback × reader/transport teardown;
+- callback × writer;
+- effect × writer.
+
+Only the existing test transport, callback, EffectPump, reconnect-factory, and
+transport-close seams are gated. Generated state records the identity and count
+of open windows, rejects a release without a corresponding owner, never permits
+more than two simultaneous windows, and ends with every gate settled. Release
+permutations and their bounded intervening yields are first-class operations.
+The V2 artifact schema adds the pair, release trace, per-step window depth, and
+composition owner snapshot to every V1 failure field.
+
+Four behavioral mutations qualify the composed space: a cancelled old write
+completes after replacement, a retired callback loses explicit takeover to an
+automatic reconnect, a deferred effect is replayed into a replacement
+generation, and a closing transport is mistaken for a healthy generation when
+a callback connects. Each mutation is inert outside its relevant pair. V1
+generation, nightly rotation, and oracles are unchanged.
+
 ### Campaign levels
 
-1. **PR smoke:** 12 fixed healthy seeds at 24 steps, plus bounded 24-seed
-   qualification of all six mutations in pytest.
+1. **PR smoke:** 12 fixed healthy V1 seeds at 24 steps, 12 fixed healthy V2
+   seeds at 48 steps, plus bounded pytest qualification of all six V1 and four
+   composition mutations.
 2. **ARM64 nightly:** 50,000 seeds at 32 steps, split into ten disjoint
    5,000-seed shards. The workflow run number advances a monotonic seed range
    from 2,000,000; rerunning the same workflow run deliberately replays the same
    range.
+   This permanent safety net runs V1 only; V2 remains a PR smoke and explicit
+   qualification target until its decision gate is met.
 3. **Long/manual release proposal:** at least 1,000,000 seeds at 48 steps across
    disjoint recorded ranges, with artifacts retained outside the repository.
    Do not add schedule shrinking or a second broker model merely to consume the
