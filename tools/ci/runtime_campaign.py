@@ -108,30 +108,6 @@ def _environment(runner_kind: str) -> dict[str, Any]:
     }
 
 
-def _elapsed_seconds(value: str) -> float:
-    parts = value.split(":")
-    if len(parts) == 2:
-        return int(parts[0]) * 60 + float(parts[1])
-    if len(parts) == 3:
-        return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
-    raise ValueError(f"unrecognized elapsed time: {value!r}")
-
-
-def _time_metrics(path: Path) -> dict[str, float | int]:
-    fields: dict[str, str] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        if ": " in stripped:
-            key, value = stripped.rsplit(": ", 1)
-            fields[key] = value
-    return {
-        "cpu_system_seconds": float(fields["System time (seconds)"]),
-        "cpu_user_seconds": float(fields["User time (seconds)"]),
-        "peak_rss_kib": int(fields["Maximum resident set size (kbytes)"]),
-        "wall_seconds": _elapsed_seconds(fields["Elapsed (wall clock) time (h:mm:ss or m:ss)"]),
-    }
-
-
 def _parse_result(stdout: str) -> dict[str, Any]:
     done = next(line for line in stdout.splitlines() if line.startswith("[DONE]"))
     coverage_line = next(line for line in stdout.splitlines() if line.startswith("[COVERAGE]"))
@@ -160,12 +136,7 @@ def _run_shard(
     failure_root.mkdir(parents=True, exist_ok=True)
     stdout_path = shard_root / "stdout.log"
     stderr_path = shard_root / "stderr.log"
-    time_path = shard_root / "time.txt"
     command = [
-        "/usr/bin/time",
-        "-v",
-        "-o",
-        str(time_path),
         str(python),
         "tests/fuzz/runtime_fuzzer.py",
         "--seed",
@@ -180,32 +151,42 @@ def _run_shard(
     env = os.environ.copy()
     env["PYTHONPATH"] = str(repo / "src")
     started = time.monotonic()
-    completed = subprocess.run(
-        command,
-        cwd=repo,
-        env=env,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    stdout_path.write_text(completed.stdout, encoding="utf-8")
-    stderr_path.write_text(completed.stderr, encoding="utf-8")
+    with (
+        stdout_path.open("w", encoding="utf-8") as stdout_file,
+        stderr_path.open("w", encoding="utf-8") as stderr_file,
+    ):
+        process = subprocess.Popen(
+            command,
+            cwd=repo,
+            env=env,
+            text=True,
+            stdout=stdout_file,
+            stderr=stderr_file,
+        )
+        _, wait_status, usage = os.wait4(process.pid, 0)
+        process.returncode = os.waitstatus_to_exitcode(wait_status)
+    observed_wall = time.monotonic() - started
+    stdout = stdout_path.read_text(encoding="utf-8")
     summary: dict[str, Any] = {
         "campaign_id": campaign_id,
         "command": command,
-        "exit_status": completed.returncode,
+        "exit_status": process.returncode,
+        "performance": {
+            "cpu_system_seconds": usage.ru_stime,
+            "cpu_user_seconds": usage.ru_utime,
+            "peak_rss_kib": usage.ru_maxrss,
+            "wall_seconds": observed_wall,
+        },
         "seed_count": shard.seed_count,
         "seed_end_exclusive": shard.seed_start + shard.seed_count,
         "seed_start": shard.seed_start,
         "shard_id": shard_name,
         "steps": steps,
-        "wall_observed_seconds": time.monotonic() - started,
+        "wall_observed_seconds": observed_wall,
     }
-    if time_path.exists():
-        summary["performance"] = _time_metrics(time_path)
-    if completed.stdout:
+    if stdout:
         try:
-            summary.update(_parse_result(completed.stdout))
+            summary.update(_parse_result(stdout))
         except (KeyError, StopIteration, ValueError, json.JSONDecodeError) as exc:
             summary["parse_error"] = repr(exc)
     summary_path = shard_root / "summary.json"

@@ -112,7 +112,6 @@ jobs:
           test "$(uname -m)" = "aarch64"
           test "$(git -C baseline rev-parse HEAD)" = "$BASELINE_SHA"
           test -z "$(git -C baseline status --porcelain)"
-          command -v /usr/bin/time
           command -v python3
       - name: Create isolated environment
         shell: bash
