@@ -38,6 +38,7 @@ Status meanings:
 | [RUNTIME-FUZZER-KEEPALIVE-FINDING-2026-08-24](https://github.com/yoch/mqttium/blob/main/docs/reports/RUNTIME-FUZZER-KEEPALIVE-FINDING-2026-08-24.md) | Current evidence | Runtime schedule reproduction, ownership analysis, and correction of the terminal-EOF keepalive task leak |
 | [RUNTIME-FUZZER-GENERATIVE-QUALIFICATION-2026-08-24](https://github.com/yoch/mqttium/blob/main/docs/reports/RUNTIME-FUZZER-GENERATIVE-QUALIFICATION-2026-08-24.md) | Current evidence | State-aware runtime schedule generation, six-mutant qualification, keepalive-cycle validation, explicit-takeover finding, and 2,000-seed reference campaign |
 | [RUNTIME-FUZZER-COMPOSITION-QUALIFICATION-2026-08-24](https://github.com/yoch/mqttium/blob/main/docs/reports/RUNTIME-FUZZER-COMPOSITION-QUALIFICATION-2026-08-24.md) | Current evidence | Two-window lifecycle composition, four behavioral-mutant qualifications, closing-transport takeover finding, and 50,000-seed decision-gate campaign |
+| [RUNTIME-FUZZER-ADVERSARIAL-AUDIT-2026-08-25](https://github.com/yoch/mqttium/blob/main/docs/reports/RUNTIME-FUZZER-ADVERSARIAL-AUDIT-2026-08-25.md) | Current evidence | Adversarial audit of the runtime fuzzer model: eight ranked blind spots, three reproducible probes, no demonstrated production bug, and the next improvement |
 
 ## Cross-client and performance program
 
