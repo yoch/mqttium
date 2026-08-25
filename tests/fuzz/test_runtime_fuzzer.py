@@ -109,8 +109,7 @@ async def test_late_duplicate_completed_publish_fails_terminal_wire_obligation(
         await original_write(transport, data)  # type: ignore[arg-type]
         newly_completed = transport.completed[completed_before:]  # type: ignore[attr-defined]
         if any(
-            item[0].packet_type is runtime_fuzzer.PacketType.DISCONNECT
-            for item in newly_completed
+            item[0].packet_type is runtime_fuzzer.PacketType.DISCONNECT for item in newly_completed
         ):
             publish = next(
                 item
