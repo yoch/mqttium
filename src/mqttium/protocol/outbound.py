@@ -447,7 +447,7 @@ class OutboundSession:
     def prepare_qos0(
         self,
         topic: str,
-        payload: bytes = b"",
+        payload: bytes,
         *,
         retain: bool = False,
         properties: Properties | None = None,
@@ -498,14 +498,9 @@ class OutboundSession:
             self._engine._emit(EffectKind.PUBLISH_COMPLETE, None)
             return PublishHandle(mid=None, qos=qos)
 
-        # One property encode and the Topic Name bytes from validation feed both
-        # the wire-size check and the logical budget. The encoder reuses both so
-        # a property table is not walked a second time and a non-ASCII topic is
-        # not encoded again on the launch path.
         topic_size, wire_property_bytes, logical_property_bytes, property_bytes = self.size_parts(
             topic, properties, topic_size=topic_size
         )
-        # Validate packet size before reserving local memory or a packet id.
         self._check_publish_wire_size(topic_size, wire_property_bytes, len(payload), qos)
         logical_topic_size = topic_size
         if canonical_topic != topic:
@@ -515,10 +510,6 @@ class OutboundSession:
                 else len(canonical_topic.encode("utf-8"))
             )
         logical_size = len(payload) + logical_topic_size + logical_property_bytes
-        # Snapshot before the first acquisition. Three local reads is all the
-        # success path pays for a shared rollback; _rollback itself is a call
-        # only taken on failure. This path is the hottest in the library and
-        # each extra Python frame on it measured ~1.5%.
         messages_start = self._pending_messages
         bytes_start = self._pending_bytes
         inflight_start = self.flow.inflight
@@ -536,16 +527,6 @@ class OutboundSession:
                 properties=properties,
                 logical_size=logical_size,
             )
-
-            # Defer wire encode until launch: avoids double work when messages sit
-            # in the Receive Maximum queue.
-            #
-            # `topic_bytes is not None` records that validation observed an
-            # active connection with window available. Keep the explicit state
-            # check and `_try_launch` acquisition here as the launch commit point:
-            # `_try_launch` owns the slot compensation if encoding/persistence
-            # raises, while the outer rollback restores the remaining admission
-            # bookkeeping.
             if self._engine.state == ConnectionState.CONNECTED and self._try_launch(
                 msg,
                 _property_bytes=property_bytes,
@@ -570,26 +551,13 @@ class OutboundSession:
         self,
         messages: Iterable[tuple[str, bytes, QoS | int, bool, Properties | None]],
     ) -> list[PublishHandle]:
-        """Queue one bounded chunk atomically with respect to engine/store state.
-
-        Admission itself is `queue_publish`, once per message — there is exactly
-        one place that acquires a budget slot, a packet id and a store row. The
-        chunk only widens the rollback scope: the inner call unwinds the message
-        that failed, this one unwinds the messages that had already succeeded.
-
-        A chunk that cannot fit the pending-message limit is rejected up front.
-        That matters because AsyncClient retries the *same* chunk after waiting
-        for space: without this, every retry would re-admit and re-unwind the
-        whole prefix. Only the count is checked, never the byte budget — counting
-        is free, whereas sizing the chunk here would encode every MQTT 5 property
-        table a second time.
-        """
+        """Queue one bounded chunk atomically with respect to engine/store state."""
         batch = messages if isinstance(messages, list) else list(messages)
         message_limit = self.config.max_pending_outbound_messages
         if message_limit is not None:
             reserving = 0
             for _topic, _payload, qos, _retain, _properties in batch:
-                if qos:  # QoS 0 reserves nothing
+                if qos:
                     reserving += 1
             if self._pending_messages + reserving > message_limit:
                 raise FlowControlError("Pending outbound message limit reached")
@@ -638,12 +606,6 @@ class OutboundSession:
     # --- broker acknowledgements -------------------------------------------
 
     def _settle(self, mid: int, expected_state: OutboundQoSState) -> bool:
-        """Delete a record and release its budget iff it is in `expected_state`.
-
-        With a transition-capable store this never reads the payload back: a
-        PUBACK for an 8 MiB publication touches metadata columns only. Without
-        one it degrades to the original read-then-delete.
-        """
         transitions = self._transitions
         if transitions is not None:
             meta = transitions.complete_out(mid, expected_state)
@@ -664,8 +626,6 @@ class OutboundSession:
         if not self._settle(mid, OutboundQoSState.WAIT_PUBACK):
             return
         self.flow.release()
-        # Emit before freeing the packet id so FIFO receipt settlement remains
-        # ordered even if a concurrent publish reuses the mid immediately.
         if reason_code >= 128:
             self._fail(mid, ProtocolError(f"PUBACK reason_code={reason_code}"))
         else:
@@ -674,7 +634,6 @@ class OutboundSession:
         self.drain()
 
     def _require_pubrel_capacity(self, size: int) -> None:
-        """Fail locally when a mandatory PUBREL cannot fit the peer limit."""
         limit = self._engine.negotiated.maximum_packet_size
         if limit is not None and size > limit:
             raise MandatoryResponseTooLargeError(
@@ -685,22 +644,12 @@ class OutboundSession:
         mid, reason_code, properties = self._decode_pubrec(raw.remaining)
         if properties is not None:
             self._engine._validate_inbound_problem_information(PacketType.PUBREC, properties)
-        # MQTT 5 §4.3.3: a PUBREC carrying a Reason Code of 0x80 or greater ends
-        # the QoS 2 exchange -- the publication failed and no PUBREL follows.
-        # This is shared by both store paths on purpose: it used to sit inside
-        # the transition branch only, so a store without conditional transitions
-        # reached the `msg is None` test first and answered an unknown MID with
-        # an orphan PUBREL 0x92 that the specification does not allow.
         if reason_code >= 128:
             self._fail_after_pubrec(mid, reason_code)
             return
         transitions = self._transitions
         limit = self._engine.negotiated.maximum_packet_size
         if limit is not None and limit < 4:
-            # The success PUBREL cannot fit. Inspect state only on this rare
-            # connection so an unrelated/duplicate PUBREC that would emit
-            # nothing keeps its historical behavior, while a real WAIT_PUBREC
-            # exchange fails before any durable transition/compaction.
             record = (
                 transitions.out_meta(mid) if transitions is not None else self.store.get_out(mid)
             )
@@ -742,7 +691,6 @@ class OutboundSession:
         self._engine._send(msg.encoded_pubrel)
 
     def _send_orphan_pubrel(self, mid: int) -> None:
-        """Answer a PUBREC with no matching record: PUBREL, 0x92 when MQTT 5."""
         reason = 0x92 if self._engine.codec.is_mqtt5 else 0
         wire = self._encode_pubrel(mid, reason)
         self._require_pubrel_capacity(len(wire))
@@ -801,12 +749,6 @@ class OutboundSession:
             if msg.qos == QoS.AT_LEAST_ONCE
             else OutboundQoSState.WAIT_PUBREC
         )
-        # A contiguous frame owns another payload-sized bytes object and replay
-        # re-encodes it anyway. A segmented item owns only its small header; its
-        # payload is the application bytes already retained by the record.
-        # An alias-only wire form is valid for this connection only. Persisting
-        # it would make reconnect replay omit the canonical Topic Name before
-        # the replacement connection has learned the mapping.
         retained = _retain_publish_item(wire) if wire_topic == msg.topic else None
         if persisted:
             transitions = self._transitions
@@ -820,20 +762,13 @@ class OutboundSession:
                     raise ProtocolError(
                         f"Outbound mid={msg.mid} changed while launching queued publish"
                     )
-                # MemoryInflightStore transitions the same object; SQLite only
-                # updates durable metadata. Keep the materialised object aligned
-                # in either case without rewriting its payload to the store.
                 msg.state = target_state
                 msg.encoded_publish = retained
             else:
-                # Third-party stores keep working through the base interface.
-                # update_out guarantees state/dup persistence and may implement
-                # the same payload-free optimization as the built-in SQLite store.
                 msg.state = target_state
                 msg.encoded_publish = retained
                 self.store.update_out(msg)
         else:
-            # First launch: no durable row exists yet, so persist the full record.
             msg.state = target_state
             msg.encoded_publish = retained
             self.store.put_out(msg)
@@ -872,9 +807,6 @@ class OutboundSession:
             msg.dup = True
             replay_properties = self._properties_without_topic_alias(msg.properties)
             if replay_properties is not msg.properties:
-                # Both the mapping and a retained frame that encoded it belong
-                # to the dead connection. Replay sends the canonical stored
-                # topic with replay-safe properties.
                 msg.properties = replay_properties
                 msg.encoded_publish = None
             retained = msg.encoded_publish
@@ -889,10 +821,6 @@ class OutboundSession:
                     properties=msg.properties,
                 )
             else:
-                # Segmented frames share the original payload. The first replay
-                # replaces only their small header; later replays reuse the
-                # already-DUP tuple. The bytes branch accepts legacy/custom-store
-                # records and drops their contiguous frame after this send.
                 wire = _mark_publish_dup(retained)
             self._engine._check_outbound_size(wire)
             msg.encoded_publish = _retain_publish_item(wire)
@@ -936,13 +864,18 @@ class OutboundSession:
         mid: int,
         stored: OutboundMessage | OutboundMessageSummary,
     ) -> None:
-        # `stored` is required: recovering it from the store here is what leaked
-        # the byte budget when a transactional store had already rolled back.
-        self.delete_record(mid)
+        # Already-durable ownership can only be released after deletion is
+        # confirmed. Unlike admission rollback, a delete failure must propagate.
+        self.store.delete_out(mid)
         self._release_reservation(self.stored_logical_size(stored))
 
     def delete_record(self, mid: int) -> None:
-        self.store.delete_out(mid)
+        try:
+            self.store.delete_out(mid)
+        except Exception:
+            # Admission rollback preserves the primary failure. Its rows are
+            # either not durable yet or already rolled back by store.batch().
+            pass
 
     def complete_record(
         self,
@@ -1000,21 +933,11 @@ class OutboundSession:
         *,
         topic_size: int | None = None,
     ) -> tuple[int, int, int, bytes | None]:
-        """Topic byte count, wire property bytes, logical property bytes, encoded table.
-
-        The wire size must count MQTT 5's mandatory property-length byte even
-        when there are no properties; the logical budget accounts for
-        application data only, so it does not. MQTT 5 returns the encoded table
-        so the PUBLISH encoder can reuse it; MQTT 3.1.1 returns ``None``.
-        Admission passes *topic_size* from validation so a non-ASCII Topic Name
-        is not encoded a second time just to learn its length.
-        """
         if topic_size is None:
             topic_size = len(topic) if topic.isascii() else len(topic.encode("utf-8"))
         if not self._is_v5:
             return topic_size, 0, 0, None
         if properties is None or not properties.values:
-            # An empty property table encodes to the single length byte 0x00.
             return topic_size, 1, 0, b"\x00"
         encoded = encode_properties(properties, PUBLISH)
         wire_property_bytes = len(encoded)
@@ -1054,7 +977,6 @@ class OutboundSession:
         payload_size: int,
         qos: QoS,
     ) -> None:
-        """Cheap upper bound vs negotiated maximum_packet_size (before full encode)."""
         limit = self._engine.negotiated.maximum_packet_size
         if limit is None:
             return
@@ -1087,14 +1009,9 @@ class OutboundSession:
             yield tuple(self.store.out_items())
 
     def has_client_session_state(self) -> bool:
-        """Whether the client has an outbound exchange the Server can resume."""
-        # Hydration reserves a flow slot for every persisted WAIT_* exchange it
-        # can admit. The window is never reset before CONNACK, so a non-zero
-        # count is an O(1) proof that at least one sent QoS 1/2 exchange exists.
         return self.flow.inflight > 0
 
     def hydrate(self) -> None:
-        """Recover packet ids and the offline queue from a durable store."""
         with self.store.batch():
             for page in self.store_summary_pages():
                 for msg in page:
@@ -1105,10 +1022,6 @@ class OutboundSession:
         unknown_size = msg.logical_size <= 0
         logical_size = self.stored_logical_size(msg)
         if unknown_size and self._transitions is not None:
-            # Records written before the store persisted logical sizes would
-            # otherwise release nothing from the byte budget when a
-            # metadata-only acknowledgement settles them. One write per legacy
-            # record, inside the hydration batch, and never again.
             self._transitions.set_out_logical_size(msg.mid, logical_size)
         self._pending_messages += 1
         self._pending_bytes += logical_size
@@ -1133,10 +1046,6 @@ class OutboundSession:
             self._queued.append(msg)
             return
         if msg.state is OutboundQoSState.WAIT_PUBCOMP:
-            # Receive Maximum constrains QoS>0 PUBLISH packets only. A resumed
-            # QoS 2 exchange retransmits PUBREL without consuming the new
-            # connection's send quota; a later PUBCOMP may still replenish that
-            # quota, capped by FlowControl at the current connection limit.
             try:
                 self._retransmit(self.materialize(msg))
             except Exception as exc:
@@ -1156,7 +1065,6 @@ class OutboundSession:
             self._fail(msg.mid, exc)
 
     def reset_flow_for_connection(self) -> None:
-        """Restart the outbound window from the CONNACK-negotiated limit."""
         self.flow.reset()
         self.flow.apply_broker_receive_maximum(
             self._engine.negotiated.receive_maximum,
@@ -1172,21 +1080,6 @@ class OutboundSession:
         self.drain()
 
     def purge_after_clean_session(self, *, sub_mids_pending: bool) -> None:
-        """Fail every unacknowledged publication: the broker dropped the session.
-
-        `_queued` mirrors every outbound record that must survive a missing
-        broker session — including WAIT_* entries `replay_session()` left there
-        when the Receive Maximum window could not admit their retransmission.
-        Those records are failed below, so their queue entries must go with
-        them: a stale entry made `drain()` re-materialise a deleted record,
-        double-release its byte reservation and retransmit a packet id the
-        pool no longer owns.
-
-        With no queued work and no SUB/UNSUB in flight, every packet id belongs
-        to a record discarded here, so the pool is reset in constant time
-        rather than id by id — it reclaims its accumulated hashing capacity
-        only on a full clear.
-        """
         if any(m.state is not OutboundQoSState.QUEUED for m in self._queued):
             self._queued = deque(m for m in self._queued if m.state is OutboundQoSState.QUEUED)
         clear_abandoned_packet_ids = not self._queued and not sub_mids_pending
@@ -1251,13 +1144,14 @@ class OutboundSession:
     def fail_queued_violating_negotiation(self) -> None:
         kept: deque[OutboundMessage | OutboundMessageSummary] = deque()
         while self._queued:
-            msg = self._queued.popleft()
+            msg = self._queued[0]
             try:
                 self.validate_against_negotiated(msg)
             except (ProtocolError, PacketTooLargeError) as exc:
                 self.discard_record(msg.mid, msg)
+                self._queued.popleft()
                 self.packet_ids.release(msg.mid)
                 self._fail(msg.mid, exc)
                 continue
-            kept.append(msg)
+            kept.append(self._queued.popleft())
         self._queued = kept
