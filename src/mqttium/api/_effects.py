@@ -34,10 +34,6 @@ class EffectOwner(Protocol):
         self, effects: deque[EngineEffect], epoch: int
     ) -> int: ...
 
-    def _apply_decoded_message_effect_batch_inline(
-        self, effects: deque[EngineEffect], epoch: int
-    ) -> int: ...
-
     async def _apply_effect(
         self,
         effect: EngineEffect,
@@ -216,14 +212,9 @@ class EffectPump:
         try:
             while self.pending:
                 effect = self.pending[0]
-                if effect.kind is EffectKind.MESSAGE:
+                kind = effect.kind
+                if kind is EffectKind.MESSAGE or kind is EffectKind.DECODED_MESSAGE:
                     if self._consume_batch(self.owner._apply_message_effect_batch_inline, epoch):
-                        continue
-                    break
-                if effect.kind is EffectKind.DECODED_MESSAGE:
-                    if self._consume_batch(
-                        self.owner._apply_decoded_message_effect_batch_inline, epoch
-                    ):
                         continue
                     break
                 if not self.owner._apply_effect_inline(effect, epoch):
@@ -255,14 +246,10 @@ class EffectPump:
                     if epoch != self.owner._connection_epoch:
                         self.discard_connection_effects()
                         continue
-                    if effect.kind is EffectKind.MESSAGE:
+                    kind = effect.kind
+                    if kind is EffectKind.MESSAGE or kind is EffectKind.DECODED_MESSAGE:
                         if self._consume_batch(
                             self.owner._apply_message_effect_batch_inline, epoch
-                        ):
-                            continue
-                    elif effect.kind is EffectKind.DECODED_MESSAGE:
-                        if self._consume_batch(
-                            self.owner._apply_decoded_message_effect_batch_inline, epoch
                         ):
                             continue
                     try:

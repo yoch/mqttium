@@ -365,6 +365,26 @@ class InboundSession:
             raise AssertionError("inbound stored-record count underflow")
         self._stored_inbound -= 1
 
+    def _complete_stored_inbound(
+        self, mid: int, expected_state: InboundQoSState, action: str
+    ) -> int:
+        """Delete one persisted inbound record and return its logical size.
+
+        A transition-capable store settles through metadata only; the base
+        interface pops the whole record. Both raise when the record moved or
+        vanished between the caller's lookup and this deletion.
+        """
+        transitions = self._transitions
+        if transitions is not None:
+            completed = transitions.complete_in(mid, expected_state)
+            if completed is None:
+                raise ProtocolError(f"Inbound mid={mid} changed while {action}")
+            return completed.logical_size
+        popped = self.store.pop_in(mid)
+        if popped is None:
+            raise ProtocolError(f"Inbound mid={mid} disappeared while {action}")
+        return self.stored_logical_size(popped)
+
     # --- packet handlers ---------------------------------------------------
 
     def _on_publish_v311(self, raw: RawPacket) -> None:
@@ -376,17 +396,8 @@ class InboundSession:
         if qos_raw == 3:
             raise MalformedPacketError("Invalid PUBLISH QoS 3")
         topic, payload, mid, retain, dup = decode_qos12_fields_v311(raw)
-        if qos_raw == int(QoS.AT_LEAST_ONCE):
-            self._on_qos1(
-                topic=topic,
-                payload=payload,
-                mid=mid,
-                retain=retain,
-                dup=dup,
-                properties=None,
-            )
-            return
-        self._on_qos2(
+        handler = self._on_qos1 if qos_raw == int(QoS.AT_LEAST_ONCE) else self._on_qos2
+        handler(
             topic=topic,
             payload=payload,
             mid=mid,
@@ -440,18 +451,8 @@ class InboundSession:
             topic = self._resolve_topic_fields(topic, properties)
         decoded_property_wire_size = property_wire_size if properties.values else None
         assert decoded_mid is not None
-        if qos is QoS.AT_LEAST_ONCE:
-            self._on_qos1(
-                topic=topic,
-                payload=payload,
-                mid=decoded_mid,
-                retain=retain,
-                dup=dup,
-                properties=properties,
-                decoded_property_wire_size=decoded_property_wire_size,
-            )
-            return
-        self._on_qos2(
+        handler = self._on_qos1 if qos is QoS.AT_LEAST_ONCE else self._on_qos2
+        handler(
             topic=topic,
             payload=payload,
             mid=decoded_mid,
@@ -482,17 +483,8 @@ class InboundSession:
             )
             return
         assert packet.mid is not None
-        if packet.qos is QoS.AT_LEAST_ONCE:
-            self._on_qos1(
-                topic=topic,
-                payload=packet.payload,
-                mid=packet.mid,
-                retain=packet.retain,
-                dup=packet.dup,
-                properties=packet.properties,
-            )
-            return
-        self._on_qos2(
+        handler = self._on_qos1 if packet.qos is QoS.AT_LEAST_ONCE else self._on_qos2
+        handler(
             topic=topic,
             payload=packet.payload,
             mid=packet.mid,
@@ -589,27 +581,16 @@ class InboundSession:
             decoded_property_wire_size=decoded_property_wire_size,
         )
 
-    def _complete_recovered_qos1_auto(
-        self, mid: int, existing: InboundMessage | InboundRecordMeta
-    ) -> None:
+    def _complete_recovered_qos1_auto(self, mid: int) -> None:
         """Settle a durable QoS 1 row redelivered into an auto-acknowledging session.
 
         A durable session may be reopened without manual_ack. Complete the old
         record rather than leaking it behind the automatic PUBACK that this
         retransmission triggers.
         """
-        if isinstance(existing, InboundMessage):
-            completed = self.store.pop_in(mid)
-            if completed is None:
-                raise ProtocolError(f"Inbound mid={mid} disappeared while acknowledging")
-            recovered_logical_size = self.stored_logical_size(completed)
-        else:
-            transitions = self._transitions
-            assert transitions is not None
-            completed_meta = transitions.complete_in(mid, InboundQoSState.WAIT_PUBACK)
-            if completed_meta is None:
-                raise ProtocolError(f"Inbound mid={mid} changed while acknowledging")
-            recovered_logical_size = completed_meta.logical_size
+        recovered_logical_size = self._complete_stored_inbound(
+            mid, InboundQoSState.WAIT_PUBACK, "acknowledging"
+        )
         self._forget_inbound()
         self._engine._send(_encode_puback_success(mid))
         # The restored Receive Maximum slot remains owned until this PUBACK
@@ -656,38 +637,19 @@ class InboundSession:
         existing = self._lookup_stored_inbound(mid)
         if existing is not None:
             if existing.state is InboundQoSState.WAIT_PUBACK:
-                self._complete_recovered_qos1_auto(mid, existing)
+                self._complete_recovered_qos1_auto(mid)
                 return
             # The record belongs to an unfinished QoS 2 exchange. Accepting the
             # QoS 1 PUBLISH would acknowledge an identifier the broker still
             # owns while leaving the QoS 2 record live.
             self._reject_packet_id_collision(mid, "QoS 1", "QoS 2")
 
-        if mid in self._pending_auto_qos1_mids:
-            # Retransmission of an auto-ACK identifier still in this effect
-            # batch: the Receive Maximum slot is already held, and the handoff
-            # flag was decided when the identifier first entered the set.
-            self._engine._send(_encode_puback_success(mid))
-            self._engine._emit(
-                (
-                    EffectKind.DECODED_MESSAGE
-                    if decoded_property_wire_size is not None
-                    else EffectKind.MESSAGE
-                ),
-                Message(
-                    topic=topic,
-                    payload=payload,
-                    qos=QoS.AT_LEAST_ONCE,
-                    retain=retain,
-                    dup=dup,
-                    mid=mid,
-                    properties=properties,
-                ),
-                decoded_property_wire_size=decoded_property_wire_size,
-            )
-            return
-
-        self._acquire_slot()
+        # A retransmission of an auto-ACK identifier still in this effect batch
+        # already holds its Receive Maximum slot, and the handoff flag was
+        # decided when the identifier first entered the set.
+        retransmission = mid in self._pending_auto_qos1_mids
+        if not retransmission:
+            self._acquire_slot()
         # Match the runtime's mandatory SEND-before-application order at the
         # producer, avoiding an EffectPump repartition on every auto-ACK.
         self._engine._send(_encode_puback_success(mid))
@@ -708,12 +670,13 @@ class InboundSession:
             ),
             decoded_property_wire_size=decoded_property_wire_size,
         )
-        # The slot stays owned until take_effects() hands this PUBACK to the
-        # runtime; a pipelined PUBLISH is then admitted by the ordinary acquire
-        # path rather than by a second decode.
-        self._pending_auto_qos1_mids.add(mid)
-        if self._inflight >= self.config.local_receive_maximum:
-            self._autoack_handoff_required = True
+        if not retransmission:
+            # The slot stays owned until take_effects() hands this PUBACK to
+            # the runtime; a pipelined PUBLISH is then admitted by the ordinary
+            # acquire path rather than by a second decode.
+            self._pending_auto_qos1_mids.add(mid)
+            if self._inflight >= self.config.local_receive_maximum:
+                self._autoack_handoff_required = True
 
     def _on_qos1_manual(
         self,
@@ -820,16 +783,7 @@ class InboundSession:
             return
         if self._tiny_peer_packet_limit:
             self._raise_mandatory_response_too_large("PUBCOMP")
-        if transitions is not None:
-            completed = transitions.complete_in(mid, state)
-            if completed is None:
-                raise ProtocolError(f"Inbound mid={mid} changed while completing PUBREL")
-            logical_size = completed.logical_size
-        else:
-            popped = store.pop_in(mid)
-            if popped is None:
-                raise ProtocolError(f"Inbound mid={mid} disappeared while completing PUBREL")
-            logical_size = self.stored_logical_size(popped)
+        logical_size = self._complete_stored_inbound(mid, state, "completing PUBREL")
         self._forget_inbound()
         self._session_state_qos2 -= 1
         engine._send(_encode_pubcomp_success(mid))
@@ -887,18 +841,7 @@ class InboundSession:
 
         wire = _encode_pubcomp_success(mid)
         self._engine._check_outbound_size(wire)
-
-        if isinstance(record, InboundMessage):
-            popped = store.pop_in(mid)
-            if popped is None:
-                raise ProtocolError(f"Inbound mid={mid} disappeared while acknowledging")
-            logical_size = self.stored_logical_size(popped)
-        else:
-            assert transitions is not None
-            completed = transitions.complete_in(mid, state)
-            if completed is None:
-                raise ProtocolError(f"Inbound mid={mid} changed while acknowledging")
-            logical_size = completed.logical_size
+        logical_size = self._complete_stored_inbound(mid, state, "acknowledging")
         self._forget_inbound()
         # The guard above already rejected every state but WAIT_USER_ACK.
         self._session_state_qos2 -= 1
@@ -909,24 +852,14 @@ class InboundSession:
         """Emit the ready prefix of manual QoS 1 acknowledgements in arrival order."""
         order = self._manual_qos1_order
         ready = self._pending_manual_qos1_acks
-        store = self.store
-        transitions = self._transitions
         while order and order[0] in ready:
             mid = order[0]
             record = self._lookup_stored_inbound(mid)
             if record is None or record.state is not InboundQoSState.WAIT_PUBACK:
                 raise ProtocolError(f"Inbound QoS 1 order lost pending mid={mid}")
-            if isinstance(record, InboundMessage):
-                popped = store.pop_in(mid)
-                if popped is None:
-                    raise ProtocolError(f"Inbound mid={mid} disappeared while acknowledging")
-                logical_size = self.stored_logical_size(popped)
-            else:
-                assert transitions is not None
-                completed = transitions.complete_in(mid, InboundQoSState.WAIT_PUBACK)
-                if completed is None:
-                    raise ProtocolError(f"Inbound mid={mid} changed while acknowledging")
-                logical_size = completed.logical_size
+            logical_size = self._complete_stored_inbound(
+                mid, InboundQoSState.WAIT_PUBACK, "acknowledging"
+            )
             order.popleft()
             ready.remove(mid)
             self._forget_inbound()

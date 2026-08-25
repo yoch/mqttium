@@ -105,40 +105,6 @@ def test_decoder_incomplete_waits() -> None:
     assert dec.next_packet() is not None
 
 
-def test_decoder_process_packets_bounded_by_bytes() -> None:
-    wires = [
-        PublishPacket(
-            topic=f"t/{index}",
-            payload=b"x" * 32,
-            qos=0,
-            retain=False,
-            dup=False,
-        ).encode()
-        for index in range(3)
-    ]
-    decoder = IncrementalDecoder()
-    decoder.feed(b"".join(wires))
-    seen = []
-
-    count, decoded_bytes = decoder.process_packets_bounded(
-        seen.append,
-        limit=256,
-        max_bytes=1,
-    )
-
-    assert count == 1
-    assert decoded_bytes >= 1
-    assert len(seen) == 1
-    assert len(decoder.drain_packets()) == 2
-
-
-@pytest.mark.parametrize("limit", [0, -1])
-def test_decoder_bounded_batch_rejects_invalid_byte_limit(limit: int) -> None:
-    decoder = IncrementalDecoder()
-    with pytest.raises(ValueError, match="max_bytes"):
-        decoder.process_packets_bounded(lambda packet: None, limit=1, max_bytes=limit)
-
-
 @pytest.mark.parametrize(
     "payload_size",
     [

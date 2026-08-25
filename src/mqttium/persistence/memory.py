@@ -339,6 +339,12 @@ class MemoryInflightStore:
             raise ValueError("max_messages must be positive")
         if max_bytes <= 0:
             raise ValueError("max_bytes must be positive")
+
+        def hydrate_page() -> tuple[InboundMessage, ...]:
+            page = tuple(current for saved_mid in mids if (current := self._in.get(saved_mid)))
+            mids.clear()
+            return page
+
         index = tuple(self._in.values())
         mids: list[int] = []
         hydrated_bytes = 0
@@ -352,22 +358,17 @@ class MemoryInflightStore:
                 )
             )
             if mids and (len(mids) >= max_messages or hydrated_bytes + message_bytes > max_bytes):
-                page = tuple(current for saved_mid in mids if (current := self._in.get(saved_mid)))
-                if page:
+                if page := hydrate_page():
                     yield page
-                mids = []
                 hydrated_bytes = 0
             mids.append(indexed_message.mid)
             hydrated_bytes += message_bytes
             if len(mids) >= max_messages or hydrated_bytes >= max_bytes:
-                page = tuple(current for saved_mid in mids if (current := self._in.get(saved_mid)))
-                if page:
+                if page := hydrate_page():
                     yield page
-                mids = []
                 hydrated_bytes = 0
         if mids:
-            page = tuple(current for mid in mids if (current := self._in.get(mid)))
-            if page:
+            if page := hydrate_page():
                 yield page
 
     def clear_in(self) -> None:

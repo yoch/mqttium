@@ -210,7 +210,7 @@ def test_decoded_properties_can_join_inline_small_delivery_batch() -> None:
 
     assert first.kind is EffectKind.DECODED_MESSAGE
     assert second.kind is EffectKind.DECODED_MESSAGE
-    applied = client._apply_decoded_message_effect_batch_inline(effects, client._connection_epoch)
+    applied = client._apply_message_effect_batch_inline(effects, client._connection_epoch)
 
     assert applied == 2
     assert client.pending_delivery_bytes == 0

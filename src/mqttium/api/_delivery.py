@@ -558,11 +558,19 @@ class ApplicationDelivery:
         self._enqueue_message_batch(callback, messages, iterator_delivery=False)
         return True
 
-    def deliver_batch_inline(  # noqa: C901
+    def deliver_message_batch_inline(  # noqa: C901
         self,
         effects: deque[EngineEffect],
         callback: Callable[[Message], Any] | None,
     ) -> int:
+        """Deliver a consecutive small-message effect prefix without suspending.
+
+        Handles MESSAGE and DECODED_MESSAGE effects in one pass: each effect's
+        own ``decoded_property_wire_size`` selects the smallness test, exactly
+        as the two per-kind copies this replaces did. Producers pair the size
+        with DECODED_MESSAGE and leave it ``None`` on MESSAGE, so a mixed
+        prefix no longer splits the batch at the kind boundary.
+        """
         callback_delivery, iterator_delivery = self._modes(callback)
         if not callback_delivery and not iterator_delivery:
             return 0
@@ -571,65 +579,19 @@ class ApplicationDelivery:
             capacity = self._callback_batch_capacity(iterator_delivery)
             messages: list[Message] = []
             for effect in effects:
-                if len(messages) >= capacity or effect.kind is not EffectKind.MESSAGE:
-                    break
-                message: Message = effect.data
-                if effect.requires_delivery_mark or not self._is_small(message):
-                    break
-                messages.append(message)
-            if len(messages) > 1:
-                self._enqueue_message_batch(callback, messages, iterator_delivery=iterator_delivery)
-                return len(messages)
-
-        # Bind the callback once instead of re-testing `callback_delivery` and
-        # asserting non-None per message; `cb is not None` carries both facts.
-        cb = callback if callback_delivery else None
-        callback_worker_ready = False
-        applied = 0
-        for effect in effects:
-            if effect.kind is not EffectKind.MESSAGE:
-                break
-            message = effect.data
-            if effect.requires_delivery_mark or not self._is_small(message):
-                break
-            if iterator_delivery and self.messages_queue.full():
-                break
-            if callback_delivery and self.callback_queue.full():
-                break
-            if iterator_delivery:
-                self.messages_queue.put_nowait(message)
-            if cb is not None:
-                if not callback_worker_ready:
-                    self.ensure_callback_worker()
-                    callback_worker_ready = True
-                self.callback_queue.put_nowait((cb, (message,), None))
-            applied += 1
-        if applied and iterator_delivery:
-            self.message_ready.set()
-        return applied
-
-    def deliver_decoded_batch_inline(  # noqa: C901
-        self,
-        effects: deque[EngineEffect],
-        callback: Callable[[Message], Any] | None,
-    ) -> int:
-        callback_delivery, iterator_delivery = self._modes(callback)
-        if not callback_delivery and not iterator_delivery:
-            return 0
-        if callback_delivery and len(effects) > 1:
-            assert callback is not None
-            capacity = self._callback_batch_capacity(iterator_delivery)
-            messages: list[Message] = []
-            for effect in effects:
-                if len(messages) >= capacity or effect.kind is not EffectKind.DECODED_MESSAGE:
+                kind = effect.kind
+                if len(messages) >= capacity or (
+                    kind is not EffectKind.MESSAGE and kind is not EffectKind.DECODED_MESSAGE
+                ):
                     break
                 message: Message = effect.data
                 property_wire_size = effect.decoded_property_wire_size
-                if (
-                    effect.requires_delivery_mark
-                    or property_wire_size is None
-                    or not self._is_small_decoded(message, property_wire_size)
-                ):
+                small = (
+                    self._is_small(message)
+                    if property_wire_size is None
+                    else self._is_small_decoded(message, property_wire_size)
+                )
+                if effect.requires_delivery_mark or not small:
                     break
                 messages.append(message)
             if len(messages) > 1:
@@ -642,15 +604,17 @@ class ApplicationDelivery:
         callback_worker_ready = False
         applied = 0
         for effect in effects:
-            if effect.kind is not EffectKind.DECODED_MESSAGE:
+            kind = effect.kind
+            if kind is not EffectKind.MESSAGE and kind is not EffectKind.DECODED_MESSAGE:
                 break
             message = effect.data
             property_wire_size = effect.decoded_property_wire_size
-            if (
-                effect.requires_delivery_mark
-                or property_wire_size is None
-                or not self._is_small_decoded(message, property_wire_size)
-            ):
+            small = (
+                self._is_small(message)
+                if property_wire_size is None
+                else self._is_small_decoded(message, property_wire_size)
+            )
+            if effect.requires_delivery_mark or not small:
                 break
             if iterator_delivery and self.messages_queue.full():
                 break

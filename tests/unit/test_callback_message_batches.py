@@ -168,7 +168,7 @@ async def test_decoded_message_callbacks_batch_as_one_physical_job() -> None:
     seen: list[bytes] = []
     client.on_message = lambda message: seen.append(message.payload)
 
-    applied = client._apply_decoded_message_effect_batch_inline(
+    applied = client._apply_message_effect_batch_inline(
         deque(_decoded_effect(i) for i in range(4)), client._connection_epoch
     )
 

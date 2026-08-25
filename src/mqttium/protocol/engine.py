@@ -561,63 +561,38 @@ class ProtocolEngine:
             # than killing the read loop with an untyped exception.
             self._emit(EffectKind.PROTOCOL_ERROR, f"Internal handler error: {exc!r}")
 
-    def _on_connack(self, raw: RawPacket) -> None:
-        if self.state != ConnectionState.CONNECTING:
-            raise ProtocolError("Unexpected CONNACK (already negotiated)")
-        session_present, reason_code, properties = self.codec.decode_connack(raw.remaining)
-        connack = ConnAckPacket(
-            session_present=session_present,
-            reason_code=reason_code,
-            properties=properties,
+    def _validate_connack_v5(self, connack: ConnAckPacket) -> None:
+        """Enforce the MQTT 5 CONNACK property obligations before acceptance."""
+        connack_method = (
+            connack.properties.get("authentication_method")
+            if connack.properties is not None
+            else None
         )
-        if self.codec.is_mqtt5:
-            connack_method = (
-                connack.properties.get("authentication_method")
-                if connack.properties is not None
-                else None
+        if connack_method is not None and connack_method != self._auth_method:
+            self._protocol_disconnect(0x82)
+            raise ProtocolError("CONNACK authentication_method does not match CONNECT")
+        if connack.reason_code == 0 and self._auth_method is not None and connack_method is None:
+            self._protocol_disconnect(0x82)
+            raise ProtocolError(
+                "Successful CONNACK must repeat CONNECT authentication_method [MQTT-4.12.0-5]"
             )
-            if connack_method is not None and connack_method != self._auth_method:
-                self._protocol_disconnect(0x82)
-                raise ProtocolError("CONNACK authentication_method does not match CONNECT")
-            if (
-                connack.reason_code == 0
-                and self._auth_method is not None
-                and connack_method is None
-            ):
-                self._protocol_disconnect(0x82)
-                raise ProtocolError(
-                    "Successful CONNACK must repeat CONNECT authentication_method [MQTT-4.12.0-5]"
-                )
-            if (
-                connack.properties is not None
-                and connack.properties.get("authentication_data") is not None
-                and self._auth_method is None
-            ):
-                self._protocol_disconnect(0x82)
-                raise ProtocolError("CONNACK authentication_data requires authentication_method")
-            if (
-                self._sent_request_response_information == 0
-                and connack.properties is not None
-                and connack.properties.get("response_information") is not None
-            ):
-                self._protocol_disconnect(0x82)
-                raise ProtocolError(
-                    "CONNACK response_information was not requested [MQTT-3.1.2-28]"
-                )
-        if connack.reason_code != 0:
-            self._reauth_in_progress = False
-            self.state = ConnectionState.DISCONNECTED
-            self._emit(EffectKind.CONNACK, connack)
-            self._emit(
-                EffectKind.DISCONNECTED,
-                DisconnectInfo(
-                    reason_code=connack.reason_code,
-                    properties=connack.properties,
-                    from_broker=True,
-                ),
-            )
-            return
+        if (
+            connack.properties is not None
+            and connack.properties.get("authentication_data") is not None
+            and self._auth_method is None
+        ):
+            self._protocol_disconnect(0x82)
+            raise ProtocolError("CONNACK authentication_data requires authentication_method")
+        if (
+            self._sent_request_response_information == 0
+            and connack.properties is not None
+            and connack.properties.get("response_information") is not None
+        ):
+            self._protocol_disconnect(0x82)
+            raise ProtocolError("CONNACK response_information was not requested [MQTT-3.1.2-28]")
 
+    def _validate_accepted_connack(self, connack: ConnAckPacket) -> None:
+        """Reject a successful CONNACK whose session claims contradict this Client."""
         if self.codec.is_mqtt5 and not self.config.client_id:
             assigned_client_id = (
                 connack.properties.get("assigned_client_identifier")
@@ -656,6 +631,33 @@ class ProtocolEngine:
             raise ProtocolError(
                 "CONNACK reports Session Present but the Client has no Session State [MQTT-3.2.2-4]"
             )
+
+    def _on_connack(self, raw: RawPacket) -> None:
+        if self.state != ConnectionState.CONNECTING:
+            raise ProtocolError("Unexpected CONNACK (already negotiated)")
+        session_present, reason_code, properties = self.codec.decode_connack(raw.remaining)
+        connack = ConnAckPacket(
+            session_present=session_present,
+            reason_code=reason_code,
+            properties=properties,
+        )
+        if self.codec.is_mqtt5:
+            self._validate_connack_v5(connack)
+        if connack.reason_code != 0:
+            self._reauth_in_progress = False
+            self.state = ConnectionState.DISCONNECTED
+            self._emit(EffectKind.CONNACK, connack)
+            self._emit(
+                EffectKind.DISCONNECTED,
+                DisconnectInfo(
+                    reason_code=connack.reason_code,
+                    properties=connack.properties,
+                    from_broker=True,
+                ),
+            )
+            return
+
+        self._validate_accepted_connack(connack)
 
         self.negotiated = NegotiatedSettings.from_connack(
             connack.properties,

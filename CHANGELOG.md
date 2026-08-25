@@ -6,6 +6,13 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Removed
+
+- `IncrementalDecoder.process_packets_bounded` (Provisional). The client's
+  ingress loops carry their own count/byte bounds and the auto-acknowledgement
+  handoff boundary, so the method had no caller left. Use `next_packet()` in a
+  bounded loop, exactly as the client does.
+
 ### Added
 
 - Complete stateful outbound MQTT 5 Topic Alias support for explicit
@@ -32,6 +39,10 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Remove a replay-parked outbound QoS 1/2 queue entry when the broker settles
+  its exchange before a send-quota slot frees up. The stale entry made the
+  next queue drain resurrect the completed durable record and retransmit a
+  settled publication. Found by the stateful invariant fuzzer (seed 1).
 - Let an explicit callback `connect()` replace a connection whose transport is
   already closing under keepalive ownership but whose reader has not yet
   retired the engine's connected state.
