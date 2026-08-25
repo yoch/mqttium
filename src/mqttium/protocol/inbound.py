@@ -139,6 +139,7 @@ class InboundSession:
         "_stored_inbound",
         "_session_state_qos2",
         "_tiny_peer_packet_limit",
+        "_topic_alias_maximum",
         "_transitions",
         "config",
         "handle_publish",
@@ -174,6 +175,7 @@ class InboundSession:
         self._on_qos1 = self._on_qos1_manual if self.config.manual_ack else self._on_qos1_auto
         self._tiny_peer_packet_limit = False
         self._aliases: dict[int, str] = {}
+        self._topic_alias_maximum = 0
         self._inflight = 0
         self._autoack_handoff_required = False
         # Auto-ACK QoS 1 identifiers whose PUBACK is still inside the current
@@ -260,6 +262,17 @@ class InboundSession:
     def start_connection(self) -> None:
         """Reset state scoped to one network connection before CONNECT."""
         self._aliases.clear()
+        connect_properties = self.config.connect_properties
+        configured_topic_alias_maximum = (
+            connect_properties.get("topic_alias_maximum")
+            if connect_properties is not None
+            else None
+        )
+        self._topic_alias_maximum = (
+            self.config.topic_alias_maximum
+            if configured_topic_alias_maximum is None
+            else int(configured_topic_alias_maximum)
+        )
         self._inflight = 0
         self._autoack_handoff_required = False
         self._pending_auto_qos1_mids.clear()
@@ -1082,10 +1095,10 @@ class InboundSession:
                 raise ProtocolError("PUBLISH with empty topic and no topic alias")
             return topic
         alias = int(alias)
-        max_alias = self.config.topic_alias_maximum
+        max_alias = self._topic_alias_maximum
         # max_alias == 0 means inbound aliases are not accepted.
         if alias == 0 or alias > max_alias:
-            # MQTT 5 §3.3.2.3.5: DISCONNECT 0x94 (Topic Alias invalid).
+            # MQTT 5 §3.3.2.3.4: DISCONNECT 0x94 (Topic Alias invalid).
             self._protocol_disconnect(0x94)
             raise ProtocolError(f"Invalid topic alias {alias}")
         if topic:
