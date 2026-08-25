@@ -60,7 +60,9 @@ def test_resumed_session_replays_pubrel_when_send_quota_is_exhausted() -> None:
     _feed(engine, encode_frame(PacketType.CONNACK, 0, bytes(body)))
 
     sends = [effect.data for effect in engine.take_effects() if effect.kind is EffectKind.SEND]
-    packet_types = [((item if isinstance(item, bytes) else item[0])[0] >> 4) for item in sends]
+    packet_types = [
+        (item if isinstance(item, bytes) else item[0])[0] & 0xF0 for item in sends
+    ]
 
     assert PacketType.PUBLISH.value in packet_types
     assert PacketType.PUBREL.value in packet_types
