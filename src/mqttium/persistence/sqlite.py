@@ -929,6 +929,12 @@ class SqliteInflightStore:
             raise ValueError("max_messages must be positive")
         if max_bytes <= 0:
             raise ValueError("max_bytes must be positive")
+
+        def hydrate_page() -> tuple[InboundMessage, ...]:
+            page = self._in_messages_for_mids(tuple(mids))
+            mids.clear()
+            return page
+
         index_mids = array("q")
         index_sizes = array("q")
         with self._lock:
@@ -939,22 +945,17 @@ class SqliteInflightStore:
         hydrated_bytes = 0
         for mid, message_bytes in zip(index_mids, index_sizes, strict=True):
             if mids and (len(mids) >= max_messages or hydrated_bytes + message_bytes > max_bytes):
-                page = self._in_messages_for_mids(tuple(mids))
-                if page:
+                if page := hydrate_page():
                     yield page
-                mids = []
                 hydrated_bytes = 0
             mids.append(mid)
             hydrated_bytes += message_bytes
             if len(mids) >= max_messages or hydrated_bytes >= max_bytes:
-                page = self._in_messages_for_mids(tuple(mids))
-                if page:
+                if page := hydrate_page():
                     yield page
-                mids = []
                 hydrated_bytes = 0
         if mids:
-            page = self._in_messages_for_mids(tuple(mids))
-            if page:
+            if page := hydrate_page():
                 yield page
 
     def clear_in(self) -> None:

@@ -6,6 +6,13 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Removed
+
+- `IncrementalDecoder.process_packets_bounded` (Provisional). The client's
+  ingress loops carry their own count/byte bounds and the auto-acknowledgement
+  handoff boundary, so the method had no caller left. Use `next_packet()` in a
+  bounded loop, exactly as the client does.
+
 ### Added
 
 - Complete stateful outbound MQTT 5 Topic Alias support for explicit

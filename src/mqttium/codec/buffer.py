@@ -9,7 +9,6 @@ Design constraints (from Paho perf audit + gmqtt critique):
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass
 
 from mqttium.codec.vbi import decode_vbi
@@ -215,34 +214,3 @@ class IncrementalDecoder:
                 break
             packets.append(packet)
         return packets
-
-    def process_packets_bounded(
-        self,
-        callback: Callable[[RawPacket], None],
-        *,
-        limit: int,
-        max_bytes: int,
-    ) -> tuple[int, int]:
-        """Decode one count- and byte-bounded packet batch.
-
-        ``max_bytes`` is a target rather than a packet-size limit: the packet
-        that reaches the target is included, so one individually larger packet
-        is always allowed to make progress. Five bytes of fixed-header overhead
-        are conservatively charged per packet.
-        """
-        if limit <= 0:
-            raise ValueError("limit must be positive")
-        if max_bytes <= 0:
-            raise ValueError("max_bytes must be positive")
-        count = 0
-        decoded_bytes = 0
-        for _ in range(limit):
-            packet = self.next_packet()
-            if packet is None:
-                break
-            callback(packet)
-            count += 1
-            decoded_bytes += len(packet.remaining) + 5
-            if decoded_bytes >= max_bytes:
-                break
-        return count, decoded_bytes
