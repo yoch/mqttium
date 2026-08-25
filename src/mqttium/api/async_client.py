@@ -90,6 +90,7 @@ _GRACEFUL_DISCONNECT_DRAIN_TIMEOUT = 5.0
 _FATAL_DISCONNECT_DRAIN_TIMEOUT = 0.25
 
 _ReceiptT = TypeVar("_ReceiptT", "PublishReceipt", "PublishBatchReceipt")
+_AckResultT = TypeVar("_AckResultT", "SubscribeResult", "UnsubscribeResult")
 
 
 def _fifo_register(
@@ -141,6 +142,14 @@ def _extend_message_effects(
             )
             for message, wire_size in zip(messages, property_sizes, strict=True)
         )
+
+
+def _terminal_publish_result(effect: EngineEffect) -> tuple[int | None, BaseException | None]:
+    """Extract the (mid, reason) outcome of a terminal publish effect."""
+    if effect.kind is EffectKind.PUBLISH_COMPLETE:
+        return effect.data, None
+    failure: PublishFailure = effect.data
+    return failure.mid, failure.reason
 
 
 def _positive(name: str, value: float) -> None:
@@ -1021,12 +1030,7 @@ class AsyncClient:
                 await self._force_close(preserve_reconnect=reconnect_attempt)
             except BaseException:
                 pass
-            if self._engine.state not in (
-                ConnectionState.NEW,
-                ConnectionState.DISCONNECTED,
-            ):
-                self._engine.notify_transport_closed()
-                self._engine.take_effects()
+            self._retire_engine_connection()
             raise
 
     async def _await_connack_or_disconnect(self, timeout: float) -> ConnAckPacket:
@@ -1503,14 +1507,7 @@ class AsyncClient:
             fut: asyncio.Future[SubscribeResult] = loop.create_future()
             self._sub_futs[mid] = fut
             self._collect_effects_locked()
-        await self._drain_effects()
-        try:
-            return await asyncio.wait_for(
-                fut, timeout=timeout if timeout is not None else self._ack_timeout
-            )
-        except TimeoutError as exc:
-            self._sub_futs.pop(mid, None)
-            raise MQTTTimeoutError(f"SUBACK timed out for mid={mid}") from exc
+        return await self._await_request_ack(fut, self._sub_futs, mid, timeout, "SUBACK")
 
     async def unsubscribe(
         self,
@@ -1539,14 +1536,25 @@ class AsyncClient:
             fut: asyncio.Future[UnsubscribeResult] = loop.create_future()
             self._unsub_futs[mid] = fut
             self._collect_effects_locked()
+        return await self._await_request_ack(fut, self._unsub_futs, mid, timeout, "UNSUBACK")
+
+    async def _await_request_ack(
+        self,
+        fut: asyncio.Future[_AckResultT],
+        futs: dict[int, asyncio.Future[_AckResultT]],
+        mid: int,
+        timeout: float | None,
+        ack_name: str,
+    ) -> _AckResultT:
+        """Flush effects and await one registered SUBACK/UNSUBACK future."""
         await self._drain_effects()
         try:
             return await asyncio.wait_for(
                 fut, timeout=timeout if timeout is not None else self._ack_timeout
             )
         except TimeoutError as exc:
-            self._unsub_futs.pop(mid, None)
-            raise MQTTTimeoutError(f"UNSUBACK timed out for mid={mid}") from exc
+            futs.pop(mid, None)
+            raise MQTTTimeoutError(f"{ack_name} timed out for mid={mid}") from exc
 
     def messages(self) -> AsyncIterator[Message]:
         """Return the delivered-message iterator for the current generation.
@@ -2196,36 +2204,27 @@ class AsyncClient:
                         properties=response.properties,
                     )
                     self._collect_effects_locked()
-        elif kind is EffectKind.MESSAGE:
+        elif kind is EffectKind.MESSAGE or kind is EffectKind.DECODED_MESSAGE:
             message: Message = effect.data
-            pending_delivery = self._accept_message(message, self.on_message)
-            if pending_delivery is not None:
-                await pending_delivery
-            if effect.requires_delivery_mark and message.mid is not None:
-                async with self._engine_lock:
-                    self._engine.inbound.mark_delivered(message.mid)
-        elif kind is EffectKind.DECODED_MESSAGE:
-            message = effect.data
             property_wire_size = effect.decoded_property_wire_size
-            assert property_wire_size is not None
-            pending_delivery = self._accept_decoded_message(
-                message, self.on_message, property_wire_size
-            )
+            # Producers pair the decoded size with DECODED_MESSAGE and leave it
+            # None on MESSAGE, so the size selects the admission entry point.
+            if property_wire_size is None:
+                pending_delivery = self._accept_message(message, self.on_message)
+            else:
+                pending_delivery = self._accept_decoded_message(
+                    message, self.on_message, property_wire_size
+                )
             if pending_delivery is not None:
                 await pending_delivery
             if effect.requires_delivery_mark and message.mid is not None:
                 async with self._engine_lock:
                     self._engine.inbound.mark_delivered(message.mid)
-        elif kind is EffectKind.PUBLISH_COMPLETE:
-            mid: int | None = effect.data
-            self._settle_publish(mid, None)
+        elif kind is EffectKind.PUBLISH_COMPLETE or kind is EffectKind.PUBLISH_FAILED:
+            mid, reason = _terminal_publish_result(effect)
+            self._settle_publish(mid, reason)
             if self.on_publish is not None:
-                await self._enqueue_callback(self.on_publish, mid, None)
-        elif kind is EffectKind.PUBLISH_FAILED:
-            failure: PublishFailure = effect.data
-            self._settle_publish(failure.mid, failure.reason)
-            if self.on_publish is not None:
-                await self._enqueue_callback(self.on_publish, failure.mid, failure.reason)
+                await self._enqueue_callback(self.on_publish, mid, reason)
         elif kind is EffectKind.SUBACK:
             self._resolve_suback(effect.data)
         elif kind is EffectKind.UNSUBACK:
@@ -2364,13 +2363,7 @@ class AsyncClient:
 
     def _notify_publish_space(self) -> None:
         """Wake every parked publisher (teardown / reconnect)."""
-        waiters = self._publish_waiter_futs
-        while waiters:
-            fut = waiters.popleft()
-            if fut.done():
-                continue
-            fut.set_result(None)
-            self._publish_wakeups += 1
+        self._wake_publish_waiters(len(self._publish_waiter_futs))
 
     def _resolve_connack(self, connack: ConnAckPacket) -> None:
         if connack.reason_code != 0:
@@ -2443,13 +2436,7 @@ class AsyncClient:
 
     def _settle_terminal_effect(self, effect: EngineEffect) -> None:
         """Settle one terminal publish effect during final teardown."""
-        if effect.kind is EffectKind.PUBLISH_COMPLETE:
-            mid: int | None = effect.data
-            reason: BaseException | None = None
-        else:
-            failure: PublishFailure = effect.data
-            mid = failure.mid
-            reason = failure.reason
+        mid, reason = _terminal_publish_result(effect)
         self._settle_publish(mid, reason)
         if self.on_publish is not None:
             try:
@@ -2524,16 +2511,20 @@ class AsyncClient:
         except Exception:
             pass
 
+    def _retire_engine_connection(self) -> None:
+        """Retire engine connection state after a locally failed connection."""
+        if self._engine.state not in (
+            ConnectionState.NEW,
+            ConnectionState.DISCONNECTED,
+        ):
+            self._engine.notify_transport_closed()
+            self._engine.take_effects()
+
     async def _force_close_after_local_packet_failure(self) -> None:
         """Close transport and finalize engine state for local packet-size failures."""
         await self._force_close()
         async with self._engine_lock:
-            if self._engine.state not in (
-                ConnectionState.NEW,
-                ConnectionState.DISCONNECTED,
-            ):
-                self._engine.notify_transport_closed()
-                self._engine.take_effects()
+            self._retire_engine_connection()
 
     async def _force_close(self, *, preserve_reconnect: bool = False) -> None:
         await self._invalidate_connection_epoch()
