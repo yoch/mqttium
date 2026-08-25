@@ -75,6 +75,7 @@ class OutboundSession:
         "_encode_pubrel",
         "_engine",
         "_is_v5",
+        "_parked_entries",
         "_queued",
         "_paged_store",
         "_transitions",
@@ -115,6 +116,10 @@ class OutboundSession:
         self.packet_ids = PacketIdPool()
         self.flow = FlowControl(self.config.local_receive_maximum)
         self._queued: deque[OutboundMessage | OutboundMessageSummary] = deque()
+        # Replay-parked WAIT_* entries currently in `_queued` (see
+        # `_unpark_settled`). Zero on every path that does not involve a
+        # resumed session whose retransmissions exceeded the send quota.
+        self._parked_entries = 0
         self._pending_messages = 0
         self._pending_bytes = 0
         self._pending_high_water_messages = 0
@@ -650,12 +655,32 @@ class OutboundSession:
             if meta is None:
                 return False
             self._release_reservation(meta.logical_size)
-            return True
-        msg = self.store.get_out(mid)
-        if msg is None or msg.state is not expected_state:
-            return False
-        self.complete_record(mid, msg)
+        else:
+            msg = self.store.get_out(mid)
+            if msg is None or msg.state is not expected_state:
+                return False
+            self.complete_record(mid, msg)
+        if self._parked_entries:
+            self._unpark_settled(mid)
         return True
+
+    def _unpark_settled(self, mid: int) -> None:
+        """Drop the replay-parked queue entry of a settled exchange.
+
+        `replay_session()` parks a WAIT_* record in `_queued` when the send
+        quota cannot admit its retransmission. The broker can still settle the
+        exchange while it is parked; the stale entry must leave the queue with
+        the record, or `drain()` would re-materialise the deleted record,
+        resurrect it through `update_out` and retransmit a settled
+        publication — and a reallocated packet identifier could later collide
+        with it in the queue.
+        """
+        queued = self._queued
+        for index, stored in enumerate(queued):
+            if stored.mid == mid:
+                del queued[index]
+                self._parked_entries -= 1
+                return
 
     def on_puback(self, raw: RawPacket) -> None:
         mid, reason_code, properties = self._decode_puback(raw.remaining)
@@ -914,6 +939,7 @@ class OutboundSession:
     def drain(self) -> None:
         while self._queued and self.flow.try_acquire():
             stored = self._queued[0]
+            parked = self._parked_entries and stored.state is not OutboundQoSState.QUEUED
             try:
                 msg = self.materialize(stored)
                 if msg.state is OutboundQoSState.QUEUED:
@@ -924,10 +950,14 @@ class OutboundSession:
                 self.flow.release()
                 self.discard_record(stored.mid, stored)
                 self._queued.popleft()
+                if parked:
+                    self._parked_entries -= 1
                 self.packet_ids.release(stored.mid)
                 self._fail(stored.mid, exc)
                 continue
             self._queued.popleft()
+            if parked:
+                self._parked_entries -= 1
 
     # --- store records and budget -------------------------------------------
 
@@ -1149,6 +1179,9 @@ class OutboundSession:
                 self._fail(msg.mid, exc)
             return
         if not self.flow.try_acquire():
+            # Parked: retransmission must wait for a send-quota slot. The
+            # exchange itself remains live and can be settled while it waits.
+            self._parked_entries += 1
             self._queued.append(msg)
             return
         try:
@@ -1170,6 +1203,7 @@ class OutboundSession:
     def replay_session(self) -> None:
         self.reset_flow_for_connection()
         self._queued.clear()
+        self._parked_entries = 0
         for page in self.store_summary_pages():
             for msg in page:
                 self._replay_message(msg)
@@ -1193,6 +1227,7 @@ class OutboundSession:
         """
         if any(m.state is not OutboundQoSState.QUEUED for m in self._queued):
             self._queued = deque(m for m in self._queued if m.state is OutboundQoSState.QUEUED)
+        self._parked_entries = 0
         clear_abandoned_packet_ids = not self._queued and not sub_mids_pending
         for page in self.store_summary_pages():
             for msg in page:
