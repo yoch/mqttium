@@ -40,6 +40,7 @@ Status meanings:
 | [RUNTIME-FUZZER-GENERATIVE-QUALIFICATION-2026-08-24](https://github.com/yoch/mqttium/blob/main/docs/reports/RUNTIME-FUZZER-GENERATIVE-QUALIFICATION-2026-08-24.md) | Current evidence | State-aware runtime schedule generation, six-mutant qualification, keepalive-cycle validation, explicit-takeover finding, and 2,000-seed reference campaign |
 | [RUNTIME-FUZZER-COMPOSITION-QUALIFICATION-2026-08-24](https://github.com/yoch/mqttium/blob/main/docs/reports/RUNTIME-FUZZER-COMPOSITION-QUALIFICATION-2026-08-24.md) | Current evidence | Two-window lifecycle composition, four behavioral-mutant qualifications, closing-transport takeover finding, and 50,000-seed decision-gate campaign |
 | [RUNTIME-FUZZER-PRESSURE-QUALIFICATION-2026-08-25](https://github.com/yoch/mqttium/blob/main/docs/reports/RUNTIME-FUZZER-PRESSURE-QUALIFICATION-2026-08-25.md) | Current evidence | V3 pressure/interleaving profile: capability composition, four bounded lifecycle overlaps, coverage-gated campaigns, parked-publisher contract, and eight mutation qualifications |
+| [RUNTIME-FUZZER-PRESSURE-LONG-CAMPAIGN-2026-08-26](https://github.com/yoch/mqttium/blob/main/docs/reports/RUNTIME-FUZZER-PRESSURE-LONG-CAMPAIGN-2026-08-26.md) | Current evidence | One-million-seed V3 x86-64 campaign at 48 steps: zero failures, full mandatory pressure coverage, and recorded trace diversity |
 
 ## Cross-client and performance program
 

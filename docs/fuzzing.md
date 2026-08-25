@@ -196,6 +196,12 @@ long campaign completed 1,000,000 schedules at 48 steps with zero failures and
 99.98% unique scheduling traces; V1 is now a stable safety net rather than an
 area for further grammar expansion.
 
+The V3 long campaign completed 1,000,000 schedules at 48 steps on x86-64 with
+zero failures, all mandatory pressure counters nonzero, and 99.9736% unique
+scheduling traces. V2 retains a clean 50,000-seed calibration; its recommended
+million-seed two-window campaign remains pending. See the dated reports for the
+exact commits, environments, ranges, and limitations.
+
 The local release runner can orchestrate multiple deterministic shards:
 
 ```bash
