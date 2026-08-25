@@ -115,10 +115,7 @@ def _check_invariants(engine: ProtocolEngine, step: int, history: list[str]) -> 
     # reconnect there is therefore no one-to-one mapping from durable WAIT_*
     # states to flow.inflight; the negotiated bounds remain invariant.
     if not 0 <= outbound.flow.inflight <= outbound.flow.limit:
-        fail(
-            f"flow.inflight={outbound.flow.inflight} outside "
-            f"[0, {outbound.flow.limit}]"
-        )
+        fail(f"flow.inflight={outbound.flow.inflight} outside [0, {outbound.flow.limit}]")
 
     queued = [m.mid for m in outbound._queued]
     if len(queued) != len(set(queued)):
