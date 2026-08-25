@@ -175,7 +175,7 @@ class InboundSession:
         self._on_qos1 = self._on_qos1_manual if self.config.manual_ack else self._on_qos1_auto
         self._tiny_peer_packet_limit = False
         self._aliases: dict[int, str] = {}
-        self._topic_alias_maximum = 0
+        self._topic_alias_maximum = self.config.topic_alias_maximum
         self._inflight = 0
         self._autoack_handoff_required = False
         # Auto-ACK QoS 1 identifiers whose PUBACK is still inside the current
