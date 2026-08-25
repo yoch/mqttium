@@ -32,6 +32,10 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Remove a replay-parked outbound QoS 1/2 queue entry when the broker settles
+  its exchange before a send-quota slot frees up. The stale entry made the
+  next queue drain resurrect the completed durable record and retransmit a
+  settled publication. Found by the stateful invariant fuzzer (seed 1).
 - Let an explicit callback `connect()` replace a connection whose transport is
   already closing under keepalive ownership but whose reader has not yet
   retired the engine's connected state.
