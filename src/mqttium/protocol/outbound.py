@@ -922,8 +922,8 @@ class OutboundSession:
                     self._retransmit(msg)
             except Exception as exc:
                 self.flow.release()
-                self._queued.popleft()
                 self.discard_record(stored.mid, stored)
+                self._queued.popleft()
                 self.packet_ids.release(stored.mid)
                 self._fail(stored.mid, exc)
                 continue
@@ -938,16 +938,18 @@ class OutboundSession:
     ) -> None:
         # `stored` is required: recovering it from the store here is what leaked
         # the byte budget when a transactional store had already rolled back.
-        self.delete_record(mid)
+        # This path only discards already-durable ownership, so deletion must be
+        # confirmed before its reservation or packet identifier can be released.
+        self.store.delete_out(mid)
         self._release_reservation(self.stored_logical_size(stored))
 
     def delete_record(self, mid: int) -> None:
         try:
             self.store.delete_out(mid)
         except Exception:
-            # Preserve the original launch/validation failure. A broken store is
-            # surfaced separately by the read/client boundary and must not leak
-            # flow slots or packet identifiers in memory.
+            # Preserve the original admission failure. Transactional stores have
+            # already rolled their batch back when _rollback reaches this helper;
+            # unlike discard_record(), this is best-effort cleanup only.
             pass
 
     def complete_record(
@@ -1257,13 +1259,14 @@ class OutboundSession:
     def fail_queued_violating_negotiation(self) -> None:
         kept: deque[OutboundMessage | OutboundMessageSummary] = deque()
         while self._queued:
-            msg = self._queued.popleft()
+            msg = self._queued[0]
             try:
                 self.validate_against_negotiated(msg)
             except (ProtocolError, PacketTooLargeError) as exc:
                 self.discard_record(msg.mid, msg)
+                self._queued.popleft()
                 self.packet_ids.release(msg.mid)
                 self._fail(msg.mid, exc)
                 continue
-            kept.append(msg)
+            kept.append(self._queued.popleft())
         self._queued = kept
