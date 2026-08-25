@@ -71,9 +71,7 @@ def test_non_publish_control_packet_materializes_prefix_before_effect() -> None:
     # the pre-MQTT-5 behavior this PR deliberately rejects.
     client = _client_v5()
     client._decoder.feed(
-        _publish_v5("one")
-        + encode_frame(PacketType.DISCONNECT, 0, b"")
-        + _publish_v5("ignored")
+        _publish_v5("one") + encode_frame(PacketType.DISCONNECT, 0, b"") + _publish_v5("ignored")
     )
 
     handled, _, _, captured, _ = client._process_direct_qos0_batch()
