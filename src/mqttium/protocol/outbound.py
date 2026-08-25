@@ -447,7 +447,7 @@ class OutboundSession:
     def prepare_qos0(
         self,
         topic: str,
-        payload: bytes,
+        payload: bytes = b"",
         *,
         retain: bool = False,
         properties: Properties | None = None,
@@ -922,8 +922,8 @@ class OutboundSession:
                     self._retransmit(msg)
             except Exception as exc:
                 self.flow.release()
-                self._queued.popleft()
                 self.discard_record(stored.mid, stored)
+                self._queued.popleft()
                 self.packet_ids.release(stored.mid)
                 self._fail(stored.mid, exc)
                 continue
@@ -942,13 +942,7 @@ class OutboundSession:
         self._release_reservation(self.stored_logical_size(stored))
 
     def delete_record(self, mid: int) -> None:
-        try:
-            self.store.delete_out(mid)
-        except Exception:
-            # Preserve the original launch/validation failure. A broken store is
-            # surfaced separately by the read/client boundary and must not leak
-            # flow slots or packet identifiers in memory.
-            pass
+        self.store.delete_out(mid)
 
     def complete_record(
         self,
