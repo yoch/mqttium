@@ -922,8 +922,18 @@ class OutboundSession:
                     self._retransmit(msg)
             except Exception as exc:
                 self.flow.release()
-                self._queued.popleft()
-                self.discard_record(stored.mid, stored)
+                popped = self._queued.popleft()
+                # Durable cleanup must not create a phantom: if the store still
+                # holds the row after we report definitive failure and release the
+                # packet id, a fresh engine will resurrect it. When delete fails,
+                # keep the reservation and packet id and re-queue for retry.
+                try:
+                    self.store.delete_out(stored.mid)
+                except Exception:
+                    # May still be durable — keep pending/accounting and retry later.
+                    self._queued.appendleft(popped)
+                    break
+                self._release_reservation(self.stored_logical_size(stored))
                 self.packet_ids.release(stored.mid)
                 self._fail(stored.mid, exc)
                 continue
