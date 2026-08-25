@@ -1,0 +1,37 @@
+name: Apply validated publish waiter oracle
+
+on:
+  push:
+    branches: [fix/runtime-fuzzer-publish-waiter-terminal]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+      - name: Apply exact locally validated patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git hash-object tests/fuzz/runtime_fuzzer.py)" = "477dfa129e244033438ce4ffe089738a63b3dec1"
+          test "$(git hash-object tests/fuzz/test_runtime_fuzzer.py)" = "80d5f4ec2a769ec019febd325a45afd5addb45fb"
+          test "$(sha256sum .github/389a.patch | cut -d' ' -f1)" = "f79c094ab72b6fc86107dad4ad37c55acda2a7f065075a17dd5b75d28fa7dcfd"
+          git apply --check .github/389a.patch
+          git apply .github/389a.patch
+          test "$(git hash-object tests/fuzz/runtime_fuzzer.py)" = "147b1b372790421b683eefb83dc24685b35bf010"
+          test "$(git hash-object tests/fuzz/test_runtime_fuzzer.py)" = "8922c3aa7b81caca0e614e076a871f0588dd356f"
+          rm .github/389a.patch .github/workflows/apply-389a.yml
+          git diff --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          changed="$(git diff --cached --name-only | sort)"
+          test "$changed" = $'tests/fuzz/runtime_fuzzer.py\ntests/fuzz/test_runtime_fuzzer.py'
+          git commit -m "test(fuzz): assert terminal publish waiter accounting"
+          git push origin HEAD:fix/runtime-fuzzer-publish-waiter-terminal
