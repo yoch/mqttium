@@ -20,6 +20,7 @@ from tests.fuzz.runtime_pressure_fuzzer import (
     PressureFamily,
     PressureMutation,
     RuntimeFuzzFailure,
+    _PressureHarness,
     assert_pressure_coverage,
     generate_pressure_schedule,
     run_pressure_campaign,
@@ -116,6 +117,19 @@ async def test_burst_reaches_write_many_coalescing() -> None:
     assert run.final_snapshot["pressure"]["counters"]["write_many_calls"] >= 1
 
 
+async def test_write_many_counter_ignores_single_frame_calls() -> None:
+    schedule = generate_pressure_schedule(_seed_for(PressureFamily.BURST_WRITE_MANY), steps=36)
+    harness = _PressureHarness(schedule, None)
+
+    try:
+        for operation in schedule.operations[:4]:
+            await harness.execute(operation)
+
+        assert harness.pressure_counters()["write_many_calls"] == 0
+    finally:
+        await harness.cleanup()
+
+
 async def test_segmented_payload_takes_the_two_write_path() -> None:
     run = await run_pressure_schedule(
         generate_pressure_schedule(_seed_for(PressureFamily.SEGMENTED), steps=36)
@@ -159,15 +173,81 @@ async def test_parked_publisher_is_observed_and_settles_exactly_once(
     assert bool(cancelled) == (family is PressureFamily.PARKED_CANCEL)
 
 
-async def test_pressure_overlaps_a_lifecycle_ownership_window() -> None:
+async def test_parked_publisher_retries_across_reconnect_ownership_transition() -> None:
     run = await run_pressure_schedule(
-        generate_pressure_schedule(_seed_for(PressureFamily.WRITER_PRESSURE_TEARDOWN), steps=36)
+        generate_pressure_schedule(_seed_for(PressureFamily.PRESSURE_RECONNECT), steps=36)
     )
+
+    pressure = run.final_snapshot["pressure"]
+    assert pressure["publish_waiters_high_water"] >= 1
+    assert pressure["counters"]["pressure_reconnect_overlaps"] == 1
+    assert run.final_snapshot["client"]["receipts"]["publish_waiters"] == 0
+    publishers = [
+        task
+        for task in run.final_snapshot["application_tasks"]
+        if task["label"].startswith("publish-")
+    ]
+    assert len(publishers) >= 3
+    assert all(task["done"] and not task["cancelled"] for task in publishers)
+
+
+async def test_pressure_overlaps_a_lifecycle_ownership_window() -> None:
+    schedule = generate_pressure_schedule(
+        _seed_for(PressureFamily.PRESSURE_READER_TEARDOWN), steps=36
+    )
+    harness = _PressureHarness(schedule, None)
+
+    try:
+        for operation in schedule.operations:
+            await harness.execute(operation)
+            if (operation.actor, operation.action) == ("checkpoint", "overlap"):
+                break
+
+        assert harness.transport.close_entered.is_set()
+        assert not harness.transport.close_gate.is_set()
+        assert harness.pressure_counters()["pressure_lifecycle_overlaps"] == 1
+    finally:
+        await harness.cleanup()
+
+    run = await run_pressure_schedule(schedule)
 
     counters = run.final_snapshot["pressure"]["counters"]
     assert counters["pressure_lifecycle_overlaps"] == 1
-    assert counters["writer_waiters_observed"] == 1
+    assert counters["pressure_reader_teardown_overlaps"] == 1
     assert run.final_snapshot["client"]["writer"]["queued_bytes"] == 0
+
+
+@pytest.mark.parametrize(
+    ("family", "counter"),
+    [
+        (
+            PressureFamily.PRESSURE_READER_TEARDOWN,
+            "pressure_reader_teardown_overlaps",
+        ),
+        (PressureFamily.PRESSURE_RECONNECT, "pressure_reconnect_overlaps"),
+        (PressureFamily.PRESSURE_CALLBACK, "pressure_callback_overlaps"),
+        (PressureFamily.PRESSURE_EFFECT, "pressure_effect_overlaps"),
+    ],
+)
+async def test_pressure_covers_each_bounded_lifecycle_window(
+    family: PressureFamily,
+    counter: str,
+) -> None:
+    run = await run_pressure_schedule(generate_pressure_schedule(_seed_for(family), steps=36))
+
+    counters = run.final_snapshot["pressure"]["counters"]
+    assert counters["pressure_lifecycle_overlaps"] == 1
+    assert counters[counter] == 1
+
+
+async def test_writer_pressure_reaches_sixteen_resident_frames() -> None:
+    run = await run_pressure_schedule(
+        generate_pressure_schedule(_seed_for(PressureFamily.PRESSURE_CALLBACK), steps=36)
+    )
+
+    pressure = run.final_snapshot["pressure"]
+    assert pressure["writer_resident_high_water"] >= 16
+    assert pressure["counters"]["writer_16_resident_observed"] == 1
 
 
 @pytest.mark.parametrize(
@@ -176,18 +256,21 @@ async def test_pressure_overlaps_a_lifecycle_ownership_window() -> None:
         (PressureMutation.EAGER_ACCEPT_DROPS_FRAME, 8),
         (PressureMutation.EAGER_REFUSAL_LIES, 4),
         (PressureMutation.SEGMENTED_PAYLOAD_DROPPED, 2),
-        (PressureMutation.PARKED_PUBLISHER_NOT_WOKEN, 4),
-        (PressureMutation.PUBLISH_WAITER_DECREMENT_LOST, 6),
+        (PressureMutation.PARKED_PUBLISHER_NOT_WOKEN, 6),
+        (PressureMutation.PUBLISH_WAITER_DECREMENT_LOST, 8),
+        (PressureMutation.WRITE_MANY_DECOALESCED, 2),
+        (PressureMutation.WRITER_PRESSURE_BYPASSED, 2),
+        (PressureMutation.PRESSURE_LIFECYCLE_SEPARATED, 8),
     ],
 )
 async def test_short_campaign_detects_known_pressure_bug_classes(
     mutation: PressureMutation,
     minimum_detected: int,
 ) -> None:
-    result = await run_pressure_campaign(seeds=range(16), steps=36, mutation=mutation)
+    result = await run_pressure_campaign(seeds=range(22), steps=36, mutation=mutation)
 
     assert result.failures >= minimum_detected
-    assert result.completed == 16
+    assert result.completed == 22
 
 
 async def test_missed_wakeup_and_leaked_waiter_hit_their_specific_oracles() -> None:
@@ -200,6 +283,24 @@ async def test_missed_wakeup_and_leaked_waiter_hit_their_specific_oracles() -> N
     with pytest.raises(RuntimeFuzzFailure, match="publish waiter survived terminal teardown"):
         await run_pressure_schedule(
             parked_release, mutation=PressureMutation.PUBLISH_WAITER_DECREMENT_LOST
+        )
+
+
+async def test_new_negative_controls_hit_their_specific_coverage_oracles() -> None:
+    write_many = generate_pressure_schedule(_seed_for(PressureFamily.BURST_WRITE_MANY), steps=36)
+    callback = generate_pressure_schedule(_seed_for(PressureFamily.PRESSURE_CALLBACK), steps=36)
+    reader_teardown = generate_pressure_schedule(
+        _seed_for(PressureFamily.PRESSURE_READER_TEARDOWN), steps=36
+    )
+
+    with pytest.raises(RuntimeFuzzFailure, match="write_many coalescing was not reached"):
+        await run_pressure_schedule(write_many, mutation=PressureMutation.WRITE_MANY_DECOALESCED)
+    with pytest.raises(RuntimeFuzzFailure, match="writer admission"):
+        await run_pressure_schedule(callback, mutation=PressureMutation.WRITER_PRESSURE_BYPASSED)
+    with pytest.raises(RuntimeFuzzFailure, match="pressure did not overlap"):
+        await run_pressure_schedule(
+            reader_teardown,
+            mutation=PressureMutation.PRESSURE_LIFECYCLE_SEPARATED,
         )
 
 

@@ -54,7 +54,10 @@ class PressureFamily(StrEnum):
     PARKED_RELEASE = "parked_release"
     PARKED_CANCEL = "parked_cancel"
     PARKED_TEARDOWN = "parked_teardown"
-    WRITER_PRESSURE_TEARDOWN = "writer_pressure_teardown"
+    PRESSURE_READER_TEARDOWN = "pressure_reader_teardown"
+    PRESSURE_RECONNECT = "pressure_reconnect"
+    PRESSURE_CALLBACK = "pressure_callback"
+    PRESSURE_EFFECT = "pressure_effect"
 
 
 class PressureMutation(StrEnum):
@@ -65,6 +68,9 @@ class PressureMutation(StrEnum):
     SEGMENTED_PAYLOAD_DROPPED = "segmented_payload_dropped"
     PARKED_PUBLISHER_NOT_WOKEN = "parked_publisher_not_woken"
     PUBLISH_WAITER_DECREMENT_LOST = "publish_waiter_decrement_lost"
+    WRITE_MANY_DECOALESCED = "write_many_decoalesced"
+    WRITER_PRESSURE_BYPASSED = "writer_pressure_bypassed"
+    PRESSURE_LIFECYCLE_SEPARATED = "pressure_lifecycle_separated"
 
 
 # Payload shape classes (issue #388): tiny frames, frames sized so a four-item
@@ -105,7 +111,11 @@ class PressureSchedule:
     settle_plan: tuple[int, ...]
 
     def as_v1_schedule(self) -> RuntimeSchedule:
-        return RuntimeSchedule(self.seed, self.operations, auto_reconnect=False)
+        return RuntimeSchedule(
+            self.seed,
+            self.operations,
+            auto_reconnect=self.family is PressureFamily.PRESSURE_RECONNECT,
+        )
 
 
 @dataclass(slots=True, frozen=True)
@@ -162,7 +172,13 @@ REQUIRED_PRESSURE_COVERAGE = (
     "segmented_writes",
     "parked_publisher_observed",
     "writer_waiters_observed",
+    "writer_4_resident_observed",
+    "writer_16_resident_observed",
     "pressure_lifecycle_overlaps",
+    "pressure_reader_teardown_overlaps",
+    "pressure_reconnect_overlaps",
+    "pressure_callback_overlaps",
+    "pressure_effect_overlaps",
 )
 
 
@@ -214,6 +230,7 @@ def _family_operations(  # noqa: C901
         # No eager path: the same one-turn burst reaches the writer task as
         # one four-frame batch, coalesced through the transport's write_many.
         return [
+            _op("transport", "reset_write_many"),
             _op("schedule", "settle", 0),
             _op("app", "burst", "4:1:batch"),
             _op("schedule", "settle", 2),
@@ -286,23 +303,86 @@ def _family_operations(  # noqa: C901
                 )
             )
         return operations
-    # WRITER_PRESSURE_TEARDOWN: writer ownership window held while a producer
-    # burst saturates writer admission, then reader teardown lands on top —
-    # the one bounded pressure x lifecycle-window overlap this profile
-    # composes (issue #388).
+    if family is PressureFamily.PRESSURE_READER_TEARDOWN:
+        # Hold transport.close() so the reader teardown is an observable owner
+        # while two unfinished QoS 1 records retain outbound pressure.
+        return [
+            _op("app", "publish_class", "1:tiny"),
+            _op("checkpoint", "wire", "PUBLISH"),
+            _op("app", "publish_class", "1:tiny"),
+            _op("checkpoint", "wire", "PUBLISH"),
+            _op("schedule", "hold_close"),
+            _op("broker", "inject_eof"),
+            _op("checkpoint", "close_blocked"),
+            _op("checkpoint", "overlap", "reader_teardown"),
+            _op("schedule", "release_close"),
+            _op("checkpoint", "terminal"),
+        ]
+    if family is PressureFamily.PRESSURE_RECONNECT:
+        # The reconnect factory owns the lifecycle transition while a third
+        # application publisher remains parked behind two unfinished records.
+        return [
+            _op("app", "publish_class", "1:tiny"),
+            _op("checkpoint", "wire", "PUBLISH"),
+            _op("app", "publish_class", "1:tiny"),
+            _op("checkpoint", "wire", "PUBLISH"),
+            _op("app", "publish_class", "1:tiny"),
+            _op("checkpoint", "publisher_parked"),
+            _op("factory", "block_next"),
+            _op("broker", "inject_eof"),
+            _op("checkpoint", "factory_blocked"),
+            _op("checkpoint", "overlap", "reconnect"),
+            _op("schedule", "release_factory"),
+            _op("checkpoint", "wire", "CONNECT"),
+            _op("broker", "connack"),
+            _op("checkpoint", "connected"),
+            _op("checkpoint", "wire", "PUBLISH"),
+            _op("broker", "puback_pending"),
+            _op("app", "disconnect"),
+            _op("checkpoint", "terminal"),
+        ]
+
+    if family is PressureFamily.PRESSURE_CALLBACK:
+        # Open the callback worker first: it is independent from the EffectPump
+        # path that subsequently parks application publishers on the writer.
+        burst = 18
+        return [
+            _op("callback", "block_once"),
+            _op("broker", "publish", 0),
+            _op("checkpoint", "callback_active"),
+            _op("schedule", "hold_writes"),
+            _op("app", "publish_class", "0:tiny"),
+            _op("checkpoint", "writer_active"),
+            _op("schedule", "settle", 0),
+            _op("app", "burst", f"{burst}:0:tiny"),
+            _op("schedule", "settle", 2),
+            _op("checkpoint", "writer_waiter"),
+            _op("checkpoint", "overlap", "callback"),
+            _op("schedule", "release_callback"),
+            _op("schedule", "release_writes"),
+            _op("checkpoint", "wire_bulk", f"PUBLISH:{burst + 1}"),
+            _op("checkpoint", "callbacks_drained"),
+            _op("app", "disconnect"),
+            _op("checkpoint", "terminal"),
+        ]
+
+    assert family is PressureFamily.PRESSURE_EFFECT
+    # EffectPump ownership cannot be opened behind writer-blocked SEND effects;
+    # instead, retain unfinished QoS 1 session pressure while blocking a later
+    # inbound effect. This still composes exactly one lifecycle owner.
     return [
-        _op("schedule", "hold_writes"),
-        _op("app", "publish_class", "0:tiny"),
-        _op("checkpoint", "writer_active"),
-        _op("schedule", "settle", 0),
-        _op("app", "burst", "6:0:tiny"),
-        _op("schedule", "settle", 2),
-        _op("checkpoint", "writer_waiter"),
-        _op("checkpoint", "overlap"),
-        _op("broker", "eof"),
-        _op("schedule", "release_writes"),
-        # EOF teardown stops the writer but only an explicit lifecycle call
-        # discards its queue; the terminal residency oracle requires that.
+        _op("app", "publish_class", "1:tiny"),
+        _op("checkpoint", "wire", "PUBLISH"),
+        _op("app", "publish_class", "1:tiny"),
+        _op("checkpoint", "wire", "PUBLISH"),
+        _op("effect", "block_next"),
+        _op("broker", "publish", 1),
+        _op("checkpoint", "effect_active"),
+        _op("checkpoint", "overlap", "effect"),
+        _op("schedule", "release_effect"),
+        _op("checkpoint", "wire", "PUBACK"),
+        _op("checkpoint", "callbacks_drained"),
+        _op("broker", "puback_pending"),
         _op("app", "disconnect"),
         _op("checkpoint", "terminal"),
     ]
@@ -319,8 +399,10 @@ def generate_pressure_schedule(seed: int, steps: int = 36) -> PressureSchedule:
     # the rest draw both axes so absence is also composed with every motif.
     if family in (PressureFamily.EAGER_PACED, PressureFamily.BURST_LATENCY_BATCH):
         profile = PressureProfile(write_nowait=True, write_many=bool(rng.randrange(2)))
-    elif family in (PressureFamily.BURST_WRITE_MANY, PressureFamily.WRITER_PRESSURE_TEARDOWN):
+    elif family is PressureFamily.BURST_WRITE_MANY:
         profile = PressureProfile(write_nowait=False, write_many=True)
+    elif family in (PressureFamily.PRESSURE_CALLBACK, PressureFamily.PRESSURE_EFFECT):
+        profile = PressureProfile(write_nowait=False, write_many=bool(rng.randrange(2)))
     else:
         profile = PressureProfile(
             write_nowait=bool(rng.randrange(2)),
@@ -407,8 +489,23 @@ class _PressureTransport(v1._ScheduleTransport):
         await super().write(data)
 
     async def write_many(self, parts: list[bytes]) -> None:
-        self.write_many_calls += 1
+        if self.mutation is PressureMutation.WRITE_MANY_DECOALESCED:
+            for part in parts:
+                await super().write(part)
+            return
+        attempted_at = len(self.attempted)
         await super().write(b"".join(parts))
+        publish_count = sum(
+            packet.packet_type is PacketType.PUBLISH for packet in self.attempted[attempted_at:]
+        )
+        if len(parts) > 1 and publish_count >= 4:
+            # Mono-frame capability use and unrelated control batches prove no
+            # producer coalescing. Require the intended four-PUBLISH burst.
+            self.write_many_calls += 1
+
+    def inject_eof(self) -> None:
+        """Enter reader-owned teardown without pre-closing the transport."""
+        self._rx.put_nowait(b"")
 
 
 class _PressureHarness(v1._RuntimeHarness):
@@ -416,7 +513,8 @@ class _PressureHarness(v1._RuntimeHarness):
         self.pressure_schedule = schedule
         self.pressure_mutation = mutation
         self.publish_waiters_high_water = 0
-        self.overlap_observed = False
+        self.writer_resident_high_water = 0
+        self.overlap_observed: set[str] = set()
         self._acked_counts: Counter[int] = Counter()
         super().__init__(schedule.as_v1_schedule(), None)
         self._install_pressure_mutation()
@@ -429,12 +527,14 @@ class _PressureHarness(v1._RuntimeHarness):
         options["max_outbound_messages"] = 32
         options["max_outbound_bytes"] = 256 * 1024
         family = self.pressure_schedule.family
-        if family in _PARKED_FAMILIES:
+        if family in _PARKED_FAMILIES or family is PressureFamily.PRESSURE_RECONNECT:
             # Two unacknowledged QoS 1 exchanges saturate admission, so the
             # third concurrent publisher parks (issue #389 part B).
             options["max_pending_outbound_messages"] = 2
-        elif family is PressureFamily.WRITER_PRESSURE_TEARDOWN:
-            options["max_outbound_messages"] = 4
+        elif family is PressureFamily.PRESSURE_CALLBACK:
+            options["max_outbound_messages"] = 16
+        if self.pressure_mutation is PressureMutation.WRITER_PRESSURE_BYPASSED:
+            options["max_outbound_messages"] = 32
         return options
 
     async def _factory(
@@ -442,6 +542,14 @@ class _PressureHarness(v1._RuntimeHarness):
     ) -> _PressureTransport:
         del host, port, ssl
         self.factory_attempts += 1
+        if self.fail_factory_once:
+            self.fail_factory_once = False
+            self.factory_failed.set()
+            raise ConnectionRefusedError("runtime fuzzer reconnect factory failure")
+        if self.block_factory_once:
+            self.block_factory_once = False
+            self.factory_entered.set()
+            await self.factory_gate.wait()
         transport = _PressureTransport(
             len(self.transports) + 1,
             self.client._connection_epoch,
@@ -451,6 +559,38 @@ class _PressureHarness(v1._RuntimeHarness):
         )
         self.transports.append(transport)
         return transport
+
+    def _install_effect_gate(self) -> None:
+        original = self.client._apply_effect
+        original_inline = self.client._apply_effect_inline
+
+        def defer_gated_effect(_client: Any, effect: Any, epoch: int) -> bool:
+            if self.block_effect_once:
+                return False
+            return original_inline(effect, epoch)
+
+        async def gated_apply(
+            _client: Any,
+            effect: Any,
+            *,
+            nowait: bool,
+            epoch: int | None = None,
+        ) -> None:
+            if self.block_effect_once:
+                self.block_effect_once = False
+                self.effect_entered.set()
+                await self.effect_gate.wait()
+            if self.fail_effect_once:
+                self.fail_effect_once = False
+                raise RuntimeError("runtime fuzzer injected effect failure")
+            await original(effect, nowait=nowait, epoch=epoch)
+
+        self._replace(self.client, "_apply_effect", MethodType(gated_apply, self.client))
+        self._replace(
+            self.client,
+            "_apply_effect_inline",
+            MethodType(defer_gated_effect, self.client),
+        )
 
     def _install_pressure_mutation(self) -> None:
         if self.pressure_mutation is PressureMutation.PARKED_PUBLISHER_NOT_WOKEN:
@@ -500,7 +640,13 @@ class _PressureHarness(v1._RuntimeHarness):
             "segmented_writes": writer.segmented_writes,
             "parked_publisher_observed": int(self.publish_waiters_high_water > 0),
             "writer_waiters_observed": int(writer.enqueue_suspensions > 0),
-            "pressure_lifecycle_overlaps": int(self.overlap_observed),
+            "writer_4_resident_observed": int(self.writer_resident_high_water >= 4),
+            "writer_16_resident_observed": int(self.writer_resident_high_water >= 16),
+            "pressure_lifecycle_overlaps": int(bool(self.overlap_observed)),
+            "pressure_reader_teardown_overlaps": int("reader_teardown" in self.overlap_observed),
+            "pressure_reconnect_overlaps": int("reconnect" in self.overlap_observed),
+            "pressure_callback_overlaps": int("callback" in self.overlap_observed),
+            "pressure_effect_overlaps": int("effect" in self.overlap_observed),
         }
 
     async def execute(self, operation: RuntimeOperation) -> None:  # noqa: C901
@@ -529,6 +675,16 @@ class _PressureHarness(v1._RuntimeHarness):
             transport = self.transport
             assert isinstance(transport, _PressureTransport)
             transport.refuse_nowait_pending += int(value)
+        elif (actor, action) == ("transport", "reset_write_many"):
+            self.operations.append(operation.render())
+            transport = self.transport
+            assert isinstance(transport, _PressureTransport)
+            transport.write_many_calls = 0
+        elif (actor, action) == ("broker", "inject_eof"):
+            self.operations.append(operation.render())
+            transport = self.transport
+            assert isinstance(transport, _PressureTransport)
+            transport.inject_eof()
         elif (actor, action) == ("broker", "puback_pending"):
             # Acknowledge every completed QoS > 0 PUBLISH occurrence that has
             # not been acknowledged yet. Occurrences, not identifiers: a
@@ -587,6 +743,7 @@ class _PressureHarness(v1._RuntimeHarness):
             "segmented",
             "wire_bulk",
             "publisher_parked",
+            "close_blocked",
             "overlap",
         ):
             self.operations.append(operation.render())
@@ -656,18 +813,67 @@ class _PressureHarness(v1._RuntimeHarness):
                 lambda: self.client.stats().receipts.publish_waiters > 0,
                 "application publisher never parked on outbound admission",
             )
-        else:
-            # The pressure state below and the teardown that follows overlap
-            # by construction; record that the composition actually happened.
-            assert self.client.stats().writer.waiters > 0, (
-                "pressure x lifecycle overlap checkpoint reached without writer pressure"
+        elif action == "close_blocked":
+            await self._wait_until(
+                lambda: (
+                    self.transport.close_entered.is_set() and not self.transport.close_gate.is_set()
+                ),
+                "reader teardown did not block closing its transport",
             )
-            self.overlap_observed = True
+        else:
+            kind = str(value)
+            if self.pressure_mutation is PressureMutation.PRESSURE_LIFECYCLE_SEPARATED:
+                if kind == "callback":
+                    self.callback_gate.set()
+                elif kind == "effect":
+                    self.effect_gate.set()
+                elif kind == "reader_teardown":
+                    self.transport.release_close()
+                else:
+                    self.factory_gate.set()
+                await self._turns(8)
+            await self._wait_until(
+                lambda: self._overlap_active(kind),
+                f"pressure did not overlap the {kind} lifecycle window",
+            )
+            self.overlap_observed.add(kind)
+
+    def _overlap_active(self, kind: str) -> bool:
+        stats = self.client.stats()
+        if kind == "reader_teardown":
+            return (
+                self.transport.close_entered.is_set()
+                and not self.transport.close_gate.is_set()
+                and stats.outbound.pending_messages > 0
+            )
+        if kind == "reconnect":
+            return (
+                self.factory_entered.is_set()
+                and not self.factory_gate.is_set()
+                and stats.outbound.pending_messages > 0
+                and stats.receipts.publish_waiters > 0
+            )
+        if kind == "callback":
+            return (
+                self.callback_entered.is_set()
+                and not self.callback_gate.is_set()
+                and stats.writer.waiters > 0
+            )
+        if kind == "effect":
+            return (
+                self.effect_entered.is_set()
+                and not self.effect_gate.is_set()
+                and stats.outbound.pending_messages > 0
+            )
+        raise AssertionError(f"unknown pressure/lifecycle overlap kind: {kind}")
 
     def _check_oracles(self, *, terminal: bool = False) -> None:
         waiters = self.client.stats().receipts.publish_waiters
         if waiters > self.publish_waiters_high_water:
             self.publish_waiters_high_water = waiters
+        resident = self.client._write_pump.resident_messages
+        if resident > self.writer_resident_high_water:
+            self.writer_resident_high_water = resident
         super()._check_oracles(terminal=terminal)
 
     def owner_snapshot(self) -> dict[str, Any]:
@@ -676,6 +882,7 @@ class _PressureHarness(v1._RuntimeHarness):
             "family": self.pressure_schedule.family.value,
             "profile": asdict(self.pressure_schedule.profile),
             "publish_waiters_high_water": self.publish_waiters_high_water,
+            "writer_resident_high_water": self.writer_resident_high_water,
             "counters": self.pressure_counters(),
         }
         return snapshot

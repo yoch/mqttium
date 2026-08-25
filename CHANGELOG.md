@@ -17,12 +17,14 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 - Add the V3 pressure/interleaving runtime fuzz target: transport
   `write_nowait`/`write_many` capability composition with deterministic eager
-  refusal, one-turn producer bursts against a 4–16+ frame writer, tiny /
+  refusal, one-turn producer bursts reaching 4- and 16-frame writer residency, tiny /
   batching-scale / segmented payload classes, a seeded 0/1/2/4-turn settlement
-  budget, one pressure × lifecycle-window overlap, and coverage-gated
-  campaigns with five mutation-qualified oracles. Parked application
+  budget, separate pressure overlaps with reader teardown, reconnect, callback,
+  and EffectPump ownership, and coverage-gated campaigns with eight
+  mutation-qualified oracles. Parked application
   publishers are now observed in the parked state during execution and every
-  exit (acknowledgement, cancellation, terminal teardown) is qualified.
+  exit (acknowledgement, cancellation, terminal teardown, reconnect ownership
+  transition) is qualified.
 - Raise the PR-gate stateful fuzz budget to 6 seeds × 200 steps (~4 s); the
   previous 2 × 50 budget provably could not reach the replay-parked
   settlement defect fixed earlier at seed 1, step 188.
