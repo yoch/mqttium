@@ -43,11 +43,13 @@ Advisory paired timing (median candidate/base over 7 pairs, shared cloud
 host): every synchronous scenario within 0.987–1.049 with base CVs of the same
 magnitude — no systematic movement in either direction.
 
-Tests go from 1450 to 1454 passing (integration: 16, fuzz suites green);
-coverage rises from 89.80% to 90.21%. Source across the engine:
-`inbound.py` 1230→1163, `_delivery.py` 963→927, `_effects.py` 396→383,
-`async_client.py` 2602→2593, `engine.py` 962→964, `outbound.py` 1272→1303
-(+31 for the defect fix below, −14 of pre-existing duplication).
+Tests go from 1450 to 1451 passing — four regression tests added for the
+defect below, three tests of a removed dead Provisional helper deleted —
+with integration (16) and both fuzz suites green; coverage rises from 89.80%
+to 90.27%. Source across `src/` is a net **−122 lines**: `inbound.py`
+1230→1163, `_delivery.py` 963→927, `_effects.py` 396→383, `buffer.py`
+248→216, `async_client.py` 2602→2593, `engine.py` 962→964, `outbound.py`
+1272→1303 (+31 for the defect fix below, −14 of pre-existing duplication).
 
 ## What was changed
 
@@ -126,6 +128,29 @@ per drained message — `qos1_cycle_*`, `mqtt5_puback_reason_cycle` and
 `tests/unit/test_replay_parked_settlement.py` pins the settlement, the
 resurrection ban and identifier reuse over Memory and SQLite stores; the full
 stateful suite (12 seeds × 200 steps) passes on the fixed tree.
+
+## Second pass: secondary engine layers
+
+The persistence, codec, packet, transport and dispatch layers were fully
+audited on 2026-08-16 and received only reviewed fixes since, so this pass
+looked specifically for accretion those fixes left behind.
+
+- **`IncrementalDecoder.process_packets_bounded` removed** (Provisional, with
+  changelog and migration note). The direct-QoS 0 ingress work gave the
+  client's read loop its own count/byte bounds plus the auto-acknowledgement
+  handoff boundary, orphaning the method; its unbounded sibling
+  `process_packets` was removed for the same reason in 1.0.0rc7.
+- **`in_replay_pages` flush dedup** in both built-in stores: each carried
+  three copies of "hydrate the accumulated identifiers, yield if non-empty,
+  reset"; one local helper per implementation now owns it. Replay-only, cold.
+- **Examined and declined: the conditional-transition shells.**
+  `complete_out`/`transition_out` and `complete_in`/`transition_in` share a
+  read-validate-mutate-commit shell in `SqliteInflightStore` (~60 dedupable
+  lines). Every zero-cost factoring shape was ruled out: any shared shell adds
+  at least one Python call per conditional mutation, and these run once per
+  acknowledgement on the SQLite hot path (`qos1_cycle_sqlite`,
+  `qos2_cycle_sqlite`). Declined on the same rule the 2026-08-16 audit applied
+  to the ACK decoders.
 
 ## Looks redundant, is load-bearing (additions to the 2026-08-16 list)
 
