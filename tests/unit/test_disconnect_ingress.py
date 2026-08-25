@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from mqttium.codec.buffer import IncrementalDecoder
-from mqttium.enums import ConnectionState, PacketType, QoS
+from mqttium.enums import ConnectionState, MQTTProtocolVersion, PacketType, QoS
 from mqttium.packets import PublishPacket, encode_frame
 from mqttium.protocol.effects import EffectKind
 from mqttium.protocol.engine import EngineConfig, ProtocolEngine
@@ -17,10 +17,13 @@ def _feed(engine: ProtocolEngine, wire: bytes) -> None:
     engine.handle_raw(raw)
 
 
-def _connected_engine() -> ProtocolEngine:
-    engine = ProtocolEngine(EngineConfig(client_id="disconnect-ingress"))
+def _connected_engine(
+    protocol: MQTTProtocolVersion = MQTTProtocolVersion.MQTTv311,
+) -> ProtocolEngine:
+    engine = ProtocolEngine(EngineConfig(client_id="disconnect-ingress", protocol=protocol))
     engine.begin_connect()
-    _feed(engine, encode_frame(PacketType.CONNACK, 0, b"\x00\x00"))
+    connack = b"\x00\x00\x00" if protocol is MQTTProtocolVersion.MQTTv5 else b"\x00\x00"
+    _feed(engine, encode_frame(PacketType.CONNACK, 0, connack))
     engine.take_effects()
     return engine
 
@@ -56,7 +59,7 @@ def test_disconnected_state_ignores_inbound_packets() -> None:
     disconnect reason. They are transport noise, exactly like the packets
     ignored while DISCONNECTING.
     """
-    engine = _connected_engine()
+    engine = _connected_engine(MQTTProtocolVersion.MQTTv5)
     _feed(engine, encode_frame(PacketType.DISCONNECT, 0, b""))
     assert engine.state is ConnectionState.DISCONNECTED
 

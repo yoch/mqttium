@@ -66,9 +66,12 @@ def test_mixed_qos1_batch_materializes_in_original_order() -> None:
 
 
 def test_non_publish_control_packet_materializes_prefix_before_effect() -> None:
-    client = _client()
+    # Server DISCONNECT is valid only in MQTT 5. Keep this fast-path ordering
+    # regression on a protocol where the packet is legal instead of relying on
+    # the pre-MQTT-5 behavior this PR deliberately rejects.
+    client = _client_v5()
     client._decoder.feed(
-        _publish("one") + encode_frame(PacketType.DISCONNECT, 0, b"") + _publish("ignored")
+        _publish_v5("one") + encode_frame(PacketType.DISCONNECT, 0, b"") + _publish_v5("ignored")
     )
 
     handled, _, _, captured, _ = client._process_direct_qos0_batch()
