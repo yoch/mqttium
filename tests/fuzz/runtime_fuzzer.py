@@ -385,7 +385,12 @@ def _anchor_operations(  # noqa: C901
         operations.append(_op("effect", "fail_on_release"))
     release_position = rng.randrange(3)
     if release_position == 0:
-        operations.append(_op("schedule", "release_writes"))
+        operations.extend(
+            (
+                _op("schedule", "release_writes"),
+                _op("checkpoint", "wire", "PUBLISH"),
+            )
+        )
     operations.extend(
         (
             _op("schedule", "release_effect"),
