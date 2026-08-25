@@ -32,6 +32,6 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
           changed="$(git diff --cached --name-only | sort)"
-          test "$changed" = $'tests/fuzz/runtime_fuzzer.py\ntests/fuzz/test_runtime_fuzzer.py'
+          test "$changed" = $'.github/389a.patch\n.github/workflows/apply-389a.yml\ntests/fuzz/runtime_fuzzer.py\ntests/fuzz/test_runtime_fuzzer.py'
           git commit -m "test(fuzz): assert terminal publish waiter accounting"
           git push origin HEAD:fix/runtime-fuzzer-publish-waiter-terminal
