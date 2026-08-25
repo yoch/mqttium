@@ -952,13 +952,9 @@ class OutboundSession:
             # unlike discard_record(), this is best-effort cleanup only.
             pass
 
-    def complete_record(
-        self,
-        mid: int,
-        stored: OutboundMessage | OutboundMessageSummary,
-    ) -> None:
-        self.store.delete_out(mid)
-        self._release_reservation(self.stored_logical_size(stored))
+    # A successful settlement releases exactly the same durable ownership as a
+    # discard; the two names keep call sites saying which one is happening.
+    complete_record = discard_record
 
     def materialize(self, stored: OutboundMessage | OutboundMessageSummary) -> OutboundMessage:
         if isinstance(stored, OutboundMessage):

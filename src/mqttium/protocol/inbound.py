@@ -376,17 +376,8 @@ class InboundSession:
         if qos_raw == 3:
             raise MalformedPacketError("Invalid PUBLISH QoS 3")
         topic, payload, mid, retain, dup = decode_qos12_fields_v311(raw)
-        if qos_raw == int(QoS.AT_LEAST_ONCE):
-            self._on_qos1(
-                topic=topic,
-                payload=payload,
-                mid=mid,
-                retain=retain,
-                dup=dup,
-                properties=None,
-            )
-            return
-        self._on_qos2(
+        handler = self._on_qos1 if qos_raw == int(QoS.AT_LEAST_ONCE) else self._on_qos2
+        handler(
             topic=topic,
             payload=payload,
             mid=mid,
@@ -440,18 +431,8 @@ class InboundSession:
             topic = self._resolve_topic_fields(topic, properties)
         decoded_property_wire_size = property_wire_size if properties.values else None
         assert decoded_mid is not None
-        if qos is QoS.AT_LEAST_ONCE:
-            self._on_qos1(
-                topic=topic,
-                payload=payload,
-                mid=decoded_mid,
-                retain=retain,
-                dup=dup,
-                properties=properties,
-                decoded_property_wire_size=decoded_property_wire_size,
-            )
-            return
-        self._on_qos2(
+        handler = self._on_qos1 if qos is QoS.AT_LEAST_ONCE else self._on_qos2
+        handler(
             topic=topic,
             payload=payload,
             mid=decoded_mid,
@@ -482,17 +463,8 @@ class InboundSession:
             )
             return
         assert packet.mid is not None
-        if packet.qos is QoS.AT_LEAST_ONCE:
-            self._on_qos1(
-                topic=topic,
-                payload=packet.payload,
-                mid=packet.mid,
-                retain=packet.retain,
-                dup=packet.dup,
-                properties=packet.properties,
-            )
-            return
-        self._on_qos2(
+        handler = self._on_qos1 if packet.qos is QoS.AT_LEAST_ONCE else self._on_qos2
+        handler(
             topic=topic,
             payload=packet.payload,
             mid=packet.mid,
@@ -663,31 +635,12 @@ class InboundSession:
             # owns while leaving the QoS 2 record live.
             self._reject_packet_id_collision(mid, "QoS 1", "QoS 2")
 
-        if mid in self._pending_auto_qos1_mids:
-            # Retransmission of an auto-ACK identifier still in this effect
-            # batch: the Receive Maximum slot is already held, and the handoff
-            # flag was decided when the identifier first entered the set.
-            self._engine._send(_encode_puback_success(mid))
-            self._engine._emit(
-                (
-                    EffectKind.DECODED_MESSAGE
-                    if decoded_property_wire_size is not None
-                    else EffectKind.MESSAGE
-                ),
-                Message(
-                    topic=topic,
-                    payload=payload,
-                    qos=QoS.AT_LEAST_ONCE,
-                    retain=retain,
-                    dup=dup,
-                    mid=mid,
-                    properties=properties,
-                ),
-                decoded_property_wire_size=decoded_property_wire_size,
-            )
-            return
-
-        self._acquire_slot()
+        # A retransmission of an auto-ACK identifier still in this effect batch
+        # already holds its Receive Maximum slot, and the handoff flag was
+        # decided when the identifier first entered the set.
+        retransmission = mid in self._pending_auto_qos1_mids
+        if not retransmission:
+            self._acquire_slot()
         # Match the runtime's mandatory SEND-before-application order at the
         # producer, avoiding an EffectPump repartition on every auto-ACK.
         self._engine._send(_encode_puback_success(mid))
@@ -708,12 +661,13 @@ class InboundSession:
             ),
             decoded_property_wire_size=decoded_property_wire_size,
         )
-        # The slot stays owned until take_effects() hands this PUBACK to the
-        # runtime; a pipelined PUBLISH is then admitted by the ordinary acquire
-        # path rather than by a second decode.
-        self._pending_auto_qos1_mids.add(mid)
-        if self._inflight >= self.config.local_receive_maximum:
-            self._autoack_handoff_required = True
+        if not retransmission:
+            # The slot stays owned until take_effects() hands this PUBACK to
+            # the runtime; a pipelined PUBLISH is then admitted by the ordinary
+            # acquire path rather than by a second decode.
+            self._pending_auto_qos1_mids.add(mid)
+            if self._inflight >= self.config.local_receive_maximum:
+                self._autoack_handoff_required = True
 
     def _on_qos1_manual(
         self,
