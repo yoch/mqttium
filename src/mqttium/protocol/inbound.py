@@ -1092,6 +1092,7 @@ class InboundSession:
         alias = props.get("topic_alias") if props else None
         if alias is None:
             if not topic:
+                self._protocol_disconnect(0x82)
                 raise ProtocolError("PUBLISH with empty topic and no topic alias")
             return topic
         alias = int(alias)
