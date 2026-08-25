@@ -187,8 +187,11 @@ jobs:
           done
       - name: Hypothesis and short stateful fuzz
         env:
-          MQTTIUM_FUZZ_SEEDS: "2"
-          MQTTIUM_FUZZ_STEPS: "50"
+          # 6 x 200 costs ~4 s and reaches depths the previous 2 x 50 budget
+          # provably could not: the replay-parked settlement defect fixed in
+          # #398 first manifests at seed 1, step 188.
+          MQTTIUM_FUZZ_SEEDS: "6"
+          MQTTIUM_FUZZ_STEPS: "200"
         run: python -m pytest -q -W error --strict-config --strict-markers tests/fuzz/test_hypothesis_fuzz.py tests/fuzz/test_stateful_invariants.py
       - name: AsyncClient runtime schedule smoke and mutation qualification
         run: |
@@ -198,9 +201,13 @@ jobs:
           PYTHONPATH=src python -m tests.fuzz.runtime_composition_fuzzer \
             --seed 0 --seeds 12 --steps 48 \
             --artifacts-dir "$RUNNER_TEMP/runtime-fuzz/composition"
+          PYTHONPATH=src python -m tests.fuzz.runtime_pressure_fuzzer \
+            --seed 0 --seeds 32 --steps 36 --require-coverage \
+            --artifacts-dir "$RUNNER_TEMP/runtime-fuzz/pressure"
           python -m pytest -q -W error --strict-config --strict-markers \
             tests/fuzz/test_runtime_fuzzer.py \
-            tests/fuzz/test_runtime_composition_fuzzer.py
+            tests/fuzz/test_runtime_composition_fuzzer.py \
+            tests/fuzz/test_runtime_pressure_fuzzer.py
       - name: Retain runtime schedule failures
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

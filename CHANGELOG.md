@@ -15,6 +15,17 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Added
 
+- Add the V3 pressure/interleaving runtime fuzz target: transport
+  `write_nowait`/`write_many` capability composition with deterministic eager
+  refusal, one-turn producer bursts against a 4–16+ frame writer, tiny /
+  batching-scale / segmented payload classes, a seeded 0/1/2/4-turn settlement
+  budget, one pressure × lifecycle-window overlap, and coverage-gated
+  campaigns with five mutation-qualified oracles. Parked application
+  publishers are now observed in the parked state during execution and every
+  exit (acknowledgement, cancellation, terminal teardown) is qualified.
+- Raise the PR-gate stateful fuzz budget to 6 seeds × 200 steps (~4 s); the
+  previous 2 × 50 budget provably could not reach the replay-parked
+  settlement defect fixed earlier at seed 1, step 188.
 - Complete stateful outbound MQTT 5 Topic Alias support for explicit
   application mappings, including empty Topic Name reuse, replacement,
   connection-scoped reset, and canonical-topic persistence/replay for QoS 1/2.
