@@ -21,10 +21,10 @@ class _Boom(Exception):
     pass
 
 
-def _store(kind: str, tmp_path: Path) -> Any:
+def _store(kind: str, path: Path) -> Any:
     if kind == "memory":
         return MemoryInflightStore()
-    return SqliteInflightStore(tmp_path / "inflight.db")
+    return SqliteInflightStore(path.with_suffix(".db"))
 
 
 def _complete_first(engine: ProtocolEngine, mid: int, qos: QoS) -> None:
@@ -100,13 +100,15 @@ def test_drain_delete_failure_keeps_fifo_ownership_until_retry(
     assert [msg.mid for msg in engine._queued] == [second.mid, third.mid]
     assert engine.flow.inflight == 0
 
-    # Both injected faults were transient. Retrying the existing drain resumes
-    # from the same head; the later message cannot overtake it.
+    # Both faults were transient. Retry resumes at the same head; the later
+    # publication cannot overtake the retained durable owner.
     engine.outbound.drain()
     retry_effects = engine.take_effects()
     assert any(e.kind is EffectKind.SEND for e in retry_effects)
     assert [msg.mid for msg in engine._queued] == [third.mid]
-    assert store.get_out(second.mid).state is (
+    retried = store.get_out(second.mid)
+    assert retried is not None
+    assert retried.state is (
         OutboundQoSState.WAIT_PUBACK if qos is QoS.AT_LEAST_ONCE else OutboundQoSState.WAIT_PUBREC
     )
     assert engine.packet_ids.in_use(second.mid)
@@ -163,6 +165,65 @@ def test_replay_delete_failure_keeps_durable_record_and_primary_context(
 
     if isinstance(store, SqliteInflightStore):
         store.close()
+
+
+def test_sqlite_surviving_record_rehydrates_the_same_ownership_after_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "restart.db"
+    store = SqliteInflightStore(path)
+    config = EngineConfig(local_receive_maximum=1, max_outbound_inflight=1)
+    engine = ProtocolEngine(config, store)
+    engine.state = ConnectionState.CONNECTED
+    first = engine.queue_publish("t/1", b"one", qos=QoS.AT_LEAST_ONCE)
+    second = engine.queue_publish("t/2", b"two", qos=QoS.AT_LEAST_ONCE)
+    assert first.mid is not None and second.mid is not None
+    engine.take_effects()
+
+    original_transition = SqliteInflightStore.transition_out
+    original_delete = SqliteInflightStore.delete_out
+    faults = {"transition": 1, "delete": 1}
+
+    def transition_out(
+        self: SqliteInflightStore,
+        mid: int,
+        expected: OutboundQoSState,
+        new_state: OutboundQoSState,
+        *,
+        compact: bool = False,
+    ) -> Any:
+        if mid == second.mid and faults["transition"]:
+            faults["transition"] -= 1
+            raise _Boom("transition failed")
+        return original_transition(self, mid, expected, new_state, compact=compact)
+
+    def delete_out(self: SqliteInflightStore, mid: int) -> bool:
+        if mid == second.mid and faults["delete"]:
+            faults["delete"] -= 1
+            raise _Boom("delete failed")
+        return original_delete(self, mid)
+
+    monkeypatch.setattr(SqliteInflightStore, "transition_out", transition_out)
+    monkeypatch.setattr(SqliteInflightStore, "delete_out", delete_out)
+    feed_engine(engine, PubAckPacket(mid=first.mid).encode())
+    assert any(e.kind is EffectKind.PROTOCOL_ERROR for e in engine.take_effects())
+    assert store.get_out(second.mid) is not None
+    assert engine.packet_ids.in_use(second.mid)
+
+    monkeypatch.undo()
+    store.close()
+    reopened = SqliteInflightStore(path)
+    recovered = ProtocolEngine(
+        EngineConfig(local_receive_maximum=1, max_outbound_inflight=1),
+        reopened,
+    )
+    record = reopened.get_out(second.mid)
+    assert record is not None and record.state is OutboundQoSState.QUEUED
+    assert recovered.pending_outbound_messages == 1
+    assert recovered.packet_ids.in_use(second.mid)
+    assert [msg.mid for msg in recovered._queued] == [second.mid]
+    reopened.close()
 
 
 def test_negotiation_discard_failure_keeps_queue_until_delete_recovers(
