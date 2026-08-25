@@ -44,7 +44,7 @@ def test_empty_topic_without_alias_sends_protocol_error_disconnect() -> None:
     assert effects[0].kind is EffectKind.SEND
     disconnect_item = effects[0].data
     disconnect = disconnect_item if isinstance(disconnect_item, bytes) else disconnect_item[0]
-    assert (disconnect[0] >> 4) == PacketType.DISCONNECT.value
+    assert (disconnect[0] & 0xF0) == PacketType.DISCONNECT.value
     assert disconnect[2] == 0x82
     assert any(effect.kind is EffectKind.DISCONNECTED for effect in effects)
     assert any(effect.kind is EffectKind.PROTOCOL_ERROR for effect in effects)
