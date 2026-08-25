@@ -107,5 +107,5 @@ def test_alias_above_effective_advertised_maximum_is_still_rejected() -> None:
     sends = [effect.data for effect in effects if effect.kind is EffectKind.SEND]
     assert len(sends) == 1
     disconnect = sends[0] if isinstance(sends[0], bytes) else sends[0][0]
-    assert (disconnect[0] >> 4) == PacketType.DISCONNECT.value
+    assert (disconnect[0] & 0xF0) == PacketType.DISCONNECT.value
     assert disconnect[2] == 0x94
