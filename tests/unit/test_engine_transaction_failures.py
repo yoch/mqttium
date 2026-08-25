@@ -122,7 +122,7 @@ def test_queued_launch_failure_releases_resources_and_emits_failure() -> None:
     assert store.get_out(second.mid) is None
 
 
-def test_qos2_replay_never_exceeds_local_window() -> None:
+def test_qos2_pubrel_replay_does_not_consume_local_publish_window() -> None:
     store = MemoryInflightStore()
     for mid in (1, 2, 3):
         store.put_out(
@@ -154,15 +154,18 @@ def test_qos2_replay_never_exceeds_local_window() -> None:
         )
     )
     effects = engine.take_effects()
-    assert engine.flow.inflight == 1
-    assert _sent_packet_types(effects).count(PacketType.PUBREL) == 1
 
-    for completed_mid, remaining in ((1, 2), (2, 1), (3, 0)):
+    # The local outbound window throttles QoS>0 PUBLISH packets, not PUBREL.
+    # Every resumed QoS 2 exchange can therefore retransmit its PUBREL without
+    # acquiring a flow slot, even when max_outbound_inflight is one.
+    assert engine.flow.inflight == 0
+    assert _sent_packet_types(effects).count(PacketType.PUBREL) == 3
+
+    for completed_mid in (1, 2, 3):
         engine.handle_raw(_raw(PubCompPacket(mid=completed_mid).encode()))
         effects = engine.take_effects()
-        assert engine.flow.inflight == (1 if remaining else 0)
-        expected_pubrel = 1 if remaining else 0
-        assert _sent_packet_types(effects).count(PacketType.PUBREL) == expected_pubrel
+        assert engine.flow.inflight == 0
+        assert PacketType.PUBREL not in _sent_packet_types(effects)
 
     assert list(store.out_items()) == []
     assert len(engine.packet_ids) == 0
