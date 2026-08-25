@@ -122,6 +122,68 @@ def test_queued_launch_failure_releases_resources_and_emits_failure() -> None:
     assert store.get_out(second.mid) is None
 
 
+class _FailPubrelReplayStore(MemoryInflightStore):
+    def update_out(self, msg: OutboundMessage) -> None:
+        if msg.state is OutboundQoSState.WAIT_PUBCOMP:
+            raise RuntimeError("PUBREL replay write failed")
+        super().update_out(msg)
+
+
+def test_pubrel_replay_failure_does_not_release_publish_window() -> None:
+    store = _FailPubrelReplayStore()
+    store.put_out(
+        OutboundMessage(
+            mid=1,
+            topic="replay/publish",
+            payload=b"x",
+            qos=QoS.EXACTLY_ONCE,
+            retain=False,
+            state=OutboundQoSState.WAIT_PUBREC,
+        )
+    )
+    store.put_out(
+        OutboundMessage(
+            mid=2,
+            topic="",
+            payload=b"",
+            qos=QoS.EXACTLY_ONCE,
+            retain=False,
+            state=OutboundQoSState.WAIT_PUBCOMP,
+        )
+    )
+
+    engine = ProtocolEngine(
+        config=EngineConfig(
+            client_id="qos2-replay-failure",
+            clean_start=False,
+            protocol=MQTTProtocolVersion.MQTTv311,
+            max_outbound_inflight=1,
+        ),
+        store=store,
+    )
+    engine.begin_connect()
+    engine.handle_raw(
+        RawPacket(
+            packet_type=PacketType.CONNACK,
+            flags=0,
+            remaining=b"\x01\x00",
+        )
+    )
+    effects = engine.take_effects()
+
+    failures = [effect.data for effect in effects if effect.kind is EffectKind.PUBLISH_FAILED]
+    assert len(failures) == 1
+    assert failures[0].mid == 2
+    assert isinstance(failures[0].reason, RuntimeError)
+    assert engine.flow.inflight == 1
+    assert engine.packet_ids.in_use(1)
+    assert not engine.packet_ids.in_use(2)
+    assert store.get_out(1) is not None
+    assert store.get_out(2) is None
+    assert _sent_packet_types(effects).count(PacketType.PUBLISH) == 1
+    assert PacketType.PUBREL not in _sent_packet_types(effects)
+
+
 def test_qos2_pubrel_replay_does_not_consume_local_publish_window() -> None:
     store = MemoryInflightStore()
     for mid in (1, 2, 3):
