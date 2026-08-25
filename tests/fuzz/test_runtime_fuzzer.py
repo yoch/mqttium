@@ -141,6 +141,26 @@ async def test_late_duplicate_completed_publish_fails_terminal_wire_obligation(
         await run_schedule(schedule)
 
 
+async def test_terminal_oracle_rejects_publish_waiter_accounting_leak() -> None:
+    schedule = RuntimeSchedule(
+        seed=97,
+        operations=(
+            RuntimeOperation("app", "connect"),
+            RuntimeOperation("checkpoint", "wire", "CONNECT"),
+            RuntimeOperation("broker", "connack"),
+            RuntimeOperation("checkpoint", "connected"),
+            RuntimeOperation("app", "disconnect"),
+            RuntimeOperation("checkpoint", "terminal"),
+        ),
+    )
+
+    with pytest.raises(RuntimeFuzzFailure, match="publish waiter survived terminal teardown"):
+        await run_schedule(
+            schedule,
+            mutation=RuntimeMutation.PUBLISH_WAITER_ACCOUNTING_LEAK,
+        )
+
+
 async def test_whole_schedule_watchdog_reports_deadlock_and_allows_cleanup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

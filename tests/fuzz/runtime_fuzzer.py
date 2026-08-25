@@ -37,6 +37,7 @@ class RuntimeMutation(StrEnum):
     CALLBACK_CANCEL_STOPS_WORKER = "callback_cancel_stops_worker"
     LATE_EFFECT_ABANDONED = "late_effect_abandoned"
     USER_TAKEOVER_LOSES = "user_takeover_loses"
+    PUBLISH_WAITER_ACCOUNTING_LEAK = "publish_waiter_accounting_leak"
 
 
 @dataclass(slots=True, frozen=True)
@@ -750,6 +751,8 @@ class _RuntimeHarness:
                 "_prepare_explicit_connect",
                 MethodType(connected_auto_generation_wins, self.client),
             )
+        elif self.mutation is RuntimeMutation.PUBLISH_WAITER_ACCOUNTING_LEAK:
+            self._replace(self.client, "_publish_waiters", 1)
 
     def _replace(self, owner: object, name: str, replacement: object) -> None:
         self._mutation_restores.append((owner, name, getattr(owner, name)))
@@ -1129,6 +1132,9 @@ class _RuntimeHarness:
             assert stats.writer.waiters == 0, "writer waiter survived terminal teardown"
             assert stats.effects.waiters == 0, "effect drain waiter survived terminal teardown"
             assert stats.delivery.waiters == 0, "delivery waiter survived terminal teardown"
+            assert stats.receipts.publish_waiters == 0, (
+                "publish waiter survived terminal teardown"
+            )
             assert pump.resident_messages == 0, "writer retained a message after teardown"
             assert stats.writer.queued_bytes == 0, "writer retained bytes after teardown"
             assert stats.effects.pending == 0, "effect survived terminal teardown"
