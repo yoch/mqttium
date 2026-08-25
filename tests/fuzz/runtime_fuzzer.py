@@ -561,29 +561,37 @@ class _RuntimeHarness:
         self._expected_loop_cancellations = 0
         self._mutation_restores: list[tuple[object, str, object]] = []
         self._wire_targets: dict[PacketType, int] = {}
-        self.client = AsyncClient(
-            client_id=f"runtime-fuzz-{schedule.seed}",
-            protocol=MQTTProtocolVersion.MQTTv5,
-            reconnect=ReconnectPolicy(
-                enabled=schedule.auto_reconnect,
-                initial_delay=0,
-                max_delay=0,
-                max_retries=3,
-                stable_after=0.05,
-                connect_timeout=0.5,
-            ),
-            max_outbound_messages=1,
-            max_outbound_bytes=4096,
-            max_pending_callbacks=4,
-            message_delivery="callback",
-            keepalive=0,
-        )
+        # Event-loop turns awaited after every operation. V1/V2 schedules keep
+        # the historical unconditional four-turn convergence; the pressure
+        # profile varies it per schedule to reach short-lived interleavings.
+        self.settle_turns = 4
+        self.client = AsyncClient(**self._client_options())
         self.client._transport_factory = self._factory
         self.client.on_message = self._on_message
         self.client.on_disconnect = self._on_disconnect
         self._install_receipt_oracle()
         self._install_effect_gate()
         self._install_mutation()
+
+    def _client_options(self) -> dict[str, Any]:
+        """Constructor options for the schedule's client; profiles override."""
+        return {
+            "client_id": f"runtime-fuzz-{self.schedule.seed}",
+            "protocol": MQTTProtocolVersion.MQTTv5,
+            "reconnect": ReconnectPolicy(
+                enabled=self.schedule.auto_reconnect,
+                initial_delay=0,
+                max_delay=0,
+                max_retries=3,
+                stable_after=0.05,
+                connect_timeout=0.5,
+            ),
+            "max_outbound_messages": 1,
+            "max_outbound_bytes": 4096,
+            "max_pending_callbacks": 4,
+            "message_delivery": "callback",
+            "keepalive": 0,
+        }
 
     @property
     def transport(self) -> _ScheduleTransport:
@@ -958,7 +966,7 @@ class _RuntimeHarness:
             await self._checkpoint(action, value)
         else:
             raise AssertionError(f"unknown runtime operation: {rendered}")
-        await self._turns(4)
+        await self._turns(self.settle_turns)
         self._check_application_tasks()
         self._check_loop_contexts()
         self._check_oracles()
@@ -1099,7 +1107,13 @@ class _RuntimeHarness:
         assert 0 <= outbound.flow_inflight <= outbound.flow_limit
         assert outbound.queued_messages + outbound.flow_inflight <= outbound.pending_messages
         assert outbound.packet_ids_in_use == outbound.pending_messages
-        assert stats.receipts.publish == outbound.pending_messages
+        if not self.client._teardown_final:
+            # Receipts mirror unfinished engine records only until terminal
+            # teardown fails them; durable session records legitimately
+            # outlive their receipts so a present session can be resumed.
+            assert stats.receipts.publish == outbound.pending_messages, (
+                "publish receipts diverged from unfinished engine records"
+            )
         assert 0 <= stats.inbound.inflight <= stats.inbound.receive_maximum
         assert stats.delivery.pending_bytes >= 0
         callback_task = self.client._callback_worker_task
