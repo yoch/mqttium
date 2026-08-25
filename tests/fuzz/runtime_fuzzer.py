@@ -676,7 +676,7 @@ class _RuntimeHarness:
             MethodType(gated_apply, self.client),
         )
 
-    def _install_mutation(self) -> None:
+    def _install_mutation(self) -> None:  # noqa: C901
         if self.mutation is RuntimeMutation.WRITER_FAILURE_NO_WAKE:
 
             async def advance_without_wakeup(pump: object, epoch: int) -> None:
