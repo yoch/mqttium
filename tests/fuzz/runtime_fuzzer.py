@@ -1132,9 +1132,7 @@ class _RuntimeHarness:
             assert stats.writer.waiters == 0, "writer waiter survived terminal teardown"
             assert stats.effects.waiters == 0, "effect drain waiter survived terminal teardown"
             assert stats.delivery.waiters == 0, "delivery waiter survived terminal teardown"
-            assert stats.receipts.publish_waiters == 0, (
-                "publish waiter survived terminal teardown"
-            )
+            assert stats.receipts.publish_waiters == 0, "publish waiter survived terminal teardown"
             assert pump.resident_messages == 0, "writer retained a message after teardown"
             assert stats.writer.queued_bytes == 0, "writer retained bytes after teardown"
             assert stats.effects.pending == 0, "effect survived terminal teardown"
