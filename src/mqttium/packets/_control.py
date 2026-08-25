@@ -27,7 +27,7 @@ _DISCONNECT = b"\xe0\x00"
 
 def decode_disconnect_v311(remaining: bytes) -> tuple[int, Properties | None]:
     require_end(0, len(remaining), DISCONNECT)
-    return 0, None
+    raise ProtocolError("Server DISCONNECT is not valid before MQTT 5")
 
 
 def encode_pingreq() -> bytes:
