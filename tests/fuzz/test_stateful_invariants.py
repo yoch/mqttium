@@ -6,8 +6,8 @@ Two harnesses, both seed-reproducible and both cheap enough to run in CI:
   publish / acknowledge / reconnect / drop sequences and re-checks the
   invariants documented in ``AGENTS.md`` after *every* step. It is a regression
   net for the accounting that ``OutboundSession`` and ``InboundSession`` own:
-  budgets, packet identifiers and the flow window must always agree with the
-  durable store, whatever order the operations arrived in.
+  budgets and packet identifiers must agree with the durable store, while the
+  connection-scoped flow window must always remain within its negotiated bound.
 
 * ``test_store_implementations_agree`` treats ``MemoryInflightStore`` as the
   reference model for ``SqliteInflightStore``. The sessions are written against
@@ -109,15 +109,16 @@ def _check_invariants(engine: ProtocolEngine, step: int, history: list[str]) -> 
     if outbound.pending_bytes != expected_bytes:
         fail(f"pending_bytes={outbound.pending_bytes} but the records sum to {expected_bytes}")
 
-    launched = sum(1 for r in records if r.state in _LAUNCHED)
-    if engine.state is ConnectionState.CONNECTED:
-        if outbound.flow.inflight != min(launched, outbound.flow.limit):
-            fail(
-                f"flow.inflight={outbound.flow.inflight} but {launched} records are "
-                f"launched (limit={outbound.flow.limit})"
-            )
-    if outbound.flow.inflight > outbound.flow.limit:
-        fail(f"flow.inflight={outbound.flow.inflight} exceeds limit={outbound.flow.limit}")
+    # Send Quota is connection-scoped credit, not durable-record occupancy.
+    # A resumed WAIT_PUBCOMP retransmits PUBREL without consuming quota, while
+    # its later PUBCOMP can replenish quota consumed by another PUBLISH. After
+    # reconnect there is therefore no one-to-one mapping from durable WAIT_*
+    # states to flow.inflight; the negotiated bounds remain invariant.
+    if not 0 <= outbound.flow.inflight <= outbound.flow.limit:
+        fail(
+            f"flow.inflight={outbound.flow.inflight} outside "
+            f"[0, {outbound.flow.limit}]"
+        )
 
     queued = [m.mid for m in outbound._queued]
     if len(queued) != len(set(queued)):
