@@ -1138,6 +1138,18 @@ class OutboundSession:
         if msg.state is OutboundQoSState.QUEUED:
             self._queued.append(msg)
             return
+        if msg.state is OutboundQoSState.WAIT_PUBCOMP:
+            # Receive Maximum constrains QoS>0 PUBLISH packets only. A resumed
+            # QoS 2 exchange retransmits PUBREL without consuming the new
+            # connection's send quota; a later PUBCOMP may still replenish that
+            # quota, capped by FlowControl at the current connection limit.
+            try:
+                self._retransmit(self.materialize(msg))
+            except Exception as exc:
+                self.discard_record(msg.mid, msg)
+                self.packet_ids.release(msg.mid)
+                self._fail(msg.mid, exc)
+            return
         if not self.flow.try_acquire():
             self._queued.append(msg)
             return
