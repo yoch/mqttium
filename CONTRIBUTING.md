@@ -38,6 +38,9 @@ Fuzzing commands:
 PYTHONPATH=src python tests/fuzz/fuzz.py --seed 1 --iterations 20000
 python -m pytest -q tests/fuzz/test_hypothesis_fuzz.py
 python -m pytest -q tests/fuzz/test_stateful_invariants.py
+PYTHONPATH=src python -m tests.fuzz.runtime_pressure_fuzzer \
+  --seed 0 --seeds 32 --steps 36 --require-coverage \
+  --artifacts-dir /tmp/mqttium-runtime-pressure-fuzz
 ```
 
 See the [testing and coverage guide](docs/testing.md) for the suite taxonomy,

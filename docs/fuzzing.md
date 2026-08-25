@@ -12,6 +12,7 @@ protocol invariants rather than treating every parser exception as a failure.
 | replay interleavings | page hydration followed by PUBREL, delivery handoff, close, continuation, and reconnect | Memory/SQLite equivalence; no completed, delivered, or stale-epoch emission |
 | `runtime` | external MQTT events plus explicit releases at writer, lifecycle, and callback boundaries | owner accounting, effect settlement, epoch isolation, and terminal liveness |
 | `runtime-composition` | legal history plus two simultaneously open MQTTium ownership windows | V1 oracles plus release-order, takeover, and cross-generation ownership |
+| `runtime-pressure` | transport capability choices, producer bursts, payload classes, admission saturation, and one lifecycle owner at a time | exact wire obligations, pressure high water, parked-producer settlement, and observed pressure/lifecycle overlap |
 
 `tests/fuzz/fuzz.py` is dependency-free and driven by an explicit seed.
 `tests/fuzz/test_hypothesis_fuzz.py` adds property-based generation, shrinking,
@@ -42,6 +43,11 @@ PYTHONPATH=src python tests/fuzz/runtime_fuzzer.py \
 PYTHONPATH=src python -m tests.fuzz.runtime_composition_fuzzer \
   --seed 0 --seeds 24 --steps 48 \
   --artifacts-dir /tmp/mqttium-runtime-composition-fuzz
+
+# Pressure/interleaving profile with mandatory surface coverage (V3)
+PYTHONPATH=src python -m tests.fuzz.runtime_pressure_fuzzer \
+  --seed 0 --seeds 32 --steps 36 --require-coverage \
+  --artifacts-dir /tmp/mqttium-runtime-pressure-fuzz
 ```
 
 ## Runtime schedule target
@@ -143,17 +149,39 @@ generation, and a closing transport is mistaken for a healthy generation when
 a callback connects. Each mutation is inert outside its relevant pair. V1
 generation, nightly rotation, and oracles are unchanged.
 
+## Runtime pressure target
+
+`tests/fuzz/runtime_pressure_fuzzer.py` is the bounded V3 profile over the V1
+harness. Eleven seed-selected families vary `write_nowait` and `write_many`
+presence, deterministic eager refusal, 4- and 16-frame writer residency,
+one-turn producer bursts, tiny/batching/segmented payloads, and 0/1/2/4-turn
+settlement. Three dedicated families plus the reconnect-overlap family place a
+real application publisher behind saturated outbound admission and qualify ACK
+release, cancellation, terminal teardown, and reconnect ownership transition.
+
+Four more families compose pressure separately with reader teardown, reconnect
+factory, callback worker, and EffectPump ownership. An overlap counts only
+while both owners are observable at the same checkpoint. Campaign coverage is
+mandatory by default and requires a `write_many` call carrying at least four
+PUBLISH frames, rather than mono-frame capability use or an unrelated control
+batch. Eight test-only mutations or negative controls
+qualify eager accept/refusal, latency batching, vectored coalescing, segmented
+writes, parked-publisher wake/accounting, writer parking, and all four lifecycle
+overlaps. Failure artifacts use schema `mqttium-runtime-fuzz-v3` and retain the
+profile, family, settlement plan, pressure high water, and owner snapshot.
+
 ### Campaign levels
 
 1. **PR smoke:** 12 fixed healthy V1 seeds at 24 steps, 12 fixed healthy V2
-   seeds at 48 steps, plus bounded pytest qualification of all six V1 and four
-   composition mutations.
+   seeds at 48 steps, 32 coverage-gated V3 seeds at 36 steps, bounded pytest
+   qualification of all six V1, four V2, and eight V3 mutations, plus the
+   stateful invariant campaign at 6 seeds × 200 steps.
 2. **ARM64 nightly:** 50,000 seeds at 32 steps, split into ten disjoint
    5,000-seed shards. The workflow run number advances a monotonic seed range
    from 2,000,000; rerunning the same workflow run deliberately replays the same
    range.
-   This permanent safety net runs V1 only; V2 remains a PR smoke and explicit
-   qualification target until its decision gate is met.
+   This permanent safety net runs V1 only; V2/V3 remain PR smoke and explicit
+   qualification targets until their campaign rotation is chosen.
 3. **Long/manual release proposal:** at least 1,000,000 seeds at 48 steps across
    disjoint recorded ranges, with artifacts retained outside the repository.
    Do not add schedule shrinking or a second broker model merely to consume the
@@ -167,6 +195,12 @@ campaign context. Healthy seeds emit only shard and campaign summaries. The V1
 long campaign completed 1,000,000 schedules at 48 steps with zero failures and
 99.98% unique scheduling traces; V1 is now a stable safety net rather than an
 area for further grammar expansion.
+
+The V3 long campaign completed 1,000,000 schedules at 48 steps on x86-64 with
+zero failures, all mandatory pressure counters nonzero, and 99.9736% unique
+scheduling traces. V2 retains a clean 50,000-seed calibration; its recommended
+million-seed two-window campaign remains pending. See the dated reports for the
+exact commits, environments, ranges, and limitations.
 
 The local release runner can orchestrate multiple deterministic shards:
 
