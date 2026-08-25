@@ -61,6 +61,86 @@ async def test_failed_transport_write_is_attempted_but_not_completed() -> None:
     assert attempted.count("PUBLISH") == completed.count("PUBLISH") + 1
 
 
+async def test_duplicate_completed_publish_fails_wire_obligation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_write = runtime_fuzzer._ScheduleTransport.write
+
+    async def duplicate_completed_publish(transport: object, data: object) -> None:
+        completed_before = len(transport.completed)  # type: ignore[attr-defined]
+        await original_write(transport, data)  # type: ignore[arg-type]
+        newly_completed = transport.completed[completed_before:]  # type: ignore[attr-defined]
+        transport.completed.extend(  # type: ignore[attr-defined]
+            item
+            for item in newly_completed
+            if item[0].packet_type is runtime_fuzzer.PacketType.PUBLISH
+        )
+
+    monkeypatch.setattr(
+        runtime_fuzzer._ScheduleTransport,
+        "write",
+        duplicate_completed_publish,
+    )
+    schedule = RuntimeSchedule(
+        seed=95,
+        operations=(
+            RuntimeOperation("app", "connect"),
+            RuntimeOperation("checkpoint", "wire", "CONNECT"),
+            RuntimeOperation("broker", "connack"),
+            RuntimeOperation("checkpoint", "connected"),
+            RuntimeOperation("app", "publish", 0),
+            RuntimeOperation("checkpoint", "wire", "PUBLISH"),
+            RuntimeOperation("app", "disconnect"),
+            RuntimeOperation("checkpoint", "terminal"),
+        ),
+    )
+
+    with pytest.raises(RuntimeFuzzFailure, match="wire multiplicity"):
+        await run_schedule(schedule)
+
+
+async def test_late_duplicate_completed_publish_fails_terminal_wire_obligation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_write = runtime_fuzzer._ScheduleTransport.write
+
+    async def duplicate_publish_on_disconnect(transport: object, data: object) -> None:
+        completed_before = len(transport.completed)  # type: ignore[attr-defined]
+        await original_write(transport, data)  # type: ignore[arg-type]
+        newly_completed = transport.completed[completed_before:]  # type: ignore[attr-defined]
+        if any(
+            item[0].packet_type is runtime_fuzzer.PacketType.DISCONNECT for item in newly_completed
+        ):
+            publish = next(
+                item
+                for item in reversed(transport.completed[:completed_before])  # type: ignore[attr-defined]
+                if item[0].packet_type is runtime_fuzzer.PacketType.PUBLISH
+            )
+            transport.completed.append(publish)  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(
+        runtime_fuzzer._ScheduleTransport,
+        "write",
+        duplicate_publish_on_disconnect,
+    )
+    schedule = RuntimeSchedule(
+        seed=96,
+        operations=(
+            RuntimeOperation("app", "connect"),
+            RuntimeOperation("checkpoint", "wire", "CONNECT"),
+            RuntimeOperation("broker", "connack"),
+            RuntimeOperation("checkpoint", "connected"),
+            RuntimeOperation("app", "publish", 0),
+            RuntimeOperation("checkpoint", "wire", "PUBLISH"),
+            RuntimeOperation("app", "disconnect"),
+            RuntimeOperation("checkpoint", "terminal"),
+        ),
+    )
+
+    with pytest.raises(RuntimeFuzzFailure, match="wire multiplicity"):
+        await run_schedule(schedule)
+
+
 async def test_whole_schedule_watchdog_reports_deadlock_and_allows_cleanup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -242,7 +322,7 @@ def test_generator_uses_step_budget_and_produces_diverse_schedule_traces() -> No
 
 
 async def test_campaign_reports_trace_diversity_and_operation_coverage() -> None:
-    result = await run_campaign(seeds=range(24), steps=24)
+    result = await run_campaign(seeds=range(48), steps=24)
 
     assert result.failures == 0
     assert result.unique_operation_traces >= 22

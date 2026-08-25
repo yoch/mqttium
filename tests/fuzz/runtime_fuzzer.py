@@ -385,7 +385,12 @@ def _anchor_operations(  # noqa: C901
         operations.append(_op("effect", "fail_on_release"))
     release_position = rng.randrange(3)
     if release_position == 0:
-        operations.append(_op("schedule", "release_writes"))
+        operations.extend(
+            (
+                _op("schedule", "release_writes"),
+                _op("checkpoint", "wire", "PUBLISH"),
+            )
+        )
     operations.extend(
         (
             _op("schedule", "release_effect"),
@@ -968,6 +973,12 @@ class _RuntimeHarness:
                 ),
                 f"transport write checkpoint {packet_type.name} was not reached",
             )
+            observed = sum(transport.count(packet_type) for transport in self.transports)
+            if observed != target:
+                raise AssertionError(
+                    f"wire multiplicity mismatch for {packet_type.name}: "
+                    f"expected={target} observed={observed}"
+                )
         elif action == "connected":
             await self._wait_until(
                 lambda: self.client.is_connected,
@@ -1109,6 +1120,12 @@ class _RuntimeHarness:
                 "connection epoch was not invalidated before transport ownership changed"
             )
         if terminal:
+            for packet_type, target in self._wire_targets.items():
+                observed = sum(transport.count(packet_type) for transport in self.transports)
+                assert observed == target, (
+                    f"wire multiplicity mismatch for {packet_type.name}: "
+                    f"expected={target} observed={observed}"
+                )
             assert stats.writer.waiters == 0, "writer waiter survived terminal teardown"
             assert stats.effects.waiters == 0, "effect drain waiter survived terminal teardown"
             assert stats.delivery.waiters == 0, "delivery waiter survived terminal teardown"

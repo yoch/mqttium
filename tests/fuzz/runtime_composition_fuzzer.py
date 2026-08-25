@@ -241,6 +241,7 @@ def _composition_operations(
             _op("factory", "block_next"),
             _op("broker", "inject_eof"),
             _op("schedule", "release_effect"),
+            _op("checkpoint", "wire", "PUBACK"),
         ]
         if not replay_after_replacement:
             operations.append(_op("effect", "replay_retired"))
