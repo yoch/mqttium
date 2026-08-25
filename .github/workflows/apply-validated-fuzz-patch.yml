@@ -1,0 +1,39 @@
+name: Apply validated fuzz patch
+
+on:
+  push:
+    branches: [fix/runtime-fuzzer-wire-obligations]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: fix/runtime-fuzzer-wire-obligations
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Apply exact locally-qualified patch
+        run: |
+          set -euo pipefail
+          test "$(git hash-object tests/fuzz/runtime_fuzzer.py)" = c66a3b34b3f18c27e3450a9781132001441489c9
+          test "$(git hash-object tests/fuzz/runtime_composition_fuzzer.py)" = 8f33380713bc3a681d91d5d9d9138bddf9e4a114
+          test "$(git hash-object tests/fuzz/test_runtime_fuzzer.py)" = 47100a948acc4b4f9e02e012d53e9c4096b6c552
+          echo 'ccd6fd254e881e11b5cc99fb0b557b70a4bdc6df66dcc60ad68f5a33f14f9465  .github/local-final-fuzz.patch' | sha256sum -c -
+          git apply --check .github/local-final-fuzz.patch
+          git apply .github/local-final-fuzz.patch
+          test "$(git hash-object tests/fuzz/runtime_fuzzer.py)" = 477dfa129e244033438ce4ffe089738a63b3dec1
+          test "$(git hash-object tests/fuzz/runtime_composition_fuzzer.py)" = 825ca367ae825158b7c2f74692cf3575b2ba04c9
+          test "$(git hash-object tests/fuzz/test_runtime_fuzzer.py)" = b51aae2024a5a5a2af1384d4ffaf62c9f842ff37
+          git diff --check
+          rm .github/local-final-fuzz.patch .github/workflows/apply-validated-fuzz-patch.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'test(fuzz): qualify strict wire obligations'
+          git push origin HEAD:fix/runtime-fuzzer-wire-obligations
