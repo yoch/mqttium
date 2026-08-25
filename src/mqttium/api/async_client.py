@@ -2148,16 +2148,7 @@ class AsyncClient:
     ) -> int:
         if epoch != self._connection_epoch:
             return 0
-        return self._delivery.deliver_batch_inline(effects, self.on_message)
-
-    def _apply_decoded_message_effect_batch_inline(
-        self,
-        effects: deque[EngineEffect],
-        epoch: int,
-    ) -> int:
-        if epoch != self._connection_epoch:
-            return 0
-        return self._delivery.deliver_decoded_batch_inline(effects, self.on_message)
+        return self._delivery.deliver_message_batch_inline(effects, self.on_message)
 
     async def _flush_effects(self) -> None:
         async with self._engine_lock:

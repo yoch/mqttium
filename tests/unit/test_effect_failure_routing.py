@@ -47,12 +47,6 @@ class _Owner:
         del effects, epoch
         return 0
 
-    def _apply_decoded_message_effect_batch_inline(
-        self, effects: deque[EngineEffect], epoch: int
-    ) -> int:
-        del effects, epoch
-        return 0
-
     async def _apply_effect(
         self,
         effect: EngineEffect,
