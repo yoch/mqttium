@@ -17,7 +17,7 @@ import time
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from itertools import islice
-from typing import Any, Literal, Never
+from typing import Any, Literal, Never, TypeVar
 
 from mqttium.api._delivery import ApplicationDelivery, MessageDelivery
 from mqttium.api._effects import EffectPump, StaleConnectionEffect
@@ -52,7 +52,9 @@ from mqttium.errors import (
 from mqttium.packets import (
     AuthPacket,
     ConnAckPacket,
+    SubAckPacket,
     SubscribeOptions,
+    UnsubAckPacket,
     encode_disconnect,
 )
 from mqttium.packets._publish import (
@@ -86,6 +88,59 @@ PublishBackpressure = Literal["wait", "error"]
 
 _GRACEFUL_DISCONNECT_DRAIN_TIMEOUT = 5.0
 _FATAL_DISCONNECT_DRAIN_TIMEOUT = 0.25
+
+_ReceiptT = TypeVar("_ReceiptT", "PublishReceipt", "PublishBatchReceipt")
+
+
+def _fifo_register(
+    registry: dict[int, _ReceiptT | deque[_ReceiptT]],
+    mid: int,
+    entry: _ReceiptT,
+) -> None:
+    """Register one receipt under a packet identifier, FIFO on reuse."""
+    current = registry.get(mid)
+    if current is None:
+        registry[mid] = entry
+    elif isinstance(current, deque):
+        current.append(entry)
+    else:
+        registry[mid] = deque((current, entry))
+
+
+def _fifo_pop(
+    registry: dict[int, _ReceiptT | deque[_ReceiptT]],
+    mid: int,
+) -> _ReceiptT | None:
+    """Pop the oldest receipt registered under a packet identifier."""
+    current = registry.pop(mid, None)
+    if current is None or not isinstance(current, deque):
+        return current
+    entry = current.popleft()
+    if len(current) == 1:
+        registry[mid] = current[0]
+    elif current:
+        registry[mid] = current
+    return entry
+
+
+def _extend_message_effects(
+    sink: list[EngineEffect],
+    messages: list[Message],
+    property_sizes: list[int | None] | None,
+) -> None:
+    """Materialise borrowed-decode QoS 0 messages as ordinary engine effects."""
+    if property_sizes is None:
+        sink.extend(EngineEffect(EffectKind.MESSAGE, message, False, None) for message in messages)
+    else:
+        sink.extend(
+            EngineEffect(
+                EffectKind.DECODED_MESSAGE if wire_size is not None else EffectKind.MESSAGE,
+                message,
+                False,
+                wire_size,
+            )
+            for message, wire_size in zip(messages, property_sizes, strict=True)
+        )
 
 
 def _positive(name: str, value: float) -> None:
@@ -591,7 +646,7 @@ class AsyncClient:
             return PublishReceipt(mid=None, qos=handle.qos)
         assert handle.mid is not None
         receipt = PublishReceipt(mid=handle.mid, qos=handle.qos)
-        self._register_publish_receipt(handle.mid, receipt)
+        _fifo_register(self._receipts, handle.mid, receipt)
         return receipt
 
     def _direct_qos0_ready(self, callback_count: int = 1) -> bool:
@@ -700,7 +755,7 @@ class AsyncClient:
         )
         assert handle.mid is not None
         receipt = PublishReceipt(mid=handle.mid, qos=handle.qos)
-        self._register_publish_receipt(handle.mid, receipt)
+        _fifo_register(self._receipts, handle.mid, receipt)
         return receipt
 
     def _queue_qos0_on_loop(
@@ -766,21 +821,7 @@ class AsyncClient:
             OSError: If TCP/TLS setup or the initial MQTT CONNECT write fails.
             asyncio.CancelledError: If the calling task is cancelled.
         """
-        async with self._lifecycle_lock:
-            await self._prepare_explicit_connect()
-            self._host = host
-            self._port = port
-            self._ssl = ssl
-            was_alt = self._unix_path is not None or self._ws_url is not None
-            self._unix_path = None
-            self._ws_url = None
-            self._ws_headers = None
-            if was_alt:
-                self._transport_factory = TcpTransport.connect
-            self._intentional_disconnect = False
-            timeout = timeout if timeout is not None else self._reconnect.connect_timeout
-            self._reconnect.reset()
-            return await self._connect_once_locked(host, port, ssl=ssl, timeout=timeout)
+        return await self._connect_explicit(host, port, ssl=ssl, timeout=timeout)
 
     async def connect_unix(
         self,
@@ -803,28 +844,18 @@ class AsyncClient:
             OSError: If Unix socket setup or the initial MQTT CONNECT write fails.
             asyncio.CancelledError: If the calling task is cancelled.
         """
-        async with self._lifecycle_lock:
-            await self._prepare_explicit_connect()
-            self._unix_path = path
-            self._ws_url = None
-            self._ws_headers = None
-            self._host = path
-            self._port = 0
-            self._ssl = None
-            self._intentional_disconnect = False
 
-            async def _factory(
-                host: str,
-                port: int,
-                *,
-                ssl: object | None = None,
-            ) -> AsyncTransport:
-                return await UnixSocketTransport.connect(self._unix_path or host)
+        async def _factory(
+            host: str,
+            port: int,
+            *,
+            ssl: object | None = None,
+        ) -> AsyncTransport:
+            return await UnixSocketTransport.connect(self._unix_path or host)
 
-            self._transport_factory = _factory
-            timeout = timeout if timeout is not None else self._reconnect.connect_timeout
-            self._reconnect.reset()
-            return await self._connect_once_locked(path, 0, ssl=None, timeout=timeout)
+        return await self._connect_explicit(
+            path, 0, ssl=None, timeout=timeout, unix_path=path, factory=_factory
+        )
 
     async def connect_ws(
         self,
@@ -853,32 +884,67 @@ class AsyncClient:
             ValueError: If the URL or WebSocket options are invalid.
             asyncio.CancelledError: If the calling task is cancelled.
         """
+
+        async def _factory(
+            host: str,
+            port: int,
+            *,
+            ssl: object | None = None,
+        ) -> AsyncTransport:
+            return await WebSocketTransport.connect(
+                self._ws_url or host,
+                ssl=ssl if ssl is not None else self._ssl,
+                extra_headers=self._ws_headers,
+            )
+
+        return await self._connect_explicit(
+            url,
+            0,
+            ssl=ssl,
+            timeout=timeout,
+            ws_url=url,
+            ws_headers=extra_headers,
+            factory=_factory,
+        )
+
+    async def _connect_explicit(
+        self,
+        host: str,
+        port: int,
+        *,
+        ssl: ssl.SSLContext | bool | None,
+        timeout: float | None,
+        unix_path: str | None = None,
+        ws_url: str | None = None,
+        ws_headers: dict[str, str] | None = None,
+        factory: Callable[..., Awaitable[AsyncTransport]] | None = None,
+    ) -> ConnAckPacket:
+        """Shared body of the explicit connect entry points.
+
+        Records the endpoint for later reconnects, replaces any automatic
+        generation, and performs one connection attempt under the lifecycle
+        lock.
+        """
         async with self._lifecycle_lock:
             await self._prepare_explicit_connect()
-            self._ws_url = url
-            self._ws_headers = extra_headers
-            self._unix_path = None
-            self._host = url
-            self._port = 0
+            was_alt = self._unix_path is not None or self._ws_url is not None
+            self._unix_path = unix_path
+            self._ws_url = ws_url
+            self._ws_headers = ws_headers
+            self._host = host
+            self._port = port
             self._ssl = ssl
+            if factory is not None:
+                self._transport_factory = factory
+            elif was_alt:
+                # Reclaim the default TCP factory only when leaving an
+                # alternative endpoint: an injected factory must survive a
+                # plain TCP connect (custom transports rely on this seam).
+                self._transport_factory = TcpTransport.connect
             self._intentional_disconnect = False
-
-            async def _factory(
-                host: str,
-                port: int,
-                *,
-                ssl: object | None = None,
-            ) -> AsyncTransport:
-                return await WebSocketTransport.connect(
-                    self._ws_url or host,
-                    ssl=ssl if ssl is not None else self._ssl,
-                    extra_headers=self._ws_headers,
-                )
-
-            self._transport_factory = _factory
             timeout = timeout if timeout is not None else self._reconnect.connect_timeout
             self._reconnect.reset()
-            return await self._connect_once_locked(url, 0, ssl=ssl, timeout=timeout)
+            return await self._connect_once_locked(host, port, ssl=ssl, timeout=timeout)
 
     async def _connect_once_locked(
         self,
@@ -1047,9 +1113,7 @@ class AsyncClient:
                 # application stream, which the reconnect loop would otherwise
                 # keep alive.
                 if not self._will_reconnect():
-                    self._fail_pending(self._disconnect_exc or MQTTError("Disconnected"))
-                    await self._shutdown_callback_worker(drain=True)
-                    self._delivery.close()
+                    await self._terminal_shutdown(self._disconnect_exc or MQTTError("Disconnected"))
                 return
             # Preserve validation semantics: an invalid reason code must fail
             # before teardown, just as it did before shutdown became bounded.
@@ -1213,7 +1277,7 @@ class AsyncClient:
                     else:
                         assert handle.mid is not None
                         receipt = PublishReceipt(mid=handle.mid, qos=handle.qos)
-                        self._register_publish_receipt(handle.mid, receipt)
+                        _fifo_register(self._receipts, handle.mid, receipt)
                 except FlowControlError as flow_exc:
                     if (
                         nowait
@@ -1270,7 +1334,7 @@ class AsyncClient:
                     for handle in handles:
                         receipt._register(handle.mid)
                         if handle.mid is not None:
-                            self._register_batch_receipt(handle.mid, receipt)
+                            _fifo_register(self._batch_receipts, handle.mid, receipt)
                     self._collect_effects_locked()
                     self._drain_effects_inline()
                     return
@@ -1581,20 +1645,8 @@ class AsyncClient:
         def materialize_captured() -> None:
             if not captured:
                 return
-            if captured_property_sizes is None:
-                engine._effects.extend(
-                    EngineEffect(EffectKind.MESSAGE, message, False, None) for message in captured
-                )
-            else:
-                engine._effects.extend(
-                    EngineEffect(
-                        EffectKind.DECODED_MESSAGE if wire_size is not None else EffectKind.MESSAGE,
-                        message,
-                        False,
-                        wire_size,
-                    )
-                    for message, wire_size in zip(captured, captured_property_sizes, strict=True)
-                )
+            _extend_message_effects(engine._effects, captured, captured_property_sizes)
+            if captured_property_sizes is not None:
                 captured_property_sizes.clear()
             captured.clear()
 
@@ -1712,27 +1764,9 @@ class AsyncClient:
                             ):
                                 self._effect_pump.record_inline_batch(len(captured))
                             else:
-                                if captured_property_sizes is None:
-                                    self._engine._effects.extend(
-                                        EngineEffect(EffectKind.MESSAGE, message, False, None)
-                                        for message in captured
-                                    )
-                                else:
-                                    self._engine._effects.extend(
-                                        EngineEffect(
-                                            (
-                                                EffectKind.DECODED_MESSAGE
-                                                if wire_size is not None
-                                                else EffectKind.MESSAGE
-                                            ),
-                                            message,
-                                            False,
-                                            wire_size,
-                                        )
-                                        for message, wire_size in zip(
-                                            captured, captured_property_sizes, strict=True
-                                        )
-                                    )
+                                _extend_message_effects(
+                                    self._engine._effects, captured, captured_property_sizes
+                                )
                         if handled and self._engine.has_pending_effects:
                             self._collect_effects_locked()
                     if self._effect_pump.pending:
@@ -1836,6 +1870,17 @@ class AsyncClient:
                     self._reconnect_task = asyncio.create_task(
                         self._reconnect_loop(), name="mqttium-reconnect"
                     )
+
+    async def _terminal_shutdown(self, exc: BaseException) -> None:
+        """Fail pending work and close the application stream, terminally.
+
+        ``_fail_pending`` already marks teardown final and wakes parked
+        publishers; this adds the callback-worker drain and stream close that
+        every terminal path shares.
+        """
+        self._fail_pending(exc)
+        await self._shutdown_callback_worker(drain=True)
+        self._delivery.close()
 
     def _retry_reason(self) -> int | None:
         """The reason code the reconnect policy judges: broker DISCONNECT, else CONNACK."""
@@ -1998,11 +2043,9 @@ class AsyncClient:
                 if not self._reconnect.should_retry(reason, self._engine.config.protocol):
                     # Retry budget exhausted: the stream must terminate, not
                     # park forever now that transient paths keep it open.
-                    self._fail_pending(self._disconnect_exc or MQTTError("Reconnect exhausted"))
-                    self._teardown_final = True
-                    self._notify_publish_space()
-                    await self._shutdown_callback_worker(drain=True)
-                    self._delivery.close()
+                    await self._terminal_shutdown(
+                        self._disconnect_exc or MQTTError("Reconnect exhausted")
+                    )
                     return
                 delay = self._reconnect.next_delay()
                 await asyncio.sleep(delay)
@@ -2030,11 +2073,7 @@ class AsyncClient:
                     if isinstance(exc, AssertionError):
                         # Never reuse an engine after a proven local invariant
                         # violation, including one raised during reconnect.
-                        self._fail_pending(exc)
-                        self._teardown_final = True
-                        self._notify_publish_space()
-                        await self._shutdown_callback_worker(drain=True)
-                        self._delivery.close()
+                        await self._terminal_shutdown(exc)
                         return
                     continue
         except asyncio.CancelledError:
@@ -2080,21 +2119,27 @@ class AsyncClient:
             self._settle_publish(failure.mid, failure.reason)
             return True
         if kind is EffectKind.SUBACK:
-            sub_result = SubscribeResult.from_packet(effect.data)
-            sub_fut = self._sub_futs.pop(sub_result.mid, None)
-            if sub_fut is not None and not sub_fut.done():
-                sub_fut.set_result(sub_result)
+            self._resolve_suback(effect.data)
             return True
         if kind is EffectKind.UNSUBACK:
-            unsub_result = UnsubscribeResult.from_packet(effect.data)
-            unsub_fut = self._unsub_futs.pop(unsub_result.mid, None)
-            if unsub_fut is not None and not unsub_fut.done():
-                unsub_fut.set_result(unsub_result)
+            self._resolve_unsuback(effect.data)
             return True
         if kind is EffectKind.PINGRESP:
             self._ping_pending = False
             return True
         return False
+
+    def _resolve_suback(self, packet: SubAckPacket) -> None:
+        sub_result = SubscribeResult.from_packet(packet)
+        sub_fut = self._sub_futs.pop(sub_result.mid, None)
+        if sub_fut is not None and not sub_fut.done():
+            sub_fut.set_result(sub_result)
+
+    def _resolve_unsuback(self, packet: UnsubAckPacket) -> None:
+        unsub_result = UnsubscribeResult.from_packet(packet)
+        unsub_fut = self._unsub_futs.pop(unsub_result.mid, None)
+        if unsub_fut is not None and not unsub_fut.done():
+            unsub_fut.set_result(unsub_result)
 
     def _apply_message_effect_batch_inline(
         self,
@@ -2191,15 +2236,9 @@ class AsyncClient:
             if self.on_publish is not None:
                 await self._enqueue_callback(self.on_publish, failure.mid, failure.reason)
         elif kind is EffectKind.SUBACK:
-            sub_result = SubscribeResult.from_packet(effect.data)
-            sub_fut = self._sub_futs.pop(sub_result.mid, None)
-            if sub_fut is not None and not sub_fut.done():
-                sub_fut.set_result(sub_result)
+            self._resolve_suback(effect.data)
         elif kind is EffectKind.UNSUBACK:
-            unsub_result = UnsubscribeResult.from_packet(effect.data)
-            unsub_fut = self._unsub_futs.pop(unsub_result.mid, None)
-            if unsub_fut is not None and not unsub_fut.done():
-                unsub_fut.set_result(unsub_result)
+            self._resolve_unsuback(effect.data)
         elif kind is EffectKind.PINGRESP:
             self._ping_pending = False
         elif kind is EffectKind.DISCONNECTED:
@@ -2274,7 +2313,7 @@ class AsyncClient:
         # QoS 0 carries no packet identifier: its receipt is never registered
         # and its batch entry completes at submission.
         if mid is not None:
-            receipt = self._pop_publish_receipt(mid)
+            receipt = _fifo_pop(self._receipts, mid)
             if receipt is not None:
                 if reason is not None:
                     receipt._error = reason
@@ -2282,7 +2321,7 @@ class AsyncClient:
             # Most clients never call publish_many, so skip the lookup rather
             # than hashing every acknowledged identifier against an empty table.
             if self._batch_receipts:
-                batch = self._pop_batch_receipt(mid)
+                batch = _fifo_pop(self._batch_receipts, mid)
                 if batch is not None:
                     batch._complete(mid, reason)
         # Inlined check: _settle_publish runs per acknowledgement, and the
@@ -2427,49 +2466,19 @@ class AsyncClient:
             except MessageDeliveryError as exc:
                 self._report_callback_error(self.on_publish, exc)
 
+    # Established internal test/benchmark seams; runtime call sites use the
+    # module-level FIFO helpers directly to avoid a wrapper frame per publish.
     def _register_publish_receipt(self, mid: int, receipt: PublishReceipt) -> None:
-        current = self._receipts.get(mid)
-        if current is None:
-            self._receipts[mid] = receipt
-        elif isinstance(current, deque):
-            current.append(receipt)
-        else:
-            self._receipts[mid] = deque((current, receipt))
+        _fifo_register(self._receipts, mid, receipt)
 
     def _pop_publish_receipt(self, mid: int) -> PublishReceipt | None:
-        current = self._receipts.pop(mid, None)
-        if current is None:
-            return None
-        if not isinstance(current, deque):
-            return current
-        receipt = current.popleft()
-        if len(current) == 1:
-            self._receipts[mid] = current[0]
-        elif current:
-            self._receipts[mid] = current
-        return receipt
+        return _fifo_pop(self._receipts, mid)
 
     def _register_batch_receipt(self, mid: int, receipt: PublishBatchReceipt) -> None:
-        current = self._batch_receipts.get(mid)
-        if current is None:
-            self._batch_receipts[mid] = receipt
-        elif isinstance(current, deque):
-            current.append(receipt)
-        else:
-            self._batch_receipts[mid] = deque((current, receipt))
+        _fifo_register(self._batch_receipts, mid, receipt)
 
     def _pop_batch_receipt(self, mid: int) -> PublishBatchReceipt | None:
-        current = self._batch_receipts.pop(mid, None)
-        if current is None:
-            return None
-        if not isinstance(current, deque):
-            return current
-        receipt = current.popleft()
-        if len(current) == 1:
-            self._batch_receipts[mid] = current[0]
-        elif current:
-            self._batch_receipts[mid] = current
-        return receipt
+        return _fifo_pop(self._batch_receipts, mid)
 
     def _fail_non_replayable(self, exc: BaseException) -> None:
         for sub_fut in self._sub_futs.values():
