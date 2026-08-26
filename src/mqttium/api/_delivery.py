@@ -562,6 +562,9 @@ class ApplicationDelivery:
                         return False
                 elif not self._is_small_decoded(message, wire_size):
                     return False
+        if len(messages) == 1 and self.can_dispatch_callback_inline(callback):
+            self.dispatch_callback_inline(callback, messages[0])
+            return True
         self._enqueue_message_batch(callback, messages, iterator_delivery=False)
         return True
 

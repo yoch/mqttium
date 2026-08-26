@@ -2122,17 +2122,17 @@ class AsyncClient:
         if kind is EffectKind.PUBLISH_COMPLETE:
             mid: int | None = effect.data
             callback = self.on_publish
-            if callback is None:
-                self._settle_publish(mid, None)
-                return True
-            return self._apply_terminal_callback_inline(callback, mid, None)
+            if callback is not None:
+                return self._apply_terminal_callback_inline(callback, mid, None)
+            self._settle_publish(mid, None)
+            return True
         if kind is EffectKind.PUBLISH_FAILED:
             failure: PublishFailure = effect.data
             callback = self.on_publish
-            if callback is None:
-                self._settle_publish(failure.mid, failure.reason)
-                return True
-            return self._apply_terminal_callback_inline(callback, failure.mid, failure.reason)
+            if callback is not None:
+                return self._apply_terminal_callback_inline(callback, failure.mid, failure.reason)
+            self._settle_publish(failure.mid, failure.reason)
+            return True
         if kind is EffectKind.SUBACK:
             self._resolve_suback(effect.data)
             return True
