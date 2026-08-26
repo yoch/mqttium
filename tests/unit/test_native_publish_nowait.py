@@ -57,6 +57,188 @@ async def test_publish_nowait_registers_qos1_receipt() -> None:
     assert client._pop_publish_receipt(receipt.mid) is receipt
 
 
+@pytest.mark.parametrize("qos", [QoS.AT_LEAST_ONCE, QoS.EXACTLY_ONCE])
+async def test_publish_nowait_qosn_hands_the_single_send_directly(qos: QoS) -> None:
+    client = AsyncClient(max_outbound_messages=8)
+    client._engine.state = ConnectionState.CONNECTED
+
+    receipt = client.publish_nowait("native/qosn-direct", b"payload", qos=qos)
+
+    assert receipt.qos is qos
+    assert receipt.mid is not None
+    assert client._receipts[receipt.mid] is receipt
+    assert client._effect_pump.batches == 0
+    assert client._effect_pump.enqueued == 0
+    assert not client._engine.has_pending_effects
+    assert client.stats().writer.queued_messages == 1
+    assert client._engine.store.get_out(receipt.mid) is not None
+
+
+async def test_publish_nowait_qosn_registers_receipt_before_writer_commit(monkeypatch) -> None:
+    client = AsyncClient(max_outbound_messages=8)
+    client._engine.state = ConnectionState.CONNECTED
+    original_commit = client._try_enqueue_outbound
+    observed: list[bool] = []
+
+    def checking_commit(item, *, epoch=None):
+        receipts = list(client._receipts.values())
+        observed.append(len(receipts) == 1 and receipts[0].mid is not None)
+        return original_commit(item, epoch=epoch)
+
+    monkeypatch.setattr(client, "_try_enqueue_outbound", checking_commit)
+
+    receipt = client.publish_nowait("native/receipt-before-wire", b"x", qos=1)
+
+    assert observed == [True]
+    assert receipt.mid is not None
+    assert client._receipts[receipt.mid] is receipt
+
+
+async def test_publish_nowait_qosn_writer_refusal_precedes_protocol_mutation() -> None:
+    client = AsyncClient(max_outbound_messages=1, max_outbound_bytes=1024)
+    client._engine.state = ConnectionState.CONNECTED
+    client.publish_nowait("native/occupy-writer", b"first", qos=0)
+
+    before = client._engine.outbound.stats()
+    with pytest.raises(FlowControlError):
+        client.publish_nowait("native/refused-qos1", b"second", qos=1)
+
+    after = client._engine.outbound.stats()
+    assert after.pending_messages == before.pending_messages == 0
+    assert after.pending_bytes == before.pending_bytes == 0
+    assert after.flow_inflight == before.flow_inflight == 0
+    assert after.packet_ids_in_use == before.packet_ids_in_use == 0
+    assert client._receipts == {}
+    assert not client._engine.has_pending_effects
+    assert not client._effect_pump.pending
+
+
+async def test_publish_nowait_qosn_full_flow_falls_back_to_engine_queue(monkeypatch) -> None:
+    client = AsyncClient(max_outbound_inflight=1, max_outbound_messages=8)
+    client._engine.state = ConnectionState.CONNECTED
+    # The focused client tests bypass CONNACK, which normally applies this cap.
+    client._engine.flow.limit = 1
+    first = client.publish_nowait("native/first", b"x", qos=1)
+
+    def direct_commit_forbidden(*_args, **_kwargs):
+        raise AssertionError("full flow must not use the direct writer commit")
+
+    monkeypatch.setattr(client, "_try_enqueue_outbound", direct_commit_forbidden)
+    second = client.publish_nowait("native/queued", b"y", qos=1)
+
+    assert first.mid is not None
+    assert second.mid is not None
+    assert client.stats().writer.queued_messages == 1
+    assert client.stats().outbound.queued_messages == 1
+    assert client._engine.outbound.pending_messages == 2
+
+
+async def test_publish_nowait_qosn_pending_engine_effect_disables_direct_commit() -> None:
+    client = AsyncClient(max_outbound_messages=8)
+    client._engine.state = ConnectionState.CONNECTED
+    client._engine._emit(EffectKind.PINGRESP)
+
+    receipt = client.publish_nowait("native/pending-effect", b"x", qos=1)
+
+    assert receipt.mid is not None
+    assert client._effect_pump.batches == 1
+    assert client._effect_pump.multi_effect_batches == 1
+    assert not client._engine.has_pending_effects
+
+
+async def test_publish_nowait_qosn_pending_pump_disables_direct_handoff(monkeypatch) -> None:
+    client = AsyncClient(max_outbound_messages=8)
+    client._engine.state = ConnectionState.CONNECTED
+    client._effect_pump.pending.append(EngineEffect(kind=EffectKind.PINGRESP, data=None))
+    observed_direct_sinks: list[object] = []
+    original = type(client._engine.outbound).queue_publish
+
+    def observe_handoff(outbound, *args, **kwargs):
+        observed_direct_sinks.append(kwargs.get("_direct_wires"))
+        return original(outbound, *args, **kwargs)
+
+    monkeypatch.setattr(type(client._engine.outbound), "queue_publish", observe_handoff)
+    receipt = client.publish_nowait("native/pending-pump", b"x", qos=1)
+
+    assert receipt.mid is not None
+    assert observed_direct_sinks == [None]
+    assert client.stats().writer.queued_messages == 1
+    assert not client._effect_pump.pending
+
+
+async def test_publish_nowait_qosn_topic_alias_stays_on_engine_effect_path() -> None:
+    client = AsyncClient(
+        protocol=MQTTProtocolVersion.MQTTv5,
+        max_outbound_messages=8,
+    )
+    client._engine.state = ConnectionState.CONNECTED
+    client._engine.negotiated = NegotiatedSettings(topic_alias_maximum=2)
+
+    receipt = client.publish_nowait(
+        "canonical/topic",
+        b"payload",
+        qos=1,
+        properties=Properties({"topic_alias": 1}),
+    )
+
+    assert receipt.mid is not None
+    assert client._effect_pump.batches == 1
+    assert not client._engine.has_pending_effects
+
+
+async def test_publish_nowait_qosn_reentrant_writer_refusal_falls_back_bounded(
+    monkeypatch,
+) -> None:
+    client = AsyncClient(max_outbound_messages=8)
+    client._engine.state = ConnectionState.CONNECTED
+    monkeypatch.setattr(client, "_try_enqueue_outbound", lambda *_args, **_kwargs: False)
+
+    receipt = client.publish_nowait("native/reentrant-refusal", b"x", qos=1)
+
+    assert receipt.mid is not None
+    assert client.stats().writer.queued_messages == 0
+    assert len(client._effect_pump.pending) == 1
+    assert client._effect_pump.pending[0].kind is EffectKind.SEND
+    assert client._receipts[receipt.mid] is receipt
+
+
+async def test_publish_nowait_qosn_reentrant_flow_change_keeps_queued_receipt(
+    monkeypatch,
+) -> None:
+    client = AsyncClient(max_outbound_messages=8)
+    client._engine.state = ConnectionState.CONNECTED
+    monkeypatch.setattr(type(client._engine.flow), "try_acquire", lambda _self: False)
+
+    receipt = client.publish_nowait("native/reentrant-flow", b"x", qos=1)
+
+    assert receipt.mid is not None
+    assert client.stats().outbound.queued_messages == 1
+    assert client.stats().writer.queued_messages == 0
+    assert client._receipts[receipt.mid] is receipt
+    assert not client._engine.has_pending_effects
+
+
+async def test_publish_nowait_qosn_reentrant_effect_preserves_generic_order(
+    monkeypatch,
+) -> None:
+    client = AsyncClient(max_outbound_messages=8)
+    client._engine.state = ConnectionState.CONNECTED
+    original = type(client._engine.outbound).queue_publish
+
+    def queue_after_effect(outbound, *args, **kwargs):
+        outbound._engine._emit(EffectKind.PINGRESP)
+        return original(outbound, *args, **kwargs)
+
+    monkeypatch.setattr(type(client._engine.outbound), "queue_publish", queue_after_effect)
+    receipt = client.publish_nowait("native/reentrant-effect", b"x", qos=1)
+
+    assert receipt.mid is not None
+    assert client._effect_pump.batches == 1
+    assert client._effect_pump.multi_effect_batches == 1
+    assert client.stats().writer.queued_messages == 1
+    assert not client._engine.has_pending_effects
+
+
 async def test_publish_nowait_callback_uses_direct_writer_admission() -> None:
     client = AsyncClient(max_outbound_messages=512)
     client._engine.state = ConnectionState.CONNECTED

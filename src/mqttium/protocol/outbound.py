@@ -471,6 +471,11 @@ class OutboundSession:
             topic_bytes=topic_bytes,
         )
 
+    def restore_direct_wire(self, wire: WriteItem) -> None:
+        """Return a refused direct handoff to the engine's ordered effects."""
+
+        self._engine._send(wire)
+
     def queue_publish(
         self,
         topic: str,
@@ -479,6 +484,7 @@ class OutboundSession:
         qos: QoS | int = QoS.AT_MOST_ONCE,
         retain: bool = False,
         properties: Properties | None = None,
+        _direct_wires: list[WriteItem] | None = None,
     ) -> PublishHandle:
         if self._engine.state is ConnectionState.DISCONNECTING:
             raise NotConnectedError("publish is not allowed while disconnecting")
@@ -551,13 +557,18 @@ class OutboundSession:
             # `_try_launch` owns the slot compensation if encoding/persistence
             # raises, while the outer rollback restores the remaining admission
             # bookkeeping.
-            if self._engine.state == ConnectionState.CONNECTED and self._try_launch(
-                msg,
-                _property_bytes=property_bytes,
-                _topic_bytes=topic_bytes,
-                _wire_topic=topic,
-            ):
-                return PublishHandle(mid=mid, qos=qos)
+            if self._engine.state == ConnectionState.CONNECTED:
+                wire = self._try_launch(
+                    msg,
+                    _property_bytes=property_bytes,
+                    _topic_bytes=topic_bytes,
+                    _wire_topic=topic,
+                    _emit_send=_direct_wires is None,
+                )
+                if wire is not None:
+                    if _direct_wires is not None:
+                        _direct_wires.append(wire)
+                    return PublishHandle(mid=mid, qos=qos)
 
             self.store.put_out(msg)
             self._queued.append(msg)
@@ -805,7 +816,8 @@ class OutboundSession:
         _property_bytes: bytes | None = None,
         _topic_bytes: bytes | None = None,
         _wire_topic: str | None = None,
-    ) -> None:
+        _emit_send: bool = True,
+    ) -> WriteItem:
         wire_topic = msg.topic if _wire_topic is None else _wire_topic
         wire = msg.encoded_publish
         if wire is None:
@@ -862,10 +874,12 @@ class OutboundSession:
             msg.state = target_state
             msg.encoded_publish = retained
             self.store.put_out(msg)
-        self._engine._send(wire)
+        if _emit_send:
+            self._engine._send(wire)
         properties = msg.properties
         if properties is not None and properties.get("topic_alias") is not None:
             self.commit_topic_alias(wire_topic, properties)
+        return wire
 
     def _try_launch(
         self,
@@ -874,20 +888,22 @@ class OutboundSession:
         _property_bytes: bytes | None = None,
         _topic_bytes: bytes | None = None,
         _wire_topic: str | None = None,
-    ) -> bool:
+        _emit_send: bool = True,
+    ) -> WriteItem | None:
         if not self.flow.try_acquire():
-            return False
+            return None
         try:
-            self._launch(
+            wire = self._launch(
                 msg,
                 _property_bytes=_property_bytes,
                 _topic_bytes=_topic_bytes,
                 _wire_topic=_wire_topic,
+                _emit_send=_emit_send,
             )
         except Exception:
             self.flow.release()
             raise
-        return True
+        return wire
 
     def _retransmit(self, msg: OutboundMessage) -> None:
         if msg.state in (

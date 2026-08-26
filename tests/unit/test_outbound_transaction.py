@@ -285,6 +285,28 @@ def test_commit_accounts_exactly_once_per_message(tmp_path: Path) -> None:
         assert sorted(msg.mid for msg in engine.store.out_items()) == [1, 2, 3, 4, 5]
 
 
+def test_direct_wire_handoff_keeps_the_engine_transaction_authoritative(tmp_path: Path) -> None:
+    for engine in _stores(tmp_path):
+        wires: list[Any] = []
+
+        handle = engine.outbound.queue_publish(
+            "direct/qos1",
+            b"payload",
+            qos=QoS.AT_LEAST_ONCE,
+            _direct_wires=wires,
+        )
+
+        assert handle.mid == 1
+        assert len(wires) == 1
+        assert engine.take_effects() == []
+        assert engine.flow.inflight == 1
+        assert engine.pending_outbound_messages == 1
+        assert engine.packet_ids._used == {1}
+        stored = engine.store.get_out(1)
+        assert stored is not None
+        assert stored.state is OutboundQoSState.WAIT_PUBACK
+
+
 def test_qos0_in_a_batch_acquires_nothing(tmp_path: Path) -> None:
     for engine in _stores(tmp_path):
         before = _snapshot(engine)

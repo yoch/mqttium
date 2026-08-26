@@ -304,6 +304,37 @@ def _native_publish(scenario: str) -> ScenarioMeasurement:
     return asyncio.run(run())
 
 
+def _native_publish_qos1(_scenario: str) -> ScenarioMeasurement:
+    """Measure synchronous QoS 1 admission before acknowledgements arrive."""
+
+    from mqttium.api.async_client import AsyncClient
+    from mqttium.enums import ConnectionState
+
+    client = AsyncClient(
+        client_id="paired-native-publish-qos1",
+        max_pending_outbound_messages=None,
+        max_pending_outbound_bytes=None,
+    )
+    _install_discard_writer(client)
+    client._engine.state = ConnectionState.CONNECTED
+    # This isolated cell bypasses CONNACK, which normally installs the broker's
+    # outbound Receive Maximum. Keep every measured admission launchable.
+    client._engine.flow.limit = 65_535
+
+    async def run() -> ScenarioMeasurement:
+        warmup = 1_000
+        operations = 20_000
+        started = 0.0
+        for index in range(warmup + operations):
+            if index == warmup:
+                started = time.perf_counter()
+            client.publish_nowait(TOPIC, b"x", qos=1)
+        elapsed = time.perf_counter() - started
+        return ScenarioMeasurement(elapsed, operations, operations / elapsed)
+
+    return asyncio.run(run())
+
+
 def _compat_qos1(_scenario: str) -> ScenarioMeasurement:
     from mqttium.compat.paho import CallbackAPIVersion, Client
     from mqttium.enums import ConnectionState
@@ -585,6 +616,7 @@ REGISTRY: dict[str, Callable[[str], ScenarioMeasurement]] = {
     "async_publish_nowait_qos0": _native_publish,
     "native_publish_nowait_qos0": _native_publish,
     "native_publish_nowait_qos0_callback": _native_publish,
+    "native_publish_nowait_qos1": _native_publish_qos1,
     "compat_publish_qos1": _compat_qos1,
     "compat_publish_qos0_batch": _compat_qos0,
     "effect_send_inline": _effects,

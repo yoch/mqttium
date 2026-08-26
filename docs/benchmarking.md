@@ -9,7 +9,9 @@ be committed.
 - `hotpath_profile.py` counts calls, primitive calls, and allocations. These
   exact measurements are the first place to look for redundant work.
 - `paired_regression.py` compares isolated implementation paths in fresh
-  processes and alternating order.
+  processes and alternating order. Its `native_publish_nowait_qos1` cell
+  isolates synchronous QoS 1 admission with enough flow window to keep every
+  measured operation in the immediately-launchable regime.
 - `paired_network.py` records advisory closed-loop QoS 1 capacity and PUBACK
   latency. It is not a release gate because its raw-arm A/A stability is not
   reliable enough to use its legacy CV rule as a general release decision.

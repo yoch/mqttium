@@ -702,6 +702,81 @@ class AsyncClient:
             self._enqueue_callback_repeated_nowait(callback, (None, None), 1)
         return PublishReceipt(mid=None, qos=QoS.AT_MOST_ONCE)
 
+    def _try_direct_qosn_publish_nowait(
+        self,
+        topic: str,
+        payload: bytes,
+        *,
+        qos: QoS | int,
+        retain: bool,
+        properties: Properties | None,
+    ) -> PublishReceipt | None:
+        """Commit one immediately launchable QoS 1/2 publish without the pump.
+
+        OutboundSession still performs the complete admission transaction and
+        produces the wire item. This shortcut registers the receipt before
+        handing that item to the checked writer admission API. Any queued/replay,
+        alias, disconnected, flow-control, or pending-effect state stays on the
+        generic engine/effect path.
+        """
+
+        if qos not in (QoS.AT_LEAST_ONCE, QoS.EXACTLY_ONCE):
+            return None
+        engine = self._engine
+        outbound = engine.outbound
+        if (
+            engine.state is not ConnectionState.CONNECTED
+            or outbound.flow.available <= 0
+            or self._effect_pump.pending
+            or engine.has_pending_effects
+            or (properties is not None and properties.get("topic_alias") is not None)
+        ):
+            return None
+
+        # Refuse before acquiring the outbound budget, MID, durable row, or flow
+        # slot. Writer admission checks again at commit: retaining the pump's
+        # boundedness is more important than speculating that no synchronous
+        # store or signal hook could have re-entered between the two operations.
+        write_pump = self._write_pump
+        if write_pump.resident_messages or write_pump.queued_bytes:
+            size = outbound.publish_wire_size(topic, len(payload), qos, properties)
+            if not write_pump.can_enqueue_size(size):
+                raise FlowControlError(write_pump.refusal(size))
+        wires: list[WriteItem] = []
+        handle = outbound.queue_publish(
+            topic,
+            payload,
+            qos=qos,
+            retain=retain,
+            properties=properties,
+            _direct_wires=wires,
+        )
+        assert handle.mid is not None
+        receipt = PublishReceipt(mid=handle.mid, qos=handle.qos)
+        _fifo_register(self._receipts, handle.mid, receipt)
+        if not wires:
+            # A synchronous reentrant hook exhausted the flow window after the
+            # readiness check. OutboundSession authoritatively parked the record;
+            # there is no SEND effect to bypass or restore.
+            return receipt
+        if len(wires) != 1:
+            raise AssertionError("direct QoS publish produced multiple wire items")
+        if self._effect_pump.pending or engine.has_pending_effects:
+            # Preserve an effect that appeared synchronously after the readiness
+            # snapshot. Appending this SEND after it keeps the engine's order.
+            outbound.restore_direct_wire(wires[0])
+            self._finalize_loop_commands()
+            return receipt
+        # Receipt registration is deliberately before this call: an eager
+        # transport write may make an ACK readable at the next loop turn.
+        if not self._try_enqueue_outbound(wires[0], epoch=self._connection_epoch):
+            # A synchronous reentrant hook can invalidate the exact preview.
+            # Restore the ordinary SEND effect instead of over-admitting the
+            # bounded writer; the generic pump now owns progress, as before.
+            outbound.restore_direct_wire(wires[0])
+            self._finalize_loop_commands()
+        return receipt
+
     def _try_direct_qos0_many(
         self,
         requests: list[tuple[str, bytes, QoS | int, bool, Properties | None]],
@@ -1202,6 +1277,15 @@ class AsyncClient:
             retain=retain,
             properties=properties,
             nowait=True,
+        )
+        if direct is not None:
+            return direct
+        direct = self._try_direct_qosn_publish_nowait(
+            topic,
+            data,
+            qos=qos,
+            retain=retain,
+            properties=properties,
         )
         if direct is not None:
             return direct

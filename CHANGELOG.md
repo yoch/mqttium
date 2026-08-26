@@ -6,6 +6,13 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Changed
+
+- Let immediately launchable QoS 1/2 `publish_nowait()` calls hand their sole
+  engine-produced wire item directly to the write pump after receipt
+  registration. Queued, replay, Topic Alias, disconnected, flow-limited, and
+  pending-effect cases retain the generic bounded effect pipeline.
+
 ## [1.0.0rc10] - 2026-08-26
 
 ### Removed

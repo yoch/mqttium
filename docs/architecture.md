@@ -229,6 +229,14 @@ where required.
 `asyncio.Queue.put_nowait()`. It shares native admission and receipt creation
 without pretending to be thread-safe.
 
+When a QoS 1/2 publication can launch immediately and both effect owners are
+empty, the outbound session may return its sole encoded wire item directly to
+the runtime adapter. The session still owns validation, budget reservation,
+packet-ID allocation, persistence, flow-slot acquisition, and rollback. The
+client registers the receipt before committing the same-turn writer admission.
+Queued/replay state, Topic Aliases, connection transitions, exhausted flow, and
+pending effects always use the ordinary engine/effect pipeline.
+
 The Paho façade owns a bounded cross-thread ingress queue and commits work on the
 client loop. It never mutates the protocol engine, receipt registry, or effect
 pump directly. Compatibility stops where historical behaviour would violate
