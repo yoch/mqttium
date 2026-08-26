@@ -304,6 +304,56 @@ def _native_publish(scenario: str) -> ScenarioMeasurement:
     return asyncio.run(run())
 
 
+def _native_publish_fixed_costs(_scenario: str) -> ScenarioMeasurement:
+    """Measure the synchronous wrapper without protocol or writer work."""
+    from mqttium.api.async_client import AsyncClient
+    from mqttium.api.models import PublishReceipt
+    from mqttium.enums import ConnectionState, QoS
+
+    client = AsyncClient(client_id="paired-native-fixed-costs")
+    client._engine.state = ConnectionState.CONNECTED
+
+    async def run() -> ScenarioMeasurement:
+        client._owner_loop = asyncio.get_running_loop()
+        client._try_direct_qos0_publish = lambda *_args, **_kwargs: None
+        client._queue_publish_on_loop = lambda *_args, **_kwargs: PublishReceipt(
+            mid=1, qos=QoS.AT_LEAST_ONCE
+        )
+        client._finalize_loop_commands = lambda: None
+        return _measure(
+            lambda: client.publish_nowait(TOPIC, b"x", qos=1),
+            operations=500_000,
+            warmup=10_000,
+        )
+
+    return asyncio.run(run())
+
+
+def _nowait_empty_writer_capacity(_scenario: str) -> ScenarioMeasurement:
+    """Isolate the no-preview capacity check used by the common idle writer."""
+    import inspect
+
+    from mqttium.api.async_client import AsyncClient
+    from mqttium.enums import ConnectionState
+
+    client = AsyncClient(client_id="paired-nowait-capacity")
+    client._engine.state = ConnectionState.CONNECTED
+    check = client._check_nowait_publish_capacity
+    # The candidate removes the unused retain argument. Select the source
+    # signature before timing so one benchmark works against both revisions.
+    if len(inspect.signature(check).parameters) == 5:
+
+        def run_check() -> None:
+            check(TOPIC, b"x", 1, False, None)
+
+    else:
+
+        def run_check() -> None:
+            check(TOPIC, b"x", 1, None)
+
+    return _measure(run_check, operations=1_000_000, warmup=20_000)
+
+
 def _compat_qos1(_scenario: str) -> ScenarioMeasurement:
     from mqttium.compat.paho import CallbackAPIVersion, Client
     from mqttium.enums import ConnectionState
@@ -495,15 +545,21 @@ def _websocket_mask(_scenario: str) -> ScenarioMeasurement:
     return _measure(lambda: _mask_payload(payload, b"abcd"), operations=20_000, warmup=500)
 
 
-def _receipt(_scenario: str) -> ScenarioMeasurement:
+def _receipt(scenario: str) -> ScenarioMeasurement:
     from mqttium.api.models import PublishReceipt
     from mqttium.enums import QoS
 
-    return _measure(
-        lambda: PublishReceipt(mid=1, qos=QoS.AT_LEAST_ONCE)._settle(),
-        operations=200_000,
-        warmup=3_000,
-    )
+    def allocate() -> PublishReceipt:
+        return PublishReceipt(mid=1, qos=QoS.AT_LEAST_ONCE)
+
+    operation: Callable[[], object] = allocate
+    if scenario == "receipt_settle_unawaited":
+
+        def settle() -> None:
+            PublishReceipt(mid=1, qos=QoS.AT_LEAST_ONCE)._settle()
+
+        operation = settle
+    return _measure(operation, operations=500_000, warmup=10_000)
 
 
 def _publish_completion(scenario: str) -> ScenarioMeasurement:
@@ -585,6 +641,8 @@ REGISTRY: dict[str, Callable[[str], ScenarioMeasurement]] = {
     "async_publish_nowait_qos0": _native_publish,
     "native_publish_nowait_qos0": _native_publish,
     "native_publish_nowait_qos0_callback": _native_publish,
+    "native_publish_nowait_fixed_costs": _native_publish_fixed_costs,
+    "nowait_empty_writer_capacity": _nowait_empty_writer_capacity,
     "compat_publish_qos1": _compat_qos1,
     "compat_publish_qos0_batch": _compat_qos0,
     "effect_send_inline": _effects,
@@ -596,6 +654,7 @@ REGISTRY: dict[str, Callable[[str], ScenarioMeasurement]] = {
     "delivery_both": _delivery,
     "effect_single_message_callback": _single_message_effect,
     "websocket_mask_4k": _websocket_mask,
+    "receipt_allocate": _receipt,
     "receipt_settle_unawaited": _receipt,
     "publish_complete_receipt": _publish_completion,
     "publish_complete_callback": _publish_completion,

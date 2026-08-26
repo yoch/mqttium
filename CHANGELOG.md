@@ -6,6 +6,12 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Changed
+
+- Avoid converting and validating publish QoS twice in the common
+  `publish_nowait()` path where the writer is empty. Protocol admission remains
+  authoritative, and a loaded writer still previews the exact encoded size.
+
 ## [1.0.0rc10] - 2026-08-26
 
 ### Removed

@@ -1205,7 +1205,7 @@ class AsyncClient:
         )
         if direct is not None:
             return direct
-        self._check_nowait_publish_capacity(topic, data, qos, retain, properties)
+        self._check_nowait_publish_capacity(topic, data, qos, properties)
         receipt = self._queue_publish_on_loop(
             topic,
             data,
@@ -1266,7 +1266,7 @@ class AsyncClient:
                     if direct is not None:
                         return direct
                     if nowait:
-                        self._check_nowait_publish_capacity(topic, data, qos, retain, properties)
+                        self._check_nowait_publish_capacity(topic, data, qos, properties)
                     # Keep the native async hot path inline. Routing these
                     # operations through the adapter boundary measured 2.36% slower.
                     handle = self._engine.outbound.queue_publish(
@@ -1946,12 +1946,10 @@ class AsyncClient:
         topic: str,
         payload: bytes,
         qos: QoS | int,
-        retain: bool,
         properties: Properties | None,
     ) -> None:
-        level = QoS(qos)
         will_send = self._engine.state == ConnectionState.CONNECTED and (
-            level == QoS.AT_MOST_ONCE or self._engine.flow.available > 0
+            qos == QoS.AT_MOST_ONCE or self._engine.flow.available > 0
         )
         if not will_send:
             return
@@ -1963,7 +1961,11 @@ class AsyncClient:
         # writer batch has already left the queue but still occupies the bound.
         if not self._write_pump.resident_messages and not self._write_pump.queued_bytes:
             return
-        size = self._preview_publish_size(topic, payload, level, properties)
+        # Leave QoS conversion and validation to publish_wire_size when sizing
+        # is actually necessary. The ordinary empty-writer path is immediately
+        # followed by protocol admission, which performs the authoritative
+        # conversion; doing it here too was a fixed per-call cost.
+        size = self._preview_publish_size(topic, payload, qos, properties)
         if not self._can_enqueue_outbound_size(size):
             raise FlowControlError(self._write_pump.refusal(size))
 
