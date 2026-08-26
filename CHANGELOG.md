@@ -6,6 +6,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [1.0.0rc10] - 2026-08-26
+
 ### Removed
 
 - `IncrementalDecoder.process_packets_bounded` (Provisional). The client's
@@ -93,6 +95,12 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   watchdog and connection timeout. Strict CI defaults remain unchanged, while
   low-priority campaigns on shared runners can avoid classifying OS
   descheduling as MQTTium liveness failures.
+- Screen open-loop loop-lag confirmation candidates with relative and additive
+  confidence bounds, so sub-millisecond point-ratio noise cannot exhaust the
+  bounded confirmation budget, and allow the superseded overflow result to be
+  reevaluated reproducibly from its retained ABBA pairs without overwriting the
+  original artifact. Expected local release-gate failures now exit with concise
+  log and manifest paths instead of a Python traceback.
 - Keep unsupported inbound AUTH handling and its protocol DISCONNECT in the
   protocol engine; the asyncio runtime no longer carries a second DISCONNECT
   construction path.
@@ -925,7 +933,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - Pre-spin-out comparative analysis and generated coverage data from the
   published source tree.
 
-[Unreleased]: https://github.com/yoch/mqttium/compare/v1.0.0rc9...HEAD
+[Unreleased]: https://github.com/yoch/mqttium/compare/v1.0.0rc10...HEAD
+[1.0.0rc10]: https://github.com/yoch/mqttium/compare/v1.0.0rc9...v1.0.0rc10
 [1.0.0rc9]: https://github.com/yoch/mqttium/compare/v1.0.0rc8...v1.0.0rc9
 [1.0.0rc8]: https://github.com/yoch/mqttium/compare/v1.0.0rc7...v1.0.0rc8
 [1.0.0rc7]: https://github.com/yoch/mqttium/compare/v1.0.0rc6...v1.0.0rc7

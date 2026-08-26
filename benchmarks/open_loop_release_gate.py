@@ -13,9 +13,11 @@ the same target rate.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import os
+import re
 import statistics
 import subprocess
 import sys
@@ -571,6 +573,80 @@ def confirmed_loop_regression(
     return confirmed, noise_floor
 
 
+def loop_requires_confirmation(
+    ab_pairs: list[dict[str, Any]], *, max_loop_lag_ratio: float
+) -> bool:
+    """Screen for a directional loop-lag signal before spending confirmation work."""
+    estimate = metrics(ab_pairs)
+    return (
+        estimate.loop_lag_ratio.geometric_mean > max_loop_lag_ratio
+        and estimate.loop_lag_ratio.lower_95 > 1.0
+        and estimate.loop_lag_delta.lower_95_ms > 0.0
+    )
+
+
+def reevaluate_confirmation_overflow(payload: dict[str, Any]) -> dict[str, Any]:
+    """Reapply the corrected screen to retained initial ABBA evidence only."""
+    invalidations = payload.get("invalidations")
+    if (
+        payload.get("status") != "invalid"
+        or payload.get("policy") != "strict"
+        or payload.get("failures")
+        or not isinstance(invalidations, list)
+        or len(invalidations) != 1
+        or re.fullmatch(r"\d+ cells require confirmation; bounded maximum is \d+", invalidations[0])
+        is None
+    ):
+        raise ValueError("only a strict confirmation-budget overflow can be reevaluated")
+
+    thresholds = payload.get("thresholds")
+    if not isinstance(thresholds, dict):
+        raise ValueError("retained evidence has no threshold record")
+    min_completed_ratio = float(thresholds["min_completed_ratio"])
+    max_loop_lag_ratio = float(thresholds["max_loop_lag_ratio"])
+    scenarios = payload.get("scenarios")
+    if not isinstance(scenarios, list) or not scenarios:
+        raise ValueError("retained evidence has no scenarios")
+
+    result = copy.deepcopy(payload)
+    suspects: list[dict[str, Any]] = []
+    for record in result["scenarios"]:
+        if record.get("confirmation") is not None:
+            raise ValueError("reevaluation requires untouched initial scenarios")
+        pairs = record.get("initial_pairs")
+        if not isinstance(pairs, list):
+            raise ValueError("reevaluation requires retained initial ABBA pairs")
+        estimate = metrics(pairs)
+        record["initial_metrics"] = _metrics_dict(estimate)
+        record["final_metrics"] = _metrics_dict(estimate)
+        record["throughput_suspect"] = estimate.throughput_median < min_completed_ratio
+        record["loop_suspect"] = loop_requires_confirmation(
+            pairs, max_loop_lag_ratio=max_loop_lag_ratio
+        )
+        if record["throughput_suspect"] or record["loop_suspect"]:
+            suspects.append(record)
+
+    result["reevaluation"] = {
+        "original_status": payload["status"],
+        "original_invalidations": list(invalidations),
+        "acquisition": "none; retained initial ABBA pairs only",
+        "policy_change": (
+            "loop confirmation screening now requires the relative threshold "
+            "and positive relative/additive 95% lower bounds"
+        ),
+    }
+    result["failures"] = []
+    if suspects:
+        result["status"] = "invalid"
+        result["invalidations"] = [
+            f"{len(suspects)} cells still require fresh confirmation under the corrected screen"
+        ]
+    else:
+        result["status"] = "passed"
+        result["invalidations"] = []
+    return result
+
+
 def _load_label(point: LoadPoint) -> str:
     if point.mode == "baseline_capacity_fraction":
         return f"load={point.value:.2f}"
@@ -630,7 +706,9 @@ def _initial_record(
         "confirmation": None,
         "final_metrics": _metrics_dict(initial),
         "throughput_suspect": initial.throughput_median < args.min_completed_ratio,
-        "loop_suspect": initial.loop_lag_median_ratio > args.max_loop_lag_ratio,
+        "loop_suspect": loop_requires_confirmation(
+            pairs, max_loop_lag_ratio=args.max_loop_lag_ratio
+        ),
     }
     print(
         f"{record['label']}: throughput={initial.throughput_median:.4f} "
@@ -883,6 +961,16 @@ def _write_result(output: Path, payload: dict[str, Any]) -> None:
     output.with_suffix(".md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _report_decision(result: dict[str, Any]) -> None:
+    status = result["status"]
+    if status == "passed":
+        return
+    reasons = result.get("invalidations", []) or result.get("failures", [])
+    print(f"open-loop release gate {status}", file=sys.stderr)
+    for reason in reasons:
+        print(f"- {reason}", file=sys.stderr)
+
+
 def _result_template(
     args: argparse.Namespace,
     *,
@@ -909,6 +997,10 @@ def _result_template(
             "min_completed_ratio": args.min_completed_ratio,
             "max_loop_lag_ratio": args.max_loop_lag_ratio,
             "control_max_throughput_deviation": args.control_max_throughput_deviation,
+            "loop_confirmation_screen": (
+                "geometric mean above ratio threshold with relative and additive "
+                "95% lower bounds above zero effect"
+            ),
             "loop_absolute_materiality": "same-code A/A additive noise envelope",
             "loop_confidence": 0.95,
         },
@@ -968,6 +1060,7 @@ def parent(args: argparse.Namespace) -> int:
         result["status"] = "invalid"
         result["invalidations"] = ["strict open-loop release evidence requires --cpu pinning"]
         _write_result(args.output, result)
+        _report_decision(result)
         return 2
 
     try:
@@ -1002,12 +1095,13 @@ def parent(args: argparse.Namespace) -> int:
             raw_dir=raw_dir,
         )
         _write_result(args.output, result)
+        _report_decision(result)
         return exit_code if args.policy == "strict" else 0
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
         result["status"] = "invalid"
         result["invalidations"] = [str(exc)]
         _write_result(args.output, result)
-        print(f"open-loop release gate invalid: {exc}", file=sys.stderr)
+        _report_decision(result)
         return 2 if args.policy == "strict" else 0
 
 

@@ -94,3 +94,23 @@ def test_parse_args_requires_cpu_for_performance_profiles(monkeypatch: Any) -> N
         local_release.parse_args()
 
     assert exc_info.value.code == 2
+
+
+def test_failed_gate_retains_log_and_raises_a_release_failure(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    local_release = _local_release(monkeypatch)
+    recorder = local_release.Recorder(tmp_path, "performance")
+
+    with pytest.raises(local_release.ReleaseGateFailed) as exc_info:
+        recorder.run(
+            "example-gate",
+            [sys.executable, "-c", "print('gate reason'); raise SystemExit(2)"],
+        )
+
+    failure = exc_info.value
+    assert failure.name == "example-gate"
+    assert failure.returncode == 2
+    assert failure.log == tmp_path / "00-example-gate.log"
+    assert failure.manifest == tmp_path / "manifest.json"
+    assert failure.log.read_text(encoding="utf-8") == "gate reason\n"
