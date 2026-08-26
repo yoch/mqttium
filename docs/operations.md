@@ -61,10 +61,11 @@ publication budget is full. Configure its request and byte limits separately.
 ### QoS 0 completion is writer admission
 
 MQTT has no broker acknowledgement for QoS 0. MQTTium therefore completes the
-`PublishReceipt` and schedules `on_publish` after the encoded packet has been
-admitted to the writer queue. This boundary does **not** mean that the transport
-has written the bytes, that the socket send buffer has drained, or that the
-broker has received the publication.
+`PublishReceipt` and dispatches `on_publish` after the encoded packet has been
+admitted to the writer queue. An idle synchronous callback may run inline;
+otherwise dispatch uses the bounded callback worker. This boundary does **not**
+mean that the transport has written the bytes, that the socket send buffer has
+drained, or that the broker has received the publication.
 
 Consequently, an `on_publish` counter is not a socket-level outstanding-byte
 limit for QoS 0: incrementing before `publish_nowait()` and decrementing in the

@@ -9,8 +9,10 @@ after this controller has accepted them.
 from __future__ import annotations
 
 import asyncio
+import inspect
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable
+from types import FunctionType, MethodType
 from typing import Any, Literal, cast
 
 from mqttium.api.stats import DeliveryStats
@@ -141,6 +143,11 @@ class ApplicationDelivery:
         self.closed = asyncio.Event()
         self._stream_generation = 0
         self.callback_task: asyncio.Task[None] | None = None
+        # True while either the worker or the opportunistic reader/effect path
+        # is executing user code. It is also the reentrancy guard: a callback
+        # that publishes or causes another delivery always falls back to the
+        # bounded queue instead of nesting user callbacks.
+        self._callback_active = False
         self._callback_stop = False
         self.delivery_timeout = delivery_timeout
         self.callback_shutdown_timeout = callback_shutdown_timeout
@@ -618,15 +625,23 @@ class ApplicationDelivery:
                 break
             if iterator_delivery and self.messages_queue.full():
                 break
-            if callback_delivery and self.callback_queue.full():
+            dispatch_inline = cb is not None and self.can_dispatch_callback_inline(cb)
+            if cb is not None and not dispatch_inline and self.callback_queue.full():
                 break
             if iterator_delivery:
                 self.messages_queue.put_nowait(message)
             if cb is not None:
-                if not callback_worker_ready:
-                    self.ensure_callback_worker()
-                    callback_worker_ready = True
-                self.callback_queue.put_nowait((cb, (message,), None))
+                # The idle synchronous case stays in the reader/effect-drain
+                # turn. A callback that causes another delivery trips
+                # `_callback_active`; that nested work and any queued burst
+                # retain the bounded worker semantics.
+                if dispatch_inline:
+                    self.dispatch_callback_inline(cb, message)
+                else:
+                    if not callback_worker_ready:
+                        self.ensure_callback_worker()
+                        callback_worker_ready = True
+                    self.callback_queue.put_nowait((cb, (message,), None))
             applied += 1
         if applied and iterator_delivery:
             self.message_ready.set()
@@ -784,6 +799,53 @@ class ApplicationDelivery:
             return False
         return True
 
+    @staticmethod
+    def _is_async_callback(callback: Callable[..., Any]) -> bool:
+        """Recognise coroutine functions, including async callable objects."""
+        if isinstance(callback, (FunctionType, MethodType)):
+            return bool(callback.__code__.co_flags & inspect.CO_COROUTINE)
+        return inspect.iscoroutinefunction(callback) or inspect.iscoroutinefunction(
+            type(callback).__call__
+        )
+
+    def can_dispatch_callback_inline(self, callback: Callable[..., Any]) -> bool:
+        """Whether a plain synchronous callback can run without a queue hop."""
+        return (
+            not self._callback_active
+            and self.callback_queue.empty()
+            and not self._is_async_callback(callback)
+        )
+
+    def try_dispatch_callback_inline(self, callback: Callable[..., Any], *args: Any) -> bool:
+        """Run one idle synchronous callback now, isolating application errors.
+
+        A nominally synchronous callable is still allowed by the public
+        contract to return an awaitable. In that uncommon case its already
+        created awaitable is handed to the bounded worker without invoking the
+        callback twice.
+        """
+        if not self.can_dispatch_callback_inline(callback):
+            return False
+        self.dispatch_callback_inline(callback, *args)
+        return True
+
+    def dispatch_callback_inline(self, callback: Callable[..., Any], *args: Any) -> None:
+        """Invoke a callback after the caller established inline eligibility."""
+        self._callback_active = True
+        try:
+            try:
+                result = callback(*args)
+            except asyncio.CancelledError as exc:
+                self._propagate_callback_cancellation(callback, exc)
+            except Exception as exc:
+                self.report_callback_error(callback, exc)
+            else:
+                if inspect.isawaitable(result):
+                    self.ensure_callback_worker()
+                    self.callback_queue.put_nowait((lambda: result, (), None))
+        finally:
+            self._callback_active = False
+
     def has_callback_capacity(self, count: int = 1) -> bool:
         """Whether ``count`` callbacks can be admitted without suspending."""
         maximum = self.callback_queue.maxsize
@@ -852,6 +914,7 @@ class ApplicationDelivery:
     async def _callback_worker(self) -> None:
         while not self._callback_stop:
             callback, args, token = await self.callback_queue.get()
+            self._callback_active = True
             try:
                 if token is _CALLBACK_MESSAGE_BATCH:
                     messages = args[0]
@@ -876,6 +939,7 @@ class ApplicationDelivery:
                     if token is not None:
                         self.release_nowait(cast(AccountedDeliveryToken, token))
             finally:
+                self._callback_active = False
                 self.callback_queue.task_done()
         self._discard_callback_queue()
 
