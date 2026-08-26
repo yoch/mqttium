@@ -43,8 +43,13 @@ class _CallbackMessageBatchToken:
     __slots__ = ()
 
 
+class _CallbackArgsBatchToken:
+    __slots__ = ()
+
+
 _CALLBACK_MESSAGE_BATCH = _CallbackMessageBatchToken()
-CallbackQueueToken = DeliveryToken | _CallbackMessageBatchToken
+_CALLBACK_ARGS_BATCH = _CallbackArgsBatchToken()
+CallbackQueueToken = DeliveryToken | _CallbackMessageBatchToken | _CallbackArgsBatchToken
 CallbackJob = tuple[Callable[..., Any], tuple[Any, ...], CallbackQueueToken]
 TrackedIteratorMessage = tuple[Message, AccountedDeliveryToken]
 IteratorQueueItem = Message | TrackedIteratorMessage
@@ -867,6 +872,26 @@ class ApplicationDelivery:
         for _ in range(count):
             self.callback_queue.put_nowait((callback, args, None))
 
+    def enqueue_callback_batch_nowait(
+        self,
+        callback: Callable[..., Any],
+        args_batch: list[tuple[Any, ...]],
+    ) -> None:
+        """Enqueue distinct argument tuples as one bounded physical job.
+
+        The queue bound remains logical: capacity for every callback is
+        preflighted and reserved even though only one worker wakeup is needed.
+        """
+        count = len(args_batch)
+        if count < 2:
+            raise RuntimeError("callback argument batch requires at least two jobs")
+        if not self.has_callback_capacity(count):
+            raise RuntimeError("callback batch exceeds preflighted capacity")
+        self.ensure_callback_worker()
+        job: Any = (callback, (args_batch,), _CALLBACK_ARGS_BATCH)
+        self.callback_queue.put_nowait(job)
+        self._reserve_callback_batch(count)
+
     async def enqueue_callback(
         self,
         callback: Callable[..., Any],
@@ -910,6 +935,8 @@ class ApplicationDelivery:
                 break
             if token is _CALLBACK_MESSAGE_BATCH:
                 self._release_callback_batch(len(args[0]))
+            elif token is _CALLBACK_ARGS_BATCH:
+                self._release_callback_batch(len(args[0]))
             elif token is not None:
                 self.release_nowait(cast(AccountedDeliveryToken, token))
             self.callback_queue.task_done()
@@ -931,6 +958,19 @@ class ApplicationDelivery:
                                 self.report_callback_error(callback, exc)
                     finally:
                         self._release_callback_batch(len(messages))
+                    continue
+                if token is _CALLBACK_ARGS_BATCH:
+                    args_batch = args[0]
+                    try:
+                        for callback_args in args_batch:
+                            try:
+                                await self.invoke(callback, *callback_args)
+                            except asyncio.CancelledError as exc:
+                                self._propagate_callback_cancellation(callback, exc)
+                            except Exception as exc:
+                                self.report_callback_error(callback, exc)
+                    finally:
+                        self._release_callback_batch(len(args_batch))
                     continue
                 try:
                     await self.invoke(callback, *args)

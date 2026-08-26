@@ -386,6 +386,7 @@ class AsyncClient:
         self._can_dispatch_callback_inline = self._delivery.can_dispatch_callback_inline
         self._has_callback_capacity = self._delivery.has_callback_capacity
         self._enqueue_callback_repeated_nowait = self._delivery.enqueue_callback_repeated_nowait
+        self._enqueue_callback_batch_nowait = self._delivery.enqueue_callback_batch_nowait
         self._enqueue_callback = self._delivery.enqueue_callback
         self._report_callback_error = self._delivery.report_callback_error
         self._shutdown_callback_worker = self._delivery.shutdown_callbacks
@@ -2193,6 +2194,32 @@ class AsyncClient:
         if epoch != self._connection_epoch or self._engine_lock.locked():
             return 0
         return self._delivery.deliver_message_batch_inline(effects, self.on_message)
+
+    def _apply_terminal_effect_batch_inline(
+        self,
+        effects: deque[EngineEffect],
+        epoch: int,
+    ) -> int:
+        """Settle a consecutive publish-result prefix in one ordered pass."""
+        if epoch != self._connection_epoch or len(effects) < 2:
+            return 0
+        callback = self.on_publish
+        outcomes: list[tuple[int | None, BaseException | None]] = []
+        for effect in effects:
+            kind = effect.kind
+            if kind is not EffectKind.PUBLISH_COMPLETE and kind is not EffectKind.PUBLISH_FAILED:
+                break
+            outcomes.append(_terminal_publish_result(effect))
+        count = len(outcomes)
+        if count < 2:
+            return 0
+        if callback is not None:
+            if not self._has_callback_capacity(count):
+                return 0
+            self._enqueue_callback_batch_nowait(callback, outcomes)
+        for mid, reason in outcomes:
+            self._settle_publish(mid, reason)
+        return count
 
     async def _flush_effects(self) -> None:
         async with self._engine_lock:

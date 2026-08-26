@@ -16,6 +16,10 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   transport path even when its producer-burst throttle is disarmed. Responses
   still fall back to the bounded FIFO whenever an earlier frame, active batch,
   suspended producer or transport backpressure makes eager admission unsafe.
+- Settle consecutive PUBACK/PUBCOMP completion effects in one ordered
+  `EffectPump` pass. When `on_publish` is installed, the batch occupies its
+  full logical share of the bounded callback queue but needs only one physical
+  worker job and wake-up; saturated queues retain the established slow path.
 
 ## [1.0.0rc10] - 2026-08-26
 

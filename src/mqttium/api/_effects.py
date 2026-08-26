@@ -34,6 +34,10 @@ class EffectOwner(Protocol):
         self, effects: deque[EngineEffect], epoch: int
     ) -> int: ...
 
+    def _apply_terminal_effect_batch_inline(
+        self, effects: deque[EngineEffect], epoch: int
+    ) -> int: ...
+
     async def _apply_effect(
         self,
         effect: EngineEffect,
@@ -182,11 +186,11 @@ class EffectPump:
         apply: Callable[[deque[EngineEffect], int], int],
         epoch: int,
     ) -> bool:
-        """Apply a consecutive non-persisted small-message prefix.
+        """Apply a consecutive effect prefix accepted by the owner.
 
-        `apply` is the owner's MESSAGE or DECODED_MESSAGE batch acceptor; only
-        which one is bound differs between the two kinds. One call per batch,
-        not per message.
+        One owner call covers the whole accepted prefix, then the pump advances
+        its ordered deque and progress counters without interpreting each
+        effect again.
         """
         applied = apply(self.pending, epoch)
         if not applied:
@@ -217,6 +221,9 @@ class EffectPump:
                     if self._consume_batch(self.owner._apply_message_effect_batch_inline, epoch):
                         continue
                     break
+                if kind is EffectKind.PUBLISH_COMPLETE or kind is EffectKind.PUBLISH_FAILED:
+                    if self._consume_batch(self.owner._apply_terminal_effect_batch_inline, epoch):
+                        continue
                 if not self.owner._apply_effect_inline(effect, epoch):
                     break
                 self.pending.popleft()
@@ -250,6 +257,11 @@ class EffectPump:
                     if kind is EffectKind.MESSAGE or kind is EffectKind.DECODED_MESSAGE:
                         if self._consume_batch(
                             self.owner._apply_message_effect_batch_inline, epoch
+                        ):
+                            continue
+                    if kind is EffectKind.PUBLISH_COMPLETE or kind is EffectKind.PUBLISH_FAILED:
+                        if self._consume_batch(
+                            self.owner._apply_terminal_effect_batch_inline, epoch
                         ):
                             continue
                     try:
