@@ -15,8 +15,26 @@ python benchmarks/local_release.py rc --base-ref <approved-baseline>
 The runner writes commands, versions, durations, logs and result artifacts under
 its versioned temporary result directory, manages Mosquitto with guaranteed cleanup, and
 fails if a local quality, performance, memory, artifact, or smoke gate is
-missing. Performance evidence remains local because hosted timing is not stable
-enough for small regressions.
+missing. An expected non-zero gate result exits without a Python traceback and
+prints the retained command log and manifest paths; the gate log contains the
+recorded failure or invalidation reason. Performance evidence remains local
+because hosted timing is not stable enough for small regressions.
+
+An open-loop run invalidated **only** because the old point-ratio screen
+overflowed its bounded confirmation budget may be reevaluated without new
+acquisition after a reviewed screening-policy correction:
+
+```bash
+python benchmarks/reevaluate_open_loop_release_gate.py \
+  --input <retained-original.json> \
+  --output <separate-reevaluated.json>
+```
+
+The reevaluator refuses other failure or invalidation classes, refuses an
+overwritten source artifact, recomputes every scenario from retained initial
+ABBA pairs, and remains invalid if any cell still needs confirmation. Its
+separate artifact records the original invalidation, source-artifact digest,
+evaluator commit, and policy-source digest. Retain both artifacts.
 
 The same profile builds and validates the wheel and sdist, installs the wheel
 without source-tree imports, imports every packaged module and exercises TCP,

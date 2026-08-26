@@ -95,6 +95,12 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   watchdog and connection timeout. Strict CI defaults remain unchanged, while
   low-priority campaigns on shared runners can avoid classifying OS
   descheduling as MQTTium liveness failures.
+- Screen open-loop loop-lag confirmation candidates with relative and additive
+  confidence bounds, so sub-millisecond point-ratio noise cannot exhaust the
+  bounded confirmation budget, and allow the superseded overflow result to be
+  reevaluated reproducibly from its retained ABBA pairs without overwriting the
+  original artifact. Expected local release-gate failures now exit with concise
+  log and manifest paths instead of a Python traceback.
 - Keep unsupported inbound AUTH handling and its protocol DISCONNECT in the
   protocol engine; the asyncio runtime no longer carries a second DISCONNECT
   construction path.

@@ -32,6 +32,24 @@ class CommandResult:
     log: str
 
 
+class ReleaseGateFailed(Exception):
+    """Expected non-zero result from a recorded release gate."""
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        returncode: int,
+        log: Path,
+        manifest: Path,
+    ) -> None:
+        super().__init__(f"{name} exited with status {returncode}")
+        self.name = name
+        self.returncode = returncode
+        self.log = log
+        self.manifest = manifest
+
+
 class Recorder:
     def __init__(self, output: Path, profile: str) -> None:
         self.output = output
@@ -125,8 +143,12 @@ class Recorder:
         )
         self.write_manifest()
         if completed.returncode:
-            print(completed.stdout, file=sys.stderr)
-            raise subprocess.CalledProcessError(completed.returncode, command)
+            raise ReleaseGateFailed(
+                name=name,
+                returncode=completed.returncode,
+                log=self.output / log_name,
+                manifest=self.output / "manifest.json",
+            )
 
 
 def _slug(value: str) -> str:
@@ -731,7 +753,7 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def main() -> None:
+def main() -> int:
     args = parse_args()
     revision = _capture(["git", "rev-parse", "--short", "HEAD"], cwd=ROOT)
     output = args.output_dir or Path("/tmp") / "mqttium-release" / revision / args.profile
@@ -753,9 +775,15 @@ def main() -> None:
                 run_robustness(recorder, port=args.port)
             if args.profile == "rc":
                 run_package(recorder)
+    except ReleaseGateFailed as exc:
+        print(f"local release gate failed: {exc}", file=sys.stderr)
+        print(f"log: {exc.log}", file=sys.stderr)
+        print(f"manifest: {exc.manifest}", file=sys.stderr)
+        return exc.returncode or 1
     finally:
         recorder.write_manifest()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

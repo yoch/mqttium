@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib
+import json
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -141,6 +143,167 @@ def test_loop_regression_requires_relative_confidence_and_absolute_materiality(g
     assert estimate.loop_lag_ratio.lower_95 > 1.0
     assert estimate.loop_lag_delta.lower_95_ms > noise_floor
     assert confirmed is True
+
+
+def test_initial_loop_screen_ignores_an_unconfirmed_point_ratio(gate) -> None:
+    pairs = _cycles(1, base_loop=0.10, candidate_loop=0.20)
+    pairs.extend(_cycles(1, base_loop=0.10, candidate_loop=0.10))
+
+    estimate = gate.metrics(pairs)
+
+    assert estimate.loop_lag_median_ratio == pytest.approx(1.5)
+    assert estimate.loop_lag_ratio.lower_95 < 1.0
+    assert estimate.loop_lag_delta.lower_95_ms < 0.0
+    assert gate.loop_requires_confirmation(pairs, max_loop_lag_ratio=1.05) is False
+
+
+def test_initial_loop_screen_keeps_a_consistent_material_regression(gate) -> None:
+    pairs = _cycles(2, base_loop=0.10, candidate_loop=0.20)
+
+    assert gate.loop_requires_confirmation(pairs, max_loop_lag_ratio=1.05) is True
+
+
+def test_strict_cli_explains_an_invalid_decision_without_a_traceback(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parents[2]
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(root / "benchmarks" / "open_loop_release_gate.py"),
+            "--base-root",
+            str(root),
+            "--candidate-root",
+            str(root),
+            "--policy",
+            "strict",
+            "--output",
+            str(tmp_path / "result.json"),
+        ],
+        cwd=root,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 2
+    assert "strict open-loop release evidence requires --cpu pinning" in completed.stderr
+    assert "Traceback" not in completed.stderr
+
+
+def test_confirmation_budget_overflow_can_be_reevaluated_from_retained_pairs(gate) -> None:
+    pairs = _cycles(1, base_loop=0.10, candidate_loop=0.20)
+    pairs.extend(_cycles(1, base_loop=0.10, candidate_loop=0.10))
+    payload = {
+        "status": "invalid",
+        "policy": "strict",
+        "thresholds": {"min_completed_ratio": 0.97, "max_loop_lag_ratio": 1.05},
+        "scenarios": [
+            {
+                "label": "noisy cell",
+                "initial_pairs": pairs,
+                "initial_metrics": {},
+                "final_metrics": {},
+                "throughput_suspect": False,
+                "loop_suspect": True,
+                "confirmation": None,
+            }
+        ],
+        "failures": [],
+        "invalidations": ["15 cells require confirmation; bounded maximum is 4"],
+    }
+
+    reevaluated = gate.reevaluate_confirmation_overflow(payload)
+
+    assert reevaluated["status"] == "passed"
+    assert reevaluated["scenarios"][0]["loop_suspect"] is False
+    assert reevaluated["reevaluation"]["original_status"] == "invalid"
+    assert payload["status"] == "invalid"
+
+
+def test_reevaluation_refuses_to_pass_a_cell_that_still_needs_confirmation(gate) -> None:
+    pairs = _cycles(2, base_loop=0.10, candidate_loop=0.20)
+    payload = {
+        "status": "invalid",
+        "policy": "strict",
+        "thresholds": {"min_completed_ratio": 0.97, "max_loop_lag_ratio": 1.05},
+        "scenarios": [
+            {
+                "label": "material cell",
+                "initial_pairs": pairs,
+                "initial_metrics": {},
+                "final_metrics": {},
+                "throughput_suspect": False,
+                "loop_suspect": True,
+                "confirmation": None,
+            }
+        ],
+        "failures": [],
+        "invalidations": ["5 cells require confirmation; bounded maximum is 4"],
+    }
+
+    reevaluated = gate.reevaluate_confirmation_overflow(payload)
+
+    assert reevaluated["status"] == "invalid"
+    assert reevaluated["invalidations"] == [
+        "1 cells still require fresh confirmation under the corrected screen"
+    ]
+
+
+def test_reevaluation_cli_writes_separate_traceable_evidence(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parents[2]
+    pairs = _cycles(1, base_loop=0.10, candidate_loop=0.20)
+    pairs.extend(_cycles(1, base_loop=0.10, candidate_loop=0.10))
+    source = tmp_path / "original.json"
+    output = tmp_path / "reevaluated.json"
+    source.write_text(
+        json.dumps(
+            {
+                "status": "invalid",
+                "policy": "strict",
+                "base_sha": "a" * 40,
+                "candidate_sha": "b" * 40,
+                "thresholds": {
+                    "min_completed_ratio": 0.97,
+                    "max_loop_lag_ratio": 1.05,
+                },
+                "scenarios": [
+                    {
+                        "label": "noisy cell",
+                        "initial_pairs": pairs,
+                        "initial_metrics": {},
+                        "final_metrics": {},
+                        "throughput_suspect": False,
+                        "loop_suspect": True,
+                        "confirmation": None,
+                    }
+                ],
+                "failures": [],
+                "invalidations": ["15 cells require confirmation; bounded maximum is 4"],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(root / "benchmarks" / "reevaluate_open_loop_release_gate.py"),
+            "--input",
+            str(source),
+            "--output",
+            str(output),
+        ],
+        cwd=root,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0
+    result = json.loads(output.read_text(encoding="utf-8"))
+    assert result["status"] == "passed"
+    assert result["reevaluation"]["source_artifact_sha256"]
+    assert json.loads(source.read_text(encoding="utf-8"))["status"] == "invalid"
 
 
 def test_same_code_throughput_control_reuses_existing_two_percent_bias_budget(gate) -> None:

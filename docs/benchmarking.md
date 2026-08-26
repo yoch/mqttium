@@ -20,6 +20,20 @@ be committed.
 - `paired_open_loop.py` measures completion and loop lag at calibrated or fixed
   absolute load. It can sweep outbound windows while calling `AsyncClient`
   directly; no cross-client adapter participates in the measurement.
+- `open_loop_release_gate.py` anchors fractional load to baseline capacity and
+  uses a two-stage loop-lag decision. The initial ABBA screen must exceed the
+  relative threshold with relative and additive 95% lower bounds above the
+  no-effect boundary before it consumes one of the bounded same-code A/A
+  confirmation slots. Final rejection still requires the additive increase to
+  exceed the measured same-code noise envelope.
+
+The open-loop loop-lag rule is a targeted regression detector, not an
+equivalence proof. Its initial screen uses necessary conditions from the final
+pre-existing verdict: a point estimate above 1.05 whose relative or additive
+95% interval still crosses the no-effect boundary remains diagnostic. It cannot
+fail the release or consume scarce same-code controls by itself. Throughput,
+runner eligibility, exact completion, and the deeper controlled network gate
+remain separate evidence.
 - `paired_writer_capacity.py` protects the native `publish_nowait` closed-loop
   writer regime for QoS 0/1. It yields once per application outstanding window
   and yields/retries on synchronous backpressure, matching the scheduling shape
