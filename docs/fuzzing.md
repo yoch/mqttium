@@ -204,9 +204,10 @@ area for further grammar expansion.
 
 The V3 long campaign completed 1,000,000 schedules at 48 steps on x86-64 with
 zero failures, all mandatory pressure counters nonzero, and 99.9736% unique
-scheduling traces. V2 retains a clean 50,000-seed calibration; its recommended
-million-seed two-window campaign remains pending. See the dated reports for the
-exact commits, environments, ranges, and limitations.
+scheduling traces. V2 also completed its recommended million-seed two-window
+campaign with zero failures, all six composition pairs, and all 64 release
+traces. See the dated reports for the exact commits, environments, ranges, and
+limitations.
 
 Runtime-fuzzer watchdogs and connection deadlines use the system monotonic
 clock. That clock advances while the OS deschedules a process, so the strict
