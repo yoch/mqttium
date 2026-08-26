@@ -58,7 +58,10 @@ may admit `on_publish` to the bounded callback queue and settle the receipt
 immediately. User callback code still runs only in the callback worker; a full
 queue falls back to the ordered effect path and its existing backpressure. QoS
 0 batches preflight capacity for every callback before admitting any write, so
-the direct path cannot split a batch across the two paths.
+the direct path cannot split a batch across the two paths. Consecutive terminal
+QoS 1/2 effects from one ingress batch settle in engine order in one pump pass.
+Their distinct callback arguments share one physical worker job while reserving
+one bounded callback-queue slot per logical completion.
 
 ### Network writes
 

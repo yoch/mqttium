@@ -551,6 +551,41 @@ def _publish_completion(scenario: str) -> ScenarioMeasurement:
     return asyncio.run(run_callback())
 
 
+def _publish_completion_batch(_scenario: str) -> ScenarioMeasurement:
+    """Apply one ingress-shaped completion batch per effect collection."""
+    from mqttium.api import AsyncClient
+    from mqttium.api.models import PublishReceipt
+    from mqttium.enums import QoS
+    from mqttium.protocol.effects import EffectKind
+
+    async def run() -> ScenarioMeasurement:
+        client = AsyncClient(
+            client_id="paired-publish-completion-batch",
+            max_pending_callbacks=4_096,
+        )
+        client.on_publish = lambda _mid, _reason: None
+        batch_size = 64
+        warmup_batches = 32
+        measured_batches = 2_000
+        started = 0.0
+        for batch in range(warmup_batches + measured_batches):
+            if batch == warmup_batches:
+                started = time.perf_counter()
+            for mid in range(1, batch_size + 1):
+                receipt = PublishReceipt(mid=mid, qos=QoS.AT_LEAST_ONCE)
+                client._register_publish_receipt(mid, receipt)
+                client._engine._emit(EffectKind.PUBLISH_COMPLETE, mid)
+            client._collect_effects_locked()
+            await client._drain_effects()
+            await client._callback_queue.join()
+        elapsed = time.perf_counter() - started
+        await client._shutdown_callback_worker(drain=False)
+        operations = measured_batches * batch_size
+        return ScenarioMeasurement(elapsed, operations, operations / elapsed)
+
+    return asyncio.run(run())
+
+
 def _prime_process_wide_tables() -> None:
     """Build lazily-initialised module tables before anything is profiled.
 
@@ -599,6 +634,7 @@ REGISTRY: dict[str, Callable[[str], ScenarioMeasurement]] = {
     "receipt_settle_unawaited": _receipt,
     "publish_complete_receipt": _publish_completion,
     "publish_complete_callback": _publish_completion,
+    "publish_complete_callback_batch": _publish_completion_batch,
 }
 
 
