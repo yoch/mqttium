@@ -308,6 +308,110 @@ async def test_paced_writes_rearm_eager_on_the_next_loop_turn() -> None:
         await pump.stop()
 
 
+async def test_protocol_response_ignores_only_the_burst_throttle() -> None:
+    """An idle ACK is eager even after producer eager admission was disarmed."""
+    transport = _EagerTransport()
+    pump = _pump()
+    pump.start(transport)
+    try:
+        pump._eager_armed = False
+
+        assert pump.try_enqueue_protocol_response(b"ack") is True
+
+        assert transport.written == [b"ack"]
+        assert pump.queued_messages == 0
+        assert pump.eager_writes == 1
+    finally:
+        await pump.stop()
+
+
+async def test_protocol_response_never_overtakes_queued_data() -> None:
+    """The response shortcut retains the eager path's empty-queue condition."""
+    transport = _EagerTransport()
+    pump = _pump()
+    pump._write_nowait = transport.write_nowait
+    pump._eager_armed = False
+    try:
+        assert pump.try_enqueue(b"publish") is True
+        assert pump.try_enqueue_protocol_response(b"puback") is True
+
+        assert transport.written == []
+        assert pump.queued_messages == 2
+        pump.start(transport)
+        await asyncio.wait_for(pump.join(), timeout=1.0)
+        assert transport.written == [b"publish", b"puback"]
+    finally:
+        await pump.stop()
+
+
+async def test_protocol_response_fallback_remains_bounded() -> None:
+    pump = _pump(max_messages=1, max_bytes=8)
+    try:
+        assert pump.try_enqueue_protocol_response(b"first") is True
+        assert pump.try_enqueue_protocol_response(b"second") is False
+        assert pump.queued_messages == 1
+        assert pump.queued_bytes == len(b"first")
+    finally:
+        pump.discard()
+
+
+async def test_segmented_protocol_response_item_is_never_eager() -> None:
+    transport = _EagerTransport()
+    pump = _pump()
+    pump._write_nowait = transport.write_nowait
+    try:
+        assert pump.try_enqueue_protocol_response((b"header", b"payload")) is True
+        assert transport.written == []
+        assert pump.queued_messages == 1
+        assert pump.eager_writes == 0
+    finally:
+        pump.discard()
+
+
+class _SegmentGateTransport(_EagerTransport):
+    """Holds a segmented header write so a response can race its payload."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.header_started = asyncio.Event()
+        self.release_header = asyncio.Event()
+
+    async def write(self, data: bytes) -> None:
+        self._enter()
+        try:
+            self.calls.append(("write", data))
+            if data == b"header":
+                self.header_started.set()
+                await self.release_header.wait()
+            else:
+                await asyncio.sleep(0)
+        finally:
+            self._exit()
+
+
+async def test_protocol_response_never_splits_an_in_flight_segmented_write() -> None:
+    """Ignoring the burst throttle must not ignore the active-batch guard."""
+    transport = _SegmentGateTransport()
+    pump = _pump()
+    pump.start(transport)
+    try:
+        assert pump.try_enqueue((b"header", b"payload")) is True
+        await asyncio.wait_for(transport.header_started.wait(), timeout=1.0)
+        assert pump._writing is True
+
+        assert pump.try_enqueue_protocol_response(b"puback") is True
+        assert transport.written == [b"header"]
+
+        transport.release_header.set()
+        await asyncio.wait_for(pump.join(), timeout=1.0)
+
+        assert transport.written == [b"header", b"payload", b"puback"]
+        assert transport.max_in_flight <= 1
+    finally:
+        transport.release_header.set()
+        await pump.stop()
+
+
 async def test_stale_rearm_cannot_arm_a_new_transport_generation() -> None:
     old = _EagerTransport()
     pump = _pump()

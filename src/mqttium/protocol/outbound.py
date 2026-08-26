@@ -744,7 +744,7 @@ class OutboundSession:
                 compact=True,
             )
             if changed is not None:
-                self._engine._send(_encode_pubrel_success(mid))
+                self._engine._send_protocol_response(_encode_pubrel_success(mid))
                 return
             if transitions.out_meta(mid) is None:
                 self._send_orphan_pubrel(mid)
@@ -764,14 +764,14 @@ class OutboundSession:
         if msg.encoded_pubrel is None:
             msg.encoded_pubrel = _encode_pubrel_success(mid)
         self.store.update_out(msg)
-        self._engine._send(msg.encoded_pubrel)
+        self._engine._send_protocol_response(msg.encoded_pubrel)
 
     def _send_orphan_pubrel(self, mid: int) -> None:
         """Answer a PUBREC with no matching record: PUBREL, 0x92 when MQTT 5."""
         reason = 0x92 if self._engine.codec.is_mqtt5 else 0
         wire = self._encode_pubrel(mid, reason)
         self._require_pubrel_capacity(len(wire))
-        self._engine._send(wire)
+        self._engine._send_protocol_response(wire)
 
     def _fail_after_pubrec(self, mid: int, reason_code: int) -> None:
         if not self._settle(mid, OutboundQoSState.WAIT_PUBREC):
@@ -932,7 +932,7 @@ class OutboundSession:
                 msg.encoded_pubrel = _encode_pubrel_success(msg.mid)
                 self.store.update_out(msg)
             self._engine._check_outbound_size(msg.encoded_pubrel)
-            self._engine._send(msg.encoded_pubrel)
+            self._engine._send_protocol_response(msg.encoded_pubrel)
             return
         raise ProtocolError(f"Cannot retransmit outbound state {msg.state!r}")
 

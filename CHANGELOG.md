@@ -6,6 +6,13 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Changed
+
+- Send idle PUBACK, PUBREC, PUBREL and PUBCOMP frames through the writer's eager
+  transport path even when its producer-burst throttle is disarmed. Responses
+  still fall back to the bounded FIFO whenever an earlier frame, active batch,
+  suspended producer or transport backpressure makes eager admission unsafe.
+
 ## [1.0.0rc10] - 2026-08-26
 
 ### Removed

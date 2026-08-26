@@ -242,6 +242,9 @@ class ProtocolEngine:
     def _send(self, packet: WriteItem) -> None:
         self._emit(EffectKind.SEND, packet)
 
+    def _send_protocol_response(self, packet: bytes) -> None:
+        self._effects.append(EngineEffect(EffectKind.SEND, packet, protocol_response=True))
+
     def begin_connect(self) -> bytes:
         if self.state in (
             ConnectionState.CONNECTED,

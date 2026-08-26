@@ -13,7 +13,11 @@ this guide takes precedence over the higher-level description in `architecture.m
    non-segmented frame straight through the transport's optional
    `write_nowait`, which saves the event-loop turn the writer task would
    otherwise cost. A segmented frame is never written that way, because it is
-   two consecutive writes and nothing may land between them.
+   two consecutive writes and nothing may land between them. PUBACK, PUBREC,
+   PUBREL and PUBCOMP responses may bypass the one-eager-write-per-loop batching
+   throttle, but never the ordering checks: a queued frame, active batch,
+   suspended producer or segmented item always keeps the response on the same
+   bounded FIFO path.
 2. **One effect stream.** Engine sessions emit through `ProtocolEngine`; no
    component keeps a second effect list.
 3. **Register completion before sending.** A receipt or SUBACK/UNSUBACK future
