@@ -663,21 +663,20 @@ class AsyncClient:
 
     def _direct_qos0_ready(self, callback_count: int = 1) -> bool:
         """True when a native QoS 0 write can bypass the effect adapter safely."""
+        if self.on_publish is None:
+            return not self._effect_pump.pending and not self._engine.has_pending_effects
         callback = self.on_publish
-        callback_ready = (
-            callback is None
-            or (
+        assert callback is not None
+        if not (
+            (
                 callback_count == 1
                 and not self._engine_lock.locked()
                 and self._can_dispatch_callback_inline(callback)
             )
             or self._has_callback_capacity(callback_count)
-        )
-        return (
-            callback_ready
-            and not self._effect_pump.pending
-            and not self._engine.has_pending_effects
-        )
+        ):
+            return False
+        return not self._effect_pump.pending and not self._engine.has_pending_effects
 
     def _try_direct_qos0_publish(
         self,
@@ -2120,8 +2119,20 @@ class AsyncClient:
             connack: ConnAckPacket = effect.data
             self._resolve_connack(connack)
             return True
-        if kind is EffectKind.PUBLISH_COMPLETE or kind is EffectKind.PUBLISH_FAILED:
-            return self._apply_terminal_effect_inline(effect)
+        if kind is EffectKind.PUBLISH_COMPLETE:
+            mid: int | None = effect.data
+            callback = self.on_publish
+            if callback is None:
+                self._settle_publish(mid, None)
+                return True
+            return self._apply_terminal_callback_inline(callback, mid, None)
+        if kind is EffectKind.PUBLISH_FAILED:
+            failure: PublishFailure = effect.data
+            callback = self.on_publish
+            if callback is None:
+                self._settle_publish(failure.mid, failure.reason)
+                return True
+            return self._apply_terminal_callback_inline(callback, failure.mid, failure.reason)
         if kind is EffectKind.SUBACK:
             self._resolve_suback(effect.data)
             return True
@@ -2133,12 +2144,13 @@ class AsyncClient:
             return True
         return False
 
-    def _apply_terminal_effect_inline(self, effect: EngineEffect) -> bool:
-        mid, reason = _terminal_publish_result(effect)
-        callback = self.on_publish
-        if callback is None:
-            self._settle_publish(mid, reason)
-            return True
+    def _apply_terminal_callback_inline(
+        self,
+        callback: Callable[[int | None, BaseException | None], object],
+        mid: int | None,
+        reason: BaseException | None,
+    ) -> bool:
+        """Settle and dispatch one terminal callback outside the engine lock."""
         if self._engine_lock.locked():
             return False
         if self._can_dispatch_callback_inline(callback):
