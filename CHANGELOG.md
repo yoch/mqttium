@@ -12,6 +12,10 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   the reader/effect-drain turn after receipt or delivery settlement. Async
   callbacks, callback bursts, reentrant delivery, and occupied/full callback
   queues retain the bounded callback-worker path and its existing backpressure.
+- Send idle PUBACK, PUBREC, PUBREL and PUBCOMP frames through the writer's eager
+  transport path even when its producer-burst throttle is disarmed. Responses
+  still fall back to the bounded FIFO whenever an earlier frame, active batch,
+  suspended producer or transport backpressure makes eager admission unsafe.
 
 ## [1.0.0rc10] - 2026-08-26
 

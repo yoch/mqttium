@@ -45,6 +45,11 @@ class EngineEffect:
     # this fresh PUBLISH. None means no trusted decode-time size is available;
     # store/replay effects deliberately omit it.
     decoded_property_wire_size: int | None = None
+    # SEND only: the frame advances a QoS 1/2 protocol exchange rather than
+    # carrying application data. The runtime may use a latency-oriented writer
+    # admission path, but must preserve the writer's FIFO and single-write
+    # invariants when that path is not immediately safe.
+    protocol_response: bool = False
 
 
 @dataclass(slots=True)

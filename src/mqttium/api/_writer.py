@@ -328,6 +328,61 @@ class WritePump:
         self.last_outbound = time.monotonic()
         return True
 
+    def _try_write_protocol_response_eager(self, item: WriteItem) -> bool:
+        """Try the eager path without applying the producer-burst throttle.
+
+        This intentionally repeats the five load-bearing ordering checks from
+        ``_try_write_eager``. Keeping the ordinary producer method unchanged is
+        part of the QoS 0 performance contract; the paired regression tests pin
+        both copies to the same FIFO and segmented-write behavior.
+        """
+        write_nowait = self._write_nowait
+        if (
+            write_nowait is None
+            or self._writing
+            or self.waiters
+            or isinstance(item, tuple)
+            or not self.queue.empty()
+        ):
+            return False
+        if not write_nowait(item):
+            return False
+        self._eager_armed = False
+        generation = self._eager_generation
+        asyncio.get_running_loop().call_soon(self._rearm_eager_if_idle, generation)
+        self.eager_writes += 1
+        self.eager_bytes += len(item)
+        self.last_outbound = time.monotonic()
+        return True
+
+    def try_enqueue_protocol_response(
+        self,
+        item: WriteItem,
+        *,
+        epoch: int | None = None,
+    ) -> bool:
+        """Admit a QoS protocol response, eagerly whenever FIFO permits.
+
+        Protocol responses are not producer data bursts, so they do not share
+        the one-eager-write-per-loop batching throttle. The same five ordering
+        and single-writer conditions as ``_try_write_eager`` remain enforced. A
+        queued frame, active batch, suspended producer, segmented item, or
+        transport refusal therefore falls back to the ordinary bounded FIFO.
+        """
+        if epoch is None:
+            epoch = self.epoch
+        if epoch != self.epoch:
+            raise StaleConnectionEffect
+        size = item_size(item)
+        if not self.can_enqueue_size(size):
+            return False
+        if self._try_write_protocol_response_eager(item):
+            return True
+        self.queue.put_nowait(item)
+        self.queued_bytes += size
+        self._admit_queued()
+        return True
+
     def try_enqueue(self, item: WriteItem, *, epoch: int | None = None) -> bool:
         if epoch is None:
             epoch = self.epoch
