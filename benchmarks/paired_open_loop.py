@@ -42,10 +42,12 @@ class CallbackCompletionTracker:
     def __init__(self) -> None:
         self.completions: asyncio.Queue[tuple[int, int]] = asyncio.Queue()
         self.published_ns: dict[int, deque[int]] = {}
+        self.pacer_slept: dict[int, deque[bool | None]] = {}
         self.early: dict[int, deque[int]] = {}
 
-    def record_publish(self, mid: int, sent_ns: int) -> None:
+    def record_publish(self, mid: int, sent_ns: int, pacer_slept: bool | None = None) -> None:
         self.published_ns.setdefault(mid, deque()).append(sent_ns)
+        self.pacer_slept.setdefault(mid, deque()).append(pacer_slept)
         early = self.early.get(mid)
         if early:
             self.completions.put_nowait((mid, early.popleft()))
@@ -59,12 +61,21 @@ class CallbackCompletionTracker:
             self.early.setdefault(mid, deque()).append(finished_ns)
 
     async def next_latency_ms(self, timeout: float) -> float:
+        latency_ms, _pacer_slept = await self.next_sample(timeout)
+        return latency_ms
+
+    async def next_sample(self, timeout: float) -> tuple[float, bool | None]:
+        """Return latency with the pacing decision for the matched publish."""
         mid, finished_ns = await asyncio.wait_for(self.completions.get(), timeout=timeout)
         sent = self.published_ns[mid]
         sent_ns = sent.popleft()
         if not sent:
             del self.published_ns[mid]
-        return (finished_ns - sent_ns) / 1_000_000
+        pacing = self.pacer_slept[mid]
+        pacer_slept = pacing.popleft()
+        if not pacing:
+            del self.pacer_slept[mid]
+        return (finished_ns - sent_ns) / 1_000_000, pacer_slept
 
 
 @dataclass
@@ -87,6 +98,13 @@ class OpenLoopResult:
     delivery_latency_p99_ms: float
     loop_lag_p95_ms: float
     loop_lag_p99_ms: float
+    pacer_sleep_count: int
+    pacer_catch_up_count: int
+    pacer_max_catch_up_streak: int
+    ack_latency_after_pacer_sleep_p50_ms: float | None
+    ack_latency_after_pacer_sleep_p95_ms: float | None
+    ack_latency_during_catch_up_p50_ms: float | None
+    ack_latency_during_catch_up_p95_ms: float | None
     cpu_seconds: float
     effect_inline: int
     effect_enqueued: int
@@ -118,11 +136,20 @@ async def sample(args: argparse.Namespace, topic: str) -> OpenLoopResult:
     client = await _connected_client(args.protocol, args.window)
     callback_tracker = CallbackCompletionTracker()
     latencies: list[float] = []
+    slept_latencies: list[float] = []
+    catch_up_latencies: list[float] = []
     receipt_tasks: list[asyncio.Task[None]] = []
 
-    async def observe_receipt(receipt, sent_ns: int) -> None:
+    def record_latency(latency_ms: float, pacer_slept: bool | None) -> None:
+        latencies.append(latency_ms)
+        if pacer_slept is True:
+            slept_latencies.append(latency_ms)
+        elif pacer_slept is False:
+            catch_up_latencies.append(latency_ms)
+
+    async def observe_receipt(receipt, sent_ns: int, pacer_slept: bool | None) -> None:
         await receipt.wait()
-        latencies.append((time.monotonic_ns() - sent_ns) / 1_000_000)
+        record_latency((time.monotonic_ns() - sent_ns) / 1_000_000, pacer_slept)
 
     if args.completion == "callback":
 
@@ -137,16 +164,29 @@ async def sample(args: argparse.Namespace, topic: str) -> OpenLoopResult:
     paced = args.target_rate > 0
     interval = 1.0 / args.target_rate if paced else 0.0
     schedule_lag: list[float] = []
+    pacer_sleep_count = 0
+    pacer_catch_up_count = 0
+    catch_up_streak = 0
+    pacer_max_catch_up_streak = 0
     cpu_started = time.process_time()
     started = loop.time() + (0.05 if paced else 0.0)
     offered_started = 0.0
     try:
         for sequence in range(args.count):
             deadline = started + sequence * interval if paced else loop.time()
+            pacer_slept: bool | None = None
             if paced:
                 delay = deadline - loop.time()
                 if delay > 0:
                     await asyncio.sleep(delay)
+                    pacer_slept = True
+                    pacer_sleep_count += 1
+                    catch_up_streak = 0
+                else:
+                    pacer_slept = False
+                    pacer_catch_up_count += 1
+                    catch_up_streak += 1
+                    pacer_max_catch_up_streak = max(pacer_max_catch_up_streak, catch_up_streak)
             actual = loop.time()
             if sequence == 0:
                 offered_started = actual
@@ -155,15 +195,18 @@ async def sample(args: argparse.Namespace, topic: str) -> OpenLoopResult:
             receipt = await client.publish(topic, _payload(sequence, args.payload_bytes), qos=1)
             assert receipt.mid is not None
             if args.completion == "receipt":
-                receipt_tasks.append(asyncio.create_task(observe_receipt(receipt, sent_ns)))
+                receipt_tasks.append(
+                    asyncio.create_task(observe_receipt(receipt, sent_ns, pacer_slept))
+                )
             else:
-                callback_tracker.record_publish(receipt.mid, sent_ns)
+                callback_tracker.record_publish(receipt.mid, sent_ns, pacer_slept)
         offered_elapsed = max(loop.time() - offered_started, 1e-9)
         if args.completion == "receipt":
             await asyncio.gather(*receipt_tasks)
         else:
             for _ in range(args.count):
-                latencies.append(await callback_tracker.next_latency_ms(args.timeout))
+                latency_ms, pacer_slept = await callback_tracker.next_sample(args.timeout)
+                record_latency(latency_ms, pacer_slept)
         completed_elapsed = max(loop.time() - offered_started, 1e-9)
         effects = client.stats().effects
         return OpenLoopResult(
@@ -185,6 +228,21 @@ async def sample(args: argparse.Namespace, topic: str) -> OpenLoopResult:
             delivery_latency_p99_ms=0.0,
             loop_lag_p95_ms=percentile(schedule_lag, 0.95),
             loop_lag_p99_ms=percentile(schedule_lag, 0.99),
+            pacer_sleep_count=pacer_sleep_count,
+            pacer_catch_up_count=pacer_catch_up_count,
+            pacer_max_catch_up_streak=pacer_max_catch_up_streak,
+            ack_latency_after_pacer_sleep_p50_ms=(
+                statistics.median(slept_latencies) if slept_latencies else None
+            ),
+            ack_latency_after_pacer_sleep_p95_ms=(
+                percentile(slept_latencies, 0.95) if slept_latencies else None
+            ),
+            ack_latency_during_catch_up_p50_ms=(
+                statistics.median(catch_up_latencies) if catch_up_latencies else None
+            ),
+            ack_latency_during_catch_up_p95_ms=(
+                percentile(catch_up_latencies, 0.95) if catch_up_latencies else None
+            ),
             cpu_seconds=time.process_time() - cpu_started,
             effect_inline=effects.inline_effects,
             effect_enqueued=effects.enqueued,

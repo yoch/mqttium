@@ -56,24 +56,35 @@ def test_load_points_reject_non_positive_or_non_finite_rates(open_loop, value: s
 async def test_callback_completion_tracker_preserves_reused_mid_fifo(open_loop) -> None:
     tracker = open_loop.CallbackCompletionTracker()
 
-    tracker.record_publish(1, 100)
-    tracker.record_publish(1, 200)
+    tracker.record_publish(1, 100, True)
+    tracker.record_publish(1, 200, False)
     tracker.record_completion(1, 130)
     tracker.record_completion(1, 250)
 
-    assert await tracker.next_latency_ms(0.1) == 0.00003
-    assert await tracker.next_latency_ms(0.1) == 0.00005
+    assert await tracker.next_sample(0.1) == (0.00003, True)
+    assert await tracker.next_sample(0.1) == (0.00005, False)
     assert tracker.published_ns == {}
+    assert tracker.pacer_slept == {}
 
 
 async def test_callback_completion_tracker_matches_early_callback(open_loop) -> None:
     tracker = open_loop.CallbackCompletionTracker()
 
     tracker.record_completion(7, 150)
-    tracker.record_publish(7, 100)
+    tracker.record_publish(7, 100, True)
 
-    assert await tracker.next_latency_ms(0.1) == 0.00005
+    assert await tracker.next_sample(0.1) == (0.00005, True)
     assert tracker.early == {}
+
+
+async def test_callback_completion_tracker_keeps_latency_only_api(open_loop) -> None:
+    tracker = open_loop.CallbackCompletionTracker()
+
+    tracker.record_publish(3, 100)
+    tracker.record_completion(3, 140)
+
+    assert await tracker.next_latency_ms(0.1) == 0.00004
+    assert tracker.pacer_slept == {}
 
 
 def test_run_worker_surfaces_subprocess_failure(
