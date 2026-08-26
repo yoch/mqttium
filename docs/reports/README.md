@@ -26,6 +26,7 @@ Status meanings:
 | [RELEASE-CANDIDATE-1.0.0rc4](https://github.com/yoch/mqttium/blob/main/docs/reports/RELEASE-CANDIDATE-1.0.0rc4.md) | Superseded | Later release candidates and final release evidence |
 | [RELEASE-CANDIDATE-1.0.0rc5](https://github.com/yoch/mqttium/blob/main/docs/reports/RELEASE-CANDIDATE-1.0.0rc5.md) | Superseded | Later release candidates and final release evidence |
 | [RELEASE-CANDIDATE-1.0.0rc6](https://github.com/yoch/mqttium/blob/main/docs/reports/RELEASE-CANDIDATE-1.0.0rc6.md) | Superseded | Final release evidence for the exact release commit |
+| [RELEASE-CANDIDATE-1.0.0rc10](https://github.com/yoch/mqttium/blob/main/docs/reports/RELEASE-CANDIDATE-1.0.0rc10.md) | Current evidence | RC10 fuzz, local quality/performance/robustness/package, open-loop requalification and hosted candidate evidence |
 | [QUALITY-AUDIT-0.2.0b4](https://github.com/yoch/mqttium/blob/main/docs/reports/QUALITY-AUDIT-0.2.0b4.md) | Superseded | Later engine-quality audits and current quality gates |
 | [QUALITY-AUDIT-1.0.0rc2](https://github.com/yoch/mqttium/blob/main/docs/reports/QUALITY-AUDIT-1.0.0rc2.md) | Superseded | Later engine-quality audits and current quality gates |
 | [ENGINE-QUALITY-AUDIT-2026-08-17](https://github.com/yoch/mqttium/blob/main/docs/reports/ENGINE-QUALITY-AUDIT-2026-08-17.md) | Superseded | Closure and independent review below |
