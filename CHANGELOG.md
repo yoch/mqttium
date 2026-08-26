@@ -89,6 +89,10 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Changed
 
+- Let V1/V2/V3 runtime-fuzzer campaigns configure their wall-clock schedule
+  watchdog and connection timeout. Strict CI defaults remain unchanged, while
+  low-priority campaigns on shared runners can avoid classifying OS
+  descheduling as MQTTium liveness failures.
 - Keep unsupported inbound AUTH handling and its protocol DISCONNECT in the
   protocol engine; the asyncio runtime no longer carries a second DISCONNECT
   construction path.

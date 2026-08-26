@@ -11,6 +11,7 @@ from tests.fuzz.runtime_composition_fuzzer import (
     CompositionMutation,
     CompositionPair,
     generate_composed_schedule,
+    main as composition_main,
     run_composed_schedule,
     run_composition_campaign,
 )
@@ -54,6 +55,69 @@ def test_callback_reader_pair_covers_eof_and_real_keepalive_teardown() -> None:
 
     assert "broker.inject_eof" in operations
     assert "keepalive.timeout_due" in operations
+
+
+def test_cli_watchdog_override_controls_the_real_schedule(tmp_path: Path) -> None:
+    exit_status = composition_main(
+        [
+            "--seed",
+            "0",
+            "--seeds",
+            "1",
+            "--steps",
+            "48",
+            "--watchdog-seconds",
+            "0.000000001",
+            "--artifacts-dir",
+            str(tmp_path),
+        ]
+    )
+
+    assert exit_status == 1
+    artifact = json.loads(next(tmp_path.glob("*.json")).read_text(encoding="utf-8"))
+    assert "whole-schedule liveness watchdog expired" in artifact["failure"]
+    assert artifact["timing"] == {
+        "connect_timeout_seconds": 0.5,
+        "watchdog_seconds": 0.000000001,
+    }
+
+
+def test_cli_connect_timeout_override_controls_callback_connect(tmp_path: Path) -> None:
+    short_status = composition_main(
+        [
+            "--seed",
+            "0",
+            "--seeds",
+            "1",
+            "--steps",
+            "48",
+            "--connect-timeout-seconds",
+            "0.000000001",
+            "--artifacts-dir",
+            str(tmp_path),
+        ]
+    )
+
+    assert short_status == 1
+    artifact = json.loads(next(tmp_path.glob("*.json")).read_text(encoding="utf-8"))
+    assert artifact["failure"]
+
+    long_status = composition_main(
+        [
+            "--seed",
+            "0",
+            "--seeds",
+            "1",
+            "--steps",
+            "48",
+            "--connect-timeout-seconds",
+            "10",
+            "--artifacts-dir",
+            str(tmp_path / "long"),
+        ]
+    )
+
+    assert long_status == 0
 
 
 @pytest.mark.parametrize("seed", range(6))

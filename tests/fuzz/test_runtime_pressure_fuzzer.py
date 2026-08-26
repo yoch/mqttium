@@ -11,6 +11,7 @@ publisher exactly once with a zero terminal waiter count.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -23,6 +24,7 @@ from tests.fuzz.runtime_pressure_fuzzer import (
     _PressureHarness,
     assert_pressure_coverage,
     generate_pressure_schedule,
+    main as pressure_main,
     run_pressure_campaign,
     run_pressure_schedule,
 )
@@ -49,6 +51,28 @@ def test_generator_is_deterministic_and_covers_every_family() -> None:
     # Both capability axes are composed present and absent.
     assert {schedule.profile.write_nowait for schedule in schedules} == {True, False}
     assert {schedule.profile.write_many for schedule in schedules} == {True, False}
+
+
+def test_v3_cli_accepts_shared_runner_timeouts(tmp_path: Path) -> None:
+    exit_status = pressure_main(
+        [
+            "--seed",
+            "0",
+            "--seeds",
+            "1",
+            "--steps",
+            "36",
+            "--watchdog-seconds",
+            "30",
+            "--connect-timeout-seconds",
+            "10",
+            "--no-require-coverage",
+            "--artifacts-dir",
+            str(tmp_path),
+        ]
+    )
+
+    assert exit_status == 0
 
 
 async def test_pressure_schedule_is_reproducible() -> None:
@@ -326,5 +350,10 @@ async def test_pressure_failure_writes_a_replayable_artifact(tmp_path) -> None:
         "write_many": schedule.profile.write_many,
     }
     assert saved["operations"] == artifact.operations
+    assert saved["timing"] == {
+        "connect_timeout_seconds": 0.5,
+        "watchdog_seconds": 4.0,
+    }
     assert "pressure" in saved["owners"]
     assert "seed=" in artifact.to_text()
+    assert "timing=" in artifact.to_text()
