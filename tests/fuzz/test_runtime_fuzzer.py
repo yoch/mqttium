@@ -18,6 +18,27 @@ from tests.fuzz.runtime_fuzzer import (
 )
 
 
+def test_v1_cli_accepts_shared_runner_timeouts(tmp_path) -> None:
+    exit_status = runtime_fuzzer.main(
+        [
+            "--seed",
+            "0",
+            "--seeds",
+            "1",
+            "--steps",
+            "24",
+            "--watchdog-seconds",
+            "30",
+            "--connect-timeout-seconds",
+            "10",
+            "--artifacts-dir",
+            str(tmp_path),
+        ]
+    )
+
+    assert exit_status == 0
+
+
 async def test_unexpected_application_task_exception_fails_the_schedule() -> None:
     schedule = RuntimeSchedule(
         seed=90,
@@ -375,10 +396,15 @@ async def test_runtime_failure_writes_a_replayable_human_readable_artifact(tmp_p
     assert saved["seed"] == 0
     assert saved["mutation"] == "writer_failure_no_wake"
     assert saved["operations"] == artifact.operations
+    assert saved["timing"] == {
+        "connect_timeout_seconds": 0.5,
+        "watchdog_seconds": 2.0,
+    }
     assert "writer" in saved["owners"]
     assert "waiter" in saved["failure"]
     assert "seed=0" in artifact.to_text()
     assert "operations:" in artifact.to_text()
+    assert "timing=" in artifact.to_text()
 
 
 @pytest.mark.parametrize(

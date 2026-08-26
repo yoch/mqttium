@@ -48,6 +48,12 @@ PYTHONPATH=src python -m tests.fuzz.runtime_composition_fuzzer \
 PYTHONPATH=src python -m tests.fuzz.runtime_pressure_fuzzer \
   --seed 0 --seeds 32 --steps 36 --require-coverage \
   --artifacts-dir /tmp/mqttium-runtime-pressure-fuzz
+
+# Long V2/V3 campaign on a shared, low-priority runner
+PYTHONPATH=src nice -n 19 python -m tests.fuzz.runtime_composition_fuzzer \
+  --seed 5000000 --seeds 10000 --steps 48 \
+  --watchdog-seconds 30 --connect-timeout-seconds 10 \
+  --artifacts-dir /tmp/mqttium-runtime-composition-long
 ```
 
 ## Runtime schedule target
@@ -201,6 +207,22 @@ zero failures, all mandatory pressure counters nonzero, and 99.9736% unique
 scheduling traces. V2 retains a clean 50,000-seed calibration; its recommended
 million-seed two-window campaign remains pending. See the dated reports for the
 exact commits, environments, ranges, and limitations.
+
+Runtime-fuzzer watchdogs and connection deadlines use the system monotonic
+clock. That clock advances while the OS deschedules a process, so the strict
+CI defaults can produce environmental liveness failures when a campaign runs
+at low priority on an actively shared host. Keep the defaults for CI and
+dedicated runners. Shared long campaigns must record explicit
+`--watchdog-seconds` and `--connect-timeout-seconds` values in their manifests;
+30 seconds and 10 seconds respectively are the current local starting profile.
+These options change only when the test harness declares a timeout, not any
+ownership, wire, epoch, accounting, task-settlement, or terminal oracle.
+
+A timeout seen under host contention is still a finding until replayed. Stop
+the campaign, preserve its artifact, replay the exact seed with the recorded
+schedule, and only classify it as environmental when isolated repetitions pass
+and the failure evidence contains no independent invariant violation. Do not
+raise the limits to make a deterministic failure green.
 
 The local release runner can orchestrate multiple deterministic shards:
 

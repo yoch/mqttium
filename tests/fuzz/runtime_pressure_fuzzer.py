@@ -142,6 +142,7 @@ class PressureFailureArtifact:
     checkpoints: list[str]
     owners: dict[str, Any]
     failure: str
+    timing: dict[str, float]
 
     def to_dict(self) -> dict[str, Any]:
         return {"schema": "mqttium-runtime-fuzz-v3", **asdict(self)}
@@ -153,6 +154,7 @@ class PressureFailureArtifact:
             f"seed={self.seed}\n"
             f"family={self.family}\n"
             f"profile={json.dumps(self.profile, sort_keys=True)}\n"
+            f"timing={json.dumps(self.timing, sort_keys=True)}\n"
             f"mutation={self.mutation or 'none'}\n"
             f"failure={self.failure}\n"
             "operations:\n"
@@ -509,14 +511,24 @@ class _PressureTransport(v1._ScheduleTransport):
 
 
 class _PressureHarness(v1._RuntimeHarness):
-    def __init__(self, schedule: PressureSchedule, mutation: PressureMutation | None) -> None:
+    def __init__(
+        self,
+        schedule: PressureSchedule,
+        mutation: PressureMutation | None,
+        *,
+        connect_timeout_seconds: float = 0.5,
+    ) -> None:
         self.pressure_schedule = schedule
         self.pressure_mutation = mutation
         self.publish_waiters_high_water = 0
         self.writer_resident_high_water = 0
         self.overlap_observed: set[str] = set()
         self._acked_counts: Counter[int] = Counter()
-        super().__init__(schedule.as_v1_schedule(), None)
+        super().__init__(
+            schedule.as_v1_schedule(),
+            None,
+            connect_timeout_seconds=connect_timeout_seconds,
+        )
         self._install_pressure_mutation()
 
     def _client_options(self) -> dict[str, Any]:
@@ -894,8 +906,13 @@ async def run_pressure_schedule(
     mutation: PressureMutation | None = None,
     artifacts_dir: Path | None = None,
     watchdog_seconds: float = 4.0,
+    connect_timeout_seconds: float = 0.5,
 ) -> RuntimeRun:
-    harness = _PressureHarness(schedule, mutation)
+    harness = _PressureHarness(
+        schedule,
+        mutation,
+        connect_timeout_seconds=connect_timeout_seconds,
+    )
     loop = asyncio.get_running_loop()
     previous_handler = loop.get_exception_handler()
     loop.set_exception_handler(lambda _loop, context: harness.loop_contexts.append(context))
@@ -943,6 +960,10 @@ async def run_pressure_schedule(
             list(harness.checkpoints),
             owners,
             f"{type(failure).__name__}: {failure}",
+            {
+                "connect_timeout_seconds": connect_timeout_seconds,
+                "watchdog_seconds": watchdog_seconds,
+            },
         )
         if artifacts_dir is not None:
             artifacts_dir.mkdir(parents=True, exist_ok=True)
@@ -976,6 +997,8 @@ async def run_pressure_campaign(
     mutation: PressureMutation | None = None,
     artifacts_dir: Path | None = None,
     require_coverage: bool = False,
+    watchdog_seconds: float = 4.0,
+    connect_timeout_seconds: float = 0.5,
 ) -> PressureCampaignResult:
     started = time.monotonic()
     completed = 0
@@ -1005,6 +1028,8 @@ async def run_pressure_campaign(
                 schedule,
                 mutation=mutation,
                 artifacts_dir=artifacts_dir,
+                watchdog_seconds=watchdog_seconds,
+                connect_timeout_seconds=connect_timeout_seconds,
             )
         except RuntimeFuzzFailure:
             failing_seeds.append(seed)
@@ -1035,6 +1060,8 @@ async def _main_async(args: argparse.Namespace) -> int:
         mutation=(PressureMutation(args.mutation) if args.mutation is not None else None),
         artifacts_dir=args.artifacts_dir,
         require_coverage=args.require_coverage,
+        watchdog_seconds=args.watchdog_seconds,
+        connect_timeout_seconds=args.connect_timeout_seconds,
     )
     print(
         f"[DONE] target=runtime-pressure seeds={result.completed} "
@@ -1053,6 +1080,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--seeds", type=int, default=16)
     parser.add_argument("--steps", type=int, default=36)
+    parser.add_argument(
+        "--watchdog-seconds",
+        type=float,
+        default=4.0,
+        help="whole-schedule wall-clock watchdog (raise for a shared low-priority runner)",
+    )
+    parser.add_argument(
+        "--connect-timeout-seconds",
+        type=float,
+        default=0.5,
+        help="harness reconnect/callback-connect deadline",
+    )
     parser.add_argument("--mutation", choices=tuple(PressureMutation), default=None)
     parser.add_argument(
         "--require-coverage",
@@ -1066,8 +1105,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=Path("/tmp/mqttium-runtime-pressure-fuzz"),
     )
     args = parser.parse_args(argv)
-    if args.seed < 0 or args.seeds <= 0 or args.steps < 28:
-        parser.error("seed must be non-negative; seeds positive; steps at least 28")
+    if (
+        args.seed < 0
+        or args.seeds <= 0
+        or args.steps < 28
+        or args.watchdog_seconds <= 0
+        or args.connect_timeout_seconds <= 0
+    ):
+        parser.error("seed must be non-negative; counts and timeouts positive; steps at least 28")
     return asyncio.run(_main_async(args))
 
 

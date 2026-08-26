@@ -90,6 +90,7 @@ class CompositionFailureArtifact:
     checkpoints: list[str]
     owners: dict[str, Any]
     failure: str
+    timing: dict[str, float]
 
     def to_dict(self) -> dict[str, Any]:
         return {"schema": "mqttium-runtime-fuzz-v2", **asdict(self)}
@@ -103,6 +104,7 @@ class CompositionFailureArtifact:
             f"mutation={self.mutation or 'none'}\n"
             f"release_trace={self.release_trace}\n"
             f"failure={self.failure}\n"
+            f"timing={json.dumps(self.timing, sort_keys=True)}\n"
             "operations:\n"
             f"{operations}\n"
             "owners:\n"
@@ -458,12 +460,22 @@ class _CompositionTransport(v1._ScheduleTransport):
 
 
 class _CompositionHarness(v1._RuntimeHarness):
-    def __init__(self, schedule: ComposedSchedule, mutation: CompositionMutation | None) -> None:
+    def __init__(
+        self,
+        schedule: ComposedSchedule,
+        mutation: CompositionMutation | None,
+        *,
+        connect_timeout_seconds: float = 0.5,
+    ) -> None:
         self.composed_schedule = schedule
         self.composition_mutation = mutation
         self.effect_outcomes: list[tuple[int, int]] = []
         self.retired_effect: tuple[EngineEffect, bool, int, Any] | None = None
-        super().__init__(schedule.as_v1_schedule(), None)
+        super().__init__(
+            schedule.as_v1_schedule(),
+            None,
+            connect_timeout_seconds=connect_timeout_seconds,
+        )
         self._install_composition_mutation()
 
     async def _factory(
@@ -699,8 +711,13 @@ async def run_composed_schedule(
     mutation: CompositionMutation | None = None,
     artifacts_dir: Path | None = None,
     watchdog_seconds: float = 2.0,
+    connect_timeout_seconds: float = 0.5,
 ) -> RuntimeRun:
-    harness = _CompositionHarness(schedule, mutation)
+    harness = _CompositionHarness(
+        schedule,
+        mutation,
+        connect_timeout_seconds=connect_timeout_seconds,
+    )
     loop = asyncio.get_running_loop()
     previous_handler = loop.get_exception_handler()
     loop.set_exception_handler(lambda _loop, context: harness.loop_contexts.append(context))
@@ -748,6 +765,10 @@ async def run_composed_schedule(
             list(harness.checkpoints),
             owners,
             f"{type(failure).__name__}: {failure}",
+            {
+                "connect_timeout_seconds": connect_timeout_seconds,
+                "watchdog_seconds": watchdog_seconds,
+            },
         )
         if artifacts_dir is not None:
             artifacts_dir.mkdir(parents=True, exist_ok=True)
@@ -766,6 +787,8 @@ async def run_composition_campaign(
     steps: int,
     mutation: CompositionMutation | None = None,
     artifacts_dir: Path | None = None,
+    watchdog_seconds: float = 2.0,
+    connect_timeout_seconds: float = 0.5,
 ) -> CompositionCampaignResult:
     started = time.monotonic()
     completed = 0
@@ -805,6 +828,8 @@ async def run_composition_campaign(
                 schedule,
                 mutation=mutation,
                 artifacts_dir=artifacts_dir,
+                watchdog_seconds=watchdog_seconds,
+                connect_timeout_seconds=connect_timeout_seconds,
             )
         except RuntimeFuzzFailure:
             failing_seeds.append(seed)
@@ -832,6 +857,8 @@ async def _main_async(args: argparse.Namespace) -> int:
         steps=args.steps,
         mutation=(CompositionMutation(args.mutation) if args.mutation is not None else None),
         artifacts_dir=args.artifacts_dir,
+        watchdog_seconds=args.watchdog_seconds,
+        connect_timeout_seconds=args.connect_timeout_seconds,
     )
     print(
         f"[DONE] target=runtime-composition seeds={result.completed} "
@@ -852,6 +879,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--seeds", type=int, default=24)
     parser.add_argument("--steps", type=int, default=48)
+    parser.add_argument(
+        "--watchdog-seconds",
+        type=float,
+        default=2.0,
+        help="whole-schedule wall-clock watchdog (raise for a shared low-priority runner)",
+    )
+    parser.add_argument(
+        "--connect-timeout-seconds",
+        type=float,
+        default=0.5,
+        help="harness reconnect/callback-connect deadline",
+    )
     parser.add_argument("--mutation", choices=tuple(CompositionMutation), default=None)
     parser.add_argument(
         "--artifacts-dir",
@@ -859,8 +898,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=Path("/tmp/mqttium-runtime-composition-fuzz"),
     )
     args = parser.parse_args(argv)
-    if args.seed < 0 or args.seeds <= 0 or args.steps < 32:
-        parser.error("seed must be non-negative; seeds positive; steps at least 32")
+    if (
+        args.seed < 0
+        or args.seeds <= 0
+        or args.steps < 32
+        or args.watchdog_seconds <= 0
+        or args.connect_timeout_seconds <= 0
+    ):
+        parser.error("seed must be non-negative; counts and timeouts positive; steps at least 32")
     return asyncio.run(_main_async(args))
 
 
