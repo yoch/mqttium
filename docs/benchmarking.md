@@ -43,6 +43,11 @@ remain separate evidence.
   against a tight writer message window. It is the contention harness for the
   targeted-wake experiment; default concurrency is 1/4/16 (64/256 are opt-in).
   It does not replace `paired_writer_capacity.py`.
+- `paired_protocol_responses.py` isolates the event-loop hop for PUBACK,
+  PUBREC, PUBREL and PUBCOMP. The effects come from real engine transitions,
+  pass through `AsyncClient` and `WritePump`, and are measured with the normal
+  producer eager throttle disarmed. An untimed segmented-write race makes every
+  worker fail if a response can overtake a header or payload.
 - `application_stress.py` exercises callbacks, iterators, backpressure, memory,
   and SQLite persistence.
 - `memory_profile.py` enforces versioned tracemalloc and logical-counter limits.
@@ -117,6 +122,37 @@ capacity by simply disabling eager writes would fail that side of the contract.
 The GitHub `Paired Regression` workflow runs a shorter version of this cell as
 **advisory** functional/diagnostic coverage. Its hosted-runner numbers are not a
 substitute for the strict eligible-host A/A and A/B sequence above.
+
+### Protocol-response eager regression gate
+
+Run `paired_protocol_responses.py` after a writer response-path change. Its
+worker generates all four QoS response packet types through the sans-io engine,
+then times their runtime admission in finite 256-frame reader batches. The JSON
+records the immediate-versus-queued decision as well as p50/p95/p99 latency, so
+the target branch is verified independently of timer noise. Strict A/B requires
+every candidate response to reach an idle transport inline, a rate gain of at
+least 10%, and a p50 no higher than 85% of baseline. As with other paired gates,
+an eligible-host A/A control must pass first:
+
+```bash
+python benchmarks/runner_probe.py \
+  --output /tmp/mqttium-runner.json --enforce
+
+python benchmarks/paired_protocol_responses.py \
+  --base-root "$BASELINE" --candidate-root "$BASELINE" \
+  --repeat 8 --cpu 2 --policy strict \
+  --preflight-report /tmp/mqttium-runner.json \
+  --output /tmp/mqttium-protocol-response-aa.json
+
+python benchmarks/paired_protocol_responses.py \
+  --base-root "$BASELINE" --candidate-root . \
+  --repeat 8 --cpu 2 --policy strict \
+  --preflight-report /tmp/mqttium-runner.json \
+  --output /tmp/mqttium-protocol-response-ab.json
+```
+
+This is a runtime scheduling microbenchmark, not a broker RTT claim. Retain the
+QoS 1/2 network capacity and application RTT cells as end-to-end evidence.
 
 ## Keeping the harness out of the result
 
