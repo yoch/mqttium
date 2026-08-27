@@ -24,16 +24,21 @@ is `main`. Performance gates additionally require exact 40-character commit
 SHAs and an explicit confirmation that every selected commit has been reviewed
 and is trusted. Moving branches and tags are not accepted as performance inputs.
 
-The diagnostic `targeted-micro` profile is a deliberately narrow exception: it
-is accepted only when `ARM64 Paired Regression` is dispatched from
-`refs/heads/codex/arm64-pacer-diagnostics`. It requires exact base and candidate
-SHAs plus the same trusted-code confirmation. Scenario names are a bounded,
-comma-separated list validated against the candidate's registry before any
-measurement starts. The workflow invokes the candidate's
+The diagnostic `targeted-micro` and `targeted-protocol-responses` profiles are
+deliberately narrow exceptions: they are accepted only when `ARM64 Paired
+Regression` is dispatched from
+`refs/heads/codex/arm64-pacer-diagnostics`. Both require exact base and candidate
+SHAs plus the same trusted-code confirmation. For `targeted-micro`, scenario
+names are a bounded, comma-separated list validated against the candidate's
+registry before any measurement starts. The workflow invokes the candidate's
 `benchmarks/paired_regression.py`, so a reviewed candidate can contribute new
-scenarios without treating scenario input as shell text. The profile records a
-quiet-host preflight and emits JSON artifacts; it is diagnostic, not release
-evidence.
+scenarios without treating scenario input as shell text.
+
+`targeted-protocol-responses` runs the candidate's
+`benchmarks/paired_protocol_responses.py` with constant arguments. It first
+requires a strict eight-pair base-versus-base control to pass, then runs a
+strict base-versus-candidate gate on CPU 2. Both profiles record a quiet-host
+preflight and emit JSON artifacts; they are diagnostic, not release evidence.
 
 `ARM64 Paired Regression` and `ARM64 Network Release Gate` necessarily execute
 the selected base/candidate source trees. Treat them as privileged maintainer
@@ -144,10 +149,10 @@ silently survive into a stable-release decision.
 The dispatch ref selects the workflow definition as well as gating the job.
 GitHub only enables `workflow_dispatch` for workflow files present on the
 default branch, and maintainers must explicitly select the diagnostic branch
-when launching `targeted-micro`. Selecting `main`, a tag, or another branch
-leaves that job ineligible. The ref guard does not establish code trust: the
-diagnostic branch and both exact input commits still require review because all
-three can execute code on the persistent runner.
+when launching either targeted profile. Selecting `main`, a tag, or another
+branch leaves those jobs ineligible. The ref guard does not establish code
+trust: the diagnostic branch and both exact input commits still require review
+because all three can execute code on the persistent runner.
 
 ## Persistent-runner hygiene
 
