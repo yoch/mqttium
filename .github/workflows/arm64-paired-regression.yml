@@ -3,6 +3,14 @@ name: ARM64 Paired Regression
 on:
   workflow_dispatch:
     inputs:
+      profile:
+        description: Benchmark campaign to run
+        required: true
+        default: full
+        type: choice
+        options:
+          - full
+          - targeted-micro
       base_ref:
         description: Exact reviewed capacity-baseline commit SHA
         required: true
@@ -12,8 +20,12 @@ on:
         required: true
         type: string
       latency_base_ref:
-        description: Exact reviewed latency-baseline commit SHA
-        required: true
+        description: Exact reviewed latency-baseline commit SHA (required for full)
+        required: false
+        type: string
+      scenarios:
+        description: Comma-separated candidate micro scenarios (required for targeted-micro)
+        required: false
         type: string
       confirm_trusted_code:
         description: I confirm that every input commit was reviewed and is trusted on the persistent runner
@@ -30,7 +42,7 @@ concurrency:
 
 jobs:
   paired:
-    if: inputs.confirm_trusted_code && github.ref == 'refs/heads/main'
+    if: inputs.profile == 'full' && inputs.confirm_trusted_code && github.ref == 'refs/heads/main'
     runs-on: [self-hosted, linux, ARM64]
     timeout-minutes: 90
     env:
@@ -313,3 +325,219 @@ jobs:
             wait "$pid" 2>/dev/null || true
           fi
           rm -rf "$JOB_ROOT"
+
+  targeted-micro:
+    name: Targeted micro / ARM64 / system Python 3.13
+    if: inputs.profile == 'targeted-micro' && inputs.confirm_trusted_code && github.ref == 'refs/heads/codex/arm64-pacer-diagnostics'
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 45
+    env:
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+    steps:
+      - name: Check out trusted diagnostic harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          path: harness
+          persist-credentials: false
+
+      - name: Set run-specific workspace
+        run: echo "JOB_ROOT=$RUNNER_TEMP/mqttium-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+
+      - name: Validate immutable trusted commits
+        env:
+          BASE_REF: ${{ inputs.base_ref }}
+          CANDIDATE_REF: ${{ inputs.candidate_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for value in "$BASE_REF" "$CANDIDATE_REF"; do
+            [[ "$value" =~ ^[0-9a-fA-F]{40}$ ]] || {
+              echo "base_ref and candidate_ref must be exact commit SHAs" >&2
+              exit 2
+            }
+          done
+
+      - name: Check out candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.candidate_ref }}
+          path: candidate
+          persist-credentials: false
+
+      - name: Check out baseline
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.base_ref }}
+          path: base
+          persist-credentials: false
+
+      - name: Verify exact checked-out commits
+        env:
+          BASE_REF: ${{ inputs.base_ref }}
+          CANDIDATE_REF: ${{ inputs.candidate_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C base rev-parse HEAD)" = "${BASE_REF,,}"
+          test "$(git -C candidate rev-parse HEAD)" = "${CANDIDATE_REF,,}"
+
+      - name: Verify dedicated runner prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "aarch64"
+          command -v python3
+          python3 - <<'PY'
+          import sys
+          if sys.version_info[:2] != (3, 13):
+              raise SystemExit(f"expected system Python 3.13, got {sys.version}")
+          PY
+          command -v mosquitto
+          if pgrep -a mosquitto; then
+            echo "A pre-existing Mosquitto process would contaminate microbenchmark evidence." >&2
+            exit 1
+          fi
+
+      - name: Create isolated virtual environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$JOB_ROOT"
+          mkdir -p "$JOB_ROOT"
+          python3 -m venv "$JOB_ROOT/venv"
+          echo "$JOB_ROOT/venv/bin" >> "$GITHUB_PATH"
+
+      - run: python -m pip install "psutil>=6,<8"
+
+      - name: Enforce quiet dedicated-runner preflight
+        working-directory: harness
+        run: |
+          python benchmarks/runner_probe.py \
+            --output "$JOB_ROOT/runner.json" \
+            --require-temperature \
+            --wait-seconds 60 \
+            --poll-seconds 5 \
+            --consecutive-eligible 2 \
+            --enforce
+
+      - name: Validate requested candidate scenarios
+        env:
+          REQUESTED_SCENARIOS: ${{ inputs.scenarios }}
+          BASE_REF: ${{ inputs.base_ref }}
+          CANDIDATE_REF: ${{ inputs.candidate_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import importlib.util
+          import json
+          import os
+          import re
+          import sys
+          from pathlib import Path
+
+          raw = os.environ["REQUESTED_SCENARIOS"]
+          scenarios = [value.strip() for value in raw.split(",")]
+          if not raw.strip() or any(not value for value in scenarios):
+              raise SystemExit("scenarios must be a non-empty comma-separated list")
+          if len(scenarios) > 12:
+              raise SystemExit("at most 12 targeted scenarios may be requested")
+          if len(set(scenarios)) != len(scenarios):
+              raise SystemExit("duplicate scenarios are not allowed")
+          token = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}").fullmatch
+          invalid_tokens = [value for value in scenarios if token(value) is None]
+          if invalid_tokens:
+              raise SystemExit(f"invalid scenario token(s): {invalid_tokens!r}")
+
+          benchmark_dir = Path("candidate/benchmarks").resolve()
+          sys.path[:0] = [str(benchmark_dir), str(Path("candidate/src").resolve())]
+          spec = importlib.util.spec_from_file_location(
+              "candidate_paired_regression", benchmark_dir / "paired_regression.py"
+          )
+          if spec is None or spec.loader is None:
+              raise SystemExit("cannot load candidate paired_regression.py")
+          module = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = module
+          spec.loader.exec_module(module)
+          available = set(module.SCENARIOS)
+          unknown = [value for value in scenarios if value not in available]
+          if unknown:
+              raise SystemExit(f"candidate does not define scenario(s): {unknown!r}")
+
+          manifest = {
+              "base_ref": os.environ["BASE_REF"].lower(),
+              "candidate_ref": os.environ["CANDIDATE_REF"].lower(),
+              "scenarios": scenarios,
+          }
+          output = Path(os.environ["JOB_ROOT"]) / "targeted-micro-request.json"
+          output.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+          PY
+
+      - name: Run targeted candidate microbenchmarks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          root = Path(os.environ["JOB_ROOT"])
+          request = json.loads((root / "targeted-micro-request.json").read_text(encoding="utf-8"))
+          script = Path("candidate/benchmarks/paired_regression.py")
+          scenario_results = []
+          for index, scenario in enumerate(request["scenarios"], start=1):
+              output = root / f"targeted-micro-{index:02d}.json"
+              subprocess.run(
+                  [
+                      sys.executable,
+                      str(script),
+                      "--base-root",
+                      "base",
+                      "--candidate-root",
+                      "candidate",
+                      "--scenario",
+                      scenario,
+                      "--repeat",
+                      "11",
+                      "--cpu",
+                      "2",
+                      "--output",
+                      str(output),
+                  ],
+                  check=True,
+              )
+              payload = json.loads(output.read_text(encoding="utf-8"))
+              scenario_results.extend(payload["scenarios"])
+
+          combined = {
+              "base_ref": request["base_ref"],
+              "candidate_ref": request["candidate_ref"],
+              "repeat": 11,
+              "cpu": 2,
+              "scenarios": scenario_results,
+          }
+          (root / "targeted-micro.json").write_text(
+              json.dumps(combined, indent=2) + "\n", encoding="utf-8"
+          )
+          PY
+
+      - name: Upload targeted micro measurements
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: arm64-targeted-micro-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/mqttium-${{ github.run_id }}-${{ github.run_attempt }}/*.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Clean run-specific workspace
+        if: always()
+        shell: bash
+        run: rm -rf "$JOB_ROOT"
