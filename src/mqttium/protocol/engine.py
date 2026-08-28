@@ -37,6 +37,7 @@ from mqttium.protocol.effects import (
     DisconnectInfo,
     EffectKind,
     EngineEffect,
+    ProtocolResponseEffect,
     PublishFailure as PublishFailure,
     PublishHandle,
 )
@@ -243,7 +244,7 @@ class ProtocolEngine:
         self._emit(EffectKind.SEND, packet)
 
     def _send_protocol_response(self, packet: bytes) -> None:
-        self._effects.append(EngineEffect(EffectKind.SEND, packet, protocol_response=True))
+        self._effects.append(ProtocolResponseEffect(EffectKind.SEND, packet))
 
     def begin_connect(self) -> bytes:
         if self.state in (
