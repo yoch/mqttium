@@ -31,7 +31,7 @@ def _feed_connack_ok(engine: ProtocolEngine, session_present: bool = False) -> N
 def _take_sends(engine: ProtocolEngine) -> list[bytes]:
     out: list[bytes] = []
     for e in engine.take_effects():
-        if e.kind is EffectKind.SEND:
+        if e.kind in (EffectKind.SEND, EffectKind.SEND_PROTOCOL_RESPONSE):
             data = e.data
             out.append(data if isinstance(data, bytes) else data[0] + data[1])
     return out
@@ -120,7 +120,9 @@ def test_qos2_inbound_dedup() -> None:
     effects = engine.take_effects()
     messages = [e for e in effects if e.kind is EffectKind.MESSAGE]
     assert len(messages) == 1
-    sends = [e.data for e in effects if e.kind is EffectKind.SEND]
+    sends = [
+        e.data for e in effects if e.kind in (EffectKind.SEND, EffectKind.SEND_PROTOCOL_RESPONSE)
+    ]
     assert len(sends) == 1  # PUBREC
 
     # Duplicate PUBLISH with DUP — must not redeliver.
@@ -137,14 +139,14 @@ def test_qos2_inbound_dedup() -> None:
     engine.handle_raw(dec.next_packet())  # type: ignore[arg-type]
     effects = engine.take_effects()
     assert not any(e.kind is EffectKind.MESSAGE for e in effects)
-    assert any(e.kind is EffectKind.SEND for e in effects)  # PUBREC again
+    assert any(e.kind is EffectKind.SEND_PROTOCOL_RESPONSE for e in effects)  # PUBREC again
 
     # PUBREL completes
     dec = IncrementalDecoder()
     dec.feed(PubRelPacket(mid=7).encode())
     engine.handle_raw(dec.next_packet())  # type: ignore[arg-type]
     effects = engine.take_effects()
-    assert any(e.kind is EffectKind.SEND for e in effects)  # PUBCOMP
+    assert any(e.kind is EffectKind.SEND_PROTOCOL_RESPONSE for e in effects)  # PUBCOMP
     assert engine.store.get_in(7) is None
 
 

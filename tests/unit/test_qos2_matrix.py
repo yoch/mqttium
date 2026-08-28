@@ -37,7 +37,11 @@ def _drop_and_reconnect(engine: ProtocolEngine, session_present: bool) -> list[b
     engine.take_effects()
     engine.begin_connect()
     _feed(engine, _connack(session_present))
-    return [_as_bytes(e.data) for e in engine.take_effects() if e.kind is EffectKind.SEND]
+    return [
+        _as_bytes(e.data)
+        for e in engine.take_effects()
+        if e.kind in (EffectKind.SEND, EffectKind.SEND_PROTOCOL_RESPONSE)
+    ]
 
 
 def test_qos2_loss_before_publish_clean_session() -> None:

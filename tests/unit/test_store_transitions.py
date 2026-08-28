@@ -128,7 +128,7 @@ def sends(engine: ProtocolEngine) -> list[bytes]:
     return [
         write_item_bytes(effect.data)
         for effect in engine.take_effects()
-        if effect.kind is EffectKind.SEND
+        if effect.kind in (EffectKind.SEND, EffectKind.SEND_PROTOCOL_RESPONSE)
     ]
 
 

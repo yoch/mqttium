@@ -9,7 +9,7 @@ from mqttium.codec.buffer import IncrementalDecoder
 from mqttium.enums import MQTTProtocolVersion, PacketType, QoS
 from mqttium.packets import PubRecPacket, PubRelPacket, PublishPacket, encode_frame
 from mqttium.protocol.config import EngineConfig
-from mqttium.protocol.effects import EffectKind, EngineEffect, ProtocolResponseEffect
+from mqttium.protocol.effects import EffectKind, EngineEffect
 from mqttium.protocol.engine import ProtocolEngine
 
 
@@ -34,12 +34,12 @@ def _connected_engine() -> ProtocolEngine:
     return engine
 
 
-def test_protocol_response_marker_does_not_expand_generic_effects() -> None:
+def test_protocol_response_kind_does_not_expand_generic_effects() -> None:
     ordinary = EngineEffect(EffectKind.SEND, b"data")
-    response = ProtocolResponseEffect(EffectKind.SEND, b"ack")
+    response = EngineEffect(EffectKind.SEND_PROTOCOL_RESPONSE, b"ack")
 
-    assert not hasattr(ordinary, "protocol_response")
-    assert response.protocol_response is True
+    assert ordinary.kind is EffectKind.SEND
+    assert response.kind is EffectKind.SEND_PROTOCOL_RESPONSE
     assert not hasattr(response, "__dict__")
     assert sys.getsizeof(response) == sys.getsizeof(ordinary)
 
@@ -57,8 +57,11 @@ def test_inbound_puback_is_marked_as_protocol_response() -> None:
 
     _feed(engine, publish.encode(MQTTProtocolVersion.MQTTv5))
 
-    send = next(effect for effect in engine.take_effects() if effect.kind is EffectKind.SEND)
-    assert send.protocol_response is True
+    send = next(
+        effect
+        for effect in engine.take_effects()
+        if effect.kind is EffectKind.SEND_PROTOCOL_RESPONSE
+    )
     assert send.data[0] & 0xF0 == PacketType.PUBACK
 
 
@@ -72,8 +75,11 @@ def test_outbound_pubrel_is_marked_as_protocol_response() -> None:
         PubRecPacket(mid=handle.mid or 0).encode(MQTTProtocolVersion.MQTTv5),
     )
 
-    send = next(effect for effect in engine.take_effects() if effect.kind is EffectKind.SEND)
-    assert send.protocol_response is True
+    send = next(
+        effect
+        for effect in engine.take_effects()
+        if effect.kind is EffectKind.SEND_PROTOCOL_RESPONSE
+    )
     assert send.data[0] & 0xF0 == PacketType.PUBREL
 
 
@@ -89,13 +95,19 @@ def test_inbound_qos2_responses_are_marked_as_protocol_responses() -> None:
     )
 
     _feed(engine, publish.encode(MQTTProtocolVersion.MQTTv5))
-    pubrec = next(effect for effect in engine.take_effects() if effect.kind is EffectKind.SEND)
-    assert pubrec.protocol_response is True
+    pubrec = next(
+        effect
+        for effect in engine.take_effects()
+        if effect.kind is EffectKind.SEND_PROTOCOL_RESPONSE
+    )
     assert pubrec.data[0] & 0xF0 == PacketType.PUBREC
 
     _feed(engine, PubRelPacket(mid=9).encode(MQTTProtocolVersion.MQTTv5))
-    pubcomp = next(effect for effect in engine.take_effects() if effect.kind is EffectKind.SEND)
-    assert pubcomp.protocol_response is True
+    pubcomp = next(
+        effect
+        for effect in engine.take_effects()
+        if effect.kind is EffectKind.SEND_PROTOCOL_RESPONSE
+    )
     assert pubcomp.data[0] & 0xF0 == PacketType.PUBCOMP
 
 
@@ -107,7 +119,7 @@ def test_runtime_routes_marked_send_to_protocol_response_admission() -> None:
     client._try_enqueue_outbound = lambda data, *, epoch=None: ordinary.append(data) is None
 
     applied = client._apply_effect_inline(
-        ProtocolResponseEffect(EffectKind.SEND, b"ack"),
+        EngineEffect(EffectKind.SEND_PROTOCOL_RESPONSE, b"ack"),
         client._connection_epoch,
     )
 

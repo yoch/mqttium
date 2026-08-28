@@ -8,6 +8,7 @@ from benchmarks.paired_protocol_responses import (
     _run_phase,
 )
 from mqttium.enums import PacketType
+from mqttium.protocol.effects import EffectKind
 
 
 def test_benchmark_corpus_comes_from_all_four_engine_transitions() -> None:
@@ -16,7 +17,7 @@ def test_benchmark_corpus_comes_from_all_four_engine_transitions() -> None:
     assert [PacketType.from_byte(effect.data[0]).name for effect in effects] == list(
         _EXPECTED_TYPES
     )
-    assert all(effect.protocol_response is True for effect in effects)
+    assert all(effect.kind is EffectKind.SEND_PROTOCOL_RESPONSE for effect in effects)
 
 
 async def test_candidate_benchmark_reaches_idle_transport_inline_and_keeps_fifo() -> None:

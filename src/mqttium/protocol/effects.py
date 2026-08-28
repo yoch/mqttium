@@ -17,6 +17,9 @@ from mqttium.types import Properties
 
 class EffectKind(Enum):
     SEND = auto()
+    # Writer-owned wire response to an inbound QoS packet. The distinct
+    # internal kind keeps ordinary SEND dispatch byte-for-byte unchanged.
+    SEND_PROTOCOL_RESPONSE = auto()
     MESSAGE = auto()
     DECODED_MESSAGE = auto()
     CONNACK = auto()
@@ -45,13 +48,6 @@ class EngineEffect:
     # this fresh PUBLISH. None means no trusted decode-time size is available;
     # store/replay effects deliberately omit it.
     decoded_property_wire_size: int | None = None
-
-
-class ProtocolResponseEffect(EngineEffect):
-    """SEND marker that leaves ordinary ``EngineEffect`` instances unchanged."""
-
-    __slots__ = ()
-    protocol_response = True
 
 
 @dataclass(slots=True)

@@ -29,7 +29,7 @@ def _raw(wire: bytes) -> RawPacket:
 def _sent_packet_types(effects) -> list[PacketType]:
     result: list[PacketType] = []
     for effect in effects:
-        if effect.kind is not EffectKind.SEND:
+        if effect.kind not in (EffectKind.SEND, EffectKind.SEND_PROTOCOL_RESPONSE):
             continue
         data = effect.data
         wire = data if isinstance(data, bytes) else data[0] + data[1]

@@ -45,7 +45,10 @@ def test_auto_qos1_puback_skips_packet_dataclass(monkeypatch) -> None:
     effects = engine.take_effects()
 
     assert calls == [7]
-    assert [effect.kind for effect in effects] == [EffectKind.SEND, EffectKind.MESSAGE]
+    assert [effect.kind for effect in effects] == [
+        EffectKind.SEND_PROTOCOL_RESPONSE,
+        EffectKind.MESSAGE,
+    ]
     assert effects[0].data == b"\x40\x02\x00\x07"
 
 
@@ -94,7 +97,10 @@ def test_auto_qos2_pubrec_skips_packet_dataclass(monkeypatch) -> None:
     effects = engine.take_effects()
 
     assert calls == [7]
-    assert [effect.kind for effect in effects] == [EffectKind.SEND, EffectKind.MESSAGE]
+    assert [effect.kind for effect in effects] == [
+        EffectKind.SEND_PROTOCOL_RESPONSE,
+        EffectKind.MESSAGE,
+    ]
     assert effects[0].data == b"\x50\x02\x00\x07"
 
 
@@ -118,7 +124,7 @@ def test_success_pubrec_settle_skips_property_decoder(monkeypatch) -> None:
     effects = engine.take_effects()
 
     assert calls == 0
-    assert any(effect.kind is EffectKind.SEND for effect in effects)
+    assert any(effect.kind is EffectKind.SEND_PROTOCOL_RESPONSE for effect in effects)
     assert any(effect.data == b"\x62\x02" + pack_u16(handle.mid) for effect in effects)
 
 

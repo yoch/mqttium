@@ -60,7 +60,7 @@ def _engine(store: MemoryInflightStore | SqliteInflightStore | None = None) -> P
 
 
 def _puback_mids(engine: ProtocolEngine) -> list[int]:
-    sends = [e.data for e in engine.take_effects() if e.kind is EffectKind.SEND]
+    sends = [e.data for e in engine.take_effects() if e.kind is EffectKind.SEND_PROTOCOL_RESPONSE]
     return [int.from_bytes(frame[2:4], "big") for frame in sends if frame[0] >> 4 == 4]
 
 
