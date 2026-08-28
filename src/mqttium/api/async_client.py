@@ -67,6 +67,7 @@ from mqttium.protocol.engine import (
     EngineConfig,
     EngineEffect,
     ProtocolEngine,
+    ProtocolResponseEffect,
     PublishFailure,
 )
 from mqttium.protocol.negotiated import NegotiatedSettings
@@ -2123,7 +2124,7 @@ class AsyncClient:
             return True
         kind = effect.kind
         if kind is EffectKind.SEND:
-            if effect.protocol_response:
+            if isinstance(effect, ProtocolResponseEffect):
                 return self._try_enqueue_protocol_response(effect.data, epoch=epoch)
             return self._try_enqueue_outbound(effect.data, epoch=epoch)
         if kind is EffectKind.CONNACK and self.on_connect is None:
@@ -2208,7 +2209,7 @@ class AsyncClient:
     ) -> None:
         kind = effect.kind
         if kind is EffectKind.SEND:
-            if effect.protocol_response and self._try_enqueue_protocol_response(
+            if isinstance(effect, ProtocolResponseEffect) and self._try_enqueue_protocol_response(
                 effect.data, epoch=epoch
             ):
                 return
