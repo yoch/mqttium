@@ -346,6 +346,7 @@ class AsyncClient:
         # the single-effect hot path.
         self._collect_effects_locked = self._effect_pump.collect_from_engine
         self._drain_effects_inline = self._effect_pump.drain_inline
+        self._drain_ingress_ack_batch_inline = self._effect_pump.drain_ingress_ack_batch_inline
         self._schedule_effect_flush = self._effect_pump.schedule
         self._drain_effects = self._effect_pump.drain
         self._discard_connection_effects = self._effect_pump.discard_connection_effects
@@ -1779,6 +1780,17 @@ class AsyncClient:
                         if handled and self._engine.has_pending_effects:
                             self._collect_effects_locked()
                     if self._effect_pump.pending:
+                        # A multi-packet reader batch ending in a terminal
+                        # publish result is the inbound ACK batching seam. The
+                        # ordinary EffectPump loop deliberately has no terminal
+                        # branch, keeping QoS 0 and single-ACK latency unchanged.
+                        if handled > 1:
+                            tail_kind = self._effect_pump.pending[-1].kind
+                            if (
+                                tail_kind is EffectKind.PUBLISH_COMPLETE
+                                or tail_kind is EffectKind.PUBLISH_FAILED
+                            ):
+                                self._drain_ingress_ack_batch_inline()
                         await self._drain_effects()
                     # A batch that stopped short of both bounds emptied the
                     # buffer, so there is nothing to decode until the next

@@ -73,6 +73,27 @@ async def test_one_tcp_read_batches_puback_and_pubcomp_settlement() -> None:
     assert seen == [qos1.mid, qos2.mid]
 
 
+async def test_single_puback_read_keeps_the_ordinary_completion_path() -> None:
+    client = AsyncClient(client_id="batch-ack-single-control")
+    engine = client._engine
+    engine.state = ConnectionState.CONNECTED
+    publish = engine.queue_publish("batch/single", b"one", qos=QoS.AT_LEAST_ONCE)
+    assert publish.mid is not None
+    engine.take_effects()
+    receipt = PublishReceipt(publish.mid, QoS.AT_LEAST_ONCE)
+    client._register_publish_receipt(publish.mid, receipt)
+
+    def unexpected_batch() -> None:
+        raise AssertionError("one PUBACK must not enter ACK batching")
+
+    client._drain_ingress_ack_batch_inline = unexpected_batch
+    client._transport = _OneReadTransport(PubAckPacket(publish.mid).encode())
+
+    await client._read_loop()
+
+    assert receipt.is_done()
+
+
 async def test_terminal_batch_is_one_physical_bounded_callback_job() -> None:
     client = AsyncClient(client_id="batch-ack-physical", max_pending_callbacks=4)
     receipts = [PublishReceipt(mid, QoS.AT_LEAST_ONCE) for mid in (1, 2, 3)]
@@ -84,7 +105,7 @@ async def test_terminal_batch_is_one_physical_bounded_callback_job() -> None:
     client.on_publish = lambda mid, _reason: seen.append(mid)
 
     client._collect_effects_locked()
-    client._drain_effects_inline()
+    client._drain_ingress_ack_batch_inline()
 
     assert all(receipt.is_done() for receipt in receipts)
     assert len(client._callback_queue._queue) == 1  # type: ignore[attr-defined]
@@ -154,7 +175,7 @@ async def test_duplicate_mids_settle_receipts_in_per_mid_fifo_order() -> None:
         client._engine._emit(EffectKind.PUBLISH_COMPLETE, mid)
 
     client._collect_effects_locked()
-    client._drain_effects_inline()
+    client._drain_ingress_ack_batch_inline()
 
     assert settled == ["old-7", "mid-8", "reused-7"]
     assert old.is_done() and other.is_done() and reused.is_done()
@@ -162,6 +183,24 @@ async def test_duplicate_mids_settle_receipts_in_per_mid_fifo_order() -> None:
     await client._callback_queue.join()
     assert callbacks == [7, 8, 7]
     await client._shutdown_callback_worker(drain=False)
+
+
+def test_general_qos0_effect_drain_never_checks_terminal_batching() -> None:
+    client = AsyncClient(client_id="batch-ack-qos0-control")
+    client._engine._emit(EffectKind.SEND, b"qos0")
+    client._engine._emit(EffectKind.PUBLISH_COMPLETE, None)
+    client._collect_effects_locked()
+
+    def unexpected_batch(_effects: object, _epoch: int) -> int:
+        raise AssertionError("ordinary QoS 0 drain must not enter ACK batching")
+
+    client._apply_terminal_effect_batch_inline = unexpected_batch  # type: ignore[method-assign]
+
+    client._drain_effects_inline()
+
+    assert not client._pending_effects
+    assert client._outbound.get_nowait() == b"qos0"
+    client._outbound.task_done()
 
 
 def test_terminal_batch_preflights_the_whole_logical_callback_bound() -> None:

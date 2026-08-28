@@ -221,9 +221,6 @@ class EffectPump:
                     if self._consume_batch(self.owner._apply_message_effect_batch_inline, epoch):
                         continue
                     break
-                if kind is EffectKind.PUBLISH_COMPLETE or kind is EffectKind.PUBLISH_FAILED:
-                    if self._consume_batch(self.owner._apply_terminal_effect_batch_inline, epoch):
-                        continue
                 if not self.owner._apply_effect_inline(effect, epoch):
                     break
                 self.pending.popleft()
@@ -233,6 +230,42 @@ class EffectPump:
             self.draining_inline = False
         if self.pending:
             self.schedule()
+
+    def drain_ingress_ack_batch_inline(self) -> None:
+        """Apply an ingress batch ending in terminal publish results.
+
+        The reader calls this only after decoding several packets and observing
+        a terminal effect at the tail. Keeping that detection outside
+        ``drain_inline`` leaves the general SEND/QoS 0 loop unchanged.
+        """
+        if self.draining_inline or self.lock.locked() or not self.pending:
+            return
+        epoch = self.pending_epoch
+        if epoch != self.owner._connection_epoch:
+            self.discard_connection_effects()
+            if not self.pending:
+                return
+            epoch = self.pending_epoch
+        self.draining_inline = True
+        try:
+            while self.pending:
+                effect = self.pending[0]
+                kind = effect.kind
+                if kind is EffectKind.PUBLISH_COMPLETE or kind is EffectKind.PUBLISH_FAILED:
+                    if self._consume_batch(self.owner._apply_terminal_effect_batch_inline, epoch):
+                        continue
+                    break
+                # Message delivery has its own batch admission and may need
+                # persistence marking. Let the established drain own it.
+                if kind is EffectKind.MESSAGE or kind is EffectKind.DECODED_MESSAGE:
+                    break
+                if not self.owner._apply_effect_inline(effect, epoch):
+                    break
+                self.pending.popleft()
+                self.inline_effects += 1
+                self._complete()
+        finally:
+            self.draining_inline = False
 
     def schedule(self) -> None:
         self.flush_requested = True
@@ -257,11 +290,6 @@ class EffectPump:
                     if kind is EffectKind.MESSAGE or kind is EffectKind.DECODED_MESSAGE:
                         if self._consume_batch(
                             self.owner._apply_message_effect_batch_inline, epoch
-                        ):
-                            continue
-                    if kind is EffectKind.PUBLISH_COMPLETE or kind is EffectKind.PUBLISH_FAILED:
-                        if self._consume_batch(
-                            self.owner._apply_terminal_effect_batch_inline, epoch
                         ):
                             continue
                     try:
