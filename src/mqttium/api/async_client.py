@@ -358,7 +358,6 @@ class AsyncClient:
         # async enqueue call cost while moving their state to one owner.
         self._can_enqueue_outbound_size = self._write_pump.can_enqueue_size
         self._try_enqueue_outbound = self._write_pump.try_enqueue
-        self._try_enqueue_protocol_response = self._write_pump.try_enqueue_protocol_response
         self._try_enqueue_outbound_many = self._write_pump.try_enqueue_many
         self._enqueue_outbound = self._write_pump.enqueue
         self._delivery = ApplicationDelivery(
@@ -2109,6 +2108,15 @@ class AsyncClient:
         if negotiated is not None:
             return negotiated
         return self._engine.config.keepalive
+
+    def _try_enqueue_protocol_response(
+        self,
+        item: WriteItem,
+        *,
+        epoch: int | None = None,
+    ) -> bool:
+        """Admit a protocol response without caching another per-client method."""
+        return self._write_pump.try_enqueue_protocol_response(item, epoch=epoch)
 
     def _apply_effect_inline(self, effect: EngineEffect, epoch: int) -> bool:
         if epoch != self._connection_epoch:
