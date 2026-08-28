@@ -2231,9 +2231,8 @@ class AsyncClient:
                     # A callback can replace itself, publish or return an
                     # awaitable. Leave the remaining ordered prefix to a fresh
                     # dispatch decision or the established batch fallback.
-                    if (
-                        self.on_publish is not callback
-                        or not self._can_dispatch_callback_inline(callback)
+                    if self.on_publish is not callback or not self._can_dispatch_callback_inline(
+                        callback
                     ):
                         break
                     self._settle_publish(mid, reason)
