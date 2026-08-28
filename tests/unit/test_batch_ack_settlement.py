@@ -61,7 +61,11 @@ async def test_one_tcp_read_batches_puback_and_pubcomp_settlement() -> None:
 
     client._enqueue_callback_batch_nowait = record_batch
     seen: list[int | None] = []
-    client.on_publish = lambda mid, _reason: seen.append(mid)
+
+    async def on_publish(mid: int | None, _reason: BaseException | None) -> None:
+        seen.append(mid)
+
+    client.on_publish = on_publish
     client._transport = _OneReadTransport(
         PubAckPacket(qos1.mid).encode() + PubCompPacket(qos2.mid).encode()
     )
@@ -102,7 +106,11 @@ async def test_terminal_batch_is_one_physical_bounded_callback_job() -> None:
         client._register_publish_receipt(receipt.mid, receipt)
         client._engine._emit(EffectKind.PUBLISH_COMPLETE, receipt.mid)
     seen: list[int | None] = []
-    client.on_publish = lambda mid, _reason: seen.append(mid)
+
+    async def on_publish(mid: int | None, _reason: BaseException | None) -> None:
+        seen.append(mid)
+
+    client.on_publish = on_publish
 
     client._collect_effects_locked()
     client._drain_ingress_ack_batch_inline()
@@ -144,7 +152,11 @@ async def test_terminal_callback_batch_isolates_each_callback_error() -> None:
 async def test_shutdown_releases_terminal_batch_callback_capacity() -> None:
     client = AsyncClient(client_id="batch-ack-shutdown", max_pending_callbacks=4)
     effects = deque(EngineEffect(EffectKind.PUBLISH_COMPLETE, mid) for mid in (1, 2, 3))
-    client.on_publish = lambda _mid, _reason: None
+
+    async def on_publish(_mid: int | None, _reason: BaseException | None) -> None:
+        return None
+
+    client.on_publish = on_publish
 
     assert client._apply_terminal_effect_batch_inline(effects, client._connection_epoch) == 3
     assert client.stats().delivery.callback_queued == 3
@@ -179,10 +191,59 @@ async def test_duplicate_mids_settle_receipts_in_per_mid_fifo_order() -> None:
 
     assert settled == ["old-7", "mid-8", "reused-7"]
     assert old.is_done() and other.is_done() and reused.is_done()
-    assert len(client._callback_queue._queue) == 1  # type: ignore[attr-defined]
-    await client._callback_queue.join()
+    assert client._callback_queue.empty()
     assert callbacks == [7, 8, 7]
+    await client._callback_queue.join()
     await client._shutdown_callback_worker(drain=False)
+
+
+async def test_idle_sync_terminal_batch_dispatches_inline_until_reentrant_queueing() -> None:
+    client = AsyncClient(client_id="batch-ack-inline-reentrant", max_pending_callbacks=4)
+    effects = deque(EngineEffect(EffectKind.PUBLISH_COMPLETE, mid) for mid in (1, 2, 3))
+    receipts = {mid: PublishReceipt(mid, QoS.AT_LEAST_ONCE) for mid in (1, 2, 3)}
+    for mid, receipt in receipts.items():
+        client._register_publish_receipt(mid, receipt)
+    seen: list[int | None] = []
+
+    def callback(mid: int | None, _reason: BaseException | None) -> None:
+        seen.append(mid)
+        if mid == 1:
+            assert client._try_enqueue_callback(callback, 99, None)
+
+    client.on_publish = callback
+
+    assert client._apply_terminal_effect_batch_inline(effects, client._connection_epoch) == 1
+    assert seen == [1]
+    assert receipts[1].is_done()
+    assert not receipts[2].is_done()
+
+    remaining = deque(tuple(effects)[1:])
+    assert client._apply_terminal_effect_batch_inline(remaining, client._connection_epoch) == 2
+    await client._callback_queue.join()
+
+    assert seen == [1, 99, 2, 3]
+    assert all(receipt.is_done() for receipt in receipts.values())
+    await client._shutdown_callback_worker(drain=False)
+
+
+def test_inline_terminal_batch_reloads_a_replaced_callback() -> None:
+    client = AsyncClient(client_id="batch-ack-inline-replaced-callback")
+    effects = deque(EngineEffect(EffectKind.PUBLISH_COMPLETE, mid) for mid in (1, 2, 3))
+    seen: list[tuple[str, int | None]] = []
+
+    def replacement(mid: int | None, _reason: BaseException | None) -> None:
+        seen.append(("replacement", mid))
+
+    def initial(mid: int | None, _reason: BaseException | None) -> None:
+        seen.append(("initial", mid))
+        client.on_publish = replacement
+
+    client.on_publish = initial
+    assert client._apply_terminal_effect_batch_inline(effects, client._connection_epoch) == 1
+    remaining = deque(tuple(effects)[1:])
+    assert client._apply_terminal_effect_batch_inline(remaining, client._connection_epoch) == 2
+
+    assert seen == [("initial", 1), ("replacement", 2), ("replacement", 3)]
 
 
 def test_general_qos0_effect_drain_never_checks_terminal_batching() -> None:
@@ -211,7 +272,11 @@ def test_terminal_batch_preflights_the_whole_logical_callback_bound() -> None:
         assert receipt.mid is not None
         client._register_publish_receipt(receipt.mid, receipt)
         effects.append(EngineEffect(EffectKind.PUBLISH_COMPLETE, receipt.mid))
-    client.on_publish = lambda _mid, _reason: None
+
+    async def on_publish(_mid: int | None, _reason: BaseException | None) -> None:
+        return None
+
+    client.on_publish = on_publish
 
     applied = client._apply_terminal_effect_batch_inline(effects, client._connection_epoch)
 

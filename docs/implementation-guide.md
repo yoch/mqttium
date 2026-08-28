@@ -243,8 +243,9 @@ replay uses the paged interface for both built-in stores.
 - QoS 1 receipts complete at PUBACK.
 - QoS 2 receipts complete at PUBCOMP.
 - Consecutive PUBACK/PUBCOMP results handed off by one ingress batch settle in
-  engine order. Their `on_publish` calls may share one physical callback-worker
-  job, but each call still consumes logical bounded-queue capacity; insufficient
+  engine order. Idle synchronous `on_publish` calls run in that pass. Async,
+  reentrant or occupied delivery may share one physical callback-worker job,
+  but each call still consumes logical bounded-queue capacity; insufficient
   capacity retains the ordinary ordered backpressure path.
 - SUBACK and UNSUBACK return all per-filter reason codes; a reason code at or
   above `0x80` remains data in the result rather than becoming a blanket

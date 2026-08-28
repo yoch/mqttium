@@ -62,10 +62,12 @@ lock is held. QoS 0 batches preflight capacity for every callback before
 admitting any write, so the direct path cannot split a batch across paths.
 Consecutive terminal QoS 1/2 effects from one ingress batch settle in engine
 order in one pump pass.
-Their distinct callback arguments share one physical worker job while reserving
-one bounded callback-queue slot per logical completion. The reader selects this
-specialised pass only for a multi-packet batch ending in a terminal result; the
-general effect loop, including QoS 0 and single-result handling, stays unchanged.
+Idle synchronous callbacks run inline until reentrant work occupies the worker.
+Async, reentrant or already-occupied delivery shares one physical worker job
+while reserving one bounded callback-queue slot per logical completion. The
+reader selects this specialised pass only for a multi-packet batch ending in a
+terminal result; the general effect loop, including QoS 0 and single-result
+handling, stays unchanged.
 
 ### Network writes
 

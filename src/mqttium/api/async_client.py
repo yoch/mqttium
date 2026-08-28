@@ -2224,6 +2224,22 @@ class AsyncClient:
         if count < 2:
             return 0
         if callback is not None:
+            if not self._engine_lock.locked() and self._can_dispatch_callback_inline(callback):
+                applied = 0
+                for mid, reason in outcomes:
+                    # A callback can replace itself, publish or return an
+                    # awaitable. Leave the remaining ordered prefix to a fresh
+                    # dispatch decision or the established batch fallback.
+                    if (
+                        self.on_publish is not callback
+                        or not self._can_dispatch_callback_inline(callback)
+                    ):
+                        break
+                    self._settle_publish(mid, reason)
+                    self._dispatch_callback_inline(callback, mid, reason)
+                    applied += 1
+                if applied:
+                    return applied
             if not self._has_callback_capacity(count):
                 return 0
             self._enqueue_callback_batch_nowait(callback, outcomes)
