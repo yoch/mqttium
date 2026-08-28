@@ -6,6 +6,13 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Changed
+
+- Invoke idle synchronous `on_publish` and eligible `on_message` callbacks in
+  the reader/effect-drain turn after receipt or delivery settlement. Async
+  callbacks, callback bursts, reentrant delivery, and occupied/full callback
+  queues retain the bounded callback-worker path and its existing backpressure.
+
 ## [1.0.0rc10] - 2026-08-26
 
 ### Removed

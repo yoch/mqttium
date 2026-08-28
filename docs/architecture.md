@@ -54,11 +54,12 @@ flush worker. A single immediately applicable effect is handled inline; it does
 not allocate a task or enter the deque. Suspended work is tagged with the
 connection epoch so effects from an old transport cannot modify a new session.
 For QoS 0 writer admission and terminal QoS 1/2 publishes, inline application
-may admit `on_publish` to the bounded callback queue and settle the receipt
-immediately. User callback code still runs only in the callback worker; a full
-queue falls back to the ordered effect path and its existing backpressure. QoS
-0 batches preflight capacity for every callback before admitting any write, so
-the direct path cannot split a batch across the two paths.
+settles the receipt immediately. If callback delivery is idle and `on_publish`
+is synchronous, user code may run in that same turn; async, reentrant, occupied
+or full-queue delivery uses the bounded callback worker and its existing
+backpressure. The guard also prevents callbacks from running while the engine
+lock is held. QoS 0 batches preflight capacity for every callback before
+admitting any write, so the direct path cannot split a batch across paths.
 
 ### Network writes
 
@@ -81,9 +82,11 @@ The delivery mode is selected when the client is constructed. Specialised
 admission functions avoid repeated mode branches on every incoming message
 while preserving one authoritative owner for reservations and lifecycle.
 
-Callback exceptions are isolated from protocol state. A message delivered to
-both a callback and an iterator releases its byte reservation only after both
-references are gone.
+Idle synchronous callbacks may run directly in the reader/effect-drain turn;
+the worker remains the bounded fallback for async callbacks, reentrancy and
+bursts. Callback exceptions are isolated from protocol state. A message
+delivered to both a callback and an iterator releases its byte reservation only
+after both references are gone.
 
 ### Ingress
 

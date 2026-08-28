@@ -69,10 +69,8 @@ async def test_publish_nowait_callback_uses_direct_writer_admission() -> None:
     assert client._effect_pump.enqueued == 0
     assert client._effect_flush_task is None
     assert client.stats().writer.queued_messages == 100
-    assert seen == []
-    await client._callback_queue.join()
     assert seen == [None] * 100
-    await client._shutdown_callback_worker(drain=False)
+    assert client._callback_worker_task is None
 
 
 async def test_qos0_callback_marks_writer_admission_not_transport_drain() -> None:
@@ -302,12 +300,10 @@ async def test_direct_path_writer_refusal_does_not_enqueue_a_callback() -> None:
         client.publish_nowait("native/full", b"second", qos=0)
 
     assert client.stats().writer.queued_messages == 1
-    assert client._callback_queue.qsize() == 1
+    assert client._callback_queue.qsize() == 0
     assert not client._engine.has_pending_effects
     assert not client._effect_pump.pending
-    await client._callback_queue.join()
     assert seen == [(None, None)]
-    await client._shutdown_callback_worker(drain=False)
 
 
 async def test_publish_many_callback_capacity_falls_back_atomically() -> None:

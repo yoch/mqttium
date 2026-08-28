@@ -7,9 +7,10 @@ import pytest
 
 from mqttium.api import AsyncClient
 from mqttium.api.models import PublishBatchReceipt, PublishReceipt
-from mqttium.enums import QoS
+from mqttium.enums import ConnectionState, QoS
 from mqttium.protocol.engine import PublishFailure
 from mqttium.protocol.effects import EffectKind, EngineEffect
+from mqttium.types import Message
 
 
 def test_effect_operations_are_bound_directly_to_the_pump() -> None:
@@ -33,7 +34,7 @@ def test_effect_diagnostic_attributes_are_views() -> None:
 
 
 @pytest.mark.parametrize("qos", (QoS.AT_LEAST_ONCE, QoS.EXACTLY_ONCE))
-async def test_qosn_completion_with_callback_settles_inline_and_runs_in_worker(qos: QoS) -> None:
+async def test_qosn_completion_with_idle_sync_callback_runs_inline(qos: QoS) -> None:
     client = AsyncClient(client_id=f"effect-qos{int(qos)}-callback")
     receipt = PublishReceipt(mid=7, qos=qos)
     batch = PublishBatchReceipt()
@@ -54,11 +55,8 @@ async def test_qosn_completion_with_callback_settles_inline_and_runs_in_worker(q
     assert batch.is_done()
     assert not client._pending_effects
     assert client._effect_pump.enqueued == 0
-    assert seen == []
-
-    await asyncio.wait_for(client._callback_queue.join(), timeout=1.0)
     assert seen == [(7, None, True, True)]
-    await client._shutdown_callback_worker(drain=False)
+    assert client._callback_worker_task is None
 
 
 async def test_inline_completion_keeps_callback_exceptions_isolated() -> None:
@@ -89,7 +87,21 @@ async def test_inline_completion_keeps_callback_exceptions_isolated() -> None:
     assert client._effect_pump.error is None
 
 
-async def test_publish_failure_with_callback_settles_inline_and_runs_in_worker() -> None:
+async def test_sync_callback_never_runs_under_engine_lock() -> None:
+    client = AsyncClient(client_id="effect-lock-boundary")
+    seen_lock_states: list[bool] = []
+    client.on_publish = lambda _mid, _reason: seen_lock_states.append(client._engine_lock.locked())
+
+    async with client._engine_lock:
+        client._engine._emit(EffectKind.PUBLISH_COMPLETE, 31)
+        client._collect_effects_locked()
+        assert seen_lock_states == []
+
+    client._drain_effects_inline()
+    assert seen_lock_states == [False]
+
+
+async def test_idle_sync_publish_failure_callback_runs_inline() -> None:
     client = AsyncClient(client_id="effect-failure-callback")
     receipt = PublishReceipt(mid=9, qos=QoS.AT_LEAST_ONCE)
     client._register_publish_receipt(9, receipt)
@@ -104,9 +116,47 @@ async def test_publish_failure_with_callback_settles_inline_and_runs_in_worker()
     assert receipt._error is failure
     assert not client._pending_effects
     assert client._effect_pump.enqueued == 0
-    await asyncio.wait_for(client._callback_queue.join(), timeout=1.0)
     assert seen == [(9, failure)]
+    assert client._callback_worker_task is None
+
+
+async def test_async_publish_callback_stays_on_bounded_worker() -> None:
+    client = AsyncClient(client_id="effect-async-callback")
+    receipt = PublishReceipt(mid=10, qos=QoS.AT_LEAST_ONCE)
+    client._register_publish_receipt(10, receipt)
+    seen: list[int | None] = []
+
+    async def on_publish(mid: int | None, _reason: BaseException | None) -> None:
+        seen.append(mid)
+
+    client.on_publish = on_publish
+    client._engine._emit(EffectKind.PUBLISH_COMPLETE, 10)
+    client._collect_effects_locked()
+
+    assert receipt.is_done()
+    assert seen == []
+    assert client._callback_queue.qsize() == 1
+    await client._callback_queue.join()
+    assert seen == [10]
     await client._shutdown_callback_worker(drain=False)
+
+
+async def test_idle_sync_message_callback_runs_inline_after_engine_lock() -> None:
+    client = AsyncClient(client_id="effect-inline-message", message_delivery="callback")
+    seen: list[tuple[str, bool]] = []
+    client.on_message = lambda message: seen.append((message.topic, client._engine_lock.locked()))
+
+    async with client._engine_lock:
+        client._engine._emit(
+            EffectKind.MESSAGE,
+            Message(topic="inline/message", payload=b"x"),
+        )
+        client._collect_effects_locked()
+        assert seen == []
+
+    client._drain_effects_inline()
+    assert seen == [("inline/message", False)]
+    assert client._callback_worker_task is None
 
 
 async def test_full_callback_queue_retains_async_completion_backpressure() -> None:
@@ -149,6 +199,30 @@ async def test_full_callback_queue_retains_async_completion_backpressure() -> No
     assert seen == ["running", "queued", 11]
     assert not client._pending_effects
     assert client._effect_pump.enqueued == client._effect_pump.applied
+    await client._shutdown_callback_worker(drain=False)
+
+
+async def test_inline_publish_callback_reentrancy_falls_back_to_bounded_worker() -> None:
+    client = AsyncClient(client_id="effect-reentrant", max_pending_callbacks=2)
+    client._engine.state = ConnectionState.CONNECTED
+    receipt = PublishReceipt(mid=17, qos=QoS.AT_LEAST_ONCE)
+    client._register_publish_receipt(17, receipt)
+    seen: list[int | None] = []
+
+    def on_publish(mid: int | None, _reason: BaseException | None) -> None:
+        seen.append(mid)
+        if mid == 17:
+            client.publish_nowait("reentrant/qos0", b"x", qos=0)
+
+    client.on_publish = on_publish
+    client._engine._emit(EffectKind.PUBLISH_COMPLETE, 17)
+    client._collect_effects_locked()
+
+    assert receipt.is_done()
+    assert seen == [17]
+    assert client._callback_queue.qsize() == 1
+    await client._callback_queue.join()
+    assert seen == [17, None]
     await client._shutdown_callback_worker(drain=False)
 
 

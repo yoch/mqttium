@@ -381,6 +381,9 @@ class AsyncClient:
         self._accept_decoded_message = self._delivery.decoded_acceptor()
         self._spawn_callback = self._delivery.spawn_callback
         self._try_enqueue_callback = self._delivery.try_enqueue_callback
+        self._try_dispatch_callback_inline = self._delivery.try_dispatch_callback_inline
+        self._dispatch_callback_inline = self._delivery.dispatch_callback_inline
+        self._can_dispatch_callback_inline = self._delivery.can_dispatch_callback_inline
         self._has_callback_capacity = self._delivery.has_callback_capacity
         self._enqueue_callback_repeated_nowait = self._delivery.enqueue_callback_repeated_nowait
         self._enqueue_callback = self._delivery.enqueue_callback
@@ -660,12 +663,20 @@ class AsyncClient:
 
     def _direct_qos0_ready(self, callback_count: int = 1) -> bool:
         """True when a native QoS 0 write can bypass the effect adapter safely."""
-
-        return (
-            (self.on_publish is None or self._has_callback_capacity(callback_count))
-            and not self._effect_pump.pending
-            and not self._engine.has_pending_effects
-        )
+        if self.on_publish is None:
+            return not self._effect_pump.pending and not self._engine.has_pending_effects
+        callback = self.on_publish
+        assert callback is not None
+        if not (
+            (
+                callback_count == 1
+                and not self._engine_lock.locked()
+                and self._can_dispatch_callback_inline(callback)
+            )
+            or self._has_callback_capacity(callback_count)
+        ):
+            return False
+        return not self._effect_pump.pending and not self._engine.has_pending_effects
 
     def _try_direct_qos0_publish(
         self,
@@ -699,7 +710,10 @@ class AsyncClient:
         if properties is not None and properties.get("topic_alias") is not None:
             self._engine.outbound.commit_topic_alias(topic, properties)
         if callback is not None:
-            self._enqueue_callback_repeated_nowait(callback, (None, None), 1)
+            if self._engine_lock.locked() or not self._try_dispatch_callback_inline(
+                callback, None, None
+            ):
+                self._enqueue_callback_repeated_nowait(callback, (None, None), 1)
         return PublishReceipt(mid=None, qos=QoS.AT_MOST_ONCE)
 
     def _try_direct_qos0_many(
@@ -2109,21 +2123,14 @@ class AsyncClient:
             mid: int | None = effect.data
             callback = self.on_publish
             if callback is not None:
-                # QoS 0 deliberately retains its SEND/completion effect path so
-                # writer admission remains ordered before the callback. QoS 1/2
-                # are already terminal here; admitting their callback to the
-                # bounded worker queue cannot run user code in this call.
-                if mid is None or not self._try_enqueue_callback(callback, mid, None):
-                    return False
+                return self._apply_terminal_callback_inline(callback, mid, None)
             self._settle_publish(mid, None)
             return True
         if kind is EffectKind.PUBLISH_FAILED:
             failure: PublishFailure = effect.data
             callback = self.on_publish
-            if callback is not None and not self._try_enqueue_callback(
-                callback, failure.mid, failure.reason
-            ):
-                return False
+            if callback is not None:
+                return self._apply_terminal_callback_inline(callback, failure.mid, failure.reason)
             self._settle_publish(failure.mid, failure.reason)
             return True
         if kind is EffectKind.SUBACK:
@@ -2136,6 +2143,24 @@ class AsyncClient:
             self._ping_pending = False
             return True
         return False
+
+    def _apply_terminal_callback_inline(
+        self,
+        callback: Callable[[int | None, BaseException | None], object],
+        mid: int | None,
+        reason: BaseException | None,
+    ) -> bool:
+        """Settle and dispatch one terminal callback outside the engine lock."""
+        if self._engine_lock.locked():
+            return False
+        if self._can_dispatch_callback_inline(callback):
+            self._settle_publish(mid, reason)
+            self._dispatch_callback_inline(callback, mid, reason)
+            return True
+        if not self._try_enqueue_callback(callback, mid, reason):
+            return False
+        self._settle_publish(mid, reason)
+        return True
 
     def _resolve_suback(self, packet: SubAckPacket) -> None:
         sub_result = SubscribeResult.from_packet(packet)
@@ -2154,7 +2179,7 @@ class AsyncClient:
         effects: deque[EngineEffect],
         epoch: int,
     ) -> int:
-        if epoch != self._connection_epoch:
+        if epoch != self._connection_epoch or self._engine_lock.locked():
             return 0
         return self._delivery.deliver_message_batch_inline(effects, self.on_message)
 

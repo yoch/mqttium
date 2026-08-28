@@ -198,13 +198,16 @@ The small-message reserve prevents one large payload from starving telemetry.
 It is disabled when it would make a single otherwise valid packet impossible to
 admit.
 
-User callbacks run outside engine critical sections. Exceptions are isolated and
-reported through the established callback policy; they do not stop the protocol
-reader or leak delivery capacity. Consecutive small MESSAGE effects that require
-no persisted delivery mark (QoS 0 and fresh automatic QoS 1) may transfer to the
-bounded callback/iterator queues during the inline effect drain. Persisted QoS 1,
-QoS 2 and replay deliveries keep the established awaited path and are marked only
-after application delivery accepts them.
+User callbacks run outside engine critical sections. When callback delivery is
+idle, a plain synchronous `on_publish` or eligible `on_message` callback may run
+in the reader/effect-drain turn. A reentrancy guard sends callback-initiated
+delivery, async callbacks, and occupied-queue bursts through the bounded worker.
+Exceptions are isolated and reported through the established callback policy;
+they do not stop the protocol reader or leak delivery capacity. Consecutive
+small MESSAGE effects that require no persisted delivery mark (QoS 0 and fresh
+automatic QoS 1) may be applied during the inline effect drain. Persisted QoS 1,
+QoS 2 and replay deliveries keep the established awaited path and are marked
+only after application delivery accepts them.
 
 ## Persistence
 
@@ -229,10 +232,10 @@ replay uses the paged interface for both built-in stores.
 ## API completion and errors
 
 - QoS 0 receipts complete at writer admission. When callback capacity is
-  immediately available, `on_publish` is admitted to the isolated callback
-  worker in the same loop turn; otherwise the whole operation retains the
-  ordered EffectPump path. A batch must preflight every callback before any
-  direct writer admission.
+  immediately available, an idle synchronous `on_publish` may run inline;
+  otherwise it is admitted to the isolated bounded worker in the same loop
+  turn. A batch must preflight every callback before any direct writer
+  admission.
 - QoS 1 receipts complete at PUBACK.
 - QoS 2 receipts complete at PUBCOMP.
 - SUBACK and UNSUBACK return all per-filter reason codes; a reason code at or

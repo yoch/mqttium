@@ -40,8 +40,11 @@ background thread.
 | `auth_handler` | MQTT 5 enhanced-authentication handler |
 
 Callbacks execute outside protocol-engine critical sections. Synchronous
-callbacks must not block the event loop. Callback failures go to the event
-loop's exception handler without silently changing protocol state.
+`on_publish` and eligible `on_message` callbacks may execute inline when
+callback delivery is idle; async, reentrant and queued callbacks use the
+bounded worker. Synchronous callbacks must not block the event loop. Callback
+failures go to the event loop's exception handler without silently changing
+protocol state.
 
 ## Loop confinement
 
