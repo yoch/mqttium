@@ -40,7 +40,9 @@ def test_targeted_micro_keeps_inputs_out_of_shell_commands() -> None:
 
 def test_targeted_protocol_responses_runs_strict_control_before_gate() -> None:
     workflow = WORKFLOW.read_text(encoding="utf-8")
-    targeted = workflow.split("  targeted-protocol-responses:\n", maxsplit=1)[1]
+    targeted = workflow.split("  targeted-protocol-responses:\n", maxsplit=1)[1].split(
+        "  cross-client-matrix:\n", maxsplit=1
+    )[0]
 
     assert (
         "if: inputs.profile == 'targeted-protocol-responses' "
@@ -67,3 +69,30 @@ def test_targeted_protocol_responses_runs_strict_control_before_gate() -> None:
     assert "${{" not in campaign
     assert "protocol-responses-aa.json" in targeted
     assert "protocol-responses-ab.json" in targeted
+
+
+def test_cross_client_matrix_is_ref_bound_pinned_and_interleaved() -> None:
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    matrix = workflow.split("  cross-client-matrix:\n", maxsplit=1)[1]
+
+    assert (
+        "if: inputs.profile == 'cross-client-matrix' && inputs.confirm_trusted_code "
+        "&& github.ref == 'refs/heads/codex/arm64-pacer-diagnostics'"
+    ) in matrix
+    assert matrix.count("persist-credentials: false") == 3
+    assert "9b2b074eea6bdbeb6178bbd736b08bd22c05a8ce" in matrix
+    assert "eclipse-mosquitto:2.1.2-alpine@sha256:" in matrix
+    assert '[[ "$CANDIDATE_REF" =~ ^[0-9a-fA-F]{40}$ ]]' in matrix
+    assert "paho-mqtt==2.1.0" in matrix
+    assert "gmqtt==0.7.0" in matrix
+    assert "--clients gmqtt,mqttium" in matrix
+    for scenario in (
+        "pub_qos_sweep_telemetry",
+        "rtt_capacity_qos1",
+        "puback_latency_fixed_rate",
+        "application_rtt_qos1",
+    ):
+        assert f"--scenario {scenario}" in matrix
+    assert "--profile standard --runs 3" in matrix
+    assert "--load-profile-dir" in matrix
+    assert "runner-post-calibration.json" in matrix

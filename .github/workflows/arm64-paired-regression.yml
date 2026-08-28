@@ -12,6 +12,7 @@ on:
           - full
           - targeted-micro
           - targeted-protocol-responses
+          - cross-client-matrix
       base_ref:
         description: Exact reviewed capacity-baseline commit SHA
         required: true
@@ -700,6 +701,232 @@ jobs:
             ${{ runner.temp }}/mqttium-${{ github.run_id }}-${{ github.run_attempt }}/*.json
           if-no-files-found: warn
           retention-days: 30
+
+      - name: Clean run-specific workspace
+        if: always()
+        shell: bash
+        run: rm -rf "$JOB_ROOT"
+
+  cross-client-matrix:
+    name: Cross-client matrix / ARM64 / Python 3.13
+    if: inputs.profile == 'cross-client-matrix' && inputs.confirm_trusted_code && github.ref == 'refs/heads/codex/arm64-pacer-diagnostics'
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 150
+    env:
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      BENCH_REF: 9b2b074eea6bdbeb6178bbd736b08bd22c05a8ce
+      MOSQUITTO_IMAGE: eclipse-mosquitto:2.1.2-alpine@sha256:6f8d8a947c506f8a2290ec65cd4bd2bc7cb4d43fb5f6271f861cb013e2ef9797
+
+    steps:
+      - name: Check out trusted runner harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          path: harness
+          persist-credentials: false
+
+      - name: Set run-specific workspace
+        run: echo "JOB_ROOT=$RUNNER_TEMP/mqttium-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+
+      - name: Validate immutable candidate
+        env:
+          CANDIDATE_REF: ${{ inputs.candidate_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$CANDIDATE_REF" =~ ^[0-9a-fA-F]{40}$ ]] || {
+            echo "candidate_ref must be an exact commit SHA" >&2
+            exit 2
+          }
+
+      - name: Check out candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.candidate_ref }}
+          path: candidate
+          persist-credentials: false
+
+      - name: Check out immutable cross-client harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: yoch/mqtt-python-client-bench
+          ref: 9b2b074eea6bdbeb6178bbd736b08bd22c05a8ce
+          path: cross-client
+          persist-credentials: false
+
+      - name: Verify exact checked-out commits
+        env:
+          CANDIDATE_REF: ${{ inputs.candidate_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C harness rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git -C candidate rev-parse HEAD)" = "${CANDIDATE_REF,,}"
+          test "$(git -C cross-client rev-parse HEAD)" = "$BENCH_REF"
+
+      - name: Verify dedicated runner and container prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "aarch64"
+          command -v python3
+          command -v docker
+          command -v openssl
+          command -v taskset
+          python3 - <<'PY'
+          import sys
+          if sys.version_info[:2] != (3, 13):
+              raise SystemExit(f"expected system Python 3.13, got {sys.version}")
+          PY
+          docker info >/dev/null
+          docker compose version
+          if pgrep -a mosquitto; then
+            echo "A host Mosquitto process would contaminate the matrix." >&2
+            exit 1
+          fi
+          if docker compose -f cross-client/docker-compose.yml ps -a -q | grep -q .; then
+            echo "A stale benchmark compose container would contaminate the matrix." >&2
+            exit 1
+          fi
+
+      - name: Create isolated virtual environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$JOB_ROOT"
+          mkdir -p "$JOB_ROOT/results" "$JOB_ROOT/calibrations"
+          python3 -m venv "$JOB_ROOT/venv"
+          echo "$JOB_ROOT/venv/bin" >> "$GITHUB_PATH"
+
+      - name: Install exact clients and benchmark harness
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install "psutil>=6,<8" "paho-mqtt==2.1.0" "gmqtt==0.7.0"
+          python -m pip install -e cross-client
+          python -m pip install -e candidate
+
+      - name: Verify benchmark identities
+        env:
+          CANDIDATE_REF: ${{ inputs.candidate_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from importlib.metadata import version
+          from pathlib import Path
+          import mqttium
+
+          candidate = (Path.cwd() / "candidate" / "src").resolve()
+          loaded = Path(mqttium.__file__).resolve()
+          if not loaded.is_relative_to(candidate):
+              raise SystemExit(f"mqttium was not loaded from candidate: {loaded}")
+          expected = {"gmqtt": "0.7.0", "paho-mqtt": "2.1.0"}
+          for distribution, wanted in expected.items():
+              actual = version(distribution)
+              if actual != wanted:
+                  raise SystemExit(f"expected {distribution} {wanted}, got {actual}")
+          print("mqttium", version("mqttium"), loaded)
+          PY
+          printf '%s\n' "$CANDIDATE_REF" > "$JOB_ROOT/candidate-ref.txt"
+          printf '%s\n' "$BENCH_REF" > "$JOB_ROOT/bench-ref.txt"
+
+      - name: Pull pinned Mosquitto 2.1.2 image
+        run: docker pull "$MOSQUITTO_IMAGE"
+
+      - name: Enforce quiet dedicated-runner preflight
+        working-directory: harness
+        run: |
+          python benchmarks/runner_probe.py \
+            --output "$JOB_ROOT/runner-cross-client.json" \
+            --require-temperature \
+            --wait-seconds 180 \
+            --poll-seconds 10 \
+            --consecutive-eligible 3 \
+            --enforce
+
+      - name: Standard interleaved capacity and fixed-rate matrix
+        working-directory: cross-client
+        env:
+          MQTT_BENCH_MOSQUITTO_IMAGE: ${{ env.MOSQUITTO_IMAGE }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m mqtt_client_bench.run matrix \
+            --clients gmqtt,mqttium \
+            --scenario pub_qos_sweep_telemetry \
+            --profile standard --runs 3 \
+            --output-dir "$JOB_ROOT/results"
+          python -m mqtt_client_bench.run matrix \
+            --clients gmqtt,mqttium \
+            --scenario rtt_capacity_qos1 \
+            --profile standard --runs 3 \
+            --output-dir "$JOB_ROOT/results"
+          python -m mqtt_client_bench.run matrix \
+            --clients gmqtt,mqttium \
+            --scenario puback_latency_fixed_rate \
+            --profile standard --runs 3 \
+            --output-dir "$JOB_ROOT/results"
+
+      - name: Calibrate both clients for application RTT
+        working-directory: cross-client
+        env:
+          MQTT_BENCH_MOSQUITTO_IMAGE: ${{ env.MOSQUITTO_IMAGE }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m mqtt_client_bench.run calibrate \
+            --client gmqtt --profile standard \
+            --output "$JOB_ROOT/calibrations/gmqtt-load.json"
+          python -m mqtt_client_bench.run calibrate \
+            --client mqttium --profile standard \
+            --output "$JOB_ROOT/calibrations/mqttium-load.json"
+
+      - name: Requalify runner after calibration
+        working-directory: harness
+        run: |
+          python benchmarks/runner_probe.py \
+            --output "$JOB_ROOT/runner-post-calibration.json" \
+            --require-temperature \
+            --wait-seconds 180 \
+            --poll-seconds 10 \
+            --consecutive-eligible 3 \
+            --enforce
+
+      - name: Standard interleaved application RTT matrix
+        working-directory: cross-client
+        env:
+          MQTT_BENCH_MOSQUITTO_IMAGE: ${{ env.MOSQUITTO_IMAGE }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m mqtt_client_bench.run matrix \
+            --clients gmqtt,mqttium \
+            --scenario application_rtt_qos1 \
+            --profile standard --runs 3 \
+            --load-profile-dir "$JOB_ROOT/calibrations" \
+            --output-dir "$JOB_ROOT/results"
+
+      - name: Upload cross-client measurements
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: arm64-cross-client-matrix-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/mqttium-${{ github.run_id }}-${{ github.run_attempt }}/*.json
+            ${{ runner.temp }}/mqttium-${{ github.run_id }}-${{ github.run_attempt }}/*.txt
+            ${{ runner.temp }}/mqttium-${{ github.run_id }}-${{ github.run_attempt }}/results/*.json
+            ${{ runner.temp }}/mqttium-${{ github.run_id }}-${{ github.run_attempt }}/calibrations/*.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Stop benchmark broker
+        if: always()
+        working-directory: cross-client
+        env:
+          MQTT_BENCH_MOSQUITTO_IMAGE: ${{ env.MOSQUITTO_IMAGE }}
+        run: python -m mqtt_client_bench.run broker down || docker compose down --remove-orphans
 
       - name: Clean run-specific workspace
         if: always()
