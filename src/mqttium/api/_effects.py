@@ -132,7 +132,7 @@ class EffectPump:
             others: list[EngineEffect] = []
             out_of_order = False
             for effect in effects:
-                if effect.kind is EffectKind.SEND:
+                if effect.kind in (EffectKind.SEND, EffectKind.SEND_PROTOCOL_RESPONSE):
                     if others:
                         out_of_order = True
                     sends.append(effect)

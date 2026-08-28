@@ -197,7 +197,7 @@ def test_automatic_puback_at_exact_broker_packet_limit_is_emitted() -> None:
     _feed(engine, _publish(QoS.AT_LEAST_ONCE))
     effects = engine.take_effects()
 
-    sent = [effect.data for effect in effects if effect.kind is EffectKind.SEND]
+    sent = [effect.data for effect in effects if effect.kind is EffectKind.SEND_PROTOCOL_RESPONSE]
     assert sent == [b"\x40\x02\x00\x07"]
     assert any(effect.kind is EffectKind.MESSAGE for effect in effects)
     assert not any(effect.kind is EffectKind.PROTOCOL_ERROR for effect in effects)
@@ -208,17 +208,17 @@ def test_qos2_at_exact_broker_packet_limit_completes_exchange() -> None:
 
     _feed(engine, _publish(QoS.EXACTLY_ONCE))
     first = engine.take_effects()
-    assert [effect.data for effect in first if effect.kind is EffectKind.SEND] == [
-        b"\x50\x02\x00\x07"
-    ]
+    assert [
+        effect.data for effect in first if effect.kind is EffectKind.SEND_PROTOCOL_RESPONSE
+    ] == [b"\x50\x02\x00\x07"]
     assert any(effect.kind is EffectKind.MESSAGE for effect in first)
     assert engine.store.get_in(7) is not None
 
     _feed(engine, encode_pubrel_success(7))
     second = engine.take_effects()
-    assert [effect.data for effect in second if effect.kind is EffectKind.SEND] == [
-        b"\x70\x02\x00\x07"
-    ]
+    assert [
+        effect.data for effect in second if effect.kind is EffectKind.SEND_PROTOCOL_RESPONSE
+    ] == [b"\x70\x02\x00\x07"]
     assert engine.store.get_in(7) is None
     assert engine.inbound._inflight == 0
 
@@ -248,9 +248,9 @@ def test_manual_puback_at_exact_limit_completes_record() -> None:
     engine.ack(7)
     effects = engine.take_effects()
 
-    assert [effect.data for effect in effects if effect.kind is EffectKind.SEND] == [
-        b"\x40\x02\x00\x07"
-    ]
+    assert [
+        effect.data for effect in effects if effect.kind is EffectKind.SEND_PROTOCOL_RESPONSE
+    ] == [b"\x40\x02\x00\x07"]
     assert engine.store.get_in(7) is None
     assert engine.inbound._inflight == 0
 

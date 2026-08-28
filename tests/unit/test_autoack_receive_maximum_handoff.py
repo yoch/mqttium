@@ -114,7 +114,7 @@ def test_effect_handoff_releases_autoack_receive_maximum_slot() -> None:
 
     _feed(engine, _publish(1))
     first = engine.take_effects()
-    assert any(effect.kind is EffectKind.SEND for effect in first)
+    assert any(effect.kind is EffectKind.SEND_PROTOCOL_RESPONSE for effect in first)
     assert engine.state is ConnectionState.CONNECTED
 
     _feed(engine, _publish(2))
@@ -124,7 +124,7 @@ def test_effect_handoff_releases_autoack_receive_maximum_slot() -> None:
     assert [effect.data.payload for effect in second if effect.kind is EffectKind.MESSAGE] == [
         b"\x02"
     ]
-    assert any(effect.kind is EffectKind.SEND for effect in second)
+    assert any(effect.kind is EffectKind.SEND_PROTOCOL_RESPONSE for effect in second)
     assert not any(effect.kind is EffectKind.PROTOCOL_ERROR for effect in second)
 
 
@@ -137,7 +137,9 @@ def test_duplicate_qos1_before_puback_handoff_does_not_consume_second_slot() -> 
 
     assert engine.state is ConnectionState.CONNECTED
     assert len([effect for effect in effects if effect.kind is EffectKind.MESSAGE]) == 2
-    assert len([effect for effect in effects if effect.kind is EffectKind.SEND]) == 2
+    assert (
+        len([effect for effect in effects if effect.kind is EffectKind.SEND_PROTOCOL_RESPONSE]) == 2
+    )
     assert not any(effect.kind is EffectKind.PROTOCOL_ERROR for effect in effects)
 
 

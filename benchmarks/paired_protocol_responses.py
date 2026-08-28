@@ -125,7 +125,11 @@ def _take_send(engine: Any, expected_type: Any) -> Any:
     from mqttium.protocol.effects import EffectKind
 
     effects = engine.take_effects()
-    sends = [effect for effect in effects if effect.kind is EffectKind.SEND]
+    sends = [
+        effect
+        for effect in effects
+        if effect.kind in (EffectKind.SEND, EffectKind.SEND_PROTOCOL_RESPONSE)
+    ]
     if len(sends) != 1:
         raise AssertionError(f"expected one SEND effect, got {len(sends)}")
     effect = sends[0]
@@ -216,6 +220,7 @@ async def _assert_segmented_fifo(effect: Any) -> None:
 async def _run_phase(count: int, *, turn_batch: int = 256) -> ResponseResult:
     from mqttium.api import AsyncClient
     from mqttium.enums import PacketType
+    from mqttium.protocol.effects import EffectKind
 
     effects = _build_response_effects()
     packet_types = [PacketType.from_byte(effect.data[0]).name for effect in effects]
@@ -224,7 +229,7 @@ async def _run_phase(count: int, *, turn_batch: int = 256) -> ResponseResult:
     marked = [
         packet_type
         for packet_type, effect in zip(packet_types, effects, strict=True)
-        if getattr(effect, "protocol_response", False)
+        if effect.kind is EffectKind.SEND_PROTOCOL_RESPONSE
     ]
     await _assert_segmented_fifo(effects[0])
 
