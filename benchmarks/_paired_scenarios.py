@@ -564,6 +564,7 @@ def _publish_completion_batch(_scenario: str) -> ScenarioMeasurement:
             max_pending_callbacks=4_096,
         )
         client.on_publish = lambda _mid, _reason: None
+        drain_ack_batch = getattr(client, "_drain_ingress_ack_batch_inline", None)
         batch_size = 64
         warmup_batches = 32
         measured_batches = 2_000
@@ -576,6 +577,8 @@ def _publish_completion_batch(_scenario: str) -> ScenarioMeasurement:
                 client._register_publish_receipt(mid, receipt)
                 client._engine._emit(EffectKind.PUBLISH_COMPLETE, mid)
             client._collect_effects_locked()
+            if drain_ack_batch is not None:
+                drain_ack_batch()
             await client._drain_effects()
             await client._callback_queue.join()
         elapsed = time.perf_counter() - started

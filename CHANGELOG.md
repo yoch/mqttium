@@ -20,6 +20,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   `EffectPump` pass. When `on_publish` is installed, the batch occupies its
   full logical share of the bounded callback queue but needs only one physical
   worker job and wake-up; saturated queues retain the established slow path.
+  Detection is reader-local, leaving the general QoS 0/single-effect drain
+  unchanged.
 
 ## [1.0.0rc10] - 2026-08-26
 
