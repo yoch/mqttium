@@ -478,6 +478,8 @@ jobs:
           PY
 
       - name: Run targeted candidate microbenchmarks
+        env:
+          PYTHONPATH: candidate/src
         shell: bash
         run: |
           set -euo pipefail

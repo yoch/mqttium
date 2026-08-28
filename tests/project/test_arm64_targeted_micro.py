@@ -35,6 +35,7 @@ def test_targeted_micro_keeps_inputs_out_of_shell_commands() -> None:
     assert 'Path("candidate/benchmarks/paired_regression.py")' in targeted
     assert "eval " not in targeted
     assert "targeted-micro.json" in targeted
+    assert "PYTHONPATH: candidate/src" in targeted
 
 
 def test_targeted_protocol_responses_runs_strict_control_before_gate() -> None:
