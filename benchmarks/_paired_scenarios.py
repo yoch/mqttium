@@ -551,7 +551,7 @@ def _publish_completion(scenario: str) -> ScenarioMeasurement:
     return asyncio.run(run_callback())
 
 
-def _publish_completion_batch(_scenario: str) -> ScenarioMeasurement:
+def _publish_completion_batch(scenario: str) -> ScenarioMeasurement:
     """Apply one ingress-shaped completion batch per effect collection."""
     from mqttium.api import AsyncClient
     from mqttium.api.models import PublishReceipt
@@ -563,7 +563,14 @@ def _publish_completion_batch(_scenario: str) -> ScenarioMeasurement:
             client_id="paired-publish-completion-batch",
             max_pending_callbacks=4_096,
         )
-        client.on_publish = lambda _mid, _reason: None
+        if scenario.endswith("_async"):
+
+            async def on_publish(_mid: int | None, _reason: BaseException | None) -> None:
+                return None
+
+            client.on_publish = on_publish
+        else:
+            client.on_publish = lambda _mid, _reason: None
         drain_ack_batch = getattr(client, "_drain_ingress_ack_batch_inline", None)
         batch_size = 64
         warmup_batches = 32
@@ -638,6 +645,7 @@ REGISTRY: dict[str, Callable[[str], ScenarioMeasurement]] = {
     "publish_complete_receipt": _publish_completion,
     "publish_complete_callback": _publish_completion,
     "publish_complete_callback_batch": _publish_completion_batch,
+    "publish_complete_callback_batch_async": _publish_completion_batch,
 }
 
 
