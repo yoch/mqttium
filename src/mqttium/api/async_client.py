@@ -346,7 +346,6 @@ class AsyncClient:
         # the single-effect hot path.
         self._collect_effects_locked = self._effect_pump.collect_from_engine
         self._drain_effects_inline = self._effect_pump.drain_inline
-        self._drain_ingress_ack_batch_inline = self._effect_pump.drain_ingress_ack_batch_inline
         self._schedule_effect_flush = self._effect_pump.schedule
         self._drain_effects = self._effect_pump.drain
         self._discard_connection_effects = self._effect_pump.discard_connection_effects
@@ -387,7 +386,6 @@ class AsyncClient:
         self._can_dispatch_callback_inline = self._delivery.can_dispatch_callback_inline
         self._has_callback_capacity = self._delivery.has_callback_capacity
         self._enqueue_callback_repeated_nowait = self._delivery.enqueue_callback_repeated_nowait
-        self._enqueue_callback_batch_nowait = self._delivery.enqueue_callback_batch_nowait
         self._enqueue_callback = self._delivery.enqueue_callback
         self._report_callback_error = self._delivery.report_callback_error
         self._shutdown_callback_worker = self._delivery.shutdown_callbacks
@@ -2232,6 +2230,18 @@ class AsyncClient:
         for mid, reason in outcomes:
             self._settle_publish(mid, reason)
         return count
+
+    def _drain_ingress_ack_batch_inline(self) -> None:
+        """Drain the reader-local terminal-effect batch seam."""
+        self._effect_pump.drain_ingress_ack_batch_inline()
+
+    def _enqueue_callback_batch_nowait(
+        self,
+        callback: Callable[..., Any],
+        args_batch: list[tuple[Any, ...]],
+    ) -> None:
+        """Enqueue one logical callback batch without per-client method caching."""
+        self._delivery.enqueue_callback_batch_nowait(callback, args_batch)
 
     async def _flush_effects(self) -> None:
         async with self._engine_lock:
