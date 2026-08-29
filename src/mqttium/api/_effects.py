@@ -13,9 +13,10 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Protocol
 
 from mqttium.api.stats import EffectStats
-from mqttium.protocol.effects import EffectKind, EngineEffect
+from mqttium.protocol.effects import EffectKind, EngineEffect, PublishFailure
 
 if TYPE_CHECKING:
+    from mqttium.api._delivery import ApplicationDelivery
     from mqttium.protocol.engine import ProtocolEngine
 
 
@@ -26,15 +27,14 @@ class StaleConnectionEffect(Exception):
 class EffectOwner(Protocol):
     _connection_epoch: int
     _disconnect_exc: BaseException | None
+    _delivery: ApplicationDelivery
     _engine: ProtocolEngine
+    _engine_lock: asyncio.Lock
+    on_publish: Callable[[int | None, BaseException | None], object] | None
 
     def _apply_effect_inline(self, effect: EngineEffect, epoch: int) -> bool: ...
 
     def _apply_message_effect_batch_inline(
-        self, effects: deque[EngineEffect], epoch: int
-    ) -> int: ...
-
-    def _apply_terminal_effect_batch_inline(
         self, effects: deque[EngineEffect], epoch: int
     ) -> int: ...
 
@@ -49,6 +49,57 @@ class EffectOwner(Protocol):
     async def _close_transport_after_connection_failure(self) -> None: ...
 
     def _settle_terminal_effect(self, effect: EngineEffect) -> None: ...
+
+    def _can_dispatch_callback_inline(self, callback: Callable[..., object]) -> bool: ...
+
+    def _dispatch_callback_inline(self, callback: Callable[..., object], *args: object) -> None: ...
+
+    def _has_callback_capacity(self, count: int = 1) -> bool: ...
+
+    def _settle_publish(self, mid: int | None, reason: BaseException | None) -> None: ...
+
+
+def _apply_terminal_effect_batch_inline(
+    owner: EffectOwner,
+    effects: deque[EngineEffect],
+    epoch: int,
+) -> int:
+    """Settle a consecutive publish-result prefix in one ordered pass."""
+    if epoch != owner._connection_epoch or len(effects) < 2:
+        return 0
+    callback = owner.on_publish
+    outcomes: list[tuple[int | None, BaseException | None]] = []
+    for effect in effects:
+        kind = effect.kind
+        if kind is EffectKind.PUBLISH_COMPLETE:
+            outcomes.append((effect.data, None))
+        elif kind is EffectKind.PUBLISH_FAILED:
+            failure: PublishFailure = effect.data
+            outcomes.append((failure.mid, failure.reason))
+        else:
+            break
+    count = len(outcomes)
+    if count < 2:
+        return 0
+    if callback is not None:
+        if not owner._engine_lock.locked() and owner._can_dispatch_callback_inline(callback):
+            applied = 0
+            for mid, reason in outcomes:
+                if owner.on_publish is not callback or not owner._can_dispatch_callback_inline(
+                    callback
+                ):
+                    break
+                owner._settle_publish(mid, reason)
+                owner._dispatch_callback_inline(callback, mid, reason)
+                applied += 1
+            if applied:
+                return applied
+        if not owner._has_callback_capacity(count):
+            return 0
+        owner._delivery.enqueue_callback_batch_nowait(callback, outcomes)
+    for mid, reason in outcomes:
+        owner._settle_publish(mid, reason)
+    return count
 
 
 class EffectPump:
@@ -252,7 +303,12 @@ class EffectPump:
                 effect = self.pending[0]
                 kind = effect.kind
                 if kind is EffectKind.PUBLISH_COMPLETE or kind is EffectKind.PUBLISH_FAILED:
-                    if self._consume_batch(self.owner._apply_terminal_effect_batch_inline, epoch):
+                    applied = _apply_terminal_effect_batch_inline(self.owner, self.pending, epoch)
+                    if applied:
+                        for _ in range(applied):
+                            self.pending.popleft()
+                            self.inline_effects += 1
+                            self._complete()
                         continue
                     break
                 # Message delivery has its own batch admission and may need

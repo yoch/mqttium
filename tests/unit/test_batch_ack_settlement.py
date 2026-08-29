@@ -6,6 +6,7 @@ from collections import deque
 from collections.abc import Callable
 
 from mqttium.api import AsyncClient
+from mqttium.api._effects import _apply_terminal_effect_batch_inline
 from mqttium.api.models import PublishReceipt
 from mqttium.enums import ConnectionState, QoS
 from mqttium.packets import PubAckPacket, PubCompPacket, PubRecPacket
@@ -171,7 +172,7 @@ async def test_terminal_callback_batch_isolates_each_callback_error() -> None:
         lambda _callback, exc: errors.append(exc)
     )
 
-    assert client._apply_terminal_effect_batch_inline(effects, client._connection_epoch) == 3
+    assert _apply_terminal_effect_batch_inline(client, effects, client._connection_epoch) == 3
     await client._callback_queue.join()
 
     assert seen == [1, 3]
@@ -188,7 +189,7 @@ async def test_shutdown_releases_terminal_batch_callback_capacity() -> None:
 
     client.on_publish = on_publish
 
-    assert client._apply_terminal_effect_batch_inline(effects, client._connection_epoch) == 3
+    assert _apply_terminal_effect_batch_inline(client, effects, client._connection_epoch) == 3
     assert client.stats().delivery.callback_queued == 3
     assert client._callback_queue.maxsize == 2
 
@@ -242,13 +243,13 @@ async def test_idle_sync_terminal_batch_dispatches_inline_until_reentrant_queuei
 
     client.on_publish = callback
 
-    assert client._apply_terminal_effect_batch_inline(effects, client._connection_epoch) == 1
+    assert _apply_terminal_effect_batch_inline(client, effects, client._connection_epoch) == 1
     assert seen == [1]
     assert receipts[1].is_done()
     assert not receipts[2].is_done()
 
     remaining = deque(tuple(effects)[1:])
-    assert client._apply_terminal_effect_batch_inline(remaining, client._connection_epoch) == 2
+    assert _apply_terminal_effect_batch_inline(client, remaining, client._connection_epoch) == 2
     await client._callback_queue.join()
 
     assert seen == [1, 99, 2, 3]
@@ -269,9 +270,9 @@ def test_inline_terminal_batch_reloads_a_replaced_callback() -> None:
         client.on_publish = replacement
 
     client.on_publish = initial
-    assert client._apply_terminal_effect_batch_inline(effects, client._connection_epoch) == 1
+    assert _apply_terminal_effect_batch_inline(client, effects, client._connection_epoch) == 1
     remaining = deque(tuple(effects)[1:])
-    assert client._apply_terminal_effect_batch_inline(remaining, client._connection_epoch) == 2
+    assert _apply_terminal_effect_batch_inline(client, remaining, client._connection_epoch) == 2
 
     assert seen == [("initial", 1), ("replacement", 2), ("replacement", 3)]
 
@@ -308,7 +309,7 @@ def test_terminal_batch_preflights_the_whole_logical_callback_bound() -> None:
 
     client.on_publish = on_publish
 
-    applied = client._apply_terminal_effect_batch_inline(effects, client._connection_epoch)
+    applied = _apply_terminal_effect_batch_inline(client, effects, client._connection_epoch)
 
     assert applied == 0
     assert not any(receipt.is_done() for receipt in receipts)
@@ -327,7 +328,7 @@ def test_stale_epoch_cannot_settle_a_terminal_batch_directly() -> None:
         effects.append(EngineEffect(EffectKind.PUBLISH_COMPLETE, receipt.mid))
     client._connection_epoch = 2
 
-    applied = client._apply_terminal_effect_batch_inline(effects, epoch=1)
+    applied = _apply_terminal_effect_batch_inline(client, effects, epoch=1)
 
     assert applied == 0
     assert not any(receipt.is_done() for receipt in receipts)

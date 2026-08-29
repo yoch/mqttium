@@ -2212,47 +2212,6 @@ class AsyncClient:
             return 0
         return self._delivery.deliver_message_batch_inline(effects, self.on_message)
 
-    def _apply_terminal_effect_batch_inline(
-        self,
-        effects: deque[EngineEffect],
-        epoch: int,
-    ) -> int:
-        """Settle a consecutive publish-result prefix in one ordered pass."""
-        if epoch != self._connection_epoch or len(effects) < 2:
-            return 0
-        callback = self.on_publish
-        outcomes: list[tuple[int | None, BaseException | None]] = []
-        for effect in effects:
-            kind = effect.kind
-            if kind is not EffectKind.PUBLISH_COMPLETE and kind is not EffectKind.PUBLISH_FAILED:
-                break
-            outcomes.append(_terminal_publish_result(effect))
-        count = len(outcomes)
-        if count < 2:
-            return 0
-        if callback is not None:
-            if not self._engine_lock.locked() and self._can_dispatch_callback_inline(callback):
-                applied = 0
-                for mid, reason in outcomes:
-                    # A callback can replace itself, publish or return an
-                    # awaitable. Leave the remaining ordered prefix to a fresh
-                    # dispatch decision or the established batch fallback.
-                    if self.on_publish is not callback or not self._can_dispatch_callback_inline(
-                        callback
-                    ):
-                        break
-                    self._settle_publish(mid, reason)
-                    self._dispatch_callback_inline(callback, mid, reason)
-                    applied += 1
-                if applied:
-                    return applied
-            if not self._has_callback_capacity(count):
-                return 0
-            self._delivery.enqueue_callback_batch_nowait(callback, outcomes)
-        for mid, reason in outcomes:
-            self._settle_publish(mid, reason)
-        return count
-
     async def _flush_effects(self) -> None:
         async with self._engine_lock:
             self._collect_effects_locked()
