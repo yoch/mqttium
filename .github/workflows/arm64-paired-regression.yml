@@ -100,8 +100,8 @@ jobs:
           command -v python3
           python3 - <<'PY'
           import sys
-          if sys.version_info[:2] != (3, 13):
-              raise SystemExit(f"expected system Python 3.13, got {sys.version}")
+          if sys.version_info[:2] not in ((3, 13), (3, 14)):
+              raise SystemExit(f"expected supported system Python 3.13/3.14, got {sys.version}")
           PY
           command -v mosquitto
           command -v mosquitto_sub
@@ -329,7 +329,7 @@ jobs:
           rm -rf "$JOB_ROOT"
 
   targeted-micro:
-    name: Targeted micro / ARM64 / system Python 3.13
+    name: Targeted micro / ARM64 / system Python
     if: inputs.profile == 'targeted-micro' && inputs.confirm_trusted_code && github.ref == 'refs/heads/codex/arm64-pacer-diagnostics'
     runs-on: [self-hosted, linux, ARM64]
     timeout-minutes: 45
@@ -394,8 +394,8 @@ jobs:
           command -v python3
           python3 - <<'PY'
           import sys
-          if sys.version_info[:2] != (3, 13):
-              raise SystemExit(f"expected system Python 3.13, got {sys.version}")
+          if sys.version_info[:2] not in ((3, 13), (3, 14)):
+              raise SystemExit(f"expected supported system Python 3.13/3.14, got {sys.version}")
           PY
           command -v mosquitto
           if pgrep -a mosquitto; then
@@ -547,7 +547,7 @@ jobs:
         run: rm -rf "$JOB_ROOT"
 
   targeted-writer-latency-10k:
-    name: Targeted writer capacity + latency 10k / ARM64 / Python 3.13
+    name: Targeted writer capacity + latency 10k / ARM64 / system Python
     if: inputs.profile == 'targeted-writer-latency-10k' && inputs.confirm_trusted_code && github.ref == 'refs/heads/codex/arm64-pacer-diagnostics'
     runs-on: [self-hosted, linux, ARM64]
     timeout-minutes: 30
@@ -612,8 +612,8 @@ jobs:
           command -v python3
           python3 - <<'PY'
           import sys
-          if sys.version_info[:2] != (3, 13):
-              raise SystemExit(f"expected system Python 3.13, got {sys.version}")
+          if sys.version_info[:2] not in ((3, 13), (3, 14)):
+              raise SystemExit(f"expected supported system Python 3.13/3.14, got {sys.version}")
           PY
           command -v mosquitto
           command -v taskset
@@ -760,7 +760,7 @@ jobs:
         run: rm -rf "$JOB_ROOT"
 
   targeted-protocol-responses:
-    name: Targeted protocol responses / ARM64 / system Python 3.13
+    name: Targeted protocol responses / ARM64 / system Python
     if: inputs.profile == 'targeted-protocol-responses' && inputs.confirm_trusted_code && github.ref == 'refs/heads/codex/arm64-pacer-diagnostics'
     runs-on: [self-hosted, linux, ARM64]
     timeout-minutes: 45
@@ -825,8 +825,8 @@ jobs:
           command -v python3
           python3 - <<'PY'
           import sys
-          if sys.version_info[:2] != (3, 13):
-              raise SystemExit(f"expected system Python 3.13, got {sys.version}")
+          if sys.version_info[:2] not in ((3, 13), (3, 14)):
+              raise SystemExit(f"expected supported system Python 3.13/3.14, got {sys.version}")
           PY
           command -v mosquitto
           if pgrep -a mosquitto; then
