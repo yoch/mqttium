@@ -571,7 +571,11 @@ def _publish_completion_batch(scenario: str) -> ScenarioMeasurement:
             client.on_publish = on_publish
         else:
             client.on_publish = lambda _mid, _reason: None
-        drain_ack_batch = getattr(client, "_drain_ingress_ack_batch_inline", None)
+        drain_ack_batch = getattr(
+            client._effect_pump,
+            "drain_ingress_ack_batch_inline",
+            None,
+        )
         batch_size = 64
         warmup_batches = 32
         measured_batches = 2_000
