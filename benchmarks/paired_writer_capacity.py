@@ -318,6 +318,13 @@ def assess_rates(
     return ratio, baseline_cv, candidate_cv, invalidations, regressions
 
 
+def _parse_qos_values(raw: str) -> list[int]:
+    values = [int(value) for value in raw.split(",")]
+    if not values or any(value not in (0, 1, 2) for value in values):
+        raise ValueError
+    return values
+
+
 def parent(args: argparse.Namespace) -> int:
     script = Path(__file__).resolve()
     roots = {
@@ -467,7 +474,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=11883)
     parser.add_argument("--protocol", choices=("311", "5"), default="311")
-    parser.add_argument("--qos", type=int, choices=(0, 1), default=0)
+    parser.add_argument("--qos", type=int, choices=(0, 1, 2), default=0)
     parser.add_argument("--qos-values", default="0,1")
     parser.add_argument("--payload-bytes", type=int, default=256)
     parser.add_argument("--inflight", type=int, default=20)
@@ -500,12 +507,10 @@ def parse_args() -> argparse.Namespace:
     if args.warmup_count < 0 or args.count <= 0 or args.count_qos0 <= 0 or args.count_qos1 <= 0:
         parser.error("counts must be positive (warmup may be zero)")
     try:
-        qos_values = [int(value) for value in args.qos_values.split(",")]
+        _parse_qos_values(args.qos_values)
     except ValueError as exc:
-        parser.error("--qos-values accepts comma-separated 0,1")
+        parser.error("--qos-values accepts comma-separated 0,1,2")
         raise AssertionError from exc
-    if not qos_values or any(value not in (0, 1) for value in qos_values):
-        parser.error("--qos-values accepts comma-separated 0,1")
     if args.max_aa_ratio_deviation < 0:
         parser.error("--max-aa-ratio-deviation must be non-negative")
     return args

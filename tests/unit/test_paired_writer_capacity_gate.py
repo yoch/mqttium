@@ -10,7 +10,11 @@ _BENCHMARKS = Path(__file__).resolve().parents[2] / "benchmarks"
 if str(_BENCHMARKS) not in sys.path:
     sys.path.insert(0, str(_BENCHMARKS))
 
-from paired_writer_capacity import assess_rates  # noqa: E402
+from paired_writer_capacity import _parse_qos_values, assess_rates  # noqa: E402
+
+
+def test_qos2_can_be_selected_for_protocol_response_diagnostics() -> None:
+    assert _parse_qos_values("0,1,2") == [0, 1, 2]
 
 
 def _assess(base: list[float], candidate: list[float], *, aa: bool = False):
