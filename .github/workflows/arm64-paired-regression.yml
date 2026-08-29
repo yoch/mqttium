@@ -547,7 +547,7 @@ jobs:
         run: rm -rf "$JOB_ROOT"
 
   targeted-writer-latency-10k:
-    name: Targeted writer latency 10k / ARM64 / system Python 3.13
+    name: Targeted writer capacity + latency 10k / ARM64 / Python 3.13
     if: inputs.profile == 'targeted-writer-latency-10k' && inputs.confirm_trusted_code && github.ref == 'refs/heads/codex/arm64-pacer-diagnostics'
     runs-on: [self-hosted, linux, ARM64]
     timeout-minutes: 30
@@ -672,6 +672,38 @@ jobs:
           done
           cat "$root/mosquitto.log"
           exit 1
+
+      - name: Strict writer-capacity A/A control
+        shell: bash
+        run: |
+          set -euo pipefail
+          python candidate/benchmarks/paired_writer_capacity.py \
+            --base-root base --candidate-root base \
+            --protocol 311 --qos-values 0,1 --payload-bytes 256 \
+            --inflight 20 --outstanding 64 --max-queued 200 \
+            --warmup-count 5000 --repeat 8 \
+            --count-qos0 100000 --count-qos1 40000 \
+            --timeout 120 --cpu 2 \
+            --policy strict \
+            --preflight-report "$JOB_ROOT/runner.json" \
+            --output "$JOB_ROOT/writer-capacity-aa.json" \
+            --summary-output "$JOB_ROOT/writer-capacity-aa.md"
+
+      - name: Strict writer-capacity A/B gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python candidate/benchmarks/paired_writer_capacity.py \
+            --base-root base --candidate-root candidate \
+            --protocol 311 --qos-values 0,1 --payload-bytes 256 \
+            --inflight 20 --outstanding 64 --max-queued 200 \
+            --warmup-count 5000 --repeat 8 \
+            --count-qos0 100000 --count-qos1 40000 \
+            --timeout 120 --cpu 2 \
+            --policy strict \
+            --preflight-report "$JOB_ROOT/runner.json" \
+            --output "$JOB_ROOT/writer-capacity-ab.json" \
+            --summary-output "$JOB_ROOT/writer-capacity-ab.md"
 
       - name: Strict 10k writer-latency A/A control
         shell: bash
