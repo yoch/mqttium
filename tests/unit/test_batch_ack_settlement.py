@@ -53,13 +53,13 @@ async def test_one_tcp_read_batches_puback_and_pubcomp_settlement() -> None:
         client._register_publish_receipt(receipt.mid, receipt)
 
     enqueued: list[list[tuple[object, ...]]] = []
-    enqueue = client._enqueue_callback_batch_nowait
+    enqueue = client._delivery.enqueue_callback_batch_nowait
 
     def record_batch(callback: Callable[..., object], args_batch: list[tuple[object, ...]]) -> None:
         enqueued.append(args_batch.copy())
         enqueue(callback, args_batch)
 
-    client._enqueue_callback_batch_nowait = record_batch
+    client._delivery.enqueue_callback_batch_nowait = record_batch
     seen: list[int | None] = []
 
     async def on_publish(mid: int | None, _reason: BaseException | None) -> None:
@@ -90,7 +90,7 @@ async def test_single_puback_read_keeps_the_ordinary_completion_path() -> None:
     def unexpected_batch() -> None:
         raise AssertionError("one PUBACK must not enter ACK batching")
 
-    client._drain_ingress_ack_batch_inline = unexpected_batch
+    client._effect_pump.drain_ingress_ack_batch_inline = unexpected_batch
     client._transport = _OneReadTransport(PubAckPacket(publish.mid).encode())
 
     await client._read_loop()
@@ -113,7 +113,7 @@ async def test_terminal_batch_is_one_physical_bounded_callback_job() -> None:
     client.on_publish = on_publish
 
     client._collect_effects_locked()
-    client._drain_ingress_ack_batch_inline()
+    client._effect_pump.drain_ingress_ack_batch_inline()
 
     assert all(receipt.is_done() for receipt in receipts)
     assert len(client._callback_queue._queue) == 1  # type: ignore[attr-defined]
@@ -187,7 +187,7 @@ async def test_duplicate_mids_settle_receipts_in_per_mid_fifo_order() -> None:
         client._engine._emit(EffectKind.PUBLISH_COMPLETE, mid)
 
     client._collect_effects_locked()
-    client._drain_ingress_ack_batch_inline()
+    client._effect_pump.drain_ingress_ack_batch_inline()
 
     assert settled == ["old-7", "mid-8", "reused-7"]
     assert old.is_done() and other.is_done() and reused.is_done()

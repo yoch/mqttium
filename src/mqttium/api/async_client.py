@@ -1802,7 +1802,7 @@ class AsyncClient:
                                 tail_kind is EffectKind.PUBLISH_COMPLETE
                                 or tail_kind is EffectKind.PUBLISH_FAILED
                             ):
-                                self._drain_ingress_ack_batch_inline()
+                                self._effect_pump.drain_ingress_ack_batch_inline()
                         await self._drain_effects()
                     # A batch that stopped short of both bounds emptied the
                     # buffer, so there is nothing to decode until the next
@@ -2241,22 +2241,10 @@ class AsyncClient:
                     return applied
             if not self._has_callback_capacity(count):
                 return 0
-            self._enqueue_callback_batch_nowait(callback, outcomes)
+            self._delivery.enqueue_callback_batch_nowait(callback, outcomes)
         for mid, reason in outcomes:
             self._settle_publish(mid, reason)
         return count
-
-    def _drain_ingress_ack_batch_inline(self) -> None:
-        """Drain the reader-local terminal-effect batch seam."""
-        self._effect_pump.drain_ingress_ack_batch_inline()
-
-    def _enqueue_callback_batch_nowait(
-        self,
-        callback: Callable[..., Any],
-        args_batch: list[tuple[Any, ...]],
-    ) -> None:
-        """Enqueue one logical callback batch without per-client method caching."""
-        self._delivery.enqueue_callback_batch_nowait(callback, args_batch)
 
     async def _flush_effects(self) -> None:
         async with self._engine_lock:
