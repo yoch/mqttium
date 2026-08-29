@@ -224,13 +224,14 @@ async def _run_phase(count: int, *, turn_batch: int = 256) -> ResponseResult:
     from mqttium.protocol.effects import EffectKind
 
     effects = _build_response_effects()
+    response_kind = getattr(EffectKind, "SEND_PROTOCOL_RESPONSE", EffectKind.SEND)
     packet_types = [PacketType.from_byte(effect.data[0]).name for effect in effects]
     if tuple(packet_types) != _EXPECTED_TYPES:
         raise AssertionError(f"response corpus changed: {packet_types!r}")
     marked = [
         packet_type
         for packet_type, effect in zip(packet_types, effects, strict=True)
-        if effect.kind is EffectKind.SEND_PROTOCOL_RESPONSE
+        if effect.kind is response_kind
     ]
     await _assert_segmented_fifo(effects[0])
 
