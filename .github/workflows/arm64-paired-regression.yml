@@ -679,7 +679,7 @@ jobs:
           set -euo pipefail
           python candidate/benchmarks/paired_writer_capacity.py \
             --base-root base --candidate-root base \
-            --protocol 311 --qos-values 0,1 --payload-bytes 256 \
+            --protocol 311 --qos-values 0,1,2 --payload-bytes 256 \
             --inflight 20 --outstanding 64 --max-queued 200 \
             --warmup-count 5000 --repeat 8 \
             --count-qos0 100000 --count-qos1 40000 \
@@ -695,7 +695,7 @@ jobs:
           set -euo pipefail
           python candidate/benchmarks/paired_writer_capacity.py \
             --base-root base --candidate-root candidate \
-            --protocol 311 --qos-values 0,1 --payload-bytes 256 \
+            --protocol 311 --qos-values 0,1,2 --payload-bytes 256 \
             --inflight 20 --outstanding 64 --max-queued 200 \
             --warmup-count 5000 --repeat 8 \
             --count-qos0 100000 --count-qos1 40000 \
