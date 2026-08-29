@@ -40,6 +40,11 @@ class CapacityResult:
     cpu_seconds: float
     sync_rejected: int
     drain_seconds: float
+    writer_batches: int
+    writer_batched_items: int
+    writer_batched_bytes: int
+    writer_eager_writes: int
+    writer_eager_bytes: int
 
 
 @dataclass(slots=True)
@@ -96,6 +101,8 @@ async def _run_phase(
     state = _PhaseState()
     progress = asyncio.Event()
     _configure_completion_tracking(client, qos=qos, state=state, progress=progress)
+    write_pump = getattr(client, "_write_pump", None)
+    writer_before = write_pump.stats() if write_pump is not None else None
 
     loop = asyncio.get_running_loop()
     cpu_started = time.process_time()
@@ -144,10 +151,15 @@ async def _run_phase(
     cpu_seconds = time.process_time() - cpu_started
 
     drain_started = time.perf_counter()
-    write_pump = getattr(client, "_write_pump", None)
     if write_pump is not None:
         await asyncio.wait_for(write_pump.join(), timeout=timeout)
     drain_seconds = time.perf_counter() - drain_started
+    writer_after = write_pump.stats() if write_pump is not None else None
+
+    def writer_delta(name: str) -> int:
+        if writer_before is None or writer_after is None:
+            return 0
+        return int(getattr(writer_after, name) - getattr(writer_before, name))
 
     return CapacityResult(
         protocol="",
@@ -161,6 +173,11 @@ async def _run_phase(
         cpu_seconds=cpu_seconds,
         sync_rejected=state.sync_rejected,
         drain_seconds=drain_seconds,
+        writer_batches=writer_delta("batches"),
+        writer_batched_items=writer_delta("batched_items"),
+        writer_batched_bytes=writer_delta("batched_bytes"),
+        writer_eager_writes=writer_delta("eager_writes"),
+        writer_eager_bytes=writer_delta("eager_bytes"),
     )
 
 

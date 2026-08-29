@@ -67,3 +67,11 @@ def test_targeted_protocol_responses_runs_strict_control_before_gate() -> None:
     assert "${{" not in campaign
     assert "protocol-responses-aa.json" in targeted
     assert "protocol-responses-ab.json" in targeted
+
+
+def test_targeted_writer_uses_one_harness_for_both_product_revisions() -> None:
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    targeted = workflow.split("  targeted-writer-latency-10k:\n", maxsplit=1)[1]
+
+    assert targeted.count("python harness/benchmarks/paired_writer_capacity.py") == 2
+    assert "python candidate/benchmarks/paired_writer_capacity.py" not in targeted

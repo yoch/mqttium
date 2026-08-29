@@ -677,7 +677,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python candidate/benchmarks/paired_writer_capacity.py \
+          python harness/benchmarks/paired_writer_capacity.py \
             --base-root base --candidate-root base \
             --protocol 311 --qos-values 0,1,2 --payload-bytes 256 \
             --inflight 20 --outstanding 64 --max-queued 200 \
@@ -693,7 +693,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python candidate/benchmarks/paired_writer_capacity.py \
+          python harness/benchmarks/paired_writer_capacity.py \
             --base-root base --candidate-root candidate \
             --protocol 311 --qos-values 0,1,2 --payload-bytes 256 \
             --inflight 20 --outstanding 64 --max-queued 200 \
