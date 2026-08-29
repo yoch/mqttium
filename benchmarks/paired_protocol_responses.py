@@ -125,10 +125,11 @@ def _take_send(engine: Any, expected_type: Any) -> Any:
     from mqttium.protocol.effects import EffectKind
 
     effects = engine.take_effects()
+    response_kind = getattr(EffectKind, "SEND_PROTOCOL_RESPONSE", EffectKind.SEND)
     sends = [
         effect
         for effect in effects
-        if effect.kind in (EffectKind.SEND, EffectKind.SEND_PROTOCOL_RESPONSE)
+        if effect.kind in (EffectKind.SEND, response_kind)
     ]
     if len(sends) != 1:
         raise AssertionError(f"expected one SEND effect, got {len(sends)}")
