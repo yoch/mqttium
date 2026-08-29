@@ -5,8 +5,12 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Callable
 
+import mqttium.api.async_client as async_client_module
 from mqttium.api import AsyncClient
-from mqttium.api._effects import _apply_terminal_effect_batch_inline
+from mqttium.api._effects import (
+    _apply_terminal_effect_batch_inline,
+    drain_ingress_ack_batch_inline,
+)
 from mqttium.api.models import PublishReceipt
 from mqttium.enums import ConnectionState, QoS
 from mqttium.packets import PubAckPacket, PubCompPacket, PubRecPacket
@@ -78,7 +82,7 @@ async def test_one_tcp_read_batches_puback_and_pubcomp_settlement() -> None:
     assert seen == [qos1.mid, qos2.mid]
 
 
-async def test_single_puback_read_keeps_the_ordinary_completion_path() -> None:
+async def test_single_puback_read_keeps_the_ordinary_completion_path(monkeypatch) -> None:
     client = AsyncClient(client_id="batch-ack-single-control")
     engine = client._engine
     engine.state = ConnectionState.CONNECTED
@@ -91,7 +95,7 @@ async def test_single_puback_read_keeps_the_ordinary_completion_path() -> None:
     def unexpected_batch() -> None:
         raise AssertionError("one PUBACK must not enter ACK batching")
 
-    client._effect_pump.drain_ingress_ack_batch_inline = unexpected_batch
+    monkeypatch.setattr(async_client_module, "drain_ingress_ack_batch_inline", unexpected_batch)
     client._transport = _OneReadTransport(PubAckPacket(publish.mid).encode())
 
     await client._read_loop()
@@ -99,7 +103,7 @@ async def test_single_puback_read_keeps_the_ordinary_completion_path() -> None:
     assert receipt.is_done()
 
 
-async def test_sync_idle_multi_ack_read_keeps_point_one_inline_path() -> None:
+async def test_sync_idle_multi_ack_read_keeps_point_one_inline_path(monkeypatch) -> None:
     client = AsyncClient(client_id="batch-ack-sync-inline-control")
     client._engine.state = ConnectionState.CONNECTED
     publishes = [
@@ -119,7 +123,7 @@ async def test_sync_idle_multi_ack_read_keeps_point_one_inline_path() -> None:
     def unexpected_batch() -> None:
         raise AssertionError("sync idle completions already have an inline drain")
 
-    client._effect_pump.drain_ingress_ack_batch_inline = unexpected_batch
+    monkeypatch.setattr(async_client_module, "drain_ingress_ack_batch_inline", unexpected_batch)
     client._transport = _OneReadTransport(PubAckPacket(1).encode() + PubAckPacket(2).encode())
 
     await client._read_loop()
@@ -144,7 +148,7 @@ async def test_terminal_batch_is_one_physical_bounded_callback_job() -> None:
     client.on_publish = on_publish
 
     client._collect_effects_locked()
-    client._effect_pump.drain_ingress_ack_batch_inline()
+    drain_ingress_ack_batch_inline(client._effect_pump)
 
     assert all(receipt.is_done() for receipt in receipts)
     assert len(client._callback_queue._queue) == 1  # type: ignore[attr-defined]
@@ -218,7 +222,7 @@ async def test_duplicate_mids_settle_receipts_in_per_mid_fifo_order() -> None:
         client._engine._emit(EffectKind.PUBLISH_COMPLETE, mid)
 
     client._collect_effects_locked()
-    client._effect_pump.drain_ingress_ack_batch_inline()
+    drain_ingress_ack_batch_inline(client._effect_pump)
 
     assert settled == ["old-7", "mid-8", "reused-7"]
     assert old.is_done() and other.is_done() and reused.is_done()

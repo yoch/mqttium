@@ -102,6 +102,46 @@ def _apply_terminal_effect_batch_inline(
     return count
 
 
+def drain_ingress_ack_batch_inline(pump: EffectPump) -> None:
+    """Apply an ingress batch ending in terminal publish results.
+
+    The reader calls this only after decoding several packets and observing a
+    terminal effect at the tail. Keeping the seam outside the pump class leaves
+    its QoS 0 attribute lookup table unchanged.
+    """
+    if pump.draining_inline or pump.lock.locked() or not pump.pending:
+        return
+    epoch = pump.pending_epoch
+    if epoch != pump.owner._connection_epoch:
+        pump.discard_connection_effects()
+        if not pump.pending:
+            return
+        epoch = pump.pending_epoch
+    pump.draining_inline = True
+    try:
+        while pump.pending:
+            effect = pump.pending[0]
+            kind = effect.kind
+            if kind is EffectKind.PUBLISH_COMPLETE or kind is EffectKind.PUBLISH_FAILED:
+                applied = _apply_terminal_effect_batch_inline(pump.owner, pump.pending, epoch)
+                if applied:
+                    for _ in range(applied):
+                        pump.pending.popleft()
+                        pump.inline_effects += 1
+                        pump._complete()
+                    continue
+                break
+            if kind is EffectKind.MESSAGE or kind is EffectKind.DECODED_MESSAGE:
+                break
+            if not pump.owner._apply_effect_inline(effect, epoch):
+                break
+            pump.pending.popleft()
+            pump.inline_effects += 1
+            pump._complete()
+    finally:
+        pump.draining_inline = False
+
+
 class EffectPump:
     """Serialize engine effects without charging the single-effect fast path.
 
@@ -281,47 +321,6 @@ class EffectPump:
             self.draining_inline = False
         if self.pending:
             self.schedule()
-
-    def drain_ingress_ack_batch_inline(self) -> None:
-        """Apply an ingress batch ending in terminal publish results.
-
-        The reader calls this only after decoding several packets and observing
-        a terminal effect at the tail. Keeping that detection outside
-        ``drain_inline`` leaves the general SEND/QoS 0 loop unchanged.
-        """
-        if self.draining_inline or self.lock.locked() or not self.pending:
-            return
-        epoch = self.pending_epoch
-        if epoch != self.owner._connection_epoch:
-            self.discard_connection_effects()
-            if not self.pending:
-                return
-            epoch = self.pending_epoch
-        self.draining_inline = True
-        try:
-            while self.pending:
-                effect = self.pending[0]
-                kind = effect.kind
-                if kind is EffectKind.PUBLISH_COMPLETE or kind is EffectKind.PUBLISH_FAILED:
-                    applied = _apply_terminal_effect_batch_inline(self.owner, self.pending, epoch)
-                    if applied:
-                        for _ in range(applied):
-                            self.pending.popleft()
-                            self.inline_effects += 1
-                            self._complete()
-                        continue
-                    break
-                # Message delivery has its own batch admission and may need
-                # persistence marking. Let the established drain own it.
-                if kind is EffectKind.MESSAGE or kind is EffectKind.DECODED_MESSAGE:
-                    break
-                if not self.owner._apply_effect_inline(effect, epoch):
-                    break
-                self.pending.popleft()
-                self.inline_effects += 1
-                self._complete()
-        finally:
-            self.draining_inline = False
 
     def schedule(self) -> None:
         self.flush_requested = True

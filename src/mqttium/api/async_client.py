@@ -20,7 +20,11 @@ from itertools import islice
 from typing import Any, Literal, Never, TypeVar
 
 from mqttium.api._delivery import ApplicationDelivery, MessageDelivery
-from mqttium.api._effects import EffectPump, StaleConnectionEffect
+from mqttium.api._effects import (
+    EffectPump,
+    StaleConnectionEffect,
+    drain_ingress_ack_batch_inline,
+)
 from mqttium.api._writer import WritePump
 from mqttium.api.models import (
     PublishBatchReceipt,
@@ -1809,7 +1813,7 @@ class AsyncClient:
                                 tail_kind is EffectKind.PUBLISH_COMPLETE
                                 or tail_kind is EffectKind.PUBLISH_FAILED
                             ):
-                                self._effect_pump.drain_ingress_ack_batch_inline()
+                                drain_ingress_ack_batch_inline(self._effect_pump)
                         await self._drain_effects()
                     # A batch that stopped short of both bounds emptied the
                     # buffer, so there is nothing to decode until the next
