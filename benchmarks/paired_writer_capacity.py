@@ -45,6 +45,11 @@ class CapacityResult:
     writer_batched_bytes: int
     writer_eager_writes: int
     writer_eager_bytes: int
+    effect_batches: int
+    effect_multi_effect_batches: int
+    effect_enqueued: int
+    effect_inline_effects: int
+    effect_apply_suspensions: int
 
 
 @dataclass(slots=True)
@@ -103,6 +108,8 @@ async def _run_phase(
     _configure_completion_tracking(client, qos=qos, state=state, progress=progress)
     write_pump = getattr(client, "_write_pump", None)
     writer_before = write_pump.stats() if write_pump is not None else None
+    effect_pump = getattr(client, "_effect_pump", None)
+    effects_before = effect_pump.stats() if effect_pump is not None else None
 
     loop = asyncio.get_running_loop()
     cpu_started = time.process_time()
@@ -155,11 +162,17 @@ async def _run_phase(
         await asyncio.wait_for(write_pump.join(), timeout=timeout)
     drain_seconds = time.perf_counter() - drain_started
     writer_after = write_pump.stats() if write_pump is not None else None
+    effects_after = effect_pump.stats() if effect_pump is not None else None
 
     def writer_delta(name: str) -> int:
         if writer_before is None or writer_after is None:
             return 0
         return int(getattr(writer_after, name) - getattr(writer_before, name))
+
+    def effect_delta(name: str) -> int:
+        if effects_before is None or effects_after is None:
+            return 0
+        return int(getattr(effects_after, name) - getattr(effects_before, name))
 
     return CapacityResult(
         protocol="",
@@ -178,6 +191,11 @@ async def _run_phase(
         writer_batched_bytes=writer_delta("batched_bytes"),
         writer_eager_writes=writer_delta("eager_writes"),
         writer_eager_bytes=writer_delta("eager_bytes"),
+        effect_batches=effect_delta("batches"),
+        effect_multi_effect_batches=effect_delta("multi_effect_batches"),
+        effect_enqueued=effect_delta("enqueued"),
+        effect_inline_effects=effect_delta("inline_effects"),
+        effect_apply_suspensions=effect_delta("apply_suspensions"),
     )
 
 
