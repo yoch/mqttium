@@ -1795,8 +1795,15 @@ class AsyncClient:
                         # A multi-packet reader batch ending in a terminal
                         # publish result is the inbound ACK batching seam. The
                         # ordinary EffectPump loop deliberately has no terminal
-                        # branch, keeping QoS 0 and single-ACK latency unchanged.
-                        if handled > 1:
+                        # branch. A sync idle callback is already dispatched in
+                        # that loop with no worker wakeup, so batching is reserved
+                        # for async or currently non-inline callback delivery.
+                        callback = self.on_publish
+                        if (
+                            handled > 1
+                            and callback is not None
+                            and not self._can_dispatch_callback_inline(callback)
+                        ):
                             tail_kind = self._effect_pump.pending[-1].kind
                             if (
                                 tail_kind is EffectKind.PUBLISH_COMPLETE

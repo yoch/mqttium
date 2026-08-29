@@ -98,6 +98,36 @@ async def test_single_puback_read_keeps_the_ordinary_completion_path() -> None:
     assert receipt.is_done()
 
 
+async def test_sync_idle_multi_ack_read_keeps_point_one_inline_path() -> None:
+    client = AsyncClient(client_id="batch-ack-sync-inline-control")
+    client._engine.state = ConnectionState.CONNECTED
+    publishes = [
+        client._engine.queue_publish(f"batch/sync/{mid}", b"x", qos=QoS.AT_LEAST_ONCE)
+        for mid in (1, 2)
+    ]
+    client._engine.take_effects()
+    mids = [publish.mid for publish in publishes]
+    assert mids == [1, 2]
+    receipts = [PublishReceipt(mid, QoS.AT_LEAST_ONCE) for mid in mids if mid is not None]
+    for receipt in receipts:
+        assert receipt.mid is not None
+        client._register_publish_receipt(receipt.mid, receipt)
+    seen: list[int | None] = []
+    client.on_publish = lambda mid, _reason: seen.append(mid)
+
+    def unexpected_batch() -> None:
+        raise AssertionError("sync idle completions already have an inline drain")
+
+    client._effect_pump.drain_ingress_ack_batch_inline = unexpected_batch
+    client._transport = _OneReadTransport(PubAckPacket(1).encode() + PubAckPacket(2).encode())
+
+    await client._read_loop()
+
+    assert all(receipt.is_done() for receipt in receipts)
+    assert seen == [1, 2]
+    assert client._callback_queue.empty()
+
+
 async def test_terminal_batch_is_one_physical_bounded_callback_job() -> None:
     client = AsyncClient(client_id="batch-ack-physical", max_pending_callbacks=4)
     receipts = [PublishReceipt(mid, QoS.AT_LEAST_ONCE) for mid in (1, 2, 3)]
