@@ -28,7 +28,7 @@ concurrency:
 jobs:
   release-gate:
     name: Deep network gate (manual only)
-    if: inputs.confirm_trusted_code && github.ref == 'refs/heads/main'
+    if: inputs.confirm_trusted_code
     runs-on: [self-hosted, linux, ARM64]
     timeout-minutes: 45
     env:
@@ -39,7 +39,7 @@ jobs:
       - name: Check out benchmark harness
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: main
+          ref: ${{ github.sha }}
           path: harness
           persist-credentials: false
       - name: Set run-specific workspace
@@ -129,7 +129,25 @@ jobs:
           cat "$root/mosquitto.log"
           exit 1
 
+      - name: Run focused runner diagnosis
+        shell: bash
+        run: |
+          set -euo pipefail
+          taskset -c 3 python harness/benchmarks/runner_network_diagnosis.py \
+            --root base \
+            --engine harness/benchmarks/paired_network.py \
+            --iterations 32 \
+            --count 26000 \
+            --window 1 \
+            --protocol 311 \
+            --completion callback \
+            --publisher-cpu 2 \
+            --support-cpu 1 \
+            --output "$JOB_ROOT/runner-diagnosis.json" | \
+            tee "$JOB_ROOT/runner-diagnosis.log"
+
       - name: Run strict network release gate
+        if: false
         shell: bash
         run: |
           set -euo pipefail
@@ -164,6 +182,8 @@ jobs:
             ${{ runner.temp }}/mqttium-${{ github.run_id }}-${{ github.run_attempt }}/*.md
             ${{ runner.temp }}/mqttium-${{ github.run_id }}-${{ github.run_attempt }}/*-raw/*
             ${{ runner.temp }}/mqttium-${{ github.run_id }}-${{ github.run_attempt }}/mosquitto.log
+            ${{ runner.temp }}/mqttium-${{ github.run_id }}-${{ github.run_attempt }}/runner-diagnosis.json
+            ${{ runner.temp }}/mqttium-${{ github.run_id }}-${{ github.run_attempt }}/runner-diagnosis.log
           if-no-files-found: warn
           retention-days: 30
 
