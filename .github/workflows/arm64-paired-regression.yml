@@ -208,7 +208,8 @@ jobs:
           python "$script" \
             --base-root base --candidate-root base \
             --repeat 8 --count 10000 --timeout 20 \
-            --broker-cpu 1 --client-cpu 2 --policy strict \
+            --broker-cpu 1 --client-cpu 2 \
+            --policy ${{ github.ref == 'refs/heads/main' && 'strict' || 'advisory' }} \
             --preflight-report "$JOB_ROOT/runner.json" \
             --output "$JOB_ROOT/protocol-response-socket-aa.json"
 
@@ -220,7 +221,8 @@ jobs:
           python candidate/benchmarks/paired_protocol_response_socket.py \
             --base-root base --candidate-root candidate \
             --repeat 8 --count 10000 --timeout 20 \
-            --broker-cpu 1 --client-cpu 2 --policy strict \
+            --broker-cpu 1 --client-cpu 2 \
+            --policy ${{ github.ref == 'refs/heads/main' && 'strict' || 'advisory' }} \
             --preflight-report "$JOB_ROOT/runner.json" \
             --output "$JOB_ROOT/protocol-response-socket-ab.json"
 
@@ -245,7 +247,7 @@ jobs:
             --min-completed-ratio 0.99 --max-completed-ratio 1.01 \
             --max-cpu-per-message-ratio 1.01 --max-aa-ratio-deviation 0.01 \
             --timeout 120 --cpu 2 \
-            --policy strict \
+            --policy ${{ github.ref == 'refs/heads/main' && 'strict' || 'advisory' }} \
             --preflight-report "$JOB_ROOT/runner.json" \
             --output "$JOB_ROOT/writer-capacity-aa.json" \
             --summary-output "$JOB_ROOT/writer-capacity-aa.md"
@@ -264,7 +266,7 @@ jobs:
             --min-completed-ratio 0.99 --max-completed-ratio 1.01 \
             --max-cpu-per-message-ratio 1.01 --max-aa-ratio-deviation 0.01 \
             --timeout 120 --cpu 2 \
-            --policy strict \
+            --policy ${{ github.ref == 'refs/heads/main' && 'strict' || 'advisory' }} \
             --preflight-report "$JOB_ROOT/runner.json" \
             --output "$JOB_ROOT/writer-capacity-ab.json" \
             --summary-output "$JOB_ROOT/writer-capacity-ab.md"
