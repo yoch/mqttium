@@ -209,6 +209,13 @@ automatic QoS 1) may be applied during the inline effect drain. Persisted QoS 1,
 QoS 2 and replay deliveries keep the established awaited path and are marked
 only after application delivery accepts them.
 
+Topic-filtered callbacks are an `AsyncClient` concern. `TopicMatcher` selects
+application callbacks after the engine has already emitted MESSAGE effects; the
+protocol layer never sees filters or user callables. The matcher exists only
+while at least one filter is registered. Inbound delivery consults an installed
+`_message_callback` pointer (`on_message`, the topic router, or `None`) so the
+unused-filter path has no matcher branch.
+
 ## Persistence
 
 Store transitions accept both expected and new states. A mismatch is a protocol

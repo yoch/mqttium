@@ -101,7 +101,8 @@ completion and failure counts without creating one task per publication.
 ## Choosing inbound delivery
 
 The default `message_delivery="auto"` chooses callback delivery when
-`on_message` is assigned and iterator delivery otherwise.
+`on_message` is assigned or a topic-filtered callback is registered, and
+iterator delivery otherwise.
 
 Iterator delivery keeps control flow in the consuming task:
 
@@ -118,6 +119,17 @@ async def on_message(message) -> None:
 
 
 client.on_message = on_message
+```
+
+Route a subset of topics without replacing `on_message`. Matching filters run
+instead of the default callback, in registration order:
+
+```python
+def on_sensor(message) -> None:
+    handle_sensor(message)
+
+
+client.message_callback_add("sensors/+", on_sensor)
 ```
 
 Use `message_delivery="both"` only when two independent application consumers

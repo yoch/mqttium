@@ -54,7 +54,8 @@ automatically a WebSocket endpoint.
 
 ## Messages are not delivered
 
-With `message_delivery="auto"`, assigning `on_message` selects callback
+With `message_delivery="auto"`, assigning `on_message` or registering a
+topic-filtered callback with `message_callback_add` selects callback
 delivery; otherwise the iterator is used. With `"both"`, both consumers retain
 capacity. Check callback exceptions through the event loop exception handler
 and inspect delivery queue counts and bytes.

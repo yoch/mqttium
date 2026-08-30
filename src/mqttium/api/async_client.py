@@ -37,6 +37,7 @@ from mqttium.api.stats import (
     TransportStats,
 )
 from mqttium.codec.buffer import DEFAULT_MAX_PACKET_SIZE, IncrementalDecoder
+from mqttium.dispatch.matcher import TopicMatcher
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, PacketType, QoS
 from mqttium.errors import (
     FlowControlError,
@@ -72,6 +73,7 @@ from mqttium.protocol.engine import (
 from mqttium.protocol.negotiated import NegotiatedSettings
 from mqttium.protocol.reconnect import ReconnectPolicy
 from mqttium.persistence.memory import InflightStore
+from mqttium.topics import validate_subscribe_filter
 from mqttium.transport._stream import AsyncTransport
 from mqttium.transport.tcp import TcpTransport
 from mqttium.transport.unix import UnixSocketTransport
@@ -421,7 +423,9 @@ class AsyncClient:
         self._last_disconnect: DisconnectInfo | None = None
         self._last_connack_reason: int | None = None
 
-        self.on_message: OnMessage | None = None
+        self._on_message: OnMessage | None = None
+        self._message_callback: OnMessage | None = None
+        self._topic_callbacks: TopicMatcher | None = None
         self.on_connect: OnConnect | None = None
         self.on_disconnect: OnDisconnect | None = None
         self.on_publish: OnPublish | None = None
@@ -1486,6 +1490,109 @@ class AsyncClient:
         self.auth_handler = handler
         self._engine.reconfigure(accept_auth=handler is not None)
 
+    @property
+    def on_message(self) -> OnMessage | None:
+        """Default callback used when no topic-specific callback matches."""
+        return self._on_message
+
+    @on_message.setter
+    def on_message(self, callback: OnMessage | None) -> None:
+        self._on_message = callback
+        if self._topic_callbacks is None:
+            self._message_callback = callback
+
+    def message_callback_add(self, topic_filter: str, callback: OnMessage) -> None:
+        """Register a message callback for one MQTT topic filter.
+
+        Matching filtered callbacks run instead of ``on_message``, in
+        registration order. Replacing the callback for an existing filter
+        keeps that order. Filters are validated as SUBSCRIBE topic filters.
+        Shared-subscription filters match the filter string literally.
+        """
+        validate_subscribe_filter(topic_filter)
+        matcher = self._topic_callbacks
+        if matcher is None:
+            matcher = TopicMatcher()
+            matcher[topic_filter] = callback
+            self._topic_callbacks = matcher
+            self._message_callback = self._dispatch_topic_message
+            return
+        matcher[topic_filter] = callback
+
+    def message_callback_remove(self, topic_filter: str) -> None:
+        """Remove the callback registered for ``topic_filter``, if any."""
+        matcher = self._topic_callbacks
+        if matcher is None:
+            return
+        try:
+            del matcher[topic_filter]
+        except KeyError:
+            return
+        if not matcher:
+            self._topic_callbacks = None
+            self._message_callback = self._on_message
+
+    def _dispatch_topic_message(self, message: Message) -> Any:
+        """Dispatch matching callbacks, or the current default callback."""
+        matcher = self._topic_callbacks
+        if matcher is not None:
+            callbacks = matcher.iter_match(message.topic)
+            matched = False
+            for callback in callbacks:
+                matched = True
+                try:
+                    result = callback(message)
+                except asyncio.CancelledError as exc:
+                    self._delivery._propagate_callback_cancellation(callback, exc)
+                    continue
+                except Exception as exc:
+                    self._report_callback_error(callback, exc)
+                    continue
+                if isinstance(result, Awaitable):
+                    return self._continue_topic_callbacks(
+                        callback, result, tuple(callbacks), message
+                    )
+            if matched:
+                return None
+
+        callback = self._on_message
+        if callback is None:
+            return None
+        try:
+            result = callback(message)
+        except asyncio.CancelledError as exc:
+            self._delivery._propagate_callback_cancellation(callback, exc)
+            return None
+        except Exception as exc:
+            self._report_callback_error(callback, exc)
+            return None
+        if isinstance(result, Awaitable):
+            return self._continue_topic_callbacks(callback, result, (), message)
+        return None
+
+    async def _continue_topic_callbacks(
+        self,
+        callback: OnMessage,
+        result: Awaitable[Any],
+        callbacks: Iterable[OnMessage],
+        message: Message,
+    ) -> None:
+        try:
+            await result
+        except asyncio.CancelledError as exc:
+            self._delivery._propagate_callback_cancellation(callback, exc)
+        except Exception as exc:
+            self._report_callback_error(callback, exc)
+        for callback in callbacks:
+            try:
+                result = callback(message)
+                if isinstance(result, Awaitable):
+                    await result
+            except asyncio.CancelledError as exc:
+                self._delivery._propagate_callback_cancellation(callback, exc)
+            except Exception as exc:
+                self._report_callback_error(callback, exc)
+
     async def subscribe(
         self,
         topics: str | Iterable[str | tuple[str, SubscribeOptions | int | QoS]],
@@ -1761,7 +1868,8 @@ class AsyncClient:
                             if (
                                 direct_qos0_mode
                                 and (
-                                    self._delivery.mode == "callback" or self.on_message is not None
+                                    self._delivery.mode == "callback"
+                                    or self._message_callback is not None
                                 )
                                 and not self._effect_pump.pending
                                 and self._engine.state is ConnectionState.CONNECTED
@@ -1782,7 +1890,7 @@ class AsyncClient:
                                 )
                         if captured:
                             if self._delivery.deliver_callback_messages_inline(
-                                captured, self.on_message, captured_property_sizes
+                                captured, self._message_callback, captured_property_sizes
                             ):
                                 self._effect_pump.record_inline_batch(len(captured))
                             else:
@@ -2181,7 +2289,7 @@ class AsyncClient:
     ) -> int:
         if epoch != self._connection_epoch or self._engine_lock.locked():
             return 0
-        return self._delivery.deliver_message_batch_inline(effects, self.on_message)
+        return self._delivery.deliver_message_batch_inline(effects, self._message_callback)
 
     async def _flush_effects(self) -> None:
         async with self._engine_lock:
@@ -2235,10 +2343,10 @@ class AsyncClient:
             # Producers pair the decoded size with DECODED_MESSAGE and leave it
             # None on MESSAGE, so the size selects the admission entry point.
             if property_wire_size is None:
-                pending_delivery = self._accept_message(message, self.on_message)
+                pending_delivery = self._accept_message(message, self._message_callback)
             else:
                 pending_delivery = self._accept_decoded_message(
-                    message, self.on_message, property_wire_size
+                    message, self._message_callback, property_wire_size
                 )
             if pending_delivery is not None:
                 await pending_delivery

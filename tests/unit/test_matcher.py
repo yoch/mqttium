@@ -120,3 +120,12 @@ def test_values_may_be_none_and_deletion_is_explicit() -> None:
     del matcher["nullable/topic"]
     with pytest.raises(KeyError):
         _ = matcher["nullable/topic"]
+
+
+def test_empty_matcher_is_falsy() -> None:
+    matcher = TopicMatcher()
+    assert not matcher
+    matcher["sensors/+"] = "cb"
+    assert matcher
+    del matcher["sensors/+"]
+    assert not matcher

@@ -23,7 +23,7 @@ no sampler, logging, or formatting cost.
 | --- | --- |
 | Publish completion or failure | `await receipt.wait()` and `receipt.is_done()` |
 | Connection lifecycle | `on_connect` and `on_disconnect` |
-| Incoming messages | `on_message` or `async for message in client.messages()` |
+| Incoming messages | `on_message`, `message_callback_add`, or `async for message in client.messages()` |
 | Current state | `client.is_connected`, `client.state`, `client.negotiated` |
 | Protocol failures | typed exceptions such as `ProtocolError` and `MQTTTimeoutError` |
 | Broker disconnect details | `DisconnectInfo` |

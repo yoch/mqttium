@@ -201,6 +201,7 @@ class Client:
             max_pending_inbound_bytes=max_pending_inbound_bytes,
             max_outbound_inflight=max_outbound_inflight,
             publish_backpressure="error",
+            message_delivery="callback",
         )
         # Cache the hot adapter boundary methods once. This avoids repeated
         # AsyncClient attribute traversal in every Paho publication while keeping
@@ -213,7 +214,7 @@ class Client:
         self._thread: threading.Thread | None = None
         self._started = threading.Event()
         self._stopping = threading.Event()
-        self._topic_callbacks = TopicMatcher()
+        self._topic_callbacks: TopicMatcher | None = None
         self._publish_pending: SimpleQueue[_PendingPublish] = SimpleQueue()
         self._publish_spillover: _PendingPublish | None = None
         self._publish_schedule_lock = threading.Lock()
@@ -244,13 +245,25 @@ class Client:
 
         self.on_connect: Callable[..., Any] | None = None
         self.on_disconnect: Callable[..., Any] | None = None
-        self.on_message: Callable[..., Any] | None = None
+        self._on_message: Callable[..., Any] | None = None
         self._on_publish: Callable[..., Any] | None = None
 
         self._async.on_connect = self._dispatch_connect
         self._async.on_disconnect = self._dispatch_disconnect
-        self._async.on_message = self._dispatch_message
-        # on_publish is installed on demand: see the property below.
+        # Message and publish dispatchers are installed only while requested.
+
+    @property
+    def on_message(self) -> Callable[..., Any] | None:
+        return self._on_message
+
+    @on_message.setter
+    def on_message(self, callback: Callable[..., Any] | None) -> None:
+        def _set() -> None:
+            self._on_message = callback
+            if self._topic_callbacks is None:
+                self._async.on_message = self._dispatch_message if callback is not None else None
+
+        self._run_loop_mutation(_set)
 
     @property
     def on_publish(self) -> Callable[..., Any] | None:
@@ -338,12 +351,31 @@ class Client:
 
     def message_callback_add(self, sub: str, callback: Callable[..., Any]) -> None:
         validate_subscribe_filter(sub)
-        self._run_loop_mutation(lambda: self._topic_callbacks.__setitem__(sub, callback))
+
+        def _add() -> None:
+            matcher = self._topic_callbacks
+            if matcher is None:
+                matcher = TopicMatcher()
+                matcher[sub] = callback
+                self._topic_callbacks = matcher
+                self._async.on_message = self._dispatch_message
+                return
+            matcher[sub] = callback
+
+        self._run_loop_mutation(_add)
 
     def message_callback_remove(self, sub: str) -> None:
         def _remove() -> None:
+            matcher = self._topic_callbacks
+            if matcher is None:
+                return
             with suppress(KeyError):
-                del self._topic_callbacks[sub]
+                del matcher[sub]
+            if not matcher:
+                self._topic_callbacks = None
+                self._async.on_message = (
+                    self._dispatch_message if self._on_message is not None else None
+                )
 
         self._run_loop_mutation(_remove)
 
@@ -1110,11 +1142,17 @@ class Client:
         self._safe_callback(cb, self, self._userdata, flags, reason, props)
 
     def _dispatch_message(self, msg: Message) -> None:
-        wrapped = MQTTMessage(msg)
-        matched = False
-        for cb in self._topic_callbacks.iter_match(msg.topic):
-            matched = True
-            self._safe_callback(cb, self, self._userdata, wrapped)
-        # Paho: default on_message only if no filtered callback matched.
-        if not matched and self.on_message is not None:
-            self._safe_callback(self.on_message, self, self._userdata, wrapped)
+        matcher = self._topic_callbacks
+        if matcher is not None:
+            callbacks = matcher.iter_match(msg.topic)
+            first = next(callbacks, None)
+            if first is not None:
+                wrapped = MQTTMessage(msg)
+                self._safe_callback(first, self, self._userdata, wrapped)
+                for callback in callbacks:
+                    self._safe_callback(callback, self, self._userdata, wrapped)
+                return
+
+        callback = self._on_message
+        if callback is not None:
+            self._safe_callback(callback, self, self._userdata, MQTTMessage(msg))

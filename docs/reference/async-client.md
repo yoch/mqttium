@@ -21,6 +21,8 @@ background thread.
         - ack
         - auth
         - set_auth_handler
+        - message_callback_add
+        - message_callback_remove
         - stats
       inherited_members: false
       heading_level: 2
@@ -36,15 +38,21 @@ background thread.
 | `on_connect` | Sync or async callback after successful connection |
 | `on_disconnect` | Sync or async callback for disconnection |
 | `on_message` | Sync or async message callback |
+| `message_callback_add` / `message_callback_remove` | Topic-filtered message callbacks; matching filters run instead of `on_message` |
 | `on_publish` | Sync or async publish-completion callback |
 | `auth_handler` | MQTT 5 enhanced-authentication handler |
 
 Callbacks execute outside protocol-engine critical sections. Synchronous
-`on_publish` and eligible `on_message` callbacks may execute inline when
-callback delivery is idle; async, reentrant and queued callbacks use the
-bounded worker. Synchronous callbacks must not block the event loop. Callback
-failures go to the event loop's exception handler without silently changing
-protocol state.
+`on_publish` and eligible `on_message` / topic-filtered callbacks may execute
+inline when callback delivery is idle; async, reentrant and queued callbacks
+use the bounded worker. Synchronous callbacks must not block the event loop.
+Callback failures go to the event loop's exception handler without silently
+changing protocol state.
+
+Matching `message_callback_add` filters run instead of `on_message`, in
+registration order. Shared-subscription filters match the filter string
+literally, as in Paho. Iterator-only delivery ignores callbacks, including
+topic filters.
 
 ## Loop confinement
 
