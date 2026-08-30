@@ -2263,7 +2263,19 @@ class AsyncClient:
         if kind is EffectKind.PINGRESP:
             self._ping_pending = False
             return True
+        if kind is EffectKind.PROTOCOL_ERROR:
+            self._raise_protocol_effect(effect.data)
         return False
+
+    def _raise_protocol_effect(self, data: object) -> Never:
+        error = (
+            data
+            if isinstance(data, (MalformedPacketError, PacketTooLargeError, ProtocolError))
+            else ProtocolError(str(data))
+        )
+        if self._engine.state is ConnectionState.DISCONNECTED:
+            self._disconnect_exc = error
+        raise error
 
     def _apply_terminal_callback_inline(
         self,
@@ -2405,10 +2417,7 @@ class AsyncClient:
                 self._engine.continue_inbound_replay()
                 self._collect_effects_locked()
         elif kind is EffectKind.PROTOCOL_ERROR:
-            error = ProtocolError(str(effect.data))
-            if self._engine.state is ConnectionState.DISCONNECTED:
-                self._disconnect_exc = error
-            raise error
+            self._raise_protocol_effect(effect.data)
         else:
             never: Never = kind
             raise MQTTError(f"Unhandled effect {never!r}")

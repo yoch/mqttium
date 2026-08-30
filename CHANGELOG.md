@@ -39,6 +39,9 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Preserve malformed-packet and packet-too-large classifications across the
+  protocol engine/runtime boundary so MQTT 5 fatal DISCONNECT responses use the
+  normative reason code instead of falling back to generic Protocol Error.
 - Reject MQTT 5 PUBLISH and Will payloads that are not well-formed UTF-8 when
   their Payload Format Indicator is 1. QoS 1/2 validation happens before
   admission or persistence; binary payloads remain valid when the indicator is
