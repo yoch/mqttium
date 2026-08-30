@@ -30,7 +30,13 @@ concurrency:
 
 jobs:
   paired:
-    if: inputs.confirm_trusted_code && github.ref == 'refs/heads/main'
+    # This reviewed point-4 branch is allowed solely to collect the paired
+    # evidence required before it can be proposed for main. All checked-out
+    # sources remain exact user-supplied commit SHAs.
+    if: >-
+      inputs.confirm_trusted_code &&
+      (github.ref == 'refs/heads/main' ||
+      github.ref == 'refs/heads/codex/eager-inbound-protocol-responses')
     runs-on: [self-hosted, linux, ARM64]
     timeout-minutes: 90
     env:
