@@ -5,6 +5,7 @@ from __future__ import annotations
 from mqttium.codec.vbi import append_vbi
 from mqttium.enums import PacketType
 from mqttium.errors import ProtocolError
+from mqttium.types import Properties
 
 
 def encode_frame(packet_type: PacketType, flags: int, remaining: bytes | bytearray) -> bytes:
@@ -25,3 +26,15 @@ def _require_outbound_mid(mid: int, what: str) -> None:
 def _require_outbound_reason(reason: int, allowed: frozenset[int], what: str) -> None:
     if reason not in allowed:
         raise ProtocolError(f"{what} contains invalid reason code 0x{reason:02x}")
+
+
+def validate_payload_format(payload: bytes, properties: Properties | None) -> None:
+    """Enforce the sender-side MQTT 5 Payload Format Indicator contract."""
+    if properties is None or properties.get("payload_format_indicator") != 1:
+        return
+    try:
+        payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ProtocolError(
+            "Payload Format Indicator 1 requires a well-formed UTF-8 payload"
+        ) from exc

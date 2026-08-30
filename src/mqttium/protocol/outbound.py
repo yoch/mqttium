@@ -39,6 +39,7 @@ from mqttium.protocol.effects import EffectKind, PublishFailure, PublishHandle
 from mqttium.protocol.flow_control import FlowControl
 from mqttium.protocol.packet_ids import PacketIdPool
 from mqttium.packets._ack import encode_pubrel_success as _encode_pubrel_success
+from mqttium.packets._common import validate_payload_format
 from mqttium.protocol._sizing import publish_logical_size
 from mqttium.protocol.stats import OutboundStats
 from mqttium.topics import encode_validated_publish_topic, validate_publish_topic
@@ -355,6 +356,7 @@ class OutboundSession:
     def _validate_publish_request(
         self,
         topic: str,
+        payload: bytes,
         qos: QoS | int,
         retain: bool,
         properties: Properties | None,
@@ -380,6 +382,12 @@ class OutboundSession:
                 raise ProtocolError(
                     "subscription_identifier is not allowed on an outbound PUBLISH [MQTT-3.3.4-6]"
                 )
+            # QoS 1/2 can be persisted before their first encode. Validate the
+            # payload claim before admission so invalid state never reaches the
+            # store. QoS 0 is encoded immediately and uses the packet-boundary
+            # validation instead.
+            if level and self._is_v5:
+                validate_payload_format(payload, properties)
             alias_value = properties.get("topic_alias") if self._is_v5 else None
             if alias_value is not None:
                 alias = int(alias_value)
@@ -460,7 +468,7 @@ class OutboundSession:
         """Prepare a mutation-free QoS 0 publication for the native runtime."""
 
         _qos, topic_bytes, _topic_size, _canonical_topic = self._validate_publish_request(
-            topic, QoS.AT_MOST_ONCE, retain, properties
+            topic, payload, QoS.AT_MOST_ONCE, retain, properties
         )
         assert topic_bytes is not None
         return self._prepare_qos0_validated(
@@ -483,7 +491,7 @@ class OutboundSession:
         if self._engine.state is ConnectionState.DISCONNECTING:
             raise NotConnectedError("publish is not allowed while disconnecting")
         qos, topic_bytes, topic_size, canonical_topic = self._validate_publish_request(
-            topic, qos, retain, properties
+            topic, payload, qos, retain, properties
         )
 
         if qos == QoS.AT_MOST_ONCE:
