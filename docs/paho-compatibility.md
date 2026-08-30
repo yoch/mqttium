@@ -125,12 +125,15 @@ positive `session_expiry_interval` for MQTT v5. Reconnect then uses Clean Start
 
 **Rejected.** Topic aliases must remain explicit and observable.
 
-### 7. Releasing the local Receive Maximum slot at PUBREC under load
+### 7. Replenishing the MQTT 5 send quota after a successful PUBREC
 
-**Rejected for now.** MQTT 5 permits early release, but doing so caused
-intermittent stalls under load through an accumulation of `WAIT_PUBCOMP`
-messages and writer-queue pressure. The local window therefore remains held
-until PUBCOMP. Reconsider this only with supporting measurements.
+**Rejected by the protocol.** A successful PUBREC (Reason Code below `0x80`)
+does not replenish the sender's Receive Maximum quota: the QoS 2 exchange still
+owns that slot until PUBCOMP. A PUBREC with Reason Code `0x80` or greater ends
+the exchange and does replenish the quota immediately. PUBREL is not itself a
+QoS 1/2 PUBLISH and therefore does not acquire a Receive Maximum slot. Holding
+the slot through a successful PUBREC is a wire-protocol correctness requirement,
+not an optional load-management policy.
 
 ### 8. Mutating the protocol engine directly from publisher threads
 

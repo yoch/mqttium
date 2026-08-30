@@ -18,6 +18,10 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Changed
 
+- Correct the Paho compatibility design notes to state the normative MQTT 5
+  Receive Maximum behavior for QoS 2: successful PUBREC keeps the sender's
+  quota slot until PUBCOMP, failed PUBREC releases it, and PUBREL does not
+  acquire a slot.
 - Keep the Paho compatibility façade callback-only for inbound delivery and
   install its message dispatcher and topic matcher only while `on_message` or a
   filtered callback is registered. Idle façade clients therefore allocate no
