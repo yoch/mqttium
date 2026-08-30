@@ -356,8 +356,10 @@ class Client:
             matcher = self._topic_callbacks
             if matcher is None:
                 matcher = TopicMatcher()
+                matcher[sub] = callback
                 self._topic_callbacks = matcher
                 self._async.on_message = self._dispatch_message
+                return
             matcher[sub] = callback
 
         self._run_loop_mutation(_add)
@@ -1143,9 +1145,10 @@ class Client:
         matcher = self._topic_callbacks
         if matcher is not None:
             callbacks = matcher.iter_match(msg.topic)
-            for callback in callbacks:
+            first = next(callbacks, None)
+            if first is not None:
                 wrapped = MQTTMessage(msg)
-                self._safe_callback(callback, self, self._userdata, wrapped)
+                self._safe_callback(first, self, self._userdata, wrapped)
                 for callback in callbacks:
                     self._safe_callback(callback, self, self._userdata, wrapped)
                 return

@@ -15,7 +15,7 @@ import asyncio
 import ssl
 import time
 from collections import deque
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from itertools import islice
 from typing import Any, Literal, Never, TypeVar
 
@@ -1549,7 +1549,9 @@ class AsyncClient:
                     self._report_callback_error(callback, exc)
                     continue
                 if isinstance(result, Awaitable):
-                    return self._continue_topic_callbacks(callback, result, callbacks, message)
+                    return self._continue_topic_callbacks(
+                        callback, result, tuple(callbacks), message
+                    )
             if matched:
                 return None
 
@@ -1565,14 +1567,14 @@ class AsyncClient:
             self._report_callback_error(callback, exc)
             return None
         if isinstance(result, Awaitable):
-            return self._continue_topic_callbacks(callback, result, iter(()), message)
+            return self._continue_topic_callbacks(callback, result, (), message)
         return None
 
     async def _continue_topic_callbacks(
         self,
         callback: OnMessage,
         result: Awaitable[Any],
-        callbacks: Iterator[OnMessage],
+        callbacks: Iterable[OnMessage],
         message: Message,
     ) -> None:
         try:
