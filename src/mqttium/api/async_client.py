@@ -308,6 +308,16 @@ class AsyncClient:
         effective_max_packet_size = (
             maximum_packet_size if maximum_packet_size is not None else DEFAULT_MAX_PACKET_SIZE
         )
+        configured_max_packet_size = (
+            connect_properties.get("maximum_packet_size")
+            if protocol == MQTTProtocolVersion.MQTTv5 and connect_properties is not None
+            else None
+        )
+        initial_decoder_max_packet_size = (
+            configured_max_packet_size
+            if isinstance(configured_max_packet_size, int)
+            else effective_max_packet_size
+        )
         pwd = password.encode("utf-8") if isinstance(password, str) else password
         self._engine = ProtocolEngine(
             EngineConfig(
@@ -332,7 +342,7 @@ class AsyncClient:
             ),
             store=store,
         )
-        self._decoder = IncrementalDecoder(max_packet_size=effective_max_packet_size)
+        self._decoder = IncrementalDecoder(max_packet_size=initial_decoder_max_packet_size)
         self._max_ingress_batch_bytes = max_ingress_batch_bytes
         self._transport: AsyncTransport | None = None
         self._reader_task: asyncio.Task[None] | None = None
@@ -368,7 +378,7 @@ class AsyncClient:
             max_pending_messages=max_pending_messages,
             max_pending_callbacks=max_pending_callbacks,
             max_pending_delivery_bytes=max_pending_delivery_bytes,
-            maximum_packet_size=effective_max_packet_size,
+            maximum_packet_size=initial_decoder_max_packet_size,
             delivery_timeout=delivery_timeout,
             callback_shutdown_timeout=callback_shutdown_timeout,
         )
@@ -1012,6 +1022,9 @@ class AsyncClient:
             self._write_pump.reset()
             self._ping_pending = False
             connect_packet = self._engine.begin_connect()
+            sent_maximum_packet_size = self._engine._sent_maximum_packet_size
+            if sent_maximum_packet_size is not None:
+                self._decoder.max_packet_size = sent_maximum_packet_size
             self._connack_fut = loop.create_future()
             self._connect_disconnect_fut = loop.create_future()
             self._write_pump.start(transport)

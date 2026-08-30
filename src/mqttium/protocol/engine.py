@@ -91,6 +91,7 @@ class ProtocolEngine:
         self._prefer_session_resume = False
         self._sent_clean_start = False
         self._sent_session_expiry_interval: int | None = None
+        self._sent_maximum_packet_size = self.config.maximum_packet_size
         self._sent_request_problem_information = 1
         self._sent_request_response_information = 0
         self._auth_method: str | None = None
@@ -330,6 +331,18 @@ class ProtocolEngine:
         )
         wire = packet.encode()
 
+        sent_receive_maximum = self.config.local_receive_maximum
+        sent_topic_alias_maximum = self.config.topic_alias_maximum
+        sent_maximum_packet_size = self.config.maximum_packet_size
+        if self.config.protocol == MQTTProtocolVersion.MQTTv5:
+            assert connect_props is not None
+            sent_receive_maximum = int(connect_props.get("receive_maximum", 65535))
+            sent_topic_alias_maximum = int(connect_props.get("topic_alias_maximum", 0))
+            configured_packet_size = connect_props.get("maximum_packet_size")
+            sent_maximum_packet_size = (
+                None if configured_packet_size is None else int(configured_packet_size)
+            )
+
         # Commit connection state only after every validation and the encoding
         # have succeeded. A synchronous configuration error must leave the
         # engine reusable rather than stranded in CONNECTING.
@@ -341,6 +354,7 @@ class ProtocolEngine:
         self._sent_session_expiry_interval = (
             connect_props.get("session_expiry_interval") if connect_props is not None else None
         )
+        self._sent_maximum_packet_size = sent_maximum_packet_size
         request_problem_information = (
             connect_props.get("request_problem_information") if connect_props is not None else None
         )
@@ -355,7 +369,10 @@ class ProtocolEngine:
         )
         self.state = ConnectionState.CONNECTING
         self.outbound.start_connection()
-        self.inbound.start_connection()
+        self.inbound.start_connection(
+            receive_maximum=sent_receive_maximum,
+            topic_alias_maximum=sent_topic_alias_maximum,
+        )
         # Negotiated capabilities are connection-scoped. Queued messages are
         # validated against the new values only after the next CONNACK.
         self.negotiated = NegotiatedSettings()
