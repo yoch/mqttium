@@ -197,9 +197,7 @@ async def test_real_task_cancellation_stops_callback_sequence() -> None:
     client.message_callback_add("sensors/+", later)
     callback = client._message_callback
     assert callback is not None
-    task = asyncio.create_task(
-        client._invoke(callback, Message(topic="sensors/1", payload=b"x"))
-    )
+    task = asyncio.create_task(client._invoke(callback, Message(topic="sensors/1", payload=b"x")))
     await started.wait()
     task.cancel()
 
