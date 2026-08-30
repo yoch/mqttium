@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from mqttium.api.async_client import AsyncClient
 from mqttium.errors import ProtocolError
+from mqttium.protocol.engine import EffectKind, EngineEffect
 from mqttium.types import Message
 
 
@@ -13,6 +16,16 @@ async def _deliver(client: AsyncClient, topic: str) -> None:
     callback = client._message_callback
     assert callback is not None
     await client._invoke(callback, Message(topic=topic, payload=b"payload"))
+
+
+async def _apply(client: AsyncClient, topic: str) -> None:
+    await client._apply_effect(
+        EngineEffect(
+            kind=EffectKind.MESSAGE,
+            data=Message(topic=topic, payload=b"payload"),
+        ),
+        nowait=False,
+    )
 
 
 async def test_topic_callbacks_override_default_only_when_a_filter_matches() -> None:
@@ -50,6 +63,85 @@ async def test_topic_callbacks_preserve_order_across_async_callbacks() -> None:
 
     await _deliver(client, "sensors/kitchen/temp")
     assert calls == ["first", "second", "third"]
+
+
+async def test_matching_callback_failure_does_not_suppress_later_matches() -> None:
+    client = AsyncClient(message_delivery="callback")
+    calls: list[str] = []
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    errors: list[dict[str, object]] = []
+    loop.set_exception_handler(lambda _loop, context: errors.append(context))
+
+    def broken(_message: Message) -> None:
+        calls.append("broken")
+        raise RuntimeError("boom")
+
+    try:
+        client.add_message_callback("sensors/#", broken)
+        client.add_message_callback("sensors/+/temp", lambda _message: calls.append("after"))
+        await _deliver(client, "sensors/kitchen/temp")
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    assert calls == ["broken", "after"]
+    assert len(errors) == 1
+    assert isinstance(errors[0].get("exception"), RuntimeError)
+
+
+async def test_all_sync_overlapping_callbacks_stay_inline() -> None:
+    client = AsyncClient(message_delivery="callback")
+    calls: list[str] = []
+    client.add_message_callback("sensors/#", lambda _message: calls.append("hash"))
+    client.add_message_callback("sensors/+/temp", lambda _message: calls.append("plus"))
+
+    callback = client._message_callback
+    assert callback is not None
+    assert client._can_dispatch_callback_inline(callback)
+    client._dispatch_callback_inline(
+        callback,
+        Message(topic="sensors/kitchen/temp", payload=b"payload"),
+    )
+
+    assert calls == ["hash", "plus"]
+    assert client._callback_worker_task is None
+
+
+async def test_topic_callback_selects_auto_callback_delivery() -> None:
+    client = AsyncClient()
+    seen: list[str] = []
+    client.add_message_callback("sensors/+", lambda message: seen.append(message.topic))
+
+    await _apply(client, "sensors/1")
+    await asyncio.wait_for(client._callback_queue.join(), timeout=1.0)
+
+    assert seen == ["sensors/1"]
+    assert client._messages.empty()
+    await client._shutdown_callback_worker(drain=False)
+
+
+async def test_iterator_mode_ignores_topic_callbacks() -> None:
+    client = AsyncClient(message_delivery="iterator")
+    seen: list[str] = []
+    client.add_message_callback("sensors/+", lambda message: seen.append(message.topic))
+
+    await _apply(client, "sensors/1")
+
+    assert seen == []
+    assert client._messages.get_nowait().topic == "sensors/1"
+
+
+async def test_both_mode_delivers_to_topic_callback_and_iterator() -> None:
+    client = AsyncClient(message_delivery="both")
+    seen: list[str] = []
+    client.add_message_callback("sensors/+", lambda message: seen.append(message.topic))
+
+    await _apply(client, "sensors/1")
+    await asyncio.wait_for(client._callback_queue.join(), timeout=1.0)
+
+    assert seen == ["sensors/1"]
+    assert client._messages.get_nowait().topic == "sensors/1"
+    await client._shutdown_callback_worker(drain=False)
 
 
 async def test_replacing_a_topic_callback_keeps_one_registration() -> None:
