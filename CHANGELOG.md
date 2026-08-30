@@ -27,6 +27,12 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   callbacks, callback bursts, reentrant delivery, and occupied/full callback
   queues retain the bounded callback-worker path and its existing backpressure.
 
+### Fixed
+
+- Preserve malformed-packet and packet-too-large classifications across the
+  protocol engine/runtime boundary so MQTT 5 fatal DISCONNECT responses use the
+  normative reason code instead of falling back to generic Protocol Error.
+
 ## [1.0.0rc10] - 2026-08-26
 
 ### Removed

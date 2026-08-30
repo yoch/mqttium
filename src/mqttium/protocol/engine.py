@@ -555,7 +555,10 @@ class ProtocolEngine:
             # the peer with a synthetic MQTT protocol error.
             raise
         except (ProtocolError, MalformedPacketError, PacketTooLargeError) as exc:
-            self._emit(EffectKind.PROTOCOL_ERROR, str(exc))
+            # The runtime owns the final wire response for validation/decoding
+            # failures that did not already call _protocol_disconnect(). Keep
+            # the category so it can select the normative MQTT 5 reason code.
+            self._emit(EffectKind.PROTOCOL_ERROR, exc)
         except Exception as exc:
             # Isolate store/persistence errors: surface as protocol error rather
             # than killing the read loop with an untyped exception.
