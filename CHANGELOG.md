@@ -37,6 +37,13 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   callbacks, callback bursts, reentrant delivery, and occupied/full callback
   queues retain the bounded callback-worker path and its existing backpressure.
 
+### Fixed
+
+- Reject MQTT 5 PUBLISH and Will payloads that are not well-formed UTF-8 when
+  their Payload Format Indicator is 1. QoS 1/2 validation happens before
+  admission or persistence; binary payloads remain valid when the indicator is
+  absent or zero.
+
 ## [1.0.0rc10] - 2026-08-26
 
 ### Removed
