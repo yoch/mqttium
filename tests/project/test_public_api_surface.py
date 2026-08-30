@@ -176,6 +176,8 @@ def test_async_client_stable_method_parameter_contract() -> None:
         "ack": ("self", "message"),
         "auth": ("self", "reason_code", "properties"),
         "set_auth_handler": ("self", "handler"),
+        "message_callback_add": ("self", "topic_filter", "callback"),
+        "message_callback_remove": ("self", "topic_filter"),
         "stats": ("self",),
     }
 

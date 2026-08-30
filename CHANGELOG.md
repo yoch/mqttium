@@ -6,6 +6,16 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Added
+
+- Add Stable `AsyncClient.message_callback_add` / `message_callback_remove` for
+  topic-filtered inbound callbacks. Matching filters run instead of `on_message`,
+  in registration order, using the existing `TopicMatcher`. The matcher is
+  allocated only while at least one filter is registered, so the inbound hot
+  path stays a single `None` check when the feature is unused. Protocol engine
+  and the Paho façade remain independent: the façade keeps its own matcher and
+  VERSION2 callback wrapping.
+
 ### Changed
 
 - Invoke idle synchronous `on_publish` and eligible `on_message` callbacks in

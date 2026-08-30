@@ -68,12 +68,14 @@ The stable `AsyncClient` surface is:
 - lifecycle: `connect`, `connect_unix`, `connect_ws`, `disconnect`;
 - publication: `publish`, `publish_nowait`, `publish_many`;
 - subscriptions: `subscribe`, `unsubscribe`;
-- inbound delivery: `messages`, `ack`;
+- inbound delivery: `messages`, `ack`, `message_callback_add`,
+  `message_callback_remove`;
 - MQTT 5 authentication: `auth`, `set_auth_handler`;
 - state: `state`, `is_connected`, `negotiated`, `effective_client_id`;
 - diagnostics: `stats` and the immutable `ClientStats` tree;
-- callbacks: `on_connect`, `on_disconnect`, `on_message`, `on_publish` and
-  `auth_handler`.
+- callbacks: `on_connect`, `on_disconnect`, `on_message`, `on_publish`,
+  `auth_handler`, and topic-filtered callbacks registered with
+  `message_callback_add`.
 
 `publish_nowait()` and `stats()` are synchronous but loop-confined. They are not
 cross-thread APIs. Threaded migration code should use

@@ -72,6 +72,11 @@ A practical staged migration is:
    `wait_for_publish()` with `await receipt.wait()`;
 4. remove the compatibility loop after the final synchronous boundary is gone.
 
+Native `AsyncClient` also has `message_callback_add` / `message_callback_remove`.
+The names match Paho; the callback receives a native `Message` rather than a
+façade `MQTTMessage`, and there is no `client` / `userdata` prefix. Matching
+filters take precedence over `on_message`, as in Paho.
+
 Do not call blocking `Client` methods from its network-thread callbacks. Move
 that operation to another thread or convert the callback path to the native
 client.

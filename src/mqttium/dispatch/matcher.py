@@ -56,6 +56,9 @@ class TopicMatcher:
         if levels is not None:
             self._wildcards.pop(topic_filter, None)
 
+    def __bool__(self) -> bool:
+        return bool(self._entries)
+
     def iter_match(self, topic: str) -> Iterator[Any]:
         """Yield values whose MQTT filters match ``topic`` in insertion order."""
 

@@ -37,6 +37,7 @@ from mqttium.api.stats import (
     TransportStats,
 )
 from mqttium.codec.buffer import DEFAULT_MAX_PACKET_SIZE, IncrementalDecoder
+from mqttium.dispatch.matcher import TopicMatcher
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, PacketType, QoS
 from mqttium.errors import (
     FlowControlError,
@@ -72,6 +73,7 @@ from mqttium.protocol.engine import (
 from mqttium.protocol.negotiated import NegotiatedSettings
 from mqttium.protocol.reconnect import ReconnectPolicy
 from mqttium.persistence.memory import InflightStore
+from mqttium.topics import validate_subscribe_filter
 from mqttium.transport._stream import AsyncTransport
 from mqttium.transport.tcp import TcpTransport
 from mqttium.transport.unix import UnixSocketTransport
@@ -85,6 +87,15 @@ OnDisconnect = Callable[[BaseException | None], Any]
 OnPublish = Callable[[int | None, BaseException | None], Any]
 OnAuth = Callable[[AuthPacket], Any]
 PublishBackpressure = Literal["wait", "error"]
+
+
+async def _invoke_topic_callbacks(callbacks: tuple[OnMessage, ...], message: Message) -> None:
+    """Run overlapping topic callbacks, awaiting any async results in order."""
+    for callback in callbacks:
+        result = callback(message)
+        if isinstance(result, Awaitable):
+            await result
+
 
 _GRACEFUL_DISCONNECT_DRAIN_TIMEOUT = 5.0
 _FATAL_DISCONNECT_DRAIN_TIMEOUT = 0.25
@@ -426,6 +437,9 @@ class AsyncClient:
         self.on_disconnect: OnDisconnect | None = None
         self.on_publish: OnPublish | None = None
         self.auth_handler: OnAuth | None = auth_handler
+        # Allocated on the first message_callback_add and cleared when empty so
+        # the inbound hot path stays a single None check when unused.
+        self._topic_callbacks: TopicMatcher | None = None
 
     # Diagnostic compatibility views. Effect state has one owner in EffectPump;
     # these historical read-only names remain for tests and instrumentation.
@@ -1486,6 +1500,49 @@ class AsyncClient:
         self.auth_handler = handler
         self._engine.reconfigure(accept_auth=handler is not None)
 
+    def message_callback_add(self, topic_filter: str, callback: OnMessage) -> None:
+        """Register a message callback for one MQTT topic filter.
+
+        Matching filtered callbacks run instead of ``on_message``, in
+        registration order. Replacing the callback for an existing filter
+        keeps that order. Filters are validated as SUBSCRIBE topic filters.
+        Shared-subscription filters match the filter string literally.
+        """
+        validate_subscribe_filter(topic_filter)
+        matcher = self._topic_callbacks
+        if matcher is None:
+            matcher = TopicMatcher()
+            self._topic_callbacks = matcher
+        matcher[topic_filter] = callback
+
+    def message_callback_remove(self, topic_filter: str) -> None:
+        """Remove the callback registered for ``topic_filter``, if any."""
+        matcher = self._topic_callbacks
+        if matcher is None:
+            return
+        try:
+            del matcher[topic_filter]
+        except KeyError:
+            return
+        if not matcher:
+            self._topic_callbacks = None
+
+    def _dispatch_topic_message(self, message: Message) -> Any:
+        """Invoke matching topic callbacks, else ``on_message``."""
+        matcher = self._topic_callbacks
+        if matcher is not None:
+            iterator = matcher.iter_match(message.topic)
+            first = next(iterator, None)
+            if first is not None:
+                second = next(iterator, None)
+                if second is None:
+                    return first(message)
+                return _invoke_topic_callbacks((first, second, *iterator), message)
+        callback = self.on_message
+        if callback is None:
+            return None
+        return callback(message)
+
     async def subscribe(
         self,
         topics: str | Iterable[str | tuple[str, SubscribeOptions | int | QoS]],
@@ -1756,13 +1813,18 @@ class AsyncClient:
                     async with self._engine_lock:
                         captured: list[Message] = []
                         captured_property_sizes: list[int | None] | None = None
+                        # One None check: topic matching is off the hot path
+                        # until message_callback_add allocates the matcher.
+                        on_message = (
+                            self.on_message
+                            if self._topic_callbacks is None
+                            else self._dispatch_topic_message
+                        )
                         with self._engine.store.batch():
                             header = getattr(self._decoder, "next_header_byte", None)
                             if (
                                 direct_qos0_mode
-                                and (
-                                    self._delivery.mode == "callback" or self.on_message is not None
-                                )
+                                and (self._delivery.mode == "callback" or on_message is not None)
                                 and not self._effect_pump.pending
                                 and self._engine.state is ConnectionState.CONNECTED
                                 and header is not None
@@ -1782,7 +1844,7 @@ class AsyncClient:
                                 )
                         if captured:
                             if self._delivery.deliver_callback_messages_inline(
-                                captured, self.on_message, captured_property_sizes
+                                captured, on_message, captured_property_sizes
                             ):
                                 self._effect_pump.record_inline_batch(len(captured))
                             else:
@@ -2181,7 +2243,10 @@ class AsyncClient:
     ) -> int:
         if epoch != self._connection_epoch or self._engine_lock.locked():
             return 0
-        return self._delivery.deliver_message_batch_inline(effects, self.on_message)
+        on_message = (
+            self.on_message if self._topic_callbacks is None else self._dispatch_topic_message
+        )
+        return self._delivery.deliver_message_batch_inline(effects, on_message)
 
     async def _flush_effects(self) -> None:
         async with self._engine_lock:
@@ -2234,11 +2299,14 @@ class AsyncClient:
             property_wire_size = effect.decoded_property_wire_size
             # Producers pair the decoded size with DECODED_MESSAGE and leave it
             # None on MESSAGE, so the size selects the admission entry point.
+            on_message = (
+                self.on_message if self._topic_callbacks is None else self._dispatch_topic_message
+            )
             if property_wire_size is None:
-                pending_delivery = self._accept_message(message, self.on_message)
+                pending_delivery = self._accept_message(message, on_message)
             else:
                 pending_delivery = self._accept_decoded_message(
-                    message, self.on_message, property_wire_size
+                    message, on_message, property_wire_size
                 )
             if pending_delivery is not None:
                 await pending_delivery

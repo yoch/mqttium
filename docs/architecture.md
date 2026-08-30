@@ -78,6 +78,11 @@ stream. Capacity is returned after the corresponding queued data is drained.
 user-callback worker, shutdown/reset, and delivery statistics. It deliberately
 does not own MQTT state, transport state, or reconnect policy.
 
+Topic-filtered callbacks live on `AsyncClient`. `TopicMatcher` chooses which
+application callable receives a delivered message; the protocol engine still
+emits undifferentiated MESSAGE effects and never imports dispatch or compat
+code.
+
 The delivery mode is selected when the client is constructed. Specialised
 admission functions avoid repeated mode branches on every incoming message
 while preserving one authoritative owner for reservations and lifecycle.
