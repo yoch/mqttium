@@ -370,7 +370,9 @@ class Client:
                 del matcher[sub]
             if not matcher:
                 self._topic_callbacks = None
-                self._async.on_message = self._dispatch_message if self._on_message is not None else None
+                self._async.on_message = (
+                    self._dispatch_message if self._on_message is not None else None
+                )
 
         self._run_loop_mutation(_remove)
 
