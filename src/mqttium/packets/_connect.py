@@ -13,7 +13,7 @@ from __future__ import annotations
 from mqttium.codec.primitives import pack_u16, pack_utf8
 from mqttium.enums import PacketType, QoS
 from mqttium.errors import ProtocolError
-from mqttium.packets._common import encode_frame
+from mqttium.packets._common import encode_frame, validate_payload_format
 from mqttium.types import Properties
 from mqttium.codec.properties import CONNECT, WILL, encode_properties
 
@@ -55,6 +55,8 @@ def _validate_connect(
         raise ProtocolError("Password exceeds MQTT binary-data limit")
     if len(will_payload) > 65535:
         raise ProtocolError("Will payload exceeds MQTT binary-data limit")
+    if v5:
+        validate_payload_format(will_payload, will_properties)
     if (
         v5
         and properties is not None

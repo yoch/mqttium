@@ -13,7 +13,7 @@ from mqttium.codec.properties import PUBLISH, decode_properties, encode_properti
 from mqttium.codec.vbi import MAX_VBI, append_vbi
 from mqttium.enums import PacketType, QoS
 from mqttium.errors import MalformedPacketError, PacketTooLargeError, ProtocolError
-from mqttium.packets._common import _require_outbound_mid
+from mqttium.packets._common import _require_outbound_mid, validate_payload_format
 from mqttium.topics import validate_received_publish_topic
 from mqttium.transport.writes import SEGMENT_THRESHOLD, WriteItem
 from mqttium.types import Message, Properties
@@ -308,6 +308,7 @@ def encode_publish_item_v5(
     elif not properties or not properties.values:
         props = _EMPTY_PROPS
     else:
+        validate_payload_format(payload, properties)
         props = encode_properties(properties, PUBLISH)
     payload_size = len(payload)
     remaining_length = 2 + topic_size + (2 if level else 0) + len(props) + payload_size
