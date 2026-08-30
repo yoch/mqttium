@@ -201,6 +201,7 @@ class Client:
             max_pending_inbound_bytes=max_pending_inbound_bytes,
             max_outbound_inflight=max_outbound_inflight,
             publish_backpressure="error",
+            message_delivery="callback",
         )
         # Cache the hot adapter boundary methods once. This avoids repeated
         # AsyncClient attribute traversal in every Paho publication while keeping
