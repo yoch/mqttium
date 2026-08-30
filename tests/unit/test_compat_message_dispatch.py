@@ -67,6 +67,24 @@ def test_topic_callbacks_install_dispatch_only_while_needed() -> None:
     assert client._async._message_callback is None
 
 
+def test_topic_callback_remove_preserves_dispatch_until_last_filter() -> None:
+    client = Client(CallbackAPIVersion.VERSION2)
+
+    client.message_callback_remove("missing/#")
+    assert client._topic_callbacks is None
+    assert client._async.on_message is None
+
+    client.message_callback_add("sensors/#", lambda *_args: None)
+    client.message_callback_add("other/#", lambda *_args: None)
+    client.message_callback_remove("other/#")
+
+    assert client._topic_callbacks is not None
+    assert _has_message_dispatch(client)
+    client.message_callback_remove("sensors/#")
+    assert client._topic_callbacks is None
+    assert client._async.on_message is None
+
+
 def test_filtered_dispatch_wraps_once_and_skips_unmatched_allocation(monkeypatch) -> None:
     client = Client(CallbackAPIVersion.VERSION2)
     wrapped: list[object] = []
