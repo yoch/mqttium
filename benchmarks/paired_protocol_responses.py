@@ -207,7 +207,7 @@ async def _assert_segmented_fifo(effect: Any) -> None:
         await pump.stop()
 
 
-async def _run_phase(count: int, *, turn_batch: int = 256) -> ResponseResult:
+async def _run_phase(count: int, *, turn_batch: int = 1) -> ResponseResult:
     from mqttium.api import AsyncClient
     from mqttium.enums import PacketType
     from mqttium.protocol.effects import EffectKind
@@ -245,9 +245,9 @@ async def _run_phase(count: int, *, turn_batch: int = 256) -> ResponseResult:
             else:
                 await pump.join()
             latencies_us.append((time.perf_counter_ns() - response_started) / 1_000.0)
-            # Bound call_soon re-arm handles and model a finite packet batch
-            # from one TCP read. Baseline already yields through join(); the
-            # candidate gets one loop turn per response batch, not per ACK.
+            # Model paced request/response traffic: each isolated inbound
+            # packet gets a loop turn in which the response permit can re-arm.
+            # Burst coalescing is pinned separately by the writer tests.
             if (index + 1) % turn_batch == 0:
                 await asyncio.sleep(0)
         elapsed = time.perf_counter() - started

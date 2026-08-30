@@ -325,6 +325,40 @@ async def test_protocol_response_ignores_only_the_burst_throttle() -> None:
         await pump.stop()
 
 
+async def test_only_first_protocol_response_of_a_synchronous_burst_is_eager() -> None:
+    """A reader batch seeds one ACK, then leaves the rest to coalescing."""
+    transport = _EagerTransport()
+    pump = _pump(max_messages=32, max_bytes=64)
+    pump.start(transport)
+    try:
+        pump._eager_armed = False
+        for _ in range(20):
+            assert pump.try_enqueue_protocol_response(b"a") is True
+
+        assert transport.written == [b"a"]
+        assert pump.queued_messages == 19
+        await pump.join()
+        assert transport.written == [b"a"] * 20
+        assert pump.batches == 1
+        assert pump.batched_items == 19
+    finally:
+        await pump.stop()
+
+
+async def test_one_response_can_follow_one_producer_eager_write() -> None:
+    """The response permit is independent from the producer's permit."""
+    transport = _EagerTransport()
+    pump = _pump()
+    pump.start(transport)
+    try:
+        assert pump.try_enqueue(b"publish") is True
+        assert pump.try_enqueue_protocol_response(b"puback") is True
+        assert transport.written == [b"publish", b"puback"]
+        assert pump.queued_messages == 0
+    finally:
+        await pump.stop()
+
+
 async def test_protocol_response_never_overtakes_queued_data() -> None:
     """The response shortcut retains the eager path's empty-queue condition."""
     transport = _EagerTransport()
@@ -424,13 +458,16 @@ async def test_stale_rearm_cannot_arm_a_new_transport_generation() -> None:
     try:
         current_generation = pump._eager_generation
         pump._eager_armed = False
+        pump._response_eager_armed = False
 
         # Model a delayed call_soon callback left by the old connection.
         pump._rearm_eager_if_idle(stale_generation)
         assert pump._eager_armed is False
+        assert pump._response_eager_armed is False
 
         pump._rearm_eager_if_idle(current_generation)
         assert pump._eager_armed is True
+        assert pump._response_eager_armed is True
     finally:
         await pump.stop()
 

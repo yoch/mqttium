@@ -74,6 +74,10 @@ class WritePump:
         # then queues the rest so the writer task can coalesce them. A paced
         # producer is re-armed on the next loop turn while the writer is idle.
         self._eager_armed = False
+        # A response may follow one producer eager write in the same turn, but
+        # an inbound burst still seeds only one immediate response before the
+        # remaining frames return to the coalescing writer path.
+        self._response_eager_armed = False
         # Delayed re-arm callbacks carry this generation. Lifecycle changes
         # invalidate it so a callback from an old transport can never arm a new
         # connection.
@@ -130,6 +134,7 @@ class WritePump:
     def _drop_eager_binding(self) -> None:
         self._eager_generation += 1
         self._eager_armed = False
+        self._response_eager_armed = False
         self._write_nowait = None
 
     def _rearm_eager_if_idle(self, generation: int) -> None:
@@ -140,6 +145,7 @@ class WritePump:
             and self.queue.empty()
         ):
             self._eager_armed = True
+            self._response_eager_armed = True
 
     def reset(self) -> None:
         """Start a new transport epoch with an empty queue."""
@@ -161,6 +167,7 @@ class WritePump:
         self._eager_generation += 1
         self._write_nowait = getattr(transport, "write_nowait", None)
         self._eager_armed = self._write_nowait is not None
+        self._response_eager_armed = self._write_nowait is not None
         self.task = asyncio.create_task(self._run(), name="mqttium-writer")
 
     async def stop(self) -> None:
@@ -329,16 +336,19 @@ class WritePump:
         return True
 
     def _try_write_protocol_response_eager(self, item: WriteItem) -> bool:
-        """Try the eager path without applying the producer-burst throttle.
+        """Try the one-shot response path independently of producer throttle.
 
         This intentionally repeats the five load-bearing ordering checks from
         ``_try_write_eager``. Keeping the ordinary producer method unchanged is
         part of the QoS 0 performance contract; the paired regression tests pin
-        both copies to the same FIFO and segmented-write behavior.
+        both copies to the same FIFO and segmented-write behavior. A separate
+        one-per-turn permit lets one response follow a producer eager write but
+        sends the remainder of an inbound burst through normal coalescing.
         """
         write_nowait = self._write_nowait
         if (
-            write_nowait is None
+            not self._response_eager_armed
+            or write_nowait is None
             or self._writing
             or self.waiters
             or isinstance(item, tuple)
@@ -348,6 +358,7 @@ class WritePump:
         if not write_nowait(item):
             return False
         self._eager_armed = False
+        self._response_eager_armed = False
         generation = self._eager_generation
         asyncio.get_running_loop().call_soon(self._rearm_eager_if_idle, generation)
         self.eager_writes += 1
@@ -363,11 +374,12 @@ class WritePump:
     ) -> bool:
         """Admit a QoS protocol response, eagerly whenever FIFO permits.
 
-        Protocol responses are not producer data bursts, so they do not share
-        the one-eager-write-per-loop batching throttle. The same five ordering
-        and single-writer conditions as ``_try_write_eager`` remain enforced. A
-        queued frame, active batch, suspended producer, segmented item, or
-        transport refusal therefore falls back to the ordinary bounded FIFO.
+        Protocol responses have one independent eager permit per loop turn, so
+        one can follow a producer eager write without turning a response burst
+        into individual transport calls. The same five ordering and
+        single-writer conditions as ``_try_write_eager`` remain enforced. A
+        queued frame, active batch, suspended producer, segmented item, spent
+        response permit, or transport refusal falls back to the bounded FIFO.
         """
         if epoch is None:
             epoch = self.epoch
@@ -576,8 +588,10 @@ class WritePump:
                 # scheduled the producer-side next-turn callback.
                 if queue.empty() and self._write_nowait is not None:
                     self._eager_armed = True
+                    self._response_eager_armed = True
                 first = await queue.get()
                 self._eager_armed = False
+                self._response_eager_armed = False
                 self._sample_high_water(queue.qsize() + 1)
                 batch: list[WriteItem] = [first]
                 while len(batch) < 256:

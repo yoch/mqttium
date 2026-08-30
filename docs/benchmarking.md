@@ -127,12 +127,14 @@ substitute for the strict eligible-host A/A and A/B sequence above.
 
 Run `paired_protocol_responses.py` after a writer response-path change. Its
 worker generates the three inbound QoS response packet types through the
-sans-io engine, then times their runtime admission in finite 256-frame reader
-batches. The JSON records the immediate-versus-queued decision as well as
+sans-io engine, then times their paced runtime admission with one loop turn per
+response. The JSON records the immediate-versus-queued decision as well as
 p50/p95/p99 latency, so the target branch is verified independently of timer
-noise. Strict A/B requires every candidate response to reach an idle transport
-inline, a rate gain of at least 10%, and a p50 no higher than 85% of baseline.
-As with other paired gates, an eligible-host A/A control must pass first:
+noise. Writer tests separately require a synchronous response burst to send one
+frame eagerly and coalesce the rest. Strict A/B requires every paced candidate
+response to reach an idle transport inline, a rate gain of at least 10%, and a
+p50 no higher than 85% of baseline. As with other paired gates, an eligible-host
+A/A control must pass first:
 
 ```bash
 python benchmarks/runner_probe.py \
