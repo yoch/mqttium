@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 
 from mqttium.api import AsyncClient
+from mqttium.api.models import PublishReceipt
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, QoS
 from mqttium.errors import ProtocolError
 from mqttium.packets import PublishPacket
@@ -130,6 +131,36 @@ async def test_each_read_costs_exactly_one_decode() -> None:
     assert handled == 3
     assert next_calls == 6
     assert acquisitions == 3 + TEARDOWN_ACQUISITIONS
+
+
+async def test_only_multi_packet_read_uses_ingress_ack_batch_seam() -> None:
+    client = AsyncClient()
+    client._engine.state = ConnectionState.CONNECTED
+    receipts: list[PublishReceipt] = []
+    mids: list[int] = []
+    for _ in range(3):
+        handle = client._engine.queue_publish("batch/outbound", b"x", qos=QoS.AT_LEAST_ONCE)
+        assert handle.mid is not None
+        receipt = PublishReceipt(mid=handle.mid, qos=QoS.AT_LEAST_ONCE)
+        client._register_publish_receipt(handle.mid, receipt)
+        client._engine.take_effects()
+        mids.append(handle.mid)
+        receipts.append(receipt)
+    client._transport = _ScriptedTransport([puback(mids[0]), puback(mids[1]) + puback(mids[2])])
+    calls = 0
+    original = client._drain_ingress_ack_batch_inline
+
+    def counted() -> int:
+        nonlocal calls
+        calls += 1
+        return original()
+
+    client._drain_ingress_ack_batch_inline = counted
+
+    await client._read_loop()
+
+    assert calls == 1
+    assert all(receipt.is_done() for receipt in receipts)
 
 
 async def test_full_count_batch_re_enters_to_find_the_buffer_empty() -> None:

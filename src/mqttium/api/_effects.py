@@ -34,6 +34,10 @@ class EffectOwner(Protocol):
         self, effects: deque[EngineEffect], epoch: int
     ) -> int: ...
 
+    def _apply_terminal_effect_batch_inline(
+        self, effects: deque[EngineEffect], epoch: int
+    ) -> int: ...
+
     async def _apply_effect(
         self,
         effect: EngineEffect,
@@ -226,6 +230,32 @@ class EffectPump:
             self.draining_inline = False
         if self.pending:
             self.schedule()
+
+    def drain_ingress_ack_batch_inline(self) -> int:
+        """Apply a multi-ACK terminal prefix without changing general drain."""
+        if self.draining_inline or self.lock.locked() or len(self.pending) < 2:
+            return 0
+        first = self.pending[0].kind
+        second = self.pending[1].kind
+        if not (
+            (first is EffectKind.PUBLISH_COMPLETE or first is EffectKind.PUBLISH_FAILED)
+            and (second is EffectKind.PUBLISH_COMPLETE or second is EffectKind.PUBLISH_FAILED)
+        ):
+            return 0
+        epoch = self.pending_epoch
+        if epoch != self.owner._connection_epoch:
+            self.discard_connection_effects()
+            return 0
+        self.draining_inline = True
+        try:
+            applied = self.owner._apply_terminal_effect_batch_inline(self.pending, epoch)
+            for _ in range(applied):
+                self.pending.popleft()
+                self.inline_effects += 1
+                self._complete()
+        finally:
+            self.draining_inline = False
+        return applied
 
     def schedule(self) -> None:
         self.flush_requested = True

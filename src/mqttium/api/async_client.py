@@ -346,6 +346,7 @@ class AsyncClient:
         # the single-effect hot path.
         self._collect_effects_locked = self._effect_pump.collect_from_engine
         self._drain_effects_inline = self._effect_pump.drain_inline
+        self._drain_ingress_ack_batch_inline = self._effect_pump.drain_ingress_ack_batch_inline
         self._schedule_effect_flush = self._effect_pump.schedule
         self._drain_effects = self._effect_pump.drain
         self._discard_connection_effects = self._effect_pump.discard_connection_effects
@@ -1792,6 +1793,8 @@ class AsyncClient:
                         if handled and self._engine.has_pending_effects:
                             self._collect_effects_locked()
                     if self._effect_pump.pending:
+                        if handled > 1:
+                            self._drain_ingress_ack_batch_inline()
                         await self._drain_effects()
                     # A batch that stopped short of both bounds emptied the
                     # buffer, so there is nothing to decode until the next
@@ -2182,6 +2185,34 @@ class AsyncClient:
         if epoch != self._connection_epoch or self._engine_lock.locked():
             return 0
         return self._delivery.deliver_message_batch_inline(effects, self.on_message)
+
+    def _apply_terminal_effect_batch_inline(
+        self,
+        effects: deque[EngineEffect],
+        epoch: int,
+    ) -> int:
+        """Settle a consecutive terminal prefix in one ordered pass."""
+        if epoch != self._connection_epoch or self._engine_lock.locked():
+            return 0
+        callback = self.on_publish
+        applied = 0
+        for effect in effects:
+            kind = effect.kind
+            if kind is EffectKind.PUBLISH_COMPLETE:
+                mid: int | None = effect.data
+                reason = None
+            elif kind is EffectKind.PUBLISH_FAILED:
+                failure: PublishFailure = effect.data
+                mid = failure.mid
+                reason = failure.reason
+            else:
+                break
+            if callback is None:
+                self._settle_publish(mid, reason)
+            elif not self._apply_terminal_callback_inline(callback, mid, reason):
+                break
+            applied += 1
+        return applied
 
     async def _flush_effects(self) -> None:
         async with self._engine_lock:

@@ -60,6 +60,9 @@ or full-queue delivery uses the bounded callback worker and its existing
 backpressure. The guard also prevents callbacks from running while the engine
 lock is held. QoS 0 batches preflight capacity for every callback before
 admitting any write, so the direct path cannot split a batch across paths.
+When one network read yields consecutive terminal QoS 1/2 results, the reader
+settles that prefix in one ordered pump pass; single acknowledgements and every
+non-terminal effect retain the general drain.
 
 ### Network writes
 

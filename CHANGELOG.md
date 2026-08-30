@@ -12,6 +12,9 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   the reader/effect-drain turn after receipt or delivery settlement. Async
   callbacks, callback bursts, reentrant delivery, and occupied/full callback
   queues retain the bounded callback-worker path and its existing backpressure.
+- Settle consecutive PUBACK/PUBCOMP results from a multi-packet network read in
+  one ordered effect-pump pass. Single acknowledgements and QoS 0 retain their
+  existing paths, and callback overflow still falls back to the bounded worker.
 
 ## [1.0.0rc10] - 2026-08-26
 
