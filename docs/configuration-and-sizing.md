@@ -32,6 +32,14 @@ the process memory budget.
 `local_receive_maximum` controls inbound work. `max_outbound_inflight` controls
 outbound work. Neither changes the MQTT packet-identifier range.
 
+For MQTT 5, an explicit `receive_maximum`, `maximum_packet_size`, or
+`topic_alias_maximum` in `connect_properties` overrides the corresponding
+dedicated constructor setting. MQTTium snapshots the value encoded in each
+CONNECT and enforces that same value for the resulting network connection;
+later mutation of the application-owned `Properties` object affects only a
+future connection. Prefer the dedicated settings unless direct property control
+is needed.
+
 ### Outbound protocol admission
 
 | Setting | Default | Purpose |
