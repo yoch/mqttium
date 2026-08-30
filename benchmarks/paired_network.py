@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import gc
 import json
 import math
 import os
+import resource
 import statistics
 import subprocess
 import sys
@@ -48,6 +50,12 @@ class WorkerResult:
     effect_inline: int
     effect_enqueued: int
     effect_suspensions: int
+    self_minor_faults: int = 0
+    self_major_faults: int = 0
+    self_voluntary_context_switches: int = 0
+    self_involuntary_context_switches: int = 0
+    gc_collections: tuple[int, int, int] = (0, 0, 0)
+    gc_collected: tuple[int, int, int] = (0, 0, 0)
 
 
 class InvalidMeasurement(RuntimeError):
@@ -298,6 +306,8 @@ def worker(args: argparse.Namespace) -> None:
             raise RuntimeError(f"cannot pin publisher worker to CPU {args.cpu}") from exc
     delivery_started = time.perf_counter()
     cpu_started = time.process_time()
+    usage_started = resource.getrusage(resource.RUSAGE_SELF)
+    gc_started = gc.get_stats()
     try:
         ack_seconds, effects, ack_latencies = asyncio.run(
             publish(
@@ -322,6 +332,8 @@ def worker(args: argparse.Namespace) -> None:
         raise RuntimeError("subscriber payload sequence mismatch")
 
     delivery_seconds = time.perf_counter() - delivery_started
+    usage_finished = resource.getrusage(resource.RUSAGE_SELF)
+    gc_finished = gc.get_stats()
     result = WorkerResult(
         completion=args.completion,
         protocol=args.protocol,
@@ -343,6 +355,18 @@ def worker(args: argparse.Namespace) -> None:
         effect_inline=effects["inline"],
         effect_enqueued=effects["enqueued"],
         effect_suspensions=effects["suspensions"],
+        self_minor_faults=usage_finished.ru_minflt - usage_started.ru_minflt,
+        self_major_faults=usage_finished.ru_majflt - usage_started.ru_majflt,
+        self_voluntary_context_switches=usage_finished.ru_nvcsw - usage_started.ru_nvcsw,
+        self_involuntary_context_switches=usage_finished.ru_nivcsw - usage_started.ru_nivcsw,
+        gc_collections=tuple(
+            after["collections"] - before["collections"]
+            for before, after in zip(gc_started, gc_finished, strict=True)
+        ),
+        gc_collected=tuple(
+            after["collected"] - before["collected"]
+            for before, after in zip(gc_started, gc_finished, strict=True)
+        ),
     )
     print(json.dumps(asdict(result)))
 

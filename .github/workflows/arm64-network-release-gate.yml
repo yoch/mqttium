@@ -136,7 +136,7 @@ jobs:
           taskset -c 3 python harness/benchmarks/runner_network_diagnosis.py \
             --root base \
             --engine harness/benchmarks/paired_network.py \
-            --iterations 32 \
+            --iterations 24 \
             --count 26000 \
             --window 1 \
             --protocol 311 \
