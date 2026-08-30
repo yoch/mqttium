@@ -96,7 +96,7 @@ def test_recovered_autoack_puback_holds_receive_maximum_slot_until_handoff() -> 
     assert engine.state is ConnectionState.DISCONNECTED
     assert not [effect for effect in effects if effect.kind is EffectKind.MESSAGE]
     error = next(effect.data for effect in effects if effect.kind is EffectKind.PROTOCOL_ERROR)
-    assert "Receive Maximum exceeded" in error
+    assert "Receive Maximum exceeded" in str(error)
 
 
 def test_recovered_autoack_mid_cannot_be_reused_by_qos2_before_handoff() -> None:
@@ -108,7 +108,7 @@ def test_recovered_autoack_mid_cannot_be_reused_by_qos2_before_handoff() -> None
 
     assert engine.state is ConnectionState.DISCONNECTED
     error = next(effect.data for effect in effects if effect.kind is EffectKind.PROTOCOL_ERROR)
-    assert "reused by QoS 2 while QoS 1 PUBACK is pending" in error
+    assert "reused by QoS 2 while QoS 1 PUBACK is pending" in str(error)
 
 
 def test_recovered_autoack_slot_is_released_at_effect_handoff() -> None:

@@ -7,7 +7,7 @@ import pytest
 from mqttium.api.async_client import AsyncClient
 from mqttium.codec.properties import CONNACK, SUBACK, encode_properties
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, PacketType
-from mqttium.errors import ProtocolError
+from mqttium.errors import MalformedPacketError, PacketTooLargeError, ProtocolError
 from mqttium.packets import encode_disconnect, encode_frame
 from mqttium.protocol.config import EngineConfig
 from mqttium.protocol.effects import EffectKind
@@ -110,6 +110,45 @@ def test_connack_auth_mismatch_finishes_engine_teardown() -> None:
     assert any(effect.kind is EffectKind.PROTOCOL_ERROR for effect in effects)
 
 
+@pytest.mark.parametrize(
+    "failure",
+    [
+        MalformedPacketError("malformed packet"),
+        PacketTooLargeError("packet too large"),
+        ProtocolError("protocol error"),
+    ],
+)
+def test_engine_protocol_error_effect_preserves_typed_failure(
+    failure: ProtocolError | MalformedPacketError,
+) -> None:
+    engine = ProtocolEngine()
+    engine.state = ConnectionState.CONNECTED
+
+    def fail_handler(raw: object) -> None:
+        del raw
+        raise failure
+
+    engine._handlers_by_state[ConnectionState.CONNECTED][PacketType.PINGRESP] = fail_handler
+    feed_engine(engine, encode_frame(PacketType.PINGRESP, 0, b""))
+
+    effects = engine.take_effects()
+    error = next(effect.data for effect in effects if effect.kind is EffectKind.PROTOCOL_ERROR)
+    assert error is failure
+
+
+def test_bad_disconnect_flags_preserve_malformed_packet_classification() -> None:
+    engine = ProtocolEngine(
+        EngineConfig(client_id="bad-flags", protocol=MQTTProtocolVersion.MQTTv5)
+    )
+    _connect_v5(engine)
+
+    feed_engine(engine, encode_frame(PacketType.DISCONNECT, 0x01, b""))
+
+    effects = engine.take_effects()
+    error = next(effect.data for effect in effects if effect.kind is EffectKind.PROTOCOL_ERROR)
+    assert isinstance(error, MalformedPacketError)
+
+
 def test_request_problem_information_zero_rejects_suback_without_settling() -> None:
     engine = ProtocolEngine(
         EngineConfig(
@@ -209,9 +248,10 @@ class _InvalidConnackTransport(QueueTransport):
     def __init__(self) -> None:
         super().__init__()
         self.sent_connack = False
+        self.written: list[bytes] = []
 
     async def write(self, data: bytes) -> None:
-        del data
+        self.written.append(data)
         if not self.sent_connack:
             self.sent_connack = True
             self.push_rx(b"\x20\x03\x00\x00\x00")
@@ -231,3 +271,5 @@ async def test_connect_surfaces_local_connack_protocol_failure_and_closes_transp
         await client.connect("broker", 1883, timeout=1.0)
 
     assert transport.is_closing()
+    disconnects = [wire for wire in transport.written if wire[0] & 0xF0 == PacketType.DISCONNECT]
+    assert disconnects == [encode_disconnect(0x82, MQTTProtocolVersion.MQTTv5)]

@@ -5,8 +5,25 @@ from __future__ import annotations
 import asyncio
 
 from mqttium.api.async_client import AsyncClient
+from mqttium.codec.buffer import IncrementalDecoder, RawPacket
 from mqttium.enums import MQTTProtocolVersion, PacketType
+from mqttium.errors import MalformedPacketError
 from mqttium.packets import encode_frame
+from tests.support import ScriptedBrokerTransport, transport_factory
+
+
+class _BadDisconnectFlagsTransport(ScriptedBrokerTransport):
+    """Completes CONNECT, then sends DISCONNECT with a reserved flag set."""
+
+    def __init__(self) -> None:
+        super().__init__(protocol=MQTTProtocolVersion.MQTTv5)
+
+    def handle_packet(self, raw: RawPacket) -> None:
+        if raw.packet_type is PacketType.CONNECT:
+            super().handle_packet(raw)
+            self.push_rx(encode_frame(PacketType.DISCONNECT, 0x01, b""))
+            return
+        super().handle_packet(raw)
 
 
 class _FatalTransport:
@@ -59,6 +76,30 @@ class _FatalTransport:
 
     def is_closing(self) -> bool:
         return self._closing
+
+
+async def test_bad_disconnect_flags_send_malformed_packet_0x81_once() -> None:
+    """[MQTT-3.14.1-1] Reserved DISCONNECT flags require reason 0x81."""
+    transport = _BadDisconnectFlagsTransport()
+    client = AsyncClient(client_id="bad-flags", protocol=MQTTProtocolVersion.MQTTv5)
+    client._transport_factory = transport_factory(transport)
+
+    await client.connect("fake", 1883, timeout=1.0)
+    reader = client._reader_task
+    assert reader is not None
+    await asyncio.wait_for(reader, timeout=1.0)
+
+    decoder = IncrementalDecoder()
+    for wire in transport.written:
+        decoder.feed(wire)
+    disconnects = [
+        packet
+        for packet in decoder.drain_packets(limit=100)
+        if packet.packet_type is PacketType.DISCONNECT
+    ]
+    assert len(disconnects) == 1
+    assert disconnects[0].remaining[0] == 0x81
+    assert isinstance(client._disconnect_exc, MalformedPacketError)
 
 
 class _BlockedFatalTransport(_FatalTransport):

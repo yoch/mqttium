@@ -78,7 +78,7 @@ def test_pending_qos1_puback_counts_against_fresh_qos2() -> None:
     assert messages == [b"\x01"]
     assert engine.state is ConnectionState.DISCONNECTED
     error = next(effect.data for effect in effects if effect.kind is EffectKind.PROTOCOL_ERROR)
-    assert "Receive Maximum exceeded" in error
+    assert "Receive Maximum exceeded" in str(error)
 
 
 def test_cross_qos_reuse_of_pending_autoack_mid_is_protocol_error() -> None:
@@ -92,7 +92,7 @@ def test_cross_qos_reuse_of_pending_autoack_mid_is_protocol_error() -> None:
     messages = [effect.data.payload for effect in effects if effect.kind is EffectKind.MESSAGE]
     assert messages == [b"\x07"]
     error = next(effect.data for effect in effects if effect.kind is EffectKind.PROTOCOL_ERROR)
-    assert "reused by QoS 2 while QoS 1 PUBACK is pending" in error
+    assert "reused by QoS 2 while QoS 1 PUBACK is pending" in str(error)
 
 
 def test_qos2_duplicate_does_not_double_charge_pending_autoack_window() -> None:
@@ -180,7 +180,7 @@ def test_mqtt5_wildcard_is_rejected_before_receive_maximum() -> None:
 
     assert engine.state is ConnectionState.CONNECTED
     error = next(effect.data for effect in effects if effect.kind is EffectKind.PROTOCOL_ERROR)
-    assert "wildcards" in error
+    assert "wildcards" in str(error)
     assert not any(effect.kind is EffectKind.DISCONNECTED for effect in effects)
     messages = [effect.data.payload for effect in effects if effect.kind is EffectKind.MESSAGE]
     assert messages == [b"\x01"]
