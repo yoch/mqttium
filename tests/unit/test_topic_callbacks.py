@@ -114,6 +114,9 @@ async def test_remove_unknown_filter_is_a_no_op() -> None:
     client = AsyncClient(client_id="topic-remove-missing")
     client.message_callback_remove("sensors/+")
     client.message_callback_add("sensors/+", lambda _message: None)
+    client.message_callback_add("other/#", lambda _message: None)
+    client.message_callback_remove("missing/#")
+    assert client._topic_callbacks is not None
     client.message_callback_remove("other/#")
     assert client._topic_callbacks is not None
     client.message_callback_remove("sensors/+")
