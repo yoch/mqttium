@@ -57,11 +57,7 @@ def test_unknown_pubrec_reason_response_fits_at_five() -> None:
 
     engine.handle_raw(_pubrec(77))
 
-    sends = [
-        effect.data
-        for effect in engine.take_effects()
-        if effect.kind is EffectKind.SEND_PROTOCOL_RESPONSE
-    ]
+    sends = [effect.data for effect in engine.take_effects() if effect.kind is EffectKind.SEND]
     assert sends == [bytes.fromhex("6203004d92")]
 
 

@@ -1,10 +1,10 @@
-"""Paired benchmark for QoS protocol-response writer latency.
+"""Paired benchmark for inbound QoS protocol-response writer latency.
 
-The engine produces one real PUBACK, PUBREC, PUBREL and PUBCOMP effect per
-cycle.  The runtime applies each effect while the ordinary producer eager path
-is deliberately disarmed, modelling a response generated after a write in the
-same reader turn.  The old path must wake the writer task; the response-aware
-path may append to the transport synchronously when all FIFO guards allow it.
+The engine produces one real PUBACK, PUBREC and PUBCOMP effect per cycle.  The
+runtime applies each effect while the ordinary producer eager path is
+deliberately disarmed, modelling a response generated after a write in the same
+reader turn.  The old path must wake the writer task; the response-aware path
+may append to the transport synchronously when all FIFO guards allow it.
 
 Every worker also races a response against an in-flight segmented write before
 the timed phase.  That invariant check is deliberately outside the timing
@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Any
 
 
-_EXPECTED_TYPES = ("PUBACK", "PUBREC", "PUBREL", "PUBCOMP")
+_EXPECTED_TYPES = ("PUBACK", "PUBREC", "PUBCOMP")
 
 
 @dataclass(slots=True)
@@ -126,11 +126,7 @@ def _take_send(engine: Any, expected_type: Any) -> Any:
 
     effects = engine.take_effects()
     response_kind = getattr(EffectKind, "SEND_PROTOCOL_RESPONSE", EffectKind.SEND)
-    sends = [
-        effect
-        for effect in effects
-        if effect.kind in (EffectKind.SEND, response_kind)
-    ]
+    sends = [effect for effect in effects if effect.kind in (EffectKind.SEND, response_kind)]
     if len(sends) != 1:
         raise AssertionError(f"expected one SEND effect, got {len(sends)}")
     effect = sends[0]
@@ -143,7 +139,7 @@ def _take_send(engine: Any, expected_type: Any) -> Any:
 def _build_response_effects() -> list[Any]:
     """Exercise each engine transition that owns a protocol response."""
     from mqttium.enums import MQTTProtocolVersion, PacketType, QoS
-    from mqttium.packets import PubRecPacket, PubRelPacket, PublishPacket, encode_frame
+    from mqttium.packets import PubRelPacket, PublishPacket, encode_frame
     from mqttium.protocol.config import EngineConfig
     from mqttium.protocol.engine import ProtocolEngine
 
@@ -177,15 +173,8 @@ def _build_response_effects() -> list[Any]:
     _feed(engine, PubRelPacket(mid=102).encode(protocol))
     pubcomp = _take_send(engine, PacketType.PUBCOMP)
 
-    outbound = engine.queue_publish("bench/response/outbound", b"x", qos=QoS.EXACTLY_ONCE)
-    engine.take_effects()  # the application PUBLISH is not part of this phase
-    if outbound.mid is None:
-        raise AssertionError("outbound QoS 2 publish returned no MID")
-    _feed(engine, PubRecPacket(mid=outbound.mid).encode(protocol))
-    pubrel = _take_send(engine, PacketType.PUBREL)
-
     # Keep the wire-order sequence stable and visible in every artefact.
-    return [puback, pubrec, pubrel, pubcomp]
+    return [puback, pubrec, pubcomp]
 
 
 def _response_admitter(pump: Any):
@@ -245,7 +234,7 @@ async def _run_phase(count: int, *, turn_batch: int = 256) -> ResponseResult:
     started = time.perf_counter()
     try:
         for index in range(count):
-            effect = effects[index & 3]
+            effect = effects[index % len(effects)]
             pump._eager_armed = False
             before = len(transport.written)
             response_started = time.perf_counter_ns()
@@ -267,7 +256,7 @@ async def _run_phase(count: int, *, turn_batch: int = 256) -> ResponseResult:
     finally:
         await pump.stop()
 
-    expected_wire = [effects[index & 3].data for index in range(count)]
+    expected_wire = [effects[index % len(effects)].data for index in range(count)]
     if transport.written != expected_wire:
         raise AssertionError("protocol response wire FIFO changed")
     latencies_us.sort()
@@ -491,8 +480,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--worker", action="store_true")
     parser.add_argument("--base-root", type=Path)
     parser.add_argument("--candidate-root", type=Path)
-    parser.add_argument("--warmup-count", type=int, default=4_000)
-    parser.add_argument("--count", type=int, default=100_000)
+    parser.add_argument("--warmup-count", type=int, default=3_999)
+    parser.add_argument("--count", type=int, default=99_999)
     parser.add_argument("--repeat", type=int, default=8)
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument("--cpu", type=int)
@@ -508,10 +497,11 @@ def parse_args() -> argparse.Namespace:
         parser.error("--base-root and --candidate-root are required")
     if args.repeat <= 0 or args.repeat % 2:
         parser.error("--repeat must be a positive even count (complete ABBA cycles)")
-    if args.warmup_count < 0 or args.count <= 0 or args.count % 4:
-        parser.error("--count must be a positive multiple of four; warmup may be zero")
-    if args.warmup_count % 4:
-        parser.error("--warmup-count must be a multiple of four")
+    corpus_size = len(_EXPECTED_TYPES)
+    if args.warmup_count < 0 or args.count <= 0 or args.count % corpus_size:
+        parser.error("--count must be a positive multiple of three; warmup may be zero")
+    if args.warmup_count % corpus_size:
+        parser.error("--warmup-count must be a multiple of three")
     if args.timeout <= 0:
         parser.error("--timeout must be positive")
     if args.max_cv < 0 or args.max_aa_ratio_deviation < 0:

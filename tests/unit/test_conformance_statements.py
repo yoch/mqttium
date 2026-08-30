@@ -541,7 +541,7 @@ def test_mqtt_4_3_3_6_replay_sends_pubrel_not_publish() -> None:
     engine.begin_connect()
     _feed(engine, _connack_wire(session_present=True, protocol=MQTTProtocolVersion.MQTTv5))
 
-    frames = [e.data for e in engine.take_effects() if e.kind is EffectKind.SEND_PROTOCOL_RESPONSE]
+    frames = [e.data for e in engine.take_effects() if e.kind is EffectKind.SEND]
     kinds = {(frame if isinstance(frame, bytes) else frame[0])[0] & 0xF0 for frame in frames}
     assert PacketType.PUBREL.value in kinds
     assert PacketType.PUBLISH.value not in kinds

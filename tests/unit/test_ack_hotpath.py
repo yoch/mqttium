@@ -124,7 +124,7 @@ def test_success_pubrec_settle_skips_property_decoder(monkeypatch) -> None:
     effects = engine.take_effects()
 
     assert calls == 0
-    assert any(effect.kind is EffectKind.SEND_PROTOCOL_RESPONSE for effect in effects)
+    assert any(effect.kind is EffectKind.SEND for effect in effects)
     assert any(effect.data == b"\x62\x02" + pack_u16(handle.mid) for effect in effects)
 
 

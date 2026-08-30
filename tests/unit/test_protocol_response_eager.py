@@ -65,7 +65,7 @@ def test_inbound_puback_is_marked_as_protocol_response() -> None:
     assert send.data[0] & 0xF0 == PacketType.PUBACK
 
 
-def test_outbound_pubrel_is_marked_as_protocol_response() -> None:
+def test_outbound_pubrel_retains_producer_batching() -> None:
     engine = _connected_engine()
     handle = engine.queue_publish("response/qos2", b"x", qos=QoS.EXACTLY_ONCE)
     engine.take_effects()
@@ -75,11 +75,7 @@ def test_outbound_pubrel_is_marked_as_protocol_response() -> None:
         PubRecPacket(mid=handle.mid or 0).encode(MQTTProtocolVersion.MQTTv5),
     )
 
-    send = next(
-        effect
-        for effect in engine.take_effects()
-        if effect.kind is EffectKind.SEND_PROTOCOL_RESPONSE
-    )
+    send = next(effect for effect in engine.take_effects() if effect.kind is EffectKind.SEND)
     assert send.data[0] & 0xF0 == PacketType.PUBREL
 
 
