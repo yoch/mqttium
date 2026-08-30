@@ -21,6 +21,9 @@ class TopicMatcher:
         self._wildcards: dict[str, None] = {}
         self._next_sequence = 0
 
+    def __bool__(self) -> bool:
+        return bool(self._entries)
+
     @staticmethod
     def _compile(topic_filter: str) -> tuple[str, ...] | None:
         levels = tuple(topic_filter.split("/"))

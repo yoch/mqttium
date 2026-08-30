@@ -21,6 +21,8 @@ background thread.
         - ack
         - auth
         - set_auth_handler
+        - add_message_callback
+        - remove_message_callback
         - stats
       inherited_members: false
       heading_level: 2
@@ -35,16 +37,27 @@ background thread.
 | `effective_client_id` | Requested or broker-assigned client identifier |
 | `on_connect` | Sync or async callback after successful connection |
 | `on_disconnect` | Sync or async callback for disconnection |
-| `on_message` | Sync or async message callback |
+| `on_message` | Sync or async default message callback |
+| `add_message_callback()` | Register or replace a callback for one MQTT topic filter |
+| `remove_message_callback()` | Remove a topic-filtered callback |
 | `on_publish` | Sync or async publish-completion callback |
 | `auth_handler` | MQTT 5 enhanced-authentication handler |
 
+Topic-filtered callbacks use MQTT subscription-filter matching, including `+`
+and `#`. Every matching callback runs in registration order; `on_message` is the
+fallback and runs only when no filtered callback matches. Re-registering the
+same filter replaces its callback without changing its position. Removing an
+unknown filter is a no-op.
+
 Callbacks execute outside protocol-engine critical sections. Synchronous
-`on_publish` and eligible `on_message` callbacks may execute inline when
-callback delivery is idle; async, reentrant and queued callbacks use the
-bounded worker. Synchronous callbacks must not block the event loop. Callback
-failures go to the event loop's exception handler without silently changing
-protocol state.
+`on_publish` and eligible message callbacks may execute inline when callback
+delivery is idle; async, reentrant and queued callbacks use the bounded worker.
+Synchronous callbacks must not block the event loop. Callback failures go to the
+event loop's exception handler without silently changing protocol state.
+
+The topic router is installed only while at least one filtered callback exists.
+Without filtered callbacks, inbound delivery keeps the direct `on_message`
+callback path and performs no topic matching or additional per-message branch.
 
 ## Loop confinement
 
