@@ -149,6 +149,13 @@ class ApplicationDelivery:
         # bounded queue instead of nesting user callbacks.
         self._callback_active = False
         self._callback_stop = False
+        # At most one parked inline awaitable. A sync callback may fill the
+        # bounded queue reentrantly before returning an awaitable; that
+        # continuation is not a new admission. It runs after the physical jobs
+        # already queued at park time, using public qsize() rather than mutating
+        # asyncio.Queue internals.
+        self._inline_continuation: tuple[Callable[..., Any], Awaitable[Any]] | None = None
+        self._inline_continuation_after = 0
         self.delivery_timeout = delivery_timeout
         self.callback_shutdown_timeout = callback_shutdown_timeout
 
@@ -815,6 +822,7 @@ class ApplicationDelivery:
         """Whether a plain synchronous callback can run without a queue hop."""
         return (
             not self._callback_active
+            and self._inline_continuation is None
             and self.callback_queue.empty()
             and not self._is_async_callback(callback)
         )
@@ -844,10 +852,84 @@ class ApplicationDelivery:
                 self.report_callback_error(callback, exc)
             else:
                 if inspect.isawaitable(result):
-                    self.ensure_callback_worker()
-                    self.callback_queue.put_nowait((lambda: result, (), None))
+                    self._enqueue_inline_continuation(callback, result)
         finally:
             self._callback_active = False
+
+    def _enqueue_inline_continuation(
+        self,
+        callback: Callable[..., Any],
+        result: Awaitable[Any],
+    ) -> None:
+        """Hand a sync callback's returned awaitable to the worker."""
+        self.ensure_callback_worker()
+        try:
+            self.callback_queue.put_nowait(
+                (self._resume_inline_awaitable, (callback, result), None)
+            )
+        except asyncio.QueueFull:
+            self._park_inline_continuation(callback, result)
+
+    def _park_inline_continuation(
+        self,
+        callback: Callable[..., Any],
+        result: Awaitable[Any],
+    ) -> None:
+        """Run ``result`` after jobs already admitted, without a new queue slot.
+
+        Inline dispatch is single-entrant, so at most one continuation is
+        parked. ``qsize()`` is the number of physical jobs that must complete
+        first to preserve FIFO with the bounded queue.
+        """
+        if self._inline_continuation is not None:
+            raise RuntimeError("inline continuation is already parked")
+        queued = self.callback_queue.qsize()
+        if queued <= 0:
+            raise RuntimeError("full callback queue has no job to follow")
+        self._inline_continuation = (callback, result)
+        self._inline_continuation_after = queued
+
+    async def _resume_inline_awaitable(
+        self,
+        callback: Callable[..., Any],
+        result: Awaitable[Any],
+    ) -> None:
+        try:
+            await result
+        except asyncio.CancelledError as exc:
+            self._propagate_callback_cancellation(callback, exc)
+        except Exception as exc:
+            self.report_callback_error(callback, exc)
+
+    def _take_due_inline_continuation(self) -> Awaitable[Any] | None:
+        """Return the parked awaitable once its predecessors have completed.
+
+        The idle worker path is a single pointer check: no coroutine is created
+        unless a continuation is actually due.
+        """
+        pending = self._inline_continuation
+        if pending is None:
+            return None
+        self._inline_continuation_after -= 1
+        if self._inline_continuation_after > 0:
+            return None
+        self._inline_continuation = None
+        callback, result = pending
+        if self._callback_stop:
+            if inspect.iscoroutine(result):
+                result.close()
+            return None
+        return self._resume_inline_awaitable(callback, result)
+
+    def _discard_inline_continuation(self) -> None:
+        pending = self._inline_continuation
+        self._inline_continuation = None
+        self._inline_continuation_after = 0
+        if pending is None:
+            return
+        _callback, result = pending
+        if inspect.iscoroutine(result):
+            result.close()
 
     def has_callback_capacity(self, count: int = 1) -> bool:
         """Whether ``count`` callbacks can be admitted without suspending."""
@@ -913,6 +995,7 @@ class ApplicationDelivery:
             elif token is not None:
                 self.release_nowait(cast(AccountedDeliveryToken, token))
             self.callback_queue.task_done()
+        self._discard_inline_continuation()
 
     async def _callback_worker(self) -> None:
         while not self._callback_stop:
@@ -931,16 +1014,19 @@ class ApplicationDelivery:
                                 self.report_callback_error(callback, exc)
                     finally:
                         self._release_callback_batch(len(messages))
-                    continue
-                try:
-                    await self.invoke(callback, *args)
-                except asyncio.CancelledError as exc:
-                    self._propagate_callback_cancellation(callback, exc)
-                except Exception as exc:
-                    self.report_callback_error(callback, exc)
-                finally:
-                    if token is not None:
-                        self.release_nowait(cast(AccountedDeliveryToken, token))
+                else:
+                    try:
+                        await self.invoke(callback, *args)
+                    except asyncio.CancelledError as exc:
+                        self._propagate_callback_cancellation(callback, exc)
+                    except Exception as exc:
+                        self.report_callback_error(callback, exc)
+                    finally:
+                        if token is not None:
+                            self.release_nowait(cast(AccountedDeliveryToken, token))
+                due = self._take_due_inline_continuation()
+                if due is not None:
+                    await due
             finally:
                 self._callback_active = False
                 self.callback_queue.task_done()
