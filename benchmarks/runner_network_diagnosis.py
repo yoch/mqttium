@@ -272,6 +272,7 @@ def main() -> int:
     payload = {
         "metadata": {
             "python": sys.version,
+            "pythonmalloc": os.environ.get("PYTHONMALLOC", "default"),
             "root": str(args.root.resolve()),
             "engine": str(args.engine.resolve()),
             "publisher_cpu": args.publisher_cpu,

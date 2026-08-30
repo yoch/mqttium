@@ -136,15 +136,29 @@ jobs:
           taskset -c 3 python harness/benchmarks/runner_network_diagnosis.py \
             --root base \
             --engine harness/benchmarks/paired_network.py \
-            --iterations 24 \
+            --iterations 16 \
             --count 26000 \
             --window 1 \
             --protocol 311 \
             --completion callback \
             --publisher-cpu 2 \
             --support-cpu 1 \
-            --output "$JOB_ROOT/runner-diagnosis.json" | \
-            tee "$JOB_ROOT/runner-diagnosis.log"
+            --output "$JOB_ROOT/runner-diagnosis-default.json" | \
+            tee "$JOB_ROOT/runner-diagnosis-default.log"
+
+          taskset -c 3 env PYTHONMALLOC=malloc \
+            python harness/benchmarks/runner_network_diagnosis.py \
+            --root base \
+            --engine harness/benchmarks/paired_network.py \
+            --iterations 16 \
+            --count 26000 \
+            --window 1 \
+            --protocol 311 \
+            --completion callback \
+            --publisher-cpu 2 \
+            --support-cpu 1 \
+            --output "$JOB_ROOT/runner-diagnosis-malloc.json" | \
+            tee "$JOB_ROOT/runner-diagnosis-malloc.log"
 
       - name: Run strict network release gate
         if: false
