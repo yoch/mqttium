@@ -216,3 +216,151 @@ async def test_auto_returns_to_iterator_after_last_filter_without_fallback() -> 
     await _deliver(client, "sensors/1")
 
     assert client._messages.get_nowait().topic == "sensors/1"
+
+
+async def test_sync_fallback_failure_is_reported_as_fallback() -> None:
+    client = AsyncClient(message_delivery="callback")
+    errors: list[dict[str, object]] = []
+    loop = asyncio.get_running_loop()
+    previous = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: errors.append(context))
+
+    def bad(_message: Message) -> None:
+        raise RuntimeError("fallback")
+
+    try:
+        client.on_message = bad
+        client.message_callback_add("sensors/#", lambda _message: None)
+        callback = client._message_callback
+        assert callback is not None
+        await client._invoke(callback, Message(topic="other", payload=b"x"))
+    finally:
+        loop.set_exception_handler(previous)
+
+    assert len(errors) == 1
+    assert errors[0]["callback"] is bad
+    assert isinstance(errors[0]["exception"], RuntimeError)
+
+
+async def test_async_fallback_failure_is_reported_as_fallback() -> None:
+    client = AsyncClient(message_delivery="callback")
+    errors: list[dict[str, object]] = []
+    loop = asyncio.get_running_loop()
+    previous = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: errors.append(context))
+
+    async def bad(_message: Message) -> None:
+        await asyncio.sleep(0)
+        raise RuntimeError("fallback")
+
+    try:
+        client.on_message = bad
+        client.message_callback_add("sensors/#", lambda _message: None)
+        callback = client._message_callback
+        assert callback is not None
+        await client._invoke(callback, Message(topic="other", payload=b"x"))
+    finally:
+        loop.set_exception_handler(previous)
+
+    assert len(errors) == 1
+    assert errors[0]["callback"] is bad
+    assert isinstance(errors[0]["exception"], RuntimeError)
+
+
+async def test_fallback_self_cancellation_is_reported() -> None:
+    client = AsyncClient(message_delivery="callback")
+    errors: list[dict[str, object]] = []
+    loop = asyncio.get_running_loop()
+    previous = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: errors.append(context))
+
+    def cancelling(_message: Message) -> None:
+        raise asyncio.CancelledError
+
+    try:
+        client.on_message = cancelling
+        client.message_callback_add("sensors/#", lambda _message: None)
+        callback = client._message_callback
+        assert callback is not None
+        await client._invoke(callback, Message(topic="other", payload=b"x"))
+    finally:
+        loop.set_exception_handler(previous)
+
+    assert len(errors) == 1
+    assert errors[0]["callback"] is cancelling
+    assert isinstance(errors[0]["exception"], asyncio.CancelledError)
+
+
+async def test_later_sync_failure_after_async_match_is_isolated() -> None:
+    client = AsyncClient(message_delivery="callback")
+    seen: list[str] = []
+    errors: list[dict[str, object]] = []
+    loop = asyncio.get_running_loop()
+    previous = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: errors.append(context))
+
+    async def first(_message: Message) -> None:
+        seen.append("first")
+        await asyncio.sleep(0)
+
+    def bad(_message: Message) -> None:
+        seen.append("bad")
+        raise RuntimeError("later")
+
+    def good(_message: Message) -> None:
+        seen.append("good")
+
+    try:
+        client.message_callback_add("sensors/#", first)
+        client.message_callback_add("sensors/+", bad)
+        client.message_callback_add("sensors/1", good)
+        callback = client._message_callback
+        assert callback is not None
+        await client._invoke(callback, Message(topic="sensors/1", payload=b"x"))
+    finally:
+        loop.set_exception_handler(previous)
+
+    assert seen == ["first", "bad", "good"]
+    assert len(errors) == 1
+    assert errors[0]["callback"] is bad
+
+
+async def test_later_async_failure_and_self_cancellation_are_isolated() -> None:
+    client = AsyncClient(message_delivery="callback")
+    seen: list[str] = []
+    errors: list[dict[str, object]] = []
+    loop = asyncio.get_running_loop()
+    previous = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: errors.append(context))
+
+    async def first(_message: Message) -> None:
+        seen.append("first")
+        await asyncio.sleep(0)
+
+    async def bad(_message: Message) -> None:
+        seen.append("bad")
+        await asyncio.sleep(0)
+        raise RuntimeError("later async")
+
+    def cancelling(_message: Message) -> None:
+        seen.append("cancel")
+        raise asyncio.CancelledError
+
+    def good(_message: Message) -> None:
+        seen.append("good")
+
+    try:
+        client.message_callback_add("sensors/#", first)
+        client.message_callback_add("sensors/+", bad)
+        client.message_callback_add("sensors/1", cancelling)
+        client.message_callback_add("+/1", good)
+        callback = client._message_callback
+        assert callback is not None
+        await client._invoke(callback, Message(topic="sensors/1", payload=b"x"))
+    finally:
+        loop.set_exception_handler(previous)
+
+    assert seen == ["first", "bad", "cancel", "good"]
+    assert len(errors) == 2
+    assert errors[0]["callback"] is bad
+    assert errors[1]["callback"] is cancelling
