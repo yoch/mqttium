@@ -31,6 +31,12 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   callbacks, callback bursts, reentrant delivery, and occupied/full callback
   queues retain the bounded callback-worker path and its existing backpressure.
 
+### Fixed
+
+- Reuse an MQTT 5 broker-assigned Client Identifier when reconnecting the same
+  durable Session, and fail before CONNECT when persisted resumable QoS state
+  has no stable ClientID after a process restart.
+
 ## [1.0.0rc10] - 2026-08-26
 
 ### Removed

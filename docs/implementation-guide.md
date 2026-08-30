@@ -89,6 +89,10 @@ the requested configuration.
 | `assigned_client_identifier` | local client ID | expose as the effective ID |
 | subscription capabilities | available | reject unsupported filters before sending |
 
+A broker-assigned MQTT 5 ClientID is retained by the engine as the Session
+identity for same-instance durable reconnects. It is not part of the inflight
+store contract; process-restart recovery requires a stable configured ClientID.
+
 `EngineConfig.local_receive_maximum` defaults to 65535 because the standalone
 engine follows the protocol maximum. `AsyncClient` intentionally defaults to
 100 to provide an operationally bounded application client. This difference is
