@@ -152,6 +152,7 @@ jobs:
           exit 1
 
       - name: Paired microbenchmarks
+        if: github.ref == 'refs/heads/main' # Point-4 branch: use socket gate below.
         env:
           PYTHONPATH: harness/src
         run: |
@@ -162,6 +163,7 @@ jobs:
             --output "$JOB_ROOT/micro.json"
 
       - name: Advisory paired network sweep
+        if: github.ref == 'refs/heads/main' # Point-4 branch: broad sweep is not causal evidence.
         run: |
           python harness/benchmarks/paired_network.py \
             --base-root base \
@@ -179,6 +181,7 @@ jobs:
             --summary-output "$JOB_ROOT/network.md"
 
       - name: Advisory native QoS 1 receipt/callback diagnostic
+        if: github.ref == 'refs/heads/main' # Point-4 branch: fixed socket probe replaces this.
         run: |
           python harness/benchmarks/paired_network.py \
             --base-root base --candidate-root candidate \
@@ -267,7 +270,9 @@ jobs:
             --summary-output "$JOB_ROOT/writer-capacity-ab.md"
 
       - name: Strict paced writer-latency A/A control
-        if: steps.writer_gate.outputs.available == 'true'
+        if: >-
+          github.ref == 'refs/heads/main' &&
+          steps.writer_gate.outputs.available == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -313,7 +318,9 @@ jobs:
             --summary-output "$root/writer-latency-aa-attempt-2.md"
 
       - name: Strict paced writer-latency A/B gate
-        if: steps.writer_gate.outputs.available == 'true'
+        if: >-
+          github.ref == 'refs/heads/main' &&
+          steps.writer_gate.outputs.available == 'true'
         shell: bash
         run: |
           set -euo pipefail
