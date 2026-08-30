@@ -14,12 +14,13 @@ this guide takes precedence over the higher-level description in `architecture.m
    `write_nowait`, which saves the event-loop turn the writer task would
    otherwise cost. A segmented frame is never written that way, because it is
    two consecutive writes and nothing may land between them. Inbound PUBACK,
-   PUBREC and PUBCOMP responses have one independent eager permit per loop turn,
-   but never bypass the ordering checks: a queued frame, active batch, suspended
-   producer, segmented item or earlier response in the same burst keeps the
-   response on the bounded FIFO path. Outbound PUBREL is part of the producer's
-   QoS 2 exchange and retains the ordinary throttle so it can coalesce with
-   outbound PUBLISH.
+   PUBREC and PUBCOMP may consume the one response use left after an eager
+   producer write in the same loop turn. An idle response consumes the ordinary
+   eager use instead; a later response in either case takes the bounded FIFO.
+   A queued frame, active batch, suspended producer or segmented item still
+   prevents that shortcut. Outbound PUBREL is part of the producer's QoS 2
+   exchange and retains the ordinary throttle so it can coalesce with outbound
+   PUBLISH.
 2. **One effect stream.** Engine sessions emit through `ProtocolEngine`; no
    component keeps a second effect list.
 3. **Register completion before sending.** A receipt or SUBACK/UNSUBACK future

@@ -12,12 +12,12 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   the reader/effect-drain turn after receipt or delivery settlement. Async
   callbacks, callback bursts, reentrant delivery, and occupied/full callback
   queues retain the bounded callback-worker path and its existing backpressure.
-- Send idle inbound PUBACK, PUBREC and PUBCOMP frames through the writer's eager
-  transport path even when its producer-burst throttle is disarmed. One
-  response per loop turn gets this independent permit; the rest of a burst
-  returns to the coalescing FIFO. Earlier frames, active batches, suspended
-  producers and transport backpressure also force that fallback. Outbound
-  PUBREL retains ordinary producer batching.
+- Let one inbound PUBACK, PUBREC or PUBCOMP follow an eager producer write in
+  the same loop turn without adding a writer-task hop. The writer uses one
+  three-state eager permit, so an idle response still uses the ordinary eager
+  path and subsequent responses return to the coalescing FIFO. Earlier frames,
+  active batches, suspended producers and transport backpressure also force
+  that fallback. Outbound PUBREL retains ordinary producer batching.
 
 ## [1.0.0rc10] - 2026-08-26
 

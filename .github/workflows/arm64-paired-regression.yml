@@ -86,8 +86,8 @@ jobs:
           command -v python3
           python3 - <<'PY'
           import sys
-          if sys.version_info[:2] != (3, 13):
-              raise SystemExit(f"expected system Python 3.13, got {sys.version}")
+          if sys.version_info[:2] not in ((3, 13), (3, 14)):
+              raise SystemExit(f"expected system Python 3.13/3.14, got {sys.version}")
           PY
           command -v mosquitto
           command -v mosquitto_sub
@@ -184,6 +184,37 @@ jobs:
             --output "$JOB_ROOT/qos1-completion.json" \
             --summary-output "$JOB_ROOT/qos1-completion.md"
 
+      - name: Strict protocol-response socket A/A control
+        id: response_socket_gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          script="candidate/benchmarks/paired_protocol_response_socket.py"
+          if [ ! -f "$script" ]; then
+            echo "candidate does not provide paired_protocol_response_socket.py; socket gate skipped"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "available=true" >> "$GITHUB_OUTPUT"
+          python "$script" \
+            --base-root base --candidate-root base \
+            --repeat 8 --count 10000 --timeout 20 \
+            --broker-cpu 1 --client-cpu 2 --policy strict \
+            --preflight-report "$JOB_ROOT/runner.json" \
+            --output "$JOB_ROOT/protocol-response-socket-aa.json"
+
+      - name: Strict protocol-response socket A/B gate
+        if: steps.response_socket_gate.outputs.available == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python candidate/benchmarks/paired_protocol_response_socket.py \
+            --base-root base --candidate-root candidate \
+            --repeat 8 --count 10000 --timeout 20 \
+            --broker-cpu 1 --client-cpu 2 --policy strict \
+            --preflight-report "$JOB_ROOT/runner.json" \
+            --output "$JOB_ROOT/protocol-response-socket-ab.json"
+
       - name: Strict closed-loop writer-capacity A/A control
         id: writer_gate
         shell: bash
@@ -198,10 +229,12 @@ jobs:
           echo "available=true" >> "$GITHUB_OUTPUT"
           python "$script" \
             --base-root base --candidate-root base \
-            --protocol 311 --qos-values 0,1 --payload-bytes 256 \
+            --protocol 311 --qos-values 0,1,2 --payload-bytes 256 \
             --inflight 20 --outstanding 64 --max-queued 200 \
             --warmup-count 5000 --repeat 8 \
-            --count-qos0 100000 --count-qos1 40000 \
+            --count-qos0 100000 --count-qos1 40000 --count-qos2 20000 \
+            --min-completed-ratio 0.99 --max-completed-ratio 1.01 \
+            --max-cpu-per-message-ratio 1.01 --max-aa-ratio-deviation 0.01 \
             --timeout 120 --cpu 2 \
             --policy strict \
             --preflight-report "$JOB_ROOT/runner.json" \
@@ -215,10 +248,12 @@ jobs:
           set -euo pipefail
           python candidate/benchmarks/paired_writer_capacity.py \
             --base-root base --candidate-root candidate \
-            --protocol 311 --qos-values 0,1 --payload-bytes 256 \
+            --protocol 311 --qos-values 0,1,2 --payload-bytes 256 \
             --inflight 20 --outstanding 64 --max-queued 200 \
             --warmup-count 5000 --repeat 8 \
-            --count-qos0 100000 --count-qos1 40000 \
+            --count-qos0 100000 --count-qos1 40000 --count-qos2 20000 \
+            --min-completed-ratio 0.99 --max-completed-ratio 1.01 \
+            --max-cpu-per-message-ratio 1.01 --max-aa-ratio-deviation 0.01 \
             --timeout 120 --cpu 2 \
             --policy strict \
             --preflight-report "$JOB_ROOT/runner.json" \

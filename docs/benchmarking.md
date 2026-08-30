@@ -35,7 +35,7 @@ fail the release or consume scarce same-code controls by itself. Throughput,
 runner eligibility, exact completion, and the deeper controlled network gate
 remain separate evidence.
 - `paired_writer_capacity.py` protects the native `publish_nowait` closed-loop
-  writer regime for QoS 0/1. It yields once per application outstanding window
+  writer regime for QoS 0/1/2. It yields once per application outstanding window
   and yields/retries on synchronous backpressure, matching the scheduling shape
   used by the external native capacity harness. Its primary metric is the
   candidate/base completed-rate ratio, not an absolute cross-machine rate.
@@ -48,6 +48,11 @@ remain separate evidence.
   pass through `AsyncClient` and `WritePump`, and are measured with the normal
   producer eager throttle disarmed. An untimed segmented-write race makes every
   worker fail if a response can overtake a header or payload.
+- `paired_protocol_response_socket.py` is the complementary two-process TCP
+  probe. It records broker-write-to-response-read latency for idle QoS 1,
+  callback/publish collision QoS 1, both QoS 2 response legs, and 16/64-frame
+  bursts. It is the network proof for the response-after-producer state, not a
+  substitute for a general application-RTT benchmark.
 - `application_stress.py` exercises callbacks, iterators, backpressure, memory,
   and SQLite persistence.
 - `memory_profile.py` enforces versioned tracemalloc and logical-counter limits.
@@ -99,23 +104,28 @@ python benchmarks/runner_probe.py \
 # Harness control: BASELINE is a checkout/worktree of the recorded baseline.
 python benchmarks/paired_writer_capacity.py \
   --base-root "$BASELINE" --candidate-root "$BASELINE" \
-  --protocol 311 --qos-values 0,1 --payload-bytes 256 \
+  --protocol 311 --qos-values 0,1,2 --payload-bytes 256 \
   --inflight 20 --outstanding 64 --max-queued 200 --repeat 8 \
+  --min-completed-ratio 0.99 --max-completed-ratio 1.01 \
+  --max-cpu-per-message-ratio 1.01 \
   --policy strict --preflight-report /tmp/mqttium-runner.json \
   --output /tmp/mqttium-writer-capacity-aa.json
 
 python benchmarks/paired_writer_capacity.py \
   --base-root "$BASELINE" --candidate-root . \
-  --protocol 311 --qos-values 0,1 --payload-bytes 256 \
+  --protocol 311 --qos-values 0,1,2 --payload-bytes 256 \
   --inflight 20 --outstanding 64 --max-queued 200 --repeat 8 \
+  --min-completed-ratio 0.99 --max-completed-ratio 1.01 \
+  --max-cpu-per-message-ratio 1.01 \
   --policy strict --preflight-report /tmp/mqttium-runner.json \
   --output /tmp/mqttium-writer-capacity-ab.json
 ```
 
-The A/A median completed-rate ratio must stay within 2% and baseline CV at or
-below 5%. The A/B candidate must retain at least 95% of the recorded baseline
-completed rate for both QoS 0 and QoS 1. This is a regression floor, not a
-cross-client performance claim. The paced open-loop acceptance cells at 2,500 and 7,500
+The A/A median completed-rate ratio must stay within 1% and baseline CV at or
+below 5%. The A/B 90% paired bootstrap interval for completed rate must remain
+inside 0.99–1.01 for QoS 0, QoS 1 and QoS 2; the CPU/message upper bound must
+also stay at or below 1.01. This is an equivalence gate, not a cross-client
+performance claim. The paced open-loop acceptance cells at 2,500 and 7,500
 messages/s remain separate evidence and must still be retained; recovering
 capacity by simply disabling eager writes would fail that side of the contract.
 
@@ -155,6 +165,31 @@ python benchmarks/paired_protocol_responses.py \
 
 This is a runtime scheduling microbenchmark, not a broker RTT claim. Retain the
 QoS 1/2 network capacity and application RTT cells as end-to-end evidence.
+
+`paired_protocol_response_socket.py` supplies the missing causal network cell.
+It does not use a rate pacer or capacity calibration: each broker response is
+closed-loop and the broker/client workers are pinned separately. First run an
+A/A control, then A/B on the same eligible host:
+
+```bash
+python benchmarks/paired_protocol_response_socket.py \
+  --base-root "$BASELINE" --candidate-root "$BASELINE" \
+  --repeat 8 --count 10000 --broker-cpu 1 --client-cpu 2 \
+  --policy strict --preflight-report /tmp/mqttium-runner.json \
+  --output /tmp/mqttium-protocol-response-socket-aa.json
+
+python benchmarks/paired_protocol_response_socket.py \
+  --base-root "$BASELINE" --candidate-root . \
+  --repeat 8 --count 10000 --broker-cpu 1 --client-cpu 2 \
+  --policy strict --preflight-report /tmp/mqttium-runner.json \
+  --output /tmp/mqttium-protocol-response-socket-ab.json
+```
+
+Strict A/B requires the callback/publish collision p50 to improve by at least
+10% and 5 microseconds in at least seven of eight pairs. Idle p50 must remain
+within 5%; all p95/p99 cells must remain within 5%; every burst must retain
+writer coalescing. These rules make an absent network benefit an explicit
+rejection, rather than an invitation to tune batching thresholds.
 
 ## Keeping the harness out of the result
 

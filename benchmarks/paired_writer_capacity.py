@@ -17,6 +17,7 @@ import argparse
 import asyncio
 import json
 import os
+import random
 import statistics
 import subprocess
 import sys
@@ -314,6 +315,7 @@ def assess_rates(
     aa_control: bool,
     max_aa_ratio_deviation: float,
     label: str,
+    max_completed_ratio: float | None = None,
 ) -> tuple[float, float, float, list[str], list[str]]:
     """Evaluate one paired cell; split invalid measurement from regression."""
     ratios = [candidate / base for base, candidate in zip(base_rates, candidate_rates, strict=True)]
@@ -332,7 +334,21 @@ def assess_rates(
         )
     if not aa_control and ratio < min_completed_ratio:
         regressions.append(f"{label}: candidate/base completed ratio {ratio:.4f}")
+    if not aa_control and max_completed_ratio is not None and ratio > max_completed_ratio:
+        regressions.append(f"{label}: candidate/base completed ratio {ratio:.4f}")
     return ratio, baseline_cv, candidate_cv, invalidations, regressions
+
+
+def paired_median_interval(ratios: list[float], *, samples: int = 10_000) -> tuple[float, float]:
+    """Return a deterministic two-sided 90% bootstrap interval for paired ratios."""
+    if not ratios:
+        return 0.0, 0.0
+    random_source = random.Random(71)
+    medians = [
+        statistics.median(random_source.choices(ratios, k=len(ratios))) for _ in range(samples)
+    ]
+    medians.sort()
+    return medians[round((len(medians) - 1) * 0.05)], medians[round((len(medians) - 1) * 0.95)]
 
 
 def parent(args: argparse.Namespace) -> int:
@@ -352,6 +368,8 @@ def parent(args: argparse.Namespace) -> int:
         "thresholds": {
             "max_baseline_cv": args.max_baseline_cv,
             "min_completed_ratio": args.min_completed_ratio,
+            "max_completed_ratio": args.max_completed_ratio,
+            "max_cpu_per_message_ratio": args.max_cpu_per_message_ratio,
             "max_aa_ratio_deviation": args.max_aa_ratio_deviation,
         },
         "harness": {
@@ -386,7 +404,12 @@ def parent(args: argparse.Namespace) -> int:
     assert isinstance(scenarios, list)
 
     for qos in qos_values:
-        count = args.count_qos0 if qos == 0 else args.count_qos1
+        if qos == 0:
+            count = args.count_qos0
+        elif qos == 1:
+            count = args.count_qos1
+        else:
+            count = args.count_qos2
         base_rates: list[float] = []
         candidate_rates: list[float] = []
         pairs: list[dict[str, object]] = []
@@ -432,12 +455,45 @@ def parent(args: argparse.Namespace) -> int:
             candidate_rates,
             max_baseline_cv=args.max_baseline_cv,
             min_completed_ratio=args.min_completed_ratio,
+            max_completed_ratio=args.max_completed_ratio,
             aa_control=aa_control,
             max_aa_ratio_deviation=args.max_aa_ratio_deviation,
             label=label,
         )
         invalidations.extend(cell_invalid)
         regressions.extend(cell_regressions)
+        completed_ratios = [
+            candidate / base for base, candidate in zip(base_rates, candidate_rates, strict=True)
+        ]
+        completed_interval = paired_median_interval(completed_ratios)
+        if not aa_control and completed_interval[0] < args.min_completed_ratio:
+            regressions.append(
+                f"{label}: 90% completed-rate interval lower bound {completed_interval[0]:.4f}"
+            )
+        if (
+            not aa_control
+            and args.max_completed_ratio is not None
+            and completed_interval[1] > args.max_completed_ratio
+        ):
+            regressions.append(
+                f"{label}: 90% completed-rate interval upper bound {completed_interval[1]:.4f}"
+            )
+        cpu_ratios = [
+            (float(candidate["cpu_seconds"]) / int(candidate["count"]))
+            / max(float(base["cpu_seconds"]) / int(base["count"]), 1e-12)
+            for base, candidate in ((pair["base"], pair["candidate"]) for pair in pairs)
+            if isinstance(base, dict) and isinstance(candidate, dict)
+        ]
+        cpu_ratio = statistics.median(cpu_ratios)
+        cpu_interval = paired_median_interval(cpu_ratios)
+        if (
+            not aa_control
+            and args.max_cpu_per_message_ratio is not None
+            and cpu_interval[1] > args.max_cpu_per_message_ratio
+        ):
+            regressions.append(
+                f"{label}: 90% CPU/message interval upper bound {cpu_interval[1]:.4f}"
+            )
         scenarios.append(
             {
                 "protocol": args.protocol,
@@ -452,6 +508,9 @@ def parent(args: argparse.Namespace) -> int:
                 "candidate_completed_cv": candidate_cv,
                 "base_median_completed_rate": statistics.median(base_rates),
                 "candidate_median_completed_rate": statistics.median(candidate_rates),
+                "completed_ratio_90pct_interval": completed_interval,
+                "median_candidate_over_base_cpu_per_message": cpu_ratio,
+                "cpu_per_message_ratio_90pct_interval": cpu_interval,
                 "pairs": pairs,
             }
         )
@@ -484,7 +543,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=11883)
     parser.add_argument("--protocol", choices=("311", "5"), default="311")
-    parser.add_argument("--qos", type=int, choices=(0, 1), default=0)
+    parser.add_argument("--qos", type=int, choices=(0, 1, 2), default=0)
     parser.add_argument("--qos-values", default="0,1")
     parser.add_argument("--payload-bytes", type=int, default=256)
     parser.add_argument("--inflight", type=int, default=20)
@@ -494,6 +553,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--count", type=int, default=100_000)
     parser.add_argument("--count-qos0", type=int, default=100_000)
     parser.add_argument("--count-qos1", type=int, default=40_000)
+    parser.add_argument("--count-qos2", type=int, default=20_000)
     parser.add_argument("--repeat", type=int, default=8)
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--cpu", type=int)
@@ -501,6 +561,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--preflight-report", type=Path)
     parser.add_argument("--max-baseline-cv", type=float, default=0.05)
     parser.add_argument("--min-completed-ratio", type=float, default=0.95)
+    parser.add_argument("--max-completed-ratio", type=float)
+    parser.add_argument("--max-cpu-per-message-ratio", type=float)
     parser.add_argument("--max-aa-ratio-deviation", type=float, default=0.02)
     parser.add_argument("--output", type=Path, default=Path("/tmp/paired-writer-capacity.json"))
     parser.add_argument("--summary-output", type=Path)
@@ -514,15 +576,21 @@ def parse_args() -> argparse.Namespace:
         parser.error("--payload-bytes must be non-negative")
     if args.inflight <= 0 or args.outstanding <= 0 or args.max_queued < 0:
         parser.error("--inflight/--outstanding must be positive and --max-queued non-negative")
-    if args.warmup_count < 0 or args.count <= 0 or args.count_qos0 <= 0 or args.count_qos1 <= 0:
+    if (
+        args.warmup_count < 0
+        or args.count <= 0
+        or args.count_qos0 <= 0
+        or args.count_qos1 <= 0
+        or args.count_qos2 <= 0
+    ):
         parser.error("counts must be positive (warmup may be zero)")
     try:
         qos_values = [int(value) for value in args.qos_values.split(",")]
     except ValueError as exc:
-        parser.error("--qos-values accepts comma-separated 0,1")
+        parser.error("--qos-values accepts comma-separated 0,1,2")
         raise AssertionError from exc
-    if not qos_values or any(value not in (0, 1) for value in qos_values):
-        parser.error("--qos-values accepts comma-separated 0,1")
+    if not qos_values or any(value not in (0, 1, 2) for value in qos_values):
+        parser.error("--qos-values accepts comma-separated 0,1,2")
     if args.max_aa_ratio_deviation < 0:
         parser.error("--max-aa-ratio-deviation must be non-negative")
     return args

@@ -308,8 +308,8 @@ async def test_paced_writes_rearm_eager_on_the_next_loop_turn() -> None:
         await pump.stop()
 
 
-async def test_protocol_response_ignores_only_the_burst_throttle() -> None:
-    """An idle ACK is eager even after producer eager admission was disarmed."""
+async def test_protocol_response_can_consume_the_producer_spent_state() -> None:
+    """One ACK may follow an eager producer before the loop regains control."""
     transport = _EagerTransport()
     pump = _pump()
     pump.start(transport)
@@ -345,16 +345,36 @@ async def test_only_first_protocol_response_of_a_synchronous_burst_is_eager() ->
         await pump.stop()
 
 
+async def test_idle_response_spends_the_shared_eager_state() -> None:
+    """An idle response is eager, but cannot make a response burst eager."""
+    transport = _EagerTransport()
+    pump = _pump(max_messages=4, max_bytes=32)
+    pump.start(transport)
+    try:
+        assert pump.try_enqueue_protocol_response(b"first") is True
+        assert pump.try_enqueue_protocol_response(b"second") is True
+
+        assert transport.written == [b"first"]
+        assert pump.queued_messages == 1
+        await pump.join()
+        assert transport.written == [b"first", b"second"]
+    finally:
+        await pump.stop()
+
+
 async def test_one_response_can_follow_one_producer_eager_write() -> None:
-    """The response permit is independent from the producer's permit."""
+    """The producer-spent state admits exactly one following response."""
     transport = _EagerTransport()
     pump = _pump()
     pump.start(transport)
     try:
         assert pump.try_enqueue(b"publish") is True
         assert pump.try_enqueue_protocol_response(b"puback") is True
+        assert pump.try_enqueue_protocol_response(b"second-puback") is True
         assert transport.written == [b"publish", b"puback"]
-        assert pump.queued_messages == 0
+        assert pump.queued_messages == 1
+        await pump.join()
+        assert transport.written == [b"publish", b"puback", b"second-puback"]
     finally:
         await pump.stop()
 
@@ -457,17 +477,14 @@ async def test_stale_rearm_cannot_arm_a_new_transport_generation() -> None:
     pump.start(new)
     try:
         current_generation = pump._eager_generation
-        pump._eager_armed = False
-        pump._response_eager_armed = False
+        pump._eager_armed = None
 
         # Model a delayed call_soon callback left by the old connection.
         pump._rearm_eager_if_idle(stale_generation)
-        assert pump._eager_armed is False
-        assert pump._response_eager_armed is False
+        assert pump._eager_armed is None
 
         pump._rearm_eager_if_idle(current_generation)
         assert pump._eager_armed is True
-        assert pump._response_eager_armed is True
     finally:
         await pump.stop()
 
