@@ -2124,8 +2124,6 @@ class AsyncClient:
         kind = effect.kind
         if kind is EffectKind.SEND:
             return self._try_enqueue_outbound(effect.data, epoch=epoch)
-        if kind is EffectKind.SEND_PROTOCOL_RESPONSE:
-            return self._try_enqueue_protocol_response(effect.data, epoch=epoch)
         if kind is EffectKind.CONNACK and self.on_connect is None:
             connack: ConnAckPacket = effect.data
             self._resolve_connack(connack)
@@ -2153,6 +2151,8 @@ class AsyncClient:
         if kind is EffectKind.PINGRESP:
             self._ping_pending = False
             return True
+        if kind is EffectKind.SEND_PROTOCOL_RESPONSE:
+            return self._try_enqueue_protocol_response(effect.data, epoch=epoch)
         return False
 
     def _apply_terminal_callback_inline(
