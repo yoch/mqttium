@@ -212,7 +212,9 @@ only after application delivery accepts them.
 Topic-filtered callbacks are an `AsyncClient` concern. `TopicMatcher` selects
 application callbacks after the engine has already emitted MESSAGE effects; the
 protocol layer never sees filters or user callables. The matcher exists only
-while at least one filter is registered.
+while at least one filter is registered. Inbound delivery consults an installed
+`_message_callback` pointer (`on_message`, the topic router, or `None`) so the
+unused-filter path has no matcher branch.
 
 ## Persistence
 

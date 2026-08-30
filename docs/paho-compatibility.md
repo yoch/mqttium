@@ -59,6 +59,12 @@ the complete connect, subscribe, publish, callback and shutdown lifecycle. See
 
 Shared-subscription callback filters are matched literally, as in Paho: a callback registered for `$share/group/filter` does not match a delivered message whose Topic Name is `filter`.
 
+The façade configures the inner `AsyncClient` with `message_delivery="callback"`
+and installs its message dispatcher only while `on_message` or a topic filter is
+registered. Idle façade clients therefore do not accumulate inbound messages on
+an unused iterator. Overlapping topic callbacks share one `MQTTMessage` wrapper
+per delivered message.
+
 For one-shot helpers, prefer the async-native `mqttium.helpers` API instead of
 `paho.mqtt.publish` or `paho.mqtt.subscribe`.
 
@@ -197,4 +203,5 @@ still pending, which is what preserves ordering across QoS levels.
 - `tests/unit/test_compat_publish_perf.py` — effect ordering, MID reuse, mixed-QoS coalescing, cancellation, loop shutdown, and concurrent QoS 1 admission
 - `tests/unit/test_compat_publish_edges.py` — oversized drain handling and complete QoS 2 publish handshake
 - `tests/unit/test_compat_facade_mid_lifecycle.py` — façade MID wrap collisions, settlement/callback release, and callback-toggle correlation
+- `tests/unit/test_compat_message_dispatch.py` — lazy inbound dispatcher, callback-only delivery, and shared `MQTTMessage` wrapping
 - `tests/integration/test_compat_publish_live.py` — end-to-end QoS 0 and concurrent QoS 1 callbacks and delivery

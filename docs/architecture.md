@@ -81,7 +81,10 @@ does not own MQTT state, transport state, or reconnect policy.
 Topic-filtered callbacks live on `AsyncClient`. `TopicMatcher` chooses which
 application callable receives a delivered message; the protocol engine still
 emits undifferentiated MESSAGE effects and never imports dispatch or compat
-code.
+code. Inbound delivery reads an installed `_message_callback` pointer:
+`on_message` or `None` while no filter exists, and the topic router only while
+filters are registered. The unused-filter hot path therefore has no matcher
+branch.
 
 The delivery mode is selected when the client is constructed. Specialised
 admission functions avoid repeated mode branches on every incoming message
