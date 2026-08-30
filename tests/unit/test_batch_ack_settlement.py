@@ -72,3 +72,26 @@ async def test_full_callback_queue_leaves_batch_for_bounded_worker() -> None:
     await client._shutdown_callback_worker(drain=False)
     assert seen == [7, 8]
     assert all(receipt.is_done() for receipt in receipts)
+
+
+def test_callback_reentrancy_does_not_extend_or_invalidate_batch_iteration() -> None:
+    client = AsyncClient(client_id="batch-ack-reentrant")
+    seen: list[int | None] = []
+
+    def on_publish(mid: int | None, _reason: BaseException | None) -> None:
+        seen.append(mid)
+        if mid == 7:
+            client._effect_pump.pending.append(EngineEffect(EffectKind.PUBLISH_COMPLETE, 9))
+
+    client.on_publish = on_publish
+    receipts = [_receipt(client, mid) for mid in (7, 8, 9)]
+    client._engine._emit(EffectKind.PUBLISH_COMPLETE, 7)
+    client._engine._emit(EffectKind.PUBLISH_COMPLETE, 8)
+    client._collect_effects_locked()
+
+    applied = client._effect_pump.drain_ingress_ack_batch_inline()
+
+    assert applied == 2
+    assert seen == [7, 8]
+    assert [effect.data for effect in client._effect_pump.pending] == [9]
+    assert [receipt.is_done() for receipt in receipts] == [True, True, False]

@@ -2196,7 +2196,13 @@ class AsyncClient:
             return 0
         callback = self.on_publish
         applied = 0
-        for effect in effects:
+        # User callbacks may synchronously publish and append new effects to
+        # this deque. Index only the prefix that existed on entry: deque
+        # iteration rejects mutation, and nested effects belong to the general
+        # drain rather than this ingress ACK batch.
+        limit = len(effects)
+        while applied < limit:
+            effect = effects[applied]
             kind = effect.kind
             if kind is EffectKind.PUBLISH_COMPLETE:
                 mid: int | None = effect.data
