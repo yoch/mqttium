@@ -39,7 +39,7 @@ class IncrementalDecoder:
     __slots__ = ("_buf", "_start", "_max_packet_size", "_high_water")
 
     def __init__(self, max_packet_size: int = DEFAULT_MAX_PACKET_SIZE) -> None:
-        if max_packet_size < 2:
+        if max_packet_size < 1:
             raise ValueError("max_packet_size too small")
         self._buf = bytearray()
         self._start = 0
@@ -117,7 +117,7 @@ class IncrementalDecoder:
 
     @max_packet_size.setter
     def max_packet_size(self, value: int) -> None:
-        if value < 2:
+        if value < 1:
             raise ValueError("max_packet_size too small")
         self._max_packet_size = value
 

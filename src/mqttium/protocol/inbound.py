@@ -134,6 +134,7 @@ class InboundSession:
         "_manual_qos1_order",
         "_pending_bytes",
         "_pending_high_water_bytes",
+        "_receive_maximum",
         "_recovered_mids",
         "_replay",
         "_stored_inbound",
@@ -176,6 +177,7 @@ class InboundSession:
         self._tiny_peer_packet_limit = False
         self._aliases: dict[int, str] = {}
         self._topic_alias_maximum = self.config.topic_alias_maximum
+        self._receive_maximum = self.config.local_receive_maximum
         self._inflight = 0
         self._autoack_handoff_required = False
         # Auto-ACK QoS 1 identifiers whose PUBACK is still inside the current
@@ -259,20 +261,11 @@ class InboundSession:
 
     # --- lifecycle ---------------------------------------------------------
 
-    def start_connection(self) -> None:
+    def start_connection(self, *, receive_maximum: int, topic_alias_maximum: int) -> None:
         """Reset state scoped to one network connection before CONNECT."""
         self._aliases.clear()
-        connect_properties = self.config.connect_properties
-        configured_topic_alias_maximum = (
-            connect_properties.get("topic_alias_maximum")
-            if connect_properties is not None
-            else None
-        )
-        self._topic_alias_maximum = (
-            self.config.topic_alias_maximum
-            if configured_topic_alias_maximum is None
-            else int(configured_topic_alias_maximum)
-        )
+        self._receive_maximum = receive_maximum
+        self._topic_alias_maximum = topic_alias_maximum
         self._inflight = 0
         self._autoack_handoff_required = False
         self._pending_auto_qos1_mids.clear()
@@ -337,7 +330,7 @@ class InboundSession:
         """Snapshot this session's own accounting."""
         return InboundStats(
             inflight=self._inflight,
-            receive_maximum=self.config.local_receive_maximum,
+            receive_maximum=self._receive_maximum,
             topic_aliases=len(self._aliases),
             replay_pending=self._replay is not None,
             pending_bytes=self._pending_bytes,
@@ -599,7 +592,7 @@ class InboundSession:
         # reservation can be released immediately without freeing the slot early.
         self._release_pending_bytes(recovered_logical_size)
         self._pending_auto_qos1_mids.add(mid)
-        if self._inflight >= self.config.local_receive_maximum:
+        if self._inflight >= self._receive_maximum:
             self._autoack_handoff_required = True
 
     def _on_qos1_auto_tiny(self, *, mid: int, **_unused: object) -> None:
@@ -675,7 +668,7 @@ class InboundSession:
             # the runtime; a pipelined PUBLISH is then admitted by the ordinary
             # acquire path rather than by a second decode.
             self._pending_auto_qos1_mids.add(mid)
-            if self._inflight >= self.config.local_receive_maximum:
+            if self._inflight >= self._receive_maximum:
                 self._autoack_handoff_required = True
 
     def _on_qos1_manual(
@@ -1066,7 +1059,7 @@ class InboundSession:
 
     def _validate_slot_capacity(self, logical_size: int | None = None) -> None:
         """Validate Receive Maximum/quota without reserving anything."""
-        if self._inflight >= self.config.local_receive_maximum:
+        if self._inflight >= self._receive_maximum:
             self._protocol_disconnect(0x93)
             raise ProtocolError("Receive Maximum exceeded")
         byte_limit = self.config.max_pending_inbound_bytes
@@ -1086,7 +1079,7 @@ class InboundSession:
         )
 
     def _acquire_slot(self, logical_size: int | None = None) -> None:
-        receive_maximum = self.config.local_receive_maximum
+        receive_maximum = self._receive_maximum
         inflight = self._inflight
         if inflight >= receive_maximum:
             # MQTT 5 §3.3.4: DISCONNECT 0x93 (Receive Maximum exceeded).

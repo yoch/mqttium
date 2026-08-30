@@ -49,14 +49,14 @@ def test_rejects_packets_outside_connection_state() -> None:
     engine.handle_raw(_raw(publish.encode()))
     effects = engine.take_effects()
     assert [effect.kind for effect in effects] == [EffectKind.PROTOCOL_ERROR]
-    assert "state=NEW" in effects[0].data
+    assert "state=NEW" in str(effects[0].data)
 
     engine.begin_connect()
     engine.handle_raw(_raw(PubAckPacket(mid=1).encode()))
     effects = engine.take_effects()
     assert [effect.kind for effect in effects] == [EffectKind.PROTOCOL_ERROR]
-    assert "PUBACK" in effects[0].data
-    assert "CONNECTING" in effects[0].data
+    assert "PUBACK" in str(effects[0].data)
+    assert "CONNECTING" in str(effects[0].data)
 
 
 class _FailingPutStore(MemoryInflightStore):
