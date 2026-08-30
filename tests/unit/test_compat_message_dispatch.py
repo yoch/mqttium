@@ -22,6 +22,16 @@ def test_idle_compat_client_does_not_install_message_dispatch() -> None:
     assert client._topic_callbacks is None
     assert client._async.on_message is None
     assert client._async._message_callback is None
+    assert client._async._delivery.mode == "callback"
+
+    result = client._async._accept_message(
+        Message(topic="ignored", payload=b"x"),
+        client._async._message_callback,
+    )
+    assert result is None
+    assert client._async._messages.empty()
+    assert client._async._callback_queue.empty()
+    assert client._async._callback_worker_task is None
 
 
 def test_default_message_callback_installs_and_removes_dispatch() -> None:
