@@ -535,6 +535,150 @@ async def test_shutdown_discards_parked_inline_continuation() -> None:
     assert seen == ["queued"]
 
 
+async def test_parked_continuation_runs_after_two_physical_jobs() -> None:
+    client = AsyncClient(message_delivery="callback", max_pending_callbacks=2)
+    seen: list[str] = []
+
+    def first_job() -> None:
+        seen.append("a")
+
+    def second_job() -> None:
+        seen.append("b")
+
+    async def pending() -> None:
+        seen.append("continuation")
+
+    def outer() -> object:
+        client._delivery.spawn_callback(first_job)
+        client._delivery.spawn_callback(second_job)
+        return pending()
+
+    client._delivery.dispatch_callback_inline(outer)
+    assert client._callback_queue.qsize() == 2
+    assert client._delivery._inline_continuation is not None
+    assert client._delivery._inline_continuation_after == 2
+
+    await client._callback_queue.join()
+    assert seen == ["a", "b", "continuation"]
+    assert client._delivery._inline_continuation is None
+    await client._shutdown_callback_worker(drain=False)
+
+
+async def test_inline_self_cancellation_is_reported() -> None:
+    client = AsyncClient(message_delivery="callback")
+    errors: list[dict[str, object]] = []
+    loop = asyncio.get_running_loop()
+    previous = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: errors.append(context))
+
+    def cancelling() -> None:
+        raise asyncio.CancelledError
+
+    try:
+        client._delivery.dispatch_callback_inline(cancelling)
+    finally:
+        loop.set_exception_handler(previous)
+
+    assert len(errors) == 1
+    assert errors[0]["callback"] is cancelling
+    assert isinstance(errors[0]["exception"], asyncio.CancelledError)
+
+
+async def test_parked_continuation_self_cancellation_is_original_callback() -> None:
+    client = AsyncClient(message_delivery="callback", max_pending_callbacks=1)
+    errors: list[dict[str, object]] = []
+    loop = asyncio.get_running_loop()
+    previous = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: errors.append(context))
+
+    async def cancelling() -> None:
+        raise asyncio.CancelledError
+
+    def outer() -> object:
+        client._delivery.spawn_callback(lambda: None)
+        return cancelling()
+
+    try:
+        client._delivery.dispatch_callback_inline(outer)
+        await client._callback_queue.join()
+    finally:
+        loop.set_exception_handler(previous)
+        await client._shutdown_callback_worker(drain=False)
+
+    assert len(errors) == 1
+    assert errors[0]["callback"] is outer
+    assert isinstance(errors[0]["exception"], asyncio.CancelledError)
+
+
+def test_parking_twice_or_on_empty_queue_is_rejected() -> None:
+    client = AsyncClient(message_delivery="callback", max_pending_callbacks=1)
+
+    async def pending() -> None:
+        return None
+
+    first = pending()
+    second = pending()
+    try:
+        with pytest.raises(RuntimeError, match="no job to follow"):
+            client._delivery._park_inline_continuation(lambda: None, first)
+        client._delivery.callback_queue.put_nowait((lambda: None, (), None))
+        client._delivery._park_inline_continuation(lambda: None, first)
+        with pytest.raises(RuntimeError, match="already parked"):
+            client._delivery._park_inline_continuation(lambda: None, second)
+    finally:
+        client._delivery._discard_inline_continuation()
+        for coro in (first, second):
+            if inspect.getcoroutinestate(coro) != inspect.CORO_CLOSED:
+                coro.close()
+        try:
+            client._delivery.callback_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+        else:
+            client._delivery.callback_queue.task_done()
+
+
+async def test_stop_flag_closes_due_inline_continuation() -> None:
+    client = AsyncClient(message_delivery="callback", max_pending_callbacks=1)
+
+    async def pending() -> None:
+        return None
+
+    coro = pending()
+    client._delivery.callback_queue.put_nowait((lambda: None, (), None))
+    client._delivery._park_inline_continuation(lambda: None, coro)
+    client._delivery._callback_stop = True
+    assert client._delivery._take_due_inline_continuation() is None
+    assert inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED
+    client._delivery.callback_queue.get_nowait()
+    client._delivery.callback_queue.task_done()
+
+
+async def test_stop_flag_skips_close_for_non_coroutine_awaitable() -> None:
+    client = AsyncClient(message_delivery="callback", max_pending_callbacks=1)
+    future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+    future.set_result(None)
+    client._delivery.callback_queue.put_nowait((lambda: None, (), None))
+    client._delivery._park_inline_continuation(lambda: None, future)
+    client._delivery._callback_stop = True
+    assert client._delivery._take_due_inline_continuation() is None
+    assert future.done()
+    client._delivery.callback_queue.get_nowait()
+    client._delivery.callback_queue.task_done()
+
+
+async def test_discard_non_coroutine_awaitable_skips_close() -> None:
+    client = AsyncClient(message_delivery="callback", max_pending_callbacks=1)
+    future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+    future.set_result(None)
+    client._delivery.callback_queue.put_nowait((lambda: None, (), None))
+    client._delivery._park_inline_continuation(lambda: None, future)
+    client._delivery._discard_inline_continuation()
+    assert client._delivery._inline_continuation is None
+    client._delivery.callback_queue.get_nowait()
+    client._delivery.callback_queue.task_done()
+
+
 async def test_filter_mutation_during_dispatch_does_not_change_current_matches() -> None:
     client = AsyncClient(message_delivery="callback")
     seen: list[str] = []
