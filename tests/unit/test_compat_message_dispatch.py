@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import pytest
+
 import mqttium.compat.paho as paho_module
 from mqttium.compat.paho import CallbackAPIVersion, Client
+from mqttium.errors import ProtocolError
 from mqttium.types import Message
 
 
@@ -83,6 +86,17 @@ def test_topic_callback_remove_preserves_dispatch_until_last_filter() -> None:
     client.message_callback_remove("sensors/#")
     assert client._topic_callbacks is None
     assert client._async.on_message is None
+
+
+def test_invalid_filter_does_not_install_matcher_or_dispatch() -> None:
+    client = Client(CallbackAPIVersion.VERSION2)
+
+    with pytest.raises(ProtocolError):
+        client.message_callback_add("sport/#/ranking", lambda *_args: None)
+
+    assert client._topic_callbacks is None
+    assert client._async.on_message is None
+    assert not _has_message_dispatch(client)
 
 
 def test_filtered_dispatch_wraps_once_and_skips_unmatched_allocation(monkeypatch) -> None:

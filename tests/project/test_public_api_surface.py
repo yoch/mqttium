@@ -204,14 +204,17 @@ def test_protocol_lazy_exports_are_complete_and_discoverable() -> None:
 
 
 def test_protocol_and_dispatch_do_not_import_compat() -> None:
-    """Native layers stay independent of the Paho façade."""
+    """Native layers stay independent of the Paho façade and API routing."""
     root = Path(__file__).resolve().parents[2] / "src" / "mqttium"
     offenders: list[str] = []
     for directory in ("protocol", "dispatch"):
         for path in (root / directory).rglob("*.py"):
             text = path.read_text(encoding="utf-8")
+            relative = str(path.relative_to(root))
             if "mqttium.compat" in text:
-                offenders.append(str(path.relative_to(root)))
+                offenders.append(relative)
+            if "mqttium.api" in text:
+                offenders.append(relative)
     engine = (root / "protocol" / "engine.py").read_text(encoding="utf-8")
     if "mqttium.dispatch" in engine:
         offenders.append("protocol/engine.py")
