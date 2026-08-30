@@ -70,6 +70,20 @@ The broker may return a different negotiated expiry. Inspect
 `client.negotiated.session_expiry_interval` after CONNACK when that distinction
 matters operationally.
 
+When the first connection uses an empty ClientID, MQTT 5 requires the broker to
+return an Assigned Client Identifier. MQTTium reuses that identifier for
+durable reconnects made by the same client instance, so `Clean Start=0`
+addresses the same broker Session.
+
+The assigned identifier is not persisted by `InflightStore`. Restart-safe
+session recovery therefore requires an explicit, stable, non-empty `client_id`.
+If a new engine finds resumable QoS state while configured with an empty
+ClientID and `clean_start=False`, it raises `ProtocolError` before sending
+CONNECT rather than replaying that state under a different broker-assigned
+identity. An empty local store cannot reveal broker-only subscriptions from a
+previous process, so applications that depend on retaining those subscriptions
+must also configure a stable ClientID.
+
 ## What SQLite persists
 
 `SqliteInflightStore` persists protocol state that must remain consistent across
@@ -87,7 +101,8 @@ It does not persist:
 - callback and iterator queues;
 - QoS 0 publications after process loss;
 - subscription intent independently of the broker session;
-- credentials, connection targets or reconnect policy.
+- credentials, connection targets or reconnect policy;
+- broker-assigned Client Identifiers.
 
 Applications that must recreate subscriptions when the broker reports no
 session should do so from `on_connect` or their connection workflow.

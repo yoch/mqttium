@@ -36,9 +36,9 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   the reader/effect-drain turn after receipt or delivery settlement. Async
   callbacks, callback bursts, reentrant delivery, and occupied/full callback
   queues retain the bounded callback-worker path and its existing backpressure.
-
-### Fixed
-
+- Reuse an MQTT 5 broker-assigned Client Identifier when reconnecting the same
+  durable Session, and fail before CONNECT when persisted resumable QoS state
+  has no stable ClientID after a process restart.
 - Preserve malformed-packet and packet-too-large classifications across the
   protocol engine/runtime boundary so MQTT 5 fatal DISCONNECT responses use the
   normative reason code instead of falling back to generic Protocol Error.

@@ -89,6 +89,12 @@ class ProtocolEngine:
         self.inbound = InboundSession(self)
         # After a durable session is established, next CONNECT uses Clean Start 0.
         self._prefer_session_resume = False
+        # A broker-assigned MQTT 5 ClientID identifies the same Session as an
+        # application-supplied one. Retain it for reconnects owned by this
+        # engine; persistence stores deliberately contain QoS state, not
+        # connection credentials/identity.
+        self._session_client_id = self.config.client_id or None
+        self._sent_client_id = self.config.client_id
         self._sent_clean_start = False
         self._sent_session_expiry_interval: int | None = None
         self._sent_maximum_packet_size = self.config.maximum_packet_size
@@ -243,6 +249,24 @@ class ProtocolEngine:
     def _send(self, packet: WriteItem) -> None:
         self._emit(EffectKind.SEND, packet)
 
+    def _client_id_for_connect(self, clean_start: bool) -> str:
+        client_id = self.config.client_id
+        if self._prefer_session_resume and not client_id and self._session_client_id:
+            client_id = self._session_client_id
+        if (
+            self.config.protocol == MQTTProtocolVersion.MQTTv5
+            and not client_id
+            and not clean_start
+            and (
+                self.outbound.has_client_session_state() or self.inbound.has_client_session_state()
+            )
+        ):
+            raise ProtocolError(
+                "Cannot resume persisted MQTT 5 session with an empty ClientID; "
+                "configure a stable non-empty client_id for process-restart recovery"
+            )
+        return client_id
+
     def begin_connect(self) -> bytes:
         if self.state in (
             ConnectionState.CONNECTED,
@@ -257,6 +281,7 @@ class ProtocolEngine:
         clean_start = self.config.clean_start
         if self._prefer_session_resume:
             clean_start = False
+        client_id = self._client_id_for_connect(clean_start)
         configured_auth_method = None
         if self.config.connect_properties is not None:
             configured_auth_method = self.config.connect_properties.get("authentication_method")
@@ -281,7 +306,7 @@ class ProtocolEngine:
                 )
         if (
             self.config.protocol == MQTTProtocolVersion.MQTTv311
-            and not self.config.client_id
+            and not client_id
             and not clean_start
         ):
             # [MQTT-3.1.3-7]: a zero-byte ClientId requires CleanSession 1. The
@@ -316,7 +341,7 @@ class ProtocolEngine:
         if will is not None:
             validate_publish_topic(will.topic)
         packet = ConnectPacket(
-            client_id=self.config.client_id,
+            client_id=client_id,
             clean_start=clean_start,
             keepalive=self.config.keepalive,
             username=self.config.username,
@@ -350,6 +375,7 @@ class ProtocolEngine:
             str(configured_auth_method) if configured_auth_method is not None else None
         )
         self._reauth_in_progress = False
+        self._sent_client_id = client_id
         self._sent_clean_start = clean_start
         self._sent_session_expiry_interval = (
             connect_props.get("session_expiry_interval") if connect_props is not None else None
@@ -613,7 +639,7 @@ class ProtocolEngine:
 
     def _validate_accepted_connack(self, connack: ConnAckPacket) -> None:
         """Reject a successful CONNACK whose session claims contradict this Client."""
-        if self.codec.is_mqtt5 and not self.config.client_id:
+        if self.codec.is_mqtt5 and not self._sent_client_id:
             assigned_client_id = (
                 connack.properties.get("assigned_client_identifier")
                 if connack.properties is not None
@@ -685,6 +711,11 @@ class ProtocolEngine:
             requested_session_expiry=self._sent_session_expiry_interval,
             local_client_id=self.config.client_id,
         )
+        assigned_client_id = self.negotiated.assigned_client_identifier
+        if self._sent_client_id:
+            self._session_client_id = self._sent_client_id
+        elif assigned_client_id:
+            self._session_client_id = assigned_client_id
         self.inbound.configure_peer_packet_limit(self.negotiated.maximum_packet_size)
 
         self._reauth_in_progress = False
@@ -982,3 +1013,12 @@ class ProtocolEngine:
             self._prefer_session_resume = bool(expiry)
         else:
             self._prefer_session_resume = not self.config.clean_start
+
+    @property
+    def effective_client_id(self) -> str:
+        """ClientID identifying the active or most recently attempted Session."""
+        return (
+            self.negotiated.assigned_client_identifier
+            or self._sent_client_id
+            or self.config.client_id
+        )

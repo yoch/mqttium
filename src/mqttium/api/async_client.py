@@ -630,7 +630,7 @@ class AsyncClient:
     @property
     def effective_client_id(self) -> str:
         """Configured client id, or the broker-assigned id when one was supplied."""
-        return self.negotiated.effective_client_id(self._engine.config.client_id)
+        return self._engine.effective_client_id
 
     @property
     def _last_disconnect_info(self) -> DisconnectInfo | None:
