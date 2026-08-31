@@ -46,6 +46,26 @@ def _read_key_values(path: Path) -> dict[str, int]:
     return values
 
 
+def _read_process_stat(pid: int) -> dict[str, int]:
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    closing_parenthesis = raw.rfind(")")
+    if closing_parenthesis < 0:
+        return {}
+    fields = raw[closing_parenthesis + 2 :].split()
+    try:
+        return {
+            "minor_faults": int(fields[7]),
+            "major_faults": int(fields[9]),
+            "user_ticks": int(fields[11]),
+            "system_ticks": int(fields[12]),
+        }
+    except (IndexError, ValueError):
+        return {}
+
+
 def _time_in_state() -> dict[str, int]:
     values: dict[str, int] = {}
     path = CPUFREQ_ROOT / "stats" / "time_in_state"
@@ -127,6 +147,8 @@ def _run_worker(args: argparse.Namespace, iteration: int) -> dict[str, Any]:
     sampled_frequencies: list[int] = []
     last_status: dict[str, int] = {}
     last_io: dict[str, int] = {}
+    fault_timeline: list[dict[str, int]] = []
+    worker_cgroup: str | None = None
     wall_started = time.perf_counter()
 
     with tempfile.TemporaryDirectory(prefix="mqttium-worker-diagnosis-") as directory:
@@ -153,10 +175,25 @@ def _run_worker(args: argparse.Namespace, iteration: int) -> dict[str, Any]:
                     sampled_frequencies.append(frequency)
                 status = _read_key_values(Path(f"/proc/{process.pid}/status"))
                 io_values = _read_key_values(Path(f"/proc/{process.pid}/io"))
+                process_stat = _read_process_stat(process.pid)
                 if status:
                     last_status = status
                 if io_values:
                     last_io = io_values
+                if process_stat:
+                    fault_timeline.append(
+                        {
+                            "elapsed_ms": round((time.perf_counter() - wall_started) * 1000),
+                            **process_stat,
+                        }
+                    )
+                if worker_cgroup is None:
+                    try:
+                        worker_cgroup = (
+                            Path(f"/proc/{process.pid}/cgroup").read_text(encoding="utf-8").strip()
+                        )
+                    except OSError:
+                        pass
                 time.sleep(args.sample_interval)
             returncode = os.waitstatus_to_exitcode(wait_status)
             process.returncode = returncode
@@ -193,6 +230,8 @@ def _run_worker(args: argparse.Namespace, iteration: int) -> dict[str, Any]:
             "sample_count": len(sampled_frequencies),
             "last_proc_status": last_status,
             "last_proc_io": last_io,
+            "fault_timeline": fault_timeline,
+            "worker_cgroup": worker_cgroup,
             "time_in_state_delta": tick_delta,
             "before": before,
             "after": after,
