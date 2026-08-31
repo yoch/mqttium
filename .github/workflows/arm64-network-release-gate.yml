@@ -68,19 +68,34 @@ jobs:
           path: candidate
           persist-credentials: false
 
-      - name: Set up Python 3.13 control runtime
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
-        with:
-          python-version: "3.13"
-          architecture: arm64
+      - name: Extract Debian Python 3.13 control runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$JOB_ROOT/python313"
+          mkdir -p "$root/debs" "$root/rootfs"
+          cd "$root/debs"
+          for package in \
+            python3.13-minimal \
+            libpython3.13-minimal \
+            python3.13 \
+            libpython3.13-stdlib
+          do
+            apt-get download "$package"
+          done
+          for archive in ./*.deb; do
+            dpkg-deb -x "$archive" "$root/rootfs"
+          done
+          echo "$root/rootfs/usr/bin" >> "$GITHUB_PATH"
+          echo "PYTHONHOME=$root/rootfs/usr" >> "$GITHUB_ENV"
 
       - name: Verify dedicated runner
         shell: bash
         run: |
           set -euo pipefail
           test "$(uname -m)" = "aarch64"
-          command -v python
-          python --version
+          command -v python3.13
+          python3.13 --version
           command -v mosquitto
           command -v mosquitto_sub
           command -v taskset
@@ -95,6 +110,7 @@ jobs:
           done
 
       - name: Create isolated virtual environment
+        if: false
         shell: bash
         run: |
           set -euo pipefail
@@ -104,6 +120,7 @@ jobs:
           echo "$JOB_ROOT/venv/bin" >> "$GITHUB_PATH"
 
       - name: Install probe dependency
+        if: false
         run: python -m pip install "psutil>=6,<8"
 
       - name: Start isolated broker on CPU 0
@@ -152,7 +169,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          taskset -c 3 python harness/benchmarks/runner_network_diagnosis.py \
+          taskset -c 3 python3.13 harness/benchmarks/runner_network_diagnosis.py \
             --root base \
             --engine harness/benchmarks/paired_network.py \
             --iterations 32 \
@@ -176,7 +193,7 @@ jobs:
             exit 0
           fi
           setarch "$architecture" -R taskset -c 3 \
-            python harness/benchmarks/runner_network_diagnosis.py \
+            python3.13 harness/benchmarks/runner_network_diagnosis.py \
             --root base \
             --engine harness/benchmarks/paired_network.py \
             --iterations 12 \
