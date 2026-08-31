@@ -167,8 +167,8 @@ def _support_cpu_only(cpu: int) -> None:
     os.sched_setaffinity(0, {cpu})
 
 
-def _worker_command(args: argparse.Namespace) -> list[str]:
-    return [
+def _worker_command(args: argparse.Namespace, iteration: int) -> list[str]:
+    worker = [
         sys.executable,
         str(args.engine.resolve()),
         "--worker",
@@ -191,13 +191,31 @@ def _worker_command(args: argparse.Namespace) -> list[str]:
         "--cpu",
         str(args.publisher_cpu),
     ]
+    if args.perf_output_dir is None:
+        return worker
+    perf_data = args.perf_output_dir / f"worker-{iteration:02d}.data"
+    return [
+        "perf",
+        "record",
+        "--quiet",
+        "--event",
+        "page-faults:u",
+        "--count",
+        str(args.perf_period),
+        "--call-graph",
+        "fp",
+        "--output",
+        str(perf_data),
+        "--",
+        *worker,
+    ]
 
 
 def _run_worker(args: argparse.Namespace, iteration: int) -> dict[str, Any]:
     environment = os.environ.copy()
     environment["PYTHONPATH"] = str(args.root.resolve() / "src")
     environment["PYTHONHASHSEED"] = "0"
-    command = _worker_command(args)
+    command = _worker_command(args, iteration)
     before = _host_snapshot()
     sampled_frequencies: list[int] = []
     last_status: dict[str, int] = {}
@@ -346,8 +364,14 @@ def main() -> int:
     parser.add_argument("--publisher-cpu", type=int, default=2)
     parser.add_argument("--support-cpu", type=int, default=1)
     parser.add_argument("--sample-interval", type=float, default=0.02)
+    parser.add_argument("--perf-output-dir", type=Path)
+    parser.add_argument("--perf-period", type=int, default=100)
+    parser.add_argument("--stop-after-self-minor-faults", type=int)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+
+    if args.perf_output_dir is not None:
+        args.perf_output_dir.mkdir(parents=True, exist_ok=True)
 
     rows: list[dict[str, Any]] = []
     for iteration in range(1, args.iterations + 1):
@@ -366,6 +390,9 @@ def main() -> int:
             ),
             flush=True,
         )
+        stop_threshold = args.stop_after_self_minor_faults
+        if stop_threshold is not None and worker["self_minor_faults"] >= stop_threshold:
+            break
 
     payload = {
         "metadata": {
@@ -377,6 +404,7 @@ def main() -> int:
             "support_cpu": args.support_cpu,
             "monitor_affinity": sorted(os.sched_getaffinity(0)),
             "randomize_va_space": _read_int(Path("/proc/sys/kernel/randomize_va_space")),
+            "perf_period": args.perf_period if args.perf_output_dir is not None else None,
             "monitor_personality": Path("/proc/self/personality")
             .read_text(encoding="utf-8")
             .strip(),
