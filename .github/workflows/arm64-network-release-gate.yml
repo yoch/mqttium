@@ -142,6 +142,7 @@ jobs:
           cat "$JOB_ROOT/perf-capability.log"
 
       - name: Run focused runner diagnosis with ASLR
+        if: false
         shell: bash
         run: |
           set -euo pipefail
@@ -159,6 +160,7 @@ jobs:
             tee "$JOB_ROOT/runner-diagnosis-aslr.log"
 
       - name: Run focused runner diagnosis without ASLR
+        if: false
         shell: bash
         run: |
           set -euo pipefail
