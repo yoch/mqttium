@@ -129,22 +129,46 @@ jobs:
           cat "$root/mosquitto.log"
           exit 1
 
-      - name: Run focused runner diagnosis
+      - name: Run focused runner diagnosis with ASLR
         shell: bash
         run: |
           set -euo pipefail
           taskset -c 3 python harness/benchmarks/runner_network_diagnosis.py \
             --root base \
             --engine harness/benchmarks/paired_network.py \
-            --iterations 16 \
+            --iterations 12 \
             --count 26000 \
             --window 1 \
             --protocol 311 \
             --completion callback \
             --publisher-cpu 2 \
             --support-cpu 1 \
-            --output "$JOB_ROOT/runner-diagnosis-timeline.json" | \
-            tee "$JOB_ROOT/runner-diagnosis-timeline.log"
+            --output "$JOB_ROOT/runner-diagnosis-aslr.json" | \
+            tee "$JOB_ROOT/runner-diagnosis-aslr.log"
+
+      - name: Run focused runner diagnosis without ASLR
+        shell: bash
+        run: |
+          set -euo pipefail
+          architecture="$(uname -m)"
+          if ! setarch "$architecture" -R true; then
+            printf '%s\n' '{"available": false, "reason": "setarch -R denied"}' \
+              > "$JOB_ROOT/runner-diagnosis-no-aslr.json"
+            exit 0
+          fi
+          setarch "$architecture" -R taskset -c 3 \
+            python harness/benchmarks/runner_network_diagnosis.py \
+            --root base \
+            --engine harness/benchmarks/paired_network.py \
+            --iterations 12 \
+            --count 26000 \
+            --window 1 \
+            --protocol 311 \
+            --completion callback \
+            --publisher-cpu 2 \
+            --support-cpu 1 \
+            --output "$JOB_ROOT/runner-diagnosis-no-aslr.json" | \
+            tee "$JOB_ROOT/runner-diagnosis-no-aslr.log"
 
       - name: Run strict network release gate
         if: false
@@ -182,8 +206,8 @@ jobs:
             ${{ runner.temp }}/mqttium-${{ github.run_id }}-${{ github.run_attempt }}/*.md
             ${{ runner.temp }}/mqttium-${{ github.run_id }}-${{ github.run_attempt }}/*-raw/*
             ${{ runner.temp }}/mqttium-${{ github.run_id }}-${{ github.run_attempt }}/mosquitto.log
-            ${{ runner.temp }}/mqttium-${{ github.run_id }}-${{ github.run_attempt }}/runner-diagnosis.json
-            ${{ runner.temp }}/mqttium-${{ github.run_id }}-${{ github.run_attempt }}/runner-diagnosis.log
+            ${{ runner.temp }}/mqttium-${{ github.run_id }}-${{ github.run_attempt }}/runner-diagnosis-*.json
+            ${{ runner.temp }}/mqttium-${{ github.run_id }}-${{ github.run_attempt }}/runner-diagnosis-*.log
           if-no-files-found: warn
           retention-days: 30
 

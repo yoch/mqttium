@@ -66,6 +66,57 @@ def _read_process_stat(pid: int) -> dict[str, int]:
         return {}
 
 
+def _read_memory_layout(pid: int) -> dict[str, Any]:
+    try:
+        executable = os.readlink(f"/proc/{pid}/exe")
+        mappings = Path(f"/proc/{pid}/maps").read_text(encoding="utf-8").splitlines()
+        personality = Path(f"/proc/{pid}/personality").read_text(encoding="utf-8").strip()
+    except OSError:
+        return {}
+
+    selected: dict[str, str] = {}
+    anonymous_rw_bytes = 0
+    anonymous_rw_mappings = 0
+    for line in mappings:
+        fields = line.split(maxsplit=5)
+        if len(fields) < 5:
+            continue
+        address, permissions, _offset, _device, _inode = fields[:5]
+        path = fields[5] if len(fields) == 6 else ""
+        start_text, _, end_text = address.partition("-")
+        try:
+            size = int(end_text, 16) - int(start_text, 16)
+        except ValueError:
+            continue
+        if not path and permissions.startswith("rw"):
+            anonymous_rw_mappings += 1
+            anonymous_rw_bytes += size
+
+        basename = Path(path).name if path.startswith("/") else path
+        key: str | None = None
+        if path == executable and "x" in permissions:
+            key = "python_text"
+        elif "libpython" in basename and "x" in permissions:
+            key = "libpython_text"
+        elif basename.startswith("libc.so") and "x" in permissions:
+            key = "libc_text"
+        elif basename.startswith("libm.so") and "x" in permissions:
+            key = "libm_text"
+        elif path in {"[heap]", "[stack]", "[vdso]", "[vvar]"}:
+            key = path[1:-1]
+        if key is not None and key not in selected:
+            selected[key] = f"0x{int(start_text, 16):x}"
+
+    return {
+        "executable": executable,
+        "personality": personality,
+        "selected_bases": selected,
+        "mapping_count": len(mappings),
+        "anonymous_rw_mapping_count": anonymous_rw_mappings,
+        "anonymous_rw_bytes": anonymous_rw_bytes,
+    }
+
+
 def _time_in_state() -> dict[str, int]:
     values: dict[str, int] = {}
     path = CPUFREQ_ROOT / "stats" / "time_in_state"
@@ -149,6 +200,7 @@ def _run_worker(args: argparse.Namespace, iteration: int) -> dict[str, Any]:
     last_io: dict[str, int] = {}
     fault_timeline: list[dict[str, int]] = []
     worker_cgroup: str | None = None
+    memory_layout: dict[str, Any] = {}
     wall_started = time.perf_counter()
 
     with tempfile.TemporaryDirectory(prefix="mqttium-worker-diagnosis-") as directory:
@@ -194,6 +246,8 @@ def _run_worker(args: argparse.Namespace, iteration: int) -> dict[str, Any]:
                         )
                     except OSError:
                         pass
+                if not memory_layout and time.perf_counter() - wall_started >= 0.2:
+                    memory_layout = _read_memory_layout(process.pid)
                 time.sleep(args.sample_interval)
             returncode = os.waitstatus_to_exitcode(wait_status)
             process.returncode = returncode
@@ -232,6 +286,7 @@ def _run_worker(args: argparse.Namespace, iteration: int) -> dict[str, Any]:
             "last_proc_io": last_io,
             "fault_timeline": fault_timeline,
             "worker_cgroup": worker_cgroup,
+            "memory_layout": memory_layout,
             "time_in_state_delta": tick_delta,
             "before": before,
             "after": after,
@@ -317,6 +372,10 @@ def main() -> int:
             "publisher_cpu": args.publisher_cpu,
             "support_cpu": args.support_cpu,
             "monitor_affinity": sorted(os.sched_getaffinity(0)),
+            "randomize_va_space": _read_int(Path("/proc/sys/kernel/randomize_va_space")),
+            "monitor_personality": Path("/proc/self/personality")
+            .read_text(encoding="utf-8")
+            .strip(),
         },
         "summary": _summarize(rows),
         "rows": rows,
