@@ -145,6 +145,14 @@ jobs:
             perf stat -e page-faults:u true 2>&1 || true
           } > "$JOB_ROOT/perf-capability.log"
           cat "$JOB_ROOT/perf-capability.log"
+          {
+            printf '%s\n' '=== libc dynamic symbols around allocator ==='
+            nm -D -n /usr/lib/aarch64-linux-gnu/libc.so.6 | \
+              sed -n '/^000000000009/p'
+            printf '%s\n' '=== Python dynamic symbols around socket recv ==='
+            nm -D -n /usr/bin/python3.14 | \
+              sed -n '/^00000000006[de]/p'
+          } > "$JOB_ROOT/allocator-symbols.log" 2>&1 || true
 
       - name: Profile page-fault modes with ASLR
         shell: bash
@@ -190,6 +198,26 @@ jobs:
             --perf-period 100 \
             --output "$JOB_ROOT/runner-diagnosis-no-aslr.json" | \
             tee "$JOB_ROOT/runner-diagnosis-no-aslr.log"
+
+      - name: Prove glibc mmap threshold causality
+        shell: bash
+        run: |
+          set -euo pipefail
+          for threshold in 131072 1048576; do
+            MALLOC_MMAP_THRESHOLD_="$threshold" taskset -c 3 \
+              python3.14 harness/benchmarks/runner_network_diagnosis.py \
+              --root base \
+              --engine harness/benchmarks/paired_network.py \
+              --iterations 12 \
+              --count 13000 \
+              --window 1 \
+              --protocol 311 \
+              --completion callback \
+              --publisher-cpu 2 \
+              --support-cpu 1 \
+              --output "$JOB_ROOT/runner-diagnosis-mmap-$threshold.json" | \
+              tee "$JOB_ROOT/runner-diagnosis-mmap-$threshold.log"
+          done
 
       - name: Decode perf evidence
         if: always()
@@ -245,6 +273,7 @@ jobs:
             ${{ runner.temp }}/mqttium-${{ github.run_id }}-${{ github.run_attempt }}/*-raw/*
             ${{ runner.temp }}/mqttium-${{ github.run_id }}-${{ github.run_attempt }}/mosquitto.log
             ${{ runner.temp }}/mqttium-${{ github.run_id }}-${{ github.run_attempt }}/perf-capability.log
+            ${{ runner.temp }}/mqttium-${{ github.run_id }}-${{ github.run_attempt }}/allocator-symbols.log
             ${{ runner.temp }}/mqttium-${{ github.run_id }}-${{ github.run_attempt }}/runner-diagnosis-*.json
             ${{ runner.temp }}/mqttium-${{ github.run_id }}-${{ github.run_attempt }}/runner-diagnosis-*.log
             ${{ runner.temp }}/mqttium-${{ github.run_id }}-${{ github.run_attempt }}/perf-*/*
