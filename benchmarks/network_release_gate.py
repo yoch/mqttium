@@ -373,6 +373,7 @@ def _fresh_preflight(
     label: str,
     raw_dir: Path,
     quiet_seconds: float,
+    ignore_historical_load: bool,
 ) -> Path:
     if quiet_seconds > 0:
         print(f"{label}: fixed inter-block quiet period {quiet_seconds:.0f}s")
@@ -386,6 +387,8 @@ def _fresh_preflight(
         "--require-temperature",
         "--enforce",
     ]
+    if ignore_historical_load:
+        command.append("--ignore-historical-load")
     completed = subprocess.run(command, check=False)
     if completed.returncode:
         raise RuntimeError(f"{label}: fresh runner preflight failed")
@@ -493,6 +496,7 @@ def _run_phase(
     initial_quiet_seconds: float,
     blocks: int,
     cycle_seeds: list[int],
+    check_historical_load: bool,
 ) -> dict[str, Any]:
     if blocks < 1:
         raise ValueError("phase must acquire at least one block")
@@ -507,6 +511,7 @@ def _run_phase(
             label=block_label,
             raw_dir=raw_dir,
             quiet_seconds=quiet_seconds,
+            ignore_historical_load=not (check_historical_load and block == 0),
         )
         for hash_seed in cycle_seeds:
             cycle_label = f"{block_label}-seed-{hash_seed}"
@@ -646,6 +651,7 @@ def parent(args: argparse.Namespace) -> int:
             initial_quiet_seconds=0.0,
             blocks=args.control_blocks,
             cycle_seeds=args.control_cycle_seeds,
+            check_historical_load=True,
         )
         base_control = _control_evaluations(args, base_control_payload)
         result["base_control"] = [_evaluation_dict(item) for item in base_control]
@@ -665,6 +671,7 @@ def parent(args: argparse.Namespace) -> int:
             initial_quiet_seconds=args.inter_phase_quiet_seconds,
             blocks=args.control_blocks,
             cycle_seeds=args.control_cycle_seeds,
+            check_historical_load=False,
         )
         candidate_control = _control_evaluations(args, candidate_control_payload)
         result["candidate_control"] = [_evaluation_dict(item) for item in candidate_control]
@@ -684,6 +691,7 @@ def parent(args: argparse.Namespace) -> int:
             initial_quiet_seconds=args.inter_phase_quiet_seconds,
             blocks=args.ab_blocks,
             cycle_seeds=args.cycle_seeds,
+            check_historical_load=False,
         )
         ab = evaluate_ab_payload(
             ab_payload,

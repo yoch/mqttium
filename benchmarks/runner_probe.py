@@ -75,6 +75,11 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--interval", type=float, default=1.0)
     parser.add_argument("--max-load-per-cpu", type=float, default=0.25)
+    parser.add_argument(
+        "--ignore-historical-load",
+        action="store_true",
+        help="ignore the one-minute load average while retaining instantaneous checks",
+    )
     parser.add_argument("--max-cpu-percent", type=float, default=20.0)
     parser.add_argument("--max-temperature-c", type=float, default=80.0)
     parser.add_argument("--required-governor", default="performance")
@@ -115,7 +120,7 @@ def main() -> None:
         parser.error("--consecutive-eligible > 1 requires --wait-seconds > 0")
 
     limits = PreflightLimits(
-        max_load_per_cpu=args.max_load_per_cpu,
+        max_load_per_cpu=None if args.ignore_historical_load else args.max_load_per_cpu,
         max_cpu_percent=args.max_cpu_percent,
         max_temperature_c=args.max_temperature_c,
         required_governor=args.required_governor or None,

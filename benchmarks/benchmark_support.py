@@ -91,7 +91,7 @@ def runner_metadata(*, broker_version_command: list[str] | None = None) -> dict[
 
 @dataclass(frozen=True, slots=True)
 class PreflightLimits:
-    max_load_per_cpu: float = 0.25
+    max_load_per_cpu: float | None = 0.25
     max_cpu_percent: float = 20.0
     max_temperature_c: float = 80.0
     required_governor: str | None = "performance"
@@ -128,7 +128,7 @@ def evaluate_preflight(sample: dict[str, Any], limits: PreflightLimits) -> list[
     """Return reasons that make a sample unsuitable as gate evidence."""
     failures: list[str] = []
     load = float(sample["load_1m_per_cpu"])
-    if load > limits.max_load_per_cpu:
+    if limits.max_load_per_cpu is not None and load > limits.max_load_per_cpu:
         failures.append(f"1-minute load per CPU {load:.3f} exceeds {limits.max_load_per_cpu:.3f}")
     cpu = float(sample["cpu_percent"])
     if cpu > limits.max_cpu_percent:
