@@ -108,6 +108,7 @@ jobs:
         run: |
           set -euo pipefail
           root="$JOB_ROOT"
+          mkdir -p "$root"
           cat > "$root/mosquitto.conf" <<'EOF'
           persistence false
           allow_anonymous true
