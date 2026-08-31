@@ -6,6 +6,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [1.0.0rc11] - 2026-08-30
+
 ### Added
 
 - Add Stable `AsyncClient.message_callback_add` / `message_callback_remove` for
@@ -18,6 +20,11 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Changed
 
+- Stabilize the manual ARM64 network release gate by fixing the measured process
+  address layout, using six-cycle same-code controls, and checking historical
+  host load only before the first block. Later blocks retain instantaneous CPU,
+  temperature, and governor checks without waiting for their own one-minute load
+  average to decay.
 - Correct the Paho compatibility design notes to state the normative MQTT 5
   Receive Maximum behavior for QoS 2: successful PUBREC keeps the sender's
   quota slot until PUBCOMP, failed PUBREC releases it, and PUBREL does not
@@ -974,7 +981,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - Pre-spin-out comparative analysis and generated coverage data from the
   published source tree.
 
-[Unreleased]: https://github.com/yoch/mqttium/compare/v1.0.0rc10...HEAD
+[Unreleased]: https://github.com/yoch/mqttium/compare/v1.0.0rc11...HEAD
+[1.0.0rc11]: https://github.com/yoch/mqttium/compare/v1.0.0rc10...v1.0.0rc11
 [1.0.0rc10]: https://github.com/yoch/mqttium/compare/v1.0.0rc9...v1.0.0rc10
 [1.0.0rc9]: https://github.com/yoch/mqttium/compare/v1.0.0rc8...v1.0.0rc9
 [1.0.0rc8]: https://github.com/yoch/mqttium/compare/v1.0.0rc7...v1.0.0rc8

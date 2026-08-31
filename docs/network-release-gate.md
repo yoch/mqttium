@@ -11,8 +11,8 @@ silently redefine release criteria.
 ## Intended use and cost
 
 This is a **deep, manual release/audit gate**, not routine CI. On the dedicated
-Raspberry Pi 5 ARM64 runner, the protocol takes roughly 10-15 minutes: a short
-same-code smoke for each tree, then the full A/B. Do not add it to push,
+Raspberry Pi 5 ARM64 runner, the protocol takes several minutes: a same-code
+control for each tree, then the full A/B. Do not add it to push,
 pull-request or normal `main` workflows.
 
 GitHub provides `.github/workflows/arm64-network-release-gate.yml` as an explicit
@@ -27,21 +27,23 @@ microbenchmarks instead.
 A release-grade run is fail-closed and executes these phases in order:
 
 1. fresh dedicated-runner preflight;
-2. baseline same-code A/A **smoke** (one block, three ABBA cycles);
-3. fixed 30-second quiet period and fresh preflight;
-4. candidate same-code A/A **smoke** (one block, three ABBA cycles);
-5. fixed 30-second quiet period and fresh preflight;
+2. baseline same-code A/A control (two blocks, six ABBA cycles);
+3. fresh preflight;
+4. candidate same-code A/A control (two blocks, six ABBA cycles);
+5. fresh preflight;
 6. baseline-versus-candidate A/B, only if both controls passed (two blocks,
    six seeds, twelve ABBA cycles).
 
-Same-code controls exist to catch a drunk host or a broken acquisition chain.
-They keep the same bias and equivalence numeric bands as A/B, but they do not
-repeat the full 12-cycle schedule. The no-regression decision is the A/B phase.
+Same-code controls exist to catch a busy host or a broken acquisition chain.
+They keep the same bias and equivalence numeric bands as A/B, with half of the
+12-cycle A/B schedule. The no-regression decision is the A/B phase. The gate
+never retries preflight until the host happens to look eligible.
 
-The quiet periods are deterministic. The gate never retries preflight until the
-host happens to look eligible. `runner_probe.py` uses the one-minute load average,
-so a 30-second pause is a compromise: it is long enough to drop the worst of a
-short control, and leftover load still fails closed at the next preflight.
+The initial preflight checks both instantaneous CPU use and the one-minute load
+average. Later preflights keep the instantaneous CPU, temperature and governor
+checks but ignore the historical load average, because that moving average then
+contains the gate's own preceding block. This detects active competing work
+without requiring a minute of idle time between blocks.
 
 A failed A/A invalidates the experiment. The A/B phase is not interpreted when
 the measurement chain cannot demonstrate bounded same-code bias and adequate
@@ -60,12 +62,12 @@ The validated default **A/B** cell is:
 - one complete ABBA cycle per seed and block;
 - therefore **12 complete ABBA cycles / 24 paired samples per scenario**;
 - approximately two seconds target duration per low-level sample;
-- 30-second fixed quiet periods between A/B blocks and between phases.
+- a fresh host preflight before every phase.
 
-Same-code A/A controls use the same cells, thresholds and sample duration, but
-only **one block** and seeds `0,1,2` (three ABBA cycles). That is enough to
-reject a biased or broken host without spending two-thirds of the wall clock on
-same-code repetition.
+Same-code A/A controls use the same cells, thresholds and sample duration, with
+**two blocks** and seeds `0,1,2` (six ABBA cycles). Three cycles were sufficient
+to reject gross instability but produced unnecessarily wide Student-t intervals
+for the batch-shaped cells.
 
 On the four-core ARM64 runner, use:
 
@@ -73,8 +75,26 @@ On the four-core ARM64 runner, use:
 - gate, subscriber and observer: CPUs 1 and 3;
 - publisher worker: CPU 2.
 
-Launch the gate under `taskset -c 1,3`, pass `--cpu 2`, and start Mosquitto
-separately under `taskset -c 0`.
+Launch the gate under `setarch "$(uname -m)" -R taskset -c 1,3`, pass `--cpu 2`,
+and start Mosquitto separately under `taskset -c 0`.
+
+### Why the release gate fixes the process address layout
+
+CPython's selector socket transport passes a 256 KiB buffer size to `recv()`.
+On the runner's glibc 2.43 build, randomized fresh processes can consequently
+fall into distinct allocator regimes: the normal regime incurs roughly 500
+minor faults for a 13,000-message sample, while the slow regime incurs roughly
+26,500 — two faults per message — and loses about 25% throughput. `perf`
+attributed about 90% of the slow process's sampled faults to
+`PyBytes_FromStringAndSize()` and its libc allocation path. Python 3.13.15 and
+3.14.6 both reproduce the modes, so this is not a Python 3.14 regression or a
+busy runner.
+
+The release gate therefore disables ASLR for every measured process. This fixes
+one reproducible address layout for a sensitive same-host code comparison; it
+does not widen an acceptance threshold or select among completed results. A
+fixed-layout result supports the relative A/B decision, but is not evidence that
+absolute production performance is invariant across randomized layouts.
 
 ### Why window 8 is not a release point
 
@@ -174,20 +194,21 @@ Run Mosquitto separately on the dedicated benchmark host, then compare exact
 checkouts/worktrees:
 
 ```bash
-taskset -c 1,3 python benchmarks/network_release_gate.py \
+setarch "$(uname -m)" -R taskset -c 1,3 \
+  python benchmarks/network_release_gate.py \
   --base-root "$BASE" \
   --candidate-root "$CANDIDATE" \
   --protocols 311 \
   --completions callback \
   --payloads 64 \
   --windows 1,20,64 \
-  --control-blocks 1 \
+  --control-blocks 2 \
   --control-cycle-seeds 0,1,2 \
   --ab-blocks 2 \
   --cycle-seeds 0,1,2,3,4,5 \
   --target-sample-seconds 2.0 \
   --cpu 2 \
-  --inter-phase-quiet-seconds 30 \
+  --inter-phase-quiet-seconds 0 \
   --policy strict \
   --output /tmp/mqttium-network-release.json
 ```
