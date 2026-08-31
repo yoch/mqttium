@@ -39,6 +39,12 @@ They keep the same bias and equivalence numeric bands as A/B, with half of the
 12-cycle A/B schedule. The no-regression decision is the A/B phase. The gate
 never retries preflight until the host happens to look eligible.
 
+The initial preflight checks both instantaneous CPU use and the one-minute load
+average. Later preflights keep the instantaneous CPU, temperature and governor
+checks but ignore the historical load average, because that moving average then
+contains the gate's own preceding block. This detects active competing work
+without requiring a minute of idle time between blocks.
+
 A failed A/A invalidates the experiment. The A/B phase is not interpreted when
 the measurement chain cannot demonstrate bounded same-code bias and adequate
 precision.

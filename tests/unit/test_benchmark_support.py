@@ -36,3 +36,17 @@ def test_temperature_can_be_required_on_a_dedicated_runner() -> None:
     )
 
     assert failures == ["temperature sensors are unavailable"]
+
+
+def test_historical_load_can_be_ignored_after_initial_preflight() -> None:
+    failures = evaluate_preflight(
+        {
+            "load_1m_per_cpu": 4.0,
+            "cpu_percent": 0.0,
+            "max_temperature_c": 50.0,
+            "cpu_governors": ["performance"],
+        },
+        PreflightLimits(max_load_per_cpu=None),
+    )
+
+    assert failures == []

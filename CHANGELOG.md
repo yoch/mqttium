@@ -20,6 +20,11 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Changed
 
+- Stabilize the manual ARM64 network release gate by fixing the measured process
+  address layout, using six-cycle same-code controls, and checking historical
+  host load only before the first block. Later blocks retain instantaneous CPU,
+  temperature, and governor checks without waiting for their own one-minute load
+  average to decay.
 - Correct the Paho compatibility design notes to state the normative MQTT 5
   Receive Maximum behavior for QoS 2: successful PUBREC keeps the sender's
   quota slot until PUBCOMP, failed PUBREC releases it, and PUBREL does not

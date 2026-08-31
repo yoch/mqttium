@@ -10,6 +10,7 @@ import pytest
 
 from benchmarks.network_release_gate import (
     _combine_phase_payloads,
+    _fresh_preflight,
     _parse_control_cycle_seeds,
     _parse_cycle_seeds,
     _run_engine_cycle,
@@ -251,6 +252,33 @@ def test_seeded_engine_cycle_sets_pythonhashseed(
         hash_seed=5,
     )
     assert payload["status"] == "passed"
+
+
+def test_followup_preflight_ignores_only_historical_load(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    captured: list[str] = []
+
+    def fake_run(command: list[str], *, check: bool) -> SimpleNamespace:
+        assert check is False
+        captured.extend(command)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("benchmarks.network_release_gate.subprocess.run", fake_run)
+    args = SimpleNamespace(runner_probe=Path("benchmarks/runner_probe.py"))
+
+    report = _fresh_preflight(
+        args,
+        label="followup",
+        raw_dir=tmp_path,
+        quiet_seconds=0.0,
+        ignore_historical_load=True,
+    )
+
+    assert report == tmp_path / "followup-preflight.json"
+    assert "--ignore-historical-load" in captured
+    assert "--require-temperature" in captured
+    assert "--enforce" in captured
 
 
 def test_raw_arm_cv_is_diagnostic_when_abba_estimator_is_precise() -> None:
