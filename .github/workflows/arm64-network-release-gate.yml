@@ -199,7 +199,7 @@ jobs:
             --payloads 64 \
             --windows 1,20,64 \
             --control-blocks 1 \
-            --control-cycle-seeds 0,1 \
+            --control-cycle-seeds 0,1,2 \
             --ab-blocks 1 \
             --cycle-seeds 0,1,2,3,4,5 \
             --target-sample-seconds 1.0 \
