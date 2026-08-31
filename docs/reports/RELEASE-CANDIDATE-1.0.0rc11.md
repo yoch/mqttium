@@ -4,6 +4,8 @@ Candidate source before release metadata:
 `a9050562f5186dec0f9b0d081f43419dfa4794c8` (`main`, 2026-08-30).
 Release metadata and hosted-candidate commit:
 `c6ffabc24653778f35112cfb8f153456c20f2835`.
+Final evidence/harness commit:
+`222971802589d303cb5c46bc1baa3e4254d49a0d`.
 
 ## Scope
 
@@ -68,7 +70,7 @@ tests, and the strict documentation build.
 
 ## Hosted matrix and exact distributions
 
-The exact `c6ffabc` PR head passed repository quality, Python 3.11–3.14,
+The exact `2229718` PR head passed repository quality, Python 3.11–3.14,
 Linux MQTT 3.1.1/MQTT 5 soaks, resilience, fuzz, package validation, macOS
 3.11/3.14, Windows 3.11/3.14, Codecov, Read the Docs and the `CI required`
 aggregate. The pull-request publication workflow built one wheel and one sdist,
@@ -80,39 +82,47 @@ The downloaded Actions artifact passed strict Twine and wheel-content checks.
 Its SHA-256 values are:
 
 - wheel: `d98c52fb3e96beea03a524d0796c7b2fc9cc46060c0582c7450865b29b6e0675`;
-- sdist: `42eaa9b6ede91f9c9972d8043622709ce1f8c37954e1101b6d14e3782d5446bd`.
+- sdist: `7c379e45df8a6383100fbfe5d1c8d7681c848201aeba6c8799fab28d85569629`.
 
 ## ARM64 network-gate validity
 
-Two fresh strict ARM64 workflow attempts compared exact baseline
-`1cd4dce6d3e6169323faa1c1d6a19f9d4597402a` (`v1.0.0rc10`) with exact
-candidate `c6ffabc`. Both passed the dedicated-runner, CPU-governor, broker
-isolation and tool preflight, but both were invalidated by the baseline
-same-code A/A control before candidate controls or A/B acquisition began:
+The failed controls were traced to a process-layout-sensitive allocation mode,
+not to competing runner load or CPU throttling. In the slow mode each inbound
+read caused roughly two additional minor faults per message around asyncio's
+256 KiB receive allocation. It reproduced on Python 3.13 and 3.14 on the same
+host, so it is not a Python 3.14 regression. Pinning the benchmark process
+layout with `setarch -R` removes the bimodality without changing MQTTium, the
+scenario or any acceptance threshold. The runner remains checked for active
+CPU use, temperature, governor and frequency before every block; only the
+one-minute historical-load check is limited to the initial preflight so a
+completed block cannot reject its successor.
 
-- [run 33335615137](https://github.com/yoch/mqttium/actions/runs/33335615137):
-  window 1 throughput estimate 0.9076 and ACK-p50 estimate 1.1116, with wide
-  equivalence intervals; window 64 was stable at 0.9983 and 1.0027;
-- [run 33335763668](https://github.com/yoch/mqttium/actions/runs/33335763668):
-  window 1 estimates moved in the opposite direction to 1.0372 and 0.9437,
-  while confidence intervals at windows 1, 20 and 64 exceeded their strict
-  equivalence bands.
+[Strict run 33381427389](https://github.com/yoch/mqttium/actions/runs/33381427389)
+compared exact baseline `1cd4dce6d3e6169323faa1c1d6a19f9d4597402a`
+(`v1.0.0rc10`) with exact candidate `2229718`. It passed with two independent
+control blocks and two A/B blocks:
 
-Both artifacts contain zero candidate-control scenarios and zero A/B
-scenarios. They therefore establish neither a regression nor equivalence for
-RC11. The opposite movement between same-code attempts is environmental
-instability, not product evidence. No threshold, sample duration, scenario or
-policy was changed, and no third attempt was consumed.
+- baseline A/A throughput ratio 0.9997, 95% CI [0.9953, 1.0041], and ACK-p50
+  ratio 1.0008, 95% CI [0.9972, 1.0045];
+- candidate A/A throughput ratio 1.0008, 95% CI [0.9964, 1.0053], and ACK-p50
+  ratio 0.9996, 95% CI [0.9952, 1.0040];
+- candidate/base throughput ratio 1.0344, 95% CI [1.0185, 1.0505]; and
+- candidate/base ACK-p50 ratio 0.9375, 95% CI [0.9362, 0.9388].
+
+The result represents a 3.44% geometric-mean closed-loop throughput gain and a
+6.25% ACK-p50 reduction at QoS 1, callback completion and window 1. All 24 A/B
+paired samples completed, and neither same-code control showed meaningful
+bias. The scope is deliberately the latency-sensitive window-1 callback path;
+the unchanged functional, resource and cross-platform gates cover the broader
+release.
 
 ## Release decision
 
-RC11 is prepared as a functionally and cross-platform validated source and
-artifact candidate. It is not yet recommended for tagging or publication:
-because the release includes callback hot-path work, the repository's required
-performance evidence must come from a future strict run whose A/A controls are
-valid and whose candidate A/B verdict passes. The invalid controls above must
-not be reinterpreted as either failure or success.
+RC11 is recommended for merge, tagging and prerelease publication. Functional,
+robustness, cross-platform, artifact and strict ARM64 hot-path gates all pass;
+the measured callback change improves both window-1 throughput and ACK latency
+with valid same-code controls.
 
-This evidence-report addition changes no runtime source. The release PR should
-remain open until that performance condition is satisfied or the maintainer
-explicitly makes and records a different release decision.
+This evidence-report addition changes no runtime source. The exact distributions
+above were built from `2229718`; the following report-only commit therefore does
+not alter the validated runtime package contents.
