@@ -90,17 +90,15 @@ jobs:
           done
 
       - name: Create isolated virtual environment
-        if: false
         shell: bash
         run: |
           set -euo pipefail
           rm -rf "$JOB_ROOT"
           mkdir -p "$JOB_ROOT"
-          python -m venv "$JOB_ROOT/venv"
+          python3.14 -m venv "$JOB_ROOT/venv"
           echo "$JOB_ROOT/venv/bin" >> "$GITHUB_PATH"
 
       - name: Install probe dependency
-        if: false
         run: python -m pip install "psutil>=6,<8"
 
       - name: Start isolated broker on CPU 0
