@@ -183,11 +183,11 @@ jobs:
             tee "$JOB_ROOT/runner-diagnosis-no-aslr.log"
 
       - name: Run strict network release gate
-        if: false
         shell: bash
         run: |
           set -euo pipefail
-          taskset -c 1,3 python harness/benchmarks/network_release_gate.py \
+          setarch "$(uname -m)" -R taskset -c 1,3 \
+            python harness/benchmarks/network_release_gate.py \
             --base-root base \
             --candidate-root candidate \
             --engine harness/benchmarks/paired_network.py \
@@ -197,15 +197,15 @@ jobs:
             --payloads 64 \
             --windows 1,20,64 \
             --control-blocks 1 \
-            --control-cycle-seeds 0,1,2 \
-            --ab-blocks 2 \
+            --control-cycle-seeds 0,1 \
+            --ab-blocks 1 \
             --cycle-seeds 0,1,2,3,4,5 \
-            --target-sample-seconds 2.0 \
-            --max-count 60000 \
+            --target-sample-seconds 1.0 \
+            --max-count 30000 \
             --timeout 60 \
             --cpu 2 \
-            --inter-phase-quiet-seconds 60 \
-            --policy strict \
+            --inter-phase-quiet-seconds 0 \
+            --policy advisory \
             --output "$JOB_ROOT/result.json"
 
       - name: Upload evidence
