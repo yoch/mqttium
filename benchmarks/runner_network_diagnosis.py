@@ -75,6 +75,7 @@ def _read_memory_layout(pid: int) -> dict[str, Any]:
         return {}
 
     selected: dict[str, str] = {}
+    executable_mapping_bases: dict[str, str] = {}
     anonymous_rw_bytes = 0
     anonymous_rw_mappings = 0
     for line in mappings:
@@ -93,6 +94,8 @@ def _read_memory_layout(pid: int) -> dict[str, Any]:
             anonymous_rw_bytes += size
 
         basename = Path(path).name if path.startswith("/") else path
+        if path.startswith("/") and "x" in permissions and path not in executable_mapping_bases:
+            executable_mapping_bases[path] = f"0x{int(start_text, 16):x}"
         key: str | None = None
         if path == executable and "x" in permissions:
             key = "python_text"
@@ -111,6 +114,7 @@ def _read_memory_layout(pid: int) -> dict[str, Any]:
         "executable": executable,
         "personality": personality,
         "selected_bases": selected,
+        "executable_mapping_bases": executable_mapping_bases,
         "mapping_count": len(mappings),
         "anonymous_rw_mapping_count": anonymous_rw_mappings,
         "anonymous_rw_bytes": anonymous_rw_bytes,

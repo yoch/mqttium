@@ -129,6 +129,18 @@ jobs:
           cat "$root/mosquitto.log"
           exit 1
 
+      - name: Probe page-fault tracing support
+        shell: bash
+        run: |
+          {
+            command -v perf || true
+            perf --version 2>&1 || true
+            printf 'perf_event_paranoid='
+            cat /proc/sys/kernel/perf_event_paranoid
+            perf stat -e page-faults:u true 2>&1 || true
+          } > "$JOB_ROOT/perf-capability.log"
+          cat "$JOB_ROOT/perf-capability.log"
+
       - name: Run focused runner diagnosis with ASLR
         shell: bash
         run: |
@@ -136,8 +148,8 @@ jobs:
           taskset -c 3 python harness/benchmarks/runner_network_diagnosis.py \
             --root base \
             --engine harness/benchmarks/paired_network.py \
-            --iterations 12 \
-            --count 26000 \
+            --iterations 48 \
+            --count 13000 \
             --window 1 \
             --protocol 311 \
             --completion callback \
@@ -160,8 +172,8 @@ jobs:
             python harness/benchmarks/runner_network_diagnosis.py \
             --root base \
             --engine harness/benchmarks/paired_network.py \
-            --iterations 12 \
-            --count 26000 \
+            --iterations 4 \
+            --count 13000 \
             --window 1 \
             --protocol 311 \
             --completion callback \
@@ -206,6 +218,7 @@ jobs:
             ${{ runner.temp }}/mqttium-${{ github.run_id }}-${{ github.run_attempt }}/*.md
             ${{ runner.temp }}/mqttium-${{ github.run_id }}-${{ github.run_attempt }}/*-raw/*
             ${{ runner.temp }}/mqttium-${{ github.run_id }}-${{ github.run_attempt }}/mosquitto.log
+            ${{ runner.temp }}/mqttium-${{ github.run_id }}-${{ github.run_attempt }}/perf-capability.log
             ${{ runner.temp }}/mqttium-${{ github.run_id }}-${{ github.run_attempt }}/runner-diagnosis-*.json
             ${{ runner.temp }}/mqttium-${{ github.run_id }}-${{ github.run_attempt }}/runner-diagnosis-*.log
           if-no-files-found: warn
