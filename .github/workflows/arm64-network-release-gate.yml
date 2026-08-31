@@ -135,6 +135,7 @@ jobs:
           exit 1
 
       - name: Probe page-fault tracing support
+        if: false
         shell: bash
         run: |
           {
@@ -155,6 +156,7 @@ jobs:
           } > "$JOB_ROOT/allocator-symbols.log" 2>&1 || true
 
       - name: Profile page-fault modes with ASLR
+        if: false
         shell: bash
         run: |
           set -euo pipefail
@@ -174,6 +176,7 @@ jobs:
             tee "$JOB_ROOT/runner-diagnosis-aslr.log"
 
       - name: Run focused runner diagnosis without ASLR
+        if: false
         shell: bash
         run: |
           set -euo pipefail
@@ -200,6 +203,7 @@ jobs:
             tee "$JOB_ROOT/runner-diagnosis-no-aslr.log"
 
       - name: Prove glibc mmap threshold causality
+        if: false
         shell: bash
         run: |
           set -euo pipefail
@@ -220,6 +224,7 @@ jobs:
           done
 
       - name: Compare deterministic glibc controls
+        if: false
         shell: bash
         run: |
           set -euo pipefail
@@ -244,7 +249,7 @@ jobs:
           done
 
       - name: Decode perf evidence
-        if: always()
+        if: false
         shell: bash
         run: |
           set -uo pipefail
@@ -260,7 +265,6 @@ jobs:
           done
 
       - name: Run strict network release gate
-        if: false
         shell: bash
         run: |
           set -euo pipefail
@@ -274,16 +278,16 @@ jobs:
             --completions callback \
             --payloads 64 \
             --windows 1 \
-            --control-blocks 1 \
+            --control-blocks 2 \
             --control-cycle-seeds 0,1,2 \
-            --ab-blocks 1 \
+            --ab-blocks 2 \
             --cycle-seeds 0,1,2,3,4,5 \
-            --target-sample-seconds 1.0 \
-            --max-count 30000 \
+            --target-sample-seconds 2.0 \
+            --max-count 60000 \
             --timeout 60 \
             --cpu 2 \
             --inter-phase-quiet-seconds 0 \
-            --policy advisory \
+            --policy strict \
             --output "$JOB_ROOT/result.json"
 
       - name: Upload evidence
