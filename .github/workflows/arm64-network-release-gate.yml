@@ -219,6 +219,30 @@ jobs:
               tee "$JOB_ROOT/runner-diagnosis-mmap-$threshold.log"
           done
 
+      - name: Compare deterministic glibc controls
+        shell: bash
+        run: |
+          set -euo pipefail
+          for control in top-pad no-mmap; do
+            case "$control" in
+              top-pad) tunables='glibc.malloc.top_pad=1048576' ;;
+              no-mmap) tunables='glibc.malloc.mmap_max=0' ;;
+            esac
+            GLIBC_TUNABLES="$tunables" taskset -c 3 \
+              python3.14 harness/benchmarks/runner_network_diagnosis.py \
+              --root base \
+              --engine harness/benchmarks/paired_network.py \
+              --iterations 24 \
+              --count 13000 \
+              --window 1 \
+              --protocol 311 \
+              --completion callback \
+              --publisher-cpu 2 \
+              --support-cpu 1 \
+              --output "$JOB_ROOT/runner-diagnosis-$control.json" | \
+              tee "$JOB_ROOT/runner-diagnosis-$control.log"
+          done
+
       - name: Decode perf evidence
         if: always()
         shell: bash
