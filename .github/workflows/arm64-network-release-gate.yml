@@ -68,12 +68,19 @@ jobs:
           path: candidate
           persist-credentials: false
 
+      - name: Set up Python 3.13 control runtime
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.13"
+          architecture: arm64
+
       - name: Verify dedicated runner
         shell: bash
         run: |
           set -euo pipefail
           test "$(uname -m)" = "aarch64"
-          command -v python3
+          command -v python
+          python --version
           command -v mosquitto
           command -v mosquitto_sub
           command -v taskset
@@ -93,7 +100,7 @@ jobs:
           set -euo pipefail
           rm -rf "$JOB_ROOT"
           mkdir -p "$JOB_ROOT"
-          python3 -m venv "$JOB_ROOT/venv"
+          python -m venv "$JOB_ROOT/venv"
           echo "$JOB_ROOT/venv/bin" >> "$GITHUB_PATH"
 
       - name: Install probe dependency
@@ -142,14 +149,13 @@ jobs:
           cat "$JOB_ROOT/perf-capability.log"
 
       - name: Run focused runner diagnosis with ASLR
-        if: false
         shell: bash
         run: |
           set -euo pipefail
           taskset -c 3 python harness/benchmarks/runner_network_diagnosis.py \
             --root base \
             --engine harness/benchmarks/paired_network.py \
-            --iterations 48 \
+            --iterations 32 \
             --count 13000 \
             --window 1 \
             --protocol 311 \
@@ -160,7 +166,6 @@ jobs:
             tee "$JOB_ROOT/runner-diagnosis-aslr.log"
 
       - name: Run focused runner diagnosis without ASLR
-        if: false
         shell: bash
         run: |
           set -euo pipefail
@@ -174,7 +179,7 @@ jobs:
             python harness/benchmarks/runner_network_diagnosis.py \
             --root base \
             --engine harness/benchmarks/paired_network.py \
-            --iterations 4 \
+            --iterations 12 \
             --count 13000 \
             --window 1 \
             --protocol 311 \
@@ -185,6 +190,7 @@ jobs:
             tee "$JOB_ROOT/runner-diagnosis-no-aslr.log"
 
       - name: Run strict network release gate
+        if: false
         shell: bash
         run: |
           set -euo pipefail
