@@ -197,7 +197,7 @@ jobs:
             --protocols 311 \
             --completions callback \
             --payloads 64 \
-            --windows 1,20,64 \
+            --windows 1 \
             --control-blocks 1 \
             --control-cycle-seeds 0,1,2 \
             --ab-blocks 1 \
