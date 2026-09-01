@@ -14,6 +14,13 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   topic or encode MQTT 5 properties twice; packet identifiers, receipts,
   rollback, wire ordering, and queue bounds are unchanged.
 
+### Fixed
+
+- Keep inline message delivery stable when a synchronous `on_message` callback
+  publishes reentrantly. The nested publication may append SEND effects to the
+  active effect deque; those effects now remain ordered behind the message
+  prefix instead of invalidating its iterator and failing the connection.
+
 ## [1.0.0rc11] - 2026-08-30
 
 ### Added

@@ -1,4 +1,4 @@
-"""publish() from a callback must preserve QoS completion semantics."""
+"""Native and façade callback publication preserve QoS completion semantics."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import threading
 import time
 
 from mqttium.codec.buffer import IncrementalDecoder
+from mqttium.api import AsyncClient
 from mqttium.compat.paho import CallbackAPIVersion, Client, MQTTMessageInfo
 from mqttium.enums import PacketType, QoS
 from mqttium.packets import PubAckPacket, PublishPacket, encode_frame
@@ -45,9 +46,21 @@ class FakeBrokerTransport:
     def is_closing(self) -> bool:
         return self._closing
 
-    def push_publish(self, topic: str, payload: bytes) -> None:
+    def push_publish(
+        self,
+        topic: str,
+        payload: bytes,
+        *,
+        qos: QoS = QoS.AT_MOST_ONCE,
+        mid: int | None = None,
+    ) -> None:
         pkt = PublishPacket(
-            topic=topic, payload=payload, qos=QoS.AT_MOST_ONCE, retain=False, dup=False
+            topic=topic,
+            payload=payload,
+            qos=qos,
+            retain=False,
+            dup=False,
+            mid=mid,
         )
         self._rx.put_nowait(pkt.encode())
 
@@ -112,6 +125,35 @@ def test_publish_from_on_message_waits_for_puback() -> None:
     finally:
         client.disconnect()
         client.loop_stop()
+
+
+async def test_native_inline_on_message_can_publish_qos1_reentrantly() -> None:
+    fake = FakeBrokerTransport(auto_ack=True)
+    client = AsyncClient(client_id="native-cb-pub", message_delivery="callback")
+
+    async def factory(host: str, port: int, *, ssl: object = None) -> FakeBrokerTransport:
+        return fake
+
+    client._transport_factory = factory  # type: ignore[assignment]
+    delivered = asyncio.Event()
+    receipts = []
+
+    def on_message(message) -> None:
+        assert client._delivery._callback_active is True
+        receipts.append(client.publish_nowait("out/echo", b"reply:" + message.payload, qos=1))
+        delivered.set()
+
+    client.on_message = on_message
+    await client.connect("fake", 1883)
+    try:
+        fake.push_publish("in/t", b"hello", qos=QoS.AT_LEAST_ONCE, mid=41)
+
+        await asyncio.wait_for(delivered.wait(), timeout=1.0)
+        assert len(receipts) == 1
+        await asyncio.wait_for(receipts[0].wait(), timeout=1.0)
+        assert [packet.payload for packet in fake.published] == [b"reply:hello"]
+    finally:
+        await client.disconnect()
 
 
 def test_inner_publish_callback_tracks_the_facade_callback() -> None:
