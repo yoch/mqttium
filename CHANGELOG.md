@@ -6,6 +6,14 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Changed
+
+- Reuse one mutation-free QoS 1/2 publication preparation between synchronous
+  writer-capacity preflight and protocol admission. Resident-writer
+  `publish_nowait()` and `publish(..., nowait=True)` calls no longer size the
+  topic or encode MQTT 5 properties twice; packet identifiers, receipts,
+  rollback, wire ordering, and queue bounds are unchanged.
+
 ## [1.0.0rc11] - 2026-08-30
 
 ### Added
