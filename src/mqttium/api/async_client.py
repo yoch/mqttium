@@ -2121,7 +2121,7 @@ class AsyncClient:
             properties,
             include_wire_size=True,
         )
-        prepared_size = prepared.wire_size
+        _level, _topic, _canonical, _properties, _logical_size, prepared_size = prepared
         assert prepared_size is not None
         if not self._can_enqueue_outbound_size(prepared_size):
             raise FlowControlError(self._write_pump.refusal(prepared_size))

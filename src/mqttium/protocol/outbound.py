@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, TypeAlias
 
 from mqttium.codec.buffer import RawPacket
 from mqttium.codec.properties import PUBLISH, encode_properties
@@ -67,15 +67,10 @@ def _mark_publish_dup(item: WriteItem) -> WriteItem:
     return (bytes((header[0] | 0x08,)) + header[1:], payload)
 
 
-class _PreparedPublish(NamedTuple):
-    """Mutation-free values shared by writer preflight and QoS admission."""
-
-    qos: QoS
-    topic_bytes: bytes | None
-    canonical_topic: str
-    property_bytes: bytes | None
-    logical_size: int
-    wire_size: int | None
+# qos, encoded topic, canonical topic, encoded properties, logical size,
+# optional exact wire size. A plain tuple is deliberate: this object exists on
+# every QoS 1/2 admission and NamedTuple's generated constructor is measurable.
+_PreparedPublish: TypeAlias = tuple[QoS, bytes | None, str, bytes | None, int, int | None]
 
 
 class OutboundSession:
@@ -447,7 +442,7 @@ class OutboundSession:
         if engine.state != ConnectionState.CONNECTED and level == QoS.AT_MOST_ONCE:
             raise NotConnectedError("Cannot publish QoS 0 while disconnected")
         if level is QoS.AT_MOST_ONCE:
-            return _PreparedPublish(level, topic_bytes, canonical_topic, None, 0, None)
+            return level, topic_bytes, canonical_topic, None, 0, None
 
         # One property encode and the Topic Name bytes from validation feed the
         # writer preflight, wire-size check and logical budget. The encoder
@@ -470,7 +465,7 @@ class OutboundSession:
                 else len(canonical_topic.encode("utf-8"))
             )
         logical_size = len(payload) + logical_topic_size + logical_property_bytes
-        return _PreparedPublish(
+        return (
             level,
             topic_bytes,
             canonical_topic,
@@ -514,7 +509,7 @@ class OutboundSession:
         prepared = self._prepare_publish_request(
             topic, payload, QoS.AT_MOST_ONCE, retain, properties
         )
-        topic_bytes = prepared.topic_bytes
+        _qos, topic_bytes, _canonical_topic, _property_bytes, _logical_size, _wire_size = prepared
         assert topic_bytes is not None
         return self._prepare_qos0_validated(
             topic,
@@ -542,8 +537,7 @@ class OutboundSession:
             # Internal callers prepare and commit synchronously on the owning
             # loop, with no await or callback between the two operations.
             prepared = _prepared
-        qos = prepared.qos
-        topic_bytes = prepared.topic_bytes
+        qos, topic_bytes, canonical_topic, property_bytes, logical_size, _wire_size = prepared
 
         if qos == QoS.AT_MOST_ONCE:
             assert topic_bytes is not None
@@ -562,9 +556,6 @@ class OutboundSession:
             self._engine._emit(EffectKind.PUBLISH_COMPLETE, None)
             return PublishHandle(mid=None, qos=qos)
 
-        canonical_topic = prepared.canonical_topic
-        property_bytes = prepared.property_bytes
-        logical_size = prepared.logical_size
         # Snapshot before the first acquisition. Three local reads is all the
         # success path pays for a shared rollback; _rollback itself is a call
         # only taken on failure. This path is the hottest in the library and

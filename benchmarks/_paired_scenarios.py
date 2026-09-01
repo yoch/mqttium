@@ -261,11 +261,24 @@ def _native_publish(scenario: str) -> ScenarioMeasurement:
     from mqttium.enums import ConnectionState
 
     callback = scenario == "native_publish_nowait_qos0_callback"
-    client = AsyncClient(
-        client_id="paired-native-publish",
-        max_pending_callbacks=4_096,
-    )
-    _install_discard_writer(client)
+    qos1_resident = scenario == "native_publish_nowait_qos1_resident"
+    qos1_payload = b"x" * 64
+    if qos1_resident:
+        client = AsyncClient(
+            client_id="paired-native-publish",
+            local_receive_maximum=65_535,
+            max_outbound_inflight=65_535,
+            max_pending_outbound_messages=65_535,
+            max_pending_outbound_bytes=1 << 30,
+            max_outbound_messages=65_535,
+            max_outbound_bytes=1 << 30,
+        )
+    else:
+        client = AsyncClient(
+            client_id="paired-native-publish",
+            max_pending_callbacks=4_096,
+        )
+        _install_discard_writer(client)
     client._engine.state = ConnectionState.CONNECTED
     if callback:
         client.on_publish = lambda _mid, _reason: None
@@ -289,12 +302,14 @@ def _native_publish(scenario: str) -> ScenarioMeasurement:
             return ScenarioMeasurement(elapsed, operations, operations / elapsed)
 
         warmup = 2_000
-        operations = 60_000
+        operations = 40_000 if qos1_resident else 60_000
         started = 0.0
         for index in range(warmup + operations):
             if index == warmup:
                 started = time.perf_counter()
-            if scenario == "native_publish_nowait_qos0" and hasattr(client, "publish_nowait"):
+            if qos1_resident:
+                client.publish_nowait(TOPIC, qos1_payload, qos=1)
+            elif scenario == "native_publish_nowait_qos0" and hasattr(client, "publish_nowait"):
                 client.publish_nowait(TOPIC, b"x", qos=0)
             else:
                 await client.publish(TOPIC, b"x", qos=0, nowait=True)
@@ -585,6 +600,7 @@ REGISTRY: dict[str, Callable[[str], ScenarioMeasurement]] = {
     "async_publish_nowait_qos0": _native_publish,
     "native_publish_nowait_qos0": _native_publish,
     "native_publish_nowait_qos0_callback": _native_publish,
+    "native_publish_nowait_qos1_resident": _native_publish,
     "compat_publish_qos1": _compat_qos1,
     "compat_publish_qos0_batch": _compat_qos0,
     "effect_send_inline": _effects,
