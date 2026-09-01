@@ -620,7 +620,13 @@ class ApplicationDelivery:
         cb = callback if callback_delivery else None
         callback_worker_ready = False
         applied = 0
-        for effect in effects:
+        # Fix the bound before invoking user code. An inline callback may call
+        # publish_nowait(), which appends SEND to this same EffectPump deque.
+        # Deque indexing remains valid across appends; its iterator does not.
+        # Newly appended effects stay behind this prefix and are applied by the
+        # owning pump after it removes the delivered messages.
+        for index in range(len(effects)):
+            effect = effects[index]
             kind = effect.kind
             if kind is not EffectKind.MESSAGE and kind is not EffectKind.DECODED_MESSAGE:
                 break
