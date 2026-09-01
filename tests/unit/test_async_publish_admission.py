@@ -101,6 +101,23 @@ async def test_nowait_writer_rejection_is_atomic_for_qos1() -> None:
     assert not client._pending_effects
 
 
+async def test_publish_nowait_writer_rejection_is_atomic_for_qos1() -> None:
+    client = AsyncClient(max_outbound_messages=1, max_outbound_bytes=1024)
+    client._engine.state = ConnectionState.CONNECTED
+    assert client._write_pump.try_enqueue(b"occupied") is True
+    before_ids = len(client._engine.packet_ids)
+    before_records = list(client._engine.store.out_items())
+
+    with pytest.raises(FlowControlError):
+        client.publish_nowait("admission/writer", b"payload", qos=1)
+
+    assert client._engine.pending_outbound_messages == 0
+    assert len(client._engine.packet_ids) == before_ids
+    assert list(client._engine.store.out_items()) == before_records
+    assert not client._receipts
+    assert not client._pending_effects
+
+
 async def test_nowait_batch_writer_rejection_is_atomic() -> None:
     client = AsyncClient(max_outbound_messages=1, max_outbound_bytes=1024)
     client._engine.state = ConnectionState.CONNECTED
