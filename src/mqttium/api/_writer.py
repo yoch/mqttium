@@ -23,6 +23,17 @@ _LATENCY_BATCH_MIN_ITEMS = 4
 _LATENCY_BATCH_MAX_ITEMS = 16
 _LATENCY_BATCH_TARGET_BYTES = 48 * 1024
 
+_SUCCESS_ACK_TYPES = frozenset((0x40, 0x50, 0x70))
+
+
+def _is_success_ack_frame(item: WriteItem) -> bool:
+    return (
+        isinstance(item, bytes)
+        and len(item) == 4
+        and item[1] == 2
+        and item[0] in _SUCCESS_ACK_TYPES
+    )
+
 
 class WritePump:
     """Serialize transport writes and own their bounded queue invariant."""
@@ -74,10 +85,15 @@ class WritePump:
         # then queues the rest so the writer task can coalesce them. A paced
         # producer is re-armed on the next loop turn while the writer is idle.
         self._eager_armed = False
+        # Success ACKs have one independent permit.  This keeps an inbound ACK
+        # from consuming the application data permit without allowing an
+        # unbounded same-turn ACK burst.
+        self._ack_eager_armed = False
         # Delayed re-arm callbacks carry this generation. Lifecycle changes
         # invalidate it so a callback from an old transport can never arm a new
         # connection.
         self._eager_generation = 0
+        self._eager_rearm_scheduled = False
 
     @property
     def queued_messages(self) -> int:
@@ -130,16 +146,23 @@ class WritePump:
     def _drop_eager_binding(self) -> None:
         self._eager_generation += 1
         self._eager_armed = False
+        self._ack_eager_armed = False
+        self._eager_rearm_scheduled = False
         self._write_nowait = None
 
     def _rearm_eager_if_idle(self, generation: int) -> None:
-        if (
-            generation == self._eager_generation
-            and self._write_nowait is not None
-            and not self._writing
-            and self.queue.empty()
-        ):
+        if generation != self._eager_generation:
+            return
+        self._eager_rearm_scheduled = False
+        if self._write_nowait is not None and not self._writing and self.queue.empty():
             self._eager_armed = True
+            self._ack_eager_armed = True
+
+    def _schedule_eager_rearm(self) -> None:
+        if self._eager_rearm_scheduled:
+            return
+        self._eager_rearm_scheduled = True
+        asyncio.get_running_loop().call_soon(self._rearm_eager_if_idle, self._eager_generation)
 
     def reset(self) -> None:
         """Start a new transport epoch with an empty queue."""
@@ -161,6 +184,8 @@ class WritePump:
         self._eager_generation += 1
         self._write_nowait = getattr(transport, "write_nowait", None)
         self._eager_armed = self._write_nowait is not None
+        self._ack_eager_armed = self._write_nowait is not None
+        self._eager_rearm_scheduled = False
         self.task = asyncio.create_task(self._run(), name="mqttium-writer")
 
     async def stop(self) -> None:
@@ -309,8 +334,9 @@ class WritePump:
         completion without awaiting.
         """
         write_nowait = self._write_nowait
+        is_ack = _is_success_ack_frame(item)
         if (
-            not self._eager_armed
+            not (self._ack_eager_armed if is_ack else self._eager_armed)
             or write_nowait is None
             or self._writing
             or self.waiters
@@ -320,9 +346,11 @@ class WritePump:
             return False
         if not write_nowait(item):
             return False
-        self._eager_armed = False
-        generation = self._eager_generation
-        asyncio.get_running_loop().call_soon(self._rearm_eager_if_idle, generation)
+        if is_ack:
+            self._ack_eager_armed = False
+        else:
+            self._eager_armed = False
+        self._schedule_eager_rearm()
         self.eager_writes += 1
         self.eager_bytes += len(item)
         self.last_outbound = time.monotonic()
@@ -521,6 +549,7 @@ class WritePump:
                 # scheduled the producer-side next-turn callback.
                 if queue.empty() and self._write_nowait is not None:
                     self._eager_armed = True
+                    self._ack_eager_armed = True
                 first = await queue.get()
                 self._eager_armed = False
                 self._sample_high_water(queue.qsize() + 1)
