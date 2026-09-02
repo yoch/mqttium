@@ -33,6 +33,30 @@ def test_effect_diagnostic_attributes_are_views() -> None:
     assert client._effect_flush_task is client._effect_pump.task
 
 
+def test_reentrant_send_flushes_only_after_inline_message_drain() -> None:
+    client = AsyncClient(client_id="effect-reentrant-send", message_delivery="callback")
+    written: list[bytes] = []
+    client._write_pump._write_nowait = lambda data: written.append(data) is None
+    client._write_pump._eager_armed = False
+
+    def on_message(_message: Message) -> None:
+        client._engine._emit(EffectKind.SEND, b"reply")
+        client._collect_effects_locked()
+        assert written == []
+
+    client.on_message = on_message
+    client._engine._emit(
+        EffectKind.MESSAGE,
+        Message(topic="request", payload=b"request"),
+    )
+    client._collect_effects_locked()
+    client._drain_effects_inline()
+
+    assert written == [b"reply"]
+    assert client._write_pump.queued_messages == 0
+    assert client._write_pump.resident_messages == 0
+
+
 @pytest.mark.parametrize("qos", (QoS.AT_LEAST_ONCE, QoS.EXACTLY_ONCE))
 async def test_qosn_completion_with_idle_sync_callback_runs_inline(qos: QoS) -> None:
     client = AsyncClient(client_id=f"effect-qos{int(qos)}-callback")

@@ -46,6 +46,8 @@ class EffectOwner(Protocol):
 
     def _settle_terminal_effect(self, effect: EngineEffect) -> None: ...
 
+    def _flush_reentrant_singleton_inline(self) -> None: ...
+
 
 class EffectPump:
     """Serialize engine effects without charging the single-effect fast path.
@@ -72,6 +74,7 @@ class EffectPump:
         self.task: asyncio.Task[None] | None = None
         self.flush_requested = False
         self.draining_inline = False
+        self._reentrant_send_collected = False
         self._failing_close = False
         # Decision counters. The SEND-first partition protects an ordering that
         # is easy to break and hard to debug, so before changing how batches are
@@ -87,6 +90,8 @@ class EffectPump:
         effects = self.owner._engine.take_effects()
         if not effects:
             return
+        if self.draining_inline and any(effect.kind is EffectKind.SEND for effect in effects):
+            self._reentrant_send_collected = True
         epoch = self.owner._connection_epoch
         self.batches += 1
 
@@ -209,6 +214,7 @@ class EffectPump:
                 return
             epoch = self.pending_epoch
         self.draining_inline = True
+        self._reentrant_send_collected = False
         try:
             while self.pending:
                 effect = self.pending[0]
@@ -224,8 +230,12 @@ class EffectPump:
                 self._complete()
         finally:
             self.draining_inline = False
+        flush_reentrant = self._reentrant_send_collected
+        self._reentrant_send_collected = False
         if self.pending:
             self.schedule()
+        elif flush_reentrant:
+            self.owner._flush_reentrant_singleton_inline()
 
     def schedule(self) -> None:
         self.flush_requested = True

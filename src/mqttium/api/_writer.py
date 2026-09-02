@@ -343,6 +343,30 @@ class WritePump:
         self._admit_queued()
         return True
 
+    def try_flush_reentrant_singleton(self) -> bool:
+        """Flush one callback-created frame after its owning effect drain."""
+        if self.queue.qsize() != 1:
+            return False
+        write_nowait = self._write_nowait
+        if write_nowait is None or self._writing or self.waiters:
+            return False
+
+        self._sample_high_water(1)
+        item = self.queue.get_nowait()
+        if isinstance(item, tuple) or not write_nowait(item):
+            self.queue.task_done()
+            self.queue.put_nowait(item)
+            return False
+
+        self.queue.task_done()
+        size = item_size(item)
+        self.queued_bytes -= size
+        self._release_resident()
+        self.eager_writes += 1
+        self.eager_bytes += size
+        self.last_outbound = time.monotonic()
+        return True
+
     def _try_flush_latency_batch(self) -> bool:
         """Flush one short queued burst without waiting for the writer task.
 

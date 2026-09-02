@@ -194,6 +194,22 @@ async def test_transport_declining_the_eager_write_falls_back_to_the_queue() -> 
         await pump.stop()
 
 
+async def test_reentrant_singleton_flush_restores_queue_accounting() -> None:
+    transport = _EagerTransport()
+    pump = _pump()
+    pump._write_nowait = transport.write_nowait
+    pump._eager_armed = False
+
+    assert pump.try_enqueue(b"reply") is True
+    assert pump.try_flush_reentrant_singleton() is True
+
+    assert transport.written == [b"reply"]
+    assert pump.queued_messages == 0
+    assert pump.queued_bytes == 0
+    assert pump.resident_messages == 0
+    assert pump.eager_writes == 1
+
+
 async def test_wire_order_is_preserved_across_eager_and_queued_frames() -> None:
     transport = _EagerTransport()
     pump = _pump()

@@ -820,6 +820,9 @@ class AsyncClient:
         self._collect_effects_locked()
         self._drain_effects_inline()
 
+    def _flush_reentrant_singleton_inline(self) -> None:
+        self._write_pump.try_flush_reentrant_singleton()
+
     def _queue_subscribe_on_loop(
         self,
         topics: str | Iterable[str | tuple[str, SubscribeOptions | int | QoS]],
