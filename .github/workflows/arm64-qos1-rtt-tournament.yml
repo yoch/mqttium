@@ -136,8 +136,9 @@ jobs:
           set -euo pipefail
           rm -rf "$JOB_ROOT"
           mkdir -p "$JOB_ROOT"
-          python3 -c 'import psutil'
-          python3 harness/benchmarks/runner_probe.py \
+          python3 -m venv "$JOB_ROOT/venv"
+          "$JOB_ROOT/venv/bin/python" -m pip install "psutil>=6,<8"
+          "$JOB_ROOT/venv/bin/python" harness/benchmarks/runner_probe.py \
             --output "$JOB_ROOT/runner.json" \
             --require-temperature \
             --enforce
@@ -167,7 +168,7 @@ jobs:
           fi
 
           mv "$JOB_ROOT/callback-aa.json" "$JOB_ROOT/callback-aa-attempt-1.json"
-          python3 harness/benchmarks/runner_probe.py \
+          "$JOB_ROOT/venv/bin/python" harness/benchmarks/runner_probe.py \
             --output "$JOB_ROOT/runner-retry.json" \
             --require-temperature \
             --enforce
@@ -258,7 +259,7 @@ jobs:
             mv "$JOB_ROOT/writer-capacity-aa.md" \
               "$JOB_ROOT/writer-capacity-aa-attempt-1.md"
           fi
-          python3 harness/benchmarks/runner_probe.py \
+          "$JOB_ROOT/venv/bin/python" harness/benchmarks/runner_probe.py \
             --output "$JOB_ROOT/runner-capacity-retry.json" \
             --require-temperature \
             --enforce
