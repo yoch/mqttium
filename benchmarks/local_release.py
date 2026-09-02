@@ -635,7 +635,7 @@ def run_package(recorder: Recorder) -> None:
     recorder.run("wheel-install", [str(python), "-m", "pip", "install", "--no-deps", wheels[0]])
     recorder.run("wheel-pip-check", [str(python), "-m", "pip", "check"])
     version = _capture(
-        [sys.executable, "-c", "import mqttium; print(mqttium.__version__)"], cwd=ROOT
+        [str(python), "-I", "-c", "import mqttium; print(mqttium.__version__)"], cwd=ROOT
     )
     recorder.run(
         "wheel-import-all",
