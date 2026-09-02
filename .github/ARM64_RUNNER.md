@@ -35,19 +35,19 @@ remain the primary portability/version gates.
 
 ## Validated host model
 
-The repository runner probe on 2026-08-17 observed the actual `rpi5` runner as:
+The repository runner probe on 2026-09-02 observed the actual `rpi5` runner as:
 
 - Raspberry Pi 5 Model B, AArch64, 4 logical CPUs;
 - Debian GNU/Linux 13 (trixie);
 - GitHub Actions runner 2.336.0;
-- system Python 3.13.5;
+- system Python 3.14;
 - a working native `python3 -m venv` / pip environment;
 - native Mosquitto broker/client tools and `taskset` available;
 - all CPU governors set to `performance` during strict validation.
 
 `actions/setup-python` does **not** currently provide a Python ARM64 build for
 Debian 13, so the self-hosted workflows deliberately use the validated system
-Python 3.13 and create a fresh venv for each job. Python 3.11-3.14 compatibility
+Python 3.14 and create a fresh venv for each job. Python 3.11-3.14 compatibility
 continues to be enforced by the existing GitHub-hosted matrix rather than being
 claimed by this ARM64 runner.
 
