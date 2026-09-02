@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   test:
-    name: ARM64 / system Python 3.13
+    name: ARM64 / system Python 3.14
     if: github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main'
     runs-on: [self-hosted, linux, ARM64]
     timeout-minutes: 35
@@ -35,8 +35,8 @@ jobs:
           command -v python3
           python3 - <<'PY'
           import sys
-          if sys.version_info[:2] != (3, 13):
-              raise SystemExit(f"expected system Python 3.13, got {sys.version}")
+          if sys.version_info[:2] != (3, 14):
+              raise SystemExit(f"expected system Python 3.14, got {sys.version}")
           PY
           command -v openssl
           command -v mosquitto

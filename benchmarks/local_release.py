@@ -507,8 +507,8 @@ def run_robustness(recorder: Recorder, *, port: int) -> None:
         )
 
 
-def _runner_preflight_command(output: Path) -> list[str]:
-    return [
+def _runner_preflight_command(output: Path, *, ignore_historical_load: bool = False) -> list[str]:
+    command = [
         sys.executable,
         "benchmarks/runner_probe.py",
         "--enforce",
@@ -521,6 +521,9 @@ def _runner_preflight_command(output: Path) -> list[str]:
         "--output",
         str(output),
     ]
+    if ignore_historical_load:
+        command.append("--ignore-historical-load")
+    return command
 
 
 def run_performance(
@@ -560,7 +563,7 @@ def run_performance(
     network_preflight = recorder.output / "runner-network.json"
     recorder.run(
         "runner-preflight-network",
-        _runner_preflight_command(network_preflight),
+        _runner_preflight_command(network_preflight, ignore_historical_load=True),
         timeout=90,
     )
     network_command = [
@@ -632,7 +635,7 @@ def run_package(recorder: Recorder) -> None:
     recorder.run("wheel-install", [str(python), "-m", "pip", "install", "--no-deps", wheels[0]])
     recorder.run("wheel-pip-check", [str(python), "-m", "pip", "check"])
     version = _capture(
-        [sys.executable, "-c", "import mqttium; print(mqttium.__version__)"], cwd=ROOT
+        [str(python), "-I", "-c", "import mqttium; print(mqttium.__version__)"], cwd=ROOT
     )
     recorder.run(
         "wheel-import-all",
