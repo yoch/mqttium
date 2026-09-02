@@ -8,6 +8,8 @@ Release metadata commit:
 `4e52384af0da6ae51547d1e29f60df99158feee3`.
 Hosted-candidate and ARM64 workflow-alignment commit:
 `1a2a80e58e1f19a0ad3d2e4eb241b2d081126352`.
+Final pre-report candidate and release-harness commit:
+`5f045f414cd8ab4d24db153e9424793a89f875a0`.
 
 ## Scope
 
@@ -45,10 +47,10 @@ quality, Python 3.11–3.14, Linux MQTT 3.1.1 and MQTT 5 soaks, resilience, fuzz
 package validation, macOS 3.11/3.14, Windows 3.11/3.14, Codecov, Read the Docs,
 and the `CI required` aggregate.
 
-The exact RC metadata/workflow head `1a2a80e` passed the same hosted matrix in
-[CI run 33623673079](https://github.com/yoch/mqttium/actions/runs/33623673079),
-[soak run 33623673895](https://github.com/yoch/mqttium/actions/runs/33623673895),
-and [distribution run 33623672905](https://github.com/yoch/mqttium/actions/runs/33623672905).
+The exact final pre-report head `5f045f4` passed the same hosted matrix in
+[CI run 33652259920](https://github.com/yoch/mqttium/actions/runs/33652259920),
+[soak run 33652260020](https://github.com/yoch/mqttium/actions/runs/33652260020),
+and [distribution run 33652259884](https://github.com/yoch/mqttium/actions/runs/33652259884).
 The publication workflow built one wheel and one sdist, then passed wheel
 smokes on Python 3.11–3.14, the Python 3.12 sdist smoke, and the
 installed-artifact resilience smoke. Publication jobs were correctly skipped.
@@ -56,7 +58,7 @@ installed-artifact resilience smoke. Publication jobs were correctly skipped.
 The downloaded Actions distributions have these SHA-256 values:
 
 - wheel: `49fc4ff6b8adaedb285dda3564c617c4ba1c580a1abadd2722c6d4673aea702d`;
-- sdist: `0019b6c725e0037a23b47a88aea02908168fb4d8d138f601e5889d581003a265`.
+- sdist: `2a2f0836aeaa3af93d54f99240cbfe3fb0acb4f1138c50aa21357944f64bc1d5`.
 
 ## ARM64 decision evidence
 
@@ -82,25 +84,37 @@ Python 3.14. The repository's trust boundary permits the general self-hosted
 workflow to run only from `main`, so this correction must be confirmed by the
 automatic post-merge run before publication.
 
-## Local validation boundary
+## Local candidate evidence
 
-No heavy local gate was run for this candidate because the available x86-64
-host was under unrelated load and the maintainer explicitly reserved precise
-validation for the ARM64 GitHub runner. The focused workflow-contract test
-passed locally after the Python 3.14 alignment.
+The local `rc` acquisition at `e942e57`, with `v1.0.0rc11` as its baseline,
+passed quality, unit coverage, required Mosquitto integration, the controlled
+micro suite, the strict 32-cell open-loop gate, call/allocation and memory
+profiles, memory thresholds, application stress, both 30-second reconnect
+soaks, distribution build, Twine, wheel-content, isolated installation,
+`pip check`, and import of every packaged module. The generic closed-loop
+network artifact was advisory and invalid because several cells exceeded its
+CV limit; no conclusion in this report uses that artifact.
 
-The hosted matrix and tournament qualify this preparation PR for merge, but do
-not waive the maintained release procedure. Tagging and publication remain
-blocked until the post-merge ARM64 CI passes and the clean local candidate gate
-is completed on an eligible host with `v1.0.0rc11` as its approved baseline.
+That run stopped at the first installed-wheel smoke because the release
+harness read the expected version from an unrelated editable environment
+(`1.0.0rc11`) instead of the isolated wheel it had just installed
+(`1.0.0rc12`). Commit `5f045f4` corrects only that version source. The isolated
+wheel reports `1.0.0rc12`, and the exact hosted distribution run above passes
+all TCP, resilience, wheel and sdist smokes on the corrected commit.
+
+A later local repetition was stopped once the host was no longer reserved.
+Its partial results are not release evidence. No timing result acquired after
+that point is cited. The accepted evidence therefore composes the complete
+functional, robustness and strict open-loop results from `e942e57` with exact
+hosted package validation at `5f045f4`; the intervening change is confined to
+the release harness and does not alter MQTTium runtime code.
 
 ## Release decision
 
-RC12 is recommended for merge as a prepared candidate. It is not yet approved
-for tagging or prerelease publication. The two remaining publication gates are
-the post-merge ARM64 general CI and the clean local candidate gate described
-above.
+RC12 is recommended for merge. Tagging and prerelease publication remain
+conditional only on the automatic post-merge ARM64 general CI passing on
+`main`.
 
 This report-only addition changes no runtime source. The exact distributions
-above were built from `1a2a80e`; the report commit therefore does not alter the
+above were built from `5f045f4`; the report commit therefore does not alter the
 validated runtime package contents.
