@@ -60,12 +60,13 @@ def test_run_performance_requalifies_external_gates_and_uses_open_loop_gate(
         "runner.json",
         "runner-network.json",
     ]
-    for _name, command, timeout in preflight_calls:
+    for name, command, timeout in preflight_calls:
         assert "--enforce" in command
         assert _argument(command, "--wait-seconds") == "60"
         assert _argument(command, "--poll-seconds") == "5"
         assert _argument(command, "--consecutive-eligible") == "2"
         assert timeout == 90
+        assert ("--ignore-historical-load" in command) is (name == "runner-preflight-network")
 
     network = next(
         command for name, command, _timeout in recorder.calls if name == "paired-network-advisory"
