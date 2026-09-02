@@ -1,0 +1,333 @@
+name: ARM64 QoS1 RTT Tournament
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: Exact reviewed control commit SHA
+        required: true
+        type: string
+      candidate_b_ref:
+        description: Exact reviewed candidate B commit SHA
+        required: true
+        type: string
+      candidate_aprime_ref:
+        description: Exact reviewed targeted A-prime commit SHA
+        required: true
+        type: string
+      candidate_f_ref:
+        description: Exact reviewed bounded two-permit candidate SHA
+        required: true
+        type: string
+      candidate_d_ref:
+        description: Optional exact reviewed nowait-microbatch candidate SHA
+        required: false
+        type: string
+      confirm_trusted_code:
+        description: I confirm that every input commit was reviewed and is trusted on the persistent runner
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mqttium-arm64-runner
+  cancel-in-progress: false
+
+jobs:
+  tournament:
+    if: inputs.confirm_trusted_code && github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 75
+    env:
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+    steps:
+      - name: Check out immutable benchmark harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: main
+          path: harness
+          persist-credentials: false
+
+      - name: Set run-specific workspace
+        run: echo "JOB_ROOT=$RUNNER_TEMP/mqttium-qos1-rtt-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+
+      - name: Validate immutable trusted commits
+        env:
+          BASE_REF: ${{ inputs.base_ref }}
+          B_REF: ${{ inputs.candidate_b_ref }}
+          APRIME_REF: ${{ inputs.candidate_aprime_ref }}
+          F_REF: ${{ inputs.candidate_f_ref }}
+          D_REF: ${{ inputs.candidate_d_ref }}
+        run: |
+          set -euo pipefail
+          for value in "$BASE_REF" "$B_REF" "$APRIME_REF" "$F_REF"; do
+            [[ "$value" =~ ^[0-9a-fA-F]{40}$ ]] || {
+              echo "required refs must be exact commit SHAs" >&2
+              exit 2
+            }
+          done
+          if [ -n "$D_REF" ] && [[ ! "$D_REF" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "candidate_d_ref must be empty or an exact commit SHA" >&2
+            exit 2
+          fi
+
+      - name: Check out control
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.base_ref }}
+          path: control
+          persist-credentials: false
+
+      - name: Check out candidate B
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.candidate_b_ref }}
+          path: candidate-b
+          persist-credentials: false
+
+      - name: Check out candidate A-prime
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.candidate_aprime_ref }}
+          path: candidate-aprime
+          persist-credentials: false
+
+      - name: Check out candidate F
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.candidate_f_ref }}
+          path: candidate-f
+          persist-credentials: false
+
+      - name: Check out optional candidate D
+        if: inputs.candidate_d_ref != ''
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.candidate_d_ref }}
+          path: candidate-d
+          persist-credentials: false
+
+      - name: Verify dedicated runner prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "aarch64"
+          command -v python3
+          command -v mosquitto
+          command -v taskset
+          python3 - <<'PY'
+          import sys
+          if sys.version_info[:2] != (3, 14):
+              raise SystemExit(f"expected system Python 3.14, got {sys.version}")
+          PY
+          if pgrep -a mosquitto; then
+            echo "A pre-existing Mosquitto process would contaminate paired evidence." >&2
+            exit 1
+          fi
+
+      - name: Prepare run directory and enforce preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$JOB_ROOT"
+          mkdir -p "$JOB_ROOT"
+          python3 -c 'import psutil'
+          python3 harness/benchmarks/runner_probe.py \
+            --output "$JOB_ROOT/runner.json" \
+            --require-temperature \
+            --enforce
+
+      - name: Strict callback-response A/A control
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_control() {
+            python3 harness/benchmarks/paired_qos1_rtt.py \
+              --base-root control --candidate-root control \
+              --suite callback --aa-control \
+              --repeat 20 --warmup 1000 --count 10000 \
+              --cpu 2 --timeout 120 \
+              --output "$JOB_ROOT/callback-aa.json"
+          }
+
+          set +e
+          run_control
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ]; then
+            exit 0
+          fi
+          if [ "$rc" -ne 2 ]; then
+            exit "$rc"
+          fi
+
+          mv "$JOB_ROOT/callback-aa.json" "$JOB_ROOT/callback-aa-attempt-1.json"
+          python3 harness/benchmarks/runner_probe.py \
+            --output "$JOB_ROOT/runner-retry.json" \
+            --require-temperature \
+            --enforce
+          run_control
+
+      - name: Paired callback-response candidates
+        shell: bash
+        run: |
+          set -euo pipefail
+          for spec in b:candidate-b aprime:candidate-aprime f:candidate-f; do
+            name="${spec%%:*}"
+            root="${spec#*:}"
+            output="$JOB_ROOT/callback-$name.json"
+            set +e
+            python3 harness/benchmarks/paired_qos1_rtt.py \
+              --base-root control --candidate-root "$root" \
+              --suite callback \
+              --repeat 20 --warmup 1000 --count 10000 \
+              --cpu 2 --timeout 120 \
+              --output "$output"
+            rc=$?
+            set -e
+            if [ ! -s "$output" ]; then
+              exit "$rc"
+            fi
+          done
+
+      - name: Start isolated Mosquitto pinned to CPU 0
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$JOB_ROOT/mosquitto.conf" <<'EOF'
+          persistence false
+          allow_anonymous true
+          max_inflight_messages 1000
+          max_queued_messages 100000
+          max_queued_bytes 0
+          connection_messages false
+          log_type error
+          listener 11883 127.0.0.1
+          EOF
+          taskset -c 0 mosquitto -c "$JOB_ROOT/mosquitto.conf" > "$JOB_ROOT/mosquitto.log" 2>&1 &
+          echo "$!" > "$JOB_ROOT/mosquitto.pid"
+          for _ in $(seq 1 50); do
+            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            if ! kill -0 "$(cat "$JOB_ROOT/mosquitto.pid")" 2>/dev/null; then
+              cat "$JOB_ROOT/mosquitto.log"
+              exit 1
+            fi
+            sleep 0.2
+          done
+          cat "$JOB_ROOT/mosquitto.log"
+          exit 1
+
+      - name: Strict writer-capacity A/A control
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_control() {
+            local preflight="$1"
+            local suffix="$2"
+            python3 harness/benchmarks/paired_writer_capacity.py \
+              --base-root control --candidate-root control \
+              --protocol 311 --qos-values 0,1 --payload-bytes 256 \
+              --inflight 20 --outstanding 64 --max-queued 200 \
+              --warmup-count 5000 --repeat 8 \
+              --count-qos0 100000 --count-qos1 40000 \
+              --timeout 120 --cpu 2 --policy strict \
+              --preflight-report "$preflight" \
+              --output "$JOB_ROOT/writer-capacity-aa$suffix.json" \
+              --summary-output "$JOB_ROOT/writer-capacity-aa$suffix.md"
+          }
+
+          set +e
+          run_control "$JOB_ROOT/runner.json" ""
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ]; then
+            exit 0
+          fi
+          if [ "$rc" -ne 2 ]; then
+            exit "$rc"
+          fi
+
+          mv "$JOB_ROOT/writer-capacity-aa.json" \
+            "$JOB_ROOT/writer-capacity-aa-attempt-1.json"
+          if [ -f "$JOB_ROOT/writer-capacity-aa.md" ]; then
+            mv "$JOB_ROOT/writer-capacity-aa.md" \
+              "$JOB_ROOT/writer-capacity-aa-attempt-1.md"
+          fi
+          python3 harness/benchmarks/runner_probe.py \
+            --output "$JOB_ROOT/runner-capacity-retry.json" \
+            --require-temperature \
+            --enforce
+          run_control "$JOB_ROOT/runner-capacity-retry.json" "-attempt-2"
+
+      - name: Strict writer-capacity candidates
+        shell: bash
+        run: |
+          set -euo pipefail
+          specs=(b:candidate-b aprime:candidate-aprime f:candidate-f)
+          if [ -d candidate-d ]; then
+            specs+=(d:candidate-d)
+          fi
+          preflight="$JOB_ROOT/runner.json"
+          if [ -f "$JOB_ROOT/runner-capacity-retry.json" ]; then
+            preflight="$JOB_ROOT/runner-capacity-retry.json"
+          fi
+          for spec in "${specs[@]}"; do
+            name="${spec%%:*}"
+            root="${spec#*:}"
+            output="$JOB_ROOT/writer-capacity-$name.json"
+            set +e
+            python3 harness/benchmarks/paired_writer_capacity.py \
+              --base-root control --candidate-root "$root" \
+              --protocol 311 --qos-values 0,1 --payload-bytes 256 \
+              --inflight 20 --outstanding 64 --max-queued 200 \
+              --warmup-count 5000 --repeat 8 \
+              --count-qos0 100000 --count-qos1 40000 \
+              --timeout 120 --cpu 2 --policy strict \
+              --preflight-report "$preflight" \
+              --output "$output" \
+              --summary-output "$JOB_ROOT/writer-capacity-$name.md"
+            rc=$?
+            set -e
+            if [ ! -s "$output" ]; then
+              exit "$rc"
+            fi
+          done
+
+      - name: Isolated nowait-microbatch candidate D
+        if: inputs.candidate_d_ref != ''
+        shell: bash
+        run: |
+          python3 harness/benchmarks/paired_qos1_rtt.py \
+            --base-root control --candidate-root candidate-d \
+            --suite microbatch --repeat 8 --trials 40 \
+            --cpu 2 --timeout 120 \
+            --output "$JOB_ROOT/microbatch-d.json"
+
+      - name: Upload focused evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: arm64-qos1-rtt-tournament-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/mqttium-qos1-rtt-${{ github.run_id }}-${{ github.run_attempt }}/*.json
+            ${{ runner.temp }}/mqttium-qos1-rtt-${{ github.run_id }}-${{ github.run_attempt }}/*.md
+            ${{ runner.temp }}/mqttium-qos1-rtt-${{ github.run_id }}-${{ github.run_attempt }}/mosquitto.log
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Clean up run-specific state
+        if: always()
+        shell: bash
+        run: |
+          pidfile="$JOB_ROOT/mosquitto.pid"
+          if [ -f "$pidfile" ]; then
+            pid="$(cat "$pidfile")"
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+          fi
+          rm -rf "$JOB_ROOT"
