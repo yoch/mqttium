@@ -13,6 +13,10 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   `publish_nowait()` and `publish(..., nowait=True)` calls no longer size the
   topic or encode MQTT 5 properties twice; packet identifiers, receipts,
   rollback, wire ordering, and queue bounds are unchanged.
+- Give fixed success PUBACK, PUBREC, and PUBCOMP frames one bounded eager-write
+  permit independent from application data. A synchronous `on_message` reply
+  can therefore reach the transport in the callback turn, while ACK and data
+  bursts remain limited to one eager write of each kind per event-loop turn.
 
 ### Fixed
 

@@ -104,6 +104,38 @@ async def test_eager_write_reaches_the_transport_without_a_loop_turn() -> None:
         await pump.stop()
 
 
+@pytest.mark.parametrize("packet_type", (0x40, 0x50, 0x70))
+async def test_success_ack_and_data_have_independent_eager_permits(packet_type: int) -> None:
+    transport = _EagerTransport()
+    pump = _pump()
+    pump.start(transport)
+    try:
+        ack = bytes((packet_type, 2, 0, 1))
+        assert pump.try_enqueue(ack) is True
+        assert pump.try_enqueue(b"\x30\x00") is True
+
+        assert transport.written == [ack, b"\x30\x00"]
+        assert pump.queued_messages == 0
+        assert pump.eager_writes == 2
+    finally:
+        await pump.stop()
+
+
+async def test_success_ack_eager_burst_is_bounded_to_one_per_turn() -> None:
+    transport = _EagerTransport()
+    pump = _pump()
+    pump.start(transport)
+    try:
+        for mid in range(1, 17):
+            assert pump.try_enqueue(b"\x40\x02" + mid.to_bytes(2, "big")) is True
+
+        assert len(transport.written) == 1
+        assert pump.queued_messages == 15
+        assert pump.eager_writes == 1
+    finally:
+        await pump.stop()
+
+
 async def test_eager_write_updates_last_outbound_for_keepalive() -> None:
     transport = _EagerTransport()
     pump = _pump()
