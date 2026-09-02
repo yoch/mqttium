@@ -7,7 +7,9 @@ from mqttium.api.async_client import AsyncClient
 from mqttium.enums import ConnectionState
 
 
-async def test_latency_batch_trigger_is_awaited_qos_only(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_latency_batch_trigger_covers_all_qosn_entrypoints(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     calls: list[WritePump] = []
 
     def record(pump: WritePump) -> bool:
@@ -25,8 +27,15 @@ async def test_latency_batch_trigger_is_awaited_qos_only(monkeypatch: pytest.Mon
     nowait_qos1 = AsyncClient()
     nowait_qos1._engine.state = ConnectionState.CONNECTED
     await nowait_qos1.publish("latency/nowait", b"x", qos=1, nowait=True)
-    assert calls == []
+    assert calls == [nowait_qos1._write_pump]
 
+    calls.clear()
+    sync_nowait_qos1 = AsyncClient()
+    sync_nowait_qos1._engine.state = ConnectionState.CONNECTED
+    sync_nowait_qos1.publish_nowait("latency/sync-nowait", b"x", qos=1)
+    assert calls == [sync_nowait_qos1._write_pump]
+
+    calls.clear()
     awaited_qos0 = AsyncClient()
     awaited_qos0._engine.state = ConnectionState.CONNECTED
     await awaited_qos0.publish("latency/qos0", b"x", qos=0)
