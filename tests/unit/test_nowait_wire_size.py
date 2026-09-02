@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 import mqttium.packets._publish as publish_v311_module
+import mqttium.protocol.outbound as outbound_module
 from mqttium.api import AsyncClient
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, QoS
 from mqttium.packets import PublishPacket
@@ -89,6 +90,82 @@ async def test_publish_nowait_encodes_only_the_real_frame(monkeypatch) -> None:
     assert packet_calls == 0
     assert item_calls == 1
     assert client._effect_flush_task is None
+
+
+@pytest.mark.parametrize("entrypoint", ["publish_nowait", "publish"])
+async def test_nowait_qos1_prepares_properties_once_with_resident_writer(
+    monkeypatch: pytest.MonkeyPatch,
+    entrypoint: str,
+) -> None:
+    """Writer preflight and protocol admission must share one preparation."""
+    calls = 0
+    original = outbound_module.encode_properties
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(outbound_module, "encode_properties", counted)
+    client = AsyncClient(
+        protocol=MQTTProtocolVersion.MQTTv5,
+        max_outbound_messages=8,
+        max_outbound_bytes=4096,
+    )
+    client._engine.state = ConnectionState.CONNECTED
+    assert client._write_pump.try_enqueue(b"occupied") is True
+    properties = _properties(MQTTProtocolVersion.MQTTv5, rich=True)
+
+    if entrypoint == "publish_nowait":
+        receipt = client.publish_nowait(
+            "bench/nowait",
+            b"payload",
+            qos=QoS.AT_LEAST_ONCE,
+            properties=properties,
+        )
+    else:
+        receipt = await client.publish(
+            "bench/nowait",
+            b"payload",
+            qos=QoS.AT_LEAST_ONCE,
+            properties=properties,
+            nowait=True,
+        )
+
+    assert receipt.mid is not None
+    assert calls == 1
+    assert client._outbound.get_nowait() == b"occupied"
+    assert client._outbound.get_nowait() == PublishPacket(
+        topic="bench/nowait",
+        payload=b"payload",
+        qos=QoS.AT_LEAST_ONCE,
+        retain=False,
+        dup=False,
+        mid=receipt.mid,
+        properties=properties,
+    ).encode_write_item(MQTTProtocolVersion.MQTTv5)
+
+
+async def test_nowait_qos1_sizes_v311_once_with_resident_writer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    original = outbound_module.OutboundSession.size_parts
+
+    def counted(self, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(outbound_module.OutboundSession, "size_parts", counted)
+    client = AsyncClient(max_outbound_messages=8, max_outbound_bytes=4096)
+    client._engine.state = ConnectionState.CONNECTED
+    assert client._write_pump.try_enqueue(b"occupied") is True
+
+    receipt = client.publish_nowait("bench/nowait", b"payload", qos=QoS.AT_LEAST_ONCE)
+
+    assert receipt.mid is not None
+    assert calls == 1
 
 
 def test_qos1_launch_frame_matches_publish_packet() -> None:

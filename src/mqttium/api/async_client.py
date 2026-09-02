@@ -71,6 +71,7 @@ from mqttium.protocol.engine import (
     PublishFailure,
 )
 from mqttium.protocol.negotiated import NegotiatedSettings
+from mqttium.protocol.outbound import _PreparedPublish
 from mqttium.protocol.reconnect import ReconnectPolicy
 from mqttium.persistence.memory import InflightStore
 from mqttium.topics import validate_subscribe_filter
@@ -654,6 +655,7 @@ class AsyncClient:
         qos: int | QoS,
         retain: bool,
         properties: Properties | None = None,
+        _prepared: _PreparedPublish | None = None,
     ) -> PublishReceipt:
         """Admit one publish and register its receipt without flushing.
 
@@ -667,6 +669,7 @@ class AsyncClient:
             qos=qos,
             retain=retain,
             properties=properties,
+            _prepared=_prepared,
         )
         if handle.qos == QoS.AT_MOST_ONCE:
             return PublishReceipt(mid=None, qos=handle.qos)
@@ -704,7 +707,7 @@ class AsyncClient:
     ) -> PublishReceipt | None:
         # Compare before converting: every QoS 1/2 publish reaches this line and
         # would otherwise construct an enum only to be rejected. Invalid values
-        # still raise ValueError from _validate_publish_request downstream.
+        # still raise ValueError from _prepare_publish_request downstream.
         if qos != QoS.AT_MOST_ONCE or not self._direct_qos0_ready():
             return None
         callback = self.on_publish
@@ -1236,13 +1239,14 @@ class AsyncClient:
         )
         if direct is not None:
             return direct
-        self._check_nowait_publish_capacity(topic, data, qos, retain, properties)
+        prepared = self._check_nowait_publish_capacity(topic, data, qos, retain, properties)
         receipt = self._queue_publish_on_loop(
             topic,
             data,
             qos=qos,
             retain=retain,
             properties=properties,
+            _prepared=prepared,
         )
         self._finalize_loop_commands()
         return receipt
@@ -1296,8 +1300,11 @@ class AsyncClient:
                     )
                     if direct is not None:
                         return direct
+                    prepared = None
                     if nowait:
-                        self._check_nowait_publish_capacity(topic, data, qos, retain, properties)
+                        prepared = self._check_nowait_publish_capacity(
+                            topic, data, qos, retain, properties
+                        )
                     # Keep the native async hot path inline. Routing these
                     # operations through the adapter boundary measured 2.36% slower.
                     handle = self._engine.outbound.queue_publish(
@@ -1306,6 +1313,7 @@ class AsyncClient:
                         qos=qos,
                         retain=retain,
                         properties=properties,
+                        _prepared=prepared,
                     )
                     if handle.qos == QoS.AT_MOST_ONCE:
                         receipt = PublishReceipt(mid=None, qos=handle.qos)
@@ -2083,13 +2091,15 @@ class AsyncClient:
         qos: QoS | int,
         retain: bool,
         properties: Properties | None,
-    ) -> None:
-        level = QoS(qos)
-        will_send = self._engine.state == ConnectionState.CONNECTED and (
-            level == QoS.AT_MOST_ONCE or self._engine.flow.available > 0
-        )
-        if not will_send:
-            return
+    ) -> _PreparedPublish | None:
+        if self._engine.state != ConnectionState.CONNECTED:
+            # Preserve validation order: invalid QoS raises before the later
+            # connection-state guard, as it did when every preflight converted.
+            QoS(qos)
+            return None
+        if qos != QoS.AT_MOST_ONCE and self._engine.flow.available <= 0:
+            QoS(qos)
+            return None
         # An empty writer (no resident frames, no charged bytes) admits a
         # single item of any size, so its size cannot change the answer.
         # Sizing it anyway measured the topic and, on MQTT 5 with properties,
@@ -2097,10 +2107,25 @@ class AsyncClient:
         # again immediately afterwards. qsize()==0 is not enough: an in-flight
         # writer batch has already left the queue but still occupies the bound.
         if not self._write_pump.resident_messages and not self._write_pump.queued_bytes:
-            return
-        size = self._preview_publish_size(topic, payload, level, properties)
-        if not self._can_enqueue_outbound_size(size):
-            raise FlowControlError(self._write_pump.refusal(size))
+            return None
+        if qos == QoS.AT_MOST_ONCE:
+            size = self._preview_publish_size(topic, payload, qos, properties)
+            if not self._can_enqueue_outbound_size(size):
+                raise FlowControlError(self._write_pump.refusal(size))
+            return None
+        prepared = self._engine.outbound._prepare_publish_request(
+            topic,
+            payload,
+            qos,
+            retain,
+            properties,
+            include_wire_size=True,
+        )
+        prepared_size = prepared.wire_size
+        assert prepared_size is not None
+        if not self._can_enqueue_outbound_size(prepared_size):
+            raise FlowControlError(self._write_pump.refusal(prepared_size))
+        return prepared
 
     def _check_nowait_publish_many_capacity(
         self,

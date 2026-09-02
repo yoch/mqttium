@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Iterable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from mqttium.codec.buffer import RawPacket
 from mqttium.codec.properties import PUBLISH, encode_properties
@@ -65,6 +65,17 @@ def _mark_publish_dup(item: WriteItem) -> WriteItem:
     if header[0] & 0x08:
         return item
     return (bytes((header[0] | 0x08,)) + header[1:], payload)
+
+
+class _PreparedPublish(NamedTuple):
+    """Mutation-free values shared by writer preflight and QoS admission."""
+
+    qos: QoS
+    topic_bytes: bytes | None
+    canonical_topic: str
+    property_bytes: bytes | None
+    logical_size: int
+    wire_size: int | None
 
 
 class OutboundSession:
@@ -353,15 +364,17 @@ class OutboundSession:
             raise ProtocolError(f"Unknown outbound topic alias {alias} on this connection")
         return canonical_topic
 
-    def _validate_publish_request(
+    def _prepare_publish_request(
         self,
         topic: str,
         payload: bytes,
         qos: QoS | int,
         retain: bool,
         properties: Properties | None,
-    ) -> tuple[QoS, bytes | None, int, str]:
-        """Validate one outbound PUBLISH and retain Topic Name bytes when launching.
+        *,
+        include_wire_size: bool = False,
+    ) -> _PreparedPublish:
+        """Validate and size one PUBLISH without acquiring outbound state.
 
         QoS 0 always encodes immediately. QoS 1/2 encode when the session is
         connected so the launch path can reuse the bytes; an offline queue
@@ -433,7 +446,38 @@ class OutboundSession:
 
         if engine.state != ConnectionState.CONNECTED and level == QoS.AT_MOST_ONCE:
             raise NotConnectedError("Cannot publish QoS 0 while disconnected")
-        return level, topic_bytes, topic_size, canonical_topic
+        if level is QoS.AT_MOST_ONCE:
+            return _PreparedPublish(level, topic_bytes, canonical_topic, None, 0, None)
+
+        # One property encode and the Topic Name bytes from validation feed the
+        # writer preflight, wire-size check and logical budget. The encoder
+        # reuses both on an immediate launch.
+        topic_size, wire_property_bytes, logical_property_bytes, property_bytes = self.size_parts(
+            topic, properties, topic_size=topic_size
+        )
+        wire_size = self._check_publish_wire_size(
+            topic_size,
+            wire_property_bytes,
+            len(payload),
+            level,
+            include_wire_size=include_wire_size,
+        )
+        logical_topic_size = topic_size
+        if canonical_topic != topic:
+            logical_topic_size = (
+                len(canonical_topic)
+                if canonical_topic.isascii()
+                else len(canonical_topic.encode("utf-8"))
+            )
+        logical_size = len(payload) + logical_topic_size + logical_property_bytes
+        return _PreparedPublish(
+            level,
+            topic_bytes,
+            canonical_topic,
+            property_bytes,
+            logical_size,
+            wire_size,
+        )
 
     def _prepare_qos0_validated(
         self,
@@ -467,9 +511,10 @@ class OutboundSession:
     ) -> WriteItem:
         """Prepare a mutation-free QoS 0 publication for the native runtime."""
 
-        _qos, topic_bytes, _topic_size, _canonical_topic = self._validate_publish_request(
+        prepared = self._prepare_publish_request(
             topic, payload, QoS.AT_MOST_ONCE, retain, properties
         )
+        topic_bytes = prepared.topic_bytes
         assert topic_bytes is not None
         return self._prepare_qos0_validated(
             topic,
@@ -487,12 +532,18 @@ class OutboundSession:
         qos: QoS | int = QoS.AT_MOST_ONCE,
         retain: bool = False,
         properties: Properties | None = None,
+        _prepared: _PreparedPublish | None = None,
     ) -> PublishHandle:
-        if self._engine.state is ConnectionState.DISCONNECTING:
-            raise NotConnectedError("publish is not allowed while disconnecting")
-        qos, topic_bytes, topic_size, canonical_topic = self._validate_publish_request(
-            topic, payload, qos, retain, properties
-        )
+        if _prepared is None:
+            if self._engine.state is ConnectionState.DISCONNECTING:
+                raise NotConnectedError("publish is not allowed while disconnecting")
+            prepared = self._prepare_publish_request(topic, payload, qos, retain, properties)
+        else:
+            # Internal callers prepare and commit synchronously on the owning
+            # loop, with no await or callback between the two operations.
+            prepared = _prepared
+        qos = prepared.qos
+        topic_bytes = prepared.topic_bytes
 
         if qos == QoS.AT_MOST_ONCE:
             assert topic_bytes is not None
@@ -511,23 +562,9 @@ class OutboundSession:
             self._engine._emit(EffectKind.PUBLISH_COMPLETE, None)
             return PublishHandle(mid=None, qos=qos)
 
-        # One property encode and the Topic Name bytes from validation feed both
-        # the wire-size check and the logical budget. The encoder reuses both so
-        # a property table is not walked a second time and a non-ASCII topic is
-        # not encoded again on the launch path.
-        topic_size, wire_property_bytes, logical_property_bytes, property_bytes = self.size_parts(
-            topic, properties, topic_size=topic_size
-        )
-        # Validate packet size before reserving local memory or a packet id.
-        self._check_publish_wire_size(topic_size, wire_property_bytes, len(payload), qos)
-        logical_topic_size = topic_size
-        if canonical_topic != topic:
-            logical_topic_size = (
-                len(canonical_topic)
-                if canonical_topic.isascii()
-                else len(canonical_topic.encode("utf-8"))
-            )
-        logical_size = len(payload) + logical_topic_size + logical_property_bytes
+        canonical_topic = prepared.canonical_topic
+        property_bytes = prepared.property_bytes
+        logical_size = prepared.logical_size
         # Snapshot before the first acquisition. Three local reads is all the
         # success path pays for a shared rollback; _rollback itself is a call
         # only taken on failure. This path is the hottest in the library and
@@ -1095,18 +1132,21 @@ class OutboundSession:
         wire_property_bytes: int,
         payload_size: int,
         qos: QoS,
-    ) -> None:
+        *,
+        include_wire_size: bool = False,
+    ) -> int | None:
         """Cheap upper bound vs negotiated maximum_packet_size (before full encode)."""
         limit = self._engine.negotiated.maximum_packet_size
-        if limit is None:
-            return
+        if limit is None and not include_wire_size:
+            return None
         encoded_size = self._publish_wire_size_from_parts(
             topic_bytes, wire_property_bytes, payload_size, qos
         )
-        if encoded_size > limit:
+        if limit is not None and encoded_size > limit:
             raise PacketTooLargeError(
                 f"Encoded packet size {encoded_size} exceeds broker maximum_packet_size {limit}"
             )
+        return encoded_size
 
     def _check_publish_size(
         self,
