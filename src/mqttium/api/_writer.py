@@ -23,6 +23,17 @@ _LATENCY_BATCH_MIN_ITEMS = 4
 _LATENCY_BATCH_MAX_ITEMS = 16
 _LATENCY_BATCH_TARGET_BYTES = 48 * 1024
 
+_SUCCESS_ACK_TYPES = frozenset((0x40, 0x50, 0x70))
+
+
+def _is_success_ack_frame(item: WriteItem) -> bool:
+    return (
+        isinstance(item, bytes)
+        and len(item) == 4
+        and item[1] == 2
+        and item[0] in _SUCCESS_ACK_TYPES
+    )
+
 
 class WritePump:
     """Serialize transport writes and own their bounded queue invariant."""
@@ -309,6 +320,7 @@ class WritePump:
         completion without awaiting.
         """
         write_nowait = self._write_nowait
+        is_ack = _is_success_ack_frame(item)
         if (
             not self._eager_armed
             or write_nowait is None
@@ -320,9 +332,10 @@ class WritePump:
             return False
         if not write_nowait(item):
             return False
-        self._eager_armed = False
-        generation = self._eager_generation
-        asyncio.get_running_loop().call_soon(self._rearm_eager_if_idle, generation)
+        if not is_ack:
+            self._eager_armed = False
+            generation = self._eager_generation
+            asyncio.get_running_loop().call_soon(self._rearm_eager_if_idle, generation)
         self.eager_writes += 1
         self.eager_bytes += len(item)
         self.last_outbound = time.monotonic()
