@@ -6,6 +6,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [1.0.0rc12] - 2026-09-02
+
 ### Changed
 
 - Reuse one mutation-free QoS 1/2 publication preparation between synchronous
@@ -1000,7 +1002,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - Pre-spin-out comparative analysis and generated coverage data from the
   published source tree.
 
-[Unreleased]: https://github.com/yoch/mqttium/compare/v1.0.0rc11...HEAD
+[Unreleased]: https://github.com/yoch/mqttium/compare/v1.0.0rc12...HEAD
+[1.0.0rc12]: https://github.com/yoch/mqttium/compare/v1.0.0rc11...v1.0.0rc12
 [1.0.0rc11]: https://github.com/yoch/mqttium/compare/v1.0.0rc10...v1.0.0rc11
 [1.0.0rc10]: https://github.com/yoch/mqttium/compare/v1.0.0rc9...v1.0.0rc10
 [1.0.0rc9]: https://github.com/yoch/mqttium/compare/v1.0.0rc8...v1.0.0rc9
