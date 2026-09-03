@@ -509,20 +509,58 @@ class OutboundSession:
         retain: bool = False,
         properties: Properties | None = None,
     ) -> WriteItem:
-        """Prepare a mutation-free QoS 0 publication for the native runtime."""
+        """Prepare QoS 0 directly, without allocating a prepared carrier."""
 
-        prepared = self._prepare_publish_request(
-            topic, payload, QoS.AT_MOST_ONCE, retain, properties
-        )
-        topic_bytes = prepared.topic_bytes
-        assert topic_bytes is not None
-        return self._prepare_qos0_validated(
+        engine = self._engine
+        alias: int | None = None
+        if properties is None:
+            # Keep the common telemetry path branch-light: QoS 0 has no
+            # admission state to carry into a later transaction.
+            topic_bytes = encode_validated_publish_topic(topic)
+        else:
+            if not self._is_v5 and properties.values:
+                raise ProtocolError("PUBLISH properties require MQTT 5")
+            if self._is_v5 and properties.get("subscription_identifier") is not None:
+                raise ProtocolError(
+                    "subscription_identifier is not allowed on an outbound PUBLISH [MQTT-3.3.4-6]"
+                )
+            alias_value = properties.get("topic_alias") if self._is_v5 else None
+            if alias_value is not None:
+                alias = int(alias_value)
+                self._resolve_outbound_alias(topic, alias)
+            allow_empty = alias is not None and not topic
+            topic_bytes = (
+                encode_validated_publish_topic(topic, allow_empty=True)
+                if allow_empty
+                else encode_validated_publish_topic(topic)
+            )
+
+        if engine.state == ConnectionState.CONNECTED:
+            negotiated = engine.negotiated
+            # maximum_qos cannot reject QoS 0; do not pay the comparison on
+            # the hottest publication path.
+            if retain and not negotiated.retain_available:
+                raise ProtocolError("Broker does not support retain")
+            if alias is not None and alias > negotiated.topic_alias_maximum:
+                raise ProtocolError(
+                    f"topic_alias {alias} exceeds broker topic_alias_maximum "
+                    f"{negotiated.topic_alias_maximum}"
+                )
+        else:
+            raise NotConnectedError("Cannot publish QoS 0 while disconnected")
+
+        item = self._encode_publish(
             topic,
             payload,
+            qos=QoS.AT_MOST_ONCE,
             retain=retain,
+            dup=False,
+            mid=None,
             properties=properties,
-            topic_bytes=topic_bytes,
+            _topic_bytes=topic_bytes,
         )
+        engine._check_outbound_size(item)
+        return item
 
     def queue_publish(
         self,
@@ -537,7 +575,22 @@ class OutboundSession:
         if _prepared is None:
             if self._engine.state is ConnectionState.DISCONNECTING:
                 raise NotConnectedError("publish is not allowed while disconnecting")
-            prepared = self._prepare_publish_request(topic, payload, qos, retain, properties)
+            level = QoS(qos)
+            if level is QoS.AT_MOST_ONCE:
+                item = self.prepare_qos0(
+                    topic,
+                    payload,
+                    retain=retain,
+                    properties=properties,
+                )
+                self._engine._send(item)
+                if properties is not None and properties.get("topic_alias") is not None:
+                    self.commit_topic_alias(topic, properties)
+                # Completion follows SEND so compatibility on_publish cannot run
+                # before the outbound queue has accepted the frame.
+                self._engine._emit(EffectKind.PUBLISH_COMPLETE, None)
+                return PublishHandle(mid=None, qos=level)
+            prepared = self._prepare_publish_request(topic, payload, level, retain, properties)
         else:
             # Internal callers prepare and commit synchronously on the owning
             # loop, with no await or callback between the two operations.
@@ -545,6 +598,8 @@ class OutboundSession:
         qos = prepared.qos
         topic_bytes = prepared.topic_bytes
 
+        # Keep compatibility with an already-created internal QoS 0 carrier;
+        # ordinary publication no longer allocates one.
         if qos == QoS.AT_MOST_ONCE:
             assert topic_bytes is not None
             item = self._prepare_qos0_validated(
