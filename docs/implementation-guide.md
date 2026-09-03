@@ -283,8 +283,8 @@ explicit architectural alternative: it would need correctness justification
  both kinds wire-first. Kind alone therefore cannot classify: a fresh
  automatic QoS 1 `SEND_ACK(PUBACK)` is emitted with no durable row, while a
  fresh QoS 2 `SEND_ACK(PUBREC)` is emitted after `put_in`, and an orphan
- `SEND_ACK(PUBCOMP)` answers an unknown identifier. The instances, at
- `main@ed3f6a7`:
+  `SEND_ACK(PUBCOMP)` answers an unknown identifier. The instances, at
+  `main@5403636ab1ccc9da45363fe1ac9858f49f1d6219`:
 
 - Observation scope (survives any durable failure): effects with no durable
   dependency — orphan answers (duplicate-QoS 2 `PUBREC` re-emission, orphan
