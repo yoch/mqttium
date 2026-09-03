@@ -147,14 +147,15 @@ Work from an older epoch is discarded rather than applied to the new transport.
 ### Outbound QoS 1
 
 Admission reserves logical capacity, allocates a packet ID, persists the PUBLISH,
-registers its receipt, then emits the frame. PUBACK emits completion before
-deleting state and releasing the ID and capacity.
+registers its receipt, then emits the frame. PUBACK is the terminal broker
+boundary: its receipt completes on observation even if durable cleanup fails;
+cleanup never vetoes it.
 
 ### Outbound QoS 2
 
 PUBLISH remains persisted until PUBREC. A successful PUBREC atomically replaces
-the durable record with PUBREL. PUBCOMP emits completion and then releases the
-remaining resources. A terminal negative PUBREC fails the receipt and releases
+the durable record with PUBREL. PUBCOMP is the terminal boundary under the same
+rule as PUBACK above. A terminal negative PUBREC fails the receipt and releases
 the transaction.
 
 ### Inbound QoS 1 and 2
@@ -258,16 +259,10 @@ between them, keeping only terminal publish outcomes and discarding the
 lot's other unexposed effects.
 
  Scope is decided per effect instance by the precise transition it depends
- on, never by `EffectKind` alone: since #427, `SEND_ACK` carries every
- success ACK while reason-carrying frames stay `SEND`, so a fresh automatic
- QoS 1 PUBACK (no durable row) and a fresh QoS 2 PUBREC (after `put_in`)
- share a kind but not a scope. Terminal publish effects (`PUBLISH_COMPLETE`
- on an observed success ACK, `PUBLISH_FAILED` on an observed MQTT 5 reason
- at or above `0x80`, including negative PUBREC) belong to the observation
- of the ACK: a later local cleanup failure can neither replace the broker
- outcome nor suppress the effect. CONNACK is excluded for this phase: it
- resolves the `connect()` future before inbound replay and the final drain
- complete.
+ on, never by `EffectKind` alone (a fresh automatic QoS 1 PUBACK has no
+ durable row; a fresh QoS 2 PUBREC follows `put_in`). CONNACK is excluded
+ for this phase: it resolves the `connect()` future before inbound replay
+ and the final drain complete.
 
 Four guarantees, all normative:
 
@@ -287,10 +282,7 @@ Four guarantees, all normative:
 4. Broker and local store share no distributed transaction: perfect crash
    recovery and absence of duplication are not guaranteed.
 
-Covered by `tests/unit/test_ingress_failure_semantics.py` (terminal receipt
-preserved across settle/batch-exit failures, commit-dependent effects
-dropped, resurrected-but-never-replayed known-stale row, original exception
-on `on_disconnect`, no reconnect, no silent reuse or admission).
+Covered by `tests/unit/test_ingress_failure_semantics.py`.
 
 ## API completion and errors
 

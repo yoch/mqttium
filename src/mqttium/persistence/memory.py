@@ -19,13 +19,24 @@ from mqttium.types import (
 
 class InflightStore(Protocol):
     """The minimum a store must provide. Session replay materialises the whole
-    store at once, which is proportional to total session size."""
+    store at once, which is proportional to total session size.
+
+    Implementations MUST NOT report storage, backend, integrity, or lifecycle
+    failures with ``mqttium.errors.MQTTError`` or any of its subclasses: those
+    types belong to the MQTT/client layers, and the engine attributes them to
+    the peer. Use backend-native or ordinary Python exceptions (``OSError``,
+    ``RuntimeError``, ``ValueError``, ``KeyError``, DB-API errors) instead. A
+    store that raises an MQTT exception leaves its classification outside the
+    supported contract.
+    """
 
     def batch(self) -> AbstractContextManager[None]:
         """Group store mutations into one atomic unit.
 
         If the body raises, prior mutations in that batch must not become
-        durable (rollback). See ``docs/sessions-and-persistence.md``
+        durable (rollback). The batch itself must not suppress an exception
+        raised by its body or by batch close: callers rely on observing the
+        original failure. See ``docs/sessions-and-persistence.md``
         (capability matrix) for the base ``InflightStore`` contract: atomic
         ``batch()`` mutations and ordered whole-record iteration.
         """

@@ -989,13 +989,15 @@ class AsyncClient:
         generation, and performs one connection attempt under the lifecycle
         lock.
         """
-        if self._local_terminal_failure is not None:
-            raise MQTTError(
-                "Client is unusable after a local terminal failure; "
-                "create a new AsyncClient instead of reusing this one"
-            )
         async with self._lifecycle_lock:
             await self._prepare_explicit_connect()
+            # Rechecked, not just entry-checked: the latch is set-once, so a
+            # failure that landed while waiting on the lock is observed here.
+            if self._local_terminal_failure is not None:
+                raise MQTTError(
+                    "Client is unusable after a local terminal failure; "
+                    "create a new AsyncClient instead of reusing this one"
+                )
             was_alt = self._unix_path is not None or self._ws_url is not None
             self._unix_path = unix_path
             self._ws_url = ws_url
@@ -1318,15 +1320,15 @@ class AsyncClient:
             MQTTError: If a previous local terminal failure fail-stopped
                 this client; create a new one instead of reusing it.
         """
-        if self._local_terminal_failure is not None:
-            raise MQTTError(
-                "Client is unusable after a local terminal failure; "
-                "create a new AsyncClient instead of reusing this one"
-            )
         data = payload.encode("utf-8") if isinstance(payload, str) else payload
         while True:
             waiter: asyncio.Future[None] | None = None
             async with self._engine_lock:
+                if self._local_terminal_failure is not None:
+                    raise MQTTError(
+                        "Client is unusable after a local terminal failure; "
+                        "create a new AsyncClient instead of reusing this one"
+                    )
                 try:
                     direct = self._try_direct_qos0_publish(
                         topic,
@@ -1394,6 +1396,11 @@ class AsyncClient:
         while True:
             waiter: asyncio.Future[None] | None = None
             async with self._engine_lock:
+                if self._local_terminal_failure is not None:
+                    raise MQTTError(
+                        "Client is unusable after a local terminal failure; "
+                        "create a new AsyncClient instead of reusing this one"
+                    )
                 try:
                     if self._try_direct_qos0_many(requests, receipt, nowait=nowait):
                         return
@@ -1972,15 +1979,20 @@ class AsyncClient:
                             # Everything here is synchronous under the engine
                             # lock with no await between latch and retire, so
                             # no admission can slip into the window. Latch
-                            # first so reconnect and reuse decisions see it,
-                            # keep only terminal publish outcomes among this
+                            # first so reconnect and reuse decisions see it.
+                            # A pending explicit connect() must fail with the
+                            # original cause instead of timing out on CONNACK.
+                            self._local_terminal_failure = exc
+                            connack_fut = self._connack_fut
+                            if connack_fut is not None and not connack_fut.done():
+                                connack_fut.set_exception(exc)
+                            # Keep only terminal publish outcomes among this
                             # lot's new effects — anything else was never
                             # durably committed and must not be exposed — then
                             # retire connection-visible state immediately via
                             # the idempotent lifecycle boundary (the finally
                             # below re-enters it harmlessly) and let the
                             # original exception propagate.
-                            self._local_terminal_failure = exc
                             effects = self._engine._effects
                             kept = [
                                 effect
@@ -2329,9 +2341,10 @@ class AsyncClient:
                     continue
                 except Exception as exc:
                     self._disconnect_exc = exc
-                    if isinstance(exc, AssertionError):
+                    if isinstance(exc, AssertionError) or self._local_terminal_failure is not None:
                         # Never reuse an engine after a proven local invariant
-                        # violation, including one raised during reconnect.
+                        # violation — or after any latched local-terminal
+                        # failure, including one raised during reconnect.
                         await self._terminal_shutdown(exc)
                         return
                     continue
@@ -2497,7 +2510,15 @@ class AsyncClient:
                 await pending_delivery
             if effect.requires_delivery_mark and message.mid is not None:
                 async with self._engine_lock:
-                    self._engine.inbound.mark_delivered(message.mid)
+                    try:
+                        self._engine.inbound.mark_delivered(message.mid)
+                    except Exception as exc:
+                        # Store failure after application delivery accepted the
+                        # message: fail-stop with the original cause and let
+                        # the EffectPump run its close and terminal settlement.
+                        # The delivered outcome itself is not disturbed.
+                        self._local_terminal_failure = exc
+                        raise
         elif kind is EffectKind.PUBLISH_COMPLETE or kind is EffectKind.PUBLISH_FAILED:
             mid, reason = _terminal_publish_result(effect)
             self._settle_publish(mid, reason)
@@ -2534,7 +2555,17 @@ class AsyncClient:
             if epoch is not None and epoch != self._connection_epoch:
                 return
             async with self._engine_lock:
-                self._engine.continue_inbound_replay()
+                try:
+                    self._engine.continue_inbound_replay()
+                except Exception as exc:
+                    # Store failure while paging the redelivery cursor:
+                    # fail-stop with the original cause; the EffectPump runs
+                    # its close and terminal settlement. No retire here: the
+                    # reader teardown retires through its standard path, and
+                    # mutating engine state from the pump would add a second
+                    # owner.
+                    self._local_terminal_failure = exc
+                    raise
                 self._collect_effects_locked()
         elif kind is EffectKind.PROTOCOL_ERROR:
             self._raise_protocol_effect(effect.data)

@@ -187,6 +187,14 @@ therefore keeps the base correctness semantics with eager replay and
 best-effort phase-two compaction; it does not silently acquire atomic
 conditional-transition guarantees from a read/update fallback.
 
+A third-party store MUST NOT report storage, backend, integrity, or
+lifecycle failures with `MQTTError` or any of its subclasses: the engine
+attributes those types to the peer. Use backend-native or ordinary Python
+exceptions (`OSError`, `RuntimeError`, `ValueError`, `KeyError`, DB-API
+errors) instead. Likewise, `batch()` must not suppress an exception raised
+by its body or by batch close; the runtime observes the original failure to
+fail-stop the connection.
+
 ## Reconnect policy
 
 The native client does not reconnect unless a `ReconnectPolicy` is supplied.

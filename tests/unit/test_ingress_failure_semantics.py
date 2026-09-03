@@ -19,21 +19,28 @@ from pathlib import Path
 import pytest
 
 from mqttium import MQTTError
-from mqttium.api import AsyncClient, ReconnectPolicy
+from mqttium.api import AsyncClient, PublishMessage, ReconnectPolicy
 from mqttium.codec.buffer import IncrementalDecoder, RawPacket
-from mqttium.enums import ConnectionState, MQTTProtocolVersion, PacketType, QoS
+from mqttium.enums import (
+    ConnectionState,
+    MQTTProtocolVersion,
+    OutboundQoSState,
+    PacketType,
+    QoS,
+)
 from mqttium.packets import (
     PubAckPacket,
     PubCompPacket,
     PublishPacket,
     PubRecPacket,
     PubRelPacket,
+    encode_frame,
 )
 from mqttium.persistence.memory import MemoryInflightStore
 from mqttium.persistence.sqlite import SqliteInflightStore
 from mqttium.protocol.effects import EffectKind
 from mqttium.protocol.engine import EngineConfig, ProtocolEngine
-from mqttium.types import InboundMessage, InboundQoSState
+from mqttium.types import InboundMessage, InboundQoSState, OutboundMessage
 
 
 STORE_FAILURE = "durable settle failed"
@@ -43,14 +50,67 @@ class _FailSettleStore(MemoryInflightStore):
     """Refuse durable settlement while admitting everything else."""
 
     fail_mids: set[int] | None = None
+    error: BaseException | None = None
 
     def _must_fail(self, mid: int) -> bool:
         return self.fail_mids is None or mid in self.fail_mids
 
     def complete_out(self, mid: int, expected_state):  # noqa: ANN001, ANN202
         if self._must_fail(mid):
+            if self.error is not None:
+                raise self.error
             raise OSError(STORE_FAILURE)
         return super().complete_out(mid, expected_state)
+
+
+class _FailMarkStore(MemoryInflightStore):
+    """Accept delivery rows but refuse the delivered mark."""
+
+    fail_mark = False
+    mark_error: BaseException | None = None
+
+    def mark_in_delivered(self, mid: int) -> bool:
+        if self.fail_mark:
+            if self.mark_error is not None:
+                raise self.mark_error
+            raise OSError("delivery mark failed")
+        return super().mark_in_delivered(mid)
+
+
+class _FailReplayPagesStore(MemoryInflightStore):
+    """Serve the first replay page, then fail like a cursor read error."""
+
+    fail_pages = False
+    page_error: BaseException | None = None
+
+    def in_replay_pages(
+        self,
+        max_messages: int = 64,
+        max_bytes: int = 1 << 20,
+    ):
+        pages = super().in_replay_pages(max_messages=max_messages, max_bytes=max_bytes)
+        first = True
+        for page in pages:
+            if not first:
+                if self.page_error is not None:
+                    raise self.page_error
+                raise OSError("replay page failed")
+            first = False
+            yield page
+
+
+class _FailReplayStore(MemoryInflightStore):
+    """Refuse the outbound replay index read used at session restore."""
+
+    fail_replay = False
+    restore_error: BaseException | None = None
+
+    def out_summary_pages(self, page_size: int = 256):
+        if self.fail_replay:
+            if self.restore_error is not None:
+                raise self.restore_error
+            raise OSError("restore failed")
+        yield from super().out_summary_pages(page_size)
 
 
 class _FailPutInStore(MemoryInflightStore):
@@ -128,10 +188,13 @@ def test_puback_settle_failure_emits_complete_and_raises() -> None:
     handle = engine.queue_publish("failure/terminal", b"x", qos=QoS.AT_LEAST_ONCE)
     assert handle.mid is not None
     engine.take_effects()
+    sentinel = OSError(STORE_FAILURE)
+    store.error = sentinel
     store.fail_mids = {handle.mid}
 
-    with pytest.raises(OSError, match=STORE_FAILURE):
+    with pytest.raises(OSError) as raised:
         engine.handle_raw(_raw(PubAckPacket(mid=handle.mid).encode()))
+    assert raised.value is sentinel
     effects = engine.take_effects()
     assert [(effect.kind, effect.data) for effect in effects] == [
         (EffectKind.PUBLISH_COMPLETE, handle.mid)
@@ -212,6 +275,7 @@ class _ManualBrokerTransport:
         self.decoder = IncrementalDecoder()
         self.written: list[bytes] = []
         self.publishes: list[PublishPacket] = []
+        self.connack_override: bytes | None = None
 
     def push_rx(self, data: bytes) -> None:
         self._rx.put_nowait(data)
@@ -233,6 +297,9 @@ class _ManualBrokerTransport:
 
     def handle_packet(self, raw: RawPacket) -> None:
         if raw.packet_type is PacketType.CONNECT:
+            if self.connack_override is not None:
+                self.push_rx(self.connack_override)
+                return
             body = b"\x00\x00"
             self.push_rx(bytes((0x20, len(body))) + body)
         elif raw.packet_type is PacketType.PUBLISH:
@@ -271,9 +338,16 @@ def _failing_client(
     store,
     on_disconnect: list,
     disconnected: asyncio.Event,
+    *,
+    clean_start: bool = True,
 ) -> AsyncClient:
     policy = ReconnectPolicy(enabled=True, initial_delay=0.05, max_delay=0.05)
-    client = AsyncClient(client_id="ingress-failure", store=store, reconnect=policy)
+    client = AsyncClient(
+        client_id="ingress-failure",
+        store=store,
+        reconnect=policy,
+        clean_start=clean_start,
+    )
     calls = 0
     inner = transport
 
@@ -308,6 +382,8 @@ async def test_puback_store_failure_keeps_receipt_and_fail_stops() -> None:
     await _wait_for(lambda: len(transport.publishes) == 1)
     mid = transport.publishes[0].mid
     assert mid is not None
+    sentinel = OSError(STORE_FAILURE)
+    store.error = sentinel
     store.fail_mids = {mid}
     transport.push_rx(PubAckPacket(mid=mid).encode())
 
@@ -315,8 +391,7 @@ async def test_puback_store_failure_keeps_receipt_and_fail_stops() -> None:
     await asyncio.wait_for(receipt.wait(), timeout=5.0)
 
     assert len(errors) == 1
-    assert isinstance(errors[0], OSError)
-    assert STORE_FAILURE in str(errors[0])
+    assert errors[0] is sentinel
     assert 14 not in _written_types(transport)
     await asyncio.sleep(0.4)
     assert client._factory_calls() == 1
@@ -448,9 +523,10 @@ async def test_pubrel_store_divergence_fail_stops_client() -> None:
             mid=31,
         ).encode()
     )
-    await _wait_for(lambda: store.get_in(31) is not None)
-    engine = client._engine
-    engine.take_effects()
+    # Wait for the handshake PUBREC on the wire instead of draining the
+    # engine effect stream owned by the live client and its EffectPump.
+    await _wait_for(lambda: any((frame[0] >> 4) == 5 for frame in transport.written))
+    assert store.get_in(31) is not None
     store.diverge = True
     transport.push_rx(PubRelPacket(mid=31).encode())
 
@@ -485,6 +561,8 @@ async def test_no_admission_after_fail_stop() -> None:
     client = _failing_client(transport, store, errors, disconnected)
 
     await client.connect("fake", timeout=2.0)
+    reader = client._reader_task
+    assert reader is not None
     receipt = await client.publish("failure/admission", b"x", qos=1)
     await _wait_for(lambda: len(transport.publishes) == 1)
     mid = transport.publishes[0].mid
@@ -520,6 +598,9 @@ async def test_no_admission_after_fail_stop() -> None:
         client._queue_qosn_on_loop("failure/admission", b"z", qos=QoS.AT_LEAST_ONCE, retain=False)
     assert len(client._engine.packet_ids) == mids_before
     assert sorted(m.mid for m in store.out_items()) == rows_before
+    # Only assert on the engine effect stream once its owning reader task is
+    # fully terminated; anything earlier races teardown.
+    await _wait_for(lambda: reader.done())
     assert not client._engine.take_effects()
     await client.disconnect()
 
@@ -582,6 +663,317 @@ async def test_failed_lot_keeps_terminal_and_drops_commit_dependent(
     assert not client._engine.packet_ids.in_use(mid_a1)
     assert client._engine.packet_ids.in_use(mid_b1)
     assert 14 not in _written_types(transport)
+    await asyncio.sleep(0.4)
+    assert client._factory_calls() == 1
+    with pytest.raises(MQTTError, match="local terminal failure"):
+        await client.connect("fake", timeout=2.0)
+    await client.disconnect()
+
+
+def _parked_setup(store, max_pending: int = 1):  # noqa: ANN001, ANN202
+    """Connected client with one held QoS 1 publish filling pending capacity."""
+    transport = _ManualBrokerTransport()
+    disconnected = asyncio.Event()
+    errors: list[BaseException | None] = []
+    policy = ReconnectPolicy(enabled=True, initial_delay=0.05, max_delay=0.05)
+    client = AsyncClient(
+        client_id="parked-crossing",
+        store=store,
+        reconnect=policy,
+        max_pending_outbound_messages=max_pending,
+    )
+    calls = 0
+
+    async def factory(host: str, port: int, *, ssl: object = None):  # noqa: ANN202
+        nonlocal calls
+        del host, port, ssl
+        calls += 1
+        return transport
+
+    client._transport_factory = factory  # type: ignore[assignment]
+
+    def _record(error: BaseException | None) -> None:
+        errors.append(error)
+        disconnected.set()
+
+    client.on_disconnect = _record  # type: ignore[assignment]
+    return client, transport, errors, disconnected, lambda: calls
+
+
+async def test_parked_publish_fails_after_fail_stop() -> None:
+    """A publish parked on capacity that wakes after fail-stop is refused.
+
+    B passes admission while healthy and parks; the lot settles A (freeing
+    capacity) then fails on the QoS 2 put_in; teardown wakes B, whose retry
+    rechecks under the lock and fails without admitting anything.
+    """
+    store = _FailPutInStore()
+    client, transport, errors, disconnected, calls = _parked_setup(store)
+
+    await client.connect("fake", timeout=2.0)
+    first = await client.publish("failure/parked-a", b"a", qos=1)
+    await _wait_for(lambda: len(transport.publishes) == 1)
+    parked = asyncio.create_task(client.publish("failure/parked-b", b"b", qos=1))
+    await _wait_for(lambda: client._publish_waiters >= 1)
+    lot = (
+        PubAckPacket(mid=transport.publishes[0].mid).encode()
+        + PublishPacket(
+            topic="failure/parked-a2",
+            payload=b"a2",
+            qos=QoS.EXACTLY_ONCE,
+            retain=False,
+            dup=False,
+            mid=41,
+        ).encode()
+    )
+    transport.push_rx(lot)
+
+    with pytest.raises(MQTTError, match="local terminal failure"):
+        await asyncio.wait_for(parked, timeout=5.0)
+    await asyncio.wait_for(disconnected.wait(), timeout=5.0)
+    await asyncio.wait_for(first.wait(), timeout=5.0)
+
+    assert len(errors) == 1
+    assert isinstance(errors[0], OSError)
+    assert list(store.out_items()) == []
+    assert len(client._engine.packet_ids) == 0
+    await asyncio.sleep(0.4)
+    assert calls() == 1
+    await client.disconnect()
+
+
+async def test_parked_publish_many_fails_after_fail_stop() -> None:
+    """Same crossing for a batch parked mid-submission: PublishBatchError."""
+    from mqttium.errors import PublishBatchError
+
+    store = _FailPutInStore()
+    client, transport, errors, disconnected, calls = _parked_setup(store, max_pending=2)
+
+    await client.connect("fake", timeout=2.0)
+    first = await client.publish("failure/many-a", b"a", qos=1)
+    await _wait_for(lambda: len(transport.publishes) == 1)
+    batch = asyncio.create_task(
+        client.publish_many(
+            [
+                PublishMessage("failure/many-b1", b"b1", qos=1),
+                PublishMessage("failure/many-b2", b"b2", qos=1),
+            ]
+        )
+    )
+    await _wait_for(lambda: client._publish_waiters >= 1)
+    lot = (
+        PubAckPacket(mid=transport.publishes[0].mid).encode()
+        + PublishPacket(
+            topic="failure/many-a2",
+            payload=b"a2",
+            qos=QoS.EXACTLY_ONCE,
+            retain=False,
+            dup=False,
+            mid=41,
+        ).encode()
+    )
+    transport.push_rx(lot)
+
+    with pytest.raises(PublishBatchError) as failed:
+        await asyncio.wait_for(batch, timeout=5.0)
+    assert isinstance(failed.value.__cause__, MQTTError)
+    await asyncio.wait_for(disconnected.wait(), timeout=5.0)
+    await asyncio.wait_for(first.wait(), timeout=5.0)
+    assert list(store.out_items()) == []
+    await asyncio.sleep(0.4)
+    assert calls() == 1
+    await client.disconnect()
+
+
+async def test_connack_restore_failure_fails_fast_with_original_cause() -> None:
+    """Store failure during session restore fails connect() with the cause.
+
+    A second concurrent connect task that passed its entry guard while healthy
+    is refused by the recheck after the lock; no transport is opened for it,
+    on_connect never succeeds, and no CONNACK is exposed.
+    """
+    store = _FailReplayStore()
+    sentinel = OSError("restore failed")
+    store.restore_error = sentinel
+    record = OutboundMessage(
+        mid=9,
+        topic="held/restore",
+        payload=b"x",
+        qos=QoS.AT_LEAST_ONCE,
+        retain=False,
+        state=OutboundQoSState.WAIT_PUBACK,
+    )
+    store.put_out(record)
+    transport = _ManualBrokerTransport()
+    disconnected = asyncio.Event()
+    errors: list[BaseException | None] = []
+    policy = ReconnectPolicy(enabled=True, initial_delay=0.05, max_delay=0.05)
+    client = AsyncClient(
+        client_id="connack-restore", store=store, reconnect=policy, clean_start=False
+    )
+    calls = 0
+    connected_calls: list[object] = []
+
+    async def factory(host: str, port: int, *, ssl: object = None):  # noqa: ANN202
+        nonlocal calls
+        del host, port, ssl
+        calls += 1
+        return transport
+
+    client._transport_factory = factory  # type: ignore[assignment]
+
+    def _record(error: BaseException | None) -> None:
+        errors.append(error)
+        disconnected.set()
+
+    client.on_disconnect = _record  # type: ignore[assignment]
+    client.on_connect = connected_calls.append  # type: ignore[assignment]
+    transport.connack_override = encode_frame(PacketType.CONNACK, 0, b"\x01\x00")
+    # Armed after construction (hydrate already ran) and before any CONNACK:
+    # nothing reads the replay index in between.
+    store.fail_replay = True
+
+    first = asyncio.create_task(client.connect("fake", timeout=5.0))
+    await _wait_for(lambda: len(transport.written) == 1)
+    second = asyncio.create_task(client.connect("fake", timeout=5.0))
+    await asyncio.sleep(0.05)
+
+    with pytest.raises(OSError) as failed:
+        await asyncio.wait_for(first, timeout=5.0)
+    assert failed.value is sentinel
+    with pytest.raises(MQTTError, match="local terminal failure"):
+        await asyncio.wait_for(second, timeout=5.0)
+    await asyncio.wait_for(disconnected.wait(), timeout=5.0)
+    assert connected_calls == []
+    assert len(errors) == 1
+    assert errors[0] is sentinel
+    assert calls == 1
+    with pytest.raises(MQTTError, match="local terminal failure"):
+        await client.connect("fake", timeout=2.0)
+    await client.disconnect()
+
+
+async def test_reconnect_in_progress_stops_on_restore_failure() -> None:
+    """No second reconnect attempt after a restore failure during the first."""
+    store = _FailReplayStore()
+    sentinel = OSError("restore failed")
+    store.restore_error = sentinel
+    first_transport = _ManualBrokerTransport()
+    second_transport = _ManualBrokerTransport()
+    disconnected = asyncio.Event()
+    errors: list[BaseException | None] = []
+    policy = ReconnectPolicy(enabled=True, initial_delay=0.05, max_delay=0.05)
+    client = AsyncClient(
+        client_id="reconnect-stop", store=store, reconnect=policy, clean_start=False
+    )
+    calls = 0
+
+    async def factory(host: str, port: int, *, ssl: object = None):  # noqa: ANN202
+        nonlocal calls
+        del host, port, ssl
+        calls += 1
+        return first_transport if calls == 1 else second_transport
+
+    client._transport_factory = factory  # type: ignore[assignment]
+
+    def _record(error: BaseException | None) -> None:
+        errors.append(error)
+        if len(errors) == 2:
+            disconnected.set()
+
+    client.on_disconnect = _record  # type: ignore[assignment]
+
+    await client.connect("fake", timeout=2.0)
+    await client.publish("failure/reconnect-held", b"x", qos=1)
+    await _wait_for(lambda: len(first_transport.publishes) == 1)
+    # Arm before the loss: nothing reads the replay index between here and the
+    # second CONNACK, while the auto-answer below would race a later arming.
+    store.fail_replay = True
+    second_transport.connack_override = encode_frame(PacketType.CONNACK, 0, b"\x01\x00")
+    await first_transport.close()
+    await _wait_for(lambda: calls == 2)
+    await _wait_for(
+        lambda: any(
+            (frame[0] & 0xF0) == int(PacketType.CONNECT) for frame in second_transport.written
+        )
+    )
+
+    await asyncio.wait_for(disconnected.wait(), timeout=5.0)
+    assert errors[-1] is sentinel
+    await asyncio.sleep(0.4)
+    assert calls == 2
+    with pytest.raises(MQTTError, match="local terminal failure"):
+        await client.connect("fake", timeout=2.0)
+    await client.disconnect()
+
+
+async def test_delivery_mark_failure_latches_without_disturbing_delivery() -> None:
+    """A delivery-mark store failure fail-stops but keeps the delivered message."""
+    store = _FailMarkStore()
+    sentinel = OSError("delivery mark failed")
+    store.mark_error = sentinel
+    transport = _ManualBrokerTransport()
+    disconnected = asyncio.Event()
+    errors: list[BaseException | None] = []
+    received: list[bytes] = []
+    client = _failing_client(transport, store, errors, disconnected)
+    client.on_message = lambda message: received.append(message.payload)
+
+    await client.connect("fake", timeout=2.0)
+    store.fail_mark = True
+    transport.push_rx(
+        PublishPacket(
+            topic="failure/mark",
+            payload=b"delivered",
+            qos=QoS.EXACTLY_ONCE,
+            retain=False,
+            dup=False,
+            mid=31,
+        ).encode()
+    )
+
+    await asyncio.wait_for(disconnected.wait(), timeout=5.0)
+    await _wait_for(lambda: len(received) == 1)
+    assert received == [b"delivered"]
+    assert len(errors) == 1
+    assert errors[0] is sentinel
+    await asyncio.sleep(0.4)
+    assert client._factory_calls() == 1
+    with pytest.raises(MQTTError, match="local terminal failure"):
+        await client.connect("fake", timeout=2.0)
+    await client.disconnect()
+
+
+async def test_replay_continuation_failure_latches() -> None:
+    """A redelivery-cursor store failure fail-stops after the first batch."""
+    store = _FailReplayPagesStore()
+    sentinel = OSError("replay page failed")
+    store.page_error = sentinel
+    for mid in range(1, 71):
+        store.put_in(
+            InboundMessage(
+                mid=mid,
+                topic=f"failure/replay-{mid}",
+                payload=b"x",
+                qos=QoS.EXACTLY_ONCE,
+                retain=False,
+                state=InboundQoSState.WAIT_PUBREL,
+            )
+        )
+    transport = _ManualBrokerTransport()
+    disconnected = asyncio.Event()
+    errors: list[BaseException | None] = []
+    received: list[bytes] = []
+    client = _failing_client(transport, store, errors, disconnected, clean_start=False)
+    client.on_message = lambda message: received.append(message.payload)
+    transport.connack_override = encode_frame(PacketType.CONNACK, 0, b"\x01\x00")
+
+    await client.connect("fake", timeout=2.0)
+
+    await asyncio.wait_for(disconnected.wait(), timeout=5.0)
+    assert len(received) == 64
+    assert len(errors) == 1
+    assert errors[0] is sentinel
     await asyncio.sleep(0.4)
     assert client._factory_calls() == 1
     with pytest.raises(MQTTError, match="local terminal failure"):
