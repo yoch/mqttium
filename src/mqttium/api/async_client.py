@@ -371,8 +371,10 @@ class AsyncClient:
         # async enqueue call cost while moving their state to one owner.
         self._can_enqueue_outbound_size = self._write_pump.can_enqueue_size
         self._try_enqueue_outbound = self._write_pump.try_enqueue
+        self._try_enqueue_outbound_ack = self._write_pump.try_enqueue_ack
         self._try_enqueue_outbound_many = self._write_pump.try_enqueue_many
         self._enqueue_outbound = self._write_pump.enqueue
+        self._enqueue_outbound_ack = self._write_pump.enqueue_ack
         self._delivery = ApplicationDelivery(
             mode=message_delivery,
             protocol=protocol,
@@ -2261,6 +2263,8 @@ class AsyncClient:
         kind = effect.kind
         if kind is EffectKind.SEND:
             return self._try_enqueue_outbound(effect.data, epoch=epoch)
+        if kind is EffectKind.SEND_ACK:
+            return self._try_enqueue_outbound_ack(effect.data, epoch=epoch)
         if kind is EffectKind.CONNACK and self.on_connect is None:
             connack: ConnAckPacket = effect.data
             self._resolve_connack(connack)
@@ -2356,6 +2360,8 @@ class AsyncClient:
         kind = effect.kind
         if kind is EffectKind.SEND:
             await self._enqueue_outbound(effect.data, nowait=nowait, epoch=epoch)
+        elif kind is EffectKind.SEND_ACK:
+            await self._enqueue_outbound_ack(effect.data, nowait=nowait, epoch=epoch)
         elif kind is EffectKind.CONNACK:
             connack: ConnAckPacket = effect.data
             self._resolve_connack(connack)

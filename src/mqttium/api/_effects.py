@@ -113,8 +113,8 @@ class EffectPump:
 
         if len(effects) > 1:
             self.multi_effect_batches += 1
-            # Partition SEND-first in one pass, and let that same pass answer
-            # whether the batch needed it: a SEND seen after a non-SEND is
+            # Partition wire effects first in one pass, and let that same pass answer
+            # whether the batch needed it: SEND/SEND_ACK after a non-wire effect is
             # exactly the condition. The two-generator form this replaces walked
             # the batch twice and always rebuilt the list, even for the common
             # batch that was already ordered.
@@ -128,7 +128,7 @@ class EffectPump:
             others: list[EngineEffect] = []
             out_of_order = False
             for effect in effects:
-                if effect.kind is EffectKind.SEND:
+                if effect.kind is EffectKind.SEND or effect.kind is EffectKind.SEND_ACK:
                     if others:
                         out_of_order = True
                     sends.append(effect)

@@ -412,7 +412,7 @@ def test_mqtt_4_6_0_2_pubacks_follow_the_order_the_publishes_arrived() -> None:
                 properties=None,
             ).encode(MQTTProtocolVersion.MQTTv5),
         )
-    sends = [e.data for e in engine.take_effects() if e.kind is EffectKind.SEND]
+    sends = [e.data for e in engine.take_effects() if e.kind is EffectKind.SEND_ACK]
     assert [int.from_bytes(frame[2:4], "big") for frame in sends] == list(arrival)
 
 

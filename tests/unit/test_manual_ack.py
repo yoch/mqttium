@@ -28,7 +28,7 @@ def _as_bytes(data: object) -> bytes:
 
 
 def _sends(effects: list) -> list[bytes]:
-    return [_as_bytes(e.data) for e in effects if e.kind is EffectKind.SEND]
+    return [_as_bytes(e.data) for e in effects if e.kind is EffectKind.SEND_ACK]
 
 
 def test_manual_ack_defers_qos1_puback() -> None:

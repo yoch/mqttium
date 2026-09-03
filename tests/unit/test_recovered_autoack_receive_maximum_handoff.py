@@ -117,7 +117,7 @@ def test_recovered_autoack_slot_is_released_at_effect_handoff() -> None:
     _feed(engine, _publish(7, dup=True))
     first = engine.take_effects()
 
-    assert any(effect.kind is EffectKind.SEND for effect in first)
+    assert any(effect.kind is EffectKind.SEND_ACK for effect in first)
     assert engine._inbound_inflight == 0
     assert engine.state is ConnectionState.CONNECTED
 

@@ -519,7 +519,7 @@ class InboundSession:
                 self._reject_packet_id_collision(mid, "QoS 2", "QoS 1")
             if self._tiny_peer_packet_limit:
                 self._raise_mandatory_response_too_large("PUBREC")
-            engine._send(_encode_pubrec_success(mid))
+            engine._send_ack(_encode_pubrec_success(mid))
             return
         if mid in self._pending_auto_qos1_mids:
             # The same identifier cannot start a QoS 2 exchange while the QoS 1
@@ -554,7 +554,7 @@ class InboundSession:
         self._session_state_qos2 += 1
         # Runtime effect application is SEND-first. Produce the protocol ACK in
         # that order here so every QoS2 delivery avoids EffectPump repartition.
-        engine._send(_encode_pubrec_success(mid))
+        engine._send_ack(_encode_pubrec_success(mid))
         engine._emit(
             (
                 EffectKind.DECODED_MESSAGE
@@ -585,7 +585,7 @@ class InboundSession:
             mid, InboundQoSState.WAIT_PUBACK, "acknowledging"
         )
         self._forget_inbound()
-        self._engine._send(_encode_puback_success(mid))
+        self._engine._send_ack(_encode_puback_success(mid))
         # The restored Receive Maximum slot remains owned until this PUBACK
         # leaves the engine effect batch, exactly like a fresh automatic QoS 1
         # acknowledgement. The persisted record is already complete, so its byte
@@ -645,7 +645,7 @@ class InboundSession:
             self._acquire_slot()
         # Match the runtime's mandatory SEND-before-application order at the
         # producer, avoiding an EffectPump repartition on every auto-ACK.
-        self._engine._send(_encode_puback_success(mid))
+        self._engine._send_ack(_encode_puback_success(mid))
         self._engine._emit(
             (
                 EffectKind.DECODED_MESSAGE
@@ -751,7 +751,7 @@ class InboundSession:
         if record is None:
             if self._tiny_peer_packet_limit:
                 self._raise_mandatory_response_too_large("PUBCOMP")
-            engine._send(_encode_pubcomp_success(mid))
+            engine._send_ack(_encode_pubcomp_success(mid))
             return
         state = record.state
         if state is InboundQoSState.WAIT_USER_ACK:
@@ -779,7 +779,7 @@ class InboundSession:
         logical_size = self._complete_stored_inbound(mid, state, "completing PUBREL")
         self._forget_inbound()
         self._session_state_qos2 -= 1
-        engine._send(_encode_pubcomp_success(mid))
+        engine._send_ack(_encode_pubcomp_success(mid))
         self._release_slot(logical_size)
 
     # --- application acknowledgement and replay ---------------------------
@@ -838,7 +838,7 @@ class InboundSession:
         self._forget_inbound()
         # The guard above already rejected every state but WAIT_USER_ACK.
         self._session_state_qos2 -= 1
-        self._engine._send(wire)
+        self._engine._send_ack(wire)
         self._release_slot(logical_size)
 
     def _drain_manual_qos1_acks(self) -> None:
@@ -856,7 +856,7 @@ class InboundSession:
             order.popleft()
             ready.remove(mid)
             self._forget_inbound()
-            self._engine._send(_encode_puback_success(mid))
+            self._engine._send_ack(_encode_puback_success(mid))
             self._release_slot(logical_size)
 
     def replay_session(self) -> None:

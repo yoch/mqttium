@@ -45,7 +45,7 @@ def test_auto_qos1_puback_skips_packet_dataclass(monkeypatch) -> None:
     effects = engine.take_effects()
 
     assert calls == [7]
-    assert [effect.kind for effect in effects] == [EffectKind.SEND, EffectKind.MESSAGE]
+    assert [effect.kind for effect in effects] == [EffectKind.SEND_ACK, EffectKind.MESSAGE]
     assert effects[0].data == b"\x40\x02\x00\x07"
 
 
@@ -94,7 +94,7 @@ def test_auto_qos2_pubrec_skips_packet_dataclass(monkeypatch) -> None:
     effects = engine.take_effects()
 
     assert calls == [7]
-    assert [effect.kind for effect in effects] == [EffectKind.SEND, EffectKind.MESSAGE]
+    assert [effect.kind for effect in effects] == [EffectKind.SEND_ACK, EffectKind.MESSAGE]
     assert effects[0].data == b"\x50\x02\x00\x07"
 
 

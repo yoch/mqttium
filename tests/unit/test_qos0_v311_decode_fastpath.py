@@ -112,7 +112,7 @@ def test_qos1_uses_direct_acknowledged_path_after_composition(monkeypatch) -> No
     )
 
     effects = engine.take_effects()
-    assert [effect.kind for effect in effects] == [EffectKind.SEND, EffectKind.MESSAGE]
+    assert [effect.kind for effect in effects] == [EffectKind.SEND_ACK, EffectKind.MESSAGE]
     assert effects[1].data.mid == 7
     assert effects[1].data.qos is QoS.AT_LEAST_ONCE
     assert calls == 0
@@ -129,7 +129,7 @@ def test_mqtt5_qos2_emits_pubrec_before_message() -> None:
     )
 
     effects = engine.take_effects()
-    assert [effect.kind for effect in effects] == [EffectKind.SEND, EffectKind.MESSAGE]
+    assert [effect.kind for effect in effects] == [EffectKind.SEND_ACK, EffectKind.MESSAGE]
     assert effects[1].data.mid == 8
     assert effects[1].data.qos is QoS.EXACTLY_ONCE
 
