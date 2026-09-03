@@ -784,7 +784,17 @@ class OutboundSession:
         mid, reason_code, properties = self._decode_puback(raw.remaining)
         if properties is not None:
             self._engine._validate_inbound_problem_information(PacketType.PUBACK, properties)
-        if not self._settle(mid, OutboundQoSState.WAIT_PUBACK):
+        try:
+            settled = self._settle(mid, OutboundQoSState.WAIT_PUBACK)
+        except Exception:
+            # The broker outcome was already observed: preserve it even though
+            # durable cleanup failed, then let the original failure propagate.
+            if reason_code >= 128:
+                self._fail(mid, ProtocolError(f"PUBACK reason_code={reason_code}"))
+            else:
+                self._engine._emit(EffectKind.PUBLISH_COMPLETE, mid)
+            raise
+        if not settled:
             return
         self.flow.release()
         # Emit before freeing the packet id so FIFO receipt settlement remains
@@ -872,7 +882,14 @@ class OutboundSession:
         self._engine._send(wire)
 
     def _fail_after_pubrec(self, mid: int, reason_code: int) -> None:
-        if not self._settle(mid, OutboundQoSState.WAIT_PUBREC):
+        try:
+            settled = self._settle(mid, OutboundQoSState.WAIT_PUBREC)
+        except Exception:
+            # Negative PUBREC ends the exchange: the broker failure is the
+            # terminal outcome regardless of the cleanup failure.
+            self._fail(mid, ProtocolError(f"PUBREC reason_code={reason_code}"))
+            raise
+        if not settled:
             return
         self.flow.release()
         self._fail(mid, ProtocolError(f"PUBREC reason_code={reason_code}"))
@@ -883,7 +900,15 @@ class OutboundSession:
         mid, reason_code, properties = self._decode_pubcomp(raw.remaining)
         if properties is not None:
             self._engine._validate_inbound_problem_information(PacketType.PUBCOMP, properties)
-        if not self._settle(mid, OutboundQoSState.WAIT_PUBCOMP):
+        try:
+            settled = self._settle(mid, OutboundQoSState.WAIT_PUBCOMP)
+        except Exception:
+            if reason_code >= 128:
+                self._fail(mid, ProtocolError(f"PUBCOMP reason_code={reason_code}"))
+            else:
+                self._engine._emit(EffectKind.PUBLISH_COMPLETE, mid)
+            raise
+        if not settled:
             return
         self.flow.release()
         if reason_code >= 128:

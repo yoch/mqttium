@@ -11,7 +11,6 @@ from mqttium.api.models import PublishReceipt
 from mqttium.codec.buffer import RawPacket
 from mqttium.enums import ConnectionState, PacketType, QoS
 from mqttium.packets import encode_frame
-from mqttium.protocol.effects import EffectKind
 from mqttium.protocol.engine import ProtocolEngine
 from mqttium.protocol.reconnect import ReconnectPolicy
 
@@ -74,20 +73,21 @@ def test_engine_invariant_assertion_propagates_unchanged() -> None:
     assert engine.take_effects() == []
 
 
-def test_engine_generic_handler_error_remains_contained() -> None:
+def test_engine_generic_handler_error_propagates_with_identity() -> None:
     engine = ProtocolEngine()
     engine.state = ConnectionState.CONNECTED
+    failure = RuntimeError("store failed")
 
     def fail_handler(raw: RawPacket) -> None:
-        raise RuntimeError("store failed")
+        raise failure
 
     engine._handlers_by_state[ConnectionState.CONNECTED][PacketType.PINGRESP] = fail_handler
-    engine.handle_raw(_raw_pingresp())
 
-    effects = engine.take_effects()
-    assert len(effects) == 1
-    assert effects[0].kind is EffectKind.PROTOCOL_ERROR
-    assert "RuntimeError('store failed')" in str(effects[0].data)
+    with pytest.raises(RuntimeError) as raised:
+        engine.handle_raw(_raw_pingresp())
+
+    assert raised.value is failure
+    assert engine.take_effects() == []
 
 
 async def test_runtime_invariant_failure_is_terminal_without_reconnect() -> None:

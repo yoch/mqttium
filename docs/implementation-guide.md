@@ -247,44 +247,25 @@ packet is decoded), COMMIT (local state, durable or in memory, is updated),
 EXPOSE (an effect becomes application- or wire-visible). Packets are not
 rollbackable once observed; only local state is.
 
-The current batching is lot-scoped, not per-packet: the read loop opens one
-outer `store.batch()` around the whole ingress lot and collects effects after
-it closes. On the swallowing path (a failure converted to an effect inside
-`handle_raw`), the lot commits normally, so an earlier packet's durable
-mutation stays committed and its effects stay applicable. If a failure instead
-propagated across the batch boundary, the whole lot — including unrelated
-earlier packets — would roll back while their already-produced effects sit
-uncollected, a behavior change for redelivery and replay, not a neutral
-refactor. Per-packet atomicity (for example nested per-packet batches) is an
-explicit architectural alternative: it would need correctness justification
-(partial-lot durability vs replay/resume interplay) and performance
- justification (per-packet transaction overhead vs per-lot), and is not
- specified here.
-
- Rollback alone does not retract effects, which is a current defect, not a
- neutral edge: a propagated exception rolls the outer lot batch back, but the
- read-loop `finally` then advances the epoch, calls
- `notify_transport_closed()`, and collects whatever sits in `engine._effects`
- under the new epoch before draining it. Pre-rollback effects are therefore
- recollected and applied despite the rollback (effect-commit without
- durable-commit). A plain temporal truncate (discard everything since
- batch-start) is not the rule either: it would discard terminal broker-outcome
- effects that must survive. The rule is selective discard by dependency: on
- rollback, discard exactly the commit-scope effects produced since the batch
- started — observation-scope effects, including observed terminal broker
- outcomes, survive. The mechanism (dependency-tagged journal boundary, or
- equivalent) is implementation detail; the discard set is normative.
+The batching is lot-scoped, not per-packet: the read loop opens one outer
+`store.batch()` around the whole ingress lot and collects effects after it
+closes. A propagated failure rolls the lot back, but rollback alone does not
+retract effects — the read-loop `finally` advances the epoch, calls
+`notify_transport_closed()`, and collects whatever sits in `engine._effects`
+under the new epoch before draining it. The rule is therefore selective
+discard by dependency: on rollback, discard exactly the commit-scope effects
+produced since the batch started; observation-scope effects survive. The
+mechanism (a dependency-aware journal boundary, or equivalent) is
+implementation detail; the discard set is normative. Per-packet atomicity
+remains an explicit non-specified alternative.
 
  Each effect produced while handling one packet belongs to exactly one scope,
  decided per effect instance by the precise transition it depends on — never
- by `EffectKind` alone. Since #427, `SEND_ACK` carries every success ACK
- (PUBACK/PUBREC/PUBCOMP, bytes-only, so the writer does not rediscover the
- type) while reason-carrying frames stay `SEND`, and the pump still partitions
- both kinds wire-first. Kind alone therefore cannot classify: a fresh
- automatic QoS 1 `SEND_ACK(PUBACK)` is emitted with no durable row, while a
- fresh QoS 2 `SEND_ACK(PUBREC)` is emitted after `put_in`, and an orphan
-  `SEND_ACK(PUBCOMP)` answers an unknown identifier. The instances, at
-  `main@5403636ab1ccc9da45363fe1ac9858f49f1d6219`:
+ by `EffectKind` alone: since #427, `SEND_ACK` carries every success ACK while
+ reason-carrying frames stay `SEND`, so a fresh automatic QoS 1 PUBACK (no
+ durable row) and a fresh QoS 2 PUBREC (after `put_in`) share a kind but not
+ a scope. The instances, at
+ `main@5403636ab1ccc9da45363fe1ac9858f49f1d6219`:
 
 - Observation scope (survives any durable failure): effects with no durable
   dependency — orphan answers (duplicate-QoS 2 `PUBREC` re-emission, orphan
@@ -362,27 +343,17 @@ Consequences, all normative for the implementation:
   classification) are implementation choices; the normative rule is only that
   MQTT reconnect is never the automatic repair for such a failure.
 
-Acceptance for the implementation (PR `fix/ingress-failure-semantics`):
-a deterministic A/B test where packet A produces a durable mutation plus an
-effect and packet B makes the store raise, in three variants — (a) an effect
-genuinely dependent on the durable COMMIT, asserting it is discarded (with
-its durable mutation rolled back per the lot semantics above) rather than
-applied; (b) an observed terminal broker outcome (PUBACK/PUBCOMP, success
-and `0x80+` cases) whose receipt must keep the broker result despite the
-cleanup failure, with the local failure on its separate channel; (c) the
-central reproducer — terminal ACK A, cleanup A committed inside the batch,
-failure B, outer rollback resurrecting the row — asserting the receipt stays
-terminal, the row is treated as known-stale under fail-stop (no automatic
-reconnect, no replay, explicit application recovery only), and never silently
-replayed as unfinished. No universal transactional RAM undo is promised;
-instead, asserting in all variants that after fail-stop no incoherent RAM
-state is reused or exposed: stored-record counts, QoS 2 session count,
-Receive Maximum inflight, inbound/outbound pending bytes and message counts,
-packet identifiers, flow window, queue and parked entries, pending
-acknowledgement sets and order, plus exposed versus discarded effects,
-`on_disconnect` exception identity, and the reconnect decision; no reconnect
-loop against a durably broken store; full suite, fuzz smoke, and broker
-integration green.
+Acceptance is covered by `tests/unit/test_ingress_failure_semantics.py`: engine
+reproducers (commit-dependent failure emits nothing; PUBACK success and
+`0x80+` broker failures settle their terminal outcome while the original
+store error propagates; negative PUBREC likewise) and AsyncClient reproducers
+— a failed lot keeps the terminal receipt, drops commit-dependent effects
+(no PUBREC sent, no delivery, row absent), resurrects-but-never-replays the
+known-stale row, surfaces the original exception on `on_disconnect`, sends no
+peer-blaming DISCONNECT, performs no automatic reconnect, and refuses silent
+reuse with `MQTTError`. No universal transactional RAM undo is promised;
+instead the tests assert that after fail-stop no incoherent RAM state is
+reused or exposed.
 
 ## API completion and errors
 

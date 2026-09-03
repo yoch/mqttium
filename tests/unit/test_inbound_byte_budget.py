@@ -241,7 +241,7 @@ def test_persistence_failure_rolls_back_reservation_before_delivery(
 ) -> None:
     store = FailingInboundStore()
     engine = connected_engine(manual_ack=manual_ack, store=store)
-    packet = PublishPacket(
+    feed_target = PublishPacket(
         topic="failure/rollback",
         payload=b"body",
         qos=qos,
@@ -250,17 +250,15 @@ def test_persistence_failure_rolls_back_reservation_before_delivery(
         mid=31,
     )
 
-    feed(engine, packet.encode())
+    with pytest.raises(OSError, match="persistence unavailable"):
+        feed(engine, feed_target.encode())
     effects = engine.take_effects()
 
     snapshot = engine.inbound.stats()
     assert snapshot.inflight == 0
     assert snapshot.pending_bytes == 0
     assert not any(effect.kind is EffectKind.MESSAGE for effect in effects)
-    assert any(
-        effect.kind is EffectKind.PROTOCOL_ERROR and "persistence unavailable" in str(effect.data)
-        for effect in effects
-    )
+    assert effects == []
 
 
 def test_sqlite_reopen_restores_and_releases_bytes_without_payload_read(tmp_path: Path) -> None:
