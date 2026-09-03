@@ -267,10 +267,13 @@ explicit architectural alternative: it would need correctness justification
  `notify_transport_closed()`, and collects whatever sits in `engine._effects`
  under the new epoch before draining it. Pre-rollback effects are therefore
  recollected and applied despite the rollback (effect-commit without
- durable-commit). The rule is selective discard: on rollback, discard exactly
- the effects produced since the batch started, and only those. The mechanism
- (a journal boundary recorded at batch start, or equivalent) is implementation
- detail; the discard set is normative.
+ durable-commit). A plain temporal truncate (discard everything since
+ batch-start) is not the rule either: it would discard terminal broker-outcome
+ effects that must survive. The rule is selective discard by dependency: on
+ rollback, discard exactly the commit-scope effects produced since the batch
+ started — observation-scope effects, including observed terminal broker
+ outcomes, survive. The mechanism (dependency-tagged journal boundary, or
+ equivalent) is implementation detail; the discard set is normative.
 
  Each effect produced while handling one packet belongs to exactly one scope,
  decided per effect instance by the precise transition it depends on — never
@@ -283,16 +286,17 @@ explicit architectural alternative: it would need correctness justification
  `SEND_ACK(PUBCOMP)` answers an unknown identifier. The instances, at
  `main@ed3f6a7`:
 
-- Observation scope (survives any durable failure): QoS 0 MESSAGE, automatic
-  QoS 1 MESSAGE without delivery mark, SUBACK, UNSUBACK, PINGRESP, AUTH,
-  DISCONNECTED, duplicate-QoS 2 `PUBREC` re-emission against an existing
-  record (read-only dependency), orphan `PUBCOMP` for an unknown identifier
-  (no state exists to record), orphan reason-carrying `PUBREL` (stays `SEND`),
-  and terminal broker-outcome effects — `PUBLISH_COMPLETE` on an observed
-  success ACK, `PUBLISH_FAILED` on an observed MQTT 5 reason code at or above
-  `0x80`. The terminal effect belongs to the observation of the ACK, so a
-  later local cleanup failure can neither replace the broker outcome (success
-  or precise broker failure) nor suppress the effect.
+- Observation scope (survives any durable failure): effects with no durable
+  dependency — orphan answers (duplicate-QoS 2 `PUBREC` re-emission, orphan
+  `PUBCOMP`, orphan reason-carrying `PUBREL`), QoS 0 and automatic-QoS 1
+  MESSAGE without delivery mark, and terminal broker-outcome effects —
+  `PUBLISH_COMPLETE` on an observed success ACK, `PUBLISH_FAILED` on an
+  observed MQTT 5 reason code at or above `0x80`. The terminal effect belongs
+  to the observation of the ACK, so a later local cleanup failure can neither
+  replace the broker outcome (success or precise broker failure) nor suppress
+  the effect. Other observation-only effects (SUBACK, UNSUBACK, PINGRESP,
+  AUTH, DISCONNECTED) follow the same rule without needing per-kind
+  legislation here.
 - Commit scope (emitted only after the durable transition it depends on is
   confirmed): fresh QoS 2 `PUBREC` (after `put_in`), recovered-QoS 1 PUBACK
   (after the stored record is completed), manual QoS 1/2 PUBACK/PUBCOMP
@@ -320,6 +324,22 @@ Consequences, all normative for the implementation:
   violations (malformed, unexpected, oversize-by-peer). The existing raw
   propagation of `MandatoryResponseTooLargeError` and `AssertionError` is the
   template, not the exception.
+- The implementation obeys exactly three rules. (1) Effects depending on a
+  rolled-back durable commit are never exposed (selective discard by
+  dependency, above). (2) An observed terminal broker publish outcome
+  determines its receipt despite cleanup failure — success and precise
+  `0x80+` broker failure alike, on a separate channel from the local
+  failure. (3) Incoherent, stale, or ambiguous persistence fails safe: the
+  receipt keeps the observed broker outcome; the original local exception is
+  exposed separately; no peer-blaming DISCONNECT; the current
+  engine/session becomes unfit for automatic reconnect and replay, and no
+  MQTT reconnection is used as repair; recovery happens only through
+  explicit application action with the existing API (new session/engine,
+  discard/reset/repair as appropriate); after a crash/restart without a
+  durable tombstone, a duplication remains possible and is documented as not
+  recoverable. Explicitly not built now: per-packet transactions,
+  savepoints, tombstones, new persistence infrastructure — each would need
+  its own correctness/performance proof.
 - Attribution is not retryability. A preserved local exception must additionally
   map onto the reconnect policy: a persistence failure whose preconditions
   have not changed, or whose durable outcome is ambiguous, must not trigger
@@ -327,23 +347,11 @@ Consequences, all normative for the implementation:
   existing non-reconnecting local failures (`AssertionError`,
   `MandatoryResponseTooLargeError`) are the precedent. Recovery reasons over
   three working dimensions — origin, retryability of the cause, certainty of
-  the durable outcome — where the last is hypothesized, not demonstrated, to
-  be load-bearing. Known-intact state may replay (at-least-once duplicates
-  included); known-committed state must never resurrect an exchange;
-  unknown-outcome state must halt and expose rather than recover silently.
-  The hypothesis stays provisional until the deterministic A/B test below
-  reproduces each case; it must not become an absolute rule beforehand.
-- Remote observation versus durable state is tracked as coherence pairs, not
-  as either side alone. The critical case the blanket rule `known-intact may
-  replay` gets wrong: packet A observes a terminal PUBACK/PUBCOMP, its
-  durable cleanup commits inside the batch, then packet B fails and the outer
-  rollback resurrects A's row. The receipt of A stays terminal, but the row
-  is not `known-intact`: it is **known-stale relative to the observed broker
-  outcome**, and replaying it would retransmit a completed exchange as
-  unfinished. For known-stale rows the model selects a defended policy —
-  per-packet commit granularity, terminal-knowledge tombstone, fail-stop with
-  no replay, or an argued alternative — rather than replaying by default.
-  This third A/B variant is part of acceptance.
+  the durable outcome — as a hypothesis, not a rule: remote observation
+  versus durable state is tracked as coherence pairs (coherent / known-stale
+  / unknown), and the known-stale case (terminal outcome observed, cleanup
+  committed, row resurrected by rollback) is decided by rule (3) above,
+  never by silent replay.
 - Crash window: broker and store share no distributed transaction. Once PUBACK
   is received it cannot be unreceived, and recording `ACK OBSERVED` can itself
   fail or be interrupted by a crash. The implementation must define the
@@ -361,18 +369,20 @@ genuinely dependent on the durable COMMIT, asserting it is discarded (with
 its durable mutation rolled back per the lot semantics above) rather than
 applied; (b) an observed terminal broker outcome (PUBACK/PUBCOMP, success
 and `0x80+` cases) whose receipt must keep the broker result despite the
-cleanup failure, with the local failure on its separate channel; (c) a
-terminal broker outcome whose durable cleanup committed inside the batch
-before B failed, so the outer rollback resurrects the row — asserting the
-receipt stays terminal while the row is treated as known-stale under the
-selected policy, never silently replayed as unfinished — asserting in all
-variants durable state, exposed versus discarded effects, receipt outcome,
-the full RAM ledger set mutated by A (stored-record counts, QoS 2 session
-count, Receive Maximum inflight, inbound/outbound pending bytes and message
-counts, packet identifiers, flow window, queue and parked entries, pending
-acknowledgement sets and order), `on_disconnect` exception identity, and the
-reconnect decision; no reconnect loop against a durably broken store; full
-suite, fuzz smoke, and broker integration green.
+cleanup failure, with the local failure on its separate channel; (c) the
+central reproducer — terminal ACK A, cleanup A committed inside the batch,
+failure B, outer rollback resurrecting the row — asserting the receipt stays
+terminal, the row is treated as known-stale under fail-stop (no automatic
+reconnect, no replay, explicit application recovery only), and never silently
+replayed as unfinished. No universal transactional RAM undo is promised;
+instead, asserting in all variants that after fail-stop no incoherent RAM
+state is reused or exposed: stored-record counts, QoS 2 session count,
+Receive Maximum inflight, inbound/outbound pending bytes and message counts,
+packet identifiers, flow window, queue and parked entries, pending
+acknowledgement sets and order, plus exposed versus discarded effects,
+`on_disconnect` exception identity, and the reconnect decision; no reconnect
+loop against a durably broken store; full suite, fuzz smoke, and broker
+integration green.
 
 ## API completion and errors
 
