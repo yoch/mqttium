@@ -22,9 +22,10 @@ class InflightStore(Protocol):
     store at once, which is proportional to total session size.
 
     Implementations MUST NOT report storage, backend, integrity, or lifecycle
-    failures with ``mqttium.errors.MQTTError`` or any of its subclasses: those
-    types belong to the MQTT/client layers, and the engine attributes them to
-    the peer. Use backend-native or ordinary Python exceptions (``OSError``,
+    failures with ``mqttium.errors.MQTTError`` or any of its subclasses:
+    ``MQTTError`` is reserved for MQTT/client-layer semantics, and using it
+    for store failures makes classification unsupported and ambiguous. Use
+    backend-native or ordinary Python exceptions (``OSError``,
     ``RuntimeError``, ``ValueError``, ``KeyError``, DB-API errors) instead. A
     store that raises an MQTT exception leaves its classification outside the
     supported contract.

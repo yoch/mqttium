@@ -562,6 +562,90 @@ async def test_pubrel_store_divergence_fail_stops_client() -> None:
     await client.disconnect()
 
 
+async def test_pubcomp_success_cleanup_failure() -> None:
+    """PUBCOMP success settles even when its durable cleanup fails."""
+    store = _FailSettleStore()
+    engine = _connected_engine(store=store)
+    handle = engine.queue_publish("failure/comp-ok", b"x", qos=QoS.EXACTLY_ONCE)
+    assert handle.mid is not None
+    engine.handle_raw(_raw(PubRecPacket(mid=handle.mid).encode()))
+    engine.take_effects()
+    store.fail_mids = {handle.mid}
+
+    with pytest.raises(OSError, match=STORE_FAILURE):
+        engine.handle_raw(_raw(PubCompPacket(mid=handle.mid).encode()))
+    effects = engine.take_effects()
+    assert [(effect.kind, effect.data) for effect in effects] == [
+        (EffectKind.PUBLISH_COMPLETE, handle.mid)
+    ]
+    assert engine.packet_ids.in_use(handle.mid)
+    assert engine.flow.inflight == 1
+
+
+async def test_effect_failure_retires_before_close_completes() -> None:
+    """No QoS 0/subscribe admission can slip in before transport close ends.
+
+    The delivery-mark failure latches and retires synchronously; while the
+    close itself is still blocked, the engine is already DISCONNECTED, so
+    QoS 0 publish, subscribe, and the QoS 0 loop adapter are centrally
+    refused without writing anything or allocating anything.
+    """
+    store = _FailMarkStore()
+    sentinel = OSError("delivery mark failed")
+    store.mark_error = sentinel
+    store.fail_mark = True
+    transport = _ManualBrokerTransport()
+    transport.close_entered = asyncio.Event()
+    transport.allow_close = asyncio.Event()
+    disconnected = asyncio.Event()
+    errors: list[BaseException | None] = []
+    received: list[bytes] = []
+    client = _failing_client(transport, store, errors, disconnected)
+    client.on_message = lambda message: received.append(message.payload)
+
+    await client.connect("fake", timeout=2.0)
+    mids_before = len(client._engine.packet_ids)
+    written_before = len(transport.written)
+    transport.push_rx(
+        PublishPacket(
+            topic="failure/retire",
+            payload=b"in",
+            qos=QoS.EXACTLY_ONCE,
+            retain=False,
+            dup=False,
+            mid=31,
+        ).encode()
+    )
+    await asyncio.wait_for(transport.close_entered.wait(), timeout=5.0)
+
+    assert client._engine.state is ConnectionState.DISCONNECTED
+    assert client._local_terminal_failure is sentinel
+    from mqttium.errors import NotConnectedError
+
+    try:
+        with pytest.raises(NotConnectedError):
+            client.publish_nowait("failure/retire", b"y", qos=0)
+        with pytest.raises(NotConnectedError):
+            await client.subscribe("failure/retire")
+        with pytest.raises(NotConnectedError):
+            client._queue_qos0_on_loop("failure/retire", b"y", retain=False)
+        assert len(client._engine.packet_ids) == mids_before
+        # Exactly one legitimate new frame: the lot's own PUBREC handshake.
+        # Nothing admitted afterwards may write or allocate. (The pending
+        # DISCONNECTED effect belongs to the blocked teardown; draining the
+        # engine stream here would steal it, so it is not asserted on.)
+        new_frames = transport.written[written_before:]
+        assert [frame[0] >> 4 for frame in new_frames] == [5]
+    finally:
+        transport.allow_close.set()
+
+    await asyncio.wait_for(disconnected.wait(), timeout=5.0)
+    assert received == [b"in"]
+    assert len(errors) == 1
+    assert errors[0] is sentinel
+    await client.disconnect()
+
+
 async def test_no_admission_after_fail_stop() -> None:
     """Once fail-stopped, the instance admits nothing new.
 

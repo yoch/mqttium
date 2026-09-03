@@ -416,11 +416,12 @@ class AsyncClient:
         self._sub_futs: dict[int, asyncio.Future[SubscribeResult]] = {}
         self._unsub_futs: dict[int, asyncio.Future[UnsubscribeResult]] = {}
         self._disconnect_exc: BaseException | None = None
-        # Set once by a local-terminal ingress failure (store/persistence error
-        # escaping the read-loop batch). While set, the protocol/persistence
-        # state is unfit for automatic reconnect or silent reuse: reconnect is
-        # suppressed and explicit connect() is refused. Never cleared; the
-        # application must create a new client.
+        # Set once by a local-terminal ingress failure (inside the read-loop
+        # batch or while applying an effect that touches persistence). While
+        # set, the protocol/persistence state is unfit for automatic
+        # reconnect or silent reuse: reconnect is suppressed and explicit
+        # connect() is refused. Never cleared; the application must create
+        # a new client.
         self._local_terminal_failure: BaseException | None = None
         # Set once a connection is torn down, cleared by the next connect. Read
         # by _publish_wait_failure(); _closed is set too late in teardown to use.
@@ -671,7 +672,10 @@ class AsyncClient:
         Keeping finalization separate lets adapters commit a bounded batch and
         collect/drain effects once.
         """
-        if self._local_terminal_failure is not None:
+        # QoS 0 keeps its engine-owned rule (refused while disconnected,
+        # fail-stop or not); only QoS 1/2, which would otherwise queue
+        # offline, needs the fail-stop refusal here.
+        if qos != QoS.AT_MOST_ONCE and self._local_terminal_failure is not None:
             raise MQTTError(
                 "Client is unusable after a local terminal failure; "
                 "create a new AsyncClient instead of reusing this one"
@@ -1329,7 +1333,13 @@ class AsyncClient:
         while True:
             waiter: asyncio.Future[None] | None = None
             async with self._engine_lock:
-                if self._local_terminal_failure is not None:
+                # Rechecked on every attempt, not just at entry: a publish
+                # parked on backpressure must observe a fail-stop that landed
+                # while it waited, instead of admitting afterwards. One
+                # predictable branch per attempt; retries repass it naturally.
+                # QoS 0 keeps its engine-owned disconnected rule; only QoS 1/2
+                # (which would otherwise queue offline) is refused here.
+                if qos != QoS.AT_MOST_ONCE and self._local_terminal_failure is not None:
                     raise MQTTError(
                         "Client is unusable after a local terminal failure; "
                         "create a new AsyncClient instead of reusing this one"
@@ -1987,7 +1997,10 @@ class AsyncClient:
                             # first so reconnect and reuse decisions see it.
                             # A pending explicit connect() must fail with the
                             # original cause instead of timing out on CONNACK.
-                            self._local_terminal_failure = exc
+                            # First cause wins: a later local failure must not
+                            # replace it.
+                            if self._local_terminal_failure is None:
+                                self._local_terminal_failure = exc
                             connack_fut = self._connack_fut
                             if connack_fut is not None and not connack_fut.done():
                                 connack_fut.set_exception(exc)
@@ -2095,8 +2108,11 @@ class AsyncClient:
                 self._disconnect_exc = MQTTError("Connection closed")
             # A latched local-terminal failure is authoritative: a secondary
             # writer/keepalive error that overwrote _disconnect_exc must never
-            # replace it for settlement and callbacks.
-            terminal_cause = self._local_terminal_failure or self._disconnect_exc
+            # replace it for settlement and callbacks. The explicit None test
+            # (not truthiness) keeps even a falsey backend exception identical.
+            terminal_cause = self._local_terminal_failure
+            if terminal_cause is None:
+                terminal_cause = self._disconnect_exc
             self._fail_non_replayable(terminal_cause)
             will_reconnect = self._will_reconnect()
             if not will_reconnect:
@@ -2329,6 +2345,10 @@ class AsyncClient:
                     return
                 delay = self._reconnect.next_delay()
                 await asyncio.sleep(delay)
+                cause = self._local_terminal_failure
+                if cause is not None:
+                    await self._terminal_shutdown(cause)
+                    return
                 try:
                     async with self._lifecycle_lock:
                         if self._intentional_disconnect:
@@ -2343,6 +2363,12 @@ class AsyncClient:
                         )
                     # Only clear backoff after the connection stays up.
                     await asyncio.sleep(self._reconnect.stable_after)
+                    cause = self._local_terminal_failure
+                    if cause is not None:
+                        # A local-terminal failure landed while this attempt
+                        # was proving itself stable: never start another one.
+                        await self._terminal_shutdown(cause)
+                        return
                     if self.is_connected:
                         self._reconnect.reset()
                         return
@@ -2350,11 +2376,13 @@ class AsyncClient:
                     continue
                 except Exception as exc:
                     self._disconnect_exc = exc
-                    if isinstance(exc, AssertionError) or self._local_terminal_failure is not None:
+                    cause = self._local_terminal_failure
+                    if isinstance(exc, AssertionError) or cause is not None:
                         # Never reuse an engine after a proven local invariant
                         # violation — or after any latched local-terminal
-                        # failure, including one raised during reconnect.
-                        await self._terminal_shutdown(exc)
+                        # failure, including one raised during reconnect. The
+                        # first latched cause wins over the current exception.
+                        await self._terminal_shutdown(cause if cause is not None else exc)
                         return
                     continue
         except asyncio.CancelledError:
@@ -2525,8 +2553,13 @@ class AsyncClient:
                         # Store failure after application delivery accepted the
                         # message: fail-stop with the original cause and let
                         # the EffectPump run its close and terminal settlement.
-                        # The delivered outcome itself is not disturbed.
-                        self._local_terminal_failure = exc
+                        # The delivered outcome itself is not disturbed. First
+                        # cause wins; retire connection-visible state right
+                        # away so no admission slips in before the transport
+                        # close completes.
+                        if self._local_terminal_failure is None:
+                            self._local_terminal_failure = exc
+                        self._engine.notify_transport_closed()
                         raise
         elif kind is EffectKind.PUBLISH_COMPLETE or kind is EffectKind.PUBLISH_FAILED:
             mid, reason = _terminal_publish_result(effect)
@@ -2569,11 +2602,15 @@ class AsyncClient:
                 except Exception as exc:
                     # Store failure while paging the redelivery cursor:
                     # fail-stop with the original cause; the EffectPump runs
-                    # its close and terminal settlement. No retire here: the
-                    # reader teardown retires through its standard path, and
-                    # mutating engine state from the pump would add a second
-                    # owner.
-                    self._local_terminal_failure = exc
+                    # its close and terminal settlement. Retire immediately
+                    # for the same reason as above; the reader teardown
+                    # re-enters the idempotent boundary harmlessly. No retire
+                    # would leave admissions possible until the transport
+                    # close completes, and mutating engine state from the pump
+                    # is limited to this idempotent call.
+                    if self._local_terminal_failure is None:
+                        self._local_terminal_failure = exc
+                    self._engine.notify_transport_closed()
                     raise
                 self._collect_effects_locked()
         elif kind is EffectKind.PROTOCOL_ERROR:
