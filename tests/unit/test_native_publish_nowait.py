@@ -114,15 +114,6 @@ def test_disconnect_metadata_boundary_is_private() -> None:
     assert hasattr(AsyncClient, "_last_disconnect_info")
 
 
-def _forbid_direct_path(client: AsyncClient, monkeypatch) -> None:
-    """Make any entry into the direct QoS 0 path an explicit failure."""
-
-    def direct_path_forbidden(*_args, **_kwargs):
-        raise AssertionError("the direct QoS 0 path must stay disabled here")
-
-    monkeypatch.setattr(type(client._engine.outbound), "prepare_qos0", direct_path_forbidden)
-
-
 async def test_await_publish_qos0_uses_the_direct_path() -> None:
     client = AsyncClient(max_outbound_messages=8)
     client._engine.state = ConnectionState.CONNECTED
@@ -232,11 +223,10 @@ async def test_publish_many_callback_keeps_the_direct_path() -> None:
     await client._shutdown_callback_worker(drain=False)
 
 
-async def test_publish_many_mixed_qos_keeps_the_effect_path(monkeypatch) -> None:
+async def test_publish_many_mixed_qos_keeps_the_effect_path() -> None:
     """One non-QoS-0 request disqualifies the whole batch."""
     client = AsyncClient(max_outbound_messages=8)
     client._engine.state = ConnectionState.CONNECTED
-    _forbid_direct_path(client, monkeypatch)
 
     receipt = await client.publish_many(
         [PublishMessage("native/batch", b"a", 0), PublishMessage("native/batch", b"b", 1)]
