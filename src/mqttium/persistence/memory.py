@@ -21,7 +21,16 @@ class InflightStore(Protocol):
     """The minimum a store must provide. Session replay materialises the whole
     store at once, which is proportional to total session size."""
 
-    def batch(self) -> AbstractContextManager[None]: ...
+    def batch(self) -> AbstractContextManager[None]:
+        """Group store mutations into one atomic unit.
+
+        If the body raises, prior mutations in that batch must not become
+        durable (rollback). See ``docs/sessions-and-persistence.md``
+        (capability matrix) for the base ``InflightStore`` contract: atomic
+        ``batch()`` mutations and ordered whole-record iteration.
+        """
+        ...
+
     def put_out(self, msg: OutboundMessage) -> None: ...
     def get_out(self, mid: int) -> OutboundMessage | None: ...
     def delete_out(self, mid: int) -> bool: ...
