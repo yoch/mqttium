@@ -32,6 +32,7 @@ class EffectKind(Enum):
     # batch at a time and asks the runtime to come back for the next one, so
     # delivery backpressure applies between batches instead of after all of them.
     CONTINUE_INBOUND_REPLAY = auto()
+    SEND_ACK = auto()
 
 
 @dataclass(slots=True)

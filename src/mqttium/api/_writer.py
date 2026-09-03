@@ -23,18 +23,6 @@ _LATENCY_BATCH_MIN_ITEMS = 4
 _LATENCY_BATCH_MAX_ITEMS = 16
 _LATENCY_BATCH_TARGET_BYTES = 48 * 1024
 
-_SUCCESS_ACK_TYPES = frozenset((0x40, 0x50, 0x70))
-
-
-def _is_success_ack_frame(item: WriteItem) -> bool:
-    return (
-        isinstance(item, bytes)
-        and len(item) == 4
-        and item[1] == 2
-        and item[0] in _SUCCESS_ACK_TYPES
-    )
-
-
 class WritePump:
     """Serialize transport writes and own their bounded queue invariant."""
 
@@ -305,39 +293,16 @@ class WritePump:
             bytes_used += size
         return self.refusal()
 
-    def _try_write_eager(self, item: WriteItem) -> bool:
-        """Write straight through when the writer task would only add a hop.
+    def _try_write_data_eager(self, item: WriteItem) -> bool:
+        """Write one ordinary frame straight through when doing so preserves order.
 
-        Every queued frame costs one event-loop turn: the writer task has to be
-        scheduled out of ``await queue.get()`` before a single byte moves. When
-        nothing is queued and no write is in flight, that turn buys nothing.
-
-        ``_eager_armed`` limits that shortcut to the first write before the loop
-        regains control. A synchronous producer burst therefore wakes the writer
-        on its second frame and lets the existing batch path do the throughput
-        work, while a paced producer can still take the zero-hop path each time.
-
-        Wire order is preserved because the five original conditions still hold
-        together, and each one is load-bearing:
-
-        * ``_write_nowait`` is absent unless the transport's write is a plain
-          buffer append;
-        * ``_writing`` covers the writer task's whole batch — a segmented item
-          is two consecutive writes, and a frame landing between them would
-          corrupt the packet;
-        * an empty queue is what makes this ordered: ``put_nowait`` leaves the
-          item visible until the writer pops it, so a non-empty queue always
-          means an earlier frame is still owed;
-        * a producer suspended in :meth:`enqueue` must not be overtaken;
-        * segmented items are never written eagerly, for the reason above.
-
-        None of the checks can be invalidated between them: this runs to
-        completion without awaiting.
+        DATA and success-ACK permits are deliberately separate. The producer now
+        carries ACK provenance explicitly, so this hottest path never inspects
+        packet bytes merely to decide which permit applies.
         """
         write_nowait = self._write_nowait
-        is_ack = _is_success_ack_frame(item)
         if (
-            not (self._ack_eager_armed if is_ack else self._eager_armed)
+            not self._eager_armed
             or write_nowait is None
             or self._writing
             or self.waiters
@@ -347,10 +312,27 @@ class WritePump:
             return False
         if not write_nowait(item):
             return False
-        if is_ack:
-            self._ack_eager_armed = False
-        else:
-            self._eager_armed = False
+        self._eager_armed = False
+        self._schedule_eager_rearm()
+        self.eager_writes += 1
+        self.eager_bytes += len(item)
+        self.last_outbound = time.monotonic()
+        return True
+
+    def _try_write_ack_eager(self, item: bytes) -> bool:
+        """Use the independent one-per-turn success-ACK eager permit."""
+        write_nowait = self._write_nowait
+        if (
+            not self._ack_eager_armed
+            or write_nowait is None
+            or self._writing
+            or self.waiters
+            or not self.queue.empty()
+        ):
+            return False
+        if not write_nowait(item):
+            return False
+        self._ack_eager_armed = False
         self._schedule_eager_rearm()
         self.eager_writes += 1
         self.eager_bytes += len(item)
@@ -365,7 +347,23 @@ class WritePump:
         size = item_size(item)
         if not self.can_enqueue_size(size):
             return False
-        if self._try_write_eager(item):
+        if self._try_write_data_eager(item):
+            return True
+        self.queue.put_nowait(item)
+        self.queued_bytes += size
+        self._admit_queued()
+        return True
+
+    def try_enqueue_ack(self, item: bytes, *, epoch: int | None = None) -> bool:
+        """Admit a known success ACK without classifying its wire bytes."""
+        if epoch is None:
+            epoch = self.epoch
+        if epoch != self.epoch:
+            raise StaleConnectionEffect
+        size = len(item)
+        if not self.can_enqueue_size(size):
+            return False
+        if self._try_write_ack_eager(item):
             return True
         self.queue.put_nowait(item)
         self.queued_bytes += size
@@ -464,21 +462,14 @@ class WritePump:
         self._admit_queued(len(items))
         return True
 
-    async def enqueue(
+    async def _enqueue_after_wait(
         self,
         item: WriteItem,
+        size: int,
         *,
-        nowait: bool = False,
-        epoch: int | None = None,
+        epoch: int,
     ) -> None:
-        if epoch is None:
-            epoch = self.epoch
-        if self.try_enqueue(item, epoch=epoch):
-            return
-        size = item_size(item)
-        if nowait:
-            raise FlowControlError(self.refusal(size))
-
+        """Wait for writer capacity after an immediate admission attempt failed."""
         async with self.space:
             while True:
                 if epoch != self.epoch:
@@ -516,6 +507,39 @@ class WritePump:
             self.queue.put_nowait(item)
             self.queued_bytes += size
             self._admit_queued()
+
+    async def enqueue(
+        self,
+        item: WriteItem,
+        *,
+        nowait: bool = False,
+        epoch: int | None = None,
+    ) -> None:
+        if epoch is None:
+            epoch = self.epoch
+        if self.try_enqueue(item, epoch=epoch):
+            return
+        size = item_size(item)
+        if nowait:
+            raise FlowControlError(self.refusal(size))
+        await self._enqueue_after_wait(item, size, epoch=epoch)
+
+    async def enqueue_ack(
+        self,
+        item: bytes,
+        *,
+        nowait: bool = False,
+        epoch: int | None = None,
+    ) -> None:
+        """Enqueue a known success ACK while retaining its independent permit."""
+        if epoch is None:
+            epoch = self.epoch
+        if self.try_enqueue_ack(item, epoch=epoch):
+            return
+        size = len(item)
+        if nowait:
+            raise FlowControlError(self.refusal(size))
+        await self._enqueue_after_wait(item, size, epoch=epoch)
 
     async def _write_contiguous(
         self,

@@ -249,6 +249,10 @@ class ProtocolEngine:
     def _send(self, packet: WriteItem) -> None:
         self._emit(EffectKind.SEND, packet)
 
+    def _send_ack(self, packet: bytes) -> None:
+        """Emit a success ACK without making the writer rediscover its type."""
+        self._emit(EffectKind.SEND_ACK, packet)
+
     def _client_id_for_connect(self, clean_start: bool) -> str:
         client_id = self.config.client_id
         if self._prefer_session_resume and not client_id and self._session_client_id:
