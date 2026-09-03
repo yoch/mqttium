@@ -866,7 +866,7 @@ class AsyncClient:
             ProtocolError: If the client is already connecting/connected or the
                 broker refuses or violates the protocol.
             MQTTError: If :meth:`disconnect` cancels connection setup.
-            MQTTError: If a previous local persistence failure fail-stopped
+            MQTTError: If a previous local terminal failure fail-stopped
                 this client; create a new one instead of reusing it.
             OSError: If TCP/TLS setup or the initial MQTT CONNECT write fails.
             asyncio.CancelledError: If the calling task is cancelled.
@@ -891,7 +891,7 @@ class AsyncClient:
         Raises:
             MQTTTimeoutError: If connection or CONNACK exceeds the deadline.
             ProtocolError: If the broker refuses or violates the protocol.
-            MQTTError: If a previous local persistence failure fail-stopped
+            MQTTError: If a previous local terminal failure fail-stopped
                 this client; create a new one instead of reusing it.
             OSError: If Unix socket setup or the initial MQTT CONNECT write fails.
             asyncio.CancelledError: If the calling task is cancelled.
@@ -931,7 +931,7 @@ class AsyncClient:
         Raises:
             MQTTTimeoutError: If connection or CONNACK exceeds the deadline.
             ProtocolError: If the broker refuses or violates the MQTT protocol.
-            MQTTError: If a previous local persistence failure fail-stopped
+            MQTTError: If a previous local terminal failure fail-stopped
                 this client; create a new one instead of reusing it.
             ConnectionError: If the WebSocket upgrade, transport, or initial
                 MQTT CONNECT write fails.
@@ -981,7 +981,7 @@ class AsyncClient:
         """
         if self._local_terminal_failure is not None:
             raise MQTTError(
-                "Client is unusable after a local persistence failure; "
+                "Client is unusable after a local terminal failure; "
                 "create a new AsyncClient instead of reusing this one"
             )
         async with self._lifecycle_lock:
@@ -1903,9 +1903,12 @@ class AsyncClient:
                     async with self._engine_lock:
                         captured: list[Message] = []
                         captured_property_sizes: list[int | None] | None = None
-                        with self._engine.store.batch():
-                            effect_start = len(self._engine._effects)
-                            try:
+                        # The try wraps the whole batch statement, including its
+                        # exit: a commit failure at batch close is a local
+                        # failure like any store error inside the body.
+                        effect_start = len(self._engine._effects)
+                        try:
+                            with self._engine.store.batch():
                                 header = getattr(self._decoder, "next_header_byte", None)
                                 if (
                                     direct_qos0_mode
@@ -1930,34 +1933,42 @@ class AsyncClient:
                                     handled, handled_bytes, handoff_required = (
                                         self._process_ingress_batch()
                                     )
-                            except (
-                                MandatoryResponseTooLargeError,
-                                PacketTooLargeError,
-                                MalformedPacketError,
-                                ProtocolError,
-                            ):
-                                raise
-                            except Exception as exc:
-                                # Local failure (store/persistence error): fail-stop.
-                                # Latch first so reconnect and reuse decisions see
-                                # it, then keep only terminal publish outcomes
-                                # among this lot's new effects — anything else was
-                                # never durably committed and must not be exposed —
-                                # and let the original exception propagate.
-                                self._local_terminal_failure = exc
-                                effects = self._engine._effects
-                                kept = [
-                                    effect
-                                    for effect in effects[effect_start:]
-                                    if effect.kind
-                                    in (
-                                        EffectKind.PUBLISH_COMPLETE,
-                                        EffectKind.PUBLISH_FAILED,
-                                    )
-                                ]
-                                del effects[effect_start:]
-                                effects.extend(kept)
-                                raise
+                        except (
+                            MandatoryResponseTooLargeError,
+                            PacketTooLargeError,
+                            MalformedPacketError,
+                            ProtocolError,
+                        ):
+                            raise
+                        except Exception as exc:
+                            # Local failure (store/persistence error, including
+                            # a batch-exit commit failure): fail-stop.
+                            # Everything here is synchronous under the engine
+                            # lock with no await between latch and retire, so
+                            # no admission can slip into the window. Latch
+                            # first so reconnect and reuse decisions see it,
+                            # keep only terminal publish outcomes among this
+                            # lot's new effects — anything else was never
+                            # durably committed and must not be exposed — then
+                            # retire connection-visible state immediately via
+                            # the idempotent lifecycle boundary (the finally
+                            # below re-enters it harmlessly) and let the
+                            # original exception propagate.
+                            self._local_terminal_failure = exc
+                            effects = self._engine._effects
+                            kept = [
+                                effect
+                                for effect in effects[effect_start:]
+                                if effect.kind
+                                in (
+                                    EffectKind.PUBLISH_COMPLETE,
+                                    EffectKind.PUBLISH_FAILED,
+                                )
+                            ]
+                            del effects[effect_start:]
+                            effects.extend(kept)
+                            self._engine.notify_transport_closed()
+                            raise
                         if captured:
                             if self._delivery.deliver_callback_messages_inline(
                                 captured, self._message_callback, captured_property_sizes

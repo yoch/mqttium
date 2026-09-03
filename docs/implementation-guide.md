@@ -253,11 +253,13 @@ closes. A propagated failure rolls the lot back, but rollback alone does not
 retract effects — the read-loop `finally` advances the epoch, calls
 `notify_transport_closed()`, and collects whatever sits in `engine._effects`
 under the new epoch before draining it. The rule is therefore selective
-discard by dependency: on rollback, discard exactly the commit-scope effects
-produced since the batch started; observation-scope effects survive. The
-mechanism (a dependency-aware journal boundary, or equivalent) is
-implementation detail; the discard set is normative. Per-packet atomicity
-remains an explicit non-specified alternative.
+ discard by dependency: on rollback, discard exactly the commit-scope effects
+ produced since the batch started; observation-scope effects survive. Latch,
+ filter, and transport-closed retire run synchronously under the engine lock
+ with no await between them, so no admission can slip into the window. The
+ mechanism (a dependency-aware journal boundary, or equivalent) is
+ implementation detail; the discard set is normative. Per-packet atomicity
+ remains an explicit non-specified alternative.
 
  Each effect produced while handling one packet belongs to exactly one scope,
  decided per effect instance by the precise transition it depends on — never

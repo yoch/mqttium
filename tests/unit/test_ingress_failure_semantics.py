@@ -12,6 +12,8 @@ refuses silent reuse.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -64,6 +66,19 @@ class _FailSqliteSettleStore(SqliteInflightStore):
         if self.fail_mids is None or mid in self.fail_mids:
             raise OSError(STORE_FAILURE)
         return super().complete_out(mid, expected_state)
+
+
+class _ExitFailingStore(SqliteInflightStore):
+    """Runs the lot body normally, then fails like a commit error on exit."""
+
+    fail_exit = False
+
+    @contextmanager
+    def batch(self) -> Iterator[None]:
+        with super().batch():
+            yield
+            if self.fail_exit:
+                raise OSError("batch commit failed")
 
 
 def _raw(wire: bytes) -> RawPacket:
@@ -301,8 +316,104 @@ async def test_puback_store_failure_keeps_receipt_and_fail_stops() -> None:
     await asyncio.sleep(0.4)
     assert client._factory_calls() == 1
     assert client.state is ConnectionState.DISCONNECTED
-    with pytest.raises(MQTTError, match="local persistence failure"):
+    with pytest.raises(MQTTError, match="local terminal failure"):
         await client.connect("fake", timeout=2.0)
+    await client.disconnect()
+
+
+async def test_batch_exit_failure_rolls_back_and_fail_stops(
+    tmp_path: Path,
+) -> None:
+    """A commit failure at batch exit latched, filtered, and fail-stopped.
+
+    The lot body runs normally (terminal settle + commit-dependent put committed
+    in-transaction); the OSError at exit rolls everything back. The receipt of
+    the settled message stays terminal, the other lot effects never surface,
+    the original commit error reaches on_disconnect, and nothing reconnects.
+    """
+    store = _ExitFailingStore(tmp_path / "exit.db")
+    transport = _ManualBrokerTransport()
+    disconnected = asyncio.Event()
+    errors: list[BaseException | None] = []
+    client = _failing_client(transport, store, errors, disconnected)
+
+    await client.connect("fake", timeout=2.0)
+    receipt = await client.publish("failure/exit-a1", b"a1", qos=1)
+    await _wait_for(lambda: len(transport.publishes) == 1)
+    mid = transport.publishes[0].mid
+    assert mid is not None
+    store.fail_exit = True
+    lot = (
+        PubAckPacket(mid=mid).encode()
+        + PublishPacket(
+            topic="failure/exit-a2",
+            payload=b"a2",
+            qos=QoS.EXACTLY_ONCE,
+            retain=False,
+            dup=False,
+            mid=42,
+        ).encode()
+    )
+    transport.push_rx(lot)
+
+    await asyncio.wait_for(disconnected.wait(), timeout=5.0)
+    await asyncio.wait_for(receipt.wait(), timeout=5.0)
+
+    assert len(errors) == 1
+    assert isinstance(errors[0], OSError)
+    assert "commit failed" in str(errors[0])
+    # Rolled back: the settled row is back, the QoS 2 row never landed.
+    assert store.get_out(mid) is not None
+    assert store.get_in(42) is None
+    # Filtered: no PUBREC for the rolled-back QoS 2 publish.
+    assert 5 not in _written_types(transport)
+    assert 14 not in _written_types(transport)
+    await asyncio.sleep(0.4)
+    assert client._factory_calls() == 1
+    with pytest.raises(MQTTError, match="local terminal failure"):
+        await client.connect("fake", timeout=2.0)
+    await client.disconnect()
+
+
+async def test_no_admission_after_fail_stop() -> None:
+    """Once fail-stopped, the instance admits nothing new.
+
+    The latch and the transport-closed retire happen synchronously under the
+    engine lock with no await between them, so no admission can slip into the
+    window: QoS 0 publish, subscribe, and manual ack are centrally refused via
+    ConnectionState, and no MID, row, or effect is created.
+    """
+    store = _FailSettleStore()
+    transport = _ManualBrokerTransport()
+    disconnected = asyncio.Event()
+    errors: list[BaseException | None] = []
+    client = _failing_client(transport, store, errors, disconnected)
+
+    await client.connect("fake", timeout=2.0)
+    receipt = await client.publish("failure/admission", b"x", qos=1)
+    await _wait_for(lambda: len(transport.publishes) == 1)
+    mid = transport.publishes[0].mid
+    assert mid is not None
+    store.fail_mids = {mid}
+    mids_before = len(client._engine.packet_ids)
+    rows_before = sorted(m.mid for m in store.out_items())
+    transport.push_rx(PubAckPacket(mid=mid).encode())
+
+    await asyncio.wait_for(disconnected.wait(), timeout=5.0)
+    await asyncio.wait_for(receipt.wait(), timeout=5.0)
+    assert client._engine.state is ConnectionState.DISCONNECTED
+
+    from mqttium.errors import NotConnectedError
+
+    with pytest.raises(NotConnectedError):
+        client.publish_nowait("failure/admission", b"y", qos=0)
+    with pytest.raises(NotConnectedError):
+        await client.subscribe("failure/admission")
+    with pytest.raises(NotConnectedError):
+        client._engine.ack(mid)
+    assert len(client._engine.packet_ids) == mids_before
+    assert sorted(m.mid for m in store.out_items()) == rows_before
+    assert not client._engine.take_effects()
     await client.disconnect()
 
 
@@ -366,6 +477,6 @@ async def test_failed_lot_keeps_terminal_and_drops_commit_dependent(
     assert 14 not in _written_types(transport)
     await asyncio.sleep(0.4)
     assert client._factory_calls() == 1
-    with pytest.raises(MQTTError, match="local persistence failure"):
+    with pytest.raises(MQTTError, match="local terminal failure"):
         await client.connect("fake", timeout=2.0)
     await client.disconnect()
