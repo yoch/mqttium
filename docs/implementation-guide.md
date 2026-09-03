@@ -240,6 +240,74 @@ stores snapshot ordered identifiers when iteration starts and look up each page
 when it is consumed, so records deleted before that lookup are omitted. Runtime
 replay uses the paged interface for both built-in stores.
 
+## Failure semantics
+
+An ingress lot passes through three events that cannot be merged: OBSERVE (a
+packet is decoded), COMMIT (local state, durable or in memory, is updated),
+EXPOSE (an effect becomes application- or wire-visible). Packets are not
+rollbackable once observed; only local state is. Durability is therefore
+per-packet, not per-lot: when packet A commits and packet B fails, A's durable
+mutation stays committed and A's effects stay applicable. Whole-lot rollback
+would additionally require discarding effects produced since the batch started,
+which the runtime does not do today.
+
+Each effect produced while handling one packet belongs to exactly one scope:
+
+- Observation scope (survives any durable failure): QoS 0 MESSAGE, automatic
+  QoS 1 MESSAGE without delivery mark, SUBACK, UNSUBACK, PINGRESP, AUTH,
+  CONNACK (apart from its session-restore consequences below), DISCONNECTED,
+  and orphan PUBREL/PUBCOMP answering unknown identifiers (no state exists to
+  record).
+- Commit scope (emitted only after the durable transition it depends on is
+  confirmed): automatic QoS 2 PUBREC (sent after `put_in`), manual QoS 1 and
+  QoS 2 MESSAGE with delivery mark, outbound `PUBLISH_COMPLETE` (after the
+  settle delete), `PUBLISH_FAILED` (exactly once per resolved exchange), and
+  session-restore retransmissions (replay reads committed rows only).
+
+Consequences, all normative for the implementation:
+
+- A terminal broker outcome that has been observed (PUBACK/PUBCOMP received,
+  including MQTT 5 reason codes at or above `0x80`) determines the receipt:
+  success, or the broker's precise failure. A subsequent local cleanup failure
+  must not replace that outcome, nor prevent the terminal effect. The order
+  `wire-ACK observed → terminal effect → durable cleanup` is load-bearing;
+  the current `wire-ACK → settle → terminal effect` order lets a store failure
+  hide an already-observed broker outcome and is a Stable contract bug
+  (`architecture.md`, receipts and completion).
+- A local failure keeps its identity end to end: no `str()` conversion, no
+  re-wrap into a peer-attributed error, no normative peer-blaming DISCONNECT
+  for a local cause. Peer-attributed `PROTOCOL_ERROR` stays reserved for wire
+  violations (malformed, unexpected, oversize-by-peer). The existing raw
+  propagation of `MandatoryResponseTooLargeError` and `AssertionError` is the
+  template, not the exception.
+- Attribution is not retryability. A preserved local exception must additionally
+  map onto the reconnect policy: durable-health failures whose preconditions
+  have not changed must not trigger transport reconnect loops that re-execute
+  the failing local operation. The existing non-reconnecting local failures
+  (`AssertionError`, `MandatoryResponseTooLargeError`) are the precedent; the
+  mapping is by failure class, with three working dimensions — origin,
+  retryability of the cause, and certainty of the durable outcome — of which
+  only the last decides whether silent recovery is safe. Known-intact state
+  may replay (at-least-once duplicates included); known-committed state must
+  never resurrect an exchange; unknown-outcome state must halt and expose
+  rather than recover silently.
+- Crash window: broker and store share no distributed transaction. Once PUBACK
+  is received it cannot be unreceived, and recording `ACK OBSERVED` can itself
+  fail or be interrupted by a crash. The implementation must define the
+  application-visible commit point, preserve local error identity, refuse
+  absurd automatic recovery, mark the store unhealthy, document the crash
+  recovery guarantee — and must not promise correct divergence recovery in
+  every failure model.
+
+Acceptance for the implementation (PR `fix/ingress-failure-semantics`):
+a deterministic A/B test where packet A produces a durable mutation plus an
+effect and packet B makes the store raise, asserting durable state, applied
+versus discarded effects, receipt outcome, MID and budget ledgers,
+`on_disconnect` exception identity, and the reconnect decision; receipt
+outcomes for broker success and broker `0x80+` failure under store failure;
+no reconnect loop against a durably broken store; full suite, fuzz smoke,
+and broker integration green.
+
 ## API completion and errors
 
 - QoS 0 receipts complete at writer admission. When callback capacity is
