@@ -76,11 +76,7 @@ def test_wait_puback_completes_when_reopened_without_manual_ack() -> None:
     )
 
     effects = engine.take_effects()
-    sends = [
-        write_item_bytes(effect.data)
-        for effect in effects
-        if effect.kind is EffectKind.SEND_ACK
-    ]
+    sends = [write_item_bytes(effect.data) for effect in effects if effect.kind is EffectKind.SEND_ACK]
     assert sends == [PubAckPacket(mid=18).encode()]
     assert not [effect for effect in effects if effect.kind is EffectKind.MESSAGE]
     assert store.get_in(18) is None
