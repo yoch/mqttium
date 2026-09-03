@@ -6,6 +6,12 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Changed
+
+- Clarify that only MQTT 3.1.1 and MQTT 5 are supported and tested. MQTT 3.1
+  (`MQTTProtocolVersion.MQTTv31`) is explicitly out of the support matrix; the
+  Stable enum member is retained for backwards compatibility.
+
 ## [1.0.0rc12] - 2026-09-02
 
 ### Changed

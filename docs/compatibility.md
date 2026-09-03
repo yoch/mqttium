@@ -20,6 +20,8 @@ on the operating system; Unix-domain sockets are not a portable Windows API.
 
 ## MQTT protocol
 
+Only MQTT 3.1.1 and MQTT 5 are supported and tested.
+
 | Capability | MQTT 3.1.1 | MQTT 5 |
 | --- | :---: | :---: |
 | CONNECT and clean/new sessions | Yes | Yes |
@@ -32,6 +34,11 @@ on the operating system; Unix-domain sockets are not a portable Windows API.
 | Topic aliases | Not applicable | Explicit, connection-scoped |
 
 Protocol conformance evidence is indexed in [Protocol Conformance](conformance.md).
+
+`MQTTProtocolVersion.MQTTv31` remains a Stable enum member for backwards
+compatibility, but it selects an unsupported protocol. Handlers may exist for
+internal and decode completeness; they carry no support claim and no
+conformance claim.
 
 ## Transports
 
