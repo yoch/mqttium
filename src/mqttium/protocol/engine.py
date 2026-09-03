@@ -135,6 +135,14 @@ class ProtocolEngine:
         self._pending_sub_requests: dict[int, tuple[PacketType, int]] = {}
 
     def take_effects(self) -> list[EngineEffect]:
+        """Take pending effects; the ownership-transfer boundary.
+
+        Taking the batch also releases the Receive Maximum slots held by the
+        auto-PUBACKs in that batch (see
+        ``InboundSession.release_pending_auto_qos1``; the read loop stops
+        ingress on ``_autoack_handoff_required``). The two operations are
+        intentionally atomic, not separable primitives.
+        """
         effects = self._effects
         self._effects = []
         # Handing the complete effect batch to the runtime is the first
