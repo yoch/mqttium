@@ -258,29 +258,53 @@ uncollected, a behavior change for redelivery and replay, not a neutral
 refactor. Per-packet atomicity (for example nested per-packet batches) is an
 explicit architectural alternative: it would need correctness justification
 (partial-lot durability vs replay/resume interplay) and performance
-justification (per-packet transaction overhead vs per-lot), and is not
-specified here.
+ justification (per-packet transaction overhead vs per-lot), and is not
+ specified here.
 
-Each effect produced while handling one packet belongs to exactly one scope:
+ Rollback alone does not retract effects, which is a current defect, not a
+ neutral edge: a propagated exception rolls the outer lot batch back, but the
+ read-loop `finally` then advances the epoch, calls
+ `notify_transport_closed()`, and collects whatever sits in `engine._effects`
+ under the new epoch before draining it. Pre-rollback effects are therefore
+ recollected and applied despite the rollback (effect-commit without
+ durable-commit). The rule is selective discard: on rollback, discard exactly
+ the effects produced since the batch started, and only those. The mechanism
+ (a journal boundary recorded at batch start, or equivalent) is implementation
+ detail; the discard set is normative.
+
+ Each effect produced while handling one packet belongs to exactly one scope,
+ decided per effect instance by the precise transition it depends on — never
+ by `EffectKind` alone. Since #427, `SEND_ACK` carries every success ACK
+ (PUBACK/PUBREC/PUBCOMP, bytes-only, so the writer does not rediscover the
+ type) while reason-carrying frames stay `SEND`, and the pump still partitions
+ both kinds wire-first. Kind alone therefore cannot classify: a fresh
+ automatic QoS 1 `SEND_ACK(PUBACK)` is emitted with no durable row, while a
+ fresh QoS 2 `SEND_ACK(PUBREC)` is emitted after `put_in`, and an orphan
+ `SEND_ACK(PUBCOMP)` answers an unknown identifier. The instances, at
+ `main@ed3f6a7`:
 
 - Observation scope (survives any durable failure): QoS 0 MESSAGE, automatic
   QoS 1 MESSAGE without delivery mark, SUBACK, UNSUBACK, PINGRESP, AUTH,
-  CONNACK (apart from its session-restore consequences below), DISCONNECTED,
-  orphan PUBREL/PUBCOMP answering unknown identifiers (no state exists to
-  record), and terminal broker-outcome effects: `PUBLISH_COMPLETE` on an
-  observed success ACK and `PUBLISH_FAILED` on an observed MQTT 5 reason code
-  at or above `0x80`. The terminal effect belongs to the observation of the
-  ACK, so a later local cleanup failure can neither replace the broker
-  outcome nor suppress the effect — and a broker failure reason must survive
-  exactly as precisely as a broker success.
+  DISCONNECTED, duplicate-QoS 2 `PUBREC` re-emission against an existing
+  record (read-only dependency), orphan `PUBCOMP` for an unknown identifier
+  (no state exists to record), orphan reason-carrying `PUBREL` (stays `SEND`),
+  and terminal broker-outcome effects — `PUBLISH_COMPLETE` on an observed
+  success ACK, `PUBLISH_FAILED` on an observed MQTT 5 reason code at or above
+  `0x80`. The terminal effect belongs to the observation of the ACK, so a
+  later local cleanup failure can neither replace the broker outcome (success
+  or precise broker failure) nor suppress the effect.
 - Commit scope (emitted only after the durable transition it depends on is
-  confirmed): automatic QoS 2 PUBREC (sent after `put_in`), manual QoS 1 and
-  QoS 2 MESSAGE with delivery mark, success-ACK wire frames (`SEND` and, since
-  #427, `SEND_ACK`: PUBACK/PUBREC/PUBCOMP success, bytes-only, distinguished
-  solely so the writer does not rediscover their type — the effect pump still
-  partitions both kinds wire-first), reason-carrying and orphan frames (which
-  stay `SEND`), and session-restore retransmissions (replay reads committed
-  rows only).
+  confirmed): fresh QoS 2 `PUBREC` (after `put_in`), recovered-QoS 1 PUBACK
+  (after the stored record is completed), manual QoS 1/2 PUBACK/PUBCOMP
+  (after their stored records are completed), post-delete PUBCOMP, manual
+  QoS 1/2 MESSAGE with delivery mark, and session-restore retransmissions
+  (replay reads committed rows only).
+
+CONNACK is explicitly excluded from the observation-survives rule for this
+phase: the CONNACK effect resolves the `connect()` future before inbound
+replay and the final drain complete, so broker-CONNACK observation versus
+application-visible connect success is a boundary the implementation must
+decide separately and is left open here.
 
 Consequences, all normative for the implementation:
 
@@ -303,12 +327,23 @@ Consequences, all normative for the implementation:
   existing non-reconnecting local failures (`AssertionError`,
   `MandatoryResponseTooLargeError`) are the precedent. Recovery reasons over
   three working dimensions — origin, retryability of the cause, certainty of
-  the durable outcome — where the last is hypothesized (not yet demonstrated)
-  to be load-bearing: known-intact state may replay (at-least-once duplicates
+  the durable outcome — where the last is hypothesized, not demonstrated, to
+  be load-bearing. Known-intact state may replay (at-least-once duplicates
   included); known-committed state must never resurrect an exchange;
   unknown-outcome state must halt and expose rather than recover silently.
-  The deterministic A/B test below is the vehicle that promotes or rejects
-  this hypothesis.
+  The hypothesis stays provisional until the deterministic A/B test below
+  reproduces each case; it must not become an absolute rule beforehand.
+- Remote observation versus durable state is tracked as coherence pairs, not
+  as either side alone. The critical case the blanket rule `known-intact may
+  replay` gets wrong: packet A observes a terminal PUBACK/PUBCOMP, its
+  durable cleanup commits inside the batch, then packet B fails and the outer
+  rollback resurrects A's row. The receipt of A stays terminal, but the row
+  is not `known-intact`: it is **known-stale relative to the observed broker
+  outcome**, and replaying it would retransmit a completed exchange as
+  unfinished. For known-stale rows the model selects a defended policy —
+  per-packet commit granularity, terminal-knowledge tombstone, fail-stop with
+  no replay, or an argued alternative — rather than replaying by default.
+  This third A/B variant is part of acceptance.
 - Crash window: broker and store share no distributed transaction. Once PUBACK
   is received it cannot be unreceived, and recording `ACK OBSERVED` can itself
   fail or be interrupted by a crash. The implementation must define the
@@ -321,14 +356,21 @@ Consequences, all normative for the implementation:
 
 Acceptance for the implementation (PR `fix/ingress-failure-semantics`):
 a deterministic A/B test where packet A produces a durable mutation plus an
-effect and packet B makes the store raise, in two variants — (a) an effect
+effect and packet B makes the store raise, in three variants — (a) an effect
 genuinely dependent on the durable COMMIT, asserting it is discarded (with
 its durable mutation rolled back per the lot semantics above) rather than
 applied; (b) an observed terminal broker outcome (PUBACK/PUBCOMP, success
 and `0x80+` cases) whose receipt must keep the broker result despite the
-cleanup failure, with the local failure on its separate channel — asserting
-in both variants durable state, exposed versus discarded effects, receipt
-outcome, MID and budget ledgers, `on_disconnect` exception identity, and the
+cleanup failure, with the local failure on its separate channel; (c) a
+terminal broker outcome whose durable cleanup committed inside the batch
+before B failed, so the outer rollback resurrects the row — asserting the
+receipt stays terminal while the row is treated as known-stale under the
+selected policy, never silently replayed as unfinished — asserting in all
+variants durable state, exposed versus discarded effects, receipt outcome,
+the full RAM ledger set mutated by A (stored-record counts, QoS 2 session
+count, Receive Maximum inflight, inbound/outbound pending bytes and message
+counts, packet identifiers, flow window, queue and parked entries, pending
+acknowledgement sets and order), `on_disconnect` exception identity, and the
 reconnect decision; no reconnect loop against a durably broken store; full
 suite, fuzz smoke, and broker integration green.
 
