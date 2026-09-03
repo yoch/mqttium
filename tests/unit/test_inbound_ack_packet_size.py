@@ -197,7 +197,7 @@ def test_automatic_puback_at_exact_broker_packet_limit_is_emitted() -> None:
     _feed(engine, _publish(QoS.AT_LEAST_ONCE))
     effects = engine.take_effects()
 
-    sent = [effect.data for effect in effects if effect.kind is EffectKind.SEND]
+    sent = [effect.data for effect in effects if effect.kind is EffectKind.SEND_ACK]
     assert sent == [b"\x40\x02\x00\x07"]
     assert any(effect.kind is EffectKind.MESSAGE for effect in effects)
     assert not any(effect.kind is EffectKind.PROTOCOL_ERROR for effect in effects)
@@ -208,7 +208,7 @@ def test_qos2_at_exact_broker_packet_limit_completes_exchange() -> None:
 
     _feed(engine, _publish(QoS.EXACTLY_ONCE))
     first = engine.take_effects()
-    assert [effect.data for effect in first if effect.kind is EffectKind.SEND] == [
+    assert [effect.data for effect in first if effect.kind is EffectKind.SEND_ACK] == [
         b"\x50\x02\x00\x07"
     ]
     assert any(effect.kind is EffectKind.MESSAGE for effect in first)
@@ -216,7 +216,7 @@ def test_qos2_at_exact_broker_packet_limit_completes_exchange() -> None:
 
     _feed(engine, encode_pubrel_success(7))
     second = engine.take_effects()
-    assert [effect.data for effect in second if effect.kind is EffectKind.SEND] == [
+    assert [effect.data for effect in second if effect.kind is EffectKind.SEND_ACK] == [
         b"\x70\x02\x00\x07"
     ]
     assert engine.store.get_in(7) is None
@@ -237,7 +237,7 @@ def test_manual_puback_size_failure_preserves_durable_record() -> None:
 
     assert engine.store.get_in(7) is not None
     assert engine.inbound._inflight == 1
-    assert not any(effect.kind is EffectKind.SEND for effect in engine.take_effects())
+    assert not any(effect.kind is EffectKind.SEND_ACK for effect in engine.take_effects())
 
 
 def test_manual_puback_at_exact_limit_completes_record() -> None:
@@ -248,7 +248,7 @@ def test_manual_puback_at_exact_limit_completes_record() -> None:
     engine.ack(7)
     effects = engine.take_effects()
 
-    assert [effect.data for effect in effects if effect.kind is EffectKind.SEND] == [
+    assert [effect.data for effect in effects if effect.kind is EffectKind.SEND_ACK] == [
         b"\x40\x02\x00\x07"
     ]
     assert engine.store.get_in(7) is None

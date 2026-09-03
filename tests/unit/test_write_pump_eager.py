@@ -111,7 +111,7 @@ async def test_success_ack_and_data_have_independent_eager_permits(packet_type: 
     pump.start(transport)
     try:
         ack = bytes((packet_type, 2, 0, 1))
-        assert pump.try_enqueue(ack) is True
+        assert pump.try_enqueue_ack(ack) is True
         assert pump.try_enqueue(b"\x30\x00") is True
 
         assert transport.written == [ack, b"\x30\x00"]
@@ -127,7 +127,7 @@ async def test_success_ack_eager_burst_is_bounded_to_one_per_turn() -> None:
     pump.start(transport)
     try:
         for mid in range(1, 17):
-            assert pump.try_enqueue(b"\x40\x02" + mid.to_bytes(2, "big")) is True
+            assert pump.try_enqueue_ack(b"\x40\x02" + mid.to_bytes(2, "big")) is True
 
         assert len(transport.written) == 1
         assert pump.queued_messages == 15

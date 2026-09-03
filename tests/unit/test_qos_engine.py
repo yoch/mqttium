@@ -120,7 +120,7 @@ def test_qos2_inbound_dedup() -> None:
     effects = engine.take_effects()
     messages = [e for e in effects if e.kind is EffectKind.MESSAGE]
     assert len(messages) == 1
-    sends = [e.data for e in effects if e.kind is EffectKind.SEND]
+    sends = [e.data for e in effects if e.kind is EffectKind.SEND_ACK]
     assert len(sends) == 1  # PUBREC
 
     # Duplicate PUBLISH with DUP — must not redeliver.
@@ -137,14 +137,14 @@ def test_qos2_inbound_dedup() -> None:
     engine.handle_raw(dec.next_packet())  # type: ignore[arg-type]
     effects = engine.take_effects()
     assert not any(e.kind is EffectKind.MESSAGE for e in effects)
-    assert any(e.kind is EffectKind.SEND for e in effects)  # PUBREC again
+    assert any(e.kind is EffectKind.SEND_ACK for e in effects)  # PUBREC again
 
     # PUBREL completes
     dec = IncrementalDecoder()
     dec.feed(PubRelPacket(mid=7).encode())
     engine.handle_raw(dec.next_packet())  # type: ignore[arg-type]
     effects = engine.take_effects()
-    assert any(e.kind is EffectKind.SEND for e in effects)  # PUBCOMP
+    assert any(e.kind is EffectKind.SEND_ACK for e in effects)  # PUBCOMP
     assert engine.store.get_in(7) is None
 
 

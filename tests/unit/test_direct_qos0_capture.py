@@ -56,7 +56,7 @@ def test_mixed_qos1_batch_materializes_in_original_order() -> None:
     assert captured == []
     assert [effect.kind for effect in client._engine._effects] == [
         EffectKind.MESSAGE,
-        EffectKind.SEND,
+        EffectKind.SEND_ACK,
         EffectKind.MESSAGE,
         EffectKind.MESSAGE,
     ]

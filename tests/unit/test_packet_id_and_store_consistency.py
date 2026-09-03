@@ -227,7 +227,7 @@ def test_inbound_qos2_duplicate_is_still_answered_with_pubrec() -> None:
 
     assert engine.state is ConnectionState.CONNECTED
     assert not [e for e in effects if e.kind is EffectKind.DISCONNECTED]
-    assert [e for e in effects if e.kind is EffectKind.SEND], "duplicate must re-send PUBREC"
+    assert [e for e in effects if e.kind is EffectKind.SEND_ACK], "duplicate must re-send PUBREC"
     _assert_accounting_exact(engine)
 
 
