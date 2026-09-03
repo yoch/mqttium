@@ -671,6 +671,11 @@ class AsyncClient:
         Keeping finalization separate lets adapters commit a bounded batch and
         collect/drain effects once.
         """
+        if self._local_terminal_failure is not None:
+            raise MQTTError(
+                "Client is unusable after a local terminal failure; "
+                "create a new AsyncClient instead of reusing this one"
+            )
         handle = self._engine.outbound.queue_publish(
             topic,
             payload,
@@ -794,6 +799,11 @@ class AsyncClient:
         properties: Properties | None = None,
     ) -> PublishReceipt:
         """Admit QoS 1/2 and register its receipt for loop-bound adapters."""
+        if self._local_terminal_failure is not None:
+            raise MQTTError(
+                "Client is unusable after a local terminal failure; "
+                "create a new AsyncClient instead of reusing this one"
+            )
         handle = self._engine.outbound.queue_publish(
             topic,
             payload,
@@ -1234,6 +1244,8 @@ class AsyncClient:
                 negotiated packet-size limit.
             ProtocolError: If the topic, properties, or request violates MQTT or
                 negotiated broker capabilities.
+            MQTTError: If a previous local terminal failure fail-stopped
+                this client; create a new one instead of reusing it.
             ValueError: If ``qos`` is not 0, 1, or 2.
         """
         try:
@@ -1303,7 +1315,14 @@ class AsyncClient:
             ProtocolError: If the request violates protocol or negotiated limits.
             asyncio.CancelledError: If a waiting producer is cancelled; no new
                 publication state is retained for the cancelled request.
+            MQTTError: If a previous local terminal failure fail-stopped
+                this client; create a new one instead of reusing it.
         """
+        if self._local_terminal_failure is not None:
+            raise MQTTError(
+                "Client is unusable after a local terminal failure; "
+                "create a new AsyncClient instead of reusing this one"
+            )
         data = payload.encode("utf-8") if isinstance(payload, str) else payload
         while True:
             waiter: asyncio.Future[None] | None = None
@@ -1442,7 +1461,14 @@ class AsyncClient:
                 work admitted before that failure.
             asyncio.CancelledError: If submission is cancelled. Publications
                 already admitted remain active and are not rolled back.
+            MQTTError: If a previous local terminal failure fail-stopped
+                this client; create a new one instead of reusing it.
         """
+        if self._local_terminal_failure is not None:
+            raise MQTTError(
+                "Client is unusable after a local terminal failure; "
+                "create a new AsyncClient instead of reusing this one"
+            )
         if chunk_size <= 0:
             raise ValueError("chunk_size must be greater than 0")
         receipt = PublishBatchReceipt(

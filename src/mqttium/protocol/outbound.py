@@ -965,7 +965,7 @@ class OutboundSession:
                     target_state,
                 )
                 if changed is None:
-                    raise ProtocolError(
+                    raise RuntimeError(
                         f"Outbound mid={msg.mid} changed while launching queued publish"
                     )
                 # MemoryInflightStore transitions the same object; SQLite only
@@ -1114,7 +1114,7 @@ class OutboundSession:
             return stored
         message = self.store.get_out(stored.mid)
         if message is None:
-            raise ProtocolError(f"Missing durable outbound record mid={stored.mid}")
+            raise RuntimeError(f"Missing durable outbound record mid={stored.mid}")
         if message.logical_size <= 0:
             message.logical_size = self.stored_logical_size(stored)
         return message

@@ -27,12 +27,13 @@ from mqttium.packets import (
     PubCompPacket,
     PublishPacket,
     PubRecPacket,
+    PubRelPacket,
 )
 from mqttium.persistence.memory import MemoryInflightStore
 from mqttium.persistence.sqlite import SqliteInflightStore
 from mqttium.protocol.effects import EffectKind
 from mqttium.protocol.engine import EngineConfig, ProtocolEngine
-from mqttium.types import InboundMessage
+from mqttium.types import InboundMessage, InboundQoSState
 
 
 STORE_FAILURE = "durable settle failed"
@@ -68,8 +69,12 @@ class _FailSqliteSettleStore(SqliteInflightStore):
         return super().complete_out(mid, expected_state)
 
 
-class _ExitFailingStore(SqliteInflightStore):
-    """Runs the lot body normally, then fails like a commit error on exit."""
+class _BatchExitFailingStore(SqliteInflightStore):
+    """Runs the lot body normally, then raises a batch-exit failure.
+
+    The exception traverses the SQLite batch, which rolls the lot back —
+    like a commit error at exit, without mocking sqlite internals.
+    """
 
     fail_exit = False
 
@@ -78,7 +83,7 @@ class _ExitFailingStore(SqliteInflightStore):
         with super().batch():
             yield
             if self.fail_exit:
-                raise OSError("batch commit failed")
+                raise OSError("batch exit failed")
 
 
 def _raw(wire: bytes) -> RawPacket:
@@ -331,7 +336,7 @@ async def test_batch_exit_failure_rolls_back_and_fail_stops(
     the settled message stays terminal, the other lot effects never surface,
     the original commit error reaches on_disconnect, and nothing reconnects.
     """
-    store = _ExitFailingStore(tmp_path / "exit.db")
+    store = _BatchExitFailingStore(tmp_path / "exit.db")
     transport = _ManualBrokerTransport()
     disconnected = asyncio.Event()
     errors: list[BaseException | None] = []
@@ -361,12 +366,102 @@ async def test_batch_exit_failure_rolls_back_and_fail_stops(
 
     assert len(errors) == 1
     assert isinstance(errors[0], OSError)
-    assert "commit failed" in str(errors[0])
+    assert "batch exit failed" in str(errors[0])
     # Rolled back: the settled row is back, the QoS 2 row never landed.
     assert store.get_out(mid) is not None
     assert store.get_in(42) is None
     # Filtered: no PUBREC for the rolled-back QoS 2 publish.
     assert 5 not in _written_types(transport)
+    assert 14 not in _written_types(transport)
+    await asyncio.sleep(0.4)
+    assert client._factory_calls() == 1
+    with pytest.raises(MQTTError, match="local terminal failure"):
+        await client.connect("fake", timeout=2.0)
+    await client.disconnect()
+
+
+class _DivergentInboundStore(MemoryInflightStore):
+    """Reports a WAIT_PUBREL record, then denies its conditional delete."""
+
+    diverge = False
+
+    def complete_in(self, mid: int, expected_state: InboundQoSState) -> object:
+        if self.diverge:
+            return None
+        return super().complete_in(mid, expected_state)
+
+
+def _qos2_exchange(engine: ProtocolEngine, mid: int = 31) -> None:
+    engine.handle_raw(
+        _raw(
+            PublishPacket(
+                topic="failure/divergent",
+                payload=b"body",
+                qos=QoS.EXACTLY_ONCE,
+                retain=False,
+                dup=False,
+                mid=mid,
+            ).encode()
+        )
+    )
+    engine.take_effects()
+
+
+def test_pubrel_store_divergence_traverses_unchanged() -> None:
+    """A local store divergence is not a peer protocol error.
+
+    The store reports a WAIT_PUBREL record, then its conditional delete
+    observes a move: RuntimeError with identity, nothing emitted, no PUBCOMP.
+    """
+    store = _DivergentInboundStore()
+    engine = _connected_engine(store=store)
+    _qos2_exchange(engine)
+    assert store.get_in(31) is not None
+    store.diverge = True
+
+    failure = None
+    try:
+        engine.handle_raw(_raw(PubRelPacket(mid=31).encode()))
+    except RuntimeError as exc:
+        failure = exc
+    assert failure is not None
+    assert "changed while completing PUBREL" in str(failure)
+    assert engine.take_effects() == []
+
+
+async def test_pubrel_store_divergence_fail_stops_client() -> None:
+    """Client-level traversal: identity, no peer DISCONNECT, no reconnect."""
+    store = _DivergentInboundStore()
+    transport = _ManualBrokerTransport()
+    disconnected = asyncio.Event()
+    errors: list[BaseException | None] = []
+    client = _failing_client(transport, store, errors, disconnected)
+
+    await client.connect("fake", timeout=2.0)
+    transport.push_rx(
+        PublishPacket(
+            topic="failure/divergent",
+            payload=b"body",
+            qos=QoS.EXACTLY_ONCE,
+            retain=False,
+            dup=False,
+            mid=31,
+        ).encode()
+    )
+    await _wait_for(lambda: store.get_in(31) is not None)
+    engine = client._engine
+    engine.take_effects()
+    store.diverge = True
+    transport.push_rx(PubRelPacket(mid=31).encode())
+
+    await asyncio.wait_for(disconnected.wait(), timeout=5.0)
+    assert len(errors) == 1
+    assert isinstance(errors[0], RuntimeError)
+    assert "changed while completing PUBREL" in str(errors[0])
+    # The QoS 2 handshake PUBREC went out normally; no PUBCOMP for the
+    # unfinished exchange and no peer-blaming DISCONNECT followed it.
+    assert _written_types(transport) == [1, 5]
+    assert 7 not in _written_types(transport)
     assert 14 not in _written_types(transport)
     await asyncio.sleep(0.4)
     assert client._factory_calls() == 1
@@ -411,6 +506,18 @@ async def test_no_admission_after_fail_stop() -> None:
         await client.subscribe("failure/admission")
     with pytest.raises(NotConnectedError):
         client._engine.ack(mid)
+    # QoS 1/2 offline queueing is a feature while merely disconnected, so the
+    # fail-stop latch — not ConnectionState — must refuse it here.
+    from mqttium.api import PublishMessage
+
+    with pytest.raises(MQTTError, match="local terminal failure"):
+        await client.publish("failure/admission", b"z", qos=1)
+    with pytest.raises(MQTTError, match="local terminal failure"):
+        client.publish_nowait("failure/admission", b"z", qos=1)
+    with pytest.raises(MQTTError, match="local terminal failure"):
+        await client.publish_many([PublishMessage("failure/admission", b"z", qos=1)])
+    with pytest.raises(MQTTError, match="local terminal failure"):
+        client._queue_qosn_on_loop("failure/admission", b"z", qos=QoS.AT_LEAST_ONCE, retain=False)
     assert len(client._engine.packet_ids) == mids_before
     assert sorted(m.mid for m in store.out_items()) == rows_before
     assert not client._engine.take_effects()

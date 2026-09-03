@@ -245,117 +245,52 @@ replay uses the paged interface for both built-in stores.
 An ingress lot passes through three events that cannot be merged: OBSERVE (a
 packet is decoded), COMMIT (local state, durable or in memory, is updated),
 EXPOSE (an effect becomes application- or wire-visible). Packets are not
-rollbackable once observed; only local state is.
+rollbackable once observed; only local state is. The read loop opens one
+outer `store.batch()` around the whole ingress lot and collects effects after
+it closes; per-packet atomicity is explicitly not specified.
 
-The batching is lot-scoped, not per-packet: the read loop opens one outer
-`store.batch()` around the whole ingress lot and collects effects after it
-closes. A propagated failure rolls the lot back, but rollback alone does not
-retract effects — the read-loop `finally` advances the epoch, calls
+A propagated failure rolls the lot back, but rollback alone does not retract
+effects: the read-loop `finally` advances the epoch, calls
 `notify_transport_closed()`, and collects whatever sits in `engine._effects`
-under the new epoch before draining it. The rule is therefore selective
- discard by dependency: on rollback, discard exactly the commit-scope effects
- produced since the batch started; observation-scope effects survive. Latch,
- filter, and transport-closed retire run synchronously under the engine lock
- with no await between them, so no admission can slip into the window. The
- mechanism (a dependency-aware journal boundary, or equivalent) is
- implementation detail; the discard set is normative. Per-packet atomicity
- remains an explicit non-specified alternative.
+under the new epoch before draining it. Latch, filter, and transport-closed
+retire therefore run synchronously under the engine lock with no await
+between them, keeping only terminal publish outcomes and discarding the
+lot's other unexposed effects.
 
- Each effect produced while handling one packet belongs to exactly one scope,
- decided per effect instance by the precise transition it depends on — never
- by `EffectKind` alone: since #427, `SEND_ACK` carries every success ACK while
- reason-carrying frames stay `SEND`, so a fresh automatic QoS 1 PUBACK (no
- durable row) and a fresh QoS 2 PUBREC (after `put_in`) share a kind but not
- a scope. The instances, at
- `main@5403636ab1ccc9da45363fe1ac9858f49f1d6219`:
+ Scope is decided per effect instance by the precise transition it depends
+ on, never by `EffectKind` alone: since #427, `SEND_ACK` carries every
+ success ACK while reason-carrying frames stay `SEND`, so a fresh automatic
+ QoS 1 PUBACK (no durable row) and a fresh QoS 2 PUBREC (after `put_in`)
+ share a kind but not a scope. Terminal publish effects (`PUBLISH_COMPLETE`
+ on an observed success ACK, `PUBLISH_FAILED` on an observed MQTT 5 reason
+ at or above `0x80`, including negative PUBREC) belong to the observation
+ of the ACK: a later local cleanup failure can neither replace the broker
+ outcome nor suppress the effect. CONNACK is excluded for this phase: it
+ resolves the `connect()` future before inbound replay and the final drain
+ complete.
 
-- Observation scope (survives any durable failure): effects with no durable
-  dependency — orphan answers (duplicate-QoS 2 `PUBREC` re-emission, orphan
-  `PUBCOMP`, orphan reason-carrying `PUBREL`), QoS 0 and automatic-QoS 1
-  MESSAGE without delivery mark, and terminal broker-outcome effects —
-  `PUBLISH_COMPLETE` on an observed success ACK, `PUBLISH_FAILED` on an
-  observed MQTT 5 reason code at or above `0x80`. The terminal effect belongs
-  to the observation of the ACK, so a later local cleanup failure can neither
-  replace the broker outcome (success or precise broker failure) nor suppress
-  the effect. Other observation-only effects (SUBACK, UNSUBACK, PINGRESP,
-  AUTH, DISCONNECTED) follow the same rule without needing per-kind
-  legislation here.
-- Commit scope (emitted only after the durable transition it depends on is
-  confirmed): fresh QoS 2 `PUBREC` (after `put_in`), recovered-QoS 1 PUBACK
-  (after the stored record is completed), manual QoS 1/2 PUBACK/PUBCOMP
-  (after their stored records are completed), post-delete PUBCOMP, manual
-  QoS 1/2 MESSAGE with delivery mark, and session-restore retransmissions
-  (replay reads committed rows only).
+Four guarantees, all normative:
 
-CONNACK is explicitly excluded from the observation-survives rule for this
-phase: the CONNACK effect resolves the `connect()` future before inbound
-replay and the final drain complete, so broker-CONNACK observation versus
-application-visible connect success is a boundary the implementation must
-decide separately and is left open here.
+1. An ingress lot that fails locally exposes none of its ordinary unexposed
+   effects. The normal hot path stays `_settle()` then emit; only a cleanup
+   failure emits the already-observed outcome first.
+2. An observed terminal publish broker outcome determines its receipt
+   despite cleanup failure. Durable cleanup never vetoes the terminal effect.
+3. A local-terminal failure fail-stops the `AsyncClient`: the original
+   exception is preserved end to end (no `str()`, no peer-blaming DISCONNECT
+   — `PROTOCOL_ERROR` stays reserved for wire violations); the connection is
+   retired immediately; no automatic reconnect or replay; no new publish
+   admission; no silent reuse (`connect()` refuses — create a new client);
+   remaining receipts fail with the local cause. Direct `ProtocolEngine`
+   consumers receive the original exception and decide retirement
+   themselves; the engine carries no fail-stop latch.
+4. Broker and local store share no distributed transaction: perfect crash
+   recovery and absence of duplication are not guaranteed.
 
-Consequences, all normative for the implementation:
-
-- The order `wire-ACK observed → terminal effect → durable cleanup` is
-  load-bearing; the current `wire-ACK → settle → terminal effect` order lets
-  a store failure hide an already-observed broker outcome (success or precise
-  `0x80+` failure) and is a Stable contract bug (`architecture.md`, receipts
-  and completion). Durable cleanup is a separate obligation with its own
-  failure channel, never a veto on the terminal effect.
-- A local failure keeps its identity end to end: no `str()` conversion, no
-  re-wrap into a peer-attributed error, no normative peer-blaming DISCONNECT
-  for a local cause. Peer-attributed `PROTOCOL_ERROR` stays reserved for wire
-  violations (malformed, unexpected, oversize-by-peer). The existing raw
-  propagation of `MandatoryResponseTooLargeError` and `AssertionError` is the
-  template, not the exception.
-- The implementation obeys exactly three rules. (1) Effects depending on a
-  rolled-back durable commit are never exposed (selective discard by
-  dependency, above). (2) An observed terminal broker publish outcome
-  determines its receipt despite cleanup failure — success and precise
-  `0x80+` broker failure alike, on a separate channel from the local
-  failure. (3) Incoherent, stale, or ambiguous persistence fails safe: the
-  receipt keeps the observed broker outcome; the original local exception is
-  exposed separately; no peer-blaming DISCONNECT; the current
-  engine/session becomes unfit for automatic reconnect and replay, and no
-  MQTT reconnection is used as repair; recovery happens only through
-  explicit application action with the existing API (new session/engine,
-  discard/reset/repair as appropriate); after a crash/restart without a
-  durable tombstone, a duplication remains possible and is documented as not
-  recoverable. Explicitly not built now: per-packet transactions,
-  savepoints, tombstones, new persistence infrastructure — each would need
-  its own correctness/performance proof.
-- Attribution is not retryability. A preserved local exception must additionally
-  map onto the reconnect policy: a persistence failure whose preconditions
-  have not changed, or whose durable outcome is ambiguous, must not trigger
-  transport reconnect loops that re-execute the failing local operation. The
-  existing non-reconnecting local failures (`AssertionError`,
-  `MandatoryResponseTooLargeError`) are the precedent. Recovery reasons over
-  three working dimensions — origin, retryability of the cause, certainty of
-  the durable outcome — as a hypothesis, not a rule: remote observation
-  versus durable state is tracked as coherence pairs (coherent / known-stale
-  / unknown), and the known-stale case (terminal outcome observed, cleanup
-  committed, row resurrected by rollback) is decided by rule (3) above,
-  never by silent replay.
-- Crash window: broker and store share no distributed transaction. Once PUBACK
-  is received it cannot be unreceived, and recording `ACK OBSERVED` can itself
-  fail or be interrupted by a crash. The implementation must define the
-  application-visible commit point, preserve local error identity, refuse
-  absurd automatic recovery, document the crash recovery guarantee — and must
-  not promise correct divergence recovery in every failure model. Candidate
-  mechanisms (store-health flag, durable-ambiguity flag, failure
-  classification) are implementation choices; the normative rule is only that
-  MQTT reconnect is never the automatic repair for such a failure.
-
-Acceptance is covered by `tests/unit/test_ingress_failure_semantics.py`: engine
-reproducers (commit-dependent failure emits nothing; PUBACK success and
-`0x80+` broker failures settle their terminal outcome while the original
-store error propagates; negative PUBREC likewise) and AsyncClient reproducers
-— a failed lot keeps the terminal receipt, drops commit-dependent effects
-(no PUBREC sent, no delivery, row absent), resurrects-but-never-replays the
-known-stale row, surfaces the original exception on `on_disconnect`, sends no
-peer-blaming DISCONNECT, performs no automatic reconnect, and refuses silent
-reuse with `MQTTError`. No universal transactional RAM undo is promised;
-instead the tests assert that after fail-stop no incoherent RAM state is
-reused or exposed.
+Covered by `tests/unit/test_ingress_failure_semantics.py` (terminal receipt
+preserved across settle/batch-exit failures, commit-dependent effects
+dropped, resurrected-but-never-replayed known-stale row, original exception
+on `on_disconnect`, no reconnect, no silent reuse or admission).
 
 ## API completion and errors
 
