@@ -989,6 +989,11 @@ class AsyncClient:
         generation, and performs one connection attempt under the lifecycle
         lock.
         """
+        if self._local_terminal_failure is not None:
+            raise MQTTError(
+                "Client is unusable after a local terminal failure; "
+                "create a new AsyncClient instead of reusing this one"
+            )
         async with self._lifecycle_lock:
             await self._prepare_explicit_connect()
             # Rechecked, not just entry-checked: the latch is set-once, so a
@@ -2088,10 +2093,14 @@ class AsyncClient:
                 pass
             if self._disconnect_exc is None:
                 self._disconnect_exc = MQTTError("Connection closed")
-            self._fail_non_replayable(self._disconnect_exc)
+            # A latched local-terminal failure is authoritative: a secondary
+            # writer/keepalive error that overwrote _disconnect_exc must never
+            # replace it for settlement and callbacks.
+            terminal_cause = self._local_terminal_failure or self._disconnect_exc
+            self._fail_non_replayable(terminal_cause)
             will_reconnect = self._will_reconnect()
             if not will_reconnect:
-                self._fail_pending(self._disconnect_exc)
+                self._fail_pending(terminal_cause)
                 # Wake any publish() parked on outbound backpressure.
                 await self._write_pump.wake_waiters()
                 # Cancel writer + close transport so no task/fd leaks.
@@ -2106,7 +2115,7 @@ class AsyncClient:
                 # message stream: the same iterator resumes after reconnect.
                 self._delivery.close()
             try:
-                callback_error = None if clean_disconnect else self._disconnect_exc
+                callback_error = None if clean_disconnect else terminal_cause
                 await self._invoke(self.on_disconnect, callback_error)
             except Exception as exc:
                 self._report_callback_error(self.on_disconnect, exc)

@@ -16,7 +16,9 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   keeps only terminal publish outcomes and drops anything else it produced;
   a local-terminal failure fail-stops the client (no automatic reconnect or
   replay, explicit `connect()` refused, no new publish admission — create a
-  new `AsyncClient`). Direct `ProtocolEngine` consumers: `handle_raw()` may
+  new `AsyncClient`). A replacement client built on the same ambiguous or
+  known-stale store is not automatically repaired: reconcile persistence and
+  broker-session state explicitly. Direct `ProtocolEngine` consumers: `handle_raw()` may
   now raise local store exceptions that previously surfaced as
   `PROTOCOL_ERROR` effects; handle them around `handle_raw()` instead of
   matching on `"Internal handler error"`.

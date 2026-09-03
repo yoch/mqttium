@@ -276,6 +276,15 @@ class _ManualBrokerTransport:
         self.written: list[bytes] = []
         self.publishes: list[PublishPacket] = []
         self.connack_override: bytes | None = None
+        # Optional write gating for fail-stop race tests. When a frame's type
+        # nibble is in block_kinds, write() signals entered_write and waits
+        # for release_write; with fail_writes set it raises write_error
+        # instead (simulating a write failing while teardown is closing).
+        self.block_kinds: set[int] = set()
+        self.entered_write = asyncio.Event()
+        self.release_write = asyncio.Event()
+        self.close_entered: asyncio.Event | None = None
+        self.allow_close: asyncio.Event | None = None
 
     def push_rx(self, data: bytes) -> None:
         self._rx.put_nowait(data)
@@ -287,6 +296,9 @@ class _ManualBrokerTransport:
     async def write(self, data: bytes) -> None:
         if isinstance(data, tuple):
             data = data[0] + data[1]
+        if (data[0] >> 4) in self.block_kinds:
+            self.entered_write.set()
+            await self.release_write.wait()
         self.written.append(data)
         self.decoder.feed(data)
         for raw in self.decoder.drain_packets():
@@ -308,6 +320,10 @@ class _ManualBrokerTransport:
 
     async def close(self) -> None:
         self._closing = True
+        if self.close_entered is not None:
+            self.close_entered.set()
+        if self.allow_close is not None:
+            await self.allow_close.wait()
         self.push_rx(b"")
 
     def is_closing(self) -> bool:
@@ -974,6 +990,65 @@ async def test_replay_continuation_failure_latches() -> None:
     assert len(received) == 64
     assert len(errors) == 1
     assert errors[0] is sentinel
+    await asyncio.sleep(0.4)
+    assert client._factory_calls() == 1
+    with pytest.raises(MQTTError, match="local terminal failure"):
+        await client.connect("fake", timeout=2.0)
+    await client.disconnect()
+
+
+async def test_secondary_writer_failure_preserves_terminal_cause() -> None:
+    """A writer failure during close must not replace the latched cause.
+
+    An outbound PUBLISH write stays genuinely in flight (blocked) while an
+    inbound delivery-mark failure latches and starts the close. A writer
+    failure landing as ``_disconnect_exc`` at that point — ``_writer_failed``
+    assigns it unconditionally, verified by code reading — must not leak
+    into settlement or callbacks: the teardown uses the latched cause.
+    """
+    store = _FailMarkStore()
+    sentinel = OSError("delivery mark failed")
+    store.mark_error = sentinel
+    store.fail_mark = True
+    writer_failure = OSError("writer write failed")
+    transport = _ManualBrokerTransport()
+    transport.block_kinds = {3}
+    transport.close_entered = asyncio.Event()
+    transport.allow_close = asyncio.Event()
+    disconnected = asyncio.Event()
+    errors: list[BaseException | None] = []
+    received: list[bytes] = []
+    client = _failing_client(transport, store, errors, disconnected)
+    client.on_message = lambda message: received.append(message.payload)
+
+    await client.connect("fake", timeout=2.0)
+    outbound = await client.publish("failure/writer-race", b"out", qos=1)
+    await asyncio.wait_for(transport.entered_write.wait(), timeout=5.0)
+    transport.push_rx(
+        PublishPacket(
+            topic="failure/writer-mark",
+            payload=b"in",
+            qos=QoS.EXACTLY_ONCE,
+            retain=False,
+            dup=False,
+            mid=31,
+        ).encode()
+    )
+    await asyncio.wait_for(transport.close_entered.wait(), timeout=5.0)
+    assert client._local_terminal_failure is sentinel
+    # Simulate the writer failure landing first: _writer_failed assigns
+    # _disconnect_exc unconditionally.
+    client._disconnect_exc = writer_failure
+    transport.release_write.set()
+    transport.allow_close.set()
+
+    await asyncio.wait_for(disconnected.wait(), timeout=5.0)
+    assert received == [b"in"]
+    assert len(errors) == 1
+    assert errors[0] is sentinel
+    with pytest.raises(OSError) as failed:
+        await asyncio.wait_for(outbound.wait(), timeout=5.0)
+    assert failed.value is sentinel
     await asyncio.sleep(0.4)
     assert client._factory_calls() == 1
     with pytest.raises(MQTTError, match="local terminal failure"):

@@ -276,9 +276,12 @@ Four guarantees, all normative:
    — `PROTOCOL_ERROR` stays reserved for wire violations); the connection is
    retired immediately; no automatic reconnect or replay; no new publish
    admission; no silent reuse (`connect()` refuses — create a new client);
-   remaining receipts fail with the local cause. Direct `ProtocolEngine`
-   consumers receive the original exception and decide retirement
-   themselves; the engine carries no fail-stop latch.
+   remaining receipts fail with the local cause. A replacement client built
+   on the same ambiguous or known-stale store is not automatically repaired:
+   before supplying persistence state to it, the application must explicitly
+   decide and reconcile the store and broker-session state. Direct
+   `ProtocolEngine` consumers receive the original exception and decide
+   retirement themselves; the engine carries no fail-stop latch.
 4. Broker and local store share no distributed transaction: perfect crash
    recovery and absence of duplication are not guaranteed.
 
