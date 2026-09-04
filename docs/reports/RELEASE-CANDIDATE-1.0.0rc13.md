@@ -98,7 +98,18 @@ The exact pre-metadata source `cf8f93d` passed on `main`:
 - [ARM64 CI run 33841508003](https://github.com/yoch/mqttium/actions/runs/33841508003);
 - [Runtime fuzz nightly run 33842207734](https://github.com/yoch/mqttium/actions/runs/33842207734).
 
-Candidate-PR CI evidence: (filled in after the preparation PR runs).
+Candidate-PR CI evidence: preparation PR #429, head `fc4ce42`, passed the
+full hosted matrix:
+
+- [CI run 33847229283](https://github.com/yoch/mqttium/actions/runs/33847229283)
+  (quality, tests 3.11–3.14, Mosquitto integration, resilience,
+  cross-platform macOS/Windows 3.11+3.14, fuzz, package, `CI required`);
+- [distribution run 33847229284](https://github.com/yoch/mqttium/actions/runs/33847229284)
+  (wheel/sdist build, smoke-basic 3.11–3.14, smoke-resilience; publish and
+  verify-pypi correctly skipped);
+- [soak run 33847229295](https://github.com/yoch/mqttium/actions/runs/33847229295)
+  (linux-soak MQTT 3.1.1 and MQTT 5 passed);
+- Read the Docs build for the PR passed.
 
 ## Release decision
 
