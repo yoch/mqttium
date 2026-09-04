@@ -1212,7 +1212,10 @@ async def test_replay_failure_during_stable_after_stops_reconnect() -> None:
 
     def _record(error: BaseException | None) -> None:
         errors.append(error)
-        disconnected.set()
+        # Only the fail-stop teardown counts: the plain transport-loss
+        # teardown fires first on every run and must not satisfy the wait.
+        if len(errors) == 2:
+            disconnected.set()
 
     client.on_disconnect = _record  # type: ignore[assignment]
 
