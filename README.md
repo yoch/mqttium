@@ -33,7 +33,7 @@ The package has no runtime dependencies and is fully typed.
 | Delivery choices | Async iteration, sync or async callbacks, optional dual delivery, and manual acknowledgement |
 | Transports | TCP, TLS, WebSocket, and Unix-domain sockets |
 | Operations | Immutable runtime snapshots, queue high-water marks, and broker-negotiated limits |
-| Efficient production | Bounded `publish_many()` and loop-bound `publish_nowait()` without changing delivery semantics |
+| Efficient native path | Bounded `publish_many()`, loop-bound `publish_nowait()`, and measured hot-path optimisation without changing delivery semantics |
 
 MQTTium keeps protocol state in a synchronous state machine and leaves sockets,
 timers, callbacks, and task ownership to the asyncio adapter. That separation
@@ -118,6 +118,42 @@ batch = await client.publish_many(
 await batch.wait()
 ```
 
+## Performance
+
+Performance is a design constraint, not a separate fast mode. MQTTium's native
+asyncio path is measured together with MQTT semantics, bounded resource use,
+backpressure, and event-loop fairness.
+
+Current same-host standard-profile validation of `1.0.0rc13` against the
+post-#422 baseline shows the intended publish-path improvements without a
+material regression in the QoS 0 or RTT guardrails:
+
+| Workload | `1.0.0rc13` vs post-#422 baseline |
+| --- | ---: |
+| Publish QoS 0/1/2 sweep | **+9.4%** |
+| QoS 1 inflight capacity | **+4.5%** |
+| QoS 0 payload throughput | ≈ flat |
+| Application RTT capacity | ≈ flat |
+
+These are same-host version-regression results, not cross-client ranking claims.
+Absolute throughput depends on the machine, broker, workload, and completion
+contract. Cross-client comparisons live in the separate
+[`mqtt-python-client-bench`](https://github.com/yoch/mqtt-python-client-bench)
+project; its [live report](https://yoch.github.io/mqtt-python-client-bench/)
+publishes exact versions, environment details, scenario semantics, and stated
+limitations. Release comparisons use interleaved runs so client order does not
+silently become part of the result.
+
+For cross-client context, `gmqtt` is the closest established asyncio peer where
+the measured contract matches. Eclipse Paho is included as a widely known
+synchronous reference point: useful for orientation, but not presented as a
+direct asyncio peer. The benchmark keeps I/O models distinct and only compares
+results where the completion semantics are equivalent.
+
+MQTTium's own
+[benchmarking contract](https://mqttium.readthedocs.io/en/stable/benchmarking/)
+defines the paired regression gates used during development.
+
 ## Reconnect and durable sessions
 
 Automatic reconnect is opt-in through `ReconnectPolicy`. Durable recovery also
@@ -167,23 +203,13 @@ The complete documentation is available on
 | [Transports and security](https://mqttium.readthedocs.io/en/stable/transports-and-tls/) | TCP, TLS, WebSocket, Unix sockets, and credential handling |
 | [MQTT 5](https://mqttium.readthedocs.io/en/stable/mqtt-5/) | Properties, authentication, topic aliases, and negotiated limits |
 | [Operations](https://mqttium.readthedocs.io/en/stable/operations/) | Runtime snapshots, pressure diagnosis, and graceful shutdown |
+| [Benchmarking](https://mqttium.readthedocs.io/en/stable/benchmarking/) | Performance methodology, regression gates, and measurement semantics |
 | [Stable API reference](https://mqttium.readthedocs.io/en/stable/reference/) | Supported imports, signatures, defaults, and exceptions |
 | [Compatibility matrix](https://mqttium.readthedocs.io/en/stable/compatibility/) | Python, platform, broker, protocol, and transport validation |
 
 Architecture, conformance, stability tiers, benchmarking methodology, and
 release evidence are documented separately so current contracts are not mixed
 with historical reports.
-
-## Performance claims
-
-Performance is treated as an evidence discipline, not a slogan. Changes must
-preserve MQTT semantics, bounded memory, backpressure, and event-loop fairness.
-The [benchmarking contract](https://mqttium.readthedocs.io/en/stable/benchmarking/)
-defines valid comparisons.
-Cross-client results will be linked only after the independent benchmark
-repository publishes reviewed MQTTium, Paho, and gmqtt runs with exact versions,
-environment details, raw artifacts, comparable completion semantics, and stated
-limitations.
 
 ## Support and contributing
 
