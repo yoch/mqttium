@@ -6,6 +6,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [1.0.0rc13] - 2026-09-04
+
 ### Fixed
 
 - Local store/persistence failures during ingress processing now propagate
@@ -28,6 +30,15 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - Clarify that only MQTT 3.1.1 and MQTT 5 are supported and tested. MQTT 3.1
   (`MQTTProtocolVersion.MQTTv31`) is explicitly out of the support matrix; the
   Stable enum member is retained for backwards compatibility.
+- Restore the ordinary QoS 0 publication hot path, removing the generic
+  prepared-publish carrier overhead while preserving validation and
+  backpressure semantics.
+- Reduce QoS 1/2 publication preparation overhead and remove success-ACK byte
+  reclassification from ordinary writer admission by carrying ACK provenance
+  internally; no Stable API or ordering/backpressure semantics changed.
+- Document `InflightStore.batch()` atomicity and the `take_effects()`
+  ownership-transfer boundary; third-party stores must not report backend
+  failures with `MQTTError`.
 
 ## [1.0.0rc12] - 2026-09-02
 
@@ -1025,7 +1036,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - Pre-spin-out comparative analysis and generated coverage data from the
   published source tree.
 
-[Unreleased]: https://github.com/yoch/mqttium/compare/v1.0.0rc12...HEAD
+[Unreleased]: https://github.com/yoch/mqttium/compare/v1.0.0rc13...HEAD
+[1.0.0rc13]: https://github.com/yoch/mqttium/compare/v1.0.0rc12...v1.0.0rc13
 [1.0.0rc12]: https://github.com/yoch/mqttium/compare/v1.0.0rc11...v1.0.0rc12
 [1.0.0rc11]: https://github.com/yoch/mqttium/compare/v1.0.0rc10...v1.0.0rc11
 [1.0.0rc10]: https://github.com/yoch/mqttium/compare/v1.0.0rc9...v1.0.0rc10
