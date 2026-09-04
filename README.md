@@ -144,6 +144,12 @@ publishes exact versions, environment details, scenario semantics, and stated
 limitations. Release comparisons use interleaved runs so client order does not
 silently become part of the result.
 
+For cross-client context, `gmqtt` is the closest established asyncio peer where
+the measured contract matches. Eclipse Paho is included as a widely known
+synchronous reference point: useful for orientation, but not presented as a
+direct asyncio peer. The benchmark keeps I/O models distinct and only compares
+results where the completion semantics are equivalent.
+
 MQTTium's own
 [benchmarking contract](https://mqttium.readthedocs.io/en/stable/benchmarking/)
 defines the paired regression gates used during development.
