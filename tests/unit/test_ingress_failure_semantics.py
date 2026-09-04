@@ -1219,7 +1219,10 @@ async def test_replay_failure_during_stable_after_stops_reconnect() -> None:
     await client.connect("fake", timeout=5.0)
     await _wait_for(lambda: len(received) >= 64)
     held = await client.publish("failure/stable-held2", b"x", qos=1)
-    await _wait_for(lambda: len(first_transport.publishes) == 1)
+    assert held.mid is not None
+    # The seeded retransmit may share a write batch with our PUBLISH, so wait
+    # for our MID specifically rather than an exact publish count.
+    await _wait_for(lambda: any(p.mid == held.mid for p in first_transport.publishes))
     await first_transport.close()
     await _wait_for(lambda: calls == 2)
     # The reconnect attempt succeeds; its redelivery cursor then fails while
