@@ -35,7 +35,7 @@ Classification:
 - Stable observable behavior: #428 (with CHANGELOG migration note for
   direct `ProtocolEngine` consumers).
 - Provisional contract: third-party stores must not report backend failures
-  with `MQTTError` (#425 docstring; no SQLite runtime change).
+  with `MQTTError` (#428 contract/docs; no SQLite runtime change).
 - Internal/performance: #422, #423, #427 (`EffectKind` is Internal per
   `docs/api-stability.md`; validation, ordering and backpressure semantics
   unchanged).
