@@ -250,19 +250,19 @@ rollbackable once observed; only local state is. The read loop opens one
 outer `store.batch()` around the whole ingress lot and collects effects after
 it closes; per-packet atomicity is explicitly not specified.
 
-A propagated failure rolls the lot back, but rollback alone does not retract
-effects: the read-loop `finally` advances the epoch, calls
-`notify_transport_closed()`, and collects whatever sits in `engine._effects`
-under the new epoch before draining it. Latch, filter, and transport-closed
-retire therefore run synchronously under the engine lock with no await
-between them, keeping only terminal publish outcomes and discarding the
-lot's other unexposed effects.
-
- Scope is decided per effect instance by the precise transition it depends
- on, never by `EffectKind` alone (a fresh automatic QoS 1 PUBACK has no
- durable row; a fresh QoS 2 PUBREC follows `put_in`). CONNACK is excluded
- for this phase: it resolves the `connect()` future before inbound replay
- and the final drain complete.
+A propagated failure reaches the read-loop `finally`, which advances the
+epoch, calls `notify_transport_closed()`, and collects whatever sits in
+`engine._effects` under the new epoch before draining it: rollback alone
+does not retract effects. Latch, filter, and transport-closed retire
+therefore run synchronously under the engine lock with no await
+between them. The read loop groups an ingress lot inside `store.batch()`.
+For a transactional store, an exception rolls back the durable mutations
+covered by that batch. Fail-stop does not assume transactional rollback of
+in-memory protocol state. On a local-terminal lot failure, only
+already-established terminal publish outcomes (`PUBLISH_COMPLETE` /
+`PUBLISH_FAILED`) are intentionally preserved; other unexposed effects from
+the failed lot are discarded. This is not a generic effect-dependency or
+provenance mechanism.
 
 Four guarantees, all normative:
 

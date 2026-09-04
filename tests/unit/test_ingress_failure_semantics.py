@@ -78,23 +78,35 @@ class _FailMarkStore(MemoryInflightStore):
 
 
 class _FailReplayPagesStore(MemoryInflightStore):
-    """Serve the first replay page, then fail like a cursor read error."""
+    """Fail redelivery-cursor reads on demand.
 
-    fail_pages = False
+    With only ``page_error`` set, the second page read of any replay fails
+    (single-session continuation test). With ``fail_later_calls`` set, only
+    replays after the first full one fail that way, so an initial session can
+    restore cleanly before a reconnect hits the failure.
+    """
+
+    fail_later_calls = False
     page_error: BaseException | None = None
+    _replay_calls = 0
 
     def in_replay_pages(
         self,
         max_messages: int = 64,
         max_bytes: int = 1 << 20,
     ):
+        self._replay_calls += 1
+        error = self.page_error
+        fail_this_call = error is not None and (not self.fail_later_calls or self._replay_calls > 1)
         pages = super().in_replay_pages(max_messages=max_messages, max_bytes=max_bytes)
+        if not fail_this_call:
+            yield from pages
+            return
+        assert error is not None
         first = True
         for page in pages:
             if not first:
-                if self.page_error is not None:
-                    raise self.page_error
-                raise OSError("replay page failed")
+                raise error
             first = False
             yield page
 
@@ -1137,4 +1149,133 @@ async def test_secondary_writer_failure_preserves_terminal_cause() -> None:
     assert client._factory_calls() == 1
     with pytest.raises(MQTTError, match="local terminal failure"):
         await client.connect("fake", timeout=2.0)
+    await client.disconnect()
+
+
+async def test_replay_failure_during_stable_after_stops_reconnect() -> None:
+    """A redelivery failure after a successful reconnect CONNACK stops the loop.
+
+    The reconnect attempt itself succeeds (session present, first replay page
+    redelivered); the cursor then fails while the loop sleeps `stable_after`.
+    Without the post-sleep latch check the loop would start a new attempt;
+    with it, the pending work fails with the sentinel and nothing reconnects.
+    """
+    store = _FailReplayPagesStore()
+    sentinel = OSError("replay page failed")
+    store.page_error = sentinel
+    store.fail_later_calls = True
+    for mid in range(1, 71):
+        store.put_in(
+            InboundMessage(
+                mid=mid,
+                topic=f"failure/stable-{mid}",
+                payload=b"x",
+                qos=QoS.EXACTLY_ONCE,
+                retain=False,
+                state=InboundQoSState.WAIT_PUBREL,
+            )
+        )
+    store.put_out(
+        OutboundMessage(
+            mid=9,
+            topic="failure/stable-held",
+            payload=b"x",
+            qos=QoS.AT_LEAST_ONCE,
+            retain=False,
+            state=OutboundQoSState.WAIT_PUBACK,
+        )
+    )
+    first_transport = _ManualBrokerTransport()
+    second_transport = _ManualBrokerTransport()
+    first_transport.connack_override = encode_frame(PacketType.CONNACK, 0, b"\x01\x00")
+    second_transport.connack_override = encode_frame(PacketType.CONNACK, 0, b"\x01\x00")
+    disconnected = asyncio.Event()
+    errors: list[BaseException | None] = []
+    received: list[bytes] = []
+    policy = ReconnectPolicy(enabled=True, initial_delay=0.05, max_delay=0.05, stable_after=1.0)
+    client = AsyncClient(
+        client_id="stable-after",
+        store=store,
+        reconnect=policy,
+        clean_start=False,
+    )
+    client.on_message = lambda message: received.append(message.payload)
+    calls = 0
+
+    async def factory(host: str, port: int, *, ssl: object = None):  # noqa: ANN202
+        nonlocal calls
+        del host, port, ssl
+        calls += 1
+        return first_transport if calls == 1 else second_transport
+
+    client._transport_factory = factory  # type: ignore[assignment]
+
+    def _record(error: BaseException | None) -> None:
+        errors.append(error)
+        disconnected.set()
+
+    client.on_disconnect = _record  # type: ignore[assignment]
+
+    await client.connect("fake", timeout=5.0)
+    await _wait_for(lambda: len(received) >= 64)
+    held = await client.publish("failure/stable-held2", b"x", qos=1)
+    await _wait_for(lambda: len(first_transport.publishes) == 1)
+    await first_transport.close()
+    await _wait_for(lambda: calls == 2)
+    # The reconnect attempt succeeds; its redelivery cursor then fails while
+    # the loop sleeps stable_after. No third attempt may follow.
+    await asyncio.wait_for(disconnected.wait(), timeout=10.0)
+    assert errors[-1] is sentinel
+    # Outlive the reconnect loop's stable_after window (1.0s from the
+    # attempt's return): a third attempt here would prove the loop ignored
+    # the latched failure after proving itself stable.
+    await asyncio.sleep(1.6)
+    assert calls == 2
+    with pytest.raises(OSError) as failed:
+        await asyncio.wait_for(held.wait(), timeout=5.0)
+    assert failed.value is sentinel
+    with pytest.raises(MQTTError, match="local terminal failure"):
+        await client.connect("fake", timeout=2.0)
+    await client.disconnect()
+
+
+async def test_stable_after_sleep_checks_latched_failure() -> None:
+    """White-box: a failure landing mid-stable_after stops the loop.
+
+    Sets the latch directly once the reconnect attempt has connected and the
+    loop sleeps, proving the post-sleep branch (not the attempt-except path)
+    terminally shuts down with the first cause and schedules no new attempt.
+    """
+    store = _FailReplayPagesStore()
+    sentinel = OSError("restore failed")
+    first_transport = _ManualBrokerTransport()
+    second_transport = _ManualBrokerTransport()
+    second_transport.connack_override = encode_frame(PacketType.CONNACK, 0, b"\x01\x00")
+    policy = ReconnectPolicy(enabled=True, initial_delay=0.05, max_delay=0.05, stable_after=0.3)
+    client = AsyncClient(client_id="stable-sleep", store=store, reconnect=policy, clean_start=False)
+    calls = 0
+
+    async def factory(host: str, port: int, *, ssl: object = None):  # noqa: ANN202
+        nonlocal calls
+        del host, port, ssl
+        calls += 1
+        return first_transport if calls == 1 else second_transport
+
+    client._transport_factory = factory  # type: ignore[assignment]
+
+    await client.connect("fake", timeout=5.0)
+    held = await client.publish("failure/stable-held", b"x", qos=1)
+    await _wait_for(lambda: len(first_transport.publishes) == 1)
+    await first_transport.close()
+    await _wait_for(lambda: calls == 2)
+    await _wait_for(lambda: client.is_connected)
+    # The reconnect attempt has connected; the loop now sleeps stable_after.
+    # Land a local failure mid-sleep, after any attempt-scoped handling.
+    client._local_terminal_failure = sentinel
+    await asyncio.sleep(0.8)
+    assert calls == 2
+    assert client._reconnect_task is None or client._reconnect_task.done()
+    with pytest.raises(OSError) as failed:
+        await asyncio.wait_for(held.wait(), timeout=5.0)
+    assert failed.value is sentinel
     await client.disconnect()
