@@ -137,10 +137,12 @@ material regression in the QoS 0 or RTT guardrails:
 
 These are same-host version-regression results, not cross-client ranking claims.
 Absolute throughput depends on the machine, broker, workload, and completion
-contract. Cross-client comparisons are kept in the independent
+contract. Cross-client comparisons live in the separate
 [`mqtt-python-client-bench`](https://github.com/yoch/mqtt-python-client-bench)
-project and are published from interleaved runs with exact versions, environment
-details, scenario semantics, and limitations.
+project; its [live report](https://yoch.github.io/mqtt-python-client-bench/)
+publishes exact versions, environment details, scenario semantics, and stated
+limitations. Release comparisons use interleaved runs so client order does not
+silently become part of the result.
 
 MQTTium's own
 [benchmarking contract](https://mqttium.readthedocs.io/en/stable/benchmarking/)
