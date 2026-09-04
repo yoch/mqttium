@@ -365,17 +365,19 @@ class InboundSession:
 
         A transition-capable store settles through metadata only; the base
         interface pops the whole record. Both raise when the record moved or
-        vanished between the caller's lookup and this deletion.
+        vanished between the caller's lookup and this deletion. That is store
+        divergence, never a peer protocol violation: RuntimeError, so the
+        engine lets it traverse instead of peer-blaming it.
         """
         transitions = self._transitions
         if transitions is not None:
             completed = transitions.complete_in(mid, expected_state)
             if completed is None:
-                raise ProtocolError(f"Inbound mid={mid} changed while {action}")
+                raise RuntimeError(f"Inbound mid={mid} changed while {action}")
             return completed.logical_size
         popped = self.store.pop_in(mid)
         if popped is None:
-            raise ProtocolError(f"Inbound mid={mid} disappeared while {action}")
+            raise RuntimeError(f"Inbound mid={mid} disappeared while {action}")
         return self.stored_logical_size(popped)
 
     # --- packet handlers ---------------------------------------------------
@@ -692,7 +694,7 @@ class InboundSession:
             if existing.state is InboundQoSState.WAIT_PUBACK:
                 message = existing if isinstance(existing, InboundMessage) else store.get_in(mid)
                 if message is None:
-                    raise ProtocolError(f"Inbound mid={mid} disappeared while redelivering")
+                    raise RuntimeError(f"Inbound mid={mid} disappeared while redelivering")
                 self._emit_message(message, dup=True)
                 return
             self._reject_packet_id_collision(mid, "QoS 1", "QoS 2")
@@ -768,7 +770,7 @@ class InboundSession:
                     InboundQoSState.WAIT_USER_ACK,
                 )
                 if changed is None:
-                    raise ProtocolError(f"Inbound mid={mid} changed while processing PUBREL")
+                    raise RuntimeError(f"Inbound mid={mid} changed while processing PUBREL")
             else:
                 assert isinstance(record, InboundMessage)
                 record.state = InboundQoSState.WAIT_USER_ACK

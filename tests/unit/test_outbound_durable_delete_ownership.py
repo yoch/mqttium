@@ -84,11 +84,15 @@ def test_drain_delete_failure_keeps_fifo_ownership_until_retry(
     monkeypatch.setattr(type(store), "transition_out", transition_out)
     monkeypatch.setattr(type(store), "delete_out", delete_out)
 
-    _complete_first(engine, first.mid, qos)
+    # The store fault escapes handle_raw instead of becoming PROTOCOL_ERROR.
+    # First completes normally in both QoS modes (faults target second.mid);
+    # the launch of second then raises inside drain.
+    with pytest.raises(_Boom):
+        _complete_first(engine, first.mid, qos)
     effects = engine.take_effects()
 
     assert any(e.kind is EffectKind.PUBLISH_COMPLETE and e.data == first.mid for e in effects)
-    assert any(e.kind is EffectKind.PROTOCOL_ERROR for e in effects)
+    assert not any(e.kind is EffectKind.PROTOCOL_ERROR for e in effects)
     assert not any(
         e.kind is EffectKind.PUBLISH_FAILED and getattr(e.data, "mid", None) == second.mid
         for e in effects
@@ -206,8 +210,9 @@ def test_sqlite_surviving_record_rehydrates_the_same_ownership_after_restart(
 
     monkeypatch.setattr(SqliteInflightStore, "transition_out", transition_out)
     monkeypatch.setattr(SqliteInflightStore, "delete_out", delete_out)
-    feed_engine(engine, PubAckPacket(mid=first.mid).encode())
-    assert any(e.kind is EffectKind.PROTOCOL_ERROR for e in engine.take_effects())
+    with pytest.raises(_Boom, match="delete failed"):
+        feed_engine(engine, PubAckPacket(mid=first.mid).encode())
+    assert not any(e.kind is EffectKind.PROTOCOL_ERROR for e in engine.take_effects())
     assert store.get_out(second.mid) is not None
     assert engine.packet_ids.in_use(second.mid)
 

@@ -147,14 +147,15 @@ Work from an older epoch is discarded rather than applied to the new transport.
 ### Outbound QoS 1
 
 Admission reserves logical capacity, allocates a packet ID, persists the PUBLISH,
-registers its receipt, then emits the frame. PUBACK emits completion before
-deleting state and releasing the ID and capacity.
+registers its receipt, then emits the frame. PUBACK is the terminal broker
+boundary: its receipt completes on observation even if durable cleanup fails;
+cleanup never vetoes it.
 
 ### Outbound QoS 2
 
 PUBLISH remains persisted until PUBREC. A successful PUBREC atomically replaces
-the durable record with PUBREL. PUBCOMP emits completion and then releases the
-remaining resources. A terminal negative PUBREC fails the receipt and releases
+the durable record with PUBREL. PUBCOMP is the terminal boundary under the same
+rule as PUBACK above. A terminal negative PUBREC fails the receipt and releases
 the transaction.
 
 ### Inbound QoS 1 and 2
@@ -239,6 +240,52 @@ record objects rather than deep-copying them. Paged iterators in both built-in
 stores snapshot ordered identifiers when iteration starts and look up each page
 when it is consumed, so records deleted before that lookup are omitted. Runtime
 replay uses the paged interface for both built-in stores.
+
+## Failure semantics
+
+An ingress lot passes through three events that cannot be merged: OBSERVE (a
+packet is decoded), COMMIT (local state, durable or in memory, is updated),
+EXPOSE (an effect becomes application- or wire-visible). Packets are not
+rollbackable once observed; only local state is. The read loop opens one
+outer `store.batch()` around the whole ingress lot and collects effects after
+it closes; per-packet atomicity is explicitly not specified.
+
+A propagated failure reaches the read-loop `finally`, which advances the
+epoch, calls `notify_transport_closed()`, and collects whatever sits in
+`engine._effects` under the new epoch before draining it: rollback alone
+does not retract effects. Latch, filter, and transport-closed retire
+therefore run synchronously under the engine lock with no await
+between them. The read loop groups an ingress lot inside `store.batch()`.
+For a transactional store, an exception rolls back the durable mutations
+covered by that batch. Fail-stop does not assume transactional rollback of
+in-memory protocol state. On a local-terminal lot failure, only
+already-established terminal publish outcomes (`PUBLISH_COMPLETE` /
+`PUBLISH_FAILED`) are intentionally preserved; other unexposed effects from
+the failed lot are discarded. This is not a generic effect-dependency or
+provenance mechanism.
+
+Four guarantees, all normative:
+
+1. An ingress lot that fails locally exposes none of its ordinary unexposed
+   effects. The normal hot path stays `_settle()` then emit; only a cleanup
+   failure emits the already-observed outcome first.
+2. An observed terminal publish broker outcome determines its receipt
+   despite cleanup failure. Durable cleanup never vetoes the terminal effect.
+3. A local-terminal failure fail-stops the `AsyncClient`: the original
+   exception is preserved end to end (no `str()`, no peer-blaming DISCONNECT
+   — `PROTOCOL_ERROR` stays reserved for wire violations); the connection is
+   retired immediately; no automatic reconnect or replay; no new publish
+   admission; no silent reuse (`connect()` refuses — create a new client);
+   remaining receipts fail with the local cause. A replacement client built
+   on the same ambiguous or known-stale store is not automatically repaired:
+   before supplying persistence state to it, the application must explicitly
+   decide and reconcile the store and broker-session state. Direct
+   `ProtocolEngine` consumers receive the original exception and decide
+   retirement themselves; the engine carries no fail-stop latch.
+4. Broker and local store share no distributed transaction: perfect crash
+   recovery and absence of duplication are not guaranteed.
+
+Covered by `tests/unit/test_ingress_failure_semantics.py`.
 
 ## API completion and errors
 

@@ -8,7 +8,6 @@ from pathlib import Path
 import pytest
 
 from mqttium.enums import InboundQoSState, OutboundQoSState, PacketType, QoS
-from mqttium.errors import ProtocolError
 from mqttium.packets import PubRecPacket, PubRelPacket, PublishPacket, encode_frame
 from mqttium.persistence.memory import MemoryInflightStore
 from mqttium.persistence.sqlite import SqliteInflightStore
@@ -114,7 +113,7 @@ def test_manual_ack_releases_nothing_when_conditional_completion_is_refused() ->
     engine.take_effects()
     store.refuse_in_complete = True
 
-    with pytest.raises(ProtocolError, match="changed while acknowledging"):
+    with pytest.raises(RuntimeError, match="changed while acknowledging"):
         engine.ack(7)
 
     assert send_effects(engine) == []

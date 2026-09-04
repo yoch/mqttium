@@ -614,10 +614,13 @@ class ProtocolEngine:
             # failures that did not already call _protocol_disconnect(). Keep
             # the category so it can select the normative MQTT 5 reason code.
             self._emit(EffectKind.PROTOCOL_ERROR, exc)
-        except Exception as exc:
-            # Isolate store/persistence errors: surface as protocol error rather
-            # than killing the read loop with an untyped exception.
-            self._emit(EffectKind.PROTOCOL_ERROR, f"Internal handler error: {exc!r}")
+        except Exception:
+            # Any other exception (store/persistence failure, unexpected bug)
+            # is local, not a peer protocol violation: it propagates with its
+            # original object so the runtime attributes, settles, and
+            # reconnect-gates it as a local failure. Terminal broker outcomes
+            # already observed were emitted by the handler before raising.
+            raise
 
     def _validate_connack_v5(self, connack: ConnAckPacket) -> None:
         """Enforce the MQTT 5 CONNACK property obligations before acceptance."""
