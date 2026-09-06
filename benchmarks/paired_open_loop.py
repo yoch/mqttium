@@ -91,6 +91,16 @@ class OpenLoopResult:
     effect_inline: int
     effect_enqueued: int
     effect_suspensions: int
+    writer_batches: int
+    writer_batched_items: int
+    writer_eager_writes: int
+    writer_high_water_messages: int
+    writer_enqueue_suspensions: int
+    effect_batches: int
+    effect_multi_batches: int
+    effect_reordered_batches: int
+    effect_pending_high_water: int
+    effect_applied: int
 
 
 def _payload(sequence: int, size: int) -> bytes:
@@ -165,7 +175,9 @@ async def sample(args: argparse.Namespace, topic: str) -> OpenLoopResult:
             for _ in range(args.count):
                 latencies.append(await callback_tracker.next_latency_ms(args.timeout))
         completed_elapsed = max(loop.time() - offered_started, 1e-9)
-        effects = client.stats().effects
+        snapshot = client.stats()
+        effects = snapshot.effects
+        writer = snapshot.writer
         return OpenLoopResult(
             mode="sample",
             completion=args.completion,
@@ -189,6 +201,16 @@ async def sample(args: argparse.Namespace, topic: str) -> OpenLoopResult:
             effect_inline=effects.inline_effects,
             effect_enqueued=effects.enqueued,
             effect_suspensions=effects.apply_suspensions,
+            writer_batches=writer.batches,
+            writer_batched_items=writer.batched_items,
+            writer_eager_writes=writer.eager_writes,
+            writer_high_water_messages=writer.high_water_messages,
+            writer_enqueue_suspensions=writer.enqueue_suspensions,
+            effect_batches=effects.batches,
+            effect_multi_batches=effects.multi_effect_batches,
+            effect_reordered_batches=effects.reordered_batches,
+            effect_pending_high_water=effects.pending_high_water,
+            effect_applied=effects.applied,
         )
     finally:
         await client.disconnect()

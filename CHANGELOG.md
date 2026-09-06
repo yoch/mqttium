@@ -6,6 +6,19 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Changed
+
+- `PublishReceipt.wait()` no longer routes waiters through `asyncio.shield()`
+  over one shared future. Each active waiter now parks on its own future held
+  in a lazily created list, which isolates cancellation by construction instead
+  of by wrapping. Observable semantics are unchanged: a publication nobody
+  awaits still allocates no completion primitive, cancelling one `wait()`
+  cancels only that waiter, a waiter created after another was cancelled still
+  completes, and every waiter still receives the same terminal error instance.
+  Settlement now releases the waiter collection, so no future is retained past
+  completion or cancellation. The private `_future` field is replaced by
+  `_waiters`.
+
 ## [1.0.0rc13] - 2026-09-04
 
 ### Fixed

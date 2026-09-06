@@ -179,14 +179,15 @@ class PublishBatchReceipt:
 class PublishReceipt:
     """Handle returned by ``AsyncClient.publish``.
 
-    Completion is a flag, and the shared future behind :meth:`wait` is created
+    Completion is a flag, and the waiter list behind :meth:`wait` is created
     only if somebody actually waits. A publication that is never awaited -- the
     whole point of ``publish_nowait`` -- therefore allocates no completion
-    primitive at all. Active waiters use shielded views of that shared future so
-    cancelling one wait cannot cancel completion for the receipt or other
-    waiters.
+    primitive at all. Each active waiter parks on its own future, so cancelling
+    one wait cancels only that waiter: receipt completion and the other waiters
+    are untouched by construction, without an ``asyncio.shield()`` wrapper on
+    the awaited path.
 
-    The shared future only ever carries ``None``. Failures live in ``_error`` and
+    Waiter futures only ever carry ``None``. Failures live in ``_error`` and
     are raised by :meth:`wait` after it resolves, so a receipt that fails and is
     never awaited cannot leave an unretrieved exception behind -- which matters
     here, because the library installs no logging to absorb one.
@@ -200,7 +201,7 @@ class PublishReceipt:
 
     mid: int | None
     qos: QoS
-    _future: asyncio.Future[None] | None = None
+    _waiters: list[asyncio.Future[None]] | None = None
     _error: BaseException | None = None
     _settled: bool = False
     _on_settle: Callable[[PublishReceipt], None] | None = field(
@@ -208,28 +209,53 @@ class PublishReceipt:
     )
 
     def _settle(self) -> None:
-        """Mark completion and wake a waiter if one is parked."""
+        """Mark completion and wake every parked waiter."""
         self._settled = True
         on_settle = self._on_settle
         if on_settle is not None:
             self._on_settle = None
             on_settle(self)
-        future = self._future
-        if future is not None and not future.done():
-            future.set_result(None)
+        waiters = self._waiters
+        if waiters is not None:
+            # Release the collection before resolving so a defensive duplicate
+            # settlement cannot retain waiters or resolve them twice.
+            self._waiters = None
+            for waiter in waiters:
+                # A waiter cancelled between its cancellation and its removal
+                # is already done; resolving it would raise InvalidStateError.
+                if not waiter.done():
+                    waiter.set_result(None)
 
     async def wait(self) -> None:
         """Wait for protocol completion and re-raise its terminal error.
 
-        QoS 0 is already complete when the receipt is returned. Cancelling one
-        waiter does not cancel the shared receipt or other waiters.
+        QoS 0 is already complete when the receipt is returned. Each waiter
+        parks on its own future, so cancelling one waiter does not cancel the
+        receipt or any other waiter.
         """
         if self.qos != QoS.AT_MOST_ONCE and not self._settled:
-            future = self._future
-            if future is None:
-                future = asyncio.get_running_loop().create_future()
-                self._future = future
-            await asyncio.shield(future)
+            waiter: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+            waiters = self._waiters
+            if waiters is None:
+                self._waiters = [waiter]
+            else:
+                waiters.append(waiter)
+            try:
+                await waiter
+            except BaseException:
+                # Settlement clears the collection, so only a waiter leaving
+                # before completion -- cancellation -- has anything to retire.
+                waiters = self._waiters
+                if waiters is not None:
+                    try:
+                        waiters.remove(waiter)
+                    except ValueError:  # pragma: no cover - defensive
+                        pass
+                    if not waiters:
+                        # The last waiter left: return to the lazy shape a
+                        # never-awaited receipt has.
+                        self._waiters = None
+                raise
         if self._error is not None:
             raise self._error
 

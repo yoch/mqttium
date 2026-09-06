@@ -124,11 +124,13 @@ async def test_receipt_never_awaited_allocates_no_completion_primitive() -> None
 
     receipt = client.publish_nowait("lazy/qos1", b"x", qos=1)
 
-    assert receipt._future is None
+    assert receipt._waiters is None
     client._settle_publish(receipt.mid, None)
     assert receipt.is_done()
-    assert receipt._future is None
+    assert receipt._waiters is None
     await receipt.wait()
+    # Waiting after settlement stays on the flag fast path.
+    assert receipt._waiters is None
 
 
 async def test_receipt_awaited_before_completion_resolves_once() -> None:
@@ -138,12 +140,15 @@ async def test_receipt_awaited_before_completion_resolves_once() -> None:
 
     waiter = asyncio.ensure_future(receipt.wait())
     await asyncio.sleep(0)
-    assert receipt._future is not None
+    assert receipt._waiters is not None
+    assert len(receipt._waiters) == 1
 
     client._settle_publish(receipt.mid, None)
     await waiter
     assert receipt.is_done()
-    # A second settle must not raise InvalidStateError on the resolved future.
+    # Settlement releases the collection instead of retaining resolved futures.
+    assert receipt._waiters is None
+    # A second settle must not raise InvalidStateError on a resolved waiter.
     receipt._settle()
 
 
@@ -154,21 +159,27 @@ async def test_receipt_waiter_cancellation_is_isolated() -> None:
     first = asyncio.create_task(receipt.wait())
     second = asyncio.create_task(receipt.wait())
     await asyncio.sleep(0)
-    assert receipt._future is not None
+    assert receipt._waiters is not None
+    assert len(receipt._waiters) == 2
 
     first.cancel()
     with pytest.raises(asyncio.CancelledError):
         await first
 
-    assert receipt._future is not None
-    assert not receipt._future.cancelled()
+    # Only the cancelled waiter is retired; the receipt stays completable.
+    assert receipt._waiters is not None
+    assert len(receipt._waiters) == 1
+    assert not receipt._settled
     assert not second.done()
 
-    # A later waiter must also remain attached to the same live completion.
+    # A later waiter must also attach to the same live completion.
     third = asyncio.create_task(receipt.wait())
     await asyncio.sleep(0)
     assert not third.done()
+    assert receipt._waiters is not None
+    assert len(receipt._waiters) == 2
 
     receipt._settle()
     await asyncio.gather(second, third)
     assert receipt.is_done()
+    assert receipt._waiters is None

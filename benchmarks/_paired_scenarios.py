@@ -506,6 +506,43 @@ def _receipt(_scenario: str) -> ScenarioMeasurement:
     )
 
 
+def _receipt_wait(scenario: str) -> ScenarioMeasurement:
+    """Cost of a receipt that is actually awaited before it completes.
+
+    Every other receipt scenario settles without a parked waiter, so none of
+    them exercises `PublishReceipt.wait()` on its suspending path. Waiters are
+    batched so one event-loop iteration is amortised over `batch` of them
+    rather than charged to each measured operation.
+    """
+    from mqttium.api.models import PublishReceipt
+    from mqttium.enums import QoS
+
+    waiters = 8 if scenario.endswith("concurrent") else 1
+    batch = 64 // waiters
+    rounds = 3_000
+    warmup_rounds = 200
+
+    async def run() -> ScenarioMeasurement:
+        loop = asyncio.get_running_loop()
+        started = 0.0
+        for index in range(warmup_rounds + rounds):
+            if index == warmup_rounds:
+                started = time.perf_counter()
+            receipts = [PublishReceipt(mid=1, qos=QoS.AT_LEAST_ONCE) for _ in range(batch)]
+            tasks = [
+                loop.create_task(receipt.wait()) for receipt in receipts for _ in range(waiters)
+            ]
+            await asyncio.sleep(0)
+            for receipt in receipts:
+                receipt._settle()
+            await asyncio.gather(*tasks)
+        elapsed = time.perf_counter() - started
+        operations = rounds * batch * waiters
+        return ScenarioMeasurement(elapsed, operations, operations / elapsed)
+
+    return asyncio.run(run())
+
+
 def _publish_completion(scenario: str) -> ScenarioMeasurement:
     from mqttium.api import AsyncClient
     from mqttium.api.models import PublishReceipt
@@ -597,6 +634,8 @@ REGISTRY: dict[str, Callable[[str], ScenarioMeasurement]] = {
     "effect_single_message_callback": _single_message_effect,
     "websocket_mask_4k": _websocket_mask,
     "receipt_settle_unawaited": _receipt,
+    "receipt_wait_single": _receipt_wait,
+    "receipt_wait_concurrent": _receipt_wait,
     "publish_complete_receipt": _publish_completion,
     "publish_complete_callback": _publish_completion,
 }
