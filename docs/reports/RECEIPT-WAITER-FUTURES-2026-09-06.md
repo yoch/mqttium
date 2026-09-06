@@ -224,9 +224,9 @@ against an A/A that held both arms at 1.787 / 1.786 ms. It is consistent with
 the mechanism — `shield()` costs one extra event-loop hop per completion, which
 at this pacing is roughly the observed difference.
 
-**No CPU claim is made.** cpu µs/msg reads +1.27% at one rate and −15.42% at the
-other; the metric is not stable enough on this host to support a conclusion in
-either direction.
+No CPU claim was made from this pass alone: cpu µs/msg read +1.27% at one rate
+and −15.42% at the other. The matched-load campaign below reproduces both
+readings and resolves them — the CPU saving is real and rate-dependent.
 
 The harness marks these runs `invalid` on per-arm p50 cv (8–23%). The paired
 medians are nevertheless tight, which is what ABBA pairing is for; the raw cv is
@@ -254,28 +254,128 @@ MQTT 3.1.1. That pass had an A/A band of ±6%, the MQTT 5 arm moved the other wa
 (+1.71%), and the tightened re-run puts the cell at −0.34%. It was noise. It is
 recorded because it would have been a merge blocker had it held.
 
-## Observed regression
+## Matched-load validation (2026-09-06, second campaign)
 
-**MQTT 5, receipt completion, window 32: subscriber-observed end-to-end delivery
-latency rises.**
+The closed-loop result below was re-examined because `paired_network.py` is
+windowed: the candidate completes receipts faster, so the two arms do not offer
+the same load over time. A delivery-latency difference measured there cannot be
+separated from the throughput difference that caused it.
+
+`paired_open_loop.py` answers the question directly. Its pacer is an absolute
+deadline schedule (`started + sequence * interval`) and receipts are observed in
+separate tasks, so completion speed does not gate publication. In
+`absolute_rate` mode both arms receive the identical `target_rate` and identical
+`count`, with no per-arm calibration. The delivery metric is the same
+`mosquitto_sub` QoS 0 probe that produced the closed-loop number.
+
+Runner isolation as above. `--repeat 8`, payload 64, receipt completion.
+
+### Validity
+
+| Cell | offered vs target (base / cand) | offered skew cand/base | completion ratio |
+| --- | --- | ---: | ---: |
+| 311 w32 @2500 | +0.00% / −0.01% | −0.010% | 1.0000 |
+| 311 w32 @5000 | +0.01% / −0.00% | −0.011% | 1.0000 |
+| 5 w32 @2500 | +0.01% / +0.01% | −0.004% | 1.0000 |
+| 5 w32 @5000 | +0.00% / +0.00% | +0.001% | 1.0000 |
+
+Load matching is exact. Every cell is valid.
+
+A first attempt without desktop confinement produced an A/A band spanning −73%
+to +27% on delivery percentiles and was discarded without being read as a
+result; the numbers here are from the confined re-run.
+
+### The accused cell is cleared
+
+**MQTT 5, receipt, window 32, 2500 msg/s** — the cell that carried the closed-loop
++7.43%:
+
+| Metric | A/A band | A/B |
+| --- | ---: | ---: |
+| delivery p50 | +0.64% | **−1.61%** |
+| delivery p95 | −0.42% | **−0.51%** |
+| ACK p95 | −0.11% | −6.15% |
+| ACK p99 | +0.35% | −5.62% |
+
+At matched load the delivery difference disappears. The closed-loop +7.43% was
+an artefact of the candidate offering more throughput in a windowed benchmark,
+not a latency cost at equal work.
+
+### A different regression is confirmed
+
+At **5000 msg/s** the candidate degrades median latency on every cell measured —
+both protocols, windows 8, 32 and 64:
+
+| Cell | offered skew | delivery p50 (A/A) | delivery p95 | ACK p50 | cpu µs/msg |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 311 w8 | −0.006% | **+32.93%** (+0.01%) | −0.58% | +5.70% | −16.25% |
+| 311 w32 | −0.006% | **+27.50%** (+0.22%) | −0.13% | +9.21% | −16.91% |
+| 311 w64 | −0.001% | **+26.84%** (+1.75%) | −0.52% | +10.05% | −16.97% |
+| 5 w8 | −0.001% | **+32.99%** (+2.11%) | −0.30% | +17.98% | −15.01% |
+| 5 w32 | +0.001% | **+25.55%** (−0.12%) | +0.36% | +11.36% | −18.99% |
+| 5 w64 | +0.005% | **+31.76%** (+0.00%) | +0.79% | +7.82% | −17.52% |
+
+Absolute delivery p50: **0.134 ms → 0.167–0.178 ms**. Completion ratio 1.0000
+everywhere. A/A band for delivery p50 is ±2.1%.
+
+Reproduced across two independent campaigns hours apart. For 311 w32:
+
+| Metric | first campaign | second campaign |
+| --- | ---: | ---: |
+| @2500 ACK p50 | −71.84% | −73.30% |
+| @2500 delivery p50 | −12.60% | −13.39% |
+| @5000 ACK p50 | +7.14% | +9.21% |
+| @5000 delivery p50 | **+25.79%** | **+27.50%** |
+| @5000 cpu µs/msg | −15.42% | −16.91% |
+
+### Localisation
+
+- **Not protocol-specific.** MQTT 3.1.1 shows it as strongly as MQTT 5.
+- **Not window-specific.** Present at windows 8, 32 and 64.
+- **Not delivery-specific.** Publisher ACK p50 degrades too (+5.7% to +18.0%).
+- **Rate-dependent.** At 2500 msg/s every metric improves, ACK p50 by −73%.
+- **Medians only.** delivery p95 stays neutral (−0.58% to +0.79%, A/A ±0.6%) and
+  ACK p95/p99 improve by 5–10%.
+
+### Mechanism
+
+`effect_inline` is identical between arms (30001). `effect_enqueued` rises from
+7 400–9 200 to 11 600–12 900 — about **+40% more effects deferred to the
+`EffectPump`** instead of applied inline. The candidate moves work off the inline
+path onto the deferred path: the aggregate costs 15–19% less CPU, but a message
+whose completion is deferred waits an extra pump turn, which lifts the median
+while leaving the tail unaffected or better.
+
+This is a measured counter difference, not an inference from timings alone. It
+does not by itself say whether the shift is inherent to per-waiter futures or an
+interaction with the pump's batching thresholds; that is not resolved here.
+
+### CPU
+
+The matched-load campaign does support a CPU claim at 5000 msg/s: −15.0% to
+−19.0% across six cells, against A/A bands of −2.7% to +2.1%, reproduced across
+both campaigns. At 2500 msg/s cpu µs/msg is neutral to slightly worse (+1.21%,
+A/A +0.57%).
+
+## Superseded reading — closed-loop delivery interaction
+
+The first campaign measured, with `paired_network.py` at window 32 on MQTT 5:
 
 | Metric | A/A | A/B |
 | --- | ---: | ---: |
-| delivery p50 | +0.21% | **+7.43%** (0.559 → 0.600 ms) |
-| delivery p95 | +0.89% | **+4.62%** (0.850 → 0.889 ms) |
-| delivery p99 | +0.59% | **+3.38%** (0.904 → 0.934 ms) |
+| delivery p50 | +0.21% | +7.43% (0.559 → 0.600 ms) |
+| delivery p95 | +0.89% | +4.62% (0.850 → 0.889 ms) |
+| delivery p99 | +0.59% | +3.38% (0.904 → 0.934 ms) |
 
-Reproduced across three independent runs (+0.04, +0.05, +0.04 ms on p50). On the
-same cell, publisher ACK latency *improves* (p50 −2.29%, p99 −2.73%) and ACK
-throughput rises +1.39%.
+Reproduced across three runs of that harness. The measurement is retained: it is
+a correct observation of a **closed-loop throughput/delivery interaction**, in
+which the candidate also raised ACK throughput +1.39% on the same cell.
 
-The coherent reading is a throughput/latency trade at fixed offered load: the
-candidate completes receipts sooner, admits the next publication sooner, and the
-QoS 0 observer therefore sees each message slightly later. That reading is
-consistent with all three measurements on the cell but it is an interpretation,
-not a demonstrated mechanism. MQTT 3.1.1 at the same window does not show it,
-and neither does either protocol at window 1 or 64 (except 311 w64 delivery p99
-at +6.14%, whose A/A is +9.59% and therefore says nothing).
+It is *not* evidence of a matched-load regression, and the earlier wording in
+this report — "a throughput/latency trade at fixed offered load" — was wrong:
+`paired_network.py` does not hold offered load fixed. The matched-load campaign
+above shows that cell is neutral at equal absolute rate, and locates a real
+regression elsewhere.
 
 ## Not used as justification
 
@@ -285,10 +385,20 @@ results were invalidated by adversarial review. Nothing here rests on them.
 
 ## Verdict
 
-The change is defended by MQTTium-before versus MQTTium-after only: a ~59%
-in-process throughput gain on the awaited-receipt path, +6.2 to +6.6% sequential
-ACK throughput against a real broker on both protocols, a −72% ack p50 at a
-paced 2500 msg/s, strictly lower memory with no retained waiter futures, and no
-regression on QoS 0, QoS 1 never-awaited, QoS 2, callback completion,
-persistence, delivery or writer paths. The one repeatable adverse cell is
-documented above rather than resolved.
+**Blocked.** At matched absolute load the candidate degrades median end-to-end
+delivery latency by 25–33% at 5000 msg/s, on both protocols and at every window
+tested, against an A/A band of ±2.1%, with completion ratio 1.0000 and offered
+load matched to better than 0.01%. Publisher ACK p50 degrades on the same cells.
+The effect is reproduced across two independent campaigns and carries a
+mechanism marker: about 40% more effects deferred to the `EffectPump`.
+
+Everything else in this report stands: correctness, the ~59% in-process gain on
+the awaited-receipt path, +6.2 to +6.6% sequential ACK throughput, the −73% ack
+p50 at 2500 msg/s, a real 15–19% CPU saving at 5000 msg/s, strictly lower memory
+with no retained waiter futures, and neutrality on QoS 0, QoS 1 never-awaited,
+QoS 2, callback completion, persistence and writer paths.
+
+The change buys aggregate CPU at the cost of median latency once the completion
+rate is high enough for deferral to bind. That trade is not obviously wrong, but
+it is a user-visible behaviour change on a path the change did not intend to
+touch, and it is not what the pull request currently claims.
