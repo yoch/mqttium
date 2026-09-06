@@ -1,0 +1,109 @@
+name: RC13 three-way benchmark ARM64
+
+on:
+  push:
+    branches: [bench/matched-load-arm64-rc13]
+    paths:
+      - .github/workflows/benchmark-matched-load-arm64.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mqttium-benchmark-arm64
+  cancel-in-progress: false
+
+jobs:
+  benchmark:
+    name: mqttium vs gmqtt vs Paho
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 360
+    env:
+      BENCH_SHA: 4b1f964cfa199640e1ce651005faf0046f374e2c
+      RESULTS_DIR: ${{ runner.temp }}/mqtt-client-bench-arm64
+      MATRIX_RUNS: "5"
+      MQTTIUM_VER: "1.0.0rc13"
+      GMQTT_VER: "0.7.0"
+      PAHO_VER: "2.1.0"
+    steps:
+      - name: Checkout exact benchmark harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: yoch/mqtt-python-client-bench
+          ref: 4b1f964cfa199640e1ce651005faf0046f374e2c
+          path: bench
+          persist-credentials: false
+
+      - name: Verify runner and harness provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "aarch64" || { echo "expected aarch64, got $(uname -m)"; exit 1; }
+          python3 --version
+          docker --version
+          docker compose version
+          cd bench
+          test "$(git rev-parse HEAD)" = "$BENCH_SHA"
+          git status --short
+
+      - name: Create isolated benchmark environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd bench
+          python3 -m venv .venv
+          . .venv/bin/activate
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,paho,gmqtt,mqttium]"
+          pip install --force-reinstall --no-cache-dir \
+            "mqttium==$MQTTIUM_VER" \
+            "gmqtt==$GMQTT_VER" \
+            "paho-mqtt==$PAHO_VER"
+
+      - name: Validate matched-load harness
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd bench
+          . .venv/bin/activate
+          PYTHONPATH=src python -m unittest tests.test_unit tests.test_rtt_initiator -v
+
+      - name: Calibrate ARM64 host profile
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd bench
+          . .venv/bin/activate
+          PYTHONPATH=src python -m mqtt_client_bench.run calibrate-host \
+            --profile standard \
+            --role runner \
+            --budget-seconds 300
+
+      - name: Run strict three-way interleaved campaign
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd bench
+          bash scripts/run_mqttium_gmqtt_paho_arm64.sh
+
+      - name: Stop managed broker
+        if: always()
+        shell: bash
+        run: |
+          if [ -x bench/.venv/bin/python ]; then
+            cd bench
+            . .venv/bin/activate
+            PYTHONPATH=src python -m mqtt_client_bench.run broker down || true
+          fi
+
+      - name: Upload benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: mqttium-gmqtt-paho-arm64-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/mqtt-client-bench-arm64
+            bench/hosts/*.json
+          if-no-files-found: warn
+          retention-days: 14
