@@ -1,0 +1,319 @@
+name: TEMP ARM64 receipt waiter experiment v2
+
+on:
+  push:
+    branches: [bench/receipt-waiter-arm64-exp-v2]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mqttium-arm64-runner
+  cancel-in-progress: false
+
+env:
+  BASE_SHA: 4560e44aeb24b8a4f7f6ce903766579fac481cbd
+  PYTHONUNBUFFERED: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  experiment:
+    name: receipt waiter v2 correctness + A/A + A/B
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 120
+    steps:
+      - name: Checkout immutable harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.BASE_SHA }}
+          path: harness
+          persist-credentials: false
+
+      - name: Checkout immutable baseline
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.BASE_SHA }}
+          path: base
+          persist-credentials: false
+
+      - name: Checkout isolated candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.BASE_SHA }}
+          path: candidate
+          persist-credentials: false
+
+      - name: Prepare runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "aarch64"
+          python3 - <<'PY'
+          import sys
+          if sys.version_info[:2] != (3, 14):
+              raise SystemExit(f"expected Python 3.14, got {sys.version}")
+          PY
+          command -v taskset
+          if pgrep -a mosquitto; then
+            echo "pre-existing Mosquitto would contaminate paired evidence" >&2
+            exit 1
+          fi
+          echo "JOB_ROOT=$RUNNER_TEMP/receipt-waiter-v2-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+
+      - name: Create isolated environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/receipt-waiter-v2-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -p "$RUNNER_TEMP/receipt-waiter-v2-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          python3 -m venv "$RUNNER_TEMP/receipt-waiter-v2-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/venv"
+          echo "$RUNNER_TEMP/receipt-waiter-v2-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/venv/bin" >> "$GITHUB_PATH"
+
+      - name: Install exact baseline dev dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install -e "./harness[dev]"
+          python -m pip install "psutil>=6,<8"
+
+      - name: Apply candidate only in isolated workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("candidate/src/mqttium/api/models.py")
+          text = path.read_text()
+          replacements = (
+              (
+                  "    Completion is a flag, and the shared future behind :meth:`wait` is created\n"
+                  "    only if somebody actually waits. A publication that is never awaited -- the\n"
+                  "    whole point of ``publish_nowait`` -- therefore allocates no completion\n"
+                  "    primitive at all. Active waiters use shielded views of that shared future so\n"
+                  "    cancelling one wait cannot cancel completion for the receipt or other\n"
+                  "    waiters.\n\n"
+                  "    The shared future only ever carries ``None``. Failures live in ``_error`` and\n",
+                  "    Completion is a flag, and per-waiter futures behind :meth:`wait` are created\n"
+                  "    only if somebody actually waits. A publication that is never awaited -- the\n"
+                  "    whole point of ``publish_nowait`` -- therefore allocates no completion\n"
+                  "    primitive at all. Each active waiter owns its future, so cancelling one wait\n"
+                  "    cannot cancel completion for the receipt or other waiters.\n\n"
+                  "    Waiter futures only ever carry ``None``. Failures live in ``_error`` and\n",
+              ),
+              ("    _future: asyncio.Future[None] | None = None\n", "    _waiters: list[asyncio.Future[None]] | None = None\n"),
+              (
+                  "        future = self._future\n        if future is not None and not future.done():\n            future.set_result(None)\n",
+                  "        waiters = self._waiters\n        self._waiters = None\n        if waiters is not None:\n            for future in waiters:\n                if not future.done():\n                    future.set_result(None)\n",
+              ),
+              (
+                  "        if self.qos != QoS.AT_MOST_ONCE and not self._settled:\n            future = self._future\n            if future is None:\n                future = asyncio.get_running_loop().create_future()\n                self._future = future\n            await asyncio.shield(future)\n        if self._error is not None:\n            raise self._error\n",
+                  "        if self.qos != QoS.AT_MOST_ONCE and not self._settled:\n            future = asyncio.get_running_loop().create_future()\n            waiters = self._waiters\n            if waiters is None:\n                waiters = []\n                self._waiters = waiters\n            waiters.append(future)\n            try:\n                await future\n            finally:\n                if not self._settled:\n                    current = self._waiters\n                    if current is not None:\n                        try:\n                            current.remove(future)\n                        except ValueError:\n                            pass\n        if self._error is not None:\n            raise self._error\n",
+              ),
+              (
+                  "        QoS 0 is already complete when the receipt is returned. Cancelling one\n        waiter does not cancel the shared receipt or other waiters.\n",
+                  "        QoS 0 is already complete when the receipt is returned. Cancelling one\n        waiter does not cancel the receipt or other waiters.\n",
+              ),
+          )
+          for old, new in replacements:
+              if text.count(old) != 1:
+                  raise SystemExit(f"candidate source anchor count={text.count(old)} for {old[:50]!r}")
+              text = text.replace(old, new)
+          path.write_text(text)
+
+          # Adapt only private representation assertions in the candidate test copy.
+          test_path = Path("candidate/tests/unit/test_nonreplayable_failures.py")
+          tests = test_path.read_text()
+          replacements = (
+              ("    assert receipt._future is None\n    client._settle_publish(receipt.mid, None)\n    assert receipt.is_done()\n    assert receipt._future is None\n",
+               "    assert receipt._waiters is None\n    client._settle_publish(receipt.mid, None)\n    assert receipt.is_done()\n    assert receipt._waiters is None\n"),
+              ("    assert receipt._future is not None\n\n    client._settle_publish(receipt.mid, None)\n",
+               "    assert receipt._waiters is not None and len(receipt._waiters) == 1\n\n    client._settle_publish(receipt.mid, None)\n"),
+              ("    assert receipt._future is not None\n\n    first.cancel()\n",
+               "    assert receipt._waiters is not None and len(receipt._waiters) == 2\n\n    first.cancel()\n"),
+              ("    assert receipt._future is not None\n    assert not receipt._future.cancelled()\n    assert not second.done()\n",
+               "    await asyncio.sleep(0)\n    assert receipt._waiters is not None and len(receipt._waiters) == 1\n    assert all(not waiter.cancelled() for waiter in receipt._waiters)\n    assert not second.done()\n"),
+              ("    third = asyncio.create_task(receipt.wait())\n    await asyncio.sleep(0)\n    assert not third.done()\n\n    receipt._settle()\n",
+               "    third = asyncio.create_task(receipt.wait())\n    await asyncio.sleep(0)\n    assert receipt._waiters is not None and len(receipt._waiters) == 2\n    assert not third.done()\n\n    receipt._settle()\n"),
+              ("    await asyncio.gather(second, third)\n    assert receipt.is_done()\n",
+               "    await asyncio.gather(second, third)\n    assert receipt.is_done()\n    assert receipt._waiters is None\n"),
+          )
+          for old, new in replacements:
+              if tests.count(old) != 1:
+                  raise SystemExit(f"candidate test anchor count={tests.count(old)} for {old[:50]!r}")
+              tests = tests.replace(old, new)
+          test_path.write_text(tests)
+          PY
+          git -C candidate diff --check
+          printf '%s\n' "$(git -C candidate diff --name-only)"
+          test "$(git -C candidate diff --name-only | sort | tr '\n' ' ')" = "src/mqttium/api/models.py tests/unit/test_nonreplayable_failures.py "
+          git -C candidate diff -- src/mqttium/api/models.py > "$JOB_ROOT/candidate.patch"
+          git -C candidate diff -- tests/unit/test_nonreplayable_failures.py > "$JOB_ROOT/candidate-test-adaptation.patch"
+          sha256sum "$JOB_ROOT/candidate.patch" "$JOB_ROOT/candidate-test-adaptation.patch" > "$JOB_ROOT/patches.sha256"
+
+      - name: Explicit receipt lifetime/cancellation contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH=candidate/src python - <<'PY'
+          import asyncio
+          from mqttium.api.models import PublishReceipt
+          from mqttium.enums import QoS
+
+          async def main():
+              r = PublishReceipt(mid=1, qos=QoS.AT_LEAST_ONCE)
+              assert r._waiters is None
+              r._settle(); await r.wait(); assert r._waiters is None
+
+              r = PublishReceipt(mid=2, qos=QoS.AT_LEAST_ONCE)
+              a = asyncio.create_task(r.wait())
+              b = asyncio.create_task(r.wait())
+              await asyncio.sleep(0)
+              assert r._waiters is not None and len(r._waiters) == 2
+              a.cancel()
+              try:
+                  await a
+              except asyncio.CancelledError:
+                  pass
+              await asyncio.sleep(0)
+              assert r._waiters is not None and len(r._waiters) == 1
+              c = asyncio.create_task(r.wait())
+              await asyncio.sleep(0)
+              assert r._waiters is not None and len(r._waiters) == 2
+              r._settle()
+              await asyncio.gather(b, c)
+              assert r._waiters is None and r.is_done()
+
+              r = PublishReceipt(mid=3, qos=QoS.AT_LEAST_ONCE)
+              tasks = [asyncio.create_task(r.wait()) for _ in range(32)]
+              await asyncio.sleep(0)
+              assert r._waiters is not None and len(r._waiters) == 32
+              r._settle(); await asyncio.gather(*tasks); assert r._waiters is None
+
+              sentinel = RuntimeError("sentinel")
+              r = PublishReceipt(mid=4, qos=QoS.AT_LEAST_ONCE)
+              t = asyncio.create_task(r.wait()); await asyncio.sleep(0)
+              r._error = sentinel; r._settle()
+              try:
+                  await t
+              except RuntimeError as exc:
+                  assert exc is sentinel
+              else:
+                  raise AssertionError("error identity changed")
+          asyncio.run(main())
+          PY
+
+      - name: Static and full unit regression guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd candidate && PYTHONPATH=src ruff format --check src/mqttium/api/models.py tests/unit/test_nonreplayable_failures.py)
+          (cd candidate && PYTHONPATH=src ruff check src/mqttium/api/models.py tests/unit/test_nonreplayable_failures.py)
+          (cd candidate && PYTHONPATH=src python -m pytest -q -W error --strict-config --strict-markers tests/unit)
+
+      - name: Qualify ARM64 runner before performance
+        shell: bash
+        run: |
+          set -euo pipefail
+          python harness/benchmarks/runner_probe.py --output "$JOB_ROOT/runner.json" --require-temperature --enforce
+
+      - name: Create focused receipt micro
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$JOB_ROOT/receipt_wait_micro.py" <<'PY'
+          import argparse, asyncio, json, time
+          from mqttium.api.models import PublishReceipt
+          from mqttium.enums import QoS
+
+          async def pending(n):
+              loop = asyncio.get_running_loop()
+              for _ in range(1000):
+                  r=PublishReceipt(mid=1,qos=QoS.AT_LEAST_ONCE); loop.call_soon(r._settle); await r.wait()
+              t=time.perf_counter_ns()
+              for _ in range(n):
+                  r=PublishReceipt(mid=1,qos=QoS.AT_LEAST_ONCE); loop.call_soon(r._settle); await r.wait()
+              return (time.perf_counter_ns()-t)/n
+          async def settled(n):
+              for _ in range(2000):
+                  r=PublishReceipt(mid=1,qos=QoS.AT_LEAST_ONCE); r._settle(); await r.wait()
+              t=time.perf_counter_ns()
+              for _ in range(n):
+                  r=PublishReceipt(mid=1,qos=QoS.AT_LEAST_ONCE); r._settle(); await r.wait()
+              return (time.perf_counter_ns()-t)/n
+          async def main():
+              p=argparse.ArgumentParser(); p.add_argument('--label'); p.add_argument('--scenario'); p.add_argument('--count',type=int)
+              a=p.parse_args(); fn=pending if a.scenario=='pending' else settled
+              print(json.dumps({'label':a.label,'scenario':a.scenario,'ns_per_wait':await fn(a.count)}))
+          asyncio.run(main())
+          PY
+
+      - name: Focused receipt A/A + A/B in ABBA order
+        shell: bash
+        run: |
+          set -euo pipefail
+          : > "$JOB_ROOT/receipt-micro.jsonl"
+          run_one() { taskset -c 2 env PYTHONPATH="$1/src" python "$JOB_ROOT/receipt_wait_micro.py" --label "$2" --scenario "$3" --count "$4" >> "$JOB_ROOT/receipt-micro.jsonl"; }
+          for scenario in pending settled; do
+            count=20000; [ "$scenario" = settled ] && count=100000
+            for cycle in 1 2 3 4 5 6; do
+              run_one base aa_a "$scenario" "$count"; run_one base aa_b "$scenario" "$count"; run_one base aa_b "$scenario" "$count"; run_one base aa_a "$scenario" "$count"
+              run_one base base "$scenario" "$count"; run_one candidate candidate "$scenario" "$count"; run_one candidate candidate "$scenario" "$count"; run_one base base "$scenario" "$count"
+            done
+          done
+          python - <<'PY'
+          import json, os, pathlib, statistics
+          rows=[json.loads(x) for x in (pathlib.Path(os.environ['JOB_ROOT'])/'receipt-micro.jsonl').read_text().splitlines()]
+          out={}
+          for scenario in ('pending','settled'):
+              s=[r for r in rows if r['scenario']==scenario]
+              m={k:statistics.median(r['ns_per_wait'] for r in s if r['label']==k) for k in ('aa_a','aa_b','base','candidate')}
+              out[scenario]={'medians_ns':m,'aa_ratio':m['aa_b']/m['aa_a'],'candidate_base_ratio':m['candidate']/m['base']}
+          p=pathlib.Path(os.environ['JOB_ROOT'])/'receipt-micro-summary.json'; p.write_text(json.dumps(out,indent=2)+'\n'); print(json.dumps(out,indent=2))
+          PY
+
+      - name: Source-shaped callback A/A control
+        shell: bash
+        run: |
+          set -euo pipefail
+          taskset -c 2 python harness/benchmarks/paired_qos1_rtt.py --suite callback --base-root base --candidate-root base --repeat 9 --warmup 500 --count 5000 --cpu 2 --aa-control --max-cv 0.08 --max-aa-drift 0.05 --output "$JOB_ROOT/callback-aa.json"
+
+      - name: Source-shaped callback A/B candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          taskset -c 2 python harness/benchmarks/paired_qos1_rtt.py --suite callback --base-root base --candidate-root candidate --repeat 9 --warmup 500 --count 5000 --cpu 2 --max-cv 0.08 --output "$JOB_ROOT/callback-ab.json"
+
+      - name: Source-shaped microbatch A/A control
+        shell: bash
+        run: |
+          set -euo pipefail
+          taskset -c 2 python harness/benchmarks/paired_qos1_rtt.py --suite microbatch --base-root base --candidate-root base --repeat 7 --trials 30 --cpu 2 --output "$JOB_ROOT/microbatch-aa.json"
+
+      - name: Source-shaped microbatch A/B candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          taskset -c 2 python harness/benchmarks/paired_qos1_rtt.py --suite microbatch --base-root base --candidate-root candidate --repeat 7 --trials 30 --cpu 2 --output "$JOB_ROOT/microbatch-ab.json"
+
+      - name: Postflight
+        if: always()
+        shell: bash
+        run: |
+          if [ -n "${JOB_ROOT:-}" ] && [ -d "$JOB_ROOT" ]; then
+            python harness/benchmarks/runner_probe.py --output "$JOB_ROOT/runner-postflight.json" --require-temperature --enforce || true
+          fi
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: receipt-waiter-arm64-v2-${{ github.run_id }}
+          path: |
+            ${{ env.JOB_ROOT }}/*.json
+            ${{ env.JOB_ROOT }}/*.jsonl
+            ${{ env.JOB_ROOT }}/*.patch
+            ${{ env.JOB_ROOT }}/*.sha256
+          if-no-files-found: warn
+          retention-days: 30
