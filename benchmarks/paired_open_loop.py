@@ -91,6 +91,11 @@ class OpenLoopResult:
     effect_inline: int
     effect_enqueued: int
     effect_suspensions: int
+    effect_batches: int
+    effect_multi_batches: int
+    effect_reordered_batches: int
+    effect_pending_high_water: int
+    effect_applied: int
 
 
 def _payload(sequence: int, size: int) -> bytes:
@@ -189,6 +194,11 @@ async def sample(args: argparse.Namespace, topic: str) -> OpenLoopResult:
             effect_inline=effects.inline_effects,
             effect_enqueued=effects.enqueued,
             effect_suspensions=effects.apply_suspensions,
+            effect_batches=effects.batches,
+            effect_multi_batches=effects.multi_effect_batches,
+            effect_reordered_batches=effects.reordered_batches,
+            effect_pending_high_water=effects.pending_high_water,
+            effect_applied=effects.applied,
         )
     finally:
         await client.disconnect()

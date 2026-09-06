@@ -383,14 +383,169 @@ The cross-client mqttium/gmqtt RTT figures are excluded. The corrected campaign
 in `yoch/mqtt-python-client-bench#32` had not landed, and the superseded bridged
 results were invalidated by adversarial review. Nothing here rests on them.
 
+## Scheduling experiment — prototype C (deferred batched wake)
+
+The matched-load regression above raised an obvious suspicion: the change removed two things at
+once, not one. `asyncio.shield()` costs allocations *and* it inserts a scheduling hop.
+
+| Arm | Wake path from `_settle()` to the application waiter | Hops | Callbacks (N waiters) |
+| --- | --- | ---: | --- |
+| **A** `main` | `set_result(shared)` → `call_soon` ×N `_inner_done_callback` → `outer.set_result` ×N → `call_soon` ×N `Task.__wakeup` | 2 | 2N |
+| **B** PR #432 | `set_result(waiter)` ×N → `call_soon` ×N `Task.__wakeup` | 1 | N |
+| **C** prototype | `call_soon` ×1 `_resolve_receipt_waiters` → `set_result` ×N → `call_soon` ×N `Task.__wakeup` | 2 | N+1 |
+
+C keeps per-waiter futures, lazy allocation, cancellation isolation and the absence of `shield`,
+while restoring A's wake phase with one scheduled callback per receipt instead of one per waiter.
+It is **not committed**; the runtime on this branch remains B. The patch, against B:
+
+```python
+def _resolve_receipt_waiters(waiters: list[asyncio.Future[None]]) -> None:
+    for waiter in waiters:
+        if not waiter.done():
+            waiter.set_result(None)
+
+# in _settle(), replacing the inline resolve loop:
+        waiters = self._waiters
+        if waiters is not None:
+            self._waiters = None
+            waiters[0].get_loop().call_soon(_resolve_receipt_waiters, waiters)
+```
+
+Seven targeted tests covered the races the deferred wake introduces (cancellation between
+settlement and wake, a fully cancelled list, exactly one wake batch per receipt under repeated
+settlement, error identity, list release proven by weakref, loop confinement, and `is_done()`
+still observable synchronously). All passed.
+
+### Micro — how much of B survives in C
+
+A/A noise floor ±0.87 %. Time per waiter; "C keeps" is C's share of B's absolute gain over A.
+
+| Cell | A/A | A→B | A→C | A ns | B ns | C ns | C keeps |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| pending, 1 waiter | −0.85% | −36.10% | **−28.60%** | 12907 | 8247 | 9367 | 76% |
+| 2 concurrent | −0.10% | −36.53% | **−31.12%** | 12779 | 8110 | 8797 | 85% |
+| 8 concurrent | −0.12% | −36.45% | **−35.59%** | 12286 | 7808 | 7942 | 97% |
+| 32 concurrent | −0.53% | −36.93% | **−36.25%** | 12139 | 7656 | 7785 | 97% |
+| cancellation storm 32 | −0.64% | −27.79% | **−27.80%** | 12379 | 8939 | 8994 | 98% |
+| already settled | −0.24% | −0.50% | −0.72% | 174.6 | 173.7 | 173.9 | — |
+| never awaited | +0.87% | −0.01% | +0.73% | 426.8 | 426.7 | 433.5 | — |
+| QoS 0 | −0.44% | −2.50% | −1.04% | 168.9 | 164.7 | 165.8 | — |
+
+The 76 → 85 → 97 % progression with waiter count is the predicted signature: A schedules one
+callback per waiter, C schedules one per receipt. Memory is unchanged from B byte for byte
+(1152 / 2244 / 3232 / 8056 / 27688 / 109424 bytes at 0/1/2/8/32/128 waiters), zero futures
+retained after settlement or after a cancellation storm, zero RSS and object growth.
+
+### Fixed-rate, matched absolute load
+
+Window 32, payload 64, receipt completion, `--repeat 8`, offered skew ≤ 0.017 %, completion ratio
+1.0000 in every cell. A/A rows are the band for the rows beneath them. p99 omitted: its A/A band
+reaches ±5.9 %.
+
+| Cell | Pair | ACK p50 | ACK p95 | deliv p50 | deliv p95 | cpu µs/msg |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 311 @2500 | A/A | +1.45% | −0.15% | +1.69% | −0.38% | −1.26% |
+| | **A→C** | −8.78% | −2.12% | **−4.00%** | −2.98% | −1.76% |
+| 5 @2500 | A/A | +0.95% | +0.09% | +2.04% | −0.12% | −1.65% |
+| | **A→C** | −8.53% | −2.47% | **−3.57%** | −3.36% | −3.03% |
+| 311 @5000 | A/A | +1.53% | +0.10% | +0.55% | −0.28% | −0.28% |
+| | A→B | +9.21% | −5.98% | **+27.50%** | −0.13% | −16.91% |
+| | **A→C** | +34.57% | +15.16% | **+22.10%** | +0.40% | −16.50% |
+| | B→C | +7.06% | +1.10% | −4.13% | −2.10% | +6.44% |
+| 5 @5000 | A/A | −0.71% | +0.65% | −0.02% | −0.18% | +0.26% |
+| | A→B | +18.41% | −6.66% | **+24.17%** | +2.27% | −17.96% |
+| | **A→C** | +32.23% | −1.06% | **+17.54%** | +1.92% | −12.82% |
+| | B→C | +11.02% | +4.10% | −3.26% | −6.72% | +3.44% |
+
+**C does not remove the regression.** It recovers about a fifth of it and keeps the CPU saving.
+At 2500 msg/s C is better than baseline on every metric on both protocols.
+
+There is also a structural reason C could not have fixed *this* benchmark: it parks exactly one
+waiter per receipt, and at N=1 arms A and C are identical — two hops, two callbacks. C's advantage
+over A only exists for N>1, which the micro exercises and the network harness does not.
+
+### EffectPump counters
+
+The inline fast path requires `len(effects) == 1 and not self.pending`: an effect rides it only if
+it arrives alone.
+
+| Cell · arm | batches | multi-effect | multi % | enqueued | high water | deliv p50 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 311 @2500 A | 10785 | 2716 | 25.2% | 6950 | 6 | 0.208 ms |
+| 311 @2500 C | 10952 | 2940 | 26.8% | 7014 | 8 | 0.200 ms |
+| 311 @5000 A | 24864 | 1828 | 7.3% | 6964 | 54 | 0.132 ms |
+| 311 @5000 C | 22068 | 2813 | 12.7% | 10748 | 36 | 0.161 ms |
+| 311 @5000 B | 21480 | 3008 | 14.0% | 11554 | 36 | 0.166 ms |
+| 5 @5000 A | 24344 | 2112 | 8.7% | 7769 | 28 | 0.133 ms |
+| 5 @5000 C | 22290 | 2754 | 12.4% | 10464 | 36 | 0.156 ms |
+
+`inline_effects` is identical (30001) in every arm and `apply_suspensions` is 0 throughout.
+
+### A hypothesis, and its falsification
+
+Across twelve cells at fixed rate, `effect_enqueued` tracks delivery p50 at **r = +0.969**
+(multi-effect batches r = +0.904, cpu/msg r = −0.919), and the relation holds in both directions:
+B→C *reduces* grouping and *reduces* delivery p50. That suggested the regression was the CPU
+saving pushing effects off the inline path onto the deferred pump.
+
+The control falsifies it. Sweeping **main alone** across six rates moves its own multi-effect
+share further than any patch does, and delivery p50 does not follow:
+
+| main @ rate | offered | batches | multi % | enq/msg | deliv p50 | ACK p50 | cpu µs/msg |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1500 | 1500.1 | 7313 | 23.0% | 0.750 | 0.160 ms | 0.425 ms | 210.6 |
+| 2500 | 2500.2 | 10831 | 25.5% | 0.926 | 0.207 ms | 0.558 ms | 159.5 |
+| 3500 | 3500.1 | 15197 | 18.9% | 0.826 | 0.243 ms | 0.570 ms | 144.8 |
+| 5000 | 5000.4 | 23705 | 9.5% | 0.570 | 0.134 ms | 0.521 ms | 152.4 |
+| 6500 | 6500.5 | 31874 | 19.8% | 0.691 | 0.100 ms | 0.509 ms | 155.5 |
+| 8000 | 8000.6 | 33630 | 28.4% | 1.000 | 0.130 ms | 0.636 ms | 126.8 |
+
+Within main, multi % versus delivery p50 gives **r = +0.101**. Main's highest grouping (28.4 % at
+8000 msg/s) sits at 0.130 ms — better than several of its lower-grouping points, and better than
+the candidate at 5000 msg/s with 12.7 % grouping. The cross-arm correlation was measured with the
+rate held fixed and only the code varying; it does not survive the reciprocal control. **The
+batching-cliff explanation is withdrawn.** Grouping is a co-symptom.
+
+`collect_from_engine()` is called from 16 sites in `async_client.py` but only 3 of them
+(the publish paths) follow it with `drain_inline()`; the ingress paths do not. That asymmetry is
+recorded here as an observation, not as a diagnosis — the control above forbids concluding from it.
+
+### What survives
+
+- The regression is real, matched-load, reproduced in three campaigns, both protocols, three
+  window sizes.
+- It is **rate-dependent**, appearing between 2500 and 5000 msg/s. At 2500 every arm beats
+  baseline.
+- It moves the **median** only: delivery p95 stays inside its A/A band, ACK p95/p99 usually
+  improve.
+- It is **monotone in how much of the shield is removed**: at 311@5000, A → C → B is
+  0.132 → 0.161 → 0.166 ms, with C the intermediate arm by construction.
+- CPU is genuinely lower: 13–18 % at 5000 msg/s against an A/A band under 1.7 %.
+
+Main's own curve carries an unexplained discontinuity between 3500 and 5000 msg/s — delivery p50
+goes 0.243 → 0.134 ms while its grouping collapses from 18.9 % to 9.5 %. Whatever regime main
+enters there, the faster arms may be failing to enter it. That would invert the framing: not "the
+candidate is pushed onto a slow path" but "the candidate no longer qualifies for a fast one".
+It is the next thing to probe, on main alone, before any further arm comparison.
+
+### Mechanism verdict
+
+`DEFERRED WAKE HYPOTHESIS DISPROVEN` — the wake phase accounts for roughly a fifth of the
+regression and cannot account for the rest. The batching mediator proposed to explain the
+remainder is disproven by its own control. The mechanism is open.
+
 ## Verdict
 
 **Blocked.** At matched absolute load the candidate degrades median end-to-end
 delivery latency by 25–33% at 5000 msg/s, on both protocols and at every window
 tested, against an A/A band of ±2.1%, with completion ratio 1.0000 and offered
 load matched to better than 0.01%. Publisher ACK p50 degrades on the same cells.
-The effect is reproduced across two independent campaigns and carries a
-mechanism marker: about 40% more effects deferred to the `EffectPump`.
+The effect is reproduced across three independent campaigns.
+
+Prototype C shows the wake phase is not the cause: restoring it recovers about a
+fifth of the regression while keeping the CPU saving. The `EffectPump` batching
+shift that looked like the mediator is disproven by a main-only rate sweep. The
+mechanism is unresolved and the investigation continues.
 
 Everything else in this report stands: correctness, the ~59% in-process gain on
 the awaited-receipt path, +6.2 to +6.6% sequential ACK throughput, the −73% ack
