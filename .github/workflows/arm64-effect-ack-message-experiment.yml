@@ -1,0 +1,303 @@
+name: ARM64 Effect ACK+MESSAGE Experiment
+
+on:
+  push:
+    branches:
+      - bench/effect-ack-message-arm64-exp
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mqttium-arm64-runner
+  cancel-in-progress: false
+
+jobs:
+  experiment:
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 45
+    env:
+      BASE_SHA: 4fe90af36660bce06c12e9a8c57cb9a6223abe5a
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+    steps:
+      - name: Check out baseline
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ env.BASE_SHA }}
+          path: base
+          persist-credentials: false
+
+      - name: Check out candidate workspace
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ env.BASE_SHA }}
+          path: candidate
+          persist-credentials: false
+
+      - name: Create isolated environment and preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/effect-pair-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          echo "JOB_ROOT=$root" >> "$GITHUB_ENV"
+          rm -rf "$root"
+          mkdir -p "$root"
+          python3 -m venv "$root/venv"
+          echo "$root/venv/bin" >> "$GITHUB_PATH"
+          "$root/venv/bin/python" -m pip install -e 'candidate[dev]' 'psutil>=6,<8'
+          "$root/venv/bin/python" base/benchmarks/runner_probe.py \
+            --output "$root/runner.json" --require-temperature --enforce
+
+      - name: Apply candidate only in temporary workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('candidate/src/mqttium/api/_effects.py')
+          text = path.read_text(encoding='utf-8')
+          start_marker = '        if len(effects) > 1:\n'
+          end_marker = '        if not self.pending:\n'
+          start = text.index(start_marker)
+          end = text.index(end_marker, start)
+          block = text[start:end]
+          prefix = (
+              '        if len(effects) > 1:\n'
+              '            self.multi_effect_batches += 1\n'
+          )
+          if not block.startswith(prefix):
+              raise SystemExit('unexpected EffectPump partition source shape')
+          remainder = block[len(prefix):]
+          indented = ''.join(('    ' + line) if line.strip() else line for line in remainder.splitlines(True))
+          replacement = (
+              prefix
+              + '            exact_ack_message = (\n'
+              + '                len(effects) == 2\n'
+              + '                and effects[0].kind is EffectKind.SEND_ACK\n'
+              + '                and effects[1].kind is EffectKind.MESSAGE\n'
+              + '            )\n'
+              + '            if not exact_ack_message:\n'
+              + indented
+          )
+          path.write_text(text[:start] + replacement + text[end:], encoding='utf-8')
+          PY
+          python -m py_compile candidate/src/mqttium/api/_effects.py
+          git -C candidate diff --check
+          git -C candidate diff -- src/mqttium/api/_effects.py
+
+      - name: Targeted correctness guards
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH=candidate/src python -m pytest -q \
+            candidate/tests/unit/test_ack_hotpath.py \
+            candidate/tests/unit/test_async_runtime_interleavings.py
+          PYTHONPATH=candidate/src python - <<'PY'
+          from mqttium.api import AsyncClient
+          from mqttium.enums import ConnectionState
+          from mqttium.protocol.effects import EffectKind
+          from mqttium.types import Message
+
+          def kinds(client):
+              return [effect.kind for effect in client._effect_pump.pending]
+
+          c = AsyncClient(client_id='effect-pair-correctness', message_delivery='iterator')
+          c._engine.state = ConnectionState.CONNECTED
+          msg = Message(topic='bench/inbound', payload=b'x')
+
+          c._engine._emit(EffectKind.SEND_ACK, b'ack')
+          c._engine._emit(EffectKind.MESSAGE, msg)
+          c._collect_effects_locked()
+          assert kinds(c) == [EffectKind.SEND_ACK, EffectKind.MESSAGE]
+          assert c._effect_pump.reordered_batches == 0
+          c._effect_pump.pending.clear()
+
+          c._engine._emit(EffectKind.MESSAGE, msg)
+          c._engine._emit(EffectKind.SEND_ACK, b'ack')
+          c._collect_effects_locked()
+          assert kinds(c) == [EffectKind.SEND_ACK, EffectKind.MESSAGE]
+          assert c._effect_pump.reordered_batches == 1
+          print('ordering guards: PASS')
+          PY
+
+      - name: Write isolated micro harness
+        shell: bash
+        run: |
+          cat > "$JOB_ROOT/effect_pair_micro.py" <<'PY'
+          from __future__ import annotations
+          import argparse, json, os, statistics, subprocess, sys, time
+          from pathlib import Path
+
+          def worker(cell: str, operations: int, cpu: int | None) -> None:
+              if cpu is not None and hasattr(os, 'sched_setaffinity'):
+                  os.sched_setaffinity(0, {cpu})
+              from mqttium.api._effects import EffectPump
+              from mqttium.protocol.effects import EffectKind, EngineEffect
+
+              if cell == 'ack_message':
+                  effects = [
+                      EngineEffect(EffectKind.SEND_ACK, b'x'),
+                      EngineEffect(EffectKind.MESSAGE, None),
+                  ]
+              elif cell == 'ordered8':
+                  effects = [EngineEffect(EffectKind.SEND, b'x') for _ in range(8)]
+              elif cell == 'reordered':
+                  effects = [
+                      EngineEffect(EffectKind.MESSAGE, None),
+                      EngineEffect(EffectKind.SEND_ACK, b'x'),
+                  ]
+              else:
+                  raise SystemExit(cell)
+
+              class Engine:
+                  def take_effects(self):
+                      return effects
+
+              class Owner:
+                  _connection_epoch = 0
+                  _disconnect_exc = None
+                  _engine = Engine()
+
+              pump = EffectPump(Owner())
+              warmup = max(5000, operations // 20)
+              for _ in range(warmup):
+                  pump.collect_from_engine(); pump.pending.clear()
+              t0 = time.perf_counter()
+              for _ in range(operations):
+                  pump.collect_from_engine(); pump.pending.clear()
+              elapsed = time.perf_counter() - t0
+              print(json.dumps({'ops_per_s': operations / elapsed, 'elapsed': elapsed}))
+
+          def run_one(script: Path, root: Path, cell: str, operations: int, cpu: int) -> float:
+              env = os.environ.copy(); env['PYTHONPATH'] = str(root / 'src')
+              p = subprocess.run(
+                  [sys.executable, str(script), '--worker', '--cell', cell,
+                   '--operations', str(operations), '--cpu', str(cpu)],
+                  check=True, capture_output=True, text=True, env=env,
+              )
+              return float(json.loads(p.stdout.splitlines()[-1])['ops_per_s'])
+
+          def cv(values):
+              mean = statistics.fmean(values)
+              return statistics.stdev(values) / mean if len(values) > 1 and mean else 0.0
+
+          def parent(args):
+              script = Path(__file__).resolve()
+              roots = {'base': args.base.resolve(), 'candidate': args.candidate.resolve()}
+              cells = {'ack_message': 500_000, 'ordered8': 120_000, 'reordered': 350_000}
+              output = {}
+              for cell, operations in cells.items():
+                  ratios=[]; bases=[]; candidates=[]; pairs=[]
+                  for i in range(args.repeat):
+                      order=('base','candidate') if i % 2 == 0 else ('candidate','base')
+                      measured={v: run_one(script, roots[v], cell, operations, args.cpu) for v in order}
+                      ratio=measured['candidate']/measured['base']
+                      ratios.append(ratio); bases.append(measured['base']); candidates.append(measured['candidate'])
+                      pairs.append({'order': order, 'base': measured['base'], 'candidate': measured['candidate'], 'ratio': ratio})
+                  output[cell] = {
+                      'median_candidate_over_base': statistics.median(ratios),
+                      'min': min(ratios), 'max': max(ratios),
+                      'base_cv': cv(bases), 'candidate_cv': cv(candidates), 'pairs': pairs,
+                  }
+                  x=output[cell]
+                  print(f"{cell}: candidate/base={x['median_candidate_over_base']:.5f} CV={x['base_cv']:.2%}/{x['candidate_cv']:.2%} range=[{x['min']:.5f},{x['max']:.5f}]")
+              Path(args.output).write_text(json.dumps(output, indent=2) + '\n')
+
+          p=argparse.ArgumentParser()
+          p.add_argument('--worker', action='store_true'); p.add_argument('--cell')
+          p.add_argument('--operations', type=int, default=1); p.add_argument('--cpu', type=int, default=2)
+          p.add_argument('--base', type=Path); p.add_argument('--candidate', type=Path)
+          p.add_argument('--repeat', type=int, default=21); p.add_argument('--output', default='/tmp/effect-pair-micro.json')
+          a=p.parse_args()
+          worker(a.cell, a.operations, a.cpu) if a.worker else parent(a)
+          PY
+
+      - name: Micro A/A control
+        shell: bash
+        run: |
+          set -euo pipefail
+          python "$JOB_ROOT/effect_pair_micro.py" \
+            --base base --candidate base --repeat 21 --cpu 2 \
+            --output "$JOB_ROOT/micro-aa.json" | tee "$JOB_ROOT/micro-aa.txt"
+          python - <<'PY'
+          import json, os
+          p=json.load(open(os.environ['JOB_ROOT'] + '/micro-aa.json'))
+          for name, cell in p.items():
+              drift=abs(cell['median_candidate_over_base'] - 1.0)
+              if drift > 0.015 or cell['base_cv'] > 0.025 or cell['candidate_cv'] > 0.025:
+                  raise SystemExit(f'A/A invalid for {name}: {cell}')
+          PY
+
+      - name: Micro A/B
+        shell: bash
+        run: |
+          set -euo pipefail
+          python "$JOB_ROOT/effect_pair_micro.py" \
+            --base base --candidate candidate --repeat 21 --cpu 2 \
+            --output "$JOB_ROOT/micro-ab.json" | tee "$JOB_ROOT/micro-ab.txt"
+
+      - name: Source-shaped callback A/A control
+        shell: bash
+        run: |
+          set -euo pipefail
+          python base/benchmarks/paired_qos1_rtt.py \
+            --base-root base --candidate-root base \
+            --suite callback --repeat 12 --warmup 1000 --count 15000 \
+            --cpu 2 --aa-control --max-cv 0.03 --max-aa-drift 0.03 \
+            --output "$JOB_ROOT/callback-aa.json" | tee "$JOB_ROOT/callback-aa.txt"
+
+      - name: Source-shaped callback A/B
+        shell: bash
+        run: |
+          set -euo pipefail
+          python base/benchmarks/paired_qos1_rtt.py \
+            --base-root base --candidate-root candidate \
+            --suite callback --repeat 12 --warmup 1000 --count 15000 \
+            --cpu 2 --max-cv 0.03 --max-aa-drift 0.03 \
+            --output "$JOB_ROOT/callback-ab.json" | tee "$JOB_ROOT/callback-ab.txt"
+
+      - name: Decision summary
+        if: success()
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, os
+          root=os.environ['JOB_ROOT']
+          micro=json.load(open(root + '/micro-ab.json'))
+          callback=json.load(open(root + '/callback-ab.json'))
+          aa=json.load(open(root + '/callback-aa.json'))
+          target=micro['ack_message']['median_candidate_over_base']
+          rate=callback['summary']['operations_per_second']['median_candidate_over_base']
+          p50=callback['summary']['latency_p50_ns']['median_candidate_over_base']
+          aa_rate=aa['summary']['operations_per_second']['median_candidate_over_base']
+          aa_p50=aa['summary']['latency_p50_ns']['median_candidate_over_base']
+          print(f'ACK+MESSAGE micro candidate/base: {target:.5f}')
+          print(f'callback A/A rate={aa_rate:.5f} p50={aa_p50:.5f}')
+          print(f'callback A/B rate={rate:.5f} p50={p50:.5f}')
+          if target < 1.02:
+              print('DECISION: REJECT — isolated ceiling too small/noisy')
+          elif rate < 1.005 and p50 > 0.995:
+              print('DECISION: REJECT — isolated win does not survive source-shaped path')
+          else:
+              print('DECISION: KEEP FOR DEEPER A/B — source-shaped signal survives')
+          PY
+
+      - name: Upload experiment
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0 # v7
+        with:
+          name: effect-ack-message-${{ github.run_id }}
+          path: |
+            ${{ env.JOB_ROOT }}/*.json
+            ${{ env.JOB_ROOT }}/*.txt
+            ${{ env.JOB_ROOT }}/runner.json
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Cleanup
+        if: always()
+        shell: bash
+        run: rm -rf "$JOB_ROOT"
