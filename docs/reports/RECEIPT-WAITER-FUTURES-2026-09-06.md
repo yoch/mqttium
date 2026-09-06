@@ -766,8 +766,14 @@ and is **not** in `publisher cpu/msg`. Broker CPU from `/proc/<pid>/stat` is ~0.
 arms. B's publisher CPU saving survives (about −5 to −6 % at 4500/5000/5500, −1.6 % at 5250) and
 is not a short-run artefact: completion is full.
 
-The in-loop campaigns reported −10 to −17 % because they also counted time the loop spent
-sleeping in the pacer. An independent clock shrinks that gap; it does not remove it.
+The in-loop campaigns reported −10 to −17 %. That difference is **not** explained by sleep
+accounting: `time.process_time()` excludes time the process spends sleeping, so the in-loop figure
+never contained pacer sleep. The two numbers are not decomposable that way. In-loop and external
+pacing impose different temporal workload shapes, which put the writer in different scheduling
+regimes (eager share 0.46–0.58 versus ~0.99), so their CPU/msg figures measure the same runtime
+doing differently shaped work. An independent clock shrinks the measured gap; it does not remove
+it, and the two campaigns should be compared as separate regimes rather than as one metric
+corrected for overhead.
 
 ### What this does not yet cover
 
@@ -860,8 +866,10 @@ that band is trustworthy: **−0.31 % at 5000** against an in-loop **+22 to +27 
 5250. The residual intra-class difference the previous section flagged (on-time p50 0.113 vs 0.130
 at 5000) is also gone: 0.113 vs 0.112.
 
-ACK p50 improves 14–30 %, beyond its A/A band of 3.7–11.7 %. Delivery p95/p99 improve 5–13 % but
-their bands are far wider, so that is descriptive only.
+ACK p50 improves 14–30 %, beyond its A/A band of 3.7–11.7 %. Delivery p95 and p99 are
+**inconclusive on this host**: their A/A spread reaches +86 % and +132 %, which is wider than any
+A/B difference measured, so neither neutrality nor improvement can be claimed for them here. The
+raw A/B readings (−5 to −13 %) are recorded only so the direction is not lost.
 
 ### Temporal equivalence
 
@@ -880,6 +888,34 @@ inter-arrival p95 differed by a factor of five between regimes. One asymmetry de
 still depends on how promptly the publisher loop picks work up, so a residual coupling survives —
 it is small at 5000–5500 and large at 4500.
 
+### Final confidence set — MQTT 5 and window 64
+
+Same host, same placement, same pacer. MQTT 5 at the two rates whose A/A band is trustworthy here,
+window 32 and window 64. Validity on every cell: pacer emitted rate and publisher received rate
+agree between arms to 0.1 msg/s, completion ratio 1.0000, zero lost tokens, sequences intact.
+
+| protocol | window | rate | delivery p50 B/A | its A/A band | ACK p50 B/A | its A/A band |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 3.1.1 | 32 | 4500 | +0.65% | ±4.97% | −29.9% | ±11.7% |
+| 3.1.1 | 32 | 5000 | **−0.31%** | ±1.57% | **−14.5%** | ±3.7% |
+| 3.1.1 | 32 | 5250 | −1.88% | ±2.09% | −21.6% | ±8.7% |
+| 3.1.1 | 32 | 5500 | −2.23% | ±10.9% | −26.3% | ±5.0% |
+| 5 | 32 | 5000 | **−0.29%** | ±4.19% | **−13.6%** | ±4.5% |
+| 5 | 32 | 5250 | −1.60% | ±1.63% | −21.9% | ±6.3% |
+| 5 | 64 | 5000 | −0.66% | ±2.41% | −18.1% | ±3.4% |
+| 5 | 64 | 5250 | −3.90% | ±3.09% | −23.2% | ±8.1% |
+
+**Delivery p50 is inside or better than its own A/A band in all eight cells**, on both protocols and
+both windows. **ACK p50 is better in all eight**, by 13.6–29.9 % against bands of 3.4–11.7 %.
+
+Delivery p95 and p99 remain **inconclusive on this host** at every cell: their A/A spread reaches
++80 % (5 w32 @5000), +176 % (5 w32 @5250) and +132 % (3.1.1 @4500), wider than any A/B difference
+observed. CPU is likewise not qualifiable here, for the reason given above. Neither is claimed.
+
+Window 8 and a bursty-trace replay were prepared as optional extensions and are **not** needed: the
+blocking cell is neutral on two protocols, two windows, two rates and two hosts, and no cell in the
+set moves adversely.
+
 ### Agreement between hosts
 
 | | Cloud Agent host | i7-3770 |
@@ -892,33 +928,47 @@ Two different CPUs, two brokers, two Python builds, same conclusion.
 **Outcome on this host: `IN-LOOP PACING ARTEFACT CONFIRMED`**, with CPU explicitly not qualifiable
 here and tails not qualifiable here.
 
+The performance investigation ends here. The blocker that motivated it does not survive a
+temporally independent stimulus, on either host, on either protocol, at either window.
+
 ## Verdict
 
-The matched-load campaigns remain in this report as closed-loop and fixed-average-rate
-observations. They showed a real 25–33 % delivery-p50 gap at 5000 msg/s when the pacer lived in
-MQTTium's event loop. The rate-regime diagnosis showed that gap was a class-mix effect driven by
-`asyncio.sleep` overshooting to ~1.1 ms.
+**Accept.** The change is defended by MQTTium-before versus MQTTium-after only.
 
-The external-pacer control then gave A and B the same arrival process. On the Cloud Agent host,
-MQTT 3.1.1 QoS 1 window 32 payload 64 at 4500/5000/5250/5500:
+Every measurement in this report is retained, including the ones whose interpretation was later
+corrected. The chronology matters and is the point:
 
-- delivery p50/p95 sit inside the A/A noise floor (5000 p50 **−0.5 %** vs an in-loop **+25–33 %**);
-- ACK latency is neutral to slightly better;
-- eager/msg is 0.996 on both arms;
-- publisher CPU remains lower on B (−4 to −6 % at three of four rates);
-- pacer, transport and token→publish distributions match.
+1. **Closed-loop** (`paired_network.py`, windowed): the candidate raised ACK throughput and the
+   subscriber saw MQTT 5 / w32 delivery p50 rise 7.4 %. Historical observation; the arms did not
+   offer the same load over time, so it is not causal evidence.
+2. **Fixed average rate** (`paired_open_loop.py`, absolute-rate mode): delivery p50 rose 25–33 % at
+   5000 msg/s with offered load matched to 0.01 %. Historical observation; the average rate was
+   matched but the temporal shape was not. **Superseded interpretation** — it read as a runtime
+   regression and was not one.
+3. **Rate-regime diagnosis**: the in-loop pacer's sub-millisecond `asyncio.sleep` overshoots to
+   ~1.1 ms below ~5250 msg/s. Catch-up bursts decide what share of frames take the
+   one-per-loop-turn eager write path (#254). Per class the arms are the same speed
+   (on-time p50 0.132/0.132, 0.111/0.111, 0.110/0.110); only the mix differs, and the mix follows
+   how much wall time each arm leaves the loop idle. Two earlier mechanisms were proposed and both
+   were falsified by their own reciprocal controls — the `EffectPump` grouping cliff (r = +0.101
+   within main) and the writer latency-batch gate (unreachable: queue high-water peaks at 2530 B
+   against a 48 KiB threshold).
+4. **External-pacer control**: a dedicated process holds the clock and ships timestamped tokens
+   over a Unix datagram socketpair; the publisher never sleeps to pace. Jitter p95 is 0.34–0.39 µs
+   against ~1100 µs in-loop. Delivery p50 is inside its A/A band in all eight cells across two
+   protocols, two windows, two rates and two hosts. ACK p50 improves 13.6–29.9 %.
 
-**`IN-LOOP PACING ARTEFACT CONFIRMED`.** The i7-3770 repeat asked for here has since been run and
-agrees: delivery p50 at 5000 msg/s is −0.31 % against an in-loop +22 to +27 %. What that host
-cannot settle is CPU — its publisher saturates one core under the harness's own per-token cost, so
-`cpu/msg` reads the target interval for both arms — and the tail bands, whose A/A spread reaches
-tens of percent there.
+What is **not** claimed: delivery p95/p99 on the i7-3770 (A/A spread up to +176 %), and CPU on that
+host (the publisher saturates one core under the harness's own per-token cost). The cloud host,
+which has headroom, keeps B's publisher CPU 4–6 % lower; the in-loop campaigns measured −15 to
+−19 % on a differently shaped workload. Those two figures are not decomposable into one another —
+`time.process_time()` excludes sleep — and are reported as separate regimes.
 
-Do not merge until a small MQTT 5 / window confidence set lands. Nothing here authorises a runtime
-change; the candidate is still the `5f2dd2d` waiter implementation.
+Against that, the case for the change is unchanged and was never in dispute: the #76 cancellation
+guarantee is preserved and now has explicit coverage; ~59 % in-process throughput on the awaited
+receipt path; +6.2 to +6.6 % sequential ACK throughput against a real broker on both protocols;
+20 % to 48 % less memory with **zero** waiter futures retained after settlement or cancellation,
+where main retains the shared future; and neutrality on QoS 0, QoS 1 never-awaited, QoS 2, callback
+completion, persistence, reconnect and every writer path measured. The runtime diff is one file.
 
-Everything else in this report stands: correctness, the ~59 % in-process gain on the
-awaited-receipt path, +6.2 to +6.6 % sequential ACK throughput, the −73 % ack p50 at 2500 msg/s
-under in-loop pacing, a real CPU saving, strictly lower memory with no retained waiter futures,
-and neutrality on QoS 0, QoS 1 never-awaited, QoS 2, callback completion, persistence and writer
-paths.
+`#432 ACCEPT — MERGE-READY`. Not merged here.
