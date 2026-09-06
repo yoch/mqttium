@@ -1,0 +1,119 @@
+name: Callback Batch2 Inline Head Hosted ARM64
+
+on:
+  push:
+    branches: [perf/callback-batch2-inline-head-gh-arm-check]
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 25
+    steps:
+      - name: Check out exact baseline
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 4fe90af36660bce06c12e9a8c57cb9a6223abe5a
+          path: base
+          persist-credentials: false
+
+      - name: Check out exact candidate workspace
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 4fe90af36660bce06c12e9a8c57cb9a6223abe5a
+          path: candidate
+          persist-credentials: false
+
+      - name: Check out exact experiment source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 79b5e48b32900f8e12bc2c6854acc089d820fbe6
+          path: source
+          persist-credentials: false
+
+      - name: Check out exact benchmark harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 22731e60c01f00f4f0dfb125bf664893d21537af
+          path: harness
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: candidate/pyproject.toml
+
+      - name: Materialize exact T3 candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          import textwrap
+
+          workflow = Path('source/.github/workflows/arm64-callback-batch2-inline-head-experiment.yml').read_text(encoding='utf-8')
+          anchor = workflow.index('      - name: Apply batch2 inline-head candidate')
+          marker = "          python - <<'PY'\n"
+          start = workflow.index(marker, anchor) + len(marker)
+          end = workflow.index("\n          PY\n", start)
+          Path('/tmp/apply_candidate.py').write_text(textwrap.dedent(workflow[start:end]), encoding='utf-8')
+          PY
+          python /tmp/apply_candidate.py
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('candidate/src/mqttium/api/_delivery.py')
+          text = path.read_text(encoding='utf-8')
+          start = text.index('    def _dispatch_callback_batch_head_inline(')
+          end = text.index('    def _enqueue_inline_continuation(', start)
+          region = text[start:end]
+          lines = region.splitlines(keepends=True)
+          fixed = lines[0] + ''.join(line if not line.strip() else '    ' + line for line in lines[1:])
+          path.write_text(text[:start] + fixed + text[end:], encoding='utf-8')
+          PY
+          python -m py_compile candidate/src/mqttium/api/_delivery.py
+          git -C candidate diff --check
+          python -m pip install -e 'candidate[dev]'
+
+      - name: A/A control
+        shell: bash
+        run: |
+          set -euo pipefail
+          python harness/benchmarks/callback_coalesced_inline_probe.py \
+            --base-root base --candidate-root base \
+            --repeat 10 --batches 5000 --warmup-batches 500 --cpu 2 \
+            --output /tmp/aa.json | tee /tmp/aa.txt
+
+      - name: A/B candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python harness/benchmarks/callback_coalesced_inline_probe.py \
+            --base-root base --candidate-root candidate \
+            --repeat 10 --batches 5000 --warmup-batches 500 --cpu 2 \
+            --output /tmp/ab.json | tee /tmp/ab.txt
+
+      - name: Corrected summary
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          aa=json.load(open('/tmp/aa.json'))['cells']
+          ab=json.load(open('/tmp/ab.json'))['cells']
+          fields=('operations_per_second','callback_p50_ns','callback_p95_ns','first_callback_p50_ns','second_callback_p50_ns','batch_rtt_p50_ns','batch_rtt_p95_ns')
+          for size in ('2','8'):
+              print(f'BATCH {size}')
+              for field in fields:
+                  a=aa[size]['summary'][field]
+                  b=ab[size]['summary'][field]
+                  corrected=b['median_candidate_over_base']/a['median_candidate_over_base']
+                  print(
+                      f'{field} AA={a["median_candidate_over_base"]:.6f} '
+                      f'AB={b["median_candidate_over_base"]:.6f} '
+                      f'CORRECTED={corrected:.6f} '
+                      f'AA_CV=({a["base_cv"]:.4f},{a["candidate_cv"]:.4f}) '
+                      f'AB_CV=({b["base_cv"]:.4f},{b["candidate_cv"]:.4f})'
+                  )
+          PY
