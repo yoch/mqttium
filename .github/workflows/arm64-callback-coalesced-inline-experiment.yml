@@ -117,7 +117,6 @@ jobs:
           python - <<'PY'
           import json, os
           root=os.environ['JOB_ROOT']
-          aa=json.load(open(root+'/aa.json'))['cells']
           ab=json.load(open(root+'/ab.json'))['cells']
           b2=ab['2']['summary']; b8=ab['8']['summary']
           cb2=b2['callback_p50_ns']['median_candidate_over_base']
@@ -140,7 +139,7 @@ jobs:
 
       - name: Upload experiment
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: callback-coalesced-inline-${{ github.run_id }}
           path: |
