@@ -779,6 +779,119 @@ rates that defined the blocker is enough to classify the in-loop signal.
 reading measured a coupled pacer/runtime system. Under a temporally independent load it is not a
 demonstrated runtime regression.
 
+## External-pacer control — repeat on the original i7-3770
+
+The section above ran on the Cloud Agent host and asked for this repeat. Same harness
+(`benchmarks/external_pacer.py`, unchanged), same runtime (`src/` byte-identical to `5f2dd2d`),
+same question, on the desktop that produced every earlier table in this report — so these
+milliseconds *are* comparable to the in-loop campaigns.
+
+### Host and placement
+
+| | |
+| --- | --- |
+| CPU | Intel i7-3770, 4 physical cores, **SMT** — sibling pairs (0,4) (1,5) (2,6) (3,7) |
+| Governor | `performance` |
+| Python | 3.12.13 · Mosquitto 2.0.18, fresh instance on `127.0.0.1:21883` |
+| Affinity | desktop CPU 0 · harness + `mosquitto_sub` CPU 4 · broker CPU 1 · publisher CPU 2 · pacer CPU 3 |
+
+The cloud host has no SMT, so its 0/1/2/3 map is four whole cores. Here it is not: five consumers
+share four physical cores. Broker, publisher and pacer each get a core with an **idle sibling**;
+the desktop and the harness share core 0. A first attempt paired the broker with the subscriber on
+core 1 and produced 8–10 ms ACK p99 tails; that placement is superseded by the one above.
+
+### Pacer qualification (no MQTT)
+
+| rate | target µs | emission p50 | emission p95 | emission p99 | receiver p50 | receiver p95 | lateness p95 | transport p95 | catch-up | lost |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 4500 | 222.2 | 222.222 | 222.350 | 222.744 | 222.188 | 224.521 | **0.388 µs** | 13.9 µs | 0.000% | 0 |
+| 5000 | 200.0 | 199.999 | 200.099 | 200.316 | 199.971 | 202.130 | **0.344 µs** | 15.9 µs | 0.007% | 0 |
+| 5250 | 190.5 | 190.476 | 190.573 | 190.856 | 190.435 | 192.616 | **0.350 µs** | 18.7 µs | 0.025% | 0 |
+| 5500 | 181.8 | 181.817 | 181.929 | 182.220 | 181.755 | 184.068 | **0.391 µs** | 15.3 µs | 0.133% | 0 |
+
+Worst lateness p95 is **0.391 µs** against the ~1100 µs of the in-loop `asyncio.sleep` pacer:
+**2813× tighter**, with zero lost tokens and intact sequences. The acceptance gate is met.
+
+### What this host cannot qualify
+
+`publisher_cpu_seconds` is **2.99999 s for a 3.000 s sample** — the publisher sits at 100.00 % of
+one core at every rate, so `cpu/msg` reads the target interval exactly (ratio 1.003 at all four
+rates) for both arms. The cause is the harness's own per-token receive path (~50–55 µs/msg on top
+of MQTTium's ~145–150 µs): the transport backlog means a token is always already buffered,
+`sock_recv` never blocks, and `process_time` degenerates to wall time. **No CPU conclusion can be
+drawn on this host** — neither for nor against. The in-loop campaigns and the cloud host remain the
+CPU evidence.
+
+The same ceiling widens the tail bands. A/A max-min spread over 8 identical samples:
+
+| rate | deliv p50 | deliv p95 | deliv p99 | ACK p50 | ACK p95 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 4500 | +4.97% | +36.3% | +131.7% | +11.7% | +18.1% |
+| **5000** | **+1.57%** | +10.4% | +19.5% | +3.7% | +16.2% |
+| **5250** | **+2.09%** | +86.6% | +36.4% | +8.7% | +102.6% |
+| 5500 | +10.86% | +38.9% | +37.9% | +5.0% | +21.1% |
+
+Only **delivery p50 at 5000 and 5250** has a band tight enough to read (±1.6 % / ±2.1 %). Those are
+precisely the rates that defined the blocker, so the control still answers its question — but
+p95, p99 and ACK are reported below as descriptive, not as claims.
+
+### A/B — main (A) versus PR #432 (B), external pacer
+
+Validity: pacer emitted rate and publisher received rate agree to 0.1 msg/s between arms,
+completion ratio 1.0000, zero lost tokens, sequences intact, at all four rates.
+
+| rate | arm | deliv p50 | deliv p95 | ACK p50 | ACK p95 | eager/msg | transport p50 | recv interval p50 |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 4500 | A | 0.111 | 0.154 | 0.585 | 0.691 | 0.954 | 124.5 µs | 223.3 µs |
+| 4500 | B | 0.112 | 0.135 | 0.410 | 0.470 | 0.985 | 40.2 µs | 220.5 µs |
+| | **B/A** | **+0.65%** | −12.2% | −29.9% | −32.0% | +3.2% | −67.7% | −1.3% |
+| 5000 | A | 0.113 | 0.194 | 0.595 | 0.779 | 0.753 | 109.2 µs | 216.9 µs |
+| 5000 | B | 0.112 | 0.185 | 0.509 | 0.615 | 0.828 | 106.4 µs | 210.8 µs |
+| | **B/A** | **−0.31%** | −5.0% | −14.5% | −21.0% | +10.0% | −2.6% | −2.8% |
+| 5250 | A | 0.114 | 0.211 | 0.647 | 0.926 | 0.654 | 103.0 µs | 215.8 µs |
+| 5250 | B | 0.112 | 0.184 | 0.507 | 0.642 | 0.740 | 100.4 µs | 210.0 µs |
+| | **B/A** | **−1.88%** | −12.9% | −21.6% | −30.7% | +13.1% | −2.6% | −2.7% |
+| 5500 | A | 0.116 | 0.209 | 0.704 | 0.898 | 0.587 | 102.6 µs | 215.3 µs |
+| 5500 | B | 0.113 | 0.184 | 0.519 | 0.646 | 0.636 | 95.3 µs | 210.6 µs |
+| | **B/A** | **−2.23%** | −11.7% | −26.3% | −28.0% | +8.2% | −7.2% | −2.2% |
+
+**Delivery p50 is neutral to better at every rate**, inside the A/A band at the two rates where
+that band is trustworthy: **−0.31 % at 5000** against an in-loop **+22 to +27 %**, and −1.88 % at
+5250. The residual intra-class difference the previous section flagged (on-time p50 0.113 vs 0.130
+at 5000) is also gone: 0.113 vs 0.112.
+
+ACK p50 improves 14–30 %, beyond its A/A band of 3.7–11.7 %. Delivery p95/p99 improve 5–13 % but
+their bands are far wider, so that is descriptive only.
+
+### Temporal equivalence
+
+| quantity | skew B vs A |
+| --- | ---: |
+| pacer emitted rate | ≤ 0.002 % |
+| publisher received rate | ≤ 0.002 % |
+| receiver inter-arrival p50 | −1.3 % to −2.8 % |
+| receiver inter-arrival p95 | −3.6 % to −9.2 % |
+| token → publish p50 | −1.0 % to −3.7 % |
+| transport delay p50 | −2.6 % to **−67.7 %** (4500) |
+
+Not perfectly identical, but two orders of magnitude closer than the in-loop pacer, whose
+inter-arrival p95 differed by a factor of five between regimes. One asymmetry deserves naming: at
+4500 msg/s the candidate drains the token socket in 40 µs where main takes 124 µs. Transport delay
+still depends on how promptly the publisher loop picks work up, so a residual coupling survives —
+it is small at 5000–5500 and large at 4500.
+
+### Agreement between hosts
+
+| | Cloud Agent host | i7-3770 |
+| --- | ---: | ---: |
+| delivery p50 at 5000 msg/s, B/A | −0.5 % | **−0.31 %** |
+| in-loop equivalent | +25–33 % | +22–27 % |
+
+Two different CPUs, two brokers, two Python builds, same conclusion.
+
+**Outcome on this host: `IN-LOOP PACING ARTEFACT CONFIRMED`**, with CPU explicitly not qualifiable
+here and tails not qualifiable here.
+
 ## Verdict
 
 The matched-load campaigns remain in this report as closed-loop and fixed-average-rate
@@ -795,8 +908,13 @@ MQTT 3.1.1 QoS 1 window 32 payload 64 at 4500/5000/5250/5500:
 - publisher CPU remains lower on B (−4 to −6 % at three of four rates);
 - pacer, transport and token→publish distributions match.
 
-**`IN-LOOP PACING ARTEFACT CONFIRMED`.** Do not merge until the original i7-3770 repeats this
-control and a small MQTT 5 / window confidence set lands. Nothing here authorises a runtime
+**`IN-LOOP PACING ARTEFACT CONFIRMED`.** The i7-3770 repeat asked for here has since been run and
+agrees: delivery p50 at 5000 msg/s is −0.31 % against an in-loop +22 to +27 %. What that host
+cannot settle is CPU — its publisher saturates one core under the harness's own per-token cost, so
+`cpu/msg` reads the target interval for both arms — and the tail bands, whose A/A spread reaches
+tens of percent there.
+
+Do not merge until a small MQTT 5 / window confidence set lands. Nothing here authorises a runtime
 change; the candidate is still the `5f2dd2d` waiter implementation.
 
 Everything else in this report stands: correctness, the ~59 % in-process gain on the
