@@ -1,0 +1,470 @@
+name: TEMP ARM64 receipt waiter experiment
+
+on:
+  push:
+    branches: [bench/receipt-waiter-arm64-exp]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mqttium-arm64-runner
+  cancel-in-progress: false
+
+env:
+  BASE_SHA: 4560e44aeb24b8a4f7f6ce903766579fac481cbd
+  PYTHONUNBUFFERED: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  experiment:
+    name: receipt waiter A/A + A/B
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 120
+    steps:
+      - name: Check out exact harness baseline
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ env.BASE_SHA }}
+          path: harness
+          persist-credentials: false
+
+      - name: Check out exact baseline
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ env.BASE_SHA }}
+          path: base
+          persist-credentials: false
+
+      - name: Check out candidate workspace from the same immutable baseline
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ env.BASE_SHA }}
+          path: candidate
+          persist-credentials: false
+
+      - name: Set isolated workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "JOB_ROOT=$RUNNER_TEMP/receipt-waiter-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+
+      - name: Verify dedicated ARM64 host
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "aarch64"
+          command -v python3
+          command -v taskset
+          command -v mosquitto
+          python3 - <<'PY'
+          import sys
+          if sys.version_info[:2] != (3, 14):
+              raise SystemExit(f"expected system Python 3.14, got {sys.version}")
+          PY
+          if pgrep -a mosquitto; then
+            echo "A pre-existing Mosquitto process would contaminate paired evidence." >&2
+            exit 1
+          fi
+
+      - name: Create isolated environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$JOB_ROOT"
+          mkdir -p "$JOB_ROOT"
+          python3 -m venv "$JOB_ROOT/venv"
+          echo "$JOB_ROOT/venv/bin" >> "$GITHUB_PATH"
+
+      - name: Install exact baseline dev dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install -e "./harness[dev]"
+          python -m pip install "psutil>=6,<8"
+
+      - name: Apply candidate only inside the runner workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("candidate/src/mqttium/api/models.py")
+          text = path.read_text()
+          old_field = "    _future: asyncio.Future[None] | None = None\n"
+          new_field = "    _waiters: list[asyncio.Future[None]] | None = None\n"
+          old_settle = '''        future = self._future\n        if future is not None and not future.done():\n            future.set_result(None)\n'''
+          new_settle = '''        waiters = self._waiters\n        self._waiters = None\n        if waiters is not None:\n            for future in waiters:\n                if not future.done():\n                    future.set_result(None)\n'''
+          old_wait = '''        if self.qos != QoS.AT_MOST_ONCE and not self._settled:\n            future = self._future\n            if future is None:\n                future = asyncio.get_running_loop().create_future()\n                self._future = future\n            await asyncio.shield(future)\n        if self._error is not None:\n            raise self._error\n'''
+          new_wait = '''        if self.qos != QoS.AT_MOST_ONCE and not self._settled:\n            future = asyncio.get_running_loop().create_future()\n            waiters = self._waiters\n            if waiters is None:\n                waiters = []\n                self._waiters = waiters\n            waiters.append(future)\n            try:\n                await future\n            finally:\n                if not self._settled:\n                    current = self._waiters\n                    if current is not None:\n                        try:\n                            current.remove(future)\n                        except ValueError:\n                            pass\n        if self._error is not None:\n            raise self._error\n'''
+          for old, new, label in (
+              (old_field, new_field, "field"),
+              (old_settle, new_settle, "settle"),
+              (old_wait, new_wait, "wait"),
+          ):
+              if text.count(old) != 1:
+                  raise SystemExit(f"candidate patch anchor {label!r} count={text.count(old)}; fail closed")
+              text = text.replace(old, new)
+          path.write_text(text)
+          PY
+          git -C candidate diff --check
+          git -C candidate diff -- src/mqttium/api/models.py > "$JOB_ROOT/candidate.patch"
+          test -s "$JOB_ROOT/candidate.patch"
+          sha256sum "$JOB_ROOT/candidate.patch" | tee "$JOB_ROOT/candidate.patch.sha256"
+          if git -C candidate diff --name-only | grep -vx 'src/mqttium/api/models.py'; then
+            echo "candidate touched an unexpected file" >&2
+            exit 2
+          fi
+
+      - name: Candidate receipt cancellation and lifetime contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH=candidate/src python - <<'PY'
+          import asyncio
+          from mqttium.api.models import PublishReceipt
+          from mqttium.enums import QoS
+
+          async def tick():
+              await asyncio.sleep(0)
+
+          async def main():
+              # Never-awaited remains allocation-lazy.
+              r = PublishReceipt(mid=1, qos=QoS.AT_LEAST_ONCE)
+              assert r._waiters is None
+              assert not r.is_done()
+
+              # Already-settled wait allocates no waiter structure.
+              r._settle()
+              await r.wait()
+              assert r._waiters is None
+
+              # One pending waiter.
+              r = PublishReceipt(mid=2, qos=QoS.AT_LEAST_ONCE)
+              one = asyncio.create_task(r.wait())
+              await tick()
+              assert r._waiters is not None and len(r._waiters) == 1
+              r._settle()
+              await one
+              assert r._waiters is None and r.is_done()
+
+              # Cancellation isolation: A cancelled waiter must not poison B,
+              # a later C, or final receipt completion (#76 contract).
+              r = PublishReceipt(mid=3, qos=QoS.AT_LEAST_ONCE)
+              a = asyncio.create_task(r.wait())
+              b = asyncio.create_task(r.wait())
+              await tick()
+              assert r._waiters is not None and len(r._waiters) == 2
+              a.cancel()
+              try:
+                  await a
+              except asyncio.CancelledError:
+                  pass
+              else:
+                  raise AssertionError("cancelled waiter did not cancel")
+              await tick()
+              assert r._waiters is not None and len(r._waiters) == 1
+              c = asyncio.create_task(r.wait())
+              await tick()
+              assert r._waiters is not None and len(r._waiters) == 2
+              r._settle()
+              await asyncio.gather(b, c)
+              assert r._waiters is None and r.is_done()
+
+              # Many independent waiters all complete exactly once.
+              r = PublishReceipt(mid=4, qos=QoS.AT_LEAST_ONCE)
+              tasks = [asyncio.create_task(r.wait()) for _ in range(32)]
+              await tick()
+              assert r._waiters is not None and len(r._waiters) == 32
+              r._settle()
+              await asyncio.gather(*tasks)
+              assert r._waiters is None
+
+              # Error identity is unchanged.
+              sentinel = RuntimeError("sentinel")
+              r = PublishReceipt(mid=5, qos=QoS.AT_LEAST_ONCE)
+              task = asyncio.create_task(r.wait())
+              await tick()
+              r._error = sentinel
+              r._settle()
+              try:
+                  await task
+              except RuntimeError as exc:
+                  assert exc is sentinel
+              else:
+                  raise AssertionError("receipt error was not propagated")
+
+          asyncio.run(main())
+          PY
+
+      - name: Candidate static and full unit regression guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd candidate && PYTHONPATH=src ruff format --check src/mqttium/api/models.py)
+          (cd candidate && PYTHONPATH=src ruff check src/mqttium/api/models.py)
+          (cd candidate && PYTHONPATH=src python -m pytest -q -W error --strict-config --strict-markers tests/unit)
+
+      - name: Create receipt-wait micro harness
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$JOB_ROOT/receipt_wait_micro.py" <<'PY'
+          import argparse
+          import asyncio
+          import json
+          import statistics
+          import time
+
+          from mqttium.api.models import PublishReceipt
+          from mqttium.enums import QoS
+
+          async def run_pending(count: int) -> float:
+              loop = asyncio.get_running_loop()
+              warmup = min(2000, max(200, count // 10))
+              for _ in range(warmup):
+                  r = PublishReceipt(mid=1, qos=QoS.AT_LEAST_ONCE)
+                  loop.call_soon(r._settle)
+                  await r.wait()
+              start = time.perf_counter_ns()
+              for _ in range(count):
+                  r = PublishReceipt(mid=1, qos=QoS.AT_LEAST_ONCE)
+                  loop.call_soon(r._settle)
+                  await r.wait()
+              return (time.perf_counter_ns() - start) / count
+
+          async def run_settled(count: int) -> float:
+              warmup = min(5000, max(500, count // 10))
+              for _ in range(warmup):
+                  r = PublishReceipt(mid=1, qos=QoS.AT_LEAST_ONCE)
+                  r._settle()
+                  await r.wait()
+              start = time.perf_counter_ns()
+              for _ in range(count):
+                  r = PublishReceipt(mid=1, qos=QoS.AT_LEAST_ONCE)
+                  r._settle()
+                  await r.wait()
+              return (time.perf_counter_ns() - start) / count
+
+          async def main() -> None:
+              p = argparse.ArgumentParser()
+              p.add_argument("--label", required=True)
+              p.add_argument("--scenario", choices=("pending", "settled"), required=True)
+              p.add_argument("--count", type=int, required=True)
+              args = p.parse_args()
+              value = await (run_pending(args.count) if args.scenario == "pending" else run_settled(args.count))
+              print(json.dumps({"label": args.label, "scenario": args.scenario, "ns_per_wait": value}))
+
+          asyncio.run(main())
+          PY
+
+      - name: Receipt micro A/A and A/B, ABBA ordered
+        shell: bash
+        run: |
+          set -euo pipefail
+          : > "$JOB_ROOT/receipt-micro.jsonl"
+          run_one() {
+            local root="$1" label="$2" scenario="$3" count="$4"
+            taskset -c 2 env PYTHONPATH="$root/src" python "$JOB_ROOT/receipt_wait_micro.py" \
+              --label "$label" --scenario "$scenario" --count "$count" >> "$JOB_ROOT/receipt-micro.jsonl"
+          }
+          for scenario in pending settled; do
+            count=20000
+            [ "$scenario" = settled ] && count=100000
+            for cycle in 1 2 3 4 5 6; do
+              # same-code A/A control
+              run_one base aa_a "$scenario" "$count"
+              run_one base aa_b "$scenario" "$count"
+              run_one base aa_b "$scenario" "$count"
+              run_one base aa_a "$scenario" "$count"
+              # A/B candidate experiment
+              run_one base base "$scenario" "$count"
+              run_one candidate candidate "$scenario" "$count"
+              run_one candidate candidate "$scenario" "$count"
+              run_one base base "$scenario" "$count"
+            done
+          done
+          python - <<'PY'
+          import json, pathlib, statistics
+          p = pathlib.Path(__import__('os').environ['JOB_ROOT']) / 'receipt-micro.jsonl'
+          rows = [json.loads(line) for line in p.read_text().splitlines()]
+          out = {}
+          for scenario in ('pending', 'settled'):
+              subset = [r for r in rows if r['scenario'] == scenario]
+              meds = {}
+              for label in ('aa_a','aa_b','base','candidate'):
+                  vals = [r['ns_per_wait'] for r in subset if r['label'] == label]
+                  meds[label] = statistics.median(vals)
+              out[scenario] = {
+                  'medians_ns': meds,
+                  'aa_ratio': meds['aa_b'] / meds['aa_a'],
+                  'candidate_base_ratio': meds['candidate'] / meds['base'],
+              }
+          dest = pathlib.Path(__import__('os').environ['JOB_ROOT']) / 'receipt-micro-summary.json'
+          dest.write_text(json.dumps(out, indent=2) + '\n')
+          print(json.dumps(out, indent=2))
+          PY
+
+      - name: Paired micro A/A control
+        shell: bash
+        run: |
+          set -euo pipefail
+          python harness/benchmarks/paired_regression.py \
+            --base-root base --candidate-root base --repeat 9 \
+            --output "$JOB_ROOT/paired-micro-aa.json"
+
+      - name: Paired micro A/B candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python harness/benchmarks/paired_regression.py \
+            --base-root base --candidate-root candidate --repeat 9 \
+            --output "$JOB_ROOT/paired-micro-ab.json"
+
+      - name: Requalify runner before network measurements
+        shell: bash
+        run: |
+          set -euo pipefail
+          ok=0
+          for attempt in 1 2 3 4 5 6 7 8; do
+            if python harness/benchmarks/runner_probe.py \
+              --output "$JOB_ROOT/runner-preflight-${attempt}.json" \
+              --require-temperature --enforce; then
+              cp "$JOB_ROOT/runner-preflight-${attempt}.json" "$JOB_ROOT/runner.json"
+              ok=1
+              break
+            fi
+            sleep 15
+          done
+          [ "$ok" -eq 1 ] || { echo "runner never became eligible; fail closed" >&2; exit 2; }
+
+      - name: Start isolated Mosquitto pinned to CPU 0
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$JOB_ROOT/mosquitto.conf" <<'EOF'
+          persistence false
+          allow_anonymous true
+          max_inflight_messages 1000
+          max_queued_messages 100000
+          max_queued_bytes 0
+          connection_messages false
+          log_type error
+          listener 11883 127.0.0.1
+          EOF
+          taskset -c 0 mosquitto -c "$JOB_ROOT/mosquitto.conf" > "$JOB_ROOT/mosquitto.log" 2>&1 &
+          echo "$!" > "$JOB_ROOT/mosquitto.pid"
+          for _ in $(seq 1 50); do
+            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            kill -0 "$(cat "$JOB_ROOT/mosquitto.pid")" 2>/dev/null || { cat "$JOB_ROOT/mosquitto.log"; exit 1; }
+            sleep 0.2
+          done
+          cat "$JOB_ROOT/mosquitto.log"
+          exit 1
+
+      - name: Network receipt/callback A/A control
+        shell: bash
+        run: |
+          set -euo pipefail
+          python harness/benchmarks/paired_network.py \
+            --base-root base --candidate-root base \
+            --policy advisory --preflight-report "$JOB_ROOT/runner.json" \
+            --repeat 8 --cpu 2 --windows 1,8,32,64 \
+            --protocols 311,5 --payloads 64 \
+            --completions receipt,callback --count-small 10000 \
+            --output "$JOB_ROOT/network-aa.json" \
+            --summary-output "$JOB_ROOT/network-aa.md"
+
+      - name: Fresh preflight between A/A and A/B
+        shell: bash
+        run: |
+          set -euo pipefail
+          ok=0
+          for attempt in 1 2 3 4 5 6 7 8; do
+            if python harness/benchmarks/runner_probe.py \
+              --output "$JOB_ROOT/runner-ab-${attempt}.json" \
+              --require-temperature --enforce; then
+              cp "$JOB_ROOT/runner-ab-${attempt}.json" "$JOB_ROOT/runner-ab.json"
+              ok=1
+              break
+            fi
+            sleep 15
+          done
+          [ "$ok" -eq 1 ] || { echo "runner not eligible for A/B; fail closed" >&2; exit 2; }
+
+      - name: Network receipt/callback A/B candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python harness/benchmarks/paired_network.py \
+            --base-root base --candidate-root candidate \
+            --policy advisory --preflight-report "$JOB_ROOT/runner-ab.json" \
+            --repeat 8 --cpu 2 --windows 1,8,32,64 \
+            --protocols 311,5 --payloads 64 \
+            --completions receipt,callback --count-small 10000 \
+            --output "$JOB_ROOT/network-ab.json" \
+            --summary-output "$JOB_ROOT/network-ab.md"
+
+      - name: Fixed-rate receipt A/A control
+        shell: bash
+        run: |
+          set -euo pipefail
+          python harness/benchmarks/paired_open_loop.py \
+            --base-root base --candidate-root base \
+            --protocols 311,5 --payloads 64 --windows 64 \
+            --target-rates 2500,5000,10000 --completions receipt \
+            --repeat 8 --count-small 5000 --timeout 120 --cpu 2 \
+            --policy advisory --preflight-report "$JOB_ROOT/runner-ab.json" \
+            --output "$JOB_ROOT/open-loop-aa.json" \
+            --summary-output "$JOB_ROOT/open-loop-aa.md"
+
+      - name: Fixed-rate receipt A/B candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python harness/benchmarks/paired_open_loop.py \
+            --base-root base --candidate-root candidate \
+            --protocols 311,5 --payloads 64 --windows 64 \
+            --target-rates 2500,5000,10000 --completions receipt \
+            --repeat 8 --count-small 5000 --timeout 120 --cpu 2 \
+            --policy advisory --preflight-report "$JOB_ROOT/runner-ab.json" \
+            --output "$JOB_ROOT/open-loop-ab.json" \
+            --summary-output "$JOB_ROOT/open-loop-ab.md"
+
+      - name: Postflight runner eligibility
+        if: always()
+        shell: bash
+        run: |
+          if [ -n "${JOB_ROOT:-}" ] && [ -d "$JOB_ROOT" ]; then
+            python harness/benchmarks/runner_probe.py \
+              --output "$JOB_ROOT/runner-postflight.json" \
+              --require-temperature --enforce || true
+          fi
+
+      - name: Upload all evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: receipt-waiter-arm64-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/receipt-waiter-${{ github.run_id }}-${{ github.run_attempt }}/*.json
+            ${{ runner.temp }}/receipt-waiter-${{ github.run_id }}-${{ github.run_attempt }}/*.jsonl
+            ${{ runner.temp }}/receipt-waiter-${{ github.run_id }}-${{ github.run_attempt }}/*.md
+            ${{ runner.temp }}/receipt-waiter-${{ github.run_id }}-${{ github.run_attempt }}/*.patch
+            ${{ runner.temp }}/receipt-waiter-${{ github.run_id }}-${{ github.run_attempt }}/*.sha256
+            ${{ runner.temp }}/receipt-waiter-${{ github.run_id }}-${{ github.run_attempt }}/mosquitto.log
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Stop isolated broker and clean workspace
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "$JOB_ROOT/mosquitto.pid" ]; then
+            pid="$(cat "$JOB_ROOT/mosquitto.pid")"
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+          fi
+          rm -rf "$JOB_ROOT"
