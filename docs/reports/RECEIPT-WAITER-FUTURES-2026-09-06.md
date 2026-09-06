@@ -534,6 +534,124 @@ It is the next thing to probe, on main alone, before any further arm comparison.
 regression and cannot account for the rest. The batching mediator proposed to explain the
 remainder is disproven by its own control. The mechanism is open.
 
+## Rate-regime diagnosis — the pacer, not the receipt
+
+The matched-load campaigns above matched the *average* offered rate to better than 0.01 %. They
+did not check whether the two arms presented the same arrival process. `paired_open_loop.py`
+paces from inside MQTTium's own event loop, so they need not, and a dense main-only sweep shows
+they do not.
+
+`benchmarks/rate_regime_probe.py` (diagnostic only, no runtime change) records per publication the
+schedule deadline, the moment of admission, the resulting lateness, the real inter-arrival
+interval, whether the pacer was already behind, the ACK latency, and — joined by sequence through
+the subscriber — the delivery latency.
+
+### main alone, 3000 → 6000 msg/s, MQTT 3.1.1, window 32, payload 64, 4 repeats
+
+| rate | d p25 | d p50 | d p75 | d p95 | ack p50 | cpu µs/msg | lag p50 | lag p95 | catch-up | burst p95 | eager/msg | items/batch | enq/msg |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 3000 | 0.136 | 0.229 | 0.249 | 0.270 | 0.534 | 156.1 | 0.454 | 1.079 | 51.7% | 3.0 | 0.483 | 2.99 | 0.854 |
+| 3250 | 0.154 | 0.242 | 0.266 | 0.292 | 0.595 | 139.9 | 0.356 | 1.095 | 60.3% | 4.0 | 0.397 | 3.73 | 0.890 |
+| 3500 | 0.134 | 0.242 | 0.269 | 0.289 | 0.557 | 143.3 | 0.368 | 1.089 | 54.7% | 4.0 | 0.453 | 3.98 | 0.819 |
+| 3750 | 0.134 | 0.181 | 0.268 | 0.292 | 0.630 | 143.4 | 0.223 | 1.081 | 53.7% | 4.5 | 0.463 | 3.10 | 0.773 |
+| 4000 | 0.134 | 0.265 | 0.285 | 0.318 | 0.587 | 139.5 | 0.277 | 1.099 | 53.2% | 5.0 | 0.468 | 4.93 | 0.744 |
+| 4250 | 0.133 | 0.180 | 0.281 | 0.316 | 0.650 | 138.8 | 0.190 | 1.101 | 54.1% | 5.0 | 0.459 | 3.21 | 0.735 |
+| 4500 | 0.132 | 0.153 | 0.297 | 0.342 | 0.632 | 144.5 | 0.144 | 1.103 | 46.8% | 6.0 | 0.532 | 4.62 | 0.632 |
+| 4750 | 0.132 | 0.159 | 0.298 | 0.342 | 0.650 | 142.2 | 0.141 | 1.111 | 49.1% | 6.0 | 0.509 | 3.33 | 0.659 |
+| 5000 | 0.123 | 0.136 | 0.290 | 0.356 | 0.528 | 148.9 | 0.104 | 1.109 | 41.9% | 7.0 | 0.581 | 2.96 | 0.583 |
+| **5250** | 0.109 | 0.121 | 0.149 | 0.272 | 0.393 | 175.4 | 0.039 | **0.596** | **15.8%** | 7.0 | **0.842** | 2.96 | 0.221 |
+| **5500** | 0.107 | 0.111 | 0.131 | 0.141 | 0.356 | 182.2 | 0.026 | **0.103** | **3.6%** | 5.0 | **0.964** | 2.32 | 0.063 |
+| 6000 | 0.089 | 0.107 | 0.110 | 0.149 | 0.461 | 167.6 | 0.092 | 0.111 | 12.4% | 1.0 | 0.876 | 1.14 | 0.243 |
+
+**Transition: between 5000 and 5500 msg/s, complete by 5250.**
+
+The 6000 row is at capacity — cpu/msg 0.168 ms against a 0.167 ms target interval — so its
+per-class split is not usable (the classifier puts 87.6 % of messages in "late" and leaves the
+on-time class with too few samples). Its aggregate figures are fine; its decomposition is not.
+
+### The pacer, not the client
+
+`lag p95` is **1.08–1.11 ms at every rate from 3000 to 5000**, independent of the target interval,
+which ranges 0.333 → 0.200 ms. A lateness floor that does not scale with the interval is the
+signature of the event loop's millisecond timer granularity: a sub-millisecond `asyncio.sleep()`
+overshoots to about 1 ms. `late_fraction > 0` is **100.0 %** at every rate — every publication is
+late.
+
+The arrival process is consequently not paced at all below the frontier. Median real inter-arrival
+is ~0.09 ms where the target is 0.235–0.333 ms, while p95 is ~1.31 ms: the pacer sleeps about
+1.3 ms and then fires a burst. Interval CV is 1.36–1.73. At 5250–5500 the median interval converges
+on the target (0.187 vs 0.190; 0.181 vs 0.182), p95 collapses to 0.19–0.25 ms and CV falls to 1.01.
+
+The mechanism runs through the eager write permit established in
+[#254](https://github.com/yoch/mqttium/pull/254) — one eager write per loop turn:
+
+1. a sub-millisecond sleep overshoots to ~1.1 ms;
+2. the pacer wakes late and admits a burst of catch-up publications inside one loop turn;
+3. only the first frame of that turn takes the eager path; the rest queue;
+4. queued frames wait for the writer task and deliver in ~0.30 ms instead of ~0.133 ms;
+5. `eager/msg` follows exactly: 0.46–0.58 in the bursty regime, **0.964** at 5500.
+
+Above the frontier the per-message CPU cost (~180 µs) approaches the target interval (~185 µs),
+the loop always has work, `epoll` returns promptly, timers become accurate and bursts disappear.
+The fast regime is the *expensive* one: cpu/msg rises 148.9 → 182.2 while latency falls.
+
+### main does not get faster per message
+
+| rate | on-time share | on-time p50 | late share | late p50 | catch-up share | catch-up p50 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 3000 | 10.6% | 0.133 | 37.8% | 0.140 | 51.7% | 0.247 |
+| 4000 | 11.1% | 0.133 | 35.9% | 0.135 | 53.2% | 0.283 |
+| 5000 | 18.8% | 0.112 | 39.7% | 0.132 | 41.9% | 0.302 |
+| 5250 | 55.8% | 0.111 | 28.5% | 0.121 | 15.8% | 0.319 |
+| 5500 | 74.7% | 0.110 | 22.5% | 0.113 | 3.6% | 0.319 |
+
+An on-time message costs 0.133 → 0.110 ms across the whole sweep. What moves is the **share**. The
+delivery histogram agrees: at 3000 msg/s it is multi-modal (28.0 % in 0.125–0.150, 28.2 % in
+0.200–0.250, 23.7 % in 0.250–0.350); at 5500 it is one tight mode with 96.6 % under 0.150 ms.
+
+### Pacer control — main versus candidate B at identical rates
+
+| rate | arm | cpu µs/msg | catch-up | lag p95 | eager/msg | on-time share | deliv p50 | deliv p95 | on-time p50 | catch-up p50 |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 4500 | A | 142.8 | 48.2% | 1.104 | 0.518 | 12.2% | 0.160 | 0.347 | 0.132 | 0.305 |
+| 4500 | B | 129.0 | **55.5%** | 1.100 | **0.445** | 12.2% | 0.270 | 0.351 | **0.132** | **0.303** |
+| 5000 | A | 151.8 | 40.4% | 1.099 | 0.596 | 21.6% | 0.135 | 0.366 | 0.113 | 0.306 |
+| 5000 | B | 127.6 | **57.3%** | 1.115 | **0.427** | 13.9% | 0.171 | 0.382 | 0.130 | **0.302** |
+| 5250 | A | 164.6 | 25.3% | 1.023 | 0.748 | 40.9% | 0.123 | 0.359 | 0.111 | 0.311 |
+| 5250 | B | 136.0 | **45.7%** | 1.115 | **0.543** | 17.7% | 0.143 | 0.377 | **0.111** | 0.320 |
+| 5500 | A | 182.1 | 2.9% | **0.084** | 0.971 | 82.8% | 0.110 | 0.136 | 0.110 | 0.328 |
+| 5500 | B | 158.4 | **24.2%** | **0.906** | **0.759** | 30.6% | 0.124 | 0.356 | **0.110** | 0.313 |
+
+At every rate the candidate spends 10–17 % less CPU per message, and at every rate it shows a
+**higher** catch-up fraction (+7.3 to +21.2 points) and a **lower** eager share (−14 to −28 %).
+
+The decisive column is the last two. **Per class, the two arms are the same speed**: on-time p50 is
+0.132 / 0.132, 0.111 / 0.111, 0.110 / 0.110; catch-up p50 is 0.305 / 0.303, 0.311 / 0.320,
+0.328 / 0.313. The candidate is not slower for any kind of message. Only the mix differs.
+
+The 5500 row is the clearest case: main has crossed into the accurate-timer regime
+(lag p95 0.084 ms, 82.8 % on-time) while the candidate has not (lag p95 0.906 ms, 30.6 % on-time).
+Their aggregate delivery p50 differs by 12.2 % and p95 by 162 % for that reason alone.
+
+### What this establishes, and what it does not
+
+Established: the harness paces from inside the loop under test; which timer regime an arm occupies
+depends on how much wall time it spends in that loop; a cheaper arm occupies it less and therefore
+stays in the bursty regime at rates where main has left it. **Average rate matched, temporal shape
+differs.** The aggregate delivery-p50 gap is explained by class mix, with identical per-class
+latency.
+
+Not established: that an external producer would show no difference at all. That requires a pacing
+source outside the loop under test, which does not exist in this repository. Nothing here proves
+the candidate is free of a smaller real effect underneath the artefact.
+
+**Mechanism classification: `PACER REGIME TRANSITION`.**
+
+The earlier verdict in this report — that the matched-load campaign confirmed a regression — must
+therefore be read with its scope: it matched average offered rate, not offered-load shape, and the
+difference in shape accounts for the observed gap. The measurements are retained unchanged; their
+interpretation is corrected here.
+
 ## Verdict
 
 **Blocked.** At matched absolute load the candidate degrades median end-to-end
@@ -544,8 +662,18 @@ The effect is reproduced across three independent campaigns.
 
 Prototype C shows the wake phase is not the cause: restoring it recovers about a
 fifth of the regression while keeping the CPU saving. The `EffectPump` batching
-shift that looked like the mediator is disproven by a main-only rate sweep. The
-mechanism is unresolved and the investigation continues.
+shift that looked like the mediator is disproven by a main-only rate sweep.
+
+The rate-regime diagnosis then located the mediator outside MQTTium: the
+benchmark paces from inside the event loop under test, sub-millisecond sleeps
+overshoot to ~1.1 ms below ~5250 msg/s, and the resulting catch-up bursts decide
+what share of frames take the one-per-loop-turn eager write path. Per class the
+two arms are the same speed; only the mix differs, and the mix is set by how much
+wall time each arm leaves the loop idle. The blocking evidence is therefore an
+artefact of in-loop pacing rather than a demonstrated user-visible regression —
+but an external-pacer control does not exist in this repository, so the claim is
+not yet closed in the other direction either. The PR stays blocked pending that
+control.
 
 Everything else in this report stands: correctness, the ~59% in-process gain on
 the awaited-receipt path, +6.2 to +6.6% sequential ACK throughput, the −73% ack
