@@ -57,6 +57,22 @@ jobs:
           Path('candidate/tests/unit/test_callback_batch2_inline_head_experiment.py').write_text(tests, encoding='utf-8')
           PY
           python /tmp/apply_candidate.py
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('candidate/src/mqttium/api/_delivery.py')
+          text = path.read_text(encoding='utf-8')
+          start = text.index('    def _dispatch_callback_batch_head_inline(')
+          end = text.index('    def _enqueue_inline_continuation(', start)
+          region = text[start:end]
+          lines = region.splitlines(keepends=True)
+          fixed = lines[0] + ''.join(
+              line if not line.strip() else '    ' + line
+              for line in lines[1:]
+          )
+          text = text[:start] + fixed + text[end:]
+          path.write_text(text, encoding='utf-8')
+          PY
           python -m py_compile candidate/src/mqttium/api/_delivery.py
           git -C candidate diff --check
 
