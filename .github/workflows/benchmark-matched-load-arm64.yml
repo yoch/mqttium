@@ -47,6 +47,7 @@ jobs:
           test "$(uname -m)" = "aarch64" || { echo "expected aarch64, got $(uname -m)"; exit 1; }
           python3 --version
           command -v mosquitto
+          command -v taskset
           mosquitto -h 2>&1 | head -n 3
           if pgrep -a mosquitto; then
             echo "A pre-existing Mosquitto process makes the runner unsafe for this benchmark." >&2
@@ -70,13 +71,17 @@ jobs:
             "gmqtt==$GMQTT_VER" \
             "paho-mqtt==$PAHO_VER"
 
-      - name: Validate matched-load harness
+      - name: Validate matched-load invariants
         shell: bash
         run: |
           set -euo pipefail
           cd bench
           . .venv/bin/activate
-          PYTHONPATH=src python -m unittest tests.test_unit tests.test_rtt_initiator -v
+          PYTHONPATH=src python -m unittest -v \
+            tests.test_unit.CrossClientLoadTests \
+            tests.test_unit.DualProtocolTests.test_fixed_rate_latency_is_absolute_and_dual \
+            tests.test_unit.MetricsTests.test_rtt_capacity_scenario_is_closed_loop \
+            tests.test_rtt_initiator
 
       - name: Calibrate ARM64 host identity and harness cost
         shell: bash
@@ -108,7 +113,13 @@ jobs:
           max_packet_size 16777216
           max_keepalive 120
           EOF
-          mosquitto -c "$RUNNER_TEMP/mosquitto-bench.conf" > "$RUNNER_TEMP/mosquitto-bench.log" 2>&1 &
+          broker_cpuset="$(cd bench && . .venv/bin/activate && PYTHONPATH=src python - <<'PY'
+          from mqtt_client_bench.telemetry import allocate_cpuset
+          print(allocate_cpuset(["sut", "broker", "loadgen", "orch"], profile="standard")["broker"])
+          PY
+          )"
+          echo "Broker cpuset: $broker_cpuset"
+          taskset -c "$broker_cpuset" mosquitto -c "$RUNNER_TEMP/mosquitto-bench.conf" > "$RUNNER_TEMP/mosquitto-bench.log" 2>&1 &
           pid=$!
           echo "BROKER_PID=$pid" >> "$GITHUB_ENV"
           sleep 1
