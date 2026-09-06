@@ -171,15 +171,24 @@ def host_info() -> dict[str, Any]:
     gov_path = cpu_root / "cpu0" / "cpufreq" / "scaling_governor"
     if gov_path.exists():
         governor = gov_path.read_text().strip()
+    # host_info() is imported by the unit suite, which runs on hosts with no
+    # /proc and no broker binary. Every probe here degrades to a label.
     model = "unknown"
-    with open("/proc/cpuinfo", encoding="utf-8") as handle:
-        for line in handle:
-            if line.startswith("model name"):
-                model = line.split(":", 1)[1].strip()
-                break
-    mosq = subprocess.run(["mosquitto", "-h"], capture_output=True, text=True, check=False)
-    mosq_text = (mosq.stdout or mosq.stderr or "").splitlines()
-    mosq_version = mosq_text[0] if mosq_text else "unknown"
+    try:
+        with open("/proc/cpuinfo", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("model name"):
+                    model = line.split(":", 1)[1].strip()
+                    break
+    except OSError:
+        model = "unavailable"
+    try:
+        mosq = subprocess.run(["mosquitto", "-h"], capture_output=True, text=True, check=False)
+    except OSError:
+        mosq_version = "unavailable"
+    else:
+        mosq_text = (mosq.stdout or mosq.stderr or "").splitlines()
+        mosq_version = mosq_text[0] if mosq_text else "unknown"
     return {
         "cpu_model": model,
         "cpus": os.cpu_count(),
