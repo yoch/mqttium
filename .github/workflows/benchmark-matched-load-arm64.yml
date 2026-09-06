@@ -20,21 +20,23 @@ jobs:
     runs-on: [self-hosted, linux, ARM64]
     timeout-minutes: 360
     env:
-      BENCH_SHA: 4b1f964cfa199640e1ce651005faf0046f374e2c
+      BENCH_SHA: 0b7f0e57457461f9de60d5658e8ff9566de269dc
       MATRIX_RUNS: "5"
       MQTTIUM_VER: "1.0.0rc13"
       GMQTT_VER: "0.7.0"
       PAHO_VER: "2.1.0"
     steps:
-      - name: Set run-specific results directory
+      - name: Set run-specific paths
         shell: bash
-        run: echo "RESULTS_DIR=$RUNNER_TEMP/mqtt-client-bench-arm64-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+        run: |
+          echo "RESULTS_DIR=$RUNNER_TEMP/mqtt-client-bench-arm64-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+          echo "BENCH_BROKER=127.0.0.1:11883" >> "$GITHUB_ENV"
 
       - name: Checkout exact benchmark harness
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: yoch/mqtt-python-client-bench
-          ref: 4b1f964cfa199640e1ce651005faf0046f374e2c
+          ref: 0b7f0e57457461f9de60d5658e8ff9566de269dc
           path: bench
           persist-credentials: false
 
@@ -44,8 +46,12 @@ jobs:
           set -euo pipefail
           test "$(uname -m)" = "aarch64" || { echo "expected aarch64, got $(uname -m)"; exit 1; }
           python3 --version
-          docker --version
-          docker compose version
+          command -v mosquitto
+          mosquitto -h 2>&1 | head -n 3
+          if pgrep -a mosquitto; then
+            echo "A pre-existing Mosquitto process makes the runner unsafe for this benchmark." >&2
+            exit 1
+          fi
           cd bench
           test "$(git rev-parse HEAD)" = "$BENCH_SHA"
           git status --short
@@ -72,7 +78,7 @@ jobs:
           . .venv/bin/activate
           PYTHONPATH=src python -m unittest tests.test_unit tests.test_rtt_initiator -v
 
-      - name: Calibrate ARM64 host profile
+      - name: Calibrate ARM64 host identity and harness cost
         shell: bash
         run: |
           set -euo pipefail
@@ -81,23 +87,48 @@ jobs:
           PYTHONPATH=src python -m mqtt_client_bench.run calibrate-host \
             --profile standard \
             --role runner \
-            --budget-seconds 300
+            --skip-ceilings
 
-      - name: Run strict three-way interleaved campaign
+      - name: Start isolated native Mosquitto
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/mosquitto-bench.conf" <<'EOF'
+          listener 11883 127.0.0.1
+          protocol mqtt
+          set_tcp_nodelay true
+          allow_anonymous true
+          persistence false
+          connection_messages false
+          log_dest stdout
+          log_type error
+          sys_interval 1
+          max_inflight_messages 1000
+          max_queued_messages 10000
+          max_packet_size 16777216
+          max_keepalive 120
+          EOF
+          mosquitto -c "$RUNNER_TEMP/mosquitto-bench.conf" > "$RUNNER_TEMP/mosquitto-bench.log" 2>&1 &
+          pid=$!
+          echo "BROKER_PID=$pid" >> "$GITHUB_ENV"
+          sleep 1
+          kill -0 "$pid"
+          cat "$RUNNER_TEMP/mosquitto-bench.log"
+
+      - name: Run strict three-way matched-load RTT campaign
         shell: bash
         run: |
           set -euo pipefail
           cd bench
           bash scripts/run_mqttium_gmqtt_paho_arm64.sh
 
-      - name: Stop managed broker
+      - name: Stop native broker
         if: always()
         shell: bash
         run: |
-          if [ -x bench/.venv/bin/python ]; then
-            cd bench
-            . .venv/bin/activate
-            PYTHONPATH=src python -m mqtt_client_bench.run broker down || true
+          if [ -n "${BROKER_PID:-}" ]; then
+            kill "$BROKER_PID" 2>/dev/null || true
+            wait "$BROKER_PID" 2>/dev/null || true
           fi
 
       - name: Upload benchmark evidence
@@ -108,5 +139,7 @@ jobs:
           path: |
             ${{ env.RESULTS_DIR }}
             bench/hosts/*.json
+            ${{ runner.temp }}/mosquitto-bench.conf
+            ${{ runner.temp }}/mosquitto-bench.log
           if-no-files-found: warn
           retention-days: 14
