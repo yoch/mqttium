@@ -21,12 +21,15 @@ jobs:
     timeout-minutes: 360
     env:
       BENCH_SHA: 4b1f964cfa199640e1ce651005faf0046f374e2c
-      RESULTS_DIR: ${{ runner.temp }}/mqtt-client-bench-arm64
       MATRIX_RUNS: "5"
       MQTTIUM_VER: "1.0.0rc13"
       GMQTT_VER: "0.7.0"
       PAHO_VER: "2.1.0"
     steps:
+      - name: Set run-specific results directory
+        shell: bash
+        run: echo "RESULTS_DIR=$RUNNER_TEMP/mqtt-client-bench-arm64-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+
       - name: Checkout exact benchmark harness
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -103,7 +106,7 @@ jobs:
         with:
           name: mqttium-gmqtt-paho-arm64-${{ github.run_id }}
           path: |
-            ${{ runner.temp }}/mqtt-client-bench-arm64
+            ${{ env.RESULTS_DIR }}
             bench/hosts/*.json
           if-no-files-found: warn
           retention-days: 14
