@@ -1,0 +1,72 @@
+name: Callback Batch2 Inline Head x86 Check
+
+on:
+  push:
+    branches: [perf/callback-batch2-inline-head-x86-check]
+
+permissions:
+  contents: read
+
+jobs:
+  semantics:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out exact baseline
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 4fe90af36660bce06c12e9a8c57cb9a6223abe5a
+          path: candidate
+          persist-credentials: false
+
+      - name: Check out exact experiment source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 79b5e48b32900f8e12bc2c6854acc089d820fbe6
+          path: source
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: candidate/pyproject.toml
+
+      - name: Materialize exact candidate and semantic guards
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          import textwrap
+
+          workflow = Path('source/.github/workflows/arm64-callback-batch2-inline-head-experiment.yml').read_text(encoding='utf-8')
+
+          apply_anchor = workflow.index('      - name: Apply batch2 inline-head candidate')
+          apply_start_marker = "          python - <<'PY'\n"
+          apply_start = workflow.index(apply_start_marker, apply_anchor) + len(apply_start_marker)
+          apply_end = workflow.index("\n          PY\n", apply_start)
+          apply_script = textwrap.dedent(workflow[apply_start:apply_end])
+          Path('/tmp/apply_candidate.py').write_text(apply_script, encoding='utf-8')
+
+          test_anchor = workflow.index('      - name: Add experiment-only semantic guards')
+          test_start_marker = "          cat > candidate/tests/unit/test_callback_batch2_inline_head_experiment.py <<'PY'\n"
+          test_start = workflow.index(test_start_marker, test_anchor) + len(test_start_marker)
+          test_end = workflow.index("\n          PY\n", test_start)
+          tests = textwrap.dedent(workflow[test_start:test_end])
+          Path('candidate/tests/unit/test_callback_batch2_inline_head_experiment.py').write_text(tests, encoding='utf-8')
+          PY
+          python /tmp/apply_candidate.py
+          python -m py_compile candidate/src/mqttium/api/_delivery.py
+          git -C candidate diff --check
+
+      - name: Run focused correctness set
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install -e 'candidate[dev]'
+          PYTHONPATH=candidate/src python -m pytest -q -W error \
+            candidate/tests/unit/test_callback_batch2_inline_head_experiment.py \
+            candidate/tests/unit/test_callback_message_batches.py \
+            candidate/tests/unit/test_topic_callback_dispatch_contract.py \
+            candidate/tests/unit/test_compat_callback_publish.py
