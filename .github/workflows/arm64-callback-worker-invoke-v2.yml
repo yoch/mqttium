@@ -1,0 +1,144 @@
+name: ARM64 Callback Worker Invoke V2
+
+on:
+  push:
+    branches: [bench/callback-worker-invoke-arm64-exp-v2]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mqttium-arm64-runner
+  cancel-in-progress: false
+
+jobs:
+  experiment:
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 40
+    env:
+      BASE_SHA: 4fe90af36660bce06c12e9a8c57cb9a6223abe5a
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with: {ref: "${{ env.BASE_SHA }}", path: base, persist-credentials: false}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with: {ref: "${{ env.BASE_SHA }}", path: candidate, persist-credentials: false}
+      - name: Environment and preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/callback-v2-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"; echo "JOB_ROOT=$root" >> "$GITHUB_ENV"
+          rm -rf "$root" && mkdir -p "$root" && python3 -m venv "$root/venv" && echo "$root/venv/bin" >> "$GITHUB_PATH"
+          "$root/venv/bin/python" -m pip install -e 'candidate[dev]' 'psutil>=6,<8'
+          "$root/venv/bin/python" base/benchmarks/runner_probe.py --output "$root/runner.json" --require-temperature --enforce
+      - name: Apply worker-only candidate
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('candidate/src/mqttium/api/_delivery.py'); s=p.read_text()
+          a='                                await self.invoke(callback, message)\n'
+          b='                                result = callback(message)\n                                if isinstance(result, Awaitable):\n                                    await result\n'
+          c='                        await self.invoke(callback, *args)\n'
+          d='                        result = callback(*args)\n                        if isinstance(result, Awaitable):\n                            await result\n'
+          assert s.count(a)==1 and s.count(c)==1
+          p.write_text(s.replace(a,b).replace(c,d))
+          PY
+          python -m py_compile candidate/src/mqttium/api/_delivery.py
+          python -m ruff format --check candidate/src/mqttium/api/_delivery.py
+          python -m ruff check candidate/src/mqttium/api/_delivery.py
+          git -C candidate diff --check
+      - name: Targeted callback tests
+        shell: bash
+        run: |
+          files=$(find candidate/tests/unit -maxdepth 1 -type f \( -name '*callback*' -o -name '*delivery*' \) -print)
+          if [ -n "$files" ]; then PYTHONPATH=candidate/src python -m pytest -q $files; fi
+      - name: Write stable paired benchmark
+        shell: bash
+        run: |
+          cat > "$JOB_ROOT/bench.py" <<'PY'
+          import argparse, asyncio, json, os, statistics, subprocess, sys, time
+          from pathlib import Path
+          def cv(v):
+              m=statistics.fmean(v); return statistics.stdev(v)/m if len(v)>1 and m else 0.0
+          async def measure(cell,n):
+              from mqttium.api._delivery import ApplicationDelivery
+              from mqttium.enums import MQTTProtocolVersion
+              from mqttium.types import Message
+              d=ApplicationDelivery(mode='callback',protocol=MQTTProtocolVersion.MQTTv311,max_pending_messages=64,max_pending_callbacks=max(n+8,256),max_pending_delivery_bytes=None,maximum_packet_size=4096,delivery_timeout=2,callback_shutdown_timeout=2)
+              msg=Message(topic='bench',payload=b'x'); count=0
+              if cell=='coalesced_sync':
+                  def cb(_):
+                      nonlocal count; count+=1
+                  batch=16; rounds=n//batch; n=rounds*batch; messages=[msg]*batch
+                  t=time.perf_counter()
+                  for _ in range(rounds):
+                      assert d.deliver_callback_messages_inline(messages,cb)
+                      await d.callback_queue.join()
+                  elapsed=time.perf_counter()-t
+              elif cell=='single_async':
+                  async def cb(_):
+                      nonlocal count; count+=1
+                  for _ in range(n): d.callback_queue.put_nowait((cb,(msg,),None))
+                  t=time.perf_counter(); d.ensure_callback_worker(); await d.callback_queue.join(); elapsed=time.perf_counter()-t
+              elif cell=='inline_sync':
+                  def cb(_):
+                      nonlocal count; count+=1
+                  t=time.perf_counter()
+                  for _ in range(n): d.dispatch_callback_inline(cb,msg)
+                  elapsed=time.perf_counter()-t
+              else: raise SystemExit(cell)
+              assert count==n,(cell,count,n); await d.shutdown_callbacks(drain=True); return n/elapsed
+          def worker(cell,n,cpu):
+              if hasattr(os,'sched_setaffinity'): os.sched_setaffinity(0,{cpu})
+              print(json.dumps({'ops':asyncio.run(measure(cell,n))}))
+          def one(script,root,cell,n,cpu):
+              env=os.environ.copy(); env['PYTHONPATH']=str(root/'src')
+              p=subprocess.run([sys.executable,str(script),'--worker','--cell',cell,'--n',str(n),'--cpu',str(cpu)],env=env,check=True,capture_output=True,text=True)
+              return float(json.loads(p.stdout.splitlines()[-1])['ops'])
+          def parent(a):
+              roots={'base':a.base.resolve(),'candidate':a.candidate.resolve()}; script=Path(__file__).resolve(); cells={'coalesced_sync':64000,'single_async':50000,'inline_sync':200000}; out={}
+              for cell,n in cells.items():
+                  ratios=[]; bs=[]; cs=[]
+                  for i in range(a.repeat):
+                      order=('base','candidate') if i%2==0 else ('candidate','base'); m={v:one(script,roots[v],cell,n,a.cpu) for v in order}; ratios.append(m['candidate']/m['base']); bs.append(m['base']); cs.append(m['candidate'])
+                  out[cell]={'ratio':statistics.median(ratios),'min':min(ratios),'max':max(ratios),'base_cv':cv(bs),'candidate_cv':cv(cs)}; x=out[cell]; print(f"{cell}: {x['ratio']:.5f} CV={x['base_cv']:.2%}/{x['candidate_cv']:.2%} range=[{x['min']:.5f},{x['max']:.5f}]")
+              Path(a.output).write_text(json.dumps(out,indent=2)+'\n')
+          ap=argparse.ArgumentParser(); ap.add_argument('--worker',action='store_true'); ap.add_argument('--cell'); ap.add_argument('--n',type=int,default=1); ap.add_argument('--cpu',type=int,default=2); ap.add_argument('--base',type=Path); ap.add_argument('--candidate',type=Path); ap.add_argument('--repeat',type=int,default=21); ap.add_argument('--output',default='/tmp/x.json'); a=ap.parse_args(); worker(a.cell,a.n,a.cpu) if a.worker else parent(a)
+          PY
+      - name: A/A
+        shell: bash
+        run: |
+          python "$JOB_ROOT/bench.py" --base base --candidate base --repeat 21 --cpu 2 --output "$JOB_ROOT/aa.json" | tee "$JOB_ROOT/aa.txt"
+          python - <<'PY'
+          import json,os
+          d=json.load(open(os.environ['JOB_ROOT']+'/aa.json'))
+          for n,c in d.items():
+              if abs(c['ratio']-1)>0.015 or c['base_cv']>0.025 or c['candidate_cv']>0.025: raise SystemExit(f'A/A invalid {n}: {c}')
+          PY
+      - name: A/B
+        shell: bash
+        run: |
+          python "$JOB_ROOT/bench.py" --base base --candidate candidate --repeat 21 --cpu 2 --output "$JOB_ROOT/ab.json" | tee "$JOB_ROOT/ab.txt"
+      - name: Decision
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json,os
+          d=json.load(open(os.environ['JOB_ROOT']+'/ab.json')); b=d['coalesced_sync']['ratio']; a=d['single_async']['ratio']; i=d['inline_sync']['ratio']
+          print(f'coalesced_sync={b:.5f} async={a:.5f} inline={i:.5f}')
+          if b < 1.01: print('DECISION: REJECT — coalesced worker gain below 1%')
+          elif a < 0.99 or i < 0.99: print('DECISION: REJECT — negative control regression')
+          else: print('DECISION: KEEP — source-shaped validation justified')
+          PY
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: callback-worker-v2-${{ github.run_id }}
+          path: ${{ env.JOB_ROOT }}/*
+          retention-days: 14
+      - name: Cleanup
+        if: always()
+        run: rm -rf "$JOB_ROOT"
