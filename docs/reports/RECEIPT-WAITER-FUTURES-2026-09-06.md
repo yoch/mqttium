@@ -642,8 +642,9 @@ differs.** The aggregate delivery-p50 gap is explained by class mix, with identi
 latency.
 
 Not established: that an external producer would show no difference at all. That requires a pacing
-source outside the loop under test, which does not exist in this repository. Nothing here proves
-the candidate is free of a smaller real effect underneath the artefact.
+source outside the loop under test, which did not exist when the rate-regime diagnosis was written.
+Nothing in that diagnosis proved the candidate free of a smaller real effect underneath the
+artefact. The control is the next section.
 
 **Mechanism classification: `PACER REGIME TRANSITION`.**
 
@@ -652,36 +653,154 @@ therefore be read with its scope: it matched average offered rate, not offered-l
 difference in shape accounts for the observed gap. The measurements are retained unchanged; their
 interpretation is corrected here.
 
+## External-pacer control
+
+Question: when A (`main@4560e44`) and B (runtime of `5f2dd2d`, unchanged) receive the same
+temporal process from a clock **outside** MQTTium's event loop, does the candidate still show a
+user-visible latency regression?
+
+`benchmarks/external_pacer.py` is that clock. A dedicated process sleeps until
+`start + sequence * interval − 150 µs` then spins to the absolute deadline, and emits a 24-byte
+token `(seq, deadline_ns, emit_ns)` over a Unix datagram socketpair. The publisher loop never
+calls `asyncio.sleep` to pace. The same pacer binary, margin, CPUs and broker are used for every
+arm. Runtime `src/` is byte-identical to `5f2dd2d`.
+
+This control was **not** run on the original i7-3770. It ran on the Cloud Agent host that executed
+this section. Absolute milliseconds are therefore not comparable to the tables above; the
+causal question is. The in-loop 1.1 ms timer artefact **does** reproduce here, so the host is a
+valid place to ask whether that artefact was the blocker.
+
+### Host
+
+| | |
+| --- | --- |
+| CPU | `Intel(R) Xeon(R) Processor` (KVM), 4 vCPU, 1 thread/core, no SMT siblings |
+| Governor | unavailable (`cpu0/cpufreq/scaling_governor` absent) |
+| Python | 3.12.3 |
+| Mosquitto | 2.1.2, fresh instance, `127.0.0.1:22883`, `allow_anonymous`, no persistence |
+| Affinity | harness + `mosquitto_sub`: CPU 0; broker: CPU 1; publisher: CPU 2; pacer: CPU 3 |
+| Transport | `socket.socketpair(AF_UNIX, SOCK_DGRAM)` after a 8000-token micro against stream pair and filesystem `AF_UNIX` datagram |
+| Safety margin | 150 µs for every arm (calibrated once: 50 µs overshoots, 100–150 µs give lateness p95 ≈ 0.2 µs) |
+
+`time.sleep(200 µs)` p50/p95 = 257 / 258 µs. `asyncio.sleep(200 µs)` p50/p95/p99 = **1084 / 1200 / 1273 µs**.
+The millisecond loop timer exists on this host too.
+
+### Pacer qualification (no MQTT)
+
+4.0 s at each rate, lightweight receiver, same affinity as the MQTT campaign.
+
+| rate | target µs | emission p50/p95/p99 | receiver p50/p95/p99 | late p95 µs | transport p95 µs | burst % |
+| ---: | --------: | -------------------: | -------------------: | ----------: | ---------------: | ------: |
+| 4500 | 222.2 | 222.22 / 222.26 / 222.27 | 222.20 / 223.18 / 344.90 | 0.19 | 13.02 | 0.07 |
+| 5000 | 200.0 | 200.00 / 200.04 / 200.05 | 200.00 / 200.51 / 201.11 | 0.20 | 6.19 | 0.00 |
+| 5250 | 190.5 | 190.48 / 190.52 / 190.53 | 190.47 / 191.14 / 191.63 | 0.20 | 6.24 | 0.00 |
+| 5500 | 181.8 | 181.82 / 181.87 / 182.04 | 181.81 / 182.73 / 184.48 | 0.30 | 7.19 | 0.00 |
+
+Emission jitter is three orders of magnitude below the 1.1 ms `asyncio.sleep` floor. Receiver p99
+at 4500 (345 µs) is still well under a millisecond and is a single-run tail, not a catch-up burst.
+The source is accepted.
+
+### A/A noise floor
+
+MQTT 3.1.1, QoS 1, receipt completion, window 32, payload 64, 4.0 s samples, 5 A/A pairs per rate.
+Completion ratio 1.0000 and zero lost tokens on every sample.
+
+| rate | pair Δ ack p50 | pair Δ delivery p50 | pair Δ cpu/msg |
+| ---: | --- | --- | --- |
+| 4500 | −0.10 % (−0.65 .. +0.48) | +0.28 % (−1.24 .. +3.67) | +0.11 % (−1.49 .. +2.95) |
+| 5000 | +0.14 % (−0.39 .. +0.31) | +0.02 % (−0.78 .. +0.63) | +0.44 % (−0.49 .. +0.90) |
+| 5250 | −0.12 % (−0.25 .. +1.50) | +0.64 % (−0.49 .. +18.25) | −0.08 % (−1.27 .. +3.30) |
+| 5500 | −0.13 % (−0.55 .. −0.01) | −0.37 % (−1.52 .. −0.28) | +0.90 % (−1.68 .. +0.96) |
+
+5000 msg/s — the cell that blocked the PR — is stable to well under 1 % on delivery p50. 5250 has
+one host step (0.038 → 0.045 ms) that lands on both copies of A; it is not a code delta. Delivery
+p99 is not a usable metric on this host (A/A at 5000 spans 0.049–0.094 ms).
+
+Eager share under the external pacer is **0.996** on every A/A cell. The in-loop pacer at these
+rates produced 0.43–0.60. Independent stimulus puts both arms on the eager path.
+
+### A/B, interleaved ABBA × 2
+
+Same pacer, same CPUs, same broker, same rates. A is `PYTHONPATH=/tmp/mqttium-main-4560e44/src`.
+B is `PYTHONPATH` of this tree. Medians of four samples per arm.
+
+| rate | arm | CPU µs/msg | ACK p50/p95/p99 | delivery p50/p95/p99 | eager/msg | token→publish p50/p95 µs |
+| ---: | --- | ---------: | --------------: | -------------------: | --------: | -----------------------: |
+| 4500 | A | 116.5 | 0.313 / 0.328 / 0.366 | 0.060 / 0.067 / 0.239 | 0.996 | 0.69 / 0.77 |
+| 4500 | B | 111.0 | 0.308 / 0.318 / 0.349 | 0.060 / 0.065 / 0.245 | 0.996 | 0.68 / 0.74 |
+| 5000 | A | 114.2 | 0.289 / 0.302 / 0.336 | 0.046 / 0.049 / 0.061 | 0.996 | 0.68 / 0.76 |
+| 5000 | B | 107.1 | 0.284 / 0.291 / 0.330 | 0.045 / 0.050 / 0.077 | 0.996 | 0.69 / 0.75 |
+| 5250 | A | 110.2 | 0.279 / 0.291 / 0.327 | 0.045 / 0.050 / 0.060 | 0.996 | 0.69 / 0.77 |
+| 5250 | B | 108.4 | 0.275 / 0.286 / 0.320 | 0.045 / 0.049 / 0.061 | 0.995 | 0.68 / 0.76 |
+| 5500 | A | 111.4 | 0.271 / 0.283 / 0.325 | 0.046 / 0.049 / 0.058 | 0.996 | 0.68 / 0.76 |
+| 5500 | B | 106.4 | 0.266 / 0.278 / 0.318 | 0.046 / 0.052 / 0.065 | 0.996 | 0.67 / 0.74 |
+
+A/B ratio, (B − A) / A:
+
+| rate | CPU Δ | ACK p50 Δ | ACK p95 Δ | ACK p99 Δ | delivery p50 Δ | p95 Δ | p99 Δ | eager Δ |
+| ---: | ----: | --------: | --------: | --------: | -------------: | ----: | ----: | ------: |
+| 4500 | −4.7 % | −1.6 % | −3.2 % | −4.7 % | −0.3 % | −2.7 % | +2.7 % | +0.0 % |
+| 5000 | −6.2 % | −1.7 % | −3.6 % | −1.8 % | −0.5 % | +1.4 % | +24.8 % | −0.0 % |
+| 5250 | −1.6 % | −1.3 % | −1.6 % | −1.9 % | +0.0 % | −1.8 % | +1.2 % | −0.1 % |
+| 5500 | −4.4 % | −1.9 % | −1.7 % | −2.1 % | −0.2 % | +4.7 % | +11.5 % | −0.0 % |
+
+Delivery p50 at 5000 is −0.5 % against an A/A pair band of ±0.8 %. The in-loop campaign's
+**+25–33 %** on this cell is gone. ACK p50/p95/p99 are slightly better on B at every rate.
+Eager share is identical. The +24.8 % delivery p99 at 5000 is one B sample at 0.164 ms; the other
+three B samples are 0.092 / 0.061 / 0.053, inside the A/A p99 span 0.049–0.094. It is not a
+stable residual.
+
+### Temporal equivalence
+
+Pacer emission p50 is exact on both arms (222.222 / 200.000 / 190.476 / 181.818 µs). Receiver
+inter-arrival p50 differs by at most 0.003 µs. Token→publish p50 is 0.67–0.69 µs on both arms;
+p95 0.74–0.77 µs. Transport p50 is 22–25 µs, pacer-dominated, not client-dominated. Catch-up
+fraction is 0.01–0.04 %. Lost tokens: 0. Completion ratio: 1.0000. Sequence integrity: ok.
+
+The two arms received the same arrival process. The remaining latency gap is inside A/A noise.
+
+### CPU, counted separately
+
+Publisher `process_time` only. Pacer CPU is a dedicated spinning core (~1.9–2.3 s per 4 s sample)
+and is **not** in `publisher cpu/msg`. Broker CPU from `/proc/<pid>/stat` is ~0.24–0.27 s on both
+arms. B's publisher CPU saving survives (about −5 to −6 % at 4500/5000/5500, −1.6 % at 5250) and
+is not a short-run artefact: completion is full.
+
+The in-loop campaigns reported −10 to −17 % because they also counted time the loop spent
+sleeping in the pacer. An independent clock shrinks that gap; it does not remove it.
+
+### What this does not yet cover
+
+MQTT 5, windows 8 and 64, and a repeat on the original i7-3770 were not part of this control.
+Those are a small confidence set, not a new investigation: the 3.1.1 / w32 matrix at the four
+rates that defined the blocker is enough to classify the in-loop signal.
+
+**Outcome: `IN-LOOP PACING ARTEFACT CONFIRMED`.** The previous 5000 msg/s adverse delivery-p50
+reading measured a coupled pacer/runtime system. Under a temporally independent load it is not a
+demonstrated runtime regression.
+
 ## Verdict
 
-**Blocked.** At matched absolute load the candidate degrades median end-to-end
-delivery latency by 25–33% at 5000 msg/s, on both protocols and at every window
-tested, against an A/A band of ±2.1%, with completion ratio 1.0000 and offered
-load matched to better than 0.01%. Publisher ACK p50 degrades on the same cells.
-The effect is reproduced across three independent campaigns.
+The matched-load campaigns remain in this report as closed-loop and fixed-average-rate
+observations. They showed a real 25–33 % delivery-p50 gap at 5000 msg/s when the pacer lived in
+MQTTium's event loop. The rate-regime diagnosis showed that gap was a class-mix effect driven by
+`asyncio.sleep` overshooting to ~1.1 ms.
 
-Prototype C shows the wake phase is not the cause: restoring it recovers about a
-fifth of the regression while keeping the CPU saving. The `EffectPump` batching
-shift that looked like the mediator is disproven by a main-only rate sweep.
+The external-pacer control then gave A and B the same arrival process. On the Cloud Agent host,
+MQTT 3.1.1 QoS 1 window 32 payload 64 at 4500/5000/5250/5500:
 
-The rate-regime diagnosis then located the mediator outside MQTTium: the
-benchmark paces from inside the event loop under test, sub-millisecond sleeps
-overshoot to ~1.1 ms below ~5250 msg/s, and the resulting catch-up bursts decide
-what share of frames take the one-per-loop-turn eager write path. Per class the
-two arms are the same speed; only the mix differs, and the mix is set by how much
-wall time each arm leaves the loop idle. The blocking evidence is therefore an
-artefact of in-loop pacing rather than a demonstrated user-visible regression —
-but an external-pacer control does not exist in this repository, so the claim is
-not yet closed in the other direction either. The PR stays blocked pending that
-control.
+- delivery p50/p95 sit inside the A/A noise floor (5000 p50 **−0.5 %** vs an in-loop **+25–33 %**);
+- ACK latency is neutral to slightly better;
+- eager/msg is 0.996 on both arms;
+- publisher CPU remains lower on B (−4 to −6 % at three of four rates);
+- pacer, transport and token→publish distributions match.
 
-Everything else in this report stands: correctness, the ~59% in-process gain on
-the awaited-receipt path, +6.2 to +6.6% sequential ACK throughput, the −73% ack
-p50 at 2500 msg/s, a real 15–19% CPU saving at 5000 msg/s, strictly lower memory
-with no retained waiter futures, and neutrality on QoS 0, QoS 1 never-awaited,
-QoS 2, callback completion, persistence and writer paths.
+**`IN-LOOP PACING ARTEFACT CONFIRMED`.** Do not merge until the original i7-3770 repeats this
+control and a small MQTT 5 / window confidence set lands. Nothing here authorises a runtime
+change; the candidate is still the `5f2dd2d` waiter implementation.
 
-The change buys aggregate CPU at the cost of median latency once the completion
-rate is high enough for deferral to bind. That trade is not obviously wrong, but
-it is a user-visible behaviour change on a path the change did not intend to
-touch, and it is not what the pull request currently claims.
+Everything else in this report stands: correctness, the ~59 % in-process gain on the
+awaited-receipt path, +6.2 to +6.6 % sequential ACK throughput, the −73 % ack p50 at 2500 msg/s
+under in-loop pacing, a real CPU saving, strictly lower memory with no retained waiter futures,
+and neutrality on QoS 0, QoS 1 never-awaited, QoS 2, callback completion, persistence and writer
+paths.
