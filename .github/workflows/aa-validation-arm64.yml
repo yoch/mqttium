@@ -19,7 +19,7 @@ jobs:
     runs-on: [self-hosted, linux, ARM64]
     timeout-minutes: 240
     env:
-      BENCH_SHA: 8732eddd5e072e24996ba0a3ae37338cb2ddc6fb
+      BENCH_SHA: 018cfc99159d4e740668d1a15434697b5914f32e
       MQTTIUM_VER: "1.0.0rc13"
       GMQTT_VER: "0.7.0"
       PAHO_VER: "2.1.0"
@@ -44,7 +44,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: yoch/mqtt-python-client-bench
-          ref: 8732eddd5e072e24996ba0a3ae37338cb2ddc6fb
+          ref: 018cfc99159d4e740668d1a15434697b5914f32e
           path: bench
           persist-credentials: false
 
@@ -97,6 +97,7 @@ jobs:
             tests.test_unit.RttResponderValidityTests \
             tests.test_unit.AbbaCounterbalanceTests \
             tests.test_unit.AaControlGateTests \
+            tests.test_unit.OfficialPairwisePolicyTests \
             tests.test_rtt_initiator
 
       - name: Calibrate ARM64 host identity
