@@ -1,4 +1,4 @@
-name: RC13 three-way benchmark ARM64
+name: Pairwise native RTT benchmark ARM64
 
 on:
   push:
@@ -6,6 +6,12 @@ on:
     paths:
       - .github/workflows/benchmark-matched-load-arm64.yml
   workflow_dispatch:
+    inputs:
+      profile:
+        description: smoke is non_comparable path proof; standard is the official campaign
+        type: choice
+        options: [smoke, standard]
+        default: smoke
 
 permissions:
   contents: read
@@ -16,27 +22,37 @@ concurrency:
 
 jobs:
   benchmark:
-    name: mqttium vs gmqtt vs Paho
+    name: pairwise native RTT
     runs-on: [self-hosted, linux, ARM64]
-    timeout-minutes: 360
+    timeout-minutes: 480
     env:
-      BENCH_SHA: 0b7f0e57457461f9de60d5658e8ff9566de269dc
-      MATRIX_RUNS: "5"
+      BENCH_SHA: 23855e959fd1a4d3ba0a2de4ee5f739e80f2b38f
       MQTTIUM_VER: "1.0.0rc13"
       GMQTT_VER: "0.7.0"
       PAHO_VER: "2.1.0"
+      MATRIX_RUNS: "5"
+      PROFILE: ${{ github.event.inputs.profile || 'smoke' }}
     steps:
       - name: Set run-specific paths
         shell: bash
         run: |
           echo "RESULTS_DIR=$RUNNER_TEMP/mqtt-client-bench-arm64-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
           echo "BENCH_BROKER=127.0.0.1:11883" >> "$GITHUB_ENV"
+          if [ "$PROFILE" = "smoke" ]; then
+            echo "MATRIX_RUNS=1" >> "$GITHUB_ENV"
+            echo "RUN_ABBA=1" >> "$GITHUB_ENV"
+            echo "RUN_AA=1" >> "$GITHUB_ENV"
+            echo "ABBA_BLOCKS=1" >> "$GITHUB_ENV"
+            echo "AA_BLOCKS=1" >> "$GITHUB_ENV"
+            echo "ABBA_VARIANT_INDEXES=0,1" >> "$GITHUB_ENV"
+            echo "AA_VARIANT_INDEX=0" >> "$GITHUB_ENV"
+          fi
 
       - name: Checkout exact benchmark harness
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: yoch/mqtt-python-client-bench
-          ref: 0b7f0e57457461f9de60d5658e8ff9566de269dc
+          ref: 23855e959fd1a4d3ba0a2de4ee5f739e80f2b38f
           path: bench
           persist-credentials: false
 
@@ -49,6 +65,12 @@ jobs:
           command -v mosquitto
           command -v taskset
           mosquitto -h 2>&1 | head -n 3
+          gov="$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || true)"
+          echo "governor=$gov"
+          if [ "$PROFILE" = "standard" ] && [ "$gov" != "performance" ]; then
+            echo "standard campaign requires scaling_governor=performance, got ${gov:-missing}" >&2
+            exit 1
+          fi
           if pgrep -a mosquitto; then
             echo "A pre-existing Mosquitto process makes the runner unsafe for this benchmark." >&2
             exit 1
@@ -70,8 +92,14 @@ jobs:
             "mqttium==$MQTTIUM_VER" \
             "gmqtt==$GMQTT_VER" \
             "paho-mqtt==$PAHO_VER"
+          python - <<'PY'
+          from importlib.metadata import version
+          assert version("mqttium") == "1.0.0rc13", version("mqttium")
+          assert version("gmqtt") == "0.7.0", version("gmqtt")
+          assert version("paho-mqtt") == "2.1.0", version("paho-mqtt")
+          PY
 
-      - name: Validate matched-load invariants
+      - name: Validate pairwise latency invariants
         shell: bash
         run: |
           set -euo pipefail
@@ -79,8 +107,13 @@ jobs:
           . .venv/bin/activate
           PYTHONPATH=src python -m unittest -v \
             tests.test_unit.CrossClientLoadTests \
-            tests.test_unit.DualProtocolTests.test_fixed_rate_latency_is_absolute_and_dual \
-            tests.test_unit.MetricsTests.test_rtt_capacity_scenario_is_closed_loop \
+            tests.test_unit.NativeRttDriveTests \
+            tests.test_unit.PairwiseCapacityGateTests \
+            tests.test_unit.ExternalBrokerTelemetryTests \
+            tests.test_unit.RttResponderValidityTests \
+            tests.test_unit.MetricsTests.test_application_rtt_compare_uses_latency_p50_lower_is_better \
+            tests.test_unit.MetricsTests.test_throughput_compare_still_uses_msgs_per_s \
+            tests.test_unit.CliDefaultsTests.test_compare_cli_accepts_external_broker \
             tests.test_rtt_initiator
 
       - name: Calibrate ARM64 host identity and harness cost
@@ -122,16 +155,19 @@ jobs:
           taskset -c "$broker_cpuset" mosquitto -c "$RUNNER_TEMP/mosquitto-bench.conf" > "$RUNNER_TEMP/mosquitto-bench.log" 2>&1 &
           pid=$!
           echo "BROKER_PID=$pid" >> "$GITHUB_ENV"
+          echo "BENCH_BROKER_PID=$pid" >> "$GITHUB_ENV"
+          mkdir -p "$RESULTS_DIR"
+          echo "$pid" > "$RESULTS_DIR/broker.pid"
           sleep 1
           kill -0 "$pid"
           cat "$RUNNER_TEMP/mosquitto-bench.log"
 
-      - name: Run strict three-way matched-load RTT campaign
+      - name: Run pairwise native RTT campaign
         shell: bash
         run: |
           set -euo pipefail
           cd bench
-          bash scripts/run_mqttium_gmqtt_paho_arm64.sh
+          bash scripts/run_pairwise_rtt_campaign.sh
 
       - name: Stop native broker
         if: always()
@@ -142,11 +178,11 @@ jobs:
             wait "$BROKER_PID" 2>/dev/null || true
           fi
 
-      - name: Upload benchmark evidence
+      - name: Upload pairwise-native-rtt evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: mqttium-gmqtt-paho-arm64-${{ github.run_id }}
+          name: pairwise-native-rtt-${{ env.PROFILE }}-${{ github.run_id }}
           path: |
             ${{ env.RESULTS_DIR }}
             bench/hosts/*.json
