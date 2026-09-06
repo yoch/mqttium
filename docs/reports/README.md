@@ -107,6 +107,7 @@ validity conditions pass on an eligible runner.
 | [ACK-SPECIALIZED-PRIMITIVES](https://github.com/yoch/mqttium/blob/main/docs/reports/ACK-SPECIALIZED-PRIMITIVES.md) | Superseded | Broader specialized codec bind-table implementation |
 | [RM-SLOT-UNTIL-HANDOFF](https://github.com/yoch/mqttium/blob/main/docs/reports/RM-SLOT-UNTIL-HANDOFF.md) | Current evidence | Inbound Receive Maximum ownership until effect handoff |
 | [AUTO-QOS1-MESSAGE-BATCH-DELIVERY](https://github.com/yoch/mqttium/blob/main/docs/reports/AUTO-QOS1-MESSAGE-BATCH-DELIVERY.md) | Current evidence | Automatic QoS 1 delivery batching |
+| [RECEIPT-WAITER-FUTURES-2026-09-06](https://github.com/yoch/mqttium/blob/main/docs/reports/RECEIPT-WAITER-FUTURES-2026-09-06.md) | Current evidence | Per-waiter futures for `PublishReceipt.wait()`, replacing the shared shielded future |
 
 ## Adding evidence
 
