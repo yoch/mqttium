@@ -1,0 +1,156 @@
+name: ARM64 Coalesced Callback Inline Experiment
+
+on:
+  push:
+    branches: [bench/callback-coalesced-inline-arm64-exp]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mqttium-arm64-runner
+  cancel-in-progress: false
+
+jobs:
+  experiment:
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 45
+    env:
+      BASE_SHA: 4fe90af36660bce06c12e9a8c57cb9a6223abe5a
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+    steps:
+      - name: Check out harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          path: harness
+          persist-credentials: false
+
+      - name: Check out baseline
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.BASE_SHA }}
+          path: base
+          persist-credentials: false
+
+      - name: Check out candidate workspace
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.BASE_SHA }}
+          path: candidate
+          persist-credentials: false
+
+      - name: Environment and preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/t3-inline-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          echo "JOB_ROOT=$root" >> "$GITHUB_ENV"
+          rm -rf "$root" && mkdir -p "$root"
+          python3 -m venv "$root/venv"
+          echo "$root/venv/bin" >> "$GITHUB_PATH"
+          "$root/venv/bin/python" -m pip install -e 'candidate[dev]' 'psutil>=6,<8'
+          "$root/venv/bin/python" harness/benchmarks/runner_probe.py \
+            --output "$root/runner.json" --require-temperature --enforce
+
+      - name: Apply batch-2 sync-inline ceiling candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('candidate/src/mqttium/api/_delivery.py')
+          text = path.read_text(encoding='utf-8')
+          old = '''            if len(messages) > 1:\n                self._enqueue_message_batch(callback, messages, iterator_delivery=iterator_delivery)\n                return len(messages)\n'''
+          new = '''            if len(messages) > 1:\n                # Experiment only: estimate the ceiling of keeping exactly two\n                # plain synchronous callback deliveries in the reader/effect turn.\n                # Production semantics for arbitrary sync-callables returning\n                # awaitables or reentrant callback delivery are NOT claimed here.\n                if (\n                    len(messages) == 2\n                    and not iterator_delivery\n                    and self.can_dispatch_callback_inline(callback)\n                ):\n                    self.dispatch_callback_inline(callback, messages[0])\n                    if self.can_dispatch_callback_inline(callback):\n                        self.dispatch_callback_inline(callback, messages[1])\n                    else:\n                        self._enqueue_message_batch(\n                            callback, messages[1:], iterator_delivery=False\n                        )\n                    return len(messages)\n                self._enqueue_message_batch(callback, messages, iterator_delivery=iterator_delivery)\n                return len(messages)\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f'unexpected target count: {text.count(old)}')
+          path.write_text(text.replace(old, new, 1), encoding='utf-8')
+          PY
+          python -m py_compile candidate/src/mqttium/api/_delivery.py
+          git -C candidate diff --check
+          git -C candidate diff -- src/mqttium/api/_delivery.py
+
+      - name: Targeted correctness guards
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH=candidate/src python -m pytest -q \
+            candidate/tests/unit/test_callback_message_batches.py \
+            candidate/tests/unit/test_compat_callback_publish.py \
+            candidate/tests/unit/test_async_runtime_interleavings.py
+
+      - name: Probe A/A
+        shell: bash
+        run: |
+          set -euo pipefail
+          python harness/benchmarks/callback_coalesced_inline_probe.py \
+            --base-root base --candidate-root base \
+            --repeat 12 --batches 8000 --warmup-batches 500 --cpu 2 \
+            --output "$JOB_ROOT/aa.json" | tee "$JOB_ROOT/aa.txt"
+          python - <<'PY'
+          import json, os
+          data=json.load(open(os.environ['JOB_ROOT']+'/aa.json'))
+          for size, cell in data['cells'].items():
+              for field in ('operations_per_second','callback_p50_ns','batch_rtt_p50_ns'):
+                  s=cell['summary'][field]
+                  drift=abs(s['median_candidate_over_base']-1.0)
+                  if drift > 0.03 or s['base_cv'] > 0.03 or s['candidate_cv'] > 0.03:
+                      raise SystemExit(f'A/A invalid batch={size} field={field}: {s}')
+          PY
+
+      - name: Probe A/B
+        shell: bash
+        run: |
+          set -euo pipefail
+          python harness/benchmarks/callback_coalesced_inline_probe.py \
+            --base-root base --candidate-root candidate \
+            --repeat 12 --batches 8000 --warmup-batches 500 --cpu 2 \
+            --output "$JOB_ROOT/ab.json" | tee "$JOB_ROOT/ab.txt"
+
+      - name: Decision summary
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, os
+          root=os.environ['JOB_ROOT']
+          aa=json.load(open(root+'/aa.json'))['cells']
+          ab=json.load(open(root+'/ab.json'))['cells']
+          b2=ab['2']['summary']; b8=ab['8']['summary']
+          cb2=b2['callback_p50_ns']['median_candidate_over_base']
+          rtt2=b2['batch_rtt_p50_ns']['median_candidate_over_base']
+          rate2=b2['operations_per_second']['median_candidate_over_base']
+          cb8=b8['callback_p50_ns']['median_candidate_over_base']
+          rate8=b8['operations_per_second']['median_candidate_over_base']
+          print(f'batch2 callback p50 candidate/base={cb2:.5f}')
+          print(f'batch2 batch RTT p50 candidate/base={rtt2:.5f}')
+          print(f'batch2 throughput candidate/base={rate2:.5f}')
+          print(f'batch8 callback p50 control candidate/base={cb8:.5f}')
+          print(f'batch8 throughput control candidate/base={rate8:.5f}')
+          if cb2 > 0.95 and rtt2 > 0.98 and rate2 < 1.02:
+              print('DECISION: REJECT — coalesced-inline ceiling too small')
+          elif cb8 > 1.03 or rate8 < 0.97:
+              print('DECISION: REJECT — target check regresses larger callback batches')
+          else:
+              print('DECISION: KEEP — material batch-2 signal survives; design correctness next')
+          PY
+
+      - name: Upload experiment
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0
+        with:
+          name: callback-coalesced-inline-${{ github.run_id }}
+          path: |
+            ${{ env.JOB_ROOT }}/*.json
+            ${{ env.JOB_ROOT }}/*.txt
+            ${{ env.JOB_ROOT }}/runner.json
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Cleanup
+        if: always()
+        shell: bash
+        run: rm -rf "$JOB_ROOT"
