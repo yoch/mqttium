@@ -1,0 +1,54 @@
+name: Temporary PR439 fail-fast v4
+
+on:
+  push:
+    branches: [mission/investigate-tiny-peer-packet-limit]
+
+permissions:
+  contents: write
+
+jobs:
+  implement:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: true
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -e '.[dev]'
+      - name: Apply fail-fast candidate
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import textwrap
+
+          source = Path('.github/workflows/tmp-pr439-failfast-v2.yml').read_text()
+          start_marker = '      - name: Apply corrected fail-fast policy\n        shell: bash\n        run: |\n'
+          end_marker = '\n      - name: Focused and full unit qualification\n'
+          if source.count(start_marker) != 1 or source.count(end_marker) != 1:
+              raise SystemExit('unexpected v2 workflow structure')
+          script = textwrap.dedent(source.split(start_marker, 1)[1].split(end_marker, 1)[0])
+          lines = script.splitlines(keepends=True)
+          matches = [i for i, line in enumerate(lines) if 'from typing import TYPE_CHECKING, NoReturn' in line]
+          if len(matches) != 1:
+              raise SystemExit(f'unexpected NoReturn rewrite lines: {matches}')
+          del lines[matches[0]]
+          Path('/tmp/pr439-apply.sh').write_text(''.join(lines))
+          PY
+          bash /tmp/pr439-apply.sh
+      - name: Focused and full unit qualification
+        run: |
+          python -m pytest -q tests/unit/test_inbound_ack_packet_size.py tests/unit/test_pubrel_packet_limit.py tests/unit/test_connection_failure_policy.py tests/unit/test_control_packet_size_lifecycle.py tests/unit/test_connection_loss_ownership.py tests/unit/test_protocol_validation_contracts.py
+          python -m pytest -q tests/unit
+      - name: Commit clean implementation
+        shell: bash
+        run: |
+          rm -f .github/workflows/tmp-pr439-failfast-v2.yml .github/workflows/tmp-pr439-failfast-v3.yml .github/workflows/tmp-pr439-failfast-v4.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git commit -m 'refactor: fail fast on unusable MQTT 5 peer packet limit'
+          git push origin HEAD:mission/investigate-tiny-peer-packet-limit
