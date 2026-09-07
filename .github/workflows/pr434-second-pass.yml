@@ -27,6 +27,7 @@ jobs:
           python .github/pr434_second_pass.py
       - name: Ruff
         run: |
+          python -m ruff check --fix src/mqttium/persistence tests
           python -m ruff format src/mqttium/persistence tests
           python -m ruff check src/mqttium/persistence tests
       - name: Focused unit and project tests
