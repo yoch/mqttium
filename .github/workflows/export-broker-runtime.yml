@@ -1,0 +1,43 @@
+name: Export Mosquitto runtime
+
+on:
+  push:
+    branches: [bench/rc13-slow-regime-bisect]
+    paths: [.github/workflows/export-broker-runtime.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Install broker
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mosquitto
+          mosquitto -h 2>&1 | head -n 3 | tee mosquitto-version.txt
+      - name: Pack binary and linked libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p runtime/bin runtime/lib
+          broker="$(command -v mosquitto)"
+          cp -L "$broker" runtime/bin/mosquitto
+          ldd "$broker" | tee runtime/ldd.txt
+          ldd "$broker" | awk '/=> \/|^\// {for (i=1;i<=NF;i++) if ($i ~ /^\//) print $i}' | sort -u > runtime/libs.txt
+          while read -r lib; do cp -L "$lib" runtime/lib/; done < runtime/libs.txt
+          printf '%s\n' 'Ubuntu 24.04 GitHub-hosted runtime; invoke with LD_LIBRARY_PATH=runtime/lib runtime/bin/mosquitto' > runtime/README.txt
+          tar -czf mosquitto-runtime.tar.gz runtime
+          sha256sum mosquitto-runtime.tar.gz > sha256sums.txt
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: mosquitto-offline-runtime-${{ github.run_id }}
+          path: |
+            mosquitto-runtime.tar.gz
+            mosquitto-version.txt
+            sha256sums.txt
+          retention-days: 7
