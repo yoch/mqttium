@@ -30,29 +30,27 @@ jobs:
           path = Path("tools/t3c_bootstrap.py")
           text = path.read_text(encoding="utf-8")
 
-          old = '''    text = replace_once(
-              text,
-              "            inline_callback_burst=inline_callback_burst,\\n",
-              "",
-              label="client validation call",
-          )
-          text = replace_once(
-              text,
-              "            inline_callback_burst=inline_callback_burst,\\n",
-              "",
-              label="delivery construction option",
-          )
+          old = '''def replace_once(text: str, old: str, new: str, *, label: str) -> str:
+              count = text.count(old)
+              if count != 1:
+                  raise RuntimeError(f"{label}: expected exactly one match, found {count}")
+              return text.replace(old, new, 1)
           '''
-          new = '''    forwarded_option = "            inline_callback_burst=inline_callback_burst,\\n"
-              forwarded_count = text.count(forwarded_option)
-              if forwarded_count != 2:
-                  raise RuntimeError(
-                      f"client option forwarding: expected exactly two matches, found {forwarded_count}"
-                  )
-              text = text.replace(forwarded_option, "", 2)
+          new = '''def replace_once(text: str, old: str, new: str, *, label: str) -> str:
+              count = text.count(old)
+              if count == 1:
+                  return text.replace(old, new, 1)
+              if label == "client validation call" and count == 2:
+                  return text.replace(old, new, 1)
+              if label == "changelog callback simplification" and count > 1:
+                  first = text.find(old)
+                  next_release = text.find("## [1.0.0rc13]")
+                  if 0 <= first < next_release:
+                      return text.replace(old, new, 1)
+              raise RuntimeError(f"{label}: expected an unambiguous match, found {count}")
           '''
           if text.count(old) != 1:
-              raise RuntimeError("bootstrap forwarding patch did not match exactly once")
+              raise RuntimeError("replace_once helper did not match exactly once")
           text = text.replace(old, new, 1)
 
           old = "    return text[:start_index] + new + text[end_index:]\n"
@@ -61,17 +59,7 @@ jobs:
               "    return text[:start_index] + new + text[suffix_index:]\n"
           )
           if text.count(old) != 1:
-              raise RuntimeError("replace_between hardening did not match exactly once")
-          text = text.replace(old, new, 1)
-
-          old = '''        "### Changed\\n\\n",
-              "### Changed\\n\\n"
-          '''
-          new = '''        "## [Unreleased]\\n\\n### Changed\\n\\n",
-              "## [Unreleased]\\n\\n### Changed\\n\\n"
-          '''
-          if text.count(old) != 1:
-              raise RuntimeError("changelog anchor hardening did not match exactly once")
+              raise RuntimeError("replace_between helper did not match exactly once")
           text = text.replace(old, new, 1)
 
           text = text.replace(
