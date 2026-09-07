@@ -1,0 +1,44 @@
+name: PR434 persistence contract bootstrap
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  transform:
+    if: github.event.pull_request.head.ref == 'mission/persistence-contract-pruning' && github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install test tooling
+        run: python -m pip install -e '.[dev]'
+      - name: Apply asserted transformation
+        run: python .github/pr434_transform.py
+      - name: Ruff
+        run: |
+          python -m ruff format --check src/mqttium/persistence src/mqttium/protocol
+          python -m ruff check src/mqttium/persistence src/mqttium/protocol
+      - name: Focused unit and project tests
+        run: python -m pytest -q tests/unit tests/project
+      - name: Diff hygiene
+        run: git diff --check
+      - name: Publish transformed tree
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          rm -f .github/pr434_transform.py .github/workflows/pr434-bootstrap.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git diff --cached --check
+          git commit -m 'refactor: require modern persistence contract'
+          git push origin HEAD:"$HEAD_REF"
