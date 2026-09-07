@@ -2057,6 +2057,9 @@ class AsyncClient:
         except asyncio.CancelledError:
             raise
         except MandatoryResponseTooLargeError as exc:
+            connack_fut = self._connack_fut
+            if connack_fut is not None and not connack_fut.done():
+                connack_fut.set_exception(exc)
             # The broker negotiated a legal limit, but mqttium cannot produce
             # the mandatory automatic response within it. This is a local
             # terminal capability failure, not a peer protocol violation.

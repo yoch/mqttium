@@ -166,20 +166,16 @@ def test_server_disconnect_must_not_carry_session_expiry_interval() -> None:
     assert any(effect.kind is EffectKind.PROTOCOL_ERROR for effect in effects)
 
 
-def test_pingreq_honors_negotiated_maximum_packet_size() -> None:
+def test_tiny_peer_limit_fails_before_pingreq() -> None:
     engine = ProtocolEngine(
         EngineConfig(client_id="packet-size", protocol=MQTTProtocolVersion.MQTTv5)
     )
     engine.begin_connect()
     properties = Properties()
     properties.set("maximum_packet_size", 1)
-    _feed(engine, _connack_v5(properties))
-    engine.take_effects()
-
     with pytest.raises(PacketTooLargeError):
-        engine.queue_ping()
-
-    assert engine.state is ConnectionState.CONNECTED
+        _feed(engine, _connack_v5(properties))
+    assert engine.state is ConnectionState.DISCONNECTED
     assert engine.take_effects() == []
 
 

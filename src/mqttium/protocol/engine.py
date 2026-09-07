@@ -701,7 +701,18 @@ class ProtocolEngine:
             self._session_client_id = self._sent_client_id
         elif assigned_client_id:
             self._session_client_id = assigned_client_id
-        self.inbound.configure_peer_packet_limit(self.negotiated.maximum_packet_size)
+        peer_maximum_packet_size = self.negotiated.maximum_packet_size
+        if (
+            self.codec.is_mqtt5
+            and peer_maximum_packet_size is not None
+            and peer_maximum_packet_size < 4
+        ):
+            self._reauth_in_progress = False
+            self.state = ConnectionState.DISCONNECTED
+            raise MandatoryResponseTooLargeError(
+                f"Broker maximum_packet_size {peer_maximum_packet_size} is below the "
+                "4-byte minimum required for mandatory QoS acknowledgements"
+            )
 
         self._reauth_in_progress = False
         self.state = ConnectionState.CONNECTED
