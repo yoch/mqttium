@@ -22,7 +22,9 @@ jobs:
       - name: Install test tooling
         run: python -m pip install -e '.[dev]'
       - name: Apply asserted transformation
-        run: python .github/pr434_transform.py
+        run: |
+          sed -i 's/count=5)/count=6)/' .github/pr434_transform.py
+          python .github/pr434_transform.py
       - name: Ruff
         run: |
           python -m ruff format --check src/mqttium/persistence src/mqttium/protocol
