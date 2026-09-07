@@ -1,0 +1,283 @@
+name: Slow-regime mechanism ablation ARM64
+
+on:
+  push:
+    branches: [bench/rc13-slow-regime-bisect]
+    paths: [.github/workflows/slow-regime-mechanism-ablation-arm64.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mqttium-regime-rpi5
+  cancel-in-progress: false
+
+jobs:
+  ablation:
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 180
+    env:
+      BENCH_SHA: ec332e25003a6484727697c3018ce632a025a7f2
+      SHA_433: 7d917547b491c8e521d1d82960b1e10810e4bd80
+      TARGET_RATE: "3942"
+      BROKER_PORT: "11883"
+
+    steps:
+      - name: Set paths and capture environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/mqttium-mechanism-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -p "$dir"
+          echo "RESULTS_DIR=$dir" >> "$GITHUB_ENV"
+          {
+            date -u --iso-8601=seconds
+            uname -a
+            lscpu
+            python3 --version
+            cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null || true
+            cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq 2>/dev/null || true
+            cat /proc/sys/net/unix/max_dgram_qlen 2>/dev/null || true
+            vcgencmd measure_temp 2>/dev/null || true
+            uptime
+          } | tee "$dir/environment.txt"
+          test "$(uname -m)" = aarch64
+
+      - name: Checkout exact harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: yoch/mqtt-python-client-bench
+          ref: ${{ env.BENCH_SHA }}
+          path: harness
+          persist-credentials: false
+
+      - name: Checkout unchanged 433
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: yoch/mqttium
+          ref: ${{ env.SHA_433 }}
+          path: baseline
+          persist-credentials: false
+
+      - name: Checkout pair-inline ablation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: yoch/mqttium
+          ref: ${{ env.SHA_433 }}
+          path: pair-off
+          persist-credentials: false
+
+      - name: Checkout reentrant-handoff ablation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: yoch/mqttium
+          ref: ${{ env.SHA_433 }}
+          path: handoff
+          persist-credentials: false
+
+      - name: Verify immutable base provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C harness rev-parse HEAD)" = "$BENCH_SHA"
+          for d in baseline pair-off handoff; do
+            test "$(git -C "$d" rev-parse HEAD)" = "$SHA_433"
+            test -z "$(git -C "$d" status --porcelain --untracked-files=no)"
+          done
+
+      - name: Apply two minimal falsification patches
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('pair-off/src/mqttium/api/_delivery.py')
+          s = p.read_text()
+          old = '''            if len(messages) > 1:\n                if (\n                    len(messages) == 2\n                    and not iterator_delivery\n                    and self.can_dispatch_callback_inline(callback)\n                ):\n                    self._dispatch_sync_message_pair_inline(callback, messages)\n                    return 2\n                self._enqueue_message_batch(callback, messages, iterator_delivery=iterator_delivery)\n                return len(messages)\n'''
+          new = '''            if len(messages) > 1:\n                self._enqueue_message_batch(callback, messages, iterator_delivery=iterator_delivery)\n                return len(messages)\n'''
+          assert s.count(old) == 1
+          p.write_text(s.replace(old, new, 1))
+
+          p = Path('handoff/src/mqttium/api/_effects.py')
+          s = p.read_text()
+          edits = [
+              (
+                  '''        self.flush_requested = False\n        self.draining_inline = False\n        self._failing_close = False\n''',
+                  '''        self.flush_requested = False\n        self.draining_inline = False\n        self._reentrant_drain_requested = False\n        self._failing_close = False\n''',
+              ),
+              (
+                  '''    def drain_inline(self) -> None:\n        if self.draining_inline or self.lock.locked():\n            return\n''',
+                  '''    def drain_inline(self) -> None:\n        if self.draining_inline:\n            self._reentrant_drain_requested = True\n            return\n        if self.lock.locked():\n            return\n''',
+              ),
+              (
+                  '''                if kind is EffectKind.MESSAGE or kind is EffectKind.DECODED_MESSAGE:\n                    if self._consume_batch(self.owner._apply_message_effect_batch_inline, epoch):\n                        continue\n                    break\n''',
+                  '''                if kind is EffectKind.MESSAGE or kind is EffectKind.DECODED_MESSAGE:\n                    if self._consume_batch(self.owner._apply_message_effect_batch_inline, epoch):\n                        if self._reentrant_drain_requested:\n                            break\n                        continue\n                    break\n''',
+              ),
+              (
+                  '''        finally:\n            self.draining_inline = False\n        if self.pending:\n            self.schedule()\n''',
+                  '''        finally:\n            self.draining_inline = False\n            self._reentrant_drain_requested = False\n        if self.pending:\n            self.schedule()\n''',
+              ),
+          ]
+          for old, new in edits:
+              assert s.count(old) == 1, old
+              s = s.replace(old, new, 1)
+          p.write_text(s)
+          PY
+          test "$(git -C pair-off diff --name-only)" = 'src/mqttium/api/_delivery.py'
+          test "$(git -C handoff diff --name-only)" = 'src/mqttium/api/_effects.py'
+          git -C pair-off diff -- src/mqttium/api/_delivery.py | tee "$RESULTS_DIR/pair-off.patch"
+          git -C handoff diff -- src/mqttium/api/_effects.py | tee "$RESULTS_DIR/handoff.patch"
+          {
+            echo "harness=$BENCH_SHA"
+            echo "baseline=$SHA_433"
+            echo "pair_off_base=$SHA_433"
+            echo "handoff_base=$SHA_433"
+            echo "pair_off_blob=$(git hash-object pair-off/src/mqttium/api/_delivery.py)"
+            echo "handoff_blob=$(git hash-object handoff/src/mqttium/api/_effects.py)"
+          } | tee "$RESULTS_DIR/provenance.txt"
+
+      - name: Prepare environment and validate handoff semantics
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RESULTS_DIR/venv"
+          . "$RESULTS_DIR/venv/bin/activate"
+          python -m pip install --upgrade pip
+          pip install -e './harness[dev,mqttium]' 'psutil>=6,<8'
+          python -m compileall -q pair-off/src/mqttium/api/_delivery.py handoff/src/mqttium/api/_effects.py
+          PYTHONPATH=handoff/src python -m pytest -q -o addopts='' \
+            handoff/tests/unit/test_sync_callback_contract.py \
+            handoff/tests/unit/test_topic_callback_dispatch_contract.py
+          cat > "$RESULTS_DIR/probe.py" <<'PY'
+          import asyncio
+          from mqttium.api._effects import EffectPump
+          from mqttium.protocol.effects import EffectKind, EngineEffect
+          from mqttium.types import Message
+
+          class Engine:
+              def take_effects(self): return []
+          class Owner:
+              def __init__(self):
+                  self._connection_epoch=0; self._disconnect_exc=None; self._engine=Engine()
+                  self.sent=[]; self.pump=None
+              def _apply_message_effect_batch_inline(self, effects, epoch):
+                  self.pump.pending.append(EngineEffect(EffectKind.SEND, b'x'))
+                  self.pump.drain_inline()
+                  return 1
+              def _apply_effect_inline(self, effect, epoch):
+                  self.sent.append(effect.kind); return True
+              async def _apply_effect(self, effect, *, nowait, epoch=None):
+                  self.sent.append(effect.kind)
+              async def _close_transport_after_connection_failure(self): pass
+              def _settle_terminal_effect(self, effect): pass
+
+          async def main():
+              o=Owner(); p=EffectPump(o); o.pump=p
+              p.pending.append(EngineEffect(EffectKind.MESSAGE, Message(topic='x', payload=b'y')))
+              p.pending_epoch=0; p.enqueued=1
+              p.drain_inline()
+              print('immediate', [k.name for k in o.sent], 'pending', [e.kind.name for e in p.pending])
+              await asyncio.sleep(0); await asyncio.sleep(0)
+              print('next_turn', [k.name for k in o.sent], 'pending', len(p.pending))
+          asyncio.run(main())
+          PY
+          PYTHONPATH=baseline/src python "$RESULTS_DIR/probe.py" | tee "$RESULTS_DIR/probe-baseline.txt"
+          PYTHONPATH=handoff/src python "$RESULTS_DIR/probe.py" | tee "$RESULTS_DIR/probe-handoff.txt"
+          grep -q "immediate \['SEND'\] pending \[\]" "$RESULTS_DIR/probe-baseline.txt"
+          grep -q "immediate \[\] pending \['SEND'\]" "$RESULTS_DIR/probe-handoff.txt"
+          grep -q "next_turn \['SEND'\] pending 0" "$RESULTS_DIR/probe-handoff.txt"
+
+      - name: Start native Mosquitto 2.1.2 and sampler
+        shell: bash
+        run: |
+          set -euo pipefail
+          . "$RESULTS_DIR/venv/bin/activate"
+          command -v mosquitto >/dev/null
+          { mosquitto -h 2>&1 || true; } | head -n 4 | tee "$RESULTS_DIR/broker-version.txt"
+          grep -Eq 'mosquitto version 2\.1\.2|mosquitto version 2\.1\.2' "$RESULTS_DIR/broker-version.txt"
+          ! ss -ltn | grep -q ':11883 '
+          cat > "$RESULTS_DIR/mosquitto.conf" <<'EOF'
+          listener 11883 127.0.0.1
+          protocol mqtt
+          set_tcp_nodelay true
+          allow_anonymous true
+          persistence false
+          connection_messages false
+          log_dest stdout
+          log_type error
+          sys_interval 1
+          max_inflight_messages 1000
+          max_queued_messages 10000
+          max_packet_size 16777216
+          max_keepalive 120
+          EOF
+          taskset -c 1 mosquitto -c "$RESULTS_DIR/mosquitto.conf" > "$RESULTS_DIR/mosquitto.log" 2>&1 &
+          echo "BROKER_PID=$!" >> "$GITHUB_ENV"
+          for _ in $(seq 1 50); do
+            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && break
+            sleep 0.2
+          done
+          kill -0 "$!"
+          cat > "$RESULTS_DIR/sample-host.sh" <<'SH'
+          #!/usr/bin/env bash
+          while true; do
+            printf 'ts=%s load=' "$(date +%s.%N)"; cat /proc/loadavg | tr '\n' ' '
+            printf ' temp='; vcgencmd measure_temp 2>/dev/null | tr '\n' ' ' || true
+            printf ' freq='; cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq 2>/dev/null || true
+            sleep 1
+          done
+          SH
+          chmod +x "$RESULTS_DIR/sample-host.sh"
+          "$RESULTS_DIR/sample-host.sh" >> "$RESULTS_DIR/host-samples.txt" 2>&1 &
+          echo "SAMPLER_PID=$!" >> "$GITHUB_ENV"
+
+      - name: Compare 433 versus reentrant handoff
+        shell: bash
+        run: |
+          set -euo pipefail
+          . "$RESULTS_DIR/venv/bin/activate"
+          for seg in 1 2 3; do
+            PYTHONPATH=harness/src python -m mqtt_client_bench.version_compare \
+              --client mqttium --baseline-path baseline --candidate-path handoff \
+              --scenario application_rtt_fixed_rate --variant-index 0 \
+              --target-rate "$TARGET_RATE" --pacer-mode external \
+              --blocks 2 --max-block-retries 1 --profile standard \
+              --broker 127.0.0.1:11883 --broker-pid "$BROKER_PID" \
+              --allow-unversioned-source \
+              --output "$RESULTS_DIR/handoff-seg-${seg}.json" \
+              | tee "$RESULTS_DIR/handoff-seg-${seg}.txt"
+          done
+
+      - name: Compare 433 versus pair-inline off
+        shell: bash
+        run: |
+          set -euo pipefail
+          . "$RESULTS_DIR/venv/bin/activate"
+          for seg in 1 2 3; do
+            PYTHONPATH=harness/src python -m mqtt_client_bench.version_compare \
+              --client mqttium --baseline-path baseline --candidate-path pair-off \
+              --scenario application_rtt_fixed_rate --variant-index 0 \
+              --target-rate "$TARGET_RATE" --pacer-mode external \
+              --blocks 2 --max-block-retries 1 --profile standard \
+              --broker 127.0.0.1:11883 --broker-pid "$BROKER_PID" \
+              --allow-unversioned-source \
+              --output "$RESULTS_DIR/pair-off-seg-${seg}.json" \
+              | tee "$RESULTS_DIR/pair-off-seg-${seg}.txt"
+          done
+
+      - name: Stop processes
+        if: always()
+        shell: bash
+        run: |
+          [ -n "${SAMPLER_PID:-}" ] && kill "$SAMPLER_PID" 2>/dev/null || true
+          [ -n "${BROKER_PID:-}" ] && kill "$BROKER_PID" 2>/dev/null || true
+
+      - name: Upload raw evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: slow-regime-mechanism-${{ github.run_id }}
+          path: ${{ env.RESULTS_DIR }}
+          if-no-files-found: error
+          retention-days: 14
