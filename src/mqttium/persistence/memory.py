@@ -118,14 +118,6 @@ class MemoryInflightStore:
             self._out = {}
         return deleted
 
-    def update_out(self, msg: OutboundMessage) -> None:
-        if msg.mid not in self._out:
-            raise KeyError(msg.mid)
-        self._out[msg.mid] = msg
-
-    def out_items(self) -> Iterator[OutboundMessage]:
-        return iter(tuple(self._out.values()))
-
     @staticmethod
     def _pages(
         records: dict[int, _RecordT],
@@ -144,13 +136,10 @@ class MemoryInflightStore:
             if messages:
                 yield messages
 
-    def out_pages(self, page_size: int = 256) -> Iterator[tuple[OutboundMessage, ...]]:
-        return self._pages(self._out, page_size)
-
     def out_summary_pages(
         self, page_size: int = 256
     ) -> Iterator[tuple[OutboundMessageSummary, ...]]:
-        for page in self.out_pages(page_size):
+        for page in self._pages(self._out, page_size):
             yield tuple(OutboundMessageSummary.from_message(message) for message in page)
 
     def clear_out(self) -> None:
@@ -211,23 +200,6 @@ class MemoryInflightStore:
     def get_in(self, mid: int) -> InboundMessage | None:
         return self._in.get(mid)
 
-    def pop_in(self, mid: int) -> InboundMessage | None:
-        msg = self._in.pop(mid, None)
-        if msg is not None and not self._in:
-            self._in = {}
-        return msg
-
-    def update_in(self, msg: InboundMessage) -> None:
-        if msg.mid not in self._in:
-            raise KeyError(msg.mid)
-        self._in[msg.mid] = msg
-
-    def in_items(self) -> Iterator[InboundMessage]:
-        return iter(tuple(self._in.values()))
-
-    def in_pages(self, page_size: int = 256) -> Iterator[tuple[InboundMessage, ...]]:
-        return self._pages(self._in, page_size)
-
     def in_count(self) -> int:
         return len(self._in)
 
@@ -278,9 +250,6 @@ class MemoryInflightStore:
         self._in = {}
 
     # --- conditional transitions (TransitionInflightStore) ------------------
-
-    def contains_in(self, mid: int) -> bool:
-        return mid in self._in
 
     def set_in_logical_size(self, mid: int, logical_size: int) -> bool:
         msg = self._in.get(mid)
@@ -357,7 +326,9 @@ class MemoryInflightStore:
         msg = self._in.get(mid)
         if msg is None or msg.state is not expected_state:
             return None
-        self.pop_in(mid)
+        self._in.pop(mid)
+        if not self._in:
+            self._in = {}
         return InboundRecordMeta(
             mid=mid,
             state=msg.state,

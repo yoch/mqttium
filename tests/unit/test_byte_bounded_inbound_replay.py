@@ -145,7 +145,7 @@ def test_disconnect_discards_a_message_pushed_back_by_the_emission_guard() -> No
             max_bytes: int = 1 << 20,
         ) -> Iterator[tuple[InboundMessage, ...]]:
             del max_messages, max_bytes
-            yield tuple(self.in_items())
+            yield tuple(self.get_in(meta.mid) for page in self.in_index_pages() for meta in page)
 
     payload = b"x" * 700_000
     store = LoosePageStore()

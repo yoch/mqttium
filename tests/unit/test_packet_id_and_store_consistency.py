@@ -16,7 +16,6 @@ from mqttium.api.async_client import AsyncClient
 from mqttium.codec.buffer import IncrementalDecoder
 from mqttium.enums import (
     ConnectionState,
-    InboundQoSState,
     MQTTProtocolVersion,
     OutboundQoSState,
     PacketType,
@@ -28,7 +27,7 @@ from mqttium.protocol.config import EngineConfig
 from mqttium.protocol.effects import EffectKind
 from mqttium.protocol.engine import ProtocolEngine
 from mqttium.protocol.packet_ids import PacketIdPool
-from mqttium.types import InboundMessage, OutboundMessage
+from mqttium.types import OutboundMessage
 
 
 # --------------------------------------------------------------------------
@@ -138,7 +137,9 @@ def _manual_ack_engine(local_receive_maximum: int = 8) -> ProtocolEngine:
 
 def _assert_accounting_exact(engine: ProtocolEngine) -> None:
     inbound = engine.inbound
-    records = list(engine.store.in_items())
+    records = list(
+        engine.store.get_in(meta.mid) for page in engine.store.in_index_pages() for meta in page
+    )
     assert inbound._pending_bytes == sum(inbound.stored_logical_size(r) for r in records)
     assert inbound._inflight == len(records)
 
@@ -158,14 +159,24 @@ def test_inbound_packet_id_collision_is_refused_without_touching_the_record(
 
     _inbound_publish(engine, 5, held_qos, b"A" * 100)
     engine.take_effects()
-    before = {r.mid: (r.qos, r.state, r.payload) for r in engine.store.in_items()}
+    before = {
+        r.mid: (r.qos, r.state, r.payload)
+        for r in (
+            engine.store.get_in(meta.mid) for page in engine.store.in_index_pages() for meta in page
+        )
+    }
     assert before, "the first PUBLISH must have been stored"
     _assert_accounting_exact(engine)
 
     _inbound_publish(engine, 5, arriving_qos, b"B" * 10)
     effects = engine.take_effects()
 
-    after = {r.mid: (r.qos, r.state, r.payload) for r in engine.store.in_items()}
+    after = {
+        r.mid: (r.qos, r.state, r.payload)
+        for r in (
+            engine.store.get_in(meta.mid) for page in engine.store.in_index_pages() for meta in page
+        )
+    }
     assert after == before, "the live record must survive the colliding PUBLISH"
     _assert_accounting_exact(engine)
 
@@ -370,87 +381,8 @@ async def test_effect_pump_keeps_only_a_failure_that_blocks_pending_work(
 # --------------------------------------------------------------------------
 
 
-def test_update_out_agrees_on_the_guaranteed_state_fields(tmp_path) -> None:  # noqa: ANN001
-    from mqttium.persistence.sqlite import SqliteInflightStore
-
-    memory = MemoryInflightStore()
-    sqlite = SqliteInflightStore(tmp_path / "store.db")
-
-    original = OutboundMessage(
-        mid=7,
-        topic="orig",
-        payload=b"X" * 32,
-        qos=QoS.EXACTLY_ONCE,
-        retain=False,
-        state=OutboundQoSState.WAIT_PUBREC,
-    )
-    # What _retransmit writes back: the record is re-sent with DUP set.
-    resent = OutboundMessage(
-        mid=7,
-        topic="orig",
-        payload=b"X" * 32,
-        qos=QoS.EXACTLY_ONCE,
-        retain=False,
-        state=OutboundQoSState.WAIT_PUBCOMP,
-        dup=True,
-    )
-    try:
-        for store in (memory, sqlite):
-            store.put_out(original)
-            store.update_out(resent)
-
-        from_memory = memory.get_out(7)
-        from_sqlite = sqlite.get_out(7)
-        assert from_memory is not None and from_sqlite is not None
-        assert (from_memory.state, from_memory.dup) == (from_sqlite.state, from_sqlite.dup)
-        assert (from_sqlite.state, from_sqlite.dup) == (OutboundQoSState.WAIT_PUBCOMP, True)
-    finally:
-        sqlite.close()
-
-
-def test_update_in_agrees_on_the_guaranteed_state_fields(tmp_path) -> None:  # noqa: ANN001
-    from mqttium.persistence.sqlite import SqliteInflightStore
-
-    memory = MemoryInflightStore()
-    sqlite = SqliteInflightStore(tmp_path / "store.db")
-
-    original = InboundMessage(
-        mid=3,
-        topic="orig",
-        payload=b"X" * 16,
-        qos=QoS.EXACTLY_ONCE,
-        retain=False,
-        state=InboundQoSState.WAIT_PUBREL,
-    )
-    acknowledged = InboundMessage(
-        mid=3,
-        topic="orig",
-        payload=b"X" * 16,
-        qos=QoS.EXACTLY_ONCE,
-        retain=False,
-        state=InboundQoSState.WAIT_USER_ACK,
-        delivered=True,
-        user_acked=True,
-    )
-    try:
-        for store in (memory, sqlite):
-            store.put_in(original)
-            store.update_in(acknowledged)
-
-        from_memory = memory.get_in(3)
-        from_sqlite = sqlite.get_in(3)
-        assert from_memory is not None and from_sqlite is not None
-        assert (from_memory.state, from_memory.delivered, from_memory.user_acked) == (
-            from_sqlite.state,
-            from_sqlite.delivered,
-            from_sqlite.user_acked,
-        )
-    finally:
-        sqlite.close()
-
-
-def test_update_out_preserves_retransmission_order(tmp_path) -> None:  # noqa: ANN001
-    """Order is part of the contract: an update must not move the record."""
+def test_transition_out_preserves_retransmission_order(tmp_path) -> None:  # noqa: ANN001
+    """A metadata transition must not move a durable record in replay order."""
     from mqttium.persistence.sqlite import SqliteInflightStore
 
     sqlite = SqliteInflightStore(tmp_path / "order.db")
@@ -466,11 +398,12 @@ def test_update_out_preserves_retransmission_order(tmp_path) -> None:  # noqa: A
                     state=OutboundQoSState.WAIT_PUBACK,
                 )
             )
-        first = sqlite.get_out(1)
-        assert first is not None
-        first.dup = True
-        sqlite.update_out(first)
-
-        assert [m.mid for m in sqlite.out_items()] == [1, 2, 3]
+        changed = sqlite.transition_out(
+            1,
+            OutboundQoSState.WAIT_PUBACK,
+            OutboundQoSState.WAIT_PUBREC,
+        )
+        assert changed is not None
+        assert [m.mid for page in sqlite.out_summary_pages() for m in page] == [1, 2, 3]
     finally:
         sqlite.close()

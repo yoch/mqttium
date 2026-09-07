@@ -67,7 +67,14 @@ def test_empty_outbound_topic_with_alias_is_refused_without_mutation(qos: int) -
     assert engine.take_effects() == []
     assert engine.pending_outbound_messages == 0
     assert len(engine.packet_ids) == 0
-    assert tuple(engine.store.out_items()) == ()
+    assert (
+        tuple(
+            engine.store.get_out(summary.mid)
+            for page in engine.store.out_summary_pages()
+            for summary in page
+        )
+        == ()
+    )
 
 
 def test_nonempty_topic_with_alias_remains_supported() -> None:

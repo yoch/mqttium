@@ -88,7 +88,11 @@ def _check_invariants(engine: ProtocolEngine, step: int, history: list[str]) -> 
         pytest.fail(f"step {step}: {message}\n  history:\n    {trail}")
 
     outbound = engine.outbound
-    records = list(engine.store.out_items())
+    records = list(
+        engine.store.get_out(summary.mid)
+        for page in engine.store.out_summary_pages()
+        for summary in page
+    )
     pool = engine.packet_ids
 
     # The pool's own two views of "live" must agree.
@@ -124,7 +128,9 @@ def _check_invariants(engine: ProtocolEngine, step: int, history: list[str]) -> 
     if stray:
         fail(f"_queued indexes mids with no durable record: {sorted(stray)}")
 
-    inbound_records = list(engine.store.in_items())
+    inbound_records = list(
+        engine.store.get_in(meta.mid) for page in engine.store.in_index_pages() for meta in page
+    )
     inbound = engine.inbound
     expected_inbound = sum(inbound.stored_logical_size(r) for r in inbound_records)
     if inbound._pending_bytes != expected_inbound:
@@ -177,7 +183,15 @@ def test_engine_invariants_hold(protocol: MQTTProtocolVersion, seed: int) -> Non
                 history.append(f"{step}: publish qos={int(qos)}")
                 engine.queue_publish(f"t/{rng.randint(0, 5)}", bytes(rng.randint(0, 900)), qos=qos)
             elif operation in ("puback", "pubrec", "pubcomp"):
-                candidates = [r for r in engine.store.out_items() if r.state in _LAUNCHED]
+                candidates = [
+                    r
+                    for r in (
+                        engine.store.get_out(summary.mid)
+                        for page in engine.store.out_summary_pages()
+                        for summary in page
+                    )
+                    if r.state in _LAUNCHED
+                ]
                 if not candidates:
                     continue
                 mid = rng.choice(candidates).mid
@@ -343,11 +357,6 @@ def _store_operations(rng: random.Random) -> tuple[str, Callable[[Any], object]]
         (f"put_out(mid={mid})", lambda s: s.put_out(outbound_message)),
         (f"get_out({mid})", lambda s: _norm_out(s.get_out(mid))),
         (f"delete_out({mid})", lambda s: s.delete_out(mid)),
-        ("out_items()", lambda s: [_norm_out(m) for m in s.out_items()]),
-        (
-            f"out_pages({page_size})",
-            lambda s: [_norm_out(m) for page in s.out_pages(page_size) for m in page],
-        ),
         (
             f"out_summary_pages({page_size})",
             lambda s: [
@@ -371,14 +380,7 @@ def _store_operations(rng: random.Random) -> tuple[str, Callable[[Any], object]]
         ),
         (f"put_in(mid={mid})", lambda s: s.put_in(inbound_message)),
         (f"get_in({mid})", lambda s: _norm_in(s.get_in(mid))),
-        (f"pop_in({mid})", lambda s: _norm_in(s.pop_in(mid))),
-        ("in_items()", lambda s: [_norm_in(m) for m in s.in_items()]),
-        (
-            f"in_pages({page_size})",
-            lambda s: [_norm_in(m) for page in s.in_pages(page_size) for m in page],
-        ),
         (f"in_meta({mid})", lambda s: _norm_meta(s.in_meta(mid))),
-        (f"contains_in({mid})", lambda s: s.contains_in(mid)),
         (f"mark_in_delivered({mid})", lambda s: s.mark_in_delivered(mid)),
         (
             f"transition_in({mid}, {in_old.name}->{in_new.name}, user_acked={user_acked})",
@@ -430,14 +432,38 @@ def test_store_implementations_agree(seed: int, tmp_path) -> None:  # noqa: ANN0
             agree(operation(memory), operation(sqlite), label, step)
 
             agree(
-                [_norm_out(m) for m in memory.out_items()],
-                [_norm_out(m) for m in sqlite.out_items()],
+                [
+                    _norm_out(m)
+                    for m in (
+                        memory.get_out(summary.mid)
+                        for page in memory.out_summary_pages()
+                        for summary in page
+                    )
+                ],
+                [
+                    _norm_out(m)
+                    for m in (
+                        sqlite.get_out(summary.mid)
+                        for page in sqlite.out_summary_pages()
+                        for summary in page
+                    )
+                ],
                 "outbound contents after the step",
                 step,
             )
             agree(
-                [_norm_in(m) for m in memory.in_items()],
-                [_norm_in(m) for m in sqlite.in_items()],
+                [
+                    _norm_in(m)
+                    for m in (
+                        memory.get_in(meta.mid) for page in memory.in_index_pages() for meta in page
+                    )
+                ],
+                [
+                    _norm_in(m)
+                    for m in (
+                        sqlite.get_in(meta.mid) for page in sqlite.in_index_pages() for meta in page
+                    )
+                ],
                 "inbound contents after the step",
                 step,
             )
@@ -532,8 +558,16 @@ def test_replay_interleavings_agree_and_never_emit_stale_rows(  # noqa: ANN001, 
                 assert suppressed.isdisjoint(outputs[0]), (step, operation, suppressed, outputs[0])
             _check_invariants(engines[0], step, [operation])
             _check_invariants(engines[1], step, [operation])
-            assert [_norm_in(m) for m in memory.in_items()] == [
-                _norm_in(m) for m in sqlite.in_items()
+            assert [
+                _norm_in(m)
+                for m in (
+                    memory.get_in(meta.mid) for page in memory.in_index_pages() for meta in page
+                )
+            ] == [
+                _norm_in(m)
+                for m in (
+                    sqlite.get_in(meta.mid) for page in sqlite.in_index_pages() for meta in page
+                )
             ]
     finally:
         sqlite.close()

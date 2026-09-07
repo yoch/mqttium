@@ -114,7 +114,7 @@ def test_auto_qos1_does_not_probe_an_empty_memory_store() -> None:
     assert store.contains_in_calls == 0
     assert store.get_in_calls == 0
     assert engine.inbound._stored_inbound == 0
-    assert list(store.in_items()) == []
+    assert list(store.get_in(meta.mid) for page in store.in_index_pages() for meta in page) == []
 
 
 def test_auto_qos1_does_not_select_from_empty_sqlite_inbound(tmp_path: Path) -> None:

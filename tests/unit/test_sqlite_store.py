@@ -53,31 +53,12 @@ def test_batch_commits_once(tmp_path: Path) -> None:
         store.put_out(outbound(2))
 
     assert sum(statement == "COMMIT" for statement in trace) == 1
-    assert [message.mid for message in store.out_items()] == [1, 2]
-    store.close()
-
-
-def test_update_out_only_touches_hot_state_columns(tmp_path: Path) -> None:
-    store = SqliteInflightStore(tmp_path / "hot.db")
-    store.put_out(outbound())
-    changed = OutboundMessage(
-        mid=7,
-        topic="must-not-rewrite",
-        payload=b"must-not-rewrite",
-        qos=QoS.EXACTLY_ONCE,
-        retain=True,
-        state=OutboundQoSState.WAIT_PUBCOMP,
-        dup=True,
-    )
-    store.update_out(changed)
-
-    got = store.get_out(7)
-    assert got is not None
-    assert got.topic == "a/b"
-    assert got.payload == b"payload"
-    assert got.qos is QoS.AT_LEAST_ONCE
-    assert got.state is OutboundQoSState.WAIT_PUBCOMP
-    assert got.dup is True
+    assert [
+        message.mid
+        for message in (
+            store.get_out(summary.mid) for page in store.out_summary_pages() for summary in page
+        )
+    ] == [1, 2]
     store.close()
 
 
@@ -160,7 +141,7 @@ def test_sqlite_outbound_pages_preserve_order_and_size(tmp_path: Path) -> None:
         for mid in range(1, 8):
             store.put_out(outbound(mid))
 
-    pages = list(store.out_pages(page_size=3))
+    pages = list(store.out_summary_pages(page_size=3))
 
     assert [[message.mid for message in page] for page in pages] == [
         [1, 2, 3],
@@ -184,7 +165,7 @@ def test_sqlite_outbound_pages_tolerate_deletion_between_pages(tmp_path: Path) -
         for mid in range(1, 7):
             store.put_out(outbound(mid))
 
-    pages = store.out_pages(page_size=2)
+    pages = store.out_summary_pages(page_size=2)
     assert [message.mid for message in next(pages)] == [1, 2]
     assert store.delete_out(3) is True
 
@@ -202,7 +183,7 @@ def test_memory_and_sqlite_pages_agree_on_deletion_semantics(tmp_path: Path) -> 
                 store.put_out(outbound(mid))
 
     def drain_with_deletion(store: object) -> list[int]:
-        pages = store.out_pages(page_size=2)  # type: ignore[attr-defined]
+        pages = store.out_summary_pages(page_size=2)  # type: ignore[attr-defined]
         seen = [message.mid for message in next(pages)]
         store.delete_out(3)  # type: ignore[attr-defined]
         seen.extend(message.mid for page in pages for message in page)
@@ -218,9 +199,9 @@ def test_sqlite_pages_reject_non_positive_size(tmp_path: Path) -> None:
     import pytest
 
     with pytest.raises(ValueError, match="page_size must be positive"):
-        next(store.out_pages(page_size=0))
+        next(store.out_summary_pages(page_size=0))
     with pytest.raises(ValueError, match="page_size must be positive"):
-        next(store.in_pages(page_size=-1))
+        next(store.in_index_pages(page_size=-1))
     store.close()
 
 
@@ -280,7 +261,7 @@ def test_pages_split_the_fetch_under_the_sql_variable_limit(tmp_path: Path) -> N
         for mid in range(1, total + 1):
             store.put_out(outbound(mid))
 
-    pages = list(store.out_pages(page_size=total))
+    pages = list(store.out_summary_pages(page_size=total))
 
     assert len(pages) == 1
     assert [message.mid for message in pages[0]] == list(range(1, total + 1))

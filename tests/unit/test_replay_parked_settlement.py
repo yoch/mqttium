@@ -95,14 +95,22 @@ def test_puback_for_parked_exchange_removes_its_queue_entry(
 
     assert completions == [2]
     assert [stored.mid for stored in engine.outbound._queued] == []
-    assert [record.mid for record in store.out_items()] == [1]
+    assert [
+        record.mid
+        for record in (
+            store.get_out(summary.mid) for page in store.out_summary_pages() for summary in page
+        )
+    ] == [1]
     assert engine.outbound.pending_messages == 1
 
     # Settling mid=1 drains the queue again: the settled record must stay
     # deleted and nothing may retransmit its PUBLISH.
     _feed(engine, encode_frame(PacketType.PUBACK, 0, b"\x00\x01"))
     assert PacketType.PUBLISH.value not in _sent_packet_types(engine)
-    assert list(store.out_items()) == []
+    assert (
+        list(store.get_out(summary.mid) for page in store.out_summary_pages() for summary in page)
+        == []
+    )
     assert engine.outbound.pending_messages == 0
     assert engine.outbound.pending_bytes == 0
     assert len(engine.packet_ids) == 0
@@ -127,13 +135,23 @@ def test_settled_parked_identifier_can_be_reused_without_collision(
     assert _sent_packet_types(engine).count(PacketType.PUBLISH.value) == 1
     assert handle.mid == 2
     assert [stored.mid for stored in engine.outbound._queued] == []
-    records = {record.mid: record.state for record in store.out_items()}
+    records = {
+        record.mid: record.state
+        for record in (
+            store.get_out(summary.mid) for page in store.out_summary_pages() for summary in page
+        )
+    }
     assert records == {1: OutboundQoSState.WAIT_PUBACK, 2: OutboundQoSState.WAIT_PUBACK}
     assert engine.outbound.pending_messages == 2
 
     # Settling mid=1 must not resurrect anything through a stale queue entry.
     _feed(engine, encode_frame(PacketType.PUBACK, 0, b"\x00\x01"))
     assert PacketType.PUBLISH.value not in _sent_packet_types(engine)
-    records = {record.mid: record.state for record in store.out_items()}
+    records = {
+        record.mid: record.state
+        for record in (
+            store.get_out(summary.mid) for page in store.out_summary_pages() for summary in page
+        )
+    }
     assert records == {2: OutboundQoSState.WAIT_PUBACK}
     assert engine.outbound.pending_messages == 1

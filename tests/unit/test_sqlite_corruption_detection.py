@@ -196,11 +196,11 @@ def test_paged_replay_rejects_corrupted_nonmax_sequence(
         if table == "outbound":
             store.put_out(_out(1))
             store.put_out(_out(2))
-            pages = store.out_pages()
+            pages = store.out_summary_pages()
         else:
             store.put_in(_in(1))
             store.put_in(_in(2))
-            pages = store.in_pages()
+            pages = store.in_index_pages()
         # The fixed table names are test parameters, never application input.
         store._conn.execute(  # noqa: SLF001 - intentional durable corruption
             f"UPDATE {table} SET seq=? WHERE mid=1",
