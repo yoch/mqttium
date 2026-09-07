@@ -2441,14 +2441,13 @@ class AsyncClient:
         return False
 
     def _raise_protocol_effect(self, data: object) -> Never:
-        error = (
-            data
-            if isinstance(data, (MalformedPacketError, PacketTooLargeError, ProtocolError))
-            else ProtocolError(str(data))
-        )
+        if not isinstance(data, (MalformedPacketError, ProtocolError)):
+            raise TypeError(
+                "PROTOCOL_ERROR effect payload must be MalformedPacketError or ProtocolError"
+            )
         if self._engine.state is ConnectionState.DISCONNECTED:
-            self._disconnect_exc = error
-        raise error
+            self._disconnect_exc = data
+        raise data
 
     def _apply_terminal_callback_inline(
         self,

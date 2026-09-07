@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 
 from mqttium.api._effects import EffectPump
+from mqttium.errors import ProtocolError
 from mqttium.protocol.effects import EffectKind, EngineEffect
 
 
@@ -312,7 +313,7 @@ async def test_waiter_before_failing_effect_is_not_poisoned() -> None:
 async def test_unobserved_protocol_error_routes_to_connection_owner() -> None:
     failure = RuntimeError("peer protocol diagnostic")
     owner = _Owner(
-        [EngineEffect(EffectKind.PROTOCOL_ERROR, "rude peer")],
+        [EngineEffect(EffectKind.PROTOCOL_ERROR, ProtocolError("rude peer"))],
         failure,
     )
     pump = EffectPump(owner)  # type: ignore[arg-type]
