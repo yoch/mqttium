@@ -69,19 +69,9 @@ until capacity returns.
 | `manual_ack` | `False` | Let the application control inbound QoS acknowledgement timing |
 | `max_pending_messages` | `65_536` | Iterator queue count bound |
 | `max_pending_callbacks` | `1_024` | Callback queue count bound |
-| `inline_callback_burst` | `1` | Keep callback bursts on the worker; `2` opts an eligible two-message sync burst into the reader turn |
 | `max_pending_delivery_bytes` | `64 MiB` | Payload bytes retained for application delivery |
 | `delivery_timeout` | `1.0` | Maximum wait for delivery capacity before failure |
 | `callback_shutdown_timeout` | `5.0` | Callback drain allowance during shutdown |
-
-Leave `inline_callback_burst=1` unless callback-only delivery has a measured
-two-message burst bottleneck and the message callback is guaranteed to be
-strictly synchronous, short, and non-blocking. With `2`, exactly two adjacent
-small callbacks may run before the reader/effect-drain turn yields. Declared
-async callbacks, iterator/both delivery, larger bursts, and busy callback paths
-still use the bounded worker. A sync callable that returns an awaitable violates
-the opt-in contract and is reported as a callback `TypeError`. The setting does
-not increase `max_pending_callbacks`.
 
 ### Connection and authentication
 

@@ -6,18 +6,16 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
-### Added
-
-- Add the Stable `inline_callback_burst` `AsyncClient` setting. The default
-  `1` keeps the existing singleton-inline / burst-worker scheduling policy.
-  Setting `2` opts callback-only delivery into running exactly two adjacent
-  small, idle, strictly synchronous message callbacks in the reader/effect
-  turn while retaining the hard `max_pending_callbacks` bound. Declared async
-  callbacks, iterator/both delivery and larger bursts keep the bounded worker
-  path. In the opt-in mode a nominally synchronous callback that returns an
-  awaitable is reported as a `TypeError` instead of being scheduled.
-
 ### Changed
+
+- Simplify callback scheduling around an explicit callable-form contract: `def`
+  callbacks are synchronous and `async def` callbacks are asynchronous. A
+  synchronous callback that returns an awaitable is now reported as a callback
+  `TypeError` instead of creating a hidden continuation. This removes the
+  continuation parking/resume state from callback delivery. Idle callback-only
+  pairs of small messages may now execute synchronously in one effect-drain turn;
+  larger bursts, async callbacks, queued/reentrant delivery, and iterator/both
+  delivery keep the bounded worker path. No new constructor setting is added.
 
 - `PublishReceipt.wait()` no longer routes waiters through `asyncio.shield()`
   over one shared future. Each active waiter now parks on its own future held

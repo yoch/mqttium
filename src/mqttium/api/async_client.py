@@ -172,7 +172,6 @@ def _validate_client_arguments(
     password: object,
     message_delivery: str,
     publish_backpressure: str,
-    inline_callback_burst: int,
     optional_bounds: tuple[tuple[str, int | None], ...],
     positive_bounds: tuple[tuple[str, float], ...],
     ping_timeout: float | None,
@@ -181,8 +180,6 @@ def _validate_client_arguments(
         raise ValueError("message_delivery must be 'auto', 'iterator', 'callback', or 'both'")
     if publish_backpressure not in ("wait", "error"):
         raise ValueError("publish_backpressure must be 'wait' or 'error'")
-    if inline_callback_burst not in (1, 2):
-        raise ValueError("inline_callback_burst must be 1 or 2")
     for name, optional_value in optional_bounds:
         _non_negative_optional(name, optional_value)
     for name, positive_value in positive_bounds:
@@ -228,11 +225,6 @@ class AsyncClient:
         reconnect: Reconnection policy. The default disables reconnection.
         message_delivery: ``"iterator"``, ``"callback"``, ``"both"``, or
             ``"auto"`` delivery selection.
-        inline_callback_burst: ``1`` preserves the default one-callback inline
-            fairness policy. ``2`` opts callback-only delivery into executing
-            exactly two adjacent plain synchronous message callbacks in the
-            same reader/effect turn. In that mode such callbacks must not
-            return awaitables; declared async callbacks keep the worker path.
         manual_ack: Defer terminal acknowledgement of inbound QoS messages
             until :meth:`ack` is called.
         store: Optional inflight store used for durable QoS state.
@@ -279,7 +271,6 @@ class AsyncClient:
         max_ingress_batch_bytes: int = 1 * 1024 * 1024,
         max_pending_messages: int = 65_536,
         max_pending_callbacks: int = 1_024,
-        inline_callback_burst: Literal[1, 2] = 1,
         max_pending_delivery_bytes: int | None = 64 * 1024 * 1024,
         delivery_timeout: float = 1.0,
         callback_shutdown_timeout: float = 5.0,
@@ -295,7 +286,6 @@ class AsyncClient:
             password=password,
             message_delivery=message_delivery,
             publish_backpressure=publish_backpressure,
-            inline_callback_burst=inline_callback_burst,
             optional_bounds=(
                 ("max_pending_outbound_messages", max_pending_outbound_messages),
                 ("max_pending_outbound_bytes", max_pending_outbound_bytes),
@@ -391,7 +381,6 @@ class AsyncClient:
             max_pending_messages=max_pending_messages,
             max_pending_callbacks=max_pending_callbacks,
             max_pending_delivery_bytes=max_pending_delivery_bytes,
-            inline_callback_burst=inline_callback_burst,
             maximum_packet_size=initial_decoder_max_packet_size,
             delivery_timeout=delivery_timeout,
             callback_shutdown_timeout=callback_shutdown_timeout,
@@ -409,6 +398,7 @@ class AsyncClient:
         self._try_enqueue_callback = self._delivery.try_enqueue_callback
         self._try_dispatch_callback_inline = self._delivery.try_dispatch_callback_inline
         self._dispatch_callback_inline = self._delivery.dispatch_callback_inline
+        self._run_sync_callback = self._delivery.run_sync_callback
         self._can_dispatch_callback_inline = self._delivery.can_dispatch_callback_inline
         self._has_callback_capacity = self._delivery.has_callback_capacity
         self._enqueue_callback_repeated_nowait = self._delivery.enqueue_callback_repeated_nowait
@@ -457,6 +447,7 @@ class AsyncClient:
         self._on_message: OnMessage | None = None
         self._message_callback: OnMessage | None = None
         self._topic_callbacks: TopicMatcher | None = None
+        self._topic_async_callbacks = 0
         self.on_connect: OnConnect | None = None
         self.on_disconnect: OnDisconnect | None = None
         self.on_publish: OnPublish | None = None
@@ -1597,8 +1588,23 @@ class AsyncClient:
     @on_message.setter
     def on_message(self, callback: OnMessage | None) -> None:
         self._on_message = callback
-        if self._topic_callbacks is None:
-            self._message_callback = callback
+        self._refresh_message_callback()
+
+    def _refresh_message_callback(self) -> None:
+        """Select a statically sync or async topic route on configuration changes."""
+        matcher = self._topic_callbacks
+        if matcher is None:
+            self._message_callback = self._on_message
+            return
+        fallback = self._on_message
+        route_is_async = self._topic_async_callbacks > 0 or (
+            fallback is not None and self._delivery._is_async_callback(fallback)
+        )
+        self._message_callback = (
+            self._dispatch_topic_message_async
+            if route_is_async
+            else self._dispatch_topic_message_sync
+        )
 
     def message_callback_add(self, topic_filter: str, callback: OnMessage) -> None:
         """Register a message callback for one MQTT topic filter.
@@ -1612,11 +1618,19 @@ class AsyncClient:
         matcher = self._topic_callbacks
         if matcher is None:
             matcher = TopicMatcher()
-            matcher[topic_filter] = callback
             self._topic_callbacks = matcher
-            self._message_callback = self._dispatch_topic_message
-            return
+        else:
+            try:
+                previous = matcher[topic_filter]
+            except KeyError:
+                pass
+            else:
+                if self._delivery._is_async_callback(previous):
+                    self._topic_async_callbacks -= 1
         matcher[topic_filter] = callback
+        if self._delivery._is_async_callback(callback):
+            self._topic_async_callbacks += 1
+        self._refresh_message_callback()
 
     def message_callback_remove(self, topic_filter: str) -> None:
         """Remove the callback registered for ``topic_filter``, if any."""
@@ -1624,73 +1638,53 @@ class AsyncClient:
         if matcher is None:
             return
         try:
-            del matcher[topic_filter]
+            callback = matcher[topic_filter]
         except KeyError:
             return
+        del matcher[topic_filter]
+        if self._delivery._is_async_callback(callback):
+            self._topic_async_callbacks -= 1
         if not matcher:
             self._topic_callbacks = None
-            self._message_callback = self._on_message
+            self._topic_async_callbacks = 0
+        self._refresh_message_callback()
 
-    def _dispatch_topic_message(self, message: Message) -> Any:
-        """Dispatch matching callbacks, or the current default callback."""
+    def _dispatch_topic_message_sync(self, message: Message) -> None:
+        """Dispatch a topic route known at configuration time to be synchronous."""
         matcher = self._topic_callbacks
         if matcher is not None:
-            callbacks = matcher.iter_match(message.topic)
-            matched = False
-            for callback in callbacks:
-                matched = True
-                try:
-                    result = callback(message)
-                except asyncio.CancelledError as exc:
-                    self._delivery._propagate_callback_cancellation(callback, exc)
-                    continue
-                except Exception as exc:
-                    self._report_callback_error(callback, exc)
-                    continue
-                if isinstance(result, Awaitable):
-                    return self._continue_topic_callbacks(
-                        callback, result, tuple(callbacks), message
-                    )
-            if matched:
-                return None
+            callbacks = tuple(matcher.iter_match(message.topic))
+            if callbacks:
+                for callback in callbacks:
+                    self._run_sync_callback(callback, message)
+                return
+        callback = self._on_message
+        if callback is not None:
+            self._run_sync_callback(callback, message)
 
+    async def _dispatch_topic_message_async(self, message: Message) -> None:
+        """Dispatch a route containing at least one declared-async callback."""
+        matcher = self._topic_callbacks
+        if matcher is not None:
+            callbacks = tuple(matcher.iter_match(message.topic))
+            if callbacks:
+                for callback in callbacks:
+                    try:
+                        await self._invoke(callback, message)
+                    except asyncio.CancelledError as exc:
+                        self._delivery._propagate_callback_cancellation(callback, exc)
+                    except Exception as exc:
+                        self._report_callback_error(callback, exc)
+                return
         callback = self._on_message
         if callback is None:
-            return None
+            return
         try:
-            result = callback(message)
-        except asyncio.CancelledError as exc:
-            self._delivery._propagate_callback_cancellation(callback, exc)
-            return None
-        except Exception as exc:
-            self._report_callback_error(callback, exc)
-            return None
-        if isinstance(result, Awaitable):
-            return self._continue_topic_callbacks(callback, result, (), message)
-        return None
-
-    async def _continue_topic_callbacks(
-        self,
-        callback: OnMessage,
-        result: Awaitable[Any],
-        callbacks: Iterable[OnMessage],
-        message: Message,
-    ) -> None:
-        try:
-            await result
+            await self._invoke(callback, message)
         except asyncio.CancelledError as exc:
             self._delivery._propagate_callback_cancellation(callback, exc)
         except Exception as exc:
             self._report_callback_error(callback, exc)
-        for callback in callbacks:
-            try:
-                result = callback(message)
-                if isinstance(result, Awaitable):
-                    await result
-            except asyncio.CancelledError as exc:
-                self._delivery._propagate_callback_cancellation(callback, exc)
-            except Exception as exc:
-                self._report_callback_error(callback, exc)
 
     async def subscribe(
         self,

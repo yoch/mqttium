@@ -111,7 +111,6 @@ class ApplicationDelivery:
         maximum_packet_size: int,
         delivery_timeout: float,
         callback_shutdown_timeout: float,
-        inline_callback_burst: int = 1,
     ) -> None:
         self.mode = mode
         self.callback_mode = mode in ("auto", "callback", "both")
@@ -140,7 +139,6 @@ class ApplicationDelivery:
         )
         self._callback_limit = max_pending_callbacks
         self._callback_batch_reserved = 0
-        self.inline_callback_burst = inline_callback_burst
         self.message_ready = asyncio.Event()
         self.closed = asyncio.Event()
         self._stream_generation = 0
@@ -151,13 +149,6 @@ class ApplicationDelivery:
         # bounded queue instead of nesting user callbacks.
         self._callback_active = False
         self._callback_stop = False
-        # At most one parked inline awaitable. A sync callback may fill the
-        # bounded queue reentrantly before returning an awaitable; that
-        # continuation is not a new admission. It runs after the physical jobs
-        # already queued at park time, using public qsize() rather than mutating
-        # asyncio.Queue internals.
-        self._inline_continuation: tuple[Callable[..., Any], Awaitable[Any]] | None = None
-        self._inline_continuation_after = 0
         self.delivery_timeout = delivery_timeout
         self.callback_shutdown_timeout = callback_shutdown_timeout
 
@@ -616,11 +607,10 @@ class ApplicationDelivery:
             if len(messages) > 1:
                 if (
                     len(messages) == 2
-                    and self.inline_callback_burst == 2
                     and not iterator_delivery
                     and self.can_dispatch_callback_inline(callback)
                 ):
-                    self._dispatch_strict_sync_message_burst_inline(callback, messages)
+                    self._dispatch_sync_message_pair_inline(callback, messages)
                     return 2
                 self._enqueue_message_batch(callback, messages, iterator_delivery=iterator_delivery)
                 return len(messages)
@@ -838,151 +828,66 @@ class ApplicationDelivery:
         """Whether a plain synchronous callback can run without a queue hop."""
         return (
             not self._callback_active
-            and self._inline_continuation is None
             and self.callback_queue.empty()
             and not self._is_async_callback(callback)
         )
 
-    def try_dispatch_callback_inline(self, callback: Callable[..., Any], *args: Any) -> bool:
-        """Run one idle synchronous callback now, isolating application errors.
+    @staticmethod
+    def _sync_awaitable_error(result: Any) -> TypeError:
+        """Reject a sync callback that dynamically returned async work."""
+        if inspect.iscoroutine(result):
+            result.close()
+        return TypeError(
+            "synchronous callbacks must not return awaitables; "
+            "declare asynchronous callbacks with 'async def'"
+        )
 
-        A nominally synchronous callable is still allowed by the public
-        contract to return an awaitable. In that uncommon case its already
-        created awaitable is handed to the bounded worker without invoking the
-        callback twice.
-        """
+    def run_sync_callback(self, callback: Callable[..., Any], *args: Any) -> None:
+        """Invoke one declared-sync callback and isolate application failures."""
+        try:
+            result = callback(*args)
+        except asyncio.CancelledError as exc:
+            self._propagate_callback_cancellation(callback, exc)
+        except Exception as exc:
+            self.report_callback_error(callback, exc)
+        else:
+            if result is not None and inspect.isawaitable(result):
+                self.report_callback_error(callback, self._sync_awaitable_error(result))
+
+    def try_dispatch_callback_inline(self, callback: Callable[..., Any], *args: Any) -> bool:
+        """Run one idle synchronous callback now, isolating application errors."""
         if not self.can_dispatch_callback_inline(callback):
             return False
         self.dispatch_callback_inline(callback, *args)
         return True
 
-    def _dispatch_strict_sync_message_burst_inline(
+    def _dispatch_sync_message_pair_inline(
         self,
         callback: Callable[[Message], Any],
         messages: list[Message],
     ) -> None:
-        """Run an opted-in two-message strictly synchronous burst inline.
+        """Run one eligible two-message synchronous burst inline.
 
-        The second message is reserved in the existing logical callback bound
-        while the first callback runs. Reentrant callback admissions therefore
-        remain bounded and queue behind this burst. A sync callable returning
-        an awaitable violates this opt-in contract: the awaitable is not run.
+        The second message remains reserved in the existing logical callback
+        bound while the first callback runs, so reentrant admissions queue
+        behind the pair without weakening ``max_pending_callbacks``.
         """
-        self._reserve_callback_batch(len(messages))
+        self._reserve_callback_batch(2)
         self._callback_active = True
         try:
-            for message in messages:
-                try:
-                    result = callback(message)
-                except asyncio.CancelledError as exc:
-                    self._propagate_callback_cancellation(callback, exc)
-                except Exception as exc:
-                    self.report_callback_error(callback, exc)
-                else:
-                    if inspect.isawaitable(result):
-                        if inspect.iscoroutine(result):
-                            result.close()
-                        self.report_callback_error(
-                            callback,
-                            TypeError(
-                                "inline_callback_burst=2 requires strictly synchronous "
-                                "callbacks that do not return awaitables"
-                            ),
-                        )
+            self.run_sync_callback(callback, messages[0])
+            self.run_sync_callback(callback, messages[1])
         finally:
             self._callback_active = False
-            self._release_callback_batch(len(messages))
+            self._release_callback_batch(2)
 
     def dispatch_callback_inline(self, callback: Callable[..., Any], *args: Any) -> None:
         """Invoke a callback after the caller established inline eligibility."""
         self._callback_active = True
         try:
-            try:
-                result = callback(*args)
-            except asyncio.CancelledError as exc:
-                self._propagate_callback_cancellation(callback, exc)
-            except Exception as exc:
-                self.report_callback_error(callback, exc)
-            else:
-                if inspect.isawaitable(result):
-                    self._enqueue_inline_continuation(callback, result)
+            self.run_sync_callback(callback, *args)
         finally:
             self._callback_active = False
-
-    def _enqueue_inline_continuation(
-        self,
-        callback: Callable[..., Any],
-        result: Awaitable[Any],
-    ) -> None:
-        """Hand a sync callback's returned awaitable to the worker."""
-        self.ensure_callback_worker()
-        try:
-            self.callback_queue.put_nowait(
-                (self._resume_inline_awaitable, (callback, result), None)
-            )
-        except asyncio.QueueFull:
-            self._park_inline_continuation(callback, result)
-
-    def _park_inline_continuation(
-        self,
-        callback: Callable[..., Any],
-        result: Awaitable[Any],
-    ) -> None:
-        """Run ``result`` after jobs already admitted, without a new queue slot.
-
-        Inline dispatch is single-entrant, so at most one continuation is
-        parked. ``qsize()`` is the number of physical jobs that must complete
-        first to preserve FIFO with the bounded queue.
-        """
-        if self._inline_continuation is not None:
-            raise RuntimeError("inline continuation is already parked")
-        queued = self.callback_queue.qsize()
-        if queued <= 0:
-            raise RuntimeError("full callback queue has no job to follow")
-        self._inline_continuation = (callback, result)
-        self._inline_continuation_after = queued
-
-    async def _resume_inline_awaitable(
-        self,
-        callback: Callable[..., Any],
-        result: Awaitable[Any],
-    ) -> None:
-        try:
-            await result
-        except asyncio.CancelledError as exc:
-            self._propagate_callback_cancellation(callback, exc)
-        except Exception as exc:
-            self.report_callback_error(callback, exc)
-
-    def _take_due_inline_continuation(self) -> Awaitable[Any] | None:
-        """Return the parked awaitable once its predecessors have completed.
-
-        The idle worker path is a single pointer check: no coroutine is created
-        unless a continuation is actually due.
-        """
-        pending = self._inline_continuation
-        if pending is None:
-            return None
-        self._inline_continuation_after -= 1
-        if self._inline_continuation_after > 0:
-            return None
-        self._inline_continuation = None
-        callback, result = pending
-        if self._callback_stop:
-            if inspect.iscoroutine(result):
-                result.close()
-            return None
-        return self._resume_inline_awaitable(callback, result)
-
-    def _discard_inline_continuation(self) -> None:
-        pending = self._inline_continuation
-        self._inline_continuation = None
-        self._inline_continuation_after = 0
-        if pending is None:
-            return
-        _callback, result = pending
-        if inspect.iscoroutine(result):
-            result.close()
 
     def has_callback_capacity(self, count: int = 1) -> bool:
         """Whether ``count`` callbacks can be admitted without suspending."""
@@ -1048,7 +953,6 @@ class ApplicationDelivery:
             elif token is not None:
                 self.release_nowait(cast(AccountedDeliveryToken, token))
             self.callback_queue.task_done()
-        self._discard_inline_continuation()
 
     async def _callback_worker(self) -> None:
         while not self._callback_stop:
@@ -1077,21 +981,20 @@ class ApplicationDelivery:
                     finally:
                         if token is not None:
                             self.release_nowait(cast(AccountedDeliveryToken, token))
-                due = self._take_due_inline_continuation()
-                if due is not None:
-                    await due
             finally:
                 self._callback_active = False
                 self.callback_queue.task_done()
         self._discard_callback_queue()
 
-    @staticmethod
-    async def invoke(callback: Callable[..., Any] | None, *args: Any) -> Any:
+    @classmethod
+    async def invoke(cls, callback: Callable[..., Any] | None, *args: Any) -> Any:
         if callback is None:
             return None
+        if cls._is_async_callback(callback):
+            return await callback(*args)
         result = callback(*args)
-        if isinstance(result, Awaitable):
-            return await result
+        if result is not None and inspect.isawaitable(result):
+            raise cls._sync_awaitable_error(result)
         return result
 
     @staticmethod

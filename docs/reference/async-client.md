@@ -42,36 +42,18 @@ background thread.
 | `on_publish` | Sync or async publish-completion callback |
 | `auth_handler` | MQTT 5 enhanced-authentication handler |
 
-Callbacks execute outside protocol-engine critical sections. Synchronous
-`on_publish` and eligible `on_message` / topic-filtered callbacks may execute
-inline when callback delivery is idle; async, reentrant and queued callbacks
-use the bounded worker. Synchronous callbacks must not block the event loop.
-Callback failures go to the event loop's exception handler without silently
-changing protocol state.
+Callbacks execute outside protocol-engine critical sections. Declare synchronous
+callbacks with `def` and asynchronous callbacks with `async def`; a synchronous
+callable that returns an awaitable violates the callback contract and is reported
+as a callback `TypeError` rather than being scheduled implicitly. Synchronous
+callbacks must not block the event loop.
 
-### Optional two-message synchronous burst
-
-`inline_callback_burst=1` is the Stable default and preserves the existing
-policy: an isolated eligible message callback may run inline, while a callback
-burst is handed to the bounded worker. `inline_callback_burst=2` is an explicit
-latency/throughput opt-in for callback-only consumers whose message callback is
-strictly synchronous and short. When the reader has exactly two adjacent small
-message effects and callback delivery is idle, both callbacks run in the same
-reader/effect-drain turn before it yields.
-
-The opt-in does not apply to declared `async def` callbacks, iterator or `both`
-delivery, larger bursts, or an already active/queued callback path. It does not
-relax `max_pending_callbacks`: the second callback consumes the same logical
-reservation that the worker batch would have consumed, so reentrant callback
-work queues behind the two-message burst.
-
-A callable that is declared synchronous but returns an awaitable remains
-supported by the default `inline_callback_burst=1` path. Under the explicit
-`inline_callback_burst=2` contract, however, that return value is invalid:
-MQTTium reports a callback `TypeError`; a coroutine result is closed rather than
-scheduled. Use the default or declare the callback `async def` when it needs to
-await. Because the opt-in executes two user calls in the reader turn, do not use
-it for blocking I/O, long CPU work, or callbacks with unbounded service time.
+Eligible idle `on_publish` and message callbacks may execute inline. For
+callback-only message delivery, an adjacent pair of small synchronous messages may
+run in the same effect-drain turn while retaining the hard
+`max_pending_callbacks` bound. Larger bursts, declared-async callbacks, and
+queued/reentrant delivery use the bounded worker. Callback failures go to the event
+loop's exception handler without silently changing protocol state.
 
 Matching `message_callback_add` filters run instead of `on_message`, in
 registration order. Shared-subscription filters match the filter string

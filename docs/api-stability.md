@@ -77,6 +77,11 @@ The stable `AsyncClient` surface is:
   `auth_handler`, and topic-filtered callbacks registered with
   `message_callback_add`.
 
+Callback form is part of that contract: declare synchronous callbacks with
+`def` and asynchronous callbacks with `async def`. A synchronous callable must
+not dynamically return an awaitable; MQTTium reports that as a callback
+`TypeError` instead of scheduling hidden continuation work.
+
 `publish_nowait()` and `stats()` are synchronous but loop-confined. They are not
 cross-thread APIs. Threaded migration code should use
 `mqttium.compat.paho.Client`.
@@ -84,16 +89,6 @@ cross-thread APIs. Threaded migration code should use
 Constructor keyword arguments are part of the native contract. New optional
 keywords may be added compatibly. Existing Stable defaults will not change
 without the SemVer and deprecation process below.
-
-`inline_callback_burst` is a Stable opt-in scheduling control. Its default of
-`1` preserves the existing callback-burst worker policy. Setting it to `2` may
-run exactly two adjacent small message callbacks in the reader/effect-drain
-turn when delivery is callback-only, idle, and the callback is declared
-synchronous. Those callbacks must therefore be short and non-blocking and must
-not return awaitables; violating the latter rule is reported as a callback
-`TypeError`. Declared async callbacks, iterator/both delivery, larger bursts,
-and non-idle delivery keep the bounded worker path. The hard
-`max_pending_callbacks` admission bound remains in force.
 
 `EngineConfig.local_receive_maximum` intentionally defaults to `65535`, while
 `AsyncClient.local_receive_maximum` defaults to `100`. The engine default is the
