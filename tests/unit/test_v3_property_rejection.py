@@ -18,7 +18,7 @@ from mqttium.protocol.engine import ProtocolEngine
 from mqttium.types import Message, Properties
 
 
-V3_PROTOCOLS = (MQTTProtocolVersion.MQTTv31, MQTTProtocolVersion.MQTTv311)
+V3_PROTOCOLS = (MQTTProtocolVersion.MQTTv311,)
 
 
 def _props() -> Properties:

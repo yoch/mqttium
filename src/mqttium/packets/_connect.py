@@ -2,10 +2,9 @@
 
 Unlike the PUBLISH and acknowledgement primitives, CONNECT is encoded once per
 connection and nothing binds a version-specific encoder: `ConnectPacket.encode`
-dispatches on `protocol` either way. The three wire layouts differ only in the
-protocol name/level prefix and in whether property tables are present, so they
-share one implementation instead of repeating the same validation and flag
-assembly three times.
+dispatches on `protocol` either way. The two supported wire layouts differ only
+in whether property tables are present, so they share one implementation instead
+of repeating the same validation and flag assembly twice.
 """
 
 from __future__ import annotations
@@ -17,8 +16,6 @@ from mqttium.packets._common import encode_frame, validate_payload_format
 from mqttium.types import Properties
 from mqttium.codec.properties import CONNECT, WILL, encode_properties
 
-# Protocol Name + Protocol Level, the only fixed bytes that differ by version.
-_PREFIX_V31 = b"\x00\x06MQIsdp\x03"
 _PREFIX_V311 = b"\x00\x04MQTT\x04"
 _PREFIX_V5 = b"\x00\x04MQTT\x05"
 
@@ -124,36 +121,6 @@ def _encode_connect(
         body.extend(pack_u16(len(password)))
         body.extend(password)
     return encode_frame(PacketType.CONNECT, 0, body)
-
-
-def encode_connect_v31(
-    client_id: str,
-    clean_start: bool = True,
-    keepalive: int = 60,
-    username: str | None = None,
-    password: bytes | None = None,
-    will_topic: str | None = None,
-    will_payload: bytes = b"",
-    will_qos: QoS = QoS.AT_MOST_ONCE,
-    will_retain: bool = False,
-    will_properties: Properties | None = None,
-    properties: Properties | None = None,
-) -> bytes:
-    return _encode_connect(
-        _PREFIX_V31,
-        False,
-        client_id,
-        clean_start,
-        keepalive,
-        username,
-        password,
-        will_topic,
-        will_payload,
-        will_qos,
-        will_retain,
-        will_properties,
-        properties,
-    )
 
 
 def encode_connect_v311(

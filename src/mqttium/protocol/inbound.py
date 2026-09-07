@@ -13,11 +13,8 @@ from collections.abc import Iterator
 from typing import TYPE_CHECKING, NoReturn
 
 from mqttium.codec.buffer import RawPacket
-from mqttium.enums import InboundQoSState, MQTTProtocolVersion, PacketType, QoS
+from mqttium.enums import InboundQoSState, PacketType, QoS
 from mqttium.errors import MalformedPacketError, MandatoryResponseTooLargeError, ProtocolError
-from mqttium.packets import (
-    PublishPacket,
-)
 from mqttium.packets._ack import (
     encode_pubcomp_success as _encode_pubcomp_success,
     encode_puback_success as _encode_puback_success,
@@ -136,13 +133,7 @@ class InboundSession:
         self._decode_pubrel = engine.codec.decode_pubrel
         # Fixed for the engine's lifetime, like the codec bindings above.
         self._is_v5 = engine.codec.is_mqtt5
-        protocol = self.config.protocol
-        if protocol is MQTTProtocolVersion.MQTTv5:
-            self.handle_publish = self._on_publish_v5
-        elif protocol is MQTTProtocolVersion.MQTTv311:
-            self.handle_publish = self._on_publish_v311
-        else:
-            self.handle_publish = self._on_publish_v31
+        self.handle_publish = self._on_publish_v5 if self._is_v5 else self._on_publish_v311
         # Same one-shot binding as the PUBLISH handler above: manual_ack is not
         # runtime-mutable, so the QoS 1 handler does not re-test it per message.
         self._on_qos1 = self._on_qos1_manual if self.config.manual_ack else self._on_qos1_auto
@@ -387,37 +378,6 @@ class InboundSession:
             dup=dup,
             properties=properties,
             decoded_property_wire_size=decoded_property_wire_size,
-        )
-
-    def _on_publish_v31(self, raw: RawPacket) -> None:
-        """Retain the generic decoder only for the legacy MQTT 3.1 protocol."""
-        packet = PublishPacket.decode(raw.flags, raw.remaining, MQTTProtocolVersion.MQTTv31)
-        # PublishPacket.decode already validated the topic and rejected an empty
-        # one for non-MQTT 5; MQTT 3.1 has no topic aliases to resolve.
-        topic = packet.topic
-        if packet.qos is QoS.AT_MOST_ONCE:
-            self._engine._emit(
-                EffectKind.MESSAGE,
-                Message(
-                    topic=topic,
-                    payload=packet.payload,
-                    qos=packet.qos,
-                    retain=packet.retain,
-                    dup=packet.dup,
-                    mid=None,
-                    properties=packet.properties,
-                ),
-            )
-            return
-        assert packet.mid is not None
-        handler = self._on_qos1 if packet.qos is QoS.AT_LEAST_ONCE else self._on_qos2
-        handler(
-            topic=topic,
-            payload=packet.payload,
-            mid=packet.mid,
-            retain=packet.retain,
-            dup=packet.dup,
-            properties=packet.properties,
         )
 
     def _on_qos2(

@@ -18,6 +18,16 @@ The compatibility facade is useful when changing event-loop ownership and API
 shape at the same time would make a migration too risky. It is not required for
 new async code.
 
+## MQTT 3.1 configuration
+
+`MQTTProtocolVersion.MQTTv31` remains importable with numeric value `3` for
+backwards compatibility, but selecting it is no longer executable protocol
+support. `EngineConfig(protocol=MQTTProtocolVersion.MQTTv31)` and therefore
+`AsyncClient(protocol=MQTTProtocolVersion.MQTTv31)` now fail immediately with
+`ValueError` before creating protocol/runtime state. Migrate such configuration
+to `MQTTProtocolVersion.MQTTv311` when the broker supports MQTT 3.1.1, or to
+`MQTTProtocolVersion.MQTTv5` when MQTT 5 features are required.
+
 ## From Paho
 
 The compatibility layer keeps the familiar loop and callback shape:

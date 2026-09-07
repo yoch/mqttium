@@ -78,8 +78,8 @@ def bind_codec(protocol: MQTTProtocolVersion) -> CodecBindings:
             encode_subscribe=subscribe.encode_subscribe_v5,
             encode_unsubscribe=subscribe.encode_unsubscribe_v5,
         )
-    # MQTT 3.1.1 and the MQTT 3.1 leftover share the 3.1.1 acknowledgement and
-    # control shapes; PUBLISH ingress for 3.1 still uses PublishPacket.decode.
+    if protocol is not MQTTProtocolVersion.MQTTv311:
+        raise ProtocolError(f"Unsupported MQTT protocol version: {protocol!r}")
     return CodecBindings(
         protocol=protocol,
         is_mqtt5=False,

@@ -135,13 +135,8 @@ def test_connect_validates_keepalive_and_will_fields() -> None:
         ConnectPacket(client_id="x", will_qos=QoS.AT_LEAST_ONCE).encode()
 
 
-def test_connect_encodes_each_protocol_version_layout() -> None:
-    """Pin the three CONNECT wire layouts, which share one encoder.
-
-    They differ only in the Protocol Name/Level prefix and in whether property
-    tables are present. MQTT 3.1 in particular had no encoding coverage while
-    its encoder lived inline in ConnectPacket.encode.
-    """
+def test_connect_encodes_supported_protocol_layouts() -> None:
+    """Pin the MQTT 3.1.1 and MQTT 5 CONNECT wire layouts."""
     fields = dict(
         client_id="c1",
         clean_start=True,
@@ -156,12 +151,6 @@ def test_connect_encodes_each_protocol_version_layout() -> None:
     # Will + will QoS 1 + will retain + clean start + username + password.
     flags = 0xEE
     tail = b"\x00\x02c1" + b"\x00\x03w/t\x00\x03bye" + b"\x00\x01u" + b"\x00\x02pw"
-
-    v31 = ConnectPacket(protocol=MQTTProtocolVersion.MQTTv31, **fields).encode()
-    assert v31[2:11] == b"\x00\x06MQIsdp\x03"
-    assert v31[11] == flags
-    assert v31[12:14] == b"\x00\x3c"
-    assert v31[14:] == tail
 
     v311 = ConnectPacket(protocol=V311, **fields).encode()
     assert v311[2:9] == b"\x00\x04MQTT\x04"

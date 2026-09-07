@@ -7,11 +7,7 @@ from dataclasses import dataclass
 from mqttium.enums import MQTTProtocolVersion, QoS
 from mqttium.errors import ProtocolError
 from mqttium.packets._connack import decode_connack_v311, decode_connack_v5
-from mqttium.packets._connect import (
-    encode_connect_v31,
-    encode_connect_v311,
-    encode_connect_v5,
-)
+from mqttium.packets._connect import encode_connect_v311, encode_connect_v5
 from mqttium.types import Properties
 
 
@@ -35,8 +31,6 @@ class ConnectPacket:
             encoder = encode_connect_v311
         elif self.protocol is MQTTProtocolVersion.MQTTv5:
             encoder = encode_connect_v5
-        elif self.protocol is MQTTProtocolVersion.MQTTv31:
-            encoder = encode_connect_v31
         else:
             raise ProtocolError(f"Unsupported protocol {self.protocol}")
         return encoder(
