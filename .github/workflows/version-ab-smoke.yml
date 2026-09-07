@@ -1,4 +1,4 @@
-name: MQTTium PR433 isolated A/B
+name: MQTTium slow-regime bisect PR434
 
 on:
   push:
@@ -14,11 +14,11 @@ concurrency:
 jobs:
   version-ab-smoke:
     runs-on: [self-hosted, linux, ARM64]
-    timeout-minutes: 120
+    timeout-minutes: 180
     env:
-      BENCH_SHA: 24107724d82b6458984aa18ce560ccaba0a8d316
-      BASE_SHA: 4fe90af36660bce06c12e9a8c57cb9a6223abe5a
-      CANDIDATE_SHA: 7d917547b491c8e521d1d82960b1e10810e4bd80
+      BENCH_SHA: ec332e25003a6484727697c3018ce632a025a7f2
+      BASE_SHA: 7d917547b491c8e521d1d82960b1e10810e4bd80
+      CANDIDATE_SHA: 66a850b52f1f08c6686bb5295fe029413d055adb
       TARGET_RATE: "3942"
 
     steps:
@@ -54,7 +54,7 @@ jobs:
           path: harness
           persist-credentials: false
 
-      - name: Checkout exact pre-PR433 baseline
+      - name: Checkout exact post-PR433 baseline
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: yoch/mqttium
@@ -62,7 +62,7 @@ jobs:
           path: old
           persist-credentials: false
 
-      - name: Checkout exact PR433 merge
+      - name: Checkout exact PR434 merge
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: yoch/mqttium
@@ -150,7 +150,7 @@ jobs:
           done
           exit 1
 
-      - name: Four-block isolated PR433 A/B probe
+      - name: Eight-block post-PR433 versus PR434 probe
         shell: bash
         run: |
           set -euo pipefail
@@ -162,33 +162,31 @@ jobs:
             --variant-index 0 \
             --target-rate "$TARGET_RATE" \
             --pacer-mode external \
-            --blocks 4 \
+            --blocks 8 \
             --max-block-retries 1 \
             --profile standard \
             --broker 127.0.0.1:11883 \
             --broker-pid "$BROKER_PID" \
             --host-profile "$RESULTS_DIR/host.json" \
-            --output "$RESULTS_DIR/pr433-before-after-25pct-4blocks.json" \
+            --output "$RESULTS_DIR/pre434-vs-434-8blocks.json" \
             | tee "$RESULTS_DIR/version-ab-summary.txt"
 
-      - name: Summarize result
+      - name: Summarize provenance only
         if: always()
         shell: bash
         run: |
-          if [ -f "$RESULTS_DIR/pr433-before-after-25pct-4blocks.json" ]; then
+          if [ -f "$RESULTS_DIR/pre434-vs-434-8blocks.json" ]; then
             PYTHONPATH=harness/src python - <<'PY'
           import json, os
-          p = os.path.join(os.environ["RESULTS_DIR"], "pr433-before-after-25pct-4blocks.json")
+          p = os.path.join(os.environ["RESULTS_DIR"], "pre434-vs-434-8blocks.json")
           d = json.load(open(p))
           print(json.dumps({
               "baseline": (d.get("baseline_source") or {}).get("git_sha"),
               "candidate": (d.get("candidate_source") or {}).get("git_sha"),
-              "qualification": d.get("qualification"),
-              "verdict": d.get("verdict"),
-              "block_ratios": d.get("block_ratios"),
               "executed_slots": len(d.get("runs") or []),
               "logical_slots": len(d.get("slot_rates") or []),
               "attempts": d.get("block_attempts"),
+              "note": "do not use reducer verdict; inspect raw slots",
           }, indent=2))
           PY
           fi
@@ -206,7 +204,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: mqttium-pr433-ab-${{ github.run_id }}
+          name: mqttium-pre434-vs-434-${{ github.run_id }}
           path: ${{ runner.temp }}/mqttium-version-ab-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: warn
           retention-days: 14
