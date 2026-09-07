@@ -21,7 +21,7 @@ jobs:
       SHA_433: 7d917547b491c8e521d1d82960b1e10810e4bd80
       SHA_434: 66a850b52f1f08c6686bb5295fe029413d055adb
       TARGET_RATE: "3942"
-      BROKER_IMAGE: eclipse-mosquitto:2.1.2-alpine
+      REQUIRED_MOSQUITTO: "2.1.2"
 
     steps:
       - name: Set run paths
@@ -65,11 +65,12 @@ jobs:
             head -n 20 /proc/stat
             uptime
             free -h
-            echo '--- docker ---'
-            docker --version 2>/dev/null || true
+            echo '--- mosquitto path ---'
+            command -v mosquitto || true
           } | tee "$RESULTS_DIR/environment.txt"
           test "$(uname -m)" = aarch64
           command -v taskset >/dev/null
+          command -v mosquitto >/dev/null
 
       - name: Checkout exact harness
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -174,20 +175,30 @@ jobs:
           "$RESULTS_DIR/sample-host.sh" >> "$RESULTS_DIR/host-samples.txt" 2>&1 &
           echo "SAMPLER_PID=$!" >> "$GITHUB_ENV"
 
-      - name: Start exact Mosquitto 2.1.2 broker
+      - name: Start native Mosquitto 2.1.2 broker
         shell: bash
         run: |
           set -euo pipefail
-          command -v docker >/dev/null || { echo 'Docker required for exact Mosquitto 2.1.2 broker' >&2; exit 1; }
+          broker_bin="$(command -v mosquitto)"
+          { "$broker_bin" -h 2>&1 || true; } | head -n 6 | tee "$RESULTS_DIR/broker-version.txt"
+          BROKER_VERSION="$(python3 - "$RESULTS_DIR/broker-version.txt" <<'PY'
+          import re, sys
+          text=open(sys.argv[1], encoding='utf-8').read()
+          m=re.search(r'mosquitto version\s+([0-9]+(?:\.[0-9]+)+)', text, re.I)
+          if not m:
+              raise SystemExit('could not parse mosquitto version')
+          print(m.group(1))
+          PY
+          )"
+          echo "broker_version=$BROKER_VERSION broker_bin=$broker_bin" | tee "$RESULTS_DIR/broker-native.txt"
+          if [ "$BROKER_VERSION" != "$REQUIRED_MOSQUITTO" ]; then
+            echo "Need Mosquitto $REQUIRED_MOSQUITTO, found $BROKER_VERSION; refusing to change broker version silently" >&2
+            exit 1
+          fi
           if ss -ltn | grep -q ':11883 '; then
             echo 'port 11883 already occupied' >&2
             exit 1
           fi
-          docker pull "$BROKER_IMAGE"
-          docker image inspect "$BROKER_IMAGE" --format 'image_id={{.Id}} repo_digests={{json .RepoDigests}}' \
-            | tee "$RESULTS_DIR/broker-image.txt"
-          { docker run --rm --entrypoint mosquitto "$BROKER_IMAGE" -h 2>&1 || true; } \
-            | head -n 4 | tee "$RESULTS_DIR/broker-version.txt"
           cat > "$RESULTS_DIR/mosquitto.conf" <<'EOF'
           listener 11883 127.0.0.1
           protocol mqtt
@@ -208,23 +219,18 @@ jobs:
           print(json.load(open(os.path.join(os.environ['RESULTS_DIR'],'cpuset.json')))['mapping']['broker'])
           PY
           )"
-          name="mqttium-regime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          docker rm -f "$name" >/dev/null 2>&1 || true
-          docker run -d --name "$name" --network host --cpuset-cpus "$broker_cpuset" \
-            -v "$RESULTS_DIR/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro" \
-            "$BROKER_IMAGE" > "$RESULTS_DIR/broker-container-id.txt"
-          pid="$(docker inspect -f '{{.State.Pid}}' "$name")"
-          echo "BROKER_CONTAINER=$name" >> "$GITHUB_ENV"
+          taskset -c "$broker_cpuset" "$broker_bin" -c "$RESULTS_DIR/mosquitto.conf" \
+            > "$RESULTS_DIR/mosquitto.log" 2>&1 &
+          pid=$!
           echo "BROKER_PID=$pid" >> "$GITHUB_ENV"
           echo "broker_pid=$pid broker_cpuset=$broker_cpuset comm=$(cat /proc/$pid/comm 2>/dev/null || true)" \
             | tee "$RESULTS_DIR/broker-process.txt"
           for _ in $(seq 1 50); do
             (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
-            docker ps --filter "name=$name" --filter status=running --format '{{.ID}}' | grep -q . || {
-              docker logs "$name"; exit 1;
-            }
+            kill -0 "$pid" 2>/dev/null || { cat "$RESULTS_DIR/mosquitto.log"; exit 1; }
             sleep 0.2
           done
+          cat "$RESULTS_DIR/mosquitto.log"
           exit 1
 
       - name: Run A/A checkpoints at 3942 msg/s
@@ -319,9 +325,9 @@ jobs:
         shell: bash
         run: |
           [ -n "${SAMPLER_PID:-}" ] && kill "$SAMPLER_PID" 2>/dev/null || true
-          if [ -n "${BROKER_CONTAINER:-}" ]; then
-            docker logs "$BROKER_CONTAINER" > "$RESULTS_DIR/mosquitto.log" 2>&1 || true
-            docker rm -f "$BROKER_CONTAINER" >/dev/null 2>&1 || true
+          if [ -n "${BROKER_PID:-}" ]; then
+            kill "$BROKER_PID" 2>/dev/null || true
+            wait "$BROKER_PID" 2>/dev/null || true
           fi
 
       - name: Upload raw regime evidence
