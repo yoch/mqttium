@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from mqttium import AsyncClient, MQTTProtocolVersion
+from mqttium import MQTTProtocolVersion
+from mqttium.api import AsyncClient
 from mqttium.errors import ProtocolError
 from mqttium.packets import ConnectPacket
 from mqttium.protocol.config import EngineConfig
