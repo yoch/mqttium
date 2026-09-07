@@ -8,6 +8,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Changed
 
+- Stop executing MQTT 3.1 as a client protocol. `MQTTProtocolVersion.MQTTv31` remains a Stable enum member with value `3`, but selecting it now fails during configuration before runtime state is created. The dedicated MQTT 3.1 CONNECT encoder and inbound PUBLISH path are removed; MQTT 3.1.1 and MQTT 5 remain the supported protocols.
+
 - Unify the Provisional persistence API around one complete `InflightStore`
   contract. Bounded replay, payload-free metadata paging, and conditional state
   transitions/completion are now required instead of runtime-detected optional
