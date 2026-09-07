@@ -42,12 +42,18 @@ background thread.
 | `on_publish` | Sync or async publish-completion callback |
 | `auth_handler` | MQTT 5 enhanced-authentication handler |
 
-Callbacks execute outside protocol-engine critical sections. Synchronous
-`on_publish` and eligible `on_message` / topic-filtered callbacks may execute
-inline when callback delivery is idle; async, reentrant and queued callbacks
-use the bounded worker. Synchronous callbacks must not block the event loop.
-Callback failures go to the event loop's exception handler without silently
-changing protocol state.
+Callbacks execute outside protocol-engine critical sections. Declare synchronous
+callbacks with `def` and asynchronous callbacks with `async def`; a synchronous
+callable that returns an awaitable violates the callback contract and is reported
+as a callback `TypeError` rather than being scheduled implicitly. Synchronous
+callbacks must not block the event loop.
+
+Eligible idle `on_publish` and message callbacks may execute inline. For
+callback-only message delivery, an adjacent pair of small synchronous messages may
+run in the same effect-drain turn while retaining the hard
+`max_pending_callbacks` bound. Larger bursts, declared-async callbacks, and
+queued/reentrant delivery use the bounded worker. Callback failures go to the event
+loop's exception handler without silently changing protocol state.
 
 Matching `message_callback_add` filters run instead of `on_message`, in
 registration order. Shared-subscription filters match the filter string

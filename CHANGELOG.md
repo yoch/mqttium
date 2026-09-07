@@ -8,6 +8,15 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Changed
 
+- Simplify callback scheduling around an explicit callable-form contract: `def`
+  callbacks are synchronous and `async def` callbacks are asynchronous. A
+  synchronous callback that returns an awaitable is now reported as a callback
+  `TypeError` instead of creating a hidden continuation. This removes the
+  continuation parking/resume state from callback delivery. Idle callback-only
+  pairs of small messages may now execute synchronously in one effect-drain turn;
+  larger bursts, async callbacks, queued/reentrant delivery, and iterator/both
+  delivery keep the bounded worker path. No new constructor setting is added.
+
 - `PublishReceipt.wait()` no longer routes waiters through `asyncio.shield()`
   over one shared future. Each active waiter now parks on its own future held
   in a lazily created list, which isolates cancellation by construction instead

@@ -77,6 +77,11 @@ The stable `AsyncClient` surface is:
   `auth_handler`, and topic-filtered callbacks registered with
   `message_callback_add`.
 
+Callback form is part of that contract: declare synchronous callbacks with
+`def` and asynchronous callbacks with `async def`. A synchronous callable must
+not dynamically return an awaitable; MQTTium reports that as a callback
+`TypeError` instead of scheduling hidden continuation work.
+
 `publish_nowait()` and `stats()` are synchronous but loop-confined. They are not
 cross-thread APIs. Threaded migration code should use
 `mqttium.compat.paho.Client`.

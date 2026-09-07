@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 
 import pytest
 
@@ -44,14 +43,15 @@ def test_inactive_filters_keep_direct_on_message_pointer() -> None:
 def test_on_message_assignment_updates_fallback_without_replacing_router() -> None:
     client = AsyncClient(message_delivery="callback")
     client.message_callback_add("sensors/#", lambda _message: None)
-    routed = client._message_callback
 
     def fallback(_message: Message) -> None:
         pass
 
     client.on_message = fallback
     assert client.on_message is fallback
-    assert client._message_callback is routed
+    assert client._message_callback is not fallback
+    assert client._message_callback is not None
+    assert not client._delivery._is_async_callback(client._message_callback)
 
     client.message_callback_remove("sensors/#")
     assert client._message_callback is fallback
@@ -367,316 +367,67 @@ async def test_later_async_failure_and_self_cancellation_are_isolated() -> None:
     assert errors[1]["callback"] is cancelling
 
 
-async def test_reentrant_sync_match_can_fill_queue_before_async_match() -> None:
-    client = AsyncClient(message_delivery="callback", max_pending_callbacks=1)
-    seen: list[str] = []
-    nested = Message(topic="nested/x", payload=b"nested")
-
-    def first(_message: Message) -> None:
-        seen.append("first")
-        pending = client._accept_message(nested, client._message_callback)
-        assert pending is None
-
-    async def second(_message: Message) -> None:
-        seen.append("second")
-
-    client.message_callback_add("outer/#", first)
-    client.message_callback_add("outer/+", second)
-    client.message_callback_add("nested/#", lambda _message: seen.append("nested"))
-    callback = client._message_callback
-    assert callback is not None
-
-    client._delivery.dispatch_callback_inline(
-        callback,
-        Message(topic="outer/x", payload=b"outer"),
-    )
-    assert client.stats().delivery.callback_queued == 1
-    assert client.stats().delivery.callback_limit == 1
-    assert client._callback_queue.full()
-    assert client._delivery._inline_continuation is not None
-
-    await client._callback_queue.join()
-    assert seen == ["first", "nested", "second"]
-    assert client.stats().delivery.callback_queued == 0
-    assert client._delivery._inline_continuation is None
-    await client._shutdown_callback_worker(drain=False)
-
-
-async def test_inline_continuation_chains_after_reentrant_callback_batch() -> None:
-    client = AsyncClient(message_delivery="callback", max_pending_callbacks=2)
-    seen: list[str] = []
-    batch = [
-        Message(topic="batch/1", payload=b"1"),
-        Message(topic="batch/2", payload=b"2"),
-    ]
-
-    def batch_callback(message: Message) -> None:
-        seen.append(f"batch:{message.payload.decode()}")
-
-    def first(_message: Message) -> None:
-        seen.append("first")
-        client._delivery._enqueue_message_batch(
-            batch_callback,
-            batch,
-            iterator_delivery=False,
-        )
-
-    async def second(_message: Message) -> None:
-        seen.append("second")
-
-    client.message_callback_add("outer/#", first)
-    client.message_callback_add("outer/+", second)
-    callback = client._message_callback
-    assert callback is not None
-
-    client._delivery.dispatch_callback_inline(
-        callback,
-        Message(topic="outer/x", payload=b"outer"),
-    )
-    assert client.stats().delivery.callback_queued == 2
-    assert client.stats().delivery.callback_limit == 2
-    assert client._callback_queue.full()
-    assert client._delivery._inline_continuation is not None
-
-    await client._callback_queue.join()
-    assert seen == ["first", "batch:1", "batch:2", "second"]
-    assert client.stats().delivery.callback_queued == 0
-    assert client._delivery._callback_batch_reserved == 0
-    assert client._delivery._inline_continuation is None
-    await client._shutdown_callback_worker(drain=False)
-
-
-async def test_inline_handoff_reports_continuation_failure_as_original_callback() -> None:
-    client = AsyncClient(message_delivery="callback", max_pending_callbacks=1)
-    errors: list[dict[str, object]] = []
-    seen: list[str] = []
-    loop = asyncio.get_running_loop()
-    previous = loop.get_exception_handler()
-    loop.set_exception_handler(lambda _loop, context: errors.append(context))
-
-    def queued() -> None:
-        seen.append("queued")
-
-    async def fail_after_handoff() -> None:
-        seen.append("continuation")
-        raise RuntimeError("handoff")
-
-    def outer() -> object:
-        client._delivery.spawn_callback(queued)
-        return fail_after_handoff()
-
-    try:
-        client._delivery.dispatch_callback_inline(outer)
-        assert client._delivery._inline_continuation is not None
-        await client._callback_queue.join()
-    finally:
-        loop.set_exception_handler(previous)
-        await client._shutdown_callback_worker(drain=False)
-
-    assert seen == ["queued", "continuation"]
-    assert len(errors) == 1
-    assert errors[0]["callback"] is outer
-    assert isinstance(errors[0]["exception"], RuntimeError)
-
-
-async def test_inline_continuation_failure_with_queue_space_is_original_callback() -> None:
-    client = AsyncClient(message_delivery="callback", max_pending_callbacks=8)
-    errors: list[dict[str, object]] = []
-    loop = asyncio.get_running_loop()
-    previous = loop.get_exception_handler()
-    loop.set_exception_handler(lambda _loop, context: errors.append(context))
-
-    async def fail_after_handoff() -> None:
-        raise RuntimeError("queued-handoff")
-
-    def outer() -> object:
-        return fail_after_handoff()
-
-    try:
-        client._delivery.dispatch_callback_inline(outer)
-        assert client._delivery._inline_continuation is None
-        await client._callback_queue.join()
-    finally:
-        loop.set_exception_handler(previous)
-        await client._shutdown_callback_worker(drain=False)
-
-    assert len(errors) == 1
-    assert errors[0]["callback"] is outer
-    assert isinstance(errors[0]["exception"], RuntimeError)
-
-
-async def test_shutdown_discards_parked_inline_continuation() -> None:
-    client = AsyncClient(message_delivery="callback", max_pending_callbacks=1)
-    started = asyncio.Event()
-    block = asyncio.Event()
-    seen: list[str] = []
-
-    async def queued() -> None:
-        seen.append("queued")
-        started.set()
-        await block.wait()
-
-    async def pending() -> None:
-        seen.append("continuation")
-
-    def outer() -> object:
-        client._delivery.spawn_callback(queued)
-        return pending()
-
-    client._delivery.dispatch_callback_inline(outer)
-    parked = client._delivery._inline_continuation
-    assert parked is not None
-    await started.wait()
-    assert client._delivery._inline_continuation is parked
-
-    await client._shutdown_callback_worker(drain=False)
-    assert client._delivery._inline_continuation is None
-    assert inspect.getcoroutinestate(parked[1]) == inspect.CORO_CLOSED
-    assert seen == ["queued"]
-
-
-async def test_parked_continuation_runs_after_two_physical_jobs() -> None:
-    client = AsyncClient(message_delivery="callback", max_pending_callbacks=2)
-    seen: list[str] = []
-
-    def first_job() -> None:
-        seen.append("a")
-
-    def second_job() -> None:
-        seen.append("b")
-
-    async def pending() -> None:
-        seen.append("continuation")
-
-    def outer() -> object:
-        client._delivery.spawn_callback(first_job)
-        client._delivery.spawn_callback(second_job)
-        return pending()
-
-    client._delivery.dispatch_callback_inline(outer)
-    assert client._callback_queue.qsize() == 2
-    assert client._delivery._inline_continuation is not None
-    assert client._delivery._inline_continuation_after == 2
-
-    await client._callback_queue.join()
-    assert seen == ["a", "b", "continuation"]
-    assert client._delivery._inline_continuation is None
-    await client._shutdown_callback_worker(drain=False)
-
-
-async def test_inline_self_cancellation_is_reported() -> None:
+def test_topic_router_switches_between_sync_and_async_configuration() -> None:
     client = AsyncClient(message_delivery="callback")
-    errors: list[dict[str, object]] = []
-    loop = asyncio.get_running_loop()
-    previous = loop.get_exception_handler()
-    loop.set_exception_handler(lambda _loop, context: errors.append(context))
 
-    def cancelling() -> None:
-        raise asyncio.CancelledError
+    def sync_callback(_message: Message) -> None:
+        pass
 
-    try:
-        client._delivery.dispatch_callback_inline(cancelling)
-    finally:
-        loop.set_exception_handler(previous)
+    async def async_callback(_message: Message) -> None:
+        pass
 
-    assert len(errors) == 1
-    assert errors[0]["callback"] is cancelling
-    assert isinstance(errors[0]["exception"], asyncio.CancelledError)
+    client.message_callback_add("sync/#", sync_callback)
+    assert client._message_callback is not None
+    assert not client._delivery._is_async_callback(client._message_callback)
 
+    client.message_callback_add("async/#", async_callback)
+    assert client._message_callback is not None
+    assert client._delivery._is_async_callback(client._message_callback)
 
-async def test_parked_continuation_self_cancellation_is_original_callback() -> None:
-    client = AsyncClient(message_delivery="callback", max_pending_callbacks=1)
-    errors: list[dict[str, object]] = []
-    loop = asyncio.get_running_loop()
-    previous = loop.get_exception_handler()
-    loop.set_exception_handler(lambda _loop, context: errors.append(context))
-
-    async def cancelling() -> None:
-        raise asyncio.CancelledError
-
-    def outer() -> object:
-        client._delivery.spawn_callback(lambda: None)
-        return cancelling()
-
-    try:
-        client._delivery.dispatch_callback_inline(outer)
-        await client._callback_queue.join()
-    finally:
-        loop.set_exception_handler(previous)
-        await client._shutdown_callback_worker(drain=False)
-
-    assert len(errors) == 1
-    assert errors[0]["callback"] is outer
-    assert isinstance(errors[0]["exception"], asyncio.CancelledError)
+    client.message_callback_remove("async/#")
+    assert client._message_callback is not None
+    assert not client._delivery._is_async_callback(client._message_callback)
 
 
-def test_parking_twice_or_on_empty_queue_is_rejected() -> None:
-    client = AsyncClient(message_delivery="callback", max_pending_callbacks=1)
+def test_async_fallback_makes_topic_router_async_until_replaced() -> None:
+    client = AsyncClient(message_delivery="callback")
+    client.message_callback_add("sync/#", lambda _message: None)
 
-    async def pending() -> None:
-        return None
+    async def async_fallback(_message: Message) -> None:
+        pass
 
-    first = pending()
-    second = pending()
-    try:
-        with pytest.raises(RuntimeError, match="no job to follow"):
-            client._delivery._park_inline_continuation(lambda: None, first)
-        client._delivery.callback_queue.put_nowait((lambda: None, (), None))
-        client._delivery._park_inline_continuation(lambda: None, first)
-        with pytest.raises(RuntimeError, match="already parked"):
-            client._delivery._park_inline_continuation(lambda: None, second)
-    finally:
-        client._delivery._discard_inline_continuation()
-        for coro in (first, second):
-            if inspect.getcoroutinestate(coro) != inspect.CORO_CLOSED:
-                coro.close()
-        try:
-            client._delivery.callback_queue.get_nowait()
-        except asyncio.QueueEmpty:
-            pass
-        else:
-            client._delivery.callback_queue.task_done()
+    client.on_message = async_fallback
+    assert client._message_callback is not None
+    assert client._delivery._is_async_callback(client._message_callback)
+
+    client.on_message = lambda _message: None
+    assert client._message_callback is not None
+    assert not client._delivery._is_async_callback(client._message_callback)
 
 
-async def test_stop_flag_closes_due_inline_continuation() -> None:
-    client = AsyncClient(message_delivery="callback", max_pending_callbacks=1)
+async def test_mixed_topic_route_is_one_worker_job_and_keeps_registration_order() -> None:
+    client = AsyncClient(message_delivery="callback")
+    seen: list[str] = []
 
-    async def pending() -> None:
-        return None
+    def first(_message: Message) -> None:
+        seen.append("first")
+        assert client._delivery.try_enqueue_callback(lambda: seen.append("reentrant"))
 
-    coro = pending()
-    client._delivery.callback_queue.put_nowait((lambda: None, (), None))
-    client._delivery._park_inline_continuation(lambda: None, coro)
-    client._delivery._callback_stop = True
-    assert client._delivery._take_due_inline_continuation() is None
-    assert inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED
-    client._delivery.callback_queue.get_nowait()
-    client._delivery.callback_queue.task_done()
+    async def second(_message: Message) -> None:
+        await asyncio.sleep(0)
+        seen.append("second")
 
+    client.message_callback_add("outer/#", first)
+    client.message_callback_add("outer/+", second)
+    callback = client._message_callback
+    assert callback is not None
+    assert client._delivery._is_async_callback(callback)
 
-async def test_stop_flag_skips_close_for_non_coroutine_awaitable() -> None:
-    client = AsyncClient(message_delivery="callback", max_pending_callbacks=1)
-    future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
-    future.set_result(None)
-    client._delivery.callback_queue.put_nowait((lambda: None, (), None))
-    client._delivery._park_inline_continuation(lambda: None, future)
-    client._delivery._callback_stop = True
-    assert client._delivery._take_due_inline_continuation() is None
-    assert future.done()
-    client._delivery.callback_queue.get_nowait()
-    client._delivery.callback_queue.task_done()
+    client._delivery.spawn_callback(callback, Message(topic="outer/x", payload=b"x"))
+    await client._callback_queue.join()
 
-
-async def test_discard_non_coroutine_awaitable_skips_close() -> None:
-    client = AsyncClient(message_delivery="callback", max_pending_callbacks=1)
-    future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
-    future.set_result(None)
-    client._delivery.callback_queue.put_nowait((lambda: None, (), None))
-    client._delivery._park_inline_continuation(lambda: None, future)
-    client._delivery._discard_inline_continuation()
-    assert client._delivery._inline_continuation is None
-    client._delivery.callback_queue.get_nowait()
-    client._delivery.callback_queue.task_done()
+    assert seen == ["first", "second", "reentrant"]
+    await client._shutdown_callback_worker(drain=False)
 
 
 async def test_filter_mutation_during_dispatch_does_not_change_current_matches() -> None:

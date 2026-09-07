@@ -132,6 +132,14 @@ The writer has its own byte and message limits. Applications sending large
 payloads should size the byte budget explicitly rather than relying only on a
 message count.
 
+## Callback callable form
+
+Use `def` for synchronous callbacks and `async def` for callbacks that await.
+A synchronous callback that returns a coroutine, `Future`, or other awaitable is
+no longer implicitly handed to the callback worker; it is reported as a callback
+`TypeError`. Convert such callbacks to `async def`. This removes hidden scheduling
+state and makes callback execution mode explicit from the callable itself.
+
 ## Durable sessions
 
 ```python
