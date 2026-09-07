@@ -1,4 +1,4 @@
-name: MQTTium slow-regime bisect PR434
+name: MQTTium slow-regime bisect RC13 to PR432
 
 on:
   push:
@@ -17,8 +17,8 @@ jobs:
     timeout-minutes: 180
     env:
       BENCH_SHA: ec332e25003a6484727697c3018ce632a025a7f2
-      BASE_SHA: 7d917547b491c8e521d1d82960b1e10810e4bd80
-      CANDIDATE_SHA: 66a850b52f1f08c6686bb5295fe029413d055adb
+      BASE_SHA: 4560e44aeb24b8a4f7f6ce903766579fac481cbd
+      CANDIDATE_SHA: 4fe90af36660bce06c12e9a8c57cb9a6223abe5a
       TARGET_RATE: "3942"
 
     steps:
@@ -54,7 +54,7 @@ jobs:
           path: harness
           persist-credentials: false
 
-      - name: Checkout exact post-PR433 baseline
+      - name: Checkout exact RC13 baseline
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: yoch/mqttium
@@ -62,7 +62,7 @@ jobs:
           path: old
           persist-credentials: false
 
-      - name: Checkout exact PR434 merge
+      - name: Checkout exact PR432 merge
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: yoch/mqttium
@@ -149,7 +149,7 @@ jobs:
           done
           exit 1
 
-      - name: Eight-block post-PR433 versus PR434 probe
+      - name: Eight-block RC13 versus PR432 probe
         shell: bash
         run: |
           set -euo pipefail
@@ -167,17 +167,17 @@ jobs:
             --broker 127.0.0.1:11883 \
             --broker-pid "$BROKER_PID" \
             --host-profile "$RESULTS_DIR/host.json" \
-            --output "$RESULTS_DIR/pre434-vs-434-8blocks.json" \
+            --output "$RESULTS_DIR/rc13-vs-pr432-8blocks.json" \
             | tee "$RESULTS_DIR/version-ab-summary.txt"
 
       - name: Summarize provenance only
         if: always()
         shell: bash
         run: |
-          if [ -f "$RESULTS_DIR/pre434-vs-434-8blocks.json" ]; then
+          if [ -f "$RESULTS_DIR/rc13-vs-pr432-8blocks.json" ]; then
             PYTHONPATH=harness/src python - <<'PY'
           import json, os
-          p = os.path.join(os.environ["RESULTS_DIR"], "pre434-vs-434-8blocks.json")
+          p = os.path.join(os.environ["RESULTS_DIR"], "rc13-vs-pr432-8blocks.json")
           d = json.load(open(p))
           print(json.dumps({
               "baseline": (d.get("baseline_source") or {}).get("git_sha"),
@@ -203,7 +203,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: mqttium-pre434-vs-434-${{ github.run_id }}
+          name: mqttium-rc13-vs-pr432-${{ github.run_id }}
           path: ${{ runner.temp }}/mqttium-version-ab-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: warn
           retention-days: 14
