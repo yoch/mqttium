@@ -1,0 +1,66 @@
+name: Export immutable regime snapshots
+
+on:
+  push:
+    branches: [bench/rc13-slow-regime-bisect]
+    paths: [.github/workflows/export-regime-snapshots.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      BENCH_SHA: ec332e25003a6484727697c3018ce632a025a7f2
+      SHA_433: 7d917547b491c8e521d1d82960b1e10810e4bd80
+      SHA_434: 66a850b52f1f08c6686bb5295fe029413d055adb
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: yoch/mqtt-python-client-bench
+          ref: ${{ env.BENCH_SHA }}
+          path: harness
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: yoch/mqttium
+          ref: ${{ env.SHA_433 }}
+          path: mqttium-433
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: yoch/mqttium
+          ref: ${{ env.SHA_434 }}
+          path: mqttium-434
+          persist-credentials: false
+      - name: Verify exact immutable SHAs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C harness rev-parse HEAD)" = "$BENCH_SHA"
+          test "$(git -C mqttium-433 rev-parse HEAD)" = "$SHA_433"
+          test "$(git -C mqttium-434 rev-parse HEAD)" = "$SHA_434"
+          for d in harness mqttium-433 mqttium-434; do
+            test -z "$(git -C "$d" status --porcelain --untracked-files=no)"
+          done
+          printf '%s  harness\n%s  mqttium-433\n%s  mqttium-434\n' "$BENCH_SHA" "$SHA_433" "$SHA_434" > provenance.txt
+      - name: Pack source snapshots
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar --exclude=.git -czf harness.tar.gz harness
+          tar --exclude=.git -czf mqttium-433.tar.gz mqttium-433
+          tar --exclude=.git -czf mqttium-434.tar.gz mqttium-434
+          sha256sum harness.tar.gz mqttium-433.tar.gz mqttium-434.tar.gz > sha256sums.txt
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: immutable-regime-snapshots-${{ github.run_id }}
+          path: |
+            harness.tar.gz
+            mqttium-433.tar.gz
+            mqttium-434.tar.gz
+            provenance.txt
+            sha256sums.txt
+          retention-days: 7
