@@ -80,12 +80,19 @@ def _write_sqlite(path: Path) -> None:
 def _read_sqlite(path: Path) -> None:
     with SqliteInflightStore(path) as store:
         assert store.get_out(_RECORD.mid) == _RECORD
-        assert tuple(store.out_items()) == (_RECORD,)
+        assert tuple(
+            store.get_out(summary.mid) for page in store.out_summary_pages() for summary in page
+        ) == (_RECORD,)
         assert store.delete_out(_RECORD.mid)
 
     with SqliteInflightStore(path) as store:
         assert store.get_out(_RECORD.mid) is None
-        assert tuple(store.out_items()) == ()
+        assert (
+            tuple(
+                store.get_out(summary.mid) for page in store.out_summary_pages() for summary in page
+            )
+            == ()
+        )
 
 
 def main() -> None:

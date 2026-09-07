@@ -1,12 +1,10 @@
-"""Payload-free record transitions and the whole-object fallback path."""
+"""Payload-free record transitions required by the persistence contract."""
 
 from __future__ import annotations
 
 from collections.abc import Iterator
-from contextlib import AbstractContextManager, contextmanager, nullcontext
+from contextlib import contextmanager
 from pathlib import Path
-
-import pytest
 
 from mqttium.enums import InboundQoSState, MQTTProtocolVersion, OutboundQoSState, QoS
 from mqttium.enums import PacketType
@@ -18,66 +16,11 @@ from mqttium.packets import (
     PubRelPacket,
     encode_frame,
 )
-from mqttium.persistence.memory import MemoryInflightStore, TransitionInflightStore
+from mqttium.persistence.memory import MemoryInflightStore
 from mqttium.persistence.sqlite import SqliteInflightStore
 from mqttium.protocol.engine import EffectKind, EngineConfig, ProtocolEngine
-from mqttium.types import InboundMessage, OutboundMessage
+from mqttium.types import OutboundMessage
 from tests.support import feed_engine, write_item_bytes
-
-
-class PlainInflightStore:
-    """A store predating the transition extension: whole objects only.
-
-    Third-party stores in this shape must keep working, so every session path
-    that gained a metadata-only branch is exercised through this one too.
-    """
-
-    def __init__(self) -> None:
-        self._out: dict[int, OutboundMessage] = {}
-        self._in: dict[int, InboundMessage] = {}
-
-    def batch(self) -> AbstractContextManager[None]:
-        return nullcontext()
-
-    def put_out(self, msg: OutboundMessage) -> None:
-        self._out[msg.mid] = msg
-
-    def get_out(self, mid: int) -> OutboundMessage | None:
-        return self._out.get(mid)
-
-    def delete_out(self, mid: int) -> bool:
-        return self._out.pop(mid, None) is not None
-
-    def update_out(self, msg: OutboundMessage) -> None:
-        if msg.mid not in self._out:
-            raise KeyError(msg.mid)
-        self._out[msg.mid] = msg
-
-    def out_items(self) -> Iterator[OutboundMessage]:
-        return iter(list(self._out.values()))
-
-    def clear_out(self) -> None:
-        self._out.clear()
-
-    def put_in(self, msg: InboundMessage) -> None:
-        self._in[msg.mid] = msg
-
-    def get_in(self, mid: int) -> InboundMessage | None:
-        return self._in.get(mid)
-
-    def pop_in(self, mid: int) -> InboundMessage | None:
-        return self._in.pop(mid, None)
-
-    def update_in(self, msg: InboundMessage) -> None:
-        if msg.mid not in self._in:
-            raise KeyError(msg.mid)
-        self._in[msg.mid] = msg
-
-    def in_items(self) -> Iterator[InboundMessage]:
-        return iter(list(self._in.values()))
-
-    def clear_in(self) -> None:
-        self._in.clear()
 
 
 def connack(
@@ -130,12 +73,6 @@ def sends(engine: ProtocolEngine) -> list[bytes]:
         for effect in engine.take_effects()
         if effect.kind in (EffectKind.SEND, EffectKind.SEND_ACK)
     ]
-
-
-def test_shipped_stores_satisfy_the_transition_protocol(tmp_path: Path) -> None:
-    assert isinstance(MemoryInflightStore(), TransitionInflightStore)
-    assert isinstance(SqliteInflightStore(tmp_path / "t.db"), TransitionInflightStore)
-    assert not isinstance(PlainInflightStore(), TransitionInflightStore)
 
 
 def test_puback_settles_a_sqlite_record_without_reading_the_payload(tmp_path: Path) -> None:
@@ -335,89 +272,9 @@ def test_hydration_backfills_a_legacy_logical_size(tmp_path: Path) -> None:
     reopened.close()
 
 
-@pytest.mark.parametrize("qos", [1, 2])
-def test_a_store_without_the_extension_completes_the_full_cycle(qos: int) -> None:
-    store = PlainInflightStore()
-    engine = connected_engine(store)
-    handle = engine.queue_publish("a/b", b"payload", qos=qos)
-    mid = handle.mid or 0
-    engine.take_effects()
-
-    if qos == 2:
-        feed_engine(engine, PubRecPacket(mid=mid).encode())
-        assert sends(engine) == [PubRelPacket(mid=mid).encode()]
-        feed_engine(engine, PubCompPacket(mid=mid).encode())
-    else:
-        feed_engine(engine, PubAckPacket(mid=mid).encode())
-
-    assert any(
-        effect.kind is EffectKind.PUBLISH_COMPLETE and effect.data == mid
-        for effect in engine.take_effects()
-    )
-    assert store.get_out(mid) is None
-    assert engine.pending_outbound_bytes == 0
-    assert not engine.packet_ids.in_use(mid)
-
-
-def test_a_store_without_the_extension_handles_inbound_qos2_and_manual_ack() -> None:
-    store = PlainInflightStore()
-    engine = connected_engine(store, manual_ack=True)
-    publish = PublishPacket(
-        topic="in/topic",
-        payload=b"body",
-        qos=QoS.EXACTLY_ONCE,
-        retain=False,
-        dup=False,
-        mid=8,
-    ).encode()
-    feed_engine(engine, publish)
-    engine.take_effects()
-
-    engine.mark_inbound_delivered(8)
-    record = store.get_in(8)
-    assert record is not None and record.delivered is True
-
-    feed_engine(engine, publish)  # duplicate
-    assert sends(engine) == [PubRecPacket(mid=8).encode()]
-
-    feed_engine(engine, PubRelPacket(mid=8).encode())
-    assert sends(engine) == []
-    engine.ack(8)
-    assert sends(engine) == [PubCompPacket(mid=8).encode()]
-    assert store.get_in(8) is None
-
-
-def test_a_store_without_the_extension_completes_inbound_qos1_manual_ack() -> None:
-    store = PlainInflightStore()
-    engine = connected_engine(store, manual_ack=True)
-    feed_engine(
-        engine,
-        PublishPacket(
-            topic="in/topic",
-            payload=b"body",
-            qos=QoS.AT_LEAST_ONCE,
-            retain=False,
-            dup=False,
-            mid=9,
-        ).encode(),
-    )
-
-    assert sends(engine) == []
-    engine.ack(9)
-    assert sends(engine) == [PubAckPacket(mid=9).encode()]
-    assert store.get_in(9) is None
-
-
-@pytest.mark.parametrize("store_factory", [MemoryInflightStore, PlainInflightStore])
-def test_negative_pubrec_never_answers_with_pubrel(store_factory: type) -> None:
-    """MQTT 5 §4.3.3: reason >= 0x80 ends the exchange, with or without transitions.
-
-    The reason-code test used to live inside the transition branch only, so a
-    store without conditional transitions reached the "no such record" test
-    first and answered an unknown identifier with an orphan PUBREL 0x92. Both
-    store shapes must now stay silent.
-    """
-    engine = connected_engine(store_factory(), protocol=MQTTProtocolVersion.MQTTv5)
+def test_negative_pubrec_never_answers_with_pubrel() -> None:
+    """MQTT 5 §4.3.3: a negative PUBREC ends the exchange without PUBREL."""
+    engine = connected_engine(MemoryInflightStore(), protocol=MQTTProtocolVersion.MQTTv5)
 
     # Unknown identifier: nothing to fail, and nothing may go on the wire.
     feed_engine(engine, PubRecPacket(mid=4242, reason_code=0x80).encode(MQTTProtocolVersion.MQTTv5))

@@ -22,14 +22,25 @@ async def test_nowait_rejection_is_atomic() -> None:
     first = await client.publish("admission/first", b"one", qos=1)
     assert first.mid is not None
     before_ids = len(client._engine.packet_ids)
-    before_records = list(client._engine.store.out_items())
+    before_records = list(
+        client._engine.store.get_out(summary.mid)
+        for page in client._engine.store.out_summary_pages()
+        for summary in page
+    )
 
     with pytest.raises(FlowControlError):
         await client.publish("admission/rejected", b"two", qos=1, nowait=True)
 
     assert client._engine.pending_outbound_messages == 1
     assert len(client._engine.packet_ids) == before_ids
-    assert list(client._engine.store.out_items()) == before_records
+    assert (
+        list(
+            client._engine.store.get_out(summary.mid)
+            for page in client._engine.store.out_summary_pages()
+            for summary in page
+        )
+        == before_records
+    )
     assert len(client._receipts) == 1
     assert not client._pending_effects
 
@@ -55,7 +66,11 @@ async def test_cancellation_while_waiting_leaves_no_publication_state() -> None:
     )
     await client.publish("admission/first", b"one", qos=1)
     before_ids = len(client._engine.packet_ids)
-    before_records = list(client._engine.store.out_items())
+    before_records = list(
+        client._engine.store.get_out(summary.mid)
+        for page in client._engine.store.out_summary_pages()
+        for summary in page
+    )
 
     waiting = asyncio.create_task(client.publish("admission/cancelled", b"two", qos=1))
     await asyncio.sleep(0)
@@ -66,7 +81,14 @@ async def test_cancellation_while_waiting_leaves_no_publication_state() -> None:
 
     assert client._engine.pending_outbound_messages == 1
     assert len(client._engine.packet_ids) == before_ids
-    assert list(client._engine.store.out_items()) == before_records
+    assert (
+        list(
+            client._engine.store.get_out(summary.mid)
+            for page in client._engine.store.out_summary_pages()
+            for summary in page
+        )
+        == before_records
+    )
     assert len(client._receipts) == 1
 
 
@@ -89,14 +111,25 @@ async def test_nowait_writer_rejection_is_atomic_for_qos1() -> None:
     client._engine.state = ConnectionState.CONNECTED
     assert client._write_pump.try_enqueue(b"occupied") is True
     before_ids = len(client._engine.packet_ids)
-    before_records = list(client._engine.store.out_items())
+    before_records = list(
+        client._engine.store.get_out(summary.mid)
+        for page in client._engine.store.out_summary_pages()
+        for summary in page
+    )
 
     with pytest.raises(FlowControlError):
         await client.publish("admission/writer", b"payload", qos=1, nowait=True)
 
     assert client._engine.pending_outbound_messages == 0
     assert len(client._engine.packet_ids) == before_ids
-    assert list(client._engine.store.out_items()) == before_records
+    assert (
+        list(
+            client._engine.store.get_out(summary.mid)
+            for page in client._engine.store.out_summary_pages()
+            for summary in page
+        )
+        == before_records
+    )
     assert not client._receipts
     assert not client._pending_effects
 
@@ -106,14 +139,25 @@ async def test_publish_nowait_writer_rejection_is_atomic_for_qos1() -> None:
     client._engine.state = ConnectionState.CONNECTED
     assert client._write_pump.try_enqueue(b"occupied") is True
     before_ids = len(client._engine.packet_ids)
-    before_records = list(client._engine.store.out_items())
+    before_records = list(
+        client._engine.store.get_out(summary.mid)
+        for page in client._engine.store.out_summary_pages()
+        for summary in page
+    )
 
     with pytest.raises(FlowControlError):
         client.publish_nowait("admission/writer", b"payload", qos=1)
 
     assert client._engine.pending_outbound_messages == 0
     assert len(client._engine.packet_ids) == before_ids
-    assert list(client._engine.store.out_items()) == before_records
+    assert (
+        list(
+            client._engine.store.get_out(summary.mid)
+            for page in client._engine.store.out_summary_pages()
+            for summary in page
+        )
+        == before_records
+    )
     assert not client._receipts
     assert not client._pending_effects
 
@@ -132,7 +176,11 @@ async def test_nowait_batch_writer_rejection_is_atomic() -> None:
 
     assert client._engine.pending_outbound_messages == 0
     assert not client._engine.packet_ids
-    assert not list(client._engine.store.out_items())
+    assert not list(
+        client._engine.store.get_out(summary.mid)
+        for page in client._engine.store.out_summary_pages()
+        for summary in page
+    )
     assert not client._batch_receipts
     assert not client._pending_effects
 

@@ -57,7 +57,17 @@ def test_message_limit_rejects_before_packet_id_or_store_mutation() -> None:
     assert engine.pending_outbound_messages == 1
     assert engine.pending_outbound_bytes == len(b"one") + len("admission/first")
     assert len(engine.packet_ids) == 1
-    assert sum(1 for _ in engine.store.out_items()) == 1
+    assert (
+        sum(
+            1
+            for _ in (
+                engine.store.get_out(summary.mid)
+                for page in engine.store.out_summary_pages()
+                for summary in page
+            )
+        )
+        == 1
+    )
 
 
 def test_zero_capacity_rejects_without_allocating_state() -> None:
@@ -74,7 +84,14 @@ def test_zero_capacity_rejects_without_allocating_state() -> None:
     assert engine.pending_outbound_messages == 0
     assert engine.pending_outbound_bytes == 0
     assert len(engine.packet_ids) == 0
-    assert list(engine.store.out_items()) == []
+    assert (
+        list(
+            engine.store.get_out(summary.mid)
+            for page in engine.store.out_summary_pages()
+            for summary in page
+        )
+        == []
+    )
     assert engine.take_effects() == []
 
 
@@ -193,7 +210,14 @@ def test_publish_many_rollback_restores_admission_counters(store_kind: str, tmp_
     assert engine.pending_outbound_messages == 0
     assert engine.pending_outbound_bytes == 0
     assert len(engine.packet_ids) == 0
-    assert list(engine.store.out_items()) == []
+    assert (
+        list(
+            engine.store.get_out(summary.mid)
+            for page in engine.store.out_summary_pages()
+            for summary in page
+        )
+        == []
+    )
 
 
 @pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
@@ -280,7 +304,14 @@ def test_sustained_qos1_load_returns_admission_counters_to_zero() -> None:
         assert engine.pending_outbound_bytes == 0
         assert engine.flow.inflight == 0
         assert len(engine.packet_ids) == 0
-        assert list(engine.store.out_items()) == []
+        assert (
+            list(
+                engine.store.get_out(summary.mid)
+                for page in engine.store.out_summary_pages()
+                for summary in page
+            )
+            == []
+        )
 
     assert engine.outbound.pending_high_water_messages == 50
     assert engine.outbound.pending_high_water_bytes > 0

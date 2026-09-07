@@ -74,7 +74,10 @@ def test_direct_launch_rolls_back_mid_and_flow_on_store_failure() -> None:
 
     assert engine.flow.inflight == 0
     assert len(engine.packet_ids) == 0
-    assert list(store.out_items()) == []
+    assert (
+        list(store.get_out(summary.mid) for page in store.out_summary_pages() for summary in page)
+        == []
+    )
     assert not engine.take_effects()
 
 
@@ -123,10 +126,11 @@ def test_queued_launch_failure_releases_resources_and_emits_failure() -> None:
 
 
 class _FailPubrelReplayStore(MemoryInflightStore):
-    def update_out(self, msg: OutboundMessage) -> None:
-        if msg.state is OutboundQoSState.WAIT_PUBCOMP:
-            raise RuntimeError("PUBREL replay write failed")
-        super().update_out(msg)
+    def get_out(self, mid: int) -> OutboundMessage | None:
+        msg = super().get_out(mid)
+        if msg is not None and msg.state is OutboundQoSState.WAIT_PUBCOMP:
+            raise RuntimeError("PUBREL replay materialisation failed")
+        return msg
 
 
 def test_pubrel_replay_failure_does_not_release_publish_window() -> None:
@@ -229,7 +233,10 @@ def test_qos2_pubrel_replay_does_not_consume_local_publish_window() -> None:
         assert engine.flow.inflight == 0
         assert PacketType.PUBREL not in _sent_packet_types(effects)
 
-    assert list(store.out_items()) == []
+    assert (
+        list(store.get_out(summary.mid) for page in store.out_summary_pages() for summary in page)
+        == []
+    )
     assert len(engine.packet_ids) == 0
 
 

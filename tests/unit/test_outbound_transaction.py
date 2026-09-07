@@ -84,7 +84,14 @@ def _snapshot(engine: ProtocolEngine) -> dict[str, Any]:
         "flow_inflight": engine.flow.inflight,
         "queued_mids": [msg.mid for msg in engine._queued],
         "used_mids": sorted(engine.packet_ids._used),
-        "store_mids": sorted(msg.mid for msg in engine.store.out_items()),
+        "store_mids": sorted(
+            msg.mid
+            for msg in (
+                engine.store.get_out(summary.mid)
+                for page in engine.store.out_summary_pages()
+                for summary in page
+            )
+        ),
         "effects": len(engine._effects),
     }
 
@@ -282,7 +289,14 @@ def test_commit_accounts_exactly_once_per_message(tmp_path: Path) -> None:
         # is in the store exactly once either way.
         assert engine.flow.inflight == 2
         assert [msg.mid for msg in engine._queued] == [3, 4, 5]
-        assert sorted(msg.mid for msg in engine.store.out_items()) == [1, 2, 3, 4, 5]
+        assert sorted(
+            msg.mid
+            for msg in (
+                engine.store.get_out(summary.mid)
+                for page in engine.store.out_summary_pages()
+                for summary in page
+            )
+        ) == [1, 2, 3, 4, 5]
 
 
 def test_qos0_in_a_batch_acquires_nothing(tmp_path: Path) -> None:

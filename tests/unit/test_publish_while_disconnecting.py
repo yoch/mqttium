@@ -42,7 +42,10 @@ def test_qos1_publish_is_rejected_after_disconnect_begins() -> None:
         engine.queue_publish("late/qos1", b"x", qos=1)
 
     assert engine.state is ConnectionState.DISCONNECTING
-    assert tuple(store.out_items()) == ()
+    assert (
+        tuple(store.get_out(summary.mid) for page in store.out_summary_pages() for summary in page)
+        == ()
+    )
     assert engine.pending_outbound_messages == 0
     assert len(engine.packet_ids) == 0
 
@@ -54,6 +57,9 @@ def test_publish_many_is_rejected_after_disconnect_begins() -> None:
     with pytest.raises(NotConnectedError, match="disconnecting"):
         engine.queue_publish_many([("late/qos1", b"x", 1, False, None)])
 
-    assert tuple(store.out_items()) == ()
+    assert (
+        tuple(store.get_out(summary.mid) for page in store.out_summary_pages() for summary in page)
+        == ()
+    )
     assert engine.pending_outbound_messages == 0
     assert len(engine.packet_ids) == 0

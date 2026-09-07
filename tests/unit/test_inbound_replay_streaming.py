@@ -263,24 +263,6 @@ def test_delivered_cursor_held_record_is_consistent_across_stores(
         store.close()
 
 
-def test_a_store_without_paging_keeps_the_eager_replay() -> None:
-    class PlainStore(MemoryInflightStore):
-        """Drops the opt-in extensions the streaming replay relies on."""
-
-        in_pages = None  # type: ignore[assignment]
-        in_index_pages = None  # type: ignore[assignment]
-
-    store = PlainStore()
-    fill(store, 300)
-    engine = ProtocolEngine(EngineConfig(client_id="eager", clean_start=False), store=store)
-
-    effects = resume_effects(engine)
-
-    assert message_mids(effects) == list(range(1, 301))
-    assert not any(e.kind is EffectKind.CONTINUE_INBOUND_REPLAY for e in effects)
-    assert engine.inbound.replay_pending is False
-
-
 async def test_client_replays_every_message_through_the_effect_pump() -> None:
     store = MemoryInflightStore()
     fill(store, 400)

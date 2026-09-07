@@ -380,7 +380,11 @@ def fuzz_engine(  # noqa: C901
                 engine.take_effects()
             elif op == 11:
                 # Delivery handoff can race a cursor-held replay record.
-                inbound = list(engine.store.in_items())
+                inbound = list(
+                    engine.store.get_in(meta.mid)
+                    for page in engine.store.in_index_pages()
+                    for meta in page
+                )
                 if inbound:
                     engine.mark_inbound_delivered(rng.choice(inbound).mid)
                 engine.take_effects()
@@ -443,7 +447,11 @@ def _check_engine_invariants(engine: ProtocolEngine) -> None:
     assert engine.flow.inflight <= engine.flow.limit, "flow inflight exceeds limit"
     assert engine._inbound_inflight >= 0, "negative inbound inflight"
 
-    outbound = list(engine.store.out_items())
+    outbound = list(
+        engine.store.get_out(summary.mid)
+        for page in engine.store.out_summary_pages()
+        for summary in page
+    )
     assert all(message.topic for message in outbound), "durable alias record lost canonical topic"
     outbound_mids = {msg.mid for msg in outbound}
     expected_mids = outbound_mids | set(engine._pending_sub_mids)
@@ -465,7 +473,9 @@ def _check_engine_invariants(engine: ProtocolEngine) -> None:
     assert engine.outbound.pending_bytes == sum(
         engine.outbound.stored_logical_size(message) for message in outbound
     ), "outbound byte budget mismatch"
-    inbound = list(engine.store.in_items())
+    inbound = list(
+        engine.store.get_in(meta.mid) for page in engine.store.in_index_pages() for meta in page
+    )
     assert engine.inbound._pending_bytes == sum(
         engine.inbound.stored_logical_size(message) for message in inbound
     ), "inbound byte budget mismatch"

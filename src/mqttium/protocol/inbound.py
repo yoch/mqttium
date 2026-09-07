@@ -10,17 +10,11 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Iterator
-from itertools import chain
 from typing import TYPE_CHECKING, NoReturn
 
 from mqttium.codec.buffer import RawPacket
 from mqttium.enums import InboundQoSState, MQTTProtocolVersion, PacketType, QoS
 from mqttium.errors import MalformedPacketError, MandatoryResponseTooLargeError, ProtocolError
-from mqttium.persistence.memory import (
-    BoundedInboundReplayStore,
-    PagedInflightStore,
-    TransitionInflightStore,
-)
 from mqttium.packets import (
     PublishPacket,
 )
@@ -49,24 +43,22 @@ if TYPE_CHECKING:
 # the message and byte bounds cap what the delivery layer has to absorb before
 # backpressure is consulted again.
 REPLAY_PAGE_SIZE = 256
-REPLAY_SCAN_LIMIT = 256
 REPLAY_BATCH_MESSAGES = 64
 REPLAY_BATCH_BYTES = 1 << 20
 
 
 class InboundReplayCursor:
-    """Lazy replay iterator with one-message pushback for byte-budget boundaries."""
+    """Bounded replay page iterator with one-message pushback."""
 
-    __slots__ = ("_messages", "_page_messages", "_pages", "_pending", "_remaining")
+    __slots__ = ("_page_messages", "_pages", "_pending", "_remaining")
 
     def __init__(
         self,
         pages: Iterator[tuple[InboundMessage, ...]],
         *,
-        remaining: int | None = None,
+        remaining: int,
     ) -> None:
         self._pages = pages
-        self._messages = chain.from_iterable(pages)
         self._page_messages: deque[InboundMessage] | None = None
         self._pending: InboundMessage | None = None
         self._remaining = remaining
@@ -76,15 +68,13 @@ class InboundReplayCursor:
         return self._remaining == 0 and self._pending is None and self._page_messages is None
 
     def begin_page(self) -> bool:
-        """Hydrate one store page, retaining any guarded suffix from the prior call."""
         if self._pending is not None or self._page_messages is not None:
             return True
         page = next(self._pages, None)
         if page is None:
             return False
         self._page_messages = deque(page)
-        if self._remaining is not None:
-            self._remaining -= len(page)
+        self._remaining -= len(page)
         return True
 
     def next_page_message(self) -> InboundMessage | None:
@@ -103,13 +93,6 @@ class InboundReplayCursor:
             self._page_messages = None
         return message
 
-    def next_message(self) -> InboundMessage | None:
-        if self._pending is not None:
-            message = self._pending
-            self._pending = None
-            return message
-        return next(self._messages, None)
-
     def push_back(self, message: InboundMessage) -> None:
         if self._pending is not None:
             raise AssertionError("replay cursor already has a pending message")
@@ -121,14 +104,12 @@ class InboundSession:
 
     __slots__ = (
         "_aliases",
-        "_bounded_replay_store",
         "_decode_pubrel",
         "_engine",
         "_inflight",
         "_is_v5",
         "_on_qos1",
         "_autoack_handoff_required",
-        "_paged_store",
         "_pending_auto_qos1_mids",
         "_pending_manual_qos1_acks",
         "_manual_qos1_order",
@@ -141,7 +122,6 @@ class InboundSession:
         "_session_state_qos2",
         "_tiny_peer_packet_limit",
         "_topic_alias_maximum",
-        "_transitions",
         "config",
         "handle_publish",
         "store",
@@ -153,14 +133,6 @@ class InboundSession:
         # stable for the engine lifetime (the same contract as OutboundSession).
         self.config = engine.config
         self.store = engine.store
-        # Resolved once, like the paged extension: with a transition-capable
-        # store, existence checks, delivery marks and acknowledgements never
-        # materialise an inbound payload.
-        self._transitions = self.store if isinstance(self.store, TransitionInflightStore) else None
-        self._paged_store = self.store if isinstance(self.store, PagedInflightStore) else None
-        self._bounded_replay_store = (
-            self.store if isinstance(self.store, BoundedInboundReplayStore) else None
-        )
         self._decode_pubrel = engine.codec.decode_pubrel
         # Fixed for the engine's lifetime, like the codec bindings above.
         self._is_v5 = engine.codec.is_mqtt5
@@ -203,36 +175,13 @@ class InboundSession:
         self._stored_inbound = len(self._recovered_mids)
 
     def _load_recovered_state(self) -> tuple[set[int], int, int, tuple[int, ...]]:
-        """Restore identifiers, bytes, QoS 2 count, and durable QoS 1 arrival order."""
-        transitions = self._transitions
-        if transitions is None:
-            eager_mids: set[int] = set()
-            eager_qos1: list[int] = []
-            pending_bytes = 0
-            session_state_qos2 = 0
-            for message in self.store.in_items():
-                eager_mids.add(message.mid)
-                if message.state in (
-                    InboundQoSState.WAIT_PUBREL,
-                    InboundQoSState.WAIT_USER_ACK,
-                ):
-                    session_state_qos2 += 1
-                if message.state is InboundQoSState.WAIT_PUBACK:
-                    eager_qos1.append(message.mid)
-                size = message.logical_size or self.logical_size(
-                    message.topic,
-                    message.payload,
-                    message.properties,
-                )
-                message.logical_size = size
-                pending_bytes += size
-            return eager_mids, pending_bytes, session_state_qos2, tuple(eager_qos1)
+        """Restore identifiers and accounting from the payload-free store index."""
         mids: set[int] = set()
         recovered_qos1: list[int] = []
         pending_bytes = 0
         session_state_qos2 = 0
-        unknown_sizes: set[int] = set()
-        for page in transitions.in_index_pages(REPLAY_PAGE_SIZE):
+        unknown_sizes: list[int] = []
+        for page in self.store.in_index_pages(REPLAY_PAGE_SIZE):
             for meta in page:
                 mids.add(meta.mid)
                 if meta.state in (
@@ -245,20 +194,18 @@ class InboundSession:
                 if meta.logical_size > 0:
                     pending_bytes += meta.logical_size
                 else:
-                    unknown_sizes.add(meta.mid)
-        if unknown_sizes:
-            for message in self.store.in_items():
-                if message.mid not in unknown_sizes:
-                    continue
-                size = self.logical_size(message.topic, message.payload, message.properties)
-                message.logical_size = size
-                if not transitions.set_in_logical_size(message.mid, size):
-                    raise RuntimeError(
-                        f"Inbound mid={message.mid} disappeared while restoring byte accounting"
-                    )
-                pending_bytes += size
+                    unknown_sizes.append(meta.mid)
+        for mid in unknown_sizes:
+            message = self.store.get_in(mid)
+            if message is None:
+                raise RuntimeError(f"Inbound mid={mid} disappeared while restoring byte accounting")
+            size = self.logical_size(message.topic, message.payload, message.properties)
+            if not self.store.set_in_logical_size(mid, size):
+                raise RuntimeError(f"Inbound mid={mid} disappeared while restoring byte accounting")
+            pending_bytes += size
         return mids, pending_bytes, session_state_qos2, tuple(recovered_qos1)
 
+    # --- lifecycle ---------------------------------------------------------
     # --- lifecycle ---------------------------------------------------------
 
     def start_connection(self, *, receive_maximum: int, topic_alias_maximum: int) -> None:
@@ -341,14 +288,11 @@ class InboundSession:
             pending_byte_limit=self.config.max_pending_inbound_bytes,
         )
 
-    def _lookup_stored_inbound(self, mid: int) -> InboundMessage | InboundRecordMeta | None:
-        """Return a persisted inbound record without probing an empty store."""
+    def _lookup_stored_inbound(self, mid: int) -> InboundRecordMeta | None:
+        """Return persisted inbound metadata without probing an empty store."""
         if not self._stored_inbound:
             return None
-        transitions = self._transitions
-        if transitions is not None:
-            return transitions.in_meta(mid)
-        return self.store.get_in(mid)
+        return self.store.in_meta(mid)
 
     def _remember_inbound(self) -> None:
         self._stored_inbound += 1
@@ -361,25 +305,13 @@ class InboundSession:
     def _complete_stored_inbound(
         self, mid: int, expected_state: InboundQoSState, action: str
     ) -> int:
-        """Delete one persisted inbound record and return its logical size.
+        """Conditionally delete one inbound record and return its logical size."""
+        completed = self.store.complete_in(mid, expected_state)
+        if completed is None:
+            raise RuntimeError(f"Inbound mid={mid} changed while {action}")
+        return completed.logical_size
 
-        A transition-capable store settles through metadata only; the base
-        interface pops the whole record. Both raise when the record moved or
-        vanished between the caller's lookup and this deletion. That is store
-        divergence, never a peer protocol violation: RuntimeError, so the
-        engine lets it traverse instead of peer-blaming it.
-        """
-        transitions = self._transitions
-        if transitions is not None:
-            completed = transitions.complete_in(mid, expected_state)
-            if completed is None:
-                raise RuntimeError(f"Inbound mid={mid} changed while {action}")
-            return completed.logical_size
-        popped = self.store.pop_in(mid)
-        if popped is None:
-            raise RuntimeError(f"Inbound mid={mid} disappeared while {action}")
-        return self.stored_logical_size(popped)
-
+    # --- packet handlers ---------------------------------------------------
     # --- packet handlers ---------------------------------------------------
 
     def _on_publish_v311(self, raw: RawPacket) -> None:
@@ -501,8 +433,7 @@ class InboundSession:
     ) -> None:
         engine = self._engine
         store = self.store
-        transitions = self._transitions
-        existing: InboundMessage | InboundRecordMeta | None = None
+        existing: InboundRecordMeta | None = None
         if self._stored_inbound:
             # One lookup answers both questions. The store is keyed by identifier
             # alone, so a record under this mid is a QoS 2 duplicate only if it is
@@ -512,10 +443,7 @@ class InboundSession:
             # miss costs the same as the bare existence query it replaces while a
             # duplicate no longer costs two. The `_stored_inbound` guard stays
             # inlined: it keeps the whole probe off the fresh-PUBLISH path.
-            if transitions is not None:
-                existing = transitions.in_meta(mid)
-            else:
-                existing = store.get_in(mid)
+            existing = store.in_meta(mid)
         if existing is not None:
             if existing.state is InboundQoSState.WAIT_PUBACK:
                 self._reject_packet_id_collision(mid, "QoS 2", "QoS 1")
@@ -692,7 +620,7 @@ class InboundSession:
             # but is surfaced again so an application can complete manual ACK
             # after a reconnect or callback cancellation.
             if existing.state is InboundQoSState.WAIT_PUBACK:
-                message = existing if isinstance(existing, InboundMessage) else store.get_in(mid)
+                message = store.get_in(mid)
                 if message is None:
                     raise RuntimeError(f"Inbound mid={mid} disappeared while redelivering")
                 self._emit_message(message, dup=True)
@@ -742,14 +670,10 @@ class InboundSession:
     def on_pubrel(self, raw: RawPacket) -> None:
         engine = self._engine
         config = self.config
-        store = self.store
         mid, _reason_code, properties = self._decode_pubrel(raw.remaining)
         if properties is not None:
             engine._validate_inbound_problem_information(PacketType.PUBREL, properties)
-        # One state machine for both store shapes: a transition-capable store
-        # answers through metadata only, the base interface reads the record.
-        transitions = self._transitions
-        record: InboundMessage | InboundRecordMeta | None = self._lookup_stored_inbound(mid)
+        record = self._lookup_stored_inbound(mid)
         if record is None:
             if self._tiny_peer_packet_limit:
                 self._raise_mandatory_response_too_large("PUBCOMP")
@@ -762,19 +686,13 @@ class InboundSession:
         elif state is not InboundQoSState.WAIT_PUBREL:
             raise ProtocolError(f"PUBREL for inbound mid={mid} in invalid state {state!r}")
         elif config.manual_ack and not record.user_acked:
-            # The exchange completes when the application calls ack().
-            if transitions is not None:
-                changed = transitions.transition_in(
-                    mid,
-                    InboundQoSState.WAIT_PUBREL,
-                    InboundQoSState.WAIT_USER_ACK,
-                )
-                if changed is None:
-                    raise RuntimeError(f"Inbound mid={mid} changed while processing PUBREL")
-            else:
-                assert isinstance(record, InboundMessage)
-                record.state = InboundQoSState.WAIT_USER_ACK
-                store.update_in(record)
+            changed = self.store.transition_in(
+                mid,
+                InboundQoSState.WAIT_PUBREL,
+                InboundQoSState.WAIT_USER_ACK,
+            )
+            if changed is None:
+                raise RuntimeError(f"Inbound mid={mid} changed while processing PUBREL")
             return
         if self._tiny_peer_packet_limit:
             self._raise_mandatory_response_too_large("PUBCOMP")
@@ -785,48 +703,26 @@ class InboundSession:
         self._release_slot(logical_size)
 
     # --- application acknowledgement and replay ---------------------------
+    # --- application acknowledgement and replay ---------------------------
 
     def mark_delivered(self, mid: int) -> None:
-        if not self._stored_inbound:
-            return
-        transitions = self._transitions
-        if transitions is not None:
-            # One conditional UPDATE. This runs for every delivered QoS 1/2
-            # message, so the whole-object read it replaces was the most
-            # frequent payload reconstruction in the library.
-            transitions.mark_in_delivered(mid)
-            return
-        inbound = self.store.get_in(mid)
-        if inbound is None or inbound.delivered:
-            return
-        inbound.delivered = True
-        self.store.update_in(inbound)
+        if self._stored_inbound:
+            self.store.mark_in_delivered(mid)
 
     def ack(self, mid: int) -> None:
         """Complete a deferred PUBACK or PUBCOMP in manual-ack mode."""
-        config = self.config
-        if not config.manual_ack:
+        if not self.config.manual_ack:
             raise ProtocolError("manual_ack is disabled")
-        store = self.store
-        transitions = self._transitions
-        record: InboundMessage | InboundRecordMeta | None = self._lookup_stored_inbound(mid)
+        record = self._lookup_stored_inbound(mid)
         if record is None:
             raise ProtocolError(f"No pending inbound ack for mid={mid}")
         state = record.state
         if state is InboundQoSState.WAIT_PUBREL:
-            if isinstance(record, InboundMessage):
-                record.user_acked = True
-                store.update_in(record)
-            else:
-                assert transitions is not None
-                changed = transitions.transition_in(mid, state, state, user_acked=True)
-                if changed is None:
-                    raise ProtocolError(f"Inbound mid={mid} changed while acknowledging")
+            changed = self.store.transition_in(mid, state, state, user_acked=True)
+            if changed is None:
+                raise ProtocolError(f"Inbound mid={mid} changed while acknowledging")
             return
         if state is InboundQoSState.WAIT_PUBACK:
-            # PUBACK ordering is defined by PUBLISH arrival, not by application
-            # ack() call order [MQTT-4.6.0-2]. Keep the Receive Maximum slot and
-            # durable record until every earlier QoS 1 delivery is ready too.
             self._engine._check_outbound_size(_encode_puback_success(mid))
             self._pending_manual_qos1_acks.add(mid)
             self._drain_manual_qos1_acks()
@@ -838,7 +734,6 @@ class InboundSession:
         self._engine._check_outbound_size(wire)
         logical_size = self._complete_stored_inbound(mid, state, "acknowledging")
         self._forget_inbound()
-        # The guard above already rejected every state but WAIT_USER_ACK.
         self._session_state_qos2 -= 1
         self._engine._send_ack(wire)
         self._release_slot(logical_size)
@@ -862,141 +757,57 @@ class InboundSession:
             self._release_slot(logical_size)
 
     def replay_session(self) -> None:
-        """Restore Receive Maximum accounting and start redelivering.
-
-        Only the first bounded batch is emitted here. The rest is pumped through
-        `CONTINUE_INBOUND_REPLAY`, so a 10,000-message durable session no longer
-        materialises 10,000 payloads — nor 10,000 effects — before the runtime
-        gets a chance to apply delivery backpressure.
-        """
-        paged = self._paged_store
-        bounded = self._bounded_replay_store
-        transitions = self._transitions
-        if transitions is None or (bounded is None and paged is None):
-            # A store without the paging or metadata extensions keeps the
-            # original eager behaviour: correct, just not bounded.
-            inbound_items = list(self.store.in_items())
-            self._inflight = len(inbound_items)
-            for inbound in inbound_items:
-                if self._should_redeliver(inbound):
-                    self._emit_message(inbound, dup=True)
-            self._recovered_mids.clear()
-            return
-
-        # Built-in stores count directly without re-scanning the index that
-        # construction already traversed. Third-party paged stores keep the
-        # metadata-only fallback.
-        if bounded is not None:
-            persisted = bounded.in_count()
-            pages = bounded.in_replay_pages(
-                REPLAY_BATCH_MESSAGES,
-                REPLAY_BATCH_BYTES,
-            )
-        else:
-            persisted = 0
-            for page in transitions.in_index_pages(REPLAY_PAGE_SIZE):
-                persisted += len(page)
-            assert paged is not None
-            pages = paged.in_pages(REPLAY_PAGE_SIZE)
+        """Restore Receive Maximum accounting and start bounded redelivery."""
+        persisted = self.store.in_count()
         self._inflight = persisted
         if persisted == 0:
             self._recovered_mids.clear()
             return
-        self._replay = InboundReplayCursor(
-            iter(pages),
-            remaining=persisted if bounded is not None else None,
-        )
+        pages = self.store.in_replay_pages(REPLAY_BATCH_MESSAGES, REPLAY_BATCH_BYTES)
+        self._replay = InboundReplayCursor(iter(pages), remaining=persisted)
         self.drain_replay()
 
     def drain_replay(self) -> None:
-        """Emit one bounded batch of redeliveries.
-
-        Whether more remain is read back from `replay_pending`, so there is one
-        way to ask rather than two.
-        """
+        """Emit one bounded replay batch."""
         cursor = self._replay
         if cursor is None:
             return
-        transitions = self._transitions
-        assert transitions is not None
-        if self._bounded_replay_store is not None:
-            # Built-in stores hydrate pages at the effect-batch boundary. The
-            # engine is synchronous, so that page cannot become stale before
-            # this method emits it, and no per-record metadata probe is needed.
-            if not cursor.begin_page():
-                self._replay = None
-                self._recovered_mids.clear()
-                return
-            emitted = 0
-            emitted_bytes = 0
-            while emitted < REPLAY_BATCH_MESSAGES and emitted_bytes < REPLAY_BATCH_BYTES:
-                bounded_message = cursor.next_page_message()
-                if bounded_message is None:
-                    break
-                if not self._should_redeliver(bounded_message):
-                    continue
-                message_bytes = len(bounded_message.payload) + len(
-                    bounded_message.topic.encode("utf-8")
-                )
-                if emitted and emitted_bytes + message_bytes > REPLAY_BATCH_BYTES:
-                    cursor.push_back(bounded_message)
-                    break
-                self._emit_message(bounded_message, dup=True)
-                emitted += 1
-                emitted_bytes += message_bytes
-            if cursor.bounded_complete:
-                self._replay = None
-                self._recovered_mids.clear()
-                return
-            self._engine._emit(EffectKind.CONTINUE_INBOUND_REPLAY, None)
+        if not cursor.begin_page():
+            self._replay = None
+            self._recovered_mids.clear()
             return
-        scanned = 0
         emitted = 0
         emitted_bytes = 0
-        while (
-            scanned < REPLAY_SCAN_LIMIT
-            and emitted < REPLAY_BATCH_MESSAGES
-            and emitted_bytes < REPLAY_BATCH_BYTES
-        ):
-            inbound = cursor.next_message()
+        while emitted < REPLAY_BATCH_MESSAGES and emitted_bytes < REPLAY_BATCH_BYTES:
+            inbound = cursor.next_page_message()
             if inbound is None:
-                self._replay = None
-                self._recovered_mids.clear()
-                return
-            # A legacy paged store may retain a larger page across effect
-            # batches, so refresh payload-free metadata before emission.
-            current = transitions.in_meta(inbound.mid)
-            if current is None or not self._should_redeliver(inbound, current):
-                scanned += 1
+                break
+            if not self._should_redeliver(inbound):
                 continue
             message_bytes = len(inbound.payload) + len(inbound.topic.encode("utf-8"))
             if emitted and emitted_bytes + message_bytes > REPLAY_BATCH_BYTES:
                 cursor.push_back(inbound)
                 break
-            scanned += 1
             self._emit_message(inbound, dup=True)
             emitted += 1
             emitted_bytes += message_bytes
+        if cursor.bounded_complete:
+            self._replay = None
+            self._recovered_mids.clear()
+            return
         self._engine._emit(EffectKind.CONTINUE_INBOUND_REPLAY, None)
 
-    def _should_redeliver(
-        self,
-        inbound: InboundMessage,
-        current: InboundRecordMeta | None = None,
-    ) -> bool:
-        delivered = inbound.delivered if current is None else current.delivered
-        state = inbound.state if current is None else current.state
-        user_acked = inbound.user_acked if current is None else current.user_acked
-        if not delivered:
+    def _should_redeliver(self, inbound: InboundMessage) -> bool:
+        if not inbound.delivered:
             return True
         if inbound.mid not in self._recovered_mids or not self.config.manual_ack:
             return False
-        if state in (
+        if inbound.state in (
             InboundQoSState.WAIT_PUBACK,
             InboundQoSState.WAIT_USER_ACK,
         ):
             return True
-        return state is InboundQoSState.WAIT_PUBREL and not user_acked
+        return inbound.state is InboundQoSState.WAIT_PUBREL and not inbound.user_acked
 
     def _emit_message(self, inbound: InboundMessage, *, dup: bool) -> None:
         self._engine._emit(

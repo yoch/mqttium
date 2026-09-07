@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from itertools import islice
 from contextlib import AbstractContextManager, nullcontext
-from typing import Protocol, TypeVar, runtime_checkable
+from typing import Protocol, TypeVar
 
 from mqttium.enums import InboundQoSState, OutboundQoSState
 from mqttium.types import (
@@ -18,141 +18,34 @@ from mqttium.types import (
 
 
 class InflightStore(Protocol):
-    """The minimum a store must provide. Session replay materialises the whole
-    store at once, which is proportional to total session size.
+    """Persistence contract required by the MQTT state machine.
 
-    Implementations MUST NOT report storage, backend, integrity, or lifecycle
-    failures with ``mqttium.errors.MQTTError`` or any of its subclasses:
-    ``MQTTError`` is reserved for MQTT/client-layer semantics, and using it
-    for store failures makes classification unsupported and ambiguous. Use
-    backend-native or ordinary Python exceptions (``OSError``,
-    ``RuntimeError``, ``ValueError``, ``KeyError``, DB-API errors) instead. A
-    store that raises an MQTT exception leaves its classification outside the
-    supported contract.
+    Stores provide atomic batches, bounded replay, payload-free metadata reads,
+    and conditional transitions.  These are correctness/resource guarantees,
+    not optional optimisations: the runtime has one persistence state-machine
+    path and never falls back to eager whole-store hydration or read/modify/write
+    settlement.
+
+    Storage/backend failures must use backend-native or ordinary Python
+    exceptions rather than ``MQTTError`` subclasses.  ``batch()`` must roll back
+    prior mutations when its body fails and must not suppress that failure.
     """
 
-    def batch(self) -> AbstractContextManager[None]:
-        """Group store mutations into one atomic unit.
+    def batch(self) -> AbstractContextManager[None]: ...
 
-        If the body raises, prior mutations in that batch must not become
-        durable (rollback). The batch itself must not suppress an exception
-        raised by its body or by batch close: callers rely on observing the
-        original failure. See ``docs/sessions-and-persistence.md``
-        (capability matrix) for the base ``InflightStore`` contract: atomic
-        ``batch()`` mutations and ordered whole-record iteration.
-        """
-        ...
-
+    # Outbound records: full payloads are written/materialised only when needed;
+    # acknowledgement and state changes use metadata-only operations.
     def put_out(self, msg: OutboundMessage) -> None: ...
     def get_out(self, mid: int) -> OutboundMessage | None: ...
     def delete_out(self, mid: int) -> bool: ...
-    def update_out(self, msg: OutboundMessage) -> None:
-        """Persist the mutable state of an existing record, or raise ``KeyError``.
-
-        Only ``state`` and ``dup`` are guaranteed to be written, and
-        retransmission order must survive the update. A store may narrow the
-        write to exactly those columns — ``SqliteInflightStore`` does, so a
-        retransmission does not rewrite the payload BLOB.
-
-        The corollary is that the phase-two compaction ``on_pubrec`` applies
-        through this method is **best-effort** for a store without
-        :class:`TransitionInflightStore`: the blanked topic, payload and
-        properties may not become durable. Both built-in stores implement that
-        extension, so they compact through ``transition_out(compact=True)``
-        instead and never rely on this path. A third-party store that wants
-        compaction should implement the transition extension too.
-        """
-        ...
-
-    def out_items(self) -> Iterator[OutboundMessage]: ...
-    def clear_out(self) -> None: ...
-
-    def put_in(self, msg: InboundMessage) -> None: ...
-    def get_in(self, mid: int) -> InboundMessage | None: ...
-    def pop_in(self, mid: int) -> InboundMessage | None: ...
-    def update_in(self, msg: InboundMessage) -> None:
-        """Persist the mutable state of an existing record, or raise ``KeyError``.
-
-        Same contract as :meth:`update_out`; here the guaranteed fields are
-        ``state``, ``delivered`` and ``user_acked``.
-        """
-        ...
-
-    def in_items(self) -> Iterator[InboundMessage]: ...
-    def clear_in(self) -> None: ...
-
-
-@runtime_checkable
-class PagedInflightStore(InflightStore, Protocol):
-    """Opt-in extension that keeps replay memory proportional to page size.
-
-    ``out_summary_pages`` must never read the payload column: the engine uses it
-    to rebuild the queue index and only materialises a payload when a message is
-    actually replayed. A store that does not implement this protocol still
-    works; the engine falls back to the eager ``*_items()`` path, which on a
-    6,000 x 4 KiB session is the difference between roughly 4.5 MiB and 50 MiB
-    of peak allocation.
-    """
-
-    def out_pages(self, page_size: int = 256) -> Iterator[tuple[OutboundMessage, ...]]: ...
     def out_summary_pages(
         self, page_size: int = 256
     ) -> Iterator[tuple[OutboundMessageSummary, ...]]: ...
-    def in_pages(self, page_size: int = 256) -> Iterator[tuple[InboundMessage, ...]]: ...
-
-
-@runtime_checkable
-class BoundedInboundReplayStore(InflightStore, Protocol):
-    """Opt-in extension for payload hydration bounded by messages and bytes.
-
-    Every yielded page must contain at most ``max_messages`` records and
-    at most ``max_bytes`` of payload plus UTF-8 topic data. A single record
-    larger than ``max_bytes`` is yielded alone, because replay cannot make
-    progress without materialising it.
-    """
-
-    def in_count(self) -> int:
-        """Return the durable inbound record count without reading payloads."""
-        ...
-
-    def in_replay_pages(
-        self,
-        max_messages: int = 64,
-        max_bytes: int = 1 << 20,
-    ) -> Iterator[tuple[InboundMessage, ...]]: ...
-
-
-@runtime_checkable
-class TransitionInflightStore(InflightStore, Protocol):
-    """Opt-in extension: conditional, payload-free record transitions.
-
-    The base interface only exposes whole objects, so settling a PUBACK means
-    asking a durable store to rebuild a multi-megabyte message just to delete
-    its row. These methods carry the *decision* — the state the session expects
-    and the state it wants — and return metadata only.
-
-    The store does not own the state machine. ``expected_state`` and
-    ``new_state`` always come from the session; the store only guarantees that
-    the durable mutation is atomic and conditional, returning ``None`` when the
-    record is absent or no longer in the expected state. If a transition raises,
-    its mutation must remain unapplied. A store that does not
-    implement this protocol keeps working through the whole-object path.
-    """
-
-    def set_out_logical_size(self, mid: int, logical_size: int) -> bool:
-        """Persist a logical size recomputed after reading a legacy record."""
-        ...
-
-    def out_meta(self, mid: int) -> OutboundRecordMeta | None:
-        """Read one outbound record's state and logical size, nothing else."""
-        ...
-
+    def set_out_logical_size(self, mid: int, logical_size: int) -> bool: ...
+    def out_meta(self, mid: int) -> OutboundRecordMeta | None: ...
     def complete_out(
-        self,
-        mid: int,
-        expected_state: OutboundQoSState,
+        self, mid: int, expected_state: OutboundQoSState
     ) -> OutboundRecordMeta | None: ...
-
     def transition_out(
         self,
         mid: int,
@@ -160,35 +53,24 @@ class TransitionInflightStore(InflightStore, Protocol):
         new_state: OutboundQoSState,
         *,
         compact: bool = False,
-    ) -> OutboundRecordMeta | None:
-        """Move one outbound record between states.
+    ) -> OutboundRecordMeta | None: ...
+    def clear_out(self) -> None: ...
 
-        ``compact`` says the PUBLISH phase is over and only PUBREL can still be
-        retransmitted, so retransmission material kept for the publish frame may
-        be released.
-        """
-        ...
-
-    def contains_in(self, mid: int) -> bool: ...
-
-    def set_in_logical_size(self, mid: int, logical_size: int) -> bool:
-        """Persist a logical size recomputed after reading a legacy record."""
-        ...
-
+    # Inbound records: index/replay operations are bounded and transitions do
+    # not reconstruct payloads. get_in() exists only when the application must
+    # actually redeliver one stored message.
+    def put_in(self, msg: InboundMessage) -> None: ...
+    def get_in(self, mid: int) -> InboundMessage | None: ...
+    def in_count(self) -> int: ...
+    def in_replay_pages(
+        self,
+        max_messages: int = 64,
+        max_bytes: int = 1 << 20,
+    ) -> Iterator[tuple[InboundMessage, ...]]: ...
+    def set_in_logical_size(self, mid: int, logical_size: int) -> bool: ...
     def in_meta(self, mid: int) -> InboundRecordMeta | None: ...
-
-    def in_index_pages(self, page_size: int = 256) -> Iterator[tuple[InboundRecordMeta, ...]]:
-        """Page the inbound index without reading a single payload.
-
-        Restart recovery needs the identifier set and the record count, not the
-        messages; reading them back was the largest allocation a reconnect made.
-        """
-        ...
-
-    def mark_in_delivered(self, mid: int) -> bool:
-        """Flag a record as delivered; False when absent or already flagged."""
-        ...
-
+    def in_index_pages(self, page_size: int = 256) -> Iterator[tuple[InboundRecordMeta, ...]]: ...
+    def mark_in_delivered(self, mid: int) -> bool: ...
     def transition_in(
         self,
         mid: int,
@@ -197,12 +79,10 @@ class TransitionInflightStore(InflightStore, Protocol):
         *,
         user_acked: bool | None = None,
     ) -> InboundRecordMeta | None: ...
-
     def complete_in(
-        self,
-        mid: int,
-        expected_state: InboundQoSState,
+        self, mid: int, expected_state: InboundQoSState
     ) -> InboundRecordMeta | None: ...
+    def clear_in(self) -> None: ...
 
 
 _RecordT = TypeVar("_RecordT")
@@ -238,14 +118,6 @@ class MemoryInflightStore:
             self._out = {}
         return deleted
 
-    def update_out(self, msg: OutboundMessage) -> None:
-        if msg.mid not in self._out:
-            raise KeyError(msg.mid)
-        self._out[msg.mid] = msg
-
-    def out_items(self) -> Iterator[OutboundMessage]:
-        return iter(tuple(self._out.values()))
-
     @staticmethod
     def _pages(
         records: dict[int, _RecordT],
@@ -264,13 +136,10 @@ class MemoryInflightStore:
             if messages:
                 yield messages
 
-    def out_pages(self, page_size: int = 256) -> Iterator[tuple[OutboundMessage, ...]]:
-        return self._pages(self._out, page_size)
-
     def out_summary_pages(
         self, page_size: int = 256
     ) -> Iterator[tuple[OutboundMessageSummary, ...]]:
-        for page in self.out_pages(page_size):
+        for page in self._pages(self._out, page_size):
             yield tuple(OutboundMessageSummary.from_message(message) for message in page)
 
     def clear_out(self) -> None:
@@ -331,23 +200,6 @@ class MemoryInflightStore:
     def get_in(self, mid: int) -> InboundMessage | None:
         return self._in.get(mid)
 
-    def pop_in(self, mid: int) -> InboundMessage | None:
-        msg = self._in.pop(mid, None)
-        if msg is not None and not self._in:
-            self._in = {}
-        return msg
-
-    def update_in(self, msg: InboundMessage) -> None:
-        if msg.mid not in self._in:
-            raise KeyError(msg.mid)
-        self._in[msg.mid] = msg
-
-    def in_items(self) -> Iterator[InboundMessage]:
-        return iter(tuple(self._in.values()))
-
-    def in_pages(self, page_size: int = 256) -> Iterator[tuple[InboundMessage, ...]]:
-        return self._pages(self._in, page_size)
-
     def in_count(self) -> int:
         return len(self._in)
 
@@ -398,9 +250,6 @@ class MemoryInflightStore:
         self._in = {}
 
     # --- conditional transitions (TransitionInflightStore) ------------------
-
-    def contains_in(self, mid: int) -> bool:
-        return mid in self._in
 
     def set_in_logical_size(self, mid: int, logical_size: int) -> bool:
         msg = self._in.get(mid)
@@ -477,7 +326,9 @@ class MemoryInflightStore:
         msg = self._in.get(mid)
         if msg is None or msg.state is not expected_state:
             return None
-        self.pop_in(mid)
+        self._in.pop(mid)
+        if not self._in:
+            self._in = {}
         return InboundRecordMeta(
             mid=mid,
             state=msg.state,

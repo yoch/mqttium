@@ -43,7 +43,10 @@ def test_memory_store_iterates_inbound_in_insertion_order() -> None:
     store = MemoryInflightStore()
     store.put_in(_inbound(3))
     store.put_in(_inbound(1))
-    assert [message.mid for message in store.in_items()] == [3, 1]
+    assert [
+        message.mid
+        for message in (store.get_in(meta.mid) for page in store.in_index_pages() for meta in page)
+    ] == [3, 1]
 
 
 def test_sqlite_store_iterates_inbound_in_insertion_order(tmp_path) -> None:
@@ -51,7 +54,12 @@ def test_sqlite_store_iterates_inbound_in_insertion_order(tmp_path) -> None:
     try:
         store.put_in(_inbound(4))
         store.put_in(_inbound(2))
-        assert [message.mid for message in store.in_items()] == [4, 2]
+        assert [
+            message.mid
+            for message in (
+                store.get_in(meta.mid) for page in store.in_index_pages() for meta in page
+            )
+        ] == [4, 2]
     finally:
         store.close()
 

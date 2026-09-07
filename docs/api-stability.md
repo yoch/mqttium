@@ -30,7 +30,7 @@ a future minor release with a changelog entry and migration guidance:
 
 - `ClientStats` and its nested immutable snapshot dataclasses;
 - `mqttium.compat` and the documented Paho VERSION2 subset;
-- `mqttium.persistence` store protocols and implementations;
+- `mqttium.persistence.InflightStore` and the shipped persistence implementations;
 - `mqttium.transport` transport protocols and concrete transports;
 - `mqttium.protocol.ProtocolEngine`, `EngineConfig`, `NegotiatedSettings`,
   `ReconnectPolicy`, `FlowControl`, `PublishHandle`, `PublishFailure` and
@@ -39,7 +39,10 @@ a future minor release with a changelog entry and migration guidance:
 - `mqttium.codec` framing and codec helpers.
 
 A Provisional designation is not permission for silent breakage. An incompatible
-change still requires a changelog entry and migration guidance.
+change still requires a changelog entry and migration guidance. The persistence
+contract is one complete `InflightStore` interface: bounded replay and conditional
+metadata transitions are required capabilities, not optional runtime-detected
+extensions.
 
 ### Internal
 

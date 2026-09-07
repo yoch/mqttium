@@ -681,7 +681,12 @@ async def test_no_admission_after_fail_stop() -> None:
     assert mid is not None
     store.fail_mids = {mid}
     mids_before = len(client._engine.packet_ids)
-    rows_before = sorted(m.mid for m in store.out_items())
+    rows_before = sorted(
+        m.mid
+        for m in (
+            store.get_out(summary.mid) for page in store.out_summary_pages() for summary in page
+        )
+    )
     transport.push_rx(PubAckPacket(mid=mid).encode())
 
     await asyncio.wait_for(disconnected.wait(), timeout=5.0)
@@ -709,7 +714,15 @@ async def test_no_admission_after_fail_stop() -> None:
     with pytest.raises(MQTTError, match="local terminal failure"):
         client._queue_qosn_on_loop("failure/admission", b"z", qos=QoS.AT_LEAST_ONCE, retain=False)
     assert len(client._engine.packet_ids) == mids_before
-    assert sorted(m.mid for m in store.out_items()) == rows_before
+    assert (
+        sorted(
+            m.mid
+            for m in (
+                store.get_out(summary.mid) for page in store.out_summary_pages() for summary in page
+            )
+        )
+        == rows_before
+    )
     # Only assert on the engine effect stream once its owning reader task is
     # fully terminated; anything earlier races teardown.
     await _wait_for(lambda: reader.done())
@@ -847,7 +860,10 @@ async def test_parked_publish_fails_after_fail_stop() -> None:
 
     assert len(errors) == 1
     assert isinstance(errors[0], OSError)
-    assert list(store.out_items()) == []
+    assert (
+        list(store.get_out(summary.mid) for page in store.out_summary_pages() for summary in page)
+        == []
+    )
     assert len(client._engine.packet_ids) == 0
     await asyncio.sleep(0.4)
     assert calls() == 1
@@ -891,7 +907,10 @@ async def test_parked_publish_many_fails_after_fail_stop() -> None:
     assert isinstance(failed.value.__cause__, MQTTError)
     await asyncio.wait_for(disconnected.wait(), timeout=5.0)
     await asyncio.wait_for(first.wait(), timeout=5.0)
-    assert list(store.out_items()) == []
+    assert (
+        list(store.get_out(summary.mid) for page in store.out_summary_pages() for summary in page)
+        == []
+    )
     await asyncio.sleep(0.4)
     assert calls() == 1
     await client.disconnect()

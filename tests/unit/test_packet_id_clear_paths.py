@@ -64,7 +64,14 @@ def test_failed_batch_clears_packet_ids_when_pool_started_empty() -> None:
     assert pool.allocate() == 1
     assert engine.pending_outbound_messages == 0
     assert engine.pending_outbound_bytes == 0
-    assert tuple(engine.store.out_items()) == ()
+    assert (
+        tuple(
+            engine.store.get_out(summary.mid)
+            for page in engine.store.out_summary_pages()
+            for summary in page
+        )
+        == ()
+    )
 
 
 def test_failed_batch_preserves_packet_ids_that_predate_it() -> None:
@@ -131,7 +138,10 @@ def test_missing_session_clears_all_abandoned_inflight_packet_ids_once() -> None
     assert pool.release_calls == 0
     assert pool.clear_calls == 1
     assert len(pool) == 0
-    assert tuple(store.out_items()) == ()
+    assert (
+        tuple(store.get_out(summary.mid) for page in store.out_summary_pages() for summary in page)
+        == ()
+    )
     assert engine.pending_outbound_messages == 0
     assert engine.pending_outbound_bytes == 0
 
@@ -150,4 +160,6 @@ def test_missing_session_preserves_queued_packet_ids() -> None:
     assert pool.clear_calls == 0
     assert pool.release_calls == 0
     assert pool.in_use(23)
-    assert tuple(store.out_items())
+    assert tuple(
+        store.get_out(summary.mid) for page in store.out_summary_pages() for summary in page
+    )

@@ -197,7 +197,11 @@ def _engine_invariants(engine: ProtocolEngine) -> None:
     assert engine.flow.inflight <= engine.flow.limit
     assert engine._inbound_inflight >= 0
 
-    outbound = list(engine.store.out_items())
+    outbound = list(
+        engine.store.get_out(summary.mid)
+        for page in engine.store.out_summary_pages()
+        for summary in page
+    )
     expected_mids = {msg.mid for msg in outbound} | set(engine._pending_sub_mids)
     assert set(engine.packet_ids._used) == expected_mids
 

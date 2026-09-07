@@ -124,8 +124,10 @@ def test_v1_database_migrates_without_losing_or_duplicating_records(tmp_path: Pa
     write_v1_database(path)
 
     store = SqliteInflightStore(path)
-    outbound = list(store.out_items())
-    inbound = list(store.in_items())
+    outbound = list(
+        store.get_out(summary.mid) for page in store.out_summary_pages() for summary in page
+    )
+    inbound = list(store.get_in(meta.mid) for page in store.in_index_pages() for meta in page)
     store.close()
 
     assert user_version(path) == SQLITE_SCHEMA_VERSION
@@ -226,7 +228,12 @@ def test_interrupted_migration_leaves_the_v1_database_intact(tmp_path: Path) -> 
 
     # The retry after the crash still succeeds and still sees every record.
     store = SqliteInflightStore(path)
-    assert [msg.mid for msg in store.out_items()] == [1, 2, 3]
+    assert [
+        msg.mid
+        for msg in (
+            store.get_out(summary.mid) for page in store.out_summary_pages() for summary in page
+        )
+    ] == [1, 2, 3]
     store.close()
     assert user_version(path) == SQLITE_SCHEMA_VERSION
 
@@ -244,7 +251,12 @@ def test_reopening_a_migrated_database_does_not_migrate_again(tmp_path: Path) ->
             raise AssertionError("migration re-run on an up-to-date database")
 
     store = NoSchemaWork(path)
-    assert [msg.mid for msg in store.out_items()] == [1, 2, 3]
+    assert [
+        msg.mid
+        for msg in (
+            store.get_out(summary.mid) for page in store.out_summary_pages() for summary in page
+        )
+    ] == [1, 2, 3]
     store.close()
 
 

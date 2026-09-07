@@ -49,10 +49,6 @@ _SQLITE_BUSY_TIMEOUT_SECONDS = 5.0
 # a summary read stops before the BLOB and never follows an overflow page. Each
 # ends in `mid IN`, to which `_pages` appends only a run of `?` placeholders —
 # the identifiers themselves always travel as bound parameters.
-_OUT_PAGE_SQL = (
-    "SELECT mid, seq, qos, retain, state, dup, logical_size, topic, properties, payload"
-    " FROM outbound WHERE mid IN"
-)
 _OUT_SUMMARY_PAGE_SQL = (
     "SELECT mid, seq, qos, retain, state, dup, logical_size, topic, properties,"
     " length(payload) AS payload_size FROM outbound WHERE mid IN"
@@ -678,24 +674,6 @@ class SqliteInflightStore:
             self._commit_if_needed()
             return cursor.rowcount > 0
 
-    def update_out(self, msg: OutboundMessage) -> None:
-        with self._lock:
-            self._ensure_write_transaction()
-            cur = self._conn.execute(
-                "UPDATE outbound SET state=?, dup=? WHERE mid=?",
-                (int(msg.state), int(msg.dup), msg.mid),
-            )
-            if cur.rowcount == 0:
-                raise KeyError(msg.mid)
-            self._commit_if_needed()
-
-    def out_items(self) -> Iterator[OutboundMessage]:
-        for page in self.out_pages():
-            yield from page
-
-    def out_pages(self, page_size: int = 256) -> Iterator[tuple[OutboundMessage, ...]]:
-        yield from self._pages("outbound", _OUT_PAGE_SQL, page_size, _row_to_out)
-
     def out_summary_pages(
         self, page_size: int = 256
     ) -> Iterator[tuple[OutboundMessageSummary, ...]]:
@@ -848,43 +826,6 @@ class SqliteInflightStore:
             row = self._conn.execute("SELECT * FROM inbound WHERE mid=?", (mid,)).fetchone()
         return _row_to_in(row) if row else None
 
-    def pop_in(self, mid: int) -> InboundMessage | None:
-        with self._lock:
-            row = self._conn.execute("SELECT * FROM inbound WHERE mid=?", (mid,)).fetchone()
-            if row is None:
-                return None
-            self._ensure_write_transaction()
-            self._conn.execute("DELETE FROM inbound WHERE mid=?", (mid,))
-            self._commit_if_needed()
-        return _row_to_in(row)
-
-    def update_in(self, msg: InboundMessage) -> None:
-        with self._lock:
-            self._ensure_write_transaction()
-            cur = self._conn.execute(
-                """
-                UPDATE inbound
-                SET state=?, delivered=?, user_acked=?
-                WHERE mid=?
-                """,
-                (
-                    int(msg.state),
-                    int(msg.delivered),
-                    int(msg.user_acked),
-                    msg.mid,
-                ),
-            )
-            if cur.rowcount == 0:
-                raise KeyError(msg.mid)
-            self._commit_if_needed()
-
-    def in_items(self) -> Iterator[InboundMessage]:
-        for page in self.in_pages():
-            yield from page
-
-    def in_pages(self, page_size: int = 256) -> Iterator[tuple[InboundMessage, ...]]:
-        yield from self._pages("inbound", _IN_PAGE_SQL, page_size, _row_to_in)
-
     def in_count(self) -> int:
         with self._lock:
             row = self._conn.execute("SELECT COUNT(*) FROM inbound").fetchone()
@@ -971,11 +912,6 @@ class SqliteInflightStore:
             "SELECT state, user_acked, delivered, logical_size, seq FROM inbound WHERE mid=?",
             (mid,),
         ).fetchone()
-
-    def contains_in(self, mid: int) -> bool:
-        with self._lock:
-            row = self._conn.execute("SELECT 1 FROM inbound WHERE mid=?", (mid,)).fetchone()
-        return row is not None
 
     def set_in_logical_size(self, mid: int, logical_size: int) -> bool:
         with self._lock:
