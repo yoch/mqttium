@@ -16,7 +16,7 @@ jobs:
     runs-on: [self-hosted, linux, ARM64]
     timeout-minutes: 120
     env:
-      BENCH_SHA: ec332e25003a6484727697c3018ce632a025a7f2
+      BENCH_SHA: 24107724d82b6458984aa18ce560ccaba0a8d316
       BASE_SHA: 4fe90af36660bce06c12e9a8c57cb9a6223abe5a
       CANDIDATE_SHA: 7d917547b491c8e521d1d82960b1e10810e4bd80
       TARGET_RATE: "3942"
@@ -95,6 +95,7 @@ jobs:
         run: |
           set -euo pipefail
           PYTHONPATH=src python -m unittest -v \
+            tests.test_finalization \
             tests.test_quality \
             tests.test_version_compare \
             tests.test_pacing \
