@@ -55,6 +55,11 @@ class EngineConfig:
     _attached: bool = field(default=False, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        if self.protocol not in (
+            MQTTProtocolVersion.MQTTv311,
+            MQTTProtocolVersion.MQTTv5,
+        ):
+            raise ValueError("MQTT 3.1 is not supported; use MQTT 3.1.1 or MQTT 5")
         if not 0 <= self.keepalive <= 65535:
             raise ValueError("keepalive must be between 0 and 65535")
         if not 1 <= self.local_receive_maximum <= 65535:
