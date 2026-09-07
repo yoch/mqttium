@@ -149,7 +149,7 @@ jobs:
           done
           exit 1
 
-      - name: First two-block version A/B path test
+      - name: Four-block version A/B probe
         shell: bash
         run: |
           set -euo pipefail
@@ -161,23 +161,23 @@ jobs:
             --variant-index 0 \
             --target-rate "$TARGET_RATE" \
             --pacer-mode external \
-            --blocks 2 \
+            --blocks 4 \
             --max-block-retries 1 \
             --profile standard \
             --broker 127.0.0.1:11883 \
             --broker-pid "$BROKER_PID" \
             --host-profile "$RESULTS_DIR/host.json" \
-            --output "$RESULTS_DIR/rc13-vs-main-25pct-2blocks.json" \
+            --output "$RESULTS_DIR/rc13-vs-main-25pct-4blocks.json" \
             | tee "$RESULTS_DIR/version-ab-summary.txt"
 
       - name: Summarize result
         if: always()
         shell: bash
         run: |
-          if [ -f "$RESULTS_DIR/rc13-vs-main-25pct-2blocks.json" ]; then
+          if [ -f "$RESULTS_DIR/rc13-vs-main-25pct-4blocks.json" ]; then
             PYTHONPATH=harness/src python - <<'PY'
           import json, os
-          p = os.path.join(os.environ["RESULTS_DIR"], "rc13-vs-main-25pct-2blocks.json")
+          p = os.path.join(os.environ["RESULTS_DIR"], "rc13-vs-main-25pct-4blocks.json")
           d = json.load(open(p))
           print(json.dumps({
               "baseline": (d.get("baseline_source") or {}).get("git_sha"),
@@ -201,7 +201,7 @@ jobs:
             wait "$BROKER_PID" 2>/dev/null || true
           fi
 
-      - name: Upload first version A/B evidence
+      - name: Upload version A/B evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
