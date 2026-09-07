@@ -28,7 +28,7 @@ path = "tests/unit/test_configuration_atomicity_and_teardown.py"
 rewrite(
     path,
     "from mqttium.persistence import MemoryInflightStore, PagedInflightStore\n",
-    "from mqttium.persistence import MemoryInflightStore\n",
+    "",
     label="configuration test capability import",
 )
 rewrite(
@@ -44,6 +44,19 @@ rewrite(
     "from mqttium.persistence.memory import MemoryInflightStore, PagedInflightStore\n",
     "from mqttium.persistence.memory import MemoryInflightStore\n",
     label="sqlite test capability import",
+)
+remove_between(
+    path,
+    "def test_shipped_stores_satisfy_the_paged_protocol(tmp_path: Path) -> None:\n",
+    "def test_pages_split_the_fetch_under_the_sql_variable_limit(tmp_path: Path) -> None:\n",
+    label="paged capability and eager fallback tests",
+)
+# MemoryInflightStore is no longer needed after removing the capability test.
+rewrite(
+    path,
+    "from mqttium.persistence.memory import MemoryInflightStore\n",
+    "",
+    label="sqlite obsolete memory-store import",
 )
 
 path = "tests/unit/test_store_transitions.py"
@@ -65,6 +78,12 @@ rewrite(
     "from mqttium.persistence.memory import MemoryInflightStore, TransitionInflightStore\n",
     "from mqttium.persistence.memory import MemoryInflightStore\n",
     label="transition protocol import",
+)
+rewrite(
+    path,
+    "from mqttium.types import InboundMessage, OutboundMessage\n",
+    "from mqttium.types import OutboundMessage\n",
+    label="legacy inbound fixture import",
 )
 remove_between(
     path,
@@ -91,10 +110,15 @@ rewrite(
     label="negative PUBREC modern contract test",
 )
 
-# No old capability names or fallback fixture may survive this focused module.
-text = Path(path).read_text(encoding="utf-8")
-for forbidden in ("PlainInflightStore", "TransitionInflightStore", "pytest"):
-    if forbidden in text:
-        raise AssertionError(f"legacy transition-test term remains: {forbidden}")
+# No old capability names or fallback fixture may survive the migrated tests.
+for checked_path in (
+    "tests/unit/test_configuration_atomicity_and_teardown.py",
+    "tests/unit/test_sqlite_store.py",
+    "tests/unit/test_store_transitions.py",
+):
+    text = Path(checked_path).read_text(encoding="utf-8")
+    for forbidden in ("PlainInflightStore", "TransitionInflightStore", "PagedInflightStore"):
+        if forbidden in text:
+            raise AssertionError(f"legacy store term remains in {checked_path}: {forbidden}")
 
 print("PR434 persistence test migration completed")
