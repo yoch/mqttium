@@ -1,0 +1,50 @@
+name: T3c callback simplification bootstrap
+
+on:
+  push:
+    branches: [perf/strict-sync-inline-burst2]
+
+permissions:
+  contents: write
+
+jobs:
+  rewrite:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - run: python -m pip install -e ".[dev,docs]"
+      - name: Apply asserted T3c rewrite
+        run: python tools/t3c_bootstrap.py
+      - name: Format and lint
+        run: |
+          ruff format src/mqttium/api/_delivery.py src/mqttium/api/async_client.py tests/unit/test_topic_callback_dispatch_contract.py tests/unit/test_sync_callback_contract.py
+          ruff check src/mqttium/api/_delivery.py src/mqttium/api/async_client.py tests/unit/test_topic_callback_dispatch_contract.py tests/unit/test_sync_callback_contract.py
+      - name: Focused callback contracts
+        run: |
+          python -m pytest -q -W error --strict-config --strict-markers \
+            tests/unit/test_sync_callback_contract.py \
+            tests/unit/test_callback_message_batches.py \
+            tests/unit/test_topic_callback_dispatch_contract.py \
+            tests/project/test_public_api_surface.py
+      - name: Strict docs and diff hygiene
+        run: |
+          mkdocs build --strict
+          git diff --check
+      - name: Commit validated rewrite and remove bootstrap
+        run: |
+          set -euo pipefail
+          git rm .github/workflows/t3c-bootstrap.yml tools/t3c_bootstrap.py
+          git add -A
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "perf: simplify callback dispatch contract"
+          git push origin HEAD:perf/strict-sync-inline-burst2
