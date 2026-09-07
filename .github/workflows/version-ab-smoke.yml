@@ -1,4 +1,4 @@
-name: MQTTium version A/B smoke
+name: MQTTium PR433 isolated A/B
 
 on:
   push:
@@ -17,8 +17,8 @@ jobs:
     timeout-minutes: 120
     env:
       BENCH_SHA: ec332e25003a6484727697c3018ce632a025a7f2
-      BASE_SHA: 4560e44aeb24b8a4f7f6ce903766579fac481cbd
-      CANDIDATE_SHA: 6f1351e3b60593946c520b7d1915564f76023873
+      BASE_SHA: 4fe90af36660bce06c12e9a8c57cb9a6223abe5a
+      CANDIDATE_SHA: 7d917547b491c8e521d1d82960b1e10810e4bd80
       TARGET_RATE: "3942"
 
     steps:
@@ -47,23 +47,23 @@ jobs:
           fi
 
       - name: Checkout exact benchmark harness
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: yoch/mqtt-python-client-bench
           ref: ${{ env.BENCH_SHA }}
           path: harness
           persist-credentials: false
 
-      - name: Checkout exact RC13 baseline
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Checkout exact pre-PR433 baseline
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: yoch/mqttium
           ref: ${{ env.BASE_SHA }}
           path: old
           persist-credentials: false
 
-      - name: Checkout exact current candidate
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Checkout exact PR433 merge
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: yoch/mqttium
           ref: ${{ env.CANDIDATE_SHA }}
@@ -149,7 +149,7 @@ jobs:
           done
           exit 1
 
-      - name: Four-block version A/B probe
+      - name: Four-block isolated PR433 A/B probe
         shell: bash
         run: |
           set -euo pipefail
@@ -167,17 +167,17 @@ jobs:
             --broker 127.0.0.1:11883 \
             --broker-pid "$BROKER_PID" \
             --host-profile "$RESULTS_DIR/host.json" \
-            --output "$RESULTS_DIR/rc13-vs-main-25pct-4blocks.json" \
+            --output "$RESULTS_DIR/pr433-before-after-25pct-4blocks.json" \
             | tee "$RESULTS_DIR/version-ab-summary.txt"
 
       - name: Summarize result
         if: always()
         shell: bash
         run: |
-          if [ -f "$RESULTS_DIR/rc13-vs-main-25pct-4blocks.json" ]; then
+          if [ -f "$RESULTS_DIR/pr433-before-after-25pct-4blocks.json" ]; then
             PYTHONPATH=harness/src python - <<'PY'
           import json, os
-          p = os.path.join(os.environ["RESULTS_DIR"], "rc13-vs-main-25pct-4blocks.json")
+          p = os.path.join(os.environ["RESULTS_DIR"], "pr433-before-after-25pct-4blocks.json")
           d = json.load(open(p))
           print(json.dumps({
               "baseline": (d.get("baseline_source") or {}).get("git_sha"),
@@ -203,9 +203,9 @@ jobs:
 
       - name: Upload version A/B evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: mqttium-version-ab-smoke-${{ github.run_id }}
+          name: mqttium-pr433-ab-${{ github.run_id }}
           path: ${{ runner.temp }}/mqttium-version-ab-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: warn
           retention-days: 14
