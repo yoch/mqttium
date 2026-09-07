@@ -350,7 +350,7 @@ class EffectPump:
                     raise self.error
                 if self.applied >= target:
                     return
-                await asyncio.shield(self.progress.wait())
+                await self.progress.wait()
         finally:
             self._waiter_targets.pop(waiter_id, None)
             self._error_waiters.discard(waiter_id)
