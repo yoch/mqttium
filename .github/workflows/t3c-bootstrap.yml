@@ -22,6 +22,65 @@ jobs:
           cache: pip
           cache-dependency-path: pyproject.toml
       - run: python -m pip install -e ".[dev,docs]"
+      - name: Harden bootstrap assertions
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("tools/t3c_bootstrap.py")
+          text = path.read_text(encoding="utf-8")
+
+          old = '''    text = replace_once(
+              text,
+              "            inline_callback_burst=inline_callback_burst,\\n",
+              "",
+              label="client validation call",
+          )
+          text = replace_once(
+              text,
+              "            inline_callback_burst=inline_callback_burst,\\n",
+              "",
+              label="delivery construction option",
+          )
+          '''
+          new = '''    forwarded_option = "            inline_callback_burst=inline_callback_burst,\\n"
+              forwarded_count = text.count(forwarded_option)
+              if forwarded_count != 2:
+                  raise RuntimeError(
+                      f"client option forwarding: expected exactly two matches, found {forwarded_count}"
+                  )
+              text = text.replace(forwarded_option, "", 2)
+          '''
+          if text.count(old) != 1:
+              raise RuntimeError("bootstrap forwarding patch did not match exactly once")
+          text = text.replace(old, new, 1)
+
+          old = "    return text[:start_index] + new + text[end_index:]\n"
+          new = (
+              "    suffix_index = end_index + len(end) if new.endswith(end) else end_index\n"
+              "    return text[:start_index] + new + text[suffix_index:]\n"
+          )
+          if text.count(old) != 1:
+              raise RuntimeError("replace_between hardening did not match exactly once")
+          text = text.replace(old, new, 1)
+
+          old = '''        "### Changed\\n\\n",
+              "### Changed\\n\\n"
+          '''
+          new = '''        "## [Unreleased]\\n\\n### Changed\\n\\n",
+              "## [Unreleased]\\n\\n### Changed\\n\\n"
+          '''
+          if text.count(old) != 1:
+              raise RuntimeError("changelog anchor hardening did not match exactly once")
+          text = text.replace(old, new, 1)
+
+          text = text.replace(
+              'assert client._messages.qsize() == 2',
+              'assert client._delivery.messages_queue.qsize() == 2',
+          )
+
+          path.write_text(text, encoding="utf-8")
+          PY
       - name: Apply asserted T3c rewrite
         run: python tools/t3c_bootstrap.py
       - name: Format and lint
