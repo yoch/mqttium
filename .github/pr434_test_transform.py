@@ -45,18 +45,17 @@ rewrite(
     "from mqttium.persistence.memory import MemoryInflightStore\n",
     label="sqlite test capability import",
 )
+rewrite(
+    path,
+    "from mqttium.protocol.engine import EngineConfig, ProtocolEngine\n",
+    "",
+    label="sqlite fallback-only engine imports",
+)
 remove_between(
     path,
     "def test_shipped_stores_satisfy_the_paged_protocol(tmp_path: Path) -> None:\n",
     "def test_pages_split_the_fetch_under_the_sql_variable_limit(tmp_path: Path) -> None:\n",
     label="paged capability and eager fallback tests",
-)
-# MemoryInflightStore is no longer needed after removing the capability test.
-rewrite(
-    path,
-    "from mqttium.persistence.memory import MemoryInflightStore\n",
-    "",
-    label="sqlite obsolete memory-store import",
 )
 
 path = "tests/unit/test_store_transitions.py"
