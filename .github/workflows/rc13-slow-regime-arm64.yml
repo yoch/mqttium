@@ -1,0 +1,334 @@
+name: RC13 slow-regime exact ARM64
+
+on:
+  push:
+    branches: [bench/rc13-slow-regime-bisect]
+    paths: [.github/workflows/rc13-slow-regime-arm64.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mqttium-regime-rpi5
+  cancel-in-progress: false
+
+jobs:
+  regime:
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 240
+    env:
+      BENCH_SHA: ec332e25003a6484727697c3018ce632a025a7f2
+      SHA_433: 7d917547b491c8e521d1d82960b1e10810e4bd80
+      SHA_434: 66a850b52f1f08c6686bb5295fe029413d055adb
+      TARGET_RATE: "3942"
+      BROKER_IMAGE: eclipse-mosquitto:2.1.2-alpine
+
+    steps:
+      - name: Set run paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/mqttium-regime-arm64-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -p "$dir"
+          echo "RESULTS_DIR=$dir" >> "$GITHUB_ENV"
+          echo "BROKER_PORT=11883" >> "$GITHUB_ENV"
+
+      - name: Capture ARM environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            date -u --iso-8601=seconds
+            uname -a
+            lscpu
+            python3 --version
+            echo '--- governors ---'
+            cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null || true
+            echo '--- frequencies ---'
+            cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq 2>/dev/null || true
+            echo '--- thermal ---'
+            for z in /sys/class/thermal/thermal_zone*; do
+              [ -d "$z" ] || continue
+              printf '%s ' "$z"
+              cat "$z/type" 2>/dev/null || true
+              cat "$z/temp" 2>/dev/null || true
+            done
+            command -v vcgencmd >/dev/null 2>&1 && vcgencmd measure_temp || true
+            command -v vcgencmd >/dev/null 2>&1 && vcgencmd measure_clock arm || true
+            echo '--- unix datagram queue ---'
+            cat /proc/sys/net/unix/max_dgram_qlen 2>/dev/null || true
+            echo '--- pressure ---'
+            cat /proc/pressure/cpu 2>/dev/null || true
+            cat /proc/pressure/memory 2>/dev/null || true
+            cat /proc/pressure/io 2>/dev/null || true
+            echo '--- proc stat ---'
+            head -n 20 /proc/stat
+            uptime
+            free -h
+            echo '--- docker ---'
+            docker --version 2>/dev/null || true
+          } | tee "$RESULTS_DIR/environment.txt"
+          test "$(uname -m)" = aarch64
+          command -v taskset >/dev/null
+
+      - name: Checkout exact harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: yoch/mqtt-python-client-bench
+          ref: ${{ env.BENCH_SHA }}
+          path: harness
+          persist-credentials: false
+
+      - name: Checkout independent A/A arms
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: yoch/mqttium
+          ref: ${{ env.SHA_433 }}
+          path: aa-a
+          persist-credentials: false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: yoch/mqttium
+          ref: ${{ env.SHA_433 }}
+          path: aa-b
+          persist-credentials: false
+
+      - name: Checkout A/B arms
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: yoch/mqttium
+          ref: ${{ env.SHA_433 }}
+          path: old
+          persist-credentials: false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: yoch/mqttium
+          ref: ${{ env.SHA_434 }}
+          path: new
+          persist-credentials: false
+
+      - name: Verify immutable provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C harness rev-parse HEAD)" = "$BENCH_SHA"
+          test "$(git -C aa-a rev-parse HEAD)" = "$SHA_433"
+          test "$(git -C aa-b rev-parse HEAD)" = "$SHA_433"
+          test "$(git -C old rev-parse HEAD)" = "$SHA_433"
+          test "$(git -C new rev-parse HEAD)" = "$SHA_434"
+          for d in harness aa-a aa-b old new; do
+            test -z "$(git -C "$d" status --porcelain --untracked-files=no)"
+          done
+          printf 'harness=%s\naa_a=%s\naa_b=%s\nold=%s\nnew=%s\n' \
+            "$BENCH_SHA" "$SHA_433" "$SHA_433" "$SHA_433" "$SHA_434" \
+            | tee "$RESULTS_DIR/provenance.txt"
+
+      - name: Create benchmark environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RESULTS_DIR/venv"
+          . "$RESULTS_DIR/venv/bin/activate"
+          python -m pip install --upgrade pip
+          pip install -e './harness[dev,mqttium]' 'psutil>=6,<8'
+          PYTHONPATH=harness/src python -m unittest -v \
+            harness.tests.test_quality \
+            harness.tests.test_version_compare \
+            harness.tests.test_pacing \
+            harness.tests.test_rtt_initiator
+
+      - name: Resolve CPU isolation
+        shell: bash
+        run: |
+          set -euo pipefail
+          . "$RESULTS_DIR/venv/bin/activate"
+          PYTHONPATH=harness/src python - <<'PY' | tee "$RESULTS_DIR/cpuset.json"
+          import json
+          from mqtt_client_bench.telemetry import allocate_cpuset, physical_cpu_groups
+          print(json.dumps({
+              'physical_groups': physical_cpu_groups(),
+              'mapping': allocate_cpuset(['sut','broker','loadgen','orch'], profile='standard'),
+          }, indent=2, sort_keys=True))
+          PY
+
+      - name: Start environment sampler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RESULTS_DIR/sample-host.sh" <<'SH'
+          #!/usr/bin/env bash
+          while true; do
+            printf 'ts=%s ' "$(date +%s.%N)"
+            printf 'load='; cat /proc/loadavg | tr '\n' ' '
+            printf ' temp='; cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || true
+            printf ' freq='; cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq 2>/dev/null || true
+            printf ' gov='; cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || true
+            printf ' psi='; head -n1 /proc/pressure/cpu 2>/dev/null | tr '\n' ' ' || true
+            printf ' cpu='; head -n1 /proc/stat
+            sleep 1
+          done
+          SH
+          chmod +x "$RESULTS_DIR/sample-host.sh"
+          "$RESULTS_DIR/sample-host.sh" >> "$RESULTS_DIR/host-samples.txt" 2>&1 &
+          echo "SAMPLER_PID=$!" >> "$GITHUB_ENV"
+
+      - name: Start exact Mosquitto 2.1.2 broker
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v docker >/dev/null || { echo 'Docker required for exact Mosquitto 2.1.2 broker' >&2; exit 1; }
+          if ss -ltn | grep -q ':11883 '; then
+            echo 'port 11883 already occupied' >&2
+            exit 1
+          fi
+          docker pull "$BROKER_IMAGE"
+          docker image inspect "$BROKER_IMAGE" --format 'image_id={{.Id}} repo_digests={{json .RepoDigests}}' \
+            | tee "$RESULTS_DIR/broker-image.txt"
+          { docker run --rm --entrypoint mosquitto "$BROKER_IMAGE" -h 2>&1 || true; } \
+            | head -n 4 | tee "$RESULTS_DIR/broker-version.txt"
+          cat > "$RESULTS_DIR/mosquitto.conf" <<'EOF'
+          listener 11883 127.0.0.1
+          protocol mqtt
+          set_tcp_nodelay true
+          allow_anonymous true
+          persistence false
+          connection_messages false
+          log_dest stdout
+          log_type error
+          sys_interval 1
+          max_inflight_messages 1000
+          max_queued_messages 10000
+          max_packet_size 16777216
+          max_keepalive 120
+          EOF
+          broker_cpuset="$(python3 - <<'PY'
+          import json, os
+          print(json.load(open(os.path.join(os.environ['RESULTS_DIR'],'cpuset.json')))['mapping']['broker'])
+          PY
+          )"
+          name="mqttium-regime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker rm -f "$name" >/dev/null 2>&1 || true
+          docker run -d --name "$name" --network host --cpuset-cpus "$broker_cpuset" \
+            -v "$RESULTS_DIR/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro" \
+            "$BROKER_IMAGE" > "$RESULTS_DIR/broker-container-id.txt"
+          pid="$(docker inspect -f '{{.State.Pid}}' "$name")"
+          echo "BROKER_CONTAINER=$name" >> "$GITHUB_ENV"
+          echo "BROKER_PID=$pid" >> "$GITHUB_ENV"
+          echo "broker_pid=$pid broker_cpuset=$broker_cpuset comm=$(cat /proc/$pid/comm 2>/dev/null || true)" \
+            | tee "$RESULTS_DIR/broker-process.txt"
+          for _ in $(seq 1 50); do
+            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            docker ps --filter "name=$name" --filter status=running --format '{{.ID}}' | grep -q . || {
+              docker logs "$name"; exit 1;
+            }
+            sleep 0.2
+          done
+          exit 1
+
+      - name: Run A/A checkpoints at 3942 msg/s
+        shell: bash
+        run: |
+          set -euo pipefail
+          . "$RESULTS_DIR/venv/bin/activate"
+          for seg in 1 2 3 4; do
+            echo "=== A/A segment $seg/4 ==="
+            PYTHONPATH=harness/src python -m mqtt_client_bench.version_compare \
+              --client mqttium \
+              --baseline-path aa-a \
+              --candidate-path aa-b \
+              --scenario application_rtt_fixed_rate \
+              --variant-index 0 \
+              --target-rate "$TARGET_RATE" \
+              --pacer-mode external \
+              --blocks 2 \
+              --max-block-retries 1 \
+              --profile standard \
+              --broker 127.0.0.1:11883 \
+              --broker-pid "$BROKER_PID" \
+              --output "$RESULTS_DIR/aa-seg-${seg}.json" \
+              | tee "$RESULTS_DIR/aa-seg-${seg}.txt"
+          done
+
+      - name: Run PR433 versus PR434 checkpoints at 3942 msg/s
+        shell: bash
+        run: |
+          set -euo pipefail
+          . "$RESULTS_DIR/venv/bin/activate"
+          for seg in 1 2 3 4; do
+            echo "=== #433/#434 segment $seg/4 ==="
+            PYTHONPATH=harness/src python -m mqtt_client_bench.version_compare \
+              --client mqttium \
+              --baseline-path old \
+              --candidate-path new \
+              --scenario application_rtt_fixed_rate \
+              --variant-index 0 \
+              --target-rate "$TARGET_RATE" \
+              --pacer-mode external \
+              --blocks 2 \
+              --max-block-retries 1 \
+              --profile standard \
+              --broker 127.0.0.1:11883 \
+              --broker-pid "$BROKER_PID" \
+              --output "$RESULTS_DIR/ab-seg-${seg}.json" \
+              | tee "$RESULTS_DIR/ab-seg-${seg}.txt"
+          done
+
+      - name: Extract slot ledger
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import csv, glob, json, os
+          root=os.environ['RESULTS_DIR']
+          rows=[]
+          for fn in sorted(glob.glob(os.path.join(root,'*-seg-*.json'))):
+              try: data=json.load(open(fn))
+              except Exception: continue
+              kind='AA' if os.path.basename(fn).startswith('aa-') else 'AB'
+              for r in data.get('runs', []):
+                  lat=r.get('latency') or {}
+                  pac=r.get('pacer') or r.get('pacer_telemetry') or {}
+                  rows.append({
+                      'file':os.path.basename(fn),'kind':kind,
+                      'execution_slot':r.get('execution_slot'),'logical_block':r.get('logical_block'),
+                      'attempt':r.get('block_attempt'),'block_slot':r.get('block_slot'),
+                      'arm':r.get('ab_label'),'sha':((r.get('version_source') or {}).get('git_sha')),
+                      'active_for_verdict':r.get('active_for_verdict'),
+                      'comparison_value':r.get('comparison_value'),
+                      'latency_p50_ms':lat.get('p50_ms', r.get('latency_p50_ms')),
+                      'latency_p95_ms':lat.get('p95_ms', r.get('latency_p95_ms')),
+                      'latency_p99_ms':lat.get('p99_ms', r.get('latency_p99_ms')),
+                      'status':r.get('status'),'reasons':' | '.join(map(str,r.get('reasons') or [])),
+                      'retry_reasons':' | '.join(map(str,r.get('block_retry_reasons') or [])),
+                      'pacer_catch_up_fraction':pac.get('catch_up_fraction'),
+                      'pacer_lateness_p50':pac.get('lateness_p50_s') or pac.get('lateness_p50_ms'),
+                      'pacer_lateness_p95':pac.get('lateness_p95_s') or pac.get('lateness_p95_ms'),
+                  })
+          fields=list(rows[0]) if rows else ['file']
+          with open(os.path.join(root,'slots.csv'),'w',newline='') as f:
+              w=csv.DictWriter(f,fieldnames=fields); w.writeheader(); w.writerows(rows)
+          print(f'wrote {len(rows)} raw slots')
+          PY
+          cat "$RESULTS_DIR/slots.csv" 2>/dev/null || true
+
+      - name: Stop sampler and broker
+        if: always()
+        shell: bash
+        run: |
+          [ -n "${SAMPLER_PID:-}" ] && kill "$SAMPLER_PID" 2>/dev/null || true
+          if [ -n "${BROKER_CONTAINER:-}" ]; then
+            docker logs "$BROKER_CONTAINER" > "$RESULTS_DIR/mosquitto.log" 2>&1 || true
+            docker rm -f "$BROKER_CONTAINER" >/dev/null 2>&1 || true
+          fi
+
+      - name: Upload raw regime evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: rc13-slow-regime-arm64-${{ github.run_id }}
+          path: ${{ env.RESULTS_DIR }}
+          if-no-files-found: error
+          retention-days: 14
