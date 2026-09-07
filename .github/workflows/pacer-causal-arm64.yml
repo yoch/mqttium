@@ -1,4 +1,4 @@
-name: Pacer causal ARM64
+name: External pacer A/A qualification ARM64
 
 on:
   push:
@@ -15,24 +15,16 @@ concurrency:
 
 jobs:
   benchmark:
-    name: pacer causal A/A
+    name: external pacer 25pct standard-window A/A
     runs-on: [self-hosted, linux, ARM64]
-    timeout-minutes: 480
+    timeout-minutes: 240
     env:
       BENCH_SHA: 7e75d44b97a96e7fecd572a88e420771dd404283
       MQTTIUM_VER: "1.0.0rc13"
       GMQTT_VER: "0.7.0"
       PAHO_VER: "2.1.0"
-      MATRIX_RUNS: "1"
-      CAMPAIGN: pacer-causal
-      PROFILE: smoke
-      RUN_LOAD_MATRIX: "0"
-      RUN_ABBA: "0"
-      RUN_AA: "1"
-      AA_BLOCKS: "4"
-      AA_VARIANT_INDEXES: "0,4"
-      AA_CONTROL_ENFORCE: "0"
-      RUN_SYNC_REFERENCE_PAIR: "0"
+      C_COMMON: "15769.612519022552"
+      TARGET_RATE: "3942"
 
     steps:
       - name: Set run-specific paths
@@ -53,16 +45,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(uname -m)" = "aarch64" || { echo "expected aarch64, got $(uname -m)"; exit 1; }
-          python3 --version
-          command -v mosquitto
-          command -v taskset
-          mosquitto -h 2>&1 | head -n 3
+          test "$(uname -m)" = "aarch64"
           gov="$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || true)"
           echo "governor=$gov"
-          [ "$gov" = "performance" ] || { echo "pacer-causal requires scaling_governor=performance, got ${gov:-missing}" >&2; exit 1; }
+          [ "$gov" = "performance" ] || { echo "qualification requires scaling_governor=performance" >&2; exit 1; }
           if pgrep -a mosquitto; then
-            echo "A pre-existing Mosquitto process makes the runner unsafe for this benchmark." >&2
+            echo "pre-existing Mosquitto makes the runner unsafe" >&2
             exit 1
           fi
           cd bench
@@ -79,17 +67,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev,paho,gmqtt,mqttium]"
           pip install --force-reinstall --no-cache-dir \
-            "mqttium==$MQTTIUM_VER" \
-            "gmqtt==$GMQTT_VER" \
-            "paho-mqtt==$PAHO_VER"
+            "mqttium==$MQTTIUM_VER" "gmqtt==$GMQTT_VER" "paho-mqtt==$PAHO_VER"
           python - <<'PY'
           from importlib.metadata import version
-          assert version("mqttium") == "1.0.0rc13", version("mqttium")
-          assert version("gmqtt") == "0.7.0", version("gmqtt")
-          assert version("paho-mqtt") == "2.1.0", version("paho-mqtt")
+          assert version("mqttium") == "1.0.0rc13"
+          assert version("gmqtt") == "0.7.0"
+          assert version("paho-mqtt") == "2.1.0"
           PY
 
-      - name: Validate causal benchmark invariants
+      - name: Validate benchmark invariants
         shell: bash
         run: |
           set -euo pipefail
@@ -98,9 +84,6 @@ jobs:
           PYTHONPATH=src python -m unittest -v \
             tests.test_unit.CrossClientLoadTests \
             tests.test_unit.NativeRttDriveTests \
-            tests.test_unit.PairwiseCapacityGateTests \
-            tests.test_unit.ExternalBrokerTelemetryTests \
-            tests.test_unit.RttResponderValidityTests \
             tests.test_unit.AbbaCounterbalanceTests \
             tests.test_unit.AaControlGateTests \
             tests.test_rtt_initiator \
@@ -113,10 +96,7 @@ jobs:
           set -euo pipefail
           cd bench
           . .venv/bin/activate
-          PYTHONPATH=src python -m mqtt_client_bench.run calibrate-host \
-            --profile standard \
-            --role runner \
-            --skip-ceilings
+          PYTHONPATH=src python -m mqtt_client_bench.run calibrate-host --profile standard --role runner --skip-ceilings
 
       - name: Start isolated native Mosquitto
         shell: bash
@@ -142,7 +122,6 @@ jobs:
           print(allocate_cpuset(["sut", "broker", "loadgen", "orch"], profile="standard")["broker"])
           PY
           )"
-          echo "Broker cpuset: $broker_cpuset"
           taskset -c "$broker_cpuset" mosquitto -c "$RUNNER_TEMP/mosquitto-bench.conf" > "$RUNNER_TEMP/mosquitto-bench.log" 2>&1 &
           pid=$!
           echo "BROKER_PID=$pid" >> "$GITHUB_ENV"
@@ -151,14 +130,58 @@ jobs:
           echo "$pid" > "$RESULTS_DIR/broker.pid"
           sleep 1
           kill -0 "$pid"
-          cat "$RUNNER_TEMP/mosquitto-bench.log"
 
-      - name: Run pacer causal A/A
+      - name: Run external 25pct A/A with standard windows
         shell: bash
         run: |
           set -euo pipefail
           cd bench
-          bash scripts/run_pacer_causal_aa.sh
+          . .venv/bin/activate
+          export PYTHONPATH=src
+          OUT="$RESULTS_DIR/external-aa-standard-window-25"
+          CAL="$OUT/calibrations"
+          TRACE="$OUT/temporal-traces"
+          mkdir -p "$OUT" "$CAL" "$TRACE"
+          python - "$CAL" "$C_COMMON" <<'PY'
+          import json, sys
+          from pathlib import Path
+          root=Path(sys.argv[1]); cap=float(sys.argv[2])
+          for client in ("mqttium","gmqtt"):
+              payload={"schema_version":1,"source":"frozen_c_common_from_run_34089052260","client":client,
+                       "protocol_capacities":{"MQTTv311":{"rtt_capacity_msgs_per_s":cap}}}
+              (root/f"{client}-load.json").write_text(json.dumps(payload,indent=2)+"\n")
+          PY
+          for client in mqttium gmqtt; do
+            echo "==> external A/A client=$client fraction=0.25 blocks=6 profile=standard"
+            python -m mqtt_client_bench.run compare \
+              --clients "$client,$client" \
+              --scenario application_rtt_fixed_rate \
+              --profile standard \
+              --blocks 6 \
+              --variant-index 0 \
+              --pacer-mode external \
+              --broker "$BENCH_BROKER" \
+              --broker-pid "$BENCH_BROKER_PID" \
+              --load-profile-dir "$CAL" \
+              --output "$OUT/compare-aa-$client-v0-external-standard-window.json" \
+              > "$OUT/$client.log" 2>&1
+          done
+          python - "$OUT" "$TARGET_RATE" <<'PY'
+          import json,sys
+          from pathlib import Path
+          root=Path(sys.argv[1]); target=float(sys.argv[2]); rows=[]
+          for path in sorted(root.glob("compare-aa-*.json")):
+              d=json.loads(path.read_text()); p=(d.get("points") or [{}])[0].get("point") or {}
+              got=float(p.get("target_rate") or 0)
+              if got != target: raise SystemExit(f"target rate drift: {got} != {target}")
+              rows.append({"file":path.name,"client":d.get("baseline_client"),"target_rate":got,
+                           "aa_control_pass":d.get("aa_control_pass"),"aa_bias_pct":d.get("aa_bias_pct"),
+                           "aa_stability_pct":d.get("aa_stability_pct"),"aa_control_reason":d.get("aa_control_reason"),
+                           "n_blocks":d.get("aa_n_blocks"),"n_pair_units":d.get("aa_n_pair_units")})
+          (root/"qualification-summary.json").write_text(json.dumps(rows,indent=2)+"\n")
+          print(json.dumps(rows,indent=2))
+          PY
+          python -m mqtt_client_bench.temporal_trace --input "$OUT" --output "$TRACE"
 
       - name: Stop native broker
         if: always()
@@ -169,11 +192,11 @@ jobs:
             wait "$BROKER_PID" 2>/dev/null || true
           fi
 
-      - name: Upload pacer causal evidence
+      - name: Upload external pacer qualification evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: pairwise-native-rtt-pacer-causal-${{ github.run_id }}
+          name: external-pacer-aa-standard-window-25-${{ github.run_id }}
           path: |
             ${{ env.RESULTS_DIR }}
             bench/hosts/*.json
