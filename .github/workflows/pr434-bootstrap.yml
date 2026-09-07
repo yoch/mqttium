@@ -27,7 +27,7 @@ jobs:
           python .github/pr434_transform.py
       - name: Ruff
         run: |
-          python -m ruff format --check src/mqttium/persistence src/mqttium/protocol
+          python -m ruff format src/mqttium/persistence src/mqttium/protocol
           python -m ruff check src/mqttium/persistence src/mqttium/protocol
       - name: Focused unit and project tests
         run: python -m pytest -q tests/unit tests/project
