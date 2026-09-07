@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import re
 from pathlib import Path
 
 
@@ -74,6 +75,36 @@ def assert_no_runtime_attribute_users(names: set[str]) -> None:
                 offenders.append(f"{path}:{node.lineno}:{node.attr}")
     if offenders:
         raise AssertionError("legacy persistence method still used by runtime:\n" + "\n".join(offenders))
+
+
+def migrate_test_inspection_seams() -> None:
+    """Keep test/fuzz invariants while reading stores through the modern contract."""
+
+    object_expr = r"(?P<obj>[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)"
+    out_items = re.compile(object_expr + r"\.out_items\(\)")
+    in_items = re.compile(object_expr + r"\.in_items\(\)")
+    out_pages = re.compile(object_expr + r"\.out_pages\(")
+    in_pages = re.compile(object_expr + r"\.in_pages\(")
+
+    for path in Path("tests").rglob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        text = out_items.sub(
+            lambda match: (
+                f"({match.group('obj')}.get_out(summary.mid) "
+                f"for page in {match.group('obj')}.out_summary_pages() for summary in page)"
+            ),
+            text,
+        )
+        text = in_items.sub(
+            lambda match: (
+                f"({match.group('obj')}.get_in(meta.mid) "
+                f"for page in {match.group('obj')}.in_index_pages() for meta in page)"
+            ),
+            text,
+        )
+        text = out_pages.sub(lambda match: f"{match.group('obj')}.out_summary_pages(", text)
+        text = in_pages.sub(lambda match: f"{match.group('obj')}.in_index_pages(", text)
+        path.write_text(text, encoding="utf-8")
 
 
 legacy = {
@@ -163,29 +194,36 @@ if text.count(old) != 1:
     raise AssertionError(f"expected one dead _OUT_PAGE_SQL block, found {text.count(old)}")
 p.write_text(text.replace(old, ""), encoding="utf-8")
 
-# Migrate store tests from removed whole-object page helpers to the supported
-# metadata/summary paging contract. These tests still prove ordering, deletion
-# tolerance, page-size validation and SQLite variable splitting.
-test_sqlite = "tests/unit/test_sqlite_store.py"
-p = Path(test_sqlite)
-text = p.read_text(encoding="utf-8")
-text = text.replace("store.out_pages(", "store.out_summary_pages(")
-text = text.replace("store.in_pages(", "store.in_index_pages(")
-text = text.replace("pages = store.out_pages(", "pages = store.out_summary_pages(")
-text = text.replace("pages = store.out_pages", "pages = store.out_summary_pages")
-text = text.replace("pages = store.in_pages", "pages = store.in_index_pages")
-text = text.replace("store.out_pages(page_size=2)", "store.out_summary_pages(page_size=2)")
-old_assert = '    assert [message.mid for message in store.out_items()] == [1, 2]\n'
-new_assert = (
-    '    assert [message.mid for page in store.out_summary_pages() for message in page] == [1, 2]\n'
+# Tests whose sole contract was a retired whole-object helper disappear. The
+# hash-capacity regression remains, but exercises the modern conditional delete.
+memory_cleanup = "tests/unit/test_memory_cleanup.py"
+replace_test(
+    memory_cleanup,
+    "test_memory_store_releases_inbound_hash_capacity_when_empty",
+    '''def test_memory_store_releases_inbound_hash_capacity_when_empty() -> None:
+    store = MemoryInflightStore()
+    original = store._in
+    message = InboundMessage(
+        mid=1,
+        topic="memory/in",
+        payload=b"payload",
+        qos=QoS.EXACTLY_ONCE,
+        retain=False,
+        state=InboundQoSState.WAIT_PUBREL,
+    )
+    store.put_in(message)
+
+    completed = store.complete_in(message.mid, InboundQoSState.WAIT_PUBREL)
+    assert completed is not None and completed.mid == message.mid
+    assert store._in == {}
+    assert store._in is not original''',
 )
-if text.count(old_assert) != 1:
-    raise AssertionError("batch ordering assertion did not match")
-text = text.replace(old_assert, new_assert)
-p.write_text(text, encoding="utf-8")
-remove_test(test_sqlite, "test_update_out_only_touches_hot_state_columns")
+remove_test(memory_cleanup, "test_memory_store_outbound_iteration_is_a_membership_snapshot")
+remove_test(memory_cleanup, "test_memory_store_inbound_iteration_is_a_membership_snapshot")
 
 packet_test = "tests/unit/test_packet_id_and_store_consistency.py"
+remove_test(packet_test, "test_update_out_agrees_on_the_guaranteed_state_fields")
+remove_test(packet_test, "test_update_in_agrees_on_the_guaranteed_state_fields")
 replace_test(
     packet_test,
     "test_update_out_preserves_retransmission_order",
@@ -217,7 +255,14 @@ replace_test(
         sqlite.close()''',
 )
 
-# No implementation should keep the retired names after this pass.
+migrate_test_inspection_seams()
+
+# The sqlite-store suite has one test dedicated only to update_out's old
+# partial-update semantics; modern transition tests cover the retained guarantee.
+test_sqlite = "tests/unit/test_sqlite_store.py"
+remove_test(test_sqlite, "test_update_out_only_touches_hot_state_columns")
+
+# No implementation should keep retired method definitions after this pass.
 for checked in (memory, sqlite):
     tree = ast.parse(Path(checked).read_text(encoding="utf-8"))
     methods = {
@@ -230,5 +275,25 @@ for checked in (memory, sqlite):
     overlap = methods & legacy
     if overlap:
         raise AssertionError(f"legacy methods remain in {checked}: {sorted(overlap)}")
+
+# No test should still call the retired whole-object iteration/update helpers.
+# `contains_in` is intentionally excluded here because one probe-counting test
+# subclass still defines it as a negative assertion; #436 owns test-seam cleanup.
+retired_test_calls = (
+    ".out_items(",
+    ".out_pages(",
+    ".in_items(",
+    ".in_pages(",
+    ".pop_in(",
+    ".update_out(",
+    ".update_in(",
+)
+offenders: list[str] = []
+for path in Path("tests").rglob("*.py"):
+    for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if any(term in line for term in retired_test_calls):
+            offenders.append(f"{path}:{lineno}:{line.strip()}")
+if offenders:
+    raise AssertionError("retired persistence call remains in tests:\n" + "\n".join(offenders))
 
 print("PR434 second-pass persistence pruning completed")
