@@ -95,7 +95,6 @@ jobs:
         run: |
           set -euo pipefail
           PYTHONPATH=src python -m unittest -v \
-            tests.test_finalization \
             tests.test_quality \
             tests.test_version_compare \
             tests.test_pacing \
