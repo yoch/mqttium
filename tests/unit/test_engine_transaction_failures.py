@@ -123,10 +123,11 @@ def test_queued_launch_failure_releases_resources_and_emits_failure() -> None:
 
 
 class _FailPubrelReplayStore(MemoryInflightStore):
-    def update_out(self, msg: OutboundMessage) -> None:
-        if msg.state is OutboundQoSState.WAIT_PUBCOMP:
-            raise RuntimeError("PUBREL replay write failed")
-        super().update_out(msg)
+    def get_out(self, mid: int) -> OutboundMessage | None:
+        msg = super().get_out(mid)
+        if msg is not None and msg.state is OutboundQoSState.WAIT_PUBCOMP:
+            raise RuntimeError("PUBREL replay materialisation failed")
+        return msg
 
 
 def test_pubrel_replay_failure_does_not_release_publish_window() -> None:

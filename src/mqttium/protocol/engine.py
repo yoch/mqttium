@@ -186,11 +186,6 @@ class ProtocolEngine:
         return self.outbound._queued
 
     @property
-    def _paged_store(self) -> object | None:
-        """Compatibility view of the outbound store pagination capability."""
-        return self.outbound._paged_store
-
-    @property
     def pending_outbound_messages(self) -> int:
         return self.outbound.pending_messages
 

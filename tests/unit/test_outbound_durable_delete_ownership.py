@@ -135,15 +135,15 @@ def test_replay_delete_failure_keeps_durable_record_and_primary_context(
     assert handle.mid is not None
     engine.take_effects()
 
-    original_update = type(store).update_out
+    original_get = type(store).get_out
     original_delete = type(store).delete_out
-    faults = {"update": 1, "delete": 1}
+    faults = {"get": 1, "delete": 1}
 
-    def update_out(self: Any, msg: Any) -> None:
-        if msg.mid == handle.mid and faults["update"]:
-            faults["update"] -= 1
-            raise _Boom("retransmit update failed")
-        original_update(self, msg)
+    def get_out(self: Any, mid: int) -> Any:
+        if mid == handle.mid and faults["get"]:
+            faults["get"] -= 1
+            raise _Boom("replay materialisation failed")
+        return original_get(self, mid)
 
     def delete_out(self: Any, mid: int) -> bool:
         if mid == handle.mid and faults["delete"]:
@@ -151,13 +151,13 @@ def test_replay_delete_failure_keeps_durable_record_and_primary_context(
             raise _Boom("replay delete failed")
         return original_delete(self, mid)
 
-    monkeypatch.setattr(type(store), "update_out", update_out)
+    monkeypatch.setattr(type(store), "get_out", get_out)
     monkeypatch.setattr(type(store), "delete_out", delete_out)
 
     with pytest.raises(_Boom, match="replay delete failed") as raised:
         engine.outbound.replay_session()
     assert isinstance(raised.value.__context__, _Boom)
-    assert str(raised.value.__context__) == "retransmit update failed"
+    assert str(raised.value.__context__) == "replay materialisation failed"
     assert store.get_out(handle.mid) is not None
     assert engine.packet_ids.in_use(handle.mid)
     assert engine.pending_outbound_messages == 1

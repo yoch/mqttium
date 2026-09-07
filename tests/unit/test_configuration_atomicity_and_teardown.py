@@ -11,7 +11,6 @@ from mqttium.api.models import PublishBatchReceipt, PublishReceipt
 from mqttium.compat.paho import Client
 from mqttium.enums import MQTTProtocolVersion, QoS
 from mqttium.errors import PublishBatchError
-from mqttium.persistence import MemoryInflightStore, PagedInflightStore
 from mqttium.protocol.engine import (
     EffectKind,
     EngineConfig,
@@ -153,7 +152,3 @@ def test_outbound_reservation_underflow_raises_without_corrupting_counters() -> 
         engine.outbound._release_reservation(5)
     assert engine.pending_outbound_messages == 1
     assert engine.pending_outbound_bytes == 4
-
-
-def test_paged_store_protocol_is_exported_from_the_public_package() -> None:
-    assert isinstance(MemoryInflightStore(), PagedInflightStore)

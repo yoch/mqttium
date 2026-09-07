@@ -474,13 +474,3 @@ def test_update_out_preserves_retransmission_order(tmp_path) -> None:  # noqa: A
         assert [m.mid for m in sqlite.out_items()] == [1, 2, 3]
     finally:
         sqlite.close()
-
-
-def test_both_built_in_stores_compact_through_the_transition_extension() -> None:
-    """The engine never depends on update_out for compaction: both built-in
-    stores implement TransitionInflightStore, so on_pubrec takes that path."""
-    from mqttium.persistence.memory import TransitionInflightStore
-    from mqttium.persistence.sqlite import SqliteInflightStore
-
-    assert isinstance(MemoryInflightStore(), TransitionInflightStore)
-    assert issubclass(SqliteInflightStore, TransitionInflightStore)

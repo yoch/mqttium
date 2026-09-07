@@ -34,7 +34,6 @@ from mqttium.errors import (
     ProtocolError,
     SessionDiscardedError,
 )
-from mqttium.persistence.memory import PagedInflightStore, TransitionInflightStore
 from mqttium.protocol.effects import EffectKind, PublishFailure, PublishHandle
 from mqttium.protocol.flow_control import FlowControl
 from mqttium.protocol.packet_ids import PacketIdPool
@@ -91,8 +90,6 @@ class OutboundSession:
         "_is_v5",
         "_parked_entries",
         "_queued",
-        "_paged_store",
-        "_transitions",
         "_pending_bytes",
         "_pending_high_water_bytes",
         "_pending_high_water_messages",
@@ -110,12 +107,6 @@ class OutboundSession:
         # rebound, so its identity is stable for the engine's lifetime.
         self.config = engine.config
         self.store = engine.store
-        # Resolved once: a store either pages or it does not, for its lifetime.
-        self._paged_store = self.store if isinstance(self.store, PagedInflightStore) else None
-        # Same contract for conditional transitions: acknowledgement handling
-        # settles records without ever materialising a payload when the store
-        # supports it, and falls back to the whole-object path when it does not.
-        self._transitions = self.store if isinstance(self.store, TransitionInflightStore) else None
         # Version-specialized ack codecs come from the engine's one-shot bind.
         codec = engine.codec
         # The protocol is fixed for the engine's lifetime (it is not in
@@ -741,23 +732,11 @@ class OutboundSession:
     # --- broker acknowledgements -------------------------------------------
 
     def _settle(self, mid: int, expected_state: OutboundQoSState) -> bool:
-        """Delete a record and release its budget iff it is in `expected_state`.
-
-        With a transition-capable store this never reads the payload back: a
-        PUBACK for an 8 MiB publication touches metadata columns only. Without
-        one it degrades to the original read-then-delete.
-        """
-        transitions = self._transitions
-        if transitions is not None:
-            meta = transitions.complete_out(mid, expected_state)
-            if meta is None:
-                return False
-            self._release_reservation(meta.logical_size)
-        else:
-            msg = self.store.get_out(mid)
-            if msg is None or msg.state is not expected_state:
-                return False
-            self.complete_record(mid, msg)
+        """Conditionally settle one outbound record without reading its payload."""
+        meta = self.store.complete_out(mid, expected_state)
+        if meta is None:
+            return False
+        self._release_reservation(meta.logical_size)
         if self._parked_entries:
             self._unpark_settled(mid)
         return True
@@ -818,25 +797,13 @@ class OutboundSession:
         mid, reason_code, properties = self._decode_pubrec(raw.remaining)
         if properties is not None:
             self._engine._validate_inbound_problem_information(PacketType.PUBREC, properties)
-        # MQTT 5 §4.3.3: a PUBREC carrying a Reason Code of 0x80 or greater ends
-        # the QoS 2 exchange -- the publication failed and no PUBREL follows.
-        # This is shared by both store paths on purpose: it used to sit inside
-        # the transition branch only, so a store without conditional transitions
-        # reached the `msg is None` test first and answered an unknown MID with
-        # an orphan PUBREL 0x92 that the specification does not allow.
+        # MQTT 5 §4.3.3: a negative PUBREC ends the QoS 2 exchange.
         if reason_code >= 128:
             self._fail_after_pubrec(mid, reason_code)
             return
-        transitions = self._transitions
         limit = self._engine.negotiated.maximum_packet_size
         if limit is not None and limit < 4:
-            # The success PUBREL cannot fit. Inspect state only on this rare
-            # connection so an unrelated/duplicate PUBREC that would emit
-            # nothing keeps its historical behavior, while a real WAIT_PUBREC
-            # exchange fails before any durable transition/compaction.
-            record = (
-                transitions.out_meta(mid) if transitions is not None else self.store.get_out(mid)
-            )
+            record = self.store.out_meta(mid)
             if record is None:
                 self._send_orphan_pubrel(mid)
                 return
@@ -844,35 +811,17 @@ class OutboundSession:
                 return
             self._require_pubrel_capacity(4)
             return
-        if transitions is not None:
-            changed = transitions.transition_out(
-                mid,
-                OutboundQoSState.WAIT_PUBREC,
-                OutboundQoSState.WAIT_PUBCOMP,
-                compact=True,
-            )
-            if changed is not None:
-                self._engine._send(_encode_pubrel_success(mid))
-                return
-            if transitions.out_meta(mid) is None:
-                self._send_orphan_pubrel(mid)
+        changed = self.store.transition_out(
+            mid,
+            OutboundQoSState.WAIT_PUBREC,
+            OutboundQoSState.WAIT_PUBCOMP,
+            compact=True,
+        )
+        if changed is not None:
+            self._engine._send(_encode_pubrel_success(mid))
             return
-
-        msg = self.store.get_out(mid)
-        if msg is None:
+        if self.store.out_meta(mid) is None:
             self._send_orphan_pubrel(mid)
-            return
-        if msg.state is not OutboundQoSState.WAIT_PUBREC:
-            return
-        msg.state = OutboundQoSState.WAIT_PUBCOMP
-        msg.topic = ""
-        msg.payload = b""
-        msg.properties = None
-        msg.encoded_publish = None
-        if msg.encoded_pubrel is None:
-            msg.encoded_pubrel = _encode_pubrel_success(mid)
-        self.store.update_out(msg)
-        self._engine._send(msg.encoded_pubrel)
 
     def _send_orphan_pubrel(self, mid: int) -> None:
         """Answer a PUBREC with no matching record: PUBREL, 0x92 when MQTT 5."""
@@ -957,29 +906,16 @@ class OutboundSession:
         # the replacement connection has learned the mapping.
         retained = _retain_publish_item(wire) if wire_topic == msg.topic else None
         if persisted:
-            transitions = self._transitions
-            if transitions is not None:
-                changed = transitions.transition_out(
-                    msg.mid,
-                    OutboundQoSState.QUEUED,
-                    target_state,
-                )
-                if changed is None:
-                    raise RuntimeError(
-                        f"Outbound mid={msg.mid} changed while launching queued publish"
-                    )
-                # MemoryInflightStore transitions the same object; SQLite only
-                # updates durable metadata. Keep the materialised object aligned
-                # in either case without rewriting its payload to the store.
-                msg.state = target_state
-                msg.encoded_publish = retained
-            else:
-                # Third-party stores keep working through the base interface.
-                # update_out guarantees state/dup persistence and may implement
-                # the same payload-free optimization as the built-in SQLite store.
-                msg.state = target_state
-                msg.encoded_publish = retained
-                self.store.update_out(msg)
+            changed = self.store.transition_out(
+                msg.mid,
+                OutboundQoSState.QUEUED,
+                target_state,
+            )
+            if changed is None:
+                raise RuntimeError(f"Outbound mid={msg.mid} changed while launching queued publish")
+            # The materialised record must follow the durable transition.
+            msg.state = target_state
+            msg.encoded_publish = retained
         else:
             # First launch: no durable row exists yet, so persist the full record.
             msg.state = target_state
@@ -1044,7 +980,6 @@ class OutboundSession:
                 wire = _mark_publish_dup(retained)
             self._engine._check_outbound_size(wire)
             msg.encoded_publish = _retain_publish_item(wire)
-            self.store.update_out(msg)
             self._engine._send(wire)
             properties = msg.properties
             if properties is not None and properties.get("topic_alias") is not None:
@@ -1053,8 +988,7 @@ class OutboundSession:
         if msg.state is OutboundQoSState.WAIT_PUBCOMP:
             if msg.encoded_pubrel is None:
                 msg.encoded_pubrel = _encode_pubrel_success(msg.mid)
-                self.store.update_out(msg)
-            self._engine._check_outbound_size(msg.encoded_pubrel)
+                self._engine._check_outbound_size(msg.encoded_pubrel)
             self._engine._send(msg.encoded_pubrel)
             return
         raise ProtocolError(f"Cannot retransmit outbound state {msg.state!r}")
@@ -1240,11 +1174,8 @@ class OutboundSession:
 
     def store_summary_pages(
         self,
-    ) -> Iterable[tuple[OutboundMessage | OutboundMessageSummary, ...]]:
-        if self._paged_store is not None:
-            yield from self._paged_store.out_summary_pages()
-        else:
-            yield tuple(self.store.out_items())
+    ) -> Iterable[tuple[OutboundMessageSummary, ...]]:
+        yield from self.store.out_summary_pages()
 
     def has_client_session_state(self) -> bool:
         """Whether the client has an outbound exchange the Server can resume."""
@@ -1264,12 +1195,12 @@ class OutboundSession:
         self.packet_ids.reserve(msg.mid)
         unknown_size = msg.logical_size <= 0
         logical_size = self.stored_logical_size(msg)
-        if unknown_size and self._transitions is not None:
+        if unknown_size:
             # Records written before the store persisted logical sizes would
             # otherwise release nothing from the byte budget when a
             # metadata-only acknowledgement settles them. One write per legacy
             # record, inside the hydration batch, and never again.
-            self._transitions.set_out_logical_size(msg.mid, logical_size)
+            self.store.set_out_logical_size(msg.mid, logical_size)
         self._pending_messages += 1
         self._pending_bytes += logical_size
         if msg.state is OutboundQoSState.QUEUED:
