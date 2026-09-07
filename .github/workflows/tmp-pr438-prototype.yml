@@ -1,0 +1,98 @@
+name: Temporary PR438 single-owner prototype
+
+on:
+  push:
+    branches: [experiment/pr438-single-owner]
+
+permissions:
+  contents: write
+
+jobs:
+  prototype:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: true
+      - name: Apply single-owner delivery prototype
+        shell: bash
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+          import ast
+          from pathlib import Path
+
+          path = Path('src/mqttium/api/_delivery.py')
+          text = path.read_text()
+
+          replacements = {
+              'MessageDelivery = Literal["auto", "iterator", "callback", "both"]':
+                  'MessageDelivery = Literal["auto", "iterator", "callback"]',
+              'AccountedDeliveryToken = int | _SharedDeliveryReservation':
+                  'AccountedDeliveryToken = int',
+              'self.callback_mode = mode in ("auto", "callback", "both")':
+                  'self.callback_mode = mode in ("auto", "callback")',
+              'self.iterator_mode = mode in ("iterator", "both")':
+                  'self.iterator_mode = mode == "iterator"',
+              '    else:\n        maximum_small_messages = max_pending_messages + max_pending_callbacks + 2\n':
+                  '    else:\n        maximum_small_messages = max(max_pending_messages + 1, max_pending_callbacks + 2)\n',
+          }
+          for old, new in replacements.items():
+              if text.count(old) != 1:
+                  raise SystemExit(f'unexpected replacement count for {old!r}: {text.count(old)}')
+              text = text.replace(old, new, 1)
+
+          old_accept = '''        callback_delivery = callback is not None and self.callback_mode\n        iterator_delivery = self.iterator_mode or (self.auto_mode and callback is None)\n        references = int(iterator_delivery) + int(callback_delivery)\n        if property_wire_size is None:\n            small_delivery = bool(references and self._is_small(message))\n        else:\n            small_delivery = bool(\n                references\n                and _fits_small_limit(message, self.small_message_limit, property_wire_size)\n            )\n        if small_delivery:\n            await self._accept_small(\n                message, callback if callback_delivery else None, iterator_delivery\n            )\n            return\n\n        token: DeliveryToken = None\n        iterator_enqueued = False\n        callback_enqueued = False\n        if references:\n            logical_bytes = self._reservable_size(message, property_wire_size)\n            token = self.try_reserve(logical_bytes, references)\n            if token is None:\n                token = await self.reserve_slow(logical_bytes, references)\n        try:\n            if iterator_delivery:\n                item: IteratorQueueItem = (message, token) if token is not None else message\n                try:\n                    self.messages_queue.put_nowait(item)\n                except asyncio.QueueFull:\n                    await self.put_message(item)\n                else:\n                    self.message_ready.set()\n                iterator_enqueued = True\n            if callback_delivery:\n                assert callback is not None\n                self.ensure_callback_worker()\n                job = (callback, (message,), token)\n                try:\n                    self.callback_queue.put_nowait(job)\n                except asyncio.QueueFull:\n                    await self.enqueue_callback_job_slow(job)\n                callback_enqueued = True\n        except BaseException:\n            self._release_unqueued(\n                token,\n                references=references,\n                iterator_enqueued=iterator_enqueued,\n                callback_enqueued=callback_enqueued,\n            )\n            raise\n\n    def _release_unqueued(\n        self,\n        token: DeliveryToken,\n        *,\n        references: int,\n        iterator_enqueued: bool,\n        callback_enqueued: bool,\n    ) -> None:\n        if token is None:\n            return\n        unqueued = references - int(iterator_enqueued) - int(callback_enqueued)\n        for _ in range(unqueued):\n            self.release_nowait(token)\n'''
+          new_accept = '''        callback_delivery = callback is not None and self.callback_mode\n        iterator_delivery = self.iterator_mode or (self.auto_mode and callback is None)\n        has_delivery = iterator_delivery or callback_delivery\n        if property_wire_size is None:\n            small_delivery = bool(has_delivery and self._is_small(message))\n        else:\n            small_delivery = bool(\n                has_delivery\n                and _fits_small_limit(message, self.small_message_limit, property_wire_size)\n            )\n        if small_delivery:\n            await self._accept_small(\n                message, callback if callback_delivery else None, iterator_delivery\n            )\n            return\n\n        token: DeliveryToken = None\n        iterator_enqueued = False\n        callback_enqueued = False\n        if has_delivery:\n            logical_bytes = self._reservable_size(message, property_wire_size)\n            token = self.try_reserve(logical_bytes)\n            if token is None:\n                token = await self.reserve_slow(logical_bytes)\n        try:\n            if iterator_delivery:\n                item: IteratorQueueItem = (message, token) if token is not None else message\n                try:\n                    self.messages_queue.put_nowait(item)\n                except asyncio.QueueFull:\n                    await self.put_message(item)\n                else:\n                    self.message_ready.set()\n                iterator_enqueued = True\n            if callback_delivery:\n                assert callback is not None\n                self.ensure_callback_worker()\n                job = (callback, (message,), token)\n                try:\n                    self.callback_queue.put_nowait(job)\n                except asyncio.QueueFull:\n                    await self.enqueue_callback_job_slow(job)\n                callback_enqueued = True\n        except BaseException:\n            if token is not None and not iterator_enqueued and not callback_enqueued:\n                self.release_nowait(token)\n            raise\n'''
+          if text.count(old_accept) != 1:
+              raise SystemExit(f'unexpected accept block count: {text.count(old_accept)}')
+          text = text.replace(old_accept, new_accept, 1)
+
+          old_reserve = '''    def try_reserve(self, logical_bytes: int, references: int) -> DeliveryToken:\n        limit = self.accounted_limit\n        if limit is not None and self.pending_bytes + logical_bytes > limit:\n            return None\n        self.pending_bytes += logical_bytes\n        self.pending_high_water_bytes = max(self.pending_high_water_bytes, self.pending_bytes)\n        if references == 1:\n            return logical_bytes\n        return _SharedDeliveryReservation(logical_bytes)\n\n    async def reserve_slow(self, logical_bytes: int, references: int) -> DeliveryToken:\n        while True:\n            self.waiters += 1\n            try:\n                self.space.clear()\n                token = self.try_reserve(logical_bytes, references)\n                if token is not None:\n                    return token\n                await self.space.wait()\n            finally:\n                self.waiters -= 1\n            token = self.try_reserve(logical_bytes, references)\n            if token is not None:\n                return token\n\n    def release_nowait(self, token: AccountedDeliveryToken) -> None:\n        if isinstance(token, int):\n            self.pending_bytes -= token\n        else:\n            if token.remaining <= 0:\n                return\n            token.remaining -= 1\n            if token.remaining:\n                return\n            logical_bytes = token.logical_bytes\n            token.logical_bytes = 0\n            self.pending_bytes -= logical_bytes\n        if self.waiters:\n            self.space.set()\n'''
+          new_reserve = '''    def try_reserve(self, logical_bytes: int) -> DeliveryToken:\n        limit = self.accounted_limit\n        if limit is not None and self.pending_bytes + logical_bytes > limit:\n            return None\n        self.pending_bytes += logical_bytes\n        self.pending_high_water_bytes = max(self.pending_high_water_bytes, self.pending_bytes)\n        return logical_bytes\n\n    async def reserve_slow(self, logical_bytes: int) -> DeliveryToken:\n        while True:\n            self.waiters += 1\n            try:\n                self.space.clear()\n                token = self.try_reserve(logical_bytes)\n                if token is not None:\n                    return token\n                await self.space.wait()\n            finally:\n                self.waiters -= 1\n            token = self.try_reserve(logical_bytes)\n            if token is not None:\n                return token\n\n    def release_nowait(self, token: AccountedDeliveryToken) -> None:\n        self.pending_bytes -= token\n        if self.waiters:\n            self.space.set()\n'''
+          if text.count(old_reserve) != 1:
+              raise SystemExit(f'unexpected reserve block count: {text.count(old_reserve)}')
+          text = text.replace(old_reserve, new_reserve, 1)
+
+          tree = ast.parse(text)
+          lines = text.splitlines(keepends=True)
+          spans = []
+          for node in tree.body:
+              if isinstance(node, ast.ClassDef) and node.name == '_SharedDeliveryReservation':
+                  spans.append((node.lineno, node.end_lineno))
+              if isinstance(node, ast.ClassDef) and node.name == 'ApplicationDelivery':
+                  for child in node.body:
+                      if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and child.name in {
+                          '_accept_both_unaccounted', '_accept_both_fast', '_accept_both_decoded'
+                      }:
+                          spans.append((child.lineno, child.end_lineno))
+          for start, end in sorted(spans, reverse=True):
+              del lines[start - 1:end]
+          text = ''.join(lines)
+          text = '\n'.join(
+              line for line in text.splitlines()
+              if '"both": self._accept_both_' not in line
+          ) + '\n'
+          path.write_text(text)
+
+          async_path = Path('src/mqttium/api/async_client.py')
+          text = async_path.read_text()
+          async_replacements = {
+              'if message_delivery not in ("auto", "iterator", "callback", "both"):\n        raise ValueError("message_delivery must be \'auto\', \'iterator\', \'callback\', or \'both\'")':
+                  'if message_delivery not in ("auto", "iterator", "callback"):\n        raise ValueError("message_delivery must be \'auto\', \'iterator\', or \'callback\'")',
+              'message_delivery: ``"iterator"``, ``"callback"``, ``"both"``, or\n            ``"auto"`` delivery selection.':
+                  'message_delivery: ``"iterator"``, ``"callback"``, or ``"auto"`` delivery selection.',
+          }
+          for old, new in async_replacements.items():
+              if text.count(old) != 1:
+                  raise SystemExit(f'unexpected AsyncClient replacement count for {old!r}: {text.count(old)}')
+              text = text.replace(old, new, 1)
+          async_path.write_text(text)
+          PY
+          python -m compileall -q src/mqttium
+          git diff --check
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/mqttium/api/_delivery.py src/mqttium/api/async_client.py
+          git commit -m 'experiment: require single-owner message delivery'
+          git push origin HEAD:experiment/pr438-single-owner
