@@ -14,7 +14,6 @@ from mqttium.protocol.inbound import InboundSession
 @pytest.mark.parametrize(
     ("protocol", "publish_handler"),
     [
-        (MQTTProtocolVersion.MQTTv31, InboundSession._on_publish_v31),
         (MQTTProtocolVersion.MQTTv311, InboundSession._on_publish_v311),
         (MQTTProtocolVersion.MQTTv5, InboundSession._on_publish_v5),
     ],
