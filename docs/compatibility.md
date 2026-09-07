@@ -35,10 +35,13 @@ Only MQTT 3.1.1 and MQTT 5 are supported and tested.
 
 Protocol conformance evidence is indexed in [Protocol Conformance](conformance.md).
 
-`MQTTProtocolVersion.MQTTv31` remains a Stable enum member for backwards
-compatibility, but it selects an unsupported protocol. Handlers may exist for
-internal and decode completeness; they carry no support claim and no
-conformance claim.
+`MQTTProtocolVersion.MQTTv31` remains a Stable enum member with numeric value
+`3` for backwards-compatible imports and persisted configuration parsing. It is
+not executable protocol support: selecting it when constructing `AsyncClient`
+or `EngineConfig` fails immediately with a clear unsupported-protocol error,
+before any transport, store, codec, or protocol session is created. Low-level
+decode helpers may still understand v3-shaped packet data; that carries no
+support or conformance claim for MQTT 3.1.
 
 ## Transports
 
