@@ -142,7 +142,7 @@ hierarchy:
 | Opening, locking, querying, committing, or using a closed SQLite connection | the relevant `sqlite3.Error` subclass |
 | A future or structurally inconsistent MQTTium schema; invalid batch/close lifecycle | `RuntimeError` |
 | Invalid persisted storage classes, enum/flag/size values, JSON syntax, or MQTTium JSON markers | `ValueError` (including `json.JSONDecodeError`) |
-| Updating an outbound or inbound record that is absent | `KeyError` |
+| Updating metadata for an outbound or inbound record that is absent | `KeyError` |
 | A non-positive page, message, or byte bound | `ValueError` |
 
 Page and replay iterators execute SQL and hydrate rows lazily, so these failures
@@ -166,26 +166,24 @@ already above a newly reduced outbound limit, MQTTium permits it to drain but
 does not admit more work until usage falls below the limit. Inbound replay is
 also accounted against the configured inbound byte budget.
 
-Third-party `InflightStore` implementations remain supported. Implementing the
-optional paged and transition protocols avoids eager replay and payload reads on
-acknowledgement; the minimum store protocol remains correct but may use more
-memory.
+Third-party `InflightStore` implementations remain supported through one complete
+Provisional contract. MQTTium does not detect persistence capabilities at runtime
+and there is no weaker eager-replay or read/mutate/write fallback. A custom store
+must provide the same semantic guarantees used by the shipped stores:
 
-The runtime capability matrix is deliberately additive rather than a second
-store hierarchy:
-
-| Contract | Required guarantee | Operational consequence |
+| Required part of `InflightStore` | Guarantee | Operational consequence |
 | --- | --- | --- |
-| `InflightStore` | atomic `batch()` mutations and ordered whole-record iteration | correctness and third-party compatibility; replay may materialise the store |
-| `PagedInflightStore` | ordered pages and payload-free outbound summaries | outbound recovery memory proportional to one page |
-| `BoundedInboundReplayStore` | metadata count plus message/byte-bounded hydration | inbound replay memory bounded by one batch, including large sessions |
-| `TransitionInflightStore` | conditional atomic state changes and metadata-only lookup | acknowledgements avoid payload reads; QoS 2 phase-two compaction is durable |
+| `batch()`, point reads/writes/deletes, and clear operations | atomic mutation groups and durable record ownership | rollback and session cleanup have one store path |
+| `out_summary_pages()` and `in_index_pages()` | ordered payload-free metadata pages | recovery accounting does not hydrate every payload |
+| `in_replay_pages()` and `in_count()` | message/byte-bounded inbound hydration | large inbound sessions replay with bounded resident payload memory |
+| `out_meta()` / `in_meta()`, `transition_*()`, and `complete_*()` | conditional metadata-only state changes | ACK handling avoids payload reads and QoS state changes remain atomic |
+| logical-size and delivered-state metadata updates | restart-safe admission accounting and inbound delivery state | recovered byte limits match durable ownership |
 
-Both shipped stores implement every extension, and sessions resolve those
-capabilities once when the engine is constructed. A legacy third-party store
-therefore keeps the base correctness semantics with eager replay and
-best-effort phase-two compaction; it does not silently acquire atomic
-conditional-transition guarantees from a read/update fallback.
+The former `PagedInflightStore`, `BoundedInboundReplayStore`, and
+`TransitionInflightStore` capability protocols are removed. So are the shipped
+stores' legacy whole-object iteration/update helpers. Code that needs a full
+record after reading a metadata page should call `get_out()` or `get_in()` for
+that identifier.
 
 A third-party store MUST NOT report storage, backend, integrity, or
 lifecycle failures with `MQTTError` or any of its subclasses: `MQTTError`

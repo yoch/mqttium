@@ -167,10 +167,19 @@ Historical SQLite rows are accounted for when they are first reopened. A store
 already above a new limit may drain existing work but cannot admit more until it
 falls below that limit.
 
-Third-party `InflightStore` implementations remain supported. Implementing the
-optional `PagedInflightStore` protocol enables incremental replay without
-materialising every payload at once. The fallback eager path is correct but can
-use substantially more memory for large sessions.
+Third-party `InflightStore` implementations remain supported, but the Provisional
+contract is now complete rather than capability-discovered. Custom stores must
+implement the bounded replay, metadata lookup, conditional transition, and
+conditional completion methods declared by `InflightStore`; MQTTium no longer
+falls back to eager whole-store hydration or read/mutate/write state transitions.
+
+The former `PagedInflightStore`, `BoundedInboundReplayStore`, and
+`TransitionInflightStore` capability protocols are removed. The shipped stores
+also no longer expose the retired whole-object helpers `update_out`, `out_items`,
+`out_pages`, `pop_in`, `update_in`, `in_items`, `in_pages`, or `contains_in`. Use
+`out_summary_pages()` / `in_index_pages()` for ordered metadata inspection,
+`get_out()` / `get_in()` when a payload is actually needed, and the
+`transition_*()` / `complete_*()` methods for state changes.
 
 ## Updating `EngineConfig`
 

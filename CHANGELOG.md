@@ -8,6 +8,16 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Changed
 
+- Unify the Provisional persistence API around one complete `InflightStore`
+  contract. Bounded replay, payload-free metadata paging, and conditional state
+  transitions/completion are now required instead of runtime-detected optional
+  capabilities. Remove `PagedInflightStore`, `BoundedInboundReplayStore`, and
+  `TransitionInflightStore`, together with the eager/whole-object fallback paths.
+  `MemoryInflightStore` and `SqliteInflightStore` also drop the retired helpers
+  `update_out`, `out_items`, `out_pages`, `pop_in`, `update_in`, `in_items`,
+  `in_pages`, and `contains_in`. Third-party stores must implement the modern
+  `InflightStore` contract; see the migration and persistence guides.
+
 - Simplify callback scheduling around an explicit callable-form contract: `def`
   callbacks are synchronous and `async def` callbacks are asynchronous. A
   synchronous callback that returns an awaitable is now reported as a callback
