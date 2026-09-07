@@ -1,4 +1,4 @@
-name: Strict Sync Inline Burst2 Final Benchmark
+name: T3c Callback Pair Final Benchmark
 
 on:
   push:
@@ -13,7 +13,7 @@ concurrency:
 
 env:
   BASE_SHA: 4fe90af36660bce06c12e9a8c57cb9a6223abe5a
-  CANDIDATE_SHA: de21de10b9e9758a5b0ad021582f4b23dad624de
+  CANDIDATE_SHA: db490eededc2fbd60434da3672d0dbc8e722ee0e
   HARNESS_SHA: 22731e60c01f00f4f0dfb125bf664893d21537af
   PYTHONUNBUFFERED: "1"
 
@@ -49,24 +49,15 @@ jobs:
           cache: pip
           cache-dependency-path: candidate/pyproject.toml
 
-      - name: Adapt harness to opt in only candidate arm
+      - name: Validate exact T3c candidate
         shell: bash
         run: |
           set -euo pipefail
-          python - <<'PY'
-          from pathlib import Path
-          p = Path('harness/benchmarks/callback_coalesced_inline_probe.py')
-          text = p.read_text(encoding='utf-8')
-          old = '''        max_pending_callbacks=4096,\n    )\n'''
-          new = '''        max_pending_callbacks=4096,\n        **(\n            {"inline_callback_burst": 2}\n            if Path(os.environ.get("PYTHONPATH", "")).resolve().parent.name == "candidate"\n            else {}\n        ),\n    )\n'''
-          if text.count(old) != 1:
-              raise SystemExit(f'unexpected constructor target count: {text.count(old)}')
-          p.write_text(text.replace(old, new, 1), encoding='utf-8')
-          PY
-          python -m py_compile harness/benchmarks/callback_coalesced_inline_probe.py
           python -m pip install -e 'candidate[dev]'
+          python -m py_compile harness/benchmarks/callback_coalesced_inline_probe.py
           PYTHONPATH=candidate/src python -m pytest -q -W error \
-            candidate/tests/unit/test_strict_sync_inline_burst.py
+            candidate/tests/unit/test_sync_callback_contract.py \
+            candidate/tests/unit/test_topic_callback_dispatch_contract.py
 
       - name: A/A control
         shell: bash
@@ -113,7 +104,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: strict-sync-burst2-hosted-arm64-${{ github.run_id }}
+          name: t3c-callback-pair-hosted-arm64-${{ github.run_id }}
           path: |
             /tmp/aa.json
             /tmp/ab.json
@@ -151,7 +142,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          root="$RUNNER_TEMP/strict-sync-burst2-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          root="$RUNNER_TEMP/t3c-callback-pair-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           echo "JOB_ROOT=$root" >> "$GITHUB_ENV"
           rm -rf "$root" && mkdir -p "$root"
           python3 -m venv "$root/venv"
@@ -160,23 +151,14 @@ jobs:
           "$root/venv/bin/python" harness/benchmarks/runner_probe.py \
             --output "$root/runner.json" --require-temperature --enforce
 
-      - name: Adapt harness to opt in only candidate arm
+      - name: Validate exact T3c candidate
         shell: bash
         run: |
           set -euo pipefail
-          python - <<'PY'
-          from pathlib import Path
-          p = Path('harness/benchmarks/callback_coalesced_inline_probe.py')
-          text = p.read_text(encoding='utf-8')
-          old = '''        max_pending_callbacks=4096,\n    )\n'''
-          new = '''        max_pending_callbacks=4096,\n        **(\n            {"inline_callback_burst": 2}\n            if Path(os.environ.get("PYTHONPATH", "")).resolve().parent.name == "candidate"\n            else {}\n        ),\n    )\n'''
-          if text.count(old) != 1:
-              raise SystemExit(f'unexpected constructor target count: {text.count(old)}')
-          p.write_text(text.replace(old, new, 1), encoding='utf-8')
-          PY
           python -m py_compile harness/benchmarks/callback_coalesced_inline_probe.py
           PYTHONPATH=candidate/src python -m pytest -q -W error \
-            candidate/tests/unit/test_strict_sync_inline_burst.py
+            candidate/tests/unit/test_sync_callback_contract.py \
+            candidate/tests/unit/test_topic_callback_dispatch_contract.py
 
       - name: A/A control
         shell: bash
@@ -224,7 +206,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: strict-sync-burst2-rpi5-${{ github.run_id }}
+          name: t3c-callback-pair-rpi5-${{ github.run_id }}
           path: |
             ${{ env.JOB_ROOT }}/*.json
             ${{ env.JOB_ROOT }}/*.txt
