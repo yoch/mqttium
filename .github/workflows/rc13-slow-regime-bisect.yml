@@ -1,96 +1,110 @@
-name: RC13 slow-regime bisect
+name: RC13 slow-regime noncanonical bisect
 
 on:
   push:
     branches: [bench/rc13-slow-regime-bisect]
+    paths: [.github/workflows/rc13-slow-regime-bisect.yml]
 
 permissions:
   contents: read
 
 concurrency:
-  group: mqttium-arm64-runner
+  group: mqttium-regime-hosted
   cancel-in-progress: false
 
 jobs:
-  version-ab:
-    runs-on: [self-hosted, linux, ARM64]
+  regime-probe:
+    runs-on: ubuntu-24.04
     timeout-minutes: 180
     env:
       BENCH_SHA: ec332e25003a6484727697c3018ce632a025a7f2
-      BASE_SHA: 7d917547b491c8e521d1d82960b1e10810e4bd80
-      CANDIDATE_SHA: 66a850b52f1f08c6686bb5295fe029413d055adb
+      SHA_433: 7d917547b491c8e521d1d82960b1e10810e4bd80
+      SHA_434: 66a850b52f1f08c6686bb5295fe029413d055adb
       TARGET_RATE: "3942"
-      SLOW_THRESHOLD_MS: "0.285"
+      AA_BLOCKS: "8"
+      AB_BLOCKS: "8"
+      REL_BLOCKS: "6"
 
     steps:
       - name: Set run-specific path
         shell: bash
-        run: echo "RESULTS_DIR=$RUNNER_TEMP/mqttium-slow-regime-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
-
-      - name: Verify dedicated ARM runner
-        shell: bash
         run: |
           set -euo pipefail
-          test "$(uname -m)" = "aarch64"
-          python3 - <<'PY'
-          import sys
-          if sys.version_info[:2] != (3, 14):
-              raise SystemExit(f"expected Python 3.14, got {sys.version}")
-          PY
-          command -v mosquitto
-          command -v taskset
-          gov="$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || true)"
-          echo "governor=$gov"
-          test "$gov" = performance
-          if pgrep -a mosquitto; then
-            echo "pre-existing Mosquitto would contaminate the run" >&2
-            exit 1
-          fi
+          dir="$RUNNER_TEMP/mqttium-regime-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -p "$dir"
+          echo "RESULTS_DIR=$dir" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.14"
 
       - name: Checkout exact benchmark harness
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: yoch/mqtt-python-client-bench
           ref: ${{ env.BENCH_SHA }}
           path: harness
           persist-credentials: false
 
-      - name: Checkout pre-434 baseline
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Checkout independent A/A arms at PR433
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: yoch/mqttium
-          ref: ${{ env.BASE_SHA }}
+          ref: ${{ env.SHA_433 }}
+          path: aa-a
+          persist-credentials: false
+
+      - name: Checkout second independent A/A arm at PR433
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: yoch/mqttium
+          ref: ${{ env.SHA_433 }}
+          path: aa-b
+          persist-credentials: false
+
+      - name: Checkout PR433 A/B baseline
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: yoch/mqttium
+          ref: ${{ env.SHA_433 }}
           path: old
           persist-credentials: false
 
-      - name: Checkout PR434 merge
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Checkout PR434 A/B candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: yoch/mqttium
-          ref: ${{ env.CANDIDATE_SHA }}
+          ref: ${{ env.SHA_434 }}
           path: new
           persist-credentials: false
 
-      - name: Verify immutable source provenance
+      - name: Verify immutable provenance
         shell: bash
         run: |
           set -euo pipefail
           test "$(git -C harness rev-parse HEAD)" = "$BENCH_SHA"
-          test "$(git -C old rev-parse HEAD)" = "$BASE_SHA"
-          test "$(git -C new rev-parse HEAD)" = "$CANDIDATE_SHA"
-          test -z "$(git -C old status --porcelain --untracked-files=no)"
-          test -z "$(git -C new status --porcelain --untracked-files=no)"
+          test "$(git -C aa-a rev-parse HEAD)" = "$SHA_433"
+          test "$(git -C aa-b rev-parse HEAD)" = "$SHA_433"
+          test "$(git -C old rev-parse HEAD)" = "$SHA_433"
+          test "$(git -C new rev-parse HEAD)" = "$SHA_434"
+          for d in harness aa-a aa-b old new; do
+            test -z "$(git -C "$d" status --porcelain --untracked-files=no)"
+          done
 
-      - name: Create isolated Python environment
+      - name: Install measurement dependencies
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m venv "$RUNNER_TEMP/slow-regime-venv"
-          echo "$RUNNER_TEMP/slow-regime-venv/bin" >> "$GITHUB_PATH"
-          "$RUNNER_TEMP/slow-regime-venv/bin/python" -m pip install --upgrade pip
-          "$RUNNER_TEMP/slow-regime-venv/bin/python" -m pip install -e "./harness[paho,mqttium]" "psutil>=6,<8"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mosquitto
+          sudo systemctl stop mosquitto 2>/dev/null || true
+          sudo pkill -x mosquitto 2>/dev/null || true
+          python -m venv "$RUNNER_TEMP/regime-venv"
+          echo "$RUNNER_TEMP/regime-venv/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/regime-venv/bin/python" -m pip install --upgrade pip
+          "$RUNNER_TEMP/regime-venv/bin/python" -m pip install -e "./harness[paho,mqttium]" "psutil>=6,<8"
 
-      - name: Re-run focused harness tests on ARM
+      - name: Validate focused harness invariants
         shell: bash
         working-directory: harness
         run: |
@@ -101,10 +115,81 @@ jobs:
             tests.test_pacing \
             tests.test_rtt_initiator
 
-      - name: Prepare result directory
-        run: mkdir -p "$RESULTS_DIR"
+      - name: Capture noncanonical environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            date -u --iso-8601=seconds
+            uname -a
+            lscpu
+            python --version
+            echo '--- governors ---'
+            cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null || true
+            echo '--- current frequencies ---'
+            cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq 2>/dev/null || true
+            uptime
+            free -h
+            echo '--- thermal ---'
+            for z in /sys/class/thermal/thermal_zone*; do
+              [ -d "$z" ] || continue
+              printf '%s ' "$z"
+              cat "$z/type" 2>/dev/null || true
+              cat "$z/temp" 2>/dev/null || true
+            done
+            echo '--- pressure ---'
+            cat /proc/pressure/cpu 2>/dev/null || true
+            cat /proc/pressure/memory 2>/dev/null || true
+            cat /proc/pressure/io 2>/dev/null || true
+            echo '--- proc stat ---'
+            head -n 20 /proc/stat
+          } | tee "$RESULTS_DIR/environment.txt"
 
-      - name: Calibrate host identity and harness cost
+          PYTHONPATH=harness/src python - <<'PY'
+          import json, os
+          from pathlib import Path
+          from mqtt_client_bench.telemetry import environment_metadata, physical_cpu_groups
+          env = environment_metadata()
+          env["physical_cpu_groups_exact"] = physical_cpu_groups()
+          env["noncanonical_governor"] = env.get("scaling_governor") != "performance"
+          env["benchmark_harness_sha"] = os.environ["BENCH_SHA"]
+          env["target_rate"] = float(os.environ["TARGET_RATE"])
+          Path(os.environ["RESULTS_DIR"], "environment.json").write_text(json.dumps(env, indent=2, sort_keys=True))
+          PY
+
+      - name: Build CPU isolation plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH=harness/src python - <<'PY'
+          import json, os
+          from pathlib import Path
+          from mqtt_client_bench.telemetry import allocate_cpuset, physical_cpu_groups
+          roles = ["sut", "broker", "loadgen", "orch"]
+          groups = physical_cpu_groups()
+          if len(groups) >= len(roles):
+              mapping = allocate_cpuset(roles, profile="standard")
+              fallback = False
+          elif len(groups) >= 2:
+              a = ",".join(map(str, groups[0]))
+              b = ",".join(map(str, groups[1]))
+              mapping = {"broker": a, "orch": a, "sut": b, "loadgen": b}
+              fallback = True
+          else:
+              only = ",".join(map(str, groups[0])) if groups else "0"
+              mapping = {role: only for role in roles}
+              fallback = True
+          doc = {
+              "physical_groups": groups,
+              "mapping": mapping,
+              "native_standard_isolation": not fallback,
+              "fallback_reason": None if not fallback else "fewer_than_4_physical_groups",
+          }
+          Path(os.environ["RESULTS_DIR"], "cpuset-plan.json").write_text(json.dumps(doc, indent=2, sort_keys=True))
+          print(json.dumps(doc, indent=2, sort_keys=True))
+          PY
+
+      - name: Calibrate host identity without canonical enforcement
         shell: bash
         working-directory: harness
         run: |
@@ -113,9 +198,74 @@ jobs:
             --profile standard \
             --role runner \
             --skip-ceilings \
+            --allow-busy \
             --output "$RESULTS_DIR/host.json"
 
-      - name: Start isolated native Mosquitto
+      - name: Prepare local cpuset wrapper
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RESULTS_DIR/version_compare_wrapper.py" <<'PY'
+          import json, os, sys
+          from pathlib import Path
+          import mqtt_client_bench.version_compare as vc
+
+          plan = json.loads(Path(os.environ["RESULTS_DIR"], "cpuset-plan.json").read_text())
+          mapping = plan["mapping"]
+          def planned_cpuset(roles, profile="standard"):
+              return {role: mapping[role] for role in roles}
+          vc.allocate_cpuset = planned_cpuset
+          raise SystemExit(vc.main(sys.argv[1:]))
+          PY
+
+      - name: Start low-rate host sampler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RESULTS_DIR/host_sampler.py" <<'PY'
+          import glob, json, os, time
+
+          def read(path):
+              try:
+                  with open(path, "r", encoding="utf-8") as f:
+                      return f.read().strip()
+              except OSError:
+                  return None
+
+          def cpu_stat():
+              line = (read("/proc/stat") or "").splitlines()
+              if not line:
+                  return None
+              parts = line[0].split()
+              names = ["user","nice","system","idle","iowait","irq","softirq","steal","guest","guest_nice"]
+              vals = [int(x) for x in parts[1:1+len(names)]]
+              return dict(zip(names, vals))
+
+          def thermals():
+              out = {}
+              for z in glob.glob("/sys/class/thermal/thermal_zone*"):
+                  out[z] = {"type": read(z + "/type"), "temp": read(z + "/temp")}
+              return out
+
+          while True:
+              row = {
+                  "ts": time.time(),
+                  "cpu_stat": cpu_stat(),
+                  "pressure_cpu": read("/proc/pressure/cpu"),
+                  "pressure_memory": read("/proc/pressure/memory"),
+                  "pressure_io": read("/proc/pressure/io"),
+                  "governors": {p: read(p) for p in glob.glob("/sys/devices/system/cpu/cpu*/cpufreq/scaling_governor")},
+                  "cur_freq_khz": {p: read(p) for p in glob.glob("/sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq")},
+                  "thermals": thermals(),
+                  "loadavg": read("/proc/loadavg"),
+              }
+              print(json.dumps(row, sort_keys=True), flush=True)
+              time.sleep(1.0)
+          PY
+          python "$RESULTS_DIR/host_sampler.py" >> "$RESULTS_DIR/host-samples.jsonl" 2>&1 &
+          echo "HOST_SAMPLER_PID=$!" >> "$GITHUB_ENV"
+
+      - name: Start isolated Mosquitto
         shell: bash
         run: |
           set -euo pipefail
@@ -134,12 +284,12 @@ jobs:
           max_packet_size 16777216
           max_keepalive 120
           EOF
-          broker_cpuset="$(PYTHONPATH=harness/src python - <<'PY'
-          from mqtt_client_bench.telemetry import allocate_cpuset
-          print(allocate_cpuset(["sut", "broker", "loadgen", "orch"], profile="standard")["broker"])
+          broker_cpuset="$(python - <<'PY'
+          import json, os
+          print(json.load(open(os.path.join(os.environ['RESULTS_DIR'], 'cpuset-plan.json')))['mapping']['broker'])
           PY
           )"
-          echo "broker_cpuset=$broker_cpuset"
+          echo "broker_cpuset=$broker_cpuset" | tee "$RESULTS_DIR/broker-cpuset.txt"
           taskset -c "$broker_cpuset" mosquitto -c "$RESULTS_DIR/mosquitto.conf" > "$RESULTS_DIR/mosquitto.log" 2>&1 &
           pid=$!
           echo "BROKER_PID=$pid" >> "$GITHUB_ENV"
@@ -150,11 +300,32 @@ jobs:
           done
           exit 1
 
-      - name: Eight-block pre-434 versus PR434 probe
+      - name: A/A runner-quality control at exact rate
         shell: bash
         run: |
           set -euo pipefail
-          PYTHONPATH=harness/src python -m mqtt_client_bench.version_compare \
+          PYTHONPATH=harness/src python "$RESULTS_DIR/version_compare_wrapper.py" \
+            --client mqttium \
+            --baseline-path aa-a \
+            --candidate-path aa-b \
+            --scenario application_rtt_fixed_rate \
+            --variant-index 0 \
+            --target-rate "$TARGET_RATE" \
+            --pacer-mode external \
+            --blocks "$AA_BLOCKS" \
+            --max-block-retries 1 \
+            --profile standard \
+            --broker 127.0.0.1:11883 \
+            --broker-pid "$BROKER_PID" \
+            --host-profile "$RESULTS_DIR/host.json" \
+            --output "$RESULTS_DIR/aa-433-3942.json" \
+            | tee "$RESULTS_DIR/aa-summary.txt"
+
+      - name: PR433 versus PR434 at exact RPi rate
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH=harness/src python "$RESULTS_DIR/version_compare_wrapper.py" \
             --client mqttium \
             --baseline-path old \
             --candidate-path new \
@@ -162,103 +333,204 @@ jobs:
             --variant-index 0 \
             --target-rate "$TARGET_RATE" \
             --pacer-mode external \
-            --blocks 8 \
+            --blocks "$AB_BLOCKS" \
             --max-block-retries 1 \
             --profile standard \
             --broker 127.0.0.1:11883 \
             --broker-pid "$BROKER_PID" \
             --host-profile "$RESULTS_DIR/host.json" \
-            --output "$RESULTS_DIR/pre434-vs-434-8blocks.json" \
-            | tee "$RESULTS_DIR/version-ab-summary.txt"
+            --output "$RESULTS_DIR/433-vs-434-3942.json" \
+            | tee "$RESULTS_DIR/ab-exact-summary.txt"
 
-      - name: Summarize raw slots without reducer verdict
-        if: always()
+      - name: Measure local MQTT311 RTT capacity
+        continue-on-error: true
         shell: bash
         run: |
-          if [ -f "$RESULTS_DIR/pre434-vs-434-8blocks.json" ]; then
-            PYTHONPATH=harness/src python - <<'PY' | tee "$RESULTS_DIR/raw-slot-summary.txt"
-          import json, math, os, statistics
-          p = os.path.join(os.environ["RESULTS_DIR"], "pre434-vs-434-8blocks.json")
-          d = json.load(open(p))
-          threshold = float(os.environ["SLOW_THRESHOLD_MS"])
-          print("IGNORE reducer verdict for classification; raw-slot analysis follows")
-          print("baseline", (d.get("baseline_source") or {}).get("git_sha"))
-          print("candidate", (d.get("candidate_source") or {}).get("git_sha"))
-          rows = []
-          for r in d.get("runs") or []:
-              workers = {w.get("role"): w for w in (r.get("workers") or [])}
-              init = workers.get("rtt_initiator") or {}
-              resp = workers.get("responder") or {}
-              ilib = ((init.get("runtime") or {}).get("library") or {})
-              rlib = ((resp.get("runtime") or {}).get("library") or {})
-              ie = ilib.get("effects") or {}
-              re = rlib.get("effects") or {}
-              iw = ilib.get("writer") or {}
-              rw = rlib.get("writer") or {}
-              im = ((init.get("runtime") or {}).get("measure_delta") or {})
-              rp = ((resp.get("runtime") or {}).get("process_end") or {})
-              lat = init.get("latency_summary") or {}
-              tq = r.get("temporal_quality") or {}
-              row = {
-                  "slot": r.get("execution_slot"),
-                  "block": r.get("logical_block"),
-                  "arm": r.get("ab_label"),
-                  "sha": ((r.get("version_source") or {}).get("git_sha")),
-                  "p50_ms": lat.get("p50_ms", r.get("comparison_value")),
-                  "p95_ms": lat.get("p95_ms"),
-                  "p99_ms": lat.get("p99_ms"),
-                  "slow": float(lat.get("p50_ms", r.get("comparison_value")) or 0) >= threshold,
-                  "init_effect_batches": ie.get("batches"),
-                  "init_multi_effect_batches": ie.get("multi_effect_batches"),
-                  "init_reordered_batches": ie.get("reordered_batches"),
-                  "init_writer_batches": iw.get("batches"),
-                  "init_writer_batched_items": iw.get("batched_items"),
-                  "init_nvcsw": im.get("ru_nvcsw"),
-                  "init_stime_s": im.get("ru_stime_s"),
-                  "resp_effect_batches": re.get("batches"),
-                  "resp_multi_effect_batches": re.get("multi_effect_batches"),
-                  "resp_reordered_batches": re.get("reordered_batches"),
-                  "resp_writer_batches": rw.get("batches"),
-                  "resp_writer_batched_items": rw.get("batched_items"),
-                  "resp_nvcsw": rp.get("ru_nvcsw"),
-                  "resp_stime_s": rp.get("ru_stime_s"),
-                  "pacer_lateness_p95_ns": tq.get("pacer_lateness_p95_ns"),
-                  "catch_up_fraction": tq.get("catch_up_fraction"),
-                  "stimulus_ok": tq.get("ok"),
-              }
-              rows.append(row)
-              print(json.dumps(row, sort_keys=True))
-          print("ARM SUMMARY")
-          for arm in ("A", "B"):
-              rr = [x for x in rows if x["arm"] == arm]
-              p50s = [float(x["p50_ms"]) for x in rr]
-              print(json.dumps({
-                  "arm": arm,
-                  "n": len(rr),
-                  "slow_n": sum(bool(x["slow"]) for x in rr),
-                  "slow_fraction": (sum(bool(x["slow"]) for x in rr) / len(rr)) if rr else None,
-                  "p50_min_ms": min(p50s) if p50s else None,
-                  "p50_median_ms": statistics.median(p50s) if p50s else None,
-                  "p50_max_ms": max(p50s) if p50s else None,
-                  "all_stimulus_ok": all(bool(x["stimulus_ok"]) for x in rr),
-              }, sort_keys=True))
+          set -o pipefail
+          PYTHONPATH=harness/src python -m mqtt_client_bench.run run \
+            --client mqttium \
+            --client-path old \
+            --scenario rtt_capacity_qos1 \
+            --profile standard \
+            --runs 3 \
+            --broker 127.0.0.1:11883 \
+            --broker-pid "$BROKER_PID" \
+            --host-profile "$RESULTS_DIR/host.json" \
+            --output "$RESULTS_DIR/rtt-capacity-433.json" \
+            | tee "$RESULTS_DIR/capacity-summary.txt"
+
+      - name: Resolve relative-load target
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          result = {"capacity_mqtt311": None, "exact_rate": float(os.environ["TARGET_RATE"]), "exact_fraction": None, "relative_target_rate": None, "run_relative": False}
+          p = Path(os.environ["RESULTS_DIR"], "rtt-capacity-433.json")
+          if p.exists():
+              data = json.loads(p.read_text())
+              candidates = []
+              for block in data.get("results", []):
+                  point = block.get("point") or {}
+                  if point.get("protocol") == "MQTTv311":
+                      med = (block.get("summary") or {}).get("median")
+                      if med:
+                          candidates.append(float(med))
+              if candidates:
+                  cap = candidates[0]
+                  frac = float(os.environ["TARGET_RATE"]) / cap
+                  target = 0.25 * cap
+                  result.update({"capacity_mqtt311": cap, "exact_fraction": frac, "relative_target_rate": target, "run_relative": not (0.20 <= frac <= 0.30)})
+                  if result["run_relative"]:
+                      with open(os.environ["GITHUB_ENV"], "a") as fh:
+                          fh.write(f"RELATIVE_TARGET_RATE={target:.6f}\n")
+          Path(os.environ["RESULTS_DIR"], "relative-load-decision.json").write_text(json.dumps(result, indent=2, sort_keys=True))
+          print(json.dumps(result, indent=2, sort_keys=True))
           PY
-          fi
 
-      - name: Stop native broker
+      - name: PR433 versus PR434 at local 25-percent load
+        if: env.RELATIVE_TARGET_RATE != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH=harness/src python "$RESULTS_DIR/version_compare_wrapper.py" \
+            --client mqttium \
+            --baseline-path old \
+            --candidate-path new \
+            --scenario application_rtt_fixed_rate \
+            --variant-index 0 \
+            --target-rate "$RELATIVE_TARGET_RATE" \
+            --pacer-mode external \
+            --blocks "$REL_BLOCKS" \
+            --max-block-retries 1 \
+            --profile standard \
+            --broker 127.0.0.1:11883 \
+            --broker-pid "$BROKER_PID" \
+            --host-profile "$RESULTS_DIR/host.json" \
+            --output "$RESULTS_DIR/433-vs-434-relative.json" \
+            | tee "$RESULTS_DIR/ab-relative-summary.txt"
+
+      - name: Stop samplers and broker
         if: always()
         shell: bash
         run: |
+          if [ -n "${HOST_SAMPLER_PID:-}" ]; then
+            kill "$HOST_SAMPLER_PID" 2>/dev/null || true
+            wait "$HOST_SAMPLER_PID" 2>/dev/null || true
+          fi
           if [ -n "${BROKER_PID:-}" ]; then
             kill "$BROKER_PID" 2>/dev/null || true
             wait "$BROKER_PID" 2>/dev/null || true
           fi
 
-      - name: Upload slow-regime evidence
+      - name: Extract all raw slots and internal telemetry
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        shell: bash
+        run: |
+          python - <<'PY'
+          import csv, json, math, os, statistics
+          from pathlib import Path
+
+          root = Path(os.environ["RESULTS_DIR"])
+          docs = [
+              ("aa_exact", root / "aa-433-3942.json"),
+              ("ab_exact", root / "433-vs-434-3942.json"),
+              ("ab_relative", root / "433-vs-434-relative.json"),
+          ]
+
+          def flatten(prefix, value, out):
+              if isinstance(value, dict):
+                  for k, v in value.items():
+                      flatten(f"{prefix}.{k}" if prefix else str(k), v, out)
+              elif isinstance(value, (str, int, float, bool)) or value is None:
+                  out[prefix] = value
+
+          def worker(run, role):
+              for item in run.get("workers") or []:
+                  if item.get("role") == role:
+                      return item
+              return {}
+
+          def numeric(v):
+              return v if isinstance(v, (int, float)) and math.isfinite(float(v)) else None
+
+          rows = []
+          raw_internal = []
+          for campaign, path in docs:
+              if not path.exists():
+                  continue
+              doc = json.loads(path.read_text())
+              for run in doc.get("runs") or []:
+                  init = worker(run, "rtt_initiator")
+                  resp = worker(run, "responder")
+                  lat = init.get("latency_summary") or {}
+                  row = {
+                      "campaign": campaign,
+                      "index": run.get("execution_slot"),
+                      "block": run.get("logical_block"),
+                      "attempt": run.get("block_attempt"),
+                      "block_slot": run.get("block_slot"),
+                      "selected_for_verdict": bool(run.get("active_for_verdict")),
+                      "arm": run.get("ab_label"),
+                      "sha": (run.get("version_source") or {}).get("git_sha"),
+                      "latency_p50_ms": numeric(lat.get("p50_ms")) or numeric(run.get("comparison_value")),
+                      "latency_p95_ms": numeric(lat.get("p95_ms")),
+                      "latency_p99_ms": numeric(lat.get("p99_ms")),
+                      "status": run.get("status"),
+                      "reasons": json.dumps(run.get("reasons") or [], sort_keys=True),
+                      "retry_reasons": json.dumps(run.get("block_retry_reasons") or [], sort_keys=True),
+                  }
+                  flatten("pacing", run.get("pacing") or {}, row)
+                  flatten("temporal", run.get("temporal_quality") or {}, row)
+                  flatten("initiator.library", ((init.get("runtime") or {}).get("library") or {}), row)
+                  flatten("responder.library", ((resp.get("runtime") or {}).get("library") or {}), row)
+                  flatten("initiator.measure_delta", ((init.get("runtime") or {}).get("measure_delta") or {}), row)
+                  flatten("responder.measure_delta", ((resp.get("runtime") or {}).get("measure_delta") or {}), row)
+                  for role, w in (("initiator", init), ("responder", resp)):
+                      for key in ("offered", "completed", "delivered", "throughput", "msgs_per_s", "messages"):
+                          if key in w:
+                              row[f"{role}.{key}"] = w.get(key)
+                  telemetry = run.get("telemetry") or []
+                  broker_cpu = []
+                  for sample in telemetry:
+                      b = ((sample.get("processes") or {}).get("broker") or {})
+                      val = b.get("cpu_pct")
+                      if isinstance(val, (int, float)):
+                          broker_cpu.append(float(val))
+                  row["broker_cpu_pct_median"] = statistics.median(broker_cpu) if broker_cpu else None
+                  row["broker_cpu_pct_max"] = max(broker_cpu) if broker_cpu else None
+                  rows.append(row)
+                  raw_internal.append({
+                      "campaign": campaign,
+                      "execution_slot": run.get("execution_slot"),
+                      "logical_block": run.get("logical_block"),
+                      "attempt": run.get("block_attempt"),
+                      "selected": bool(run.get("active_for_verdict")),
+                      "arm": run.get("ab_label"),
+                      "sha": (run.get("version_source") or {}).get("git_sha"),
+                      "pacing": run.get("pacing"),
+                      "temporal_quality": run.get("temporal_quality"),
+                      "initiator_runtime": init.get("runtime"),
+                      "responder_runtime": resp.get("runtime"),
+                      "telemetry": telemetry,
+                  })
+
+          fields = sorted({k for row in rows for k in row})
+          with (root / "slots-all.csv").open("w", newline="") as fh:
+              writer = csv.DictWriter(fh, fieldnames=fields)
+              writer.writeheader()
+              writer.writerows(rows)
+          (root / "slots-all.json").write_text(json.dumps(rows, indent=2, sort_keys=True))
+          (root / "slots-internal-telemetry.json").write_text(json.dumps(raw_internal, indent=2, sort_keys=True))
+          print(f"extracted {len(rows)} executed slots; no latency threshold applied")
+          PY
+
+      - name: Upload regime evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: mqttium-pre434-vs-434-${{ github.run_id }}
-          path: ${{ runner.temp }}/mqttium-slow-regime-${{ github.run_id }}-${{ github.run_attempt }}
+          name: mqttium-regime-noncanonical-${{ github.run_id }}
+          path: ${{ env.RESULTS_DIR }}
           if-no-files-found: warn
           retention-days: 14
