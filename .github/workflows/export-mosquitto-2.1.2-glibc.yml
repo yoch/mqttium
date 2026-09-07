@@ -1,0 +1,59 @@
+name: Export Mosquitto 2.1.2 glibc
+
+on:
+  push:
+    branches: [bench/rc13-slow-regime-bisect]
+    paths: [.github/workflows/export-mosquitto-2.1.2-glibc.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      VERSION: 2.1.2
+      SOURCE_SHA256: fd905380691ac65ea5a93779e8214941829e3d6e038d5edff9eac5fd74cbed02
+    steps:
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential libcjson-dev libssl-dev libwebsockets-dev libedit-dev libmicrohttpd-dev libsqlite3-dev libargon2-dev uuid-dev
+      - name: Build official source
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSLo mosq.tar.gz "https://mosquitto.org/files/source/mosquitto-${VERSION}.tar.gz"
+          echo "$SOURCE_SHA256  mosq.tar.gz" | sha256sum -c -
+          mkdir src && tar --strip-components=1 -xzf mosq.tar.gz -C src
+          make -C src -j "$(nproc)" \
+            CFLAGS='-Wall -O2' \
+            WITH_ADNS=no WITH_DOCS=no WITH_SHARED_LIBRARIES=yes WITH_SRV=no WITH_STRIP=yes WITH_WEBSOCKETS=yes \
+            prefix=/usr binary
+          mkdir -p runtime/bin runtime/lib
+          cp -L src/src/mosquitto runtime/bin/mosquitto
+          ldd runtime/bin/mosquitto | tee runtime/ldd.txt
+          ldd runtime/bin/mosquitto | awk '/=> \/|^\// {for (i=1;i<=NF;i++) if ($i ~ /^\//) print $i}' | sort -u > runtime/libs.txt
+          while read -r lib; do cp -L "$lib" runtime/lib/; done < runtime/libs.txt
+          runtime/bin/mosquitto -h > runtime/version.txt 2>&1 || true
+          head -n 3 runtime/version.txt
+          tar -czf mosquitto-2.1.2-glibc-runtime.tar.gz runtime
+          sha256sum mosquitto-2.1.2-glibc-runtime.tar.gz > sha256sums.txt
+          {
+            echo "source=https://mosquitto.org/files/source/mosquitto-${VERSION}.tar.gz"
+            echo "source_sha256=${SOURCE_SHA256}"
+            echo "build_host=ubuntu-24.04"
+            echo "cflags=-Wall -O2"
+            echo "make_flags=WITH_ADNS=no WITH_DOCS=no WITH_SHARED_LIBRARIES=yes WITH_SRV=no WITH_STRIP=yes WITH_WEBSOCKETS=yes"
+          } > provenance.txt
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: mosquitto-2.1.2-glibc-${{ github.run_id }}
+          path: |
+            mosquitto-2.1.2-glibc-runtime.tar.gz
+            provenance.txt
+            sha256sums.txt
+          retention-days: 7
