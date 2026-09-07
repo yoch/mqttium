@@ -29,7 +29,7 @@ def test_wait_user_ack_completes_when_reopened_without_manual_ack() -> None:
         store=store,
     )
     engine.state = ConnectionState.CONNECTED
-    engine._inbound_inflight = 1
+    engine.inbound._inflight = 1
 
     feed_engine(engine, PubRelPacket(mid=17).encode())
 
@@ -40,7 +40,7 @@ def test_wait_user_ack_completes_when_reopened_without_manual_ack() -> None:
     ]
     assert sends == [PubCompPacket(mid=17).encode()]
     assert store.get_in(17) is None
-    assert engine._inbound_inflight == 0
+    assert engine.inbound._inflight == 0
 
 
 def test_wait_puback_completes_when_reopened_without_manual_ack() -> None:
@@ -61,7 +61,7 @@ def test_wait_puback_completes_when_reopened_without_manual_ack() -> None:
         store=store,
     )
     engine.state = ConnectionState.CONNECTED
-    engine._inbound_inflight = 1
+    engine.inbound._inflight = 1
 
     feed_engine(
         engine,
@@ -82,4 +82,4 @@ def test_wait_puback_completes_when_reopened_without_manual_ack() -> None:
     assert sends == [PubAckPacket(mid=18).encode()]
     assert not [effect for effect in effects if effect.kind is EffectKind.MESSAGE]
     assert store.get_in(18) is None
-    assert engine._inbound_inflight == 0
+    assert engine.inbound._inflight == 0

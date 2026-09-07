@@ -167,7 +167,7 @@ def test_engine_chunk_rollback_restores_all_mutable_state() -> None:
         for page in engine.store.out_summary_pages()
         for summary in page
     )
-    assert not engine._queued
+    assert not engine.outbound._queued
     assert engine.flow.inflight == 0
     assert len(engine.packet_ids) == 0
 

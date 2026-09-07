@@ -56,7 +56,7 @@ def test_drain_delete_failure_keeps_fifo_ownership_until_retry(
     third = engine.queue_publish("t/3", b"three", qos=qos)
     assert first.mid is not None and second.mid is not None and third.mid is not None
     engine.take_effects()
-    assert [msg.mid for msg in engine._queued] == [second.mid, third.mid]
+    assert [msg.mid for msg in engine.outbound._queued] == [second.mid, third.mid]
 
     original_transition = type(store).transition_out
     original_delete = type(store).delete_out
@@ -101,7 +101,7 @@ def test_drain_delete_failure_keeps_fifo_ownership_until_retry(
     assert engine.pending_outbound_messages == 2
     assert engine.packet_ids.in_use(second.mid)
     assert engine.packet_ids.in_use(third.mid)
-    assert [msg.mid for msg in engine._queued] == [second.mid, third.mid]
+    assert [msg.mid for msg in engine.outbound._queued] == [second.mid, third.mid]
     assert engine.flow.inflight == 0
 
     # Both faults were transient. Retry resumes at the same head; the later
@@ -109,7 +109,7 @@ def test_drain_delete_failure_keeps_fifo_ownership_until_retry(
     engine.outbound.drain()
     retry_effects = engine.take_effects()
     assert any(e.kind is EffectKind.SEND for e in retry_effects)
-    assert [msg.mid for msg in engine._queued] == [third.mid]
+    assert [msg.mid for msg in engine.outbound._queued] == [third.mid]
     retried = store.get_out(second.mid)
     assert retried is not None
     assert retried.state is (
@@ -227,7 +227,7 @@ def test_sqlite_surviving_record_rehydrates_the_same_ownership_after_restart(
     assert record is not None and record.state is OutboundQoSState.QUEUED
     assert recovered.pending_outbound_messages == 1
     assert recovered.packet_ids.in_use(second.mid)
-    assert [msg.mid for msg in recovered._queued] == [second.mid]
+    assert [msg.mid for msg in recovered.outbound._queued] == [second.mid]
     reopened.close()
 
 
@@ -238,7 +238,7 @@ def test_negotiation_discard_failure_keeps_queue_until_delete_recovers(
     engine = ProtocolEngine(EngineConfig(), store)
     handle = engine.queue_publish("t", b"payload", qos=QoS.EXACTLY_ONCE)
     assert handle.mid is not None
-    assert [msg.mid for msg in engine._queued] == [handle.mid]
+    assert [msg.mid for msg in engine.outbound._queued] == [handle.mid]
     engine.negotiated = NegotiatedSettings(maximum_qos=0)
 
     original_delete = MemoryInflightStore.delete_out
@@ -259,7 +259,7 @@ def test_negotiation_discard_failure_keeps_queue_until_delete_recovers(
     assert store.get_out(handle.mid) is not None
     assert engine.packet_ids.in_use(handle.mid)
     assert engine.pending_outbound_messages == 1
-    assert [msg.mid for msg in engine._queued] == [handle.mid]
+    assert [msg.mid for msg in engine.outbound._queued] == [handle.mid]
     assert engine.take_effects() == []
 
     engine.outbound.fail_queued_violating_negotiation()
@@ -267,7 +267,7 @@ def test_negotiation_discard_failure_keeps_queue_until_delete_recovers(
     assert store.get_out(handle.mid) is None
     assert not engine.packet_ids.in_use(handle.mid)
     assert engine.pending_outbound_messages == 0
-    assert list(engine._queued) == []
+    assert list(engine.outbound._queued) == []
     assert any(
         e.kind is EffectKind.PUBLISH_FAILED and getattr(e.data, "mid", None) == handle.mid
         for e in effects
@@ -297,4 +297,4 @@ def test_admission_rollback_still_preserves_primary_failure(
     assert engine.pending_outbound_bytes == 0
     assert engine.flow.inflight == 0
     assert engine.packet_ids._used == set()
-    assert list(engine._queued) == []
+    assert list(engine.outbound._queued) == []

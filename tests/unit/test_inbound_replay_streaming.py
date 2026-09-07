@@ -72,7 +72,7 @@ def test_replay_emits_a_bounded_first_batch_and_asks_for_more() -> None:
     assert effects[-1].kind is EffectKind.CONTINUE_INBOUND_REPLAY
     # The receive window is restored in full before the first redelivery, not
     # progressively as batches are emitted.
-    assert engine._inbound_inflight == 500
+    assert engine.inbound._inflight == 500
     assert engine.inbound.replay_pending is True
 
 

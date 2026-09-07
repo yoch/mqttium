@@ -6,7 +6,6 @@ effects out. This is the correctness core that AsyncClient adapts.
 
 from __future__ import annotations
 
-from collections import deque
 from collections.abc import Callable, Iterable, KeysView
 from typing import Any
 
@@ -47,11 +46,7 @@ from mqttium.protocol.outbound import OutboundSession
 from mqttium.protocol.packet_ids import PacketIdPool
 from mqttium.topics import validate_publish_topic, validate_subscribe_filter
 from mqttium.transport.writes import WriteItem, item_size
-from mqttium.types import (
-    OutboundMessage,
-    OutboundMessageSummary,
-    Properties,
-)
+from mqttium.types import Properties
 from mqttium.errors import (
     MalformedPacketError,
     MandatoryResponseTooLargeError,
@@ -182,10 +177,6 @@ class ProtocolEngine:
         return self.outbound.flow
 
     @property
-    def _queued(self) -> deque[OutboundMessage | OutboundMessageSummary]:
-        return self.outbound._queued
-
-    @property
     def pending_outbound_messages(self) -> int:
         return self.outbound.pending_messages
 
@@ -196,22 +187,6 @@ class ProtocolEngine:
     # --- inbound facade ----------------------------------------------------
     # Preserve the diagnostic/test surface that pre-dates InboundSession while
     # keeping the state itself under one owner.
-
-    @property
-    def _topic_aliases(self) -> dict[int, str]:
-        return self.inbound._aliases
-
-    @property
-    def _inbound_inflight(self) -> int:
-        return self.inbound._inflight
-
-    @_inbound_inflight.setter
-    def _inbound_inflight(self, value: int) -> None:
-        self.inbound._inflight = value
-
-    @property
-    def _recovered_inbound_mids(self) -> set[int]:
-        return self.inbound._recovered_mids
 
     @property
     def _pending_sub_mids(self) -> KeysView[int]:

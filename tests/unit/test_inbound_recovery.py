@@ -76,7 +76,7 @@ def test_session_resume_restores_receive_window_count() -> None:
     _resume(engine)
 
     assert engine.state is ConnectionState.CONNECTED
-    assert engine._inbound_inflight == 2
+    assert engine.inbound._inflight == 2
 
 
 def test_undelivered_qos2_is_replayed_once_after_restart() -> None:
@@ -90,8 +90,8 @@ def test_undelivered_qos2_is_replayed_once_after_restart() -> None:
     assert len(messages) == 1
     assert messages[0].mid == 7
     assert messages[0].dup is True
-    assert engine._inbound_inflight == 1
-    assert engine._recovered_inbound_mids == set()
+    assert engine.inbound._inflight == 1
+    assert engine.inbound._recovered_mids == set()
 
 
 def test_recovered_manual_ack_is_redelivered_even_if_previously_delivered() -> None:

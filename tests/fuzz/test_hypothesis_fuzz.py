@@ -195,7 +195,7 @@ _frame_type = st.sampled_from(
 def _engine_invariants(engine: ProtocolEngine) -> None:
     assert engine.flow.inflight >= 0
     assert engine.flow.inflight <= engine.flow.limit
-    assert engine._inbound_inflight >= 0
+    assert engine.inbound._inflight >= 0
 
     outbound = list(
         engine.store.get_out(summary.mid)
@@ -205,7 +205,7 @@ def _engine_invariants(engine: ProtocolEngine) -> None:
     expected_mids = {msg.mid for msg in outbound} | set(engine._pending_sub_mids)
     assert set(engine.packet_ids._used) == expected_mids
 
-    queued_mids = {msg.mid for msg in engine._queued}
+    queued_mids = {msg.mid for msg in engine.outbound._queued}
     expected_flow = sum(
         1
         for msg in outbound
