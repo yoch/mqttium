@@ -1,0 +1,207 @@
+name: MQTTium version A/B smoke
+
+on:
+  push:
+    branches: [bench/version-ab-smoke]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mqttium-arm64-runner
+  cancel-in-progress: false
+
+jobs:
+  version-ab-smoke:
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 120
+    env:
+      BENCH_SHA: ec332e25003a6484727697c3018ce632a025a7f2
+      BASE_SHA: 4560e44aeb24b8a4f7f6ce903766579fac481cbd
+      CANDIDATE_SHA: 6f1351e3b60593946c520b7d1915564f76023873
+      TARGET_RATE: "3942"
+      RESULTS_DIR: ${{ runner.temp }}/mqttium-version-ab-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Verify dedicated ARM runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "aarch64"
+          python3 - <<'PY'
+          import sys
+          if sys.version_info[:2] != (3, 14):
+              raise SystemExit(f"expected Python 3.14, got {sys.version}")
+          PY
+          command -v mosquitto
+          command -v taskset
+          gov="$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || true)"
+          echo "governor=$gov"
+          test "$gov" = performance
+          if pgrep -a mosquitto; then
+            echo "pre-existing Mosquitto would contaminate the run" >&2
+            exit 1
+          fi
+
+      - name: Checkout exact benchmark harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: yoch/mqtt-python-client-bench
+          ref: ${{ env.BENCH_SHA }}
+          path: harness
+          persist-credentials: false
+
+      - name: Checkout exact RC13 baseline
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: yoch/mqttium
+          ref: ${{ env.BASE_SHA }}
+          path: old
+          persist-credentials: false
+
+      - name: Checkout exact current candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: yoch/mqttium
+          ref: ${{ env.CANDIDATE_SHA }}
+          path: new
+          persist-credentials: false
+
+      - name: Verify immutable source provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C harness rev-parse HEAD)" = "$BENCH_SHA"
+          test "$(git -C old rev-parse HEAD)" = "$BASE_SHA"
+          test "$(git -C new rev-parse HEAD)" = "$CANDIDATE_SHA"
+          test -z "$(git -C old status --porcelain --untracked-files=no)"
+          test -z "$(git -C new status --porcelain --untracked-files=no)"
+
+      - name: Create isolated Python environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/version-ab-venv"
+          echo "$RUNNER_TEMP/version-ab-venv/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/version-ab-venv/bin/python" -m pip install --upgrade pip
+          "$RUNNER_TEMP/version-ab-venv/bin/python" -m pip install -e "./harness[paho,mqttium]" "psutil>=6,<8"
+
+      - name: Re-run focused harness tests on ARM
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH=harness/src python -m unittest -v \
+            tests.test_quality \
+            tests.test_version_compare \
+            tests.test_pacing \
+            tests.test_rtt_initiator
+
+      - name: Prepare result directory
+        run: mkdir -p "$RESULTS_DIR"
+
+      - name: Calibrate host identity and harness cost
+        shell: bash
+        working-directory: harness
+        run: |
+          set -euo pipefail
+          PYTHONPATH=src python -m mqtt_client_bench.run calibrate-host \
+            --profile standard \
+            --role runner \
+            --skip-ceilings \
+            --output "$RESULTS_DIR/host.json"
+
+      - name: Start isolated native Mosquitto
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RESULTS_DIR/mosquitto.conf" <<'EOF'
+          listener 11883 127.0.0.1
+          protocol mqtt
+          set_tcp_nodelay true
+          allow_anonymous true
+          persistence false
+          connection_messages false
+          log_dest stdout
+          log_type error
+          sys_interval 1
+          max_inflight_messages 1000
+          max_queued_messages 10000
+          max_packet_size 16777216
+          max_keepalive 120
+          EOF
+          broker_cpuset="$(PYTHONPATH=harness/src python - <<'PY'
+          from mqtt_client_bench.telemetry import allocate_cpuset
+          print(allocate_cpuset(["sut", "broker", "loadgen", "orch"], profile="standard")["broker"])
+          PY
+          )"
+          echo "broker_cpuset=$broker_cpuset"
+          taskset -c "$broker_cpuset" mosquitto -c "$RESULTS_DIR/mosquitto.conf" > "$RESULTS_DIR/mosquitto.log" 2>&1 &
+          pid=$!
+          echo "BROKER_PID=$pid" >> "$GITHUB_ENV"
+          for _ in $(seq 1 50); do
+            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            kill -0 "$pid" 2>/dev/null || { cat "$RESULTS_DIR/mosquitto.log"; exit 1; }
+            sleep 0.2
+          done
+          exit 1
+
+      - name: First two-block version A/B path test
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH=harness/src python -m mqtt_client_bench.version_compare \
+            --client mqttium \
+            --baseline-path old \
+            --candidate-path new \
+            --scenario application_rtt_fixed_rate \
+            --variant-index 0 \
+            --target-rate "$TARGET_RATE" \
+            --pacer-mode external \
+            --blocks 2 \
+            --max-block-retries 1 \
+            --profile standard \
+            --broker 127.0.0.1:11883 \
+            --broker-pid "$BROKER_PID" \
+            --host-profile "$RESULTS_DIR/host.json" \
+            --output "$RESULTS_DIR/rc13-vs-main-25pct-2blocks.json" \
+            | tee "$RESULTS_DIR/version-ab-summary.txt"
+
+      - name: Summarize result
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "$RESULTS_DIR/rc13-vs-main-25pct-2blocks.json" ]; then
+            PYTHONPATH=harness/src python - <<'PY'
+          import json, os
+          p = os.path.join(os.environ["RESULTS_DIR"], "rc13-vs-main-25pct-2blocks.json")
+          d = json.load(open(p))
+          print(json.dumps({
+              "baseline": (d.get("baseline_source") or {}).get("git_sha"),
+              "candidate": (d.get("candidate_source") or {}).get("git_sha"),
+              "qualification": d.get("qualification"),
+              "verdict": d.get("verdict"),
+              "block_ratios": d.get("block_ratios"),
+              "executed_slots": len(d.get("runs") or []),
+              "logical_slots": len(d.get("slot_rates") or []),
+              "attempts": d.get("block_attempts"),
+          }, indent=2))
+          PY
+          fi
+
+      - name: Stop native broker
+        if: always()
+        shell: bash
+        run: |
+          if [ -n "${BROKER_PID:-}" ]; then
+            kill "$BROKER_PID" 2>/dev/null || true
+            wait "$BROKER_PID" 2>/dev/null || true
+          fi
+
+      - name: Upload first version A/B evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: mqttium-version-ab-smoke-${{ github.run_id }}
+          path: ${{ env.RESULTS_DIR }}
+          if-no-files-found: warn
+          retention-days: 14
