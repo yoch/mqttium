@@ -64,6 +64,7 @@ Status meanings:
 | [INDEPENDENT-QOS0-LATENCY-AUDIT-2026-08-14](https://github.com/yoch/mqttium/blob/main/docs/reports/INDEPENDENT-QOS0-LATENCY-AUDIT-2026-08-14.md) | Current evidence | Bounded native QoS 0 latency audit |
 | [NATIVE-QOS0-CALLBACK-DIRECT-2026-08-14](https://github.com/yoch/mqttium/blob/main/docs/reports/NATIVE-QOS0-CALLBACK-DIRECT-2026-08-14.md) | Current evidence | Direct callback-admission decision |
 | [SINGLE-MESSAGE-INLINE-DELIVERY-2026-08-14](https://github.com/yoch/mqttium/blob/main/docs/reports/SINGLE-MESSAGE-INLINE-DELIVERY-2026-08-14.md) | Current evidence | Inline delivery threshold decision |
+| [HOTPATH-RECON-2026-09-06](https://github.com/yoch/mqttium/blob/main/docs/reports/HOTPATH-RECON-2026-09-06.md) | Current evidence | MQTTium-only path-identity and exploratory-cost map at `4560e44`; µs are not portable; wait for native-async bench PR results before optimizing |
 
 ## Memory evidence
 
