@@ -1,4 +1,4 @@
-name: MQTTium slow-regime bisect RC13 to PR432
+name: MQTTium PR433 pair-inline causal isolation
 
 on:
   push:
@@ -14,17 +14,18 @@ concurrency:
 jobs:
   version-ab-smoke:
     runs-on: [self-hosted, linux, ARM64]
-    timeout-minutes: 180
+    timeout-minutes: 240
     env:
       BENCH_SHA: ec332e25003a6484727697c3018ce632a025a7f2
-      BASE_SHA: 4560e44aeb24b8a4f7f6ce903766579fac481cbd
-      CANDIDATE_SHA: 4fe90af36660bce06c12e9a8c57cb9a6223abe5a
+      BASE_SHA: 7d917547b491c8e521d1d82960b1e10810e4bd80
       TARGET_RATE: "3942"
 
     steps:
       - name: Set run-specific path
         shell: bash
-        run: echo "RESULTS_DIR=$RUNNER_TEMP/mqttium-version-ab-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+        run: |
+          echo "RESULTS_DIR=$RUNNER_TEMP/mqttium-version-ab-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/mqttium-version-ab-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
 
       - name: Verify dedicated ARM runner
         shell: bash
@@ -54,7 +55,7 @@ jobs:
           path: harness
           persist-credentials: false
 
-      - name: Checkout exact RC13 baseline
+      - name: Checkout exact PR433 baseline
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: yoch/mqttium
@@ -62,23 +63,62 @@ jobs:
           path: old
           persist-credentials: false
 
-      - name: Checkout exact PR432 merge
+      - name: Checkout exact PR433 source for isolated candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: yoch/mqttium
-          ref: ${{ env.CANDIDATE_SHA }}
+          ref: ${{ env.BASE_SHA }}
           path: new
           persist-credentials: false
 
-      - name: Verify immutable source provenance
+      - name: Verify immutable source provenance before patch
         shell: bash
         run: |
           set -euo pipefail
           test "$(git -C harness rev-parse HEAD)" = "$BENCH_SHA"
           test "$(git -C old rev-parse HEAD)" = "$BASE_SHA"
-          test "$(git -C new rev-parse HEAD)" = "$CANDIDATE_SHA"
-          test -z "$(git -C old status --porcelain --untracked-files=no)"
-          test -z "$(git -C new status --porcelain --untracked-files=no)"
+          test "$(git -C new rev-parse HEAD)" = "$BASE_SHA"
+          test -z "$(git -C old status --porcelain)"
+          test -z "$(git -C new status --porcelain)"
+
+      - name: Build deterministic pair-inline-disabled candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("new/src/mqttium/api/_delivery.py")
+          text = path.read_text()
+          old = "                    self._dispatch_sync_message_pair_inline(callback, messages)\n"
+          new = "                    self._enqueue_message_batch(callback, messages, iterator_delivery=False)\n"
+          if text.count(old) != 1:
+              raise SystemExit(f"expected exactly one pair-inline dispatch, found {text.count(old)}")
+          path.write_text(text.replace(old, new, 1))
+          PY
+
+          git -C new diff --check
+          git -C new diff -- src/mqttium/api/_delivery.py | tee "$RESULTS_DIR/pair-inline-disabled-working.patch"
+          test "$(git -C new diff --numstat -- src/mqttium/api/_delivery.py)" = $'1\t1\tsrc/mqttium/api/_delivery.py'
+          test "$(git -C new diff --name-only)" = "src/mqttium/api/_delivery.py"
+          grep -F -- '-                    self._dispatch_sync_message_pair_inline(callback, messages)' "$RESULTS_DIR/pair-inline-disabled-working.patch"
+          grep -F -- '+                    self._enqueue_message_batch(callback, messages, iterator_delivery=False)' "$RESULTS_DIR/pair-inline-disabled-working.patch"
+
+          git -C new config user.name "mqttium benchmark"
+          git -C new config user.email "benchmark@localhost"
+          export GIT_AUTHOR_DATE="2026-09-07T12:00:00+00:00"
+          export GIT_COMMITTER_DATE="2026-09-07T12:00:00+00:00"
+          git -C new add src/mqttium/api/_delivery.py
+          git -C new commit -m "bench: disable PR433 sync pair-inline dispatch"
+
+          candidate_sha="$(git -C new rev-parse HEAD)"
+          echo "CANDIDATE_SHA=$candidate_sha" >> "$GITHUB_ENV"
+          echo "$candidate_sha" | tee "$RESULTS_DIR/candidate-sha.txt"
+          test "$(git -C new rev-parse HEAD^)" = "$BASE_SHA"
+          test -z "$(git -C new status --porcelain)"
+          test "$(git -C new diff --name-only "$BASE_SHA"..HEAD)" = "src/mqttium/api/_delivery.py"
+          test "$(git -C new diff --numstat "$BASE_SHA"..HEAD)" = $'1\t1\tsrc/mqttium/api/_delivery.py'
+          git -C new diff "$BASE_SHA"..HEAD -- src/mqttium/api/_delivery.py | tee "$RESULTS_DIR/pair-inline-disabled.patch"
 
       - name: Create isolated Python environment
         shell: bash
@@ -100,8 +140,42 @@ jobs:
             tests.test_pacing \
             tests.test_rtt_initiator
 
-      - name: Prepare result directory
-        run: mkdir -p "$RESULTS_DIR"
+      - name: Verify isolated candidate uses worker for eligible pair
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH=new/src python - <<'PY'
+          import asyncio
+          from collections import deque
+
+          from mqttium.api import AsyncClient
+          from mqttium.protocol.effects import EffectKind, EngineEffect
+          from mqttium.types import Message
+
+          def effect(value: bytes) -> EngineEffect:
+              return EngineEffect(
+                  EffectKind.MESSAGE,
+                  Message(topic="bench/pair", payload=value),
+                  requires_delivery_mark=False,
+              )
+
+          async def main() -> None:
+              client = AsyncClient(message_delivery="callback")
+              seen: list[bytes] = []
+              client.on_message = lambda message: seen.append(message.payload)
+              applied = client._apply_message_effect_batch_inline(
+                  deque([effect(b"0"), effect(b"1")]),
+                  client._connection_epoch,
+              )
+              assert applied == 2
+              assert seen == [], seen
+              assert client._callback_worker_task is not None
+              await client._callback_queue.join()
+              assert seen == [b"0", b"1"], seen
+              await client._shutdown_callback_worker(drain=False)
+
+          asyncio.run(main())
+          PY
 
       - name: Calibrate host identity and harness cost
         shell: bash
@@ -149,7 +223,7 @@ jobs:
           done
           exit 1
 
-      - name: Eight-block RC13 versus PR432 probe
+      - name: Twelve-block PR433 pair-inline causal probe
         shell: bash
         run: |
           set -euo pipefail
@@ -161,32 +235,89 @@ jobs:
             --variant-index 0 \
             --target-rate "$TARGET_RATE" \
             --pacer-mode external \
-            --blocks 8 \
+            --blocks 12 \
             --max-block-retries 1 \
             --profile standard \
             --broker 127.0.0.1:11883 \
             --broker-pid "$BROKER_PID" \
             --host-profile "$RESULTS_DIR/host.json" \
-            --output "$RESULTS_DIR/rc13-vs-pr432-8blocks.json" \
+            --output "$RESULTS_DIR/pr433-vs-pair-inline-disabled-12blocks.json" \
             | tee "$RESULTS_DIR/version-ab-summary.txt"
 
-      - name: Summarize provenance only
+      - name: Summarize raw slow-regime evidence
         if: always()
         shell: bash
         run: |
-          if [ -f "$RESULTS_DIR/rc13-vs-pr432-8blocks.json" ]; then
+          if [ -f "$RESULTS_DIR/pr433-vs-pair-inline-disabled-12blocks.json" ]; then
             PYTHONPATH=harness/src python - <<'PY'
-          import json, os
-          p = os.path.join(os.environ["RESULTS_DIR"], "rc13-vs-pr432-8blocks.json")
-          d = json.load(open(p))
-          print(json.dumps({
-              "baseline": (d.get("baseline_source") or {}).get("git_sha"),
-              "candidate": (d.get("candidate_source") or {}).get("git_sha"),
-              "executed_slots": len(d.get("runs") or []),
-              "logical_slots": len(d.get("slot_rates") or []),
-              "attempts": d.get("block_attempts"),
-              "note": "do not use reducer verdict; inspect raw slots",
-          }, indent=2))
+          import json
+          import math
+          import os
+          import statistics
+
+          path = os.path.join(os.environ["RESULTS_DIR"], "pr433-vs-pair-inline-disabled-12blocks.json")
+          data = json.load(open(path))
+          selected = [run for run in data.get("runs", []) if run.get("active_for_verdict")]
+
+          def worker(run, role):
+              return next(item for item in run["workers"] if item.get("role") == role)
+
+          def snapshot(run):
+              responder = worker(run, "responder")
+              initiator = worker(run, "rtt_initiator")
+              rlib = responder["runtime"]["library"]
+              ilib = initiator["runtime"]["library"]
+              return {
+                  "execution_slot": run["execution_slot"],
+                  "logical_block": run["logical_block"],
+                  "logical_slot": run["logical_slot"],
+                  "label": run["ab_label"],
+                  "p50_ms": run["comparison_value"],
+                  "p95_ms": initiator["latency_summary"]["p95_ms"],
+                  "p99_ms": initiator["latency_summary"]["p99_ms"],
+                  "responder_effect_batches": rlib["effects"]["batches"],
+                  "responder_reordered_batches": rlib["effects"]["reordered_batches"],
+                  "responder_writer_batches": rlib["writer"]["batches"],
+                  "responder_batched_items": rlib["writer"]["batched_items"],
+                  "responder_eager_writes": rlib["writer"]["eager_writes"],
+                  "responder_nvcsw": responder["runtime"]["process_end"]["ru_nvcsw"],
+                  "responder_stime_s": responder["runtime"]["process_end"]["ru_stime_s"],
+                  "initiator_effect_batches": ilib["effects"]["batches"],
+                  "initiator_reordered_batches": ilib["effects"]["reordered_batches"],
+                  "initiator_writer_batches": ilib["writer"]["batches"],
+                  "initiator_batched_items": ilib["writer"]["batched_items"],
+                  "initiator_eager_writes": ilib["writer"]["eager_writes"],
+                  "initiator_nvcsw": initiator["runtime"]["measure_delta"]["ru_nvcsw"],
+                  "initiator_stime_s": initiator["runtime"]["measure_delta"]["ru_stime_s"],
+                  "pacer_lateness_p95_ns": run["pacing"]["pacer_lateness"]["p95"],
+                  "pacer_catch_up_events": run["pacing"]["catch_up"]["events"],
+              }
+
+          rows = [snapshot(run) for run in selected]
+          result = {
+              "baseline": (data.get("baseline_source") or {}).get("git_sha"),
+              "candidate": (data.get("candidate_source") or {}).get("git_sha"),
+              "selected_slots": len(rows),
+              "arms": {},
+              "slow_slots": [],
+          }
+          for label in ("A", "B"):
+              arm = [row for row in rows if row["label"] == label]
+              p50 = [row["p50_ms"] for row in arm]
+              slow = [row for row in arm if row["p50_ms"] >= 0.285]
+              result["arms"][label] = {
+                  "n": len(arm),
+                  "slow_ge_0_285_ms": len(slow),
+                  "p50_mean_ms": statistics.fmean(p50) if p50 else None,
+                  "p50_median_ms": statistics.median(p50) if p50 else None,
+                  "p50_min_ms": min(p50) if p50 else None,
+                  "p50_max_ms": max(p50) if p50 else None,
+                  "p50_values_ms": p50,
+              }
+              result["slow_slots"].extend(slow)
+          print(json.dumps(result, indent=2, sort_keys=True))
+          with open(os.path.join(os.environ["RESULTS_DIR"], "raw-slow-regime-summary.json"), "w") as handle:
+              json.dump(result, handle, indent=2, sort_keys=True)
           PY
           fi
 
@@ -199,11 +330,11 @@ jobs:
             wait "$BROKER_PID" 2>/dev/null || true
           fi
 
-      - name: Upload version A/B evidence
+      - name: Upload causal A/B evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: mqttium-rc13-vs-pr432-${{ github.run_id }}
+          name: mqttium-pr433-pair-inline-causal-${{ github.run_id }}
           path: ${{ runner.temp }}/mqttium-version-ab-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: warn
           retention-days: 14
