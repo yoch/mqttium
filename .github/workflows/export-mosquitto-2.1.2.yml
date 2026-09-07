@@ -1,0 +1,40 @@
+name: Export Mosquitto 2.1.2 rootfs
+
+on:
+  push:
+    branches: [bench/rc13-slow-regime-bisect]
+    paths: [.github/workflows/export-mosquitto-2.1.2.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Export exact Eclipse Mosquitto image rootfs
+        shell: bash
+        run: |
+          set -euo pipefail
+          image='eclipse-mosquitto:2.1.2'
+          docker pull "$image"
+          image_id="$(docker image inspect "$image" --format '{{.Id}}')"
+          image_digest="$(docker image inspect "$image" --format '{{index .RepoDigests 0}}')"
+          cid="$(docker create "$image")"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          docker export "$cid" | gzip -1 > mosquitto-2.1.2-rootfs.tar.gz
+          {
+            echo "image=$image"
+            echo "image_id=$image_id"
+            echo "image_digest=$image_digest"
+          } | tee provenance.txt
+          sha256sum mosquitto-2.1.2-rootfs.tar.gz > sha256sums.txt
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: mosquitto-2.1.2-rootfs-${{ github.run_id }}
+          path: |
+            mosquitto-2.1.2-rootfs.tar.gz
+            provenance.txt
+            sha256sums.txt
+          retention-days: 7
