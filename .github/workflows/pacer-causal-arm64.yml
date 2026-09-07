@@ -1,4 +1,4 @@
-name: External pacer A/A qualification ARM64
+name: MQTTium main external-pacer A/A preview ARM64
 
 on:
   push:
@@ -15,12 +15,12 @@ concurrency:
 
 jobs:
   benchmark:
-    name: external pacer 25pct standard-window A/A
+    name: main preview external pacer 25pct A/A
     runs-on: [self-hosted, linux, ARM64]
     timeout-minutes: 240
     env:
       BENCH_SHA: 7e75d44b97a96e7fecd572a88e420771dd404283
-      MQTTIUM_VER: "1.0.0rc13"
+      MQTTIUM_SOURCE_SHA: 86560fb0b34be88ac5ab84102c382033e6b3691d
       GMQTT_VER: "0.7.0"
       PAHO_VER: "2.1.0"
       C_COMMON: "15769.612519022552"
@@ -41,21 +41,30 @@ jobs:
           path: bench
           persist-credentials: false
 
-      - name: Verify runner and harness provenance
+      - name: Checkout exact MQTTium preview source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: yoch/mqttium
+          ref: 86560fb0b34be88ac5ab84102c382033e6b3691d
+          path: mqttium-src
+          persist-credentials: false
+
+      - name: Verify runner and source provenance
         shell: bash
         run: |
           set -euo pipefail
           test "$(uname -m)" = "aarch64"
           gov="$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || true)"
           echo "governor=$gov"
-          [ "$gov" = "performance" ] || { echo "qualification requires scaling_governor=performance" >&2; exit 1; }
+          [ "$gov" = "performance" ] || { echo "preview requires scaling_governor=performance" >&2; exit 1; }
           if pgrep -a mosquitto; then
             echo "pre-existing Mosquitto makes the runner unsafe" >&2
             exit 1
           fi
-          cd bench
-          test "$(git rev-parse HEAD)" = "$BENCH_SHA"
-          git status --short
+          test "$(git -C bench rev-parse HEAD)" = "$BENCH_SHA"
+          test "$(git -C mqttium-src rev-parse HEAD)" = "$MQTTIUM_SOURCE_SHA"
+          git -C bench status --short
+          git -C mqttium-src status --short
 
       - name: Create isolated benchmark environment
         shell: bash
@@ -66,11 +75,24 @@ jobs:
           . .venv/bin/activate
           python -m pip install --upgrade pip
           pip install -e ".[dev,paho,gmqtt,mqttium]"
-          pip install --force-reinstall --no-cache-dir \
-            "mqttium==$MQTTIUM_VER" "gmqtt==$GMQTT_VER" "paho-mqtt==$PAHO_VER"
-          python - <<'PY'
+          pip install --force-reinstall --no-cache-dir "gmqtt==$GMQTT_VER" "paho-mqtt==$PAHO_VER"
+          pip install --force-reinstall --no-cache-dir ../mqttium-src
+          mkdir -p "$RESULTS_DIR"
+          python - "$RESULTS_DIR/mqttium-source-provenance.json" "$MQTTIUM_SOURCE_SHA" <<'PY'
+          import json, sys
           from importlib.metadata import version
-          assert version("mqttium") == "1.0.0rc13"
+          import mqttium
+          payload = {
+              "source_sha": sys.argv[2],
+              "package_version": version("mqttium"),
+              "module_file": mqttium.__file__,
+              "gmqtt_version": version("gmqtt"),
+              "paho_version": version("paho-mqtt"),
+              "diagnostic_preview": True,
+              "not_a_release": True,
+          }
+          open(sys.argv[1], "w").write(json.dumps(payload, indent=2) + "\n")
+          print(json.dumps(payload, indent=2))
           assert version("gmqtt") == "0.7.0"
           assert version("paho-mqtt") == "2.1.0"
           PY
@@ -126,33 +148,33 @@ jobs:
           pid=$!
           echo "BROKER_PID=$pid" >> "$GITHUB_ENV"
           echo "BENCH_BROKER_PID=$pid" >> "$GITHUB_ENV"
-          mkdir -p "$RESULTS_DIR"
           echo "$pid" > "$RESULTS_DIR/broker.pid"
           sleep 1
           kill -0 "$pid"
 
-      - name: Run external 25pct A/A with standard windows
+      - name: Run main-preview external 25pct A/A
         shell: bash
         run: |
           set -euo pipefail
           cd bench
           . .venv/bin/activate
           export PYTHONPATH=src
-          OUT="$RESULTS_DIR/external-aa-standard-window-25"
+          OUT="$RESULTS_DIR/main-preview-external-aa-standard-window-25"
           CAL="$OUT/calibrations"
           TRACE="$OUT/temporal-traces"
           mkdir -p "$OUT" "$CAL" "$TRACE"
-          python - "$CAL" "$C_COMMON" <<'PY'
+          python - "$CAL" "$C_COMMON" "$MQTTIUM_SOURCE_SHA" <<'PY'
           import json, sys
           from pathlib import Path
-          root=Path(sys.argv[1]); cap=float(sys.argv[2])
+          root=Path(sys.argv[1]); cap=float(sys.argv[2]); source_sha=sys.argv[3]
           for client in ("mqttium","gmqtt"):
-              payload={"schema_version":1,"source":"frozen_c_common_from_run_34089052260","client":client,
+              payload={"schema_version":1,"source":"frozen_c_common_from_run_34089052260",
+                       "mqttium_source_sha":source_sha,"client":client,
                        "protocol_capacities":{"MQTTv311":{"rtt_capacity_msgs_per_s":cap}}}
               (root/f"{client}-load.json").write_text(json.dumps(payload,indent=2)+"\n")
           PY
           for client in mqttium gmqtt; do
-            echo "==> external A/A client=$client fraction=0.25 blocks=6 profile=standard"
+            echo "==> main-preview external A/A client=$client fraction=0.25 blocks=6 profile=standard"
             python -m mqtt_client_bench.run compare \
               --clients "$client,$client" \
               --scenario application_rtt_fixed_rate \
@@ -166,15 +188,16 @@ jobs:
               --output "$OUT/compare-aa-$client-v0-external-standard-window.json" \
               > "$OUT/$client.log" 2>&1
           done
-          python - "$OUT" "$TARGET_RATE" <<'PY'
+          python - "$OUT" "$TARGET_RATE" "$MQTTIUM_SOURCE_SHA" <<'PY'
           import json,sys
           from pathlib import Path
-          root=Path(sys.argv[1]); target=float(sys.argv[2]); rows=[]
+          root=Path(sys.argv[1]); target=float(sys.argv[2]); source_sha=sys.argv[3]; rows=[]
           for path in sorted(root.glob("compare-aa-*.json")):
               d=json.loads(path.read_text()); p=(d.get("points") or [{}])[0].get("point") or {}
               got=float(p.get("target_rate") or 0)
               if got != target: raise SystemExit(f"target rate drift: {got} != {target}")
               rows.append({"file":path.name,"client":d.get("baseline_client"),"target_rate":got,
+                           "mqttium_source_sha":source_sha,"diagnostic_preview":True,
                            "aa_control_pass":d.get("aa_control_pass"),"aa_bias_pct":d.get("aa_bias_pct"),
                            "aa_stability_pct":d.get("aa_stability_pct"),"aa_control_reason":d.get("aa_control_reason"),
                            "n_blocks":d.get("aa_n_blocks"),"n_pair_units":d.get("aa_n_pair_units")})
@@ -192,11 +215,11 @@ jobs:
             wait "$BROKER_PID" 2>/dev/null || true
           fi
 
-      - name: Upload external pacer qualification evidence
+      - name: Upload main-preview evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: external-pacer-aa-standard-window-25-${{ github.run_id }}
+          name: mqttium-main-external-pacer-aa-preview-${{ github.run_id }}
           path: |
             ${{ env.RESULTS_DIR }}
             bench/hosts/*.json
