@@ -20,9 +20,12 @@ jobs:
       BASE_SHA: 4560e44aeb24b8a4f7f6ce903766579fac481cbd
       CANDIDATE_SHA: 6f1351e3b60593946c520b7d1915564f76023873
       TARGET_RATE: "3942"
-      RESULTS_DIR: ${{ runner.temp }}/mqttium-version-ab-${{ github.run_id }}-${{ github.run_attempt }}
 
     steps:
+      - name: Set run-specific path
+        shell: bash
+        run: echo "RESULTS_DIR=$RUNNER_TEMP/mqttium-version-ab-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+
       - name: Verify dedicated ARM runner
         shell: bash
         run: |
@@ -202,6 +205,6 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: mqttium-version-ab-smoke-${{ github.run_id }}
-          path: ${{ env.RESULTS_DIR }}
+          path: ${{ runner.temp }}/mqttium-version-ab-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: warn
           retention-days: 14
