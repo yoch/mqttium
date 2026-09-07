@@ -134,6 +134,7 @@ def test_async_client_constructor_keywords_and_defaults() -> None:
         "max_ingress_batch_bytes": 1 * 1024 * 1024,
         "max_pending_messages": 65_536,
         "max_pending_callbacks": 1_024,
+        "inline_callback_burst": 1,
         "max_pending_delivery_bytes": 64 * 1024 * 1024,
         "delivery_timeout": 1.0,
         "callback_shutdown_timeout": 5.0,
