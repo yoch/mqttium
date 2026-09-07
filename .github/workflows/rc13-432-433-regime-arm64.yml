@@ -1,0 +1,190 @@
+name: RC13 432 433 regime ARM64
+
+on:
+  push:
+    branches: [bench/rc13-slow-regime-bisect]
+    paths: [.github/workflows/rc13-432-433-regime-arm64.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mqttium-regime-rpi5
+  cancel-in-progress: false
+
+jobs:
+  regime:
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 240
+    env:
+      BENCH_SHA: ec332e25003a6484727697c3018ce632a025a7f2
+      SHA_RC13: 4560e44aeb24b8a4f7f6ce903766579fac481cbd
+      SHA_432: 4fe90af36660bce06c12e9a8c57cb9a6223abe5a
+      SHA_433: 7d917547b491c8e521d1d82960b1e10810e4bd80
+      TARGET_RATE: "3942"
+
+    steps:
+      - name: Set paths and capture environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/mqttium-regime-boundary-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -p "$dir"
+          echo "RESULTS_DIR=$dir" >> "$GITHUB_ENV"
+          {
+            date -u --iso-8601=seconds
+            uname -a
+            lscpu
+            python3 --version
+            echo governors; cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null || true
+            echo frequencies; cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq 2>/dev/null || true
+            echo temperature; cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || true
+            echo unix_dgram; cat /proc/sys/net/unix/max_dgram_qlen 2>/dev/null || true
+            uptime
+            free -h
+          } | tee "$dir/environment.txt"
+          test "$(uname -m)" = aarch64
+
+      - name: Checkout exact harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: yoch/mqtt-python-client-bench
+          ref: ${{ env.BENCH_SHA }}
+          path: harness
+          persist-credentials: false
+
+      - name: Checkout RC13
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: yoch/mqttium
+          ref: ${{ env.SHA_RC13 }}
+          path: rc13
+          persist-credentials: false
+
+      - name: Checkout 432 A
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: yoch/mqttium
+          ref: ${{ env.SHA_432 }}
+          path: p432a
+          persist-credentials: false
+
+      - name: Checkout 432 B
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: yoch/mqttium
+          ref: ${{ env.SHA_432 }}
+          path: p432b
+          persist-credentials: false
+
+      - name: Checkout 433
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: yoch/mqttium
+          ref: ${{ env.SHA_433 }}
+          path: p433
+          persist-credentials: false
+
+      - name: Verify immutable provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C harness rev-parse HEAD)" = "$BENCH_SHA"
+          test "$(git -C rc13 rev-parse HEAD)" = "$SHA_RC13"
+          test "$(git -C p432a rev-parse HEAD)" = "$SHA_432"
+          test "$(git -C p432b rev-parse HEAD)" = "$SHA_432"
+          test "$(git -C p433 rev-parse HEAD)" = "$SHA_433"
+          printf 'harness=%s\nrc13=%s\n432=%s\n433=%s\n' "$BENCH_SHA" "$SHA_RC13" "$SHA_432" "$SHA_433" | tee "$RESULTS_DIR/provenance.txt"
+
+      - name: Prepare benchmark environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RESULTS_DIR/venv"
+          . "$RESULTS_DIR/venv/bin/activate"
+          pip install -e './harness[dev,mqttium]' 'psutil>=6,<8'
+          PYTHONPATH=harness/src python -m unittest -v harness.tests.test_quality harness.tests.test_version_compare harness.tests.test_pacing harness.tests.test_rtt_initiator
+          PYTHONPATH=harness/src python - <<'PY' | tee "$RESULTS_DIR/cpuset.json"
+          import json
+          from mqtt_client_bench.telemetry import allocate_cpuset, physical_cpu_groups
+          print(json.dumps({'physical_groups': physical_cpu_groups(), 'mapping': allocate_cpuset(['sut','broker','loadgen','orch'], profile='standard')}, indent=2))
+          PY
+
+      - name: Start native Mosquitto 2.1.2
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v mosquitto
+          mosquitto -h 2>&1 | head -n 2 | tee "$RESULTS_DIR/broker-version.txt" || true
+          mosquitto -h 2>&1 | grep -q 'version 2\.1\.2' || { echo 'Mosquitto 2.1.2 required' >&2; exit 1; }
+          cat > "$RESULTS_DIR/mosquitto.conf" <<'EOF'
+          listener 11883 127.0.0.1
+          protocol mqtt
+          set_tcp_nodelay true
+          allow_anonymous true
+          persistence false
+          connection_messages false
+          log_dest stdout
+          log_type error
+          sys_interval 1
+          max_inflight_messages 1000
+          max_queued_messages 10000
+          max_packet_size 16777216
+          max_keepalive 120
+          EOF
+          test ! -e /proc/$(pgrep -n mosquitto 2>/dev/null || echo 999999)
+          taskset -c 1 mosquitto -c "$RESULTS_DIR/mosquitto.conf" > "$RESULTS_DIR/mosquitto.log" 2>&1 &
+          pid=$!
+          echo "BROKER_PID=$pid" >> "$GITHUB_ENV"
+          for _ in $(seq 1 50); do (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && break; sleep 0.2; done
+          kill -0 "$pid"
+          printf 'pid=%s comm=%s affinity=%s\n' "$pid" "$(cat /proc/$pid/comm)" "$(taskset -pc "$pid")" | tee "$RESULTS_DIR/broker-process.txt"
+
+      - name: Start host sampler
+        shell: bash
+        run: |
+          (while true; do printf 'ts=%s temp=' "$(date +%s.%N)"; cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null | tr '\n' ' '; printf 'freq='; cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq 2>/dev/null | tr '\n' ' '; printf 'load='; cat /proc/loadavg; sleep 1; done) >> "$RESULTS_DIR/host-samples.txt" 2>&1 &
+          echo "SAMPLER_PID=$!" >> "$GITHUB_ENV"
+
+      - name: Measure RC13 versus 432
+        shell: bash
+        run: |
+          set -euo pipefail
+          . "$RESULTS_DIR/venv/bin/activate"
+          for seg in 1 2 3 4; do
+            PYTHONPATH=harness/src python -m mqtt_client_bench.version_compare \
+              --client mqttium --baseline-path rc13 --candidate-path p432a \
+              --scenario application_rtt_fixed_rate --variant-index 0 \
+              --target-rate "$TARGET_RATE" --pacer-mode external --blocks 2 --max-block-retries 1 \
+              --profile standard --broker 127.0.0.1:11883 --broker-pid "$BROKER_PID" \
+              --output "$RESULTS_DIR/rc13-432-seg-${seg}.json" | tee "$RESULTS_DIR/rc13-432-seg-${seg}.txt"
+          done
+
+      - name: Measure 432 versus 433
+        shell: bash
+        run: |
+          set -euo pipefail
+          . "$RESULTS_DIR/venv/bin/activate"
+          for seg in 1 2 3 4; do
+            PYTHONPATH=harness/src python -m mqtt_client_bench.version_compare \
+              --client mqttium --baseline-path p432b --candidate-path p433 \
+              --scenario application_rtt_fixed_rate --variant-index 0 \
+              --target-rate "$TARGET_RATE" --pacer-mode external --blocks 2 --max-block-retries 1 \
+              --profile standard --broker 127.0.0.1:11883 --broker-pid "$BROKER_PID" \
+              --output "$RESULTS_DIR/432-433-seg-${seg}.json" | tee "$RESULTS_DIR/432-433-seg-${seg}.txt"
+          done
+
+      - name: Stop processes
+        if: always()
+        shell: bash
+        run: |
+          [ -n "${SAMPLER_PID:-}" ] && kill "$SAMPLER_PID" 2>/dev/null || true
+          [ -n "${BROKER_PID:-}" ] && kill "$BROKER_PID" 2>/dev/null || true
+
+      - name: Upload raw evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: rc13-432-433-regime-${{ github.run_id }}
+          path: ${{ env.RESULTS_DIR }}
+          retention-days: 14
