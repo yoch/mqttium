@@ -82,7 +82,7 @@ def _snapshot(engine: ProtocolEngine) -> dict[str, Any]:
         "pending_messages": engine.pending_outbound_messages,
         "pending_bytes": engine.pending_outbound_bytes,
         "flow_inflight": engine.flow.inflight,
-        "queued_mids": [msg.mid for msg in engine._queued],
+        "queued_mids": [msg.mid for msg in engine.outbound._queued],
         "used_mids": sorted(engine.packet_ids._used),
         "store_mids": sorted(
             msg.mid
@@ -288,7 +288,7 @@ def test_commit_accounts_exactly_once_per_message(tmp_path: Path) -> None:
         # Only the flow window went out; the rest is queued, and every message
         # is in the store exactly once either way.
         assert engine.flow.inflight == 2
-        assert [msg.mid for msg in engine._queued] == [3, 4, 5]
+        assert [msg.mid for msg in engine.outbound._queued] == [3, 4, 5]
         assert sorted(
             msg.mid
             for msg in (
@@ -337,11 +337,11 @@ def test_launch_decision_matches_the_validation_snapshot(tmp_path: Path) -> None
         assert engine.flow.inflight == 1
         assert [e.kind for e in engine.take_effects()] == [EffectKind.SEND]
         assert engine.store.get_out(launched.mid or 0).state is OutboundQoSState.WAIT_PUBACK
-        assert [msg.mid for msg in engine._queued] == []
+        assert [msg.mid for msg in engine.outbound._queued] == []
 
         # Window now full: same connection state, opposite decision.
         queued = engine.queue_publish("a/b", b"2", qos=QoS.AT_LEAST_ONCE)
         assert engine.flow.inflight == 1, "a queued publish must not take a slot"
         assert engine.take_effects() == []
         assert engine.store.get_out(queued.mid or 0).state is OutboundQoSState.QUEUED
-        assert [msg.mid for msg in engine._queued] == [queued.mid]
+        assert [msg.mid for msg in engine.outbound._queued] == [queued.mid]

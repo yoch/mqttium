@@ -118,7 +118,7 @@ def test_manual_ack_releases_nothing_when_conditional_completion_is_refused() ->
 
     assert send_effects(engine) == []
     assert store.get_in(7) is not None
-    assert engine._inbound_inflight == 1
+    assert engine.inbound._inflight == 1
 
 
 def test_pubrel_rejects_a_qos1_record_without_deleting_or_releasing_it() -> None:
@@ -148,7 +148,7 @@ def test_pubrel_rejects_a_qos1_record_without_deleting_or_releasing_it() -> None
     record = store.get_in(9)
     assert record is not None
     assert record.state is InboundQoSState.WAIT_PUBACK
-    assert engine._inbound_inflight == 1
+    assert engine.inbound._inflight == 1
 
 
 def outbound(mid: int, state: OutboundQoSState) -> OutboundMessage:

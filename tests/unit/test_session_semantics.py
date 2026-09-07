@@ -153,7 +153,7 @@ def test_session_loss_with_blocked_replay_queue() -> None:
     engine.begin_connect()
     _feed(engine, _connack_v5(session_present=True, receive_maximum=2))
     engine.take_effects()
-    blocked = [m for m in engine._queued if m.state is OutboundQoSState.WAIT_PUBACK]
+    blocked = [m for m in engine.outbound._queued if m.state is OutboundQoSState.WAIT_PUBACK]
     assert len(blocked) == 1
     assert blocked[0].mid == handles[2].mid
 

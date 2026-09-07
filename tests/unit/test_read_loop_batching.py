@@ -104,7 +104,7 @@ async def _run_reads(
         local_receive_maximum=local_receive_maximum,
     )
     client._engine.state = ConnectionState.CONNECTED
-    client._engine._inbound_inflight = initial_inflight
+    client._engine.inbound._inflight = initial_inflight
     client._transport = _ScriptedTransport(reads)
     lock = _CountingLock()
     client._engine_lock = lock

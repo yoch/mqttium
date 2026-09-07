@@ -445,7 +445,7 @@ def fuzz_engine(  # noqa: C901
 def _check_engine_invariants(engine: ProtocolEngine) -> None:
     assert engine.flow.inflight >= 0, "negative flow inflight"
     assert engine.flow.inflight <= engine.flow.limit, "flow inflight exceeds limit"
-    assert engine._inbound_inflight >= 0, "negative inbound inflight"
+    assert engine.inbound._inflight >= 0, "negative inbound inflight"
 
     outbound = list(
         engine.store.get_out(summary.mid)
@@ -460,7 +460,7 @@ def _check_engine_invariants(engine: ProtocolEngine) -> None:
         f"packet-id mismatch: actual={sorted(actual_mids)} expected={sorted(expected_mids)}"
     )
 
-    queued_mids = {msg.mid for msg in engine._queued}
+    queued_mids = {msg.mid for msg in engine.outbound._queued}
     expected_flow = sum(
         1
         for msg in outbound

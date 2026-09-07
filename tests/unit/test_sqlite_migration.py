@@ -279,7 +279,7 @@ def test_migrated_database_replays_through_the_engine(tmp_path: Path) -> None:
 
     engine = ProtocolEngine(EngineConfig(clean_start=False), store=store)
 
-    assert len(engine._queued) == 3
+    assert len(engine.outbound._queued) == 3
     assert engine.pending_outbound_messages == 3
     # Recomputed from topic and payload size, exactly as before the column.
     assert engine.pending_outbound_bytes == 3 * (64 + len("legacy/topic"))

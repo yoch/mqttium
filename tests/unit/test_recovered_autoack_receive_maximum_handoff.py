@@ -79,7 +79,7 @@ def _recovered_engine(receive_maximum: int) -> ProtocolEngine:
     _feed(engine, encode_frame(PacketType.CONNACK, 0, body))
     engine.take_effects()
     assert engine.state is ConnectionState.CONNECTED
-    assert engine._inbound_inflight == 1
+    assert engine.inbound._inflight == 1
     return engine
 
 
@@ -87,7 +87,7 @@ def test_recovered_autoack_puback_holds_receive_maximum_slot_until_handoff() -> 
     engine = _recovered_engine(receive_maximum=1)
 
     _feed(engine, _publish(7, dup=True))
-    assert engine._inbound_inflight == 1
+    assert engine.inbound._inflight == 1
     assert engine.store.get_in(7) is None
 
     _feed(engine, _publish(8))
@@ -118,7 +118,7 @@ def test_recovered_autoack_slot_is_released_at_effect_handoff() -> None:
     first = engine.take_effects()
 
     assert any(effect.kind is EffectKind.SEND_ACK for effect in first)
-    assert engine._inbound_inflight == 0
+    assert engine.inbound._inflight == 0
     assert engine.state is ConnectionState.CONNECTED
 
     _feed(engine, _publish(8))

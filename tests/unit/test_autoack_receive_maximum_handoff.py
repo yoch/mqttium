@@ -145,9 +145,9 @@ def test_autoack_receive_maximum_slot_is_held_until_handoff() -> None:
     engine = _engine(receive_maximum=1)
 
     _feed(engine, _publish(1))
-    assert engine._inbound_inflight == 1
+    assert engine.inbound._inflight == 1
     engine.take_effects()
-    assert engine._inbound_inflight == 0
+    assert engine.inbound._inflight == 0
 
 
 def test_pipelined_qos1_does_not_use_generic_publish_decode(monkeypatch) -> None:

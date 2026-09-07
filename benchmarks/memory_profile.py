@@ -301,13 +301,15 @@ def run_protocol_qos_queue(spec: ScenarioSpec) -> dict[str, Any]:
     snapshots.append(
         probe.snapshot(
             "loaded",
-            queued_messages=len(engine._queued),
-            queued_logical_bytes=(len(engine._queued) * _logical_message_bytes(spec.payload_size)),
+            queued_messages=len(engine.outbound._queued),
+            queued_logical_bytes=(
+                len(engine.outbound._queued) * _logical_message_bytes(spec.payload_size)
+            ),
             packet_ids=len(engine.packet_ids),
             store_records=sum(1 for _ in engine.store.out_items()),
         )
     )
-    engine._queued.clear()
+    engine.outbound._queued.clear()
     engine.store.clear_out()
     engine.packet_ids.clear()
     engine.take_effects()
@@ -353,7 +355,7 @@ def run_protocol_bounded_queue(spec: ScenarioSpec) -> dict[str, Any]:
             configured_byte_limit=byte_limit,
         )
     )
-    engine._queued.clear()
+    engine.outbound._queued.clear()
     engine.store.clear_out()
     engine.packet_ids.clear()
     del engine
@@ -553,13 +555,13 @@ def run_sqlite_hydration(spec: ScenarioSpec) -> dict[str, Any]:
         snapshots.append(
             probe.snapshot(
                 "loaded",
-                queued_messages=len(engine._queued),
+                queued_messages=len(engine.outbound._queued),
                 packet_ids=len(engine.packet_ids),
                 store_records=sum(1 for _ in store.out_items()),
                 store_logical_bytes=(spec.count * _logical_message_bytes(spec.payload_size)),
             )
         )
-        engine._queued.clear()
+        engine.outbound._queued.clear()
         engine.packet_ids.clear()
         store.clear_out()
         store.close()
@@ -607,14 +609,14 @@ def run_property_heavy_outbound(spec: ScenarioSpec) -> dict[str, Any]:
     snapshots.append(
         probe.snapshot(
             "loaded",
-            queued_messages=len(engine._queued),
+            queued_messages=len(engine.outbound._queued),
             pending_logical_bytes=engine.pending_outbound_bytes,
             property_records=sum(1 for message in engine.store.out_items() if message.properties),
             packet_ids=len(engine.packet_ids),
             store_records=sum(1 for _ in engine.store.out_items()),
         )
     )
-    engine._queued.clear()
+    engine.outbound._queued.clear()
     engine.store.clear_out()
     engine.packet_ids.clear()
     del engine
@@ -659,7 +661,7 @@ def run_immediate_refusal(spec: ScenarioSpec) -> dict[str, Any]:
             pending_logical_bytes=engine.pending_outbound_bytes,
         )
     )
-    engine._queued.clear()
+    engine.outbound._queued.clear()
     engine.store.clear_out()
     engine.packet_ids.clear()
     del engine
@@ -710,7 +712,7 @@ async def _run_cancelled_admission(spec: ScenarioSpec) -> dict[str, Any]:
             receipts=len(client._receipts),
         )
     )
-    client._engine._queued.clear()
+    client._engine.outbound._queued.clear()
     client._engine.store.clear_out()
     client._engine.packet_ids.clear()
     client._receipts.clear()
@@ -773,7 +775,7 @@ def run_paho_saturation(spec: ScenarioSpec) -> dict[str, Any]:
 
     def cleanup(paho: PahoClient = client) -> None:
         engine = paho._async._engine
-        engine._queued.clear()
+        engine.outbound._queued.clear()
         engine.store.clear_out()
         engine.packet_ids.clear()
         paho._async._receipts.clear()

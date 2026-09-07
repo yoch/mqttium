@@ -55,7 +55,7 @@ def test_qos1_mid_can_be_reused_after_effect_handoff() -> None:
     assert [effect.data.payload for effect in first if effect.kind is EffectKind.MESSAGE] == [
         b"first"
     ]
-    assert engine._inbound_inflight == 0
+    assert engine.inbound._inflight == 0
 
     _feed(engine, _publish(7, b"second", dup=True))
     second = engine.take_effects()
@@ -66,4 +66,4 @@ def test_qos1_mid_can_be_reused_after_effect_handoff() -> None:
     ]
     assert any(effect.kind is EffectKind.SEND_ACK for effect in second)
     assert not any(effect.kind is EffectKind.PROTOCOL_ERROR for effect in second)
-    assert engine._inbound_inflight == 0
+    assert engine.inbound._inflight == 0
