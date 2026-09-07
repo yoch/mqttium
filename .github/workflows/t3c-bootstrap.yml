@@ -89,7 +89,7 @@ jobs:
       - name: Commit validated rewrite and remove bootstrap
         run: |
           set -euo pipefail
-          git rm .github/workflows/t3c-bootstrap.yml tools/t3c_bootstrap.py
+          git rm -f .github/workflows/t3c-bootstrap.yml tools/t3c_bootstrap.py
           git add -A
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
