@@ -1,0 +1,243 @@
+name: RC11 RC12 slow-regime ARM64
+
+on:
+  push:
+    branches: [bench/rc13-slow-regime-bisect]
+    paths: [.github/workflows/rc11-rc12-regime-arm64.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mqttium-regime-rpi5
+  cancel-in-progress: false
+
+jobs:
+  boundary:
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 180
+    env:
+      BENCH_SHA: ec332e25003a6484727697c3018ce632a025a7f2
+      SHA_RC11: 908d639e54968927008ff934b7095f2d8faa950b
+      SHA_RC12: 1d976648f25eea825a4b145edb04c0ab26a49c02
+      TARGET_RATE: "3942"
+      BROKER_PORT: "11883"
+
+    steps:
+      - name: Capture environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/mqttium-rc11-rc12-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -p "$dir"
+          echo "RESULTS_DIR=$dir" >> "$GITHUB_ENV"
+          echo "VENV_DIR=$RUNNER_TEMP/mqttium-rc11-rc12-venv-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+          {
+            date -u --iso-8601=seconds
+            uname -a
+            lscpu
+            python3 --version
+            echo governors; cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null || true
+            echo frequencies; cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq 2>/dev/null || true
+            echo temperature; cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || true
+            echo unix_dgram; cat /proc/sys/net/unix/max_dgram_qlen 2>/dev/null || true
+            uptime
+            free -h
+          } | tee "$dir/environment.txt"
+          test "$(uname -m)" = aarch64
+
+      - name: Checkout exact harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: yoch/mqtt-python-client-bench
+          ref: ${{ env.BENCH_SHA }}
+          path: harness
+          persist-credentials: false
+
+      - name: Checkout RC11
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: yoch/mqttium
+          ref: ${{ env.SHA_RC11 }}
+          path: rc11
+          persist-credentials: false
+
+      - name: Checkout RC12
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: yoch/mqttium
+          ref: ${{ env.SHA_RC12 }}
+          path: rc12
+          persist-credentials: false
+
+      - name: Verify immutable provenance and source compatibility
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C harness rev-parse HEAD)" = "$BENCH_SHA"
+          test "$(git -C rc11 rev-parse HEAD)" = "$SHA_RC11"
+          test "$(git -C rc12 rev-parse HEAD)" = "$SHA_RC12"
+          test -z "$(git -C rc11 status --porcelain --untracked-files=no)"
+          test -z "$(git -C rc12 status --porcelain --untracked-files=no)"
+          printf 'harness=%s\nrc11=%s\nrc12=%s\n' "$BENCH_SHA" "$SHA_RC11" "$SHA_RC12" | tee "$RESULTS_DIR/provenance.txt"
+          PYTHONPATH=rc11/src python3 - <<'PY'
+          import mqttium
+          from mqttium.api import AsyncClient
+          from mqttium.enums import MQTTProtocolVersion
+          c = AsyncClient(protocol=MQTTProtocolVersion.MQTTv311, message_delivery='callback')
+          print('rc11_import', mqttium.__version__, type(c).__name__)
+          PY
+          PYTHONPATH=rc12/src python3 - <<'PY'
+          import mqttium
+          from mqttium.api import AsyncClient
+          from mqttium.enums import MQTTProtocolVersion
+          c = AsyncClient(protocol=MQTTProtocolVersion.MQTTv311, message_delivery='callback')
+          print('rc12_import', mqttium.__version__, type(c).__name__)
+          PY
+
+      - name: Prepare exact harness
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv "$VENV_DIR"
+          . "$VENV_DIR/bin/activate"
+          python -m pip install --upgrade pip
+          pip install -e './harness[mqttium]' 'psutil>=6,<8'
+          PYTHONPATH=harness/src python -m unittest -v \
+            harness.tests.test_quality \
+            harness.tests.test_version_compare \
+            harness.tests.test_pacing \
+            harness.tests.test_rtt_initiator
+          PYTHONPATH=harness/src python - <<'PY' | tee "$RESULTS_DIR/cpuset.json"
+          import json
+          from mqtt_client_bench.telemetry import allocate_cpuset, physical_cpu_groups
+          print(json.dumps({
+              'physical_groups': physical_cpu_groups(),
+              'mapping': allocate_cpuset(['sut','broker','loadgen','orch'], profile='standard'),
+          }, indent=2))
+          PY
+
+      - name: Start native Mosquitto 2.1.2 and host sampler
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v mosquitto >/dev/null
+          { mosquitto -h 2>&1 || true; } | head -n 4 | tee "$RESULTS_DIR/broker-version.txt"
+          grep -q 'version 2\.1\.2' "$RESULTS_DIR/broker-version.txt" || { echo 'Mosquitto 2.1.2 required' >&2; exit 1; }
+          if pgrep -a mosquitto; then
+            echo 'pre-existing Mosquitto would contaminate the run' >&2
+            exit 1
+          fi
+          cat > "$RESULTS_DIR/mosquitto.conf" <<'EOF'
+          listener 11883 127.0.0.1
+          protocol mqtt
+          set_tcp_nodelay true
+          allow_anonymous true
+          persistence false
+          connection_messages false
+          log_dest stdout
+          log_type error
+          sys_interval 1
+          max_inflight_messages 1000
+          max_queued_messages 10000
+          max_packet_size 16777216
+          max_keepalive 120
+          EOF
+          taskset -c 1 mosquitto -c "$RESULTS_DIR/mosquitto.conf" > "$RESULTS_DIR/mosquitto.log" 2>&1 &
+          pid=$!
+          echo "BROKER_PID=$pid" >> "$GITHUB_ENV"
+          for _ in $(seq 1 50); do
+            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && break
+            kill -0 "$pid" 2>/dev/null || { cat "$RESULTS_DIR/mosquitto.log"; exit 1; }
+            sleep 0.2
+          done
+          kill -0 "$pid"
+          printf 'pid=%s comm=%s affinity=%s\n' "$pid" "$(cat /proc/$pid/comm)" "$(taskset -pc "$pid")" | tee "$RESULTS_DIR/broker-process.txt"
+          (while true; do
+            printf 'ts=%s temp=' "$(date +%s.%N)"
+            cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null | tr '\n' ' ' || true
+            printf 'freq='; cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq 2>/dev/null | tr '\n' ' ' || true
+            printf 'load='; cat /proc/loadavg
+            sleep 1
+          done) >> "$RESULTS_DIR/host-samples.txt" 2>&1 &
+          echo "SAMPLER_PID=$!" >> "$GITHUB_ENV"
+
+      - name: Measure phase 1
+        shell: bash
+        run: |
+          set -euo pipefail
+          . "$VENV_DIR/bin/activate"
+          for seg in 1 2; do
+            PYTHONPATH=harness/src python -m mqtt_client_bench.version_compare \
+              --client mqttium --baseline-path rc11 --candidate-path rc12 \
+              --scenario application_rtt_fixed_rate --variant-index 0 \
+              --target-rate "$TARGET_RATE" --pacer-mode external \
+              --blocks 2 --max-block-retries 1 --profile standard \
+              --broker 127.0.0.1:11883 --broker-pid "$BROKER_PID" \
+              --output "$RESULTS_DIR/rc11-rc12-seg-${seg}.json" \
+              | tee "$RESULTS_DIR/rc11-rc12-seg-${seg}.txt"
+          done
+
+      - name: Save phase 1 evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: rc11-rc12-phase1-${{ github.run_id }}
+          path: ${{ env.RESULTS_DIR }}
+          retention-days: 14
+
+      - name: Measure phase 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          . "$VENV_DIR/bin/activate"
+          for seg in 3 4; do
+            PYTHONPATH=harness/src python -m mqtt_client_bench.version_compare \
+              --client mqttium --baseline-path rc11 --candidate-path rc12 \
+              --scenario application_rtt_fixed_rate --variant-index 0 \
+              --target-rate "$TARGET_RATE" --pacer-mode external \
+              --blocks 2 --max-block-retries 1 --profile standard \
+              --broker 127.0.0.1:11883 --broker-pid "$BROKER_PID" \
+              --output "$RESULTS_DIR/rc11-rc12-seg-${seg}.json" \
+              | tee "$RESULTS_DIR/rc11-rc12-seg-${seg}.txt"
+          done
+
+      - name: Save phase 2 evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: rc11-rc12-phase2-${{ github.run_id }}
+          path: ${{ env.RESULTS_DIR }}
+          retention-days: 14
+
+      - name: Measure phase 3
+        shell: bash
+        run: |
+          set -euo pipefail
+          . "$VENV_DIR/bin/activate"
+          for seg in 5 6; do
+            PYTHONPATH=harness/src python -m mqtt_client_bench.version_compare \
+              --client mqttium --baseline-path rc11 --candidate-path rc12 \
+              --scenario application_rtt_fixed_rate --variant-index 0 \
+              --target-rate "$TARGET_RATE" --pacer-mode external \
+              --blocks 2 --max-block-retries 1 --profile standard \
+              --broker 127.0.0.1:11883 --broker-pid "$BROKER_PID" \
+              --output "$RESULTS_DIR/rc11-rc12-seg-${seg}.json" \
+              | tee "$RESULTS_DIR/rc11-rc12-seg-${seg}.txt"
+          done
+
+      - name: Stop processes
+        if: always()
+        shell: bash
+        run: |
+          [ -n "${SAMPLER_PID:-}" ] && kill "$SAMPLER_PID" 2>/dev/null || true
+          [ -n "${BROKER_PID:-}" ] && kill "$BROKER_PID" 2>/dev/null || true
+
+      - name: Save final evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: rc11-rc12-final-${{ github.run_id }}
+          path: ${{ env.RESULTS_DIR }}
+          if-no-files-found: error
+          retention-days: 14
