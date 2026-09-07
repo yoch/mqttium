@@ -163,3 +163,122 @@ def test_inline_callback_burst_validation() -> None:
     for value in (0, 3, -1):
         with pytest.raises(ValueError, match="inline_callback_burst must be 1 or 2"):
             AsyncClient(inline_callback_burst=value)  # type: ignore[arg-type]
+
+
+async def test_opt_in_batch2_isolates_sync_exception_and_continues() -> None:
+    client = AsyncClient(message_delivery="callback", inline_callback_burst=2)
+    seen: list[str] = []
+    errors: list[BaseException] = []
+
+    def callback(message: Message) -> None:
+        value = message.payload.decode()
+        seen.append(value)
+        if value == "0":
+            raise RuntimeError("boom")
+
+    client.on_message = callback
+    client._delivery.report_callback_error = (  # type: ignore[method-assign]
+        lambda _callback, exc: errors.append(exc)
+    )
+
+    assert (
+        client._apply_message_effect_batch_inline(
+            deque([_effect(0), _effect(1)]), client._connection_epoch
+        )
+        == 2
+    )
+    assert seen == ["0", "1"]
+    assert len(errors) == 1
+    assert isinstance(errors[0], RuntimeError)
+    assert client.stats().delivery.callback_queued == 0
+
+
+async def test_opt_in_batch2_reports_callback_self_cancellation_and_continues() -> None:
+    client = AsyncClient(message_delivery="callback", inline_callback_burst=2)
+    seen: list[str] = []
+    errors: list[BaseException] = []
+
+    def callback(message: Message) -> None:
+        value = message.payload.decode()
+        seen.append(value)
+        if value == "0":
+            raise asyncio.CancelledError("self-cancel")
+
+    client.on_message = callback
+    client._delivery.report_callback_error = (  # type: ignore[method-assign]
+        lambda _callback, exc: errors.append(exc)
+    )
+
+    assert (
+        client._apply_message_effect_batch_inline(
+            deque([_effect(0), _effect(1)]), client._connection_epoch
+        )
+        == 2
+    )
+    assert seen == ["0", "1"]
+    assert len(errors) == 1
+    assert isinstance(errors[0], asyncio.CancelledError)
+    assert client.stats().delivery.callback_queued == 0
+
+
+async def test_opt_in_batch2_rejects_non_coroutine_awaitable_without_owning_it() -> None:
+    client = AsyncClient(message_delivery="callback", inline_callback_burst=2)
+    seen: list[str] = []
+    errors: list[BaseException] = []
+    future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+
+    def callback(message: Message):  # type: ignore[no-untyped-def]
+        seen.append(message.payload.decode())
+        if message.payload == b"0":
+            return future
+        return None
+
+    client.on_message = callback
+    client._delivery.report_callback_error = (  # type: ignore[method-assign]
+        lambda _callback, exc: errors.append(exc)
+    )
+
+    assert (
+        client._apply_message_effect_batch_inline(
+            deque([_effect(0), _effect(1)]), client._connection_epoch
+        )
+        == 2
+    )
+    assert seen == ["0", "1"]
+    assert len(errors) == 1
+    assert isinstance(errors[0], TypeError)
+    assert not future.done()
+    future.cancel()
+
+
+async def test_opt_in_batch2_propagates_real_task_cancellation_and_restores_bound() -> None:
+    client = AsyncClient(
+        message_delivery="callback",
+        max_pending_callbacks=2,
+        inline_callback_burst=2,
+    )
+    seen: list[str] = []
+
+    async def run_delivery() -> None:
+        def callback(message: Message) -> None:
+            value = message.payload.decode()
+            seen.append(value)
+            if value == "0":
+                task = asyncio.current_task()
+                assert task is not None
+                task.cancel()
+                raise asyncio.CancelledError
+
+        client.on_message = callback
+        client._apply_message_effect_batch_inline(
+            deque([_effect(0), _effect(1)]), client._connection_epoch
+        )
+
+    task = asyncio.create_task(run_delivery())
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert seen == ["0"]
+    assert client.stats().delivery.callback_queued == 0
+    assert client._callback_queue.maxsize == 2
+    assert client._callback_worker_task is None

@@ -49,6 +49,30 @@ use the bounded worker. Synchronous callbacks must not block the event loop.
 Callback failures go to the event loop's exception handler without silently
 changing protocol state.
 
+### Optional two-message synchronous burst
+
+`inline_callback_burst=1` is the Stable default and preserves the existing
+policy: an isolated eligible message callback may run inline, while a callback
+burst is handed to the bounded worker. `inline_callback_burst=2` is an explicit
+latency/throughput opt-in for callback-only consumers whose message callback is
+strictly synchronous and short. When the reader has exactly two adjacent small
+message effects and callback delivery is idle, both callbacks run in the same
+reader/effect-drain turn before it yields.
+
+The opt-in does not apply to declared `async def` callbacks, iterator or `both`
+delivery, larger bursts, or an already active/queued callback path. It does not
+relax `max_pending_callbacks`: the second callback consumes the same logical
+reservation that the worker batch would have consumed, so reentrant callback
+work queues behind the two-message burst.
+
+A callable that is declared synchronous but returns an awaitable remains
+supported by the default `inline_callback_burst=1` path. Under the explicit
+`inline_callback_burst=2` contract, however, that return value is invalid:
+MQTTium reports a callback `TypeError`; a coroutine result is closed rather than
+scheduled. Use the default or declare the callback `async def` when it needs to
+await. Because the opt-in executes two user calls in the reader turn, do not use
+it for blocking I/O, long CPU work, or callbacks with unbounded service time.
+
 Matching `message_callback_add` filters run instead of `on_message`, in
 registration order. Shared-subscription filters match the filter string
 literally, as in Paho. Iterator-only delivery ignores callbacks, including

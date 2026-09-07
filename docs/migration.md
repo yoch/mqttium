@@ -132,6 +132,29 @@ The writer has its own byte and message limits. Applications sending large
 payloads should size the byte budget explicitly rather than relying only on a
 message count.
 
+## Optional two-callback inline burst
+
+Existing applications do not need to change anything: `inline_callback_burst=1`
+keeps the established callback scheduling behavior. A callback-only service can
+opt into the measured two-message fast path when its message handler is short,
+non-blocking, and strictly synchronous:
+
+```python
+client = AsyncClient(
+    "client-id",
+    message_delivery="callback",
+    inline_callback_burst=2,
+)
+```
+
+The opt-in may run exactly two adjacent small message callbacks in the
+reader/effect-drain turn before yielding. Declared `async def` callbacks,
+iterator/both delivery, larger bursts, and busy callback paths keep the bounded
+worker. A nominally synchronous callable that returns an awaitable is valid in
+the default mode but is a contract violation with `inline_callback_burst=2`;
+MQTTium reports a callback `TypeError` and does not schedule that awaitable.
+Keep the default when callback service time is not tightly bounded.
+
 ## Durable sessions
 
 ```python
