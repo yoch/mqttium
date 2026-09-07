@@ -22,20 +22,12 @@ from mqttium.errors import MessageDeliveryError
 from mqttium.protocol.effects import EffectKind, EngineEffect
 from mqttium.types import Message
 
-MessageDelivery = Literal["auto", "iterator", "callback", "both"]
+MessageDelivery = Literal["auto", "iterator", "callback"]
 
 
-class _SharedDeliveryReservation:
-    """One exact byte reservation shared by callback and iterator delivery."""
-
-    __slots__ = ("logical_bytes", "remaining")
-
-    def __init__(self, logical_bytes: int) -> None:
-        self.logical_bytes = logical_bytes
-        self.remaining = 2
 
 
-AccountedDeliveryToken = int | _SharedDeliveryReservation
+AccountedDeliveryToken = int
 DeliveryToken = AccountedDeliveryToken | None
 
 
@@ -79,7 +71,7 @@ def _budget_partition(
     elif mode == "iterator":
         maximum_small_messages = max_pending_messages + 1
     else:
-        maximum_small_messages = max_pending_messages + max_pending_callbacks + 2
+        maximum_small_messages = max(max_pending_messages + 1, max_pending_callbacks + 2)
     small_budget = max_pending_delivery_bytes // 8
     small_limit = small_budget // maximum_small_messages
     accounted_limit = max_pending_delivery_bytes - small_budget
@@ -113,8 +105,8 @@ class ApplicationDelivery:
         callback_shutdown_timeout: float,
     ) -> None:
         self.mode = mode
-        self.callback_mode = mode in ("auto", "callback", "both")
-        self.iterator_mode = mode in ("iterator", "both")
+        self.callback_mode = mode in ("auto", "callback")
+        self.iterator_mode = mode == "iterator"
         self.auto_mode = mode == "auto"
         self.protocol = protocol
         self.max_pending_messages = max_pending_messages
@@ -159,13 +151,11 @@ class ApplicationDelivery:
                 "auto": self._accept_auto_fast,
                 "iterator": self._accept_iterator_unaccounted,
                 "callback": self._accept_callback_unaccounted,
-                "both": self._accept_both_unaccounted,
             }[self.mode]
         return {
             "auto": self._accept_auto_fast,
             "iterator": self._accept_iterator_fast,
             "callback": self._accept_callback_fast,
-            "both": self._accept_both_fast,
         }[self.mode]
 
     def decoded_acceptor(self) -> DecodedMessageAcceptor:
@@ -174,7 +164,6 @@ class ApplicationDelivery:
             "auto": self._accept_auto_decoded,
             "iterator": self._accept_iterator_decoded,
             "callback": self._accept_callback_decoded,
-            "both": self._accept_both_decoded,
         }[self.mode]
 
     def _accept_iterator_unaccounted(
@@ -200,23 +189,6 @@ class ApplicationDelivery:
             return self.enqueue_callback_job_slow(job)
         return None
 
-    def _accept_both_unaccounted(
-        self, message: Message, callback: Callable[[Message], Any] | None
-    ) -> Awaitable[None] | None:
-        if callback is None:
-            return self.accept(message, callback)
-        try:
-            self.messages_queue.put_nowait(message)
-        except asyncio.QueueFull:
-            return self.accept(message, callback)
-        self.message_ready.set()
-        self.ensure_callback_worker()
-        job: CallbackJob = (callback, (message,), None)
-        try:
-            self.callback_queue.put_nowait(job)
-        except asyncio.QueueFull:
-            return self.enqueue_callback_job_slow(job)
-        return None
 
     def _accept_iterator_fast(
         self, message: Message, _callback: Callable[[Message], Any] | None
@@ -254,30 +226,6 @@ class ApplicationDelivery:
         self.callback_queue.put_nowait((callback, (message,), None))
         return None
 
-    def _accept_both_fast(
-        self, message: Message, callback: Callable[[Message], Any] | None
-    ) -> Awaitable[None] | None:
-        if callback is None:
-            return self.accept(message, callback)
-        limit = self.small_message_limit
-        if (
-            (
-                limit is not None
-                and (
-                    limit <= 0
-                    or bool(message.properties)
-                    or len(message.payload) + 4 * len(message.topic) > limit
-                )
-            )
-            or self.messages_queue.full()
-            or self.callback_queue.full()
-        ):
-            return self.accept(message, callback)
-        self.messages_queue.put_nowait(message)
-        self.message_ready.set()
-        self.ensure_callback_worker()
-        self.callback_queue.put_nowait((callback, (message,), None))
-        return None
 
     def _accept_iterator_decoded(
         self,
@@ -311,25 +259,6 @@ class ApplicationDelivery:
         self.callback_queue.put_nowait((callback, (message,), None))
         return None
 
-    def _accept_both_decoded(
-        self,
-        message: Message,
-        callback: Callable[[Message], Any] | None,
-        property_wire_size: int,
-    ) -> Awaitable[None] | None:
-        if callback is None:
-            return self.accept(message, callback, property_wire_size)
-        if (
-            not _fits_small_limit(message, self.small_message_limit, property_wire_size)
-            or self.messages_queue.full()
-            or self.callback_queue.full()
-        ):
-            return self.accept(message, callback, property_wire_size)
-        self.messages_queue.put_nowait(message)
-        self.message_ready.set()
-        self.ensure_callback_worker()
-        self.callback_queue.put_nowait((callback, (message,), None))
-        return None
 
     def _accept_auto_decoded(
         self,
@@ -392,12 +321,12 @@ class ApplicationDelivery:
         """
         callback_delivery = callback is not None and self.callback_mode
         iterator_delivery = self.iterator_mode or (self.auto_mode and callback is None)
-        references = int(iterator_delivery) + int(callback_delivery)
+        has_delivery = iterator_delivery or callback_delivery
         if property_wire_size is None:
-            small_delivery = bool(references and self._is_small(message))
+            small_delivery = bool(has_delivery and self._is_small(message))
         else:
             small_delivery = bool(
-                references
+                has_delivery
                 and _fits_small_limit(message, self.small_message_limit, property_wire_size)
             )
         if small_delivery:
@@ -409,11 +338,11 @@ class ApplicationDelivery:
         token: DeliveryToken = None
         iterator_enqueued = False
         callback_enqueued = False
-        if references:
+        if has_delivery:
             logical_bytes = self._reservable_size(message, property_wire_size)
-            token = self.try_reserve(logical_bytes, references)
+            token = self.try_reserve(logical_bytes)
             if token is None:
-                token = await self.reserve_slow(logical_bytes, references)
+                token = await self.reserve_slow(logical_bytes)
         try:
             if iterator_delivery:
                 item: IteratorQueueItem = (message, token) if token is not None else message
@@ -434,27 +363,9 @@ class ApplicationDelivery:
                     await self.enqueue_callback_job_slow(job)
                 callback_enqueued = True
         except BaseException:
-            self._release_unqueued(
-                token,
-                references=references,
-                iterator_enqueued=iterator_enqueued,
-                callback_enqueued=callback_enqueued,
-            )
+            if token is not None and not iterator_enqueued and not callback_enqueued:
+                self.release_nowait(token)
             raise
-
-    def _release_unqueued(
-        self,
-        token: DeliveryToken,
-        *,
-        references: int,
-        iterator_enqueued: bool,
-        callback_enqueued: bool,
-    ) -> None:
-        if token is None:
-            return
-        unqueued = references - int(iterator_enqueued) - int(callback_enqueued)
-        for _ in range(unqueued):
-            self.release_nowait(token)
 
     def stats(self) -> DeliveryStats:
         return DeliveryStats(
@@ -716,43 +627,31 @@ class ApplicationDelivery:
                 ) from exc
         self.message_ready.set()
 
-    def try_reserve(self, logical_bytes: int, references: int) -> DeliveryToken:
+    def try_reserve(self, logical_bytes: int) -> DeliveryToken:
         limit = self.accounted_limit
         if limit is not None and self.pending_bytes + logical_bytes > limit:
             return None
         self.pending_bytes += logical_bytes
         self.pending_high_water_bytes = max(self.pending_high_water_bytes, self.pending_bytes)
-        if references == 1:
-            return logical_bytes
-        return _SharedDeliveryReservation(logical_bytes)
+        return logical_bytes
 
-    async def reserve_slow(self, logical_bytes: int, references: int) -> DeliveryToken:
+    async def reserve_slow(self, logical_bytes: int) -> DeliveryToken:
         while True:
             self.waiters += 1
             try:
                 self.space.clear()
-                token = self.try_reserve(logical_bytes, references)
+                token = self.try_reserve(logical_bytes)
                 if token is not None:
                     return token
                 await self.space.wait()
             finally:
                 self.waiters -= 1
-            token = self.try_reserve(logical_bytes, references)
+            token = self.try_reserve(logical_bytes)
             if token is not None:
                 return token
 
     def release_nowait(self, token: AccountedDeliveryToken) -> None:
-        if isinstance(token, int):
-            self.pending_bytes -= token
-        else:
-            if token.remaining <= 0:
-                return
-            token.remaining -= 1
-            if token.remaining:
-                return
-            logical_bytes = token.logical_bytes
-            token.logical_bytes = 0
-            self.pending_bytes -= logical_bytes
+        self.pending_bytes -= token
         if self.waiters:
             self.space.set()
 

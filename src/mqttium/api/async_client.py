@@ -176,8 +176,8 @@ def _validate_client_arguments(
     positive_bounds: tuple[tuple[str, float], ...],
     ping_timeout: float | None,
 ) -> None:
-    if message_delivery not in ("auto", "iterator", "callback", "both"):
-        raise ValueError("message_delivery must be 'auto', 'iterator', 'callback', or 'both'")
+    if message_delivery not in ("auto", "iterator", "callback"):
+        raise ValueError("message_delivery must be 'auto', 'iterator', or 'callback'")
     if publish_backpressure not in ("wait", "error"):
         raise ValueError("publish_backpressure must be 'wait' or 'error'")
     for name, optional_value in optional_bounds:
@@ -223,8 +223,7 @@ class AsyncClient:
         publish_backpressure: ``"wait"`` to suspend producers or ``"error"``
             to raise :class:`~mqttium.FlowControlError` at logical capacity.
         reconnect: Reconnection policy. The default disables reconnection.
-        message_delivery: ``"iterator"``, ``"callback"``, ``"both"``, or
-            ``"auto"`` delivery selection.
+        message_delivery: ``"iterator"``, ``"callback"``, or ``"auto"`` delivery selection.
         manual_ack: Defer terminal acknowledgement of inbound QoS messages
             until :meth:`ack` is called.
         store: Optional inflight store used for durable QoS state.
