@@ -17,7 +17,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          image='eclipse-mosquitto:2.1.2'
+          image='eclipse-mosquitto:2.1.2-alpine'
           docker pull "$image"
           image_id="$(docker image inspect "$image" --format '{{.Id}}')"
           image_digest="$(docker image inspect "$image" --format '{{index .RepoDigests 0}}')"
