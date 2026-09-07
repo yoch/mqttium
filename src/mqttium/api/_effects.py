@@ -350,7 +350,11 @@ class EffectPump:
                     raise self.error
                 if self.applied >= target:
                     return
-                await asyncio.shield(self.progress.wait())
+                await self.progress.wait()
+                if waiter_id in self._error_waiters:
+                    # Preserve cancellation priority during the failing-close
+                    # handoff without spawning a shield-owned waiter task.
+                    await asyncio.sleep(0)
         finally:
             self._waiter_targets.pop(waiter_id, None)
             self._error_waiters.discard(waiter_id)
