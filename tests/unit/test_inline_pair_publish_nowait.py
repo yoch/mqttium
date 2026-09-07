@@ -68,3 +68,67 @@ async def test_sync_pair_publish_nowait_appends_sends_behind_message_prefix() ->
     assert stats.effects.pending == 0
     assert stats.effects.enqueued == stats.effects.applied
     assert not pump.pending
+
+
+async def _probe_callback_to_send_order(count: int) -> list[str]:
+    """Return logical callback/SEND handoff order for one message prefix."""
+    client = AsyncClient(
+        message_delivery="callback",
+        max_pending_callbacks=max(4, count),
+    )
+    client._engine.state = ConnectionState.CONNECTED
+    pump = client._effect_pump
+    pump.pending.extend(_message_effect(str(index).encode()) for index in range(count))
+    pump.pending_epoch = client._connection_epoch
+    pump.enqueued = count
+    pump.pending_high_water = count
+
+    events: list[str] = []
+
+    def capture_write(_item: object, *, epoch: int | None = None) -> bool:
+        assert epoch == client._connection_epoch
+        events.append("send")
+        return True
+
+    client._try_enqueue_outbound = capture_write  # type: ignore[assignment]
+
+    def on_message(message: Message) -> None:
+        events.append(f"callback:{message.payload.decode()}")
+        client.publish_nowait("response", message.payload, qos=1)
+
+    client.on_message = on_message
+    pump.drain_inline()
+
+    if client.stats().tasks.callback_worker:
+        await client._callback_queue.join()
+        await client._shutdown_callback_worker(drain=False)
+
+    assert not pump.pending
+    assert len(client._receipts) == count
+    return events
+
+
+async def test_publish_nowait_send_handoff_has_exact_pair_discontinuity() -> None:
+    """Characterize the scheduling boundary relevant to responder RTT.
+
+    A singleton has no following callback to block its reentrant SEND. Exactly
+    two eligible messages run in one EffectPump drain, so both callbacks finish
+    before either SEND can be applied. Three messages retain worker batching;
+    once the worker owns them, each callback's publish_nowait can drain its SEND
+    before the next callback starts.
+    """
+    assert await _probe_callback_to_send_order(1) == ["callback:0", "send"]
+    assert await _probe_callback_to_send_order(2) == [
+        "callback:0",
+        "callback:1",
+        "send",
+        "send",
+    ]
+    assert await _probe_callback_to_send_order(3) == [
+        "callback:0",
+        "send",
+        "callback:1",
+        "send",
+        "callback:2",
+        "send",
+    ]
