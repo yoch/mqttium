@@ -172,6 +172,7 @@ def _validate_client_arguments(
     password: object,
     message_delivery: str,
     publish_backpressure: str,
+    inline_callback_burst: int,
     optional_bounds: tuple[tuple[str, int | None], ...],
     positive_bounds: tuple[tuple[str, float], ...],
     ping_timeout: float | None,
@@ -180,6 +181,8 @@ def _validate_client_arguments(
         raise ValueError("message_delivery must be 'auto', 'iterator', 'callback', or 'both'")
     if publish_backpressure not in ("wait", "error"):
         raise ValueError("publish_backpressure must be 'wait' or 'error'")
+    if inline_callback_burst not in (1, 2):
+        raise ValueError("inline_callback_burst must be 1 or 2")
     for name, optional_value in optional_bounds:
         _non_negative_optional(name, optional_value)
     for name, positive_value in positive_bounds:
@@ -225,6 +228,11 @@ class AsyncClient:
         reconnect: Reconnection policy. The default disables reconnection.
         message_delivery: ``"iterator"``, ``"callback"``, ``"both"``, or
             ``"auto"`` delivery selection.
+        inline_callback_burst: ``1`` preserves the default one-callback inline
+            fairness policy. ``2`` opts callback-only delivery into executing
+            exactly two adjacent plain synchronous message callbacks in the
+            same reader/effect turn. In that mode such callbacks must not
+            return awaitables; declared async callbacks keep the worker path.
         manual_ack: Defer terminal acknowledgement of inbound QoS messages
             until :meth:`ack` is called.
         store: Optional inflight store used for durable QoS state.
@@ -271,6 +279,7 @@ class AsyncClient:
         max_ingress_batch_bytes: int = 1 * 1024 * 1024,
         max_pending_messages: int = 65_536,
         max_pending_callbacks: int = 1_024,
+        inline_callback_burst: Literal[1, 2] = 1,
         max_pending_delivery_bytes: int | None = 64 * 1024 * 1024,
         delivery_timeout: float = 1.0,
         callback_shutdown_timeout: float = 5.0,
@@ -286,6 +295,7 @@ class AsyncClient:
             password=password,
             message_delivery=message_delivery,
             publish_backpressure=publish_backpressure,
+            inline_callback_burst=inline_callback_burst,
             optional_bounds=(
                 ("max_pending_outbound_messages", max_pending_outbound_messages),
                 ("max_pending_outbound_bytes", max_pending_outbound_bytes),
@@ -381,6 +391,7 @@ class AsyncClient:
             max_pending_messages=max_pending_messages,
             max_pending_callbacks=max_pending_callbacks,
             max_pending_delivery_bytes=max_pending_delivery_bytes,
+            inline_callback_burst=inline_callback_burst,
             maximum_packet_size=initial_decoder_max_packet_size,
             delivery_timeout=delivery_timeout,
             callback_shutdown_timeout=callback_shutdown_timeout,

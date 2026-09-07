@@ -111,6 +111,7 @@ class ApplicationDelivery:
         maximum_packet_size: int,
         delivery_timeout: float,
         callback_shutdown_timeout: float,
+        inline_callback_burst: int = 1,
     ) -> None:
         self.mode = mode
         self.callback_mode = mode in ("auto", "callback", "both")
@@ -139,6 +140,7 @@ class ApplicationDelivery:
         )
         self._callback_limit = max_pending_callbacks
         self._callback_batch_reserved = 0
+        self.inline_callback_burst = inline_callback_burst
         self.message_ready = asyncio.Event()
         self.closed = asyncio.Event()
         self._stream_generation = 0
@@ -612,6 +614,14 @@ class ApplicationDelivery:
                     break
                 messages.append(message)
             if len(messages) > 1:
+                if (
+                    len(messages) == 2
+                    and self.inline_callback_burst == 2
+                    and not iterator_delivery
+                    and self.can_dispatch_callback_inline(callback)
+                ):
+                    self._dispatch_strict_sync_message_burst_inline(callback, messages)
+                    return 2
                 self._enqueue_message_batch(callback, messages, iterator_delivery=iterator_delivery)
                 return len(messages)
 
@@ -845,6 +855,43 @@ class ApplicationDelivery:
             return False
         self.dispatch_callback_inline(callback, *args)
         return True
+
+    def _dispatch_strict_sync_message_burst_inline(
+        self,
+        callback: Callable[[Message], Any],
+        messages: list[Message],
+    ) -> None:
+        """Run an opted-in two-message strictly synchronous burst inline.
+
+        The second message is reserved in the existing logical callback bound
+        while the first callback runs. Reentrant callback admissions therefore
+        remain bounded and queue behind this burst. A sync callable returning
+        an awaitable violates this opt-in contract: the awaitable is not run.
+        """
+        self._reserve_callback_batch(len(messages))
+        self._callback_active = True
+        try:
+            for message in messages:
+                try:
+                    result = callback(message)
+                except asyncio.CancelledError as exc:
+                    self._propagate_callback_cancellation(callback, exc)
+                except Exception as exc:
+                    self.report_callback_error(callback, exc)
+                else:
+                    if inspect.isawaitable(result):
+                        if inspect.iscoroutine(result):
+                            result.close()
+                        self.report_callback_error(
+                            callback,
+                            TypeError(
+                                "inline_callback_burst=2 requires strictly synchronous "
+                                "callbacks that do not return awaitables"
+                            ),
+                        )
+        finally:
+            self._callback_active = False
+            self._release_callback_batch(len(messages))
 
     def dispatch_callback_inline(self, callback: Callable[..., Any], *args: Any) -> None:
         """Invoke a callback after the caller established inline eligibility."""
