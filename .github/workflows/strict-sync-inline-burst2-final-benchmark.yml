@@ -1,0 +1,237 @@
+name: Strict Sync Inline Burst2 Final Benchmark
+
+on:
+  push:
+    branches: [bench/strict-sync-inline-burst2-final]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: strict-sync-inline-burst2-final
+  cancel-in-progress: false
+
+env:
+  BASE_SHA: 4fe90af36660bce06c12e9a8c57cb9a6223abe5a
+  CANDIDATE_SHA: de21de10b9e9758a5b0ad021582f4b23dad624de
+  HARNESS_SHA: 22731e60c01f00f4f0dfb125bf664893d21537af
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  hosted-arm64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 25
+    steps:
+      - name: Check out exact baseline
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.BASE_SHA }}
+          path: base
+          persist-credentials: false
+
+      - name: Check out exact PR candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+          path: candidate
+          persist-credentials: false
+
+      - name: Check out exact benchmark harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.HARNESS_SHA }}
+          path: harness
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: candidate/pyproject.toml
+
+      - name: Adapt harness to opt in only candidate arm
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('harness/benchmarks/callback_coalesced_inline_probe.py')
+          text = p.read_text(encoding='utf-8')
+          old = '''        max_pending_callbacks=4096,\n    )\n'''
+          new = '''        max_pending_callbacks=4096,\n        inline_callback_burst=(\n            2\n            if Path(os.environ.get("PYTHONPATH", "")).resolve().parent.name == "candidate"\n            else 1\n        ),\n    )\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f'unexpected constructor target count: {text.count(old)}')
+          p.write_text(text.replace(old, new, 1), encoding='utf-8')
+          PY
+          python -m py_compile harness/benchmarks/callback_coalesced_inline_probe.py
+          python -m pip install -e 'candidate[dev]'
+          PYTHONPATH=candidate/src python -m pytest -q -W error \
+            candidate/tests/unit/test_strict_sync_inline_burst.py
+
+      - name: A/A control
+        shell: bash
+        run: |
+          set -euo pipefail
+          python harness/benchmarks/callback_coalesced_inline_probe.py \
+            --base-root base --candidate-root base \
+            --repeat 12 --batches 8000 --warmup-batches 500 --cpu 2 \
+            --output /tmp/aa.json | tee /tmp/aa.txt
+
+      - name: A/B exact candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python harness/benchmarks/callback_coalesced_inline_probe.py \
+            --base-root base --candidate-root candidate \
+            --repeat 12 --batches 8000 --warmup-batches 500 --cpu 2 \
+            --output /tmp/ab.json | tee /tmp/ab.txt
+
+      - name: Corrected summary
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          aa=json.load(open('/tmp/aa.json'))['cells']
+          ab=json.load(open('/tmp/ab.json'))['cells']
+          fields=('operations_per_second','callback_p50_ns','callback_p95_ns','first_callback_p50_ns','second_callback_p50_ns','batch_rtt_p50_ns','batch_rtt_p95_ns')
+          for size in ('2','8'):
+              print(f'BATCH {size}')
+              for field in fields:
+                  a=aa[size]['summary'][field]
+                  b=ab[size]['summary'][field]
+                  corrected=b['median_candidate_over_base']/a['median_candidate_over_base']
+                  print(
+                      f'{field} AA={a["median_candidate_over_base"]:.6f} '
+                      f'AB={b["median_candidate_over_base"]:.6f} '
+                      f'CORRECTED={corrected:.6f} '
+                      f'AA_CV=({a["base_cv"]:.4f},{a["candidate_cv"]:.4f}) '
+                      f'AB_CV=({b["base_cv"]:.4f},{b["candidate_cv"]:.4f})'
+                  )
+          PY
+
+      - name: Upload hosted ARM64 evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: strict-sync-burst2-hosted-arm64-${{ github.run_id }}
+          path: |
+            /tmp/aa.json
+            /tmp/ab.json
+            /tmp/aa.txt
+            /tmp/ab.txt
+          if-no-files-found: warn
+          retention-days: 14
+
+  rpi5-arm64:
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 35
+    steps:
+      - name: Check out exact baseline
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.BASE_SHA }}
+          path: base
+          persist-credentials: false
+
+      - name: Check out exact PR candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+          path: candidate
+          persist-credentials: false
+
+      - name: Check out exact benchmark harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.HARNESS_SHA }}
+          path: harness
+          persist-credentials: false
+
+      - name: Environment and preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/strict-sync-burst2-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          echo "JOB_ROOT=$root" >> "$GITHUB_ENV"
+          rm -rf "$root" && mkdir -p "$root"
+          python3 -m venv "$root/venv"
+          echo "$root/venv/bin" >> "$GITHUB_PATH"
+          "$root/venv/bin/python" -m pip install -e 'candidate[dev]' 'psutil>=6,<8'
+          "$root/venv/bin/python" harness/benchmarks/runner_probe.py \
+            --output "$root/runner.json" --require-temperature --enforce
+
+      - name: Adapt harness to opt in only candidate arm
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('harness/benchmarks/callback_coalesced_inline_probe.py')
+          text = p.read_text(encoding='utf-8')
+          old = '''        max_pending_callbacks=4096,\n    )\n'''
+          new = '''        max_pending_callbacks=4096,\n        inline_callback_burst=(\n            2\n            if Path(os.environ.get("PYTHONPATH", "")).resolve().parent.name == "candidate"\n            else 1\n        ),\n    )\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f'unexpected constructor target count: {text.count(old)}')
+          p.write_text(text.replace(old, new, 1), encoding='utf-8')
+          PY
+          python -m py_compile harness/benchmarks/callback_coalesced_inline_probe.py
+          PYTHONPATH=candidate/src python -m pytest -q -W error \
+            candidate/tests/unit/test_strict_sync_inline_burst.py
+
+      - name: A/A control
+        shell: bash
+        run: |
+          set -euo pipefail
+          python harness/benchmarks/callback_coalesced_inline_probe.py \
+            --base-root base --candidate-root base \
+            --repeat 12 --batches 8000 --warmup-batches 500 --cpu 2 \
+            --output "$JOB_ROOT/aa.json" | tee "$JOB_ROOT/aa.txt"
+
+      - name: A/B exact candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python harness/benchmarks/callback_coalesced_inline_probe.py \
+            --base-root base --candidate-root candidate \
+            --repeat 12 --batches 8000 --warmup-batches 500 --cpu 2 \
+            --output "$JOB_ROOT/ab.json" | tee "$JOB_ROOT/ab.txt"
+
+      - name: Corrected summary
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, os
+          root=os.environ['JOB_ROOT']
+          aa=json.load(open(root+'/aa.json'))['cells']
+          ab=json.load(open(root+'/ab.json'))['cells']
+          fields=('operations_per_second','callback_p50_ns','callback_p95_ns','first_callback_p50_ns','second_callback_p50_ns','batch_rtt_p50_ns','batch_rtt_p95_ns')
+          for size in ('2','8'):
+              print(f'BATCH {size}')
+              for field in fields:
+                  a=aa[size]['summary'][field]
+                  b=ab[size]['summary'][field]
+                  corrected=b['median_candidate_over_base']/a['median_candidate_over_base']
+                  print(
+                      f'{field} AA={a["median_candidate_over_base"]:.6f} '
+                      f'AB={b["median_candidate_over_base"]:.6f} '
+                      f'CORRECTED={corrected:.6f} '
+                      f'AA_CV=({a["base_cv"]:.4f},{a["candidate_cv"]:.4f}) '
+                      f'AB_CV=({b["base_cv"]:.4f},{b["candidate_cv"]:.4f})'
+                  )
+          PY
+
+      - name: Upload RPi5 evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: strict-sync-burst2-rpi5-${{ github.run_id }}
+          path: |
+            ${{ env.JOB_ROOT }}/*.json
+            ${{ env.JOB_ROOT }}/*.txt
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Cleanup
+        if: always()
+        shell: bash
+        run: rm -rf "$JOB_ROOT"
