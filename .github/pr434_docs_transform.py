@@ -45,8 +45,8 @@ replace(
 
 replace(
     "CHANGELOG.md",
-    "### Changed\n\n",
-    "### Changed\n\n- Unify the Provisional persistence API around one complete `InflightStore`\n  contract. Bounded replay, payload-free metadata paging, and conditional state\n  transitions/completion are now required instead of runtime-detected optional\n  capabilities. Remove `PagedInflightStore`, `BoundedInboundReplayStore`, and\n  `TransitionInflightStore`, together with the eager/whole-object fallback paths.\n  `MemoryInflightStore` and `SqliteInflightStore` also drop the retired helpers\n  `update_out`, `out_items`, `out_pages`, `pop_in`, `update_in`, `in_items`,\n  `in_pages`, and `contains_in`. Third-party stores must implement the modern\n  `InflightStore` contract; see the migration and persistence guides.\n\n",
+    "## [Unreleased]\n\n### Changed\n\n",
+    "## [Unreleased]\n\n### Changed\n\n- Unify the Provisional persistence API around one complete `InflightStore`\n  contract. Bounded replay, payload-free metadata paging, and conditional state\n  transitions/completion are now required instead of runtime-detected optional\n  capabilities. Remove `PagedInflightStore`, `BoundedInboundReplayStore`, and\n  `TransitionInflightStore`, together with the eager/whole-object fallback paths.\n  `MemoryInflightStore` and `SqliteInflightStore` also drop the retired helpers\n  `update_out`, `out_items`, `out_pages`, `pop_in`, `update_in`, `in_items`,\n  `in_pages`, and `contains_in`. Third-party stores must implement the modern\n  `InflightStore` contract; see the migration and persistence guides.\n\n",
     label="unreleased persistence changelog",
 )
 
