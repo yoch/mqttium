@@ -47,9 +47,9 @@ rewrite(
 )
 rewrite(
     path,
-    "from mqttium.protocol.engine import EngineConfig, ProtocolEngine\n",
-    "",
-    label="sqlite fallback-only engine imports",
+    "from mqttium.persistence.sqlite import SqliteInflightStore\nfrom mqttium.protocol.engine import EngineConfig, ProtocolEngine\nfrom mqttium.types import InboundMessage, OutboundMessage, Properties\n",
+    "from mqttium.persistence.sqlite import SqliteInflightStore\nfrom mqttium.types import InboundMessage, OutboundMessage, Properties\n",
+    label="sqlite fallback-only top-level engine import",
 )
 remove_between(
     path,
