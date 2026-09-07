@@ -713,7 +713,7 @@ class InboundSession:
             order.popleft()
             ready.remove(mid)
             self._forget_inbound()
-            self._engine._send_ack(wire)
+            self._engine._send_ack(_encode_puback_success(mid))
             self._release_slot(logical_size)
 
     def replay_session(self) -> None:
