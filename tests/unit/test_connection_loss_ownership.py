@@ -381,7 +381,7 @@ async def test_eof_retires_connected_state_before_joining_keepalive() -> None:
         await _cleanup(client)
 
 
-async def test_impossible_pingreq_teardown_does_not_cycle_reader_and_keepalive() -> None:
+async def test_tiny_peer_limit_fails_before_keepalive_owner_starts() -> None:
     properties = Properties()
     properties.set("maximum_packet_size", 1)
     connack = encode_frame(
@@ -402,17 +402,12 @@ async def test_impossible_pingreq_teardown_does_not_cycle_reader_and_keepalive()
 
     client._transport_factory = factory
     try:
-        await client.connect("fake", 1, timeout=1.0)
-        reader = client._reader_task
-        keepalive = client._keepalive_task
-        assert reader is not None and not reader.done()
-        assert keepalive is not None and not keepalive.done()
-
-        client._write_pump.last_outbound = time.monotonic() - 2.0
-        await asyncio.wait_for(asyncio.gather(keepalive, reader), timeout=1.0)
-
+        with pytest.raises(PacketTooLargeError):
+            await client.connect("fake", 1, timeout=1.0)
         stats = client.stats()
-        assert isinstance(client._disconnect_exc, PacketTooLargeError)
+        assert not client.is_connected
+        assert client._keepalive_task is None
+        assert client._reconnect_task is None
         assert not any(
             (
                 stats.tasks.reader,
@@ -426,10 +421,6 @@ async def test_impossible_pingreq_teardown_does_not_cycle_reader_and_keepalive()
         assert stats.writer.waiters == 0
         assert stats.effects.waiters == 0
         assert stats.delivery.waiters == 0
-        assert stats.writer.queued_messages == 0
-        assert stats.writer.queued_bytes == 0
-        assert stats.effects.pending == 0
-        assert stats.receipts.publish == 0
     finally:
         await _cleanup(client)
 

@@ -8,6 +8,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Changed
 
+- Fail MQTT 5 connection negotiation locally when the Server advertises `Maximum Packet Size` below 4 bytes. Such a limit is legal, but MQTTium cannot both respect it and guarantee the mandatory 4-byte PUBACK/PUBREC/PUBCOMP QoS responses. The client now raises `PacketTooLargeError` before entering `CONNECTED` instead of carrying connection-scoped tiny-peer branches until an acknowledgement is required. A limit of 4 remains supported.
+
 - Stop executing MQTT 3.1 as a client protocol. `MQTTProtocolVersion.MQTTv31` remains a Stable enum member with value `3`, but selecting it now fails during configuration before runtime state is created. The dedicated MQTT 3.1 CONNECT encoder and inbound PUBLISH path are removed; MQTT 3.1.1 and MQTT 5 remain the supported protocols.
 
 - Unify the Provisional persistence API around one complete `InflightStore`
