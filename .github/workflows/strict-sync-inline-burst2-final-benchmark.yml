@@ -58,7 +58,7 @@ jobs:
           p = Path('harness/benchmarks/callback_coalesced_inline_probe.py')
           text = p.read_text(encoding='utf-8')
           old = '''        max_pending_callbacks=4096,\n    )\n'''
-          new = '''        max_pending_callbacks=4096,\n        inline_callback_burst=(\n            2\n            if Path(os.environ.get("PYTHONPATH", "")).resolve().parent.name == "candidate"\n            else 1\n        ),\n    )\n'''
+          new = '''        max_pending_callbacks=4096,\n        **(\n            {"inline_callback_burst": 2}\n            if Path(os.environ.get("PYTHONPATH", "")).resolve().parent.name == "candidate"\n            else {}\n        ),\n    )\n'''
           if text.count(old) != 1:
               raise SystemExit(f'unexpected constructor target count: {text.count(old)}')
           p.write_text(text.replace(old, new, 1), encoding='utf-8')
@@ -169,7 +169,7 @@ jobs:
           p = Path('harness/benchmarks/callback_coalesced_inline_probe.py')
           text = p.read_text(encoding='utf-8')
           old = '''        max_pending_callbacks=4096,\n    )\n'''
-          new = '''        max_pending_callbacks=4096,\n        inline_callback_burst=(\n            2\n            if Path(os.environ.get("PYTHONPATH", "")).resolve().parent.name == "candidate"\n            else 1\n        ),\n    )\n'''
+          new = '''        max_pending_callbacks=4096,\n        **(\n            {"inline_callback_burst": 2}\n            if Path(os.environ.get("PYTHONPATH", "")).resolve().parent.name == "candidate"\n            else {}\n        ),\n    )\n'''
           if text.count(old) != 1:
               raise SystemExit(f'unexpected constructor target count: {text.count(old)}')
           p.write_text(text.replace(old, new, 1), encoding='utf-8')
