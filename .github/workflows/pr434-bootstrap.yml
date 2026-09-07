@@ -28,8 +28,8 @@ jobs:
           python .github/pr434_test_transform.py
       - name: Ruff
         run: |
-          python -m ruff format src/mqttium/persistence src/mqttium/protocol tests/unit/test_configuration_atomicity_and_teardown.py tests/unit/test_sqlite_store.py tests/unit/test_store_transitions.py
-          python -m ruff check src/mqttium/persistence src/mqttium/protocol tests/unit/test_configuration_atomicity_and_teardown.py tests/unit/test_sqlite_store.py tests/unit/test_store_transitions.py
+          python -m ruff format src/mqttium/persistence src/mqttium/protocol tests/unit
+          python -m ruff check src/mqttium/persistence src/mqttium/protocol tests/unit
       - name: Focused unit and project tests
         run: python -m pytest -q tests/unit tests/project
       - name: Diff hygiene
