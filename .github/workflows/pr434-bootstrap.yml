@@ -25,10 +25,11 @@ jobs:
         run: |
           sed -i 's/count=5)/count=6)/' .github/pr434_transform.py
           python .github/pr434_transform.py
+          python .github/pr434_test_transform.py
       - name: Ruff
         run: |
-          python -m ruff format src/mqttium/persistence src/mqttium/protocol
-          python -m ruff check src/mqttium/persistence src/mqttium/protocol
+          python -m ruff format src/mqttium/persistence src/mqttium/protocol tests/unit/test_configuration_atomicity_and_teardown.py tests/unit/test_sqlite_store.py tests/unit/test_store_transitions.py
+          python -m ruff check src/mqttium/persistence src/mqttium/protocol tests/unit/test_configuration_atomicity_and_teardown.py tests/unit/test_sqlite_store.py tests/unit/test_store_transitions.py
       - name: Focused unit and project tests
         run: python -m pytest -q tests/unit tests/project
       - name: Diff hygiene
@@ -37,7 +38,7 @@ jobs:
         env:
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
         run: |
-          rm -f .github/pr434_transform.py .github/workflows/pr434-bootstrap.yml
+          rm -f .github/pr434_transform.py .github/pr434_test_transform.py .github/workflows/pr434-bootstrap.yml
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add -A
