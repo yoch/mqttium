@@ -1,0 +1,141 @@
+name: Bootstrap strict sync inline burst candidate
+
+on:
+  push:
+    branches: [perf/strict-sync-inline-burst2]
+
+permissions:
+  contents: write
+
+jobs:
+  build-candidate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out candidate branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: perf/strict-sync-inline-burst2
+          fetch-depth: 0
+
+      - name: Create environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv .venv
+          .venv/bin/python -m pip install -e '.[dev]'
+
+      - name: Materialize candidate and tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          .venv/bin/python - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: str, old: str, new: str) -> None:
+              p = Path(path)
+              text = p.read_text(encoding="utf-8")
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one replacement target, got {count}: {old[:100]!r}")
+              p.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+          delivery = "src/mqttium/api/_delivery.py"
+          replace_once(
+              delivery,
+              """        delivery_timeout: float,\n        callback_shutdown_timeout: float,\n    ) -> None:\n""",
+              """        delivery_timeout: float,\n        callback_shutdown_timeout: float,\n        inline_callback_burst: int = 1,\n    ) -> None:\n""",
+          )
+          replace_once(
+              delivery,
+              """        self._callback_limit = max_pending_callbacks\n        self._callback_batch_reserved = 0\n""",
+              """        self._callback_limit = max_pending_callbacks\n        self._callback_batch_reserved = 0\n        self.inline_callback_burst = inline_callback_burst\n""",
+          )
+          replace_once(
+              delivery,
+              """            if len(messages) > 1:\n                self._enqueue_message_batch(callback, messages, iterator_delivery=iterator_delivery)\n                return len(messages)\n""",
+              """            if len(messages) > 1:\n                if (\n                    len(messages) == 2\n                    and self.inline_callback_burst == 2\n                    and not iterator_delivery\n                    and self.can_dispatch_callback_inline(callback)\n                ):\n                    self._dispatch_strict_sync_message_burst_inline(callback, messages)\n                    return 2\n                self._enqueue_message_batch(callback, messages, iterator_delivery=iterator_delivery)\n                return len(messages)\n""",
+          )
+          replace_once(
+              delivery,
+              """    def dispatch_callback_inline(self, callback: Callable[..., Any], *args: Any) -> None:\n""",
+              """    def _dispatch_strict_sync_message_burst_inline(\n        self,\n        callback: Callable[[Message], Any],\n        messages: list[Message],\n    ) -> None:\n        \"\"\"Run an opted-in two-message strictly synchronous burst inline.\n\n        The second message is reserved in the existing logical callback bound\n        while the first callback runs. Reentrant callback admissions therefore\n        remain bounded and queue behind this burst. A sync callable returning\n        an awaitable violates this opt-in contract: the awaitable is not run.\n        \"\"\"\n        self._reserve_callback_batch(len(messages))\n        self._callback_active = True\n        try:\n            for message in messages:\n                try:\n                    result = callback(message)\n                except asyncio.CancelledError as exc:\n                    self._propagate_callback_cancellation(callback, exc)\n                except Exception as exc:\n                    self.report_callback_error(callback, exc)\n                else:\n                    if inspect.isawaitable(result):\n                        if inspect.iscoroutine(result):\n                            result.close()\n                        self.report_callback_error(\n                            callback,\n                            TypeError(\n                                \"inline_callback_burst=2 requires strictly synchronous \"\n                                \"callbacks that do not return awaitables\"\n                            ),\n                        )\n        finally:\n            self._callback_active = False\n            self._release_callback_batch(len(messages))\n\n    def dispatch_callback_inline(self, callback: Callable[..., Any], *args: Any) -> None:\n""",
+          )
+
+          client = "src/mqttium/api/async_client.py"
+          replace_once(
+              client,
+              """    message_delivery: str,\n    publish_backpressure: str,\n    optional_bounds: tuple[tuple[str, int | None], ...],\n""",
+              """    message_delivery: str,\n    publish_backpressure: str,\n    inline_callback_burst: int,\n    optional_bounds: tuple[tuple[str, int | None], ...],\n""",
+          )
+          replace_once(
+              client,
+              """    if publish_backpressure not in (\"wait\", \"error\"):\n        raise ValueError(\"publish_backpressure must be 'wait' or 'error'\")\n    for name, optional_value in optional_bounds:\n""",
+              """    if publish_backpressure not in (\"wait\", \"error\"):\n        raise ValueError(\"publish_backpressure must be 'wait' or 'error'\")\n    if inline_callback_burst not in (1, 2):\n        raise ValueError(\"inline_callback_burst must be 1 or 2\")\n    for name, optional_value in optional_bounds:\n""",
+          )
+          replace_once(
+              client,
+              """        message_delivery: ``\"iterator\"``, ``\"callback\"``, ``\"both\"``, or\n            ``\"auto\"`` delivery selection.\n        manual_ack: Defer terminal acknowledgement of inbound QoS messages\n""",
+              """        message_delivery: ``\"iterator\"``, ``\"callback\"``, ``\"both\"``, or\n            ``\"auto\"`` delivery selection.\n        inline_callback_burst: ``1`` preserves the default one-callback inline\n            fairness policy. ``2`` opts callback-only delivery into executing\n            exactly two adjacent plain synchronous message callbacks in the\n            same reader/effect turn. In that mode such callbacks must not\n            return awaitables; declared async callbacks keep the worker path.\n        manual_ack: Defer terminal acknowledgement of inbound QoS messages\n""",
+          )
+          replace_once(
+              client,
+              """        max_pending_messages: int = 65_536,\n        max_pending_callbacks: int = 1_024,\n        max_pending_delivery_bytes: int | None = 64 * 1024 * 1024,\n""",
+              """        max_pending_messages: int = 65_536,\n        max_pending_callbacks: int = 1_024,\n        inline_callback_burst: Literal[1, 2] = 1,\n        max_pending_delivery_bytes: int | None = 64 * 1024 * 1024,\n""",
+          )
+          replace_once(
+              client,
+              """            message_delivery=message_delivery,\n            publish_backpressure=publish_backpressure,\n            optional_bounds=(\n""",
+              """            message_delivery=message_delivery,\n            publish_backpressure=publish_backpressure,\n            inline_callback_burst=inline_callback_burst,\n            optional_bounds=(\n""",
+          )
+          replace_once(
+              client,
+              """            max_pending_callbacks=max_pending_callbacks,\n            max_pending_delivery_bytes=max_pending_delivery_bytes,\n""",
+              """            max_pending_callbacks=max_pending_callbacks,\n            max_pending_delivery_bytes=max_pending_delivery_bytes,\n            inline_callback_burst=inline_callback_burst,\n""",
+          )
+
+          tests = Path("tests/unit/test_strict_sync_inline_burst.py")
+          tests.write_text(
+              '''from __future__ import annotations\n\nimport asyncio\nfrom collections import deque\n\nimport pytest\n\nfrom mqttium.api import AsyncClient\nfrom mqttium.protocol.effects import EffectKind, EngineEffect\nfrom mqttium.types import Message\n\n\ndef _effect(i: int) -> EngineEffect:\n    return EngineEffect(\n        EffectKind.MESSAGE,\n        Message(topic="burst/test", payload=str(i).encode()),\n        requires_delivery_mark=False,\n    )\n\n\nasync def test_default_batch2_keeps_worker_path() -> None:\n    client = AsyncClient(message_delivery="callback")\n    seen: list[str] = []\n    client.on_message = lambda message: seen.append(message.payload.decode())\n\n    applied = client._apply_message_effect_batch_inline(\n        deque([_effect(0), _effect(1)]), client._connection_epoch\n    )\n\n    assert applied == 2\n    assert seen == []\n    assert client._callback_worker_task is not None\n    await client._callback_queue.join()\n    assert seen == ["0", "1"]\n    await client._shutdown_callback_worker(drain=False)\n\n\nasync def test_opt_in_batch2_runs_strict_sync_callbacks_inline() -> None:\n    client = AsyncClient(message_delivery="callback", inline_callback_burst=2)\n    seen: list[str] = []\n    client.on_message = lambda message: seen.append(message.payload.decode())\n\n    applied = client._apply_message_effect_batch_inline(\n        deque([_effect(0), _effect(1)]), client._connection_epoch\n    )\n\n    assert applied == 2\n    assert seen == ["0", "1"]\n    assert client._callback_worker_task is None\n    assert client.stats().delivery.callback_queued == 0\n\n\nasync def test_opt_in_batch2_reserves_tail_and_keeps_reentrant_fifo() -> None:\n    client = AsyncClient(\n        message_delivery="callback",\n        max_pending_callbacks=2,\n        inline_callback_burst=2,\n    )\n    seen: list[str] = []\n\n    def callback(message: Message) -> None:\n        value = message.payload.decode()\n        seen.append(value)\n        assert client.stats().delivery.callback_queued >= 1\n        if value == "0":\n            assert client._delivery.try_enqueue_callback(lambda: seen.append("reentrant"))\n            assert client.stats().delivery.callback_queued == 2\n            assert not client._delivery.try_enqueue_callback(lambda: seen.append("overflow"))\n\n    client.on_message = callback\n    applied = client._apply_message_effect_batch_inline(\n        deque([_effect(0), _effect(1)]), client._connection_epoch\n    )\n\n    assert applied == 2\n    assert seen == ["0", "1"]\n    assert client._callback_queue.maxsize == 2\n    await client._callback_queue.join()\n    assert seen == ["0", "1", "reentrant"]\n    assert client.stats().delivery.callback_queued == 0\n    await client._shutdown_callback_worker(drain=False)\n\n\nasync def test_opt_in_batch2_keeps_captured_callback_for_tail() -> None:\n    client = AsyncClient(message_delivery="callback", inline_callback_burst=2)\n    seen: list[str] = []\n\n    def replacement(message: Message) -> None:\n        seen.append(f"new:{message.payload.decode()}")\n\n    def original(message: Message) -> None:\n        value = message.payload.decode()\n        seen.append(f"old:{value}")\n        if value == "0":\n            client.on_message = replacement\n\n    client.on_message = original\n    assert (\n        client._apply_message_effect_batch_inline(\n            deque([_effect(0), _effect(1)]), client._connection_epoch\n        )\n        == 2\n    )\n    assert seen == ["old:0", "old:1"]\n\n\nasync def test_opt_in_rejects_sync_callable_returning_awaitable() -> None:\n    client = AsyncClient(message_delivery="callback", inline_callback_burst=2)\n    seen: list[str] = []\n    errors: list[BaseException] = []\n\n    async def continuation() -> None:\n        seen.append("awaited")\n\n    def callback(message: Message):  # type: ignore[no-untyped-def]\n        seen.append(f"call:{message.payload.decode()}")\n        if message.payload == b"0":\n            return continuation()\n        return None\n\n    client.on_message = callback\n    client._delivery.report_callback_error = (  # type: ignore[method-assign]\n        lambda _callback, exc: errors.append(exc)\n    )\n\n    assert (\n        client._apply_message_effect_batch_inline(\n            deque([_effect(0), _effect(1)]), client._connection_epoch\n        )\n        == 2\n    )\n    await asyncio.sleep(0)\n\n    assert seen == ["call:0", "call:1"]\n    assert len(errors) == 1\n    assert isinstance(errors[0], TypeError)\n    assert "strictly synchronous" in str(errors[0])\n    assert client._callback_worker_task is None\n\n\nasync def test_opt_in_async_callback_still_uses_worker() -> None:\n    client = AsyncClient(message_delivery="callback", inline_callback_burst=2)\n    seen: list[str] = []\n\n    async def callback(message: Message) -> None:\n        await asyncio.sleep(0)\n        seen.append(message.payload.decode())\n\n    client.on_message = callback\n    assert (\n        client._apply_message_effect_batch_inline(\n            deque([_effect(0), _effect(1)]), client._connection_epoch\n        )\n        == 2\n    )\n    assert seen == []\n    await client._callback_queue.join()\n    assert seen == ["0", "1"]\n    await client._shutdown_callback_worker(drain=False)\n\n\ndef test_inline_callback_burst_validation() -> None:\n    for value in (0, 3, -1):\n        with pytest.raises(ValueError, match="inline_callback_burst must be 1 or 2"):\n            AsyncClient(inline_callback_burst=value)  # type: ignore[arg-type]\n''',
+              encoding="utf-8",
+          )
+          PY
+
+          .venv/bin/python -m ruff format \
+            src/mqttium/api/_delivery.py \
+            src/mqttium/api/async_client.py \
+            tests/unit/test_strict_sync_inline_burst.py
+          .venv/bin/python -m py_compile \
+            src/mqttium/api/_delivery.py \
+            src/mqttium/api/async_client.py \
+            tests/unit/test_strict_sync_inline_burst.py
+          git diff --check
+
+      - name: Focused quality and correctness
+        shell: bash
+        run: |
+          set -euo pipefail
+          .venv/bin/python -m ruff check \
+            src/mqttium/api/_delivery.py \
+            src/mqttium/api/async_client.py \
+            tests/unit/test_strict_sync_inline_burst.py
+          .venv/bin/python -m pytest -q -W error \
+            tests/unit/test_strict_sync_inline_burst.py \
+            tests/unit/test_callback_message_batches.py \
+            tests/unit/test_topic_callback_dispatch_contract.py \
+            tests/unit/test_compat_callback_publish.py \
+            tests/unit/test_async_runtime_interleavings.py
+
+      - name: Commit validated candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/workflows/bootstrap-strict-sync-inline-burst2.yml
+          git diff --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/mqttium/api/_delivery.py src/mqttium/api/async_client.py \
+            tests/unit/test_strict_sync_inline_burst.py \
+            .github/workflows/bootstrap-strict-sync-inline-burst2.yml
+          git commit -m "perf: opt in to strict sync callback burst2"
+          git push origin HEAD:perf/strict-sync-inline-burst2
