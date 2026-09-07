@@ -91,9 +91,10 @@ jobs:
 
       - name: Re-run focused harness tests on ARM
         shell: bash
+        working-directory: harness
         run: |
           set -euo pipefail
-          PYTHONPATH=harness/src python -m unittest -v \
+          PYTHONPATH=src python -m unittest -v \
             tests.test_quality \
             tests.test_version_compare \
             tests.test_pacing \
