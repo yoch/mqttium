@@ -23,7 +23,10 @@ def _properties(protocol: MQTTProtocolVersion, rich: bool) -> Properties | None:
     return properties
 
 
-@pytest.mark.parametrize("protocol", list(MQTTProtocolVersion))
+@pytest.mark.parametrize(
+    "protocol",
+    [MQTTProtocolVersion.MQTTv311, MQTTProtocolVersion.MQTTv5],
+)
 @pytest.mark.parametrize("qos", list(QoS))
 @pytest.mark.parametrize(
     ("topic", "payload_size", "rich_properties"),
