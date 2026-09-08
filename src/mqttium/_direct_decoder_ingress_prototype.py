@@ -339,31 +339,35 @@ class DirectIngressTcpTransport(StreamTransport):
         protocol = self._direct_protocol
         protocol.maybe_resume_reading()
 
+        # Match StreamReader.read(): a transport exception wins over bytes that
+        # were buffered before connection_lost(exc). Normal EOF is different:
+        # the last receive generation is still drained before returning b"".
+        if protocol.exc is not None:
+            raise protocol.exc
         ready = self._consume_generation()
         if ready is not None:
             return ready
-        if protocol.exc is not None:
-            raise protocol.exc
         if protocol.eof:
             return b""
 
         # Event.clear() is paired with a generation re-check so a callback in
-        # the clear/check race cannot be lost.
+        # the clear/check race cannot be lost. An error in the same race keeps
+        # StreamReader's exception-first semantics.
         protocol.ready.clear()
+        if protocol.exc is not None:
+            raise protocol.exc
         ready = self._consume_generation()
         if ready is not None:
             return ready
-        if protocol.exc is not None:
-            raise protocol.exc
         if protocol.eof:
             return b""
 
         await protocol.ready.wait()
+        if protocol.exc is not None:
+            raise protocol.exc
         ready = self._consume_generation()
         if ready is not None:
             return ready
-        if protocol.exc is not None:
-            raise protocol.exc
         return b""
 
 
