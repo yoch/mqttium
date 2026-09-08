@@ -37,7 +37,7 @@ def _cap_selector_read_chunk(writer: asyncio.StreamWriter) -> int | None:
         return None
     if current > _SELECTOR_READ_CHUNK:
         try:
-            transport.max_size = _SELECTOR_READ_CHUNK
+            setattr(transport, "max_size", _SELECTOR_READ_CHUNK)
         except (AttributeError, TypeError):
             return current
         current = getattr(transport, "max_size", current)
