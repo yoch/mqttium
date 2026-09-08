@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from mqttium.transport.tcp import (
     _RECEIVE_BUFFER_SIZE,
     _BufferedStreamReaderProtocol,
@@ -66,7 +68,30 @@ async def test_buffered_stream_protocol_keeps_streamreader_backpressure() -> Non
     assert transport.resume_calls == 1
 
 
-async def test_tcp_roundtrip_uses_buffered_stream_protocol_only_on_selector_loop() -> None:
+async def test_tcp_roundtrip_proves_selector_uses_buffered_receive_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = {"get_buffer": 0, "buffer_updated": 0, "data_received": 0}
+    original_get_buffer = _BufferedStreamReaderProtocol.get_buffer
+    original_buffer_updated = _BufferedStreamReaderProtocol.buffer_updated
+    original_data_received = asyncio.StreamReaderProtocol.data_received
+
+    def tracked_get_buffer(self: _BufferedStreamReaderProtocol, sizehint: int) -> memoryview:
+        calls["get_buffer"] += 1
+        return original_get_buffer(self, sizehint)
+
+    def tracked_buffer_updated(self: _BufferedStreamReaderProtocol, nbytes: int) -> None:
+        calls["buffer_updated"] += 1
+        original_buffer_updated(self, nbytes)
+
+    def tracked_data_received(self: _BufferedStreamReaderProtocol, data: bytes) -> None:
+        calls["data_received"] += 1
+        original_data_received(self, data)
+
+    monkeypatch.setattr(_BufferedStreamReaderProtocol, "get_buffer", tracked_get_buffer)
+    monkeypatch.setattr(_BufferedStreamReaderProtocol, "buffer_updated", tracked_buffer_updated)
+    monkeypatch.setattr(_BufferedStreamReaderProtocol, "data_received", tracked_data_received)
+
     async def echo(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         data = await reader.read(65536)
         writer.write(data)
@@ -77,6 +102,7 @@ async def test_tcp_roundtrip_uses_buffered_stream_protocol_only_on_selector_loop
     server = await asyncio.start_server(echo, "127.0.0.1", 0)
     sock = server.sockets[0]
     host, port = sock.getsockname()[:2]
+    transport: TcpTransport | None = None
     try:
         transport = await TcpTransport.connect(str(host), int(port))
         protocol = transport._writer._protocol  # type: ignore[attr-defined]
@@ -88,7 +114,15 @@ async def test_tcp_roundtrip_uses_buffered_stream_protocol_only_on_selector_loop
 
         await transport.write(b"mqttium-buffered-stream")
         assert await transport.read(65536) == b"mqttium-buffered-stream"
-        await transport.close()
+
+        if isinstance(loop, asyncio.SelectorEventLoop):
+            assert calls["get_buffer"] > 0
+            assert calls["buffer_updated"] > 0
+            assert calls["data_received"] == 0
+        else:
+            assert calls == {"get_buffer": 0, "buffer_updated": 0, "data_received": 0}
     finally:
+        if transport is not None:
+            await transport.close()
         server.close()
         await server.wait_closed()
