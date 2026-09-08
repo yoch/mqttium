@@ -32,6 +32,9 @@ DEFAULT_MAX_PACKET_SIZE = 16 * 1024 * 1024
 DEFAULT_CAPACITY = 256 * 1024
 # Smallest window worth offering a receiver; also the compaction trigger.
 _MIN_WINDOW = 16 * 1024
+# Most one recv_into() may be offered, whatever the slab's size. Storage
+# capacity and receive quantum are separate concerns.
+RECEIVE_QUANTUM = DEFAULT_CAPACITY
 # Fully drained slabs larger than DEFAULT_CAPACITY are retired only after this
 # many consecutive drains that did not need the extra room. Giving the memory
 # back immediately costs two reallocations per frame for a stream of frames just
@@ -163,9 +166,17 @@ class IncrementalDecoder:
         `asyncio.BufferedProtocol.get_buffer()` requires. Callers must drop the
         view before the next call, since an outstanding export would block the
         slab from being replaced on the grow path.
+
+        Capped at `RECEIVE_QUANTUM`: a slab left large by an earlier oversized
+        frame would otherwise overshoot the receiver's high water in proportion
+        to retained capacity, since that check only runs afterwards.
         """
         self._ensure(need)
-        return self._view[self._end :]
+        end = self._end
+        limit = end + (need if need > RECEIVE_QUANTUM else RECEIVE_QUANTUM)
+        if limit > self._capacity:
+            limit = self._capacity
+        return self._view[end:limit]
 
     def commit(self, nbytes: int) -> None:
         """Publish `nbytes` written into the window returned by `writable_window()`."""

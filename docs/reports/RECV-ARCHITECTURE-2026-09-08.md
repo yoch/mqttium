@@ -271,6 +271,25 @@ prototype in PR #447, both of which it had guarded from the start:
 Both are the kind of defect a saturated benchmark never shows: neither affects
 throughput, and both break real connections.
 
+## Backpressure envelope
+
+The window handed to one `recv_into()` is capped at `RECEIVE_QUANTUM` (256 KiB)
+rather than spanning the free tail. Without that cap a slab left large by an
+earlier oversized frame hands its whole tail to one receive, and the high-water
+check — which can only run afterwards — is overshot in proportion to retained
+capacity. Measured on a real socket: 4 MiB frame drained, slab retained at
+8 MiB, slow reader, `SO_RCVBUF` 14 MiB, small-frame flood:
+
+| | window offered | one callback | peak buffered | overshoot vs 192 KiB |
+|---|---:|---:|---:|---:|
+| free tail | 8192 KiB | 448 KiB | 635 KiB | **3.3x** |
+| capped | 256 KiB | 256 KiB | 256 KiB | **1.3x** |
+
+The bound is now structural: `HIGH_WATER + RECEIVE_QUANTUM` = 448 KiB, whatever
+the slab size. Cost: a frame larger than the quantum takes more callbacks to
+receive (a 4 MiB frame is 16 receives rather than 1). Steady state is unchanged,
+since `RECEIVE_QUANTUM == DEFAULT_CAPACITY`.
+
 ## Growth envelope
 
 Capacity is bounded by `max_packet_size + _MIN_WINDOW`, not by the frame size
@@ -284,8 +303,34 @@ there and the same case measures 1.01x. An explicit `feed()` larger than the
 ceiling is still honoured, since WebSocket and TLS may hand over more in one
 call.
 
-Transient peak during a reallocation remains old + new capacity, which is
-inherent to a copying grow.
+Growth is by doubling, so capacity can reach ~2x the largest frame actually
+seen when that frame is well below the limit — measured 16 MiB of capacity for
+repeated 8 MiB frames. Doubling is kept because growing by the exact need would
+make receiving one large frame in 256 KiB windows quadratic in bytes copied.
+Transient peak during a reallocation remains old + new capacity, inherent to a
+copying grow.
+
+### Retained capacity by traffic profile
+
+Measured, one decoder per connection, `max_packet_size` 16 MiB:
+
+| profile | capacity/conn | reallocations | note |
+|---|---:|---:|---|
+| one huge (4 MiB) then idle | 8.00 MiB | 1 | released after 64 inbound frames |
+| one huge then sustained tiny | 0.25 MiB | 2 | released |
+| bursty huge/tiny x20 | 8.00 MiB | 1 | no thrash |
+| just-over-256 KiB x300 | 0.50 MiB | 1 | no thrash |
+| near-max 8 MiB x20 | 16.00 MiB | 1 | at the ceiling |
+| 100 conns, 1 in 10 saw a huge | 8.00 MiB (10 conns) | — | 102.5 MiB total, +76 MiB RSS |
+
+The idle case is the one to weigh: a connection that receives one frame above
+`DEFAULT_CAPACITY` and then goes quiet keeps that slab. It is not pinned
+indefinitely — retirement counts inbound *frames*, and keepalive supplies them,
+so a 60 s keepalive releases it in ~64 minutes; a reconnect releases it at once
+via `clear()`. Retiring sooner was rejected: making retention size-aware would
+release an 8 MiB slab after 2 small drains, which reintroduces grow/shrink
+thrashing on the bursty profile above, trading a bounded delay for a repeated
+cost.
 
 ## Open risks
 

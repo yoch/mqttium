@@ -12,6 +12,7 @@ import pytest
 
 from mqttium.codec.buffer import (
     _MIN_WINDOW,
+    RECEIVE_QUANTUM,
     _OVERSIZE_RETENTION,
     DEFAULT_CAPACITY,
     IncrementalDecoder,
@@ -260,3 +261,41 @@ def test_a_feed_larger_than_the_ceiling_is_still_honoured() -> None:
     decoder = IncrementalDecoder(max_packet_size=1024 * 1024)
     decoder.feed(b"\x00" * (8 * 1024 * 1024))
     assert decoder.buffered == 8 * 1024 * 1024
+
+
+def test_the_window_is_capped_regardless_of_retained_capacity() -> None:
+    # A slab left large must not hand its whole free tail to one recv_into().
+    decoder = IncrementalDecoder()
+    decoder.feed(_publish(8 * DEFAULT_CAPACITY))
+    assert decoder.next_packet() is not None
+    assert decoder.capacity > 8 * DEFAULT_CAPACITY // 2  # still retained
+
+    window = decoder.writable_window()
+    assert len(window) == RECEIVE_QUANTUM
+    window.release()
+
+    # An explicit larger need is still honoured.
+    window = decoder.writable_window(RECEIVE_QUANTUM * 2)
+    assert len(window) >= RECEIVE_QUANTUM * 2
+    window.release()
+
+
+def test_a_capped_window_still_receives_a_frame_larger_than_the_quantum() -> None:
+    decoder = IncrementalDecoder()
+    frame = _publish(3 * RECEIVE_QUANTUM)
+    offset = 0
+    windows = 0
+    while offset < len(frame):
+        window = decoder.writable_window()
+        assert len(window) <= RECEIVE_QUANTUM
+        take = min(len(window), len(frame) - offset)
+        window[:take] = frame[offset : offset + take]
+        window.release()
+        decoder.commit(take)
+        offset += take
+        windows += 1
+
+    assert windows >= 3  # the cap really did split it
+    packet = decoder.next_packet()
+    assert packet is not None
+    assert len(packet.remaining) == 3 + 3 * RECEIVE_QUANTUM
