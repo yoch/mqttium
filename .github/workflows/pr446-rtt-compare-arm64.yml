@@ -1,0 +1,163 @@
+name: PR446 RTT compare ARM64
+
+on:
+  push:
+    branches: [bench/pr445-adversarial-validation]
+    paths:
+      - .github/workflows/pr446-rtt-compare-arm64.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr446-rpi5
+  cancel-in-progress: false
+
+jobs:
+  rtt:
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 35
+    env:
+      BENCH_SHA: 37160eed99b50d1f384e1565a16d0346eb01ca56
+      MAIN_SHA: c509bcb44cd686dd53c20e25f735e2e0a5783fc8
+      DIRECT_SHA: e85f2217faff2a75c9a86199663e8134837ac73c
+      STREAM_SHA: 975954a48ce56f394502db0669e50926a18883e6
+    steps:
+      - name: Prepare paths and host gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/pr446-rtt-$GITHUB_RUN_ID"
+          mkdir -p "$dir"
+          echo "RESULTS_DIR=$dir" >> "$GITHUB_ENV"
+          test "$(uname -m)" = aarch64
+          test "$(cat /proc/sys/kernel/randomize_va_space)" != 0
+          test "$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)" = performance
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: yoch/mqtt-python-client-bench
+          ref: ${{ env.BENCH_SHA }}
+          path: harness
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: yoch/mqttium
+          ref: ${{ env.MAIN_SHA }}
+          path: main-src
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: yoch/mqttium
+          ref: ${{ env.DIRECT_SHA }}
+          path: direct445
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: yoch/mqttium
+          ref: ${{ env.STREAM_SHA }}
+          path: stream446
+          persist-credentials: false
+      - name: Verify provenance and create benchmark environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C harness rev-parse HEAD)" = "$BENCH_SHA"
+          test "$(git -C main-src rev-parse HEAD)" = "$MAIN_SHA"
+          test "$(git -C direct445 rev-parse HEAD)" = "$DIRECT_SHA"
+          test "$(git -C stream446 rev-parse HEAD)" = "$STREAM_SHA"
+          printf 'main=%s\ndirect445=%s\nstream446=%s\nharness=%s\n' "$MAIN_SHA" "$DIRECT_SHA" "$STREAM_SHA" "$BENCH_SHA" | tee "$RESULTS_DIR/provenance.txt"
+          python3 -m venv "$RESULTS_DIR/venv"
+          . "$RESULTS_DIR/venv/bin/activate"
+          python -m pip install --upgrade pip
+          pip install -e './harness[dev,mqttium]' 'psutil>=6,<8'
+          PYTHONPATH=harness/src python - <<'PY' | tee "$RESULTS_DIR/cpuset.json"
+          import json
+          from mqtt_client_bench.telemetry import allocate_cpuset, physical_cpu_groups
+          print(json.dumps({'physical_groups': physical_cpu_groups(), 'mapping': allocate_cpuset(['sut','broker','loadgen','orch'], profile='standard')}, indent=2, sort_keys=True))
+          PY
+      - name: Start native Mosquitto
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RESULTS_DIR/mosquitto.conf" <<'EOF'
+          listener 11883 127.0.0.1
+          protocol mqtt
+          set_tcp_nodelay true
+          allow_anonymous true
+          persistence false
+          connection_messages false
+          log_dest stdout
+          log_type error
+          max_inflight_messages 1000
+          max_queued_messages 10000
+          max_packet_size 16777216
+          EOF
+          broker_cpu="$(python3 - <<'PY'
+          import json, os
+          print(json.load(open(os.path.join(os.environ['RESULTS_DIR'],'cpuset.json')))['mapping']['broker'])
+          PY
+          )"
+          taskset -c "$broker_cpu" mosquitto -c "$RESULTS_DIR/mosquitto.conf" > "$RESULTS_DIR/mosquitto.log" 2>&1 &
+          echo "BROKER_PID=$!" >> "$GITHUB_ENV"
+          for _ in $(seq 1 50); do
+            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            sleep 0.1
+          done
+          exit 1
+      - name: Reference RTT main vs PR446
+        shell: bash
+        run: |
+          set -euo pipefail
+          . "$RESULTS_DIR/venv/bin/activate"
+          PYTHONPATH=harness/src python -m mqtt_client_bench.layout_runner \
+            --worker-aslr system \
+            --entrypoint version_compare -- \
+            --client mqttium \
+            --baseline-path main-src \
+            --candidate-path stream446 \
+            --scenario application_rtt_fixed_rate \
+            --variant-index 0 \
+            --target-rate 3942 \
+            --pacer-mode external \
+            --blocks 2 \
+            --max-block-retries 0 \
+            --profile standard \
+            --broker 127.0.0.1:11883 \
+            --broker-pid "$BROKER_PID" \
+            --output "$RESULTS_DIR/main-vs-stream446.json" \
+            | tee "$RESULTS_DIR/main-vs-stream446.txt"
+      - name: Reference RTT PR445 vs PR446
+        shell: bash
+        run: |
+          set -euo pipefail
+          . "$RESULTS_DIR/venv/bin/activate"
+          PYTHONPATH=harness/src python -m mqtt_client_bench.layout_runner \
+            --worker-aslr system \
+            --entrypoint version_compare -- \
+            --client mqttium \
+            --baseline-path direct445 \
+            --candidate-path stream446 \
+            --scenario application_rtt_fixed_rate \
+            --variant-index 0 \
+            --target-rate 3942 \
+            --pacer-mode external \
+            --blocks 2 \
+            --max-block-retries 0 \
+            --profile standard \
+            --broker 127.0.0.1:11883 \
+            --broker-pid "$BROKER_PID" \
+            --output "$RESULTS_DIR/direct445-vs-stream446.json" \
+            | tee "$RESULTS_DIR/direct445-vs-stream446.txt"
+      - name: Stop broker
+        if: always()
+        shell: bash
+        run: |
+          [ -n "${BROKER_PID:-}" ] && kill "$BROKER_PID" 2>/dev/null || true
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: pr446-rtt-compare-${{ github.run_id }}
+          path: ${{ env.RESULTS_DIR }}
+          if-no-files-found: error
+          retention-days: 14
