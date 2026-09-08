@@ -93,7 +93,7 @@ jobs:
           taskset -c 1 mosquitto -c "$RESULTS_DIR/mosquitto.conf" > "$RESULTS_DIR/mosquitto.log" 2>&1 &
           echo "BROKER_PID=$!" >> "$GITHUB_ENV"
           for _ in $(seq 1 50); do
-            (echo > /dev/tcp/127.0.0.1/$PORT) >/dev/null 2>&1 && exit 0
+            (echo > "/dev/tcp/127.0.0.1/$PORT") >/dev/null 2>&1 && exit 0
             sleep 0.1
           done
           exit 1
@@ -109,7 +109,7 @@ jobs:
             --candidate-path "$VARIANTS_DIR/direct" \
             --scenario application_rtt_fixed_rate --variant-index 0 --target-rate 3942 \
             --pacer-mode external --blocks 2 --max-block-retries 0 --profile standard \
-            --broker 127.0.0.1:$PORT --broker-pid "$BROKER_PID" \
+            --broker "127.0.0.1:$PORT" --broker-pid "$BROKER_PID" \
             --output "$RESULTS_DIR/base80-vs-direct-rtt.json" \
             | tee "$RESULTS_DIR/base80-vs-direct-rtt.txt"
       - name: Stop broker
