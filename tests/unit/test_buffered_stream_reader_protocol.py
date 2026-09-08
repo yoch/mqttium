@@ -1,4 +1,4 @@
-"""Tests for the small BufferedProtocol adapter used by selector TCP streams."""
+"""Tests for the #446 BufferedProtocol fallback retained beside direct ingress."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import asyncio
 
 import pytest
 
+import mqttium.transport.tcp as tcp_module
 from mqttium.transport.tcp import (
     _RECEIVE_BUFFER_SIZE,
     _BufferedStreamReaderProtocol,
@@ -41,9 +42,6 @@ async def test_buffered_stream_protocol_reuses_buffer_and_keeps_stream_coalescin
     protocol.buffer_updated(3)
     first[:3] = b"def"
     protocol.buffer_updated(3)
-
-    # Unlike #445's direct chunk queue, this alternative intentionally keeps
-    # StreamReader semantics, including coalescing data already buffered.
     assert await reader.read(6) == b"abcdef"
 
 
@@ -62,15 +60,14 @@ async def test_buffered_stream_protocol_keeps_streamreader_backpressure() -> Non
     buffer[:] = b"b" * _RECEIVE_BUFFER_SIZE
     protocol.buffer_updated(_RECEIVE_BUFFER_SIZE)
     assert transport.pause_calls == 1
-
-    # StreamReader owns the historical 128/64-KiB high/low-water behavior.
     assert len(await reader.read(96 * 1024)) == 96 * 1024
     assert transport.resume_calls == 1
 
 
-async def test_tcp_roundtrip_proves_selector_uses_buffered_receive_dispatch(
+async def test_tcp_buffered_fallback_still_uses_recv_into_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Force the non-promoted selector fallback and verify #446 semantics."""
     calls = {"get_buffer": 0, "buffer_updated": 0, "data_received": 0}
     original_get_buffer = _BufferedStreamReaderProtocol.get_buffer
     original_buffer_updated = _BufferedStreamReaderProtocol.buffer_updated
@@ -88,6 +85,7 @@ async def test_tcp_roundtrip_proves_selector_uses_buffered_receive_dispatch(
         calls["data_received"] += 1
         original_data_received(self, data)
 
+    monkeypatch.setattr(tcp_module, "_direct_ingress_supported", lambda _ssl, _loop: False)
     monkeypatch.setattr(_BufferedStreamReaderProtocol, "get_buffer", tracked_get_buffer)
     monkeypatch.setattr(_BufferedStreamReaderProtocol, "buffer_updated", tracked_buffer_updated)
     monkeypatch.setattr(_BufferedStreamReaderProtocol, "data_received", tracked_data_received)
@@ -109,18 +107,12 @@ async def test_tcp_roundtrip_proves_selector_uses_buffered_receive_dispatch(
         loop = asyncio.get_running_loop()
         if isinstance(loop, asyncio.SelectorEventLoop):
             assert isinstance(protocol, _BufferedStreamReaderProtocol)
-        else:
-            assert not isinstance(protocol, _BufferedStreamReaderProtocol)
-
         await transport.write(b"mqttium-buffered-stream")
         assert await transport.read(65536) == b"mqttium-buffered-stream"
-
         if isinstance(loop, asyncio.SelectorEventLoop):
             assert calls["get_buffer"] > 0
             assert calls["buffer_updated"] > 0
             assert calls["data_received"] == 0
-        else:
-            assert calls == {"get_buffer": 0, "buffer_updated": 0, "data_received": 0}
     finally:
         if transport is not None:
             await transport.close()
