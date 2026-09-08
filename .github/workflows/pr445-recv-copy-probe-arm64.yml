@@ -1,0 +1,55 @@
+name: PR445 recv-copy allocator probe ARM64
+
+on:
+  push:
+    branches: [bench/pr445-adversarial-validation]
+    paths:
+      - .github/workflows/pr445-recv-copy-probe-arm64.yml
+      - tools/recv_into_copy_probe.py
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr445-adversarial-rpi5
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Verify host
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          test "$(cat /proc/sys/kernel/randomize_va_space)" != 0
+          echo "sha=$(git rev-parse HEAD)"
+          echo "aslr=$(cat /proc/sys/kernel/randomize_va_space)"
+          echo "personality=$(cat /proc/$$/personality)"
+          python3 --version
+          ldd --version | head -n1
+          mkdir -p probe-results
+      - name: Fresh-process recv_into plus bytes-copy matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/recv_into_copy_probe.py \
+            --samples 16 \
+            --iterations 500 \
+            --warmup 10 \
+            --output probe-results/recv-copy.json \
+            2> >(tee probe-results/progress.txt >&2) \
+            | tee probe-results/recv-copy.txt
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: pr445-recv-copy-${{ github.run_id }}
+          path: probe-results
+          if-no-files-found: error
+          retention-days: 14
