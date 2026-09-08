@@ -6,7 +6,12 @@ import asyncio
 
 import pytest
 
-from mqttium.transport._buffered import BufferedSocketProtocol, _READ_CHUNK
+from mqttium.transport._buffered import (
+    _READ_CHUNK,
+    _READ_HIGH_WATER,
+    _READ_LOW_WATER,
+    BufferedSocketProtocol,
+)
 from mqttium.transport.tcp import TcpTransport
 
 
@@ -55,26 +60,74 @@ async def test_buffered_protocol_read_can_split_received_chunk() -> None:
     assert protocol.buffered_bytes == 0
 
 
-async def test_buffered_protocol_bounds_unread_data() -> None:
+async def test_buffered_protocol_does_not_coalesce_queued_chunks() -> None:
+    loop = asyncio.get_running_loop()
+    protocol = BufferedSocketProtocol(loop)
+    protocol.connection_made(_FakeTransport())  # type: ignore[arg-type]
+    buffer = protocol.get_buffer(-1)
+    buffer[:3] = b"abc"
+    protocol.buffer_updated(3)
+    buffer[:3] = b"def"
+    protocol.buffer_updated(3)
+
+    # read(n) promises at most n bytes, not coalescing. Preserving received
+    # chunks avoids another copy and is an intentional difference from
+    # StreamReader's aggregate bytearray.
+    assert await protocol.read(6) == b"abc"
+    assert await protocol.read(6) == b"def"
+
+
+async def test_buffered_protocol_bounds_unread_data_with_independent_watermarks() -> None:
     loop = asyncio.get_running_loop()
     protocol = BufferedSocketProtocol(loop)
     fake = _FakeTransport()
     protocol.connection_made(fake)  # type: ignore[arg-type]
 
-    # The selector may deliver one final receive chunk beyond the high-water
-    # threshold before pause_reading() takes effect, matching StreamReader's
-    # bounded-overrun behavior.
-    for _ in range(3):
-        protocol.buffer_updated(_READ_CHUNK)
+    assert _READ_LOW_WATER < _READ_HIGH_WATER
+    assert _READ_CHUNK < _READ_HIGH_WATER
 
-    assert protocol.buffered_bytes == 3 * _READ_CHUNK
-    assert fake.paused is True
-
-    assert len(await protocol.read(_READ_CHUNK)) == _READ_CHUNK
-    assert fake.paused is True
-    assert len(await protocol.read(_READ_CHUNK)) == _READ_CHUNK
-    assert protocol.buffered_bytes == _READ_CHUNK
+    # pause_reading() happens after the callback that crosses high-water, so the
+    # unread queue may overshoot by at most one receive chunk.
+    protocol.buffer_updated(_READ_CHUNK)
     assert fake.paused is False
+    protocol.buffer_updated(_READ_CHUNK)
+    assert _READ_HIGH_WATER < protocol.buffered_bytes <= _READ_HIGH_WATER + _READ_CHUNK
+    assert fake.paused is True
+
+    assert len(await protocol.read(_READ_CHUNK)) == _READ_CHUNK
+    assert protocol.buffered_bytes > _READ_LOW_WATER
+    assert fake.paused is True
+    assert len(await protocol.read(_READ_CHUNK)) == _READ_CHUNK
+    assert protocol.buffered_bytes <= _READ_LOW_WATER
+    assert fake.paused is False
+
+
+async def test_eof_preserves_buffered_data_then_becomes_terminal() -> None:
+    loop = asyncio.get_running_loop()
+    protocol = BufferedSocketProtocol(loop)
+    protocol.connection_made(_FakeTransport())  # type: ignore[arg-type]
+    buffer = protocol.get_buffer(-1)
+    buffer[:5] = b"hello"
+    protocol.buffer_updated(5)
+
+    # MQTTium intentionally treats peer EOF as terminal rather than preserving
+    # TCP half-close semantics; asyncio closes the transport when this is false.
+    assert protocol.eof_received() is None
+    assert await protocol.read(1024) == b"hello"
+    assert await protocol.read(1024) == b""
+
+
+async def test_clean_connection_loss_wakes_waiting_reader_with_eof() -> None:
+    loop = asyncio.get_running_loop()
+    protocol = BufferedSocketProtocol(loop)
+    protocol.connection_made(_FakeTransport())  # type: ignore[arg-type]
+
+    pending_read = asyncio.create_task(protocol.read())
+    await asyncio.sleep(0)
+    protocol.connection_lost(None)
+
+    assert await pending_read == b""
+    await protocol.wait_closed()
 
 
 async def test_connection_loss_wakes_reader_and_reports_error_on_close() -> None:
@@ -91,6 +144,58 @@ async def test_connection_loss_wakes_reader_and_reports_error_on_close() -> None
         await pending_read
     with pytest.raises(ConnectionResetError, match="peer reset"):
         await protocol.wait_closed()
+
+
+async def test_cancelled_drain_does_not_cancel_another_waiter() -> None:
+    loop = asyncio.get_running_loop()
+    protocol = BufferedSocketProtocol(loop)
+    protocol.connection_made(_FakeTransport())  # type: ignore[arg-type]
+    protocol.pause_writing()
+
+    first = asyncio.create_task(protocol.drain())
+    second = asyncio.create_task(protocol.drain())
+    await asyncio.sleep(0)
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+
+    assert not second.done()
+    protocol.resume_writing()
+    await second
+
+
+async def test_clean_connection_loss_releases_existing_drain_but_refuses_future_drain() -> None:
+    loop = asyncio.get_running_loop()
+    protocol = BufferedSocketProtocol(loop)
+    protocol.connection_made(_FakeTransport())  # type: ignore[arg-type]
+    protocol.pause_writing()
+
+    pending = asyncio.create_task(protocol.drain())
+    await asyncio.sleep(0)
+    protocol.connection_lost(None)
+
+    # asyncio.streams.FlowControlMixin releases a drain that was already
+    # waiting on a clean close, while every drain begun afterwards fails.
+    await pending
+    with pytest.raises(ConnectionResetError, match="Connection lost"):
+        await protocol.drain()
+
+
+async def test_error_connection_loss_fails_pending_and_future_drains() -> None:
+    loop = asyncio.get_running_loop()
+    protocol = BufferedSocketProtocol(loop)
+    protocol.connection_made(_FakeTransport())  # type: ignore[arg-type]
+    protocol.pause_writing()
+
+    pending = asyncio.create_task(protocol.drain())
+    await asyncio.sleep(0)
+    error = ConnectionResetError("peer reset")
+    protocol.connection_lost(error)
+
+    with pytest.raises(ConnectionResetError, match="peer reset"):
+        await pending
+    with pytest.raises(ConnectionResetError, match="Connection lost"):
+        await protocol.drain()
 
 
 async def test_cleartext_tcp_roundtrip_uses_buffered_transport() -> None:
