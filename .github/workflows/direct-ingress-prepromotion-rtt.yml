@@ -1,0 +1,177 @@
+name: Direct ingress pre-promotion RTT
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [perf/direct-decoder-ingress-prototype]
+    paths:
+      - .github/workflows/direct-ingress-prepromotion-rtt.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: direct-ingress-prepromotion-rtt
+  cancel-in-progress: false
+
+jobs:
+  exact-head-smoke:
+    name: Exact-head CPython 3.14 direct smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.14"
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install -e ".[dev,fuzz]"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mosquitto
+      - name: Differential and installed-client smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          HYPOTHESIS_PROFILE=direct_prepromotion \
+            python -m pytest -q -W error --strict-config --strict-markers \
+            .github/validation/test_direct_ingress_differential.py \
+            tests/unit/test_direct_decoder_ingress_prototype.py
+          PYTHONPATH=src python .github/validation/direct_ingress_prepromotion.py e2e \
+            --output "$RUNNER_TEMP/direct-e2e.json"
+      - name: Upload exact-head smoke
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: direct-prepromotion-smoke-${{ github.sha }}
+          path: ${{ runner.temp }}/direct-e2e.json
+          if-no-files-found: warn
+          retention-days: 14
+
+  rpi5-rtt:
+    name: RPi5 exact-head 4-block RTT
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 20
+    env:
+      BENCH_SHA: 37160eed99b50d1f384e1565a16d0346eb01ca56
+      PORT: "11886"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: experiment
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: yoch/mqtt-python-client-bench
+          ref: ${{ env.BENCH_SHA }}
+          path: harness
+          persist-credentials: false
+      - name: Gate host and prepare variants
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          test "$(python3 -c 'import platform; print(platform.python_version())')" = "3.14.7"
+          test "$(cat /proc/sys/kernel/randomize_va_space)" != "0"
+          test "$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)" = performance
+          version="$({ mosquitto -h 2>&1 || true; } | python3 -c 'import re,sys; t=sys.stdin.read(); m=re.search(r"mosquitto version\s+([0-9]+(?:\.[0-9]+)+)",t,re.I); print(m.group(1) if m else "")')"
+          test "$version" = "2.1.2"
+          root="$RUNNER_TEMP/direct-prepromotion-rtt-$GITHUB_RUN_ID"
+          rm -rf "$root"
+          mkdir -p "$root/variants"
+          echo "RESULTS_DIR=$root" >> "$GITHUB_ENV"
+
+          git clone --quiet --no-hardlinks experiment "$root/variants/base80"
+          git clone --quiet --no-hardlinks experiment "$root/variants/direct"
+          cat >> "$root/variants/direct/src/mqttium/api/__init__.py" <<'PY'
+          from mqttium._direct_decoder_ingress_prototype import install as _install_direct_ingress
+          _install_direct_ingress()
+          del _install_direct_ingress
+          PY
+          git -C "$root/variants/direct" config user.name "mqttium benchmark"
+          git -C "$root/variants/direct" config user.email "benchmark@localhost"
+          git -C "$root/variants/direct" add src/mqttium/api/__init__.py
+          git -C "$root/variants/direct" commit --quiet -m "benchmark: activate direct ingress"
+          test -z "$(git -C "$root/variants/base80" status --porcelain)"
+          test -z "$(git -C "$root/variants/direct" status --porcelain)"
+          git -C "$root/variants/base80" rev-parse HEAD > "$root/base80.sha"
+          git -C "$root/variants/direct" rev-parse HEAD > "$root/direct.sha"
+      - name: Create environment and broker
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RESULTS_DIR/venv"
+          . "$RESULTS_DIR/venv/bin/activate"
+          python -m pip install --upgrade pip >/dev/null
+          python -m pip install -e "./harness[dev,mqttium]" psutil >/dev/null
+          cat > "$RESULTS_DIR/mosquitto.conf" <<EOF
+          listener $PORT 127.0.0.1
+          protocol mqtt
+          set_tcp_nodelay true
+          allow_anonymous true
+          persistence false
+          connection_messages false
+          log_dest stdout
+          log_type error
+          max_inflight_messages 1000
+          max_queued_messages 10000
+          max_packet_size 16777216
+          EOF
+          taskset -c 1 mosquitto -c "$RESULTS_DIR/mosquitto.conf" \
+            > "$RESULTS_DIR/mosquitto.log" 2>&1 &
+          echo "BROKER_PID=$!" >> "$GITHUB_ENV"
+          python3 - <<'PY'
+          import os
+          import socket
+          import time
+
+          port = int(os.environ["PORT"])
+          deadline = time.monotonic() + 5
+          while time.monotonic() < deadline:
+              try:
+                  with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                      break
+              except OSError:
+                  time.sleep(0.03)
+          else:
+              raise SystemExit("broker did not become ready")
+          PY
+      - name: Run four RTT blocks
+        shell: bash
+        run: |
+          set -euo pipefail
+          . "$RESULTS_DIR/venv/bin/activate"
+          PYTHONPATH=harness/src python -m mqtt_client_bench.layout_runner \
+            --worker-aslr system --entrypoint version_compare -- \
+            --client mqttium \
+            --baseline-path "$RESULTS_DIR/variants/base80" \
+            --candidate-path "$RESULTS_DIR/variants/direct" \
+            --scenario application_rtt_fixed_rate --variant-index 0 --target-rate 3942 \
+            --pacer-mode external --blocks 4 --max-block-retries 0 --profile standard \
+            --broker "127.0.0.1:$PORT" --broker-pid "$BROKER_PID" \
+            --output "$RESULTS_DIR/base80-vs-direct-rtt.json" \
+            | tee "$RESULTS_DIR/base80-vs-direct-rtt.txt"
+      - name: Stop broker
+        if: always()
+        shell: bash
+        run: |
+          if [ -n "${BROKER_PID:-}" ]; then
+            kill "$BROKER_PID" 2>/dev/null || true
+          fi
+      - name: Upload RTT evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: direct-prepromotion-rtt-${{ github.sha }}
+          path: |
+            ${{ env.RESULTS_DIR }}/base80-vs-direct-rtt.json
+            ${{ env.RESULTS_DIR }}/base80-vs-direct-rtt.txt
+            ${{ env.RESULTS_DIR }}/base80.sha
+            ${{ env.RESULTS_DIR }}/direct.sha
+            ${{ env.RESULTS_DIR }}/mosquitto.log
+          if-no-files-found: warn
+          retention-days: 14
