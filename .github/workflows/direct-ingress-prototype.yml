@@ -1,0 +1,284 @@
+name: Direct ingress prototype matrix
+
+on:
+  push:
+    branches: [perf/direct-decoder-ingress-prototype]
+    paths:
+      - .github/workflows/direct-ingress-prototype.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: direct-ingress-prototype
+  cancel-in-progress: false
+
+env:
+  PORT: "11883"
+  PAYLOAD_SIZE: "65536"
+  WARMUP_S: "0.30"
+  MEASURE_S: "1.0"
+  PUBLISHER_S: "1.6"
+
+jobs:
+  arm64-saturated:
+    name: RPi5 / short saturated matrix
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: experiment
+          persist-credentials: false
+      - name: Verify Pi host
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          test "$(python3 -c 'import platform; print(platform.python_version())')" = "3.14.7"
+          test "$(cat /proc/sys/kernel/randomize_va_space)" != "0"
+          test "$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)" = performance
+          command -v taskset
+          command -v mosquitto
+          mkdir -p "$RUNNER_TEMP/direct-ingress-$GITHUB_RUN_ID"
+          echo "RESULTS_DIR=$RUNNER_TEMP/direct-ingress-$GITHUB_RUN_ID" >> "$GITHUB_ENV"
+      - name: Start pinned Mosquitto
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$({ mosquitto -h 2>&1 || true; } | python3 -c 'import re,sys; t=sys.stdin.read(); m=re.search(r"mosquitto version\s+([0-9]+(?:\.[0-9]+)+)",t,re.I); print(m.group(1) if m else "")')"
+          test "$version" = "2.1.2"
+          cat > "$RESULTS_DIR/mosquitto.conf" <<EOF
+          listener $PORT 127.0.0.1
+          protocol mqtt
+          set_tcp_nodelay true
+          allow_anonymous true
+          persistence false
+          connection_messages false
+          log_dest stdout
+          log_type error
+          max_inflight_messages 1000
+          max_queued_messages 10000
+          max_packet_size 16777216
+          EOF
+          taskset -c 1 mosquitto -c "$RESULTS_DIR/mosquitto.conf" > "$RESULTS_DIR/mosquitto.log" 2>&1 &
+          echo "BROKER_PID=$!" >> "$GITHUB_ENV"
+          for _ in $(seq 1 50); do
+            (echo > /dev/tcp/127.0.0.1/$PORT) >/dev/null 2>&1 && exit 0
+            sleep 0.1
+          done
+          exit 1
+      - name: Run four rotating blocks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 experiment/tools/run_receive_architecture_matrix.py \
+            --root experiment --output-dir "$RESULTS_DIR/saturated" \
+            --broker-pid "$BROKER_PID" --port "$PORT" \
+            --sut-cpu 0 --publisher-cpu 2 \
+            --payload-size "$PAYLOAD_SIZE" --warmup-s "$WARMUP_S" \
+            --measure-s "$MEASURE_S" --publisher-s "$PUBLISHER_S"
+      - name: Stop broker
+        if: always()
+        shell: bash
+        run: |
+          [ -n "${BROKER_PID:-}" ] && kill "$BROKER_PID" 2>/dev/null || true
+      - name: Upload Pi saturated evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: direct-ingress-rpi-saturated-${{ github.run_id }}
+          path: ${{ env.RESULTS_DIR }}
+          if-no-files-found: error
+          retention-days: 14
+
+  x86-saturated:
+    name: x86 hosted / advisory saturated matrix
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: experiment
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.13"
+      - name: Install broker and prepare host
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mosquitto
+          mkdir -p "$RUNNER_TEMP/direct-ingress-x86-$GITHUB_RUN_ID"
+          echo "RESULTS_DIR=$RUNNER_TEMP/direct-ingress-x86-$GITHUB_RUN_ID" >> "$GITHUB_ENV"
+          python - <<'PY'
+          import json,platform,os
+          print(json.dumps({'machine':platform.machine(),'python':platform.python_version(),'cpus':os.cpu_count()},indent=2))
+          PY
+      - name: Start Mosquitto
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RESULTS_DIR/mosquitto.conf" <<EOF
+          listener $PORT 127.0.0.1
+          protocol mqtt
+          set_tcp_nodelay true
+          allow_anonymous true
+          persistence false
+          connection_messages false
+          log_dest stdout
+          log_type error
+          max_inflight_messages 1000
+          max_queued_messages 10000
+          max_packet_size 16777216
+          EOF
+          broker_cpu=1
+          taskset -c "$broker_cpu" mosquitto -c "$RESULTS_DIR/mosquitto.conf" > "$RESULTS_DIR/mosquitto.log" 2>&1 &
+          echo "BROKER_PID=$!" >> "$GITHUB_ENV"
+          mosquitto -h 2>&1 | head -n 2 > "$RESULTS_DIR/mosquitto-version.txt" || true
+          for _ in $(seq 1 50); do
+            (echo > /dev/tcp/127.0.0.1/$PORT) >/dev/null 2>&1 && exit 0
+            sleep 0.1
+          done
+          exit 1
+      - name: Run four rotating blocks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python experiment/tools/run_receive_architecture_matrix.py \
+            --root experiment --output-dir "$RESULTS_DIR/saturated" \
+            --broker-pid "$BROKER_PID" --port "$PORT" \
+            --sut-cpu 0 --publisher-cpu 2 \
+            --payload-size "$PAYLOAD_SIZE" --warmup-s "$WARMUP_S" \
+            --measure-s "$MEASURE_S" --publisher-s "$PUBLISHER_S"
+      - name: Stop broker
+        if: always()
+        shell: bash
+        run: |
+          [ -n "${BROKER_PID:-}" ] && kill "$BROKER_PID" 2>/dev/null || true
+      - name: Upload x86 evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: direct-ingress-x86-saturated-${{ github.run_id }}
+          path: ${{ env.RESULTS_DIR }}
+          if-no-files-found: error
+          retention-days: 14
+
+  arm64-rtt:
+    name: RPi5 / short reference RTT
+    needs: arm64-saturated
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 20
+    env:
+      BENCH_SHA: 37160eed99b50d1f384e1565a16d0346eb01ca56
+      RTT_PORT: "11884"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: experiment
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: yoch/mqtt-python-client-bench
+          ref: ${{ env.BENCH_SHA }}
+          path: harness
+          persist-credentials: false
+      - name: Prepare short-lived variants
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/direct-ingress-rtt-$GITHUB_RUN_ID"
+          mkdir -p "$dir"
+          echo "RESULTS_DIR=$dir" >> "$GITHUB_ENV"
+          for arm in base80 stream128 cap128 direct; do
+            mkdir -p "$arm"
+            rsync -a --exclude .git experiment/ "$arm/"
+          done
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('stream128/src/mqttium/transport/tcp.py')
+          s=p.read_text(); old='_RECEIVE_BUFFER_SIZE = 80 * 1024'; assert old in s
+          p.write_text(s.replace(old,'_RECEIVE_BUFFER_SIZE = 128 * 1024',1))
+
+          p=Path('cap128/src/mqttium/transport/tcp.py'); s=p.read_text()
+          old='''        if ssl is None and isinstance(loop, asyncio.SelectorEventLoop):\n            reader, writer = await _open_buffered_selector_connection(host, port)\n        else:\n            # TLS already has buffered receive semantics in asyncio SSLProtocol.\n            # Proactor and third-party loops stay on the mature stdlib stream\n            # path: current Proactor feeds BufferedProtocol through an internal\n            # 64-KiB buffer, so forcing this adapter there mainly adds a copy.\n            reader, writer = await asyncio.open_connection(host, port, ssl=ssl)\n'''
+          new='''        reader, writer = await asyncio.open_connection(host, port, ssl=ssl)\n        if ssl is None and isinstance(loop, asyncio.SelectorEventLoop):\n            transport = writer.transport\n            if transport is None or not hasattr(transport, "max_size"):\n                raise RuntimeError("selector transport has no max_size control")\n            transport.max_size = 128 * 1024\n'''
+          assert old in s
+          p.write_text(s.replace(old,new,1))
+
+          p=Path('direct/src/mqttium/api/__init__.py')
+          p.write_text(p.read_text()+'''\n# benchmark-only activation\nfrom mqttium._direct_decoder_ingress_prototype import install as _install_direct_ingress\n_install_direct_ingress()\ndel _install_direct_ingress\n''')
+          PY
+      - name: Create harness environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RESULTS_DIR/venv"
+          . "$RESULTS_DIR/venv/bin/activate"
+          python -m pip install --upgrade pip >/dev/null
+          pip install -e './harness[dev,mqttium]' 'psutil>=6,<8' >/dev/null
+          PYTHONPATH=harness/src python - <<'PY' > "$RESULTS_DIR/cpuset.json"
+          import json
+          from mqtt_client_bench.telemetry import allocate_cpuset, physical_cpu_groups
+          print(json.dumps({'physical_groups':physical_cpu_groups(),'mapping':allocate_cpuset(['sut','broker','loadgen','orch'],profile='standard')},indent=2,sort_keys=True))
+          PY
+      - name: Start native Mosquitto
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RESULTS_DIR/mosquitto.conf" <<EOF
+          listener $RTT_PORT 127.0.0.1
+          protocol mqtt
+          set_tcp_nodelay true
+          allow_anonymous true
+          persistence false
+          connection_messages false
+          log_dest stdout
+          log_type error
+          max_inflight_messages 1000
+          max_queued_messages 10000
+          max_packet_size 16777216
+          EOF
+          broker_cpu="$(python3 - <<'PY'
+          import json,os
+          print(json.load(open(os.path.join(os.environ['RESULTS_DIR'],'cpuset.json')))['mapping']['broker'])
+          PY
+          )"
+          taskset -c "$broker_cpu" mosquitto -c "$RESULTS_DIR/mosquitto.conf" > "$RESULTS_DIR/mosquitto.log" 2>&1 &
+          echo "RTT_BROKER_PID=$!" >> "$GITHUB_ENV"
+          for _ in $(seq 1 50); do
+            (echo > /dev/tcp/127.0.0.1/$RTT_PORT) >/dev/null 2>&1 && exit 0
+            sleep 0.1
+          done
+          exit 1
+      - name: Compare three candidates to #446-80K
+        shell: bash
+        run: |
+          set -euo pipefail
+          . "$RESULTS_DIR/venv/bin/activate"
+          for arm in stream128 cap128 direct; do
+            PYTHONPATH=harness/src python -m mqtt_client_bench.layout_runner \
+              --worker-aslr system --entrypoint version_compare -- \
+              --client mqttium --baseline-path base80 --candidate-path "$arm" \
+              --scenario application_rtt_fixed_rate --variant-index 0 --target-rate 3942 \
+              --pacer-mode external --blocks 2 --max-block-retries 0 --profile standard \
+              --broker 127.0.0.1:$RTT_PORT --broker-pid "$RTT_BROKER_PID" \
+              --output "$RESULTS_DIR/base80-vs-${arm}.json" \
+              | tee "$RESULTS_DIR/base80-vs-${arm}.txt"
+          done
+      - name: Stop RTT broker
+        if: always()
+        shell: bash
+        run: |
+          [ -n "${RTT_BROKER_PID:-}" ] && kill "$RTT_BROKER_PID" 2>/dev/null || true
+      - name: Upload RTT evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: direct-ingress-rpi-rtt-${{ github.run_id }}
+          path: ${{ env.RESULTS_DIR }}
+          if-no-files-found: error
+          retention-days: 14
