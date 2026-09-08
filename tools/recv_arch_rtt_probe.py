@@ -1,11 +1,23 @@
-"""Request/response RTT across the four candidate receive architectures.
+"""Request/response RTT across receive *mechanisms*.
 
 Throughput probes saturate the socket and hide scheduling latency. This one
 measures the opposite regime: one small MQTT PUBLISH out, one echoed back, and
-the wall time until the client's receive path has produced an owned payload.
+the wall time until the receive path has produced an owned payload. The server
+is a plain blocking echo thread, so every difference belongs to the client
+receive path.
 
-The server is a plain blocking echo thread, so every difference between arms
-belongs to the client receive path under test.
+WHAT THIS IS. A controlled ablation of four receive *mechanisms* against one
+shared decoder -- this checkout's ``IncrementalDecoder`` -- so the only variable
+is how bytes get from the socket into it. The ``push`` arm is the real
+production code (``DecoderPushProtocol`` + ``PushStreamTransport``); the other
+three are minimal reimplementations of the mechanism each PR uses.
+
+WHAT THIS IS NOT. It is not RC13 vs #445 vs #446 vs #448 at their respective
+commits. The three baseline arms do not run those branches' code, and they
+share this branch's decoder rather than each PR's own. Numbers from it support
+"this mechanism costs less per round trip", not "PR X is faster than PR Y", and
+not "the merged client will show this in application RTT" -- see the end-to-end
+figures in docs/reports/, which are far smaller.
 
     python tools/recv_arch_rtt_probe.py --payload-size 256 --count 20000
 """
@@ -23,8 +35,7 @@ from collections import deque
 from pathlib import Path
 
 from mqttium.codec.buffer import IncrementalDecoder
-from mqttium.codec.vbi import decode_vbi
-from mqttium.errors import MalformedPacketError
+from mqttium.transport._push import DecoderPushProtocol, PushStreamTransport
 
 _RECV = 128 * 1024
 
@@ -40,55 +51,6 @@ def build_publish(payload_size: int) -> bytes:
         if not remaining:
             break
     return bytes(out) + body
-
-
-class Ring:
-    """Decoder-owned storage that `recv_into()` writes into directly."""
-
-    __slots__ = ("_buf", "_mv", "_start", "_end", "_cap")
-
-    def __init__(self, capacity: int) -> None:
-        self._cap = capacity
-        self._buf = bytearray(capacity)
-        self._mv = memoryview(self._buf)
-        self._start = 0
-        self._end = 0
-
-    def writable(self, need: int = 16384) -> memoryview:
-        if self._cap - self._end < need:
-            live = self._end - self._start
-            if self._start:
-                self._buf[0:live] = self._mv[self._start : self._end]
-                self._start, self._end = 0, live
-            if self._cap - self._end < need:
-                self._mv.release()
-                new_cap = max(self._cap * 2, live + need)
-                grown = bytearray(new_cap)
-                grown[0:live] = self._buf[0:live]
-                self._buf, self._mv, self._cap = grown, memoryview(grown), new_cap
-                self._start, self._end = 0, live
-        return self._mv[self._end :]
-
-    def commit(self, nbytes: int) -> None:
-        self._end += nbytes
-
-    def next_payload(self) -> bytes | None:
-        buf, start = self._buf, self._start
-        available = self._end - start
-        if available < 2:
-            return None
-        try:
-            remaining_length, rl_end = decode_vbi(buf, start + 1)
-        except MalformedPacketError:
-            return None
-        total = (rl_end - start) + remaining_length
-        if available < total:
-            return None
-        body = bytes(self._mv[rl_end : start + total])
-        self._start = start + total
-        if self._start == self._end:
-            self._start = self._end = 0
-        return body
 
 
 def echo_server(sock: socket.socket, stop: threading.Event) -> None:
@@ -195,49 +157,33 @@ async def arm_445(sock: socket.socket):
     return transport, recv_one
 
 
-async def arm_447(sock: socket.socket):
+async def arm_push(sock: socket.socket):
+    """The shipped implementation: production protocol, transport and decoder."""
     loop = asyncio.get_running_loop()
-    ring = Ring(_RECV)
-
-    class Protocol(asyncio.BufferedProtocol):
-        def __init__(self) -> None:
-            self.waiter: asyncio.Future[None] | None = None
-            self.fed = 0
-
-        def get_buffer(self, sizehint: int) -> memoryview:
-            return ring.writable()
-
-        def buffer_updated(self, nbytes: int) -> None:
-            if nbytes <= 0:
-                return
-            ring.commit(nbytes)
-            self.fed += 1
-            if self.waiter is not None and not self.waiter.done():
-                self.waiter.set_result(None)
-
-    transport, protocol = await loop.create_connection(Protocol, sock=sock)
+    reader = asyncio.StreamReader(loop=loop)
+    protocol = DecoderPushProtocol(reader, loop=loop)
+    raw_transport, _ = await loop.create_connection(lambda: protocol, sock=sock)
+    writer = asyncio.StreamWriter(raw_transport, protocol, reader, loop)
+    transport = PushStreamTransport(reader, writer, protocol)
+    decoder = IncrementalDecoder()
+    transport.attach_decoder(decoder)
 
     async def recv_one() -> bytes:
-        # Edge-triggered: "bytes arrived" is not "a frame is complete", so
-        # waiting on a level condition would spin without ever yielding.
         while True:
-            payload = ring.next_payload()
-            if payload is not None:
-                return payload
-            seen = protocol.fed
-            while protocol.fed == seen:
-                protocol.waiter = loop.create_future()
-                await protocol.waiter
-                protocol.waiter = None
+            packet = decoder.next_packet()
+            if packet is not None:
+                return packet.remaining
+            await transport.receive()
 
-    return transport, recv_one
+    return raw_transport, recv_one
 
 
+# Mechanism names, not PR names: these are ablations, not those branches.
 ARMS = {
-    "rc13": arm_rc13,
-    "445": arm_445,
-    "446": arm_446,
-    "447": arm_447,
+    "streamreader": arm_rc13,
+    "chunk-queue": arm_445,
+    "buffered-sr": arm_446,
+    "push": arm_push,
 }
 
 
@@ -292,10 +238,12 @@ async def main_async(args: argparse.Namespace) -> None:
     print(
         f"payload {args.payload_size} B, {args.count} round trips x {args.repeat} "
         f"interleaved reps, TCP loopback, echo server thread\n"
+        "Mechanism ablation over one shared decoder -- not a comparison of the "
+        "PR branches at their commits.\n"
     )
-    header = f"{'arm':8}{'p50 us':>9}{'p90 us':>9}{'p99 us':>9}{'mean':>9}{'vs rc13':>9}"
+    header = f"{'mechanism':14}{'p50 us':>9}{'p90 us':>9}{'p99 us':>9}{'mean':>9}{'vs base':>9}"
     print(header)
-    base = statistics.median(per_arm["rc13"])
+    base = statistics.median(per_arm["streamreader"])
     for name in order:
         values = sorted(per_arm[name])
         stats = {
@@ -307,7 +255,7 @@ async def main_async(args: argparse.Namespace) -> None:
         }
         results[name] = stats
         print(
-            f"{name:8}{stats['p50']:9.2f}{stats['p90']:9.2f}{stats['p99']:9.2f}"
+            f"{name:14}{stats['p50']:9.2f}{stats['p90']:9.2f}{stats['p99']:9.2f}"
             f"{stats['mean']:9.2f}{base / stats['p50']:8.3f}x"
         )
     if args.output:

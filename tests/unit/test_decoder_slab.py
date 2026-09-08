@@ -10,7 +10,12 @@ import random
 
 import pytest
 
-from mqttium.codec.buffer import _OVERSIZE_RETENTION, DEFAULT_CAPACITY, IncrementalDecoder
+from mqttium.codec.buffer import (
+    _MIN_WINDOW,
+    _OVERSIZE_RETENTION,
+    DEFAULT_CAPACITY,
+    IncrementalDecoder,
+)
 from mqttium.enums import PacketType
 
 
@@ -195,3 +200,63 @@ def test_random_window_chunking_matches_feed(seed: int) -> None:
 
     assert produced == expected
     assert len(produced) == len(sizes)
+
+
+def test_sustained_oversized_frames_never_churn_past_the_retention_window() -> None:
+    # Retention must key off how far each drain actually reached, not off
+    # whether that drain reallocated. Once the first oversized frame has grown
+    # the slab, later ones fit without reallocating -- and would look idle,
+    # retiring the slab on a fixed period and re-growing on the very next frame.
+    decoder = IncrementalDecoder()
+    frame = _publish(DEFAULT_CAPACITY + 8192)
+    reallocations = 0
+    original = IncrementalDecoder._reallocate
+
+    def counting(self: IncrementalDecoder, capacity: int) -> None:
+        nonlocal reallocations
+        reallocations += 1
+        original(self, capacity)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(IncrementalDecoder, "_reallocate", counting)
+        for _ in range(_OVERSIZE_RETENTION * 4):
+            decoder.feed(frame)
+            assert decoder.next_packet() is not None
+
+    assert reallocations == 1  # the initial growth only
+    assert decoder.capacity > DEFAULT_CAPACITY
+
+    # And the room is still given back once the big frames stop.
+    for _ in range(_OVERSIZE_RETENTION + 1):
+        decoder.feed(_publish(64))
+        assert decoder.next_packet() is not None
+    assert decoder.capacity == DEFAULT_CAPACITY
+
+
+def test_capacity_never_exceeds_one_maximum_frame_plus_a_window() -> None:
+    # Doubling alone reached 2x max_packet_size: a frame just over a doubling
+    # step leaves a tail too small for the next window and doubles again.
+    limit = 4 * 1024 * 1024
+    decoder = IncrementalDecoder(max_packet_size=limit)
+    frame = _publish(limit - 200)
+    assert len(frame) <= limit
+
+    offset = 0
+    while offset < len(frame):
+        window = decoder.writable_window()
+        take = min(len(window), 4096, len(frame) - offset)
+        window[:take] = frame[offset : offset + take]
+        window.release()
+        decoder.commit(take)
+        offset += take
+
+    assert decoder.capacity <= limit + _MIN_WINDOW
+    assert decoder.next_packet() is not None
+
+
+def test_a_feed_larger_than_the_ceiling_is_still_honoured() -> None:
+    # The ceiling is what framing can ever need; it must not cap an explicit
+    # feed(), which WebSocket and TLS may hand over in one call.
+    decoder = IncrementalDecoder(max_packet_size=1024 * 1024)
+    decoder.feed(b"\x00" * (8 * 1024 * 1024))
+    assert decoder.buffered == 8 * 1024 * 1024

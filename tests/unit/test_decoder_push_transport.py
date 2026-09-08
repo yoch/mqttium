@@ -434,7 +434,7 @@ async def test_receive_stats_expose_the_wakeup_to_callback_ratio() -> None:
 
     stats = transport.receive_stats()
     assert stats["recv_callbacks"] == 20
-    assert stats["wakeups"] == 20
+    assert stats["reader_resumptions"] == 20
     assert stats["recv_bytes"] > 0
     assert stats["pause_count"] == 0
 
@@ -453,3 +453,27 @@ async def test_stats_report_bytes_waiting_in_the_decoder() -> None:
     _deliver(protocol, _publish(4096)[:200])
 
     assert transport.stats().buffered_read_bytes == 200
+
+
+async def test_receive_stats_distinguish_coalescing_from_spurious_resumption() -> None:
+    # The counter must be independent of the callback count, or it cannot show
+    # either failure. Many callbacks before the reader runs is coalescing:
+    # resumptions fall below callbacks. The level-triggered bug is the mirror
+    # image -- resumptions climb while callbacks stay flat.
+    decoder = IncrementalDecoder()
+    protocol, _ = _wire(decoder)
+    transport = PushStreamTransport(asyncio.StreamReader(), None, protocol)  # type: ignore[arg-type]
+
+    for _ in range(10):
+        _deliver(protocol, _publish(64))
+    assert await transport.receive() is True
+
+    stats = transport.receive_stats()
+    assert stats["recv_callbacks"] == 10
+    assert stats["reader_resumptions"] == 1
+    assert stats["reader_waits"] == 0
+
+    decoded = 0
+    while decoder.next_packet() is not None:
+        decoded += 1
+    assert decoded == 10  # coalescing loses nothing

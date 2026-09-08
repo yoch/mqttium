@@ -3,6 +3,12 @@
 Date: 2026-09-08.
 Branch: `perf/decoder-recv-into`, on top of `c509bcb` (post-1.0.0rc13 `main`).
 
+**Provenance.** This branch is **PR #448** (`perf/decoder-recv-into`, based on
+`main@c509bcb`). A different PR #447 exists, by another author, prototyping the
+same architecture on top of #446. Earlier revisions of this file called this
+branch's arm "#447" before that PR existed; every such label has been corrected
+to #448. Measurements below are this branch's unless explicitly attributed.
+
 This records an independent replication of the RC13 / #445 / #446 comparison, the
 fourth architecture that came out of it, and — just as importantly — the
 hypotheses that were tested and **falsified**, so they are not proposed again.
@@ -14,7 +20,7 @@ hypotheses that were tested and **falsified**, so they are not proposed again.
 | RC13 (`main`) | `StreamReader` + `sock.recv(256 KiB)` |
 | #445 (`e0db213`) | `BufferedProtocol` + `recv_into` → `bytes(chunk)` → deque → `read()` |
 | #446 (`1b52cbd`) | `BufferedProtocol` + `recv_into` → `StreamReader.feed_data()` |
-| #447 (this branch) | `BufferedProtocol` + `recv_into` **into the decoder's own slab** |
+| #448 (this branch) | `BufferedProtocol` + `recv_into` **into the decoder's own slab** |
 
 All four end at the same place: an owned, immutable `bytes` payload on
 `Message`. That copy is not negotiable and none of the arms removes it.
@@ -43,15 +49,15 @@ GiB/s of application payload delivered as owned `bytes`:
 | #446 buffered SR 128 K | 1.299 | 0.954x | 0.236 | 1.024x | 0.072 | 1.020x |
 | #445 chunks 80 K | 1.217 | 0.894x | 0.228 | 0.987x | 0.070 | 1.000x |
 | #445 chunks 128 K | 1.446 | 1.062x | 0.238 | 1.030x | 0.069 | 0.990x |
-| #447 128 K | 1.376 | 1.010x | 0.545 | 2.363x | 0.179 | 2.536x |
-| **#447 256 K** | **2.502** | **1.837x** | **0.563** | **2.439x** | 0.178 | **2.523x** |
+| #448 128 K | 1.376 | 1.010x | 0.545 | 2.363x | 0.179 | 2.536x |
+| **#448 256 K** | **2.502** | **1.837x** | **0.563** | **2.439x** | 0.178 | **2.523x** |
 
 CPU seconds for the same volume — insensitive to scheduling:
 
 | | 64 KiB | 1 KiB | 256 B |
 |---|---:|---:|---:|
 | RC13 | 0.24 s | 0.57 s | 0.67 s |
-| #447 256 K | 0.14 s | 0.25 s | 0.27 s |
+| #448 256 K | 0.14 s | 0.25 s | 0.27 s |
 | gain | 1.69x | 2.25x | 2.46x |
 
 ## Latency
@@ -60,15 +66,25 @@ Request/response, one PUBLISH out and one echoed back, timed until the receive
 path has produced an owned payload. TCP loopback, blocking echo thread, 5
 interleaved repetitions. Reproduce with `tools/recv_arch_rtt_probe.py`.
 
-| payload | RC13 p50 | #445 | #446 | #447 | #447 vs RC13 |
+| payload | streamreader p50 | chunk-queue | buffered-sr | push | push vs base |
 |---|---:|---:|---:|---:|---:|
 | 256 B | 99.3 µs | 62.7 | 65.6 | **57.8** | 1.72x |
 | 4 KiB | 110.9 µs | 71.0 | 74.0 | **62.9** | 1.76x |
 | 64 KiB | 224.5 µs | 137.6 | 141.2 | **114.2** | 1.97x |
 
-**Read this narrowly.** It is a saturated echo loop with no engine, no effects
-and no callback dispatch, so it measures the receive path's own latency, not
-application RTT. The parallel prototype in PR #447 measured application RTT on
+**Read this narrowly, on two axes.**
+
+*Regime*: it is a saturated echo loop with no engine, no effects and no callback
+dispatch, so it measures the receive path's own latency, not application RTT.
+
+*Provenance*: it is an ablation of four receive **mechanisms** over one shared
+decoder -- this branch's. Only the `push` arm runs shipped code
+(`DecoderPushProtocol` + `PushStreamTransport` + `IncrementalDecoder`); the
+other three are minimal reimplementations of the mechanism each PR uses, not
+those branches at their commits. It supports "this mechanism costs less per
+round trip". It does not support "PR X is faster than PR Y".
+
+The parallel prototype in PR #447 measured application RTT on
 the RPi5 at a realistic fixed rate (3942 msg/s, external pacer) and found
 **+0.0047 %, i.e. no measurable p50 change**. That is the number to trust for
 application latency, and it is consistent with the end-to-end throughput result
@@ -88,9 +104,9 @@ run, 3 runs per arm, ~17-18 us of CPU per message in total:
 | payload | arm | msg/s (median) | CPU us/msg | `ru_minflt` |
 |---|---|---:|---:|---:|
 | 256 B | `main` | 60 109 | 16.6 | 1703-1916 |
-| 256 B | #447 | 61 134 | 16.3 | **332-432** |
+| 256 B | #448 | 61 134 | 16.3 | **332-432** |
 | 1 KiB | `main` | 56 815 | 17.8 | 4014-4717 |
-| 1 KiB | #447 | 57 578 | 17.7 | **341-431** |
+| 1 KiB | #448 | 57 578 | 17.7 | **341-431** |
 
 **Throughput end to end is within noise here — on the order of 1-2 %, not the
 2.4x of the isolated path.** The receive path simply is not this workload's
@@ -100,17 +116,17 @@ bottleneck once engine, effects, delivery and callback dispatch are included.
 consistently across every run.** That is the whole point. The regime this work
 exists to remove is the ASLR-dependent allocator/page-fault mode documented in
 `docs/network-release-gate.md`, which costs ~25 % throughput and ~2 extra faults
-per message when a process lands in it. #447 removes the allocation that feeds
+per message when a process lands in it. #448 removes the allocation that feeds
 it rather than making the fast regime faster.
 
-So the case for #447 is allocation stability first and CPU headroom second, and
+So the case for #448 is allocation stability first and CPU headroom second, and
 the RPi5 gate — where the bimodality actually bites — is the measurement that
 decides it.
 
 ## Three results that changed the framing
 
 **1. The win is largest on small messages, not large ones.** The investigation
-was framed around 64 KiB payloads, where #447 gains 1.84x. At 1 KiB and 256 B it
+was framed around 64 KiB payloads, where #448 gains 1.84x. At 1 KiB and 256 B it
 gains ~2.5x. Small messages are the RTT and message-rate regime, so the
 architecture matters most exactly where the study was not looking.
 
@@ -132,7 +148,7 @@ full-copy allocator probes began to bifurcate.
 
 ## The design trap: level- vs edge-triggered wakeup
 
-The first "realistic" #447 prototype — protocol signals, reader task drains —
+The first "realistic" #448 prototype — protocol signals, reader task drains —
 livelocked. The wait condition was level-triggered (`_end > _start`, "the
 decoder holds bytes"). Holding bytes is not holding a *complete frame*: on a
 partial frame the reader wakes, decodes nothing, never awaits, and so the event
@@ -180,7 +196,7 @@ see the previous point.
 reproducible gain. `bytes(memoryview(buf)[:n])` is already the right choice;
 `bytes(buf[:n])` is markedly worse because it slices the `bytearray` first.
 
-## What #447 costs
+## What #448 costs
 
 The decoder rewrite touches the `feed()` path used by TLS, WebSocket, Proactor
 and third-party loops. Naively it regressed that path ~3 %; inlining the
@@ -202,7 +218,7 @@ it still called `store.out_items()` / `store.in_items()`, removed by 42479f5
 
 Paired against `main`, full scale, isolated child process per scenario:
 
-| scenario | main peak | #447 peak | delta |
+| scenario | main peak | #448 peak | delta |
 |---|---:|---:|---:|
 | `inbound_bounded_persistence_4k` | 8.62 MiB | 8.87 MiB | **+0.250 MiB** |
 | `reconnect_epoch_cleanup_4k` | 8.12 MiB | 8.37 MiB | **+0.246 MiB** |
@@ -220,10 +236,20 @@ Both scenarios stay inside their thresholds (+3.13 and +1.83 MiB of headroom);
 The first version gave the slab back on every fully drained oversized frame.
 For a stream of frames just over capacity that is grow -> consume -> shrink ->
 grow: **100 reallocations for 50 frames**, reintroducing exactly the churn this
-design removes. An oversized slab is now retired only after
-`_OVERSIZE_RETENTION` (64) consecutive drains that did not need the extra room —
-1 reallocation for the same 50 frames — while `clear()` still drops it at once
-so a new connection never inherits it.
+design removes. An oversized slab is retired only after `_OVERSIZE_RETENTION` (64) consecutive
+drains whose consumed extent stayed inside `DEFAULT_CAPACITY` — 1 reallocation
+for the same 50 frames — while `clear()` drops it at once so a new connection
+never inherits it. So the slab does **not** shrink back as soon as a large frame
+is consumed: it is retained across a window of small frames first, and a
+sustained stream of large frames keeps it indefinitely. That retained memory is
+the deliberate cost of not thrashing.
+
+Keying retention off *reallocation* rather than consumed extent was itself a bug,
+caught in adversarial review: after the first oversized frame the slab is already
+large enough, so later oversized frames fit without reallocating and looked idle.
+Measured on 200 identical oversized frames, the slab was retired at frame 64 and
+re-grown at 65, again at 129/130 and 194/195 — periodic churn exactly contrary to
+the mechanism's purpose.
 
 ## Errors found by cross-review
 
@@ -245,14 +271,38 @@ prototype in PR #447, both of which it had guarded from the start:
 Both are the kind of defect a saturated benchmark never shows: neither affects
 throughput, and both break real connections.
 
+## Growth envelope
+
+Capacity is bounded by `max_packet_size + _MIN_WINDOW`, not by the frame size
+alone. Doubling on its own reached **2x `max_packet_size`**: a frame just over a
+doubling step leaves a tail smaller than the 16 KiB window, so the next
+`writable_window()` doubles again even though the frame never exceeds the limit.
+Measured with a 4 MiB limit and 4 KiB receive chunks: capacity 8 MiB, transient
+12 MiB while both slabs are alive. Framing rejects anything larger than
+`max_packet_size`, so that headroom can never be used; capacity is now capped
+there and the same case measures 1.01x. An explicit `feed()` larger than the
+ceiling is still honoured, since WebSocket and TLS may hand over more in one
+call.
+
+Transient peak during a reallocation remains old + new capacity, which is
+inherent to a copying grow.
+
 ## Open risks
 
 - CPython 3.12.13 here; 3.13.5 and 3.14.7 elsewhere. The three converge, but
   final validation is fresh-process on the RPi5 under the enforced preflight.
-- `DEFAULT_CAPACITY` is a throughput/memory trade, not an optimum. 128 KiB would
-  halve the per-connection cost; measured 1.38 vs 2.50 GiB/s on 64 KiB payloads
-  and equal on small ones. 256 KiB is the throughput choice; the argument for
-  128 KiB is real if per-connection footprint matters more.
+- **`DEFAULT_CAPACITY` = 256 KiB is justified only by the isolated large-payload
+  benchmark, and the gate should decide it.** At 1 KiB and 256 B, 128 KiB and
+  256 KiB are equal (0.545 vs 0.563 and 0.179 vs 0.178 GiB/s); only the 64 KiB
+  payload separates them (1.38 vs 2.50). The headline product claim here is
+  allocator stability, and that comes from receiving into stable storage rather
+  than from the slab's size, so it does **not** require 256 KiB. Note also that
+  the slab is paid by every decoder, including the `feed()` path: TLS, WebSocket,
+  Proactor and third-party loops carry the storage without getting the zero-copy
+  receive. For a process holding N connections the difference between the two is
+  a flat N x 128 KiB — 12.5 MiB at 100 connections, 125 MiB at 1000 — against a
+  gain confined to large-payload throughput. A client library holding one or a
+  few connections will not notice either way; a fan-out application will.
 - `_process_direct_qos0_batch` hoists `decoder._buf` once per batch. The grow
   path replaces that object, so it must never run mid-batch. It cannot today —
   the batch is synchronous and `get_buffer()` only runs in a loop callback — but

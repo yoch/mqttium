@@ -212,7 +212,7 @@ class DecoderPushProtocol(asyncio.StreamReaderProtocol, asyncio.BufferedProtocol
 class PushStreamTransport(StreamTransport):
     """Stream transport whose reads are delivered into an attached decoder."""
 
-    __slots__ = ("_protocol", "_seen")
+    __slots__ = ("_protocol", "_seen", "_resumptions", "_waits")
 
     def __init__(
         self,
@@ -223,6 +223,8 @@ class PushStreamTransport(StreamTransport):
         super().__init__(reader, writer)
         self._protocol = protocol
         self._seen = 0
+        self._resumptions = 0
+        self._waits = 0
 
     def attach_decoder(self, decoder: DecoderSink) -> None:
         self._protocol.attach(decoder)
@@ -250,24 +252,31 @@ class PushStreamTransport(StreamTransport):
         while protocol.received == self._seen:
             if protocol.at_eof:
                 return False
+            self._waits += 1
             await protocol.wait_for_data()
             if protocol.exception is not None:
                 raise protocol.exception
         self._seen = protocol.received
+        self._resumptions += 1
         return True
 
     def receive_stats(self) -> dict[str, int]:
         """Counters for diagnosing the receive path.
 
-        ``wakeups`` should track ``recv_callbacks`` closely; a large gap means
-        the reader is being woken without new bytes, which is the shape of the
-        level-triggered bug this design avoids.
+        ``reader_resumptions`` counts times ``receive()`` handed the reader work;
+        ``reader_waits`` counts times it actually had to suspend. Both are
+        independent of ``recv_callbacks``, which is the point: under a
+        level-triggered wait the reader resumes without new bytes, so
+        resumptions climb without bound while callbacks stay flat. Coalescing is
+        the opposite and equally visible -- several callbacks land before the
+        reader is scheduled, so resumptions fall below callbacks.
         """
         protocol = self._protocol
         return {
             "recv_callbacks": protocol.received,
             "recv_bytes": protocol.received_bytes,
-            "wakeups": self._seen,
+            "reader_resumptions": self._resumptions,
+            "reader_waits": self._waits,
             "pause_count": protocol.pauses,
             "resume_count": protocol.resumes,
         }

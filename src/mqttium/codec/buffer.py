@@ -26,8 +26,9 @@ from mqttium.errors import MalformedPacketError, PacketTooLargeError
 # Default local ceiling before CONNACK negotiation (256 MiB is the MQTT max).
 DEFAULT_MAX_PACKET_SIZE = 16 * 1024 * 1024
 # Steady-state slab size. Large enough that a saturated receive path batches
-# several frames per wakeup; the slab grows past it only for an oversized frame
-# and shrinks straight back once that frame is consumed.
+# several frames per wakeup. The slab grows past it only for a frame larger than
+# it, and is retired again only after _OVERSIZE_RETENTION drains that stayed
+# inside it -- not as soon as that frame is consumed. See _retire_oversize.
 DEFAULT_CAPACITY = 256 * 1024
 # Smallest window worth offering a receiver; also the compaction trigger.
 _MIN_WINDOW = 16 * 1024
@@ -60,7 +61,6 @@ class IncrementalDecoder:
         "_start",
         "_end",
         "_capacity",
-        "_grew",
         "_idle_drains",
         "_max_packet_size",
         "_high_water",
@@ -75,7 +75,6 @@ class IncrementalDecoder:
         self._start = 0
         self._end = 0
         self._capacity = 0
-        self._grew = False
         self._idle_drains = 0
         self._max_packet_size = max_packet_size
         self._high_water = 0
@@ -121,15 +120,26 @@ class IncrementalDecoder:
         capacity = self._capacity or DEFAULT_CAPACITY
         while capacity - live < need:
             capacity *= 2
-        if capacity > DEFAULT_CAPACITY:
-            self._grew = True
+        # Doubling alone can reach twice max_packet_size: a frame just over a
+        # doubling step leaves a tail too small for the next window and doubles
+        # again. Framing rejects anything larger than max_packet_size, so one
+        # maximum frame plus a window is all the slab can ever use. `need` still
+        # wins, because feed() may be handed more than that in one call.
+        ceiling = self._max_packet_size + _MIN_WINDOW
+        if capacity > ceiling:
+            capacity = max(ceiling, live + need)
         self._reallocate(capacity)
 
-    def _retire_oversize(self) -> None:
-        """Give back an oversized slab, but only once it has stopped being used."""
-        if self._grew:
-            # This drain consumed a frame that needed the extra room.
-            self._grew = False
+    def _retire_oversize(self, extent: int) -> None:
+        """Give back an oversized slab, but only once it has stopped being used.
+
+        ``extent`` is how far into the slab this drain actually reached. Using
+        the reallocation that created the slab instead would be wrong: after the
+        first oversized frame the slab is already large enough, so every later
+        oversized frame fits without reallocating and would look idle. That
+        retires the slab on a fixed period and re-grows on the very next frame.
+        """
+        if extent > DEFAULT_CAPACITY:
             self._idle_drains = 0
             return
         self._idle_drains += 1
@@ -139,10 +149,11 @@ class IncrementalDecoder:
 
     def _reset(self) -> None:
         """Rewind a fully consumed slab."""
+        extent = self._end
         self._start = 0
         self._end = 0
         if self._capacity > DEFAULT_CAPACITY:
-            self._retire_oversize()
+            self._retire_oversize(extent)
 
     def writable_window(self, need: int = _MIN_WINDOW) -> memoryview:
         """Return writable storage for a receiver to fill, then `commit()`.
@@ -270,7 +281,6 @@ class IncrementalDecoder:
         """Rewind for a new connection, dropping any oversized-frame growth."""
         self._start = 0
         self._end = 0
-        self._grew = False
         self._idle_drains = 0
         if self._capacity > DEFAULT_CAPACITY:
             self._reallocate(DEFAULT_CAPACITY)
@@ -338,7 +348,7 @@ class IncrementalDecoder:
             self._start = 0
             self._end = 0
             if self._capacity > DEFAULT_CAPACITY:
-                self._retire_oversize()
+                self._retire_oversize(body_end)
         return RawPacket(packet_type=packet_type, flags=flags, remaining=body)
 
     def drain_packets(self, limit: int = 100) -> list[RawPacket]:
