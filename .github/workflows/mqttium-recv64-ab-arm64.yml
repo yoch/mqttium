@@ -1,0 +1,205 @@
+name: MQTTium selector recv64 A/B ARM64
+
+on:
+  push:
+    branches: [bench/asyncio-recv-arm64-repro]
+    paths: [.github/workflows/mqttium-recv64-ab-arm64.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mqttium-regime-rpi5
+  cancel-in-progress: false
+
+env:
+  HARNESS_SHA: 14ada0d59ac16649ea785bd945a92b4a8202d738
+  BASE_SHA: c509bcb44cd686dd53c20e25f735e2e0a5783fc8
+  CANDIDATE_SHA: 915048203619eefd2dc1d3bae720d225bdcc8c40
+  TARGET_RATE: '3942'
+
+jobs:
+  compare:
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 90
+    steps:
+      - name: Capture environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          d="$RUNNER_TEMP/mqttium-recv64-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -p "$d"
+          echo "RESULTS_DIR=$d" >> "$GITHUB_ENV"
+          echo "VENV_DIR=$RUNNER_TEMP/mqttium-recv64-venv-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+          {
+            date -u --iso-8601=seconds
+            uname -a
+            lscpu
+            python3 --version
+            echo governors; cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null || true
+            echo frequencies; cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq 2>/dev/null || true
+            echo temperature; cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || true
+            free -h
+          } | tee "$d/environment.txt"
+          test "$(uname -m)" = aarch64
+
+      - name: Checkout controlled harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: yoch/mqtt-python-client-bench
+          ref: ${{ env.HARNESS_SHA }}
+          path: harness
+          persist-credentials: false
+
+      - name: Checkout baseline
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: yoch/mqttium
+          ref: ${{ env.BASE_SHA }}
+          path: baseline
+          persist-credentials: false
+
+      - name: Checkout candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: yoch/mqttium
+          ref: ${{ env.CANDIDATE_SHA }}
+          path: candidate
+          persist-credentials: false
+
+      - name: Verify provenance and candidate delta
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C harness rev-parse HEAD)" = "$HARNESS_SHA"
+          test "$(git -C baseline rev-parse HEAD)" = "$BASE_SHA"
+          test "$(git -C candidate rev-parse HEAD)" = "$CANDIDATE_SHA"
+          test -z "$(git -C harness status --porcelain --untracked-files=no)"
+          test -z "$(git -C baseline status --porcelain --untracked-files=no)"
+          test -z "$(git -C candidate status --porcelain --untracked-files=no)"
+          git -C candidate diff --stat "$BASE_SHA..$CANDIDATE_SHA" | tee "$RESULTS_DIR/candidate-diff-stat.txt"
+          git -C candidate diff "$BASE_SHA..$CANDIDATE_SHA" -- src/mqttium/transport/tcp.py tests/unit/test_tcp_selector_read_size.py > "$RESULTS_DIR/candidate.diff"
+          grep -q '_CPYTHON_SELECTOR_READ_SIZE = 64 \* 1024' candidate/src/mqttium/transport/tcp.py
+          printf 'harness=%s\nbase=%s\ncandidate=%s\n' "$HARNESS_SHA" "$BASE_SHA" "$CANDIDATE_SHA" | tee "$RESULTS_DIR/provenance.txt"
+
+      - name: Prepare Python
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv "$VENV_DIR"
+          . "$VENV_DIR/bin/activate"
+          python -m pip install --upgrade pip
+          pip install -e './harness[mqttium]'
+          PYTHONPATH=candidate/src python - <<'PY'
+          import asyncio
+          from mqttium.transport.tcp import _cap_cpython_selector_read_size
+
+          async def main():
+              server = await asyncio.start_server(lambda r, w: w.close(), '127.0.0.1', 0)
+              port = server.sockets[0].getsockname()[1]
+              reader, writer = await asyncio.open_connection('127.0.0.1', port)
+              transport = writer.transport
+              before = getattr(transport, 'max_size', None)
+              _cap_cpython_selector_read_size(transport)
+              after = getattr(transport, 'max_size', None)
+              print(type(transport), before, after)
+              if type(transport).__module__ == 'asyncio.selector_events' and before == 256 * 1024:
+                  assert after == 64 * 1024
+              writer.close(); await writer.wait_closed()
+              server.close(); await server.wait_closed()
+          asyncio.run(main())
+          PY
+
+      - name: Start Mosquitto
+        shell: bash
+        run: |
+          set -euo pipefail
+          { mosquitto -h 2>&1 || true; } | head -n 4 | tee "$RESULTS_DIR/broker-version.txt"
+          grep -q 'version 2\.1\.2' "$RESULTS_DIR/broker-version.txt"
+          if pgrep -a mosquitto; then echo 'pre-existing Mosquitto' >&2; exit 1; fi
+          cat > "$RESULTS_DIR/mosquitto.conf" <<'EOF'
+          listener 11883 127.0.0.1
+          protocol mqtt
+          set_tcp_nodelay true
+          allow_anonymous true
+          persistence false
+          connection_messages false
+          log_dest stdout
+          log_type error
+          sys_interval 1
+          max_inflight_messages 1000
+          max_queued_messages 10000
+          max_packet_size 16777216
+          max_keepalive 120
+          EOF
+          taskset -c 1 mosquitto -c "$RESULTS_DIR/mosquitto.conf" > "$RESULTS_DIR/mosquitto.log" 2>&1 &
+          echo "BROKER_PID=$!" >> "$GITHUB_ENV"
+          for _ in $(seq 1 50); do
+            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && break
+            kill -0 "$!" 2>/dev/null || { cat "$RESULTS_DIR/mosquitto.log"; exit 1; }
+            sleep 0.2
+          done
+
+      - name: Interleaved normal-ASLR matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          . "$VENV_DIR/bin/activate"
+          for seg in 1 2 3 4 5 6; do
+            PYTHONPATH=harness/src python -m mqtt_client_bench.aslr_runner --aslr normal -- \
+              --client mqttium --baseline-path baseline --candidate-path candidate \
+              --scenario application_rtt_fixed_rate --variant-index 0 \
+              --target-rate "$TARGET_RATE" --pacer-mode external \
+              --blocks 2 --max-block-retries 1 --profile standard \
+              --broker 127.0.0.1:11883 --broker-pid "$BROKER_PID" \
+              --output "$RESULTS_DIR/segment-$seg.json" \
+              | tee "$RESULTS_DIR/segment-$seg.txt"
+            sleep 5
+          done
+
+      - name: Summarize arms
+        if: always()
+        shell: bash
+        run: |
+          python3 - "$RESULTS_DIR" <<'PY' | tee "$RESULTS_DIR/summary.json"
+          import glob, json, statistics, sys
+          root=sys.argv[1]
+          rows={'baseline': [], 'candidate': []}
+          for path in sorted(glob.glob(root + '/segment-*.json')):
+              data=json.load(open(path))
+              for run in data.get('runs', []):
+                  if not run.get('active_for_verdict') or not run.get('version_ab_observation_usable'):
+                      continue
+                  arm=run.get('version_arm')
+                  if arm not in rows: continue
+                  workers=run.get('workers') or []
+                  effects=sum(int((((w.get('runtime') or {}).get('library') or {}).get('effects') or {}).get('batches') or 0) for w in workers)
+                  rows[arm].append((float(run['comparison_value']), effects))
+          out={}
+          for arm, values in rows.items():
+              p=[v[0] for v in values]
+              out[arm]={
+                  'n':len(values),
+                  'p50_ms_median':statistics.median(p) if p else None,
+                  'p50_ms_min':min(p) if p else None,
+                  'p50_ms_max':max(p) if p else None,
+                  'slow_ge_0_285_ms':sum(x >= 0.285 for x in p),
+                  'sorted_p50_ms':sorted(round(x, 6) for x in p),
+                  'effect_batches_median':statistics.median(v[1] for v in values) if values else None,
+              }
+          print(json.dumps(out, indent=2, sort_keys=True))
+          PY
+
+      - name: Stop broker
+        if: always()
+        shell: bash
+        run: '[ -n "${BROKER_PID:-}" ] && kill "$BROKER_PID" 2>/dev/null || true'
+
+      - name: Save evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: mqttium-recv64-ab-${{ github.run_id }}
+          path: ${{ env.RESULTS_DIR }}
+          if-no-files-found: error
+          retention-days: 14
