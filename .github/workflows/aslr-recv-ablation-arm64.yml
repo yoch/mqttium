@@ -1,0 +1,312 @@
+name: ASLR recv-allocation ablation ARM64
+
+on:
+  push:
+    branches: [perf/aslr-recv-buffer-ablation]
+    paths: [.github/workflows/aslr-recv-ablation-arm64.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mqttium-aslr-recv-ablation-rpi5
+  cancel-in-progress: false
+
+jobs:
+  ablation:
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 240
+    env:
+      BENCH_SHA: 37160eed99b50d1f384e1565a16d0346eb01ca56
+      BASELINE_SHA: c509bcb44cd686dd53c20e25f735e2e0a5783fc8
+      TARGET_RATE: "3942"
+      REQUIRED_MOSQUITTO: "2.1.2"
+      BLOCKS: "12"
+
+    steps:
+      - name: Set run paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/mqttium-aslr-recv-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -p "$dir"
+          echo "RESULTS_DIR=$dir" >> "$GITHUB_ENV"
+          echo "CANDIDATE_SHA=$GITHUB_SHA" >> "$GITHUB_ENV"
+
+      - name: Capture and verify ARM environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            date -u --iso-8601=seconds
+            uname -a
+            lscpu
+            python3 --version
+            echo '--- governors ---'
+            cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null || true
+            echo '--- frequencies ---'
+            cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq 2>/dev/null || true
+            echo '--- thermal ---'
+            for z in /sys/class/thermal/thermal_zone*; do
+              [ -d "$z" ] || continue
+              printf '%s ' "$z"; cat "$z/type" 2>/dev/null || true; cat "$z/temp" 2>/dev/null || true
+            done
+            echo '--- ASLR ---'
+            cat /proc/sys/kernel/randomize_va_space
+            echo '--- personality orchestrator ---'
+            cat /proc/$$/personality
+            echo '--- unix datagram queue ---'
+            cat /proc/sys/net/unix/max_dgram_qlen 2>/dev/null || true
+            uptime
+            free -h
+          } | tee "$RESULTS_DIR/environment.txt"
+          test "$(uname -m)" = aarch64
+          command -v taskset >/dev/null
+          command -v mosquitto >/dev/null
+          test "$(cat /proc/sys/kernel/randomize_va_space)" != "0"
+          gov="$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || true)"
+          test "$gov" = performance || { echo "expected performance governor, got ${gov:-missing}" >&2; exit 1; }
+
+      - name: Checkout exact measurement harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: yoch/mqtt-python-client-bench
+          ref: ${{ env.BENCH_SHA }}
+          path: harness
+          persist-credentials: false
+
+      - name: Checkout baseline main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: yoch/mqttium
+          ref: ${{ env.BASELINE_SHA }}
+          path: baseline
+          persist-credentials: false
+
+      - name: Checkout candidate ablation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: yoch/mqttium
+          ref: ${{ github.sha }}
+          path: candidate
+          persist-credentials: false
+
+      - name: Verify immutable provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C harness rev-parse HEAD)" = "$BENCH_SHA"
+          test "$(git -C baseline rev-parse HEAD)" = "$BASELINE_SHA"
+          test "$(git -C candidate rev-parse HEAD)" = "$CANDIDATE_SHA"
+          for d in harness baseline candidate; do
+            test -z "$(git -C "$d" status --porcelain --untracked-files=no)"
+          done
+          printf 'harness=%s\nbaseline=%s\ncandidate=%s\nworker_aslr=system\n' \
+            "$BENCH_SHA" "$BASELINE_SHA" "$CANDIDATE_SHA" | tee "$RESULTS_DIR/provenance.txt"
+
+      - name: Create benchmark environment and test harness additions
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RESULTS_DIR/venv"
+          . "$RESULTS_DIR/venv/bin/activate"
+          python -m pip install --upgrade pip
+          pip install -e './harness[dev,mqttium]' 'psutil>=6,<8'
+          PYTHONPATH=harness/src python -m unittest -v \
+            harness.tests.test_process_layout \
+            harness.tests.test_rtt_runtime_faults \
+            harness.tests.test_quality \
+            harness.tests.test_version_compare \
+            harness.tests.test_pacing \
+            harness.tests.test_rtt_initiator
+          PYTHONPATH=candidate/src python -m pytest -q candidate/tests/unit/test_stream_read_chunk.py
+
+      - name: Resolve CPU isolation
+        shell: bash
+        run: |
+          set -euo pipefail
+          . "$RESULTS_DIR/venv/bin/activate"
+          PYTHONPATH=harness/src python - <<'PY' | tee "$RESULTS_DIR/cpuset.json"
+          import json
+          from mqtt_client_bench.telemetry import allocate_cpuset, physical_cpu_groups
+          print(json.dumps({
+              'physical_groups': physical_cpu_groups(),
+              'mapping': allocate_cpuset(['sut','broker','loadgen','orch'], profile='standard'),
+          }, indent=2, sort_keys=True))
+          PY
+
+      - name: Start host sampler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RESULTS_DIR/sample-host.sh" <<'SH'
+          #!/usr/bin/env bash
+          while true; do
+            printf 'ts=%s ' "$(date +%s.%N)"
+            printf 'load='; cat /proc/loadavg | tr '\n' ' '
+            printf ' temp='; cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || true
+            printf ' freq='; cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq 2>/dev/null || true
+            printf ' gov='; cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || true
+            printf ' psi='; head -n1 /proc/pressure/cpu 2>/dev/null | tr '\n' ' ' || true
+            printf ' cpu='; head -n1 /proc/stat
+            sleep 1
+          done
+          SH
+          chmod +x "$RESULTS_DIR/sample-host.sh"
+          "$RESULTS_DIR/sample-host.sh" >> "$RESULTS_DIR/host-samples.txt" 2>&1 &
+          echo "SAMPLER_PID=$!" >> "$GITHUB_ENV"
+
+      - name: Start native Mosquitto 2.1.2 broker
+        shell: bash
+        run: |
+          set -euo pipefail
+          broker_bin="$(command -v mosquitto)"
+          { "$broker_bin" -h 2>&1 || true; } | head -n 6 | tee "$RESULTS_DIR/broker-version.txt"
+          BROKER_VERSION="$(python3 - "$RESULTS_DIR/broker-version.txt" <<'PY'
+          import re, sys
+          text=open(sys.argv[1], encoding='utf-8').read()
+          m=re.search(r'mosquitto version\s+([0-9]+(?:\.[0-9]+)+)', text, re.I)
+          if not m: raise SystemExit('could not parse mosquitto version')
+          print(m.group(1))
+          PY
+          )"
+          test "$BROKER_VERSION" = "$REQUIRED_MOSQUITTO" || { echo "Need Mosquitto $REQUIRED_MOSQUITTO, found $BROKER_VERSION" >&2; exit 1; }
+          if ss -ltn | grep -q ':11883 '; then echo 'port 11883 occupied' >&2; exit 1; fi
+          cat > "$RESULTS_DIR/mosquitto.conf" <<'EOF'
+          listener 11883 127.0.0.1
+          protocol mqtt
+          set_tcp_nodelay true
+          allow_anonymous true
+          persistence false
+          connection_messages false
+          log_dest stdout
+          log_type error
+          sys_interval 1
+          max_inflight_messages 1000
+          max_queued_messages 10000
+          max_packet_size 16777216
+          max_keepalive 120
+          EOF
+          broker_cpuset="$(python3 - <<'PY'
+          import json, os
+          print(json.load(open(os.path.join(os.environ['RESULTS_DIR'],'cpuset.json')))['mapping']['broker'])
+          PY
+          )"
+          taskset -c "$broker_cpuset" "$broker_bin" -c "$RESULTS_DIR/mosquitto.conf" > "$RESULTS_DIR/mosquitto.log" 2>&1 &
+          pid=$!
+          echo "BROKER_PID=$pid" >> "$GITHUB_ENV"
+          for _ in $(seq 1 50); do
+            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            kill -0 "$pid" 2>/dev/null || { cat "$RESULTS_DIR/mosquitto.log"; exit 1; }
+            sleep 0.2
+          done
+          cat "$RESULTS_DIR/mosquitto.log"; exit 1
+
+      - name: Run main versus 64 KiB ablation under normal ASLR
+        shell: bash
+        run: |
+          set -euo pipefail
+          . "$RESULTS_DIR/venv/bin/activate"
+          PYTHONPATH=harness/src python -m mqtt_client_bench.layout_runner \
+            --worker-aslr system \
+            --entrypoint version_compare -- \
+            --client mqttium \
+            --baseline-path baseline \
+            --candidate-path candidate \
+            --scenario application_rtt_fixed_rate \
+            --variant-index 0 \
+            --target-rate "$TARGET_RATE" \
+            --pacer-mode external \
+            --blocks "$BLOCKS" \
+            --max-block-retries 1 \
+            --profile standard \
+            --broker 127.0.0.1:11883 \
+            --broker-pid "$BROKER_PID" \
+            --output "$RESULTS_DIR/main-vs-recv64.json" \
+            | tee "$RESULTS_DIR/main-vs-recv64.txt"
+
+      - name: Extract slow-regime and page-fault ledger
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import csv, json, os, statistics
+          root=os.environ['RESULTS_DIR']
+          fn=os.path.join(root,'main-vs-recv64.json')
+          if not os.path.exists(fn):
+              raise SystemExit('measurement result missing')
+          data=json.load(open(fn))
+          rows=[]
+          for r in data.get('runs', []):
+              workers={w.get('role'):w for w in (r.get('workers') or [])}
+              def delta(role, key):
+                  return (((workers.get(role) or {}).get('runtime') or {}).get('measure_delta') or {}).get(key)
+              init=workers.get('rtt_initiator') or {}
+              resp=workers.get('responder') or {}
+              p50=r.get('comparison_value')
+              rows.append({
+                  'execution_slot':r.get('execution_slot'),
+                  'logical_block':r.get('logical_block'),
+                  'attempt':r.get('block_attempt'),
+                  'block_slot':r.get('block_slot'),
+                  'arm':r.get('ab_label'),
+                  'sha':((r.get('version_source') or {}).get('git_sha')),
+                  'active_for_verdict':r.get('active_for_verdict'),
+                  'status':r.get('status'),
+                  'temporal_ok':((r.get('temporal_quality') or {}).get('ok')),
+                  'latency_p50_ms':p50,
+                  'slow_ge_0_285':bool(p50 is not None and float(p50) >= 0.285),
+                  'init_ru_minflt':delta('rtt_initiator','ru_minflt'),
+                  'init_ru_majflt':delta('rtt_initiator','ru_majflt'),
+                  'init_ru_stime_s':delta('rtt_initiator','ru_stime_s'),
+                  'init_sent':init.get('sent_in_window'),
+                  'resp_ru_minflt':delta('responder','ru_minflt'),
+                  'resp_ru_majflt':delta('responder','ru_majflt'),
+                  'resp_ru_stime_s':delta('responder','ru_stime_s'),
+                  'resp_received':resp.get('requests_received'),
+                  'reasons':' | '.join(map(str,r.get('reasons') or [])),
+                  'retry_reasons':' | '.join(map(str,r.get('block_retry_reasons') or [])),
+              })
+          fields=list(rows[0]) if rows else ['execution_slot']
+          with open(os.path.join(root,'slots.csv'),'w',newline='') as f:
+              w=csv.DictWriter(f,fieldnames=fields); w.writeheader(); w.writerows(rows)
+          summary={}
+          for arm in ('A','B'):
+              selected=[x for x in rows if x['arm']==arm and x['active_for_verdict'] and x['temporal_ok']]
+              p=[float(x['latency_p50_ms']) for x in selected if x['latency_p50_ms'] is not None]
+              fi=[int(x['init_ru_minflt']) for x in selected if x['init_ru_minflt'] is not None]
+              fr=[int(x['resp_ru_minflt']) for x in selected if x['resp_ru_minflt'] is not None]
+              summary[arm]={
+                  'n_selected_temporal_ok':len(selected),
+                  'slow':sum(bool(x['slow_ge_0_285']) for x in selected),
+                  'p50_median_ms':statistics.median(p) if p else None,
+                  'p50_min_ms':min(p) if p else None,
+                  'p50_max_ms':max(p) if p else None,
+                  'init_ru_minflt_median':statistics.median(fi) if fi else None,
+                  'resp_ru_minflt_median':statistics.median(fr) if fr else None,
+              }
+          with open(os.path.join(root,'summary.json'),'w') as f: json.dump(summary,f,indent=2,sort_keys=True)
+          print(json.dumps(summary,indent=2,sort_keys=True))
+          print('raw_slots',len(rows))
+          PY
+          cat "$RESULTS_DIR/slots.csv"
+
+      - name: Stop sampler and broker
+        if: always()
+        shell: bash
+        run: |
+          [ -n "${SAMPLER_PID:-}" ] && kill "$SAMPLER_PID" 2>/dev/null || true
+          if [ -n "${BROKER_PID:-}" ]; then
+            kill "$BROKER_PID" 2>/dev/null || true
+            wait "$BROKER_PID" 2>/dev/null || true
+          fi
+
+      - name: Upload raw ASLR ablation evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: aslr-recv-ablation-arm64-${{ github.run_id }}
+          path: ${{ env.RESULTS_DIR }}
+          if-no-files-found: error
+          retention-days: 14
