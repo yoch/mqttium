@@ -148,15 +148,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Second pass mirrors the first pass's starting order so any first-cell
+          # effect is assigned once to each finalist across the combined 8 pairs.
           cat > sat-finalists/matrix.tsv <<'EOF'
-          0	0	445
-          1	0	446
-          2	1	446
-          3	1	445
-          4	2	446
-          5	2	445
-          6	3	445
-          7	3	446
+          0	0	446
+          1	0	445
+          2	1	445
+          3	1	446
+          4	2	445
+          5	2	446
+          6	3	446
+          7	3	445
           EOF
 
           while IFS=$'\t' read -r idx pair arm; do
@@ -186,7 +188,6 @@ jobs:
             done
             test "$ok" = 1 || { echo "subscriber not ready" >&2; kill "$subpid" || true; exit 1; }
 
-            # Publisher is deliberately the same immutable #445 SHA for both arms.
             taskset -c 2 env PYTHONPATH="$PWD/pr445/src" python3 tools/mqtt_saturated_finalists_probe.py \
               publisher --host 127.0.0.1 --port "$PORT" --topic "$topic" \
               --payload-size "$PAYLOAD_SIZE" --duration-s "$PUBLISHER_S" --output "$pub" \
