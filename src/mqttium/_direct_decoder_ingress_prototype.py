@@ -44,6 +44,12 @@ class _IngressReady(bytes):
 _INGRESS_READY = _IngressReady(b"\x00")
 
 
+def _direct_ingress_enabled(ssl: Any, loop: asyncio.AbstractEventLoop) -> bool:
+    """Return whether this connection can use selector ``recv_into`` ingress."""
+
+    return ssl is None and isinstance(loop, asyncio.SelectorEventLoop)
+
+
 class DirectIngressDecoder(_IncrementalDecoder):
     """IncrementalDecoder variant with writable spare capacity.
 
@@ -198,6 +204,7 @@ class DirectIngressDecoder(_IncrementalDecoder):
         so it can surface the protocol error rather than leaving the socket
         paused forever.
         """
+
         try:
             return self.peek_packet_bounds() is not None
         except (MalformedPacketError, PacketTooLargeError):
@@ -289,10 +296,7 @@ class _DirectDecoderProtocol(asyncio.StreamReaderProtocol, asyncio.BufferedProto
         transport = self.rx_transport
         if (
             self.read_paused
-            and (
-                self.decoder.buffered <= _READ_LOW_WATER
-                or not self.decoder.head_is_actionable()
-            )
+            and (self.decoder.buffered <= _READ_LOW_WATER or not self.decoder.head_is_actionable())
             and transport is not None
             and not transport.is_closing()
         ):
@@ -399,7 +403,7 @@ async def _connect_direct(
     decoder: DirectIngressDecoder,
 ) -> StreamTransport:
     loop = asyncio.get_running_loop()
-    if ssl is not None or not isinstance(loop, asyncio.SelectorEventLoop):
+    if not _direct_ingress_enabled(ssl, loop):
         return await _StdTcpTransport.connect(host, port, ssl=ssl)
 
     reader = asyncio.StreamReader(loop=loop)
@@ -414,7 +418,12 @@ async def _connect_direct(
 
 
 def install() -> type[_AsyncClient]:
-    """Install the benchmark-only AsyncClient subclass into mqttium.api."""
+    """Install the benchmark-only AsyncClient subclass into mqttium.api.
+
+    The ordinary decoder is retained until a clear-text SelectorEventLoop
+    connection actually selects the experiment. TLS, ProactorEventLoop and any
+    other unsupported loop therefore keep #446's transport *and* decoder.
+    """
 
     import mqttium.api as api_module
     import mqttium.api.async_client as async_client_module
@@ -428,9 +437,8 @@ def install() -> type[_AsyncClient]:
 
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, **kwargs)
-            old_decoder = self._decoder
-            decoder = DirectIngressDecoder(old_decoder.max_packet_size)
-            self._decoder = decoder
+            standard_decoder = self._decoder
+            direct_decoder: DirectIngressDecoder | None = None
 
             async def factory(
                 host: str,
@@ -438,7 +446,21 @@ def install() -> type[_AsyncClient]:
                 *,
                 ssl: Any = None,
             ) -> StreamTransport:
-                return await _connect_direct(host, port, ssl=ssl, decoder=decoder)
+                nonlocal direct_decoder
+
+                loop = asyncio.get_running_loop()
+                current_limit = self._decoder.max_packet_size
+                if _direct_ingress_enabled(ssl, loop):
+                    if direct_decoder is None:
+                        direct_decoder = DirectIngressDecoder(current_limit)
+                    else:
+                        direct_decoder.max_packet_size = current_limit
+                    self._decoder = direct_decoder
+                    return await _connect_direct(host, port, ssl=None, decoder=direct_decoder)
+
+                standard_decoder.max_packet_size = current_limit
+                self._decoder = standard_decoder
+                return await _StdTcpTransport.connect(host, port, ssl=ssl)
 
             self._transport_factory = factory
 
