@@ -9,6 +9,39 @@ from typing import Protocol
 from mqttium.transport.stats import TransportStats
 
 _WRITE_BUFFER_HIGH_WATER = 64 * 1024
+# CPython's selector transport asks socket.recv() for 256 KiB on every readable
+# callback. That allocation is upstream of StreamReader and has shown a strong
+# layout/minor-fault sensitivity on ARM. Cap it to the StreamReader's default
+# 64 KiB limit when the implementation exposes the private max_size knob. This
+# is intentionally a narrow ablation: other event loops/transports are left
+# untouched, and MQTTium's own decoder/read batching is unchanged.
+_SELECTOR_READ_CHUNK = 64 * 1024
+
+
+def _cap_selector_read_chunk(writer: asyncio.StreamWriter) -> int | None:
+    """Reduce CPython selector recv allocation when that implementation exposes it.
+
+    ``asyncio`` does not provide a public read-chunk control for streams.  The
+    selector transport does expose a mutable ``max_size`` class/instance
+    attribute; uvloop and other transports may not.  In the latter case we do
+    nothing rather than depending on a private implementation detail that is not
+    present.
+
+    Returns the effective integer max_size when observable, otherwise ``None``.
+    """
+    transport = writer.transport
+    if transport is None:
+        return None
+    current = getattr(transport, "max_size", None)
+    if not isinstance(current, int) or current <= 0:
+        return None
+    if current > _SELECTOR_READ_CHUNK:
+        try:
+            transport.max_size = _SELECTOR_READ_CHUNK
+        except (AttributeError, TypeError):
+            return current
+        current = getattr(transport, "max_size", current)
+    return int(current) if isinstance(current, int) else None
 
 
 def write_buffer_needs_drain(writer: asyncio.StreamWriter) -> bool:
@@ -32,6 +65,7 @@ class StreamTransport:
     def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         self._reader = reader
         self._writer = writer
+        _cap_selector_read_chunk(writer)
 
     async def write(self, data: bytes) -> None:
         self._writer.write(data)
