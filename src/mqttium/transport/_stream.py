@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
-from typing import Protocol
+from typing import Any, Protocol, cast
 
 from mqttium.transport.stats import TransportStats
 
@@ -37,7 +37,7 @@ def _cap_selector_read_chunk(writer: asyncio.StreamWriter) -> int | None:
         return None
     if current > _SELECTOR_READ_CHUNK:
         try:
-            setattr(transport, "max_size", _SELECTOR_READ_CHUNK)
+            cast(Any, transport).max_size = _SELECTOR_READ_CHUNK
         except (AttributeError, TypeError):
             return current
         current = getattr(transport, "max_size", current)
