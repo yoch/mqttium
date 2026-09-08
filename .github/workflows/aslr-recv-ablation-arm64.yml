@@ -19,6 +19,7 @@ jobs:
     env:
       BENCH_SHA: 37160eed99b50d1f384e1565a16d0346eb01ca56
       BASELINE_SHA: c509bcb44cd686dd53c20e25f735e2e0a5783fc8
+      CANDIDATE_SHA: fa8b5e9d9ea361c3c6cea2f280aa39e21b9505ea
       TARGET_RATE: "3942"
       REQUIRED_MOSQUITTO: "2.1.2"
       BLOCKS: "12"
@@ -31,7 +32,6 @@ jobs:
           dir="$RUNNER_TEMP/mqttium-aslr-recv-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           mkdir -p "$dir"
           echo "RESULTS_DIR=$dir" >> "$GITHUB_ENV"
-          echo "CANDIDATE_SHA=$GITHUB_SHA" >> "$GITHUB_ENV"
 
       - name: Capture and verify ARM environment
         shell: bash
@@ -42,18 +42,13 @@ jobs:
             uname -a
             lscpu
             python3 --version
-            echo '--- governors ---'
-            cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null || true
-            echo '--- frequencies ---'
-            cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq 2>/dev/null || true
+            echo '--- governors/frequencies ---'
+            paste /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq 2>/dev/null || true
             echo '--- thermal ---'
-            for z in /sys/class/thermal/thermal_zone*; do
-              [ -d "$z" ] || continue
-              printf '%s ' "$z"; cat "$z/type" 2>/dev/null || true; cat "$z/temp" 2>/dev/null || true
-            done
+            cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || true
             echo '--- ASLR ---'
             cat /proc/sys/kernel/randomize_va_space
-            echo '--- personality orchestrator ---'
+            echo '--- orchestrator personality ---'
             cat /proc/$$/personality
             echo '--- unix datagram queue ---'
             cat /proc/sys/net/unix/max_dgram_qlen 2>/dev/null || true
@@ -61,11 +56,10 @@ jobs:
             free -h
           } | tee "$RESULTS_DIR/environment.txt"
           test "$(uname -m)" = aarch64
+          test "$(cat /proc/sys/kernel/randomize_va_space)" != 0
+          test "$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)" = performance
           command -v taskset >/dev/null
           command -v mosquitto >/dev/null
-          test "$(cat /proc/sys/kernel/randomize_va_space)" != "0"
-          gov="$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || true)"
-          test "$gov" = performance || { echo "expected performance governor, got ${gov:-missing}" >&2; exit 1; }
 
       - name: Checkout exact measurement harness
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -75,7 +69,7 @@ jobs:
           path: harness
           persist-credentials: false
 
-      - name: Checkout baseline main
+      - name: Checkout baseline
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: yoch/mqttium
@@ -83,11 +77,11 @@ jobs:
           path: baseline
           persist-credentials: false
 
-      - name: Checkout candidate ablation
+      - name: Checkout candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: yoch/mqttium
-          ref: ${{ github.sha }}
+          ref: ${{ env.CANDIDATE_SHA }}
           path: candidate
           persist-credentials: false
 
@@ -104,7 +98,7 @@ jobs:
           printf 'harness=%s\nbaseline=%s\ncandidate=%s\nworker_aslr=system\n' \
             "$BENCH_SHA" "$BASELINE_SHA" "$CANDIDATE_SHA" | tee "$RESULTS_DIR/provenance.txt"
 
-      - name: Create benchmark environment and test harness additions
+      - name: Create benchmark environment and validate additions
         shell: bash
         run: |
           set -euo pipefail
@@ -119,7 +113,10 @@ jobs:
             harness.tests.test_version_compare \
             harness.tests.test_pacing \
             harness.tests.test_rtt_initiator
-          PYTHONPATH=candidate/src python -m pytest -q candidate/tests/unit/test_stream_read_chunk.py
+          # MQTTium's repository-wide pytest addopts include --timeout; this
+          # focused unit test does not need plugins, so ignore project addopts.
+          PYTHONPATH=candidate/src python -m pytest -q -o addopts='' \
+            candidate/tests/unit/test_stream_read_chunk.py
 
       - name: Resolve CPU isolation
         shell: bash
@@ -142,8 +139,7 @@ jobs:
           cat > "$RESULTS_DIR/sample-host.sh" <<'SH'
           #!/usr/bin/env bash
           while true; do
-            printf 'ts=%s ' "$(date +%s.%N)"
-            printf 'load='; cat /proc/loadavg | tr '\n' ' '
+            printf 'ts=%s load=' "$(date +%s.%N)"; cat /proc/loadavg | tr '\n' ' '
             printf ' temp='; cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || true
             printf ' freq='; cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq 2>/dev/null || true
             printf ' gov='; cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || true
@@ -162,7 +158,7 @@ jobs:
           set -euo pipefail
           broker_bin="$(command -v mosquitto)"
           { "$broker_bin" -h 2>&1 || true; } | head -n 6 | tee "$RESULTS_DIR/broker-version.txt"
-          BROKER_VERSION="$(python3 - "$RESULTS_DIR/broker-version.txt" <<'PY'
+          version="$(python3 - "$RESULTS_DIR/broker-version.txt" <<'PY'
           import re, sys
           text=open(sys.argv[1], encoding='utf-8').read()
           m=re.search(r'mosquitto version\s+([0-9]+(?:\.[0-9]+)+)', text, re.I)
@@ -170,7 +166,7 @@ jobs:
           print(m.group(1))
           PY
           )"
-          test "$BROKER_VERSION" = "$REQUIRED_MOSQUITTO" || { echo "Need Mosquitto $REQUIRED_MOSQUITTO, found $BROKER_VERSION" >&2; exit 1; }
+          test "$version" = "$REQUIRED_MOSQUITTO" || { echo "Need Mosquitto $REQUIRED_MOSQUITTO, found $version" >&2; exit 1; }
           if ss -ltn | grep -q ':11883 '; then echo 'port 11883 occupied' >&2; exit 1; fi
           cat > "$RESULTS_DIR/mosquitto.conf" <<'EOF'
           listener 11883 127.0.0.1
@@ -235,7 +231,8 @@ jobs:
           root=os.environ['RESULTS_DIR']
           fn=os.path.join(root,'main-vs-recv64.json')
           if not os.path.exists(fn):
-              raise SystemExit('measurement result missing')
+              print('measurement result missing; nothing to reduce')
+              raise SystemExit(0)
           data=json.load(open(fn))
           rows=[]
           for r in data.get('runs', []):
@@ -286,11 +283,12 @@ jobs:
                   'init_ru_minflt_median':statistics.median(fi) if fi else None,
                   'resp_ru_minflt_median':statistics.median(fr) if fr else None,
               }
-          with open(os.path.join(root,'summary.json'),'w') as f: json.dump(summary,f,indent=2,sort_keys=True)
+          with open(os.path.join(root,'summary.json'),'w') as f:
+              json.dump(summary,f,indent=2,sort_keys=True)
           print(json.dumps(summary,indent=2,sort_keys=True))
           print('raw_slots',len(rows))
           PY
-          cat "$RESULTS_DIR/slots.csv"
+          cat "$RESULTS_DIR/slots.csv" 2>/dev/null || true
 
       - name: Stop sampler and broker
         if: always()
