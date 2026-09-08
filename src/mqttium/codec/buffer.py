@@ -324,7 +324,7 @@ class IncrementalDecoder:
             rl_end = start + 3
         else:
             try:
-                remaining_length, rl_end = decode_vbi(buf, start + 1)
+                remaining_length, rl_end = decode_vbi(buf, start + 1, end=self._end)
             except MalformedPacketError:
                 if available >= 5:
                     raise
