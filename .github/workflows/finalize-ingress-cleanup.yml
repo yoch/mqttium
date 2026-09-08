@@ -1,0 +1,51 @@
+name: Finalize ingress cleanup
+
+on:
+  push:
+    branches: [perf/direct-decoder-ingress-prototype]
+    paths:
+      - .github/workflows/finalize-ingress-cleanup.yml
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: perf/direct-decoder-ingress-prototype
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Fix stale decoder test and remove staging workflows
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('tests/unit/test_direct_qos0_capture.py')
+          s = p.read_text()
+          old = '    client._decoder._buf.extend(b"\\x30\\x01\\x00")'
+          new = '    client._decoder.feed(b"\\x30\\x01\\x00")'
+          assert s.count(old) == 1
+          p.write_text(s.replace(old, new, 1))
+          PY
+          rm -f .github/workflows/apply-ingress-contract.yml
+          rm -f .github/workflows/apply-ingress-contract-v2.yml
+          rm -f .github/workflows/finalize-ingress-cleanup.yml
+          grep -R "_decoder\._buf\.extend" tests .github/validation || true
+          python -m pip install -e '.[dev]' >/dev/null
+          ruff format --check src tests benchmarks tools
+          ruff check src tests benchmarks tools
+          mypy src/mqttium
+          python -m pytest -q tests/unit/test_direct_qos0_capture.py tests/unit/test_decoder_ingress_storage.py tests/unit/test_decoder_push_transport.py
+      - name: Commit cleanup
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "mqttium implementation agent"
+          git config user.email "actions@users.noreply.github.com"
+          git add -A
+          git commit -m "test: align ingress tests with logical decoder storage"
+          git push origin HEAD:perf/direct-decoder-ingress-prototype
