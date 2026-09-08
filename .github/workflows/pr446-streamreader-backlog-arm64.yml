@@ -68,7 +68,7 @@ jobs:
           test "$(git -C pr446 rev-parse HEAD)" = "$PR446_RUNTIME_SHA"
           grep -q '_READ_CHUNK = 80 \* 1024' pr445/src/mqttium/transport/_buffered.py
           grep -q '_RECEIVE_BUFFER_SIZE = 80 \* 1024' pr446/src/mqttium/transport/tcp.py
-          printf 'pr445=%s\npr446=%s\nworker_aslr=system\nburst_bytes=163840\n' \
+          printf 'pr445=%s\npr446=%s\nworker_aslr=system\nburst_bytes=196608\nforced_backlog_bytes=131073\n' \
             "$PR445_SHA" "$PR446_RUNTIME_SHA" | tee "$RESULTS_DIR/provenance.txt"
 
       - name: Start isolated burst server
@@ -93,30 +93,33 @@ jobs:
           script = root / 'probe/tools/pr446_streamreader_backlog_probe.py'
           port = os.environ['PORT']
           plan = ['pr446'] * 24 + ['pr445'] * 8
-          random.Random(446160).shuffle(plan)
+          random.Random(446129).shuffle(plan)
           rows = []
           for index, arm in enumerate(plan, 1):
               env = os.environ.copy()
               env['PYTHONPATH'] = str((root / arm / 'src').resolve())
-              cmd = [
-                  'taskset', '-c', '0', sys.executable, str(script),
-                  '--client', '--port', port, '--warmup', '5', '--cycles', '100',
-              ]
-              proc = subprocess.run(cmd, check=True, capture_output=True, text=True, env=env)
+              cmd = ['taskset', '-c', '0', sys.executable, str(script),
+                     '--client', '--port', port, '--warmup', '5', '--cycles', '100']
+              proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
+              if proc.returncode:
+                  print(f'FAILED {arm} sample {index}:\n{proc.stderr}', file=sys.stderr)
+                  raise SystemExit(proc.returncode)
               row = json.loads(proc.stdout)
               row['arm'] = arm
               row['execution_index'] = index
               rows.append(row)
               print(
                   f"{index:02d}/{len(plan)} {arm} impl={row['implementation']} "
-                  f"max={row['max_buffered_bytes']} minflt/cycle={row['minflt_per_cycle']:.3f} "
+                  f"max={row['max_buffered_bytes']} first_min={row['first_read_bytes_min']} "
+                  f"minflt/cycle={row['minflt_per_cycle']:.3f} "
                   f"stime_us/cycle={row['stime_us_per_cycle']:.2f}",
-                  file=sys.stderr,
-                  flush=True,
+                  file=sys.stderr, flush=True,
               )
 
           if not all(r['forced_backlog_proven'] for r in rows):
-              raise SystemExit('probe invalid: at least one sample never proved >=160 KiB backlog')
+              raise SystemExit('probe invalid: a sample never exceeded the 128-KiB threshold')
+          if not all(r['large_streamreader_read_proven'] for r in rows):
+              raise SystemExit('probe invalid: a StreamReader sample did not return >128 KiB first')
 
           def summarize(arm):
               subset = [r for r in rows if r['arm'] == arm]
@@ -127,6 +130,8 @@ jobs:
                   'implementation': sorted({r['implementation'] for r in subset}),
                   'max_buffered_bytes_min': min(int(r['max_buffered_bytes']) for r in subset),
                   'max_buffered_bytes_max': max(int(r['max_buffered_bytes']) for r in subset),
+                  'first_read_bytes_min': min(int(r['first_read_bytes_min']) for r in subset),
+                  'first_read_bytes_max': max(int(r['first_read_bytes_max']) for r in subset),
                   'minflt_per_cycle_median': statistics.median(minflt),
                   'minflt_per_cycle_max': max(minflt),
                   'fault_heavy_ge_1_per_cycle': sum(v >= 1.0 for v in minflt),
@@ -135,8 +140,8 @@ jobs:
               }
 
           result = {
-              'schema_version': 1,
-              'probe': 'forced_streamreader_160k_backlog_fresh_process',
+              'schema_version': 2,
+              'probe': 'forced_over_128k_streamreader_backlog_fresh_process',
               'representative_aslr': True,
               'diagnostic_only': True,
               'pr445_sha': os.environ['PR445_SHA'],
