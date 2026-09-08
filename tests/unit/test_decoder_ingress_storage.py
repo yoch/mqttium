@@ -156,3 +156,18 @@ def test_vbi_decoder_respects_logical_end_of_capacity_slab() -> None:
         assert "Incomplete" in str(exc)
     else:
         raise AssertionError("uncommitted slab capacity participated in VBI decode")
+
+
+def test_fragmented_vbi_framing_never_reads_uncommitted_slab_capacity() -> None:
+    decoder = IncrementalDecoder(max_packet_size=4)
+    window = decoder.writable_window(64 * 1024)
+    window[:2] = b"\x30\x80"
+    window.release()
+    decoder.commit(2)
+
+    # The zero-filled capacity byte at index 2 is not network input. Before
+    # 1a2c8e52, peek_packet_bounds() let decode_vbi() read it and could turn an
+    # incomplete Remaining Length into a malformed/complete framing decision.
+    assert decoder.buffered == 2
+    assert decoder.peek_packet_bounds() is None
+    assert decoder.next_packet() is None
