@@ -434,7 +434,7 @@ def install() -> type[_AsyncClient]:
     if getattr(base_client, "_direct_ingress_prototype", False):
         return base_client
 
-    class DirectIngressAsyncClient(base_client):
+    class DirectIngressAsyncClient(_AsyncClient):
         _direct_ingress_prototype = True
 
         def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -472,6 +472,9 @@ def install() -> type[_AsyncClient]:
                 self._decoder.max_packet_size if max_packet_size is None else max_packet_size
             )
             self._decoder = decoder
+            # Unsupported transports should retain neither direct behavior nor
+            # the experiment's potentially grown receive allocation.
+            self._direct_ingress_decoder = None
 
         async def connect(
             self,
@@ -519,8 +522,8 @@ def install() -> type[_AsyncClient]:
 
     DirectIngressAsyncClient.__name__ = "AsyncClient"
     DirectIngressAsyncClient.__qualname__ = "AsyncClient"
-    async_client_module.AsyncClient = DirectIngressAsyncClient
-    api_module.AsyncClient = DirectIngressAsyncClient
+    async_client_module.AsyncClient = DirectIngressAsyncClient  # type: ignore[misc]
+    api_module.AsyncClient = DirectIngressAsyncClient  # type: ignore[misc]
     return DirectIngressAsyncClient
 
 
