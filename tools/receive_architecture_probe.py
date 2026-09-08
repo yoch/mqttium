@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Short symmetric MQTT receive probe for receive-architecture prototypes."""
+"""Short symmetric MQTT receive probe for the direct-ingress prototype."""
 
 from __future__ import annotations
 
@@ -8,11 +8,8 @@ import asyncio
 import json
 import os
 import resource
-import socket
 import time
-from contextlib import suppress
 from pathlib import Path
-from typing import Any
 
 
 def _usage() -> tuple[int, int, float, float]:
@@ -29,52 +26,11 @@ def _proc_snapshot(pid: int) -> tuple[int, int, float] | None:
     return int(fields[9]), int(fields[11]), (int(fields[13]) + int(fields[14])) / ticks
 
 
-def _install_stream128() -> None:
-    import mqttium.transport.tcp as tcp_module
-
-    tcp_module._RECEIVE_BUFFER_SIZE = 128 * 1024
-
-
-def _install_cap128() -> None:
-    import mqttium.api.async_client as async_client_module
-    import mqttium.transport.tcp as tcp_module
-    from mqttium.transport._stream import StreamTransport
-
-    class Cap128TcpTransport(StreamTransport):
-        @classmethod
-        async def connect(
-            cls,
-            host: str,
-            port: int,
-            *,
-            ssl: Any = None,
-        ) -> "Cap128TcpTransport":
-            loop = asyncio.get_running_loop()
-            reader, writer = await asyncio.open_connection(host, port, ssl=ssl)
-            if ssl is None and isinstance(loop, asyncio.SelectorEventLoop):
-                transport = writer.transport
-                if transport is None or not hasattr(transport, "max_size"):
-                    raise RuntimeError("selector transport has no max_size control")
-                transport.max_size = 128 * 1024
-            sock = writer.get_extra_info("socket")
-            if sock is not None:
-                with suppress(OSError):
-                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            return cls(reader, writer)
-
-    tcp_module.TcpTransport = Cap128TcpTransport
-    async_client_module.TcpTransport = Cap128TcpTransport
-
-
 def _client_class(arm: str):
     if arm == "direct":
         from mqttium._direct_decoder_ingress_prototype import install
 
         install()
-    elif arm == "stream128":
-        _install_stream128()
-    elif arm == "cap128":
-        _install_cap128()
     elif arm != "base80":
         raise ValueError(f"unknown arm: {arm}")
 
@@ -90,10 +46,10 @@ async def run_subscriber(args: argparse.Namespace) -> dict:
     messages = 0
     payload_bytes = 0
     measuring = False
+    receive_stats = None
 
     def on_message(message) -> None:
         nonlocal messages, payload_bytes
-        # Mutable receive storage must never escape to the application.
         if not isinstance(message.payload, bytes):
             raise AssertionError(f"payload escaped as {type(message.payload)!r}, expected bytes")
         first_message.set()
@@ -124,6 +80,9 @@ async def run_subscriber(args: argparse.Namespace) -> dict:
         elapsed = time.perf_counter() - started
         after = _usage()
         broker_after = _proc_snapshot(args.broker_pid) if args.broker_pid else None
+        stats_method = getattr(client._transport, "receive_stats", None)
+        if stats_method is not None:
+            receive_stats = stats_method()
     finally:
         measuring = False
         await client.disconnect()
@@ -156,6 +115,7 @@ async def run_subscriber(args: argparse.Namespace) -> dict:
         "broker_cpu_pct": broker_cpu_pct,
         "broker_minflt": broker_minflt,
         "broker_majflt": broker_majflt,
+        "receive_stats": receive_stats,
     }
 
 
@@ -201,7 +161,7 @@ async def run_publisher(args: argparse.Namespace) -> dict:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser()
     p.add_argument("role", choices=("subscriber", "publisher"))
-    p.add_argument("--arm", default="base80")
+    p.add_argument("--arm", choices=("base80", "direct"), default="base80")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=11883)
     p.add_argument("--topic", required=True)
