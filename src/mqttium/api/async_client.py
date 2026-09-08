@@ -75,7 +75,7 @@ from mqttium.protocol.outbound import _PreparedPublish
 from mqttium.protocol.reconnect import ReconnectPolicy
 from mqttium.persistence.memory import InflightStore
 from mqttium.topics import validate_subscribe_filter
-from mqttium.transport._stream import AsyncTransport
+from mqttium.transport._stream import AsyncTransport, DecoderPushTransport
 from mqttium.transport.tcp import TcpTransport
 from mqttium.transport.unix import UnixSocketTransport
 from mqttium.transport.websocket import WebSocketTransport
@@ -1064,6 +1064,11 @@ class AsyncClient:
             self._teardown_final = False
             self._last_disconnect = None
             self._decoder.clear()
+            if isinstance(transport, DecoderPushTransport):
+                # This transport receives straight into the decoder's storage.
+                # It stays paused until attached, so nothing is read before the
+                # decoder is ready for the new connection.
+                transport.attach_decoder(self._decoder)
             self._write_pump.reset()
             self._ping_pending = False
             connect_packet = self._engine.begin_connect()
@@ -1943,12 +1948,19 @@ class AsyncClient:
             MQTTProtocolVersion.MQTTv311,
             MQTTProtocolVersion.MQTTv5,
         )
+        # A push transport has already placed received bytes in the decoder by
+        # the time it reports them, so there is nothing to feed.
+        push = self._transport if isinstance(self._transport, DecoderPushTransport) else None
         try:
             while not self._transport.is_closing():
-                data = await self._transport.read(256 * 1024)
-                if not data:
-                    break
-                self._decoder.feed(data)
+                if push is not None:
+                    if not await push.receive():
+                        break
+                else:
+                    data = await self._transport.read(256 * 1024)
+                    if not data:
+                        break
+                    self._decoder.feed(data)
                 # Process one bounded packet batch at a time. Applying its
                 # effects before decoding the next batch propagates delivery
                 # byte backpressure all the way to transport.read().
