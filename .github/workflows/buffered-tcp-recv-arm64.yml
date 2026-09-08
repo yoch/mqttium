@@ -91,7 +91,8 @@ jobs:
           python3 -m venv "$RESULTS_DIR/venv"
           . "$RESULTS_DIR/venv/bin/activate"
           python -m pip install --upgrade pip
-          pip install -e './harness[dev,mqttium]' 'psutil>=6,<8'
+          pip install -e './harness[dev,mqttium]' 'psutil>=6,<8' 'pytest-asyncio>=0.24'
+          python -c 'import pytest_asyncio; print(pytest_asyncio.__version__)'
           PYTHONPATH=candidate/src python -m pytest -q -o addopts='' \
             candidate/tests/unit/test_buffered_tcp_transport.py
 
