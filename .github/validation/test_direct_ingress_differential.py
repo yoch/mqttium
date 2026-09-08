@@ -162,20 +162,17 @@ def test_direct_decoder_matches_size_limit_decision_without_body(
     limit,
 ):
     # Build only the fixed header. Oversize decisions are required as soon as
-    # Remaining Length is known; otherwise both decoders must remain incomplete.
+    # Remaining Length is known. RL=0 is already a complete frame; non-zero
+    # in-range declarations remain incomplete until body bytes arrive.
     from mqttium.codec.vbi import encode_vbi
 
-    wire = b"\x30" + encode_vbi(remaining_length)
+    encoded = encode_vbi(remaining_length)
+    wire = b"\x30" + encoded
     standard = IncrementalDecoder(max_packet_size=limit)
     direct = DirectIngressDecoder(max_packet_size=limit)
     standard.feed(wire)
     direct.feed(wire)
 
-    left = _packet_result(standard)
-    right = _packet_result(direct)
-    assert left[0] == right[0]
-    if left[0] == "exc":
-        assert left[1] is right[1]
-    else:
-        assert left[1] is right[1] is None
-        _assert_same_state(standard, direct)
+    survived = _drain_equally(standard, direct)
+    total_size = 1 + len(encoded) + remaining_length
+    assert survived is (total_size <= limit)
