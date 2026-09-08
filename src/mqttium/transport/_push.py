@@ -213,10 +213,9 @@ class PushStreamTransport(_StreamTransportBase):
     """TCP stream whose receive side commits directly into an attached decoder.
 
     ``receive()`` is edge-triggered on selector callbacks; buffered partial MQTT
-    data is not itself a readiness condition.  The temporary ``read`` override
-    is kept only for compatibility with the current AsyncTransport protocol and
-    fails loudly; the follow-up transport-contract commit removes that method
-    from the capability entirely.
+    data is not itself a readiness condition.  This class intentionally has no
+    ``read()`` method: decoder ingress is a distinct receive capability rather
+    than a byte-stream transport with altered semantics.
     """
 
     __slots__ = ("_protocol", "_seen", "_resumptions", "_waits")

@@ -43,14 +43,21 @@ def append_vbi(buf: bytearray, value: int) -> None:
             break
 
 
-def decode_vbi(buffer: bytes | bytearray | memoryview, offset: int = 0) -> tuple[int, int]:
+def decode_vbi(
+    buffer: bytes | bytearray | memoryview,
+    offset: int = 0,
+    *,
+    end: int | None = None,
+) -> tuple[int, int]:
     """Decode a canonical MQTT VBI starting at *offset*.
 
-    Returns ``(value, new_offset)``. MQTT requires the shortest possible
-    representation, so encodings such as ``80 00`` are malformed even though
-    they numerically represent zero.
+    ``end`` can bound the logical readable extent when *buffer* is a reusable
+    capacity slab whose physical length exceeds its committed bytes. Returns
+    ``(value, new_offset)``. MQTT requires the shortest possible representation,
+    so encodings such as ``80 00`` are malformed even though they numerically
+    represent zero.
     """
-    length = len(buffer)
+    length = len(buffer) if end is None else min(len(buffer), end)
     if offset >= length:
         raise MalformedPacketError("Incomplete Variable Byte Integer")
     first = buffer[offset]

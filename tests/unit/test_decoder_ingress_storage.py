@@ -142,3 +142,17 @@ def test_clear_releases_growth_for_reconnect() -> None:
     decoder.clear()
     assert decoder.buffered == 0
     assert decoder.capacity == 64 * 1024
+
+
+def test_vbi_decoder_respects_logical_end_of_capacity_slab() -> None:
+    from mqttium.codec.vbi import decode_vbi
+    from mqttium.errors import MalformedPacketError
+
+    slab = bytearray(64 * 1024)
+    slab[:2] = b"\x30\x80"
+    try:
+        decode_vbi(slab, 1, end=2)
+    except MalformedPacketError as exc:
+        assert "Incomplete" in str(exc)
+    else:
+        raise AssertionError("uncommitted slab capacity participated in VBI decode")

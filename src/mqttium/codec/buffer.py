@@ -184,7 +184,7 @@ class IncrementalDecoder:
         if available < 2:
             return None
         try:
-            remaining, rl_end = decode_vbi(self._buf, self._start + 1)
+            remaining, rl_end = decode_vbi(self._buf, self._start + 1, end=self._end)
         except MalformedPacketError:
             return None
         total = (rl_end - self._start) + remaining
