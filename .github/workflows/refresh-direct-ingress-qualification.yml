@@ -1,0 +1,45 @@
+name: Refresh direct ingress qualification refs
+
+on:
+  push:
+    branches: [perf/direct-decoder-ingress-prototype]
+    paths:
+      - .github/workflows/refresh-direct-ingress-qualification.yml
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: perf/direct-decoder-ingress-prototype
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Update qualification to exact runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          file=.github/workflows/direct-ingress-prepromotion-rtt.yml
+          sed -i \
+            -e 's/CANDIDATE_SHA: 3a0e71fc9055c6ccee7c67fef9cc6e0c6d53df8c/CANDIDATE_SHA: 1a2c8e52efebee845e507a35e1048d994f1b074a/' \
+            -e 's/HYPOTHESIS_PROFILE=direct_prepromotion/HYPOTHESIS_PROFILE=direct_production/' \
+            -e "s/src tests tools \.github\/validation/src tests/" \
+            "$file"
+          grep -q 'CANDIDATE_SHA: 1a2c8e52efebee845e507a35e1048d994f1b074a' "$file"
+          grep -q 'HYPOTHESIS_PROFILE=direct_production' "$file"
+          ! grep -q 'src tests tools .github/validation' "$file"
+          git diff --check
+          git diff -- "$file"
+      - name: Commit qualification refresh
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'mqttium implementation agent'
+          git config user.email 'actions@users.noreply.github.com'
+          git add .github/workflows/direct-ingress-prepromotion-rtt.yml
+          git diff --cached --quiet && exit 1
+          git commit -m 'test: requalify final direct ingress runtime'
+          git push origin HEAD:perf/direct-decoder-ingress-prototype
