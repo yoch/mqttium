@@ -1,0 +1,94 @@
+name: PR445 copy threshold ARM64
+
+on:
+  push:
+    branches: [bench/pr445-adversarial-validation]
+    paths:
+      - .github/workflows/pr445-copy-threshold-arm64.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr445-adversarial-rpi5
+  cancel-in-progress: false
+
+jobs:
+  threshold:
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Verify host
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          test "$(cat /proc/sys/kernel/randomize_va_space)" != 0
+          echo "sha=$(git rev-parse HEAD)"
+          python3 --version
+          ldd --version | head -n1
+          mkdir -p threshold-results
+      - name: Probe full-copy sizes around allocator boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' | tee threshold-results/threshold.json
+          import json, random, subprocess, sys
+          from pathlib import Path
+
+          script = str(Path('tools/recv_into_copy_probe.py').resolve())
+          sizes = (122880, 131072, 147456, 163840)
+          samples = 64
+          iterations = 300
+          warmup = 10
+          plan = [(size, sample) for size in sizes for sample in range(samples)]
+          random.Random(4452).shuffle(plan)
+          rows = []
+          for index, (size, sample) in enumerate(plan, 1):
+              cmd = [
+                  sys.executable, script, '--child', '--mode', 'recv_into_copy',
+                  '--size', str(size), '--iterations', str(iterations),
+                  '--warmup', str(warmup),
+              ]
+              result = json.loads(subprocess.run(cmd, check=True, capture_output=True, text=True).stdout)
+              result['sample'] = sample
+              result['execution_index'] = index
+              rows.append(result)
+              print(
+                  f"{index:03d}/{len(plan)} {size//1024:3d}K "
+                  f"fault/op={result['minflt_per_op']:.4f} ns/op={result['ns_per_op']:.0f}",
+                  file=sys.stderr,
+                  flush=True,
+              )
+          summary = {}
+          for size in sizes:
+              sub = [r for r in rows if r['size'] == size]
+              faults = [r['minflt_per_op'] for r in sub]
+              summary[str(size)] = {
+                  'n': len(sub),
+                  'fault_heavy_ge_0_5_per_op': sum(v >= 0.5 for v in faults),
+                  'fault_heavy_ge_0_1_per_op': sum(v >= 0.1 for v in faults),
+                  'max_minflt_per_op': max(faults),
+                  'median_minflt_per_op': sorted(faults)[len(faults)//2],
+              }
+          print(json.dumps({
+              'schema_version': 1,
+              'probe': 'recv_into_copy_threshold',
+              'sizes': list(sizes),
+              'samples_per_size': samples,
+              'iterations': iterations,
+              'summary': summary,
+              'rows': rows,
+          }, sort_keys=True))
+          PY
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: pr445-copy-threshold-${{ github.run_id }}
+          path: threshold-results
+          if-no-files-found: error
+          retention-days: 14
