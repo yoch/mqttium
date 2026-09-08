@@ -8,8 +8,10 @@ import pytest
 
 from mqttium._direct_decoder_ingress_prototype import (
     DirectIngressDecoder,
+    DirectIngressTcpTransport,
     _INGRESS_READY,
     _connect_direct,
+    _direct_ingress_enabled,
 )
 from mqttium.codec.vbi import encode_vbi
 from mqttium.errors import MalformedPacketError
@@ -22,6 +24,11 @@ def _commit(decoder: DirectIngressDecoder, data: bytes) -> None:
     finally:
         target.release()
     decoder.commit_written(len(data))
+
+
+def _require_direct_loop() -> None:
+    if not _direct_ingress_enabled(None, asyncio.get_running_loop()):
+        pytest.skip("direct decoder ingress is selector-only")
 
 
 def test_direct_decoder_accepts_fragmented_packet_into_writable_storage() -> None:
@@ -65,6 +72,7 @@ def test_direct_decoder_compacts_live_bytes_without_changing_them() -> None:
 
 
 async def test_direct_transport_waits_for_new_receive_generation_on_fragment() -> None:
+    _require_direct_loop()
     release_tail = asyncio.Event()
 
     async def send_fragmented_packet(
@@ -87,6 +95,7 @@ async def test_direct_transport_waits_for_new_receive_generation_on_fragment() -
     transport = await _connect_direct(host, port, ssl=None, decoder=decoder)
 
     try:
+        assert isinstance(transport, DirectIngressTcpTransport)
         first = await asyncio.wait_for(transport.read(), timeout=1.0)
         assert first is _INGRESS_READY
         assert decoder.next_packet() is None
@@ -110,6 +119,7 @@ async def test_direct_transport_waits_for_new_receive_generation_on_fragment() -
 
 
 async def test_direct_transport_error_precedes_unseen_receive_generation() -> None:
+    _require_direct_loop()
     release_connection = asyncio.Event()
 
     async def hold_connection(
@@ -126,6 +136,7 @@ async def test_direct_transport_error_precedes_unseen_receive_generation() -> No
     host, port = socket.getsockname()[:2]
     decoder = DirectIngressDecoder(1024 * 1024)
     transport = await _connect_direct(host, port, ssl=None, decoder=decoder)
+    assert isinstance(transport, DirectIngressTcpTransport)
     protocol = transport._direct_protocol
     error = ConnectionResetError("synthetic reset")
 
@@ -146,6 +157,7 @@ async def test_direct_transport_error_precedes_unseen_receive_generation() -> No
 
 
 async def test_direct_transport_large_fragmented_frame_crosses_watermark() -> None:
+    _require_direct_loop()
     release_connection = asyncio.Event()
     body = b"x" * 700_000
     wire = b"\x30" + encode_vbi(len(body)) + body
@@ -170,6 +182,7 @@ async def test_direct_transport_large_fragmented_frame_crosses_watermark() -> No
     transport = await _connect_direct(host, port, ssl=None, decoder=decoder)
 
     try:
+        assert isinstance(transport, DirectIngressTcpTransport)
         packet = None
         for _ in range(16):
             ingress = await asyncio.wait_for(transport.read(), timeout=1.0)
@@ -184,6 +197,36 @@ async def test_direct_transport_large_fragmented_frame_crosses_watermark() -> No
         assert transport._direct_protocol.pause_count >= 1
     finally:
         release_connection.set()
+        await transport.close()
+        server.close()
+        await server.wait_closed()
+
+
+async def test_non_selector_loop_uses_standard_transport_fallback() -> None:
+    if _direct_ingress_enabled(None, asyncio.get_running_loop()):
+        pytest.skip("fallback path is covered on non-selector event loops")
+
+    async def send_data(
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        del reader
+        writer.write(b"fallback")
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+    server = await asyncio.start_server(send_data, "127.0.0.1", 0)
+    socket = server.sockets[0]
+    host, port = socket.getsockname()[:2]
+    decoder = DirectIngressDecoder(1024 * 1024)
+    transport = await _connect_direct(host, port, ssl=None, decoder=decoder)
+
+    try:
+        assert not isinstance(transport, DirectIngressTcpTransport)
+        assert await asyncio.wait_for(transport.read(), timeout=1.0) == b"fallback"
+        assert decoder.buffered == 0
+    finally:
         await transport.close()
         server.close()
         await server.wait_closed()
