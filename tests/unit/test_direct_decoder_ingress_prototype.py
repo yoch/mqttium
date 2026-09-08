@@ -11,6 +11,7 @@ from mqttium._direct_decoder_ingress_prototype import (
     _INGRESS_READY,
     _connect_direct,
 )
+from mqttium.codec.vbi import encode_vbi
 from mqttium.errors import MalformedPacketError
 
 
@@ -137,6 +138,50 @@ async def test_direct_transport_error_precedes_unseen_receive_generation() -> No
         with pytest.raises(ConnectionResetError, match="synthetic reset"):
             await transport.read()
         assert transport._seen_callbacks == 0
+    finally:
+        release_connection.set()
+        await transport.close()
+        server.close()
+        await server.wait_closed()
+
+
+async def test_direct_transport_large_fragmented_frame_crosses_watermark() -> None:
+    release_connection = asyncio.Event()
+    body = b"x" * 700_000
+    wire = b"\x30" + encode_vbi(len(body)) + body
+
+    async def send_large_packet(
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        del reader
+        for offset in range(0, len(wire), 64 * 1024):
+            writer.write(wire[offset : offset + 64 * 1024])
+            await writer.drain()
+            await asyncio.sleep(0)
+        await release_connection.wait()
+        writer.close()
+        await writer.wait_closed()
+
+    server = await asyncio.start_server(send_large_packet, "127.0.0.1", 0)
+    socket = server.sockets[0]
+    host, port = socket.getsockname()[:2]
+    decoder = DirectIngressDecoder(2 * 1024 * 1024)
+    transport = await _connect_direct(host, port, ssl=None, decoder=decoder)
+
+    try:
+        packet = None
+        for _ in range(16):
+            ingress = await asyncio.wait_for(transport.read(), timeout=1.0)
+            assert ingress is _INGRESS_READY
+            packet = decoder.next_packet()
+            if packet is not None:
+                break
+
+        assert packet is not None
+        assert packet.remaining == body
+        assert decoder.high_water > 512 * 1024
+        assert transport._direct_protocol.pause_count >= 1
     finally:
         release_connection.set()
         await transport.close()
