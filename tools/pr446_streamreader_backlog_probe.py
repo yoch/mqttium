@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Targeted allocator probe for PR #446 StreamReader backlog.
 
-This is diagnostic evidence, not an official MQTT benchmark.  A separate server
-process sends 160-KiB bursts.  The client deliberately does not consume a burst
-until the transport's unread queue reaches at least 160 KiB, proving that two or
-more 80-KiB receive callbacks have accumulated before each measured read.
+This is diagnostic evidence, not an official MQTT benchmark. A separate server
+process sends 192-KiB bursts. The client deliberately does not consume a burst
+until the transport's unread queue is strictly above StreamReader's 128-KiB
+pause threshold. For #446 this guarantees that ``read(256 KiB)`` exercises a
+returned-bytes allocation larger than 128 KiB without assuming that selector
+callbacks arrive as two exact 80-KiB chunks.
 """
 
 from __future__ import annotations
@@ -17,7 +19,8 @@ import socket
 import struct
 from typing import Any
 
-BURST_BYTES = 160 * 1024
+BURST_BYTES = 192 * 1024
+FORCED_BACKLOG_BYTES = 128 * 1024 + 1
 READ_BYTES = 256 * 1024
 HEADER = struct.Struct("!II")
 
@@ -42,18 +45,23 @@ def run_server(host: str, port: int) -> None:
         listener.listen()
         while True:
             conn, _ = listener.accept()
-            with conn:
-                warmup, measured = HEADER.unpack(_recv_exact(conn, HEADER.size))
-                for _ in range(warmup):
-                    conn.sendall(payload)
-                    if _recv_exact(conn, 1) != b"A":
-                        raise RuntimeError("invalid warmup acknowledgement")
-                if _recv_exact(conn, 1) != b"M":
-                    raise RuntimeError("missing measurement start marker")
-                for _ in range(measured):
-                    conn.sendall(payload)
-                    if _recv_exact(conn, 1) != b"A":
-                        raise RuntimeError("invalid measurement acknowledgement")
+            try:
+                with conn:
+                    warmup, measured = HEADER.unpack(_recv_exact(conn, HEADER.size))
+                    for _ in range(warmup):
+                        conn.sendall(payload)
+                        if _recv_exact(conn, 1) != b"A":
+                            raise RuntimeError("invalid warmup acknowledgement")
+                    if _recv_exact(conn, 1) != b"M":
+                        raise RuntimeError("missing measurement start marker")
+                    for _ in range(measured):
+                        conn.sendall(payload)
+                        if _recv_exact(conn, 1) != b"A":
+                            raise RuntimeError("invalid measurement acknowledgement")
+            except (ConnectionError, ConnectionResetError, BrokenPipeError):
+                # A failed diagnostic client must not kill the reusable server;
+                # the orchestrator records and surfaces the client failure.
+                continue
 
 
 def _buffered_bytes(transport: Any) -> tuple[str, int]:
@@ -79,17 +87,20 @@ async def _wait_for_backlog(transport: Any, timeout_s: float) -> tuple[str, int]
     while True:
         implementation, current = _buffered_bytes(transport)
         maximum = max(maximum, current)
-        if current >= BURST_BYTES:
+        if current >= FORCED_BACKLOG_BYTES:
             return implementation, maximum
         if loop.time() >= deadline:
             raise TimeoutError(
-                f"backlog never reached {BURST_BYTES} bytes; max={maximum} impl={implementation}"
+                f"backlog never exceeded 128 KiB; max={maximum} impl={implementation}"
             )
         await asyncio.sleep(0)
 
 
-async def _consume_burst(transport: Any) -> None:
-    received = 0
+async def _consume_burst(transport: Any) -> int:
+    first = await transport.read(READ_BYTES)
+    if not first:
+        raise ConnectionError("short burst before first read")
+    received = len(first)
     while received < BURST_BYTES:
         data = await transport.read(READ_BYTES)
         if not data:
@@ -97,6 +108,7 @@ async def _consume_burst(transport: Any) -> None:
         received += len(data)
     if received != BURST_BYTES:
         raise RuntimeError(f"burst overshoot: {received}/{BURST_BYTES}")
+    return len(first)
 
 
 async def run_client(host: str, port: int, warmup: int, measured: int, timeout_s: float) -> dict[str, Any]:
@@ -104,6 +116,7 @@ async def run_client(host: str, port: int, warmup: int, measured: int, timeout_s
 
     transport = await TcpTransport.connect(host, port)
     max_backlog = 0
+    first_read_sizes: list[int] = []
     implementation = "unknown"
     try:
         await transport.write(HEADER.pack(warmup, measured))
@@ -118,26 +131,38 @@ async def run_client(host: str, port: int, warmup: int, measured: int, timeout_s
         for _ in range(measured):
             implementation, seen = await _wait_for_backlog(transport, timeout_s)
             max_backlog = max(max_backlog, seen)
-            await _consume_burst(transport)
+            first_read_sizes.append(await _consume_burst(transport))
             await transport.write(b"A")
         after = resource.getrusage(resource.RUSAGE_SELF)
     finally:
         await transport.close()
+
+    if implementation == "streamreader" and min(first_read_sizes) < FORCED_BACKLOG_BYTES:
+        raise RuntimeError(
+            "StreamReader first read did not exercise >128-KiB returned allocation: "
+            f"min={min(first_read_sizes)}"
+        )
 
     minflt = after.ru_minflt - before.ru_minflt
     majflt = after.ru_majflt - before.ru_majflt
     stime = after.ru_stime - before.ru_stime
     utime = after.ru_utime - before.ru_utime
     return {
-        "schema_version": 1,
-        "probe": "forced_160k_unread_backlog",
+        "schema_version": 2,
+        "probe": "forced_over_128k_unread_backlog",
         "implementation": implementation,
         "burst_bytes": BURST_BYTES,
+        "forced_backlog_bytes": FORCED_BACKLOG_BYTES,
         "read_bytes": READ_BYTES,
         "warmup_cycles": warmup,
         "measured_cycles": measured,
         "max_buffered_bytes": max_backlog,
-        "forced_backlog_proven": max_backlog >= BURST_BYTES,
+        "first_read_bytes_min": min(first_read_sizes),
+        "first_read_bytes_max": max(first_read_sizes),
+        "forced_backlog_proven": max_backlog >= FORCED_BACKLOG_BYTES,
+        "large_streamreader_read_proven": (
+            implementation != "streamreader" or min(first_read_sizes) >= FORCED_BACKLOG_BYTES
+        ),
         "ru_minflt": minflt,
         "ru_majflt": majflt,
         "ru_stime_s": stime,
