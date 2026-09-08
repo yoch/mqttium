@@ -83,6 +83,12 @@ class _BufferedTcpTransport(TcpTransport):
         await self._drain_if_needed()
 
     async def drain(self) -> None:
+        if self._transport.is_closing():
+            # Match StreamWriter.drain(): close() may mark the transport closing
+            # before protocol.connection_lost() runs on the next loop turn.
+            # Yield once so the protocol can publish connection loss rather than
+            # letting an unpaused drain return successfully in that window.
+            await asyncio.sleep(0)
         await self._protocol.drain()
 
     async def read(self, n: int = 65536) -> bytes:
@@ -113,4 +119,4 @@ class _BufferedTcpTransport(TcpTransport):
 
     async def _drain_if_needed(self) -> None:
         if self._transport.get_write_buffer_size() > _WRITE_BUFFER_HIGH_WATER:
-            await self._protocol.drain()
+            await self.drain()
