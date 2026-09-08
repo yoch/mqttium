@@ -68,15 +68,16 @@ def test_retained_old_window_cannot_block_growth() -> None:
 
 def test_near_limit_fragmented_frame_reserves_exact_extent_not_double() -> None:
     limit = 4 * 1024 * 1024
+    payload_size = limit - 32
     decoder = IncrementalDecoder(max_packet_size=limit)
-    frame = _publish(limit - 32)
+    frame = _publish(payload_size)
     assert len(frame) <= limit
     _receive(decoder, frame)
     assert decoder.capacity == len(frame)
     assert decoder.capacity_peak == len(frame)
     packet = decoder.next_packet()
     assert packet is not None
-    assert len(packet.remaining) == len(frame) - (len(frame) - len(packet.remaining))
+    assert len(packet.remaining) == payload_size + 3
 
 
 def test_repeated_large_frames_reuse_then_small_drains_retire_oversize() -> None:
@@ -97,6 +98,39 @@ def test_repeated_large_frames_reuse_then_small_drains_retire_oversize() -> None
         assert decoder.next_packet() is not None
     assert decoder.capacity == 256 * 1024
     assert decoder.shrink_count >= 1
+
+
+def test_slab_identity_is_stable_while_more_frames_remain_in_same_batch() -> None:
+    """Protect the synchronous QoS0 fast path that borrows decoder._buf once."""
+    decoder = IncrementalDecoder(max_packet_size=2 * 1024 * 1024)
+    big = _publish(1024 * 1024)
+    _receive(decoder, big)
+    assert decoder.next_packet() is not None
+    assert decoder.capacity > 256 * 1024
+
+    # Move the shrink hysteresis one drain short of retirement.
+    tiny = _publish(32)
+    for _ in range(31):
+        decoder.feed(tiny)
+        assert decoder.next_packet() is not None
+    old_slab = decoder._buf
+
+    # A receive callback can concatenate several frames in the same slab. The
+    # first consume must not swap storage while the second frame still exists.
+    decoder.feed(tiny + tiny)
+    first = decoder.peek_packet_bounds()
+    assert first is not None
+    decoder.consume_peeked_packet(first[2])
+    assert decoder._buf is old_slab
+    second = decoder.peek_packet_bounds()
+    assert second is not None
+    decoder.consume_peeked_packet(second[2])
+
+    # Retirement may swap only after the slab is fully consumed; at that point
+    # the same synchronous batch has no stale bounds left to decode.
+    assert decoder.buffered == 0
+    assert decoder.peek_packet_bounds() is None
+    assert decoder.capacity == 256 * 1024
 
 
 def test_clear_releases_growth_for_reconnect() -> None:
