@@ -106,3 +106,39 @@ async def test_direct_transport_waits_for_new_receive_generation_on_fragment() -
         await transport.close()
         server.close()
         await server.wait_closed()
+
+
+async def test_direct_transport_error_precedes_unseen_receive_generation() -> None:
+    release_connection = asyncio.Event()
+
+    async def hold_connection(
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        del reader
+        await release_connection.wait()
+        writer.close()
+        await writer.wait_closed()
+
+    server = await asyncio.start_server(hold_connection, "127.0.0.1", 0)
+    socket = server.sockets[0]
+    host, port = socket.getsockname()[:2]
+    decoder = DirectIngressDecoder(1024 * 1024)
+    transport = await _connect_direct(host, port, ssl=None, decoder=decoder)
+    protocol = transport._direct_protocol
+    error = ConnectionResetError("synthetic reset")
+
+    try:
+        _commit(decoder, b"\xc0\x00")
+        protocol.recv_callbacks += 1
+        protocol.exc = error
+        protocol.ready.set()
+
+        with pytest.raises(ConnectionResetError, match="synthetic reset"):
+            await transport.read()
+        assert transport._seen_callbacks == 0
+    finally:
+        release_connection.set()
+        await transport.close()
+        server.close()
+        await server.wait_closed()
