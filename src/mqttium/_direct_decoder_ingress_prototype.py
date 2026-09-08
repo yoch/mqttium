@@ -75,7 +75,6 @@ class DirectIngressDecoder(_IncrementalDecoder):
         return self._buf[self._start] if self._start < self._end else None
 
     def clear(self) -> None:
-        # Keep backing storage: only logical data is retired.
         self._start = 0
         self._end = 0
 
@@ -118,8 +117,6 @@ class DirectIngressDecoder(_IncrementalDecoder):
             self._high_water = buffered
 
     def feed(self, data: bytes | bytearray | memoryview) -> None:
-        # AsyncClient._read_loop still calls decoder.feed(data). Direct ingress
-        # has already committed those bytes, so the private sentinel is a no-op.
         if data is _INGRESS_READY:
             return
         if not data:
@@ -292,13 +289,23 @@ class DirectIngressTcpTransport(StreamTransport):
         self._direct_protocol = protocol
         self._direct_decoder = decoder
 
+    async def _ready_sentinel(self) -> bytes:
+        # The normal StreamReader path suspends at read() frequently enough to
+        # let timers, writer/effect tasks and cancellation run. Direct ingress
+        # can otherwise keep finding already-buffered data and spin the MQTT
+        # reader continuously under saturation. Yield exactly once before an
+        # immediate sentinel so this prototype preserves event-loop fairness.
+        await asyncio.sleep(0)
+        self._direct_protocol.maybe_resume_reading()
+        return _INGRESS_READY
+
     async def read(self, n: int = 65536) -> bytes:
         del n
         protocol = self._direct_protocol
         decoder = self._direct_decoder
         protocol.maybe_resume_reading()
         if decoder.buffered:
-            return _INGRESS_READY
+            return await self._ready_sentinel()
         if protocol.exc is not None:
             raise protocol.exc
         if protocol.eof:
@@ -306,7 +313,7 @@ class DirectIngressTcpTransport(StreamTransport):
 
         protocol.ready.clear()
         if decoder.buffered:
-            return _INGRESS_READY
+            return await self._ready_sentinel()
         if protocol.exc is not None:
             raise protocol.exc
         if protocol.eof:
@@ -314,7 +321,7 @@ class DirectIngressTcpTransport(StreamTransport):
         await protocol.ready.wait()
         protocol.maybe_resume_reading()
         if decoder.buffered:
-            return _INGRESS_READY
+            return await self._ready_sentinel()
         if protocol.exc is not None:
             raise protocol.exc
         return b""
