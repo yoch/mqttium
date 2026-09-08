@@ -191,6 +191,18 @@ class DirectIngressDecoder(_IncrementalDecoder):
             return None
         return header, pos, start + total
 
+    def head_is_actionable(self) -> bool:
+        """Whether the reader can make progress without receiving more bytes.
+
+        Malformed and oversize headers are actionable too: the reader must run
+        so it can surface the protocol error rather than leaving the socket
+        paused forever.
+        """
+        try:
+            return self.peek_packet_bounds() is not None
+        except (MalformedPacketError, PacketTooLargeError):
+            return True
+
     def consume_peeked_packet(self, body_end: int) -> None:
         if not (self._start < body_end <= self._end):
             raise AssertionError("invalid direct-ingress packet boundary")
@@ -258,9 +270,14 @@ class _DirectDecoderProtocol(asyncio.StreamReaderProtocol, asyncio.BufferedProto
         self.recv_callbacks += 1
         self.recv_bytes += nbytes
         transport = self.rx_transport
+        # Never pause merely because a large *incomplete* MQTT frame crossed
+        # the byte watermark: the decoder cannot consume that frame yet, so
+        # doing so would deadlock receive progress. Pause only when the reader
+        # can actually consume or reject the head frame.
         if (
             not self.read_paused
             and self.decoder.buffered >= _READ_HIGH_WATER
+            and self.decoder.head_is_actionable()
             and transport is not None
         ):
             transport.pause_reading()
@@ -272,7 +289,10 @@ class _DirectDecoderProtocol(asyncio.StreamReaderProtocol, asyncio.BufferedProto
         transport = self.rx_transport
         if (
             self.read_paused
-            and self.decoder.buffered <= _READ_LOW_WATER
+            and (
+                self.decoder.buffered <= _READ_LOW_WATER
+                or not self.decoder.head_is_actionable()
+            )
             and transport is not None
             and not transport.is_closing()
         ):
