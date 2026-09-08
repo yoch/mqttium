@@ -1,0 +1,46 @@
+name: PR445 buffered receive cross-platform
+
+on:
+  push:
+    branches: [bench/pr445-adversarial-validation]
+    paths:
+      - .github/workflows/pr445-buffered-recv-cross-platform.yml
+      - tools/buffered_recv_compare.py
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.14'
+      - name: Run fixed-budget receive granularity probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p probe-results
+          python tools/buffered_recv_compare.py \
+            --repeats 5 \
+            --total-mib 64 \
+            --output "probe-results/${{ runner.os }}.json" \
+            2> >(tee "probe-results/${{ runner.os }}-progress.txt" >&2) \
+            | tee "probe-results/${{ runner.os }}.txt"
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: pr445-buffered-recv-${{ runner.os }}-${{ github.run_id }}
+          path: probe-results
+          if-no-files-found: error
+          retention-days: 14
