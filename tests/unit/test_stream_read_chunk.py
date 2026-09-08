@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from mqttium.transport._stream import _SELECTOR_READ_CHUNK, StreamTransport, _cap_selector_read_chunk
+from mqttium.transport._stream import (
+    _SELECTOR_READ_CHUNK,
+    StreamTransport,
+    _cap_selector_read_chunk,
+)
 
 
 class _MutableSelectorTransport:
