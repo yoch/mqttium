@@ -1,0 +1,336 @@
+name: PR445 vs PR446 saturated MQTT ARM64
+
+on:
+  push:
+    branches: [bench/pr445-adversarial-validation]
+    paths:
+      - .github/workflows/pr445-vs-pr446-saturated-arm64.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr445-vs-pr446-saturated-rpi5
+  cancel-in-progress: false
+
+jobs:
+  saturated:
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 30
+    env:
+      PR445_SHA: e85f2217faff2a75c9a86199663e8134837ac73c
+      PR446_SHA: 2e15169b8f77dc25b5ff075a6c613049f1417828
+      PUBLISHER_SHA: e85f2217faff2a75c9a86199663e8134837ac73c
+      REQUIRED_MOSQUITTO: "2.1.2"
+      REQUIRED_PYTHON: "3.14.7"
+      PORT: "11883"
+      PAYLOAD_SIZE: "65536"
+      RECEIVE_CHUNK: "81920"
+      HIGH_WATER: "131072"
+      LOW_WATER: "65536"
+      MEASURE_S: "1.5"
+      WARMUP_S: "0.5"
+      PUBLISHER_S: "2.4"
+
+    steps:
+      - name: Checkout benchmark branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Checkout exact finalists
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.PR445_SHA }}
+          path: pr445
+          persist-credentials: false
+
+      - name: Checkout exact PR446 head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.PR446_SHA }}
+          path: pr446
+          persist-credentials: false
+
+      - name: Verify host, finalists and fixed receive sizes
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          test "$(python3 -c 'import platform; print(platform.python_version())')" = "$REQUIRED_PYTHON"
+          test "$(git -C pr445 rev-parse HEAD)" = "$PR445_SHA"
+          test "$(git -C pr446 rev-parse HEAD)" = "$PR446_SHA"
+          test -z "$(git -C pr445 status --porcelain --untracked-files=no)"
+          test -z "$(git -C pr446 status --porcelain --untracked-files=no)"
+          test "$(cat /proc/sys/kernel/randomize_va_space)" != "0"
+          test "$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)" = performance
+          test "$(nproc)" -ge 4
+          command -v taskset >/dev/null
+          command -v mosquitto >/dev/null
+
+          PYTHONPATH="$PWD/pr445/src" python3 - <<'PY'
+          from mqttium.transport import _buffered
+          assert _buffered._READ_CHUNK == 81920
+          assert _buffered._READ_HIGH_WATER == 131072
+          assert _buffered._READ_LOW_WATER == 65536
+          PY
+
+          PYTHONPATH="$PWD/pr446/src" python3 - <<'PY'
+          import asyncio
+          from mqttium.transport.tcp import _RECEIVE_BUFFER_SIZE
+          assert _RECEIVE_BUFFER_SIZE == 81920
+          loop = asyncio.new_event_loop()
+          try:
+              reader = asyncio.StreamReader(loop=loop)
+              assert reader._limit == 65536
+          finally:
+              loop.close()
+          PY
+
+          mkdir -p sat-finalists
+          {
+            date -u --iso-8601=seconds
+            uname -a
+            lscpu
+            python3 --version
+            echo "aslr=$(cat /proc/sys/kernel/randomize_va_space)"
+            echo "governor=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)"
+            echo "pr445=$PR445_SHA"
+            echo "pr446=$PR446_SHA"
+            echo "publisher=$PUBLISHER_SHA"
+            echo "sut_cpu=0 broker_cpu=1 publisher_cpu=2 orch_cpu=3"
+            echo "payload=$PAYLOAD_SIZE recv_chunk=$RECEIVE_CHUNK"
+            echo "high_water=$HIGH_WATER low_water=$LOW_WATER"
+            echo "warmup_s=$WARMUP_S measure_s=$MEASURE_S publisher_s=$PUBLISHER_S"
+          } | tee sat-finalists/environment.txt
+
+      - name: Start native Mosquitto 2.1.2 on CPU1
+        shell: bash
+        run: |
+          set -euo pipefail
+          broker_bin="$(command -v mosquitto)"
+          { "$broker_bin" -h 2>&1 || true; } | head -n 6 | tee sat-finalists/broker-version.txt
+          version="$(python3 - <<'PY'
+          import re
+          text=open('sat-finalists/broker-version.txt', encoding='utf-8').read()
+          m=re.search(r'mosquitto version\s+([0-9]+(?:\.[0-9]+)+)', text, re.I)
+          if not m: raise SystemExit('cannot parse mosquitto version')
+          print(m.group(1))
+          PY
+          )"
+          test "$version" = "$REQUIRED_MOSQUITTO"
+          if ss -ltn | grep -q ":$PORT "; then echo "port $PORT occupied" >&2; exit 1; fi
+          cat > sat-finalists/mosquitto.conf <<EOF
+          listener $PORT 127.0.0.1
+          protocol mqtt
+          set_tcp_nodelay true
+          allow_anonymous true
+          persistence false
+          connection_messages false
+          log_dest stdout
+          log_type error
+          max_inflight_messages 1000
+          max_queued_messages 10000
+          max_packet_size 16777216
+          max_keepalive 120
+          EOF
+          taskset -c 1 "$broker_bin" -c sat-finalists/mosquitto.conf > sat-finalists/mosquitto.log 2>&1 &
+          echo "BROKER_PID=$!" >> "$GITHUB_ENV"
+          for _ in $(seq 1 50); do
+            (echo > /dev/tcp/127.0.0.1/$PORT) >/dev/null 2>&1 && exit 0
+            kill -0 "$!" 2>/dev/null || { cat sat-finalists/mosquitto.log; exit 1; }
+            sleep 0.1
+          done
+          cat sat-finalists/mosquitto.log
+          exit 1
+
+      - name: Run four counterbalanced fresh-process pairs
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > sat-finalists/matrix.tsv <<'EOF'
+          0	0	445
+          1	0	446
+          2	1	446
+          3	1	445
+          4	2	446
+          5	2	445
+          6	3	445
+          7	3	446
+          EOF
+
+          while IFS=$'\t' read -r idx pair arm; do
+            if [ "$arm" = 445 ]; then
+              sub_src="$PWD/pr445/src"
+            else
+              sub_src="$PWD/pr446/src"
+            fi
+            topic="bench/finalists/${GITHUB_RUN_ID}/${idx}"
+            ready="sat-finalists/ready-${idx}"
+            sub="sat-finalists/sub-${idx}.json"
+            pub="sat-finalists/pub-${idx}.json"
+            rm -f "$ready" "$sub" "$pub"
+
+            taskset -c 0 env PYTHONPATH="$sub_src" python3 tools/mqtt_saturated_finalists_probe.py \
+              subscriber --arm "$arm" --host 127.0.0.1 --port "$PORT" --topic "$topic" \
+              --payload-size "$PAYLOAD_SIZE" --warmup-s "$WARMUP_S" --duration-s "$MEASURE_S" \
+              --broker-pid "$BROKER_PID" --ready-file "$ready" --output "$sub" \
+              > "sat-finalists/sub-${idx}.log" 2>&1 &
+            subpid=$!
+
+            ok=0
+            for _ in $(seq 1 100); do
+              if [ -f "$ready" ]; then ok=1; break; fi
+              kill -0 "$subpid" 2>/dev/null || { cat "sat-finalists/sub-${idx}.log"; exit 1; }
+              sleep 0.05
+            done
+            test "$ok" = 1 || { echo "subscriber not ready" >&2; kill "$subpid" || true; exit 1; }
+
+            # Publisher is deliberately the same immutable #445 SHA for both arms.
+            taskset -c 2 env PYTHONPATH="$PWD/pr445/src" python3 tools/mqtt_saturated_finalists_probe.py \
+              publisher --host 127.0.0.1 --port "$PORT" --topic "$topic" \
+              --payload-size "$PAYLOAD_SIZE" --duration-s "$PUBLISHER_S" --output "$pub" \
+              > "sat-finalists/pub-${idx}.log" 2>&1 &
+            pubpid=$!
+
+            wait "$subpid" || { cat "sat-finalists/sub-${idx}.log"; kill "$pubpid" 2>/dev/null || true; exit 1; }
+            wait "$pubpid" || { cat "sat-finalists/pub-${idx}.log"; exit 1; }
+            printf '%s\t%s\t%s\n' "$idx" "$pair" "$arm" >> sat-finalists/completed.tsv
+            sleep 0.10
+          done < sat-finalists/matrix.tsv
+
+      - name: Reduce paired evidence and qualify cells
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import csv, json, math, statistics
+          from pathlib import Path
+
+          rows=[]
+          for line in Path('sat-finalists/completed.tsv').read_text().splitlines():
+              idx_s, pair_s, arm = line.split('\t')
+              idx=int(idx_s); pair=int(pair_s)
+              row=json.load(open(f'sat-finalists/sub-{idx}.json'))
+              pub=json.load(open(f'sat-finalists/pub-{idx}.json'))
+              row.update({
+                  'idx': idx,
+                  'pair': pair,
+                  'arm': arm,
+                  'publisher_mib_s': pub['payload_mib_s'],
+                  'publisher_cpu_pct': pub['cpu_pct'],
+                  'publisher_ru_majflt': pub['ru_majflt'],
+                  'publisher_margin': pub['payload_mib_s'] / row['payload_mib_s'],
+              })
+              row['publisher_capacity_ok'] = row['publisher_margin'] >= 1.20
+              row['sut_saturated'] = row['sut_cpu_pct'] >= 90.0
+              row['broker_unsaturated'] = row['broker_cpu_pct'] is not None and row['broker_cpu_pct'] < 95.0
+              row['major_faults_ok'] = (
+                  row['ru_majflt'] == 0
+                  and pub['ru_majflt'] == 0
+                  and (row['broker_majflt'] in (None, 0))
+              )
+              row['qualified'] = all((
+                  row['publisher_capacity_ok'], row['sut_saturated'],
+                  row['broker_unsaturated'], row['major_faults_ok'],
+              ))
+              rows.append(row)
+          rows.sort(key=lambda r:r['idx'])
+
+          with open('sat-finalists/rows.csv','w',newline='') as f:
+              w=csv.DictWriter(f,fieldnames=sorted({k for r in rows for k in r}))
+              w.writeheader(); w.writerows(rows)
+
+          pairs=[]
+          for pair in range(4):
+              rs={r['arm']: r for r in rows if r['pair']==pair}
+              if set(rs) != {'445','446'}:
+                  raise SystemExit(f'incomplete pair {pair}: {set(rs)}')
+              a=rs['445']; b=rs['446']
+              pairs.append({
+                  'pair': pair,
+                  'order': '445-446' if a['idx'] < b['idx'] else '446-445',
+                  'qualified': bool(a['qualified'] and b['qualified']),
+                  'throughput_ratio_446_over_445': b['payload_mib_s']/a['payload_mib_s'],
+                  'cpu_ratio_446_over_445': b['ru_cpu_s']/a['ru_cpu_s'],
+                  'stime_ratio_446_over_445': b['ru_stime_s']/a['ru_stime_s'],
+                  'cpu_pct_ratio_446_over_445': b['sut_cpu_pct']/a['sut_cpu_pct'],
+                  'throughput_445_mib_s': a['payload_mib_s'],
+                  'throughput_446_mib_s': b['payload_mib_s'],
+                  'sut_cpu_445_pct': a['sut_cpu_pct'],
+                  'sut_cpu_446_pct': b['sut_cpu_pct'],
+                  'broker_cpu_445_pct': a['broker_cpu_pct'],
+                  'broker_cpu_446_pct': b['broker_cpu_pct'],
+                  'publisher_margin_445': a['publisher_margin'],
+                  'publisher_margin_446': b['publisher_margin'],
+                  'minflt_445': a['ru_minflt'],
+                  'minflt_446': b['ru_minflt'],
+              })
+
+          with open('sat-finalists/pairs.csv','w',newline='') as f:
+              w=csv.DictWriter(f,fieldnames=list(pairs[0]))
+              w.writeheader(); w.writerows(pairs)
+
+          def gmean(key):
+              vals=[float(p[key]) for p in pairs]
+              return math.exp(statistics.mean(math.log(v) for v in vals))
+          def med_arm(arm, key):
+              return statistics.median(float(r[key]) for r in rows if r['arm']==arm)
+
+          summary={
+              'n_pairs': len(pairs),
+              'all_cells_qualified': all(bool(r['qualified']) for r in rows),
+              'all_pairs_qualified': all(bool(p['qualified']) for p in pairs),
+              'paired': {
+                  'throughput_ratio_446_over_445_geomean': gmean('throughput_ratio_446_over_445'),
+                  'cpu_ratio_446_over_445_geomean': gmean('cpu_ratio_446_over_445'),
+                  'stime_ratio_446_over_445_geomean': gmean('stime_ratio_446_over_445'),
+                  'cpu_pct_ratio_446_over_445_geomean': gmean('cpu_pct_ratio_446_over_445'),
+                  'pairs': pairs,
+              },
+              'medians': {
+                  '445': {
+                      'payload_mib_s': med_arm('445','payload_mib_s'),
+                      'sut_cpu_pct': med_arm('445','sut_cpu_pct'),
+                      'ru_cpu_s': med_arm('445','ru_cpu_s'),
+                      'ru_stime_s': med_arm('445','ru_stime_s'),
+                      'broker_cpu_pct': med_arm('445','broker_cpu_pct'),
+                      'publisher_margin': med_arm('445','publisher_margin'),
+                      'ru_minflt': med_arm('445','ru_minflt'),
+                  },
+                  '446': {
+                      'payload_mib_s': med_arm('446','payload_mib_s'),
+                      'sut_cpu_pct': med_arm('446','sut_cpu_pct'),
+                      'ru_cpu_s': med_arm('446','ru_cpu_s'),
+                      'ru_stime_s': med_arm('446','ru_stime_s'),
+                      'broker_cpu_pct': med_arm('446','broker_cpu_pct'),
+                      'publisher_margin': med_arm('446','publisher_margin'),
+                      'ru_minflt': med_arm('446','ru_minflt'),
+                  },
+              },
+          }
+          Path('sat-finalists/summary.json').write_text(json.dumps(summary,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(summary,indent=2,sort_keys=True))
+          print('\nRAW ROWS')
+          print(Path('sat-finalists/rows.csv').read_text())
+          print('\nPAIRS')
+          print(Path('sat-finalists/pairs.csv').read_text())
+          PY
+
+      - name: Stop broker
+        if: always()
+        shell: bash
+        run: |
+          if [ -n "${BROKER_PID:-}" ]; then
+            kill "$BROKER_PID" 2>/dev/null || true
+            wait "$BROKER_PID" 2>/dev/null || true
+          fi
+
+      - name: Upload finalist evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: pr445-vs-pr446-saturated-${{ github.run_id }}
+          path: sat-finalists
+          if-no-files-found: error
+          retention-days: 14
