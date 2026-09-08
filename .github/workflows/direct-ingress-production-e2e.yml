@@ -38,7 +38,7 @@ jobs:
       - name: Differential and transport regression suite
         run: |
           set -euo pipefail
-          HYPOTHESIS_PROFILE=direct_prepromotion python -m pytest -q \
+          HYPOTHESIS_PROFILE=direct_production python -m pytest -q \
             .github/validation/test_direct_ingress_differential.py \
             tests/unit/test_decoder_ingress_storage.py \
             tests/unit/test_decoder_push_transport.py \
