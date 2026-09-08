@@ -1,0 +1,150 @@
+name: Direct ingress prototype saturated rerun
+
+on:
+  push:
+    branches: [perf/direct-decoder-ingress-prototype]
+    paths:
+      - .github/workflows/direct-ingress-prototype-rerun.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: direct-ingress-prototype-rerun
+  cancel-in-progress: false
+
+env:
+  PORT: "11883"
+  PAYLOAD_SIZE: "65536"
+  WARMUP_S: "0.30"
+  MEASURE_S: "1.0"
+  PUBLISHER_S: "1.6"
+
+jobs:
+  arm64:
+    name: RPi5 / 4x4 short matrix
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: experiment
+          persist-credentials: false
+      - name: Gate host and start Mosquitto
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          test "$(python3 -c 'import platform; print(platform.python_version())')" = "3.14.7"
+          test "$(cat /proc/sys/kernel/randomize_va_space)" != "0"
+          test "$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)" = performance
+          version="$({ mosquitto -h 2>&1 || true; } | python3 -c 'import re,sys; t=sys.stdin.read(); m=re.search(r"mosquitto version\s+([0-9]+(?:\.[0-9]+)+)",t,re.I); print(m.group(1) if m else "")')"
+          test "$version" = "2.1.2"
+          dir="$RUNNER_TEMP/direct-ingress-rerun-$GITHUB_RUN_ID"
+          mkdir -p "$dir"
+          echo "RESULTS_DIR=$dir" >> "$GITHUB_ENV"
+          cat > "$dir/mosquitto.conf" <<EOF
+          listener $PORT 127.0.0.1
+          protocol mqtt
+          set_tcp_nodelay true
+          allow_anonymous true
+          persistence false
+          connection_messages false
+          log_dest stdout
+          log_type error
+          max_inflight_messages 1000
+          max_queued_messages 10000
+          max_packet_size 16777216
+          EOF
+          taskset -c 1 mosquitto -c "$dir/mosquitto.conf" > "$dir/mosquitto.log" 2>&1 &
+          echo "BROKER_PID=$!" >> "$GITHUB_ENV"
+          for _ in $(seq 1 50); do
+            (echo > /dev/tcp/127.0.0.1/$PORT) >/dev/null 2>&1 && exit 0
+            sleep 0.1
+          done
+          exit 1
+      - name: Run matrix
+        shell: bash
+        run: |
+          python3 experiment/tools/run_receive_architecture_matrix.py \
+            --root experiment --output-dir "$RESULTS_DIR/saturated" \
+            --broker-pid "$BROKER_PID" --port "$PORT" --sut-cpu 0 --publisher-cpu 2 \
+            --payload-size "$PAYLOAD_SIZE" --warmup-s "$WARMUP_S" \
+            --measure-s "$MEASURE_S" --publisher-s "$PUBLISHER_S"
+      - name: Stop broker
+        if: always()
+        run: '[ -n "${BROKER_PID:-}" ] && kill "$BROKER_PID" 2>/dev/null || true'
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: direct-ingress-rpi-rerun-${{ github.run_id }}
+          path: ${{ env.RESULTS_DIR }}
+          if-no-files-found: error
+          retention-days: 14
+
+  x86:
+    name: x86 hosted / 4x4 advisory matrix
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: experiment
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.13"
+      - name: Install broker and start
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mosquitto
+          dir="$RUNNER_TEMP/direct-ingress-x86-rerun-$GITHUB_RUN_ID"
+          mkdir -p "$dir"
+          echo "RESULTS_DIR=$dir" >> "$GITHUB_ENV"
+          python - <<'PY' > "$dir/host.json"
+          import json,os,platform
+          print(json.dumps({'machine':platform.machine(),'python':platform.python_version(),'cpus':os.cpu_count()},indent=2))
+          PY
+          cat > "$dir/mosquitto.conf" <<EOF
+          listener $PORT 127.0.0.1
+          protocol mqtt
+          set_tcp_nodelay true
+          allow_anonymous true
+          persistence false
+          connection_messages false
+          log_dest stdout
+          log_type error
+          max_inflight_messages 1000
+          max_queued_messages 10000
+          max_packet_size 16777216
+          EOF
+          taskset -c 1 mosquitto -c "$dir/mosquitto.conf" > "$dir/mosquitto.log" 2>&1 &
+          echo "BROKER_PID=$!" >> "$GITHUB_ENV"
+          mosquitto -h 2>&1 | head -n 2 > "$dir/mosquitto-version.txt" || true
+          for _ in $(seq 1 50); do
+            (echo > /dev/tcp/127.0.0.1/$PORT) >/dev/null 2>&1 && exit 0
+            sleep 0.1
+          done
+          exit 1
+      - name: Run matrix
+        shell: bash
+        run: |
+          python experiment/tools/run_receive_architecture_matrix.py \
+            --root experiment --output-dir "$RESULTS_DIR/saturated" \
+            --broker-pid "$BROKER_PID" --port "$PORT" --sut-cpu 0 --publisher-cpu 2 \
+            --payload-size "$PAYLOAD_SIZE" --warmup-s "$WARMUP_S" \
+            --measure-s "$MEASURE_S" --publisher-s "$PUBLISHER_S"
+      - name: Stop broker
+        if: always()
+        run: '[ -n "${BROKER_PID:-}" ] && kill "$BROKER_PID" 2>/dev/null || true'
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: direct-ingress-x86-rerun-${{ github.run_id }}
+          path: ${{ env.RESULTS_DIR }}
+          if-no-files-found: error
+          retention-days: 14
