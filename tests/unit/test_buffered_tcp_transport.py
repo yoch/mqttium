@@ -12,7 +12,7 @@ from mqttium.transport._buffered import (
     _READ_LOW_WATER,
     BufferedSocketProtocol,
 )
-from mqttium.transport.tcp import TcpTransport
+from mqttium.transport.tcp import TcpTransport, _BufferedTcpTransport
 
 
 class _FakeTransport:
@@ -28,6 +28,14 @@ class _FakeTransport:
 
     def close(self) -> None:
         self.closed = True
+
+
+class _ClosingTransport(_FakeTransport):
+    def is_closing(self) -> bool:
+        return True
+
+    def get_write_buffer_size(self) -> int:
+        return 0
 
 
 async def test_buffered_protocol_reuses_one_receive_buffer() -> None:
@@ -196,6 +204,20 @@ async def test_error_connection_loss_fails_pending_and_future_drains() -> None:
         await pending
     with pytest.raises(ConnectionResetError, match="Connection lost"):
         await protocol.drain()
+
+
+async def test_transport_drain_yields_to_scheduled_connection_loss_when_closing() -> None:
+    loop = asyncio.get_running_loop()
+    protocol = BufferedSocketProtocol(loop)
+    fake = _ClosingTransport()
+    protocol.connection_made(fake)  # type: ignore[arg-type]
+    transport = _BufferedTcpTransport(fake, protocol)  # type: ignore[arg-type]
+
+    # StreamWriter.drain() yields once in this exact window because close() can
+    # mark the transport closing before connection_lost() runs on the next turn.
+    loop.call_soon(protocol.connection_lost, None)
+    with pytest.raises(ConnectionResetError, match="Connection lost"):
+        await transport.drain()
 
 
 async def test_cleartext_tcp_roundtrip_uses_buffered_transport() -> None:
