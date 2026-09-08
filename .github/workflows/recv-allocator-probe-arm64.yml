@@ -1,0 +1,116 @@
+name: recv allocator probe ARM64
+
+on:
+  push:
+    branches: [bench/recv-allocator-probe-arm64]
+    paths: [.github/workflows/recv-allocator-probe-arm64.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mqttium-arm64-runner
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 30
+    env:
+      PROBE_SHA: a0dc3ae779799ab623227c02c05459b64896930f
+    steps:
+      - name: Set run workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/recv-allocator-probe-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -p "$root/results"
+          echo "JOB_ROOT=$root" >> "$GITHUB_ENV"
+
+      - name: Verify ARM host
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          test "$(cat /proc/sys/kernel/randomize_va_space)" != 0
+          python3 --version
+          ldd --version | head -n1
+          echo "aslr=$(cat /proc/sys/kernel/randomize_va_space)"
+          echo "personality=$(cat /proc/$$/personality)"
+          cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || true
+          cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq 2>/dev/null || true
+          cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || true
+          command -v setarch || true
+          command -v strace || true
+
+      - name: Checkout exact allocator probe
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: yoch/mqtt-python-client-bench
+          ref: ${{ env.PROBE_SHA }}
+          path: probe
+          persist-credentials: false
+
+      - name: Verify probe provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C probe rev-parse HEAD)" = "$PROBE_SHA"
+          cp probe/scripts/recv_allocator_probe.py "$JOB_ROOT/recv_allocator_probe.py"
+          printf 'probe_sha=%s\nworker_aslr=system\n' "$PROBE_SHA" > "$JOB_ROOT/results/provenance.txt"
+
+      - name: Sample normal-ASLR process distribution
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 "$JOB_ROOT/recv_allocator_probe.py" \
+            --samples 24 \
+            --iterations 5000 \
+            --warmup 100 \
+            --payload-size 256 \
+            --recv-sizes 262144,65536 \
+            --include-recv-into \
+            --aslr system \
+            --output "$JOB_ROOT/results/system.json" \
+            | tee "$JOB_ROOT/results/system.txt"
+
+      - name: Small ASLR-off causal control
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v setarch >/dev/null; then
+            python3 "$JOB_ROOT/recv_allocator_probe.py" \
+              --samples 8 \
+              --iterations 5000 \
+              --warmup 100 \
+              --payload-size 256 \
+              --recv-sizes 262144,65536 \
+              --include-recv-into \
+              --aslr disabled \
+              --output "$JOB_ROOT/results/no-aslr-diagnostic.json" \
+              | tee "$JOB_ROOT/results/no-aslr-diagnostic.txt"
+          fi
+
+      - name: Count allocator syscalls when strace is available
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v strace >/dev/null; then
+            for spec in 'recv256:262144:' 'recv64:65536:' 'recvinto256:262144:--recv-into'; do
+              IFS=: read -r name size extra <<< "$spec"
+              strace -qq -c -e trace=mmap,mremap,munmap,brk \
+                -o "$JOB_ROOT/results/$name.strace" \
+                python3 "$JOB_ROOT/recv_allocator_probe.py" --child $extra \
+                  --recv-size "$size" --payload-size 256 --iterations 1000 --warmup 10 \
+                > "$JOB_ROOT/results/$name-child.json"
+            done
+          fi
+
+      - name: Upload allocator evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: recv-allocator-probe-arm64-${{ github.run_id }}
+          path: ${{ env.JOB_ROOT }}/results
+          if-no-files-found: error
+          retention-days: 14
