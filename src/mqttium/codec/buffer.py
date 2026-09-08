@@ -31,6 +31,11 @@ DEFAULT_MAX_PACKET_SIZE = 16 * 1024 * 1024
 DEFAULT_CAPACITY = 256 * 1024
 # Smallest window worth offering a receiver; also the compaction trigger.
 _MIN_WINDOW = 16 * 1024
+# Fully drained slabs larger than DEFAULT_CAPACITY are retired only after this
+# many consecutive drains that did not need the extra room. Giving the memory
+# back immediately costs two reallocations per frame for a stream of frames just
+# over capacity, which is the allocator churn this design exists to remove.
+_OVERSIZE_RETENTION = 64
 # Body size from which the body is copied through a memoryview instead of
 # `bytes(bytearray[a:b])` — see next_packet. Paired end-to-end decode, alternated
 # in-process over 11 repeats: 1 KiB 0.996, 4 KiB 0.989, 8 KiB 1.027, 16 KiB
@@ -49,7 +54,17 @@ class RawPacket:
 
 
 class IncrementalDecoder:
-    __slots__ = ("_buf", "_view", "_start", "_end", "_capacity", "_max_packet_size", "_high_water")
+    __slots__ = (
+        "_buf",
+        "_view",
+        "_start",
+        "_end",
+        "_capacity",
+        "_grew",
+        "_idle_drains",
+        "_max_packet_size",
+        "_high_water",
+    )
 
     def __init__(self, max_packet_size: int = DEFAULT_MAX_PACKET_SIZE) -> None:
         if max_packet_size < 1:
@@ -60,6 +75,8 @@ class IncrementalDecoder:
         self._start = 0
         self._end = 0
         self._capacity = 0
+        self._grew = False
+        self._idle_drains = 0
         self._max_packet_size = max_packet_size
         self._high_water = 0
 
@@ -104,14 +121,28 @@ class IncrementalDecoder:
         capacity = self._capacity or DEFAULT_CAPACITY
         while capacity - live < need:
             capacity *= 2
+        if capacity > DEFAULT_CAPACITY:
+            self._grew = True
         self._reallocate(capacity)
 
+    def _retire_oversize(self) -> None:
+        """Give back an oversized slab, but only once it has stopped being used."""
+        if self._grew:
+            # This drain consumed a frame that needed the extra room.
+            self._grew = False
+            self._idle_drains = 0
+            return
+        self._idle_drains += 1
+        if self._idle_drains >= _OVERSIZE_RETENTION:
+            self._idle_drains = 0
+            self._reallocate(DEFAULT_CAPACITY)
+
     def _reset(self) -> None:
-        """Rewind a fully consumed slab, giving back any oversized-frame growth."""
+        """Rewind a fully consumed slab."""
         self._start = 0
         self._end = 0
         if self._capacity > DEFAULT_CAPACITY:
-            self._reallocate(DEFAULT_CAPACITY)
+            self._retire_oversize()
 
     def writable_window(self, need: int = _MIN_WINDOW) -> memoryview:
         """Return writable storage for a receiver to fill, then `commit()`.
@@ -224,7 +255,13 @@ class IncrementalDecoder:
             self._high_water = buffered
 
     def clear(self) -> None:
-        self._reset()
+        """Rewind for a new connection, dropping any oversized-frame growth."""
+        self._start = 0
+        self._end = 0
+        self._grew = False
+        self._idle_drains = 0
+        if self._capacity > DEFAULT_CAPACITY:
+            self._reallocate(DEFAULT_CAPACITY)
 
     def next_packet(self) -> RawPacket | None:
         buf = self._buf
@@ -289,7 +326,7 @@ class IncrementalDecoder:
             self._start = 0
             self._end = 0
             if self._capacity > DEFAULT_CAPACITY:
-                self._reallocate(DEFAULT_CAPACITY)
+                self._retire_oversize()
         return RawPacket(packet_type=packet_type, flags=flags, remaining=body)
 
     def drain_packets(self, limit: int = 100) -> list[RawPacket]:

@@ -68,7 +68,7 @@ class DecoderPushProtocol(asyncio.StreamReaderProtocol, asyncio.BufferedProtocol
 
     def attach(self, sink: DecoderSink) -> None:
         self._sink = sink
-        self._resume_if_drained()
+        self.resume_if_drained()
 
     def eof_received(self) -> bool | None:
         self._eof = True
@@ -122,7 +122,7 @@ class DecoderPushProtocol(asyncio.StreamReaderProtocol, asyncio.BufferedProtocol
             if self._waiter is waiter:
                 self._waiter = None
 
-    def _resume_if_drained(self) -> None:
+    def resume_if_drained(self) -> None:
         sink = self._sink
         if (
             self._paused_reading
@@ -169,7 +169,7 @@ class PushStreamTransport(StreamTransport):
         """
         protocol = self._protocol
         # The reader has finished its batch by the time it asks for more.
-        protocol._resume_if_drained()
+        protocol.resume_if_drained()
         while protocol.received == self._seen:
             if protocol.at_eof:
                 return False

@@ -6,9 +6,11 @@ compaction, growth for an oversized frame, and the shrink back afterwards.
 
 from __future__ import annotations
 
+import random
+
 import pytest
 
-from mqttium.codec.buffer import DEFAULT_CAPACITY, IncrementalDecoder
+from mqttium.codec.buffer import _OVERSIZE_RETENTION, DEFAULT_CAPACITY, IncrementalDecoder
 from mqttium.enums import PacketType
 
 
@@ -92,10 +94,45 @@ def test_slab_grows_for_an_oversized_frame_then_shrinks_back() -> None:
 
     decoder.feed(_publish(DEFAULT_CAPACITY * 3))
     assert decoder.capacity > DEFAULT_CAPACITY
+    assert decoder.next_packet() is not None
 
-    packet = decoder.next_packet()
-    assert packet is not None
-    # A single huge frame must not pin the connection's memory for its lifetime.
+    # Retained for a while, then given back: a single huge frame must not pin
+    # the connection's memory for its lifetime.
+    for _ in range(_OVERSIZE_RETENTION + 1):
+        decoder.feed(_publish(64))
+        assert decoder.next_packet() is not None
+    assert decoder.capacity == DEFAULT_CAPACITY
+    assert decoder.buffered == 0
+
+
+def test_a_stream_of_oversized_frames_does_not_thrash_the_slab() -> None:
+    # Shrinking on every drain would reallocate twice per frame here -- grow,
+    # consume, shrink, grow -- which is the churn this design exists to remove.
+    decoder = IncrementalDecoder()
+    reallocations = 0
+    original = IncrementalDecoder._reallocate
+
+    def counting(self: IncrementalDecoder, capacity: int) -> None:
+        nonlocal reallocations
+        reallocations += 1
+        original(self, capacity)
+
+    frame = _publish(DEFAULT_CAPACITY)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(IncrementalDecoder, "_reallocate", counting)
+        for _ in range(50):
+            decoder.feed(frame)
+            assert decoder.next_packet() is not None
+
+    assert reallocations == 1
+
+
+def test_clear_drops_oversized_growth_for_the_next_connection() -> None:
+    decoder = IncrementalDecoder()
+    decoder.feed(_publish(DEFAULT_CAPACITY * 2))
+    assert decoder.capacity > DEFAULT_CAPACITY
+
+    decoder.clear()
     assert decoder.capacity == DEFAULT_CAPACITY
     assert decoder.buffered == 0
 
@@ -130,3 +167,31 @@ def test_clear_keeps_capacity_so_the_next_receive_does_not_reallocate() -> None:
     assert decoder.buffered == 0
     assert decoder.capacity == DEFAULT_CAPACITY
     assert id(decoder._buf) == identity
+
+
+@pytest.mark.parametrize("seed", range(25))
+def test_random_window_chunking_matches_feed(seed: int) -> None:
+    # The window path must frame identically to feed() no matter how the
+    # receiver's chunk boundaries fall relative to frames and compactions.
+    rng = random.Random(seed)
+    sizes = [rng.choice([0, 1, 7, 300, 4095, 4096, 40_000, 300_000]) for _ in range(12)]
+    frames = b"".join(_publish(size) for size in sizes)
+
+    reference = IncrementalDecoder()
+    reference.feed(frames)
+    expected = [p.remaining for p in reference.drain_packets(limit=64)]
+
+    decoder = IncrementalDecoder()
+    produced: list[bytes] = []
+    offset = 0
+    while offset < len(frames):
+        window = decoder.writable_window(rng.choice([1, 1024, 16 * 1024]))
+        take = min(len(window), rng.randint(1, 70_000), len(frames) - offset)
+        window[:take] = frames[offset : offset + take]
+        decoder.commit(take)
+        offset += take
+        produced.extend(p.remaining for p in decoder.drain_packets(limit=64))
+    produced.extend(p.remaining for p in decoder.drain_packets(limit=64))
+
+    assert produced == expected
+    assert len(produced) == len(sizes)
