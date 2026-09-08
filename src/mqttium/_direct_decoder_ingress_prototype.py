@@ -1,20 +1,24 @@
 """Experimental direct selector ingress for receive-path benchmarks.
 
-NOT production wired. The experiment keeps asyncio StreamReaderProtocol /
-StreamWriter lifecycle and write-side semantics, but selector recv_into() writes
-directly into storage owned by the MQTT incremental decoder. The normal
-AsyncClient read loop is deliberately left untouched: ``read()`` returns one
-private truthy sentinel after ingress has already been committed, and the
-experimental decoder treats that sentinel as a no-op feed.
+NOT production wired. Selector ``recv_into()`` writes directly into storage
+owned by the MQTT incremental decoder, removing the intermediate
+``StreamReader -> bytes -> decoder.feed()`` receive copy.
 
-Mutable storage never escapes the decoder. RawPacket bodies and application
-Message payloads are still materialised as owned ``bytes`` by the existing
-parsers before they can outlive one synchronous decode step.
+Read readiness is generation-gated: one synthetic ``read()`` notification is
+issued for newly observed selector receive callbacks, not merely because bytes
+remain buffered. This matters for TCP fragmentation because an incomplete MQTT
+frame may legitimately stay buffered while the reader waits for another network
+arrival.
+
+Mutable storage never escapes the decoder. ``RawPacket`` bodies and
+application-visible ``Message.payload`` values are still materialised as owned
+``bytes`` before they can outlive synchronous decoding.
 """
 
 from __future__ import annotations
 
 import asyncio
+import socket
 from contextlib import suppress
 from typing import Any
 
@@ -48,7 +52,7 @@ class DirectIngressDecoder(_IncrementalDecoder):
     logical ``[_start:_end]`` interval.
     """
 
-    __slots__ = ("_end",)
+    __slots__ = ("_end", "_growth_count", "_compaction_count")
 
     def __init__(
         self,
@@ -65,6 +69,8 @@ class DirectIngressDecoder(_IncrementalDecoder):
         self._end = 0
         self._max_packet_size = max_packet_size
         self._high_water = 0
+        self._growth_count = 0
+        self._compaction_count = 0
 
     @property
     def buffered(self) -> int:
@@ -73,6 +79,18 @@ class DirectIngressDecoder(_IncrementalDecoder):
     @property
     def next_header_byte(self) -> int | None:
         return self._buf[self._start] if self._start < self._end else None
+
+    @property
+    def capacity(self) -> int:
+        return len(self._buf)
+
+    @property
+    def growth_count(self) -> int:
+        return self._growth_count
+
+    @property
+    def compaction_count(self) -> int:
+        return self._compaction_count
 
     def clear(self) -> None:
         self._start = 0
@@ -88,9 +106,16 @@ class DirectIngressDecoder(_IncrementalDecoder):
             self._end = 0
             return
         live = end - start
-        self._buf[:live] = self._buf[start:end]
+        # Equal-length memoryview assignment maps to an overlapping in-place
+        # move without allocating a second bytearray of the live region.
+        view = memoryview(self._buf)
+        try:
+            self._buf[:live] = view[start:end]
+        finally:
+            view.release()
         self._start = 0
         self._end = live
+        self._compaction_count += 1
 
     def _ensure_tail(self, wanted: int) -> None:
         if len(self._buf) - self._end >= wanted:
@@ -103,6 +128,7 @@ class DirectIngressDecoder(_IncrementalDecoder):
         capacity = len(self._buf)
         new_capacity = max(needed, max(capacity * 2, _INITIAL_CAPACITY))
         self._buf.extend(b"\x00" * (new_capacity - capacity))
+        self._growth_count += 1
 
     def writable_buffer(self) -> memoryview:
         self._ensure_tail(_RX_CHUNK)
@@ -137,30 +163,22 @@ class DirectIngressDecoder(_IncrementalDecoder):
         pos = start + 1
         value = 0
         multiplier = 1
-        count = 0
+        encoded_bytes = 0
         while True:
             if pos >= self._end:
                 return None
             byte = buf[pos]
             pos += 1
-            count += 1
-            if count > 4:
-                raise MalformedPacketError("Malformed Variable Byte Integer (too long)")
+            encoded_bytes += 1
             value += (byte & 0x7F) * multiplier
             if byte & 0x80 == 0:
                 break
+            if encoded_bytes == 4:
+                raise MalformedPacketError("Malformed Variable Byte Integer (too long)")
             multiplier *= 128
 
-        canonical = (
-            1
-            if value < 128
-            else 2
-            if value < 16_384
-            else 3
-            if value < 2_097_152
-            else 4
-        )
-        if count != canonical:
+        canonical = 1 if value < 128 else 2 if value < 16_384 else 3 if value < 2_097_152 else 4
+        if encoded_bytes != canonical:
             raise MalformedPacketError("Non-canonical Variable Byte Integer")
 
         fixed_header_len = pos - start
@@ -276,7 +294,9 @@ class _DirectDecoderProtocol(asyncio.StreamReaderProtocol, asyncio.BufferedProto
 
 
 class DirectIngressTcpTransport(StreamTransport):
-    __slots__ = ("_direct_protocol", "_direct_decoder")
+    """StreamTransport facade whose read readiness tracks receive generations."""
+
+    __slots__ = ("_direct_protocol", "_direct_decoder", "_seen_callbacks")
 
     def __init__(
         self,
@@ -288,40 +308,60 @@ class DirectIngressTcpTransport(StreamTransport):
         super().__init__(reader, writer)
         self._direct_protocol = protocol
         self._direct_decoder = decoder
+        self._seen_callbacks = 0
 
-    async def _ready_sentinel(self) -> bytes:
-        # The normal StreamReader path suspends at read() frequently enough to
-        # let timers, writer/effect tasks and cancellation run. Direct ingress
-        # can otherwise keep finding already-buffered data and spin the MQTT
-        # reader continuously under saturation. Yield exactly once before an
-        # immediate sentinel so this prototype preserves event-loop fairness.
-        await asyncio.sleep(0)
-        self._direct_protocol.maybe_resume_reading()
+    def _consume_generation(self) -> bytes | None:
+        protocol = self._direct_protocol
+        callbacks = protocol.recv_callbacks
+        if callbacks == self._seen_callbacks:
+            return None
+        self._seen_callbacks = callbacks
+        protocol.maybe_resume_reading()
         return _INGRESS_READY
+
+    def receive_stats(self) -> dict[str, int]:
+        protocol = self._direct_protocol
+        decoder = self._direct_decoder
+        return {
+            "recv_callbacks": protocol.recv_callbacks,
+            "recv_bytes": protocol.recv_bytes,
+            "pause_count": protocol.pause_count,
+            "resume_count": protocol.resume_count,
+            "decoder_high_water": decoder.high_water,
+            "decoder_capacity": decoder.capacity,
+            "decoder_growth_count": decoder.growth_count,
+            "decoder_compaction_count": decoder.compaction_count,
+            "decoder_buffered": decoder.buffered,
+        }
 
     async def read(self, n: int = 65536) -> bytes:
         del n
         protocol = self._direct_protocol
-        decoder = self._direct_decoder
         protocol.maybe_resume_reading()
-        if decoder.buffered:
-            return await self._ready_sentinel()
+
+        ready = self._consume_generation()
+        if ready is not None:
+            return ready
         if protocol.exc is not None:
             raise protocol.exc
         if protocol.eof:
             return b""
 
+        # Event.clear() is paired with a generation re-check so a callback in
+        # the clear/check race cannot be lost.
         protocol.ready.clear()
-        if decoder.buffered:
-            return await self._ready_sentinel()
+        ready = self._consume_generation()
+        if ready is not None:
+            return ready
         if protocol.exc is not None:
             raise protocol.exc
         if protocol.eof:
             return b""
+
         await protocol.ready.wait()
-        protocol.maybe_resume_reading()
-        if decoder.buffered:
-            return await self._ready_sentinel()
+        ready = self._consume_generation()
+        if ready is not None:
+            return ready
         if protocol.exc is not None:
             raise protocol.exc
         return b""
@@ -344,8 +384,6 @@ async def _connect_direct(
     writer = asyncio.StreamWriter(transport, protocol, reader, loop)
     sock = writer.get_extra_info("socket")
     if sock is not None:
-        import socket
-
         with suppress(OSError):
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     return DirectIngressTcpTransport(reader, writer, protocol, decoder)
