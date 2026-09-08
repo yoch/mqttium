@@ -19,11 +19,11 @@ class BufferedSocketProtocol(asyncio.BufferedProtocol):
     ``socket.recv(256 KiB)`` and therefore allocates a temporary bytes object of
     that requested size before shrinking it to the bytes actually received.
     ``BufferedProtocol`` instead lets the selector call ``recv_into`` on a
-    buffer owned by the protocol.  We keep one 64-KiB receive buffer for the
+    buffer owned by the protocol. We keep one 64-KiB receive buffer for the
     lifetime of the connection and copy only the bytes actually received into
     immutable chunks handed to the MQTT read loop.
 
-    The public transport contract still exposes ``read(n) -> bytes``.  With
+    The public transport contract still exposes ``read(n) -> bytes``. With
     MQTTium's normal 64-KiB reads each received chunk is therefore copied once,
     not copied through StreamReader's bytearray and back out again.
     """
@@ -66,11 +66,11 @@ class BufferedSocketProtocol(asyncio.BufferedProtocol):
             self._exception = exc
         self._wake_reader()
         self._wake_writer(exc)
+        # Keep the close-notification future successful and surface the stored
+        # transport exception from wait_closed(). A connection that nobody
+        # explicitly waits closed then cannot emit an unobserved-Future warning.
         if not self._closed_waiter.done():
-            if exc is None:
-                self._closed_waiter.set_result(None)
-            else:
-                self._closed_waiter.set_exception(exc)
+            self._closed_waiter.set_result(None)
 
     def eof_received(self) -> bool | None:
         self._eof = True
@@ -163,6 +163,8 @@ class BufferedSocketProtocol(asyncio.BufferedProtocol):
 
     async def wait_closed(self) -> None:
         await self._closed_waiter
+        if self._exception is not None:
+            raise self._exception
 
     def _wake_reader(self) -> None:
         waiter = self._read_waiter
