@@ -224,6 +224,20 @@ def _malloc_trim() -> bool:
         return False
 
 
+def _out_record_count(store: Any) -> int:
+    """Count durable outbound records through the paged summary API."""
+    return sum(len(page) for page in store.out_summary_pages())
+
+
+def _out_property_record_count(store: Any) -> int:
+    return sum(1 for page in store.out_summary_pages() for record in page if record.properties)
+
+
+def _in_record_count(store: Any) -> int:
+    """Count durable inbound records through the paged index API."""
+    return sum(len(page) for page in store.in_index_pages())
+
+
 def _payload(index: int, size: int) -> bytes:
     if size <= 0:
         return b""
@@ -306,7 +320,7 @@ def run_protocol_qos_queue(spec: ScenarioSpec) -> dict[str, Any]:
                 len(engine.outbound._queued) * _logical_message_bytes(spec.payload_size)
             ),
             packet_ids=len(engine.packet_ids),
-            store_records=sum(1 for _ in engine.store.out_items()),
+            store_records=_out_record_count(engine.store),
         )
     )
     engine.outbound._queued.clear()
@@ -395,7 +409,7 @@ def run_inbound_bounded_persistence(spec: ScenarioSpec) -> dict[str, Any]:
         if engine.state is ConnectionState.DISCONNECTED:
             break
     stats = engine.inbound.stats()
-    accepted = sum(1 for _ in engine.store.in_items())
+    accepted = _in_record_count(engine.store)
     snapshots.append(
         probe.snapshot(
             "loaded",
@@ -519,7 +533,7 @@ def run_memory_store(spec: ScenarioSpec) -> dict[str, Any]:
     snapshots.append(
         probe.snapshot(
             "loaded",
-            store_records=sum(1 for _ in store.out_items()),
+            store_records=_out_record_count(store),
             store_logical_bytes=(spec.count * _logical_message_bytes(spec.payload_size)),
         )
     )
@@ -557,7 +571,7 @@ def run_sqlite_hydration(spec: ScenarioSpec) -> dict[str, Any]:
                 "loaded",
                 queued_messages=len(engine.outbound._queued),
                 packet_ids=len(engine.packet_ids),
-                store_records=sum(1 for _ in store.out_items()),
+                store_records=_out_record_count(store),
                 store_logical_bytes=(spec.count * _logical_message_bytes(spec.payload_size)),
             )
         )
@@ -611,9 +625,9 @@ def run_property_heavy_outbound(spec: ScenarioSpec) -> dict[str, Any]:
             "loaded",
             queued_messages=len(engine.outbound._queued),
             pending_logical_bytes=engine.pending_outbound_bytes,
-            property_records=sum(1 for message in engine.store.out_items() if message.properties),
+            property_records=_out_property_record_count(engine.store),
             packet_ids=len(engine.packet_ids),
-            store_records=sum(1 for _ in engine.store.out_items()),
+            store_records=_out_record_count(engine.store),
         )
     )
     engine.outbound._queued.clear()
@@ -657,7 +671,7 @@ def run_immediate_refusal(spec: ScenarioSpec) -> dict[str, Any]:
             accepted_messages=engine.pending_outbound_messages,
             rejected_messages=rejected,
             packet_ids=len(engine.packet_ids),
-            store_records=sum(1 for _ in engine.store.out_items()),
+            store_records=_out_record_count(engine.store),
             pending_logical_bytes=engine.pending_outbound_bytes,
         )
     )
@@ -708,7 +722,7 @@ async def _run_cancelled_admission(spec: ScenarioSpec) -> dict[str, Any]:
             publish_waiters=client._publish_waiters,
             pending_messages=client._engine.pending_outbound_messages,
             packet_ids=len(client._engine.packet_ids),
-            store_records=sum(1 for _ in client._engine.store.out_items()),
+            store_records=_out_record_count(client._engine.store),
             receipts=len(client._receipts),
         )
     )
@@ -768,7 +782,7 @@ def run_paho_saturation(spec: ScenarioSpec) -> dict[str, Any]:
             configured_message_limit=queue_limit,
             pending_messages=client._async._engine.pending_outbound_messages,
             packet_ids=len(client._async._engine.packet_ids),
-            store_records=sum(1 for _ in client._async._engine.store.out_items()),
+            store_records=_out_record_count(client._async._engine.store),
             pending_handoff=client._publish_spillover is not None,
         )
     )

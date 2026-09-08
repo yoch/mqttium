@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from mqttium.transport.stats import TransportStats
 
@@ -22,6 +22,20 @@ class AsyncTransport(Protocol):
     async def read(self, n: int = 65536) -> bytes: ...
     async def close(self) -> None: ...
     def is_closing(self) -> bool: ...
+
+
+@runtime_checkable
+class DecoderPushTransport(Protocol):
+    """Optional capability: deliver received bytes into the decoder's storage.
+
+    A transport offering this receives into storage the decoder owns, so the
+    reader never calls ``read()``. Like ``write_nowait``, it is an optimisation
+    a transport may provide, not an obligation: TLS, WebSocket and non-selector
+    loops cannot, and keep ``read()`` + ``feed()``.
+    """
+
+    def attach_decoder(self, decoder: object) -> None: ...
+    async def receive(self) -> bool: ...
 
 
 class StreamTransport:

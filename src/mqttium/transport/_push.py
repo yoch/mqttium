@@ -49,6 +49,7 @@ class DecoderPushProtocol(asyncio.StreamReaderProtocol, asyncio.BufferedProtocol
         super().__init__(reader, loop=loop)
         self._loop = loop
         self._sink: DecoderSink | None = None
+        self._scratch: memoryview | None = None
         self._read_transport: asyncio.Transport | None = None
         self._waiter: asyncio.Future[None] | None = None
         self._received = 0
@@ -70,6 +71,20 @@ class DecoderPushProtocol(asyncio.StreamReaderProtocol, asyncio.BufferedProtocol
         self._sink = sink
         self.resume_if_drained()
 
+    def detach(self) -> None:
+        """Stop routing into the decoder.
+
+        A reconnect hands the same decoder to a new connection, so a late
+        callback from the old one must not be able to commit stale bytes into
+        it. Reading is already stopped by close(); this makes it safe even if a
+        callback is still in flight.
+        """
+        self._sink = None
+        transport = self._read_transport
+        if not self._paused_reading and transport is not None and not transport.is_closing():
+            transport.pause_reading()
+            self._paused_reading = True
+
     def eof_received(self) -> bool | None:
         self._eof = True
         self._wake()
@@ -84,14 +99,24 @@ class DecoderPushProtocol(asyncio.StreamReaderProtocol, asyncio.BufferedProtocol
 
     def get_buffer(self, sizehint: int) -> memoryview:
         del sizehint
-        assert self._sink is not None  # reading is paused until attach()
-        return self._sink.writable_window(_MIN_WINDOW)
+        sink = self._sink
+        if sink is None:
+            # Detached, or not yet attached. Reading is paused in both cases, so
+            # this should be unreachable -- but get_buffer() may not return an
+            # empty buffer, so hand over scratch space rather than fail the
+            # connection. Whatever lands in it is dropped by buffer_updated().
+            scratch = self._scratch
+            if scratch is None:
+                scratch = self._scratch = memoryview(bytearray(_MIN_WINDOW))
+            return scratch
+        return sink.writable_window(_MIN_WINDOW)
 
     def buffer_updated(self, nbytes: int) -> None:
         if nbytes <= 0:
             return
         sink = self._sink
-        assert sink is not None
+        if sink is None:
+            return
         sink.commit(nbytes)
         self._received += 1
         if (
@@ -179,3 +204,7 @@ class PushStreamTransport(StreamTransport):
 
     async def read(self, n: int = 65536) -> bytes:
         raise RuntimeError("PushStreamTransport delivers into the decoder; use receive()")
+
+    async def close(self) -> None:
+        self._protocol.detach()
+        await super().close()

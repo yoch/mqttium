@@ -14,6 +14,7 @@ from mqttium.transport._push import (
     DecoderPushProtocol,
     PushStreamTransport,
 )
+from mqttium.transport._stream import DecoderPushTransport, StreamTransport
 from mqttium.transport.tcp import TcpTransport
 
 
@@ -209,3 +210,63 @@ async def test_tls_keeps_the_stream_path() -> None:
     assert PushStreamTransport.__mro__[1] is StreamTransport
     assert not hasattr(StreamTransport, "attach_decoder")
     assert not hasattr(StreamTransport, "receive")
+
+
+async def test_detach_stops_a_torn_down_connection_writing_into_the_decoder() -> None:
+    # A reconnect hands the same decoder to the next connection. A callback
+    # still in flight on the old one must not commit stale bytes into it.
+    decoder = IncrementalDecoder()
+    old, old_transport = _wire(decoder)
+    _deliver(old, _publish(8))
+    assert decoder.buffered > 0
+
+    decoder.clear()
+    old.detach()
+    assert old_transport.paused is True
+
+    # The old connection reports more data; it must be dropped, not committed.
+    window = old.get_buffer(-1)
+    window[:4] = b"\x30\x02ab"
+    old.buffer_updated(4)
+    assert decoder.buffered == 0
+
+    # And the decoder still works for whoever owns it now.
+    new, _ = _wire(decoder)
+    _deliver(new, _publish(8))
+    assert decoder.next_packet() is not None
+
+
+async def test_closing_the_transport_detaches_it() -> None:
+    decoder = IncrementalDecoder()
+    protocol, _ = _wire(decoder)
+
+    class _ClosableWriter:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+        async def wait_closed(self) -> None:
+            return None
+
+    writer = _ClosableWriter()
+    transport = PushStreamTransport(asyncio.StreamReader(), writer, protocol)  # type: ignore[arg-type]
+    await transport.close()
+
+    assert writer.closed is True
+    window = protocol.get_buffer(-1)
+    window[:4] = b"\x30\x02ab"
+    protocol.buffer_updated(4)
+    assert decoder.buffered == 0
+
+
+async def test_push_capability_is_declared_not_guessed() -> None:
+    # The client selects the push path on this capability, so the classes that
+    # must not offer it have to keep failing the check.
+    protocol, _ = _wire(IncrementalDecoder())
+    transport = PushStreamTransport(asyncio.StreamReader(), None, protocol)  # type: ignore[arg-type]
+    assert isinstance(transport, DecoderPushTransport)
+
+    plain = StreamTransport(asyncio.StreamReader(), None)  # type: ignore[arg-type]
+    assert not isinstance(plain, DecoderPushTransport)

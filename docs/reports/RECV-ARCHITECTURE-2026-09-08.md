@@ -185,15 +185,46 @@ brought it back to parity. Paired against `main`, 9 repetitions:
 | `ingress_engine_qos0_v5` | 1.010 |
 | `ingress_publish_qos1` | 1.003 |
 
+## Memory cost, measured
+
+`benchmarks/memory_profile.py` was broken on `main` before this could be run:
+it still called `store.out_items()` / `store.in_items()`, removed by 42479f5
+("remove retired persistence primitives"). Repaired here against the paged
+`out_summary_pages()` / `in_index_pages()` API, so the guardrail works again.
+
+Paired against `main`, full scale, isolated child process per scenario:
+
+| scenario | main peak | #447 peak | delta |
+|---|---:|---:|---:|
+| `inbound_bounded_persistence_4k` | 8.62 MiB | 8.87 MiB | **+0.250 MiB** |
+| `reconnect_epoch_cleanup_4k` | 8.12 MiB | 8.37 MiB | **+0.246 MiB** |
+| all 13 others | — | — | +0.000 MiB |
+
+Exactly one 256 KiB slab, and only in the scenarios that actually decode
+inbound traffic — the slab is allocated lazily, so a client that never receives
+pays nothing. `reconnect_epoch_cleanup_4k` gains one slab, not one per
+connection, which confirms `clear()` releases oversized growth on reconnect.
+Both scenarios stay inside their thresholds (+3.13 and +1.83 MiB of headroom);
+`check_memory_thresholds.py` passes on all 15.
+
+## Shrink hysteresis
+
+The first version gave the slab back on every fully drained oversized frame.
+For a stream of frames just over capacity that is grow -> consume -> shrink ->
+grow: **100 reallocations for 50 frames**, reintroducing exactly the churn this
+design removes. An oversized slab is now retired only after
+`_OVERSIZE_RETENTION` (64) consecutive drains that did not need the extra room —
+1 reallocation for the same 50 frames — while `clear()` still drops it at once
+so a new connection never inherits it.
+
 ## Open risks
 
 - CPython 3.12.13 here; 3.13.5 and 3.14.7 elsewhere. The three converge, but
   final validation is fresh-process on the RPi5 under the enforced preflight.
-- The slab holds `DEFAULT_CAPACITY` (256 KiB) per connection once used. It grows
-  only for an oversized frame and shrinks straight back, but the steady-state
-  per-connection footprint is larger than the old growing `bytearray` for a
-  client that only ever sees small frames. `benchmarks/memory_profile.py` and
-  `check_memory_thresholds.py` are the guardrails.
+- `DEFAULT_CAPACITY` is a throughput/memory trade, not an optimum. 128 KiB would
+  halve the per-connection cost; measured 1.38 vs 2.50 GiB/s on 64 KiB payloads
+  and equal on small ones. 256 KiB is the throughput choice; the argument for
+  128 KiB is real if per-connection footprint matters more.
 - `_process_direct_qos0_batch` hoists `decoder._buf` once per batch. The grow
   path replaces that object, so it must never run mid-batch. It cannot today —
   the batch is synchronous and `get_buffer()` only runs in a loop callback — but
