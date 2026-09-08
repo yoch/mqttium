@@ -1,0 +1,183 @@
+name: Apply ingress transport contract refactor v2
+
+on:
+  push:
+    branches: [perf/direct-decoder-ingress-prototype]
+    paths: [.github/workflows/apply-ingress-contract-v2.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: perf/direct-decoder-ingress-prototype
+          fetch-depth: 0
+          persist-credentials: true
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.12"
+      - name: Refactor transport capabilities
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > src/mqttium/transport/_stream.py <<'PY'
+          """Shared asyncio transport primitives."""
+
+          from __future__ import annotations
+
+          import asyncio
+          from contextlib import suppress
+          from typing import Protocol, runtime_checkable
+
+          from mqttium.transport.stats import TransportStats
+
+          _WRITE_BUFFER_HIGH_WATER = 64 * 1024
+
+
+          def write_buffer_needs_drain(writer: asyncio.StreamWriter) -> bool:
+              transport = writer.transport
+              return transport is not None and transport.get_write_buffer_size() > _WRITE_BUFFER_HIGH_WATER
+
+
+          class AsyncTransport(Protocol):
+              """Common transport contract; receive mode is a separate capability."""
+
+              async def write(self, data: bytes) -> None: ...
+              async def write_many(self, parts: list[bytes]) -> None: ...
+              async def close(self) -> None: ...
+              def is_closing(self) -> bool: ...
+
+
+          @runtime_checkable
+          class PullTransport(Protocol):
+              """Receive capability for transports returning byte-stream chunks."""
+
+              async def read(self, n: int = 65536) -> bytes: ...
+
+
+          @runtime_checkable
+          class DecoderPushTransport(Protocol):
+              """Receive capability for transports committing into decoder storage."""
+
+              def attach_decoder(self, decoder: object) -> None: ...
+              async def receive(self) -> bool: ...
+
+
+          class _StreamTransportBase:
+              """Writer/lifecycle half shared by pull and decoder-ingress streams."""
+
+              __slots__ = ("_reader", "_writer")
+
+              def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+                  self._reader = reader
+                  self._writer = writer
+
+              async def write(self, data: bytes) -> None:
+                  self._writer.write(data)
+                  await self._drain_if_needed()
+
+              def write_nowait(self, data: bytes) -> bool:
+                  transport = self._writer.transport
+                  if transport is not None and transport.get_write_buffer_size() + len(data) > _WRITE_BUFFER_HIGH_WATER:
+                      return False
+                  self._writer.write(data)
+                  return True
+
+              async def write_many(self, parts: list[bytes]) -> None:
+                  if not parts:
+                      return
+                  if len(parts) == 1:
+                      await self.write(parts[0])
+                      return
+                  self._writer.writelines(parts)
+                  await self._drain_if_needed()
+
+              async def drain(self) -> None:
+                  await self._writer.drain()
+
+              async def close(self) -> None:
+                  self._writer.close()
+                  with suppress(Exception):
+                      await self._writer.wait_closed()
+
+              def is_closing(self) -> bool:
+                  return self._writer.is_closing()
+
+              @property
+              def pending_write_bytes(self) -> int:
+                  transport = self._writer.transport
+                  return 0 if transport is None else transport.get_write_buffer_size()
+
+              def stats(self) -> TransportStats:
+                  return TransportStats(
+                      kind=type(self).__name__, closing=self.is_closing(),
+                      pending_write_bytes=self.pending_write_bytes,
+                      buffered_read_bytes=0, fragmented_read_bytes=0,
+                      pending_control_frames=0, pending_control_bytes=0,
+                  )
+
+              async def _drain_if_needed(self) -> None:
+                  if write_buffer_needs_drain(self._writer):
+                      await self._writer.drain()
+
+
+          class StreamTransport(_StreamTransportBase):
+              """Ordinary pull-based StreamReader/StreamWriter transport."""
+
+              async def read(self, n: int = 65536) -> bytes:
+                  return await self._reader.read(n)
+          PY
+
+          python - <<'PY'
+          from pathlib import Path
+
+          push = Path("src/mqttium/transport/_push.py")
+          text = push.read_text()
+          text = text.replace("from mqttium.transport._stream import StreamTransport", "from mqttium.transport._stream import _StreamTransportBase", 1)
+          text = text.replace("class PushStreamTransport(StreamTransport):", "class PushStreamTransport(_StreamTransportBase):", 1)
+          text = text.replace('''    async def read(self, n: int = 65536) -> bytes:\n        del n\n        raise RuntimeError("decoder ingress is push-based; use receive()")\n\n''', "", 1)
+          push.write_text(text)
+
+          tcp = Path("src/mqttium/transport/tcp.py")
+          text = tcp.read_text()
+          text = text.replace("from mqttium.transport._stream import StreamTransport", "from mqttium.transport._stream import AsyncTransport, StreamTransport", 1)
+          text = text.replace(") -> StreamTransport:\n        loop = asyncio.get_running_loop()", ") -> AsyncTransport:\n        loop = asyncio.get_running_loop()", 1)
+          text = text.replace("transport: StreamTransport = await _connect_push", "transport: AsyncTransport = await _connect_push", 1)
+          old = '''def _set_nodelay(transport: StreamTransport) -> None:\n    sock = transport._writer.get_extra_info("socket")\n'''
+          new = '''def _set_nodelay(transport: AsyncTransport) -> None:\n    writer = getattr(transport, "_writer", None)\n    if writer is None:\n        return\n    sock = writer.get_extra_info("socket")\n'''
+          assert old in text
+          text = text.replace(old, new, 1)
+          tcp.write_text(text)
+
+          client = Path("src/mqttium/api/async_client.py")
+          text = client.read_text()
+          text = text.replace("from mqttium.transport._stream import AsyncTransport, DecoderPushTransport", "from mqttium.transport._stream import AsyncTransport, DecoderPushTransport, PullTransport", 1)
+          old = '''        # A push transport has already placed received bytes in the decoder by\n        # the time it reports them, so there is nothing to feed.\n        push = self._transport if isinstance(self._transport, DecoderPushTransport) else None\n        try:\n            while not self._transport.is_closing():\n                if push is not None:\n                    if not await push.receive():\n                        break\n                else:\n                    data = await self._transport.read(256 * 1024)\n                    if not data:\n                        break\n                    self._decoder.feed(data)\n'''
+          new = '''        # Receive mode is an explicit transport capability.\n        transport = self._transport\n        push = transport if isinstance(transport, DecoderPushTransport) else None\n        pull = transport if isinstance(transport, PullTransport) else None\n        if push is None and pull is None:\n            raise TypeError("transport provides neither pull nor decoder-ingress receive")\n        try:\n            while not transport.is_closing():\n                if push is not None:\n                    if not await push.receive():\n                        break\n                else:\n                    assert pull is not None\n                    data = await pull.read(256 * 1024)\n                    if not data:\n                        break\n                    self._decoder.feed(data)\n'''
+          assert old in text
+          text = text.replace(old, new, 1)
+          client.write_text(text)
+
+          Path("src/mqttium/_direct_decoder_ingress_prototype.py").unlink()
+          Path("tests/unit/test_direct_decoder_ingress_prototype.py").unlink()
+          PY
+
+          python -m pip install -e ".[dev]" >/dev/null
+          ruff format src/mqttium tests/unit/test_decoder_ingress_storage.py tests/unit/test_buffered_stream_reader_protocol.py
+          ruff check src/mqttium tests/unit/test_decoder_ingress_storage.py tests/unit/test_buffered_stream_reader_protocol.py
+          mypy src/mqttium
+          python -m pytest -q tests/unit/test_decoder_ingress_storage.py tests/unit/test_buffered_stream_reader_protocol.py
+      - name: Commit and push
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "mqttium implementation agent"
+          git config user.email "actions@users.noreply.github.com"
+          git add -A src/mqttium tests/unit/test_direct_decoder_ingress_prototype.py
+          git commit -m "refactor: separate pull and decoder ingress transports"
+          git push origin HEAD:perf/direct-decoder-ingress-prototype
