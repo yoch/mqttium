@@ -340,3 +340,57 @@ def test_malformed_head_counts_as_ready_so_the_error_can_surface() -> None:
     decoder = IncrementalDecoder()
     decoder.feed(b"\x30\x80\x80\x80\x80\x80")
     assert decoder.head_frame_ready() is True
+
+
+async def test_a_connection_error_is_raised_not_reported_as_eof() -> None:
+    # The client's error taxonomy and reconnect policy distinguish a peer reset
+    # from a clean close. StreamReader.read() raises here, so receive() must
+    # too, or every transport failure would look like an orderly shutdown.
+    decoder = IncrementalDecoder()
+    protocol, _ = _wire(decoder)
+    transport = PushStreamTransport(asyncio.StreamReader(), None, protocol)  # type: ignore[arg-type]
+
+    protocol.connection_lost(ConnectionResetError("peer reset"))
+
+    with pytest.raises(ConnectionResetError, match="peer reset"):
+        await transport.receive()
+
+
+async def test_a_connection_error_wins_over_bytes_that_arrived_before_it() -> None:
+    # Matches StreamReader ordering: set_exception makes subsequent reads raise
+    # even when bytes were buffered first.
+    decoder = IncrementalDecoder()
+    protocol, _ = _wire(decoder)
+    transport = PushStreamTransport(asyncio.StreamReader(), None, protocol)  # type: ignore[arg-type]
+
+    _deliver(protocol, _publish(8))
+    protocol.connection_lost(ConnectionResetError("peer reset"))
+
+    with pytest.raises(ConnectionResetError):
+        await transport.receive()
+
+
+async def test_an_error_arriving_while_the_reader_waits_is_raised() -> None:
+    decoder = IncrementalDecoder()
+    protocol, _ = _wire(decoder)
+    transport = PushStreamTransport(asyncio.StreamReader(), None, protocol)  # type: ignore[arg-type]
+
+    waiting = asyncio.ensure_future(transport.receive())
+    await asyncio.sleep(0)
+    protocol.connection_lost(OSError("link went down"))
+
+    with pytest.raises(OSError, match="link went down"):
+        await asyncio.wait_for(waiting, timeout=1.0)
+
+
+async def test_a_clean_eof_still_delivers_the_last_generation() -> None:
+    decoder = IncrementalDecoder()
+    protocol, _ = _wire(decoder)
+    transport = PushStreamTransport(asyncio.StreamReader(), None, protocol)  # type: ignore[arg-type]
+
+    _deliver(protocol, _publish(8))
+    protocol.connection_lost(None)
+
+    assert await transport.receive() is True
+    assert decoder.next_packet() is not None
+    assert await transport.receive() is False

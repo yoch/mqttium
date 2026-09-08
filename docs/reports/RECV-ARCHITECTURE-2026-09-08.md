@@ -66,8 +66,16 @@ interleaved repetitions. Reproduce with `tools/recv_arch_rtt_probe.py`.
 | 4 KiB | 110.9 µs | 71.0 | 74.0 | **62.9** | 1.76x |
 | 64 KiB | 224.5 µs | 137.6 | 141.2 | **114.2** | 1.97x |
 
-This closes the question the throughput work left open. #447 does not trade
-latency for throughput; it is the best arm on both.
+**Read this narrowly.** It is a saturated echo loop with no engine, no effects
+and no callback dispatch, so it measures the receive path's own latency, not
+application RTT. The parallel prototype in PR #447 measured application RTT on
+the RPi5 at a realistic fixed rate (3942 msg/s, external pacer) and found
+**+0.0047 %, i.e. no measurable p50 change**. That is the number to trust for
+application latency, and it is consistent with the end-to-end throughput result
+below: at realistic rates the receive path is not what sets the cost.
+
+What the table does establish is the absence of a trade: this architecture does
+not buy throughput by spending latency.
 
 ## End to end, in the real client
 
@@ -216,6 +224,26 @@ design removes. An oversized slab is now retired only after
 `_OVERSIZE_RETENTION` (64) consecutive drains that did not need the extra room —
 1 reallocation for the same 50 frames — while `clear()` still drops it at once
 so a new connection never inherits it.
+
+## Errors found by cross-review
+
+Two defects in this branch were found only by comparing against the parallel
+prototype in PR #447, both of which it had guarded from the start:
+
+- **Pausing on an incomplete head frame deadlocks the connection.** A frame may
+  legally be as large as `max_packet_size`. Pausing because buffered bytes
+  crossed the high water stops the only source that can complete such a frame.
+  Reproduced with one ~256 KiB frame against a 192 KiB high water: reading
+  paused, `receive()` blocked forever. The pause now also requires the head
+  frame to be consumable, and the resume fires as soon as it stops being.
+- **A connection error was reported as a clean EOF.** `StreamReader.read()`
+  raises, and the client's error taxonomy and reconnect policy depend on that
+  distinction. The push path swallowed it. `receive()` now raises, with the
+  exception winning over bytes buffered before it, while a clean EOF still
+  delivers its last generation.
+
+Both are the kind of defect a saturated benchmark never shows: neither affects
+throughput, and both break real connections.
 
 ## Open risks
 

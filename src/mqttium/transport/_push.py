@@ -55,6 +55,7 @@ class DecoderPushProtocol(asyncio.StreamReaderProtocol, asyncio.BufferedProtocol
         self._waiter: asyncio.Future[None] | None = None
         self._received = 0
         self._eof = False
+        self._exception: BaseException | None = None
         self._paused_reading = False
 
     # -- lifecycle ---------------------------------------------------------
@@ -92,6 +93,8 @@ class DecoderPushProtocol(asyncio.StreamReaderProtocol, asyncio.BufferedProtocol
         return super().eof_received()
 
     def connection_lost(self, exc: Exception | None) -> None:
+        if exc is not None:
+            self._exception = exc
         self._eof = True
         self._wake()
         super().connection_lost(exc)
@@ -143,6 +146,10 @@ class DecoderPushProtocol(asyncio.StreamReaderProtocol, asyncio.BufferedProtocol
     @property
     def at_eof(self) -> bool:
         return self._eof
+
+    @property
+    def exception(self) -> BaseException | None:
+        return self._exception
 
     async def wait_for_data(self) -> None:
         waiter = self._loop.create_future()
@@ -200,14 +207,24 @@ class PushStreamTransport(StreamTransport):
         complete frame: on a partial frame a level condition would return
         immediately, the reader would decode nothing, never await, and so never
         let the event loop deliver the rest of the frame.
+
+        A connection error is raised rather than reported as end of stream, and
+        it wins over bytes that arrived before it -- the same ordering
+        ``StreamReader.read()`` gives, which the client's error taxonomy and
+        reconnect policy depend on. A clean EOF is different: the last receive
+        generation is still delivered before this returns False.
         """
         protocol = self._protocol
         # The reader has finished its batch by the time it asks for more.
         protocol.resume_if_drained()
+        if protocol.exception is not None:
+            raise protocol.exception
         while protocol.received == self._seen:
             if protocol.at_eof:
                 return False
             await protocol.wait_for_data()
+            if protocol.exception is not None:
+                raise protocol.exception
         self._seen = protocol.received
         return True
 
