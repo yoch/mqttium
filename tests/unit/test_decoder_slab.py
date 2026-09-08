@@ -1,0 +1,132 @@
+"""Fixed-capacity storage invariants for IncrementalDecoder.
+
+These cover the slab itself: the window handed to a receiver, in-place
+compaction, growth for an oversized frame, and the shrink back afterwards.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from mqttium.codec.buffer import DEFAULT_CAPACITY, IncrementalDecoder
+from mqttium.enums import PacketType
+
+
+def _publish(payload_size: int) -> bytes:
+    body = b"\x00\x01t" + b"p" * payload_size
+    remaining = len(body)
+    out = bytearray([0x30])
+    while True:
+        digit = remaining % 128
+        remaining //= 128
+        out.append(digit | 0x80 if remaining else digit)
+        if not remaining:
+            break
+    return bytes(out) + body
+
+
+def test_window_is_never_empty_and_survives_being_filled_to_capacity() -> None:
+    # asyncio.BufferedProtocol.get_buffer() raises RuntimeError on an empty
+    # buffer, so the window must stay usable even when the slab is full.
+    decoder = IncrementalDecoder()
+    for _ in range(64):
+        window = decoder.writable_window()
+        assert len(window) > 0
+        window[:] = b"\x00" * len(window)
+        decoder.commit(len(window))
+        decoder._start = decoder._end  # pretend the reader consumed everything
+        decoder._reset()
+
+
+def test_receiving_through_the_window_decodes_the_same_frames_as_feed() -> None:
+    frames = b"".join(_publish(size) for size in (10, 5000, 70000, 3))
+
+    through_feed = IncrementalDecoder()
+    through_feed.feed(frames)
+    expected = [(p.packet_type, p.remaining) for p in through_feed.drain_packets(limit=10)]
+
+    through_window = IncrementalDecoder()
+    offset = 0
+    while offset < len(frames):
+        window = through_window.writable_window()
+        chunk = frames[offset : offset + len(window)]
+        window[: len(chunk)] = chunk
+        through_window.commit(len(chunk))
+        offset += len(chunk)
+    actual = [(p.packet_type, p.remaining) for p in through_window.drain_packets(limit=10)]
+
+    assert actual == expected
+    assert expected[0][0] is PacketType.PUBLISH
+
+
+def test_frame_split_across_windows_and_a_compaction_still_decodes() -> None:
+    decoder = IncrementalDecoder()
+    # Consume a frame first so `_start` is non-zero and a compaction is needed.
+    decoder.feed(_publish(200))
+    assert decoder.next_packet() is not None
+
+    frame = _publish(100_000)
+    for offset in range(0, len(frame), 9973):  # deliberately unaligned chunks
+        piece = frame[offset : offset + 9973]
+        window = decoder.writable_window()
+        assert len(window) >= len(piece) or len(window) > 0
+        taken = min(len(window), len(piece))
+        window[:taken] = piece[:taken]
+        decoder.commit(taken)
+        if taken < len(piece):
+            rest = piece[taken:]
+            window = decoder.writable_window(len(rest))
+            window[: len(rest)] = rest
+            decoder.commit(len(rest))
+
+    packet = decoder.next_packet()
+    assert packet is not None
+    assert len(packet.remaining) == len(frame) - 4
+
+
+def test_slab_grows_for_an_oversized_frame_then_shrinks_back() -> None:
+    decoder = IncrementalDecoder()
+    decoder.feed(_publish(64))
+    assert decoder.next_packet() is not None
+    assert decoder.capacity == DEFAULT_CAPACITY
+
+    decoder.feed(_publish(DEFAULT_CAPACITY * 3))
+    assert decoder.capacity > DEFAULT_CAPACITY
+
+    packet = decoder.next_packet()
+    assert packet is not None
+    # A single huge frame must not pin the connection's memory for its lifetime.
+    assert decoder.capacity == DEFAULT_CAPACITY
+    assert decoder.buffered == 0
+
+
+def test_compaction_reuses_the_slab_rather_than_reallocating() -> None:
+    decoder = IncrementalDecoder()
+    decoder.feed(_publish(1000))
+    assert decoder.next_packet() is not None
+    identity = id(decoder._buf)
+
+    # Enough traffic to force many compactions without ever exceeding capacity.
+    for _ in range(200):
+        decoder.feed(_publish(20_000))
+        assert decoder.next_packet() is not None
+
+    assert id(decoder._buf) == identity
+    assert decoder.capacity == DEFAULT_CAPACITY
+
+
+def test_commit_rejects_more_than_the_window_handed_out() -> None:
+    decoder = IncrementalDecoder()
+    window = decoder.writable_window()
+    with pytest.raises(ValueError):
+        decoder.commit(len(window) + 1)
+
+
+def test_clear_keeps_capacity_so_the_next_receive_does_not_reallocate() -> None:
+    decoder = IncrementalDecoder()
+    decoder.feed(_publish(1000))
+    identity = id(decoder._buf)
+    decoder.clear()
+    assert decoder.buffered == 0
+    assert decoder.capacity == DEFAULT_CAPACITY
+    assert id(decoder._buf) == identity

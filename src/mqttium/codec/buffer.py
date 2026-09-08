@@ -1,10 +1,18 @@
 """Bounded incremental MQTT frame decoder.
 
 Design constraints (from Paho perf audit + gmqtt critique):
-- Reusable bytearray buffer with read offset and bounded compaction
+- Fixed-capacity reusable storage with read/write offsets and in-place compaction
 - Contiguous decode via indices / unpack_from when a full packet is present
-- Never expose a memoryview into the reusable buffer to callers
+- Never expose a memoryview into the reusable storage to callers
 - Enforce a maximum packet size early (after Remaining Length)
+
+The storage is a slab the decoder owns outright: `_start` is the read offset,
+`_end` the write offset, and `len(_buf)` is the capacity rather than the amount
+of live data. Nothing on the hot path reallocates -- compaction is a memmove
+inside the existing slab, and the slab only grows for a frame larger than its
+capacity. That is what lets a transport hand `writable_window()` straight to
+`socket.recv_into()`, so received bytes are never copied through an
+intermediate buffer before reaching the decoder.
 """
 
 from __future__ import annotations
@@ -17,7 +25,12 @@ from mqttium.errors import MalformedPacketError, PacketTooLargeError
 
 # Default local ceiling before CONNACK negotiation (256 MiB is the MQTT max).
 DEFAULT_MAX_PACKET_SIZE = 16 * 1024 * 1024
-_COMPACT_THRESHOLD = 64 * 1024
+# Steady-state slab size. Large enough that a saturated receive path batches
+# several frames per wakeup; the slab grows past it only for an oversized frame
+# and shrinks straight back once that frame is consumed.
+DEFAULT_CAPACITY = 256 * 1024
+# Smallest window worth offering a receiver; also the compaction trigger.
+_MIN_WINDOW = 16 * 1024
 # Body size from which the body is copied through a memoryview instead of
 # `bytes(bytearray[a:b])` — see next_packet. Paired end-to-end decode, alternated
 # in-process over 11 repeats: 1 KiB 0.996, 4 KiB 0.989, 8 KiB 1.027, 16 KiB
@@ -36,35 +49,104 @@ class RawPacket:
 
 
 class IncrementalDecoder:
-    __slots__ = ("_buf", "_start", "_max_packet_size", "_high_water")
+    __slots__ = ("_buf", "_view", "_start", "_end", "_capacity", "_max_packet_size", "_high_water")
 
     def __init__(self, max_packet_size: int = DEFAULT_MAX_PACKET_SIZE) -> None:
         if max_packet_size < 1:
             raise ValueError("max_packet_size too small")
+        # Allocated lazily so an idle or never-connected client costs nothing.
         self._buf = bytearray()
+        self._view = memoryview(self._buf)
         self._start = 0
+        self._end = 0
+        self._capacity = 0
         self._max_packet_size = max_packet_size
         self._high_water = 0
 
     @property
     def buffered(self) -> int:
-        return len(self._buf) - self._start
+        return self._end - self._start
+
+    @property
+    def capacity(self) -> int:
+        return self._capacity
 
     @property
     def next_header_byte(self) -> int | None:
         """Return the next fixed-header byte without consuming buffered data."""
-        return self._buf[self._start] if self._start < len(self._buf) else None
+        return self._buf[self._start] if self._start < self._end else None
+
+    def _reallocate(self, capacity: int) -> None:
+        live = self._end - self._start
+        grown = bytearray(capacity)
+        if live:
+            grown[0:live] = self._view[self._start : self._end]
+        # Release only after the copy: the old view is the source.
+        self._view.release()
+        self._buf = grown
+        self._view = memoryview(grown)
+        self._capacity = capacity
+        self._start = 0
+        self._end = live
+
+    def _ensure(self, need: int) -> None:
+        """Guarantee `need` writable bytes after `_end`, without reallocating if possible."""
+        if self._capacity - self._end >= need:
+            return
+        live = self._end - self._start
+        if self._capacity - live >= need:
+            # In-place memmove inside the existing slab; capacity is untouched,
+            # so neither this nor the following write reallocates.
+            self._buf[0:live] = self._view[self._start : self._end]
+            self._start = 0
+            self._end = live
+            return
+        capacity = self._capacity or DEFAULT_CAPACITY
+        while capacity - live < need:
+            capacity *= 2
+        self._reallocate(capacity)
+
+    def _reset(self) -> None:
+        """Rewind a fully consumed slab, giving back any oversized-frame growth."""
+        self._start = 0
+        self._end = 0
+        if self._capacity > DEFAULT_CAPACITY:
+            self._reallocate(DEFAULT_CAPACITY)
+
+    def writable_window(self, need: int = _MIN_WINDOW) -> memoryview:
+        """Return writable storage for a receiver to fill, then `commit()`.
+
+        The window is a view into the decoder's own slab, so bytes written into
+        it are already where the parser expects them. It is never empty, which
+        `asyncio.BufferedProtocol.get_buffer()` requires. Callers must drop the
+        view before the next call, since an outstanding export would block the
+        slab from being replaced on the grow path.
+        """
+        self._ensure(need)
+        return self._view[self._end :]
+
+    def commit(self, nbytes: int) -> None:
+        """Publish `nbytes` written into the window returned by `writable_window()`."""
+        if nbytes <= 0:
+            return
+        end = self._end + nbytes
+        if end > self._capacity:
+            raise ValueError("commit exceeds the window that was handed out")
+        self._end = end
+        buffered = end - self._start
+        if buffered > self._high_water:
+            self._high_water = buffered
 
     def peek_packet_bounds(self) -> tuple[int, int, int] | None:
         """Return ``(header, body_start, body_end)`` for the next complete frame.
 
-        The frame is not consumed and the reusable buffer is not exposed. This
+        The frame is not consumed and the reusable storage is not exposed. This
         internal hot-path primitive deliberately mirrors ``next_packet`` framing
         so the generic decoder does not pay an extra Python call per packet.
         """
         buf = self._buf
         start = self._start
-        available = len(buf) - start
+        available = self._end - start
         if available < 2:
             return None
 
@@ -101,11 +183,10 @@ class IncrementalDecoder:
 
     def consume_peeked_packet(self, body_end: int) -> None:
         """Commit a frame previously returned by :meth:`peek_packet_bounds`."""
-        assert self._start < body_end <= len(self._buf)
+        assert self._start < body_end <= self._end
         self._start = body_end
-        if self._start == len(self._buf):
-            self._buf.clear()
-            self._start = 0
+        if self._start == self._end:
+            self._reset()
 
     @property
     def high_water(self) -> int:
@@ -122,24 +203,33 @@ class IncrementalDecoder:
         self._max_packet_size = value
 
     def feed(self, data: bytes | bytearray | memoryview) -> None:
-        if not data:
+        """Copy `data` into the slab.
+
+        Kept for transports that cannot write into `writable_window()` directly:
+        TLS, WebSocket, and any non-selector event loop.
+        """
+        nbytes = len(data)
+        if not nbytes:
             return
-        if self._start > _COMPACT_THRESHOLD:
-            del self._buf[: self._start]
-            self._start = 0
-        self._buf.extend(data)
-        buffered = len(self._buf) - self._start
+        end = self._end
+        if self._capacity - end < nbytes:
+            self._ensure(nbytes)
+            end = self._end
+        # Slice assignment inside the slab: a memcpy, never a resize.
+        self._buf[end : end + nbytes] = data
+        end += nbytes
+        self._end = end
+        buffered = end - self._start
         if buffered > self._high_water:
             self._high_water = buffered
 
     def clear(self) -> None:
-        self._buf.clear()
-        self._start = 0
+        self._reset()
 
     def next_packet(self) -> RawPacket | None:
         buf = self._buf
         start = self._start
-        available = len(buf) - start
+        available = self._end - start
         if available < 2:
             return None
 
@@ -169,11 +259,11 @@ class IncrementalDecoder:
         flags = header & 0x0F
         body_start = start + fixed_header_len
         body_end = start + total
-        # Copy the body out so callers never alias the reusable buffer.
+        # Copy the body out so callers never alias the reusable storage.
         #
         # `bytes(buf[a:b])` copies twice: slicing a bytearray builds another
-        # bytearray, which `bytes()` then copies again. Going through a
-        # memoryview copies once.
+        # bytearray, which `bytes()` then copies again. Going through the slab's
+        # own memoryview copies once.
         #
         # Why not just `buf[a:b]`? It is indeed a single copy, and on its own the
         # fastest of the three. But it is a *mutable* bytearray, and that escapes
@@ -184,26 +274,22 @@ class IncrementalDecoder:
         # end to end, paired and alternated, that variant is 1.04x to 1.17x
         # slower. A memoryview is the only single-copy route to immutable bytes.
         #
-        # The view is transient and released before the buffer is touched, so no
-        # memoryview of the reusable buffer is ever handed out — the owned-bytes
-        # invariant is unchanged.
+        # The slice is transient and only ever produces owned bytes, so no
+        # memoryview of the reusable storage is ever handed out.
         #
         # Only worth it above `_VIEW_COPY_THRESHOLD`: the memoryview object costs
         # more than the second copy saves on small frames, and small frames are
         # the hot path.
         if remaining_length >= _VIEW_COPY_THRESHOLD:
-            view = memoryview(buf)
-            try:
-                body = bytes(view[body_start:body_end])
-            finally:
-                view.release()
+            body = bytes(self._view[body_start:body_end])
         else:
             body = bytes(buf[body_start:body_end])
         self._start = body_end
-        if self._start == len(self._buf):
-            # Reuse the buffer object (avoid allocating a fresh bytearray).
-            self._buf.clear()
+        if body_end == self._end:
             self._start = 0
+            self._end = 0
+            if self._capacity > DEFAULT_CAPACITY:
+                self._reallocate(DEFAULT_CAPACITY)
         return RawPacket(packet_type=packet_type, flags=flags, remaining=body)
 
     def drain_packets(self, limit: int = 100) -> list[RawPacket]:

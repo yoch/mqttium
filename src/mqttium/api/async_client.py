@@ -1064,6 +1064,12 @@ class AsyncClient:
             self._teardown_final = False
             self._last_disconnect = None
             self._decoder.clear()
+            attach_decoder = getattr(transport, "attach_decoder", None)
+            if attach_decoder is not None:
+                # This transport receives straight into the decoder's storage.
+                # It stays paused until attached, so nothing is read before the
+                # decoder is ready for the new connection.
+                attach_decoder(self._decoder)
             self._write_pump.reset()
             self._ping_pending = False
             connect_packet = self._engine.begin_connect()
@@ -1943,12 +1949,19 @@ class AsyncClient:
             MQTTProtocolVersion.MQTTv311,
             MQTTProtocolVersion.MQTTv5,
         )
+        # A push transport has already placed received bytes in the decoder by
+        # the time it reports them, so there is nothing to feed.
+        receive = getattr(self._transport, "receive", None)
         try:
             while not self._transport.is_closing():
-                data = await self._transport.read(256 * 1024)
-                if not data:
-                    break
-                self._decoder.feed(data)
+                if receive is not None:
+                    if not await receive():
+                        break
+                else:
+                    data = await self._transport.read(256 * 1024)
+                    if not data:
+                        break
+                    self._decoder.feed(data)
                 # Process one bounded packet batch at a time. Applying its
                 # effects before decoding the next batch propagates delivery
                 # byte backpressure all the way to transport.read().
