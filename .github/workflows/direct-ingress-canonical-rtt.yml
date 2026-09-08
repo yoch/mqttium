@@ -1,5 +1,8 @@
 name: Direct ingress canonical RTT
 
+# Final runtime/test code under measurement: fc0454b2e8663672a9ad8536b2a525958d09c55f.
+# This workflow-only commit does not alter the measured mqttium implementation.
+
 on:
   push:
     branches: [perf/direct-decoder-ingress-prototype]
