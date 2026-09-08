@@ -1,4 +1,4 @@
-"""Shared asyncio stream transport primitives."""
+"""Shared asyncio transport primitives."""
 
 from __future__ import annotations
 
@@ -17,29 +17,31 @@ def write_buffer_needs_drain(writer: asyncio.StreamWriter) -> bool:
 
 
 class AsyncTransport(Protocol):
+    """Common transport contract; receive mode is a separate capability."""
+
     async def write(self, data: bytes) -> None: ...
     async def write_many(self, parts: list[bytes]) -> None: ...
-    async def read(self, n: int = 65536) -> bytes: ...
     async def close(self) -> None: ...
     def is_closing(self) -> bool: ...
 
 
 @runtime_checkable
-class DecoderPushTransport(Protocol):
-    """Optional capability: deliver received bytes into the decoder's storage.
+class PullTransport(Protocol):
+    """Receive capability for transports returning byte-stream chunks."""
 
-    A transport offering this receives into storage the decoder owns, so the
-    reader never calls ``read()``. Like ``write_nowait``, it is an optimisation
-    a transport may provide, not an obligation: TLS, WebSocket and non-selector
-    loops cannot, and keep ``read()`` + ``feed()``.
-    """
+    async def read(self, n: int = 65536) -> bytes: ...
+
+
+@runtime_checkable
+class DecoderPushTransport(Protocol):
+    """Receive capability for transports committing into decoder storage."""
 
     def attach_decoder(self, decoder: object) -> None: ...
     async def receive(self) -> bool: ...
 
 
-class StreamTransport:
-    """Common StreamReader/StreamWriter transport implementation."""
+class _StreamTransportBase:
+    """Writer/lifecycle half shared by pull and decoder-ingress streams."""
 
     __slots__ = ("_reader", "_writer")
 
@@ -52,22 +54,6 @@ class StreamTransport:
         await self._drain_if_needed()
 
     def write_nowait(self, data: bytes) -> bool:
-        """Buffer one frame without awaiting when it fits below high-water.
-
-        The eager path cannot await a drain, so it is admitted only when the
-        *resulting* socket-buffer size stays at or below the local high-water
-        mark. Checking the post-write size matters because a contiguous MQTT 5
-        frame can be much larger than the publish payload segmentation threshold
-        (for example, because of large properties).
-
-        Returning ``False`` means nothing was written and the caller still owns
-        the frame. It can therefore fall back to the writer task, which is able
-        to await drain/backpressure. This method is deliberately absent from
-        :class:`AsyncTransport`: it is an optimisation a transport may offer,
-        not an obligation, and a transport whose write is more than a buffer
-        append (WebSocket masks and may flush control frames first) must not
-        provide it.
-        """
         transport = self._writer.transport
         if (
             transport is not None
@@ -88,9 +74,6 @@ class StreamTransport:
 
     async def drain(self) -> None:
         await self._writer.drain()
-
-    async def read(self, n: int = 65536) -> bytes:
-        return await self._reader.read(n)
 
     async def close(self) -> None:
         self._writer.close()
@@ -119,3 +102,10 @@ class StreamTransport:
     async def _drain_if_needed(self) -> None:
         if write_buffer_needs_drain(self._writer):
             await self._writer.drain()
+
+
+class StreamTransport(_StreamTransportBase):
+    """Ordinary pull-based StreamReader/StreamWriter transport."""
+
+    async def read(self, n: int = 65536) -> bytes:
+        return await self._reader.read(n)

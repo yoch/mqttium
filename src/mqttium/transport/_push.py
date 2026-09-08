@@ -6,7 +6,7 @@ import asyncio
 from dataclasses import replace
 from typing import Protocol
 
-from mqttium.transport._stream import StreamTransport
+from mqttium.transport._stream import _StreamTransportBase
 from mqttium.transport.stats import TransportStats
 
 # Flow-control remains deliberately wider than #446: the pre-promotion ablation
@@ -209,7 +209,7 @@ class DecoderPushProtocol(asyncio.StreamReaderProtocol, asyncio.BufferedProtocol
             waiter.set_result(None)
 
 
-class PushStreamTransport(StreamTransport):
+class PushStreamTransport(_StreamTransportBase):
     """TCP stream whose receive side commits directly into an attached decoder.
 
     ``receive()`` is edge-triggered on selector callbacks; buffered partial MQTT
@@ -284,10 +284,6 @@ class PushStreamTransport(StreamTransport):
         sink = self._protocol.sink
         buffered = 0 if sink is None else sink.buffered
         return replace(base, buffered_read_bytes=buffered)
-
-    async def read(self, n: int = 65536) -> bytes:
-        del n
-        raise RuntimeError("decoder ingress is push-based; use receive()")
 
     async def close(self) -> None:
         self._protocol.detach()

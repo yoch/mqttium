@@ -75,7 +75,7 @@ from mqttium.protocol.outbound import _PreparedPublish
 from mqttium.protocol.reconnect import ReconnectPolicy
 from mqttium.persistence.memory import InflightStore
 from mqttium.topics import validate_subscribe_filter
-from mqttium.transport._stream import AsyncTransport, DecoderPushTransport
+from mqttium.transport._stream import AsyncTransport, DecoderPushTransport, PullTransport
 from mqttium.transport.tcp import TcpTransport
 from mqttium.transport.unix import UnixSocketTransport
 from mqttium.transport.websocket import WebSocketTransport
@@ -1948,16 +1948,20 @@ class AsyncClient:
             MQTTProtocolVersion.MQTTv311,
             MQTTProtocolVersion.MQTTv5,
         )
-        # A push transport has already placed received bytes in the decoder by
-        # the time it reports them, so there is nothing to feed.
-        push = self._transport if isinstance(self._transport, DecoderPushTransport) else None
+        # Receive mode is an explicit transport capability.
+        transport = self._transport
+        push = transport if isinstance(transport, DecoderPushTransport) else None
+        pull = transport if isinstance(transport, PullTransport) else None
+        if push is None and pull is None:
+            raise TypeError("transport provides neither pull nor decoder-ingress receive")
         try:
-            while not self._transport.is_closing():
+            while not transport.is_closing():
                 if push is not None:
                     if not await push.receive():
                         break
                 else:
-                    data = await self._transport.read(256 * 1024)
+                    assert pull is not None
+                    data = await pull.read(256 * 1024)
                     if not data:
                         break
                     self._decoder.feed(data)

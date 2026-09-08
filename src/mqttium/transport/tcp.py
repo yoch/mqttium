@@ -10,7 +10,7 @@ from contextlib import suppress
 from typing import Any
 
 from mqttium.transport._push import DecoderPushProtocol, PushStreamTransport
-from mqttium.transport._stream import StreamTransport
+from mqttium.transport._stream import AsyncTransport, StreamTransport
 
 # #446's allocation-stable StreamReader fallback remains available for selector
 # runtimes outside the deliberately narrow production direct-ingress scope.
@@ -71,10 +71,10 @@ class TcpTransport(StreamTransport):
         port: int,
         *,
         ssl: Any = None,
-    ) -> StreamTransport:
+    ) -> AsyncTransport:
         loop = asyncio.get_running_loop()
         if _direct_ingress_supported(ssl, loop):
-            transport: StreamTransport = await _connect_push(loop, host, port)
+            transport: AsyncTransport = await _connect_push(loop, host, port)
         elif ssl is None and isinstance(loop, asyncio.SelectorEventLoop):
             # Preserve #446's reusable BufferedProtocol StreamReader path for a
             # selector runtime that is intentionally outside direct-ingress
@@ -100,8 +100,11 @@ async def _connect_push(
     return PushStreamTransport(reader, writer, protocol)
 
 
-def _set_nodelay(transport: StreamTransport) -> None:
-    sock = transport._writer.get_extra_info("socket")
+def _set_nodelay(transport: AsyncTransport) -> None:
+    writer = getattr(transport, "_writer", None)
+    if writer is None:
+        return
+    sock = writer.get_extra_info("socket")
     if sock is not None:
         with suppress(OSError):
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
