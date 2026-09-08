@@ -1,0 +1,118 @@
+name: PR446 saturated transport ARM64
+
+on:
+  push:
+    branches: [bench/pr445-adversarial-validation]
+    paths:
+      - .github/workflows/pr446-saturated-transport-arm64.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr446-rpi5
+  cancel-in-progress: false
+
+jobs:
+  saturated:
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 20
+    env:
+      DIRECT_SHA: e85f2217faff2a75c9a86199663e8134837ac73c
+      STREAM_SHA: 975954a48ce56f394502db0669e50926a18883e6
+      TOTAL_BYTES: 268435456
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: yoch/mqttium
+          ref: ${{ env.DIRECT_SHA }}
+          path: direct445
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: yoch/mqttium
+          ref: ${{ env.STREAM_SHA }}
+          path: stream446
+          persist-credentials: false
+      - name: Prepare and verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          test "$(cat /proc/sys/kernel/randomize_va_space)" != 0
+          test "$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)" = performance
+          test "$(git -C direct445 rev-parse HEAD)" = "$DIRECT_SHA"
+          test "$(git -C stream446 rev-parse HEAD)" = "$STREAM_SHA"
+          mkdir -p pr446-saturated
+          printf 'direct445=%s\nstream446=%s\n' "$DIRECT_SHA" "$STREAM_SHA" | tee pr446-saturated/provenance.txt
+          python3 --version | tee -a pr446-saturated/provenance.txt
+      - name: Start pinned raw TCP server
+        shell: bash
+        run: |
+          set -euo pipefail
+          taskset -c 1 python3 tools/pr446_transport_saturated_probe.py server --total "$TOTAL_BYTES" > pr446-saturated/server.log 2>&1 &
+          echo "SERVER_PID=$!" >> "$GITHUB_ENV"
+          for _ in $(seq 1 50); do
+            (echo > /dev/tcp/127.0.0.1/11999) >/dev/null 2>&1 && exit 0
+            sleep 0.1
+          done
+          cat pr446-saturated/server.log
+          exit 1
+      - name: Run pinned fresh-process ABBA matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          : > pr446-saturated/rows.jsonl
+          plan=(direct stream stream direct stream direct direct stream)
+          i=0
+          for mode in "${plan[@]}"; do
+            i=$((i+1))
+            if [ "$mode" = direct ]; then src=direct445; else src=stream446; fi
+            echo "[$i/${#plan[@]}] $mode" >&2
+            row="$(taskset -c 0 env PYTHONPATH="$PWD/$src/src" python3 tools/pr446_transport_saturated_probe.py client --total "$TOTAL_BYTES")"
+            python3 - "$mode" "$i" "$row" <<'PY' >> pr446-saturated/rows.jsonl
+          import json, sys
+          mode, index, raw = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+          obj=json.loads(raw); obj.update(mode=mode, execution_index=index)
+          print(json.dumps(obj, sort_keys=True))
+          PY
+          done
+          python3 - <<'PY' | tee pr446-saturated/summary.json
+          import json, statistics
+          rows=[json.loads(x) for x in open('pr446-saturated/rows.jsonl') if x.strip()]
+          out={'rows': rows, 'summary': {}}
+          for mode in ('direct','stream'):
+              sub=[r for r in rows if r['mode']==mode]
+              def med(k): return statistics.median(float(r[k]) for r in sub)
+              out['summary'][mode]={
+                  'n':len(sub),
+                  'mib_s_median':med('mib_s'),
+                  'cpu_s_median':med('cpu_s'),
+                  'ru_stime_s_median':med('ru_stime_s'),
+                  'ru_minflt_median':med('ru_minflt'),
+                  'read_calls_median':med('read_calls'),
+              }
+          d=out['summary']['direct']; s=out['summary']['stream']
+          out['stream_vs_direct']={
+              'throughput_ratio':s['mib_s_median']/d['mib_s_median'],
+              'cpu_ratio':s['cpu_s_median']/d['cpu_s_median'],
+              'stime_ratio':s['ru_stime_s_median']/d['ru_stime_s_median'] if d['ru_stime_s_median'] else None,
+          }
+          print(json.dumps(out, indent=2, sort_keys=True))
+          PY
+      - name: Stop server
+        if: always()
+        shell: bash
+        run: |
+          [ -n "${SERVER_PID:-}" ] && kill "$SERVER_PID" 2>/dev/null || true
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: pr446-saturated-${{ github.run_id }}
+          path: pr446-saturated
+          if-no-files-found: error
+          retention-days: 14
