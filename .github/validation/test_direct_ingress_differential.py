@@ -1,4 +1,4 @@
-"""Differential contract checks for the direct-ingress decoder prototype."""
+"""Differential framing checks for pull-feed versus decoder-owned ingress."""
 
 from __future__ import annotations
 
@@ -9,20 +9,28 @@ import pytest
 hypothesis = pytest.importorskip("hypothesis")
 from hypothesis import given, settings, strategies as st
 
-from mqttium._direct_decoder_ingress_prototype import DirectIngressDecoder
 from mqttium.codec.buffer import IncrementalDecoder
 from mqttium.errors import MQTTError
 
-settings.register_profile("direct_prepromotion", max_examples=2500, deadline=None)
-settings.load_profile(os.environ.get("HYPOTHESIS_PROFILE", "direct_prepromotion"))
+settings.register_profile("direct_production", max_examples=2500, deadline=None)
+settings.load_profile(os.environ.get("HYPOTHESIS_PROFILE", "direct_production"))
 
 _ALLOWED = (MQTTError, ValueError)
 
 
 def _logical_bytes(decoder: IncrementalDecoder) -> bytes:
-    if isinstance(decoder, DirectIngressDecoder):
-        return bytes(decoder._buf[decoder._start : decoder._end])
-    return bytes(decoder._buf[decoder._start :])
+    return bytes(decoder._buf[decoder._start : decoder._end])
+
+
+def _push(decoder: IncrementalDecoder, data: bytes, preferred: int) -> None:
+    offset = 0
+    while offset < len(data):
+        window = decoder.writable_window(preferred)
+        take = min(len(window), len(data) - offset)
+        window[:take] = data[offset : offset + take]
+        window.release()
+        decoder.commit(take)
+        offset += take
 
 
 def _packet_result(decoder: IncrementalDecoder):
@@ -32,52 +40,43 @@ def _packet_result(decoder: IncrementalDecoder):
         return ("exc", type(exc))
 
 
-def _assert_same_state(
-    standard: IncrementalDecoder,
-    direct: DirectIngressDecoder,
-) -> None:
-    assert direct.buffered == standard.buffered
-    assert _logical_bytes(direct) == _logical_bytes(standard)
-    assert direct.next_header_byte == standard.next_header_byte
-    assert direct.max_packet_size == standard.max_packet_size
+def _assert_same_state(left: IncrementalDecoder, right: IncrementalDecoder) -> None:
+    assert right.buffered == left.buffered
+    assert _logical_bytes(right) == _logical_bytes(left)
+    assert right.next_header_byte == left.next_header_byte
+    assert right.max_packet_size == left.max_packet_size
 
 
-def _drain_equally(
-    standard: IncrementalDecoder,
-    direct: DirectIngressDecoder,
-) -> bool:
-    """Drain both decoders until incomplete or an equivalent fatal error.
-
-    Returns False when a fatal decode error was observed; state after a fatal
-    protocol error is deliberately outside the comparison contract.
-    """
+def _drain_equally(left: IncrementalDecoder, right: IncrementalDecoder) -> bool:
     for _ in range(4096):
-        left = _packet_result(standard)
-        right = _packet_result(direct)
-        assert left[0] == right[0]
-        if left[0] == "exc":
-            assert left[1] is right[1]
+        a = _packet_result(left)
+        b = _packet_result(right)
+        assert a[0] == b[0]
+        if a[0] == "exc":
+            assert a[1] is b[1]
             return False
-
-        left_packet = left[1]
-        right_packet = right[1]
-        assert (left_packet is None) == (right_packet is None)
-        if left_packet is None:
-            _assert_same_state(standard, direct)
+        lp = a[1]
+        rp = b[1]
+        assert (lp is None) == (rp is None)
+        if lp is None:
+            _assert_same_state(left, right)
             return True
-
-        assert right_packet is not None
-        assert right_packet.packet_type is left_packet.packet_type
-        assert right_packet.flags == left_packet.flags
-        assert right_packet.remaining == left_packet.remaining
-        assert isinstance(left_packet.remaining, bytes)
-        assert isinstance(right_packet.remaining, bytes)
-        _assert_same_state(standard, direct)
+        assert rp is not None
+        assert rp.packet_type is lp.packet_type
+        assert rp.flags == lp.flags
+        assert rp.remaining == lp.remaining
+        assert isinstance(lp.remaining, bytes)
+        assert isinstance(rp.remaining, bytes)
+        _assert_same_state(left, right)
     raise AssertionError("decoder failed to quiesce")
 
 
-_feed = st.tuples(st.just("feed"), st.binary(max_size=192))
-_clear = st.tuples(st.just("clear"), st.just(b""))
+_feed = st.tuples(
+    st.just("feed"),
+    st.binary(max_size=192),
+    st.integers(min_value=1, max_value=256),
+)
+_clear = st.tuples(st.just("clear"), st.just(b""), st.just(1))
 
 
 @given(
@@ -87,92 +86,68 @@ _clear = st.tuples(st.just("clear"), st.just(b""))
     operations=st.lists(st.one_of(_feed, _clear), min_size=1, max_size=48),
 )
 @settings(deadline=None)
-def test_direct_decoder_matches_incremental_decoder_for_fragmented_streams(
-    max_packet_size,
-    operations,
-):
-    """Compare packets, errors, ownership and unconsumed logical bytes.
+def test_writable_ingress_matches_pull_feed_for_fragmented_streams(
+    max_packet_size: int,
+    operations: list[tuple[str, bytes, int]],
+) -> None:
+    """Packets/errors/ownership are independent of how bytes enter the slab."""
+    pull = IncrementalDecoder(max_packet_size=max_packet_size)
+    push = IncrementalDecoder(max_packet_size=max_packet_size)
 
-    Arbitrary byte chunks deliberately cover valid frames, malformed headers,
-    non-canonical VBIs, oversize declarations, concatenated frames and arbitrary
-    fragmentation. ``clear`` operations additionally exercise reuse.
-    """
-    standard = IncrementalDecoder(max_packet_size=max_packet_size)
-    direct = DirectIngressDecoder(max_packet_size=max_packet_size)
-
-    for operation, payload in operations:
+    for operation, payload, preferred in operations:
         if operation == "clear":
-            standard.clear()
-            direct.clear()
-            _assert_same_state(standard, direct)
+            pull.clear()
+            push.clear()
+            _assert_same_state(pull, push)
             continue
-
-        standard.feed(payload)
-        direct.feed(payload)
-        _assert_same_state(standard, direct)
-        if not _drain_equally(standard, direct):
+        pull.feed(payload)
+        _push(push, payload, preferred)
+        _assert_same_state(pull, push)
+        if not _drain_equally(pull, push):
             return
 
 
 @pytest.mark.parametrize(
-    ("encoded_remaining_length", "expected_exception"),
+    "encoded_remaining_length",
     [
-        (b"\x80\x00", True),  # non-canonical zero
-        (b"\x81\x00", True),  # non-canonical one
-        (b"\x80\x81\x00", True),  # non-canonical 128
-        (b"\x80\x80\x80\x80", True),  # four continuation bytes: impossible VBI
-        (b"\xff\xff\xff\xff\x00", True),  # fifth VBI byte
+        b"\x80\x00",
+        b"\x81\x00",
+        b"\x80\x81\x00",
+        b"\x80\x80\x80\x80",
+        b"\xff\xff\xff\xff\x00",
     ],
 )
-def test_direct_decoder_matches_malformed_vbi_contract(
-    encoded_remaining_length,
-    expected_exception,
-):
+def test_writable_ingress_matches_malformed_vbi_contract(encoded_remaining_length: bytes) -> None:
     wire = b"\x30" + encoded_remaining_length
-    standard = IncrementalDecoder(max_packet_size=1024)
-    direct = DirectIngressDecoder(max_packet_size=1024)
-    standard.feed(wire)
-    direct.feed(wire)
-
-    left = _packet_result(standard)
-    right = _packet_result(direct)
-    assert left[0] == right[0] == ("exc" if expected_exception else "ok")
-    if expected_exception:
-        assert left[1] is right[1]
+    pull = IncrementalDecoder(max_packet_size=1024)
+    push = IncrementalDecoder(max_packet_size=1024)
+    pull.feed(wire)
+    _push(push, wire, 1)
+    left = _packet_result(pull)
+    right = _packet_result(push)
+    assert left[0] == right[0] == "exc"
+    assert left[1] is right[1]
 
 
 @pytest.mark.parametrize(
     ("remaining_length", "limit"),
     [
-        (0, 1),
-        (0, 2),
-        (127, 64),
-        (127, 129),
-        (128, 129),
-        (128, 131),
-        (16_383, 1024),
-        (16_384, 16_387),
-        (2_097_151, 4096),
-        (2_097_152, 4096),
-        (268_435_455, 16 * 1024 * 1024),
+        (0, 1), (0, 2), (127, 64), (127, 129), (128, 129), (128, 131),
+        (16_383, 1024), (16_384, 16_387), (2_097_151, 4096),
+        (2_097_152, 4096), (268_435_455, 16 * 1024 * 1024),
     ],
 )
-def test_direct_decoder_matches_size_limit_decision_without_body(
-    remaining_length,
-    limit,
-):
-    # Build only the fixed header. Oversize decisions are required as soon as
-    # Remaining Length is known. RL=0 is already a complete frame; non-zero
-    # in-range declarations remain incomplete until body bytes arrive.
+def test_writable_ingress_matches_size_limit_decision_without_body(
+    remaining_length: int, limit: int
+) -> None:
     from mqttium.codec.vbi import encode_vbi
 
     encoded = encode_vbi(remaining_length)
     wire = b"\x30" + encoded
-    standard = IncrementalDecoder(max_packet_size=limit)
-    direct = DirectIngressDecoder(max_packet_size=limit)
-    standard.feed(wire)
-    direct.feed(wire)
-
-    survived = _drain_equally(standard, direct)
+    pull = IncrementalDecoder(max_packet_size=limit)
+    push = IncrementalDecoder(max_packet_size=limit)
+    pull.feed(wire)
+    _push(push, wire, 1)
+    survived = _drain_equally(pull, push)
     total_size = 1 + len(encoded) + remaining_length
     assert survived is (total_size <= limit)
