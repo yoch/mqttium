@@ -48,7 +48,7 @@ def test_direct_decoder_rejects_four_continuation_vbi_bytes_immediately() -> Non
 
 def test_direct_decoder_compacts_live_bytes_without_changing_them() -> None:
     decoder = DirectIngressDecoder(1024 * 1024)
-    live = bytes((i % 251 for i in range(200_000)))
+    live = bytes(i % 251 for i in range(200_000))
     decoder._buf[100_000:300_000] = live
     decoder._start = 100_000
     decoder._end = 300_000
