@@ -65,6 +65,7 @@ Status meanings:
 | [NATIVE-QOS0-CALLBACK-DIRECT-2026-08-14](https://github.com/yoch/mqttium/blob/main/docs/reports/NATIVE-QOS0-CALLBACK-DIRECT-2026-08-14.md) | Current evidence | Direct callback-admission decision |
 | [SINGLE-MESSAGE-INLINE-DELIVERY-2026-08-14](https://github.com/yoch/mqttium/blob/main/docs/reports/SINGLE-MESSAGE-INLINE-DELIVERY-2026-08-14.md) | Current evidence | Inline delivery threshold decision |
 | [HOTPATH-RECON-2026-09-06](https://github.com/yoch/mqttium/blob/main/docs/reports/HOTPATH-RECON-2026-09-06.md) | Current evidence | MQTTium-only path-identity and exploratory-cost map at `4560e44`; µs are not portable; wait for native-async bench PR results before optimizing |
+| [RECV-ARCHITECTURE-2026-09-08](https://github.com/yoch/mqttium/blob/main/docs/reports/RECV-ARCHITECTURE-2026-09-08.md) | Current evidence | Independent replication of the RC13/#445/#446 receive comparison plus a decoder-owned `recv_into` arm; records three falsified hypotheses and the level- vs edge-triggered wakeup trap; x86 directional, RPi5 decides |
 
 ## Memory evidence
 
