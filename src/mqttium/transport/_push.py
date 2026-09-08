@@ -33,6 +33,7 @@ class DecoderSink(Protocol):
 
     def writable_window(self, need: int = ...) -> memoryview: ...
     def commit(self, nbytes: int) -> None: ...
+    def head_frame_ready(self) -> bool: ...
     @property
     def buffered(self) -> int: ...
 
@@ -123,6 +124,11 @@ class DecoderPushProtocol(asyncio.StreamReaderProtocol, asyncio.BufferedProtocol
             not self._paused_reading
             and self._read_transport is not None
             and sink.buffered > _HIGH_WATER
+            # Never pause for a single incomplete frame that merely crossed the
+            # watermark: the reader cannot consume it, so nothing would ever
+            # drain the slab and the connection would hang. A frame may legally
+            # be as large as max_packet_size.
+            and sink.head_frame_ready()
         ):
             # In push mode the reader no longer applies backpressure by simply
             # not calling read(), so it has to be stated explicitly.
@@ -154,7 +160,10 @@ class DecoderPushProtocol(asyncio.StreamReaderProtocol, asyncio.BufferedProtocol
             and sink is not None
             and self._read_transport is not None
             and not self._read_transport.is_closing()
-            and sink.buffered <= _LOW_WATER
+            # Resume once the reader has caught up, or as soon as the head frame
+            # stops being consumable -- the rest of it can only arrive from the
+            # socket we paused.
+            and (sink.buffered <= _LOW_WATER or not sink.head_frame_ready())
         ):
             self._read_transport.resume_reading()
             self._paused_reading = False

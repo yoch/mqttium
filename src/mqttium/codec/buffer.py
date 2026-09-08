@@ -212,6 +212,18 @@ class IncrementalDecoder:
         body_start = start + fixed_header_len
         return header, body_start, start + total
 
+    def head_frame_ready(self) -> bool:
+        """Whether the reader can make progress without receiving more bytes.
+
+        A malformed or oversize header counts as ready: the reader must run so
+        it can surface the protocol error, rather than leaving the connection
+        paused forever waiting for bytes it will never accept.
+        """
+        try:
+            return self.peek_packet_bounds() is not None
+        except (MalformedPacketError, PacketTooLargeError):
+            return True
+
     def consume_peeked_packet(self, body_end: int) -> None:
         """Commit a frame previously returned by :meth:`peek_packet_bounds`."""
         assert self._start < body_end <= self._end

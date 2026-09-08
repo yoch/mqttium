@@ -270,3 +270,73 @@ async def test_push_capability_is_declared_not_guessed() -> None:
 
     plain = StreamTransport(asyncio.StreamReader(), None)  # type: ignore[arg-type]
     assert not isinstance(plain, DecoderPushTransport)
+
+
+async def test_a_single_frame_larger_than_high_water_does_not_deadlock() -> None:
+    # An MQTT frame may legally be as large as max_packet_size. Pausing merely
+    # because an *incomplete* frame crossed the watermark stops the only source
+    # that could complete it, and nothing can ever drain the slab.
+    decoder = IncrementalDecoder()
+    protocol, fake = _wire(decoder)
+    transport = PushStreamTransport(asyncio.StreamReader(), None, protocol)  # type: ignore[arg-type]
+
+    frame = _publish(_HIGH_WATER + 64 * 1024)
+    head = frame[: _HIGH_WATER + 1024]
+    offset = 0
+    while offset < len(head):
+        window = protocol.get_buffer(-1)
+        take = min(len(window), len(head) - offset)
+        window[:take] = head[offset : offset + take]
+        protocol.buffer_updated(take)
+        offset += take
+
+    assert decoder.buffered > _HIGH_WATER
+    assert decoder.next_packet() is None  # the frame is not complete yet
+    assert fake.paused is False  # must still be able to receive the remainder
+
+    assert await transport.receive() is True
+
+    rest = frame[len(head) :]
+    offset = 0
+    while offset < len(rest):
+        window = protocol.get_buffer(-1)
+        take = min(len(window), len(rest) - offset)
+        window[:take] = rest[offset : offset + take]
+        protocol.buffer_updated(take)
+        offset += take
+
+    assert await asyncio.wait_for(transport.receive(), timeout=1.0) is True
+    packet = decoder.next_packet()
+    assert packet is not None
+    assert len(packet.remaining) == len(frame) - 4
+
+
+async def test_a_paused_connection_resumes_when_the_head_frame_stops_being_ready() -> None:
+    # Backlog of small frames pauses the socket; once the reader drains down to
+    # a partial head frame, the remainder can only come from that same socket.
+    decoder = IncrementalDecoder()
+    protocol, fake = _wire(decoder)
+    transport = PushStreamTransport(asyncio.StreamReader(), None, protocol)  # type: ignore[arg-type]
+
+    small = _publish(8 * 1024)
+    while decoder.buffered <= _HIGH_WATER:
+        _deliver(protocol, small)
+    assert fake.paused is True
+
+    partial = _publish(4096)[:100]
+    _deliver(protocol, partial)
+
+    while decoder.next_packet() is not None:
+        pass
+    assert decoder.buffered == len(partial)
+    assert decoder.head_frame_ready() is False
+
+    assert await transport.receive() is True
+    assert fake.paused is False
+
+
+def test_malformed_head_counts_as_ready_so_the_error_can_surface() -> None:
+    # Otherwise a peer could hang the connection with a bad length prefix.
+    decoder = IncrementalDecoder()
+    decoder.feed(b"\x30\x80\x80\x80\x80\x80")
+    assert decoder.head_frame_ready() is True
