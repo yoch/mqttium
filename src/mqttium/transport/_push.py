@@ -13,9 +13,11 @@ lifecycle stay with asyncio streams, exactly as in the StreamReader variant.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from typing import Protocol
 
 from mqttium.transport._stream import StreamTransport
+from mqttium.transport.stats import TransportStats
 
 # The reader task drains in bounded batches, so the slab is allowed to hold
 # more than one receive window before the transport is asked to stop.
@@ -54,6 +56,9 @@ class DecoderPushProtocol(asyncio.StreamReaderProtocol, asyncio.BufferedProtocol
         self._read_transport: asyncio.Transport | None = None
         self._waiter: asyncio.Future[None] | None = None
         self._received = 0
+        self._received_bytes = 0
+        self._pauses = 0
+        self._resumes = 0
         self._eof = False
         self._exception: BaseException | None = None
         self._paused_reading = False
@@ -123,6 +128,7 @@ class DecoderPushProtocol(asyncio.StreamReaderProtocol, asyncio.BufferedProtocol
             return
         sink.commit(nbytes)
         self._received += 1
+        self._received_bytes += nbytes
         if (
             not self._paused_reading
             and self._read_transport is not None
@@ -137,6 +143,7 @@ class DecoderPushProtocol(asyncio.StreamReaderProtocol, asyncio.BufferedProtocol
             # not calling read(), so it has to be stated explicitly.
             self._read_transport.pause_reading()
             self._paused_reading = True
+            self._pauses += 1
         self._wake()
 
     @property
@@ -151,7 +158,27 @@ class DecoderPushProtocol(asyncio.StreamReaderProtocol, asyncio.BufferedProtocol
     def exception(self) -> BaseException | None:
         return self._exception
 
+    @property
+    def received_bytes(self) -> int:
+        return self._received_bytes
+
+    @property
+    def pauses(self) -> int:
+        return self._pauses
+
+    @property
+    def resumes(self) -> int:
+        return self._resumes
+
+    @property
+    def sink(self) -> DecoderSink | None:
+        return self._sink
+
     async def wait_for_data(self) -> None:
+        if self._waiter is not None:
+            # Overwriting the waiter would orphan the first caller, which then
+            # hangs with no diagnostic. One reader owns this transport.
+            raise RuntimeError("receive() called while another receive coroutine is waiting")
         waiter = self._loop.create_future()
         self._waiter = waiter
         try:
@@ -174,6 +201,7 @@ class DecoderPushProtocol(asyncio.StreamReaderProtocol, asyncio.BufferedProtocol
         ):
             self._read_transport.resume_reading()
             self._paused_reading = False
+            self._resumes += 1
 
     def _wake(self) -> None:
         waiter = self._waiter
@@ -227,6 +255,30 @@ class PushStreamTransport(StreamTransport):
                 raise protocol.exception
         self._seen = protocol.received
         return True
+
+    def receive_stats(self) -> dict[str, int]:
+        """Counters for diagnosing the receive path.
+
+        ``wakeups`` should track ``recv_callbacks`` closely; a large gap means
+        the reader is being woken without new bytes, which is the shape of the
+        level-triggered bug this design avoids.
+        """
+        protocol = self._protocol
+        return {
+            "recv_callbacks": protocol.received,
+            "recv_bytes": protocol.received_bytes,
+            "wakeups": self._seen,
+            "pause_count": protocol.pauses,
+            "resume_count": protocol.resumes,
+        }
+
+    def stats(self) -> TransportStats:
+        base = super().stats()
+        sink = self._protocol.sink
+        # The base class assumes bytes wait in a StreamReader; here they wait in
+        # the decoder, and reporting 0 would hide real inbound backlog.
+        buffered = 0 if sink is None else sink.buffered
+        return replace(base, buffered_read_bytes=buffered)
 
     async def read(self, n: int = 65536) -> bytes:
         raise RuntimeError("PushStreamTransport delivers into the decoder; use receive()")

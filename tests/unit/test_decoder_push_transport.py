@@ -401,3 +401,55 @@ async def test_a_clean_eof_still_delivers_the_last_generation() -> None:
     assert await transport.receive() is True
     assert decoder.next_packet() is not None
     assert await transport.receive() is False
+
+
+async def test_a_second_concurrent_reader_fails_loudly() -> None:
+    # Overwriting the waiter used to orphan the first caller, which then hung
+    # with no diagnostic at all. One reader owns this transport.
+    decoder = IncrementalDecoder()
+    protocol, _ = _wire(decoder)
+    transport = PushStreamTransport(asyncio.StreamReader(), None, protocol)  # type: ignore[arg-type]
+
+    first = asyncio.ensure_future(transport.receive())
+    await asyncio.sleep(0)
+    with pytest.raises(RuntimeError, match="another receive coroutine"):
+        await transport.receive()
+
+    _deliver(protocol, _publish(8))
+    assert await asyncio.wait_for(first, timeout=1.0) is True
+
+
+async def test_receive_stats_expose_the_wakeup_to_callback_ratio() -> None:
+    # The level-triggered bug shows up as wakeups far exceeding callbacks, so
+    # the ratio is worth being able to read at runtime.
+    decoder = IncrementalDecoder()
+    protocol, _ = _wire(decoder)
+    transport = PushStreamTransport(asyncio.StreamReader(), None, protocol)  # type: ignore[arg-type]
+
+    for _ in range(20):
+        _deliver(protocol, _publish(64))
+        assert await transport.receive() is True
+        while decoder.next_packet() is not None:
+            pass
+
+    stats = transport.receive_stats()
+    assert stats["recv_callbacks"] == 20
+    assert stats["wakeups"] == 20
+    assert stats["recv_bytes"] > 0
+    assert stats["pause_count"] == 0
+
+
+async def test_stats_report_bytes_waiting_in_the_decoder() -> None:
+    decoder = IncrementalDecoder()
+    protocol, _ = _wire(decoder)
+
+    class _Writer:
+        transport = None
+
+        def is_closing(self) -> bool:
+            return False
+
+    transport = PushStreamTransport(asyncio.StreamReader(), _Writer(), protocol)  # type: ignore[arg-type]
+    _deliver(protocol, _publish(4096)[:200])
+
+    assert transport.stats().buffered_read_bytes == 200
