@@ -495,29 +495,45 @@ def install() -> type[_AsyncClient]:
                 factory=self._direct_ingress_tcp_factory,
             )
 
-        async def connect_unix(
+        async def _connect_explicit(
             self,
-            path: str,
+            host: str,
+            port: int,
             *,
-            timeout: float | None = None,
+            ssl: ssl_module.SSLContext | bool | None,
+            timeout: float | None,
+            unix_path: str | None = None,
+            ws_url: str | None = None,
+            ws_headers: dict[str, str] | None = None,
+            factory: Any = None,
         ) -> ConnAckPacket:
-            self._restore_standard_decoder()
-            return await super().connect_unix(path, timeout=timeout)
+            # Alternative endpoint factories are invoked only after the base
+            # lifecycle guards have succeeded. Restore #446's decoder there,
+            # not in connect_unix/connect_ws before an "already connected"
+            # attempt has had a chance to fail without mutating active state.
+            if factory is not None and factory is not self._direct_ingress_tcp_factory:
+                fallback_factory = factory
 
-        async def connect_ws(
-            self,
-            url: str,
-            *,
-            ssl: ssl_module.SSLContext | bool | None = None,
-            extra_headers: dict[str, str] | None = None,
-            timeout: float | None = None,
-        ) -> ConnAckPacket:
-            self._restore_standard_decoder()
-            return await super().connect_ws(
-                url,
+                async def guarded_factory(
+                    factory_host: str,
+                    factory_port: int,
+                    *,
+                    ssl: Any = None,
+                ) -> AsyncTransport:
+                    self._restore_standard_decoder()
+                    return await fallback_factory(factory_host, factory_port, ssl=ssl)
+
+                factory = guarded_factory
+
+            return await super()._connect_explicit(
+                host,
+                port,
                 ssl=ssl,
-                extra_headers=extra_headers,
                 timeout=timeout,
+                unix_path=unix_path,
+                ws_url=ws_url,
+                ws_headers=ws_headers,
+                factory=factory,
             )
 
     DirectIngressAsyncClient.__name__ = "AsyncClient"
