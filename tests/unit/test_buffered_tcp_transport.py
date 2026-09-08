@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 
 import pytest
 
@@ -118,9 +119,9 @@ async def test_eof_preserves_buffered_data_then_becomes_terminal() -> None:
     buffer[:5] = b"hello"
     protocol.buffer_updated(5)
 
-    # MQTTium intentionally treats peer EOF as terminal rather than preserving
-    # TCP half-close semantics; asyncio closes the transport when this is false.
-    assert protocol.eof_received() is None
+    # The reader must consume queued input before it observes terminal EOF and
+    # closes the transport; an eager close would bypass its next read().
+    assert protocol.eof_received() is True
     assert await protocol.read(1024) == b"hello"
     assert await protocol.read(1024) == b""
 
@@ -218,6 +219,29 @@ async def test_transport_drain_yields_to_scheduled_connection_loss_when_closing(
     loop.call_soon(protocol.connection_lost, None)
     with pytest.raises(ConnectionResetError, match="Connection lost"):
         await transport.drain()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ConnectionResetError(errno.ECONNRESET, "peer reset"),
+        OSError(errno.ENETUNREACH, "network unreachable"),
+    ],
+)
+async def test_transport_drain_preserves_original_connection_error(error: OSError) -> None:
+    loop = asyncio.get_running_loop()
+    protocol = BufferedSocketProtocol(loop)
+    fake = _ClosingTransport()
+    protocol.connection_made(fake)  # type: ignore[arg-type]
+    transport = _BufferedTcpTransport(fake, protocol)  # type: ignore[arg-type]
+    protocol.connection_lost(error)
+
+    with pytest.raises(OSError) as caught:
+        await transport.drain()
+
+    assert caught.value is error
+    assert caught.value.errno == error.errno
+    await transport.close()
 
 
 async def test_cleartext_tcp_roundtrip_uses_buffered_transport() -> None:

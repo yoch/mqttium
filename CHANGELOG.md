@@ -8,7 +8,7 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
-- Use a reusable 80 KiB `asyncio.BufferedProtocol` receive buffer for cleartext TCP instead of the selector transport's allocation-heavy 256 KiB `socket.recv()` path. Keep read backpressure independent at 128 KiB high-water / 64 KiB low-water, and align write-drain connection-loss semantics with asyncio streams. This removes an ASLR-dependent allocator/page-fault latency regime observed on Linux/ARM64 while preserving the public transport API. TLS remains on asyncio's existing buffered SSL transport.
+- Use a reusable 80 KiB `asyncio.BufferedProtocol` receive buffer for cleartext TCP instead of the selector transport's allocation-heavy 256 KiB `socket.recv()` path. Keep read backpressure independent at 128 KiB high-water / 64 KiB low-water, preserve queued input until the reader consumes EOF, and retain the original connection error in write drains as asyncio streams do. This removes an ASLR-dependent allocator/page-fault latency regime observed on Linux/ARM64 while preserving the public transport API. TLS remains on asyncio's existing buffered SSL transport.
 
 ### Changed
 

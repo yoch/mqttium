@@ -88,12 +88,13 @@ class BufferedSocketProtocol(asyncio.BufferedProtocol):
             self._closed_waiter.set_result(None)
 
     def eof_received(self) -> bool | None:
-        # MQTTium treats transport EOF as terminal; returning false lets asyncio
-        # close the write side too instead of preserving TCP half-close semantics
-        # that the MQTT connection lifecycle never exposes.
+        # Keep the transport open until AsyncClient consumes buffered input and
+        # observes read() == b"". Closing here makes its is_closing() guard skip
+        # chunks received while application delivery was applying backpressure.
+        # The reader owns terminal shutdown, as with asyncio streams.
         self._eof = True
         self._wake_reader()
-        return None
+        return True
 
     def get_buffer(self, sizehint: int) -> bytearray:
         del sizehint
@@ -125,6 +126,9 @@ class BufferedSocketProtocol(asyncio.BufferedProtocol):
     @property
     def buffered_bytes(self) -> int:
         return self._buffered_bytes
+
+    def exception(self) -> BaseException | None:
+        return self._exception
 
     async def read(self, n: int = _READ_CHUNK) -> bytes:
         if n == 0:

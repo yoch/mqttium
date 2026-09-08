@@ -83,6 +83,11 @@ class _BufferedTcpTransport(TcpTransport):
         await self._drain_if_needed()
 
     async def drain(self) -> None:
+        # StreamWriter checks the reader's exception before its flow-control
+        # helper can replace it with a generic "Connection lost" error.
+        exc = self._protocol.exception()
+        if exc is not None:
+            raise exc
         if self._transport.is_closing():
             # Match StreamWriter.drain(): close() may mark the transport closing
             # before protocol.connection_lost() runs on the next loop turn.
