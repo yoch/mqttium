@@ -168,7 +168,11 @@ async def test_read_is_refused_so_a_stale_caller_cannot_hang() -> None:
         await transport.read(1024)
 
 
-async def test_cleartext_selector_connect_uses_the_push_path() -> None:
+async def test_cleartext_connect_uses_the_push_path_only_on_a_selector_loop() -> None:
+    # Windows defaults to ProactorEventLoop, which feeds BufferedProtocol
+    # through its own internal buffer, so the push path must not be selected
+    # there. Assert whichever branch this platform is supposed to take.
+    loop = asyncio.get_running_loop()
     listener = socket.socket()
     listener.bind(("127.0.0.1", 0))
     listener.listen(1)
@@ -178,7 +182,6 @@ async def test_cleartext_selector_connect_uses_the_push_path() -> None:
     accepted: list[socket.socket] = []
 
     async def serve() -> None:
-        loop = asyncio.get_running_loop()
         listener.setblocking(False)
         conn, _ = await loop.sock_accept(listener)
         accepted.append(conn)
@@ -186,11 +189,15 @@ async def test_cleartext_selector_connect_uses_the_push_path() -> None:
 
     server = asyncio.create_task(serve())
     transport = await TcpTransport.connect(host, port)
+    decoder = IncrementalDecoder()
     try:
-        assert isinstance(transport, PushStreamTransport)
-        decoder = IncrementalDecoder()
-        transport.attach_decoder(decoder)
-        assert await transport.receive() is True
+        if isinstance(loop, asyncio.SelectorEventLoop):
+            assert isinstance(transport, PushStreamTransport)
+            transport.attach_decoder(decoder)
+            assert await transport.receive() is True
+        else:
+            assert not isinstance(transport, DecoderPushTransport)
+            decoder.feed(await transport.read(65536))
         packet = decoder.next_packet()
         assert packet is not None
         assert len(packet.remaining) == len(frame) - 2
