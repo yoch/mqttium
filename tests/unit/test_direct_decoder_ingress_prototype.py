@@ -12,6 +12,7 @@ from mqttium._direct_decoder_ingress_prototype import (
     _INGRESS_READY,
     _connect_direct,
     _direct_ingress_enabled,
+    install,
 )
 from mqttium.codec.vbi import encode_vbi
 from mqttium.errors import MalformedPacketError
@@ -69,6 +70,35 @@ def test_direct_decoder_compacts_live_bytes_without_changing_them() -> None:
     assert bytes(decoder._buf[: len(live)]) == live
     assert decoder.compaction_count == 1
     assert decoder.growth_count == 0
+
+
+def test_install_keeps_standard_decoder_and_drops_direct_on_fallback() -> None:
+    import mqttium.api as api_module
+    import mqttium.api.async_client as async_client_module
+
+    original_api_client = api_module.AsyncClient
+    original_async_client = async_client_module.AsyncClient
+    try:
+        client_type = install()
+        client = client_type()
+        standard_decoder = client._decoder
+        assert not isinstance(standard_decoder, DirectIngressDecoder)
+
+        direct_decoder = DirectIngressDecoder(123_456)
+        client._direct_ingress_decoder = direct_decoder
+        client._decoder = direct_decoder
+        client._restore_standard_decoder()
+
+        assert client._decoder is standard_decoder
+        assert standard_decoder.max_packet_size == 123_456
+        assert client._direct_ingress_decoder is None
+    finally:
+        async_client_module.AsyncClient = original_async_client
+        api_module.AsyncClient = original_api_client
+
+
+async def test_direct_scope_excludes_tls() -> None:
+    assert not _direct_ingress_enabled(True, asyncio.get_running_loop())
 
 
 async def test_direct_transport_waits_for_new_receive_generation_on_fragment() -> None:
