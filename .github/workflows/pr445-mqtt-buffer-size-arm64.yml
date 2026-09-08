@@ -1,0 +1,146 @@
+name: PR445 MQTT buffer size ARM64
+
+on:
+  push:
+    branches: [bench/pr445-adversarial-validation]
+    paths:
+      - .github/workflows/pr445-mqtt-buffer-size-arm64.yml
+      - tools/mqtt_large_recv_probe.py
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr445-adversarial-rpi5
+  cancel-in-progress: false
+
+jobs:
+  mqtt:
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Verify and prepare
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          test "$(cat /proc/sys/kernel/randomize_va_space)" != 0
+          test "$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)" = performance
+          python3 -m venv .probe-venv
+          . .probe-venv/bin/activate
+          python -m pip install --upgrade pip
+          pip install -e .
+          mkdir -p mqtt-results
+          echo "sha=$(git rev-parse HEAD)" | tee mqtt-results/environment.txt
+          python --version | tee -a mqtt-results/environment.txt
+          ldd --version | head -n1 | tee -a mqtt-results/environment.txt
+          mosquitto -h 2>&1 | head -n4 | tee -a mqtt-results/environment.txt || true
+      - name: Start broker
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > mqtt-results/mosquitto.conf <<'EOF'
+          listener 11883 127.0.0.1
+          protocol mqtt
+          set_tcp_nodelay true
+          allow_anonymous true
+          persistence false
+          connection_messages false
+          log_dest stdout
+          log_type error
+          max_inflight_messages 1000
+          max_queued_messages 10000
+          max_packet_size 16777216
+          EOF
+          taskset -c 1 mosquitto -c mqtt-results/mosquitto.conf > mqtt-results/mosquitto.log 2>&1 &
+          echo "BROKER_PID=$!" >> "$GITHUB_ENV"
+          for _ in $(seq 1 50); do
+            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            sleep 0.1
+          done
+          cat mqtt-results/mosquitto.log
+          exit 1
+      - name: Run fresh-process matrix with fixed backpressure budget
+        shell: bash
+        run: |
+          set -euo pipefail
+          . .probe-venv/bin/activate
+          python - <<'PY' | tee mqtt-results/matrix.json
+          import json, random, subprocess, sys
+          from pathlib import Path
+
+          script = str(Path('tools/mqtt_large_recv_probe.py').resolve())
+          chunks = (65536, 98304, 131072)
+          payloads = (65536, 1048576)
+          samples = 6
+          plan = [(chunk, payload, sample) for chunk in chunks for payload in payloads for sample in range(samples)]
+          random.Random(4453).shuffle(plan)
+          rows = []
+          for index, (chunk, payload, sample) in enumerate(plan, 1):
+              cmd = [
+                  sys.executable, script,
+                  '--recv-chunk', str(chunk),
+                  '--payload-size', str(payload),
+                  '--high-water', str(512 * 1024),
+                  '--low-water', str(256 * 1024),
+                  '--warmup-s', '0.5',
+                  '--duration-s', '2.0',
+              ]
+              result = json.loads(subprocess.run(cmd, check=True, capture_output=True, text=True).stdout)
+              result['sample'] = sample
+              result['execution_index'] = index
+              rows.append(result)
+              print(
+                  f"{index:02d}/{len(plan)} chunk={chunk//1024}K payload={payload//1024}K "
+                  f"MiB/s={result['payload_mib_s']:.1f} minflt/resp={result['minflt_per_response']:.3f} "
+                  f"p50={result['rtt_p50_ms']:.3f}ms pauses={result['pause_count']}",
+                  file=sys.stderr,
+                  flush=True,
+              )
+          summary = {}
+          for chunk in chunks:
+              for payload in payloads:
+                  sub = [r for r in rows if r['recv_chunk'] == chunk and r['payload_size'] == payload]
+                  key = f"{chunk}:{payload}"
+                  def med(field):
+                      vals = sorted(float(r[field]) for r in sub)
+                      return vals[len(vals)//2]
+                  summary[key] = {
+                      'n': len(sub),
+                      'payload_mib_s_median': med('payload_mib_s'),
+                      'rtt_p50_ms_median': med('rtt_p50_ms'),
+                      'minflt_per_response_median': med('minflt_per_response'),
+                      'max_minflt_per_response': max(float(r['minflt_per_response']) for r in sub),
+                      'fault_heavy_ge_1_per_response': sum(float(r['minflt_per_response']) >= 1.0 for r in sub),
+                      'ru_stime_s_median': med('ru_stime_s'),
+                      'pause_count_sum': sum(int(r['pause_count']) for r in sub),
+                      'peak_buffered_bytes_max': max(int(r['peak_buffered_bytes']) for r in sub),
+                  }
+          print(json.dumps({
+              'schema_version': 1,
+              'probe': 'mqtt_large_recv_buffer_size',
+              'chunks': list(chunks),
+              'payloads': list(payloads),
+              'fixed_high_water': 512 * 1024,
+              'fixed_low_water': 256 * 1024,
+              'samples_per_cell': samples,
+              'summary': summary,
+              'rows': rows,
+          }, sort_keys=True))
+          PY
+      - name: Stop broker
+        if: always()
+        shell: bash
+        run: |
+          [ -n "${BROKER_PID:-}" ] && kill "$BROKER_PID" 2>/dev/null || true
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: pr445-mqtt-buffer-size-${{ github.run_id }}
+          path: mqtt-results
+          if-no-files-found: error
+          retention-days: 14
