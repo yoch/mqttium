@@ -100,9 +100,12 @@ async def test_auto_reconnect_reattaches_the_push_decoder(payload_size: int) -> 
         delivered.set()
 
     client.on_message = on_message
+    # Windows defaults to ProactorEventLoop, which keeps the read()+feed()
+    # path; the reconnect assertions hold on both, the push ones only here.
+    push_path = isinstance(asyncio.get_running_loop(), asyncio.SelectorEventLoop)
     try:
         await client.connect("127.0.0.1", port, timeout=5)
-        assert isinstance(client._transport, PushStreamTransport)
+        assert isinstance(client._transport, PushStreamTransport) is push_path
         first_decoder = client._decoder
 
         await asyncio.wait_for(delivered.wait(), timeout=10)
@@ -112,8 +115,10 @@ async def test_auto_reconnect_reattaches_the_push_decoder(payload_size: int) -> 
         # Same decoder object across connections; the truncated first frame must
         # not have leaked into the second connection's stream.
         assert client._decoder is first_decoder
-        assert isinstance(client._transport, PushStreamTransport)
-        assert client._transport.receive_stats()["recv_callbacks"] >= 1
+        transport = client._transport
+        if push_path:
+            assert isinstance(transport, PushStreamTransport)
+            assert transport.receive_stats()["recv_callbacks"] >= 1
     finally:
         await client.disconnect()
         await broker.stop()
