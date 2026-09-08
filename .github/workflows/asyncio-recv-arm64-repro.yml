@@ -1,0 +1,357 @@
+name: Asyncio recv allocator repro ARM64
+
+on:
+  push:
+    branches: [bench/asyncio-recv-arm64-repro]
+    paths: [.github/workflows/asyncio-recv-arm64-repro.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mqttium-regime-rpi5
+  cancel-in-progress: false
+
+jobs:
+  repro:
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 90
+    steps:
+      - name: Capture environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          d="$RUNNER_TEMP/asyncio-recv-repro-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -p "$d"
+          echo "RESULTS_DIR=$d" >> "$GITHUB_ENV"
+          {
+            date -u --iso-8601=seconds
+            uname -a
+            lscpu
+            python3 --version
+            ldd --version | head -n 1
+            command -v setarch || true
+            command -v strace || true
+            echo governors; cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null || true
+            echo frequencies; cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq 2>/dev/null || true
+            echo temperature; cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || true
+            free -h
+          } | tee "$d/environment.txt"
+          test "$(uname -m)" = aarch64
+
+      - name: Write standalone reproducer
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RESULTS_DIR/repro.py" <<'PY'
+          import argparse
+          import asyncio
+          import ctypes
+          import json
+          import os
+          import platform
+          import resource
+          import socket
+          import sys
+          import time
+
+          PAYLOAD_BYTE = b"x"
+          ACK = b"A"
+
+          def recv_exact(sock, n):
+              out = bytearray()
+              while len(out) < n:
+                  part = sock.recv(n - len(out))
+                  if not part:
+                      raise EOFError
+                  out.extend(part)
+              return bytes(out)
+
+          def run_server(port_file, payload_size):
+              ls = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+              ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+              ls.bind(("127.0.0.1", 0))
+              ls.listen(32)
+              with open(port_file, "w") as f:
+                  f.write(str(ls.getsockname()[1]))
+                  f.flush()
+              payload = PAYLOAD_BYTE * payload_size
+              while True:
+                  conn, _ = ls.accept()
+                  with conn:
+                      conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                      try:
+                          total = int.from_bytes(recv_exact(conn, 8), "big")
+                      except EOFError:
+                          continue
+                      for _ in range(total):
+                          conn.sendall(payload)
+                          if recv_exact(conn, 1) != ACK:
+                              raise RuntimeError("bad ack")
+
+          def snap():
+              r = resource.getrusage(resource.RUSAGE_SELF)
+              return {
+                  "minflt": r.ru_minflt,
+                  "majflt": r.ru_majflt,
+                  "utime": r.ru_utime,
+                  "stime": r.ru_stime,
+                  "nvcsw": r.ru_nvcsw,
+                  "nivcsw": r.ru_nivcsw,
+              }
+
+          def delta(a, b):
+              return {k: b[k] - a[k] for k in a}
+
+          def layout():
+              out = {}
+              try:
+                  for line in open("/proc/self/maps"):
+                      if "[heap]" in line and "heap" not in out:
+                          out["heap"] = line.split("-", 1)[0]
+                      if "libc.so" in line and "libc" not in out:
+                          out["libc"] = line.split("-", 1)[0]
+                      if "/python3" in line and "python" not in out:
+                          out["python"] = line.split("-", 1)[0]
+              except OSError:
+                  pass
+              try:
+                  libc = ctypes.CDLL(None)
+                  libc.personality.argtypes = [ctypes.c_ulong]
+                  libc.personality.restype = ctypes.c_int
+                  p = libc.personality(ctypes.c_ulong(0xFFFFFFFF))
+                  out["personality"] = hex(p & 0xFFFFFFFF)
+              except Exception:
+                  pass
+              return out
+
+          def result(mode, label, count, reads, elapsed, d, extra):
+              row = {
+                  "mode": mode,
+                  "label": label,
+                  "count": count,
+                  "read_calls": reads,
+                  "elapsed_s": elapsed,
+                  "us_per_msg": elapsed * 1e6 / count,
+                  "minflt": d["minflt"],
+                  "minflt_per_msg": d["minflt"] / count,
+                  "majflt": d["majflt"],
+                  "stime_s": d["stime"],
+                  "stime_us_per_msg": d["stime"] * 1e6 / count,
+                  "utime_s": d["utime"],
+                  "utime_us_per_msg": d["utime"] * 1e6 / count,
+                  "nvcsw": d["nvcsw"],
+                  "nivcsw": d["nivcsw"],
+                  "pid": os.getpid(),
+                  "python": sys.version.split()[0],
+                  "machine": platform.machine(),
+                  "glibc_tunables": os.environ.get("GLIBC_TUNABLES", ""),
+                  "layout": layout(),
+              }
+              row.update(extra)
+              print(json.dumps(row, sort_keys=True), flush=True)
+
+          def raw_client(port, mode, label, warmup, count, payload_size):
+              bufsize = 262144 if mode != "raw64" else 65536
+              sock = socket.create_connection(("127.0.0.1", port))
+              sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+              total = warmup + count
+              sock.sendall(total.to_bytes(8, "big"))
+              reusable = bytearray(bufsize) if mode == "rawinto256" else None
+              view = memoryview(reusable) if reusable is not None else None
+              reads = 0
+
+              def one():
+                  nonlocal reads
+                  got = 0
+                  while got < payload_size:
+                      if view is None:
+                          part = sock.recv(bufsize)
+                          if not part:
+                              raise EOFError
+                          got += len(part)
+                      else:
+                          n = sock.recv_into(view)
+                          if not n:
+                              raise EOFError
+                          got += n
+                      reads += 1
+                  sock.sendall(ACK)
+
+              for _ in range(warmup):
+                  one()
+              reads = 0
+              a = snap(); t0 = time.perf_counter()
+              for _ in range(count):
+                  one()
+              elapsed = time.perf_counter() - t0; b = snap()
+              sock.close()
+              result(mode, label, count, reads, elapsed, delta(a, b), {"recv_bufsize": bufsize})
+
+          async def stream_client(port, mode, label, warmup, count, payload_size):
+              reader, writer = await asyncio.open_connection("127.0.0.1", port)
+              transport = writer.transport
+              original = getattr(transport, "max_size", None)
+              requested = 262144 if mode == "stream256" else 65536
+              if original is None:
+                  raise RuntimeError(f"transport has no max_size: {type(transport)!r}")
+              transport.max_size = requested
+              total = warmup + count
+              writer.write(total.to_bytes(8, "big")); await writer.drain()
+              for _ in range(warmup):
+                  await reader.readexactly(payload_size)
+                  writer.write(ACK)
+                  await writer.drain()
+              a = snap(); t0 = time.perf_counter()
+              for _ in range(count):
+                  await reader.readexactly(payload_size)
+                  writer.write(ACK)
+                  await writer.drain()
+              elapsed = time.perf_counter() - t0; b = snap()
+              writer.close(); await writer.wait_closed()
+              result(mode, label, count, count, elapsed, delta(a, b), {
+                  "transport_type": f"{type(transport).__module__}.{type(transport).__name__}",
+                  "original_max_size": original,
+                  "recv_bufsize": requested,
+              })
+
+          def main():
+              p = argparse.ArgumentParser()
+              sub = p.add_subparsers(dest="cmd", required=True)
+              s = sub.add_parser("server"); s.add_argument("port_file"); s.add_argument("--payload", type=int, default=256)
+              c = sub.add_parser("client")
+              c.add_argument("--port", type=int, required=True)
+              c.add_argument("--mode", choices=("stream256", "stream64", "raw256", "raw64", "rawinto256"), required=True)
+              c.add_argument("--label", default="")
+              c.add_argument("--warmup", type=int, default=2000)
+              c.add_argument("--count", type=int, default=20000)
+              c.add_argument("--payload", type=int, default=256)
+              a = p.parse_args()
+              if a.cmd == "server":
+                  run_server(a.port_file, a.payload)
+              elif a.mode.startswith("stream"):
+                  asyncio.run(stream_client(a.port, a.mode, a.label, a.warmup, a.count, a.payload))
+              else:
+                  raw_client(a.port, a.mode, a.label, a.warmup, a.count, a.payload)
+
+          if __name__ == "__main__":
+              main()
+          PY
+          python3 -m py_compile "$RESULTS_DIR/repro.py"
+
+      - name: Run causal matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          portfile="$RESULTS_DIR/port"
+          taskset -c 1 python3 "$RESULTS_DIR/repro.py" server "$portfile" --payload 256 >"$RESULTS_DIR/server.log" 2>&1 &
+          echo "SERVER_PID=$!" >> "$GITHUB_ENV"
+          for _ in $(seq 1 100); do [ -s "$portfile" ] && break; sleep 0.05; done
+          test -s "$portfile"
+          port=$(cat "$portfile")
+          out="$RESULTS_DIR/results.jsonl"
+          : > "$out"
+
+          run_normal() { taskset -c 0 python3 "$RESULTS_DIR/repro.py" client --port "$port" --mode "$1" --label "$2" --warmup 2000 --count 20000 --payload 256 >> "$out"; }
+          run_noaslr() { taskset -c 0 setarch aarch64 -R python3 "$RESULTS_DIR/repro.py" client --port "$port" --mode "$1" --label "$2" --warmup 2000 --count 20000 --payload 256 >> "$out"; }
+          run_tunable() { taskset -c 0 env GLIBC_TUNABLES="$1" python3 "$RESULTS_DIR/repro.py" client --port "$port" --mode "$2" --label "$3" --warmup 2000 --count 20000 --payload 256 >> "$out"; }
+
+          for rep in $(seq 1 16); do
+            case $((rep % 4)) in
+              0)
+                run_normal stream256 default256
+                run_normal stream64 cap64
+                run_noaslr stream256 noaslr256
+                run_tunable glibc.malloc.mmap_threshold=1048576 stream256 threshold1m_256
+                run_tunable glibc.malloc.mmap_threshold=32768 stream64 threshold32k_64
+                ;;
+              1)
+                run_normal stream64 cap64
+                run_tunable glibc.malloc.mmap_threshold=32768 stream64 threshold32k_64
+                run_normal stream256 default256
+                run_tunable glibc.malloc.mmap_threshold=1048576 stream256 threshold1m_256
+                run_noaslr stream256 noaslr256
+                ;;
+              2)
+                run_tunable glibc.malloc.mmap_threshold=1048576 stream256 threshold1m_256
+                run_noaslr stream256 noaslr256
+                run_normal stream64 cap64
+                run_normal stream256 default256
+                run_tunable glibc.malloc.mmap_threshold=32768 stream64 threshold32k_64
+                ;;
+              3)
+                run_noaslr stream256 noaslr256
+                run_normal stream256 default256
+                run_tunable glibc.malloc.mmap_threshold=32768 stream64 threshold32k_64
+                run_normal stream64 cap64
+                run_tunable glibc.malloc.mmap_threshold=1048576 stream256 threshold1m_256
+                ;;
+            esac
+          done
+
+          for rep in $(seq 1 8); do
+            run_normal raw256 raw_recv256
+            run_normal raw64 raw_recv64
+            run_normal rawinto256 raw_recv_into256
+          done
+
+      - name: Syscall fingerprints
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v strace >/dev/null || exit 0
+          port=$(cat "$RESULTS_DIR/port")
+          for spec in 'stream256 default256' 'stream64 cap64' 'raw256 raw_recv256' 'rawinto256 raw_recv_into256'; do
+            set -- $spec; mode=$1; label=$2
+            taskset -c 0 strace -qq -c -e trace=mmap,mremap,munmap,brk,recvfrom -o "$RESULTS_DIR/strace-$label.txt" \
+              python3 "$RESULTS_DIR/repro.py" client --port "$port" --mode "$mode" --label "strace_$label" --warmup 1000 --count 5000 --payload 256 \
+              > "$RESULTS_DIR/strace-$label.json"
+          done
+
+      - name: Summarize
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "$RESULTS_DIR/results.jsonl" <<'PY' | tee "$RESULTS_DIR/summary.json"
+          import json, statistics, sys
+          rows = [json.loads(x) for x in open(sys.argv[1]) if x.strip()]
+          groups = {}
+          for r in rows:
+              groups.setdefault(r["label"], []).append(r)
+          out = {}
+          for label, rs in sorted(groups.items()):
+              def vals(k): return [float(r[k]) for r in rs]
+              out[label] = {
+                  "n": len(rs),
+                  "us_per_msg_median": statistics.median(vals("us_per_msg")),
+                  "us_per_msg_min": min(vals("us_per_msg")),
+                  "us_per_msg_max": max(vals("us_per_msg")),
+                  "minflt_per_msg_median": statistics.median(vals("minflt_per_msg")),
+                  "minflt_per_msg_min": min(vals("minflt_per_msg")),
+                  "minflt_per_msg_max": max(vals("minflt_per_msg")),
+                  "stime_us_per_msg_median": statistics.median(vals("stime_us_per_msg")),
+                  "stime_us_per_msg_min": min(vals("stime_us_per_msg")),
+                  "stime_us_per_msg_max": max(vals("stime_us_per_msg")),
+                  "majflt_total": sum(int(r["majflt"]) for r in rs),
+                  "sorted_minflt_per_msg": sorted(round(float(r["minflt_per_msg"]), 6) for r in rs),
+                  "sorted_us_per_msg": sorted(round(float(r["us_per_msg"]), 3) for r in rs),
+              }
+          print(json.dumps(out, indent=2, sort_keys=True))
+          PY
+          for f in "$RESULTS_DIR"/strace-*.txt; do [ -e "$f" ] || continue; echo "===== $f"; cat "$f"; done | tee "$RESULTS_DIR/strace-summary.txt"
+
+      - name: Stop server
+        if: always()
+        shell: bash
+        run: |
+          [ -n "${SERVER_PID:-}" ] && kill "$SERVER_PID" 2>/dev/null || true
+
+      - name: Save evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: asyncio-recv-arm64-${{ github.run_id }}
+          path: ${{ env.RESULTS_DIR }}
+          if-no-files-found: error
+          retention-days: 14
