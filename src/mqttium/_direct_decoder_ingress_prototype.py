@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import socket
+import ssl as ssl_module
 from contextlib import suppress
 from typing import Any
 
@@ -27,7 +28,8 @@ from mqttium.codec.buffer import IncrementalDecoder as _IncrementalDecoder
 from mqttium.codec.buffer import RawPacket
 from mqttium.enums import PacketType
 from mqttium.errors import MalformedPacketError, PacketTooLargeError
-from mqttium.transport._stream import StreamTransport
+from mqttium.packets import ConnAckPacket
+from mqttium.transport._stream import AsyncTransport, StreamTransport
 from mqttium.transport.tcp import TcpTransport as _StdTcpTransport
 
 _RX_CHUNK = 256 * 1024
@@ -421,8 +423,8 @@ def install() -> type[_AsyncClient]:
     """Install the benchmark-only AsyncClient subclass into mqttium.api.
 
     The ordinary decoder is retained until a clear-text SelectorEventLoop
-    connection actually selects the experiment. TLS, ProactorEventLoop and any
-    other unsupported loop therefore keep #446's transport *and* decoder.
+    connection actually selects the experiment. TLS, ProactorEventLoop, Unix
+    sockets and WebSockets therefore keep #446's transport *and* decoder.
     """
 
     import mqttium.api as api_module
@@ -437,32 +439,83 @@ def install() -> type[_AsyncClient]:
 
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, **kwargs)
-            standard_decoder = self._decoder
-            direct_decoder: DirectIngressDecoder | None = None
+            self._direct_ingress_standard_decoder = self._decoder
+            self._direct_ingress_decoder: DirectIngressDecoder | None = None
 
-            async def factory(
+            async def tcp_factory(
                 host: str,
                 port: int,
                 *,
                 ssl: Any = None,
-            ) -> StreamTransport:
-                nonlocal direct_decoder
-
+            ) -> AsyncTransport:
                 loop = asyncio.get_running_loop()
                 current_limit = self._decoder.max_packet_size
                 if _direct_ingress_enabled(ssl, loop):
-                    if direct_decoder is None:
-                        direct_decoder = DirectIngressDecoder(current_limit)
+                    decoder = self._direct_ingress_decoder
+                    if decoder is None:
+                        decoder = DirectIngressDecoder(current_limit)
+                        self._direct_ingress_decoder = decoder
                     else:
-                        direct_decoder.max_packet_size = current_limit
-                    self._decoder = direct_decoder
-                    return await _connect_direct(host, port, ssl=None, decoder=direct_decoder)
+                        decoder.max_packet_size = current_limit
+                    self._decoder = decoder
+                    return await _connect_direct(host, port, ssl=None, decoder=decoder)
 
-                standard_decoder.max_packet_size = current_limit
-                self._decoder = standard_decoder
+                self._restore_standard_decoder(current_limit)
                 return await _StdTcpTransport.connect(host, port, ssl=ssl)
 
-            self._transport_factory = factory
+            self._direct_ingress_tcp_factory = tcp_factory
+            self._transport_factory = tcp_factory
+
+        def _restore_standard_decoder(self, max_packet_size: int | None = None) -> None:
+            decoder = self._direct_ingress_standard_decoder
+            decoder.max_packet_size = (
+                self._decoder.max_packet_size if max_packet_size is None else max_packet_size
+            )
+            self._decoder = decoder
+
+        async def connect(
+            self,
+            host: str,
+            port: int = 1883,
+            *,
+            ssl: ssl_module.SSLContext | bool | None = None,
+            timeout: float | None = None,
+        ) -> ConnAckPacket:
+            # Passing the prototype factory explicitly is important when this
+            # same client previously used an alternative endpoint: base
+            # _connect_explicit() otherwise restores the ordinary TCP factory.
+            return await self._connect_explicit(
+                host,
+                port,
+                ssl=ssl,
+                timeout=timeout,
+                factory=self._direct_ingress_tcp_factory,
+            )
+
+        async def connect_unix(
+            self,
+            path: str,
+            *,
+            timeout: float | None = None,
+        ) -> ConnAckPacket:
+            self._restore_standard_decoder()
+            return await super().connect_unix(path, timeout=timeout)
+
+        async def connect_ws(
+            self,
+            url: str,
+            *,
+            ssl: ssl_module.SSLContext | bool | None = None,
+            extra_headers: dict[str, str] | None = None,
+            timeout: float | None = None,
+        ) -> ConnAckPacket:
+            self._restore_standard_decoder()
+            return await super().connect_ws(
+                url,
+                ssl=ssl,
+                extra_headers=extra_headers,
+                timeout=timeout,
+            )
 
     DirectIngressAsyncClient.__name__ = "AsyncClient"
     DirectIngressAsyncClient.__qualname__ = "AsyncClient"
