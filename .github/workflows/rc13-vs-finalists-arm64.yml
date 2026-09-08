@@ -1,0 +1,332 @@
+name: RC13 vs final receive candidates ARM64
+
+on:
+  push:
+    branches: [bench/rc13-vs-445-vs-446]
+    paths:
+      - .github/workflows/rc13-vs-finalists-arm64.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rc13-vs-finalists-rpi5
+  cancel-in-progress: false
+
+jobs:
+  saturated:
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 30
+    env:
+      RC13_SHA: 4560e44aeb24b8a4f7f6ce903766579fac481cbd
+      PR445_SHA: e0db2134c35bd50df62540dc26ab87a1e64edc7c
+      PR446_SHA: 1b52cbdf642d7b1ebe89db24ca754e949cb23322
+      PUBLISHER_SHA: e0db2134c35bd50df62540dc26ab87a1e64edc7c
+      REQUIRED_MOSQUITTO: "2.1.2"
+      REQUIRED_PYTHON: "3.14.7"
+      PORT: "11883"
+      PAYLOAD_SIZE: "65536"
+      MEASURE_S: "1.5"
+      WARMUP_S: "0.5"
+      PUBLISHER_S: "2.4"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.RC13_SHA }}
+          path: rc13
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.PR445_SHA }}
+          path: pr445
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.PR446_SHA }}
+          path: pr446
+          persist-credentials: false
+      - name: Verify host and exact refs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          test "$(python3 -c 'import platform; print(platform.python_version())')" = "$REQUIRED_PYTHON"
+          test "$(git -C rc13 rev-parse HEAD)" = "$RC13_SHA"
+          test "$(git -C pr445 rev-parse HEAD)" = "$PR445_SHA"
+          test "$(git -C pr446 rev-parse HEAD)" = "$PR446_SHA"
+          test "$(cat /proc/sys/kernel/randomize_va_space)" != "0"
+          test "$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)" = performance
+          command -v taskset >/dev/null
+          command -v mosquitto >/dev/null
+          mkdir -p rc13-finalists
+      - name: Start Mosquitto 2.1.2 on CPU1
+        shell: bash
+        run: |
+          set -euo pipefail
+          broker_bin="$(command -v mosquitto)"
+          version="$({ "$broker_bin" -h 2>&1 || true; } | python3 -c 'import re,sys; t=sys.stdin.read(); m=re.search(r"mosquitto version\s+([0-9]+(?:\.[0-9]+)+)",t,re.I); print(m.group(1) if m else "")')"
+          test "$version" = "$REQUIRED_MOSQUITTO"
+          cat > rc13-finalists/mosquitto.conf <<EOF
+          listener $PORT 127.0.0.1
+          protocol mqtt
+          set_tcp_nodelay true
+          allow_anonymous true
+          persistence false
+          connection_messages false
+          log_dest stdout
+          log_type error
+          max_inflight_messages 1000
+          max_queued_messages 10000
+          max_packet_size 16777216
+          max_keepalive 120
+          EOF
+          taskset -c 1 "$broker_bin" -c rc13-finalists/mosquitto.conf > rc13-finalists/mosquitto.log 2>&1 &
+          echo "BROKER_PID=$!" >> "$GITHUB_ENV"
+          for _ in $(seq 1 50); do
+            (echo > /dev/tcp/127.0.0.1/$PORT) >/dev/null 2>&1 && exit 0
+            sleep 0.1
+          done
+          exit 1
+      - name: Run six balanced three-arm blocks
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > rc13-finalists/matrix.tsv <<'EOF'
+          0	0	rc13
+          1	0	445
+          2	0	446
+          3	1	rc13
+          4	1	446
+          5	1	445
+          6	2	445
+          7	2	rc13
+          8	2	446
+          9	3	445
+          10	3	446
+          11	3	rc13
+          12	4	446
+          13	4	rc13
+          14	4	445
+          15	5	446
+          16	5	445
+          17	5	rc13
+          EOF
+          : > rc13-finalists/completed.tsv
+          while IFS=$'\t' read -r idx block arm; do
+            case "$arm" in
+              rc13) sub_src="$PWD/rc13/src" ;;
+              445) sub_src="$PWD/pr445/src" ;;
+              446) sub_src="$PWD/pr446/src" ;;
+              *) exit 2 ;;
+            esac
+            topic="bench/rc13-finalists/${GITHUB_RUN_ID}/${idx}"
+            ready="rc13-finalists/ready-${idx}"
+            sub="rc13-finalists/sub-${idx}.json"
+            pub="rc13-finalists/pub-${idx}.json"
+            rm -f "$ready" "$sub" "$pub"
+            taskset -c 0 env PYTHONPATH="$sub_src" python3 tools/mqtt_saturated_finalists_probe.py \
+              subscriber --arm "$arm" --host 127.0.0.1 --port "$PORT" --topic "$topic" \
+              --payload-size "$PAYLOAD_SIZE" --warmup-s "$WARMUP_S" --duration-s "$MEASURE_S" \
+              --broker-pid "$BROKER_PID" --ready-file "$ready" --output "$sub" \
+              > "rc13-finalists/sub-${idx}.log" 2>&1 &
+            subpid=$!
+            ok=0
+            for _ in $(seq 1 100); do
+              if [ -f "$ready" ]; then ok=1; break; fi
+              kill -0 "$subpid" 2>/dev/null || { cat "rc13-finalists/sub-${idx}.log"; exit 1; }
+              sleep 0.05
+            done
+            test "$ok" = 1 || { kill "$subpid" 2>/dev/null || true; exit 1; }
+            taskset -c 2 env PYTHONPATH="$PWD/pr445/src" python3 tools/mqtt_saturated_finalists_probe.py \
+              publisher --host 127.0.0.1 --port "$PORT" --topic "$topic" \
+              --payload-size "$PAYLOAD_SIZE" --duration-s "$PUBLISHER_S" --output "$pub" \
+              > "rc13-finalists/pub-${idx}.log" 2>&1 &
+            pubpid=$!
+            wait "$subpid" || { cat "rc13-finalists/sub-${idx}.log"; kill "$pubpid" 2>/dev/null || true; exit 1; }
+            wait "$pubpid" || { cat "rc13-finalists/pub-${idx}.log"; exit 1; }
+            printf '%s\t%s\t%s\n' "$idx" "$block" "$arm" >> rc13-finalists/completed.tsv
+            sleep 0.10
+          done < rc13-finalists/matrix.tsv
+      - name: Reduce balanced evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, math, statistics
+          from pathlib import Path
+          rows=[]
+          for line in Path('rc13-finalists/completed.tsv').read_text().splitlines():
+              idx_s, block_s, arm=line.split('\t')
+              idx=int(idx_s); block=int(block_s)
+              r=json.load(open(f'rc13-finalists/sub-{idx}.json'))
+              p=json.load(open(f'rc13-finalists/pub-{idx}.json'))
+              r.update(idx=idx, block=block, arm=arm,
+                       publisher_mib_s=p['payload_mib_s'],
+                       publisher_margin=p['payload_mib_s']/r['payload_mib_s'])
+              r['cpu_per_mib_s_per_mib'] = r['ru_cpu_s'] / (r['payload_bytes']/(1024*1024))
+              r['stime_per_mib_s_per_mib'] = r['ru_stime_s'] / (r['payload_bytes']/(1024*1024))
+              r['qualified']=(r['publisher_margin']>=1.2 and r['sut_cpu_pct']>=90 and r['broker_cpu_pct']<95 and r['ru_majflt']==0 and p['ru_majflt']==0)
+              rows.append(r)
+          rows.sort(key=lambda x:x['idx'])
+          blocks=[]
+          for b in range(6):
+              rs={r['arm']:r for r in rows if r['block']==b}
+              assert set(rs)=={'rc13','445','446'}
+              base=rs['rc13']
+              item={'block':b,'qualified':all(r['qualified'] for r in rs.values())}
+              for arm in ('445','446'):
+                  x=rs[arm]
+                  item[f'throughput_ratio_{arm}_over_rc13']=x['payload_mib_s']/base['payload_mib_s']
+                  item[f'cpu_per_mib_ratio_{arm}_over_rc13']=x['cpu_per_mib_s_per_mib']/base['cpu_per_mib_s_per_mib']
+                  item[f'stime_per_mib_ratio_{arm}_over_rc13']=x['stime_per_mib_s_per_mib']/base['stime_per_mib_s_per_mib']
+              blocks.append(item)
+          def gm(vals): return math.exp(statistics.mean(math.log(v) for v in vals))
+          def med(arm,key): return statistics.median(r[key] for r in rows if r['arm']==arm)
+          summary={'all_cells_qualified':all(r['qualified'] for r in rows),'blocks':blocks,'arms':{}}
+          for arm in ('rc13','445','446'):
+              summary['arms'][arm]={k:med(arm,k) for k in ('payload_mib_s','sut_cpu_pct','ru_stime_s','ru_cpu_s','ru_minflt','broker_cpu_pct','publisher_margin','cpu_per_mib_s_per_mib','stime_per_mib_s_per_mib')}
+          for arm in ('445','446'):
+              summary[f'{arm}_vs_rc13']={
+                'throughput_geomean_ratio':gm([b[f'throughput_ratio_{arm}_over_rc13'] for b in blocks]),
+                'cpu_per_mib_geomean_ratio':gm([b[f'cpu_per_mib_ratio_{arm}_over_rc13'] for b in blocks]),
+                'stime_per_mib_geomean_ratio':gm([b[f'stime_per_mib_ratio_{arm}_over_rc13'] for b in blocks]),
+              }
+          Path('rc13-finalists/summary.json').write_text(json.dumps(summary,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(summary,indent=2,sort_keys=True))
+          PY
+      - name: Stop broker
+        if: always()
+        shell: bash
+        run: |
+          [ -n "${BROKER_PID:-}" ] && kill "$BROKER_PID" 2>/dev/null || true
+      - name: Upload saturated evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: rc13-vs-finalists-saturated-${{ github.run_id }}
+          path: rc13-finalists
+          if-no-files-found: error
+          retention-days: 14
+
+  rtt:
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 45
+    env:
+      BENCH_SHA: 37160eed99b50d1f384e1565a16d0346eb01ca56
+      RC13_SHA: 4560e44aeb24b8a4f7f6ce903766579fac481cbd
+      PR445_SHA: e0db2134c35bd50df62540dc26ab87a1e64edc7c
+      PR446_SHA: 1b52cbdf642d7b1ebe89db24ca754e949cb23322
+    steps:
+      - name: Prepare paths and host gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/rc13-finalists-rtt-$GITHUB_RUN_ID"
+          mkdir -p "$dir"
+          echo "RESULTS_DIR=$dir" >> "$GITHUB_ENV"
+          test "$(uname -m)" = aarch64
+          test "$(cat /proc/sys/kernel/randomize_va_space)" != 0
+          test "$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)" = performance
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: yoch/mqtt-python-client-bench
+          ref: ${{ env.BENCH_SHA }}
+          path: harness
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.RC13_SHA }}
+          path: rc13
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.PR445_SHA }}
+          path: pr445
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.PR446_SHA }}
+          path: pr446
+          persist-credentials: false
+      - name: Create benchmark environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RESULTS_DIR/venv"
+          . "$RESULTS_DIR/venv/bin/activate"
+          python -m pip install --upgrade pip
+          pip install -e './harness[dev,mqttium]' 'psutil>=6,<8'
+          PYTHONPATH=harness/src python - <<'PY' > "$RESULTS_DIR/cpuset.json"
+          import json
+          from mqtt_client_bench.telemetry import allocate_cpuset, physical_cpu_groups
+          print(json.dumps({'physical_groups':physical_cpu_groups(),'mapping':allocate_cpuset(['sut','broker','loadgen','orch'],profile='standard')},indent=2,sort_keys=True))
+          PY
+      - name: Start native Mosquitto
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RESULTS_DIR/mosquitto.conf" <<'EOF'
+          listener 11884 127.0.0.1
+          protocol mqtt
+          set_tcp_nodelay true
+          allow_anonymous true
+          persistence false
+          connection_messages false
+          log_dest stdout
+          log_type error
+          max_inflight_messages 1000
+          max_queued_messages 10000
+          max_packet_size 16777216
+          EOF
+          broker_cpu="$(python3 - <<'PY'
+          import json,os
+          print(json.load(open(os.path.join(os.environ['RESULTS_DIR'],'cpuset.json')))['mapping']['broker'])
+          PY
+          )"
+          taskset -c "$broker_cpu" mosquitto -c "$RESULTS_DIR/mosquitto.conf" > "$RESULTS_DIR/mosquitto.log" 2>&1 &
+          echo "RTT_BROKER_PID=$!" >> "$GITHUB_ENV"
+          for _ in $(seq 1 50); do
+            (echo > /dev/tcp/127.0.0.1/11884) >/dev/null 2>&1 && exit 0
+            sleep 0.1
+          done
+          exit 1
+      - name: Run RC13 vs PR445 reference RTT
+        shell: bash
+        run: |
+          set -euo pipefail
+          . "$RESULTS_DIR/venv/bin/activate"
+          PYTHONPATH=harness/src python -m mqtt_client_bench.layout_runner \
+            --worker-aslr system --entrypoint version_compare -- \
+            --client mqttium --baseline-path rc13 --candidate-path pr445 \
+            --scenario application_rtt_fixed_rate --variant-index 0 --target-rate 3942 \
+            --pacer-mode external --blocks 4 --max-block-retries 0 --profile standard \
+            --broker 127.0.0.1:11884 --broker-pid "$RTT_BROKER_PID" \
+            --output "$RESULTS_DIR/rc13-vs-445.json" | tee "$RESULTS_DIR/rc13-vs-445.txt"
+      - name: Run RC13 vs PR446 reference RTT
+        shell: bash
+        run: |
+          set -euo pipefail
+          . "$RESULTS_DIR/venv/bin/activate"
+          PYTHONPATH=harness/src python -m mqtt_client_bench.layout_runner \
+            --worker-aslr system --entrypoint version_compare -- \
+            --client mqttium --baseline-path rc13 --candidate-path pr446 \
+            --scenario application_rtt_fixed_rate --variant-index 0 --target-rate 3942 \
+            --pacer-mode external --blocks 4 --max-block-retries 0 --profile standard \
+            --broker 127.0.0.1:11884 --broker-pid "$RTT_BROKER_PID" \
+            --output "$RESULTS_DIR/rc13-vs-446.json" | tee "$RESULTS_DIR/rc13-vs-446.txt"
+      - name: Stop RTT broker
+        if: always()
+        shell: bash
+        run: |
+          [ -n "${RTT_BROKER_PID:-}" ] && kill "$RTT_BROKER_PID" 2>/dev/null || true
+      - name: Upload RTT evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: rc13-vs-finalists-rtt-${{ github.run_id }}
+          path: ${{ env.RESULTS_DIR }}
+          if-no-files-found: error
+          retention-days: 14
