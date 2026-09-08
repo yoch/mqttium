@@ -6,6 +6,10 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- Use a reusable 64 KiB `asyncio.BufferedProtocol` receive buffer for cleartext TCP instead of the selector transport's allocation-heavy 256 KiB `socket.recv()` path. This removes an ASLR-dependent allocator/page-fault latency regime observed on Linux/ARM64 while preserving the public transport API and existing read/write backpressure. TLS remains on asyncio's existing buffered SSL transport.
+
 ### Changed
 
 - Fail MQTT 5 connection negotiation locally when the Server advertises `Maximum Packet Size` below 4 bytes. Such a limit is legal, but MQTTium cannot both respect it and guarantee the mandatory 4-byte PUBACK/PUBREC/PUBCOMP QoS responses. The client now raises `PacketTooLargeError` before entering `CONNECTED` instead of carrying connection-scoped tiny-peer branches until an acknowledgement is required. A limit of 4 remains supported.
