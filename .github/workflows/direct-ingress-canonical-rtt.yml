@@ -32,7 +32,7 @@ jobs:
           ref: ${{ env.BENCH_SHA }}
           path: harness
           persist-credentials: false
-      - name: Gate host and prepare variants
+      - name: Gate host and prepare clean Git variants
         shell: bash
         run: |
           set -euo pipefail
@@ -44,11 +44,16 @@ jobs:
           test "$version" = "2.1.2"
           dir="$RUNNER_TEMP/direct-ingress-rtt-$GITHUB_RUN_ID"
           variants="$dir/variants"
+          rm -rf "$dir"
           mkdir -p "$variants"
           echo "RESULTS_DIR=$dir" >> "$GITHUB_ENV"
           echo "VARIANTS_DIR=$variants" >> "$GITHUB_ENV"
-          rsync -a --delete --exclude .git experiment/ "$variants/base80/"
-          rsync -a --delete --exclude .git experiment/ "$variants/direct/"
+
+          # version_compare deliberately requires two distinct, clean Git
+          # sources with real SHAs. Clone the already checked-out source locally
+          # instead of rsyncing away .git metadata or weakening that invariant.
+          git clone --quiet --no-hardlinks experiment "$variants/base80"
+          git clone --quiet --no-hardlinks experiment "$variants/direct"
           cat >> "$variants/direct/src/mqttium/api/__init__.py" <<'PY'
 
           # benchmark-only activation of PR #447
@@ -56,6 +61,14 @@ jobs:
           _install_direct_ingress()
           del _install_direct_ingress
           PY
+          git -C "$variants/direct" config user.name "mqttium benchmark"
+          git -C "$variants/direct" config user.email "benchmark@localhost"
+          git -C "$variants/direct" add src/mqttium/api/__init__.py
+          git -C "$variants/direct" commit --quiet -m "benchmark: activate direct ingress"
+          test -z "$(git -C "$variants/base80" status --porcelain)"
+          test -z "$(git -C "$variants/direct" status --porcelain)"
+          git -C "$variants/base80" rev-parse HEAD | tee "$dir/base80.sha"
+          git -C "$variants/direct" rev-parse HEAD | tee "$dir/direct.sha"
       - name: Create benchmark environment and start broker
         shell: bash
         run: |
@@ -108,6 +121,11 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: direct-ingress-canonical-rtt-${{ github.run_id }}
-          path: ${{ env.RESULTS_DIR }}
-          if-no-files-found: error
+          path: |
+            ${{ env.RESULTS_DIR }}/base80-vs-direct-rtt.json
+            ${{ env.RESULTS_DIR }}/base80-vs-direct-rtt.txt
+            ${{ env.RESULTS_DIR }}/base80.sha
+            ${{ env.RESULTS_DIR }}/direct.sha
+            ${{ env.RESULTS_DIR }}/mosquitto.log
+          if-no-files-found: warn
           retention-days: 14
