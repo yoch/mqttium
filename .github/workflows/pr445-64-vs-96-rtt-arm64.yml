@@ -1,0 +1,150 @@
+name: PR445 64K vs 96K RTT ARM64
+
+on:
+  push:
+    branches: [bench/pr445-adversarial-validation]
+    paths:
+      - .github/workflows/pr445-64-vs-96-rtt-arm64.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr445-adversarial-rpi5
+  cancel-in-progress: false
+
+jobs:
+  rtt:
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 45
+    env:
+      BENCH_SHA: 37160eed99b50d1f384e1565a16d0346eb01ca56
+      SOURCE_SHA: 5fedd90b9bf7f87b61d34781cde0a5b698711ec4
+    steps:
+      - name: Prepare paths and host gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/pr445-rtt-$GITHUB_RUN_ID"
+          mkdir -p "$dir"
+          echo "RESULTS_DIR=$dir" >> "$GITHUB_ENV"
+          test "$(uname -m)" = aarch64
+          test "$(cat /proc/sys/kernel/randomize_va_space)" != 0
+          test "$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)" = performance
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: yoch/mqtt-python-client-bench
+          ref: ${{ env.BENCH_SHA }}
+          path: harness
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: yoch/mqttium
+          ref: ${{ env.SOURCE_SHA }}
+          path: base64
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: yoch/mqttium
+          ref: ${{ env.SOURCE_SHA }}
+          path: candidate96
+          persist-credentials: false
+      - name: Build clean 96K candidate with fixed read watermarks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('candidate96/src/mqttium/transport/_buffered.py')
+          text=p.read_text()
+          text=text.replace('_READ_CHUNK = 64 * 1024', '_READ_CHUNK = 96 * 1024')
+          text=text.replace('_READ_HIGH_WATER = 2 * _READ_CHUNK', '_READ_HIGH_WATER = 128 * 1024')
+          text=text.replace('_READ_LOW_WATER = _READ_CHUNK', '_READ_LOW_WATER = 64 * 1024')
+          p.write_text(text)
+          PY
+          git -C candidate96 diff --check
+          git -C candidate96 config user.name pr445-bench
+          git -C candidate96 config user.email bench@example.invalid
+          git -C candidate96 add src/mqttium/transport/_buffered.py
+          git -C candidate96 commit -m 'bench: 96K recv buffer fixed watermarks'
+          test "$(git -C base64 rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(git -C harness rev-parse HEAD)" = "$BENCH_SHA"
+          git -C candidate96 show --stat --oneline HEAD | tee "$RESULTS_DIR/candidate96.txt"
+          git -C candidate96 diff HEAD^ HEAD -- src/mqttium/transport/_buffered.py >> "$RESULTS_DIR/candidate96.txt"
+      - name: Create benchmark environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RESULTS_DIR/venv"
+          . "$RESULTS_DIR/venv/bin/activate"
+          python -m pip install --upgrade pip
+          pip install -e './harness[dev,mqttium]' 'psutil>=6,<8'
+          PYTHONPATH=harness/src python - <<'PY' | tee "$RESULTS_DIR/cpuset.json"
+          import json
+          from mqtt_client_bench.telemetry import allocate_cpuset, physical_cpu_groups
+          print(json.dumps({'physical_groups': physical_cpu_groups(), 'mapping': allocate_cpuset(['sut','broker','loadgen','orch'], profile='standard')}, indent=2, sort_keys=True))
+          PY
+      - name: Start native Mosquitto
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RESULTS_DIR/mosquitto.conf" <<'EOF'
+          listener 11883 127.0.0.1
+          protocol mqtt
+          set_tcp_nodelay true
+          allow_anonymous true
+          persistence false
+          connection_messages false
+          log_dest stdout
+          log_type error
+          max_inflight_messages 1000
+          max_queued_messages 10000
+          max_packet_size 16777216
+          EOF
+          broker_cpu="$(python3 - <<'PY'
+          import json, os
+          print(json.load(open(os.path.join(os.environ['RESULTS_DIR'],'cpuset.json')))['mapping']['broker'])
+          PY
+          )"
+          taskset -c "$broker_cpu" mosquitto -c "$RESULTS_DIR/mosquitto.conf" > "$RESULTS_DIR/mosquitto.log" 2>&1 &
+          echo "BROKER_PID=$!" >> "$GITHUB_ENV"
+          for _ in $(seq 1 50); do
+            (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1 && exit 0
+            sleep 0.1
+          done
+          exit 1
+      - name: Run exact reference RTT 64K vs 96K
+        shell: bash
+        run: |
+          set -euo pipefail
+          . "$RESULTS_DIR/venv/bin/activate"
+          PYTHONPATH=harness/src python -m mqtt_client_bench.layout_runner \
+            --worker-aslr system \
+            --entrypoint version_compare -- \
+            --client mqttium \
+            --baseline-path base64 \
+            --candidate-path candidate96 \
+            --scenario application_rtt_fixed_rate \
+            --variant-index 0 \
+            --target-rate 3942 \
+            --pacer-mode external \
+            --blocks 2 \
+            --max-block-retries 0 \
+            --profile standard \
+            --broker 127.0.0.1:11883 \
+            --broker-pid "$BROKER_PID" \
+            --output "$RESULTS_DIR/64-vs-96.json" \
+            | tee "$RESULTS_DIR/64-vs-96.txt"
+      - name: Stop broker
+        if: always()
+        shell: bash
+        run: |
+          [ -n "${BROKER_PID:-}" ] && kill "$BROKER_PID" 2>/dev/null || true
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: pr445-64-vs-96-rtt-${{ github.run_id }}
+          path: ${{ env.RESULTS_DIR }}
+          if-no-files-found: error
+          retention-days: 14
