@@ -97,6 +97,49 @@ def test_install_keeps_standard_decoder_and_drops_direct_on_fallback() -> None:
         api_module.AsyncClient = original_api_client
 
 
+async def test_rejected_alt_connect_does_not_mutate_active_direct_decoder(monkeypatch) -> None:
+    import mqttium.api as api_module
+    import mqttium.api.async_client as async_client_module
+
+    original_api_client = api_module.AsyncClient
+    original_async_client = async_client_module.AsyncClient
+    try:
+        client_type = install()
+        client = client_type()
+        direct_decoder = DirectIngressDecoder(123_456)
+        client._direct_ingress_decoder = direct_decoder
+        client._decoder = direct_decoder
+
+        async def reject_before_factory(_self) -> None:
+            raise RuntimeError("synthetic already-connected guard")
+
+        async def alt_factory(
+            host: str,
+            port: int,
+            *,
+            ssl: object | None = None,
+        ):
+            del host, port, ssl
+            raise AssertionError("alternative factory must not run")
+
+        monkeypatch.setattr(client_type, "_prepare_explicit_connect", reject_before_factory)
+        with pytest.raises(RuntimeError, match="synthetic already-connected guard"):
+            await client._connect_explicit(
+                "unused",
+                0,
+                ssl=None,
+                timeout=0.01,
+                unix_path="/unused",
+                factory=alt_factory,
+            )
+
+        assert client._decoder is direct_decoder
+        assert client._direct_ingress_decoder is direct_decoder
+    finally:
+        async_client_module.AsyncClient = original_async_client
+        api_module.AsyncClient = original_api_client
+
+
 async def test_direct_scope_excludes_tls() -> None:
     assert not _direct_ingress_enabled(True, asyncio.get_running_loop())
 
