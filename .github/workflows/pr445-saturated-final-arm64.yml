@@ -1,0 +1,225 @@
+name: PR445 pinned saturated receive ARM64
+
+on:
+  push:
+    branches: [bench/pr445-saturated-final-v4]
+    paths: [.github/workflows/pr445-saturated-final-arm64.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr445-saturated-final-rpi5
+  cancel-in-progress: false
+
+jobs:
+  saturated:
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 45
+    env:
+      PR445_SHA: 5fedd90b9bf7f87b61d34781cde0a5b698711ec4
+      REQUIRED_MOSQUITTO: "2.1.2"
+      PORT: "11883"
+      HIGH_WATER: "131072"
+      LOW_WATER: "65536"
+      MEASURE_S: "1.5"
+      WARMUP_S: "0.5"
+
+    steps:
+      - name: Checkout probe branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Checkout exact PR445 head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.PR445_SHA }}
+          path: candidate
+          persist-credentials: false
+
+      - name: Verify host and immutable candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          test "$(git -C candidate rev-parse HEAD)" = "$PR445_SHA"
+          test -z "$(git -C candidate status --porcelain --untracked-files=no)"
+          test "$(cat /proc/sys/kernel/randomize_va_space)" != "0"
+          test "$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)" = performance
+          test "$(nproc)" -ge 4
+          command -v taskset >/dev/null
+          command -v mosquitto >/dev/null
+          mkdir -p sat-results
+          {
+            date -u --iso-8601=seconds
+            uname -a
+            lscpu
+            python3 --version
+            echo "aslr=$(cat /proc/sys/kernel/randomize_va_space)"
+            echo "governor=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)"
+            echo "candidate=$PR445_SHA"
+            echo "sut_cpu=0 broker_cpu=1 publisher_cpu=2 orch_cpu=3"
+            echo "high_water=$HIGH_WATER low_water=$LOW_WATER"
+          } | tee sat-results/environment.txt
+
+      - name: Start native Mosquitto 2.1.2 on CPU1
+        shell: bash
+        run: |
+          set -euo pipefail
+          broker_bin="$(command -v mosquitto)"
+          { "$broker_bin" -h 2>&1 || true; } | head -n 6 | tee sat-results/broker-version.txt
+          version="$(python3 - <<'PY'
+          import re
+          text=open('sat-results/broker-version.txt', encoding='utf-8').read()
+          m=re.search(r'mosquitto version\s+([0-9]+(?:\.[0-9]+)+)', text, re.I)
+          if not m: raise SystemExit('cannot parse mosquitto version')
+          print(m.group(1))
+          PY
+          )"
+          test "$version" = "$REQUIRED_MOSQUITTO"
+          if ss -ltn | grep -q ":$PORT "; then echo "port $PORT occupied" >&2; exit 1; fi
+          cat > sat-results/mosquitto.conf <<EOF
+          listener $PORT 127.0.0.1
+          protocol mqtt
+          set_tcp_nodelay true
+          allow_anonymous true
+          persistence false
+          connection_messages false
+          log_dest stdout
+          log_type error
+          max_inflight_messages 1000
+          max_queued_messages 10000
+          max_packet_size 16777216
+          max_keepalive 120
+          EOF
+          taskset -c 1 "$broker_bin" -c sat-results/mosquitto.conf > sat-results/mosquitto.log 2>&1 &
+          echo "BROKER_PID=$!" >> "$GITHUB_ENV"
+          for _ in $(seq 1 50); do
+            (echo > /dev/tcp/127.0.0.1/$PORT) >/dev/null 2>&1 && exit 0
+            kill -0 "$!" 2>/dev/null || { cat sat-results/mosquitto.log; exit 1; }
+            sleep 0.1
+          done
+          cat sat-results/mosquitto.log
+          exit 1
+
+      - name: Run fresh-process saturated matrix with fixed final watermarks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' > sat-results/matrix.tsv
+          import random
+          random.seed(445960)
+          sizes=[65536,73728,81920,98304]
+          idx=0
+          for payload in (65536,1048576):
+              for rep in range(4):
+                  order=sizes[:]
+                  random.shuffle(order)
+                  for chunk in order:
+                      print(idx, payload, rep, chunk, sep='\t')
+                      idx += 1
+          PY
+
+          while IFS=$'\t' read -r idx payload rep chunk; do
+            topic="bench/pr445/sat/${GITHUB_RUN_ID}/${idx}"
+            ready="sat-results/ready-${idx}"
+            sub="sat-results/sub-${idx}.json"
+            pub="sat-results/pub-${idx}.json"
+            rm -f "$ready" "$sub" "$pub"
+
+            taskset -c 0 env PYTHONPATH="$PWD/candidate/src" python3 tools/mqtt_saturated_recv_probe.py \
+              subscriber --host 127.0.0.1 --port "$PORT" --topic "$topic" \
+              --payload-size "$payload" --recv-chunk "$chunk" \
+              --high-water "$HIGH_WATER" --low-water "$LOW_WATER" \
+              --warmup-s "$WARMUP_S" --duration-s "$MEASURE_S" \
+              --broker-pid "$BROKER_PID" --ready-file "$ready" --output "$sub" \
+              > "sat-results/sub-${idx}.log" 2>&1 &
+            subpid=$!
+
+            ok=0
+            for _ in $(seq 1 100); do
+              if [ -f "$ready" ]; then ok=1; break; fi
+              kill -0 "$subpid" 2>/dev/null || { cat "sat-results/sub-${idx}.log"; exit 1; }
+              sleep 0.05
+            done
+            test "$ok" = 1 || { echo "subscriber not ready" >&2; kill "$subpid" || true; exit 1; }
+
+            # Publisher intentionally runs slightly longer than subscriber warmup+measure.
+            taskset -c 2 env PYTHONPATH="$PWD/candidate/src" python3 tools/mqtt_saturated_recv_probe.py \
+              publisher --host 127.0.0.1 --port "$PORT" --topic "$topic" \
+              --payload-size "$payload" --duration-s "2.4" --output "$pub" \
+              > "sat-results/pub-${idx}.log" 2>&1 &
+            pubpid=$!
+
+            wait "$subpid" || { cat "sat-results/sub-${idx}.log"; kill "$pubpid" 2>/dev/null || true; exit 1; }
+            wait "$pubpid" || { cat "sat-results/pub-${idx}.log"; exit 1; }
+            printf '%s\t%s\t%s\t%s\n' "$idx" "$payload" "$rep" "$chunk" >> sat-results/completed.tsv
+            sleep 0.10
+          done < sat-results/matrix.tsv
+
+      - name: Reduce saturated evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import csv, glob, json, statistics
+          rows=[]
+          for fn in sorted(glob.glob('sat-results/sub-*.json')):
+              row=json.load(open(fn))
+              idx=int(fn.rsplit('-',1)[1].split('.')[0])
+              pub=json.load(open(f'sat-results/pub-{idx}.json'))
+              row['idx']=idx
+              row['publisher_mib_s']=pub['payload_mib_s']
+              row['publisher_stime_s']=pub['ru_stime_s']
+              row['minflt_per_message']=row['ru_minflt']/row['messages'] if row['messages'] else None
+              row['callbacks_per_message']=row['recv_callbacks']/row['messages'] if row['messages'] else None
+              rows.append(row)
+          rows.sort(key=lambda r:r['idx'])
+          with open('sat-results/rows.csv','w',newline='') as f:
+              w=csv.DictWriter(f,fieldnames=sorted(rows[0]))
+              w.writeheader(); w.writerows(rows)
+          summary={}
+          for payload in sorted({r['payload_size'] for r in rows}):
+              summary[str(payload)]={}
+              for chunk in sorted({r['recv_chunk'] for r in rows if r['payload_size']==payload}):
+                  rs=[r for r in rows if r['payload_size']==payload and r['recv_chunk']==chunk]
+                  def med(k): return statistics.median(float(r[k]) for r in rs)
+                  summary[str(payload)][str(chunk)]={
+                      'n':len(rs),
+                      'payload_mib_s_median':med('payload_mib_s'),
+                      'sut_cpu_pct_median':med('sut_cpu_pct'),
+                      'broker_cpu_pct_median':med('broker_cpu_pct'),
+                      'ru_stime_s_median':med('ru_stime_s'),
+                      'ru_minflt_median':med('ru_minflt'),
+                      'minflt_per_message_median':med('minflt_per_message'),
+                      'recv_callbacks_median':med('recv_callbacks'),
+                      'callbacks_per_message_median':med('callbacks_per_message'),
+                      'avg_recv_bytes_median':med('avg_recv_bytes'),
+                      'pause_count_median':med('pause_count'),
+                      'resume_count_median':med('resume_count'),
+                      'peak_buffered_bytes_max':max(int(r['peak_buffered_bytes']) for r in rs),
+                      'publisher_mib_s_median':med('publisher_mib_s'),
+                  }
+          with open('sat-results/summary.json','w') as f: json.dump(summary,f,indent=2,sort_keys=True)
+          print(json.dumps(summary,indent=2,sort_keys=True))
+          PY
+          cat sat-results/rows.csv
+
+      - name: Stop broker
+        if: always()
+        shell: bash
+        run: |
+          if [ -n "${BROKER_PID:-}" ]; then
+            kill "$BROKER_PID" 2>/dev/null || true
+            wait "$BROKER_PID" 2>/dev/null || true
+          fi
+
+      - name: Upload saturated evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: pr445-saturated-final-${{ github.run_id }}
+          path: sat-results
+          if-no-files-found: error
+          retention-days: 14
