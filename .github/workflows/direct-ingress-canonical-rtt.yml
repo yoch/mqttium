@@ -1,0 +1,113 @@
+name: Direct ingress canonical RTT
+
+on:
+  push:
+    branches: [perf/direct-decoder-ingress-prototype]
+    paths:
+      - .github/workflows/direct-ingress-canonical-rtt.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: direct-ingress-canonical-rtt
+  cancel-in-progress: false
+
+jobs:
+  arm64:
+    name: RPi5 / 2-block direct RTT
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 15
+    env:
+      BENCH_SHA: 37160eed99b50d1f384e1565a16d0346eb01ca56
+      PORT: "11884"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: experiment
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: yoch/mqtt-python-client-bench
+          ref: ${{ env.BENCH_SHA }}
+          path: harness
+          persist-credentials: false
+      - name: Gate host and prepare variants
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          test "$(python3 -c 'import platform; print(platform.python_version())')" = "3.14.7"
+          test "$(cat /proc/sys/kernel/randomize_va_space)" != "0"
+          test "$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)" = performance
+          version="$({ mosquitto -h 2>&1 || true; } | python3 -c 'import re,sys; t=sys.stdin.read(); m=re.search(r"mosquitto version\s+([0-9]+(?:\.[0-9]+)+)",t,re.I); print(m.group(1) if m else "")')"
+          test "$version" = "2.1.2"
+          dir="$RUNNER_TEMP/direct-ingress-rtt-$GITHUB_RUN_ID"
+          variants="$dir/variants"
+          mkdir -p "$variants"
+          echo "RESULTS_DIR=$dir" >> "$GITHUB_ENV"
+          echo "VARIANTS_DIR=$variants" >> "$GITHUB_ENV"
+          rsync -a --delete --exclude .git experiment/ "$variants/base80/"
+          rsync -a --delete --exclude .git experiment/ "$variants/direct/"
+          cat >> "$variants/direct/src/mqttium/api/__init__.py" <<'PY'
+
+          # benchmark-only activation of PR #447
+          from mqttium._direct_decoder_ingress_prototype import install as _install_direct_ingress
+          _install_direct_ingress()
+          del _install_direct_ingress
+          PY
+      - name: Create benchmark environment and start broker
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RESULTS_DIR/venv"
+          . "$RESULTS_DIR/venv/bin/activate"
+          python -m pip install --upgrade pip >/dev/null
+          pip install -e './harness[dev,mqttium]' 'psutil>=6,<8' >/dev/null
+          cat > "$RESULTS_DIR/mosquitto.conf" <<EOF
+          listener $PORT 127.0.0.1
+          protocol mqtt
+          set_tcp_nodelay true
+          allow_anonymous true
+          persistence false
+          connection_messages false
+          log_dest stdout
+          log_type error
+          max_inflight_messages 1000
+          max_queued_messages 10000
+          max_packet_size 16777216
+          EOF
+          taskset -c 1 mosquitto -c "$RESULTS_DIR/mosquitto.conf" > "$RESULTS_DIR/mosquitto.log" 2>&1 &
+          echo "BROKER_PID=$!" >> "$GITHUB_ENV"
+          for _ in $(seq 1 50); do
+            (echo > /dev/tcp/127.0.0.1/$PORT) >/dev/null 2>&1 && exit 0
+            sleep 0.1
+          done
+          exit 1
+      - name: Run two RTT blocks
+        shell: bash
+        run: |
+          set -euo pipefail
+          . "$RESULTS_DIR/venv/bin/activate"
+          PYTHONPATH=harness/src python -m mqtt_client_bench.layout_runner \
+            --worker-aslr system --entrypoint version_compare -- \
+            --client mqttium \
+            --baseline-path "$VARIANTS_DIR/base80" \
+            --candidate-path "$VARIANTS_DIR/direct" \
+            --scenario application_rtt_fixed_rate --variant-index 0 --target-rate 3942 \
+            --pacer-mode external --blocks 2 --max-block-retries 0 --profile standard \
+            --broker 127.0.0.1:$PORT --broker-pid "$BROKER_PID" \
+            --output "$RESULTS_DIR/base80-vs-direct-rtt.json" \
+            | tee "$RESULTS_DIR/base80-vs-direct-rtt.txt"
+      - name: Stop broker
+        if: always()
+        shell: bash
+        run: '[ -n "${BROKER_PID:-}" ] && kill "$BROKER_PID" 2>/dev/null || true'
+      - name: Upload RTT evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: direct-ingress-canonical-rtt-${{ github.run_id }}
+          path: ${{ env.RESULTS_DIR }}
+          if-no-files-found: error
+          retention-days: 14
