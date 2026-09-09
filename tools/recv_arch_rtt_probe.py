@@ -55,8 +55,8 @@ def build_publish(payload_size: int) -> bytes:
 
 
 def echo_server(sock: socket.socket, stop: threading.Event) -> None:
-    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         while not stop.is_set():
             chunk = sock.recv(65536)
             if not chunk:
@@ -226,24 +226,19 @@ async def measure(
     listener.listen(1)
     listener.settimeout(timeout_s)
     stop = threading.Event()
-    accepted: list[socket.socket] = []
-
-    def accept() -> None:
-        try:
-            conn, _ = listener.accept()
-        except OSError:
-            return
-        accepted.append(conn)
-        echo_server(conn, stop)
-
-    thread = threading.Thread(target=accept, daemon=True)
-    thread.start()
-
+    accepted = None
+    thread = None
     client = None
     transport = None
     samples: list[float] = []
     try:
+        # The listening backlog completes the local connection before accept.
+        # Keep setup in the owning thread: a failed connect must not leave a
+        # background thread blocked in accept until its socket timeout expires.
         client = socket.create_connection(listener.getsockname(), timeout=timeout_s)
+        accepted, _ = listener.accept()
+        thread = threading.Thread(target=echo_server, args=(accepted, stop), daemon=True)
+        thread.start()
         client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         # One timeout per arm, outside individual RTT samples. A stalled peer
         # must terminate the probe without adding per-message timer overhead.
@@ -263,11 +258,14 @@ async def measure(
         elif client is not None:
             client.close()
         listener.close()
-        for conn in accepted:
+        if accepted is not None:
             with suppress(OSError):
-                conn.shutdown(socket.SHUT_RDWR)
-            conn.close()
-        await asyncio.to_thread(thread.join, 1.0)
+                accepted.shutdown(socket.SHUT_RDWR)
+            accepted.close()
+        if thread is not None and thread.ident is not None:
+            await asyncio.to_thread(thread.join, 1.0)
+            if thread.is_alive():
+                raise RuntimeError("echo thread did not terminate after socket shutdown")
     return samples
 
 

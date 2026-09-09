@@ -248,15 +248,16 @@ Custom transports that previously satisfied `AsyncTransport` by providing
 Code that annotated `AsyncTransport` and called `.read()` should annotate
 `PullTransport` instead.
 
-
-
 ## Decoder storage and ingress contract
 
 The decoder's slab is reusable but not fixed-size. It grows progressively with
-received data, at most geometrically, and a valid known head-frame extent caps
-that growth. The announced Remaining Length is **not** a request to reserve the
-entire body immediately. This avoids multi-MiB allocations after just a header,
-without introducing timers, global budgets, or an additional framing engine.
+received data, at most geometrically, and a valid known **incomplete** head-frame
+extent caps that growth. A complete head must not cap storage for following
+frames; an explicit backlog of several frames retains amortised growth even
+when its total exceeds the per-packet ceiling. The announced Remaining Length
+is **not** a request to reserve the entire body immediately. This avoids multi-MiB
+allocations after just a header, without introducing timers, global budgets, or
+an additional framing engine.
 
 Both `feed()` and direct ingress use this sizing policy. `feed()` must still
 accept all bytes handed to it, including multiple frames in one call; a packet
@@ -284,7 +285,8 @@ subsequent large frames reuse the capacity. Tests bound total bytes copied and
 capacity, not an unsafe promise to allocate every announced frame in two steps.
 
 Retirement remains based on 64 drains since the last genuinely large frame,
-sized to recent aggregate pressure and the adaptive receive target. It is not
+sized to the recent peak of simultaneously buffered bytes and the adaptive
+receive target, not to offsets that include already-consumed traffic. It is not
 an idle timer: a slab retained after real large traffic can remain while idle.
 `clear()` resets connection state and releases oversized capacity. Configure
 `max_packet_size` for the deployment; inbound/delivery queue budgets do not

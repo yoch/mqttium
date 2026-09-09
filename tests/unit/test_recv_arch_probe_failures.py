@@ -63,3 +63,53 @@ async def test_probe_bounds_a_stalled_peer_and_reaps_its_thread(monkeypatch) -> 
     with pytest.raises(TimeoutError):
         await probe.measure("push", probe.build_publish(4), 1, 0, timeout_s=0.03)
     assert finished.is_set()
+
+
+@pytest.mark.parametrize("stage", ["connect", "accept"])
+async def test_probe_setup_failure_starts_no_thread_and_closes_sockets(monkeypatch, stage) -> None:
+    sockets = []
+    original_init = socket.socket.__init__
+    started = []
+    original_start = threading.Thread.start
+
+    def track_socket(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        sockets.append(self)
+
+    def track_start(self):
+        started.append(self)
+        original_start(self)
+
+    def fail(*args, **kwargs):
+        raise OSError(f"injected {stage} failure")
+
+    monkeypatch.setattr(socket.socket, "__init__", track_socket)
+    monkeypatch.setattr(threading.Thread, "start", track_start)
+    if stage == "connect":
+        monkeypatch.setattr(socket, "create_connection", fail)
+    else:
+        monkeypatch.setattr(socket.socket, "accept", fail)
+    with pytest.raises(OSError, match=f"injected {stage} failure"):
+        await probe.measure("push", probe.build_publish(4), 1, 0)
+    assert not started
+    assert sockets and all(sock.fileno() == -1 for sock in sockets)
+
+
+async def test_probe_arm_setup_failure_reaps_an_already_started_echo_thread(monkeypatch) -> None:
+    finished = threading.Event()
+    original_echo = probe.echo_server
+
+    def echo(sock, stop):
+        try:
+            original_echo(sock, stop)
+        finally:
+            finished.set()
+
+    async def fail(sock):
+        raise OSError("injected arm setup failure")
+
+    monkeypatch.setattr(probe, "echo_server", echo)
+    monkeypatch.setitem(probe.ARMS, "push", fail)
+    with pytest.raises(OSError, match="injected arm setup failure"):
+        await probe.measure("push", probe.build_publish(4), 1, 0)
+    assert finished.is_set()

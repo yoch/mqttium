@@ -151,11 +151,14 @@ class IncrementalDecoder:
             # actual byte requirement always wins over the head's size.
             capacity = max(required, min(capacity, exact_total))
         ceiling = self._max_packet_size + RECEIVE_QUANTUM
-        if capacity > ceiling:
-            capacity = max(ceiling, required)
+        # An explicit feed can accumulate several valid frames beyond this
+        # per-packet ceiling. Do not turn that aggregate backlog into exact-fit
+        # growth on every subsequent fragment.
+        if required <= ceiling < capacity:
+            capacity = ceiling
         self._reallocate(capacity)
 
-    def _retire_oversize(self, extent: int) -> None:
+    def _retire_oversize(self) -> None:
         """Shrink an oversized slab once large frames stop arriving.
 
         Two different things must not be confused. A drain that consumed a
@@ -163,15 +166,15 @@ class IncrementalDecoder:
         and resets the window. Aggregate pressure from coalesced small frames is
         not: it routinely exceeds `DEFAULT_CAPACITY` without any single frame
         doing so, and counting it as use pins a multi-MiB slab for a workload
-        that needs a few hundred KiB.
+        that needs a few hundred KiB. The peak is live buffered bytes, recorded
+        at ingress, not the physical write offset: consumed bytes can keep both
+        offsets advancing while the actual backlog stays small.
         """
         if self._drain_had_large_frame:
             self._drain_had_large_frame = False
             self._idle_drains = 0
             self._window_peak = 0
             return
-        if extent > self._window_peak:
-            self._window_peak = extent
         self._idle_drains += 1
         if self._idle_drains < _OVERSIZE_RETENTION:
             return
@@ -185,8 +188,10 @@ class IncrementalDecoder:
             self._reallocate(target)
 
     def _known_frame_total(self) -> int | None:
-        """Head frame's byte extent when already knowable. Allocation policy only.
+        """Size of a known incomplete head frame. Allocation policy only.
 
+        A complete head says nothing about the storage needed by following
+        frames. Using its size as a growth cap would reallocate on every feed.
         Malformed and oversize input is left to the framing methods so protocol
         errors keep their normal ordering.
         """
@@ -197,15 +202,16 @@ class IncrementalDecoder:
         except MalformedPacketError:
             return None
         total = (rl_end - self._start) + remaining
-        return None if total > self._max_packet_size else total
+        if total <= self._end - self._start or total > self._max_packet_size:
+            return None
+        return total
 
     def _reset(self) -> None:
         """Rewind a fully consumed slab."""
-        extent = self._end
         self._start = 0
         self._end = 0
         if self._capacity > self._target_window:
-            self._retire_oversize(extent)
+            self._retire_oversize()
 
     def writable_window(self, preferred: int = _MIN_WINDOW) -> memoryview:
         """Return writable storage for a receiver to fill, then `commit()`.
@@ -269,6 +275,8 @@ class IncrementalDecoder:
         buffered = end - self._start
         if buffered > self._high_water:
             self._high_water = buffered
+        if buffered > self._window_peak:
+            self._window_peak = buffered
 
     def peek_packet_bounds(self) -> tuple[int, int, int] | None:
         """Return ``(header, body_start, body_end)`` for the next complete frame.
@@ -377,6 +385,8 @@ class IncrementalDecoder:
         buffered = end - self._start
         if buffered > self._high_water:
             self._high_water = buffered
+        if buffered > self._window_peak:
+            self._window_peak = buffered
 
     def clear(self) -> None:
         """Rewind for a new connection, dropping any oversized-frame growth."""
@@ -456,7 +466,7 @@ class IncrementalDecoder:
             self._start = 0
             self._end = 0
             if self._capacity > self._target_window:
-                self._retire_oversize(body_end)
+                self._retire_oversize()
         return RawPacket(packet_type=packet_type, flags=flags, remaining=body)
 
     def drain_packets(self, limit: int = 100) -> list[RawPacket]:
