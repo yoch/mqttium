@@ -70,6 +70,8 @@ jobs:
           assert hashlib.sha256(probe.encode()).hexdigest() == '7f132613eb3cb42d1b0b83b57e81c4dc68ddbde77ac813409f6570933164b7da'
           p('results/probe.py').write_text(probe)
           PY
+          python tooling/.github/pr454-refine.py
+          cp tooling/.github/pr454-refine.py results/
           git -C tooling rev-parse HEAD > results/tooling-sha.txt
           uname -a > results/machine.txt
           lscpu >> results/machine.txt
@@ -118,7 +120,6 @@ jobs:
           assert actual == set(names), actual
           subprocess.run(['git','-C','arm-b','add','--',*names],check=True)
           tree=subprocess.check_output(['git','-C','arm-b','write-tree'],text=True).strip()
-          src=subprocess.check_output(['git','-C','arm-b','ls-files','--stage','src/mqttium/api/async_client.py'],text=True)
           out=p('results/candidate');out.mkdir()
           manifest={'parent':'a27a5f7942c86d24495f375ced1c72f440e6982b','tree':tree,'files':[]}
           for name in names:
@@ -128,13 +129,12 @@ jobs:
               with urllib.request.urlopen(req,timeout=30) as response: assert json.load(response)['sha']==sha
               dest=out/name;dest.parent.mkdir(parents=True,exist_ok=True);dest.write_bytes(data)
               manifest['files'].append({'path':name,'sha':sha,'sha256':hashlib.sha256(data).hexdigest()})
+          digest=subprocess.check_output(['git','-C','arm-b','rev-parse',tree+':src/mqttium'],text=True).strip()
+          manifest['src_tree']=digest
           (out/'manifest.json').write_text(json.dumps(manifest,indent=2))
           (out/'candidate.diff').write_bytes(subprocess.check_output(['git','-C','arm-b','diff','--cached','HEAD']))
-          import importlib.util
-          spec=importlib.util.spec_from_file_location('probe','results/probe.py');m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
-          digest=m.treehash(p('arm-b/src/mqttium')).hex()
           with open(os.environ['GITHUB_ENV'],'a') as f: f.write(f'CANDIDATE_TREE={tree}\nCANDIDATE_SRC_TREE={digest}\n')
-          print('TESTED_CANDIDATE',json.dumps(manifest),'SRC_TREE',digest)
+          print('TESTED_CANDIDATE',json.dumps(manifest))
           PY
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
@@ -160,11 +160,16 @@ jobs:
       - name: Final identity and cleanup
         if: always()
         run: |
+          set +e
           git -C arm-a status --short > results/final-a.txt
-          git -C arm-b diff --exit-code > results/unstaged-b.txt
+          git -C arm-b diff > results/unstaged-b.txt
           git -C arm-b write-tree > results/final-tree-b.txt
           echo 'Eight balanced pairs per phase, all samples retained. Practical threshold 3%; compare every metric with its own A/A distribution. Same original measurement code; identity inputs only changed. Hosted x86 and ARM64 results are separate. Network is closed-loop, not fixed offered rate.' > results/policy.txt
-          if test -f results/broker.pid; then kill "$(cat results/broker.pid)" || true; fi
+          if test -f results/broker.pid; then kill "$(cat results/broker.pid)"; fi
+          if test -f results/candidate/manifest.json; then
+            test ! -s results/unstaged-b.txt && test "$(cat results/final-tree-b.txt)" = "$CANDIDATE_TREE"
+            exit $?
+          fi
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
