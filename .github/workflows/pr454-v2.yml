@@ -1,0 +1,174 @@
+name: PR454 bounded handoff qualification
+on:
+  push:
+    branches: [work/pr454-v2-qualification]
+permissions:
+  contents: read
+concurrency:
+  group: pr454-v2-qualification
+  cancel-in-progress: false
+jobs:
+  qualify:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: x86
+            runner: ubuntu-24.04
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    permissions:
+      contents: write
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      PYTHONUNBUFFERED: '1'
+      PIP_DISABLE_PIP_VERSION_CHECK: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          path: tooling
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          ref: 9ad1f01857306ac5079ffb1d073a59fdb60e1931
+          path: arm-a
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          ref: a27a5f7942c86d24495f375ced1c72f440e6982b
+          path: arm-b
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          ref: 3919ec806d78462b0ab7905f3362268fdc707b1f
+          path: historical-harness
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.12'
+      - name: Apply exact candidate and prepare neutral measurement
+        run: |
+          set -euo pipefail
+          mkdir results
+          python - <<'PY'
+          import base64, hashlib, os, pathlib, subprocess, zlib
+          p=pathlib.Path
+          assert subprocess.check_output(['git','-C','arm-a','rev-parse','HEAD'],text=True).strip() == '9ad1f01857306ac5079ffb1d073a59fdb60e1931'
+          assert subprocess.check_output(['git','-C','arm-b','rev-parse','HEAD'],text=True).strip() == 'a27a5f7942c86d24495f375ced1c72f440e6982b'
+          patch=zlib.decompress(base64.b64decode(p('tooling/.github/pr454-v2.b64').read_bytes()))
+          assert hashlib.sha256(patch).hexdigest() == '62da57339fbecd5131bc8c48646363a4ff8b9a463d9e64c3147968b06721f4bf'
+          patchfile=p(os.environ['RUNNER_TEMP'])/'candidate.patch'; patchfile.write_bytes(patch)
+          subprocess.run(['git','-C','arm-b','apply','--check',str(patchfile)],check=True)
+          subprocess.run(['git','-C','arm-b','apply',str(patchfile)],check=True)
+          p('results/input.patch').write_bytes(patch)
+          probe=p('historical-harness/tools/pr454_perf_probe.py').read_text()
+          assert hashlib.sha256(probe.encode()).hexdigest() == '305373f69b25710227904b3d49b2d91b0bc125e9bbae01c901306a2d227378e5'
+          probe=probe.replace("HEAD='a27a5f7942c86d24495f375ced1c72f440e6982b'", "HEAD=os.environ.get('CANDIDATE_TREE','unpublished-tree')")
+          probe=probe.replace("'B':'0f55ffb86a2565af012e751e45155d36096f6dca'", "'B':os.environ['CANDIDATE_SRC_TREE']")
+          assert hashlib.sha256(probe.encode()).hexdigest() == '7f132613eb3cb42d1b0b83b57e81c4dc68ddbde77ac813409f6570933164b7da'
+          p('results/probe.py').write_text(probe)
+          PY
+          git -C tooling rev-parse HEAD > results/tooling-sha.txt
+          uname -a > results/machine.txt
+          lscpu >> results/machine.txt
+          python -V >> results/machine.txt
+          python - <<'PY'
+          import os,subprocess
+          cores={}
+          for row in subprocess.check_output(['lscpu','-p=CPU,CORE,SOCKET'],text=True).splitlines():
+              if row.startswith('#'): continue
+              cpu,core,sock=map(int,row.split(','))
+              if cpu in os.sched_getaffinity(0): cores.setdefault((sock,core),cpu)
+          cpus=list(cores.values()); assert len(cpus)>=2
+          with open(os.environ['GITHUB_ENV'],'a') as f: f.write(f'SUT_CPU={cpus[0]}\nBROKER_CPU={cpus[1]}\n')
+          print('CORE_ASSIGNMENT',cpus)
+          PY
+      - name: Install validation tools
+        working-directory: arm-b
+        run: python -m pip install -e '.[dev,fuzz,security,docs]'
+      - name: Quality on the exact formatted candidate
+        working-directory: arm-b
+        run: |
+          set -euo pipefail
+          ruff format src/mqttium/api/_delivery.py src/mqttium/api/async_client.py tests/unit/test_callback_route_reconfiguration.py tests/unit/test_callback_route_handoff.py tests/unit/test_callback_route_pressure.py
+          ruff check src tests benchmarks tools
+          ruff format --check src tests benchmarks tools
+          mypy src/mqttium
+          bandit -q -ll -r src
+          mkdocs build --strict
+          git diff --check
+      - name: Unit project resilience and fuzz checks
+        working-directory: arm-b
+        run: |
+          set -euo pipefail
+          python -m pytest -q -W error tests/unit tests/project tests/resilience | tee ../results/tests.txt
+          python -m pytest -q tests/fuzz | tee ../results/fuzz.txt
+          PYTHONPATH=src python tests/fuzz/fuzz.py --seed 1 --iterations 20000 | tee ../results/seeded.txt
+      - name: Capture tested tree and create content-addressed blobs only
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python - <<'PY'
+          import base64,hashlib,json,os,pathlib,subprocess,urllib.request
+          p=pathlib.Path
+          names=['src/mqttium/api/_delivery.py','src/mqttium/api/async_client.py','tests/unit/test_callback_route_reconfiguration.py','tests/unit/test_callback_route_handoff.py','tests/unit/test_callback_route_pressure.py','tests/unit/test_topic_callback_dispatch_contract.py','tests/unit/test_topic_callbacks.py','CHANGELOG.md','docs/reference/async-client.md','docs/migration.md']
+          actual=set(subprocess.check_output(['git','-C','arm-b','diff','--name-only'],text=True).splitlines()) | set(subprocess.check_output(['git','-C','arm-b','ls-files','--others','--exclude-standard'],text=True).splitlines())
+          assert actual == set(names), actual
+          subprocess.run(['git','-C','arm-b','add','--',*names],check=True)
+          tree=subprocess.check_output(['git','-C','arm-b','write-tree'],text=True).strip()
+          src=subprocess.check_output(['git','-C','arm-b','ls-files','--stage','src/mqttium/api/async_client.py'],text=True)
+          out=p('results/candidate');out.mkdir()
+          manifest={'parent':'a27a5f7942c86d24495f375ced1c72f440e6982b','tree':tree,'files':[]}
+          for name in names:
+              data=(p('arm-b')/name).read_bytes()
+              sha=hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest()
+              req=urllib.request.Request('https://api.github.com/repos/yoch/mqttium/git/blobs',data=json.dumps({'content':base64.b64encode(data).decode(),'encoding':'base64'}).encode(),headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json','Content-Type':'application/json'},method='POST')
+              with urllib.request.urlopen(req,timeout=30) as response: assert json.load(response)['sha']==sha
+              dest=out/name;dest.parent.mkdir(parents=True,exist_ok=True);dest.write_bytes(data)
+              manifest['files'].append({'path':name,'sha':sha,'sha256':hashlib.sha256(data).hexdigest()})
+          (out/'manifest.json').write_text(json.dumps(manifest,indent=2))
+          (out/'candidate.diff').write_bytes(subprocess.check_output(['git','-C','arm-b','diff','--cached','HEAD']))
+          import importlib.util
+          spec=importlib.util.spec_from_file_location('probe','results/probe.py');m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+          digest=m.treehash(p('arm-b/src/mqttium')).hex()
+          with open(os.environ['GITHUB_ENV'],'a') as f: f.write(f'CANDIDATE_TREE={tree}\nCANDIDATE_SRC_TREE={digest}\n')
+          print('TESTED_CANDIDATE',json.dumps(manifest),'SRC_TREE',digest)
+          PY
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: pr454-v2-candidate-${{ matrix.platform }}
+          path: results/candidate/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Start symmetric low-latency broker
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mosquitto
+          dpkg-query -W mosquitto > results/broker-version.txt
+          printf 'listener 11883 127.0.0.1\nallow_anonymous true\npersistence false\nset_tcp_nodelay true\nlog_type error\n' > "$RUNNER_TEMP/pr454-v2-mosquitto.conf"
+          cp "$RUNNER_TEMP/pr454-v2-mosquitto.conf" results/broker.conf
+          taskset -c "$BROKER_CPU" mosquitto -c "$RUNNER_TEMP/pr454-v2-mosquitto.conf" > results/broker.log 2>&1 &
+          echo $! > results/broker.pid
+          python arm-b/tools/ci/wait_for_endpoints.py --tcp 127.0.0.1:11883
+      - name: Full A/A then A/B mechanism matrix
+        run: python results/probe.py campaign --base arm-a --candidate arm-b --kind micro --count 8000 --repeats 8 --cpu "$SUT_CPU" --output results/micro
+      - name: Full A/A then A/B native MQTT QoS1 application RTT
+        run: python results/probe.py campaign --base arm-a --candidate arm-b --kind network --count 800 --repeats 8 --cpu "$SUT_CPU" --port 11883 --output results/network
+      - name: Final identity and cleanup
+        if: always()
+        run: |
+          git -C arm-a status --short > results/final-a.txt
+          git -C arm-b diff --exit-code > results/unstaged-b.txt
+          git -C arm-b write-tree > results/final-tree-b.txt
+          echo 'Eight balanced pairs per phase, all samples retained. Practical threshold 3%; compare every metric with its own A/A distribution. Same original measurement code; identity inputs only changed. Hosted x86 and ARM64 results are separate. Network is closed-loop, not fixed offered rate.' > results/policy.txt
+          if test -f results/broker.pid; then kill "$(cat results/broker.pid)" || true; fi
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: pr454-v2-results-${{ matrix.platform }}
+          path: results/
+          if-no-files-found: error
+          retention-days: 14
