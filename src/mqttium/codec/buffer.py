@@ -8,11 +8,12 @@ Design constraints (from Paho perf audit + gmqtt critique):
 
 The storage is a slab the decoder owns outright: `_start` is the read offset,
 `_end` the write offset, and `len(_buf)` is the capacity rather than the amount
-of live data. Nothing on the hot path reallocates -- compaction is a memmove
-inside the existing slab, and the slab only grows for a frame larger than its
-capacity. That is what lets a transport hand `writable_window()` straight to
-`socket.recv_into()`, so received bytes are never copied through an
-intermediate buffer before reaching the decoder.
+of live data. Compaction moves bytes within that slab; growth copies only live
+bytes into a new slab. Both use byte-oriented memoryview destinations to avoid
+CPython's temporary bytearray for bytearray slice assignment. A transport can
+hand `writable_window()` straight to `socket.recv_into()`, avoiding intermediate
+receive storage. Large frames grow progressively: an announced Remaining Length
+caps growth but does not itself cause the whole frame to be allocated.
 """
 
 from __future__ import annotations
@@ -37,10 +38,8 @@ _INITIAL_WINDOW = 64 * 1024
 _PROMOTE_AFTER = 4
 # A single frame above this is evidence the workload needs a large slab.
 _LARGE_FRAME = DEFAULT_CAPACITY
-# Above this, size the slab to the head frame's exact extent instead of doubling
-# past it. Doubling wastes up to a whole frame on multi-MiB traffic.
-_EXACT_FRAME_THRESHOLD = 512 * 1024
-# Smallest window worth offering a receiver; also the compaction trigger.
+# Default minimum preference of internal callers. The adaptive receive target
+# can offer more, while the remaining frame extent can offer less.
 _MIN_WINDOW = 16 * 1024
 # Ceiling for the adaptive receive window. Storage capacity and receive quantum
 # are separate concerns.
@@ -118,12 +117,13 @@ class IncrementalDecoder:
     def _reallocate(self, capacity: int) -> None:
         live = self._end - self._start
         grown = bytearray(capacity)
+        view = memoryview(grown)
         if live:
-            grown[0:live] = self._view[self._start : self._end]
-        # Release only after the copy: the old view is the source.
+            view[:live] = self._view[self._start : self._end]
+        # Release only after allocation and copying have succeeded.
         self._view.release()
         self._buf = grown
-        self._view = memoryview(grown)
+        self._view = view
         self._capacity = capacity
         self._start = 0
         self._end = live
@@ -136,30 +136,23 @@ class IncrementalDecoder:
         if self._capacity - live >= need:
             # In-place memmove inside the existing slab; capacity is untouched,
             # so neither this nor the following write reallocates.
-            self._buf[0:live] = self._view[self._start : self._end]
+            self._view[:live] = self._view[self._start : self._end]
             self._start = 0
             self._end = live
             return
-        capacity = self._capacity or _MIN_CAPACITY
+        required = live + need
+        # Amortised linear copying, not a full reservation based on an untrusted
+        # header. `need` is either an actual feed fragment or a bounded receive
+        # window. Retained capacity is reusable, regardless of the current head.
+        capacity = max(self._capacity * 2, _MIN_CAPACITY, required)
         if exact_total is not None:
-            # The head frame's extent is known, so size to it instead of
-            # doubling: a frame just over a step would otherwise cost a whole
-            # extra frame of slab.
-            capacity = exact_total if exact_total > live + need else live + need
-        elif need >= _EXACT_FRAME_THRESHOLD:
-            # feed() was handed this much in one call, so it is the exact need.
-            capacity = live + need
-        else:
-            while capacity - live < need:
-                capacity *= 2
-        # Doubling alone can reach twice max_packet_size: a frame just over a
-        # doubling step leaves a tail too small for the next window and doubles
-        # again. Framing rejects anything larger than max_packet_size, so one
-        # maximum frame plus a window is all the slab can ever use. `need` still
-        # wins, because feed() may be handed more than that in one call.
+            # Stop at the known frame extent, including just above a power of
+            # two. A feed fragment may also contain subsequent frames, so its
+            # actual byte requirement always wins over the head's size.
+            capacity = max(required, min(capacity, exact_total))
         ceiling = self._max_packet_size + RECEIVE_QUANTUM
         if capacity > ceiling:
-            capacity = max(ceiling, live + need)
+            capacity = max(ceiling, required)
         self._reallocate(capacity)
 
     def _retire_oversize(self, extent: int) -> None:
@@ -217,30 +210,25 @@ class IncrementalDecoder:
     def writable_window(self, preferred: int = _MIN_WINDOW) -> memoryview:
         """Return writable storage for a receiver to fill, then `commit()`.
 
-        `preferred` is an upper bound, not a floor: the window is always
-        non-empty, which is all `get_buffer()` requires, but it is shortened to
-        what an incomplete head frame still needs so the slab is never grown
-        past the frame it is receiving.
+        The requested size is max(the adaptive target, `preferred`), not a
+        guaranteed minimum or maximum. It may be shortened at a known incomplete
+        frame's end. Default transport calls offer at most `RECEIVE_QUANTUM`;
+        an explicit larger preference is supported for internal callers.
 
-        The window is a view into the decoder's own slab, so bytes written into
-        it are already where the parser expects them. It is never empty, which
-        `asyncio.BufferedProtocol.get_buffer()` requires. Callers must drop the
-        view before the next call, since an outstanding export would block the
-        slab from being replaced on the grow path.
-
-        Capped at `RECEIVE_QUANTUM`: a slab left large by an earlier oversized
-        frame would otherwise overshoot the receiver's high water in proportion
-        to retained capacity, since that check only runs afterwards.
+        One window may be outstanding. Write into it, drop the view, then call
+        `commit(nbytes)` before any other decoder operation. Views are temporary
+        writable ingress, never application payloads. Replacing storage does not
+        resize the old bytearray, but a retained view would refer to stale storage.
+        The returned window is never empty, as required by BufferedProtocol.
         """
         want = self._target_window
         if preferred > want:
             want = preferred
         exact: int | None = None
         if self._capacity - self._end < want:
-            # Only when this call is about to grow, so the framing read stays
-            # off the steady-state path. Doing it here rather than once the slab
-            # is already large is what lets a cold large frame reserve its
-            # extent at once instead of climbing there one doubling at a time.
+            # Only when tail space is short, keeping framing off the steady
+            # receive path. The known extent caps progressive growth; it is not
+            # permission to allocate the full size from an announcement alone.
             total = self._known_frame_total()
             if total is not None:
                 # Only an *incomplete* head has a remainder, so this never
@@ -367,15 +355,23 @@ class IncrementalDecoder:
         Kept for transports that cannot write into `writable_window()` directly:
         TLS, WebSocket, and any non-selector event loop.
         """
+        if isinstance(data, memoryview):
+            # len(view) counts elements (or rows), not bytes. Keep normal byte
+            # views zero-copy; flatten exotic layouts only on this cold path.
+            if not data.c_contiguous or data.obj is self._buf:
+                data = data.tobytes()
+            elif data.ndim != 1 or data.format != "B":
+                data = data.cast("B")
         nbytes = len(data)
         if not nbytes:
             return
         end = self._end
         if self._capacity - end < nbytes:
-            self._ensure(nbytes)
+            self._ensure(nbytes, self._known_frame_total())
             end = self._end
-        # Slice assignment inside the slab: a memcpy, never a resize.
-        self._buf[end : end + nbytes] = data
+        # A byte-oriented destination avoids a payload-sized temporary even for
+        # bytes sources. Source ownership remains with the caller.
+        self._view[end : end + nbytes] = data
         end += nbytes
         self._end = end
         buffered = end - self._start

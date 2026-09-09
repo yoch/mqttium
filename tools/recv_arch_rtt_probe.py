@@ -32,6 +32,7 @@ import statistics
 import threading
 import time
 from collections import deque
+from contextlib import suppress
 from pathlib import Path
 
 from mqttium.codec.buffer import IncrementalDecoder
@@ -83,7 +84,10 @@ async def arm_rc13(sock: socket.socket):
             packet = decoder.next_packet()
             if packet is not None:
                 return packet.remaining
-            decoder.feed(await reader.read(256 * 1024))
+            data = await reader.read(256 * 1024)
+            if not data:
+                raise EOFError("peer closed before a complete MQTT frame")
+            decoder.feed(data)
 
     return transport, recv_one
 
@@ -112,39 +116,61 @@ async def arm_446(sock: socket.socket):
             packet = decoder.next_packet()
             if packet is not None:
                 return packet.remaining
-            decoder.feed(await reader.read(256 * 1024))
+            data = await reader.read(256 * 1024)
+            if not data:
+                raise EOFError("peer closed before a complete MQTT frame")
+            decoder.feed(data)
 
     return transport, recv_one
+
+
+class _ChunkQueueProtocol(asyncio.BufferedProtocol):
+    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._loop = loop
+        self.buf = bytearray(_RECV)
+        self.mv = memoryview(self.buf)
+        self.chunks: deque[bytes] = deque()
+        self.waiter: asyncio.Future[None] | None = None
+        self.eof = False
+        self.error: Exception | None = None
+
+    def get_buffer(self, sizehint: int) -> bytearray:
+        return self.buf
+
+    def buffer_updated(self, nbytes: int) -> None:
+        if nbytes <= 0:
+            return
+        self.chunks.append(bytes(self.mv[:nbytes]))
+        if self.waiter is not None and not self.waiter.done():
+            self.waiter.set_result(None)
+
+    def eof_received(self) -> None:
+        self.eof = True
+        if self.waiter is not None and not self.waiter.done():
+            self.waiter.set_result(None)
+
+    def connection_lost(self, exc: Exception | None) -> None:
+        self.error = exc
+        self.eof_received()
+
+    async def read(self) -> bytes:
+        while not self.chunks:
+            if self.error is not None:
+                raise self.error
+            if self.eof:
+                return b""
+            self.waiter = self._loop.create_future()
+            try:
+                await self.waiter
+            finally:
+                self.waiter = None
+        return self.chunks.popleft()
 
 
 async def arm_445(sock: socket.socket):
     loop = asyncio.get_running_loop()
 
-    class Protocol(asyncio.BufferedProtocol):
-        def __init__(self) -> None:
-            self.buf = bytearray(_RECV)
-            self.mv = memoryview(self.buf)
-            self.chunks: deque[bytes] = deque()
-            self.waiter: asyncio.Future[None] | None = None
-
-        def get_buffer(self, sizehint: int) -> bytearray:
-            return self.buf
-
-        def buffer_updated(self, nbytes: int) -> None:
-            if nbytes <= 0:
-                return
-            self.chunks.append(bytes(self.mv[:nbytes]))
-            if self.waiter is not None and not self.waiter.done():
-                self.waiter.set_result(None)
-
-        async def read(self) -> bytes:
-            while not self.chunks:
-                self.waiter = loop.create_future()
-                await self.waiter
-                self.waiter = None
-            return self.chunks.popleft()
-
-    transport, protocol = await loop.create_connection(Protocol, sock=sock)
+    transport, protocol = await loop.create_connection(lambda: _ChunkQueueProtocol(loop), sock=sock)
     decoder = IncrementalDecoder()
 
     async def recv_one() -> bytes:
@@ -152,7 +178,10 @@ async def arm_445(sock: socket.socket):
             packet = decoder.next_packet()
             if packet is not None:
                 return packet.remaining
-            decoder.feed(await protocol.read())
+            data = await protocol.read()
+            if not data:
+                raise EOFError("peer closed before a complete MQTT frame")
+            decoder.feed(data)
 
     return transport, recv_one
 
@@ -173,7 +202,8 @@ async def arm_push(sock: socket.socket):
             packet = decoder.next_packet()
             if packet is not None:
                 return packet.remaining
-            await transport.receive()
+            if not await transport.receive():
+                raise EOFError("peer closed before a complete MQTT frame")
 
     return raw_transport, recv_one
 
@@ -187,41 +217,57 @@ ARMS = {
 }
 
 
-async def measure(arm: str, packet: bytes, count: int, warmup: int) -> list[float]:
+async def measure(
+    arm: str, packet: bytes, count: int, warmup: int, timeout_s: float = 30.0
+) -> list[float]:
     listener = socket.socket()
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.bind(("127.0.0.1", 0))
     listener.listen(1)
+    listener.settimeout(timeout_s)
     stop = threading.Event()
     accepted: list[socket.socket] = []
 
     def accept() -> None:
-        conn, _ = listener.accept()
+        try:
+            conn, _ = listener.accept()
+        except OSError:
+            return
         accepted.append(conn)
         echo_server(conn, stop)
 
     thread = threading.Thread(target=accept, daemon=True)
     thread.start()
 
-    client = socket.create_connection(listener.getsockname())
-    client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    transport, recv_one = await ARMS[arm](client)
-
+    client = None
+    transport = None
     samples: list[float] = []
     try:
-        for index in range(warmup + count):
-            start = time.perf_counter()
-            transport.write(packet)
-            await recv_one()
-            elapsed = time.perf_counter() - start
-            if index >= warmup:
-                samples.append(elapsed * 1e6)
+        client = socket.create_connection(listener.getsockname(), timeout=timeout_s)
+        client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        # One timeout per arm, outside individual RTT samples. A stalled peer
+        # must terminate the probe without adding per-message timer overhead.
+        async with asyncio.timeout(timeout_s):
+            transport, recv_one = await ARMS[arm](client)
+            for index in range(warmup + count):
+                start = time.perf_counter()
+                transport.write(packet)
+                await recv_one()
+                elapsed = time.perf_counter() - start
+                if index >= warmup:
+                    samples.append(elapsed * 1e6)
     finally:
         stop.set()
-        transport.close()
+        if transport is not None:
+            transport.close()
+        elif client is not None:
+            client.close()
         listener.close()
         for conn in accepted:
+            with suppress(OSError):
+                conn.shutdown(socket.SHUT_RDWR)
             conn.close()
+        await asyncio.to_thread(thread.join, 1.0)
     return samples
 
 
@@ -233,7 +279,9 @@ async def main_async(args: argparse.Namespace) -> None:
 
     for _ in range(args.repeat):
         for name in order:  # interleave so drift hits every arm equally
-            per_arm[name].extend(await measure(name, packet, args.count, args.warmup))
+            per_arm[name].extend(
+                await measure(name, packet, args.count, args.warmup, args.timeout_s)
+            )
 
     print(
         f"payload {args.payload_size} B, {args.count} round trips x {args.repeat} "
@@ -269,7 +317,11 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=500)
     parser.add_argument("--repeat", type=int, default=5)
     parser.add_argument("--output")
-    asyncio.run(main_async(parser.parse_args()))
+    parser.add_argument("--timeout-s", type=float, default=30.0, help="Deadline per arm")
+    args = parser.parse_args()
+    if args.count <= 0 or args.repeat <= 0 or args.warmup < 0 or args.timeout_s <= 0:
+        parser.error("count, repeat and timeout must be positive; warmup must be nonnegative")
+    asyncio.run(main_async(args))
 
 
 if __name__ == "__main__":

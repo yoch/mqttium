@@ -146,10 +146,9 @@ def test_slab_grows_for_an_oversized_frame_then_shrinks_back() -> None:
     assert decoder.capacity > baseline
     assert decoder.next_packet() is not None
 
-    # Retention fits the peak seen over a window. The drain that consumed the
-    # huge frame falls in the first window, so the slab survives that one and is
-    # retired during the second, once the peak reflects only small traffic.
-    for _ in range(2 * _OVERSIZE_RETENTION + 1):
+    # A genuinely large frame resets retention; the following small drains
+    # retire the slab after exactly one retention window.
+    for _ in range(_OVERSIZE_RETENTION):
         decoder.feed(_publish(64))
         assert decoder.next_packet() is not None
     assert decoder.capacity == _INITIAL_WINDOW  # the retirement floor
@@ -188,7 +187,7 @@ def test_clear_drops_oversized_growth_for_the_next_connection() -> None:
     assert decoder.buffered == 0
 
 
-def test_compaction_reuses_the_slab_rather_than_reallocating() -> None:
+def test_complete_frame_reuse_does_not_reallocate() -> None:
     decoder = IncrementalDecoder()
     # Warm up so the slab has settled at a size these frames fit into.
     for _ in range(5):
@@ -196,7 +195,8 @@ def test_compaction_reuses_the_slab_rather_than_reallocating() -> None:
         assert decoder.next_packet() is not None
     identity = id(decoder._buf)
 
-    # Enough traffic to force many compactions without ever exceeding capacity.
+    # Complete drains reuse storage. Real overlapping compaction is tested in
+    # test_decoder_ingress_hardening, including transient allocation accounting.
     for _ in range(200):
         decoder.feed(_publish(20_000))
         assert decoder.next_packet() is not None
@@ -529,7 +529,7 @@ def test_a_large_frame_is_sized_exactly_rather_than_doubled_past(payload: int) -
 
     assert decoder.next_packet() is not None
     assert len(frame) <= decoder.capacity < len(frame) * 5 // 4
-    assert reallocations <= 8  # geometric, not one per receive
+    assert reallocations <= 10  # geometric, not one per receive
 
 
 def test_complete_small_frames_keep_a_full_window_on_a_retained_slab() -> None:
@@ -594,20 +594,22 @@ def test_retention_distinguishes_large_frame_evidence_from_aggregate_pressure(
 
 @pytest.mark.parametrize(
     ("scenario", "max_reallocations"),
-    [("cold_8mib", 2), ("repeated_2mib", 2)],
+    [("cold_8mib", 10), ("repeated_2mib", 8)],
 )
-def test_a_known_large_head_reserves_its_extent_without_climbing(
+def test_large_head_growth_is_amortised_and_repeated_frames_reuse_storage(
     scenario: str, max_reallocations: int
 ) -> None:
-    # The extent is knowable as soon as the Remaining Length is committed, so
-    # the slab must not climb there one geometric step at a time.
+    # A known extent caps progressive growth. Do not reserve a multi-MiB frame
+    # from its header alone, or copy quadratically while the body arrives.
     decoder = IncrementalDecoder(max_packet_size=16 * 1024 * 1024)
     reallocations = 0
+    copied = 0
     original = IncrementalDecoder._reallocate
 
     def counting(self: IncrementalDecoder, capacity: int) -> None:
-        nonlocal reallocations
+        nonlocal reallocations, copied
         reallocations += 1
+        copied += self.buffered
         original(self, capacity)
 
     def receive(frame: bytes) -> None:
@@ -628,10 +630,14 @@ def test_a_known_large_head_reserves_its_extent_without_climbing(
             receive(_publish(8 * 1024 * 1024))
         else:
             frame = _publish(2 * 1024 * 1024)
-            for _ in range(20):
+            receive(frame)
+            first_growths = reallocations
+            for _ in range(19):
                 receive(frame)
+                assert reallocations == first_growths
 
     assert reallocations <= max_reallocations
+    assert copied < 2 * decoder.high_water
     # Exact, with no speculative frame-plus-quantum room.
     assert decoder.capacity < decoder.high_water + RECEIVE_QUANTUM
 
