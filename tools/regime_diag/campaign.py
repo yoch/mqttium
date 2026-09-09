@@ -1,5 +1,5 @@
 """Frozen finite diagnosis, not release-level A/B acceptance."""
-import json, os, pathlib, random, shutil, subprocess, sys, time, traceback
+import json, os, pathlib, random, shutil, subprocess, sys, time, traceback, tempfile
 from mqtt_client_bench import harness
 from mqtt_client_bench.scenarios import SCENARIO_BY_NAME,expand_scenario
 from mqtt_client_bench.telemetry import allocate_cpuset
@@ -43,9 +43,10 @@ def ids(s):
 os.sched_setaffinity(pid,ids(cpus['broker']))
 os.sched_setaffinity(0,ids(cpus['orch']))
 
-# Before collecting any outcome: 3 independently started processes per variant,
-# order randomized inside each cycle; one memory-only and one full summary trace.
-variants=['plain','counters','candidate','malloc','padding','no_wait_task','split_cpu','gc_off']
+# Before collecting any outcome: three independent repetitions, randomized
+# within cycles. Python3.14 wait_for already awaits directly; timeout_inline
+# only removes that wrapper. Responder already uses CPU3: no split-CPU placebo.
+variants=['plain','counters','candidate','malloc','padding','timeout_inline','gc_off','trace_fixed','trace_off','slack1']
 plan=[];rng=random.Random(4543942)
 for rep in range(3):
     order=variants.copy();rng.shuffle(order)
@@ -55,13 +56,13 @@ plan += [{'rep':0,'variant':'memorytrace','duration_s':6},{'rep':0,'variant':'st
 for index,spec in enumerate(plan):
     variant=spec['variant'];cell=root/'cells'/f'{index:02}-{variant}-{spec["rep"]}'
     cell.mkdir(parents=True)
-    (cell/'work').mkdir()
+    work=pathlib.Path(tempfile.mkdtemp(prefix='md-',dir='/tmp'))
     p=dict(expand_scenario(SCENARIO_BY_NAME['application_rtt_fixed_rate'],'standard')[0])
     p.update(target_rate=3942.,pacer_mode='external',version_ab_target_frozen=True,duration_s=spec['duration_s'])
     started=time.monotonic()
     try:
         r=harness.run_point(p,client='mqttium',client_path=str(candidate if variant=='candidate' else base),
-            host='127.0.0.1',port=18894,tls_port=18884,profile='standard',work_dir=cell/'work',
+            host='127.0.0.1',port=18894,tls_port=18884,profile='standard',work_dir=work,
             cpusets=cpus,load_profile=None,host_profile=None,managed_broker=False,
             external_broker_pid=pid,cross_client=True)
         r['diagnostic_variant']=variant
@@ -70,5 +71,12 @@ for index,spec in enumerate(plan):
              'reasons':r.get('reasons'),**comparison_value(r,'application_rtt_fixed_rate')}
     except Exception as e:
         (cell/'error.txt').write_text(traceback.format_exc());summary={'index':index,**spec,'error':str(e)}
+    finally:
+        (cell/'work').mkdir()
+        for f in work.iterdir():
+            if f.is_file(): shutil.copy2(f,cell/'work'/f.name)
+        shutil.rmtree(work)
     print(json.dumps(summary),flush=True)
     with (root/'summary.jsonl').open('a') as f:f.write(json.dumps(summary)+'\n')
+
+assert any((root/'cells').glob('*/result.json')), 'no measurement completed; inspect errors'

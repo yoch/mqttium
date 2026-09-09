@@ -47,8 +47,8 @@ jobs:
           set -euo pipefail
           ROOT=$(mktemp -d "$RUNNER_TEMP/pr454-regime-${GITHUB_RUN_ID}-XXXXXX")
           echo "JOB_ROOT=$ROOT" >> "$GITHUB_ENV"
-          mkdir -p results/source
-          echo "DIAG_ROOT=$PWD/results" >> "$GITHUB_ENV"
+          mkdir -p "$ROOT/results/source"
+          echo "DIAG_ROOT=$ROOT/results" >> "$GITHUB_ENV"
           test "$(git -C arm-a rev-parse HEAD)" = 9ad1f01857306ac5079ffb1d073a59fdb60e1931
           test "$(git -C arm-b rev-parse HEAD)" = 636de564dc2c92822a8361050cc24e369fe027d4
           test "$(git -C arm-b rev-parse HEAD:src/mqttium)" = 699b2dcd66ccae2d358e0c8aa740a7fe38933131
@@ -57,21 +57,16 @@ jobs:
           test "$(nproc)" -ge 4
           command -v cc
           command -v mosquitto
-          (uname -a; lscpu; python3 -V; command -v strace || true; command -v perf || true; cat /proc/sys/kernel/perf_event_paranoid; cat /proc/sys/kernel/randomize_va_space; cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor; cat /proc/self/timerslack_ns; ps -eo pid,pcpu,comm --sort=-pcpu | head -15) > results/preflight.txt
-          (strace -V || true) >> results/preflight.txt 2>&1
-          (perf stat -e minor-faults,context-switches -- true || true) >> results/preflight.txt 2>&1
-          cp -a external/src results/source/external-src
-          cp -a tooling/tools/regime_diag results/source/tooling
-          git -C arm-a rev-parse HEAD HEAD^{tree} > results/base-identity.txt
-          git -C arm-b rev-parse HEAD HEAD^{tree} > results/candidate-identity.txt
+          (uname -a; lscpu; python3 -V; command -v strace || true; command -v perf || true; cat /proc/sys/kernel/perf_event_paranoid; cat /proc/sys/kernel/randomize_va_space; cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor; cat /proc/self/timerslack_ns; ps -eo pid,pcpu,comm --sort=-pcpu | head -15) > "$ROOT/results/preflight.txt"
+          (strace -V || true) >> "$ROOT/results/preflight.txt" 2>&1
+          (perf stat -e minor-faults,context-switches -- true || true) >> "$ROOT/results/preflight.txt" 2>&1
+          cp -a external/src "$ROOT/results/source/external-src"
+          cp -a tooling/tools/regime_diag "$ROOT/results/source/tooling"
+          git -C arm-a rev-parse HEAD HEAD^{tree} > "$ROOT/results/base-identity.txt"
+          git -C arm-b rev-parse HEAD HEAD^{tree} > "$ROOT/results/candidate-identity.txt"
           python3 -m venv "$ROOT/venv"
           echo "$ROOT/venv/bin" >> "$GITHUB_PATH"
-          cc -O2 -shared -fPIC tooling/tools/regime_diag/sysaudit.c -ldl -o results/sysaudit.so
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: pr454-regime-source
-          path: results/
-          retention-days: 30
+          cc -O2 -shared -fPIC tooling/tools/regime_diag/sysaudit.c -ldl -o "$ROOT/results/sysaudit.so"
       - name: Isolated dependencies
         run: python -m pip install -e 'external[paho]' 'psutil>=6,<8'
       - name: Owned broker
@@ -87,9 +82,9 @@ jobs:
           max_queued_messages 100000
           log_type error
           EOF
-          cp "$JOB_ROOT/broker.conf" results/
-          (mosquitto -h || true) > results/broker-version.txt 2>&1
-          taskset -c 1 mosquitto -c "$JOB_ROOT/broker.conf" > results/broker.log 2>&1 &
+          cp "$JOB_ROOT/broker.conf" "$DIAG_ROOT/"
+          (mosquitto -h || true) > "$DIAG_ROOT/broker-version.txt" 2>&1
+          taskset -c 1 mosquitto -c "$JOB_ROOT/broker.conf" > "$DIAG_ROOT/broker.log" 2>&1 &
           echo $! > "$JOB_ROOT/broker.pid"
           echo "BROKER_PID=$!" >> "$GITHUB_ENV"
           python3 arm-a/tools/ci/wait_for_endpoints.py --tcp 127.0.0.1:18894
@@ -101,23 +96,24 @@ jobs:
         run: |
           set -euo pipefail
           python -m py_compile tooling/tools/regime_diag/*.py
-          python tooling/tools/regime_diag/campaign.py | tee results/campaign.log
+          python tooling/tools/regime_diag/campaign.py | tee "$DIAG_ROOT/campaign.log"
       - name: Cleanup and source readback
         if: always()
         shell: bash
         run: |
           if test -n "${JOB_ROOT:-}" && test -f "$JOB_ROOT/broker.pid"; then kill "$(cat "$JOB_ROOT/broker.pid")" 2>/dev/null || true; fi
-          mkdir -p results
-          git -C arm-a status --porcelain > results/final-base.txt
-          git -C arm-b status --porcelain > results/final-candidate.txt
-          git -C external status --porcelain > results/final-external.txt
-          test ! -s results/final-base.txt
-          test ! -s results/final-candidate.txt
-          test ! -s results/final-external.txt
-          if test -n "${JOB_ROOT:-}"; then rm -rf "$JOB_ROOT"; fi
+          git -C arm-a status --porcelain > "$DIAG_ROOT/final-base.txt"
+          git -C arm-b status --porcelain > "$DIAG_ROOT/final-candidate.txt"
+          git -C external status --porcelain > "$DIAG_ROOT/final-external.txt"
+          test ! -s "$DIAG_ROOT/final-base.txt"
+          test ! -s "$DIAG_ROOT/final-candidate.txt"
+          test ! -s "$DIAG_ROOT/final-external.txt"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
           name: pr454-regime-results
-          path: results/
+          path: ${{ env.DIAG_ROOT }}/
           retention-days: 30
+      - name: Remove owned temporary environment
+        if: always()
+        run: if test -n "${JOB_ROOT:-}"; then rm -rf "$JOB_ROOT"; fi

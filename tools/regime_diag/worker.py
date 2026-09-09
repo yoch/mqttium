@@ -11,8 +11,6 @@ src = pathlib.Path(config['client_path']).resolve()
 sys.path.insert(0, str(src/'src'))
 if variant == 'padding':
     padding = [bytearray(513+(i%31)*32) for i in range(2048)]
-if variant == 'split_cpu' and role == 'responder':
-    os.sched_setaffinity(0, {3})
 if variant == 'slack1':
     ctypes.CDLL(None).prctl(29, 1, 0, 0, 0)
 
@@ -70,7 +68,7 @@ class Barrier:
         return answer
 m.barrier_client_session = lambda *a,**kw: Barrier(original_barrier(*a,**kw))
 
-if variant == 'no_wait_task' and role == 'rtt_initiator':
+if variant == 'timeout_inline' and role == 'rtt_initiator':
     async def recv_token(loop, sock, until, until_ns=None, recv_until_ns=None):
         bound = recv_until_ns if recv_until_ns is not None else until_ns
         remaining = ((int(bound)-time.monotonic_ns())/1e9 if bound is not None
@@ -82,6 +80,19 @@ if variant == 'no_wait_task' and role == 'rtt_initiator':
         except (asyncio.TimeoutError,OSError): return None
         return m.unpack_token(data)
     m._recv_token_async = recv_token
+if variant in ('trace_fixed', 'trace_off') and role == 'rtt_initiator':
+    original_commit_trace = m._commit_trace
+    def commit_trace(state, seq, send_ns, receive_ns):
+        if seq in state.get('trace_pending', {}):
+            original_commit_trace(state, seq, send_ns, receive_ns)
+    m._commit_trace = commit_trace
+    if variant == 'trace_off':
+        original_begin = m._begin_measure_instrumentation
+        def begin(cfg, state, *args):
+            # Keep PaceRecorder and identical offered tokens; only trace is disabled.
+            c = dict(cfg, temporal_trace_max_points=-1)
+            return original_begin(c, state, *args)
+        m._begin_measure_instrumentation = begin
 if variant == 'gc_off': gc.disable()
 
 sample('startup')
