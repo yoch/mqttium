@@ -61,6 +61,25 @@ jobs:
           sudo apt-get install -y -qq mosquitto
           dpkg-query -W -f='${Version}\n' mosquitto > results/broker-version.txt
           printf 'listener 11883 127.0.0.1\nallow_anonymous true\npersistence false\nlog_type error\n' > "$RUNNER_TEMP/pr454-mosquitto.conf"
+          taskset -c "$BROKER_CPU" mosquitto -c "$RUNNER_TEMP/pr454-mosquitto.conf" > results/broker-default.log 2>&1 &
+          echo $! > results/broker.pid
+          python neutral/tools/ci/wait_for_endpoints.py --tcp 127.0.0.1:11883
+      - name: Diagnose default broker latency on base only, outside paired measurement
+        run: |
+          set -euo pipefail
+          PYTHONPATH="$PWD/arm-a/src" PYTHONHASHSEED=0 PYTHONDONTWRITEBYTECODE=1 python neutral/tools/pr454_perf_probe.py worker --arm A --kind network --count 20 --cpu "$SUT_CPU" --port 11883 > results/base-default-broker-diagnostic.json
+          kill "$(cat results/broker.pid)"
+          python - <<'PY'
+          import socket, time
+          for _ in range(100):
+              try:
+                  with socket.create_connection(('127.0.0.1',11883),timeout=.1): pass
+              except OSError: break
+              time.sleep(.05)
+          else: raise RuntimeError('old broker still listening')
+          PY
+          printf 'listener 11883 127.0.0.1\nallow_anonymous true\npersistence false\nlog_type error\nset_tcp_nodelay true\n' > "$RUNNER_TEMP/pr454-mosquitto.conf"
+          cp "$RUNNER_TEMP/pr454-mosquitto.conf" results/measured-broker.conf
           taskset -c "$BROKER_CPU" mosquitto -c "$RUNNER_TEMP/pr454-mosquitto.conf" > results/broker.log 2>&1 &
           echo $! > results/broker.pid
           python neutral/tools/ci/wait_for_endpoints.py --tcp 127.0.0.1:11883
@@ -74,7 +93,7 @@ jobs:
           git -C arm-a status --short > results/final-status-a.txt
           git -C arm-b status --short > results/final-status-b.txt
           cp neutral/tools/pr454_perf_probe.py results/
-          echo 'Fixed 8 repeats; no retries or cell exclusions. Primary practical threshold 3%; compare each metric with its own A/A distribution. Network is closed-loop, not fixed-rate.' > results/interpretation-policy.txt
+          echo 'Fixed 8 repeats; no retries or cell exclusions. Primary practical threshold 3%; compare each metric with its own A/A distribution. Network is closed-loop, not fixed-rate. Paired network broker explicitly uses set_tcp_nodelay true on both arms; default-broker base-only diagnostic is separate.' > results/interpretation-policy.txt
           if test -f results/broker.pid; then kill "$(cat results/broker.pid)" || true; fi
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
