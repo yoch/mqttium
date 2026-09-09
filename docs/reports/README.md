@@ -119,3 +119,9 @@ validity conditions pass on an eligible runner.
 3. Never commit generated benchmark output as source documentation.
 4. Add the new body here exactly once and update the status of anything it
    supersedes or retracts.
+
+
+The receive-architecture report dated 2026-09-08 is historical evidence, not the
+current decoder contract. Allocation and transport-contract hardening after
+`b7b1e77` is described in [migration guidance](../migration.md#decoder-storage-and-ingress-contract).
+Historical performance results do not qualify a later runtime revision.

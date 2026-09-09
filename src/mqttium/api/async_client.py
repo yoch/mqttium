@@ -1059,6 +1059,15 @@ class AsyncClient:
             except TimeoutError as exc:
                 raise MQTTTimeoutError("Transport connection timed out") from exc
             self._transport = transport
+            # Reject a misconfigured factory before CONNECT or background tasks.
+            # Assign first so the normal failure cleanup closes the transport.
+            push = isinstance(transport, DecoderPushTransport)
+            pull = isinstance(transport, PullTransport)
+            if push == pull:
+                raise TypeError(
+                    f"{type(transport).__name__} must offer exactly one receive capability: "
+                    "PullTransport or DecoderPushTransport"
+                )
             self._delivery.reopen()
             self._disconnect_exc = None
             self._teardown_final = False
