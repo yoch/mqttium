@@ -271,6 +271,45 @@ prototype in PR #447, both of which it had guarded from the start:
 Both are the kind of defect a saturated benchmark never shows: neither affects
 throughput, and both break real connections.
 
+## Stale slab bytes must never reach framing
+
+The slab is reused, not zeroed, so bytes past `_end` are previous traffic.
+`decode_vbi()` bounded on `len(buffer)` — the backing capacity — so a partially
+received Remaining Length continued into them. Reproduced: consume a frame whose
+body is `FF FF 10`, commit only `30 80` of the next PUBLISH, and framing yields
+`PacketTooLargeError: Packet size 35651461 exceeds maximum 16777216` on
+legitimate traffic. `head_frame_ready()` returned True, so the reader ran and
+surfaced it as fatal.
+
+`decode_vbi()` now takes an `end` bound and both framing entry points pass
+`_end`. The same oracle covers `peek_packet_bounds()`, `head_frame_ready()` and
+`next_packet()`, over four stale-byte patterns, three partial headers and 20
+randomised split streams. The borrowed MQTT 5 property path was already bounded
+via `_decode_bounded_vbi`.
+
+## First touch and adaptive receive window
+
+The slab no longer starts at the steady-state receive size. Allocation floors at
+`_MIN_CAPACITY` (16 KiB); the receive path asks for `_INITIAL_WINDOW` (64 KiB)
+and is promoted a step at a time to `RECEIVE_QUANTUM` (256 KiB) after four
+consecutive completely filled windows, which is the signal that the peer really
+has that much waiting.
+
+| | before | after |
+|---|---:|---:|
+| first touch, 4-byte ACK via `feed()` | 256 KiB | **16 KiB** |
+| first receive window | 256 KiB | 64 KiB |
+| window under sustained full fills | 256 KiB | 256 KiB |
+| window under partial fills | 256 KiB | 64 KiB |
+| memory peak vs `main` | +0.250 MiB | **+0.016 MiB** |
+
+This matters beyond the receive path: every decoder pays first touch, including
+TLS, WebSocket and Proactor users who get no zero-copy benefit, and every extra
+connection multiplies it. It also explains the `qos1_cycle_*` / `qos2_cycle_*`
+microbenchmark regressions on run 34284019205: that harness builds a fresh
+`IncrementalDecoder` per ACK, so a 256 KiB slab was allocated to decode four
+bytes.
+
 ## Backpressure envelope
 
 The window handed to one `recv_into()` is capped at `RECEIVE_QUANTUM` (256 KiB)

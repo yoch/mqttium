@@ -25,15 +25,20 @@ from mqttium.errors import MalformedPacketError, PacketTooLargeError
 
 # Default local ceiling before CONNACK negotiation (256 MiB is the MQTT max).
 DEFAULT_MAX_PACKET_SIZE = 16 * 1024 * 1024
-# Steady-state slab size. Large enough that a saturated receive path batches
-# several frames per wakeup. The slab grows past it only for a frame larger than
-# it, and is retired again only after _OVERSIZE_RETENTION drains that stayed
-# inside it -- not as soon as that frame is consumed. See _retire_oversize.
+# Steady-state receive size once a connection is demonstrably busy.
 DEFAULT_CAPACITY = 256 * 1024
+# Allocation floor. A decoder that only ever sees small frames -- an idle
+# connection, a short-lived client, the TLS/WebSocket feed() path -- never grows
+# past what it is actually handed.
+_MIN_CAPACITY = 16 * 1024
+# What the receive path asks for before anything is known about the peer.
+_INITIAL_WINDOW = 64 * 1024
+# Consecutive completely-filled windows before offering a larger one.
+_PROMOTE_AFTER = 4
 # Smallest window worth offering a receiver; also the compaction trigger.
 _MIN_WINDOW = 16 * 1024
-# Most one recv_into() may be offered, whatever the slab's size. Storage
-# capacity and receive quantum are separate concerns.
+# Ceiling for the adaptive receive window. Storage capacity and receive quantum
+# are separate concerns.
 RECEIVE_QUANTUM = DEFAULT_CAPACITY
 # Fully drained slabs larger than DEFAULT_CAPACITY are retired only after this
 # many consecutive drains that did not need the extra room. Giving the memory
@@ -65,6 +70,10 @@ class IncrementalDecoder:
         "_end",
         "_capacity",
         "_idle_drains",
+        "_window_peak",
+        "_offered",
+        "_target_window",
+        "_full_fills",
         "_max_packet_size",
         "_high_water",
     )
@@ -79,6 +88,10 @@ class IncrementalDecoder:
         self._end = 0
         self._capacity = 0
         self._idle_drains = 0
+        self._window_peak = 0
+        self._offered = 0
+        self._target_window = _INITIAL_WINDOW
+        self._full_fills = 0
         self._max_packet_size = max_packet_size
         self._high_water = 0
 
@@ -120,7 +133,7 @@ class IncrementalDecoder:
             self._start = 0
             self._end = live
             return
-        capacity = self._capacity or DEFAULT_CAPACITY
+        capacity = self._capacity or _MIN_CAPACITY
         while capacity - live < need:
             capacity *= 2
         # Doubling alone can reach twice max_packet_size: a frame just over a
@@ -128,34 +141,41 @@ class IncrementalDecoder:
         # again. Framing rejects anything larger than max_packet_size, so one
         # maximum frame plus a window is all the slab can ever use. `need` still
         # wins, because feed() may be handed more than that in one call.
-        ceiling = self._max_packet_size + _MIN_WINDOW
+        ceiling = self._max_packet_size + RECEIVE_QUANTUM
         if capacity > ceiling:
             capacity = max(ceiling, live + need)
         self._reallocate(capacity)
 
     def _retire_oversize(self, extent: int) -> None:
-        """Give back an oversized slab, but only once it has stopped being used.
+        """Shrink an oversized slab to the peak actually used over a window.
 
-        ``extent`` is how far into the slab this drain actually reached. Using
-        the reallocation that created the slab instead would be wrong: after the
-        first oversized frame the slab is already large enough, so every later
-        oversized frame fits without reallocating and would look idle. That
-        retires the slab on a fixed period and re-grows on the very next frame.
+        ``extent`` is how far this drain reached. Keying off the reallocation
+        that created the slab would be wrong: later oversized frames fit without
+        reallocating and would look idle. Keying off a single threshold would be
+        too coarse the other way -- coalesced small frames routinely exceed
+        `DEFAULT_CAPACITY`, which would pin a multi-MiB slab for a workload that
+        only ever needs a few hundred KiB. So track the peak and fit to it.
         """
-        if extent > DEFAULT_CAPACITY:
-            self._idle_drains = 0
-            return
+        if extent > self._window_peak:
+            self._window_peak = extent
         self._idle_drains += 1
-        if self._idle_drains >= _OVERSIZE_RETENTION:
-            self._idle_drains = 0
-            self._reallocate(DEFAULT_CAPACITY)
+        if self._idle_drains < _OVERSIZE_RETENTION:
+            return
+        floor = self._target_window
+        target = _MIN_CAPACITY if _MIN_CAPACITY > floor else floor
+        while target < self._window_peak:
+            target *= 2
+        self._idle_drains = 0
+        self._window_peak = 0
+        if target < self._capacity:
+            self._reallocate(target)
 
     def _reset(self) -> None:
         """Rewind a fully consumed slab."""
         extent = self._end
         self._start = 0
         self._end = 0
-        if self._capacity > DEFAULT_CAPACITY:
+        if self._capacity > self._target_window:
             self._retire_oversize(extent)
 
     def writable_window(self, need: int = _MIN_WINDOW) -> memoryview:
@@ -171,20 +191,35 @@ class IncrementalDecoder:
         frame would otherwise overshoot the receiver's high water in proportion
         to retained capacity, since that check only runs afterwards.
         """
-        self._ensure(need)
+        want = self._target_window
+        if need > want:
+            want = need
+        self._ensure(want)
         end = self._end
-        limit = end + (need if need > RECEIVE_QUANTUM else RECEIVE_QUANTUM)
+        limit = end + want
         if limit > self._capacity:
             limit = self._capacity
+        self._offered = limit - end
         return self._view[end:limit]
 
     def commit(self, nbytes: int) -> None:
         """Publish `nbytes` written into the window returned by `writable_window()`."""
         if nbytes <= 0:
             return
-        end = self._end + nbytes
-        if end > self._capacity:
+        offered = self._offered
+        if nbytes > offered:
             raise ValueError("commit exceeds the window that was handed out")
+        self._offered = 0
+        # A completely filled window means the peer had at least that much
+        # waiting; a few in a row is the signal to offer more.
+        if nbytes == offered and self._target_window < RECEIVE_QUANTUM:
+            self._full_fills += 1
+            if self._full_fills >= _PROMOTE_AFTER:
+                self._full_fills = 0
+                self._target_window *= 2
+        else:
+            self._full_fills = 0
+        end = self._end + nbytes
         self._end = end
         buffered = end - self._start
         if buffered > self._high_water:
@@ -215,7 +250,7 @@ class IncrementalDecoder:
             rl_end = start + 3
         else:
             try:
-                remaining_length, rl_end = decode_vbi(buf, start + 1)
+                remaining_length, rl_end = decode_vbi(buf, start + 1, self._end)
             except MalformedPacketError:
                 if available >= 5:
                     raise
@@ -293,8 +328,12 @@ class IncrementalDecoder:
         self._start = 0
         self._end = 0
         self._idle_drains = 0
-        if self._capacity > DEFAULT_CAPACITY:
-            self._reallocate(DEFAULT_CAPACITY)
+        self._window_peak = 0
+        self._offered = 0
+        self._target_window = _INITIAL_WINDOW
+        self._full_fills = 0
+        if self._capacity > _INITIAL_WINDOW:
+            self._reallocate(_INITIAL_WINDOW)
 
     def next_packet(self) -> RawPacket | None:
         buf = self._buf
@@ -305,7 +344,7 @@ class IncrementalDecoder:
 
         header = buf[start]
         try:
-            remaining_length, rl_end = decode_vbi(buf, start + 1)
+            remaining_length, rl_end = decode_vbi(buf, start + 1, self._end)
         except MalformedPacketError:
             # Incomplete VBI — need more bytes unless clearly malformed length.
             if available >= 5:
@@ -358,7 +397,7 @@ class IncrementalDecoder:
         if body_end == self._end:
             self._start = 0
             self._end = 0
-            if self._capacity > DEFAULT_CAPACITY:
+            if self._capacity > self._target_window:
                 self._retire_oversize(body_end)
         return RawPacket(packet_type=packet_type, flags=flags, remaining=body)
 

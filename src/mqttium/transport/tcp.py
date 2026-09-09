@@ -23,7 +23,7 @@ class TcpTransport(StreamTransport):
         ssl: Any = None,
     ) -> StreamTransport:
         loop = asyncio.get_running_loop()
-        if ssl is None and isinstance(loop, asyncio.SelectorEventLoop):
+        if ssl is None and _is_stdlib_selector_loop(loop):
             transport: StreamTransport = await _connect_push(loop, host, port)
         else:
             # TLS receives through SSLProtocol, which does not expose the raw
@@ -33,6 +33,18 @@ class TcpTransport(StreamTransport):
             transport = cls(reader, writer)
         _set_nodelay(transport)
         return transport
+
+
+def _is_stdlib_selector_loop(loop: asyncio.AbstractEventLoop) -> bool:
+    """Whether this loop is a stdlib selector loop with the measured recv_into path.
+
+    Deliberately narrower than ``isinstance(loop, SelectorEventLoop)``: a
+    third-party subclass may install its own transport, and only the stdlib one
+    is covered by the evidence behind this path.
+    """
+    return isinstance(loop, asyncio.SelectorEventLoop) and type(loop).__module__.startswith(
+        "asyncio."
+    )
 
 
 async def _connect_push(

@@ -25,13 +25,26 @@ class AsyncTransport(Protocol):
 
 
 @runtime_checkable
+class PullTransport(Protocol):
+    """Read side of :class:`AsyncTransport`: the caller asks for bytes.
+
+    Structural, so it cannot distinguish a transport whose ``read()`` works from
+    one that refuses it. Test :class:`DecoderPushTransport` first; a transport
+    matching that one delivers through ``receive()`` and its ``read()`` raises.
+    """
+
+    async def read(self, n: int = 65536) -> bytes: ...
+
+
+@runtime_checkable
 class DecoderPushTransport(Protocol):
     """Optional capability: deliver received bytes into the decoder's storage.
 
     A transport offering this receives into storage the decoder owns, so the
-    reader never calls ``read()``. Like ``write_nowait``, it is an optimisation
-    a transport may provide, not an obligation: TLS, WebSocket and non-selector
-    loops cannot, and keep ``read()`` + ``feed()``.
+    reader never calls ``read()``; it *replaces* the pull read clause rather
+    than adding to it. Like ``write_nowait``, it is an optimisation a transport
+    may provide, not an obligation: TLS, WebSocket and non-selector loops
+    cannot, and keep ``read()`` + ``feed()``.
     """
 
     def attach_decoder(self, decoder: object) -> None: ...
