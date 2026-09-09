@@ -239,9 +239,11 @@ jobs:
               r["qualified"] = (
                   r["publisher_margin"] >= 1.02
                   and r["sut_cpu_pct"] >= 90.0
-                  and (r["broker_cpu_pct"] or 0.0) < 90.0
+                  and r["broker_cpu_pct"] is not None
+                  and r["broker_cpu_pct"] < 90.0
                   and r["ru_majflt"] == 0
-                  and (r["broker_majflt"] or 0) == 0
+                  and r["broker_majflt"] is not None
+                  and r["broker_majflt"] == 0
               )
               rows.append(r)
           def gm(values):
