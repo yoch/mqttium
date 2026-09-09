@@ -214,8 +214,13 @@ class IncrementalDecoder:
         if self._capacity > self._target_window:
             self._retire_oversize(extent)
 
-    def writable_window(self, need: int = _MIN_WINDOW) -> memoryview:
+    def writable_window(self, preferred: int = _MIN_WINDOW) -> memoryview:
         """Return writable storage for a receiver to fill, then `commit()`.
+
+        `preferred` is an upper bound, not a floor: the window is always
+        non-empty, which is all `get_buffer()` requires, but it is shortened to
+        what an incomplete head frame still needs so the slab is never grown
+        past the frame it is receiving.
 
         The window is a view into the decoder's own slab, so bytes written into
         it are already where the parser expects them. It is never empty, which
@@ -228,13 +233,14 @@ class IncrementalDecoder:
         to retained capacity, since that check only runs afterwards.
         """
         want = self._target_window
-        if need > want:
-            want = need
+        if preferred > want:
+            want = preferred
         exact: int | None = None
-        if self._capacity >= _EXACT_FRAME_THRESHOLD:
-            # Already in the multi-MiB regime, so the framing cost is worth it:
-            # asking for a full window past the end of a known large frame is
-            # what makes the slab double past the frame it is receiving.
+        if self._capacity - self._end < want:
+            # Only when this call is about to grow, so the framing read stays
+            # off the steady-state path. Doing it here rather than once the slab
+            # is already large is what lets a cold large frame reserve its
+            # extent at once instead of climbing there one doubling at a time.
             total = self._known_frame_total()
             if total is not None:
                 # Only an *incomplete* head has a remainder, so this never

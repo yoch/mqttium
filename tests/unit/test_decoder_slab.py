@@ -123,11 +123,13 @@ def test_frame_split_across_windows_and_a_compaction_still_decodes() -> None:
         taken = min(len(window), len(piece))
         window[:taken] = piece[:taken]
         decoder.commit(taken)
-        if taken < len(piece):
+        while taken < len(piece):
             rest = piece[taken:]
             window = decoder.writable_window(len(rest))
-            window[: len(rest)] = rest
-            decoder.commit(len(rest))
+            step = min(len(window), len(rest))
+            window[:step] = rest[:step]
+            decoder.commit(step)
+            taken += step
 
     packet = decoder.next_packet()
     assert packet is not None
@@ -326,9 +328,9 @@ def test_the_window_is_capped_regardless_of_retained_capacity() -> None:
     assert len(window) < decoder.capacity
     window.release()
 
-    # An explicit larger need is still honoured.
+    # A larger explicit preference is honoured when no head frame bounds it.
     window = decoder.writable_window(RECEIVE_QUANTUM * 2)
-    assert len(window) >= RECEIVE_QUANTUM * 2
+    assert len(window) == RECEIVE_QUANTUM * 2
     window.release()
 
 
@@ -425,6 +427,7 @@ def test_random_split_streams_never_frame_stale_bytes(seed: int) -> None:
     while offset < len(stream):
         take = min(rng.randint(1, 900), len(stream) - offset)
         window = decoder.writable_window(take)
+        take = min(take, len(window))  # the window is a preference, not a floor
         window[:take] = stream[offset : offset + take]
         window.release()
         decoder.commit(take)
@@ -587,3 +590,79 @@ def test_retention_distinguishes_large_frame_evidence_from_aggregate_pressure(
         assert decoder.capacity == grown
     else:
         assert decoder.capacity < grown // 4
+
+
+@pytest.mark.parametrize(
+    ("scenario", "max_reallocations"),
+    [("cold_8mib", 2), ("repeated_2mib", 2)],
+)
+def test_a_known_large_head_reserves_its_extent_without_climbing(
+    scenario: str, max_reallocations: int
+) -> None:
+    # The extent is knowable as soon as the Remaining Length is committed, so
+    # the slab must not climb there one geometric step at a time.
+    decoder = IncrementalDecoder(max_packet_size=16 * 1024 * 1024)
+    reallocations = 0
+    original = IncrementalDecoder._reallocate
+
+    def counting(self: IncrementalDecoder, capacity: int) -> None:
+        nonlocal reallocations
+        reallocations += 1
+        original(self, capacity)
+
+    def receive(frame: bytes) -> None:
+        offset = 0
+        while offset < len(frame):
+            window = decoder.writable_window()
+            take = min(len(window), 65536, len(frame) - offset)
+            window[:take] = frame[offset : offset + take]
+            window.release()
+            decoder.commit(take)
+            offset += take
+        while decoder.next_packet() is not None:
+            pass
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(IncrementalDecoder, "_reallocate", counting)
+        if scenario == "cold_8mib":
+            receive(_publish(8 * 1024 * 1024))
+        else:
+            frame = _publish(2 * 1024 * 1024)
+            for _ in range(20):
+                receive(frame)
+
+    assert reallocations <= max_reallocations
+    # Exact, with no speculative frame-plus-quantum room.
+    assert decoder.capacity < decoder.high_water + RECEIVE_QUANTUM
+
+
+def test_the_head_frame_read_stays_off_the_steady_state_path() -> None:
+    # It may only fire while growing, or it becomes a per-callback framing cost.
+    decoder = IncrementalDecoder(max_packet_size=16 * 1024 * 1024)
+    frame = _publish(4096)
+    reads = 0
+    original = IncrementalDecoder._known_frame_total
+
+    def counting(self: IncrementalDecoder) -> int | None:
+        nonlocal reads
+        reads += 1
+        return original(self)
+
+    windows = 0
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(IncrementalDecoder, "_known_frame_total", counting)
+        for _ in range(2000):
+            offset = 0
+            while offset < len(frame):
+                window = decoder.writable_window()
+                windows += 1
+                take = min(len(window), len(frame) - offset)
+                window[:take] = frame[offset : offset + take]
+                window.release()
+                decoder.commit(take)
+                offset += take
+            while decoder.next_packet() is not None:
+                pass
+
+    assert windows >= 2000
+    assert reads <= 8  # only the initial growth
