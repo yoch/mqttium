@@ -102,7 +102,8 @@ jobs:
           test "$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)" = performance
           test "$(cat /proc/sys/kernel/randomize_va_space)" = 2
           python3 -c 'import sys; assert sys.version_info[:3]==(3,14,7), sys.version'
-          mosquitto -h | head -1 | grep -q '2\.1\.2'
+          version="$({ mosquitto -h 2>&1 || true; } | python3 -c 'import re,sys; t=sys.stdin.read(); m=re.search(r"mosquitto version\s+([0-9]+(?:\.[0-9]+)+)",t,re.I); print(m.group(1) if m else "")')"
+          test "$version" = 2.1.2
           pgrep -x mosquitto >/dev/null && { echo "a broker is already running" >&2; exit 1; } || true
           mkdir -p "$FINAL_OUT/cells"
           python3 - <<'PY' > "$FINAL_OUT/provenance.json"
