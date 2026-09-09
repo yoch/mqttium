@@ -19,7 +19,7 @@ def popen(cmd,*args,**kw):
         if mod in ('mqtt_client_bench.roles.rtt_initiator','mqtt_client_bench.roles.responder'):
             env=dict(kw.get('env') or os.environ)
             env.update(DIAG_CELL=str(cell),DIAG_VARIANT=variant)
-            if variant not in ('plain','candidate','memorytrace','strace'):
+            if variant.startswith('profile_'):
                 env['LD_PRELOAD']=str(root/'sysaudit.so')
             if variant=='malloc': env['PYTHONMALLOC']='malloc'
             cmd=list(cmd[:idx])+[str(tools/'worker.py'),mod]+list(cmd[idx+2:])
@@ -43,15 +43,14 @@ def ids(s):
 os.sched_setaffinity(pid,ids(cpus['broker']))
 os.sched_setaffinity(0,ids(cpus['orch']))
 
-# Before collecting any outcome: three independent repetitions, randomized
-# within cycles. Python3.14 wait_for already awaits directly; timeout_inline
-# only removes that wrapper. Responder already uses CPU3: no split-CPU placebo.
-variants=['plain','counters','candidate','malloc','padding','timeout_inline','gc_off','trace_fixed','trace_off','slack1']
-plan=[];rng=random.Random(4543942)
+# Follow-up registered after discovery matrix: all timing arms un-interposed.
+# Three shuffled fresh-process repetitions; counter profiles are separate.
+variants=['plain','unused_completion_off','persistent_reader','both']
+plan=[];rng=random.Random(4543943)
 for rep in range(3):
     order=variants.copy();rng.shuffle(order)
     plan += [{'rep':rep,'variant':v,'duration_s':12} for v in order]
-plan += [{'rep':0,'variant':'memorytrace','duration_s':6},{'rep':0,'variant':'strace','duration_s':3}]
+plan += [{'rep':0,'variant':'profile_'+v,'duration_s':12} for v in variants]
 (root/'plan.json').write_text(json.dumps(plan,indent=2))
 for index,spec in enumerate(plan):
     variant=spec['variant'];cell=root/'cells'/f'{index:02}-{variant}-{spec["rep"]}'
@@ -72,6 +71,8 @@ for index,spec in enumerate(plan):
     except Exception as e:
         (cell/'error.txt').write_text(traceback.format_exc());summary={'index':index,**spec,'error':str(e)}
     finally:
+        # Keep only regular files, never copy IPC sockets. Original full configs
+        # and traces survive even when the run raises.
         (cell/'work').mkdir()
         for f in work.iterdir():
             if f.is_file(): shutil.copy2(f,cell/'work'/f.name)
