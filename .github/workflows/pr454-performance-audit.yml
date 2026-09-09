@@ -59,7 +59,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y -qq mosquitto
-          mosquitto -h | head -3 > results/broker-version.txt
+          dpkg-query -W -f='${Version}\n' mosquitto > results/broker-version.txt
           printf 'listener 11883 127.0.0.1\nallow_anonymous true\npersistence false\nlog_type error\n' > "$RUNNER_TEMP/pr454-mosquitto.conf"
           taskset -c "$BROKER_CPU" mosquitto -c "$RUNNER_TEMP/pr454-mosquitto.conf" > results/broker.log 2>&1 &
           echo $! > results/broker.pid
