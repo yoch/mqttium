@@ -1,0 +1,933 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -8,7 +8,7 @@
+ 
+ ### Changed
+ 
+-- Receive cleartext TCP straight into the decoder's own storage on CPython selector event loops. `asyncio.BufferedProtocol.get_buffer()` returns a window carved out of `IncrementalDecoder`'s own slab, so received bytes are no longer copied through an intermediate receive buffer before reaching the parser. Storage is adaptive: it starts at 16 KiB, the receive window starts at 64 KiB and is promoted toward 256 KiB only under sustained full windows, a known large frame reserves its exact extent instead of doubling past it, and an enlarged slab is retired once large frames stop arriving. TLS, WebSocket, Proactor, non-CPython runtimes and third-party event loops keep the `read()` + `feed()` path.
++- Receive cleartext TCP straight into the decoder's own storage on CPython selector event loops. `asyncio.BufferedProtocol.get_buffer()` returns a window carved out of `IncrementalDecoder`'s own slab, so received bytes are no longer copied through an intermediate receive buffer before reaching the parser. Storage is adaptive: it starts at 16 KiB, the receive window starts at 64 KiB and is promoted toward 256 KiB only under sustained full windows, a known large frame caps progressive growth at its exact extent without reserving the entire announced body, and an enlarged slab is retired once large frames stop arriving. TLS, WebSocket, Proactor, non-CPython runtimes and third-party event loops keep the `read()` + `feed()` path.
+ 
+ - **Provisional API change.** Receiving is now a transport capability rather than part of the common contract. `AsyncTransport` no longer declares `read()`; a transport offers exactly one of `PullTransport` (`read()`) or `DecoderPushTransport` (`attach_decoder()` + `receive()`), both exported from `mqttium.transport` and both runtime-checkable. On CPython selector event loops with cleartext TCP, `TcpTransport.connect()` returns a push-capable transport rather than an instance of the calling class, and that transport has no `read()` at all, so it cannot be misclassified as pull-capable. Custom transports should declare the capability they implement; the supported extension point remains the transport factory seam, not subclassing `TcpTransport`. TLS, WebSocket, Unix sockets, Proactor, non-CPython runtimes and third-party loops keep the pull capability unchanged.
+ 
+@@ -50,6 +50,8 @@
+ 
+ ### Fixed
+ 
++- Avoid payload-sized temporary allocations when compacting or copying decoder storage. `feed()` now handles typed, multidimensional and strided memoryviews as wire bytes, and fragmented pull ingress shares the direct path's bounded large-frame sizing. A length announcement alone no longer reserves the complete packet.
++- Reject custom transports offering neither or both receive capabilities before sending CONNECT, preserving the local error rather than reporting a misleading CONNACK timeout.
+ 
+ - Local store/persistence failures during ingress processing now propagate
+   with their original exception instead of being converted into a
+ diff --git a/docs/migration.md b/docs/migration.md
+--- a/docs/migration.md
++++ b/docs/migration.md
+@@ -248,3 +248,50 @@
+ Code that annotated `AsyncTransport` and called `.read()` should annotate
+ `PullTransport` instead.
+ 
++
++
++## Decoder storage and ingress contract
++
++The decoder's slab is reusable but not fixed-size. It grows progressively with
++received data, at most geometrically, and a valid known head-frame extent caps
++that growth. The announced Remaining Length is **not** a request to reserve the
++entire body immediately. This avoids multi-MiB allocations after just a header,
++without introducing timers, global budgets, or an additional framing engine.
++
++Both `feed()` and direct ingress use this sizing policy. `feed()` must still
++accept all bytes handed to it, including multiple frames in one call; a packet
++size limit is not a limit on the size of an explicit feed. Contiguous typed or
++multidimensional memoryviews are interpreted as bytes without an intermediate
++payload copy. Non-contiguous views are flattened in logical order; that unusual
++input necessarily needs a temporary contiguous representation. The caller's
++view remains usable. Application payloads and raw packet bodies remain owned
++immutable `bytes`.
++
++`writable_window(preferred)` asks for the larger of the adaptive receive target
++and the preference. It can return fewer bytes at a known incomplete frame's end.
++It is neither a minimum-length guarantee nor a strict upper-bound argument.
++Normal transport calls remain capped by `RECEIVE_QUANTUM`; an explicit larger
++preference is supported for internal integrations. Use the actual view length.
++Write into one window, drop the view, and commit its written bytes before any
++other decoder operation. Do not retain a window across compaction, clear,
++consumption, or another receive request.
++
++Compaction and growth copy through byte-oriented memoryview destinations; they
++do not create a second buffer the size of the live data. Growth still briefly
++holds the old and new slabs, and packet delivery still materializes owned bytes.
++A first fragmented large frame may require several geometric growth steps;
++subsequent large frames reuse the capacity. Tests bound total bytes copied and
++capacity, not an unsafe promise to allocate every announced frame in two steps.
++
++Retirement remains based on 64 drains since the last genuinely large frame,
++sized to recent aggregate pressure and the adaptive receive target. It is not
++an idle timer: a slab retained after real large traffic can remain while idle.
++`clear()` resets connection state and releases oversized capacity. Configure
++`max_packet_size` for the deployment; inbound/delivery queue budgets do not
++include decoder capacity, transient copies, or buffers owned by the OS.
++
++Transport factories must return **exactly one** receive capability. A result
++with neither or both now raises `TypeError` locally before CONNECT or task
++startup and is closed by the connection failure path. Previously such a local
++configuration error could appear as a CONNACK timeout. Existing pull-only and
++push-only transports are unchanged.
+ diff --git a/docs/reports/README.md b/docs/reports/README.md
+--- a/docs/reports/README.md
++++ b/docs/reports/README.md
+@@ -119,3 +119,9 @@
+ 3. Never commit generated benchmark output as source documentation.
+ 4. Add the new body here exactly once and update the status of anything it
+    supersedes or retracts.
++
++
++The receive-architecture report dated 2026-09-08 is historical evidence, not the
++current decoder contract. Allocation and transport-contract hardening after
++`b7b1e77` is described in [migration guidance](../migration.md#decoder-storage-and-ingress-contract).
++Historical performance results do not qualify a later runtime revision.
+ diff --git a/src/mqttium/codec/buffer.py b/src/mqttium/codec/buffer.py
+--- a/src/mqttium/codec/buffer.py
++++ b/src/mqttium/codec/buffer.py
+@@ -8,11 +8,12 @@
+ 
+ The storage is a slab the decoder owns outright: `_start` is the read offset,
+ `_end` the write offset, and `len(_buf)` is the capacity rather than the amount
+-of live data. Nothing on the hot path reallocates -- compaction is a memmove
+-inside the existing slab, and the slab only grows for a frame larger than its
+-capacity. That is what lets a transport hand `writable_window()` straight to
+-`socket.recv_into()`, so received bytes are never copied through an
+-intermediate buffer before reaching the decoder.
++of live data. Compaction moves bytes within that slab; growth copies only live
++bytes into a new slab. Both use byte-oriented memoryview destinations to avoid
++CPython's temporary bytearray for bytearray slice assignment. A transport can
++hand `writable_window()` straight to `socket.recv_into()`, avoiding intermediate
++receive storage. Large frames grow progressively: an announced Remaining Length
++caps growth but does not itself cause the whole frame to be allocated.
+ """
+ 
+ from __future__ import annotations
+@@ -37,10 +38,8 @@
+ _PROMOTE_AFTER = 4
+ # A single frame above this is evidence the workload needs a large slab.
+ _LARGE_FRAME = DEFAULT_CAPACITY
+-# Above this, size the slab to the head frame's exact extent instead of doubling
+-# past it. Doubling wastes up to a whole frame on multi-MiB traffic.
+-_EXACT_FRAME_THRESHOLD = 512 * 1024
+-# Smallest window worth offering a receiver; also the compaction trigger.
++# Default minimum preference of internal callers. The adaptive receive target
++# can offer more, while the remaining frame extent can offer less.
+ _MIN_WINDOW = 16 * 1024
+ # Ceiling for the adaptive receive window. Storage capacity and receive quantum
+ # are separate concerns.
+@@ -118,12 +117,13 @@
+     def _reallocate(self, capacity: int) -> None:
+         live = self._end - self._start
+         grown = bytearray(capacity)
++        view = memoryview(grown)
+         if live:
+-            grown[0:live] = self._view[self._start : self._end]
+-        # Release only after the copy: the old view is the source.
++            view[:live] = self._view[self._start : self._end]
++        # Release only after allocation and copying have succeeded.
+         self._view.release()
+         self._buf = grown
+-        self._view = memoryview(grown)
++        self._view = view
+         self._capacity = capacity
+         self._start = 0
+         self._end = live
+@@ -136,30 +136,23 @@
+         if self._capacity - live >= need:
+             # In-place memmove inside the existing slab; capacity is untouched,
+             # so neither this nor the following write reallocates.
+-            self._buf[0:live] = self._view[self._start : self._end]
++            self._view[:live] = self._view[self._start : self._end]
+             self._start = 0
+             self._end = live
+             return
+-        capacity = self._capacity or _MIN_CAPACITY
++        required = live + need
++        # Amortised linear copying, not a full reservation based on an untrusted
++        # header. `need` is either an actual feed fragment or a bounded receive
++        # window. Retained capacity is reusable, regardless of the current head.
++        capacity = max(self._capacity * 2, _MIN_CAPACITY, required)
+         if exact_total is not None:
+-            # The head frame's extent is known, so size to it instead of
+-            # doubling: a frame just over a step would otherwise cost a whole
+-            # extra frame of slab.
+-            capacity = exact_total if exact_total > live + need else live + need
+-        elif need >= _EXACT_FRAME_THRESHOLD:
+-            # feed() was handed this much in one call, so it is the exact need.
+-            capacity = live + need
+-        else:
+-            while capacity - live < need:
+-                capacity *= 2
+-        # Doubling alone can reach twice max_packet_size: a frame just over a
+-        # doubling step leaves a tail too small for the next window and doubles
+-        # again. Framing rejects anything larger than max_packet_size, so one
+-        # maximum frame plus a window is all the slab can ever use. `need` still
+-        # wins, because feed() may be handed more than that in one call.
++            # Stop at the known frame extent, including just above a power of
++            # two. A feed fragment may also contain subsequent frames, so its
++            # actual byte requirement always wins over the head's size.
++            capacity = max(required, min(capacity, exact_total))
+         ceiling = self._max_packet_size + RECEIVE_QUANTUM
+         if capacity > ceiling:
+-            capacity = max(ceiling, live + need)
++            capacity = max(ceiling, required)
+         self._reallocate(capacity)
+ 
+     def _retire_oversize(self, extent: int) -> None:
+@@ -217,30 +210,25 @@
+     def writable_window(self, preferred: int = _MIN_WINDOW) -> memoryview:
+         """Return writable storage for a receiver to fill, then `commit()`.
+ 
+-        `preferred` is an upper bound, not a floor: the window is always
+-        non-empty, which is all `get_buffer()` requires, but it is shortened to
+-        what an incomplete head frame still needs so the slab is never grown
+-        past the frame it is receiving.
+-
+-        The window is a view into the decoder's own slab, so bytes written into
+-        it are already where the parser expects them. It is never empty, which
+-        `asyncio.BufferedProtocol.get_buffer()` requires. Callers must drop the
+-        view before the next call, since an outstanding export would block the
+-        slab from being replaced on the grow path.
+-
+-        Capped at `RECEIVE_QUANTUM`: a slab left large by an earlier oversized
+-        frame would otherwise overshoot the receiver's high water in proportion
+-        to retained capacity, since that check only runs afterwards.
++        The requested size is max(the adaptive target, `preferred`), not a
++        guaranteed minimum or maximum. It may be shortened at a known incomplete
++        frame's end. Default transport calls offer at most `RECEIVE_QUANTUM`;
++        an explicit larger preference is supported for internal callers.
++
++        One window may be outstanding. Write into it, drop the view, then call
++        `commit(nbytes)` before any other decoder operation. Views are temporary
++        writable ingress, never application payloads. Replacing storage does not
++        resize the old bytearray, but a retained view would refer to stale storage.
++        The returned window is never empty, as required by BufferedProtocol.
+         """
+         want = self._target_window
+         if preferred > want:
+             want = preferred
+         exact: int | None = None
+         if self._capacity - self._end < want:
+-            # Only when this call is about to grow, so the framing read stays
+-            # off the steady-state path. Doing it here rather than once the slab
+-            # is already large is what lets a cold large frame reserve its
+-            # extent at once instead of climbing there one doubling at a time.
++            # Only when tail space is short, keeping framing off the steady
++            # receive path. The known extent caps progressive growth; it is not
++            # permission to allocate the full size from an announcement alone.
+             total = self._known_frame_total()
+             if total is not None:
+                 # Only an *incomplete* head has a remainder, so this never
+@@ -367,15 +355,23 @@
+         Kept for transports that cannot write into `writable_window()` directly:
+         TLS, WebSocket, and any non-selector event loop.
+         """
++        if isinstance(data, memoryview):
++            # len(view) counts elements (or rows), not bytes. Keep normal byte
++            # views zero-copy; flatten exotic layouts only on this cold path.
++            if not data.c_contiguous or data.obj is self._buf:
++                data = data.tobytes()
++            elif data.ndim != 1 or data.format != "B":
++                data = data.cast("B")
+         nbytes = len(data)
+         if not nbytes:
+             return
+         end = self._end
+         if self._capacity - end < nbytes:
+-            self._ensure(nbytes)
++            self._ensure(nbytes, self._known_frame_total())
+             end = self._end
+-        # Slice assignment inside the slab: a memcpy, never a resize.
+-        self._buf[end : end + nbytes] = data
++        # A byte-oriented destination avoids a payload-sized temporary even for
++        # bytes sources. Source ownership remains with the caller.
++        self._view[end : end + nbytes] = data
+         end += nbytes
+         self._end = end
+         buffered = end - self._start
+ diff --git a/src/mqttium/api/async_client.py b/src/mqttium/api/async_client.py
+--- a/src/mqttium/api/async_client.py
++++ b/src/mqttium/api/async_client.py
+@@ -1059,6 +1059,15 @@
+             except TimeoutError as exc:
+                 raise MQTTTimeoutError("Transport connection timed out") from exc
+             self._transport = transport
++            # Reject a misconfigured factory before CONNECT or background tasks.
++            # Assign first so the normal failure cleanup closes the transport.
++            push = isinstance(transport, DecoderPushTransport)
++            pull = isinstance(transport, PullTransport)
++            if push == pull:
++                raise TypeError(
++                    f"{type(transport).__name__} must offer exactly one receive capability: "
++                    "PullTransport or DecoderPushTransport"
++                )
+             self._delivery.reopen()
+             self._disconnect_exc = None
+             self._teardown_final = False
+ diff --git a/tests/unit/test_decoder_slab.py b/tests/unit/test_decoder_slab.py
+--- a/tests/unit/test_decoder_slab.py
++++ b/tests/unit/test_decoder_slab.py
+@@ -146,10 +146,9 @@
+     assert decoder.capacity > baseline
+     assert decoder.next_packet() is not None
+ 
+-    # Retention fits the peak seen over a window. The drain that consumed the
+-    # huge frame falls in the first window, so the slab survives that one and is
+-    # retired during the second, once the peak reflects only small traffic.
+-    for _ in range(2 * _OVERSIZE_RETENTION + 1):
++    # A genuinely large frame resets retention; the following small drains
++    # retire the slab after exactly one retention window.
++    for _ in range(_OVERSIZE_RETENTION):
+         decoder.feed(_publish(64))
+         assert decoder.next_packet() is not None
+     assert decoder.capacity == _INITIAL_WINDOW  # the retirement floor
+@@ -188,7 +187,7 @@
+     assert decoder.buffered == 0
+ 
+ 
+-def test_compaction_reuses_the_slab_rather_than_reallocating() -> None:
++def test_complete_frame_reuse_does_not_reallocate() -> None:
+     decoder = IncrementalDecoder()
+     # Warm up so the slab has settled at a size these frames fit into.
+     for _ in range(5):
+@@ -196,7 +195,8 @@
+         assert decoder.next_packet() is not None
+     identity = id(decoder._buf)
+ 
+-    # Enough traffic to force many compactions without ever exceeding capacity.
++    # Complete drains reuse storage. Real overlapping compaction is tested in
++    # test_decoder_ingress_hardening, including transient allocation accounting.
+     for _ in range(200):
+         decoder.feed(_publish(20_000))
+         assert decoder.next_packet() is not None
+@@ -529,7 +529,7 @@
+ 
+     assert decoder.next_packet() is not None
+     assert len(frame) <= decoder.capacity < len(frame) * 5 // 4
+-    assert reallocations <= 8  # geometric, not one per receive
++    assert reallocations <= 10  # geometric, not one per receive
+ 
+ 
+ def test_complete_small_frames_keep_a_full_window_on_a_retained_slab() -> None:
+@@ -594,20 +594,22 @@
+ 
+ @pytest.mark.parametrize(
+     ("scenario", "max_reallocations"),
+-    [("cold_8mib", 2), ("repeated_2mib", 2)],
++    [("cold_8mib", 10), ("repeated_2mib", 8)],
+ )
+-def test_a_known_large_head_reserves_its_extent_without_climbing(
++def test_large_head_growth_is_amortised_and_repeated_frames_reuse_storage(
+     scenario: str, max_reallocations: int
+ ) -> None:
+-    # The extent is knowable as soon as the Remaining Length is committed, so
+-    # the slab must not climb there one geometric step at a time.
++    # A known extent caps progressive growth. Do not reserve a multi-MiB frame
++    # from its header alone, or copy quadratically while the body arrives.
+     decoder = IncrementalDecoder(max_packet_size=16 * 1024 * 1024)
+     reallocations = 0
++    copied = 0
+     original = IncrementalDecoder._reallocate
+ 
+     def counting(self: IncrementalDecoder, capacity: int) -> None:
+-        nonlocal reallocations
++        nonlocal reallocations, copied
+         reallocations += 1
++        copied += self.buffered
+         original(self, capacity)
+ 
+     def receive(frame: bytes) -> None:
+@@ -628,10 +630,14 @@
+             receive(_publish(8 * 1024 * 1024))
+         else:
+             frame = _publish(2 * 1024 * 1024)
+-            for _ in range(20):
++            receive(frame)
++            first_growths = reallocations
++            for _ in range(19):
+                 receive(frame)
++                assert reallocations == first_growths
+ 
+     assert reallocations <= max_reallocations
++    assert copied < 2 * decoder.high_water
+     # Exact, with no speculative frame-plus-quantum room.
+     assert decoder.capacity < decoder.high_water + RECEIVE_QUANTUM
+ 
+ diff --git a/tests/unit/test_decoder_ingress_hardening.py b/tests/unit/test_decoder_ingress_hardening.py
+new file mode 100644
+--- /dev/null
++++ b/tests/unit/test_decoder_ingress_hardening.py
+@@ -0,0 +1,181 @@
++"""Contract, transient-allocation and progress-bound regressions for ingress."""
++
++from __future__ import annotations
++
++import sys
++import tracemalloc
++from collections.abc import Callable
++
++import pytest
++
++from mqttium.codec.buffer import IncrementalDecoder, RECEIVE_QUANTUM
++from mqttium.codec.vbi import encode_vbi
++
++MIB = 1024 * 1024
++
++
++def _frame(size: int) -> bytes:
++    body = b"\x00\x01t" + bytes(range(256)) * (size // 256) + b"p" * (size % 256)
++    return b"\x30" + encode_vbi(len(body)) + body
++
++
++def _peak(action: Callable[[], object]) -> int:
++    # Tracing is diagnostic only, never used for throughput. Allocate input and
++    # backing storage before this helper so it captures the operation itself.
++    tracemalloc.start()
++    try:
++        before = tracemalloc.get_traced_memory()[0]
++        tracemalloc.reset_peak()
++        action()
++        return tracemalloc.get_traced_memory()[1] - before
++    finally:
++        tracemalloc.stop()
++
++
++@pytest.mark.parametrize("layout", ["byte", "word", "matrix", "scalar", "stride", "reverse"])
++def test_feed_treats_memoryview_as_wire_bytes(layout: str) -> None:
++    wire = b"\xd0\x00"
++    views = {
++        "byte": memoryview(wire),
++        "word": memoryview(wire).cast("H"),
++        "matrix": memoryview(wire).cast("B", (1, 2)),
++        "scalar": memoryview(wire).cast("H", ()),
++        "stride": memoryview(b"\xd0X\x00X")[::2],
++        "reverse": memoryview(wire[::-1])[::-1],
++    }
++    decoder = IncrementalDecoder()
++    source = views[layout]
++    try:
++        decoder.feed(source)
++        packet = decoder.next_packet()
++        assert packet is not None and packet.remaining == b""
++        assert decoder.buffered == 0
++        assert source.tobytes() == wire  # the caller's view was not released
++    finally:
++        for view in views.values():
++            view.release()
++
++
++def test_released_view_fails_before_mutating_decoder() -> None:
++    decoder = IncrementalDecoder()
++    decoder.feed(b"\xd0")
++    view = memoryview(b"\x00")
++    view.release()
++    with pytest.raises(ValueError):
++        decoder.feed(view)
++    assert decoder.buffered == 1
++    decoder.feed(b"\x00")
++    assert decoder.next_packet() is not None
++
++
++@pytest.mark.skipif(sys.implementation.name != "cpython", reason="CPython allocation regression")
++@pytest.mark.parametrize("kind", [bytes, bytearray, memoryview])
++def test_feed_does_not_copy_through_a_payload_sized_temporary(kind: type) -> None:
++    decoder = IncrementalDecoder()
++    window = decoder.writable_window(MIB)
++    window.release()
++    source = kind(b"x" * MIB)
++    before = decoder._buf
++    assert _peak(lambda: decoder.feed(source)) < 64 * 1024
++    assert decoder._buf is before
++    assert bytes(decoder._buf[: decoder.buffered]) == b"x" * MIB
++
++
++@pytest.mark.skipif(sys.implementation.name != "cpython", reason="CPython allocation regression")
++def test_real_overlapping_compaction_has_no_live_sized_temporary() -> None:
++    first = _frame(MIB)
++    second = _frame(8 * MIB)
++    decoder = IncrementalDecoder()
++    decoder.feed(first + second[:4 * MIB])
++    assert decoder.next_packet() is not None
++    assert 0 < decoder._start < decoder.buffered  # source/destination overlap
++    identity = decoder._buf
++
++    def compact() -> None:
++        window = decoder.writable_window()
++        window.release()
++
++    assert _peak(compact) < 64 * 1024
++    assert decoder._buf is identity
++    assert decoder._start == 0
++    assert bytes(decoder._buf[: decoder.buffered]) == second[:4 * MIB]
++    decoder.feed(second[4 * MIB:])
++    packet = decoder.next_packet()
++    assert packet is not None and packet.remaining.endswith(second[-MIB:])
++
++
++@pytest.mark.skipif(sys.implementation.name != "cpython", reason="CPython allocation regression")
++def test_growth_copies_directly_into_the_new_slab() -> None:
++    decoder = IncrementalDecoder()
++    decoder.feed(_frame(8 * MIB)[:4 * MIB])
++    target = 8 * MIB
++    # Count the new slab, but reject an additional temporary the size of live data.
++    assert _peak(lambda: decoder._reallocate(target)) < target + 64 * 1024
++    assert decoder.buffered == 4 * MIB
++
++
++@pytest.mark.parametrize("mode", ["feed", "push"])
++@pytest.mark.parametrize("size", [MIB - 32, MIB + 1, 2 * MIB + 4096, 8 * MIB, 16 * MIB - 16])
++def test_fragmented_large_frames_finish_at_exact_capacity(mode: str, size: int) -> None:
++    wire = _frame(size)
++    decoder = IncrementalDecoder()
++    offset = 0
++    while offset < len(wire):
++        count = min(65536, len(wire) - offset)
++        if mode == "push":
++            window = decoder.writable_window()
++            count = min(count, len(window))
++            window[:count] = wire[offset:offset + count]
++            window.release()
++            decoder.commit(count)
++        else:
++            decoder.feed(wire[offset:offset + count])
++        offset += count
++    assert decoder.capacity == len(wire)
++    packet = decoder.next_packet()
++    assert packet is not None and packet.remaining.endswith(wire[-size:])
++
++
++@pytest.mark.parametrize("mode", ["feed", "push"])
++def test_a_maximum_length_announcement_cannot_reserve_the_full_body(mode: str) -> None:
++    decoder = IncrementalDecoder()
++    header = b"\x30" + encode_vbi(16 * MIB - 5)
++    # One byte at a time: neither growth nor parsing may mistake stale slab
++    # contents for body progress. Only actual ingress can justify more storage.
++    for byte in header + b"\x00":
++        if mode == "push":
++            window = decoder.writable_window()
++            window[0] = byte
++            window.release()
++            decoder.commit(1)
++        else:
++            decoder.feed(bytes((byte,)))
++        assert decoder.next_packet() is None
++        assert decoder.capacity <= 2 * RECEIVE_QUANTUM
++    assert decoder.buffered == len(header) + 1
++
++
++def test_feed_can_finish_a_large_frame_and_include_following_frames() -> None:
++    wire = _frame(MIB)
++    following = b"\xd0\x00" * 30
++    decoder = IncrementalDecoder()
++    decoder.feed(wire[:65536])
++    decoder.feed(wire[65536:] + following)
++    packets = decoder.drain_packets()
++    assert len(packets) == 31
++    assert decoder.buffered == 0
++
++
++def test_explicit_window_preference_and_short_tail_contract() -> None:
++    decoder = IncrementalDecoder()
++    window = decoder.writable_window(1)
++    assert len(window) == 65536  # preference, not an upper bound
++    window.release()
++    wire = _frame(65536)
++    decoder.feed(wire[:-1])
++    window = decoder.writable_window()
++    assert len(window) == 1  # known incomplete head, not a minimum guarantee
++    window[0] = wire[-1]
++    window.release()
++    decoder.commit(1)
++    assert decoder.next_packet() is not None
+ diff --git a/tests/unit/test_transport_receive_validation.py b/tests/unit/test_transport_receive_validation.py
+new file mode 100644
+--- /dev/null
++++ b/tests/unit/test_transport_receive_validation.py
+@@ -0,0 +1,56 @@
++"""Reject invalid factory results before sending CONNECT or starting tasks."""
++
++from __future__ import annotations
++
++import pytest
++
++from mqttium.api import AsyncClient
++from tests.support import ScriptedBrokerTransport, transport_factory
++
++
++class _WriteOnly:
++    def __init__(self) -> None:
++        self.written: list[bytes] = []
++        self.closing = False
++
++    async def write(self, data: bytes) -> None:
++        self.written.append(data)
++
++    async def write_many(self, parts: list[bytes]) -> None:
++        self.written.extend(parts)
++
++    async def close(self) -> None:
++        self.closing = True
++
++    def is_closing(self) -> bool:
++        return self.closing
++
++
++class _Both(_WriteOnly):
++    async def read(self, n: int = 65536) -> bytes:
++        raise AssertionError("must fail before reading")
++
++    def attach_decoder(self, decoder: object) -> None:
++        raise AssertionError("must fail before attaching")
++
++    async def receive(self) -> bool:
++        raise AssertionError("must fail before receiving")
++
++
++@pytest.mark.parametrize("transport_type", [_WriteOnly, _Both])
++async def test_invalid_receive_capability_fails_locally_and_client_can_retry(transport_type) -> None:
++    transport = transport_type()
++    client = AsyncClient("invalid-capability")
++    client._transport_factory = transport_factory(transport)
++    try:
++        with pytest.raises(TypeError, match="exactly one receive capability"):
++            await client.connect("unused", 0, timeout=1)
++        assert transport.closing
++        assert transport.written == []
++        assert client._reader_task is None
++        valid = ScriptedBrokerTransport()
++        client._transport_factory = transport_factory(valid)
++        await client.connect("unused", 0, timeout=1)
++        assert client.is_connected
++    finally:
++        await client.disconnect()
+ diff --git a/tests/unit/test_recv_arch_probe_failures.py b/tests/unit/test_recv_arch_probe_failures.py
+new file mode 100644
+--- /dev/null
++++ b/tests/unit/test_recv_arch_probe_failures.py
+@@ -0,0 +1,65 @@
++"""The architectural probe must terminate on EOF and stalled peers."""
++
++from __future__ import annotations
++
++import asyncio
++import socket
++import threading
++from contextlib import suppress
++
++import pytest
++
++from tools import recv_arch_rtt_probe as probe
++
++
++@pytest.mark.parametrize("arm", list(probe.ARMS))
++@pytest.mark.parametrize("tail", [b"", b"\x30\x80"])
++async def test_probe_drains_a_complete_frame_then_reports_eof(arm: str, tail: bytes) -> None:
++    finished = asyncio.Event()
++    frame = probe.build_publish(4)
++
++    async def peer(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
++        try:
++            writer.write(frame + tail)
++            await writer.drain()
++        finally:
++            writer.close()
++            with suppress(OSError):
++                await writer.wait_closed()
++            finished.set()
++
++    server = await asyncio.start_server(peer, "127.0.0.1", 0)
++    sock = socket.socket()
++    sock.setblocking(False)
++    transport = None
++    try:
++        await asyncio.get_running_loop().sock_connect(sock, server.sockets[0].getsockname())
++        transport, receive = await probe.ARMS[arm](sock)
++        assert await asyncio.wait_for(receive(), 1) == b"\x00\x01tpppp"
++        with pytest.raises(EOFError, match="complete MQTT frame"):
++            await asyncio.wait_for(receive(), 1)
++    finally:
++        if transport is not None:
++            transport.close()
++        else:
++            sock.close()
++        server.close()
++        await server.wait_closed()
++        await asyncio.wait_for(finished.wait(), 1)
++        await asyncio.sleep(0)
++
++
++async def test_probe_bounds_a_stalled_peer_and_reaps_its_thread(monkeypatch) -> None:
++    finished = threading.Event()
++
++    def stalled(sock: socket.socket, stop: threading.Event) -> None:
++        try:
++            stop.wait(2)
++        finally:
++            sock.close()
++            finished.set()
++
++    monkeypatch.setattr(probe, "echo_server", stalled)
++    with pytest.raises(TimeoutError):
++        await probe.measure("push", probe.build_publish(4), 1, 0, timeout_s=0.03)
++    assert finished.is_set()
+ diff --git a/tests/resilience/test_decoder_header_budget.py b/tests/resilience/test_decoder_header_budget.py
+new file mode 100644
+--- /dev/null
++++ b/tests/resilience/test_decoder_header_budget.py
+@@ -0,0 +1,62 @@
++"""A slow peer cannot reserve a maximum packet from its length header alone."""
++
++from __future__ import annotations
++
++import asyncio
++from contextlib import suppress
++
++from mqttium.api import AsyncClient
++from mqttium.codec.buffer import RECEIVE_QUANTUM
++from mqttium.codec.vbi import encode_vbi
++
++
++async def test_large_length_announcement_only_allocates_for_receive_progress() -> None:
++    send_header = asyncio.Event()
++    send_body = asyncio.Event()
++    finished = asyncio.Event()
++    handler_done = asyncio.Event()
++    header = b"\x30" + encode_vbi(16 * 1024 * 1024 - 5)
++
++    async def peer(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
++        try:
++            await reader.read(4096)
++            writer.write(b"\x20\x02\x00\x00")
++            await writer.drain()
++            await send_header.wait()
++            writer.write(header)
++            await writer.drain()
++            await send_body.wait()
++            writer.write(b"\x00")
++            await writer.drain()
++            await finished.wait()
++        finally:
++            writer.close()
++            with suppress(OSError):
++                await writer.wait_closed()
++            handler_done.set()
++
++    server = await asyncio.start_server(peer, "127.0.0.1", 0)
++    client = AsyncClient("header-budget", keepalive=0)
++
++    async def await_ingress(size: int) -> None:
++        async with asyncio.timeout(2):
++            while client._decoder.buffered < size:
++                await asyncio.sleep(0.001)
++
++    try:
++        await client.connect("127.0.0.1", server.sockets[0].getsockname()[1], timeout=2)
++        send_header.set()
++        await await_ingress(len(header))
++        send_body.set()
++        await await_ingress(len(header) + 1)
++        assert client.is_connected
++        assert client._decoder.next_packet() is None
++        assert client._decoder.capacity <= 2 * RECEIVE_QUANTUM
++    finally:
++        send_header.set()
++        send_body.set()
++        finished.set()
++        await client.disconnect()
++        server.close()
++        await server.wait_closed()
++        await asyncio.wait_for(handler_done.wait(), 2)
+ diff --git a/tools/recv_arch_rtt_probe.py b/tools/recv_arch_rtt_probe.py
+--- a/tools/recv_arch_rtt_probe.py
++++ b/tools/recv_arch_rtt_probe.py
+@@ -32,6 +32,7 @@
+ import threading
+ import time
+ from collections import deque
++from contextlib import suppress
+ from pathlib import Path
+ 
+ from mqttium.codec.buffer import IncrementalDecoder
+@@ -83,7 +84,10 @@
+             packet = decoder.next_packet()
+             if packet is not None:
+                 return packet.remaining
+-            decoder.feed(await reader.read(256 * 1024))
++            data = await reader.read(256 * 1024)
++            if not data:
++                raise EOFError("peer closed before a complete MQTT frame")
++            decoder.feed(data)
+ 
+     return transport, recv_one
+ 
+@@ -112,7 +116,10 @@
+             packet = decoder.next_packet()
+             if packet is not None:
+                 return packet.remaining
+-            decoder.feed(await reader.read(256 * 1024))
++            data = await reader.read(256 * 1024)
++            if not data:
++                raise EOFError("peer closed before a complete MQTT frame")
++            decoder.feed(data)
+ 
+     return transport, recv_one
+ 
+@@ -126,6 +133,8 @@
+             self.mv = memoryview(self.buf)
+             self.chunks: deque[bytes] = deque()
+             self.waiter: asyncio.Future[None] | None = None
++            self.eof = False
++            self.error: Exception | None = None
+ 
+         def get_buffer(self, sizehint: int) -> bytearray:
+             return self.buf
+@@ -137,11 +146,26 @@
+             if self.waiter is not None and not self.waiter.done():
+                 self.waiter.set_result(None)
+ 
++        def eof_received(self) -> None:
++            self.eof = True
++            if self.waiter is not None and not self.waiter.done():
++                self.waiter.set_result(None)
++
++        def connection_lost(self, exc: Exception | None) -> None:
++            self.error = exc
++            self.eof_received()
++
+         async def read(self) -> bytes:
+             while not self.chunks:
++                if self.error is not None:
++                    raise self.error
++                if self.eof:
++                    return b""
+                 self.waiter = loop.create_future()
+-                await self.waiter
+-                self.waiter = None
++                try:
++                    await self.waiter
++                finally:
++                    self.waiter = None
+             return self.chunks.popleft()
+ 
+     transport, protocol = await loop.create_connection(Protocol, sock=sock)
+@@ -152,7 +176,10 @@
+             packet = decoder.next_packet()
+             if packet is not None:
+                 return packet.remaining
+-            decoder.feed(await protocol.read())
++            data = await protocol.read()
++            if not data:
++                raise EOFError("peer closed before a complete MQTT frame")
++            decoder.feed(data)
+ 
+     return transport, recv_one
+ 
+@@ -173,7 +200,8 @@
+             packet = decoder.next_packet()
+             if packet is not None:
+                 return packet.remaining
+-            await transport.receive()
++            if not await transport.receive():
++                raise EOFError("peer closed before a complete MQTT frame")
+ 
+     return raw_transport, recv_one
+ 
+@@ -187,41 +215,57 @@
+ }
+ 
+ 
+-async def measure(arm: str, packet: bytes, count: int, warmup: int) -> list[float]:
++async def measure(
++    arm: str, packet: bytes, count: int, warmup: int, timeout_s: float = 30.0
++) -> list[float]:
+     listener = socket.socket()
+     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+     listener.bind(("127.0.0.1", 0))
+     listener.listen(1)
++    listener.settimeout(timeout_s)
+     stop = threading.Event()
+     accepted: list[socket.socket] = []
+ 
+     def accept() -> None:
+-        conn, _ = listener.accept()
++        try:
++            conn, _ = listener.accept()
++        except OSError:
++            return
+         accepted.append(conn)
+         echo_server(conn, stop)
+ 
+     thread = threading.Thread(target=accept, daemon=True)
+     thread.start()
+ 
+-    client = socket.create_connection(listener.getsockname())
+-    client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+-    transport, recv_one = await ARMS[arm](client)
+-
++    client = None
++    transport = None
+     samples: list[float] = []
+     try:
+-        for index in range(warmup + count):
+-            start = time.perf_counter()
+-            transport.write(packet)
+-            await recv_one()
+-            elapsed = time.perf_counter() - start
+-            if index >= warmup:
+-                samples.append(elapsed * 1e6)
++        client = socket.create_connection(listener.getsockname(), timeout=timeout_s)
++        client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
++        # One timeout per arm, outside individual RTT samples. A stalled peer
++        # must terminate the probe without adding per-message timer overhead.
++        async with asyncio.timeout(timeout_s):
++            transport, recv_one = await ARMS[arm](client)
++            for index in range(warmup + count):
++                start = time.perf_counter()
++                transport.write(packet)
++                await recv_one()
++                elapsed = time.perf_counter() - start
++                if index >= warmup:
++                    samples.append(elapsed * 1e6)
+     finally:
+         stop.set()
+-        transport.close()
++        if transport is not None:
++            transport.close()
++        elif client is not None:
++            client.close()
+         listener.close()
+         for conn in accepted:
++            with suppress(OSError):
++                conn.shutdown(socket.SHUT_RDWR)
+             conn.close()
++        await asyncio.to_thread(thread.join, 1.0)
+     return samples
+ 
+ 
+@@ -233,7 +277,7 @@
+ 
+     for _ in range(args.repeat):
+         for name in order:  # interleave so drift hits every arm equally
+-            per_arm[name].extend(await measure(name, packet, args.count, args.warmup))
++            per_arm[name].extend(await measure(name, packet, args.count, args.warmup, args.timeout_s))
+ 
+     print(
+         f"payload {args.payload_size} B, {args.count} round trips x {args.repeat} "
+@@ -269,7 +313,11 @@
+     parser.add_argument("--warmup", type=int, default=500)
+     parser.add_argument("--repeat", type=int, default=5)
+     parser.add_argument("--output")
+-    asyncio.run(main_async(parser.parse_args()))
++    parser.add_argument("--timeout-s", type=float, default=30.0, help="Deadline per arm")
++    args = parser.parse_args()
++    if args.count <= 0 or args.repeat <= 0 or args.warmup < 0 or args.timeout_s <= 0:
++        parser.error("count, repeat and timeout must be positive; warmup must be nonnegative")
++    asyncio.run(main_async(args))
+ 
+ 
+ if __name__ == "__main__":
