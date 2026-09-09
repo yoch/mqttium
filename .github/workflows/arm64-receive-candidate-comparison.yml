@@ -18,11 +18,6 @@ on:
         description: Exact 40-character commit SHA for arm B
         required: true
         type: string
-      control_ref:
-        description: Optional exact 40-character commit SHA used as a stability anchor
-        required: false
-        default: ""
-        type: string
       confirm_trusted_code:
         description: I confirm that every input commit was reviewed and is trusted on the persistent runner
         required: true
@@ -55,21 +50,25 @@ jobs:
         env:
           A_REF: ${{ inputs.candidate_a_ref }}
           B_REF: ${{ inputs.candidate_b_ref }}
-          CONTROL_REF: ${{ inputs.control_ref }}
         run: |
           set -euo pipefail
           for value in "$A_REF" "$B_REF"; do
             [[ "$value" =~ ^[0-9a-fA-F]{40}$ ]] || { echo "arm refs must be exact commit SHAs" >&2; exit 2; }
           done
-          if [ -n "$CONTROL_REF" ]; then
-            [[ "$CONTROL_REF" =~ ^[0-9a-fA-F]{40}$ ]] || { echo "control ref must be an exact commit SHA" >&2; exit 2; }
-          fi
           [ "$A_REF" != "$B_REF" ] || { echo "the two arms must differ" >&2; exit 2; }
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ inputs.candidate_a_ref }}
           path: arm-a
+          persist-credentials: false
+      - name: Check out arm A a second time for the A/A control
+        # version_compare resolves both source paths and refuses two identical
+        # ones, and it calls Path.resolve(), so a symlink would not help.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ inputs.candidate_a_ref }}
+          path: arm-a-aa
           persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -87,14 +86,6 @@ jobs:
           ref: ${{ env.BENCH_SHA }}
           path: harness
           persist-credentials: false
-      - name: Check out control anchor
-        if: inputs.control_ref != ''
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ inputs.control_ref }}
-          path: arm-control
-          persist-credentials: false
-
       - name: Set run-specific workspace
         run: echo "FINAL_OUT=$RUNNER_TEMP/mqttium-compare-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
 
@@ -102,12 +93,12 @@ jobs:
         env:
           A_REF: ${{ inputs.candidate_a_ref }}
           B_REF: ${{ inputs.candidate_b_ref }}
-          CONTROL_REF: ${{ inputs.control_ref }}
         shell: bash
         run: |
           set -euo pipefail
           test "$(uname -m)" = aarch64
           test "$(git -C arm-a rev-parse HEAD)" = "$A_REF"
+          test "$(git -C arm-a-aa rev-parse HEAD)" = "$A_REF"
           test "$(git -C arm-b rev-parse HEAD)" = "$B_REF"
           test "$(git -C harness rev-parse HEAD)" = "$BENCH_SHA"
           test "$(git -C benchtools rev-parse HEAD)" = "$BENCHTOOLS_SHA"
@@ -126,7 +117,6 @@ jobs:
               "run_id": os.environ.get("GITHUB_RUN_ID"),
               "arm_a_sha": os.environ["A_REF"],
               "arm_b_sha": os.environ["B_REF"],
-              "control_sha": os.environ.get("CONTROL_REF") or None,
               "external_harness_repo": "yoch/mqtt-python-client-bench",
               "external_harness_sha": os.environ["BENCH_SHA"],
               "benchtools_sha": os.environ["BENCHTOOLS_SHA"],
@@ -273,11 +263,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Written against the public decoder surface both arms share, so it
-          # measures storage strategy without assuming either implementation.
-          for arm in a b; do
-            PYTHONPATH="$PWD/arm-$arm/src" ARM="$arm" python3 - <<'PY' > "$FINAL_OUT/diagnostics/storage-$arm.json"
-          import gc, json, os, resource, time
+          # Internal, symmetric diagnostic: it monkeypatches the private
+          # _reallocate on both arms alike. Each scenario runs in a fresh
+          # process, because ru_maxrss is a process-lifetime high-water mark and
+          # would otherwise report the largest scenario for every later one.
+          cat > "$FINAL_OUT/diagnostics/storage_probe.py" <<'PY'
+          import argparse, gc, json, resource, time
           from mqttium.codec.buffer import IncrementalDecoder
 
           def publish(size):
@@ -291,19 +282,6 @@ jobs:
                   if not remaining:
                       break
               return bytes(out) + body
-
-          original = IncrementalDecoder._reallocate
-
-          def instrument():
-              stats = {"reallocations": 0, "shrinks": 0, "peak_capacity": 0}
-              def counting(self, capacity):
-                  stats["reallocations"] += 1
-                  if capacity < getattr(self, "capacity", 0):
-                      stats["shrinks"] += 1
-                  if capacity > stats["peak_capacity"]:
-                      stats["peak_capacity"] = capacity
-                  original(self, capacity)
-              return stats, counting
 
           def receive(decoder, frame, chunk=65536):
               offset = 0
@@ -320,35 +298,64 @@ jobs:
               while decoder.next_packet() is not None:
                   pass
 
-          def scenario(name, script):
-              stats, counting = instrument()
-              IncrementalDecoder._reallocate = counting
-              gc.collect()
-              rss0 = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-              started = time.perf_counter()
-              decoder = IncrementalDecoder(max_packet_size=16 * 1024 * 1024)
-              script(decoder)
-              elapsed = time.perf_counter() - started
-              IncrementalDecoder._reallocate = original
-              gc.collect()
-              rss1 = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-              stats.update(scenario=name, capacity=decoder.capacity, seconds=elapsed,
-                           rss_delta_kib=rss1 - rss0)
-              return stats
+          parser = argparse.ArgumentParser()
+          parser.add_argument("--arm", required=True)
+          parser.add_argument("--scenario", required=True)
+          args = parser.parse_args()
 
-          huge = publish(8 * 1024 * 1024)
-          mid = publish(2 * 1024 * 1024)
-          tiny = publish(200)
-          results = [
-              scenario("cold_8mib", lambda d: receive(d, huge)),
-              scenario("repeated_2mib", lambda d: [receive(d, mid) for _ in range(20)]),
-              scenario("large_then_small",
-                       lambda d: (receive(d, huge), [receive(d, tiny) for _ in range(400)])),
-          ]
-          print(json.dumps({"arm": os.environ["ARM"], "scenarios": results}, indent=2, sort_keys=True))
+          stats = {"reallocations": 0, "shrinks": 0, "peak_capacity": 0}
+          original = IncrementalDecoder._reallocate
+
+          def counting(self, capacity):
+              stats["reallocations"] += 1
+              if capacity < getattr(self, "capacity", 0):
+                  stats["shrinks"] += 1
+              if capacity > stats["peak_capacity"]:
+                  stats["peak_capacity"] = capacity
+              original(self, capacity)
+
+          IncrementalDecoder._reallocate = counting
+          gc.collect()
+          rss_before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+          started = time.perf_counter()
+          decoder = IncrementalDecoder(max_packet_size=16 * 1024 * 1024)
+
+          if args.scenario == "cold_8mib":
+              receive(decoder, publish(8 * 1024 * 1024))
+          elif args.scenario == "repeated_2mib":
+              frame = publish(2 * 1024 * 1024)
+              for _ in range(20):
+                  receive(decoder, frame)
+          elif args.scenario == "large_then_small":
+              receive(decoder, publish(8 * 1024 * 1024))
+              tiny = publish(200)
+              for _ in range(400):
+                  receive(decoder, tiny)
+          else:
+              raise SystemExit(f"unknown scenario {args.scenario}")
+
+          elapsed = time.perf_counter() - started
+          IncrementalDecoder._reallocate = original
+          gc.collect()
+          stats.update(
+              arm=args.arm,
+              scenario=args.scenario,
+              retained_capacity=decoder.capacity,
+              seconds=elapsed,
+              peak_rss_kib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+              rss_delta_kib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss - rss_before,
+          )
+          print(json.dumps(stats, sort_keys=True))
           PY
+          : > "$FINAL_OUT/diagnostics/storage.jsonl"
+          for arm in a b; do
+            for scenario in cold_8mib repeated_2mib large_then_small; do
+              taskset -c 3 env PYTHONPATH="$PWD/arm-$arm/src" python3 \
+                "$FINAL_OUT/diagnostics/storage_probe.py" --arm "$arm" --scenario "$scenario" \
+                >> "$FINAL_OUT/diagnostics/storage.jsonl"
+            done
           done
-          cat "$FINAL_OUT/diagnostics/storage-a.json" "$FINAL_OUT/diagnostics/storage-b.json"
+          cat "$FINAL_OUT/diagnostics/storage.jsonl"
 
       - name: Fallback feed() microbenchmarks
         shell: bash
@@ -396,11 +403,58 @@ jobs:
           . "$FINAL_OUT/rtt/venv/bin/activate"
           PYTHONPATH=harness/src python -m mqtt_client_bench.layout_runner \
             --worker-aslr system --entrypoint version_compare -- \
-            --client mqttium --baseline-path arm-a --candidate-path arm-a \
+            --client mqttium --baseline-path arm-a --candidate-path arm-a-aa \
             --scenario application_rtt_fixed_rate --variant-index 0 --target-rate "$RTT_TARGET_RATE" \
             --pacer-mode external --blocks 4 --max-block-retries 1 --profile standard \
             --broker 127.0.0.1:11894 --broker-pid "$RTT_BROKER_PID" \
             --output "$FINAL_OUT/rtt/aa-control.json" | tee "$FINAL_OUT/rtt/aa-control.txt"
+
+      - name: Require a valid A/A control before comparing
+        shell: bash
+        run: |
+          set -euo pipefail
+          # version_compare exits 0 even when its own qualification says
+          # otherwise, so the A/A result is checked here instead. This gate is
+          # about measurement validity only -- it never inspects which arm won,
+          # and it never triggers a retry: the harness keeps its own bounded
+          # retry policy.
+          python3 - <<'PY'
+          import json, os, sys
+          from pathlib import Path
+          report = json.loads((Path(os.environ["FINAL_OUT"]) / "rtt" / "aa-control.json").read_text())
+          failures = []
+
+          qualification = report.get("qualification") or {}
+          if qualification.get("ok") is not True:
+              failures.append(f"qualification.ok={qualification.get('ok')!r}")
+
+          requested = report.get("blocks_requested")
+          complete = report.get("blocks_complete")
+          if not (complete == requested == 4):
+              failures.append(f"blocks_complete={complete!r} blocks_requested={requested!r}, expected 4")
+
+          exhausted = report.get("retry_exhausted_blocks") or []
+          if exhausted:
+              failures.append(f"retry_exhausted_blocks={exhausted!r}")
+
+          usable = report.get("usable_observations")
+          if usable is None:
+              usable = qualification.get("usable_observations")
+          if usable != 16:
+              failures.append(f"usable observations={usable!r}, expected 16")
+
+          verdict = report.get("verdict") or {}
+          effect = verdict.get("absolute_effect_pct")
+          if effect is None or abs(float(effect)) > 3.0:
+              failures.append(f"absolute_effect_pct={effect!r}, expected |effect| <= 3.0")
+
+          if failures:
+              print("A/A control is not usable; the A/B comparison will not run:")
+              for line in failures:
+                  print(f"  - {line}")
+              sys.exit(1)
+          print("A/A control valid: same-code precision established, A/B may proceed.")
+          PY
 
       - name: RTT A/B comparison
         shell: bash
