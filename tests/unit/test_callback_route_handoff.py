@@ -254,9 +254,15 @@ async def test_sync_message_snapshot_survives_mutation_of_a_later_match():
 
 async def test_handoff_capacity_failure_is_transactional():
     client = AsyncClient(message_delivery="callback", max_pending_callbacks=1)
-    job = (lambda: None, (), None)
+    from mqttium.api._delivery import _CALLBACK_MESSAGE_BATCH
+
+    job = (
+        lambda _message: None,
+        ([Message("audit/x", b"a"), Message("audit/x", b"b")],),
+        _CALLBACK_MESSAGE_BATCH,
+    )
     with pytest.raises(RuntimeError, match="reserved capacity"):
-        client._delivery._prepend_callback_job(job, 2)
+        client._delivery._prepend_callback_job(job)
     assert client._callback_queue.empty()
     assert client._callback_queue.maxsize == 1
     assert client._callback_worker_task is None
@@ -303,3 +309,118 @@ async def test_fresh_handoff_worker_installs_ownership_before_callback_disconnec
         finally:
             await client._shutdown_callback_worker(drain=False)
             loop.set_task_factory(factory)
+
+
+@pytest.mark.parametrize("eager", [False, True])
+@pytest.mark.parametrize("cancel_putter", [False, True])
+async def test_handoff_preserves_waiting_producer_order_and_join(eager, cancel_putter):
+    """Releasing a pair reservation must not let an awakened putter overtake it."""
+    if eager and not hasattr(asyncio, "eager_task_factory"):
+        pytest.skip("eager_task_factory requires Python 3.12")
+    loop = asyncio.get_running_loop()
+    factory = loop.get_task_factory()
+    if eager:
+        loop.set_task_factory(asyncio.eager_task_factory)
+    client = AsyncClient(message_delivery="callback", max_pending_callbacks=2)
+    delivery = client._delivery
+    seen = []
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    putters = []
+    joiners = []
+
+    async def tail(_message):
+        seen.append("tail-start")
+        entered.set()
+        await release.wait()
+        seen.append("tail-end")
+
+    def first(_message):
+        seen.append("first")
+        client.message_callback_add("audit/x", tail)
+        delivery.spawn_callback(lambda: seen.append("reentrant"))
+        job = (lambda: seen.append("putter"), (), None)
+        putters.append(asyncio.create_task(delivery.enqueue_callback_job_slow(job)))
+        joiners.append(asyncio.create_task(delivery.callback_queue.join()))
+        assert delivery.stats().callback_queued == 2
+
+    client.message_callback_add("audit/x", first)
+    with _callback_errors() as errors:
+        try:
+            client._apply_message_effect_batch_inline(_messages(2, EffectKind.MESSAGE), 0)
+            if cancel_putter:
+                putters[0].cancel()
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            assert not joiners[0].done()
+            await asyncio.gather(*putters, return_exceptions=cancel_putter)
+            assert delivery.stats().callback_queued <= 2
+            release.set()
+            await asyncio.wait_for(joiners[0], timeout=2)
+            assert seen == ["first", "tail-start", "tail-end", "reentrant"] + (
+                [] if cancel_putter else ["putter"]
+            )
+            assert delivery.stats().callback_queued == 0
+            assert delivery.callback_queue.maxsize == 2
+            assert errors == []
+        finally:
+            release.set()
+            for task in putters + joiners:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*putters, *joiners, return_exceptions=True)
+            await delivery.shutdown_callbacks(drain=False)
+            loop.set_task_factory(factory)
+
+
+@pytest.mark.parametrize("kind", [EffectKind.MESSAGE, EffectKind.DECODED_MESSAGE])
+async def test_handoff_precedes_a_reentrant_reserved_batch(kind):
+    client = AsyncClient(message_delivery="callback", max_pending_callbacks=4)
+    delivery = client._delivery
+    seen = []
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def tail(_message):
+        seen.append("tail")
+        entered.set()
+        await release.wait()
+
+    def first(_message):
+        seen.append("first")
+        client.message_callback_add("audit/x", tail)
+        nested = [Message("audit/x", bytes([value])) for value in range(3)]
+        assert delivery.deliver_callback_messages_inline(
+            nested, lambda message: seen.append(message.payload)
+        )
+        assert delivery.stats().callback_queued == 4
+
+    client.message_callback_add("audit/x", first)
+    with _callback_errors() as errors:
+        try:
+            assert client._apply_message_effect_batch_inline(_messages(2, kind), 0) == 2
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            assert seen == ["first", "tail"]
+            assert delivery.stats().callback_queued == 3
+            release.set()
+            await asyncio.wait_for(delivery.callback_queue.join(), timeout=2)
+            assert seen == ["first", "tail", b"\x00", b"\x01", b"\x02"]
+            assert delivery.stats().callback_queued == 0
+            assert delivery.callback_queue.maxsize == 4
+            assert errors == []
+        finally:
+            release.set()
+            await delivery.shutdown_callbacks(drain=False)
+
+
+async def test_empty_handoff_batch_is_rejected_without_mutation():
+    from mqttium.api._delivery import _CALLBACK_MESSAGE_BATCH
+
+    client = AsyncClient(message_delivery="callback", max_pending_callbacks=2)
+    delivery = client._delivery
+    with pytest.raises(RuntimeError, match="reserved capacity"):
+        delivery._prepend_callback_job((lambda _message: None, ([],), _CALLBACK_MESSAGE_BATCH))
+    assert delivery.callback_task is None
+    assert delivery.callback_queue.empty()
+    assert delivery.callback_queue.maxsize == 2
+    assert delivery.stats().callback_queued == 0
+    await asyncio.wait_for(delivery.callback_queue.join(), timeout=2)

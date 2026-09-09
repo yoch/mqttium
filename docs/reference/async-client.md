@@ -67,6 +67,12 @@ prefix is replayed. Direct callbacks captured without a router keep their
 existing batch semantics. Iterator-only delivery ignores callbacks, including
 topic filters.
 
+When a callback disconnects and reconnects the client before returning, the
+current worker job finishes normally. Jobs still queued for the terminally
+closed connection are discarded before the replacement connection is reopened;
+its newly admitted callbacks use the existing worker and are not discarded by
+the previous shutdown request. Already-active batch semantics are unchanged.
+
 ## Loop confinement
 
 `publish_nowait()` and `stats()` are synchronous but must run on the owning
