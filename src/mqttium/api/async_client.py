@@ -75,7 +75,7 @@ from mqttium.protocol.outbound import _PreparedPublish
 from mqttium.protocol.reconnect import ReconnectPolicy
 from mqttium.persistence.memory import InflightStore
 from mqttium.topics import validate_subscribe_filter
-from mqttium.transport._stream import AsyncTransport, DecoderPushTransport
+from mqttium.transport._stream import AsyncTransport, DecoderPushTransport, PullTransport
 from mqttium.transport.tcp import TcpTransport
 from mqttium.transport.unix import UnixSocketTransport
 from mqttium.transport.websocket import WebSocketTransport
@@ -1948,16 +1948,25 @@ class AsyncClient:
             MQTTProtocolVersion.MQTTv311,
             MQTTProtocolVersion.MQTTv5,
         )
-        # A push transport has already placed received bytes in the decoder by
-        # the time it reports them, so there is nothing to feed.
-        push = self._transport if isinstance(self._transport, DecoderPushTransport) else None
+        # Receiving is a capability, and the two are exclusive: a push
+        # transport has already placed the bytes in the decoder by the time it
+        # reports them, so there is nothing to feed.
+        push: DecoderPushTransport | None = None
+        pull: PullTransport | None = None
+        if isinstance(self._transport, DecoderPushTransport):
+            push = self._transport
+        elif isinstance(self._transport, PullTransport):
+            pull = self._transport
+        else:  # pragma: no cover - a transport must offer one of the two
+            raise TypeError(f"{type(self._transport).__name__} offers no receive capability")
         try:
             while not self._transport.is_closing():
                 if push is not None:
                     if not await push.receive():
                         break
                 else:
-                    data = await self._transport.read(256 * 1024)
+                    assert pull is not None
+                    data = await pull.read(256 * 1024)
                     if not data:
                         break
                     self._decoder.feed(data)

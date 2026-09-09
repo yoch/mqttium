@@ -16,7 +16,7 @@ import asyncio
 from dataclasses import replace
 from typing import Protocol
 
-from mqttium.transport._stream import StreamTransport
+from mqttium.transport._stream import StreamTransportBase
 from mqttium.transport.stats import TransportStats
 
 # The reader task drains in bounded batches, so the slab is allowed to hold
@@ -209,7 +209,7 @@ class DecoderPushProtocol(asyncio.StreamReaderProtocol, asyncio.BufferedProtocol
             waiter.set_result(None)
 
 
-class PushStreamTransport(StreamTransport):
+class PushStreamTransport(StreamTransportBase):
     """Stream transport whose reads are delivered into an attached decoder."""
 
     __slots__ = ("_protocol", "_seen", "_resumptions", "_waits")
@@ -288,9 +288,6 @@ class PushStreamTransport(StreamTransport):
         # the decoder, and reporting 0 would hide real inbound backlog.
         buffered = 0 if sink is None else sink.buffered
         return replace(base, buffered_read_bytes=buffered)
-
-    async def read(self, n: int = 65536) -> bytes:
-        raise RuntimeError("PushStreamTransport delivers into the decoder; use receive()")
 
     async def close(self) -> None:
         self._protocol.detach()

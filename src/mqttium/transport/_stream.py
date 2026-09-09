@@ -16,43 +16,41 @@ def write_buffer_needs_drain(writer: asyncio.StreamWriter) -> bool:
     return transport is not None and transport.get_write_buffer_size() > _WRITE_BUFFER_HIGH_WATER
 
 
+@runtime_checkable
 class AsyncTransport(Protocol):
+    """What every transport can do. Receiving is a separate capability."""
+
     async def write(self, data: bytes) -> None: ...
     async def write_many(self, parts: list[bytes]) -> None: ...
-    async def read(self, n: int = 65536) -> bytes: ...
     async def close(self) -> None: ...
     def is_closing(self) -> bool: ...
 
 
 @runtime_checkable
 class PullTransport(Protocol):
-    """Read side of :class:`AsyncTransport`: the caller asks for bytes.
-
-    Structural, so it cannot distinguish a transport whose ``read()`` works from
-    one that refuses it. Test :class:`DecoderPushTransport` first; a transport
-    matching that one delivers through ``receive()`` and its ``read()`` raises.
-    """
+    """Receive capability: the caller asks for the next bytes."""
 
     async def read(self, n: int = 65536) -> bytes: ...
 
 
 @runtime_checkable
 class DecoderPushTransport(Protocol):
-    """Optional capability: deliver received bytes into the decoder's storage.
+    """Receive capability: the transport commits into the decoder's storage.
 
-    A transport offering this receives into storage the decoder owns, so the
-    reader never calls ``read()``; it *replaces* the pull read clause rather
-    than adding to it. Like ``write_nowait``, it is an optimisation a transport
-    may provide, not an obligation: TLS, WebSocket and non-selector loops
-    cannot, and keep ``read()`` + ``feed()``.
+    Exclusive with :class:`PullTransport`. A transport offering this has no
+    ``read()`` at all, so neither capability check can misclassify it.
     """
 
     def attach_decoder(self, decoder: object) -> None: ...
     async def receive(self) -> bool: ...
 
 
-class StreamTransport:
-    """Common StreamReader/StreamWriter transport implementation."""
+class StreamTransportBase:
+    """Write and lifecycle half, shared by both receive capabilities.
+
+    Deliberately has no ``read()``: a push transport that inherited one would
+    satisfy the pull capability structurally while refusing to honour it.
+    """
 
     __slots__ = ("_reader", "_writer")
 
@@ -102,9 +100,6 @@ class StreamTransport:
     async def drain(self) -> None:
         await self._writer.drain()
 
-    async def read(self, n: int = 65536) -> bytes:
-        return await self._reader.read(n)
-
     async def close(self) -> None:
         self._writer.close()
         with suppress(Exception):
@@ -132,3 +127,12 @@ class StreamTransport:
     async def _drain_if_needed(self) -> None:
         if write_buffer_needs_drain(self._writer):
             await self._writer.drain()
+
+
+class StreamTransport(StreamTransportBase):
+    """Pull-capable asyncio stream transport."""
+
+    __slots__ = ()
+
+    async def read(self, n: int = 65536) -> bytes:
+        return await self._reader.read(n)

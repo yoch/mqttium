@@ -38,6 +38,16 @@ the enforced preflight (`max_load_per_cpu` 0.25, `max_cpu_percent` 20); observed
 load during the runs was 0.7–2.8. They discriminate between architectures; they
 do not replace a fresh-process RPi5 run.
 
+⚠️ **They also predate the current runtime.** The throughput, CPU, latency and
+end-to-end tables in the next four sections were produced by the first
+production-wired revision of this branch, which had a fixed 256 KiB slab, no
+adaptive window, no exact large-frame sizing and no retention policy. They are
+kept because they are what established the *architecture* — that receiving into
+decoder-owned storage removes a copy and the allocator regime with it — and they
+remain valid for that claim. **They do not validate `c8552d7f` or later.** The
+only measurements attached to the current runtime are the storage-policy and
+memory sections below, and whatever the RPi5 gate produces on the final SHA.
+
 ## Throughput and CPU
 
 GiB/s of application payload delivered as owned `bytes`:
@@ -253,8 +263,8 @@ the mechanism's purpose.
 
 ## Errors found by cross-review
 
-Two defects in this branch were found only by comparing against the parallel
-prototype in PR #447, both of which it had guarded from the start:
+Several defects in this branch were found only by adversarial review, including
+comparison against the parallel prototype in PR #447:
 
 - **Pausing on an incomplete head frame deadlocks the connection.** A frame may
   legally be as large as `max_packet_size`. Pausing because buffered bytes
@@ -268,8 +278,116 @@ prototype in PR #447, both of which it had guarded from the start:
   exception winning over bytes buffered before it, while a clean EOF still
   delivers its last generation.
 
-Both are the kind of defect a saturated benchmark never shows: neither affects
-throughput, and both break real connections.
+- **Stale slab bytes reached VBI framing.** See the section above; a partially
+  received Remaining Length continued into previous traffic and raised
+  `PacketTooLargeError` on legitimate input.
+- **A push transport satisfied the pull contract structurally** while its
+  `read()` refused to run. Receiving is now a capability and the two are
+  mutually exclusive.
+
+These are the kind of defect a saturated benchmark never shows: none affects
+throughput, and each breaks real connections or real contracts.
+
+## Stale slab bytes must never reach framing
+
+The slab is reused, not zeroed, so bytes past `_end` are previous traffic.
+`decode_vbi()` bounded on `len(buffer)` — the backing capacity — so a partially
+received Remaining Length continued into them. Reproduced: consume a frame whose
+body is `FF FF 10`, commit only `30 80` of the next PUBLISH, and framing yields
+`PacketTooLargeError: Packet size 35651461 exceeds maximum 16777216` on
+legitimate traffic. `head_frame_ready()` returned True, so the reader ran and
+surfaced it as fatal.
+
+`decode_vbi()` now takes an `end` bound and both framing entry points pass
+`_end`. The same oracle covers `peek_packet_bounds()`, `head_frame_ready()` and
+`next_packet()`, over four stale-byte patterns, three partial headers and 20
+randomised split streams. The borrowed MQTT 5 property path was already bounded
+via `_decode_bounded_vbi`.
+
+## Storage policy as it now stands
+
+Every number in this section was produced on `c8552d7f` or later; earlier
+revisions of this file described a fixed 256 KiB slab that shrank immediately,
+which is not what the runtime does.
+
+**Sizing.** Allocation floors at `_MIN_CAPACITY` (16 KiB). The receive window
+starts at `_INITIAL_WINDOW` (64 KiB) and is promoted a step at a time toward
+`RECEIVE_QUANTUM` (256 KiB) after four consecutive completely filled windows.
+Ordinary growth is geometric. Once the head frame's Remaining Length is
+committed, its extent is known, and the slab reserves exactly that instead of
+doubling past it; the window is capped at what that frame still needs, which is
+what stops growth running past it. Capacity is bounded by
+`max_packet_size + RECEIVE_QUANTUM`.
+
+Measured across power-of-two boundaries, received in 4 KiB chunks:
+
+| frame | capacity / frame | reallocations |
+|---|---:|---:|
+| 0.496 MiB (just under) | 1.01x | 4 |
+| 0.500 MiB | 1.00x | 5 |
+| 1.000 MiB | 1.00x | 5 |
+| 1.004 MiB (just over) | 1.00x | 5 |
+| 2.004 MiB | 1.00x | 5 |
+| 8.000 MiB | 1.00x | 5 |
+| 15.999 MiB (near limit) | 1.00x | 5 |
+
+Growth stays geometric — four or five reallocations for any size, not one per
+receive — so there is no quadratic copy. Transient peak during a reallocation is
+old + new capacity, inherent to a copying grow.
+
+The window is capped only for an *incomplete* head, so ordinary complete-frame
+traffic on a slab left large keeps its full 64 KiB window.
+
+**Retention.** Two things are deliberately not conflated. A drain that consumed
+a genuinely large *frame* is evidence the workload still needs the room and
+resets the window. Aggregate pressure from coalesced small frames is not:
+batches routinely exceed 256 KiB without any single frame doing so.
+
+| profile | capacity | reallocations |
+|---|---:|---:|
+| one huge, then idle | 8.00 MiB | 1 |
+| huge, then sparse tiny | 64 KiB | 2 |
+| huge, then sustained tiny | 64 KiB | 2 |
+| repeated huge x200 | 8.00 MiB | 1 |
+| alternating huge/tiny x20 | 8.00 MiB | 1 |
+| huge, then coalesced 320 KiB batches | 512 KiB | 2 |
+
+The slab is retired one retention window after large frames stop, not
+immediately: an isolated large frame does not pin memory, and repeated or
+alternating large frames do not thrash. The idle case holds until traffic
+resumes — retirement counts inbound frames, and keepalive supplies them.
+
+**First touch.** A 4-byte ACK decoded by a fresh decoder allocates 16 KiB, not
+the steady-state receive size. Against `main`, the worst memory-profile peak
+delta is **+0.016 MiB**, and `check_memory_thresholds.py` passes on all 15
+scenarios.
+
+## Errors found by cross-review## Errors found by cross-review
+
+Several defects in this branch were found only by adversarial review, including
+comparison against the parallel prototype in PR #447:
+
+- **Pausing on an incomplete head frame deadlocks the connection.** A frame may
+  legally be as large as `max_packet_size`. Pausing because buffered bytes
+  crossed the high water stops the only source that can complete such a frame.
+  Reproduced with one ~256 KiB frame against a 192 KiB high water: reading
+  paused, `receive()` blocked forever. The pause now also requires the head
+  frame to be consumable, and the resume fires as soon as it stops being.
+- **A connection error was reported as a clean EOF.** `StreamReader.read()`
+  raises, and the client's error taxonomy and reconnect policy depend on that
+  distinction. The push path swallowed it. `receive()` now raises, with the
+  exception winning over bytes buffered before it, while a clean EOF still
+  delivers its last generation.
+
+- **Stale slab bytes reached VBI framing.** See the section above; a partially
+  received Remaining Length continued into previous traffic and raised
+  `PacketTooLargeError` on legitimate input.
+- **A push transport satisfied the pull contract structurally** while its
+  `read()` refused to run. Receiving is now a capability and the two are
+  mutually exclusive.
+
+These are the kind of defect a saturated benchmark never shows: none affects
+throughput, and each breaks real connections or real contracts.
 
 ## Stale slab bytes must never reach framing
 
@@ -370,6 +488,16 @@ via `clear()`. Retiring sooner was rejected: making retention size-aware would
 release an 8 MiB slab after 2 small drains, which reintroduces grow/shrink
 thrashing on the bursty profile above, trading a bounded delay for a repeated
 cost.
+
+## What is measured on which SHA
+
+| evidence | SHA lineage | still valid for |
+|---|---|---|
+| isolated transport throughput / CPU / RTT | first production-wired revision | the architecture, not this runtime |
+| end-to-end Mosquitto throughput and minor faults | same | the allocator claim, not this runtime |
+| storage sizing, boundaries, retention profiles | `c8552d7f`+ | the current runtime |
+| memory-profile delta vs `main` (+0.016 MiB) | `c8552d7f`+ | the current runtime |
+| RPi5 paired regression run 34312448750 | `a7af610` | superseded; re-run required |
 
 ## Open risks
 

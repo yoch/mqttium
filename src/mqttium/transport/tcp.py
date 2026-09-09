@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import socket
+import sys
 from contextlib import suppress
 from typing import Any
 
 from mqttium.transport._push import DecoderPushProtocol, PushStreamTransport
-from mqttium.transport._stream import StreamTransport
+from mqttium.transport._stream import StreamTransport, StreamTransportBase
 
 
 class TcpTransport(StreamTransport):
@@ -21,10 +22,10 @@ class TcpTransport(StreamTransport):
         port: int,
         *,
         ssl: Any = None,
-    ) -> StreamTransport:
+    ) -> StreamTransportBase:
         loop = asyncio.get_running_loop()
         if ssl is None and _is_stdlib_selector_loop(loop):
-            transport: StreamTransport = await _connect_push(loop, host, port)
+            transport: StreamTransportBase = await _connect_push(loop, host, port)
         else:
             # TLS receives through SSLProtocol, which does not expose the raw
             # socket to a BufferedProtocol; Proactor and third-party loops keep
@@ -38,12 +39,14 @@ class TcpTransport(StreamTransport):
 def _is_stdlib_selector_loop(loop: asyncio.AbstractEventLoop) -> bool:
     """Whether this loop is a stdlib selector loop with the measured recv_into path.
 
-    Deliberately narrower than ``isinstance(loop, SelectorEventLoop)``: a
-    third-party subclass may install its own transport, and only the stdlib one
-    is covered by the evidence behind this path.
+    Deliberately narrower than ``isinstance(loop, SelectorEventLoop)``. A
+    third-party subclass may install its own transport, and the allocator
+    evidence behind this path is CPython-only, so neither is generalised to.
     """
-    return isinstance(loop, asyncio.SelectorEventLoop) and type(loop).__module__.startswith(
-        "asyncio."
+    return (
+        sys.implementation.name == "cpython"
+        and isinstance(loop, asyncio.SelectorEventLoop)
+        and type(loop).__module__.startswith("asyncio.")
     )
 
 
@@ -57,7 +60,7 @@ async def _connect_push(
     return PushStreamTransport(reader, writer, protocol)
 
 
-def _set_nodelay(transport: StreamTransport) -> None:
+def _set_nodelay(transport: StreamTransportBase) -> None:
     sock = transport._writer.get_extra_info("socket")
     if sock is not None:
         with suppress(OSError):

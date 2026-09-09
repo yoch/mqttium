@@ -35,6 +35,8 @@ _MIN_CAPACITY = 16 * 1024
 _INITIAL_WINDOW = 64 * 1024
 # Consecutive completely-filled windows before offering a larger one.
 _PROMOTE_AFTER = 4
+# A single frame above this is evidence the workload needs a large slab.
+_LARGE_FRAME = DEFAULT_CAPACITY
 # Above this, size the slab to the head frame's exact extent instead of doubling
 # past it. Doubling wastes up to a whole frame on multi-MiB traffic.
 _EXACT_FRAME_THRESHOLD = 512 * 1024
@@ -74,6 +76,7 @@ class IncrementalDecoder:
         "_capacity",
         "_idle_drains",
         "_window_peak",
+        "_drain_had_large_frame",
         "_offered",
         "_target_window",
         "_full_fills",
@@ -92,6 +95,7 @@ class IncrementalDecoder:
         self._capacity = 0
         self._idle_drains = 0
         self._window_peak = 0
+        self._drain_had_large_frame = False
         self._offered = 0
         self._target_window = _INITIAL_WINDOW
         self._full_fills = 0
@@ -142,6 +146,9 @@ class IncrementalDecoder:
             # doubling: a frame just over a step would otherwise cost a whole
             # extra frame of slab.
             capacity = exact_total if exact_total > live + need else live + need
+        elif need >= _EXACT_FRAME_THRESHOLD:
+            # feed() was handed this much in one call, so it is the exact need.
+            capacity = live + need
         else:
             while capacity - live < need:
                 capacity *= 2
@@ -156,15 +163,20 @@ class IncrementalDecoder:
         self._reallocate(capacity)
 
     def _retire_oversize(self, extent: int) -> None:
-        """Shrink an oversized slab to the peak actually used over a window.
+        """Shrink an oversized slab once large frames stop arriving.
 
-        ``extent`` is how far this drain reached. Keying off the reallocation
-        that created the slab would be wrong: later oversized frames fit without
-        reallocating and would look idle. Keying off a single threshold would be
-        too coarse the other way -- coalesced small frames routinely exceed
-        `DEFAULT_CAPACITY`, which would pin a multi-MiB slab for a workload that
-        only ever needs a few hundred KiB. So track the peak and fit to it.
+        Two different things must not be confused. A drain that consumed a
+        genuinely large *frame* is evidence the workload still needs the room,
+        and resets the window. Aggregate pressure from coalesced small frames is
+        not: it routinely exceeds `DEFAULT_CAPACITY` without any single frame
+        doing so, and counting it as use pins a multi-MiB slab for a workload
+        that needs a few hundred KiB.
         """
+        if self._drain_had_large_frame:
+            self._drain_had_large_frame = False
+            self._idle_drains = 0
+            self._window_peak = 0
+            return
         if extent > self._window_peak:
             self._window_peak = extent
         self._idle_drains += 1
@@ -224,11 +236,15 @@ class IncrementalDecoder:
             # asking for a full window past the end of a known large frame is
             # what makes the slab double past the frame it is receiving.
             total = self._known_frame_total()
-            if total is not None and total >= _EXACT_FRAME_THRESHOLD:
+            if total is not None:
+                # Only an *incomplete* head has a remainder, so this never
+                # shrinks the window for ordinary complete-frame traffic. Asking
+                # for more than the head still needs is what grows the slab past
+                # the frame it is receiving.
+                exact = total
                 remaining = total - (self._end - self._start)
                 if 0 < remaining < want:
                     want = remaining
-                exact = total
         self._ensure(want, exact)
         end = self._end
         limit = end + want
@@ -319,6 +335,8 @@ class IncrementalDecoder:
     def consume_peeked_packet(self, body_end: int) -> None:
         """Commit a frame previously returned by :meth:`peek_packet_bounds`."""
         assert self._start < body_end <= self._end
+        if body_end - self._start > _LARGE_FRAME:
+            self._drain_had_large_frame = True
         self._start = body_end
         if self._start == self._end:
             self._reset()
@@ -364,6 +382,7 @@ class IncrementalDecoder:
         self._end = 0
         self._idle_drains = 0
         self._window_peak = 0
+        self._drain_had_large_frame = False
         self._offered = 0
         self._target_window = _INITIAL_WINDOW
         self._full_fills = 0
@@ -429,6 +448,8 @@ class IncrementalDecoder:
         else:
             body = bytes(buf[body_start:body_end])
         self._start = body_end
+        if total > _LARGE_FRAME:
+            self._drain_had_large_frame = True
         if body_end == self._end:
             self._start = 0
             self._end = 0

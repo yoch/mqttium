@@ -443,7 +443,7 @@ def test_coalesced_small_frames_do_not_pin_a_multi_mib_slab() -> None:
     decoder.feed(_publish(4 * 1024 * 1024))
     assert decoder.next_packet() is not None
     grown = decoder.capacity
-    assert grown >= 8 * 1024 * 1024
+    assert grown > 2 * 1024 * 1024
 
     batch = _publish(64 * 1024) * 5  # ~320 KiB live per drain, all small frames
     for _ in range(4 * _OVERSIZE_RETENTION):
@@ -488,21 +488,102 @@ def test_commit_is_bounded_by_the_window_that_was_offered() -> None:
         decoder.commit(offered + 1)
 
 
-def test_a_large_frame_is_sized_exactly_rather_than_doubled_past() -> None:
-    # Doubling costs a whole extra frame when the frame sits just above a step.
-    limit = 4 * 1024 * 1024
-    decoder = IncrementalDecoder(max_packet_size=limit)
-    frame = _publish(limit - 200)
+@pytest.mark.parametrize(
+    "payload",
+    [
+        512 * 1024 - 4096,  # just under a power of two
+        512 * 1024,
+        1024 * 1024,
+        1024 * 1024 + 4096,  # just over
+        2 * 1024 * 1024 + 4096,
+        8 * 1024 * 1024,
+        16 * 1024 * 1024 - 1024,  # near max_packet_size
+    ],
+)
+def test_a_large_frame_is_sized_exactly_rather_than_doubled_past(payload: int) -> None:
+    # Doubling costs a whole extra frame when the frame sits just above a step,
+    # and growing by the exact need each time would be quadratic in bytes copied.
+    decoder = IncrementalDecoder(max_packet_size=16 * 1024 * 1024)
+    frame = _publish(payload)
+    reallocations = 0
+    original = IncrementalDecoder._reallocate
 
-    offset = 0
-    while offset < len(frame):
-        window = decoder.writable_window()
-        take = min(len(window), 4096, len(frame) - offset)
-        window[:take] = frame[offset : offset + take]
-        window.release()
-        decoder.commit(take)
-        offset += take
+    def counting(self: IncrementalDecoder, capacity: int) -> None:
+        nonlocal reallocations
+        reallocations += 1
+        original(self, capacity)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(IncrementalDecoder, "_reallocate", counting)
+        offset = 0
+        while offset < len(frame):
+            window = decoder.writable_window()
+            take = min(len(window), 4096, len(frame) - offset)
+            window[:take] = frame[offset : offset + take]
+            window.release()
+            decoder.commit(take)
+            offset += take
 
     assert decoder.next_packet() is not None
-    assert decoder.capacity < 2 * len(frame)
-    assert decoder.capacity >= len(frame)
+    assert len(frame) <= decoder.capacity < len(frame) * 5 // 4
+    assert reallocations <= 8  # geometric, not one per receive
+
+
+def test_complete_small_frames_keep_a_full_window_on_a_retained_slab() -> None:
+    # The window is only capped for an *incomplete* head; ordinary traffic on a
+    # slab left large must not be turned into tiny receives.
+    decoder = IncrementalDecoder(max_packet_size=16 * 1024 * 1024)
+    decoder.feed(_publish(4 * 1024 * 1024))
+    assert decoder.next_packet() is not None
+    decoder.feed(_publish(200) * 10)
+
+    window = decoder.writable_window()
+    assert len(window) == _INITIAL_WINDOW
+    window.release()
+
+
+@pytest.mark.parametrize(
+    ("name", "expect_retained"),
+    [
+        ("sparse_tiny", False),
+        ("sustained_tiny", False),
+        ("coalesced", False),
+        ("repeated_huge", True),
+        ("alternating", True),
+    ],
+)
+def test_retention_distinguishes_large_frame_evidence_from_aggregate_pressure(
+    name: str, expect_retained: bool
+) -> None:
+    huge = _publish(4 * 1024 * 1024)
+    tiny = _publish(200)
+    coalesced = _publish(64 * 1024) * 5
+
+    def drain(decoder: IncrementalDecoder, frame: bytes, times: int = 1) -> None:
+        for _ in range(times):
+            decoder.feed(frame)
+            while decoder.next_packet() is not None:
+                pass
+
+    decoder = IncrementalDecoder(max_packet_size=16 * 1024 * 1024)
+    drain(decoder, huge)
+    grown = decoder.capacity
+    assert grown > 2 * 1024 * 1024
+
+    if name == "sparse_tiny":
+        drain(decoder, tiny, _OVERSIZE_RETENTION + 2)
+    elif name == "sustained_tiny":
+        drain(decoder, tiny, 10 * _OVERSIZE_RETENTION)
+    elif name == "coalesced":
+        drain(decoder, coalesced, 4 * _OVERSIZE_RETENTION)
+    elif name == "repeated_huge":
+        drain(decoder, huge, 3 * _OVERSIZE_RETENTION)
+    else:
+        for _ in range(20):
+            drain(decoder, huge)
+            drain(decoder, tiny, 30)
+
+    if expect_retained:
+        assert decoder.capacity == grown
+    else:
+        assert decoder.capacity < grown // 4

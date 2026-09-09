@@ -228,3 +228,23 @@ connected instead of reconnecting per call.
 
 MQTTium is original Apache-2.0 code. Paho and gmqtt are referenced for API and
 behavioural comparison; their protocol engines are not copied.
+
+## Transport receive capabilities
+
+`AsyncTransport` no longer declares `read()`. Receiving is a capability, and a
+transport implements exactly one:
+
+- `PullTransport` — `async def read(self, n: int = 65536) -> bytes`
+- `DecoderPushTransport` — `def attach_decoder(self, decoder)` plus
+  `async def receive(self) -> bool`
+
+Both are exported from `mqttium.transport` and are runtime-checkable, so a
+consumer resolves the capability with `isinstance` and never has to guess. A
+push-capable transport has no `read()` at all, so the two checks cannot both
+succeed.
+
+Custom transports that previously satisfied `AsyncTransport` by providing
+`read()` now satisfy `AsyncTransport` *and* `PullTransport`, and need no change.
+Code that annotated `AsyncTransport` and called `.read()` should annotate
+`PullTransport` instead.
+

@@ -14,7 +14,13 @@ from mqttium.transport._push import (
     DecoderPushProtocol,
     PushStreamTransport,
 )
-from mqttium.transport._stream import DecoderPushTransport, StreamTransport
+from mqttium.transport._stream import (
+    AsyncTransport,
+    DecoderPushTransport,
+    PullTransport,
+    StreamTransport,
+    StreamTransportBase,
+)
 from mqttium.transport.tcp import TcpTransport
 
 
@@ -161,11 +167,27 @@ async def test_eof_delivers_buffered_bytes_before_becoming_terminal() -> None:
     assert await transport.receive() is False
 
 
-async def test_read_is_refused_so_a_stale_caller_cannot_hang() -> None:
+def test_a_push_transport_is_not_pull_capable() -> None:
+    # A capability that passes a structural check but refuses its own operation
+    # is not a contract. A push transport has no read() at all.
+    assert not hasattr(PushStreamTransport, "read")
+    assert issubclass(PushStreamTransport, StreamTransportBase)
+    assert not issubclass(PushStreamTransport, StreamTransport)
+
+
+async def test_the_two_receive_capabilities_are_exclusive() -> None:
     protocol, _ = _wire(IncrementalDecoder())
-    transport = PushStreamTransport(asyncio.StreamReader(), None, protocol)  # type: ignore[arg-type]
-    with pytest.raises(RuntimeError, match="use receive"):
-        await transport.read(1024)
+    push = PushStreamTransport(asyncio.StreamReader(), None, protocol)  # type: ignore[arg-type]
+    pull = StreamTransport(asyncio.StreamReader(), None)  # type: ignore[arg-type]
+
+    assert isinstance(push, DecoderPushTransport)
+    assert not isinstance(push, PullTransport)
+    assert isinstance(pull, PullTransport)
+    assert not isinstance(pull, DecoderPushTransport)
+
+    # Both still satisfy the common contract.
+    for transport in (push, pull):
+        assert isinstance(transport, AsyncTransport)
 
 
 async def test_cleartext_connect_uses_the_push_path_only_on_a_selector_loop() -> None:
@@ -209,14 +231,12 @@ async def test_cleartext_connect_uses_the_push_path_only_on_a_selector_loop() ->
         listener.close()
 
 
-async def test_tls_keeps_the_stream_path() -> None:
-    # TLS receives through SSLProtocol, which never exposes the socket to a
-    # BufferedProtocol, so it must keep feed().
-    from mqttium.transport._stream import StreamTransport
-
-    assert PushStreamTransport.__mro__[1] is StreamTransport
+def test_tls_and_websocket_keep_the_pull_capability() -> None:
+    # They receive through SSLProtocol / their own framing, which never expose
+    # the socket to a BufferedProtocol, so they must keep read() + feed().
     assert not hasattr(StreamTransport, "attach_decoder")
     assert not hasattr(StreamTransport, "receive")
+    assert hasattr(StreamTransport, "read")
 
 
 async def test_detach_stops_a_torn_down_connection_writing_into_the_decoder() -> None:
