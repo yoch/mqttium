@@ -48,23 +48,24 @@ callable that returns an awaitable violates the callback contract and is reporte
 as a callback `TypeError` rather than being scheduled implicitly. Synchronous
 callbacks must not block the event loop.
 
-Eligible idle `on_publish` and direct `on_message` callbacks may execute inline.
-Without topic filters, callback-only delivery of an adjacent pair of small
-synchronous messages may run in the same effect-drain turn while retaining the
-hard `max_pending_callbacks` bound. Topic-filtered routes always use the bounded
-worker, including fully synchronous routes and their fallback. Larger bursts,
-declared-async callbacks, and queued/reentrant delivery also use the worker.
-Callback failures go to the event loop's exception handler without silently
-changing protocol state.
+Eligible idle `on_publish` and message callbacks may execute inline. For
+callback-only message delivery, an adjacent pair of small synchronous messages may
+run in the same effect-drain turn while retaining the hard
+`max_pending_callbacks` bound. Larger bursts, declared-async callbacks, and
+queued/reentrant delivery use the bounded worker. Callback failures go to the event
+loop's exception handler without silently changing protocol state.
 
 Matching `message_callback_add` filters run instead of `on_message`, in
 registration order. Shared-subscription filters match the filter string
-literally, as in Paho. Each routed message resolves the current configuration
-when its callback job starts, then keeps that message's matching callbacks across
-awaits. Reconfiguration affects later routed messages, including messages already
-queued; removing the last filter makes captured routes use the current fallback.
-Direct callbacks captured without a router keep their existing batch semantics.
-Iterator-only delivery ignores callbacks, including topic filters.
+literally, as in Paho. Each routed message resolves the live configuration when
+its dispatcher starts and keeps that message's matching callbacks across awaits.
+Later routed messages, including already queued messages, see updated filters
+and fallback. Eligible synchronous routes remain inline. If an inline burst's
+route becomes asynchronous, only its unstarted tail transfers to the bounded
+worker, ahead of work admitted reentrantly by the earlier callback. No callback
+prefix is replayed. Direct callbacks captured without a router keep their
+existing batch semantics. Iterator-only delivery ignores callbacks, including
+topic filters.
 
 ## Loop confinement
 

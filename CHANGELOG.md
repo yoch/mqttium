@@ -8,13 +8,13 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
-- Preserve callback delivery when topic filters or their fallback change from
-  synchronous to asynchronous while messages are queued or a burst is being
-  delivered (#453). A captured internal router no longer closes valid `async def`
-  callbacks as contract violations after QoS1 has already been acknowledged.
-  Topic-filtered routes now consistently use the existing bounded worker; direct
-  non-filtered callback fast paths and strict user callable-form checks remain.
-  See the callback migration guidance for the scheduling change.
+- Preserve delivery across live sync-to-async topic-callback reconfiguration
+  without disabling eligible synchronous inline dispatch (#453). A captured sync
+  router checks its current execution mode before invoking user callbacks. Only
+  unstarted work whose route became asynchronous transfers to the bounded worker,
+  retaining FIFO ahead of reentrant admissions and the callback queue bound.
+  Queued work redirects within its existing worker job. User synchronous callbacks
+  returning awaitables remain contract violations.
 
 ### Changed
 

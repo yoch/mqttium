@@ -19,7 +19,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from itertools import islice
 from typing import Any, Literal, Never, TypeVar
 
-from mqttium.api._delivery import ApplicationDelivery, MessageDelivery
+from mqttium.api._delivery import ApplicationDelivery, MessageDelivery, _CallbackHandoff
 from mqttium.api._effects import EffectPump, StaleConnectionEffect
 from mqttium.api._writer import WritePump
 from mqttium.api.models import (
@@ -398,6 +398,7 @@ class AsyncClient:
         self._try_enqueue_callback = self._delivery.try_enqueue_callback
         self._try_dispatch_callback_inline = self._delivery.try_dispatch_callback_inline
         self._dispatch_callback_inline = self._delivery.dispatch_callback_inline
+        self._run_sync_callback = self._delivery.run_sync_callback
         self._can_dispatch_callback_inline = self._delivery.can_dispatch_callback_inline
         self._has_callback_capacity = self._delivery.has_callback_capacity
         self._enqueue_callback_repeated_nowait = self._delivery.enqueue_callback_repeated_nowait
@@ -446,6 +447,8 @@ class AsyncClient:
         self._on_message: OnMessage | None = None
         self._message_callback: OnMessage | None = None
         self._topic_callbacks: TopicMatcher | None = None
+        self._topic_async_callbacks = 0
+        self._topic_route_is_async = False
         self.on_connect: OnConnect | None = None
         self.on_disconnect: OnDisconnect | None = None
         self.on_publish: OnPublish | None = None
@@ -1603,9 +1606,21 @@ class AsyncClient:
         self._refresh_message_callback()
 
     def _refresh_message_callback(self) -> None:
-        """Keep captured topic routes safe across later configuration changes."""
+        """Select a statically sync or async topic route on configuration changes."""
+        matcher = self._topic_callbacks
+        fallback = self._on_message
+        route_is_async = self._topic_async_callbacks > 0 or (
+            fallback is not None and self._delivery._is_async_callback(fallback)
+        )
+        # Captured sync routers also survive removal of the final filter.
+        self._topic_route_is_async = route_is_async
+        if matcher is None:
+            self._message_callback = fallback
+            return
         self._message_callback = (
-            self._on_message if self._topic_callbacks is None else self._dispatch_topic_message
+            self._dispatch_topic_message_async
+            if route_is_async
+            else self._dispatch_topic_message_sync
         )
 
     def message_callback_add(self, topic_filter: str, callback: OnMessage) -> None:
@@ -1621,7 +1636,17 @@ class AsyncClient:
         if matcher is None:
             matcher = TopicMatcher()
             self._topic_callbacks = matcher
+        else:
+            try:
+                previous = matcher[topic_filter]
+            except KeyError:
+                pass
+            else:
+                if self._delivery._is_async_callback(previous):
+                    self._topic_async_callbacks -= 1
         matcher[topic_filter] = callback
+        if self._delivery._is_async_callback(callback):
+            self._topic_async_callbacks += 1
         self._refresh_message_callback()
 
     def message_callback_remove(self, topic_filter: str) -> None:
@@ -1630,20 +1655,36 @@ class AsyncClient:
         if matcher is None:
             return
         try:
-            del matcher[topic_filter]
+            callback = matcher[topic_filter]
         except KeyError:
             return
+        del matcher[topic_filter]
+        if self._delivery._is_async_callback(callback):
+            self._topic_async_callbacks -= 1
         if not matcher:
             self._topic_callbacks = None
+            self._topic_async_callbacks = 0
         self._refresh_message_callback()
 
-    async def _dispatch_topic_message(self, message: Message) -> None:
-        """Resolve live routes in one bounded worker job, never a stale sync router.
+    def _dispatch_topic_message_sync(self, message: Message) -> None:
+        """Keep steady-state sync routing inline; hand off only a stale route."""
+        if self._topic_route_is_async:
+            # No user callback for this message has started. Delivery can
+            # transfer the unstarted job without replaying a callback prefix.
+            raise _CallbackHandoff(self._dispatch_topic_message_async)
+        matcher = self._topic_callbacks
+        if matcher is not None:
+            callbacks = tuple(matcher.iter_match(message.topic))
+            if callbacks:
+                for callback in callbacks:
+                    self._run_sync_callback(callback, message)
+                return
+        callback = self._on_message
+        if callback is not None:
+            self._run_sync_callback(callback, message)
 
-        Capture matches once per message, preserving registration order across
-        awaits. Later messages resolve the updated matcher and fallback. Jobs
-        already holding this router remain valid after the last filter is removed.
-        """
+    async def _dispatch_topic_message_async(self, message: Message) -> None:
+        """Dispatch a route containing at least one declared-async callback."""
         matcher = self._topic_callbacks
         if matcher is not None:
             callbacks = tuple(matcher.iter_match(message.topic))

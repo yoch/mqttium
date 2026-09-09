@@ -185,7 +185,7 @@ async def test_async_topic_callback() -> None:
     await client._shutdown_callback_worker(drain=False)
 
 
-async def test_idle_sync_topic_callback_uses_worker_outside_engine_lock() -> None:
+async def test_idle_sync_topic_callback_runs_inline() -> None:
     client = AsyncClient(client_id="topic-inline", message_delivery="callback")
     seen: list[tuple[str, bool]] = []
     client.message_callback_add(
@@ -201,15 +201,9 @@ async def test_idle_sync_topic_callback_uses_worker_outside_engine_lock() -> Non
         client._collect_effects_locked()
         assert seen == []
 
-    try:
-        client._drain_effects_inline()
-        assert seen == []
-        assert client._callback_worker_task is not None
-        await asyncio.wait_for(client._callback_queue.join(), timeout=2)
-        assert seen == [("inline/message", False)]
-        assert client.stats().delivery.callback_queued == 0
-    finally:
-        await client._shutdown_callback_worker(drain=False)
+    client._drain_effects_inline()
+    assert seen == [("inline/message", False)]
+    assert client._callback_worker_task is None
 
 
 async def test_overlapping_async_topic_callbacks_run_in_order() -> None:
