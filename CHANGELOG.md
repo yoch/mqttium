@@ -8,6 +8,11 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Keep replacement-connection callbacks alive when a callback disconnects and
+  reconnects before its own worker job returns (#455). Reopening retires the old
+  queued work and its reservations before admitting the new connection, without
+  replacing the active worker or changing steady-state callback dispatch.
+
 - Preserve delivery across live sync-to-async topic-callback reconfiguration
   without disabling eligible synchronous inline dispatch (#453). A captured sync
   router checks its current execution mode before invoking user callbacks. Only

@@ -483,6 +483,12 @@ class ApplicationDelivery:
         )
 
     def reopen(self) -> None:
+        if self._callback_stop:
+            # A callback can disconnect and reconnect before its own job ends.
+            # Retire only the old queued work now; the same worker must not
+            # discard deliveries admitted by the replacement connection.
+            self._discard_callback_queue()
+            self._callback_stop = False
         self.closed.clear()
 
     def close(self) -> None:
@@ -901,9 +907,7 @@ class ApplicationDelivery:
             # The tail already precedes anything admitted by the first
             # callback. Transfer its reservation to a real front-of-queue job.
             tail = messages[index:]
-            self._prepend_callback_job(
-                (handoff.callback, (tail,), _CALLBACK_MESSAGE_BATCH), len(tail)
-            )
+            self._prepend_callback_job((handoff.callback, (tail,), _CALLBACK_MESSAGE_BATCH))
 
     def dispatch_callback_inline(self, callback: Callable[..., Any], *args: Any) -> None:
         """Invoke a callback after the caller established inline eligibility."""
@@ -914,9 +918,9 @@ class ApplicationDelivery:
             finally:
                 self._callback_active = False
         except _CallbackHandoff as handoff:
-            self._prepend_callback_job((handoff.callback, args, None), 1)
+            self._prepend_callback_job((handoff.callback, args, None))
 
-    def _prepend_callback_job(self, job: CallbackJob, count: int) -> None:
+    def _prepend_callback_job(self, job: CallbackJob) -> None:
         """Transfer unstarted inline work ahead of reentrant admissions.
 
         Only the cold route-change path uses this operation. Queue.put_nowait
@@ -926,7 +930,10 @@ class ApplicationDelivery:
         before admission so an eager task factory parks on the empty queue,
         rather than executing user code before its task ownership is installed.
         """
-        if count > self._callback_batch_capacity(False):
+        # Derive logical capacity from the job, never from a second count that
+        # could disagree with the worker/discard path's release accounting.
+        count = len(job[1][0]) if job[2] is _CALLBACK_MESSAGE_BATCH else 1
+        if not 0 < count <= self._callback_batch_capacity(False):
             raise RuntimeError("callback handoff exceeds its reserved capacity")
         self.ensure_callback_worker()
         self.callback_queue.put_nowait(job)
