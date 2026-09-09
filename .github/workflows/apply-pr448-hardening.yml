@@ -17,17 +17,17 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          fetch-depth: 2
+          fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
           python-version: '3.13'
-      - name: Apply the independently checked patch to its exact parent
+      - name: Apply the independently checked patch to unchanged parent sources
         shell: bash
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          test "$(git rev-parse HEAD^)" = b7b1e77cb747d8de4c7b8d2725e3f09abf95e101
+          git diff --exit-code b7b1e77cb747d8de4c7b8d2725e3f09abf95e101 -- src tests tools docs benchmarks CHANGELOG.md
           python - <<'PY'
           import hashlib, os
           from pathlib import Path
@@ -39,6 +39,22 @@ jobs:
           PY
           git apply --check "$RUNNER_TEMP/reviewed-hardening.patch"
           git apply "$RUNNER_TEMP/reviewed-hardening.patch"
+          python - <<'PY'
+          import hashlib
+          from pathlib import Path
+          from textwrap import dedent
+          p = Path('tools/recv_arch_rtt_probe.py')
+          s = p.read_text()
+          start = s.index('async def arm_445(sock: socket.socket):')
+          cls_start = s.index('    class Protocol(asyncio.BufferedProtocol):', start)
+          cls_end = s.index('    transport, protocol = await loop.create_connection(Protocol, sock=sock)', cls_start)
+          cls = dedent(s[cls_start:cls_end]).replace('class Protocol(', 'class _ChunkQueueProtocol(').replace('def __init__(self) -> None:', 'def __init__(self, loop: asyncio.AbstractEventLoop) -> None:').replace('        self.buf = bytearray(_RECV)', '        self._loop = loop\n        self.buf = bytearray(_RECV)').replace('self.waiter = loop.create_future()', 'self.waiter = self._loop.create_future()')
+          arm = 'async def arm_445(sock: socket.socket):\n    loop = asyncio.get_running_loop()\n\n'
+          s = s[:start] + cls + '\n' + arm + s[cls_end:]
+          s = s.replace('transport, protocol = await loop.create_connection(Protocol, sock=sock)', 'transport, protocol = await loop.create_connection(lambda: _ChunkQueueProtocol(loop), sock=sock)')
+          assert hashlib.sha256(s.encode()).hexdigest() == '8b69cad5048d9fd14f03f649a520244b4df2d19b17249679927e5a9d80c99661'
+          p.write_text(s)
+          PY
           git rm .github/pr448-hardening.changes .github/workflows/apply-pr448-hardening.yml
       - name: Install validation dependencies
         run: python -m pip install -e '.[dev,fuzz,security,docs]'
