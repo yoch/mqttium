@@ -228,3 +228,72 @@ connected instead of reconnecting per call.
 
 MQTTium is original Apache-2.0 code. Paho and gmqtt are referenced for API and
 behavioural comparison; their protocol engines are not copied.
+
+## Transport receive capabilities
+
+`AsyncTransport` no longer declares `read()`. Receiving is a capability, and a
+transport implements exactly one:
+
+- `PullTransport` — `async def read(self, n: int = 65536) -> bytes`
+- `DecoderPushTransport` — `def attach_decoder(self, decoder)` plus
+  `async def receive(self) -> bool`
+
+Both are exported from `mqttium.transport` and are runtime-checkable, so a
+consumer resolves the capability with `isinstance` and never has to guess. A
+push-capable transport has no `read()` at all, so the two checks cannot both
+succeed.
+
+Custom transports that previously satisfied `AsyncTransport` by providing
+`read()` now satisfy `AsyncTransport` *and* `PullTransport`, and need no change.
+Code that annotated `AsyncTransport` and called `.read()` should annotate
+`PullTransport` instead.
+
+## Decoder storage and ingress contract
+
+The decoder's slab is reusable but not fixed-size. It grows progressively with
+received data, at most geometrically, and a valid known **incomplete** head-frame
+extent caps that growth. A complete head must not cap storage for following
+frames; an explicit backlog of several frames retains amortised growth even
+when its total exceeds the per-packet ceiling. The announced Remaining Length
+is **not** a request to reserve the entire body immediately. This avoids multi-MiB
+allocations after just a header, without introducing timers, global budgets, or
+an additional framing engine.
+
+Both `feed()` and direct ingress use this sizing policy. `feed()` must still
+accept all bytes handed to it, including multiple frames in one call; a packet
+size limit is not a limit on the size of an explicit feed. Contiguous typed or
+multidimensional memoryviews are interpreted as bytes without an intermediate
+payload copy. Non-contiguous views are flattened in logical order; that unusual
+input necessarily needs a temporary contiguous representation. The caller's
+view remains usable. Application payloads and raw packet bodies remain owned
+immutable `bytes`.
+
+`writable_window(preferred)` asks for the larger of the adaptive receive target
+and the preference. It can return fewer bytes at a known incomplete frame's end.
+It is neither a minimum-length guarantee nor a strict upper-bound argument.
+Normal transport calls remain capped by `RECEIVE_QUANTUM`; an explicit larger
+preference is supported for internal integrations. Use the actual view length.
+Write into one window, drop the view, and commit its written bytes before any
+other decoder operation. Do not retain a window across compaction, clear,
+consumption, or another receive request.
+
+Compaction and growth copy through byte-oriented memoryview destinations; they
+do not create a second buffer the size of the live data. Growth still briefly
+holds the old and new slabs, and packet delivery still materializes owned bytes.
+A first fragmented large frame may require several geometric growth steps;
+subsequent large frames reuse the capacity. Tests bound total bytes copied and
+capacity, not an unsafe promise to allocate every announced frame in two steps.
+
+Retirement remains based on 64 drains since the last genuinely large frame,
+sized to the recent peak of simultaneously buffered bytes and the adaptive
+receive target, not to offsets that include already-consumed traffic. It is not
+an idle timer: a slab retained after real large traffic can remain while idle.
+`clear()` resets connection state and releases oversized capacity. Configure
+`max_packet_size` for the deployment; inbound/delivery queue budgets do not
+include decoder capacity, transient copies, or buffers owned by the OS.
+
+Transport factories must return **exactly one** receive capability. A result
+with neither or both now raises `TypeError` locally before CONNECT or task
+startup and is closed by the connection failure path. Previously such a local
+configuration error could appear as a CONNACK timeout. Existing pull-only and
+push-only transports are unchanged.

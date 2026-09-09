@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from mqttium.transport.stats import TransportStats
 
@@ -16,16 +16,41 @@ def write_buffer_needs_drain(writer: asyncio.StreamWriter) -> bool:
     return transport is not None and transport.get_write_buffer_size() > _WRITE_BUFFER_HIGH_WATER
 
 
+@runtime_checkable
 class AsyncTransport(Protocol):
+    """What every transport can do. Receiving is a separate capability."""
+
     async def write(self, data: bytes) -> None: ...
     async def write_many(self, parts: list[bytes]) -> None: ...
-    async def read(self, n: int = 65536) -> bytes: ...
     async def close(self) -> None: ...
     def is_closing(self) -> bool: ...
 
 
-class StreamTransport:
-    """Common StreamReader/StreamWriter transport implementation."""
+@runtime_checkable
+class PullTransport(Protocol):
+    """Receive capability: the caller asks for the next bytes."""
+
+    async def read(self, n: int = 65536) -> bytes: ...
+
+
+@runtime_checkable
+class DecoderPushTransport(Protocol):
+    """Receive capability: the transport commits into the decoder's storage.
+
+    Exclusive with :class:`PullTransport`. A transport offering this has no
+    ``read()`` at all, so neither capability check can misclassify it.
+    """
+
+    def attach_decoder(self, decoder: object) -> None: ...
+    async def receive(self) -> bool: ...
+
+
+class StreamTransportBase:
+    """Write and lifecycle half, shared by both receive capabilities.
+
+    Deliberately has no ``read()``: a push transport that inherited one would
+    satisfy the pull capability structurally while refusing to honour it.
+    """
 
     __slots__ = ("_reader", "_writer")
 
@@ -75,9 +100,6 @@ class StreamTransport:
     async def drain(self) -> None:
         await self._writer.drain()
 
-    async def read(self, n: int = 65536) -> bytes:
-        return await self._reader.read(n)
-
     async def close(self) -> None:
         self._writer.close()
         with suppress(Exception):
@@ -105,3 +127,12 @@ class StreamTransport:
     async def _drain_if_needed(self) -> None:
         if write_buffer_needs_drain(self._writer):
             await self._writer.drain()
+
+
+class StreamTransport(StreamTransportBase):
+    """Pull-capable asyncio stream transport."""
+
+    __slots__ = ()
+
+    async def read(self, n: int = 65536) -> bytes:
+        return await self._reader.read(n)

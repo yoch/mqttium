@@ -89,7 +89,7 @@ def test_invalid_qos0_packet_uses_engine_error_translation() -> None:
     client = _client()
     client._decoder.feed(_publish("one"))
     # PUBLISH QoS 0 with an incomplete UTF-8 topic length field.
-    client._decoder._buf.extend(b"\x30\x01\x00")
+    client._decoder.feed(b"\x30\x01\x00")
 
     handled, _, _, captured, _ = client._process_direct_qos0_batch()
 

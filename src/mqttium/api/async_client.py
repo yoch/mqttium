@@ -75,7 +75,7 @@ from mqttium.protocol.outbound import _PreparedPublish
 from mqttium.protocol.reconnect import ReconnectPolicy
 from mqttium.persistence.memory import InflightStore
 from mqttium.topics import validate_subscribe_filter
-from mqttium.transport._stream import AsyncTransport
+from mqttium.transport._stream import AsyncTransport, DecoderPushTransport, PullTransport
 from mqttium.transport.tcp import TcpTransport
 from mqttium.transport.unix import UnixSocketTransport
 from mqttium.transport.websocket import WebSocketTransport
@@ -1059,11 +1059,25 @@ class AsyncClient:
             except TimeoutError as exc:
                 raise MQTTTimeoutError("Transport connection timed out") from exc
             self._transport = transport
+            # Reject a misconfigured factory before CONNECT or background tasks.
+            # Assign first so the normal failure cleanup closes the transport.
+            push = isinstance(transport, DecoderPushTransport)
+            pull = isinstance(transport, PullTransport)
+            if push == pull:
+                raise TypeError(
+                    f"{type(transport).__name__} must offer exactly one receive capability: "
+                    "PullTransport or DecoderPushTransport"
+                )
             self._delivery.reopen()
             self._disconnect_exc = None
             self._teardown_final = False
             self._last_disconnect = None
             self._decoder.clear()
+            if isinstance(transport, DecoderPushTransport):
+                # This transport receives straight into the decoder's storage.
+                # It stays paused until attached, so nothing is read before the
+                # decoder is ready for the new connection.
+                transport.attach_decoder(self._decoder)
             self._write_pump.reset()
             self._ping_pending = False
             connect_packet = self._engine.begin_connect()
@@ -1943,12 +1957,28 @@ class AsyncClient:
             MQTTProtocolVersion.MQTTv311,
             MQTTProtocolVersion.MQTTv5,
         )
+        # Receiving is a capability, and the two are exclusive: a push
+        # transport has already placed the bytes in the decoder by the time it
+        # reports them, so there is nothing to feed.
+        push: DecoderPushTransport | None = None
+        pull: PullTransport | None = None
+        if isinstance(self._transport, DecoderPushTransport):
+            push = self._transport
+        elif isinstance(self._transport, PullTransport):
+            pull = self._transport
+        else:  # pragma: no cover - a transport must offer one of the two
+            raise TypeError(f"{type(self._transport).__name__} offers no receive capability")
         try:
             while not self._transport.is_closing():
-                data = await self._transport.read(256 * 1024)
-                if not data:
-                    break
-                self._decoder.feed(data)
+                if push is not None:
+                    if not await push.receive():
+                        break
+                else:
+                    assert pull is not None
+                    data = await pull.read(256 * 1024)
+                    if not data:
+                        break
+                    self._decoder.feed(data)
                 # Process one bounded packet batch at a time. Applying its
                 # effects before decoding the next batch propagates delivery
                 # byte backpressure all the way to transport.read().

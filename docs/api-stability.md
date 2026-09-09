@@ -31,7 +31,12 @@ a future minor release with a changelog entry and migration guidance:
 - `ClientStats` and its nested immutable snapshot dataclasses;
 - `mqttium.compat` and the documented Paho VERSION2 subset;
 - `mqttium.persistence.InflightStore` and the shipped persistence implementations;
-- `mqttium.transport` transport protocols and concrete transports;
+- `mqttium.transport` transport protocols and concrete transports. Receiving is
+  a capability, not part of the common contract: `AsyncTransport` covers write,
+  close and `is_closing`, while a transport offers exactly one of
+  `PullTransport` (`read()`) or `DecoderPushTransport` (`attach_decoder()` +
+  `receive()`). The two are mutually exclusive, so a structural check cannot
+  misclassify one as the other;
 - `mqttium.protocol.ProtocolEngine`, `EngineConfig`, `NegotiatedSettings`,
   `ReconnectPolicy`, `FlowControl`, `PublishHandle`, `PublishFailure` and
   `DisconnectInfo` for advanced integrations;
