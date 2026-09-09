@@ -40,12 +40,16 @@ a future minor release with a changelog entry and migration guidance:
 
 A Provisional designation is not permission for silent breakage. An incompatible
 change still requires a changelog entry and migration guidance. For concrete
-transports, the Provisional contract is behavioral rather than exact-class based:
-`TcpTransport.connect()` is a factory for a supported `AsyncTransport` receive
-implementation, and may return a different concrete transport when an optimized
-receive capability is selected. Preserving subclasses of `TcpTransport` across
-that factory boundary is not a supported extension seam; integrations that need
-custom connection construction should provide an `AsyncClient` transport factory.
+transports, the Provisional contract is behavioral rather than exact-class based. `AsyncTransport`
+contains the common write/lifecycle surface; a custom transport additionally implements the
+public `PullTransport` capability (`read()`) or `DecoderPushTransport` capability
+(`attach_decoder()` / `receive()`). Existing read-based custom transports remain valid pull
+transports. See [`transport-receive-capabilities.md`](transport-receive-capabilities.md) for
+the supported imports, detection rules and migration guidance. `TcpTransport.connect()` is a
+factory for a supported receive implementation and may return a different concrete transport
+when an optimized receive capability is selected. Preserving subclasses of `TcpTransport`
+across that factory boundary is not a supported extension seam; integrations that need custom
+connection construction should provide an `AsyncClient` transport factory.
 The persistence
 contract is one complete `InflightStore` interface: bounded replay and conditional
 metadata transitions are required capabilities, not optional runtime-detected
