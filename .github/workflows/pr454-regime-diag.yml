@@ -1,0 +1,123 @@
+name: PR454 fixed-rate regime diagnosis
+on:
+  push:
+    branches: [work/pr454-regime-diagnosis]
+permissions:
+  contents: read
+concurrency:
+  group: mqttium-arm64-runner
+  cancel-in-progress: false
+jobs:
+  diagnose:
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 35
+    env:
+      PYTHONUNBUFFERED: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: tooling
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: arm-a
+          ref: 9ad1f01857306ac5079ffb1d073a59fdb60e1931
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: arm-b
+          ref: 636de564dc2c92822a8361050cc24e369fe027d4
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: external
+          repository: yoch/mqtt-python-client-bench
+          ref: ec332e25003a6484727697c3018ce632a025a7f2
+          sparse-checkout: |
+            src
+            hosts
+            pyproject.toml
+            README.md
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Source identity and read-only host preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT=$(mktemp -d "$RUNNER_TEMP/pr454-regime-${GITHUB_RUN_ID}-XXXXXX")
+          echo "JOB_ROOT=$ROOT" >> "$GITHUB_ENV"
+          mkdir -p results/source
+          echo "DIAG_ROOT=$PWD/results" >> "$GITHUB_ENV"
+          test "$(git -C arm-a rev-parse HEAD)" = 9ad1f01857306ac5079ffb1d073a59fdb60e1931
+          test "$(git -C arm-b rev-parse HEAD)" = 636de564dc2c92822a8361050cc24e369fe027d4
+          test "$(git -C arm-b rev-parse HEAD:src/mqttium)" = 699b2dcd66ccae2d358e0c8aa740a7fe38933131
+          test "$(git -C external rev-parse HEAD)" = ec332e25003a6484727697c3018ce632a025a7f2
+          test "$(uname -m)" = aarch64
+          test "$(nproc)" -ge 4
+          command -v cc
+          command -v mosquitto
+          (uname -a; lscpu; python3 -V; command -v strace || true; command -v perf || true; cat /proc/sys/kernel/perf_event_paranoid; cat /proc/sys/kernel/randomize_va_space; cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor; cat /proc/self/timerslack_ns; ps -eo pid,pcpu,comm --sort=-pcpu | head -15) > results/preflight.txt
+          (strace -V || true) >> results/preflight.txt 2>&1
+          (perf stat -e minor-faults,context-switches -- true || true) >> results/preflight.txt 2>&1
+          cp -a external/src results/source/external-src
+          cp -a tooling/tools/regime_diag results/source/tooling
+          git -C arm-a rev-parse HEAD HEAD^{tree} > results/base-identity.txt
+          git -C arm-b rev-parse HEAD HEAD^{tree} > results/candidate-identity.txt
+          python3 -m venv "$ROOT/venv"
+          echo "$ROOT/venv/bin" >> "$GITHUB_PATH"
+          cc -O2 -shared -fPIC tooling/tools/regime_diag/sysaudit.c -ldl -o results/sysaudit.so
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: pr454-regime-source
+          path: results/
+          retention-days: 30
+      - name: Isolated dependencies
+        run: python -m pip install -e 'external[paho]' 'psutil>=6,<8'
+      - name: Owned broker
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$JOB_ROOT/broker.conf" <<'EOF'
+          listener 18894 127.0.0.1
+          allow_anonymous true
+          persistence false
+          set_tcp_nodelay true
+          max_inflight_messages 1000
+          max_queued_messages 100000
+          log_type error
+          EOF
+          cp "$JOB_ROOT/broker.conf" results/
+          (mosquitto -h || true) > results/broker-version.txt 2>&1
+          taskset -c 1 mosquitto -c "$JOB_ROOT/broker.conf" > results/broker.log 2>&1 &
+          echo $! > "$JOB_ROOT/broker.pid"
+          echo "BROKER_PID=$!" >> "$GITHUB_ENV"
+          python3 arm-a/tools/ci/wait_for_endpoints.py --tcp 127.0.0.1:18894
+          kill -0 "$(cat "$JOB_ROOT/broker.pid")"
+      - name: Finite syscall and allocation diagnosis
+        shell: bash
+        env:
+          PYTHONPATH: arm-a/src:external/src
+        run: |
+          set -euo pipefail
+          python -m py_compile tooling/tools/regime_diag/*.py
+          python tooling/tools/regime_diag/campaign.py | tee results/campaign.log
+      - name: Cleanup and source readback
+        if: always()
+        shell: bash
+        run: |
+          if test -n "${JOB_ROOT:-}" && test -f "$JOB_ROOT/broker.pid"; then kill "$(cat "$JOB_ROOT/broker.pid")" 2>/dev/null || true; fi
+          mkdir -p results
+          git -C arm-a status --porcelain > results/final-base.txt
+          git -C arm-b status --porcelain > results/final-candidate.txt
+          git -C external status --porcelain > results/final-external.txt
+          test ! -s results/final-base.txt
+          test ! -s results/final-candidate.txt
+          test ! -s results/final-external.txt
+          if test -n "${JOB_ROOT:-}"; then rm -rf "$JOB_ROOT"; fi
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: pr454-regime-results
+          path: results/
+          retention-days: 30
