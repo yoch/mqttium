@@ -35,6 +35,9 @@ _MIN_CAPACITY = 16 * 1024
 _INITIAL_WINDOW = 64 * 1024
 # Consecutive completely-filled windows before offering a larger one.
 _PROMOTE_AFTER = 4
+# Above this, size the slab to the head frame's exact extent instead of doubling
+# past it. Doubling wastes up to a whole frame on multi-MiB traffic.
+_EXACT_FRAME_THRESHOLD = 512 * 1024
 # Smallest window worth offering a receiver; also the compaction trigger.
 _MIN_WINDOW = 16 * 1024
 # Ceiling for the adaptive receive window. Storage capacity and receive quantum
@@ -121,7 +124,7 @@ class IncrementalDecoder:
         self._start = 0
         self._end = live
 
-    def _ensure(self, need: int) -> None:
+    def _ensure(self, need: int, exact_total: int | None = None) -> None:
         """Guarantee `need` writable bytes after `_end`, without reallocating if possible."""
         if self._capacity - self._end >= need:
             return
@@ -134,8 +137,14 @@ class IncrementalDecoder:
             self._end = live
             return
         capacity = self._capacity or _MIN_CAPACITY
-        while capacity - live < need:
-            capacity *= 2
+        if exact_total is not None:
+            # The head frame's extent is known, so size to it instead of
+            # doubling: a frame just over a step would otherwise cost a whole
+            # extra frame of slab.
+            capacity = exact_total if exact_total > live + need else live + need
+        else:
+            while capacity - live < need:
+                capacity *= 2
         # Doubling alone can reach twice max_packet_size: a frame just over a
         # doubling step leaves a tail too small for the next window and doubles
         # again. Framing rejects anything larger than max_packet_size, so one
@@ -170,6 +179,21 @@ class IncrementalDecoder:
         if target < self._capacity:
             self._reallocate(target)
 
+    def _known_frame_total(self) -> int | None:
+        """Head frame's byte extent when already knowable. Allocation policy only.
+
+        Malformed and oversize input is left to the framing methods so protocol
+        errors keep their normal ordering.
+        """
+        if self._end - self._start < 2:
+            return None
+        try:
+            remaining, rl_end = decode_vbi(self._buf, self._start + 1, self._end)
+        except MalformedPacketError:
+            return None
+        total = (rl_end - self._start) + remaining
+        return None if total > self._max_packet_size else total
+
     def _reset(self) -> None:
         """Rewind a fully consumed slab."""
         extent = self._end
@@ -194,7 +218,18 @@ class IncrementalDecoder:
         want = self._target_window
         if need > want:
             want = need
-        self._ensure(want)
+        exact: int | None = None
+        if self._capacity >= _EXACT_FRAME_THRESHOLD:
+            # Already in the multi-MiB regime, so the framing cost is worth it:
+            # asking for a full window past the end of a known large frame is
+            # what makes the slab double past the frame it is receiving.
+            total = self._known_frame_total()
+            if total is not None and total >= _EXACT_FRAME_THRESHOLD:
+                remaining = total - (self._end - self._start)
+                if 0 < remaining < want:
+                    want = remaining
+                exact = total
+        self._ensure(want, exact)
         end = self._end
         limit = end + want
         if limit > self._capacity:

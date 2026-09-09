@@ -486,3 +486,23 @@ def test_commit_is_bounded_by_the_window_that_was_offered() -> None:
     assert offered < decoder.capacity  # a retained slab has far more room
     with pytest.raises(ValueError):
         decoder.commit(offered + 1)
+
+
+def test_a_large_frame_is_sized_exactly_rather_than_doubled_past() -> None:
+    # Doubling costs a whole extra frame when the frame sits just above a step.
+    limit = 4 * 1024 * 1024
+    decoder = IncrementalDecoder(max_packet_size=limit)
+    frame = _publish(limit - 200)
+
+    offset = 0
+    while offset < len(frame):
+        window = decoder.writable_window()
+        take = min(len(window), 4096, len(frame) - offset)
+        window[:take] = frame[offset : offset + take]
+        window.release()
+        decoder.commit(take)
+        offset += take
+
+    assert decoder.next_packet() is not None
+    assert decoder.capacity < 2 * len(frame)
+    assert decoder.capacity >= len(frame)
