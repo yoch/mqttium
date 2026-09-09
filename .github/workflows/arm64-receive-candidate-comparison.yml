@@ -374,8 +374,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # paired_regression imports its scenario registry in the parent process.
+          # Give that bootstrap process arm A only so mqttium is importable; each
+          # measurement worker then overwrites PYTHONPATH with its own arm root.
           for scenario in ingress_engine_qos0 ingress_engine_qos0_v5 ingress_publish_qos1; do
-            python3 benchtools/benchmarks/paired_regression.py --scenario "$scenario" \
+            env PYTHONPATH="$PWD/arm-a/src" python3 benchtools/benchmarks/paired_regression.py --scenario "$scenario" \
               --base-root arm-a --candidate-root arm-b --repeat 9 --cpu 3 \
               --output "$FINAL_OUT/diagnostics/feed-$scenario.json" \
               | tee -a "$FINAL_OUT/diagnostics/feed.txt"
