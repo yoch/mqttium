@@ -152,14 +152,13 @@ state and makes callback execution mode explicit from the callable itself.
 
 ### Topic-route reconfiguration
 
-Topic-filtered messages now run through one declared-async internal router on the
-existing bounded callback worker, even when all registered callbacks are `def`.
-This prevents a queued or partially delivered burst from treating a newly
-registered `async def` as an invalid synchronous callback and losing delivery.
-Matches are captured per message; later routed messages see the updated filters
-and fallback. Filtered callbacks should not rely on inline execution. Direct
-non-filtered `on_message` callbacks retain their existing fast paths and captured
-batch behavior. No callback signature or constructor option changes.
+Live topic-filter or fallback changes no longer cause a captured synchronous
+router to reject a newly registered `async def` callback. Synchronous routes
+retain their inline fast paths; there is no mandatory worker hop for stable
+filtered traffic. A route that becomes asynchronous hands off only work that has
+not started, with its existing delivery order and bounds. Matches are captured
+per message, not for the whole burst. No callback signature or setting changes,
+and user `def` callbacks returning awaitables are still rejected.
 
 ## Durable sessions
 
