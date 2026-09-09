@@ -64,6 +64,10 @@ class IncrementalDecoder:
         "_compaction_count",
         "_capacity_peak",
         "_small_drain_streak",
+        "_small_pressure_peak",
+        "_drain_peak",
+        "_drain_has_large_frame",
+        "_offered_bytes",
         "_storage_generation",
     )
 
@@ -80,6 +84,10 @@ class IncrementalDecoder:
         self._compaction_count = 0
         self._capacity_peak = 0
         self._small_drain_streak = 0
+        self._small_pressure_peak = 0
+        self._drain_peak = 0
+        self._drain_has_large_frame = False
+        self._offered_bytes = 0
         self._storage_generation = 0
 
     @property
@@ -145,6 +153,7 @@ class IncrementalDecoder:
             finally:
                 view.release()
         self._buf = replacement
+        self._offered_bytes = 0
         self._start = 0
         self._end = live
         self._storage_generation += 1
@@ -248,46 +257,74 @@ class IncrementalDecoder:
         else:
             offered = preferred
             self._ensure(offered)
+        self._offered_bytes = offered
         return memoryview(self._buf)[self._end : self._end + offered]
 
     def commit(self, nbytes: int) -> None:
-        if nbytes <= 0:
-            if nbytes < 0:
-                raise ValueError("negative decoder commit")
+        if nbytes < 0:
+            raise ValueError("negative decoder commit")
+        offered = self._offered_bytes
+        if nbytes > offered:
+            raise ValueError("decoder commit exceeds last writable window")
+        # One get_buffer()/buffer_updated() pair owns one offer.  Invalidating
+        # it here makes accidental double commits fail even when retained slab
+        # capacity would otherwise hide the bug.
+        self._offered_bytes = 0
+        if nbytes == 0:
             return
         end = self._end + nbytes
-        if end > len(self._buf):
-            raise ValueError("decoder commit exceeds writable window")
         self._end = end
         buffered = end - self._start
         if buffered > self._high_water:
             self._high_water = buffered
+        if buffered > self._drain_peak:
+            self._drain_peak = buffered
 
-    def _retire_after_drain(self, extent: int) -> None:
+    def _note_consumed_frame(self, frame_size: int) -> None:
+        if frame_size > _STEADY_CAPACITY:
+            self._drain_has_large_frame = True
+
+    def _retire_after_drain(self) -> None:
         capacity = len(self._buf)
+        pressure = self._drain_peak
+        had_large_frame = self._drain_has_large_frame
+        self._drain_peak = 0
+        self._drain_has_large_frame = False
         if capacity <= _STEADY_CAPACITY:
             self._small_drain_streak = 0
+            self._small_pressure_peak = 0
             return
-        if extent > _STEADY_CAPACITY:
-            # A stream of genuinely large frames benefits from retaining the
-            # slab; do not shrink and regrow on every packet.
+        if had_large_frame:
+            # Repeated genuinely-large frames benefit from retaining the slab.
             self._small_drain_streak = 0
+            self._small_pressure_peak = 0
             return
+        # Small frames can legitimately arrive coalesced above 256 KiB.  Count
+        # them as evidence that multi-MiB frame capacity is no longer needed,
+        # while retaining enough space for the recent aggregate buffering peak.
         self._small_drain_streak += 1
+        if pressure > self._small_pressure_peak:
+            self._small_pressure_peak = pressure
         if self._small_drain_streak >= _OVERSIZE_RETENTION_DRAINS:
+            quantum = _RECONNECT_CAPACITY
+            recent = self._small_pressure_peak
+            target = max(_STEADY_CAPACITY, ((recent + quantum - 1) // quantum) * quantum)
             self._small_drain_streak = 0
-            self._reallocate(_STEADY_CAPACITY)
+            self._small_pressure_peak = 0
+            if target < capacity:
+                self._reallocate(target)
 
-    def _fully_consumed(self, extent: int) -> None:
+    def _fully_consumed(self) -> None:
         self._start = 0
         self._end = 0
-        self._retire_after_drain(extent)
+        self._retire_after_drain()
 
     def feed(self, data: bytes | bytearray | memoryview) -> None:
         """Copy bytes from a pull transport into the same decoder slab."""
         size = len(data)
         if not size:
             return
+        self._offered_bytes = 0
         self._ensure(size)
         end = self._end
         self._buf[end : end + size] = data
@@ -295,12 +332,18 @@ class IncrementalDecoder:
         buffered = self._end - self._start
         if buffered > self._high_water:
             self._high_water = buffered
+        if buffered > self._drain_peak:
+            self._drain_peak = buffered
 
     def clear(self) -> None:
         """Reset connection state and release connection-specific oversize growth."""
         self._start = 0
         self._end = 0
         self._small_drain_streak = 0
+        self._small_pressure_peak = 0
+        self._drain_peak = 0
+        self._drain_has_large_frame = False
+        self._offered_bytes = 0
         capacity = len(self._buf)
         if capacity > _RECONNECT_CAPACITY:
             self._reallocate(_RECONNECT_CAPACITY)
@@ -352,9 +395,11 @@ class IncrementalDecoder:
     def consume_peeked_packet(self, body_end: int) -> None:
         if not (self._start < body_end <= self._end):
             raise AssertionError("invalid decoder packet boundary")
+        frame_size = body_end - self._start
+        self._note_consumed_frame(frame_size)
         self._start = body_end
         if body_end == self._end:
-            self._fully_consumed(body_end)
+            self._fully_consumed()
 
     def next_packet(self) -> RawPacket | None:
         bounds = self.peek_packet_bounds()
@@ -370,9 +415,11 @@ class IncrementalDecoder:
                 view.release()
         else:
             body = bytes(self._buf[body_start:body_end])
+        frame_size = body_end - self._start
+        self._note_consumed_frame(frame_size)
         self._start = body_end
         if body_end == self._end:
-            self._fully_consumed(body_end)
+            self._fully_consumed()
         return RawPacket(
             packet_type=PacketType.from_byte(header),
             flags=header & 0x0F,

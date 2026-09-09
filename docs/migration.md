@@ -228,3 +228,15 @@ connected instead of reconnecting per call.
 
 MQTTium is original Apache-2.0 code. Paho and gmqtt are referenced for API and
 behavioural comparison; their protocol engines are not copied.
+
+## Provisional TCP transport factory behavior
+
+`mqttium.transport.TcpTransport` remains a supported Provisional transport, but
+`TcpTransport.connect()` should be treated as a factory for an `AsyncTransport`,
+not as a promise that the returned object is exactly `TcpTransport` or a caller's
+subclass. On CPython stdlib selector loops, cleartext TCP may return the
+decoder-ingress transport selected by the runtime. TLS and other fallbacks can
+still instantiate `cls(reader, writer)`, but subclass preservation is not a
+portable extension contract. Code that customized connection construction by
+subclassing `TcpTransport` should move that customization to the injectable
+`AsyncClient` transport-factory seam.

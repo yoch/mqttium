@@ -8,7 +8,7 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
-- Use a reusable 80 KiB `asyncio.BufferedProtocol` receive buffer for cleartext TCP on asyncio selector event loops. This removes the allocation-heavy `socket.recv()` path behind an ASLR-dependent allocator/page-fault latency regime observed on Linux/ARM64, while keeping asyncio streams responsible for read backpressure, buffered input at EOF, drains, and close semantics. TLS, Proactor, and non-selector event loops retain the existing stream connection path.
+- On CPython with the stdlib `SelectorEventLoop`, cleartext TCP now receives with `asyncio.BufferedProtocol.recv_into()` directly into decoder-owned reusable storage. The decoder uses lazy/adaptive receive capacity, exact reservation for known large frames, and bounded retirement after oversized traffic; this removes the allocation-heavy selector `socket.recv()` path and the intermediate `StreamReader -> bytes -> decoder.feed()` receive copy. TLS, Proactor, third-party/non-stdlib loops, Unix sockets, and WebSockets retain their established stream paths; selector fallbacks outside the direct-ingress scope keep the reusable 80 KiB StreamReader buffer.
 
 ### Changed
 

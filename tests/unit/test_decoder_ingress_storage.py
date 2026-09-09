@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from mqttium.codec.buffer import IncrementalDecoder
 
 
@@ -171,3 +173,60 @@ def test_fragmented_vbi_framing_never_reads_uncommitted_slab_capacity() -> None:
     assert decoder.buffered == 2
     assert decoder.peek_packet_bounds() is None
     assert decoder.next_packet() is None
+
+
+def test_coalesced_small_frames_retire_multi_mib_slab_without_thrashing() -> None:
+    decoder = IncrementalDecoder(max_packet_size=8 * 1024 * 1024)
+    large = _publish(4 * 1024 * 1024)
+    _receive(decoder, large)
+    assert decoder.next_packet() is not None
+    grown = decoder.capacity
+    assert grown >= len(large)
+
+    small = _publish(64 * 1024)
+    batch = small * 5
+    assert len(batch) > 256 * 1024
+    growths = decoder.growth_count
+    shrinks = decoder.shrink_count
+    for _ in range(32):
+        _receive(decoder, batch)
+        for _ in range(5):
+            assert decoder.next_packet() is not None
+        assert decoder.next_packet() is None
+
+    expected = ((len(batch) + 64 * 1024 - 1) // (64 * 1024)) * (64 * 1024)
+    assert decoder.capacity == expected
+    assert decoder.capacity < grown
+    assert decoder.growth_count == growths
+    assert decoder.shrink_count == shrinks + 1
+
+    stable_growths = decoder.growth_count
+    stable_shrinks = decoder.shrink_count
+    for _ in range(64):
+        _receive(decoder, batch)
+        for _ in range(5):
+            assert decoder.next_packet() is not None
+    assert decoder.capacity == expected
+    assert decoder.growth_count == stable_growths
+    assert decoder.shrink_count == stable_shrinks
+
+
+def test_commit_is_bounded_by_last_offered_window_not_retained_capacity() -> None:
+    decoder = IncrementalDecoder(max_packet_size=4 * 1024 * 1024)
+    large = _publish(1024 * 1024)
+    _receive(decoder, large)
+    assert decoder.next_packet() is not None
+    assert decoder.capacity > 64 * 1024
+
+    offered = decoder.writable_window(64 * 1024)
+    offered.release()
+    with pytest.raises(ValueError, match="last writable window"):
+        decoder.commit(64 * 1024 + 1)
+    assert decoder.buffered == 0
+
+    offered = decoder.writable_window(64 * 1024)
+    offered.release()
+    decoder.commit(64 * 1024)
+    assert decoder.buffered == 64 * 1024
+    with pytest.raises(ValueError, match="last writable window"):
+        decoder.commit(1)

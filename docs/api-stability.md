@@ -39,7 +39,14 @@ a future minor release with a changelog entry and migration guidance:
 - `mqttium.codec` framing and codec helpers.
 
 A Provisional designation is not permission for silent breakage. An incompatible
-change still requires a changelog entry and migration guidance. The persistence
+change still requires a changelog entry and migration guidance. For concrete
+transports, the Provisional contract is behavioral rather than exact-class based:
+`TcpTransport.connect()` is a factory for a supported `AsyncTransport` receive
+implementation, and may return a different concrete transport when an optimized
+receive capability is selected. Preserving subclasses of `TcpTransport` across
+that factory boundary is not a supported extension seam; integrations that need
+custom connection construction should provide an `AsyncClient` transport factory.
+The persistence
 contract is one complete `InflightStore` interface: bounded replay and conditional
 metadata transitions are required capabilities, not optional runtime-detected
 extensions.

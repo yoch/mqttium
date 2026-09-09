@@ -242,3 +242,18 @@ For changes whose risk specifically involves kernel/network-device behaviour,
 Nagle/coalescing, physical-network jitter or remote-broker interaction, add a
 separate two-host LAN experiment. Do not reinterpret a loopback result as proof
 of wide-area network behaviour.
+
+## Saturated consumer-ceiling qualification
+
+For a saturated receive comparison, qualification is based on the physical
+bottleneck, not fidelity to a nominal publisher rate. Every arm/cell uses the
+same rule: measured publisher supply divided by measured consumer throughput
+(`publisher_margin`) must be at least 1.02, SUT CPU must be at least 90%, broker
+CPU must remain below 90%, and neither SUT nor broker may incur major faults.
+
+An absolute `publisher msgs/s >= 97% of requested rate` check is intentionally
+not part of this gate. It is useful for fixed-offer experiments, but redundant
+for a consumer-ceiling experiment once actual publisher margin is measured, and
+it can reject a slower consumer arm merely because the publisher is backpressured
+to a different realized rate. The rule above is applied symmetrically before
+interpreting candidate/base ratios; no per-cell exception is permitted.
