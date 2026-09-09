@@ -150,6 +150,17 @@ no longer implicitly handed to the callback worker; it is reported as a callback
 `TypeError`. Convert such callbacks to `async def`. This removes hidden scheduling
 state and makes callback execution mode explicit from the callable itself.
 
+### Topic-route reconfiguration
+
+Topic-filtered messages now run through one declared-async internal router on the
+existing bounded callback worker, even when all registered callbacks are `def`.
+This prevents a queued or partially delivered burst from treating a newly
+registered `async def` as an invalid synchronous callback and losing delivery.
+Matches are captured per message; later routed messages see the updated filters
+and fallback. Filtered callbacks should not rely on inline execution. Direct
+non-filtered `on_message` callbacks retain their existing fast paths and captured
+batch behavior. No callback signature or constructor option changes.
+
 ## Durable sessions
 
 ```python

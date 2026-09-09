@@ -6,6 +6,16 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserve callback delivery when topic filters or their fallback change from
+  synchronous to asynchronous while messages are queued or a burst is being
+  delivered (#453). A captured internal router no longer closes valid `async def`
+  callbacks as contract violations after QoS1 has already been acknowledged.
+  Topic-filtered routes now consistently use the existing bounded worker; direct
+  non-filtered callback fast paths and strict user callable-form checks remain.
+  See the callback migration guidance for the scheduling change.
+
 ### Changed
 
 - Receive cleartext TCP straight into the decoder's own storage on CPython selector event loops. `asyncio.BufferedProtocol.get_buffer()` returns a window carved out of `IncrementalDecoder`'s own slab, so received bytes are no longer copied through an intermediate receive buffer before reaching the parser. Storage is adaptive: it starts at 16 KiB, the receive window starts at 64 KiB and is promoted toward 256 KiB only under sustained full windows, a known large frame caps progressive growth at its exact extent without reserving the entire announced body, and an enlarged slab is retired once large frames stop arriving. TLS, WebSocket, Proactor, non-CPython runtimes and third-party event loops keep the `read()` + `feed()` path.

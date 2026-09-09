@@ -130,3 +130,168 @@ async def test_queued_router_survives_sync_to_async_reconfiguration(
             assert errors == []
         finally:
             await client._shutdown_callback_worker(drain=False)
+
+
+def _messages(count: int, kind: EffectKind) -> deque[EngineEffect]:
+    return deque(
+        EngineEffect(
+            kind,
+            Message(topic="audit/x", payload=str(i).encode()),
+            requires_delivery_mark=False,
+            decoded_property_wire_size=0 if kind is EffectKind.DECODED_MESSAGE else None,
+        )
+        for i in range(count)
+    )
+
+
+@pytest.mark.parametrize("burst", [2, 3])
+@pytest.mark.parametrize("kind", [EffectKind.MESSAGE, EffectKind.DECODED_MESSAGE])
+async def test_reconfigured_tail_keeps_fifo_and_hard_callback_bound(
+    burst: int, kind: EffectKind
+) -> None:
+    client = AsyncClient(message_delivery="callback", max_pending_callbacks=burst)
+    seen: list[str] = []
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def replacement(message: Message) -> None:
+        assert not client._engine_lock.locked()
+        value = message.payload.decode()
+        seen.append(f"start:{value}")
+        if value == "1":
+            entered.set()
+            await release.wait()
+        seen.append(f"end:{value}")
+
+    def original(message: Message) -> None:
+        assert not client._engine_lock.locked()
+        seen.append("old:" + message.payload.decode())
+        client.message_callback_add("audit/x", replacement)
+        assert client._delivery.try_enqueue_callback(lambda: seen.append("reentrant"))
+        assert client.stats().delivery.callback_queued == burst
+        assert not client._delivery.try_enqueue_callback(lambda: seen.append("overflow"))
+
+    client.message_callback_add("audit/x", original)
+    with _callback_errors() as errors:
+        try:
+            assert (
+                client._apply_message_effect_batch_inline(
+                    _messages(burst, kind), client._connection_epoch
+                )
+                == burst
+            )
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            assert seen == ["old:0", "start:1"]
+            assert client.stats().delivery.callback_queued == burst
+            assert not client._delivery.try_enqueue_callback(lambda: seen.append("overflow"))
+            release.set()
+            await asyncio.wait_for(client._callback_queue.join(), timeout=2)
+            expected = ["old:0"]
+            for i in range(1, burst):
+                expected.extend([f"start:{i}", f"end:{i}"])
+            assert seen == expected + ["reentrant"]
+            assert client.stats().delivery.callback_queued == 0
+            assert client._callback_queue.maxsize == burst
+            assert errors == []
+        finally:
+            release.set()
+            await client._shutdown_callback_worker(drain=False)
+
+
+@pytest.mark.parametrize("mutation", ["replace_filter", "remove_all_filters"])
+@pytest.mark.parametrize("kind", [EffectKind.MESSAGE, EffectKind.DECODED_MESSAGE])
+async def test_reconfiguration_during_await_keeps_only_current_message_snapshot(
+    mutation: str, kind: EffectKind
+) -> None:
+    client = AsyncClient(message_delivery="callback")
+    seen: list[str] = []
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def first(message: Message) -> None:
+        value = message.payload.decode()
+        seen.append("first:" + value)
+        if value == "0":
+            entered.set()
+            await release.wait()
+
+    def old_tail(message: Message) -> None:
+        seen.append("old:" + message.payload.decode())
+
+    async def new_tail(message: Message) -> None:
+        await asyncio.sleep(0)
+        seen.append("new:" + message.payload.decode())
+
+    client.message_callback_add("audit/#", first)
+    client.message_callback_add("audit/+", old_tail)
+    with _callback_errors() as errors:
+        try:
+            assert (
+                client._apply_message_effect_batch_inline(
+                    _messages(2, kind), client._connection_epoch
+                )
+                == 2
+            )
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            if mutation == "replace_filter":
+                client.message_callback_add("audit/+", new_tail)
+            else:
+                client.on_message = new_tail
+                client.message_callback_remove("audit/#")
+                client.message_callback_remove("audit/+")
+            release.set()
+            await asyncio.wait_for(client._callback_queue.join(), timeout=2)
+            expected = ["first:0", "old:0"]
+            if mutation == "replace_filter":
+                expected.append("first:1")
+            assert seen == expected + ["new:1"]
+            assert errors == []
+        finally:
+            release.set()
+            await client._shutdown_callback_worker(drain=False)
+
+
+@pytest.mark.parametrize("kind", [EffectKind.MESSAGE, EffectKind.DECODED_MESSAGE])
+async def test_reconfigured_async_tail_keeps_worker_cancellation_ownership(
+    kind: EffectKind,
+) -> None:
+    client = AsyncClient(message_delivery="callback", max_pending_callbacks=3)
+    seen: list[str] = []
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def replacement(message: Message) -> None:
+        seen.append("new:" + message.payload.decode())
+        entered.set()
+        try:
+            await release.wait()
+        finally:
+            cancelled.set()
+
+    def original(message: Message) -> None:
+        seen.append("old:" + message.payload.decode())
+        client.message_callback_add("audit/x", replacement)
+
+    client.message_callback_add("audit/x", original)
+    with _callback_errors() as errors:
+        try:
+            assert (
+                client._apply_message_effect_batch_inline(
+                    _messages(3, kind), client._connection_epoch
+                )
+                == 3
+            )
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            task = client._callback_worker_task
+            assert task is not None
+            await asyncio.wait_for(client._shutdown_callback_worker(drain=False), timeout=2)
+            assert task.cancelled()
+            assert cancelled.is_set()
+            assert seen == ["old:0", "new:1"]
+            assert client.stats().delivery.callback_queued == 0
+            assert client._callback_queue.maxsize == 3
+            assert errors == []
+        finally:
+            release.set()
+            await client._shutdown_callback_worker(drain=False)
