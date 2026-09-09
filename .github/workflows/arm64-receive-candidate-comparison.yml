@@ -1,0 +1,513 @@
+name: ARM64 receive-candidate comparison
+run-name: "Receive comparison: ${{ inputs.candidate_a_ref }} vs ${{ inputs.candidate_b_ref }}"
+
+# Neutral head-to-head for competing receive-path candidates. Tooling only.
+# Measures the saturated 64 KiB receive ceiling, storage/feed diagnostics, and
+# the historic fixed-rate RTT regime under one pinned protocol.
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_a_ref:
+        description: Exact 40-character commit SHA for arm A
+        required: true
+        type: string
+      candidate_b_ref:
+        description: Exact 40-character commit SHA for arm B
+        required: true
+        type: string
+      confirm_trusted_code:
+        description: I confirm that both input commits were reviewed and are trusted on the persistent runner
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mqttium-arm64-runner
+  cancel-in-progress: false
+
+env:
+  BENCH_SHA: 37160eed99b50d1f384e1565a16d0346eb01ca56
+  BENCHTOOLS_SHA: 3369317e64bb164b672bdc4b634952fb904bdbf4
+  PAYLOAD_SIZE: "65536"
+  OFFER_MSGS_S: "14000"
+  RTT_TARGET_RATE: "3942"
+
+jobs:
+  compare:
+    if: inputs.confirm_trusted_code && github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 90
+    steps:
+      - name: Validate immutable trusted commits
+        env:
+          A_REF: ${{ inputs.candidate_a_ref }}
+          B_REF: ${{ inputs.candidate_b_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for value in "$A_REF" "$B_REF"; do
+            [[ "$value" =~ ^[0-9a-fA-F]{40}$ ]] || { echo "arm refs must be exact commit SHAs" >&2; exit 2; }
+          done
+          [ "$A_REF" != "$B_REF" ] || { echo "the two arms must differ" >&2; exit 2; }
+
+      - name: Check out arm A
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ inputs.candidate_a_ref }}
+          path: arm-a
+          persist-credentials: false
+
+      - name: Check out arm A again for A/A
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ inputs.candidate_a_ref }}
+          path: arm-a-aa
+          persist-credentials: false
+
+      - name: Check out arm B
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ inputs.candidate_b_ref }}
+          path: arm-b
+          persist-credentials: false
+
+      - name: Check out neutral benchtools
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.BENCHTOOLS_SHA }}
+          path: benchtools
+          persist-credentials: false
+
+      - name: Check out external harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: yoch/mqtt-python-client-bench
+          ref: ${{ env.BENCH_SHA }}
+          path: harness
+          persist-credentials: false
+
+      - name: Set run-specific workspace
+        shell: bash
+        run: echo "FINAL_OUT=$RUNNER_TEMP/mqttium-compare-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+
+      - name: Verify environment and record provenance
+        env:
+          A_REF: ${{ inputs.candidate_a_ref }}
+          B_REF: ${{ inputs.candidate_b_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          python3 -c 'import sys; assert sys.version_info[:3] == (3,14,7), sys.version'
+          test "$(git -C arm-a rev-parse HEAD)" = "$A_REF"
+          test "$(git -C arm-a-aa rev-parse HEAD)" = "$A_REF"
+          test "$(git -C arm-b rev-parse HEAD)" = "$B_REF"
+          test "$(git -C harness rev-parse HEAD)" = "$BENCH_SHA"
+          test "$(git -C benchtools rev-parse HEAD)" = "$BENCHTOOLS_SHA"
+          test "$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)" = performance
+          test "$(cat /proc/sys/kernel/randomize_va_space)" != 0
+          version="$({ mosquitto -h 2>&1 || true; } | python3 -c 'import re,sys; t=sys.stdin.read(); m=re.search(r"mosquitto version\s+([0-9]+(?:\.[0-9]+)+)",t,re.I); print(m.group(1) if m else "")')"
+          test "$version" = 2.1.2
+          if pgrep -x mosquitto >/dev/null; then
+            echo "a pre-existing Mosquitto process would contaminate evidence" >&2
+            exit 1
+          fi
+          rm -rf "$FINAL_OUT"
+          mkdir -p "$FINAL_OUT/saturated" "$FINAL_OUT/rtt" "$FINAL_OUT/diagnostics"
+          cc -O3 -pthread harness/scripts/mqtt_hammer.c -o "$FINAL_OUT/mqtt_hammer"
+          python3 - <<'PY' > "$FINAL_OUT/provenance.json"
+          import glob, json, os, platform, subprocess
+          def sh(*args):
+              p = subprocess.run(args, capture_output=True, text=True, check=False)
+              return p.stdout.strip()
+          print(json.dumps({
+              "workflow_main_sha": os.environ.get("GITHUB_SHA"),
+              "run_id": os.environ.get("GITHUB_RUN_ID"),
+              "arm_a_sha": os.environ["A_REF"],
+              "arm_b_sha": os.environ["B_REF"],
+              "external_harness_repo": "yoch/mqtt-python-client-bench",
+              "external_harness_sha": os.environ["BENCH_SHA"],
+              "benchtools_sha": os.environ["BENCHTOOLS_SHA"],
+              "python": platform.python_version(),
+              "kernel": sh("uname", "-r"),
+              "mosquitto": sh("mosquitto", "-h").splitlines()[0] if sh("mosquitto", "-h") else None,
+              "governor": open("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor").read().strip(),
+              "aslr": open("/proc/sys/kernel/randomize_va_space").read().strip(),
+              "cpu_affinity": {"subscriber": 0, "broker": 1, "publisher": 2, "diagnostics": 3},
+              "payload_size": int(os.environ["PAYLOAD_SIZE"]),
+              "offer_msgs_s": int(os.environ["OFFER_MSGS_S"]),
+              "rtt_target_rate": int(os.environ["RTT_TARGET_RATE"]),
+              "thermal_c": [int(open(p).read()) / 1000 for p in glob.glob("/sys/class/thermal/thermal_zone*/temp")],
+          }, indent=2, sort_keys=True))
+          PY
+          cat "$FINAL_OUT/provenance.json"
+
+      - name: Start saturated broker
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$FINAL_OUT/saturated/mosquitto.conf" <<'EOF'
+          listener 11893 127.0.0.1
+          protocol mqtt
+          set_tcp_nodelay true
+          allow_anonymous true
+          persistence false
+          connection_messages false
+          log_dest stdout
+          log_type error
+          max_inflight_messages 1000
+          max_queued_messages 10000
+          max_packet_size 16777216
+          EOF
+          taskset -c 1 mosquitto -c "$FINAL_OUT/saturated/mosquitto.conf" > "$FINAL_OUT/saturated/mosquitto.log" 2>&1 &
+          echo "SAT_BROKER_PID=$!" >> "$GITHUB_ENV"
+          for _ in $(seq 1 50); do
+            (echo > /dev/tcp/127.0.0.1/11893) >/dev/null 2>&1 && exit 0
+            sleep 0.1
+          done
+          exit 1
+
+      - name: Run six balanced saturated receive pairs
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$FINAL_OUT/saturated"
+          : > "$root/completed.tsv"
+          for block in $(seq 0 5); do
+            if (( block % 2 == 0 )); then arms=(a b); else arms=(b a); fi
+            pos=0
+            for arm in "${arms[@]}"; do
+              idx=$((block * 2 + pos)); pos=$((pos + 1))
+              src="$PWD/arm-$arm/src"
+              topic="bench/receive-compare/${GITHUB_RUN_ID}/${idx}"
+              ready="$root/ready-$idx"
+              taskset -c 0 env PYTHONPATH="$src" python3 benchtools/tools/mqtt_saturated_finalists_probe.py \
+                subscriber --arm "$arm" --host 127.0.0.1 --port 11893 --topic "$topic" \
+                --payload-size "$PAYLOAD_SIZE" --warmup-s 0.5 --duration-s 1.5 \
+                --broker-pid "$SAT_BROKER_PID" --ready-file "$ready" --output "$root/sub-$idx.json" \
+                > "$root/sub-$idx.log" 2>&1 &
+              subpid=$!
+              for _ in $(seq 1 100); do
+                [ -f "$ready" ] && break
+                kill -0 "$subpid" 2>/dev/null || { cat "$root/sub-$idx.log"; exit 1; }
+                sleep 0.05
+              done
+              test -f "$ready"
+              taskset -c 2 "$FINAL_OUT/mqtt_hammer" pub --host 127.0.0.1 --port 11893 \
+                --topic "$topic" --clients 2 --payload "$PAYLOAD_SIZE" --duration 3 --rate "$OFFER_MSGS_S" \
+                > "$root/pub-$idx.json" 2> "$root/pub-$idx.log" &
+              pubpid=$!
+              wait "$subpid"
+              wait "$pubpid"
+              printf '%s\t%s\t%s\n' "$idx" "$block" "$arm" >> "$root/completed.tsv"
+              sleep 0.1
+            done
+          done
+
+      - name: Qualify and summarise receive ceiling
+        env:
+          A_REF: ${{ inputs.candidate_a_ref }}
+          B_REF: ${{ inputs.candidate_b_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, math, os, statistics
+          from pathlib import Path
+          root = Path(os.environ["FINAL_OUT"]) / "saturated"
+          payload = float(os.environ["PAYLOAD_SIZE"])
+          lines = (root / "completed.tsv").read_text().splitlines()
+          assert len(lines) == 12, f"expected 12 completed cells, got {len(lines)}"
+          rows = []
+          for line in lines:
+              idx_s, block_s, arm = line.split("\t")
+              idx, block = int(idx_s), int(block_s)
+              r = json.loads((root / f"sub-{idx}.json").read_text())
+              p = json.loads((root / f"pub-{idx}.json").read_text())
+              offer_msgs = float(p["msgs_per_s"])
+              offer_mib = offer_msgs * payload / (1024 * 1024)
+              mib = r["payload_bytes"] / (1024 * 1024)
+              r.update(idx=idx, block=block, arm=arm, offer_msgs_s=offer_msgs, offer_mib_s=offer_mib)
+              r["publisher_margin"] = offer_mib / r["payload_mib_s"]
+              r["cpu_per_mib"] = r["ru_cpu_s"] / mib
+              r["utime_per_mib"] = r["ru_utime_s"] / mib
+              r["stime_per_mib"] = r["ru_stime_s"] / mib
+              r["qualified"] = (
+                  r["publisher_margin"] >= 1.02
+                  and r["sut_cpu_pct"] >= 90.0
+                  and r["broker_cpu_pct"] is not None
+                  and r["broker_cpu_pct"] < 90.0
+                  and r["ru_majflt"] == 0
+                  and r["broker_majflt"] is not None
+                  and r["broker_majflt"] == 0
+              )
+              rows.append(r)
+          def gm(values):
+              return math.exp(statistics.mean(math.log(x) for x in values))
+          pairs = []
+          for block in range(6):
+              by = {r["arm"]: r for r in rows if r["block"] == block}
+              assert set(by) == {"a", "b"}, f"block {block} does not contain exactly A and B"
+              a, b = by["a"], by["b"]
+              pairs.append({
+                  "block": block,
+                  "qualified": a["qualified"] and b["qualified"],
+                  "b_over_a_throughput": b["payload_mib_s"] / a["payload_mib_s"],
+                  "b_over_a_cpu_per_mib": b["cpu_per_mib"] / a["cpu_per_mib"],
+                  "b_over_a_utime_per_mib": b["utime_per_mib"] / a["utime_per_mib"],
+                  "b_over_a_stime_per_mib": b["stime_per_mib"] / a["stime_per_mib"],
+              })
+          summary = {
+              "arm_a_sha": os.environ["A_REF"],
+              "arm_b_sha": os.environ["B_REF"],
+              "bench_sha": os.environ["BENCH_SHA"],
+              "gate": "publisher_margin>=1.02; sut_cpu>=90%; broker_cpu<90%; zero major faults",
+              "all_cells_qualified": all(r["qualified"] for r in rows),
+              "b_over_a_throughput_geomean": gm([p["b_over_a_throughput"] for p in pairs]),
+              "b_over_a_cpu_per_mib_geomean": gm([p["b_over_a_cpu_per_mib"] for p in pairs]),
+              "b_over_a_utime_per_mib_geomean": gm([p["b_over_a_utime_per_mib"] for p in pairs]),
+              "b_over_a_stime_per_mib_geomean": gm([p["b_over_a_stime_per_mib"] for p in pairs]),
+              "pairs": pairs,
+              "cells": rows,
+          }
+          (root / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+          print(json.dumps(summary, indent=2, sort_keys=True))
+          assert summary["all_cells_qualified"], "some saturated cells did not qualify"
+          PY
+
+      - name: Stop saturated broker
+        if: always()
+        shell: bash
+        run: '[ -n "${SAT_BROKER_PID:-}" ] && kill "$SAT_BROKER_PID" 2>/dev/null || true'
+
+      - name: Cold large-frame storage diagnostic
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$FINAL_OUT/diagnostics/storage_probe.py" <<'PY'
+          import argparse, gc, json, resource, time
+          from mqttium.codec.buffer import IncrementalDecoder
+
+          def publish(size):
+              body = b"\x00\x01t" + b"p" * size
+              remaining = len(body)
+              out = bytearray([0x30])
+              while True:
+                  digit = remaining % 128
+                  remaining //= 128
+                  out.append(digit | 0x80 if remaining else digit)
+                  if not remaining:
+                      return bytes(out) + body
+
+          def receive(decoder, frame, chunk=65536):
+              offset = 0
+              while offset < len(frame):
+                  window = decoder.writable_window()
+                  take = min(len(window), chunk, len(frame) - offset)
+                  window[:take] = frame[offset:offset + take]
+                  try:
+                      window.release()
+                  except Exception:
+                      pass
+                  decoder.commit(take)
+                  offset += take
+              while decoder.next_packet() is not None:
+                  pass
+
+          parser = argparse.ArgumentParser()
+          parser.add_argument("--arm", required=True)
+          parser.add_argument("--scenario", required=True, choices=("cold_8mib", "repeated_2mib", "large_then_small"))
+          args = parser.parse_args()
+          stats = {"reallocations": 0, "shrinks": 0, "peak_capacity": 0}
+          original = IncrementalDecoder._reallocate
+          def counting(self, capacity):
+              stats["reallocations"] += 1
+              if capacity < getattr(self, "capacity", 0):
+                  stats["shrinks"] += 1
+              stats["peak_capacity"] = max(stats["peak_capacity"], capacity)
+              original(self, capacity)
+          IncrementalDecoder._reallocate = counting
+          gc.collect()
+          rss_before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+          started = time.perf_counter()
+          decoder = IncrementalDecoder(max_packet_size=16 * 1024 * 1024)
+          if args.scenario == "cold_8mib":
+              receive(decoder, publish(8 * 1024 * 1024))
+          elif args.scenario == "repeated_2mib":
+              frame = publish(2 * 1024 * 1024)
+              for _ in range(20):
+                  receive(decoder, frame)
+          else:
+              receive(decoder, publish(8 * 1024 * 1024))
+              tiny = publish(200)
+              for _ in range(400):
+                  receive(decoder, tiny)
+          elapsed = time.perf_counter() - started
+          IncrementalDecoder._reallocate = original
+          gc.collect()
+          peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+          stats.update(
+              arm=args.arm,
+              scenario=args.scenario,
+              retained_capacity=decoder.capacity,
+              seconds=elapsed,
+              peak_rss_kib=peak,
+              rss_delta_kib=peak - rss_before,
+          )
+          print(json.dumps(stats, sort_keys=True))
+          PY
+          : > "$FINAL_OUT/diagnostics/storage.jsonl"
+          for arm in a b; do
+            for scenario in cold_8mib repeated_2mib large_then_small; do
+              taskset -c 3 env PYTHONPATH="$PWD/arm-$arm/src" python3 \
+                "$FINAL_OUT/diagnostics/storage_probe.py" --arm "$arm" --scenario "$scenario" \
+                >> "$FINAL_OUT/diagnostics/storage.jsonl"
+            done
+          done
+          cat "$FINAL_OUT/diagnostics/storage.jsonl"
+
+      - name: Fallback feed microbenchmarks
+        shell: bash
+        run: |
+          set -euo pipefail
+          # paired_regression imports its scenario registry in the parent process.
+          # Give that bootstrap process arm A only so mqttium is importable; each
+          # measurement worker then overwrites PYTHONPATH with its own arm root.
+          for scenario in ingress_engine_qos0 ingress_engine_qos0_v5 ingress_publish_qos1; do
+            env PYTHONPATH="$PWD/arm-a/src" python3 benchtools/benchmarks/paired_regression.py --scenario "$scenario" \
+              --base-root arm-a --candidate-root arm-b --repeat 9 --cpu 3 \
+              --output "$FINAL_OUT/diagnostics/feed-$scenario.json" \
+              | tee -a "$FINAL_OUT/diagnostics/feed.txt"
+          done
+
+      - name: Prepare RTT broker and environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$FINAL_OUT/rtt"
+          python3 -m venv "$out/venv"
+          . "$out/venv/bin/activate"
+          python -m pip install --upgrade pip >/dev/null
+          python -m pip install -e './harness[dev,mqttium]' 'psutil>=6,<8' >/dev/null
+          cat > "$out/mosquitto.conf" <<'EOF'
+          listener 11894 127.0.0.1
+          protocol mqtt
+          set_tcp_nodelay true
+          allow_anonymous true
+          persistence false
+          connection_messages false
+          log_dest stdout
+          log_type error
+          max_inflight_messages 1000
+          max_queued_messages 10000
+          max_packet_size 16777216
+          EOF
+          taskset -c 1 mosquitto -c "$out/mosquitto.conf" > "$out/mosquitto.log" 2>&1 &
+          echo "RTT_BROKER_PID=$!" >> "$GITHUB_ENV"
+          for _ in $(seq 1 50); do
+            (echo > /dev/tcp/127.0.0.1/11894) >/dev/null 2>&1 && exit 0
+            sleep 0.1
+          done
+          exit 1
+
+      - name: RTT A/A control on arm A
+        shell: bash
+        run: |
+          set -euo pipefail
+          . "$FINAL_OUT/rtt/venv/bin/activate"
+          PYTHONPATH=harness/src python -m mqtt_client_bench.layout_runner \
+            --worker-aslr system --entrypoint version_compare -- \
+            --client mqttium --baseline-path arm-a --candidate-path arm-a-aa \
+            --scenario application_rtt_fixed_rate --variant-index 0 --target-rate "$RTT_TARGET_RATE" \
+            --pacer-mode external --blocks 4 --max-block-retries 1 --profile standard \
+            --broker 127.0.0.1:11894 --broker-pid "$RTT_BROKER_PID" \
+            --output "$FINAL_OUT/rtt/aa-control.json" | tee "$FINAL_OUT/rtt/aa-control.txt"
+
+      - name: Require valid A/A before A/B
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, sys
+          from pathlib import Path
+          report = json.loads((Path(os.environ["FINAL_OUT"]) / "rtt" / "aa-control.json").read_text())
+          q = report.get("qualification") or {}
+          slots = report.get("slot_rates") or []
+          verdict = report.get("verdict") or {}
+          failures = []
+          if q.get("ok") is not True:
+              failures.append(f"qualification.ok={q.get('ok')!r}")
+          if not (q.get("blocks_complete") == q.get("blocks_requested") == 4):
+              failures.append(f"blocks={q.get('blocks_complete')!r}/{q.get('blocks_requested')!r}, expected 4/4")
+          if q.get("retry_exhausted_blocks"):
+              failures.append(f"retry_exhausted_blocks={q.get('retry_exhausted_blocks')!r}")
+          if len(slots) != 16 or any(value is None for value in slots):
+              failures.append(f"usable RTT slots={sum(value is not None for value in slots)}/{len(slots)}, expected 16/16")
+          effect = verdict.get("absolute_effect_pct")
+          if effect is None or abs(float(effect)) > 3.0:
+              failures.append(f"absolute_effect_pct={effect!r}, expected |effect| <= 3.0")
+          if failures:
+              print("A/A control is not usable; A/B will not run:")
+              for failure in failures:
+                  print(f"  - {failure}")
+              sys.exit(1)
+          print("A/A control valid; A/B may proceed.")
+          PY
+
+      - name: RTT A/B comparison
+        shell: bash
+        run: |
+          set -euo pipefail
+          . "$FINAL_OUT/rtt/venv/bin/activate"
+          PYTHONPATH=harness/src python -m mqtt_client_bench.layout_runner \
+            --worker-aslr system --entrypoint version_compare -- \
+            --client mqttium --baseline-path arm-a --candidate-path arm-b \
+            --scenario application_rtt_fixed_rate --variant-index 0 --target-rate "$RTT_TARGET_RATE" \
+            --pacer-mode external --blocks 4 --max-block-retries 1 --profile standard \
+            --broker 127.0.0.1:11894 --broker-pid "$RTT_BROKER_PID" \
+            --output "$FINAL_OUT/rtt/a-vs-b.json" | tee "$FINAL_OUT/rtt/a-vs-b.txt"
+
+      - name: Require qualified RTT A/B evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, sys
+          from pathlib import Path
+          report = json.loads((Path(os.environ["FINAL_OUT"]) / "rtt" / "a-vs-b.json").read_text())
+          q = report.get("qualification") or {}
+          slots = report.get("slot_rates") or []
+          failures = []
+          if q.get("ok") is not True:
+              failures.append(f"qualification.ok={q.get('ok')!r}")
+          if not (q.get("blocks_complete") == q.get("blocks_requested") == 4):
+              failures.append(f"blocks={q.get('blocks_complete')!r}/{q.get('blocks_requested')!r}, expected 4/4")
+          if q.get("retry_exhausted_blocks"):
+              failures.append(f"retry_exhausted_blocks={q.get('retry_exhausted_blocks')!r}")
+          if len(slots) != 16 or any(value is None for value in slots):
+              failures.append(f"usable RTT slots={sum(value is not None for value in slots)}/{len(slots)}, expected 16/16")
+          if failures:
+              print("RTT A/B evidence is not qualified:")
+              for failure in failures:
+                  print(f"  - {failure}")
+              sys.exit(1)
+          print("RTT A/B evidence qualified.")
+          PY
+
+      - name: Stop RTT broker
+        if: always()
+        shell: bash
+        run: '[ -n "${RTT_BROKER_PID:-}" ] && kill "$RTT_BROKER_PID" 2>/dev/null || true'
+
+      - name: Upload comparison evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: arm64-receive-candidate-comparison-${{ github.run_id }}
+          path: ${{ env.FINAL_OUT }}
+          if-no-files-found: error
+          retention-days: 30

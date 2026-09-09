@@ -1,0 +1,307 @@
+name: ARM64 receive layout stability
+run-name: "Layout stability: ${{ inputs.candidate_a_ref }} vs ${{ inputs.candidate_b_ref }}"
+
+# One question, not a general campaign: does either candidate reproducibly enter
+# a high-minor-fault / lower-throughput regime across independent process
+# layouts that the other avoids? The permanent comparison workflow already runs
+# a fresh subscriber per cell, so what is added here is the number of
+# independent layouts, longer stabilisation, and receive-path instrumentation
+# rich enough to characterise the distribution rather than its mean.
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_a_ref:
+        description: Exact 40-character commit SHA for arm A
+        required: true
+        type: string
+      candidate_b_ref:
+        description: Exact 40-character commit SHA for arm B
+        required: true
+        type: string
+      cells_per_arm:
+        description: Measured cells per arm (12-16)
+        required: false
+        default: "14"
+        type: string
+      confirm_trusted_code:
+        description: I confirm that every input commit was reviewed and is trusted on the persistent runner
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mqttium-arm64-runner
+  cancel-in-progress: false
+
+env:
+  BENCH_SHA: 37160eed99b50d1f384e1565a16d0346eb01ca56
+  PAYLOAD_SIZE: "65536"
+  OFFER_MSGS_S: "14000"
+  WARMUP_S: "2"
+  DURATION_S: "3"
+
+jobs:
+  stability:
+    if: inputs.confirm_trusted_code && github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 90
+    steps:
+      - name: Validate immutable trusted commits
+        env:
+          A_REF: ${{ inputs.candidate_a_ref }}
+          B_REF: ${{ inputs.candidate_b_ref }}
+          CELLS: ${{ inputs.cells_per_arm }}
+        run: |
+          set -euo pipefail
+          for value in "$A_REF" "$B_REF"; do
+            [[ "$value" =~ ^[0-9a-fA-F]{40}$ ]] || { echo "arm refs must be exact commit SHAs" >&2; exit 2; }
+          done
+          [ "$A_REF" != "$B_REF" ] || { echo "the two arms must differ" >&2; exit 2; }
+          [[ "$CELLS" =~ ^1[2-6]$ ]] || { echo "cells_per_arm must be 12-16" >&2; exit 2; }
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: tooling
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ inputs.candidate_a_ref }}
+          path: arm-a
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ inputs.candidate_b_ref }}
+          path: arm-b
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: yoch/mqtt-python-client-bench
+          ref: ${{ env.BENCH_SHA }}
+          path: harness
+          persist-credentials: false
+
+      - name: Set run-specific workspace
+        run: echo "FINAL_OUT=$RUNNER_TEMP/mqttium-layout-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+
+      - name: Verify exact environment and record provenance
+        env:
+          A_REF: ${{ inputs.candidate_a_ref }}
+          B_REF: ${{ inputs.candidate_b_ref }}
+          CELLS: ${{ inputs.cells_per_arm }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          test "$(git -C arm-a rev-parse HEAD)" = "$A_REF"
+          test "$(git -C arm-b rev-parse HEAD)" = "$B_REF"
+          test "$(git -C harness rev-parse HEAD)" = "$BENCH_SHA"
+          test "$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)" = performance
+          test "$(cat /proc/sys/kernel/randomize_va_space)" = 2
+          python3 -c 'import sys; assert sys.version_info[:3]==(3,14,7), sys.version'
+          version="$({ mosquitto -h 2>&1 || true; } | python3 -c 'import re,sys; t=sys.stdin.read(); m=re.search(r"mosquitto version\s+([0-9]+(?:\.[0-9]+)+)",t,re.I); print(m.group(1) if m else "")')"
+          test "$version" = 2.1.2
+          pgrep -x mosquitto >/dev/null && { echo "a broker is already running" >&2; exit 1; } || true
+          mkdir -p "$FINAL_OUT/cells"
+          python3 - <<'PY' > "$FINAL_OUT/provenance.json"
+          import glob, json, os, platform, subprocess
+          def sh(*c):
+              return subprocess.run(c, capture_output=True, text=True, check=False).stdout.strip()
+          print(json.dumps({
+              "workflow_main_sha": os.environ.get("GITHUB_SHA"),
+              "run_id": os.environ.get("GITHUB_RUN_ID"),
+              "arm_a_sha": os.environ["A_REF"],
+              "arm_b_sha": os.environ["B_REF"],
+              "cells_per_arm": int(os.environ["CELLS"]),
+              "external_harness_repo": "yoch/mqtt-python-client-bench",
+              "external_harness_sha": os.environ["BENCH_SHA"],
+              "python": platform.python_version(),
+              "kernel": sh("uname", "-r"),
+              "mosquitto": (sh("mosquitto", "-h") or "\n").splitlines()[0],
+              "governor": open("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor").read().strip(),
+              "aslr": open("/proc/sys/kernel/randomize_va_space").read().strip(),
+              "cpu_affinity": {"subscriber": 0, "broker": 1, "publisher": 2},
+              "payload_size": int(os.environ["PAYLOAD_SIZE"]),
+              "offer_msgs_s": int(os.environ["OFFER_MSGS_S"]),
+              "warmup_s": float(os.environ["WARMUP_S"]),
+              "duration_s": float(os.environ["DURATION_S"]),
+              "thermal_c": [int(open(p).read())/1000 for p in glob.glob("/sys/class/thermal/thermal_zone*/temp")],
+          }, indent=2, sort_keys=True))
+          PY
+          cat "$FINAL_OUT/provenance.json"
+          cc -O3 -pthread harness/scripts/mqtt_hammer.c -o "$FINAL_OUT/mqtt_hammer"
+
+      - name: Start broker
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$FINAL_OUT/mosquitto.conf" <<'EOF'
+          listener 11895 127.0.0.1
+          protocol mqtt
+          set_tcp_nodelay true
+          allow_anonymous true
+          persistence false
+          connection_messages false
+          log_dest stdout
+          log_type error
+          max_inflight_messages 1000
+          max_queued_messages 10000
+          max_packet_size 16777216
+          EOF
+          taskset -c 1 mosquitto -c "$FINAL_OUT/mosquitto.conf" > "$FINAL_OUT/mosquitto.log" 2>&1 &
+          echo "BROKER_PID=$!" >> "$GITHUB_ENV"
+          for _ in $(seq 1 50); do (echo > /dev/tcp/127.0.0.1/11895) >/dev/null 2>&1 && exit 0; sleep 0.1; done
+          exit 1
+
+      - name: Measure independent process layouts
+        shell: bash
+        env:
+          CELLS: ${{ inputs.cells_per_arm }}
+        run: |
+          set -euo pipefail
+          root="$FINAL_OUT/cells"; : > "$root/completed.tsv"
+          position=0
+          for block in $(seq 0 $((CELLS - 1))); do
+            if (( block % 2 == 0 )); then arms=(a b); else arms=(b a); fi
+            for arm in "${arms[@]}"; do
+              idx=$position; position=$((position + 1))
+              topic="bench/layout/${GITHUB_RUN_ID}/${idx}"; ready="$root/ready-$idx"
+              # A brand-new subscriber process per cell: this is what varies the
+              # address-space layout under normal ASLR.
+              taskset -c 0 env PYTHONPATH="$PWD/arm-$arm/src" python3 \
+                tooling/tools/receive_layout_stability_probe.py \
+                --arm "$arm" --cell "$block" --position "$idx" \
+                --host 127.0.0.1 --port 11895 --topic "$topic" \
+                --payload-size "$PAYLOAD_SIZE" --warmup-s "$WARMUP_S" --duration-s "$DURATION_S" \
+                --broker-pid "$BROKER_PID" --ready-file "$ready" --output "$root/sub-$idx.json" \
+                > "$root/sub-$idx.log" 2>&1 &
+              subpid=$!
+              for _ in $(seq 1 200); do [ -f "$ready" ] && break; kill -0 "$subpid" 2>/dev/null || { cat "$root/sub-$idx.log"; exit 1; }; sleep 0.05; done
+              test -f "$ready"
+              taskset -c 2 "$FINAL_OUT/mqtt_hammer" pub --host 127.0.0.1 --port 11895 \
+                --topic "$topic" --clients 2 --payload "$PAYLOAD_SIZE" --duration 7 --rate "$OFFER_MSGS_S" \
+                > "$root/pub-$idx.json" 2> "$root/pub-$idx.log" &
+              pubpid=$!; wait "$subpid"; wait "$pubpid"
+              printf '%s\t%s\t%s\n' "$idx" "$block" "$arm" >> "$root/completed.tsv"
+              sleep 0.2
+            done
+          done
+
+      - name: Qualify cells and characterise the distribution
+        shell: bash
+        env:
+          A_REF: ${{ inputs.candidate_a_ref }}
+          B_REF: ${{ inputs.candidate_b_ref }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, math, os, statistics
+          from pathlib import Path
+          root = Path(os.environ['FINAL_OUT']) / 'cells'
+          payload = float(os.environ['PAYLOAD_SIZE'])
+          rows = []
+          for line in (root / 'completed.tsv').read_text().splitlines():
+              idx_s, block_s, arm = line.split('\t')
+              idx, block = int(idx_s), int(block_s)
+              r = json.loads((root / f'sub-{idx}.json').read_text())
+              p = json.loads((root / f'pub-{idx}.json').read_text())
+              offer_msgs = float(p['msgs_per_s'])
+              r['offer_msgs_s'] = offer_msgs
+              r['offer_mib_s'] = offer_msgs * payload / (1024 * 1024)
+              r['publisher_margin'] = r['offer_mib_s'] / r['payload_mib_s']
+              r['qualified'] = (
+                  r['publisher_margin'] >= 1.02
+                  and r['sut_cpu_pct'] >= 90.0
+                  and r['broker_cpu_pct'] is not None and r['broker_cpu_pct'] < 90.0
+                  and r['ru_majflt'] == 0
+                  and r['broker_majflt'] is not None and r['broker_majflt'] == 0
+              )
+              rows.append(r)
+
+          def gm(xs):
+              return math.exp(statistics.mean(math.log(x) for x in xs))
+
+          def cv(xs):
+              return statistics.stdev(xs) / statistics.mean(xs) if len(xs) > 1 else 0.0
+
+          by_arm = {a: [r for r in rows if r['arm'] == a] for a in ('a', 'b')}
+          pairs = []
+          for block in sorted({r['cell'] for r in rows}):
+              cell = {r['arm']: r for r in rows if r['cell'] == block}
+              if set(cell) != {'a', 'b'}:
+                  continue
+              pairs.append({
+                  'cell': block,
+                  'qualified': cell['a']['qualified'] and cell['b']['qualified'],
+                  'b_over_a_throughput': cell['b']['payload_mib_s'] / cell['a']['payload_mib_s'],
+                  'b_over_a_cpu_per_mib': cell['b']['cpu_per_mib'] / cell['a']['cpu_per_mib'],
+              })
+
+          # "Material" is deliberately generous: a tenth of a fault per message is
+          # already two orders of magnitude above a clean cell.
+          MATERIAL = 0.1
+          per_arm = {}
+          for arm, cells in by_arm.items():
+              faults = [c['minflt_per_message'] or 0.0 for c in cells]
+              throughput = [c['payload_mib_s'] for c in cells]
+              per_arm[arm] = {
+                  'cells': len(cells),
+                  'throughput_mib_s': sorted(round(t, 1) for t in throughput),
+                  'throughput_median': statistics.median(throughput),
+                  'throughput_cv_pct': 100.0 * cv(throughput),
+                  'minflt_per_message': sorted(round(f, 4) for f in faults),
+                  'minflt_per_message_max': max(faults),
+                  'cells_with_material_faults': sum(1 for f in faults if f > MATERIAL),
+                  'cpu_per_mib_median': statistics.median(c['cpu_per_mib'] for c in cells),
+              }
+
+          summary = {
+              'arm_a_sha': os.environ['A_REF'],
+              'arm_b_sha': os.environ['B_REF'],
+              'material_fault_threshold_per_message': MATERIAL,
+              'all_cells_qualified': all(r['qualified'] for r in rows),
+              'per_arm': per_arm,
+              'balanced_pairs': pairs,
+              'b_over_a_throughput_geomean': gm([p['b_over_a_throughput'] for p in pairs]),
+              'b_over_a_cpu_per_mib_geomean': gm([p['b_over_a_cpu_per_mib'] for p in pairs]),
+              'order_position_effect': {
+                  'first_in_cell_median_mib_s': statistics.median(
+                      [r['payload_mib_s'] for r in rows if r['position'] % 2 == 0]),
+                  'second_in_cell_median_mib_s': statistics.median(
+                      [r['payload_mib_s'] for r in rows if r['position'] % 2 == 1]),
+              },
+              'fault_vs_throughput': [
+                  {'arm': r['arm'], 'position': r['position'],
+                   'minflt_per_message': r['minflt_per_message'],
+                   'payload_mib_s': r['payload_mib_s'],
+                   'recv_callbacks': r.get('recv_callbacks'),
+                   'bytes_per_callback': r.get('bytes_per_callback'),
+                   'pause_count': r.get('pause_count'),
+                   'resume_count': r.get('resume_count'),
+                   'decoder_growths': r.get('decoder_growths'),
+                   'decoder_shrinks': r.get('decoder_shrinks')}
+                  for r in sorted(rows, key=lambda r: -(r['minflt_per_message'] or 0.0))
+              ],
+              'cells': rows,
+          }
+          (root / 'summary.json').write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n')
+          print(json.dumps({k: v for k, v in summary.items() if k != 'cells'}, indent=2, sort_keys=True))
+          assert summary['all_cells_qualified'], 'some cells did not qualify'
+          PY
+
+      - name: Stop broker
+        if: always()
+        shell: bash
+        run: '[ -n "${BROKER_PID:-}" ] && kill "$BROKER_PID" 2>/dev/null || true'
+
+      - name: Upload layout stability evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: arm64-receive-layout-stability-${{ github.run_id }}
+          path: ${{ env.FINAL_OUT }}
+          if-no-files-found: error
+          retention-days: 30
