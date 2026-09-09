@@ -248,3 +248,50 @@ Custom transports that previously satisfied `AsyncTransport` by providing
 Code that annotated `AsyncTransport` and called `.read()` should annotate
 `PullTransport` instead.
 
+
+
+## Decoder storage and ingress contract
+
+The decoder's slab is reusable but not fixed-size. It grows progressively with
+received data, at most geometrically, and a valid known head-frame extent caps
+that growth. The announced Remaining Length is **not** a request to reserve the
+entire body immediately. This avoids multi-MiB allocations after just a header,
+without introducing timers, global budgets, or an additional framing engine.
+
+Both `feed()` and direct ingress use this sizing policy. `feed()` must still
+accept all bytes handed to it, including multiple frames in one call; a packet
+size limit is not a limit on the size of an explicit feed. Contiguous typed or
+multidimensional memoryviews are interpreted as bytes without an intermediate
+payload copy. Non-contiguous views are flattened in logical order; that unusual
+input necessarily needs a temporary contiguous representation. The caller's
+view remains usable. Application payloads and raw packet bodies remain owned
+immutable `bytes`.
+
+`writable_window(preferred)` asks for the larger of the adaptive receive target
+and the preference. It can return fewer bytes at a known incomplete frame's end.
+It is neither a minimum-length guarantee nor a strict upper-bound argument.
+Normal transport calls remain capped by `RECEIVE_QUANTUM`; an explicit larger
+preference is supported for internal integrations. Use the actual view length.
+Write into one window, drop the view, and commit its written bytes before any
+other decoder operation. Do not retain a window across compaction, clear,
+consumption, or another receive request.
+
+Compaction and growth copy through byte-oriented memoryview destinations; they
+do not create a second buffer the size of the live data. Growth still briefly
+holds the old and new slabs, and packet delivery still materializes owned bytes.
+A first fragmented large frame may require several geometric growth steps;
+subsequent large frames reuse the capacity. Tests bound total bytes copied and
+capacity, not an unsafe promise to allocate every announced frame in two steps.
+
+Retirement remains based on 64 drains since the last genuinely large frame,
+sized to recent aggregate pressure and the adaptive receive target. It is not
+an idle timer: a slab retained after real large traffic can remain while idle.
+`clear()` resets connection state and releases oversized capacity. Configure
+`max_packet_size` for the deployment; inbound/delivery queue budgets do not
+include decoder capacity, transient copies, or buffers owned by the OS.
+
+Transport factories must return **exactly one** receive capability. A result
+with neither or both now raises `TypeError` locally before CONNECT or task
+startup and is closed by the connection failure path. Previously such a local
+configuration error could appear as a CONNACK timeout. Existing pull-only and
+push-only transports are unchanged.

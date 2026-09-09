@@ -8,7 +8,7 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Changed
 
-- Receive cleartext TCP straight into the decoder's own storage on CPython selector event loops. `asyncio.BufferedProtocol.get_buffer()` returns a window carved out of `IncrementalDecoder`'s own slab, so received bytes are no longer copied through an intermediate receive buffer before reaching the parser. Storage is adaptive: it starts at 16 KiB, the receive window starts at 64 KiB and is promoted toward 256 KiB only under sustained full windows, a known large frame reserves its exact extent instead of doubling past it, and an enlarged slab is retired once large frames stop arriving. TLS, WebSocket, Proactor, non-CPython runtimes and third-party event loops keep the `read()` + `feed()` path.
+- Receive cleartext TCP straight into the decoder's own storage on CPython selector event loops. `asyncio.BufferedProtocol.get_buffer()` returns a window carved out of `IncrementalDecoder`'s own slab, so received bytes are no longer copied through an intermediate receive buffer before reaching the parser. Storage is adaptive: it starts at 16 KiB, the receive window starts at 64 KiB and is promoted toward 256 KiB only under sustained full windows, a known large frame caps progressive growth at its exact extent without reserving the entire announced body, and an enlarged slab is retired once large frames stop arriving. TLS, WebSocket, Proactor, non-CPython runtimes and third-party event loops keep the `read()` + `feed()` path.
 
 - **Provisional API change.** Receiving is now a transport capability rather than part of the common contract. `AsyncTransport` no longer declares `read()`; a transport offers exactly one of `PullTransport` (`read()`) or `DecoderPushTransport` (`attach_decoder()` + `receive()`), both exported from `mqttium.transport` and both runtime-checkable. On CPython selector event loops with cleartext TCP, `TcpTransport.connect()` returns a push-capable transport rather than an instance of the calling class, and that transport has no `read()` at all, so it cannot be misclassified as pull-capable. Custom transports should declare the capability they implement; the supported extension point remains the transport factory seam, not subclassing `TcpTransport`. TLS, WebSocket, Unix sockets, Proactor, non-CPython runtimes and third-party loops keep the pull capability unchanged.
 
@@ -50,6 +50,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Avoid payload-sized temporary allocations when compacting or copying decoder storage. `feed()` now handles typed, multidimensional and strided memoryviews as wire bytes, and fragmented pull ingress shares the direct path's bounded large-frame sizing. A length announcement alone no longer reserves the complete packet.
+- Reject custom transports offering neither or both receive capabilities before sending CONNECT, preserving the local error rather than reporting a misleading CONNACK timeout.
 
 - Local store/persistence failures during ingress processing now propagate
   with their original exception instead of being converted into a
