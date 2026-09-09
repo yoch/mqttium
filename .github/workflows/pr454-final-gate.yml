@@ -1,0 +1,179 @@
+name: PR454 final pre-merge qualification
+on:
+  push:
+    branches: [work/pr454-final-gate]
+permissions:
+  contents: read
+jobs:
+  qualification:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: dedicated-arm64
+            runner: '["self-hosted","linux","ARM64"]'
+          - platform: hosted-x86
+            runner: '"ubuntu-24.04"'
+    runs-on: ${{ fromJSON(matrix.runner) }}
+    concurrency:
+      group: ${{ matrix.platform == 'dedicated-arm64' && 'mqttium-arm64-runner' || 'pr454-final-hosted-x86' }}
+      cancel-in-progress: false
+    timeout-minutes: 55
+    env:
+      PYTHONUNBUFFERED: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+      PIP_DISABLE_PIP_VERSION_CHECK: '1'
+      CANDIDATE_TREE: d9ba32e1a4ac436063da736768cfb38148e627b1
+      CANDIDATE_SRC_TREE: 699b2dcd66ccae2d358e0c8aa740a7fe38933131
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          ref: 9ad1f01857306ac5079ffb1d073a59fdb60e1931
+          path: arm-a
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          ref: 9cdb9b4d03e2b87e05f97b7a7e2422cc13ef59b2
+          path: arm-b
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          ref: 3919ec806d78462b0ab7905f3362268fdc707b1f
+          path: historical-harness
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          repository: yoch/mqtt-python-client-bench
+          ref: ec332e25003a6484727697c3018ce632a025a7f2
+          path: external-bench
+          sparse-checkout: |
+            src
+            hosts
+            mosquitto
+            README.md
+            SCENARIOS.md
+            pyproject.toml
+          sparse-checkout-cone-mode: false
+      - name: Identity, isolated environment and machine metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT=$(mktemp -d "$RUNNER_TEMP/pr454-final-${GITHUB_RUN_ID}-XXXXXX")
+          echo "JOB_ROOT=$ROOT" >> "$GITHUB_ENV"
+          mkdir -p results
+          test "$(git -C arm-a rev-parse HEAD)" = 9ad1f01857306ac5079ffb1d073a59fdb60e1931
+          test "$(git -C arm-b rev-parse HEAD)" = 9cdb9b4d03e2b87e05f97b7a7e2422cc13ef59b2
+          test "$(git -C arm-b rev-parse HEAD^{tree})" = "$CANDIDATE_TREE"
+          test "$(git -C external-bench rev-parse HEAD)" = ec332e25003a6484727697c3018ce632a025a7f2
+          python3 -m venv "$ROOT/venv"
+          echo "$ROOT/venv/bin" >> "$GITHUB_PATH"
+          uname -a > results/machine.txt
+          lscpu >> results/machine.txt
+          python3 -V >> results/machine.txt
+          printf '%s\n' "$RUNNER_NAME" >> results/machine.txt
+          if test -f /proc/device-tree/model; then cat /proc/device-tree/model >> results/machine.txt; fi
+          for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor /sys/class/thermal/thermal_zone*/temp; do
+            if test -f "$f"; then printf '%s=' "$f" >> results/machine.txt; cat "$f" >> results/machine.txt; fi
+          done
+          ps -eo pid,pcpu,comm --sort=-pcpu | head -20 >> results/machine.txt || true
+          python3 - <<'PY'
+          import hashlib, os, pathlib, subprocess
+          p=pathlib.Path
+          text=p('historical-harness/tools/pr454_perf_probe.py').read_text()
+          assert hashlib.sha256(text.encode()).hexdigest() == '305373f69b25710227904b3d49b2d91b0bc125e9bbae01c901306a2d227378e5'
+          text=text.replace("HEAD='a27a5f7942c86d24495f375ced1c72f440e6982b'", "HEAD=os.environ.get('CANDIDATE_TREE','unpublished-tree')")
+          text=text.replace("'B':'0f55ffb86a2565af012e751e45155d36096f6dca'", "'B':os.environ['CANDIDATE_SRC_TREE']")
+          assert hashlib.sha256(text.encode()).hexdigest() == '7f132613eb3cb42d1b0b83b57e81c4dc68ddbde77ac813409f6570933164b7da'
+          p('results/probe.py').write_text(text)
+          cores={}
+          for row in subprocess.check_output(['lscpu','-p=CPU,CORE,SOCKET'],text=True).splitlines():
+              if row.startswith('#'): continue
+              cpu,core,sock=map(int,row.split(','))
+              if cpu in os.sched_getaffinity(0): cores.setdefault((sock,core),cpu)
+          cpus=list(cores.values()); assert len(cpus)>=2, 'need separate exposed cores'
+          with open(os.environ['GITHUB_ENV'],'a') as f: f.write(f'SUT_CPU={cpus[0]}\nBROKER_CPU={cpus[1]}\n')
+          p('results/source-identity.txt').write_text('base=9ad1f01857306ac5079ffb1d073a59fdb60e1931\ncandidate=9cdb9b4d03e2b87e05f97b7a7e2422cc13ef59b2\nroot='+os.environ['CANDIDATE_TREE']+'\nsrc='+os.environ['CANDIDATE_SRC_TREE']+'\nexternal=ec332e25003a6484727697c3018ce632a025a7f2\n')
+          PY
+      - name: Install isolated test dependencies
+        run: python -m pip install -e 'arm-b[dev,fuzz]' -e 'external-bench[paho]' 'psutil>=6,<8'
+      - name: Fresh complete unit project resilience selection
+        working-directory: arm-b
+        run: python -m pytest -q -W error tests/unit tests/project tests/resilience | tee ../results/tests.txt
+      - name: Broker preparation on hosted runner only
+        if: matrix.platform == 'hosted-x86'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mosquitto
+      - name: Start isolated low-latency broker
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v mosquitto
+          (mosquitto -h || true) > results/broker-version.txt 2>&1
+          cat > "$JOB_ROOT/broker.conf" <<'EOF'
+          listener 18893 127.0.0.1
+          allow_anonymous true
+          persistence false
+          set_tcp_nodelay true
+          max_inflight_messages 1000
+          max_queued_messages 100000
+          log_type error
+          EOF
+          cp "$JOB_ROOT/broker.conf" results/
+          taskset -c "$BROKER_CPU" mosquitto -c "$JOB_ROOT/broker.conf" > results/broker.log 2>&1 &
+          echo $! > "$JOB_ROOT/broker.pid"
+          cp "$JOB_ROOT/broker.pid" results/
+          python arm-b/tools/ci/wait_for_endpoints.py --tcp 127.0.0.1:18893
+          kill -0 "$(cat "$JOB_ROOT/broker.pid")"
+      - name: Static routes A/A then A/B, same measurement code, 12 pairs
+        run: |
+          python results/probe.py campaign --base arm-a --candidate arm-b --kind micro --count 8000 --repeats 12 --cpu "$SUT_CPU" --output results/micro
+          python results/probe.py campaign --base arm-a --candidate arm-b --kind network --count 1600 --repeats 12 --cpu "$SUT_CPU" --port 18893 --output results/network
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: pr454-final-static-${{ matrix.platform }}
+          path: results/
+          retention-days: 30
+      - name: Fixed-rate external pacer 3942, separate same-source A/A then A/B
+        if: matrix.platform == 'dedicated-arm64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp -a arm-a "$JOB_ROOT/arm-aa"
+          python - <<'PY'
+          import json,os,pathlib
+          from mqtt_client_bench.telemetry import allocate_cpuset
+          sets=allocate_cpuset(['sut','broker','loadgen','orch'],profile='standard')
+          pathlib.Path('results/fixed-rate-cpusets.json').write_text(json.dumps(sets,indent=2))
+          ids=[]
+          for part in sets['broker'].split(','):
+              if '-' in part:
+                  a,b=map(int,part.split('-')); ids.extend(range(a,b+1))
+              else: ids.append(int(part))
+          pid=int((pathlib.Path(os.environ['JOB_ROOT'])/'broker.pid').read_text())
+          os.sched_setaffinity(pid,set(ids))
+          PY
+          python -m mqtt_client_bench.version_compare --client mqttium --baseline-path arm-a --candidate-path "$JOB_ROOT/arm-aa" --scenario application_rtt_fixed_rate --variant-index 0 --target-rate 3942 --pacer-mode external --broker 127.0.0.1:18893 --broker-pid "$(cat "$JOB_ROOT/broker.pid")" --blocks 4 --max-block-retries 1 --profile standard --output results/fixed-rate-aa.json > results/fixed-rate-aa.log 2>&1
+          python -m mqtt_client_bench.version_compare --client mqttium --baseline-path arm-a --candidate-path arm-b --scenario application_rtt_fixed_rate --variant-index 0 --target-rate 3942 --pacer-mode external --broker 127.0.0.1:18893 --broker-pid "$(cat "$JOB_ROOT/broker.pid")" --blocks 6 --max-block-retries 1 --profile standard --output results/fixed-rate-ab.json > results/fixed-rate-ab.log 2>&1
+      - name: Final source identity and owned broker cleanup
+        if: always()
+        shell: bash
+        run: |
+          if test -n "${JOB_ROOT:-}" && test -f "$JOB_ROOT/broker.pid"; then kill "$(cat "$JOB_ROOT/broker.pid")" 2>/dev/null || true; fi
+          git -C arm-a status --short > results/final-a.txt
+          git -C arm-b status --short > results/final-b.txt
+          git -C external-bench status --short > results/final-external.txt
+          git -C arm-b rev-parse HEAD^{tree} > results/final-tree.txt
+          test ! -s results/final-a.txt
+          test ! -s results/final-b.txt
+          test ! -s results/final-external.txt
+          echo 'Static: twelve balanced pairs per phase, 1600 network cycles, no sample exclusions. External: fixed3942, 4 same-source AA blocks then6 AB blocks, original whole-block stimulus-only retry<=1, every attempt retained. Practical margin3%; analyze AA validity and uncertainty, do not equate job success with performance acceptance. No absolute cross-host comparison. No merge.' > results/policy.txt
+          if test -n "${JOB_ROOT:-}"; then rm -rf "$JOB_ROOT"; fi
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: pr454-final-complete-${{ matrix.platform }}
+          path: results/
+          retention-days: 30
