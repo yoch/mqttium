@@ -1,0 +1,318 @@
+diff --git a/src/mqttium/api/_delivery.py b/src/mqttium/api/_delivery.py
+--- a/src/mqttium/api/_delivery.py
++++ b/src/mqttium/api/_delivery.py
+@@ -23,6 +23,15 @@
+ from mqttium.types import Message
+ 
+ MessageDelivery = Literal["auto", "iterator", "callback", "both"]
++
++
++class _MessageBatchCancelled(asyncio.CancelledError):
++    """Tell the effect owner which admitted prefix must never be retried."""
++
++    def __init__(self, count: int, original: asyncio.CancelledError) -> None:
++        super().__init__(*original.args)
++        self.count = count
++        self.original = original
+ 
+ 
+ class _SharedDeliveryReservation:
+@@ -562,8 +571,11 @@
+                         return False
+                 elif not self._is_small_decoded(message, wire_size):
+                     return False
+-        if len(messages) == 1 and self.can_dispatch_callback_inline(callback):
+-            self.dispatch_callback_inline(callback, messages[0])
++        if messages and self.can_dispatch_callback_inline(callback):
++            if len(messages) == 1:
++                self.dispatch_callback_inline(callback, messages[0])
++            else:
++                self._dispatch_sync_message_burst_inline(callback, messages)
+             return True
+         self._enqueue_message_batch(callback, messages, iterator_delivery=False)
+         return True
+@@ -572,6 +584,7 @@
+         self,
+         effects: deque[EngineEffect],
+         callback: Callable[[Message], Any] | None,
++        allow_inline: bool = True,
+     ) -> int:
+         """Deliver a consecutive small-message effect prefix without suspending.
+ 
+@@ -587,12 +600,21 @@
+         if callback_delivery and len(effects) > 1:
+             assert callback is not None
+             capacity = self._callback_batch_capacity(iterator_delivery)
++            inline = (
++                allow_inline
++                and not iterator_delivery
++                and self.can_dispatch_callback_inline(callback)
++            )
++            # The running first callback needs no queue slot. Inspect one more
++            # eligible effect to detect a burst whose tail cannot all fit;
++            # that burst keeps bounded worker admission instead of running A
++            # ahead of an unreserved suffix.
++            scan_capacity = capacity + int(inline)
+             messages: list[Message] = []
++            complete = True
+             for effect in effects:
+                 kind = effect.kind
+-                if len(messages) >= capacity or (
+-                    kind is not EffectKind.MESSAGE and kind is not EffectKind.DECODED_MESSAGE
+-                ):
++                if kind is not EffectKind.MESSAGE and kind is not EffectKind.DECODED_MESSAGE:
+                     break
+                 message: Message = effect.data
+                 property_wire_size = effect.decoded_property_wire_size
+@@ -603,16 +625,24 @@
+                 )
+                 if effect.requires_delivery_mark or not small:
+                     break
++                if len(messages) >= scan_capacity:
++                    complete = False
++                    break
+                 messages.append(message)
+-            if len(messages) > 1:
+-                if (
+-                    len(messages) == 2
+-                    and not iterator_delivery
+-                    and self.can_dispatch_callback_inline(callback)
+-                ):
+-                    self._dispatch_sync_message_pair_inline(callback, messages)
+-                    return 2
+-                self._enqueue_message_batch(callback, messages, iterator_delivery=iterator_delivery)
++            if len(messages) > 1 or (inline and messages and not complete):
++                if inline and complete:
++                    try:
++                        self._dispatch_sync_message_burst_inline(callback, messages)
++                    except asyncio.CancelledError as exc:
++                        raise _MessageBatchCancelled(len(messages), exc) from exc
++                else:
++                    if len(messages) > capacity:
++                        messages.pop()
++                    if not messages:
++                        return 0
++                    self._enqueue_message_batch(
++                        callback, messages, iterator_delivery=iterator_delivery
++                    )
+                 return len(messages)
+ 
+         # Bind the callback once instead of re-testing `callback_delivery` and
+@@ -641,7 +671,11 @@
+                 break
+             if iterator_delivery and self.messages_queue.full():
+                 break
+-            dispatch_inline = cb is not None and self.can_dispatch_callback_inline(cb)
++            dispatch_inline = (
++                cb is not None
++                and (iterator_delivery or (allow_inline and applied == 0))
++                and self.can_dispatch_callback_inline(cb)
++            )
+             if cb is not None and not dispatch_inline and self.callback_queue.full():
+                 break
+             if iterator_delivery:
+@@ -652,7 +686,10 @@
+                 # `_callback_active`; that nested work and any queued burst
+                 # retain the bounded worker semantics.
+                 if dispatch_inline:
+-                    self.dispatch_callback_inline(cb, message)
++                    try:
++                        self.dispatch_callback_inline(cb, message)
++                    except asyncio.CancelledError as exc:
++                        raise _MessageBatchCancelled(applied + 1, exc) from exc
+                 else:
+                     if not callback_worker_ready:
+                         self.ensure_callback_worker()
+@@ -861,25 +898,31 @@
+         self.dispatch_callback_inline(callback, *args)
+         return True
+ 
+-    def _dispatch_sync_message_pair_inline(
++    def _dispatch_sync_message_burst_inline(
+         self,
+         callback: Callable[[Message], Any],
+         messages: list[Message],
+     ) -> None:
+-        """Run one eligible two-message synchronous burst inline.
+-
+-        The second message remains reserved in the existing logical callback
+-        bound while the first callback runs, so reentrant admissions queue
+-        behind the pair without weakening ``max_pending_callbacks``.
++        """Pre-admit the tail, then run only the first synchronous delivery.
++
++        Entry requires idle delivery and enough capacity for the whole tail.
++        Starting the idle worker BEFORE enqueue also makes eager task factories
++        safe: it blocks on the empty queue. No await occurs before this helper
++        returns, so the tail remains at the queue head, ahead of reentrant work.
+         """
+-        self._reserve_callback_batch(2)
+-        self._callback_active = True
+-        try:
+-            self.run_sync_callback(callback, messages[0])
+-            self.run_sync_callback(callback, messages[1])
+-        finally:
+-            self._callback_active = False
+-            self._release_callback_batch(2)
++        tail = messages[1:]
++        self._enqueue_message_batch(callback, tail, iterator_delivery=False)
++        try:
++            self.dispatch_callback_inline(callback, messages[0])
++        except BaseException:
++            # Ordinary errors and self-raised CancelledError are isolated by
++            # run_sync_callback. A propagated interruption abandons only this
++            # unstarted tail, not any work admitted reentrantly behind it.
++            _callback, args, token = self.callback_queue.get_nowait()
++            assert token is _CALLBACK_MESSAGE_BATCH and args[0] is tail
++            self._release_callback_batch(len(tail))
++            self.callback_queue.task_done()
++            raise
+ 
+     def dispatch_callback_inline(self, callback: Callable[..., Any], *args: Any) -> None:
+         """Invoke a callback after the caller established inline eligibility."""
+diff --git a/src/mqttium/api/_effects.py b/src/mqttium/api/_effects.py
+--- a/src/mqttium/api/_effects.py
++++ b/src/mqttium/api/_effects.py
+@@ -12,6 +12,7 @@
+ from collections.abc import Callable
+ from typing import TYPE_CHECKING, Protocol
+ 
++from mqttium.api._delivery import _MessageBatchCancelled
+ from mqttium.api.stats import EffectStats
+ from mqttium.protocol.effects import EffectKind, EngineEffect
+ 
+@@ -31,7 +32,7 @@
+     def _apply_effect_inline(self, effect: EngineEffect, epoch: int) -> bool: ...
+ 
+     def _apply_message_effect_batch_inline(
+-        self, effects: deque[EngineEffect], epoch: int
++        self, effects: deque[EngineEffect], epoch: int, allow_inline: bool = True
+     ) -> int: ...
+ 
+     async def _apply_effect(
+@@ -179,8 +180,9 @@
+ 
+     def _consume_batch(
+         self,
+-        apply: Callable[[deque[EngineEffect], int], int],
++        apply: Callable[[deque[EngineEffect], int, bool], int],
+         epoch: int,
++        allow_inline: bool,
+     ) -> bool:
+         """Apply a consecutive non-persisted small-message prefix.
+ 
+@@ -188,13 +190,23 @@
+         which one is bound differs between the two kinds. One call per batch,
+         not per message.
+         """
+-        applied = apply(self.pending, epoch)
++        cancelled: asyncio.CancelledError | None = None
++        try:
++            applied = apply(self.pending, epoch, allow_inline)
++        except _MessageBatchCancelled as exc:
++            # Admission already happened; A ran and its tail was discarded.
++            # Consume that prefix before propagating cancellation, otherwise
++            # a reentrant flush request can replay A and resurrect its tail.
++            applied = exc.count
++            cancelled = exc.original
+         if not applied:
+             return False
+         for _ in range(applied):
+             self.pending.popleft()
+             self.inline_effects += 1
+             self._complete()
++        if cancelled is not None:
++            raise cancelled
+         return True
+ 
+     def drain_inline(self) -> None:
+@@ -209,12 +221,16 @@
+                 return
+             epoch = self.pending_epoch
+         self.draining_inline = True
++        allow_inline = True
+         try:
+             while self.pending:
+                 effect = self.pending[0]
+                 kind = effect.kind
+                 if kind is EffectKind.MESSAGE or kind is EffectKind.DECODED_MESSAGE:
+-                    if self._consume_batch(self.owner._apply_message_effect_batch_inline, epoch):
++                    if self._consume_batch(
++                        self.owner._apply_message_effect_batch_inline, epoch, allow_inline
++                    ):
++                        allow_inline = False
+                         continue
+                     break
+                 if not self.owner._apply_effect_inline(effect, epoch):
+@@ -237,7 +253,12 @@
+         task.add_done_callback(self._done)
+ 
+     async def _run_scheduled(self) -> None:  # noqa: C901
++        # An eager task factory can start a reentrant flush while an inline
++        # drain still owns the pending prefix. Defer until that stack unwinds.
++        if self.draining_inline:
++            await asyncio.sleep(0)
+         async with self.lock:
++            allow_inline = True
+             while True:
+                 self.flush_requested = False
+                 while self.pending:
+@@ -249,8 +270,9 @@
+                     kind = effect.kind
+                     if kind is EffectKind.MESSAGE or kind is EffectKind.DECODED_MESSAGE:
+                         if self._consume_batch(
+-                            self.owner._apply_message_effect_batch_inline, epoch
++                            self.owner._apply_message_effect_batch_inline, epoch, allow_inline
+                         ):
++                            allow_inline = False
+                             continue
+                     try:
+                         await self.owner._apply_effect(effect, nowait=False, epoch=epoch)
+diff --git a/src/mqttium/api/async_client.py b/src/mqttium/api/async_client.py
+--- a/src/mqttium/api/async_client.py
++++ b/src/mqttium/api/async_client.py
+@@ -2060,17 +2060,22 @@
+                             effects.extend(kept)
+                             self._engine.notify_transport_closed()
+                             raise
+-                        if captured:
+-                            if self._delivery.deliver_callback_messages_inline(
+-                                captured, self._message_callback, captured_property_sizes
+-                            ):
+-                                self._effect_pump.record_inline_batch(len(captured))
+-                            else:
++                        if handled and self._engine.has_pending_effects:
++                            self._collect_effects_locked()
++                    # The store transaction and engine lock must both be closed
++                    # before invoking any captured user callback. No suspension
++                    # separates capture from this first admission attempt.
++                    if captured:
++                        if self._delivery.deliver_callback_messages_inline(
++                            captured, self._message_callback, captured_property_sizes
++                        ):
++                            self._effect_pump.record_inline_batch(len(captured))
++                        else:
++                            async with self._engine_lock:
+                                 _extend_message_effects(
+                                     self._engine._effects, captured, captured_property_sizes
+                                 )
+-                        if handled and self._engine.has_pending_effects:
+-                            self._collect_effects_locked()
++                                self._collect_effects_locked()
+                     if self._effect_pump.pending:
+                         await self._drain_effects()
+                     # A batch that stopped short of both bounds emptied the
+@@ -2516,10 +2521,13 @@
+         self,
+         effects: deque[EngineEffect],
+         epoch: int,
++        allow_inline: bool = True,
+     ) -> int:
+         if epoch != self._connection_epoch or self._engine_lock.locked():
+             return 0
+-        return self._delivery.deliver_message_batch_inline(effects, self._message_callback)
++        return self._delivery.deliver_message_batch_inline(
++            effects, self._message_callback, allow_inline
++        )
+ 
+     async def _flush_effects(self) -> None:
+         async with self._engine_lock:
