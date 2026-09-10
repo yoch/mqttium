@@ -24,6 +24,14 @@ Functional correctness and resource bounds remain mandatory. Record all ratios
 and A/A noise, and label results diagnostic if the runner is ineligible. These
 measurements are not release qualification or public cross-client evidence.
 
+Record the broker's TCP settings. Small QoS 0 bursts can alternate between fast
+delivery and roughly 40-ms TCP stalls, including with identical client source;
+a short pilot may then choose an unsuitable message count. Inspect raw A/A
+durations as well as aggregate ratios. A separate broker with Mosquitto's
+`set_tcp_nodelay true` is a useful controlled condition, but it changes the
+stimulus. Preserve the original attempt and report the two conditions separately
+instead of presenting the new result as an unchanged-workload rerun.
+
 ## What each benchmark answers
 
 - `hotpath_profile.py` counts calls, primitive calls, and allocations. These
