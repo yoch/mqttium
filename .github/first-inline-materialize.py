@@ -61,6 +61,11 @@ def prepare():
     check(run('git','rev-parse','HEAD^{tree}') == BASE_TREE, 'wrong base tree')
     run('git','apply','--check',str(OUT/'input.patch'))
     run('git','apply','--index',str(OUT/'input.patch'))
+    followup = gzip.decompress((HERE/'first-inline-followup.patch.gz').read_bytes())
+    check(sha(followup) == MANIFEST['followup_sha256'], 'followup checksum')
+    (OUT/'followup.patch').write_bytes(followup)
+    run('git','apply','--check',str(OUT/'followup.patch'))
+    run('git','apply','--index',str(OUT/'followup.patch'))
     check(set(run('git','diff','--cached','--name-only').splitlines()) == set(MANIFEST['paths']), 'unexpected paths')
     check(asts() == MANIFEST['ast_sha256'], 'input AST mismatch')
     (OUT/'input-sources.json').write_text(json.dumps(snapshots(),indent=2)+'\n')
@@ -109,10 +114,11 @@ def publish():
     check(tree==record['tree'],'remote tested tree mismatch')
     commit=api('commits',{'tree':tree,'parents':[record['bootstrap']], 'message':
         'fix: harden first-inline callback ownership and expose the tested runtime\n\n'
-        'Retire cancelled callback workers including pre-start cancellation; protect\n'
-        'replacement ownership and waiting producers. Reschedule the unconsumed effect\n'
-        'suffix before relaying interrupted inline admission. Integrate 292 focused\n'
-        'prototype/ownership cases and explicit cancellation/fairness limitations.\n\n'
+        'Retire cancelled callback workers before awakened producers resume, including\n'
+        'pre-start cancellation; protect replacement ownership and waiting admissions.\n'
+        'Reschedule the unconsumed effect suffix before relaying interrupted inline\n'
+        'admission. Integrate 300 focused prototype/ownership cases and explicit\n'
+        'cancellation/fairness limitations.\n\n'
         'Restore production workflows/tools. No main write, merge or release.\n'
         'The old Pi smoke is not performance qualification of this corrected tree.\n'
         'Validation run: '+record['run_id']+'; exact tested root: '+tree+'\n'})['sha']

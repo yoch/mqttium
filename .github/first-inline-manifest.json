@@ -18,14 +18,15 @@
     "tests/unit/test_sync_callback_contract.py"
   ],
   "ast_sha256": {
-    "src/mqttium/api/_delivery.py": "737c75b01542270f0c9267b3e090b1cd2b8d301df31104b0dd7b0b87af996f47",
+    "src/mqttium/api/_delivery.py": "3ab730e65c38a35f06a5940ac1082902eae8a7b20bc848d34c82a8fbd284334e",
     "src/mqttium/api/_effects.py": "c76efc830ff059626e921bb7a7272b7cb14226d938430dd1ace14117b122441c",
     "src/mqttium/api/async_client.py": "455d7c3871d4d9acbaf14a5f58ae293b917ebe27b30f26d61b2e0c2e9124e563",
     "tests/unit/test_callback_message_batches.py": "0b376dd35eb93601d1e949a1d41877b00e01ee8fe301bb420c09287ee35b98c7",
     "tests/unit/test_effect_drain_waiters.py": "dac406a0656123f8ee500aa8fff99fc17944cd282b99273d3b8aa94bacad6c13",
     "tests/unit/test_effect_failure_routing.py": "2fe8f4655081369db077f8df1ecdbc45cc3e056f96497ac7920baccc5610851b",
     "tests/unit/test_first_inline_bursts.py": "0df6245e39f442fe6a279b5c620716310f8cc1f3504ff5397eca9a260bd1bf7d",
-    "tests/unit/test_first_inline_ownership.py": "f812c8231680812a269a3dff3b770b0ff559c22962c5627609c1164b2f831dde",
+    "tests/unit/test_first_inline_ownership.py": "224865aa5e68965dee7ff0f5f8bf33994947cc0108f09c01e3d941ef0cabb651",
     "tests/unit/test_sync_callback_contract.py": "e7faffe439e5f9964278d01c2e91a1aeb9ce5c03527616f4824083d00b6e0a41"
-  }
+  },
+  "followup_sha256": "0f0ac35e684db1f91aa20eb3d780081d791afd08fba0ccf98d3c23fdc154c098"
 }
