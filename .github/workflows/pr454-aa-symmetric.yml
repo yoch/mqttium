@@ -38,17 +38,21 @@ jobs:
           test "$(git -C bench rev-parse HEAD)" = "$HARNESS_SHA"
           ROOT=$(mktemp -d "$RUNNER_TEMP/p454-aa-${GITHUB_RUN_ID}-XXXX")
           echo "JOB_ROOT=$ROOT" >> "$GITHUB_ENV"
-          cp -a seed "$ROOT/aa-a"
-          cp -a seed "$ROOT/aa-b"
-          test ${#ROOT/aa-a} -eq ${#ROOT/aa-b}
-          test "$(git -C "$ROOT/aa-a" rev-parse HEAD)" = "$MQTTIUM_BASE"
-          test "$(git -C "$ROOT/aa-b" rev-parse HEAD)" = "$MQTTIUM_BASE"
-          test -z "$(git -C "$ROOT/aa-a" status --porcelain --untracked-files=no)"
-          test -z "$(git -C "$ROOT/aa-b" status --porcelain --untracked-files=no)"
+          AA_A="$ROOT/aa-a"
+          AA_B="$ROOT/aa-b"
+          cp -a seed "$AA_A"
+          cp -a seed "$AA_B"
+          LEN_A=${#AA_A}
+          LEN_B=${#AA_B}
+          test "$LEN_A" -eq "$LEN_B"
+          test "$(git -C "$AA_A" rev-parse HEAD)" = "$MQTTIUM_BASE"
+          test "$(git -C "$AA_B" rev-parse HEAD)" = "$MQTTIUM_BASE"
+          test -z "$(git -C "$AA_A" status --porcelain --untracked-files=no)"
+          test -z "$(git -C "$AA_B" status --porcelain --untracked-files=no)"
           python3 -m venv "$ROOT/venv"
           echo "$ROOT/venv/bin" >> "$GITHUB_PATH"
           mkdir -p results
-          printf 'aa_a=%s\naa_b=%s\nlen_a=%s\nlen_b=%s\n' "$ROOT/aa-a" "$ROOT/aa-b" "${#ROOT/aa-a}" "${#ROOT/aa-b}" > results/paths.txt
+          printf 'aa_a=%s\naa_b=%s\nlen_a=%s\nlen_b=%s\n' "$AA_A" "$AA_B" "$LEN_A" "$LEN_B" > results/paths.txt
           uname -a > results/machine.txt
           lscpu >> results/machine.txt
           for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor /sys/class/thermal/thermal_zone*/temp; do
