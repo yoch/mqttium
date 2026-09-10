@@ -1,7 +1,7 @@
 diff --git a/tests/unit/test_message_delivery.py b/tests/unit/test_message_delivery.py
 --- a/tests/unit/test_message_delivery.py
 +++ b/tests/unit/test_message_delivery.py
-@@ -139,12 +139,14 @@ async def test_explicit_reconnect_resets_closed_message_stream() -> None:
+@@ -139,11 +139,13 @@ async def test_explicit_reconnect_resets_closed_message_stream() -> None:
      client = AsyncClient(client_id="delivery-reset", max_pending_messages=2)
      original = client._messages
 +    ready = client._message_ready
