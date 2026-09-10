@@ -1,0 +1,308 @@
+diff --git a/src/mqttium/api/_delivery.py b/src/mqttium/api/_delivery.py
+--- a/src/mqttium/api/_delivery.py
++++ b/src/mqttium/api/_delivery.py
+@@ -131,19 +131,18 @@
+         self.callback_queue: asyncio.Queue[CallbackJob] = asyncio.Queue(
+             maxsize=max_pending_callbacks
+         )
+         self.message_ready = asyncio.Event()
+         self.closed = asyncio.Event()
+-        self._stream_generation = 0
++        self._delivery_generation = 0
+         self.callback_task: asyncio.Task[None] | None = None
+         # True while either the worker or the opportunistic reader/effect path
+         # is executing user code. It is also the reentrancy guard: a callback
+         # that publishes or causes another delivery always falls back to the
+         # bounded queue instead of nesting user callbacks.
+         self._callback_active = False
+         self._callback_state: Literal["open", "draining", "closed"] = "open"
+-        self._callback_generation = 0
+         self.callback_space = asyncio.Event()
+         self.delivery_timeout = delivery_timeout
+         self.callback_shutdown_timeout = callback_shutdown_timeout
+ 
+     def acceptor(self) -> MessageAcceptor:
+@@ -351,22 +350,22 @@
+         """Enqueue a message small enough to ride the unaccounted budget.
+ 
+         No reservation is taken, so there is nothing to roll back: a failure
+         here leaves only whatever the queues already accepted.
+         """
+-        generation = self._callback_generation
++        generation = self._delivery_generation
+         if callback is not None:
+             self.ensure_callback_worker()
+         if iterator_delivery:
+             try:
+                 self.messages_queue.put_nowait(message)
+             except asyncio.QueueFull:
+                 await self.put_message(message)
+             else:
+                 self.message_ready.set()
+         if callback is not None:
+-            if generation != self._callback_generation:
++            if generation != self._delivery_generation:
+                 raise MessageDeliveryError("Callback admission belongs to a retired generation")
+             self.ensure_callback_worker()
+             job: CallbackJob = (callback, (message,), None)
+             try:
+                 self.callback_queue.put_nowait(job)
+@@ -387,11 +386,11 @@
+         only difference between the two entry points, so they share this body:
+         the enqueue steps and the rollback below must not drift apart. Both are
+         slow-path entries — `acceptor()` / `decoded_acceptor()` hand the common
+         case to the specialised `_accept_*` acceptors.
+         """
+-        generation = self._callback_generation
++        generation = self._delivery_generation
+         callback_delivery = callback is not None and self.callback_mode
+         iterator_delivery = self.iterator_mode or (self.auto_mode and callback is None)
+         references = int(iterator_delivery) + int(callback_delivery)
+         if property_wire_size is None:
+             small_delivery = bool(references and self._is_small(message))
+@@ -417,11 +416,11 @@
+                     logical_bytes,
+                     references,
+                     callback_generation=generation if callback_delivery else None,
+                 )
+         try:
+-            if callback_delivery and generation != self._callback_generation:
++            if callback_delivery and generation != self._delivery_generation:
+                 raise MessageDeliveryError("Callback admission belongs to a retired generation")
+             if iterator_delivery:
+                 item: IteratorQueueItem = (message, token) if token is not None else message
+                 try:
+                     self.messages_queue.put_nowait(item)
+@@ -430,11 +429,11 @@
+                 else:
+                     self.message_ready.set()
+                 iterator_enqueued = True
+             if callback_delivery:
+                 assert callback is not None
+-                if generation != self._callback_generation:
++                if generation != self._delivery_generation:
+                     raise MessageDeliveryError("Callback admission belongs to a retired generation")
+                 self.ensure_callback_worker()
+                 job = (callback, (message,), token)
+                 try:
+                     self.callback_queue.put_nowait(job)
+@@ -479,14 +478,12 @@
+         )
+ 
+     def reopen(self) -> None:
+         self.closed.clear()
+         if self._callback_state != "open":
+-            # Keep a callback which is reconnecting as the sole consumer. Only
+-            # unstarted notifications of the old generation are abandoned.
+-            self._discard_callback_queue()
+-            self._callback_generation += 1
++            # The explicit reset already retired the prior delivery generation.
++            # A callback which reconnects remains the sole worker incarnation.
+             self._callback_state = "open"
+             self.callback_space.set()
+             self.space.set()
+ 
+     def close(self) -> None:
+@@ -601,13 +598,13 @@
+         if applied and iterator_delivery:
+             self.message_ready.set()
+         return applied
+ 
+     async def messages(self) -> AsyncIterator[Message]:
+-        generation = self._stream_generation
++        generation = self._delivery_generation
+         while True:
+-            if generation != self._stream_generation:
++            if generation != self._delivery_generation:
+                 return
+             try:
+                 item = self.messages_queue.get_nowait()
+                 if isinstance(item, tuple):
+                     message, token = item
+@@ -625,11 +622,18 @@
+             await self.message_ready.wait()
+ 
+     def reset_stream(self) -> None:
+         if not self.closed.is_set():
+             return
+-        self._stream_generation += 1
++        # An explicit connection takeover starts one new application-delivery
++        # generation for both iterator and callback consumers. Active callback
++        # code may finish; no unstarted notification or blocked admission from
++        # the retired generation may cross into the replacement connection.
++        self._delivery_generation += 1
++        self._discard_callback_queue()
++        self.callback_space.set()
++        self.space.set()
+         while True:
+             try:
+                 item = self.messages_queue.get_nowait()
+             except asyncio.QueueEmpty:
+                 break
+@@ -670,11 +674,11 @@
+     ) -> DeliveryToken:
+         self.waiters += 1
+         try:
+             while True:
+                 if callback_generation is not None and (
+-                    callback_generation != self._callback_generation
++                    callback_generation != self._delivery_generation
+                     or self._callback_state != "open"
+                 ):
+                     raise MessageDeliveryError("Callback delivery generation is closing")
+                 self.space.clear()
+                 token = self.try_reserve(logical_bytes, references)
+@@ -869,15 +873,15 @@
+             self.callback_queue.put_nowait(job)
+         except asyncio.QueueFull:
+             await self.enqueue_callback_job_slow(job)
+ 
+     async def enqueue_callback_job_slow(self, job: CallbackJob) -> None:
+-        generation = self._callback_generation
++        generation = self._delivery_generation
+         try:
+             async with asyncio.timeout(self.delivery_timeout):
+                 while True:
+-                    if generation != self._callback_generation:
++                    if generation != self._delivery_generation:
+                         raise MessageDeliveryError(
+                             "Callback admission belongs to a retired generation"
+                         )
+                     self.ensure_callback_worker()
+                     if not self.callback_queue.full():
+@@ -923,11 +927,11 @@
+         asynchronous = False
+         while self._callback_state != "closed":
+             if self._callback_state == "draining" and queue.empty():
+                 return
+             job = await queue.get()
+-            generation = self._callback_generation
++            generation = self._delivery_generation
+             remaining = 1 + queue.qsize()
+             while True:
+                 self.callback_space.set()
+                 callback, args, token = job
+                 self._callback_active = True
+@@ -953,11 +957,11 @@
+                 if task.cancelling():
+                     await asyncio.sleep(0)
+                 if self._callback_state == "closed":
+                     return
+                 remaining -= 1
+-                if not remaining or generation != self._callback_generation:
++                if not remaining or generation != self._delivery_generation:
+                     break
+                 job = queue.get_nowait()
+             # Reentrant arrivals cannot extend a round indefinitely. All
+             # unstarted jobs remain counted in the queue, never in a side list.
+             if not queue.empty():
+@@ -986,11 +990,11 @@
+                 "callback": callback,
+             }
+         )
+ 
+     async def shutdown_callbacks(self, *, drain: bool) -> None:
+-        generation = self._callback_generation
++        generation = self._delivery_generation
+         if self._callback_state != "closed":
+             self._callback_state = "draining" if drain else "closed"
+         self.callback_space.set()
+         self.space.set()
+         if self._callback_state == "closed":
+@@ -1007,11 +1011,11 @@
+                     async with asyncio.timeout(self.callback_shutdown_timeout):
+                         await self.callback_queue.join()
+                 except TimeoutError:
+                     pass
+         finally:
+-            if generation == self._callback_generation:
++            if generation == self._delivery_generation:
+                 self._callback_state = "closed"
+                 self._discard_callback_queue()
+                 task = self.callback_task
+                 if task is not None:
+                     if not task.done():
+diff --git a/src/mqttium/api/async_client.py b/src/mqttium/api/async_client.py
+--- a/src/mqttium/api/async_client.py
++++ b/src/mqttium/api/async_client.py
+@@ -1647,16 +1647,19 @@
+             if callback is None:
+                 return
+             callbacks = (callback,)
+         task = asyncio.current_task()
+         for callback in callbacks:
+-            try:
+-                await self._invoke(callback, message)
+-            except asyncio.CancelledError as exc:
+-                self._delivery._propagate_callback_cancellation(callback, exc)
+-            except Exception as exc:
+-                self._report_callback_error(callback, exc)
++            if self._delivery._is_async_callback(callback):
++                try:
++                    await callback(message)
++                except asyncio.CancelledError as exc:
++                    self._delivery._propagate_callback_cancellation(callback, exc)
++                except Exception as exc:
++                    self._report_callback_error(callback, exc)
++            else:
++                self._run_sync_callback(callback, message)
+             if task is not None and task.cancelling():
+                 await asyncio.sleep(0)
+ 
+     async def subscribe(
+         self,
+diff --git a/tests/unit/test_uniform_callbacks.py b/tests/unit/test_uniform_callbacks.py
+--- a/tests/unit/test_uniform_callbacks.py
++++ b/tests/unit/test_uniform_callbacks.py
+@@ -229,10 +229,51 @@
+         assert seen == ["new"]
+     finally:
+         release.set()
+         if producer is not None:
+             await asyncio.gather(producer, return_exceptions=True)
++        await finish(client)
++
++
++async def test_explicit_stream_reset_retires_old_callback_generation(scheduler):
++    client = AsyncClient(message_delivery="callback", max_pending_callbacks=1)
++    d = client._delivery
++    entered, release = asyncio.Event(), asyncio.Event()
++    seen = []
++
++    async def active():
++        seen.append("active")
++        entered.set()
++        await release.wait()
++
++    stale = None
++    try:
++        d.spawn_callback(active)
++        await entered.wait()
++        d.spawn_callback(lambda: seen.append("old"))
++        stale = asyncio.create_task(d.enqueue_callback(lambda: seen.append("stale")))
++        for _ in range(3):
++            await asyncio.sleep(0)
++        assert not stale.done()
++
++        # This is the application-delivery reset used by explicit connect
++        # takeover. The active callback may finish, but old queued work and a
++        # blocked old-generation admission must not cross into the replacement.
++        await client._reset_message_stream()
++        d.reopen()
++        d.spawn_callback(lambda: seen.append("new"))
++        with pytest.raises(MessageDeliveryError, match="retired generation"):
++            await asyncio.wait_for(stale, 1)
++
++        release.set()
++        await asyncio.wait_for(d.callback_queue.join(), 1)
++        assert seen == ["active", "new"]
++        bound(client, 1)
++    finally:
++        release.set()
++        if stale is not None:
++            await asyncio.gather(stale, return_exceptions=True)
+         await finish(client)
+ 
+ 
+ async def test_worker_cannot_wait_for_its_own_full_queue(scheduler):
+     client = AsyncClient(message_delivery="callback", max_pending_callbacks=1)
