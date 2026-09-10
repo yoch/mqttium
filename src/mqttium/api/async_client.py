@@ -18,7 +18,12 @@ from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from typing import Any, Never, TypeVar
 
-from mqttium.api._delivery import ApplicationDelivery, MessageDelivery
+from mqttium.api._delivery import (
+    ApplicationDelivery,
+    MessageDelivery,
+    CallbackTarget,
+    _ClassifiedCallback,
+)
 from mqttium.api._effects import EffectPump, StaleConnectionEffect
 from mqttium.api._writer import WritePump
 from mqttium.api.models import (
@@ -361,7 +366,8 @@ class AsyncClient:
         self._last_connack_reason: int | None = None
 
         self._on_message: OnMessage | None = None
-        self._message_callback: OnMessage | None = None
+        self._message_callback: CallbackTarget | None = None
+        self._frozen_fallback: _ClassifiedCallback | None = None
         self._topic_callbacks: TopicMatcher | None = None
         self.on_connect: OnConnect | None = None
         self.on_disconnect: OnDisconnect | None = None
@@ -633,7 +639,7 @@ class AsyncClient:
                 "Client is unusable after a local terminal failure; "
                 "create a new AsyncClient instead of reusing this one"
             )
-        self._routes_frozen = True
+        self._freeze_message_routes()
         async with self._lifecycle_lock:
             await self._prepare_explicit_connect()
             # Rechecked, not just entry-checked: the latch is set-once, so a
@@ -1083,6 +1089,20 @@ class AsyncClient:
         self._on_message = callback
         self._refresh_message_callback()
 
+    def _freeze_message_routes(self) -> None:
+        if self._routes_frozen:
+            return
+        self._routes_frozen = True
+        if self._on_message is not None:
+            self._frozen_fallback = self._delivery.classify(self._on_message)
+        matcher = self._topic_callbacks
+        if matcher:
+            for topic_filter, callback in matcher.items():
+                matcher[topic_filter] = self._delivery.classify(callback)
+            self._message_callback = _ClassifiedCallback(self._dispatch_topic_message, True)
+        else:
+            self._message_callback = self._frozen_fallback
+
     def _refresh_message_callback(self) -> None:
         self._message_callback = (
             self._dispatch_topic_message if self._topic_callbacks else self._on_message
@@ -1118,8 +1138,9 @@ class AsyncClient:
     async def _dispatch_topic_message(self, message: Message) -> None:
         matcher = self._topic_callbacks
         callbacks = tuple(matcher.iter_match(message.topic)) if matcher else ()
-        if not callbacks and self._on_message is not None:
-            callbacks = (self._on_message,)
+        fallback = self._frozen_fallback if self._routes_frozen else self._on_message
+        if not callbacks and fallback is not None:
+            callbacks = (fallback,)
         for callback in callbacks:
             await self._delivery.invoke_isolated(callback, message)
 

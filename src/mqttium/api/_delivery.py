@@ -6,6 +6,7 @@ import asyncio
 import inspect
 from collections.abc import AsyncIterator, Callable
 from typing import Any, Literal
+from dataclasses import dataclass
 
 from mqttium.api.stats import DeliveryStats
 from mqttium.codec.properties import PUBLISH, encode_properties
@@ -14,7 +15,16 @@ from mqttium.errors import MessageDeliveryError, MQTTError
 from mqttium.types import Message
 
 MessageDelivery = Literal["iterator", "callback"]
-CallbackJob = tuple[Callable[..., Any], tuple[Any, ...], int | None]
+
+
+@dataclass(frozen=True, slots=True)
+class _ClassifiedCallback:
+    callback: Callable[..., Any]
+    is_async: bool
+
+
+CallbackTarget = Callable[..., Any] | _ClassifiedCallback
+CallbackJob = tuple[CallbackTarget, tuple[Any, ...], int | None]
 IteratorQueueItem = tuple[Message, int]
 
 
@@ -107,7 +117,7 @@ class ApplicationDelivery:
     def try_accept(
         self,
         message: Message,
-        callback: Callable[[Message], Any] | None,
+        callback: CallbackTarget | None,
         property_wire_size: int | None = None,
         *,
         size: int | None = None,
@@ -144,7 +154,7 @@ class ApplicationDelivery:
     async def accept(
         self,
         message: Message,
-        callback: Callable[[Message], Any] | None,
+        callback: CallbackTarget | None,
         property_wire_size: int | None = None,
     ) -> None:
         if self.mode == "callback" and callback is None:
@@ -231,10 +241,20 @@ class ApplicationDelivery:
         )
 
     @classmethod
-    async def invoke(cls, callback: Callable[..., Any] | None, *args: Any) -> Any:
+    def classify(cls, callback: Callable[..., Any]) -> _ClassifiedCallback:
+        """Capture invocation mode once for a frozen message route."""
+        return _ClassifiedCallback(callback, cls._is_async_callback(callback))
+
+    @classmethod
+    async def invoke(cls, callback: CallbackTarget | None, *args: Any) -> Any:
         if callback is None:
             return None
-        if cls._is_async_callback(callback):
+        if isinstance(callback, _ClassifiedCallback):
+            is_async = callback.is_async
+            callback = callback.callback
+        else:
+            is_async = cls._is_async_callback(callback)
+        if is_async:
             return await callback(*args)
         result = callback(*args)
         if inspect.isawaitable(result):
@@ -246,7 +266,9 @@ class ApplicationDelivery:
         return result
 
     @staticmethod
-    def report_callback_error(callback: Callable[..., Any] | None, exc: BaseException) -> None:
+    def report_callback_error(callback: CallbackTarget | None, exc: BaseException) -> None:
+        if isinstance(callback, _ClassifiedCallback):
+            callback = callback.callback
         asyncio.get_running_loop().call_exception_handler(
             {
                 "message": "mqttium user callback failed",
@@ -256,14 +278,14 @@ class ApplicationDelivery:
         )
 
     def _propagate_callback_cancellation(
-        self, callback: Callable[..., Any] | None, exc: asyncio.CancelledError
+        self, callback: CallbackTarget | None, exc: asyncio.CancelledError
     ) -> None:
         task = asyncio.current_task()
         if task is None or task.cancelling():
             raise exc
         self.report_callback_error(callback, exc)
 
-    async def invoke_isolated(self, callback: Callable[..., Any], *args: Any) -> None:
+    async def invoke_isolated(self, callback: CallbackTarget, *args: Any) -> None:
         try:
             await self.invoke(callback, *args)
         except asyncio.CancelledError as exc:
