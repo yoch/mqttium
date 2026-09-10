@@ -1,0 +1,141 @@
+name: Uniform worker final lifecycle qualification
+on:
+  push:
+    branches: [work/uniform-v4-final]
+    paths: [.github/uniform-v4-final-tests.patch, .github/workflows/uniform-v4-final-qualify.yml]
+permissions:
+  contents: write
+concurrency:
+  group: mqttium-uniform-v4-final
+  cancel-in-progress: false
+jobs:
+  qualify:
+    if: github.repository == 'yoch/mqttium'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      BASE_SHA: 01aa8614da6ee13d33f0a6c4ff183cf65cfd3677
+      PRODUCT_BRANCH: experiment/uniform-message-worker
+    steps:
+      - name: Isolated root
+        run: echo "JOB_ROOT=$RUNNER_TEMP/uniform-final-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.13.5'
+      - name: Freeze held product ref
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git ls-remote origin "refs/heads/$PRODUCT_BRANCH" | cut -f1)" = "$BASE_SHA"
+          git worktree add --detach "$JOB_ROOT/candidate" "$BASE_SHA"
+          test -z "$(git -C "$JOB_ROOT/candidate" status --porcelain --untracked-files=no)"
+      - name: Preserve red-before proof of v2 stale byte admission
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$JOB_ROOT/candidate"
+          PYTHONPATH=src python - <<'PY' | tee "$JOB_ROOT/red-before.txt"
+          import asyncio
+          from mqttium.api import AsyncClient
+          from mqttium.types import Message
+          async def main():
+              client=AsyncClient(message_delivery='iterator',max_pending_messages=1,max_pending_delivery_bytes=8192)
+              d=client._delivery
+              first=Message(topic='x',payload=b'a'*5000)
+              stale_message=Message(topic='x',payload=b'b'*5000)
+              await d.accept(first,None)
+              stale=asyncio.create_task(d.accept(stale_message,None))
+              for _ in range(5): await asyncio.sleep(0)
+              assert d.waiters==1 and not stale.done()
+              generation=d._delivery_generation
+              await client._reset_message_stream()
+              assert d._delivery_generation==generation+1
+              await asyncio.wait_for(stale,1)
+              assert await asyncio.wait_for(anext(client.messages()),1) is stale_message
+              print('REPRODUCED: old byte-budget waiter crossed into the replacement delivery generation')
+          asyncio.run(main())
+          PY
+      - name: Apply final candidate patches
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$JOB_ROOT/candidate"
+          for patch in uniform-v4.patch uniform-v4-doc.patch uniform-v4-test.patch uniform-v4-final-tests.patch; do
+            git apply --check "$GITHUB_WORKSPACE/.github/$patch"
+            git apply "$GITHUB_WORKSPACE/.github/$patch"
+          done
+          test "$(git diff --name-only | sort)" = $'CHANGELOG.md\nsrc/mqttium/api/_delivery.py\ntests/unit/test_message_delivery.py\ntests/unit/test_uniform_callbacks.py'
+          git diff --check
+      - name: Install qualification dependencies
+        run: python -m pip install -e "$JOB_ROOT/candidate[dev,fuzz,security,docs]"
+      - name: Format exact candidate and run focused adversarial gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$JOB_ROOT/candidate"
+          ruff format src/mqttium/api/_delivery.py tests/unit/test_uniform_callbacks.py tests/unit/test_message_delivery.py
+          git diff --check
+          ruff format --check src/mqttium/api/_delivery.py tests/unit/test_uniform_callbacks.py tests/unit/test_message_delivery.py
+          ruff check src/mqttium/api/_delivery.py tests/unit/test_uniform_callbacks.py tests/unit/test_message_delivery.py
+          python -m pytest -q \
+            tests/unit/test_uniform_callbacks.py \
+            tests/unit/test_message_delivery.py \
+            tests/unit/test_sync_callback_contract.py \
+            tests/unit/test_topic_callback_dispatch_contract.py \
+            tests/unit/test_topic_callbacks.py \
+            tests/unit/test_callback_message_batches.py \
+            tests/unit/test_effect_pump.py \
+            tests/unit/test_direct_qos0_capture.py \
+            -W error
+      - name: Full hosted correctness gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$JOB_ROOT/candidate"
+          ruff format --check src tests benchmarks tools
+          ruff check src tests benchmarks tools
+          mypy src/mqttium
+          bandit -q -ll -r src
+          mkdocs build --strict
+          python -m pytest -q tests/unit tests/project tests/resilience -W error --cov=mqttium
+          python -m pytest -q tests/fuzz -W error
+          python tests/fuzz/fuzz.py --seed 1 --iterations 20000
+      - name: Commit exact tested tree and conditionally advance only product branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$JOB_ROOT/candidate"
+          test "$(git ls-remote origin "refs/heads/$PRODUCT_BRANCH" | cut -f1)" = "$BASE_SHA"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add CHANGELOG.md src/mqttium/api/_delivery.py tests/unit/test_uniform_callbacks.py tests/unit/test_message_delivery.py
+          git commit -m 'fix: make all blocked delivery admissions generation-safe' -m 'Use one controller-owned delivery generation and one shared capacity event for byte, iterator-slot and callback-slot waiters. Slow iterator admission waits on delivery capacity rather than inside Queue.put, so explicit takeover can wake and reject every stale producer. Keep queue/event identity stable across reset; already-woken old iterators observe the generation change and terminate. Remove callback_space. Cover byte/queue waiters, old anext wakeup, eager scheduling and saturated QoS1 callback progress. No new queue, task or public option.'
+          tested=$(git rev-parse HEAD)
+          tree=$(git rev-parse 'HEAD^{tree}')
+          src=$(git rev-parse 'HEAD:src')
+          printf '{"base":"%s","tested":"%s","tree":"%s","src_tree":"%s","run":"%s"}\n' "$BASE_SHA" "$tested" "$tree" "$src" "$GITHUB_RUN_ID" | tee "$JOB_ROOT/provenance.json"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/yoch/mqttium.git" HEAD:"refs/heads/$PRODUCT_BRANCH"
+      - name: Retain exact proof and provenance
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: uniform-final-${{ github.run_id }}
+          path: |
+            ${{ env.JOB_ROOT }}/red-before.txt
+            ${{ env.JOB_ROOT }}/provenance.json
+            .github/uniform-v4.patch
+            .github/uniform-v4-doc.patch
+            .github/uniform-v4-test.patch
+            .github/uniform-v4-final-tests.patch
+          retention-days: 30
+          if-no-files-found: warn
+      - name: Clean isolated worktree
+        if: always()
+        run: git worktree remove --force "$JOB_ROOT/candidate" || true
