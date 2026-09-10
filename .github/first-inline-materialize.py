@@ -20,7 +20,11 @@ HERE = Path(__file__).resolve().parent
 MANIFEST = json.loads((HERE / 'first-inline-manifest.json').read_text())
 
 def run(*cmd, cwd=ROOT, **kwargs):
-    return subprocess.run(cmd, cwd=cwd, text=True, check=True, capture_output=True, **kwargs).stdout.strip()
+    process = subprocess.run(cmd, cwd=cwd, text=True, capture_output=True, **kwargs)
+    if process.returncode:
+        print(process.stdout, process.stderr, file=sys.stderr)
+        process.check_returncode()
+    return process.stdout.strip()
 
 def check(ok, message):
     if not ok:
@@ -46,7 +50,13 @@ def prepare():
     check(sha(packed) == MANIFEST['payload_sha256'], 'payload checksum')
     patch = gzip.decompress(packed)
     check(sha(patch) == MANIFEST['patch_sha256'], 'patch checksum')
-    (OUT/'input.patch').write_bytes(patch)
+    # difflib omits Git's new-file mode; add metadata without changing bytes.
+    text = patch.decode()
+    for path in MANIFEST['paths']:
+        old = f'diff --git a/{path} b/{path}\n--- /dev/null\n'
+        new = f'diff --git a/{path} b/{path}\nnew file mode 100644\n--- /dev/null\n'
+        text = text.replace(old, new)
+    (OUT/'input.patch').write_text(text)
     run('git','worktree','add','--detach',str(ROOT),BASE, cwd=HERE.parent)
     check(run('git','rev-parse','HEAD^{tree}') == BASE_TREE, 'wrong base tree')
     run('git','apply','--check',str(OUT/'input.patch'))
@@ -69,7 +79,6 @@ def freeze():
             'local_commit':commit,'files':snapshots(),'ast_sha256':asts(), 'python':sys.version,
             'run_id':os.environ['GITHUB_RUN_ID']}
     (OUT/'frozen.json').write_text(json.dumps(record,indent=2)+'\n')
-    run('git','diff','--binary',BASE,commit, cwd=ROOT)
     (OUT/'candidate.patch').write_text(run('git','diff','--binary',BASE,commit)+'\n')
     for p in MANIFEST['paths']:
         dest=OUT/'sources'/p
