@@ -1,4 +1,4 @@
-"""Focused invariants for the no-helper singleton-message-run inline ablation."""
+"""Focused invariants for the sole-pending-message sync-inline ablation."""
 
 from __future__ import annotations
 
@@ -22,7 +22,22 @@ async def stop(client: AsyncClient) -> None:
     await client._shutdown_callback_worker(drain=False)
 
 
-async def test_idle_sync_one_message_run_executes_inline() -> None:
+async def test_idle_sync_sole_pending_message_executes_inline() -> None:
+    client = AsyncClient(message_delivery="callback")
+    seen: list[bytes] = []
+
+    def callback(message: Message) -> None:
+        seen.append(message.payload)
+
+    effects = deque([effect(b"one")])
+    assert client._delivery.deliver_message_batch_inline(effects, callback) == 1
+    assert seen == [b"one"]
+    assert client._callback_queue.empty()
+    assert client._callback_worker_task is None
+    await stop(client)
+
+
+async def test_single_message_with_any_pending_tail_stays_worker_owned() -> None:
     client = AsyncClient(message_delivery="callback")
     seen: list[bytes] = []
 
@@ -31,9 +46,10 @@ async def test_idle_sync_one_message_run_executes_inline() -> None:
 
     effects = deque([effect(b"one"), EngineEffect(EffectKind.PINGRESP)])
     assert client._delivery.deliver_message_batch_inline(effects, callback) == 1
+    assert seen == []
+    assert client._callback_queue.qsize() == 1
+    await asyncio.wait_for(client._callback_queue.join(), 1)
     assert seen == [b"one"]
-    assert client._callback_queue.empty()
-    assert client._callback_worker_task is None
     await stop(client)
 
 
