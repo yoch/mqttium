@@ -1,0 +1,136 @@
+name: MQTTium syscall diagnosis
+run-name: "Syscalls PR454 / ${{ github.ref_name }}"
+on:
+  push:
+    branches: ['diag/pr454-syscalls-*']
+permissions:
+  contents: read
+concurrency:
+  group: mqttium-arm64-runner
+  cancel-in-progress: false
+jobs:
+  diagnose:
+    if: github.repository == 'yoch/mqttium'
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 75
+    env:
+      PYTHONUNBUFFERED: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+      PYTHONNOUSERSITE: '1'
+      PIP_DISABLE_PIP_VERSION_CHECK: '1'
+    steps:
+      - name: Verify intended runner and create short isolated workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$RUNNER_NAME" = rpi5
+          test "$(uname -m)" = aarch64
+          ROOT=$(mktemp -d /tmp/ms-XXXXXXXX)
+          chmod 700 "$ROOT"
+          mkdir "$ROOT/out"
+          echo "JOB_ROOT=$ROOT" >> "$GITHUB_ENV"
+          echo "RESULT_DIR=$ROOT/out" >> "$GITHUB_ENV"
+          python3 -V > "$ROOT/out/python-version.txt"
+          uname -a > "$ROOT/out/machine.txt"
+          lscpu >> "$ROOT/out/machine.txt"
+          (mosquitto -h || true) > "$ROOT/out/mosquitto-version.txt" 2>&1
+          for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor /sys/class/thermal/thermal_zone*/temp /proc/sys/kernel/randomize_va_space /proc/sys/kernel/yama/ptrace_scope; do
+            if test -f "$f"; then printf '%s=' "$f" >> "$ROOT/out/machine.txt"; cat "$f" >> "$ROOT/out/machine.txt"; fi
+          done
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          path: kit
+          sparse-checkout: .github/diagnostics/mqttium-syscalls
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 9ad1f01857306ac5079ffb1d073a59fdb60e1931
+          persist-credentials: false
+          path: lib-base
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 636de564dc2c92822a8361050cc24e369fe027d4
+          persist-credentials: false
+          path: lib-head
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: yoch/mqtt-python-client-bench
+          ref: ec332e25003a6484727697c3018ce632a025a7f2
+          persist-credentials: false
+          path: harness
+          sparse-checkout: |
+            src
+            hosts
+            mosquitto
+            README.md
+            pyproject.toml
+          sparse-checkout-cone-mode: false
+      - name: Recheck live source refs before running trusted code
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request
+          def get(path):
+              req = urllib.request.Request('https://api.github.com/repos/yoch/mqttium/' + path,
+                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
+              with urllib.request.urlopen(req, timeout=30) as response:
+                  return json.load(response)
+          pr = get('pulls/454')
+          assert pr['state'] == 'open' and not pr['merged'], 'PR is no longer open'
+          assert pr['head']['sha'] == '636de564dc2c92822a8361050cc24e369fe027d4', 'PR HEAD changed; revalidate kit'
+          assert pr['base']['sha'] == '9ad1f01857306ac5079ffb1d073a59fdb60e1931', 'PR base changed; revalidate kit'
+          assert get('git/ref/heads/main')['object']['sha'] == pr['base']['sha'], 'main changed'
+          PY
+      - name: Isolated Python dependencies and user-space strace if needed
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v mosquitto
+          command -v taskset
+          python3 -m venv "$JOB_ROOT/venv"
+          "$JOB_ROOT/venv/bin/python" -m pip install 'paho-mqtt==2.1.0' 'psutil==7.0.0'
+          echo "$JOB_ROOT/venv/bin" >> "$GITHUB_PATH"
+          "$JOB_ROOT/venv/bin/python" -m pip freeze > "$RESULT_DIR/python-packages.txt"
+          if ! command -v strace >/dev/null; then
+            # No sudo, apt update, sysctl or system installation. Download the
+            # distro package using existing verified apt indexes, extract locally.
+            mkdir -p "$JOB_ROOT/deb" "$JOB_ROOT/strace-local"
+            cd "$JOB_ROOT/deb"
+            if ! apt-get download strace > "$RESULT_DIR/strace-package.log" 2>&1; then
+              echo 'strace absent and local package download failed. Install strace on rpi5 with sudo apt-get install -y strace, then rerun this workflow.' >&2
+              exit 2
+            fi
+            files=(strace_*.deb)
+            test "${#files[@]}" = 1
+            sha256sum "${files[0]}" > "$RESULT_DIR/strace-package.sha256"
+            dpkg-deb --extract "${files[0]}" "$JOB_ROOT/strace-local"
+            "$JOB_ROOT/strace-local/usr/bin/strace" -V > "$RESULT_DIR/strace-local-version.txt" 2>&1
+            echo "$JOB_ROOT/strace-local/usr/bin" >> "$GITHUB_PATH"
+          fi
+      - name: Run bounded controls and syscall captures
+        shell: bash
+        run: |
+          set -euo pipefail
+          TOOLS="$GITHUB_WORKSPACE/kit/.github/diagnostics/mqttium-syscalls"
+          cp -a "$TOOLS" "$RESULT_DIR/diagnostic-tools"
+          python "$TOOLS/campaign.py" --root "$JOB_ROOT" \
+            --base "$GITHUB_WORKSPACE/lib-base" \
+            --head "$GITHUB_WORKSPACE/lib-head" \
+            --harness "$GITHUB_WORKSPACE/harness" 2>&1 | tee "$RESULT_DIR/campaign.log"
+      - name: Save results even after a failed measurement
+        if: always() && env.RESULT_DIR != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: mqttium-syscalls-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.RESULT_DIR }}/
+          retention-days: 14
+          if-no-files-found: error
+      - name: Remove only this run's temporary files
+        if: always() && env.JOB_ROOT != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$JOB_ROOT" in /tmp/ms-*) rm -rf -- "$JOB_ROOT";; *) exit 2;; esac
+          if test -d harness/.git; then git -C harness worktree prune; fi
