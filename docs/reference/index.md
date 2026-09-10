@@ -8,11 +8,11 @@ another module does not grant the same stability tier.
 | Entry point | Native names |
 | --- | --- |
 | `mqttium` | `MQTTError`, `MalformedPacketError`, `ProtocolError`, `PacketTooLargeError`, `FlowControlError`, `MessageDeliveryError`, `NotConnectedError`, `MQTTTimeoutError`, `SessionDiscardedError`, `PublishBatchError`, `MQTTProtocolVersion`, `QoS`, `ConnectionState`, `__version__` |
-| `mqttium.api` | `AsyncClient`, `Message`, `Properties`, `PublishMessage`, `PublishReceipt`, `PublishBatchReceipt`, `SubscribeResult`, `UnsubscribeResult`, `SubscribeOptions`, `ConnAckPacket`, `AuthPacket`, `NegotiatedSettings`, `ReconnectPolicy`, `MessageDelivery`, `PublishBackpressure` |
+| `mqttium.api` | `AsyncClient`, `Message`, `Properties`, `PublishMessage`, `PublishReceipt`, `PublishBatchReceipt`, `SubscribeResult`, `UnsubscribeResult`, `SubscribeOptions`, `ConnAckPacket`, `AuthPacket`, `NegotiatedSettings`, `ReconnectPolicy`, `MessageDelivery`, `ClientStats` |
 
-`ClientStats` is available from `mqttium.api` but remains Provisional because
-new diagnostic fields may be added. `PacketType` remains importable from
-`mqttium` for alpha-series compatibility but is a Provisional low-level enum.
+`mqttium.persistence` supports `MemoryInflightStore` and `SqliteInflightStore`.
+Statistics are immutable diagnostic snapshots. Low-level packet enums and
+extension protocols are internal; the root `PacketType` export is removed.
 
 ## Reference pages
 
@@ -20,7 +20,7 @@ new diagnostic fields may be added. `PacketType` remains importable from
   subscriptions, delivery, MQTT 5 authentication, state, and callbacks.
 - [Models and Settings](models.md) — messages, properties, receipts, results,
   negotiated settings, reconnect, and API mode literals.
-- [Errors and Enums](errors-and-enums.md) — the Stable exception hierarchy and
+- [Errors and Enums](errors-and-enums.md) — the native exception hierarchy and
   common protocol/state enums.
 
 ## Completion conventions

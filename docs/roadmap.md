@@ -35,7 +35,7 @@ any separate decision to merge or publish the experiment.
 
 ## Documentation and ecosystem
 
-- Maintain one authoritative Stable API reference and one compatibility matrix.
+- Maintain one authoritative native API reference and one compatibility matrix.
 - Keep dated reports immutable and classify every report as current evidence,
   superseded, or retracted in the archive index.
 - Keep project metadata, issue forms, support policy, and release instructions

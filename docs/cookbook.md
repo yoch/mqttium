@@ -65,6 +65,38 @@ async def offer_sample(client, sample: bytes) -> bool:
 Returning `False` is useful only if the caller actually sheds, aggregates,
 retries later, or persists the sample elsewhere.
 
+## Publishing from a message callback
+
+With saturated delivery and `delivery_timeout=None`, awaiting publication
+capacity or an ACK inside the serial worker can create a circular wait. The
+ACK may sit behind an incoming message waiting for that same worker. Use a
+nonblocking offer with an explicit refusal policy:
+
+```python
+from mqttium import FlowControlError
+from mqttium.api import AsyncClient
+
+client = AsyncClient("responder", message_delivery="callback")
+refused_replies = 0
+
+
+def on_command(message) -> None:
+    global refused_replies
+    try:
+        client.publish_nowait("replies/service-a", message.payload, qos=1)
+    except FlowControlError:
+        refused_replies += 1
+
+
+client.message_callback_add("commands/service-a", on_command)
+# Configure routes before the first connection attempt.
+```
+
+This example explicitly sheds a refused reply and counts it. It never waits
+for an ACK inside the handler. If every reply must be retained, hand work to a
+separate application producer with its own queue/byte bounds and an explicit
+overflow policy; the callback must not wait on a full application queue either.
+
 ## Bounded batch publication
 
 ```python

@@ -62,8 +62,7 @@ application responses.
     options:
       heading_level: 3
 
-`PacketType` remains importable from `mqttium` but is Provisional and is not part
-of this Stable reference.
+`PacketType` is internal and is no longer re-exported from `mqttium`.
 
 ## Version
 

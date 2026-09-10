@@ -63,7 +63,7 @@ backpressure model that distinguishes MQTTium from a minimal MQTT wrapper.
 
 - **Guides** solve application tasks: configuration, sessions, transports,
   MQTT 5, operations, troubleshooting, and complete recipes.
-- **Reference** records the Stable public imports, signatures, defaults,
+- **Reference** records the experimental native imports, signatures, defaults,
   exceptions, compatibility tiers, and validated environments.
 - **Concepts** explain architecture, protocol ownership, conformance, and the
   no-library-logging decision.

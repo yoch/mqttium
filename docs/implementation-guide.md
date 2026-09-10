@@ -46,7 +46,7 @@ the inbound session likewise binds one PUBLISH handler when it is constructed.
 Hot handlers therefore contain neither a per-packet protocol branch nor a
 generic codec helper call. Acknowledgement bodies treat the two-byte success
 form and the MQTT 5 three-byte explicit-reason form as primary paths; absent
-properties are ``None``. Provisional ``mqttium.packets`` dataclasses remain
+properties are ``None``. Internal ``mqttium.packets`` dataclasses remain
 thin factories over the same primitives.
 
 MQTT UTF-8 validation applies on both encode and decode. Topics reject wildcards
@@ -95,8 +95,8 @@ store contract; process-restart recovery requires a stable configured ClientID.
 
 `EngineConfig.local_receive_maximum` defaults to 65535 because the standalone
 engine follows the protocol maximum. `AsyncClient` intentionally defaults to
-100 to provide an operationally bounded application client. This difference is
-part of the Stable API contract.
+100 to provide an operationally bounded application client. The native default remains supported; the standalone
+engine configuration is internal.
 
 Inbound and outbound topic aliases reset on every network connection. Alias
 zero, an inbound alias above the advertised maximum, or an unknown inbound

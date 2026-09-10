@@ -22,6 +22,10 @@ connection or process fails.
 
 The package has no runtime dependencies and is fully typed.
 
+This checkout is the incompatible `codex/lean-native-experiment` branch. Its
+native API and SQLite format differ from the published release; consult
+`docs/migration.md` before using existing application code or databases.
+
 ## Why MQTTium?
 
 | Need | MQTTium provides |
@@ -30,7 +34,7 @@ The package has no runtime dependencies and is fully typed.
 | Explicit completion | Publish receipts that separate local admission from the relevant MQTT acknowledgement exchange |
 | Controlled load | Message and byte budgets, wait-or-refuse backpressure, bounded ingress, writes, and application delivery |
 | Session continuity | Jittered reconnect plus in-memory or SQLite-backed inflight state with incremental replay |
-| Delivery choices | Async iteration, sync or async callbacks, optional dual delivery, and manual acknowledgement |
+| Delivery choices | Exclusive async iteration or sync/async callbacks, plus manual acknowledgement |
 | Transports | TCP, TLS, WebSocket, and Unix-domain sockets |
 | Operations | Immutable runtime snapshots, queue high-water marks, and broker-negotiated limits |
 | Efficient production | Bounded `publish_many()` and loop-bound `publish_nowait()` without changing delivery semantics |
@@ -144,9 +148,12 @@ inbound QoS 2 protocol state. It does not persist arbitrary application work,
 delivered callback/iterator queues, or subscription intent. The application
 owns the store and must close it after the client has shut down.
 
-## Paho migration
+## Experimental migration
 
-This incompatible branch supports only the native API. See the [experimental migration guide](https://mqttium.readthedocs.io/en/stable/migration/) for removed interfaces, frozen configuration, progressive batches and SQLite schema 5.
+This incompatible branch supports only the native API. See `docs/migration.md`
+in this checkout for removed interfaces, frozen configuration, progressive
+batches and SQLite schema 5. Published stable documentation describes the main
+release line.
 
 ## Documentation
 

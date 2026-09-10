@@ -190,9 +190,12 @@ reason code.
 - QoS 1: PUBACK received;
 - QoS 2: PUBCOMP received.
 
-A receipt is registered before effects can reach the writer. Completion is
-emitted before a packet identifier is returned to the pool, preventing a late
-acknowledgement from completing a later publication that reused the same ID.
+A receipt is registered before effects can reach the writer. An ACK can free
+a packet identifier while its completion effect still waits behind delivery.
+The adapter drains old effects before another awaited publication can commit;
+`publish_nowait()` refuses while effects remain pending. This settles the old
+receipt before the identifier is registered for a later publication, including
+within one aggregate batch receipt.
 
 ## Persistence
 

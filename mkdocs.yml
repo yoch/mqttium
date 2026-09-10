@@ -19,6 +19,7 @@ exclude_docs: |
   experiments/
   reports/*.md
   !reports/README.md
+  !reports/LEAN-NATIVE-EXPERIMENT-2026-09-10.md
 
 theme:
   name: material

@@ -20,6 +20,7 @@ Status meanings:
 
 | Report | Status | Use instead or interpretation |
 | --- | --- | --- |
+| [LEAN-NATIVE-EXPERIMENT-2026-09-10](LEAN-NATIVE-EXPERIMENT-2026-09-10.md) | Current evidence | Incompatible native-only branch: structural reduction, functional qualification and diagnostic exact-SHA A/A and A/B measurements; no release or merge decision |
 | [STABLE-RELEASE-EVIDENCE-2026-08-05](https://github.com/yoch/mqttium/blob/main/docs/reports/STABLE-RELEASE-EVIDENCE-2026-08-05.md) | Superseded | Early campaign evidence; require a final-release report for the exact release commit |
 | [RELEASE-CANDIDATE-1.0.0rc1](https://github.com/yoch/mqttium/blob/main/docs/reports/RELEASE-CANDIDATE-1.0.0rc1.md) | Superseded | Later release candidates and final release evidence |
 | [RELEASE-CANDIDATE-1.0.0rc3](https://github.com/yoch/mqttium/blob/main/docs/reports/RELEASE-CANDIDATE-1.0.0rc3.md) | Superseded | Later release candidates and final release evidence |

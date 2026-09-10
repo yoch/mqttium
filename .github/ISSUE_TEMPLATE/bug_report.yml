@@ -74,9 +74,9 @@ body:
       label: API surface
       options:
         - Native AsyncClient
-        - Helpers
+        - Native models or statistics
         - Persistence
-        - Transport or protocol extension
+        - Transport or protocol behavior
         - Packaging or installation
         - Not sure
     validations:
