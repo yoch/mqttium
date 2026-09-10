@@ -150,6 +150,21 @@ no longer implicitly handed to the callback worker; it is reported as a callback
 `TypeError`. Convert such callbacks to `async def`. This removes hidden scheduling
 state and makes callback execution mode explicit from the callable itself.
 
+## First-inline message bursts
+
+Eligible callback-only small-message bursts now execute their first synchronous
+message dispatch inline and their pre-admitted tail on the bounded worker. Code
+must not rely on both callbacks of a pair having run before the effect drain
+returns. Async callbacks and synchronous callbacks returning awaitables retain
+the callable-form contract above. `iterator` and `both` retain their existing
+scheduling policy.
+
+A propagated cancellation during the first dispatch abandons that burst's
+unstarted tail, not unrelated queued work. For formerly all-worker larger bursts,
+`asyncio.current_task()` during the first dispatch now refers to the reader/effect
+task; cancelling it may terminate reception. Use the supported client lifecycle
+API rather than cancelling whichever MQTTium task happens to invoke a callback.
+
 ## Durable sessions
 
 ```python
@@ -297,3 +312,27 @@ with neither or both now raises `TypeError` locally before CONNECT or task
 startup and is closed by the connection failure path. Previously such a local
 configuration error could appear as a CONNACK timeout. Existing pull-only and
 push-only transports are unchanged.
+
+## Callback execution context and cancellation
+
+The first-inline policy changes **where** the first message callback of a larger
+burst executes. On the old worker-only burst path, cancelling the current task
+cancelled the callback worker. On the new inline path it cancels the reader or
+effect flusher. The cancellation itself is still propagated, not suppressed.
+This is an observable scheduling change, not a promise that callback code which
+uses internal task cancellation will behave identically.
+
+Do not use `asyncio.current_task().cancel()` inside an `on_message` callback as
+an alias for `disconnect()`, nor as a supported way to discard just one burst.
+Use the lifecycle API for connection shutdown. Declare a callback with
+`async def` when it needs the worker execution context. Public callback arguments,
+registration order, callable-form classification, queue bounds, and real external
+task-cancellation propagation are unchanged.
+
+The fairness unit is one **message notification** in the callback-only effect
+drain. A set of matching topic filters remains one ordered notification;
+`on_publish` and `both` keep their existing policies. This does not promise a
+single user-function invocation across every callback type or a yield between
+synchronous callbacks inside the worker. The narrower unit deliberately preserves
+existing routing and publish-completion behavior instead of hiding a global
+scheduler rewrite in this change.

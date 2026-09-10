@@ -6,7 +6,25 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- Retire queued callback jobs when the callback worker is cancelled, including
+  cancellation before its coroutine starts. Release logical batch/byte
+  reservations and queue completion accounting; late completion callbacks must
+  not discard work belonging to a replacement worker.
+- Keep the remaining effects scheduled when an inline message callback cancels
+  an effect drain. The interrupted message prefix is consumed exactly once;
+  already-produced later effects and terminal publish receipts retain an owner.
+
 ### Changed
+
+- Prototype first-sync-inline message scheduling: pre-admit an eligible burst's
+  full tail to the bounded worker, execute only its first delivery inline, and
+  remove the unstarted tail if a real cancellation interrupts the first callback.
+  Consume that interrupted effect prefix so a reentrant flush cannot replay it.
+  Keep iterator/both and publish-only scheduling unchanged. Move direct QoS0 user
+  callback execution outside the engine lock and defer eager reentrant flushes
+  until the owning inline drain unwinds. No public constructor option is added.
 
 - Receive cleartext TCP straight into the decoder's own storage on CPython selector event loops. `asyncio.BufferedProtocol.get_buffer()` returns a window carved out of `IncrementalDecoder`'s own slab, so received bytes are no longer copied through an intermediate receive buffer before reaching the parser. Storage is adaptive: it starts at 16 KiB, the receive window starts at 64 KiB and is promoted toward 256 KiB only under sustained full windows, a known large frame caps progressive growth at its exact extent without reserving the entire announced body, and an enlarged slab is retired once large frames stop arriving. TLS, WebSocket, Proactor, non-CPython runtimes and third-party event loops keep the `read()` + `feed()` path.
 
