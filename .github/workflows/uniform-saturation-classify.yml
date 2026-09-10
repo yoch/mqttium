@@ -33,8 +33,8 @@ jobs:
       - name: Run identical diagnostic on both sources
         run: |
           set -euo pipefail
-          (cd "$JOB_ROOT/main" && PYTHONPATH=src python "$GITHUB_WORKSPACE/.github/uniform-saturation-diagnostic.py") | tee "$JOB_ROOT/main.json"
-          (cd "$JOB_ROOT/candidate" && PYTHONPATH=src python "$GITHUB_WORKSPACE/.github/uniform-saturation-diagnostic.py") | tee "$JOB_ROOT/candidate.json"
+          (cd "$JOB_ROOT/main" && PYTHONPATH=.:src python "$GITHUB_WORKSPACE/.github/uniform-saturation-diagnostic.py") | tee "$JOB_ROOT/main.json"
+          (cd "$JOB_ROOT/candidate" && PYTHONPATH=.:src python "$GITHUB_WORKSPACE/.github/uniform-saturation-diagnostic.py") | tee "$JOB_ROOT/candidate.json"
           python - <<'PY'
           import json,os
           from pathlib import Path
