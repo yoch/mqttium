@@ -1,0 +1,155 @@
+name: PR454 path crossover control
+on:
+  push:
+    branches: [work/pr454-path-crossover-20260910]
+permissions:
+  contents: read
+jobs:
+  crossover-rpi5:
+    runs-on: [self-hosted, linux, ARM64]
+    concurrency:
+      group: mqttium-arm64-runner
+      cancel-in-progress: false
+    timeout-minutes: 55
+    env:
+      PYTHONUNBUFFERED: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+      PIP_DISABLE_PIP_VERSION_CHECK: '1'
+      BASE_SHA: 9ad1f01857306ac5079ffb1d073a59fdb60e1931
+      CAND_SHA: 636de564dc2c92822a8361050cc24e369fe027d4
+      HARNESS_SHA: ef2382cf8ed20e5df4288102c1ae17e791a25d68
+      RATE: '3942'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          ref: 9ad1f01857306ac5079ffb1d073a59fdb60e1931
+          path: seed-base
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          ref: 636de564dc2c92822a8361050cc24e369fe027d4
+          path: seed-cand
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          repository: yoch/mqtt-python-client-bench
+          ref: ef2382cf8ed20e5df4288102c1ae17e791a25d68
+          path: bench
+      - name: Prepare isolated symmetric slots
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C seed-base rev-parse HEAD)" = "$BASE_SHA"
+          test "$(git -C seed-cand rev-parse HEAD)" = "$CAND_SHA"
+          test "$(git -C bench rev-parse HEAD)" = "$HARNESS_SHA"
+          ROOT=$(mktemp -d "$RUNNER_TEMP/p454-cross-${GITHUB_RUN_ID}-XXXX")
+          OUT="$ROOT/results"
+          mkdir -p "$OUT"
+          echo "JOB_ROOT=$ROOT" >> "$GITHUB_ENV"
+          echo "OUT=$OUT" >> "$GITHUB_ENV"
+          python3 -m venv "$ROOT/venv"
+          echo "$ROOT/venv/bin" >> "$GITHUB_PATH"
+          uname -a > "$OUT/machine.txt"
+          lscpu >> "$OUT/machine.txt"
+          for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor /sys/class/thermal/thermal_zone*/temp; do
+            if test -f "$f"; then printf '%s=' "$f" >> "$OUT/machine.txt"; cat "$f" >> "$OUT/machine.txt"; fi
+          done
+      - name: Install corrected harness
+        run: python -m pip install -e 'bench[paho]'
+      - name: Start isolated broker
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$JOB_ROOT/mosquitto.conf" <<'EOF'
+          listener 18896 127.0.0.1
+          allow_anonymous true
+          persistence false
+          set_tcp_nodelay true
+          max_inflight_messages 1000
+          max_queued_messages 100000
+          log_type error
+          EOF
+          mosquitto -c "$JOB_ROOT/mosquitto.conf" > "$OUT/mosquitto.log" 2>&1 &
+          echo $! > "$JOB_ROOT/broker.pid"
+          python seed-base/tools/ci/wait_for_endpoints.py --tcp 127.0.0.1:18896
+          python - <<'PY'
+          import json, os, pathlib
+          from mqtt_client_bench.telemetry import allocate_cpuset
+          sets=allocate_cpuset(['sut','broker','loadgen','orch'],profile='standard')
+          pathlib.Path(os.environ['OUT'],'cpusets.json').write_text(json.dumps(sets,indent=2))
+          ids=[]
+          for part in sets['broker'].split(','):
+              if '-' in part:
+                  a,b=map(int,part.split('-')); ids.extend(range(a,b+1))
+              else: ids.append(int(part))
+          pid=int((pathlib.Path(os.environ['JOB_ROOT'])/'broker.pid').read_text())
+          os.sched_setaffinity(pid,set(ids))
+          PY
+      - name: Orientation one — base in slot-a, candidate in slot-b
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp -a seed-base "$JOB_ROOT/slot-a"
+          cp -a seed-cand "$JOB_ROOT/slot-b"
+          test "${#JOB_ROOT}" -gt 0
+          test "$(git -C "$JOB_ROOT/slot-a" rev-parse HEAD)" = "$BASE_SHA"
+          test "$(git -C "$JOB_ROOT/slot-b" rev-parse HEAD)" = "$CAND_SHA"
+          printf 'phase1_base=%s\nphase1_candidate=%s\n' "$JOB_ROOT/slot-a" "$JOB_ROOT/slot-b" > "$OUT/paths.txt"
+          python -m mqtt_client_bench.version_compare \
+            --client mqttium --baseline-path "$JOB_ROOT/slot-a" --candidate-path "$JOB_ROOT/slot-b" \
+            --scenario application_rtt_fixed_rate --variant-index 0 --target-rate "$RATE" --pacer-mode external \
+            --broker 127.0.0.1:18896 --broker-pid "$(cat "$JOB_ROOT/broker.pid")" \
+            --blocks 6 --max-block-retries 1 --profile standard --output "$OUT/orientation-1.json" \
+            | tee "$OUT/orientation-1.log"
+      - name: Orientation two — candidate in slot-a, base in slot-b
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$JOB_ROOT/slot-a" "$JOB_ROOT/slot-b"
+          cp -a seed-cand "$JOB_ROOT/slot-a"
+          cp -a seed-base "$JOB_ROOT/slot-b"
+          test "$(git -C "$JOB_ROOT/slot-a" rev-parse HEAD)" = "$CAND_SHA"
+          test "$(git -C "$JOB_ROOT/slot-b" rev-parse HEAD)" = "$BASE_SHA"
+          printf 'phase2_candidate=%s\nphase2_base=%s\n' "$JOB_ROOT/slot-a" "$JOB_ROOT/slot-b" >> "$OUT/paths.txt"
+          python -m mqtt_client_bench.version_compare \
+            --client mqttium --baseline-path "$JOB_ROOT/slot-b" --candidate-path "$JOB_ROOT/slot-a" \
+            --scenario application_rtt_fixed_rate --variant-index 0 --target-rate "$RATE" --pacer-mode external \
+            --broker 127.0.0.1:18896 --broker-pid "$(cat "$JOB_ROOT/broker.pid")" \
+            --blocks 6 --max-block-retries 1 --profile standard --output "$OUT/orientation-2.json" \
+            | tee "$OUT/orientation-2.log"
+      - name: Readback source and latency summaries
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, pathlib, os
+          out={}
+          for name in ('orientation-1','orientation-2'):
+              d=json.loads(pathlib.Path(os.environ['OUT'],name+'.json').read_text())
+              rows=[]
+              for r in d['runs']:
+                  if not r.get('active_for_verdict'): continue
+                  w=next(x for x in r['workers'] if x.get('role')=='rtt_initiator')
+                  lat=w['latency_summary']; rt=(w.get('runtime') or {}).get('measure_delta') or {}
+                  layout=((w.get('runtime') or {}).get('measure_start') or {}).get('memory_layout') or {}
+                  rows.append({'block':r['logical_block'],'slot':r['block_slot'],'label':r['ab_label'],
+                    'sha':r['version_source']['git_sha'],'path':r['version_source']['path'],
+                    'p50':lat.get('p50_ms'),'p95':lat.get('p95_ms'),'p99':lat.get('p99_ms'),
+                    'nvcsw':rt.get('ru_nvcsw'),'nivcsw':rt.get('ru_nivcsw'),'minflt':rt.get('ru_minflt'),
+                    'layout':layout.get('maps_sha256')})
+              out[name]={'qualification':d['qualification'],'verdict':d['verdict'],'rows':rows}
+          pathlib.Path(os.environ['OUT'],'readback.json').write_text(json.dumps(out,indent=2,sort_keys=True))
+          PY
+          cat "$OUT/readback.json"
+      - name: Cleanup
+        if: always()
+        shell: bash
+        run: |
+          if test -n "${JOB_ROOT:-}" && test -f "$JOB_ROOT/broker.pid"; then kill "$(cat "$JOB_ROOT/broker.pid")" 2>/dev/null || true; fi
+          if test -n "${OUT:-}"; then printf 'base=%s\ncandidate=%s\nharness=%s\n' "$BASE_SHA" "$CAND_SHA" "$HARNESS_SHA" > "$OUT/identity.txt"; fi
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: pr454-path-crossover-rpi5
+          path: ${{ env.OUT }}
+          retention-days: 30
