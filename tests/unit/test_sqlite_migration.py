@@ -6,6 +6,7 @@ from tests.support import stored_record
 
 import sqlite3
 from pathlib import Path
+from contextlib import closing
 
 import pytest
 
@@ -265,13 +266,13 @@ def test_a_read_only_nested_batch_still_commits_the_outer_mutation(tmp_path: Pat
 def test_other_formats_are_refused_without_any_file_modification(tmp_path, version) -> None:
     path = tmp_path / "unsupported.db"
     write_v1_database(path)
-    with sqlite3.connect(path) as conn:
+    with closing(sqlite3.connect(path)) as conn, conn:
         conn.execute(f"PRAGMA user_version={version}")
     before = {p.name: p.read_bytes() for p in tmp_path.iterdir()}
     with pytest.raises(RuntimeError):
         SqliteInflightStore(path)
     assert {p.name: p.read_bytes() for p in tmp_path.iterdir()} == before
-    with sqlite3.connect(path) as conn:
+    with closing(sqlite3.connect(path)) as conn:
         assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
 
 
