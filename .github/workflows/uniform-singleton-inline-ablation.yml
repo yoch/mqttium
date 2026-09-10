@@ -1,0 +1,65 @@
+name: Uniform singleton-inline ablation qualification
+on:
+  push:
+    branches: [bench/uniform-singleton-inline-ablation-fd37]
+    paths:
+      - .github/apply-uniform-singleton-inline-ablation.py
+      - .github/uniform-singleton-inline-ablation-test.py
+      - .github/workflows/uniform-singleton-inline-ablation.yml
+permissions:
+  contents: read
+jobs:
+  qualify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.13.5'
+      - name: Verify exact product parent and apply one-file ablation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git merge-base HEAD fd37ed3fff3895adca0e33c3eacc34e611e7a316)" = fd37ed3fff3895adca0e33c3eacc34e611e7a316
+          python .github/apply-uniform-singleton-inline-ablation.py src/mqttium/api/_delivery.py | tee /tmp/ablation-sha256.txt
+          cp .github/uniform-singleton-inline-ablation-test.py tests/unit/test_singleton_inline_ablation.py
+          git diff --check
+          test "$(git diff --name-only)" = src/mqttium/api/_delivery.py
+      - name: Install and run focused public-contract gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install -e '.[dev]'
+          ruff format src/mqttium/api/_delivery.py tests/unit/test_singleton_inline_ablation.py
+          ruff format --check src/mqttium/api/_delivery.py tests/unit/test_singleton_inline_ablation.py
+          ruff check src/mqttium/api/_delivery.py tests/unit/test_singleton_inline_ablation.py
+          python -m pytest -q \
+            tests/unit/test_singleton_inline_ablation.py \
+            tests/unit/test_callback_message_batches.py \
+            tests/unit/test_direct_qos0_capture.py \
+            tests/unit/test_effect_pump.py \
+            tests/unit/test_message_delivery.py \
+            tests/unit/test_topic_callbacks.py \
+            tests/unit/test_topic_callback_dispatch_contract.py \
+            -W error
+      - name: Record exact ablation diff
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff -- src/mqttium/api/_delivery.py > /tmp/ablation.diff
+          git diff --stat -- src/mqttium/api/_delivery.py
+          sha256sum /tmp/ablation.diff /tmp/ablation-sha256.txt
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: singleton-inline-ablation-${{ github.run_id }}
+          path: |
+            /tmp/ablation.diff
+            /tmp/ablation-sha256.txt
+          retention-days: 14
+          if-no-files-found: warn
