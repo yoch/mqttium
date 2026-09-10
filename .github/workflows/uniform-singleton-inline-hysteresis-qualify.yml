@@ -43,8 +43,7 @@ jobs:
           python - <<'PY' | tee /tmp/hotpath-rates.json
           import asyncio, json, sys
           from pathlib import Path
-          bench = Path('benchmarks').resolve()
-          sys.path.insert(0, str(bench))
+          sys.path.insert(0, str(Path('benchmarks').resolve()))
           from hotpath_recon import _run_qos1_inbound_reply
           from mqttium.enums import MQTTProtocolVersion
 
@@ -65,9 +64,59 @@ jobs:
               }
               print(json.dumps(out, sort_keys=True))
               assert out['serial_inline_rate'] == 1.0
-              assert out['coalesced_inline_rate'] <= 1.0 / 64.0
+              assert out['coalesced_inline_rate'] == 0.0
           asyncio.run(main())
           PY
+      - name: Full repository suite; permit only explicit worker-policy inversions
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +e
+          python -m pytest -q -W error 2>&1 | tee /tmp/full-suite.log
+          pytest_rc=${PIPESTATUS[0]}
+          set -e
+          python - <<'PY'
+          from pathlib import Path
+          text = Path('/tmp/full-suite.log').read_text()
+          failures = [line for line in text.splitlines() if line.startswith('FAILED ')]
+          exact = {
+              'FAILED tests/unit/test_effect_pump.py::test_idle_sync_message_callback_runs_in_worker_after_engine_lock',
+              'FAILED tests/unit/test_hotpath_recon.py::test_qos1_inbound_reply_serial_uses_uniform_worker',
+          }
+          uniform_prefix = (
+              'FAILED tests/unit/test_uniform_callbacks.py::'
+              'test_all_message_callbacks_are_worker_owned['
+          )
+          uniform_expected = {
+              'normal-False-callback-1',
+              'normal-False-auto-1',
+              'eager-False-callback-1',
+              'eager-False-auto-1',
+          }
+          unexpected = []
+          seen_exact = set()
+          seen_uniform = set()
+          for line in failures:
+              head = line.split(' - ', 1)[0]
+              if head in exact:
+                  seen_exact.add(head)
+                  continue
+              if head.startswith(uniform_prefix) and head.endswith(']'):
+                  case = head[len(uniform_prefix):-1]
+                  if case in uniform_expected:
+                      seen_uniform.add(case)
+                      continue
+              unexpected.append(line)
+          if unexpected:
+              raise SystemExit('unexpected failures:\n' + '\n'.join(unexpected))
+          if seen_exact != exact or seen_uniform != uniform_expected or len(failures) != 6:
+              raise SystemExit(
+                  f'policy-failure set drifted: failures={len(failures)} '
+                  f'exact={seen_exact!r} uniform={seen_uniform!r}'
+              )
+          print('Only the six expected worker-ownership policy assertions failed.')
+          PY
+          test "$pytest_rc" -eq 1
       - name: Record exact diff
         shell: bash
         run: |
@@ -85,5 +134,6 @@ jobs:
             /tmp/preformat-sha256.txt
             /tmp/runtime-sha256.txt
             /tmp/hotpath-rates.json
+            /tmp/full-suite.log
           retention-days: 14
           if-no-files-found: warn
