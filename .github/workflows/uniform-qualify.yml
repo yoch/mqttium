@@ -1,0 +1,117 @@
+name: Uniform message worker qualification and initial performance
+on:
+  push:
+    branches: [work/uniform-stage-20260910]
+permissions:
+  contents: write
+concurrency:
+  group: mqttium-uniform-hosted-qualification
+  cancel-in-progress: false
+jobs:
+  qualify:
+    if: github.repository == 'yoch/mqttium'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - name: Isolated run root
+        run: echo "JOB_ROOT=$RUNNER_TEMP/uniform-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.13.5'
+      - name: Reconstruct hash-checked candidate from exact main
+        run: python .github/uniform-qualify.py prepare
+      - name: Install complete qualification dependencies
+        run: python -m pip install -e "$JOB_ROOT/slot-b[dev,fuzz,security,docs]"
+      - name: Format without semantic change and freeze immutable candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python .github/uniform-qualify.py freeze
+      - name: Quality and correctness gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$JOB_ROOT/slot-b"
+          failed=0
+          gate() {
+            local name="$1"; shift
+            set +e
+            "$@" > "$JOB_ROOT/evidence/$name.log" 2>&1
+            local rc=$?
+            set -e
+            cat "$JOB_ROOT/evidence/$name.log"
+            echo "$rc" > "$JOB_ROOT/evidence/$name.exitcode"
+            [ "$rc" -eq 0 ] || failed=1
+          }
+          gate format ruff format --check src tests benchmarks tools
+          gate lint ruff check src tests benchmarks tools
+          gate types mypy src/mqttium
+          gate security bandit -q -ll -r src
+          gate docs mkdocs build --strict
+          gate unit python -m pytest -q tests/unit tests/project tests/resilience -W error --cov=mqttium
+          gate fuzz python -m pytest -q tests/fuzz -W error
+          gate seeded python tests/fuzz/fuzz.py --seed 1 --iterations 20000
+          exit "$failed"
+      - name: Verify tested bytes
+        run: python .github/uniform-qualify.py verify
+      - name: Retain exact candidate qualification before performance
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: uniform-qualified-${{ github.run_id }}
+          path: ${{ env.JOB_ROOT }}/evidence/
+          retention-days: 30
+          if-no-files-found: warn
+      - name: Install isolated real broker
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y mosquitto
+      - name: Initial same-host A/A and A/B, with temporal windows
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$JOB_ROOT"
+          mkdir -p "$root/performance"
+          git worktree add --detach "$root/slot-a" 9ad1f01857306ac5079ffb1d073a59fdb60e1931
+          git worktree add --detach "$root/slot-c" 9ad1f01857306ac5079ffb1d073a59fdb60e1931
+          read -r sut broker_cpu < <(python -c 'import os; c=sorted(os.sched_getaffinity(0)); assert len(c)>=2; print(c[0],c[1])')
+          port=$(python -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+          printf 'listener %s 127.0.0.1\nallow_anonymous true\npersistence false\nset_tcp_nodelay true\nlog_type error\nmax_inflight_messages 1000\nmax_queued_messages 10000\n' "$port" > "$root/performance/mosquitto.conf"
+          taskset -c "$broker_cpu" mosquitto -c "$root/performance/mosquitto.conf" > "$root/performance/broker.log" 2>&1 &
+          pid=$!
+          cleanup() { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; }
+          trap cleanup EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+          python "$root/slot-b/tools/ci/wait_for_endpoints.py" --tcp "127.0.0.1:$port"
+          uname -a > "$root/performance/host.txt"
+          lscpu >> "$root/performance/host.txt"
+          (mosquitto -h || true) > "$root/performance/broker-version.txt" 2>&1
+          python -m pip freeze > "$root/performance/dependencies.txt"
+          printf 'sut=%s\nbroker=%s\n' "$sut" "$broker_cpu" > "$root/performance/cpus.txt"
+          cp "$root/evidence/frozen.json" "$root/performance/provenance.json"
+          # Sanity before timed phase; faults must be fixed, not retried as samples.
+          python "$root/slot-b/benchmarks/uniform_callback_probe.py" --source "$root/slot-a" --port "$port" --cpu "$sut" --seconds 1 > "$root/performance/sanity-A.json"
+          python "$root/slot-b/benchmarks/uniform_callback_probe.py" --source "$root/slot-b" --port "$port" --cpu "$sut" --seconds 1 > "$root/performance/sanity-B.json"
+          python "$root/slot-b/benchmarks/uniform_callback_probe.py" --base "$root/slot-a" --control "$root/slot-c" --candidate "$root/slot-b" --output "$root/performance/samples" --port "$port" --cpu "$sut" --seconds 2 --pairs 4 | tee "$root/performance/progress.log"
+          python .github/uniform-qualify.py verify
+          cp "$root/evidence/verified.json" "$root/performance/verified.json"
+      - name: Retain every performance observation
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: uniform-performance-${{ github.run_id }}
+          path: ${{ env.JOB_ROOT }}/performance/
+          retention-days: 30
+          if-no-files-found: warn
+      - name: Remove only isolated worktrees
+        if: always()
+        shell: bash
+        run: |
+          for arm in a b c; do git worktree remove --force "$JOB_ROOT/slot-$arm" || true; done
