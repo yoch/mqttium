@@ -1,0 +1,115 @@
+name: Uniform singleton-inline v2 qualification
+on:
+  push:
+    branches: [bench/uniform-singleton-inline-v2-fd37]
+    paths:
+      - .github/apply-uniform-singleton-inline-v2.py
+      - .github/uniform-singleton-inline-v2-test.py
+      - .github/workflows/uniform-singleton-inline-v2-qualify.yml
+permissions:
+  contents: read
+jobs:
+  qualify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.13.5'
+      - name: Reconstruct exact one-file runtime ablation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git merge-base HEAD fd37ed3fff3895adca0e33c3eacc34e611e7a316)" = fd37ed3fff3895adca0e33c3eacc34e611e7a316
+          python .github/apply-uniform-singleton-inline-v2.py src/mqttium/api/_delivery.py > /tmp/preformat-sha256.txt
+          cp .github/uniform-singleton-inline-v2-test.py tests/unit/test_singleton_inline_v2.py
+          git diff --check
+          test "$(git diff --name-only)" = src/mqttium/api/_delivery.py
+      - name: Lint and focused semantic gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install -e '.[dev]'
+          ruff format src/mqttium/api/_delivery.py tests/unit/test_singleton_inline_v2.py
+          ruff format --check src/mqttium/api/_delivery.py tests/unit/test_singleton_inline_v2.py
+          ruff check src/mqttium/api/_delivery.py tests/unit/test_singleton_inline_v2.py
+          sha256sum src/mqttium/api/_delivery.py | tee /tmp/runtime-sha256.txt
+          python -m pytest -q tests/unit/test_singleton_inline_v2.py -W error
+      - name: Full repository suite; permit only explicit worker-policy inversions
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +e
+          python -m pytest -q -W error 2>&1 | tee /tmp/full-suite.log
+          pytest_rc=${PIPESTATUS[0]}
+          set -e
+          python - <<'PY'
+          from pathlib import Path
+
+          text = Path('/tmp/full-suite.log').read_text()
+          failures = [line for line in text.splitlines() if line.startswith('FAILED ')]
+          exact = {
+              'FAILED tests/unit/test_effect_pump.py::test_idle_sync_message_callback_runs_in_worker_after_engine_lock',
+              'FAILED tests/unit/test_hotpath_recon.py::test_qos1_inbound_reply_serial_uses_uniform_worker',
+              'FAILED tests/unit/test_hotpath_recon.py::test_qos1_coalesced_inbound_keeps_window',
+          }
+          uniform_prefix = (
+              'FAILED tests/unit/test_uniform_callbacks.py::'
+              'test_all_message_callbacks_are_worker_owned['
+          )
+          uniform_expected = {
+              'normal-False-callback-1',
+              'normal-False-auto-1',
+              'eager-False-callback-1',
+              'eager-False-auto-1',
+          }
+          unexpected = []
+          seen_exact = set()
+          seen_uniform = set()
+          for line in failures:
+              head = line.split(' - ', 1)[0]
+              if head in exact:
+                  seen_exact.add(head)
+                  continue
+              if head.startswith(uniform_prefix) and head.endswith(']'):
+                  case = head[len(uniform_prefix):-1]
+                  if case in uniform_expected:
+                      seen_uniform.add(case)
+                      continue
+              unexpected.append(line)
+          if unexpected:
+              raise SystemExit('unexpected failures:\n' + '\n'.join(unexpected))
+          if seen_exact != exact or seen_uniform != uniform_expected or len(failures) != 7:
+              raise SystemExit(
+                  f'policy-failure set drifted: failures={len(failures)} '
+                  f'exact={seen_exact!r} uniform={seen_uniform!r}'
+              )
+          if 'failed' not in text or 'passed' not in text:
+              raise SystemExit('pytest summary missing')
+          print('Only the seven expected worker-ownership policy assertions failed.')
+          PY
+          test "$pytest_rc" -eq 1
+      - name: Record exact runtime diff
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff -- src/mqttium/api/_delivery.py > /tmp/ablation-v2.diff
+          git diff --check
+          git diff --stat -- src/mqttium/api/_delivery.py
+          sha256sum /tmp/ablation-v2.diff /tmp/runtime-sha256.txt
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: singleton-inline-v2-${{ github.run_id }}
+          path: |
+            /tmp/ablation-v2.diff
+            /tmp/preformat-sha256.txt
+            /tmp/runtime-sha256.txt
+            /tmp/full-suite.log
+          retention-days: 14
+          if-no-files-found: warn
