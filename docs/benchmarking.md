@@ -32,6 +32,27 @@ durations as well as aggregate ratios. A separate broker with Mosquitto's
 stimulus. Preserve the original attempt and report the two conditions separately
 instead of presenting the new result as an unchanged-workload rerun.
 
+`lean_native_paced.py` supplements those saturated lots with fixed offered load.
+It freezes rates at 50/75/90% of the reference long-lot A/A median before comparing
+the two source revisions. This calibration is a fraction of that measured
+workload, not a separately established sustainable open-loop capacity. A separate
+process emits scheduled tokens; the client loop does not sleep to pace itself.
+The harness retains planned arrival, pacer emission, publication call, admission
+return, delivery, and observed receipt-completion clocks in hashed companion
+files. Include those files with the result JSON. Admission return is an API
+observation, not the internal commit instant. Report deliveries before return
+explicitly; residual latency clamps those observations to zero. Scheduled-to-call
+and scheduled-to-delivery latency retain producer backlog and pacer lateness.
+
+`lean_native_diagnostics.py` separates publication, ingress with iterator or
+callback delivery, callback queue execution, and routed dispatch. Its existing
+packet-aware test transport isolates local orchestration; publication includes
+the transport's broker emulation and is not a network capacity result. Fresh
+processes run A/A and ABBA trials. Optional profiles run in separate phases and
+count Python calls and resumptions, not operating-system context switches or
+system calls. Evaluate routing candidates separately against their immediate
+predecessor and the measured same-code noise.
+
 ## What each benchmark answers
 
 - `hotpath_profile.py` counts calls, primitive calls, and allocations. These

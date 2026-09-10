@@ -58,13 +58,15 @@ durable delivery mark is required. Full destinations and persisted delivery
 marks retain asynchronous transfer. All message and publish notifications run
 on the serial callback worker, outside engine critical sections.
 
-Ready unit QoS 0 publications can use outbound validation and writer admission
+Ready QoS 0 publications can use outbound validation and writer admission
 without creating general effects. This requires a current connection and empty
 effect pipeline, and reserves callback capacity before handoff. The receipt
 exists before the writer can send bytes; topic aliases commit only after writer
 acceptance. An asynchronous clean refusal falls back to ordinary admission;
-writer exceptions propagate without retry. Batch publication retains its
-progressive unit admission path.
+writer exceptions propagate without retry. Batch publication shares this path
+without a unit receipt: its aggregate receipt registers the element before
+handoff. Only a clean refusal rolls back the registration; an exception retains
+the committed prefix. Admission remains progressive.
 
 ### Network writes
 
@@ -101,6 +103,16 @@ synchronous callables. Callback exceptions are isolated from protocol state;
 message bytes remain reserved until all matching callbacks finish. An active
 callback may disconnect and reconnect: reopening discards old queued work and
 lets the same worker serve the replacement connection.
+After every 64 completed jobs, the worker explicitly yields if queued work
+remains. It releases the completed job's bytes and queue credit before yielding;
+the initial suspension and connection ownership rules still apply.
+
+`messages()` captures the delivery generation when called, even if its returned
+iterator is never advanced. Closing and reopening delivery leaves old iterators
+terminal. Manual acknowledgements carry a private exchange identity, validated
+under the engine lock. That identity survives a genuinely resumed active session
+and is retired on exchange completion or session discard; automatic delivery
+does not allocate identities or an identity index.
 
 ### Ingress
 

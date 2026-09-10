@@ -311,14 +311,17 @@ Covered by `tests/unit/test_ingress_failure_semantics.py`.
 - Transport loss fails work only after reconnect policy becomes terminal.
 - Public exceptions must not shadow Python built-ins.
 
-Unit QoS 0 publication may bypass general effect creation only with the current
+QoS 0 publication may bypass general effect creation only with the current
 writer epoch, no terminal failure, no pending effects or active effect/engine
-lock, and enough callback capacity. It reuses outbound preparation, creates the
-receipt before handing bytes to `WritePump`, and commits any Topic Alias after
-acceptance. A clean writer refusal may fall back for awaited publication;
-exceptions propagate without retry because handoff may already have occurred.
-`publish_many()` retains ordinary progressive admission. The effect drain before
-awaited admission remains necessary for receipt settlement before MID reuse.
+lock, and enough callback capacity. It reuses outbound preparation and registers
+the unit receipt or aggregate batch element before handing bytes to `WritePump`.
+Batch admission does not allocate a unit receipt. Topic Aliases commit after
+acceptance. A clean writer refusal rolls back only that batch registration and
+may fall back for awaited publication; writer exceptions retain the registered
+prefix and propagate without retry because handoff may already have occurred.
+`publish_many()` retains progressive admission and its existing fairness points.
+The effect drain before awaited admission remains necessary for receipt
+settlement before MID reuse.
 
 ## Required validation
 
