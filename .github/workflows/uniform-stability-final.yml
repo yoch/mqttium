@@ -1,0 +1,121 @@
+name: Uniform worker final hosted stability screening
+on:
+  push:
+    branches: [bench/uniform-stability-final-fd37]
+    paths: [.github/workflows/uniform-stability-final.yml]
+permissions:
+  contents: read
+concurrency:
+  group: mqttium-uniform-final-hosted-stability
+  cancel-in-progress: false
+jobs:
+  screen:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      BASE_SHA: 9ad1f01857306ac5079ffb1d073a59fdb60e1931
+      CANDIDATE_SHA: fd37ed3fff3895adca0e33c3eacc34e611e7a316
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - name: Freeze method and paths before samples
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/uniform-final-stability-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          echo "JOB_ROOT=$root" >> "$GITHUB_ENV"
+          mkdir -p "$root/results"
+          cat > "$root/results/METHOD.md" <<'EOF'
+          # Frozen final hosted stability screen
+          - A/A first, then A/B; 6 balanced pairs per phase; fresh Python process per arm; no sample retry or A/A subtraction.
+          - Exact main versus tree-identical final PR checkpoint; same broker/host/options/path lengths within the campaign.
+          - 9 cells: sync callback batches 1/2/8/32, async8, filtered-sync8, iterator8, both8, publish-only8.
+          - MQTT 3.1.1, QoS1, 64-byte payload, closed-loop batch barrier, 250 ms warmup, 5 measured seconds/cell.
+          - Stability co-primary with mean throughput: absolute p05 100-ms throughput, 100-ms CV, fraction of full 100-ms windows below 90% of that execution's mean; all 1-s windows retained.
+          - Lower variance obtained only by uniformly slower service is not a stability win. Pair is the inference unit.
+          - Secondary: minimum window, callback/completion latency, loop-lag p95/p99, CPU/completion and queue peak.
+          - No adaptive tuning, result-based rerun, excluded completed sample, host pooling or noise subtraction.
+          EOF
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.13.5'
+      - name: Prepare exact source slots and broker
+        run: |
+          set -euo pipefail
+          git worktree add --detach "$JOB_ROOT/slot-a" "$BASE_SHA"
+          git worktree add --detach "$JOB_ROOT/slot-c" "$BASE_SHA"
+          git worktree add --detach "$JOB_ROOT/slot-b" "$CANDIDATE_SHA"
+          for item in "slot-a:$BASE_SHA" "slot-c:$BASE_SHA" "slot-b:$CANDIDATE_SHA"; do
+            slot=${item%%:*}; expected=${item#*:}
+            test "$(git -C "$JOB_ROOT/$slot" rev-parse HEAD)" = "$expected"
+            test -z "$(git -C "$JOB_ROOT/$slot" status --porcelain --untracked-files=no)"
+          done
+          python -m pip install -e "$JOB_ROOT/slot-b[dev]"
+          sudo apt-get update -qq
+          sudo apt-get install -y mosquitto
+      - name: Run frozen A/A then A/B campaign
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$JOB_ROOT/results"
+          read -r sut broker_cpu < <(python - <<'PY'
+          import os
+          cpus=sorted(os.sched_getaffinity(0)); assert len(cpus)>=2,cpus
+          print(cpus[0],cpus[1])
+          PY
+          )
+          port=$(python -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+          printf 'listener %s 127.0.0.1\nallow_anonymous true\npersistence false\nset_tcp_nodelay true\nconnection_messages false\nlog_type error\nmax_inflight_messages 1000\nmax_queued_messages 10000\n' "$port" > "$out/mosquitto.conf"
+          taskset -c "$broker_cpu" mosquitto -c "$out/mosquitto.conf" > "$out/broker.log" 2>&1 &
+          broker_pid=$!
+          cleanup() { kill "$broker_pid" 2>/dev/null || true; wait "$broker_pid" 2>/dev/null || true; }
+          trap cleanup EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+          python "$JOB_ROOT/slot-b/tools/ci/wait_for_endpoints.py" --tcp "127.0.0.1:$port"
+          printf 'sut=%s\nbroker=%s\nport=%s\n' "$sut" "$broker_cpu" "$port" > "$out/cpus.txt"
+          uname -a > "$out/host.txt"; lscpu >> "$out/host.txt"; python --version >> "$out/host.txt" 2>&1
+          (mosquitto -h || true) > "$out/broker-version.txt" 2>&1
+          python -m pip freeze > "$out/dependencies.txt"
+          python - <<'PY' > "$out/provenance.json"
+          import hashlib,json,os,subprocess
+          from pathlib import Path
+          root=Path(os.environ['JOB_ROOT']); docs={}
+          for slot,expected in [('slot-a',os.environ['BASE_SHA']),('slot-c',os.environ['BASE_SHA']),('slot-b',os.environ['CANDIDATE_SHA'])]:
+              p=root/slot
+              def git(*a): return subprocess.check_output(['git','-C',p,*a],text=True).strip()
+              docs[slot]={'sha':expected,'root':git('rev-parse','HEAD^{tree}'),'src':git('rev-parse','HEAD:src'),
+                'runtime':{f:hashlib.sha256((p/f).read_bytes()).hexdigest() for f in ['src/mqttium/api/_delivery.py','src/mqttium/api/async_client.py','src/mqttium/api/_effects.py']}}
+          print(json.dumps({'sources':docs,'tooling':os.environ['GITHUB_SHA'],'pairs':6,'seconds_per_cell':5},indent=2))
+          PY
+          python "$JOB_ROOT/slot-b/benchmarks/uniform_callback_probe.py" --source "$JOB_ROOT/slot-a" --port "$port" --cpu "$sut" --seconds 1 > "$out/sanity-A.json"
+          python "$JOB_ROOT/slot-b/benchmarks/uniform_callback_probe.py" --source "$JOB_ROOT/slot-b" --port "$port" --cpu "$sut" --seconds 1 > "$out/sanity-B.json"
+          python "$JOB_ROOT/slot-b/benchmarks/uniform_callback_probe.py" \
+            --base "$JOB_ROOT/slot-a" --control "$JOB_ROOT/slot-c" --candidate "$JOB_ROOT/slot-b" \
+            --output "$out/samples" --port "$port" --cpu "$sut" --seconds 5 --pairs 6 | tee "$out/progress.log"
+      - name: Verify exact sources after timings
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json,os,subprocess
+          from pathlib import Path
+          root=Path(os.environ['JOB_ROOT']); p=json.loads((root/'results/provenance.json').read_text())
+          for slot,d in p['sources'].items():
+              def git(*a): return subprocess.check_output(['git','-C',root/slot,*a],text=True).strip()
+              assert git('rev-parse','HEAD')==d['sha']; assert git('rev-parse','HEAD^{tree}')==d['root']; assert git('rev-parse','HEAD:src')==d['src']; assert not git('status','--porcelain','--untracked-files=no')
+          (root/'results/source-verification.txt').write_text('all source trees unchanged\n')
+          PY
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: uniform-final-stability-${{ github.run_id }}
+          path: ${{ env.JOB_ROOT }}/results/
+          retention-days: 30
+          if-no-files-found: warn
+      - name: Cleanup
+        if: always()
+        run: |
+          for slot in a b c; do git worktree remove --force "$JOB_ROOT/slot-$slot" || true; done
