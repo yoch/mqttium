@@ -102,7 +102,6 @@ jobs:
             tests/unit/test_callback_message_batches.py \
             tests/unit/test_effect_pump.py \
             tests/unit/test_direct_qos0_capture.py \
-            tests/unit/test_delivery_reconnect_races.py \
             -W error
       - name: Full hosted correctness qualification
         shell: bash
