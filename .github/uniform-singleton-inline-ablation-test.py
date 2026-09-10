@@ -94,7 +94,7 @@ async def test_both_mode_singleton_keeps_worker_ownership() -> None:
     assert client._delivery.deliver_message_batch_inline(effects, callback) == 1
     assert seen == []
     assert client._callback_queue.qsize() == 1
-    assert client._message_queue.qsize() == 1
+    assert client._delivery.messages_queue.qsize() == 1
     await asyncio.wait_for(client._callback_queue.join(), 1)
     assert seen == [b"one"]
     await stop(client)
