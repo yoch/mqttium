@@ -42,10 +42,16 @@ jobs:
             tests/unit/test_singleton_inline_ablation.py \
             tests/unit/test_callback_message_batches.py \
             tests/unit/test_direct_qos0_capture.py \
-            tests/unit/test_effect_pump.py \
             tests/unit/test_message_delivery.py \
             tests/unit/test_topic_callbacks.py \
             tests/unit/test_topic_callback_dispatch_contract.py \
+            -W error
+          # The one excluded assertion encodes fd37's deliberate internal policy
+          # that an idle sync MESSAGE must wait for the worker. This ablation is
+          # exactly a test of reversing only that policy; every other EffectPump
+          # test remains a regression gate.
+          python -m pytest -q tests/unit/test_effect_pump.py \
+            -k 'not idle_sync_message_callback_runs_in_worker_after_engine_lock' \
             -W error
       - name: Record exact ablation diff
         shell: bash
