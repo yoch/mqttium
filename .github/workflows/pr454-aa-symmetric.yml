@@ -1,0 +1,143 @@
+name: PR454 symmetric same-source control
+on:
+  push:
+    branches: [work/pr454-aa-symmetric-20260910]
+permissions:
+  contents: read
+jobs:
+  aa-symmetric-rpi5:
+    runs-on: [self-hosted, linux, ARM64]
+    concurrency:
+      group: mqttium-arm64-runner
+      cancel-in-progress: false
+    timeout-minutes: 45
+    env:
+      PYTHONUNBUFFERED: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+      PIP_DISABLE_PIP_VERSION_CHECK: '1'
+      MQTTIUM_BASE: 9ad1f01857306ac5079ffb1d073a59fdb60e1931
+      HARNESS_SHA: ef2382cf8ed20e5df4288102c1ae17e791a25d68
+      TARGET_RATE: '3942'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          ref: 9ad1f01857306ac5079ffb1d073a59fdb60e1931
+          path: seed
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          repository: yoch/mqtt-python-client-bench
+          ref: ef2382cf8ed20e5df4288102c1ae17e791a25d68
+          path: bench
+      - name: Prepare symmetric source paths and environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C seed rev-parse HEAD)" = "$MQTTIUM_BASE"
+          test "$(git -C bench rev-parse HEAD)" = "$HARNESS_SHA"
+          ROOT=$(mktemp -d "$RUNNER_TEMP/p454-aa-${GITHUB_RUN_ID}-XXXX")
+          echo "JOB_ROOT=$ROOT" >> "$GITHUB_ENV"
+          cp -a seed "$ROOT/aa-a"
+          cp -a seed "$ROOT/aa-b"
+          test ${#ROOT/aa-a} -eq ${#ROOT/aa-b}
+          test "$(git -C "$ROOT/aa-a" rev-parse HEAD)" = "$MQTTIUM_BASE"
+          test "$(git -C "$ROOT/aa-b" rev-parse HEAD)" = "$MQTTIUM_BASE"
+          test -z "$(git -C "$ROOT/aa-a" status --porcelain --untracked-files=no)"
+          test -z "$(git -C "$ROOT/aa-b" status --porcelain --untracked-files=no)"
+          python3 -m venv "$ROOT/venv"
+          echo "$ROOT/venv/bin" >> "$GITHUB_PATH"
+          mkdir -p results
+          printf 'aa_a=%s\naa_b=%s\nlen_a=%s\nlen_b=%s\n' "$ROOT/aa-a" "$ROOT/aa-b" "${#ROOT/aa-a}" "${#ROOT/aa-b}" > results/paths.txt
+          uname -a > results/machine.txt
+          lscpu >> results/machine.txt
+          for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor /sys/class/thermal/thermal_zone*/temp; do
+            if test -f "$f"; then printf '%s=' "$f" >> results/machine.txt; cat "$f" >> results/machine.txt; fi
+          done
+      - name: Install corrected harness
+        run: python -m pip install -e 'bench[paho]'
+      - name: Start isolated broker
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$JOB_ROOT/mosquitto.conf" <<'EOF'
+          listener 18895 127.0.0.1
+          allow_anonymous true
+          persistence false
+          set_tcp_nodelay true
+          max_inflight_messages 1000
+          max_queued_messages 100000
+          log_type error
+          EOF
+          mosquitto -c "$JOB_ROOT/mosquitto.conf" > results/mosquitto.log 2>&1 &
+          echo $! > "$JOB_ROOT/broker.pid"
+          python seed/tools/ci/wait_for_endpoints.py --tcp 127.0.0.1:18895
+          python - <<'PY'
+          import json, os, pathlib
+          from mqtt_client_bench.telemetry import allocate_cpuset
+          sets=allocate_cpuset(['sut','broker','loadgen','orch'],profile='standard')
+          pathlib.Path('results/cpusets.json').write_text(json.dumps(sets,indent=2))
+          ids=[]
+          for part in sets['broker'].split(','):
+              if '-' in part:
+                  a,b=map(int,part.split('-')); ids.extend(range(a,b+1))
+              else: ids.append(int(part))
+          pid=int((pathlib.Path(os.environ['JOB_ROOT'])/'broker.pid').read_text())
+          os.sched_setaffinity(pid,set(ids))
+          PY
+      - name: Symmetric A/A forward — 4 blocks
+        shell: bash
+        run: |
+          python -m mqtt_client_bench.version_compare \
+            --client mqttium \
+            --baseline-path "$JOB_ROOT/aa-a" \
+            --candidate-path "$JOB_ROOT/aa-b" \
+            --scenario application_rtt_fixed_rate \
+            --variant-index 0 --target-rate "$TARGET_RATE" --pacer-mode external \
+            --broker 127.0.0.1:18895 --broker-pid "$(cat "$JOB_ROOT/broker.pid")" \
+            --blocks 4 --max-block-retries 1 --profile standard \
+            --output results/aa-forward.json | tee results/aa-forward.log
+      - name: Symmetric A/A reversed paths — 4 blocks
+        shell: bash
+        run: |
+          python -m mqtt_client_bench.version_compare \
+            --client mqttium \
+            --baseline-path "$JOB_ROOT/aa-b" \
+            --candidate-path "$JOB_ROOT/aa-a" \
+            --scenario application_rtt_fixed_rate \
+            --variant-index 0 --target-rate "$TARGET_RATE" --pacer-mode external \
+            --broker 127.0.0.1:18895 --broker-pid "$(cat "$JOB_ROOT/broker.pid")" \
+            --blocks 4 --max-block-retries 1 --profile standard \
+            --output results/aa-reverse.json | tee results/aa-reverse.log
+      - name: Summarize path-control tails
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, pathlib
+          out={}
+          for name in ('aa-forward','aa-reverse'):
+              d=json.loads(pathlib.Path('results/'+name+'.json').read_text())
+              rows=[]
+              for r in d['runs']:
+                  if not r.get('active_for_verdict'): continue
+                  w=next(x for x in r['workers'] if x.get('role')=='rtt_initiator')
+                  lat=w['latency_summary']
+                  rows.append({'block':r['logical_block'],'slot':r['block_slot'],'label':r['ab_label'],'p50':lat['p50_ms'],'p95':lat['p95_ms'],'p99':lat['p99_ms'],'path':r['version_source']['path'],'usable':r.get('version_ab_observation_usable')})
+              out[name]={'qualification':d['qualification'],'verdict':d['verdict'],'rows':rows}
+          pathlib.Path('results/readback.json').write_text(json.dumps(out,indent=2,sort_keys=True))
+          PY
+          cat results/readback.json
+      - name: Cleanup
+        if: always()
+        shell: bash
+        run: |
+          if test -n "${JOB_ROOT:-}" && test -f "$JOB_ROOT/broker.pid"; then kill "$(cat "$JOB_ROOT/broker.pid")" 2>/dev/null || true; fi
+          git -C seed rev-parse HEAD > results/final-seed.txt
+          git -C bench rev-parse HEAD > results/final-harness.txt
+          if test -n "${JOB_ROOT:-}"; then rm -rf "$JOB_ROOT"; fi
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: pr454-aa-symmetric-rpi5
+          path: results/
+          retention-days: 30
