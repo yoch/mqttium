@@ -79,7 +79,7 @@ from mqttium.transport._stream import AsyncTransport, DecoderPushTransport, Pull
 from mqttium.transport.tcp import TcpTransport
 from mqttium.transport.unix import UnixSocketTransport
 from mqttium.transport.websocket import WebSocketTransport
-from mqttium.transport.writes import WriteItem
+from mqttium.transport.writes import WriteItem, item_size
 from mqttium.types import Message, Properties, _owned_payload
 
 OnMessage = Callable[[Message], Any]
@@ -455,6 +455,51 @@ class AsyncClient:
     def effective_client_id(self) -> str:
         """Configured client id, or the broker-assigned id when one was supplied."""
         return self._engine.effective_client_id
+
+    def _try_direct_qos0_publish(
+        self,
+        topic: str,
+        payload: bytes,
+        *,
+        retain: bool,
+        properties: Properties | None,
+        nowait: bool = False,
+    ) -> PublishReceipt | None:
+        """Hand one ready QoS 0 unit publication to the sole transport writer."""
+        pump = self._effect_pump
+        writer = self._write_pump
+        epoch = self._connection_epoch
+        callback = self.on_publish
+        if (
+            self._engine.state is not ConnectionState.CONNECTED
+            or self._local_terminal_failure is not None
+            or writer.epoch != epoch
+            or self._engine_lock.locked()
+            or pump.lock.locked()
+            or pump.draining_inline
+            or pump.pending
+            or self._engine.has_pending_effects
+            or (callback is not None and self._delivery.callback_queue.full())
+        ):
+            return None
+        item = self._engine.outbound.prepare_qos0(
+            topic, payload, retain=retain, properties=properties
+        )
+        receipt = PublishReceipt(mid=None, qos=QoS.AT_MOST_ONCE)
+        if callback is not None:
+            self._delivery.ensure_callback_worker()
+        # No await or user callback separates preflight and handoff. Writer
+        # exceptions propagate: an eager write may already have reached wire.
+        if not writer.try_enqueue(item, epoch=epoch):
+            if nowait:
+                raise FlowControlError(writer.refusal(item_size(item)))
+            return None
+        if properties is not None and properties.get("topic_alias") is not None:
+            self._engine.outbound.commit_topic_alias(topic, properties)
+        if callback is not None:
+            enqueued = self._delivery.try_enqueue_callback(callback, None, None)
+            assert enqueued, "callback capacity changed during synchronous writer handoff"
+        return receipt
 
     def _commit_publish(
         self,
@@ -928,6 +973,12 @@ class AsyncClient:
             raise RuntimeError("AsyncClient is bound to a different event loop")
         data = _owned_payload(payload)
         prepared = self._check_nowait_publish_capacity(topic, data, qos, retain, properties)
+        if qos == QoS.AT_MOST_ONCE:
+            direct = self._try_direct_qos0_publish(
+                topic, data, retain=retain, properties=properties, nowait=True
+            )
+            if direct is not None:
+                return direct
         receipt = self._commit_publish(
             topic,
             data,
@@ -978,6 +1029,12 @@ class AsyncClient:
             # still waits behind delivery. Settle that old receipt before the
             # identifier can be registered again, including within one batch.
             await self._effect_pump.drain()
+            if batch is None and qos == QoS.AT_MOST_ONCE:
+                direct = self._try_direct_qos0_publish(
+                    topic, data, retain=retain, properties=properties
+                )
+                if direct is not None:
+                    return direct
             waiter: asyncio.Future[None] | None = None
             async with self._engine_lock:
                 if self._effect_pump.pending or self._engine.has_pending_effects:
