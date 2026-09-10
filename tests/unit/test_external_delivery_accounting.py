@@ -6,7 +6,7 @@ from mqttium.api import AsyncClient
 from mqttium.types import Message
 
 
-def test_message_has_only_public_delivery_data() -> None:
+def test_message_keeps_delivery_accounting_external() -> None:
     message = Message(topic="test/topic", payload=b"payload")
 
     assert not hasattr(message, "_delivery_logical_bytes")
@@ -19,7 +19,9 @@ def test_message_has_only_public_delivery_data() -> None:
         "dup",
         "mid",
         "properties",
+        "_ack_token",
     ]
+    assert message._ack_token is None
 
 
 async def test_same_message_has_independent_queue_reservations() -> None:
