@@ -1,136 +1,35 @@
-name: First-inline batch diagnostics only
-run-name: First-inline b8a70b09 batch counters (not timing evidence)
+name: Retire unstarted first-inline counter recovery
 on:
   push:
     branches: [bench/first-inline-final-b0440f5a]
     paths: [.github/workflows/first-inline-final-measure.yml]
 permissions:
+  actions: write
   contents: read
-concurrency:
-  group: mqttium-arm64-runner
-  cancel-in-progress: false
 jobs:
-  diagnose:
+  retire:
     if: github.repository == 'yoch/mqttium' && github.ref == 'refs/heads/bench/first-inline-final-b0440f5a'
-    runs-on: [self-hosted, linux, ARM64]
-    timeout-minutes: 12
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
     steps:
-      - name: Isolated prerequisites
+      - name: Cancel only our identified optional counter run if it has not started
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: python
         run: |
-          set -euo pipefail
-          test "$(uname -m)" = aarch64
-          if pgrep -x mosquitto; then echo 'Existing broker: refusing interference'; exit 1; fi
-          echo "JOB_ROOT=$RUNNER_TEMP/first-inline-diag-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ github.sha }}
-          path: measure-tools
-          persist-credentials: false
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: 9ad1f01857306ac5079ffb1d073a59fdb60e1931
-          path: arm-a
-          persist-credentials: false
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: b8a70b09a4202278d3c5811be2e7f6b375e716e2
-          path: arm-b
-          persist-credentials: false
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: yoch/mqtt-python-client-bench
-          ref: ef2382cf8ed20e5df4288102c1ae17e791a25d68
-          path: harness
-          persist-credentials: false
-      - name: Install explicit diagnostic hook in private environment
-        run: |
-          set -euo pipefail
-          mkdir -p "$JOB_ROOT/results"
-          python3 -m venv --system-site-packages "$JOB_ROOT/venv"
-          py="$JOB_ROOT/venv/bin/python"
-          "$py" -m pip install --no-deps ./arm-b
-          "$py" -m pip install 'psutil>=6,<8' 'paho-mqtt==2.1.0'
-          export DIAG_HOOK="$PWD/measure-tools/.github/first-inline-measure/sitecustomize.py"
-          "$py" - <<'PY'
-          import json, os, sys, sysconfig
-          from pathlib import Path
-          root=Path(os.environ['JOB_ROOT'])
-          origin=getattr(sys.modules.get('sitecustomize'),'__file__',None)
-          (root/'results/hook-environment.json').write_text(json.dumps({'python':sys.version,'sitecustomize_origin':origin,'sys_path':sys.path,'purelib':sysconfig.get_paths()['purelib']},indent=2)+'\n')
-          code='import sys, runpy; not getattr(sys, "_mqttium_diag_installed", False) and runpy.run_path('+repr(os.environ['DIAG_HOOK'])+', run_name="mqttium_batch_diagnostic"); sys._mqttium_diag_installed = True\n'
-          (Path(sysconfig.get_paths()['purelib'])/'mqttium_batch_diagnostic.pth').write_text(code)
-          PY
-          export MQTTIUM_BATCH_DIAG="$JOB_ROOT/results/hook-probe"
-          "$py" - <<'PY'
-          import sys
-          from mqttium.api import AsyncClient
-          assert getattr(sys,'_mqttium_diag_installed',False)
-          c=AsyncClient(message_delivery='callback')
-          c._delivery.deliver_callback_messages_inline([],None)
-          PY
-          "$py" - <<'PY'
-          import json,os
-          from pathlib import Path
-          files=list((Path(os.environ['JOB_ROOT'])/'results/hook-probe').glob('*.json'))
-          assert files and any(json.loads(p.read_text())['counts'] for p in files), 'hook produced no counters'
-          PY
-      - name: Collect only separate diagnostic counters
-        run: |
-          set -euo pipefail
-          py="$JOB_ROOT/venv/bin/python"
-          out="$JOB_ROOT/results"
-          probe="$PWD/measure-tools/.github/first-inline-measure/probe.py"
-          port="$($py -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
-          printf 'listener %s 127.0.0.1\nset_tcp_nodelay true\nallow_anonymous true\npersistence false\nconnection_messages false\nlog_type error\nmax_inflight_messages 1000\nmax_queued_messages 10000\n' "$port" > "$out/mosquitto.conf"
-          taskset -c 1 mosquitto -c "$out/mosquitto.conf" > "$out/mosquitto.log" 2>&1 &
-          pid=$!
-          cleanup() { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; }
-          trap cleanup EXIT
-          trap 'exit 130' INT
-          trap 'exit 143' TERM
-          for _ in $(seq 1 50); do
-            kill -0 "$pid"
-            if (echo > "/dev/tcp/127.0.0.1/$port") >/dev/null 2>&1; then break; fi
-            sleep 0.1
-          done
-          (echo > "/dev/tcp/127.0.0.1/$port") >/dev/null 2>&1
-          export PYTHONPATH="$PWD/harness/src"
-          export MQTTIUM_BATCH_DIAG="$out/reference-counts"
-          "$py" -m mqtt_client_bench.layout_runner --worker-aslr system --entrypoint version_compare -- \
-            --client mqttium --baseline-path arm-a --candidate-path arm-b \
-            --scenario application_rtt_fixed_rate --variant-index 0 --target-rate 3942 \
-            --pacer-mode external --blocks 2 --max-block-retries 0 --profile smoke \
-            --broker "127.0.0.1:$port" --broker-pid "$pid" --output "$out/diagnostic-not-timing.json" > "$out/reference.log" 2>&1
-          export MQTTIUM_BATCH_DIAG="$out/fixed-counts"
-          for arm in a b; do
-            "$py" "$probe" --worker "$PWD/arm-$arm" --kind network --port "$port" --batches 100 --warmup 20 > "$out/fixed-diagnostic-$arm.json"
-          done
-          "$py" - <<'PY'
-          import hashlib,json,os,subprocess
-          from pathlib import Path
-          out=Path(os.environ['JOB_ROOT'])/'results'
-          for name in ['reference-counts','fixed-counts']:
-              docs=[json.loads(p.read_text()) for p in (out/name).glob('*.json')]
-              assert docs and any(d['counts'] for d in docs),name
-              for arm in ['arm-a','arm-b']:
-                  assert any(d['counts'] and any('/'+arm+'/' in origin for origin in d['origins']) for d in docs),(name,arm)
-          sources={}
-          for root,expected in [('arm-a','9ad1f01857306ac5079ffb1d073a59fdb60e1931'),('arm-b','b8a70b09a4202278d3c5811be2e7f6b375e716e2'),('harness','ef2382cf8ed20e5df4288102c1ae17e791a25d68')]:
-              def git(*args):return subprocess.check_output(['git','-C',root,*args],text=True).strip()
-              assert git('rev-parse','HEAD')==expected
-              assert not git('status','--porcelain','--untracked-files=no')
-              sources[root]={'sha':expected,'src_tree':git('rev-parse','HEAD:src')}
-          (out/'verification.json').write_text(json.dumps({'diagnostic_only':True,'timings_must_not_be_used':True,'sources':sources,'tooling_sha':os.environ['GITHUB_SHA']},indent=2)+'\n')
-          PY
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        if: always() && env.JOB_ROOT != ''
-        with:
-          name: first-inline-batch-diagnostic-${{ github.run_id }}
-          path: ${{ env.JOB_ROOT }}/results/
-          retention-days: 30
-          if-no-files-found: warn
-      - name: Clean this run only
-        if: always() && env.JOB_ROOT != ''
-        run: |
-          test "$JOB_ROOT" = "$RUNNER_TEMP/first-inline-diag-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          rm -rf -- "$JOB_ROOT"
+          import json, os, urllib.request
+          url='https://api.github.com/repos/yoch/mqttium/actions/runs/34456892905'
+          headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28'}
+          with urllib.request.urlopen(urllib.request.Request(url,headers=headers),timeout=30) as r:
+              run=json.load(r)
+          assert run['head_sha']=='3e21dff89d8d64454f62a9b041e7754abfcce036'
+          assert run['head_branch']=='bench/first-inline-final-b0440f5a'
+          print(json.dumps({k:run[k] for k in ['id','head_sha','status','conclusion']}))
+          if run['status'] in ['pending','queued','waiting','requested']:
+              request=urllib.request.Request(url+'/cancel',data=b'',headers=headers,method='POST')
+              with urllib.request.urlopen(request,timeout=30) as r:
+                  print('Cancellation requested:',r.status)
+          elif run['status']=='completed':
+              print('Already complete; no action.')
+          else:
+              raise SystemExit('Counter run has started; left untouched.')
