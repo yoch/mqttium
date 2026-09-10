@@ -1,5 +1,5 @@
-name: Uniform singleton-inline ARM64 RTT standard
-run-name: "Uniform singleton-inline RTT standard"
+name: Uniform singleton-inline ARM64 RTT A/B recheck
+run-name: "Uniform singleton-inline RTT A/B recheck"
 
 on:
   push:
@@ -24,10 +24,10 @@ env:
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
 jobs:
-  smoke:
+  ab_recheck:
     if: github.repository == 'yoch/mqttium' && github.ref == 'refs/heads/bench/uniform-singleton-inline-ablation-fd37'
     runs-on: [self-hosted, linux, ARM64]
-    timeout-minutes: 30
+    timeout-minutes: 24
     steps:
       - name: Validate runner and isolate output
         shell: bash
@@ -41,25 +41,18 @@ jobs:
             echo "Pre-existing Mosquitto would contaminate the persistent runner; refusing without killing it." >&2
             exit 1
           fi
-          echo "JOB_ROOT=$RUNNER_TEMP/mqttium-uniform-singleton-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+          echo "JOB_ROOT=$RUNNER_TEMP/mqttium-uniform-ab-recheck-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
 
-      - name: Checkout tooling branch
+      - name: Checkout tooling and exact sources
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ github.sha }}
           path: tooling
           persist-credentials: false
-
-      - name: Checkout exact A, C, product parent and frozen harness
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ env.BASE_SHA }}
-          path: slot-a
-          persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ env.BASE_SHA }}
-          path: slot-c
+          path: slot-a
           persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -73,19 +66,16 @@ jobs:
           path: harness
           persist-credentials: false
 
-      - name: Reconstruct exact ablation as a clean local commit
+      - name: Reconstruct exact qualified ablation
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p "$JOB_ROOT/results"
           test "$(git -C slot-a rev-parse HEAD)" = "$BASE_SHA"
-          test "$(git -C slot-c rev-parse HEAD)" = "$BASE_SHA"
           test "$(git -C slot-b rev-parse HEAD)" = "$PRODUCT_SHA"
           test "$(git -C harness rev-parse HEAD)" = "$BENCH_SHA"
-          for slot in slot-a slot-b slot-c; do test -z "$(git -C "$slot" status --porcelain --untracked-files=no)"; done
           python3 tooling/.github/apply-uniform-singleton-inline-ablation.py slot-b/src/mqttium/api/_delivery.py > "$JOB_ROOT/results/ablation-sha256.txt"
-          actual=$(sha256sum slot-b/src/mqttium/api/_delivery.py | awk '{print $1}')
-          test "$actual" = "$EXPECTED_ABLATION_SHA256"
+          test "$(sha256sum slot-b/src/mqttium/api/_delivery.py | awk '{print $1}')" = "$EXPECTED_ABLATION_SHA256"
           test "$(cat "$JOB_ROOT/results/ablation-sha256.txt")" = "$EXPECTED_ABLATION_SHA256"
           test "$(git -C slot-b diff --name-only)" = src/mqttium/api/_delivery.py
           git -C slot-b diff --check
@@ -94,6 +84,7 @@ jobs:
           git -C slot-b add src/mqttium/api/_delivery.py
           git -C slot-b commit -m 'bench: local singleton-inline ablation'
           test "$(git -C slot-b rev-parse HEAD^)" = "$PRODUCT_SHA"
+          test -z "$(git -C slot-a status --porcelain --untracked-files=no)"
           test -z "$(git -C slot-b status --porcelain --untracked-files=no)"
           git -C slot-b diff "$PRODUCT_SHA"..HEAD -- src/mqttium/api/_delivery.py > "$JOB_ROOT/results/ablation.diff"
 
@@ -110,12 +101,11 @@ jobs:
           from pathlib import Path
           files=['src/mqttium/api/_delivery.py','src/mqttium/api/async_client.py','src/mqttium/api/_effects.py']
           out={'run':os.environ['GITHUB_RUN_ID'],'tooling':os.environ['GITHUB_SHA'],'python':platform.python_version(),'sources':{}}
-          for slot, expected_parent in [('slot-a',os.environ['BASE_SHA']),('slot-c',os.environ['BASE_SHA']),('slot-b',os.environ['PRODUCT_SHA'])]:
+          for slot, expected_parent in [('slot-a',os.environ['BASE_SHA']),('slot-b',os.environ['PRODUCT_SHA'])]:
               p=Path(slot)
               def git(*args): return subprocess.check_output(['git','-C',slot,*args],text=True).strip()
               head=git('rev-parse','HEAD')
-              if slot != 'slot-b':
-                  assert head == expected_parent
+              if slot == 'slot-a': assert head == expected_parent
               else:
                   assert git('rev-parse','HEAD^') == expected_parent
                   assert hashlib.sha256((p/'src/mqttium/api/_delivery.py').read_bytes()).hexdigest()==os.environ['EXPECTED_ABLATION_SHA256']
@@ -124,7 +114,7 @@ jobs:
           print(json.dumps(out,indent=2,sort_keys=True))
           PY
 
-      - name: Start isolated broker and run frozen A/A then A/B
+      - name: Run frozen A/B standard with stimulus-only whole-block retry
         shell: bash
         run: |
           set -euo pipefail
@@ -150,8 +140,6 @@ jobs:
           echo "$broker_pid" > "$out/broker.pid"
           cleanup() { kill "$broker_pid" 2>/dev/null || true; wait "$broker_pid" 2>/dev/null || true; }
           trap cleanup EXIT
-          trap 'exit 130' INT
-          trap 'exit 143' TERM
           for _ in $(seq 1 50); do
             kill -0 "$broker_pid" 2>/dev/null || { cat "$out/mosquitto.log"; exit 1; }
             if (echo > "/dev/tcp/127.0.0.1/$port") >/dev/null 2>&1; then break; fi
@@ -159,25 +147,13 @@ jobs:
           done
           (echo > "/dev/tcp/127.0.0.1/$port") >/dev/null 2>&1
           export PYTHONPATH="$PWD/harness/src"
-          overall=0
-          for phase in aa ab; do
-            other=slot-c
-            [ "$phase" = ab ] && other=slot-b
-            set +e
-            "$py" -m mqtt_client_bench.layout_runner \
-              --worker-aslr system --entrypoint version_compare -- \
-              --client mqttium --baseline-path slot-a --candidate-path "$other" \
-              --scenario application_rtt_fixed_rate --variant-index 0 --target-rate 3942 \
-              --pacer-mode external --blocks 4 --max-block-retries 0 --profile standard \
-              --broker "127.0.0.1:$port" --broker-pid "$broker_pid" \
-              --output "$out/$phase.json" 2>&1 | tee "$out/$phase.log"
-            rc=${PIPESTATUS[0]}
-            set -e
-            printf '%s\n' "$rc" > "$out/$phase.exitcode"
-            test -s "$out/$phase.json"
-            [ "$rc" -eq 0 ] || overall=1
-          done
-          exit "$overall"
+          "$py" -m mqtt_client_bench.layout_runner \
+            --worker-aslr system --entrypoint version_compare -- \
+            --client mqttium --baseline-path slot-a --candidate-path slot-b \
+            --scenario application_rtt_fixed_rate --variant-index 0 --target-rate 3942 \
+            --pacer-mode external --blocks 4 --max-block-retries 1 --profile standard \
+            --broker "127.0.0.1:$port" --broker-pid "$broker_pid" \
+            --output "$out/ab.json" 2>&1 | tee "$out/ab.log"
 
       - name: Verify exact sources after timings
         if: always() && env.JOB_ROOT != ''
@@ -185,17 +161,17 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git -C slot-a rev-parse HEAD)" = "$BASE_SHA"
-          test "$(git -C slot-c rev-parse HEAD)" = "$BASE_SHA"
           test "$(git -C slot-b rev-parse HEAD^)" = "$PRODUCT_SHA"
           test "$(sha256sum slot-b/src/mqttium/api/_delivery.py | awk '{print $1}')" = "$EXPECTED_ABLATION_SHA256"
-          for slot in slot-a slot-b slot-c; do test -z "$(git -C "$slot" status --porcelain --untracked-files=no)"; done
+          test -z "$(git -C slot-a status --porcelain --untracked-files=no)"
+          test -z "$(git -C slot-b status --porcelain --untracked-files=no)"
           echo 'all exact source trees unchanged' > "$JOB_ROOT/results/source-verification.txt"
 
-      - name: Upload raw diagnostic evidence
+      - name: Upload raw evidence
         if: always() && env.JOB_ROOT != ''
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: uniform-singleton-inline-pi-${{ github.run_id }}
+          name: uniform-singleton-inline-ab-recheck-${{ github.run_id }}
           path: ${{ env.JOB_ROOT }}/results/
           if-no-files-found: warn
           retention-days: 14
@@ -205,5 +181,5 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$JOB_ROOT" = "$RUNNER_TEMP/mqttium-uniform-singleton-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          test "$JOB_ROOT" = "$RUNNER_TEMP/mqttium-uniform-ab-recheck-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           rm -rf -- "$JOB_ROOT"
