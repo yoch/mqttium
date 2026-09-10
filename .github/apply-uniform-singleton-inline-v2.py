@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Apply the narrow singleton-message-run inline ablation to exact fd37."""
+"""Apply the sole-pending-message sync-inline ablation to exact fd37."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ if text.count(method_anchor) != 1:
 text = text.replace(method_anchor, method_replacement)
 
 body_anchor = """        cb = callback if callback_delivery else None\n        capacity = len(effects)\n"""
-body_replacement = """        cb = callback if callback_delivery else None\n\n        # Keep the ordinary worker loop below unchanged. Only the head of a\n        # one-message eligible run may avoid the queue hop.\n        if (\n            cb is not None\n            and not iterator_delivery\n            and effects\n            and self.can_dispatch_callback_inline(cb)\n        ):\n            first = self._inline_message_candidate(effects[0])\n            if first is not None and (\n                len(effects) == 1 or self._inline_message_candidate(effects[1]) is None\n            ):\n                self.dispatch_callback_inline(cb, first)\n                return 1\n\n        capacity = len(effects)\n"""
+body_replacement = """        cb = callback if callback_delivery else None\n\n        # Keep the ordinary worker loop below unchanged. Only the sole pending\n        # eligible message may avoid the queue hop: any remaining effect makes\n        # ownership unambiguously worker-side for the whole pending run.\n        if (\n            cb is not None\n            and not iterator_delivery\n            and len(effects) == 1\n            and self.can_dispatch_callback_inline(cb)\n        ):\n            message = self._inline_message_candidate(effects[0])\n            if message is not None:\n                self.dispatch_callback_inline(cb, message)\n                return 1\n\n        capacity = len(effects)\n"""
 if text.count(body_anchor) != 1:
     raise SystemExit("singleton inline insertion anchor did not match exactly once")
 text = text.replace(body_anchor, body_replacement)
