@@ -1,8 +1,7 @@
 diff --git a/CHANGELOG.md b/CHANGELOG.md
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
-@@ -20,8 +20,6 @@
-   explicit shutdown/reopen governs queue retirement and stale admission rejection.
+@@ -20,5 +20,3 @@
    This is an experimental scheduling-contract change; see migration guidance.
  
 -### Changed
