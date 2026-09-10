@@ -63,8 +63,6 @@ jobs:
               old_generation = d._delivery_generation
               await client._reset_message_stream()
               assert d._delivery_generation == old_generation + 1
-              # This is the defect: iterator-only reserve_slow in v2 has no
-              # generation guard, so the retired producer is admitted after reset.
               await asyncio.wait_for(stale, 1)
               assert d.messages_queue.qsize() == 1
               message = await asyncio.wait_for(anext(client.messages()), 1)
@@ -84,15 +82,16 @@ jobs:
           git apply --check "$GITHUB_WORKSPACE/.github/uniform-v4-doc.patch"
           git apply "$GITHUB_WORKSPACE/.github/uniform-v4-doc.patch"
           test "$(git diff --name-only | sort)" = $'CHANGELOG.md\nsrc/mqttium/api/_delivery.py\ntests/unit/test_uniform_callbacks.py'
-          ruff format src/mqttium/api/_delivery.py tests/unit/test_uniform_callbacks.py
           git diff --check
       - name: Install complete qualification dependencies
         run: python -m pip install -e "$JOB_ROOT/candidate[dev,fuzz,security,docs]"
-      - name: Focused red-to-green and lifecycle gates
+      - name: Format and run focused red-to-green lifecycle gates
         shell: bash
         run: |
           set -euo pipefail
           cd "$JOB_ROOT/candidate"
+          ruff format src/mqttium/api/_delivery.py tests/unit/test_uniform_callbacks.py
+          git diff --check
           ruff format --check src/mqttium/api/_delivery.py tests/unit/test_uniform_callbacks.py
           ruff check src/mqttium/api/_delivery.py tests/unit/test_uniform_callbacks.py
           python -m pytest -q \
