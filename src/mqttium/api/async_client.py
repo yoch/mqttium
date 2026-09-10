@@ -1204,12 +1204,14 @@ class AsyncClient:
 
     async def _dispatch_topic_message(self, message: Message) -> None:
         matcher = self._topic_callbacks
-        callbacks = tuple(matcher.iter_match(message.topic)) if matcher else ()
         fallback = self._frozen_fallback if self._routes_frozen else self._on_message
-        if not callbacks and fallback is not None:
-            callbacks = (fallback,)
-        for callback in callbacks:
-            await self._delivery.invoke_isolated(callback, message)
+        matched = False
+        if matcher:
+            for callback in matcher.iter_match(message.topic):
+                matched = True
+                await self._delivery.invoke_isolated(callback, message)
+        if not matched and fallback is not None:
+            await self._delivery.invoke_isolated(fallback, message)
 
     async def subscribe(
         self,
