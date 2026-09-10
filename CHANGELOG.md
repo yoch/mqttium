@@ -6,6 +6,14 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed — lean native experiment
+
+- Preserve replacement-connection delivery when an active message callback
+  disconnects and reconnects; retire old queued jobs without stopping the worker.
+- Isolate cancellation originating in `on_disconnect` so notification failure
+  does not suppress automatic reconnect or terminal cleanup. Actual reader-task
+  cancellation still propagates.
+
 ### Changed — lean native experiment
 
 - Incompatible experimental native API: explicit iterator/callback delivery;

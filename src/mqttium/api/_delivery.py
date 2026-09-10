@@ -63,6 +63,11 @@ class ApplicationDelivery:
         )
 
     def reopen(self) -> None:
+        if self._callback_stop:
+            # A callback may reconnect while its worker is still active.
+            # Retire old queued work before that same worker can resume.
+            self._discard_callback_queue()
+            self._callback_stop = False
         self.closed.clear()
 
     def close(self) -> None:

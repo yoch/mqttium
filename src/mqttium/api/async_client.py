@@ -1466,6 +1466,8 @@ class AsyncClient:
             try:
                 callback_error = None if clean_disconnect else terminal_cause
                 await self._delivery.invoke(self.on_disconnect, callback_error)
+            except asyncio.CancelledError as exc:
+                self._delivery._propagate_callback_cancellation(self.on_disconnect, exc)
             except Exception as exc:
                 self._delivery.report_callback_error(self.on_disconnect, exc)
             # The callback may have disconnected or installed an explicit
