@@ -259,9 +259,11 @@ class EffectPump:
         task.add_done_callback(self._done)
 
     async def _run_scheduled(self) -> None:  # noqa: C901
-        # An eager task factory can start a reentrant flush while an inline
-        # drain still owns the pending prefix. Defer until that stack unwinds.
-        if self.draining_inline:
+        # Eager startup must suspend until schedule() registers this task.
+        # Otherwise cancellation can create an unowned successor while the
+        # first create_task() call is still on the stack. Ordinary task startup
+        # already has its identity, so this adds no scheduling hop there.
+        if self.draining_inline or self.task is None or self.task.done():
             await asyncio.sleep(0)
         async with self.lock:
             allow_inline = True
