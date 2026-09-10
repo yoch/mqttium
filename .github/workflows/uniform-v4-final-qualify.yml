@@ -2,7 +2,7 @@ name: Uniform worker final lifecycle qualification
 on:
   push:
     branches: [work/uniform-v4-final]
-    paths: [.github/uniform-v4-final-tests.patch, .github/workflows/uniform-v4-final-qualify.yml]
+    paths: [.github/uniform-final-lifecycle-test.py, .github/workflows/uniform-v4-final-qualify.yml]
 permissions:
   contents: write
 concurrency:
@@ -60,16 +60,17 @@ jobs:
               print('REPRODUCED: old byte-budget waiter crossed into the replacement delivery generation')
           asyncio.run(main())
           PY
-      - name: Apply final candidate patches
+      - name: Apply final candidate and materialize lifecycle tests
         shell: bash
         run: |
           set -euo pipefail
           cd "$JOB_ROOT/candidate"
-          for patch in uniform-v4.patch uniform-v4-doc.patch uniform-v4-test.patch uniform-v4-final-tests.patch; do
+          for patch in uniform-v4.patch uniform-v4-doc.patch uniform-v4-test.patch; do
             git apply --check "$GITHUB_WORKSPACE/.github/$patch"
             git apply "$GITHUB_WORKSPACE/.github/$patch"
           done
-          test "$(git diff --name-only | sort)" = $'CHANGELOG.md\nsrc/mqttium/api/_delivery.py\ntests/unit/test_message_delivery.py\ntests/unit/test_uniform_callbacks.py'
+          cp "$GITHUB_WORKSPACE/.github/uniform-final-lifecycle-test.py" tests/unit/test_uniform_final_lifecycle.py
+          test "$(git status --short | awk '{print $2}' | sort)" = $'CHANGELOG.md\nsrc/mqttium/api/_delivery.py\ntests/unit/test_message_delivery.py\ntests/unit/test_uniform_callbacks.py\ntests/unit/test_uniform_final_lifecycle.py'
           git diff --check
       - name: Install qualification dependencies
         run: python -m pip install -e "$JOB_ROOT/candidate[dev,fuzz,security,docs]"
@@ -78,12 +79,13 @@ jobs:
         run: |
           set -euo pipefail
           cd "$JOB_ROOT/candidate"
-          ruff format src/mqttium/api/_delivery.py tests/unit/test_uniform_callbacks.py tests/unit/test_message_delivery.py
+          ruff format src/mqttium/api/_delivery.py tests/unit/test_uniform_callbacks.py tests/unit/test_message_delivery.py tests/unit/test_uniform_final_lifecycle.py
           git diff --check
-          ruff format --check src/mqttium/api/_delivery.py tests/unit/test_uniform_callbacks.py tests/unit/test_message_delivery.py
-          ruff check src/mqttium/api/_delivery.py tests/unit/test_uniform_callbacks.py tests/unit/test_message_delivery.py
+          ruff format --check src/mqttium/api/_delivery.py tests/unit/test_uniform_callbacks.py tests/unit/test_message_delivery.py tests/unit/test_uniform_final_lifecycle.py
+          ruff check src/mqttium/api/_delivery.py tests/unit/test_uniform_callbacks.py tests/unit/test_message_delivery.py tests/unit/test_uniform_final_lifecycle.py
           python -m pytest -q \
             tests/unit/test_uniform_callbacks.py \
+            tests/unit/test_uniform_final_lifecycle.py \
             tests/unit/test_message_delivery.py \
             tests/unit/test_sync_callback_contract.py \
             tests/unit/test_topic_callback_dispatch_contract.py \
@@ -115,8 +117,8 @@ jobs:
           test "$(git ls-remote origin "refs/heads/$PRODUCT_BRANCH" | cut -f1)" = "$BASE_SHA"
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add CHANGELOG.md src/mqttium/api/_delivery.py tests/unit/test_uniform_callbacks.py tests/unit/test_message_delivery.py
-          git commit -m 'fix: make all blocked delivery admissions generation-safe' -m 'Use one controller-owned delivery generation and one shared capacity event for byte, iterator-slot and callback-slot waiters. Slow iterator admission waits on delivery capacity rather than inside Queue.put, so explicit takeover can wake and reject every stale producer. Keep queue/event identity stable across reset; already-woken old iterators observe the generation change and terminate. Remove callback_space. Cover byte/queue waiters, old anext wakeup, eager scheduling and saturated QoS1 callback progress. No new queue, task or public option.'
+          git add CHANGELOG.md src/mqttium/api/_delivery.py tests/unit/test_uniform_callbacks.py tests/unit/test_message_delivery.py tests/unit/test_uniform_final_lifecycle.py
+          git commit -m 'fix: make all blocked delivery admissions generation-safe' -m 'Use one controller-owned delivery generation and one shared capacity event for byte, iterator-slot and callback-slot waiters. Slow iterator admission waits on delivery capacity rather than inside Queue.put, so explicit takeover wakes and rejects every stale producer. Keep queue/event identity stable across reset; already-woken old iterators observe the generation change and terminate. Remove callback_space. Cover byte/queue waiters, old anext wakeup, eager scheduling and saturated QoS1 callback progress. No new queue, task or public option.'
           tested=$(git rev-parse HEAD)
           tree=$(git rev-parse 'HEAD^{tree}')
           src=$(git rev-parse 'HEAD:src')
@@ -133,7 +135,7 @@ jobs:
             .github/uniform-v4.patch
             .github/uniform-v4-doc.patch
             .github/uniform-v4-test.patch
-            .github/uniform-v4-final-tests.patch
+            .github/uniform-final-lifecycle-test.py
           retention-days: 30
           if-no-files-found: warn
       - name: Clean isolated worktree
