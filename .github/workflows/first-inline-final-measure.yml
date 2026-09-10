@@ -12,7 +12,7 @@ concurrency:
 env:
   A_SHA: 9ad1f01857306ac5079ffb1d073a59fdb60e1931
   B_SHA: b8a70b09a4202278d3c5811be2e7f6b375e716e2
-  H_SHA: 37160eed99b50d1f384e1565a16d0346eb01ca56
+  H_SHA: ef2382cf8ed20e5df4288102c1ae17e791a25d68
   PYTHONUNBUFFERED: '1'
   PIP_DISABLE_PIP_VERSION_CHECK: '1'
 jobs:
@@ -122,12 +122,11 @@ jobs:
           done
           (echo > "/dev/tcp/127.0.0.1/$port") >/dev/null 2>&1
           export PYTHONPATH="$PWD/harness/src"
-          # Qualify the diagnostic runner before collecting full samples.
           for arm in a b; do
             "$py" "$probe" --worker "$PWD/arm-$arm" --kind network --port "$port" --batches 20 --warmup 5 > "$out/probe-sanity-$arm.json"
           done
-          # Always retain A/B even if A/A is noisy, but then it is diagnostic
-          # only. No latency-based retries, omitted runs, or noise subtraction.
+          # Collect A/B even if A/A is noisy, but then use it descriptively only.
+          # No latency-based retries, omitted runs, or noise subtraction.
           overall=0
           for phase in aa ab; do
             other=arm-c
