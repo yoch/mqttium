@@ -1,0 +1,60 @@
+name: Uniform worker saturated callback progress classification
+on:
+  push:
+    branches: [bench/uniform-saturation-ce0198]
+    paths: [.github/uniform-saturation-diagnostic.py, .github/workflows/uniform-saturation-classify.yml]
+permissions:
+  contents: read
+jobs:
+  classify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      MAIN_SHA: 9ad1f01857306ac5079ffb1d073a59fdb60e1931
+      CANDIDATE_SHA: ce0198bb3aae11b00438ab2b39d7897ec62f8f0e
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.13.5'
+      - name: Create exact source worktrees
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/uniform-saturation-$GITHUB_RUN_ID"
+          echo "JOB_ROOT=$root" >> "$GITHUB_ENV"
+          git worktree add --detach "$root/main" "$MAIN_SHA"
+          git worktree add --detach "$root/candidate" "$CANDIDATE_SHA"
+          test "$(git -C "$root/main" rev-parse HEAD)" = "$MAIN_SHA"
+          test "$(git -C "$root/candidate" rev-parse HEAD)" = "$CANDIDATE_SHA"
+      - name: Run identical diagnostic on both sources
+        run: |
+          set -euo pipefail
+          (cd "$JOB_ROOT/main" && PYTHONPATH=src python "$GITHUB_WORKSPACE/.github/uniform-saturation-diagnostic.py") | tee "$JOB_ROOT/main.json"
+          (cd "$JOB_ROOT/candidate" && PYTHONPATH=src python "$GITHUB_WORKSPACE/.github/uniform-saturation-diagnostic.py") | tee "$JOB_ROOT/candidate.json"
+          python - <<'PY'
+          import json,os
+          from pathlib import Path
+          r=Path(os.environ['JOB_ROOT'])
+          docs={k:json.loads((r/f'{k}.json').read_text()) for k in ('main','candidate')}
+          assert all(x['queue_full_seen'] for x in docs.values()),docs
+          if docs['main']['reply_progressed_with_full_callback_queue'] and not docs['candidate']['reply_progressed_with_full_callback_queue']:
+              raise SystemExit('uniform candidate introduces a saturated receipt-progress regression')
+          (r/'classification.json').write_text(json.dumps(docs,indent=2)+'\n')
+          print(json.dumps(docs,indent=2))
+          PY
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: uniform-saturation-${{ github.run_id }}
+          path: ${{ env.JOB_ROOT }}/*.json
+          retention-days: 30
+          if-no-files-found: warn
+      - name: Cleanup
+        if: always()
+        run: |
+          git worktree remove --force "$JOB_ROOT/main" || true
+          git worktree remove --force "$JOB_ROOT/candidate" || true
