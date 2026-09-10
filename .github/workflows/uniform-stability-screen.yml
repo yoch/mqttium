@@ -1,0 +1,191 @@
+name: Uniform worker hosted stability screening
+run-name: Uniform worker 587a stability A/A+A/B
+on:
+  push:
+    branches: [bench/uniform-stability-587a]
+    paths: [.github/workflows/uniform-stability-screen.yml]
+permissions:
+  contents: read
+concurrency:
+  group: mqttium-uniform-hosted-stability-587a
+  cancel-in-progress: false
+jobs:
+  screen:
+    if: github.repository == 'yoch/mqttium'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      BASE_SHA: 9ad1f01857306ac5079ffb1d073a59fdb60e1931
+      CANDIDATE_SHA: 587a17a7399796342481314847b43310c77fefe1
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - name: Predeclare method and isolated root
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "JOB_ROOT=$RUNNER_TEMP/uniform-stability-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/uniform-stability-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/results"
+          cat > "$RUNNER_TEMP/uniform-stability-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/results/METHOD.md" <<'EOF'
+          # Frozen screening method
+          - Same hosted machine and broker for each campaign; fresh Python process per arm sample.
+          - A/A first, then A/B; 6 balanced AB/BA pairs per phase; no sample retry or A/A subtraction.
+          - 9 cells: sync message batches 1/2/8/32 plus async8, filtered-sync8, iterator8, both8, publish-only8.
+          - MQTT 3.1.1, QoS1, 64-byte payload, closed-loop batch barriers, 250 ms warmup, 5 measured seconds/cell.
+          - Primary service-stability views, declared before A/B: absolute 100 ms p05 throughput, 100 ms CV, fraction of full 100 ms windows below 90% of that run's mean; 1 s windows retained separately.
+          - Mean throughput remains co-primary context: lower variance caused only by uniformly slower service is not a stability win.
+          - Secondary: minimum full-window throughput, callback/batch latency, loop-lag p95/p99, CPU/completion, queue peak.
+          - Pair is the inference unit. Geometric mean B/A and pair-bootstrap 95% intervals are descriptive screening evidence only.
+          - No result-based rerun, excluded completed sample, drift correction, host pooling or adaptive tuning.
+          EOF
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.13.5'
+      - name: Prepare exact same-length source slots
+        shell: bash
+        run: |
+          set -euo pipefail
+          git worktree add --detach "$JOB_ROOT/slot-a" "$BASE_SHA"
+          git worktree add --detach "$JOB_ROOT/slot-c" "$BASE_SHA"
+          git worktree add --detach "$JOB_ROOT/slot-b" "$CANDIDATE_SHA"
+          for item in "slot-a:$BASE_SHA" "slot-c:$BASE_SHA" "slot-b:$CANDIDATE_SHA"; do
+            root=${item%%:*}; expected=${item#*:}
+            test "$(git -C "$JOB_ROOT/$root" rev-parse HEAD)" = "$expected"
+            test -z "$(git -C "$JOB_ROOT/$root" status --porcelain --untracked-files=no)"
+          done
+          python -m pip install -e "$JOB_ROOT/slot-b[dev]"
+          sudo apt-get update -qq
+          sudo apt-get install -y mosquitto
+      - name: Start isolated broker and run frozen A/A then A/B
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$JOB_ROOT/results"
+          read -r sut broker_cpu < <(python - <<'PY'
+          import os
+          cpus=sorted(os.sched_getaffinity(0)); assert len(cpus)>=2, cpus
+          print(cpus[0],cpus[1])
+          PY
+          )
+          port=$(python -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+          printf 'listener %s 127.0.0.1\nallow_anonymous true\npersistence false\nset_tcp_nodelay true\nconnection_messages false\nlog_type error\nmax_inflight_messages 1000\nmax_queued_messages 10000\n' "$port" > "$out/mosquitto.conf"
+          taskset -c "$broker_cpu" mosquitto -c "$out/mosquitto.conf" > "$out/broker.log" 2>&1 &
+          broker_pid=$!
+          cleanup() { kill "$broker_pid" 2>/dev/null || true; wait "$broker_pid" 2>/dev/null || true; }
+          trap cleanup EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+          python "$JOB_ROOT/slot-b/tools/ci/wait_for_endpoints.py" --tcp "127.0.0.1:$port"
+          printf 'sut=%s\nbroker=%s\nport=%s\n' "$sut" "$broker_cpu" "$port" > "$out/cpus.txt"
+          uname -a > "$out/host.txt"; lscpu >> "$out/host.txt"
+          python --version >> "$out/host.txt" 2>&1
+          (mosquitto -h || true) > "$out/broker-version.txt" 2>&1
+          python -m pip freeze > "$out/dependencies.txt"
+          python - <<'PY' > "$out/provenance.json"
+          import hashlib,json,os,subprocess
+          from pathlib import Path
+          root=Path(os.environ['JOB_ROOT'])
+          docs={}
+          for slot,expected in [('slot-a',os.environ['BASE_SHA']),('slot-c',os.environ['BASE_SHA']),('slot-b',os.environ['CANDIDATE_SHA'])]:
+              p=root/slot
+              def git(*args):return subprocess.check_output(['git','-C',p,*args],text=True).strip()
+              assert git('rev-parse','HEAD')==expected
+              docs[slot]={'sha':expected,'root':git('rev-parse','HEAD^{tree}'),'src':git('rev-parse','HEAD:src'),
+                'runtime':{f:hashlib.sha256((p/f).read_bytes()).hexdigest() for f in ['src/mqttium/api/_delivery.py','src/mqttium/api/async_client.py','src/mqttium/api/_effects.py']}}
+          print(json.dumps({'sources':docs,'tooling':os.environ['GITHUB_SHA'],'seconds_per_cell':5,'pairs_per_phase':6},indent=2))
+          PY
+          # Sanity only; not included in A/B estimates.
+          python "$JOB_ROOT/slot-b/benchmarks/uniform_callback_probe.py" --source "$JOB_ROOT/slot-a" --port "$port" --cpu "$sut" --seconds 1 > "$out/sanity-A.json"
+          python "$JOB_ROOT/slot-b/benchmarks/uniform_callback_probe.py" --source "$JOB_ROOT/slot-b" --port "$port" --cpu "$sut" --seconds 1 > "$out/sanity-B.json"
+          python "$JOB_ROOT/slot-b/benchmarks/uniform_callback_probe.py" \
+            --base "$JOB_ROOT/slot-a" --control "$JOB_ROOT/slot-c" --candidate "$JOB_ROOT/slot-b" \
+            --output "$out/samples" --port "$port" --cpu "$sut" --seconds 5 --pairs 6 | tee "$out/progress.log"
+      - name: Compute preregistered paired screening summary
+        shell: python
+        run: |
+          import glob,json,math,os,random,statistics
+          from pathlib import Path
+          root=Path(os.environ['JOB_ROOT'])/'results'
+          rows=[]
+          for path in sorted(glob.glob(str(root/'samples/*.json'))):
+              name=Path(path).stem
+              phase,pair,label=name.split('-')
+              d=json.loads(Path(path).read_text())
+              for c in d['cells']:
+                  counts=c['windows_100ms']['counts']
+                  mean=statistics.mean(counts)
+                  rows.append({'phase':phase,'pair':int(pair),'label':label,'mode':c['mode'],'batch':c['batch'],
+                    'mean100':c['windows_100ms']['mean_rate'],'p05_100':c['windows_100ms']['p05_rate'],
+                    'min100':c['windows_100ms']['minimum_rate'],'cv100':c['windows_100ms']['cv'],
+                    'slow100':sum(v < .9*mean for v in counts)/len(counts),
+                    'mean1':c['windows_1s']['mean_rate'],'p05_1':c['windows_1s']['p05_rate'],'cv1':c['windows_1s']['cv'],
+                    'cpu':c['cpu_us_per_completed'],'first50':c['first']['p50_us'],'first95':c['first']['p95_us'],
+                    'tail50':c['tail']['p50_us'],'tail95':c['tail']['p95_us'],'comp50':c['completion']['p50_us'],
+                    'comp95':c['completion']['p95_us'],'lag95':c['loop_lag']['p95_us'],'lag99':c['loop_lag']['p99_us'],
+                    'qpeak':c['queue_peak_at_callback']})
+          def gm(xs): return math.exp(sum(math.log(x) for x in xs)/len(xs))
+          metrics=['mean100','p05_100','min100','cv100','slow100','mean1','p05_1','cv1','cpu','first50','first95','tail50','tail95','comp50','comp95','lag95','lag99']
+          def summarize(phase,mode,batch):
+              pair_rows=[]
+              for pair in range(6):
+                  rr=[r for r in rows if r['phase']==phase and r['pair']==pair and r['mode']==mode and r['batch']==batch]
+                  a=next(r for r in rr if r['label']=='A'); b=next(r for r in rr if r['label']=='B')
+                  pair_rows.append({m:(b[m]/a[m] if a[m] not in (None,0) and b[m] is not None else None) for m in metrics})
+              result={}
+              rng=random.Random(45820260910+sum(map(ord,phase+mode))+batch)
+              for m in metrics:
+                  vals=[p[m] for p in pair_rows if p[m] is not None and p[m]>0]
+                  if not vals: result[m]=None; continue
+                  est=gm(vals); draws=[]
+                  for _ in range(20000): draws.append(gm([rng.choice(vals) for _ in vals]))
+                  draws.sort(); n=len(draws)
+                  result[m]={'ratio':est,'change_pct':100*(est-1),'ci95_pct':[100*(draws[int(.025*n)]-1),100*(draws[min(n-1,int(.975*n))]-1)],
+                             'pair_range_pct':[100*(min(vals)-1),100*(max(vals)-1)]}
+              return result
+          cells=[('callback',1),('callback',2),('callback',8),('callback',32),('async',8),('filtered',8),('iterator',8),('both',8),('publish',8)]
+          summary={'method':'METHOD.md','pairs':6,'seconds_per_cell':5,'rows':len(rows),'AA':{},'AB':{}}
+          for phase in ['AA','AB']:
+              for mode,batch in cells: summary[phase][f'{mode}-{batch}']=summarize(phase,mode,batch)
+          (root/'summary.json').write_text(json.dumps(summary,indent=2)+'\n')
+          lines=['# Hosted stability screening','', 'Positive throughput/p05 changes are better; negative CV/slow-window/lag changes are better. No A/A subtraction.','',
+                 '| cell | mean throughput | p05 100ms | CV 100ms | slow-window fraction | loop lag p95 | CPU/completion |','|---|---:|---:|---:|---:|---:|---:|']
+          for mode,batch in cells:
+              s=summary['AB'][f'{mode}-{batch}']
+              def f(m):
+                  x=s[m]
+                  return 'n/a' if x is None else f"{x['change_pct']:+.2f}% [{x['ci95_pct'][0]:+.2f},{x['ci95_pct'][1]:+.2f}]"
+              lines.append(f'| {mode}-{batch} | {f("mean100")} | {f("p05_100")} | {f("cv100")} | {f("slow100")} | {f("lag95")} | {f("cpu")} |')
+          (root/'summary.md').write_text('\n'.join(lines)+'\n')
+          print((root/'summary.md').read_text())
+      - name: Verify source immutability
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json,os,subprocess
+          from pathlib import Path
+          root=Path(os.environ['JOB_ROOT']); p=json.loads((root/'results/provenance.json').read_text())
+          for slot,d in p['sources'].items():
+              def git(*args):return subprocess.check_output(['git','-C',root/slot,*args],text=True).strip()
+              assert git('rev-parse','HEAD')==d['sha']
+              assert git('rev-parse','HEAD^{tree}')==d['root']
+              assert git('rev-parse','HEAD:src')==d['src']
+              assert not git('status','--porcelain','--untracked-files=no')
+          (root/'results/source-verification.txt').write_text('all source trees unchanged\n')
+          PY
+      - name: Retain all samples
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: uniform-stability-${{ github.run_id }}
+          path: ${{ env.JOB_ROOT }}/results/
+          retention-days: 30
+          if-no-files-found: warn
+      - name: Clean isolated worktrees
+        if: always()
+        run: |
+          for slot in a b c; do git worktree remove --force "$JOB_ROOT/slot-$slot" || true; done
