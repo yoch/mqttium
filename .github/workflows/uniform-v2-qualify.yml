@@ -1,0 +1,105 @@
+name: Uniform worker v2 exact-source qualification
+on:
+  push:
+    branches: [work/uniform-v2-stage]
+    paths: [.github/uniform-v2.patch, .github/workflows/uniform-v2-qualify.yml]
+permissions:
+  contents: write
+concurrency:
+  group: mqttium-uniform-v2-stage
+  cancel-in-progress: false
+jobs:
+  qualify:
+    if: github.repository == 'yoch/mqttium'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      BASE_SHA: a5d0ae80e08ff332ca02befdeae4b5787dad4c93
+      PRODUCT_BRANCH: experiment/uniform-message-worker
+    steps:
+      - name: Set isolated path
+        run: echo "JOB_ROOT=$RUNNER_TEMP/uniform-v2-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.13.5'
+      - name: Reconstruct exact candidate and fail on branch races
+        shell: bash
+        run: |
+          set -euo pipefail
+          remote=$(git ls-remote origin "refs/heads/$PRODUCT_BRANCH" | cut -f1)
+          test "$remote" = "$BASE_SHA"
+          git worktree add --detach "$JOB_ROOT/candidate" "$BASE_SHA"
+          cd "$JOB_ROOT/candidate"
+          git apply --check "$GITHUB_WORKSPACE/.github/uniform-v2.patch"
+          git apply "$GITHUB_WORKSPACE/.github/uniform-v2.patch"
+          test "$(git diff --name-only | sort)" = $'src/mqttium/api/_delivery.py\nsrc/mqttium/api/async_client.py\ntests/unit/test_uniform_callbacks.py'
+          git diff --check
+          python -m py_compile src/mqttium/api/_delivery.py src/mqttium/api/async_client.py tests/unit/test_uniform_callbacks.py
+      - name: Install development dependencies
+        run: python -m pip install -e "$JOB_ROOT/candidate[dev,fuzz,security,docs]"
+      - name: Focused adversarial gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$JOB_ROOT/candidate"
+          ruff format --check src/mqttium/api/_delivery.py src/mqttium/api/async_client.py tests/unit/test_uniform_callbacks.py
+          ruff check src/mqttium/api/_delivery.py src/mqttium/api/async_client.py tests/unit/test_uniform_callbacks.py
+          python -m pytest -q \
+            tests/unit/test_uniform_callbacks.py \
+            tests/unit/test_sync_callback_contract.py \
+            tests/unit/test_topic_callback_dispatch_contract.py \
+            tests/unit/test_topic_callbacks.py \
+            tests/unit/test_callback_message_batches.py \
+            tests/unit/test_effect_pump.py \
+            tests/unit/test_direct_qos0_capture.py \
+            -W error
+      - name: Full hosted correctness gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$JOB_ROOT/candidate"
+          ruff format --check src tests benchmarks tools
+          ruff check src tests benchmarks tools
+          mypy src/mqttium
+          bandit -q -ll -r src
+          mkdocs build --strict
+          python -m pytest -q tests/unit tests/project tests/resilience -W error --cov=mqttium
+          python -m pytest -q tests/fuzz -W error
+          python tests/fuzz/fuzz.py --seed 1 --iterations 20000
+      - name: Freeze tested source and advance only the experiment branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$JOB_ROOT/candidate"
+          test "$(git status --porcelain --untracked-files=no | wc -l)" -eq 3
+          remote=$(git ls-remote origin "refs/heads/$PRODUCT_BRANCH" | cut -f1)
+          test "$remote" = "$BASE_SHA"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/mqttium/api/_delivery.py src/mqttium/api/async_client.py tests/unit/test_uniform_callbacks.py
+          git commit -m 'fix: unify callback and stream delivery generations' -m 'Explicit application-delivery reset now retires queued callback work and blocked old-generation admissions as well as iterator state. Reuse one delivery generation instead of split stream/callback generations. Keep an active reconnecting callback as the sole worker incarnation. Also remove a coroutine layer from stable synchronous topic-match dispatch without static route classification. No new queue, task, state or public option.'
+          tested=$(git rev-parse HEAD)
+          tree=$(git rev-parse 'HEAD^{tree}')
+          src_tree=$(git rev-parse 'HEAD:src')
+          printf '{"base":"%s","tested":"%s","tree":"%s","src_tree":"%s","run":"%s"}\n' "$BASE_SHA" "$tested" "$tree" "$src_tree" "$GITHUB_RUN_ID" | tee "$JOB_ROOT/provenance.json"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/yoch/mqttium.git" HEAD:"refs/heads/$PRODUCT_BRANCH"
+      - name: Retain exact provenance and patch
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: uniform-v2-${{ github.run_id }}
+          path: |
+            ${{ env.JOB_ROOT }}/provenance.json
+            .github/uniform-v2.patch
+          retention-days: 30
+          if-no-files-found: warn
+      - name: Clean isolated worktree
+        if: always()
+        run: git worktree remove --force "$JOB_ROOT/candidate" || true
