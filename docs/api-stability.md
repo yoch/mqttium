@@ -63,6 +63,9 @@ waiter, not the MQTT exchange or other waiters.
 submission exposes its committed prefix through `PublishBatchError.receipt`.
 Cancellation leaves that prefix active and seals its aggregate receipt. Failure
 details have a finite configured limit, default 128, while totals stay exact.
+Ready QoS 0 batch elements use the same writer handoff as unit publication.
+Their aggregate registration precedes wire exposure. An explicit clean refusal
+can fall back to ordinary admission; an exception after handoff is never retried.
 
 `Properties` owns an immutable copy of its input mapping, repeated values and
 binary data. `ReconnectPolicy` is immutable configuration; each client owns its

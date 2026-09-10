@@ -133,6 +133,11 @@ class PublishBatchReceipt:
         if mid is not None:
             self._pending[mid] = index
 
+    def _rollback_qos0_registration(self) -> None:
+        """Undo the last QoS 0 registration after a synchronous clean refusal."""
+        assert not self._sealed and self._submitted > 0
+        self._submitted -= 1
+
     def _complete(self, mid: int, error: BaseException | None = None) -> None:
         index = self._pending.pop(mid, None)
         if index is None:

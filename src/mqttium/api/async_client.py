@@ -465,8 +465,9 @@ class AsyncClient:
         retain: bool,
         properties: Properties | None,
         nowait: bool = False,
-    ) -> PublishReceipt | None:
-        """Hand one ready QoS 0 unit publication to the sole transport writer."""
+        batch: PublishBatchReceipt | None = None,
+    ) -> PublishReceipt | bool:
+        """Hand ready QoS 0 to the writer; False declines, True accepts a batch item."""
         pump = self._effect_pump
         writer = self._write_pump
         epoch = self._connection_epoch
@@ -482,19 +483,26 @@ class AsyncClient:
             or self._engine.has_pending_effects
             or (callback is not None and self._delivery.callback_queue.full())
         ):
-            return None
+            return False
         item = self._engine.outbound.prepare_qos0(
             topic, payload, retain=retain, properties=properties
         )
-        receipt = PublishReceipt(mid=None, qos=QoS.AT_MOST_ONCE)
         if callback is not None:
             self._delivery.ensure_callback_worker()
+        receipt: PublishReceipt | bool
+        if batch is None:
+            receipt = PublishReceipt(mid=None, qos=QoS.AT_MOST_ONCE)
+        else:
+            batch._register(None)
+            receipt = True
         # No await or user callback separates preflight and handoff. Writer
         # exceptions propagate: an eager write may already have reached wire.
         if not writer.try_enqueue(item, epoch=epoch):
+            if batch is not None:
+                batch._rollback_qos0_registration()
             if nowait:
                 raise FlowControlError(writer.refusal(item_size(item)))
-            return None
+            return False
         if properties is not None and properties.get("topic_alias") is not None:
             self._engine.outbound.commit_topic_alias(topic, properties)
         if callback is not None:
@@ -978,7 +986,8 @@ class AsyncClient:
             direct = self._try_direct_qos0_publish(
                 topic, data, retain=retain, properties=properties, nowait=True
             )
-            if direct is not None:
+            if direct is not False:
+                assert direct is not True
                 return direct
         receipt = self._commit_publish(
             topic,
@@ -1030,12 +1039,12 @@ class AsyncClient:
             # still waits behind delivery. Settle that old receipt before the
             # identifier can be registered again, including within one batch.
             await self._effect_pump.drain()
-            if batch is None and qos == QoS.AT_MOST_ONCE:
+            if qos == QoS.AT_MOST_ONCE:
                 direct = self._try_direct_qos0_publish(
-                    topic, data, retain=retain, properties=properties
+                    topic, data, retain=retain, properties=properties, batch=batch
                 )
-                if direct is not None:
-                    return direct
+                if direct is not False:
+                    return None if direct is True else direct
             waiter: asyncio.Future[None] | None = None
             async with self._engine_lock:
                 if self._effect_pump.pending or self._engine.has_pending_effects:

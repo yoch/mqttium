@@ -217,21 +217,203 @@ async def test_segmented_unit_qos0_stays_in_writer_queue():
         await client.disconnect()
 
 
-async def test_publish_many_keeps_existing_prefix_registration(monkeypatch):
-    client = AsyncClient("batch-stays-general")
+async def test_publish_many_shares_direct_path_without_unit_receipts(monkeypatch):
+    client = AsyncClient("batch-direct")
     broker = _WireBroker()
     client._transport_factory = transport_factory(broker)
 
-    def forbid_unit_path(*args, **kwargs):
-        raise AssertionError("aggregate publication must retain its existing admission path")
+    def forbid_unit_receipt(*args, **kwargs):
+        raise AssertionError("batch must not allocate per-item receipts")
 
     try:
         await client.connect("fake")
-        monkeypatch.setattr(client, "_try_direct_qos0_publish", forbid_unit_path)
+        monkeypatch.setattr(client_module, "PublishReceipt", forbid_unit_receipt)
         receipt = await client.publish_many(PublishMessage("t", bytes([i])) for i in range(3))
         await receipt.wait()
         await client._write_pump.join()
         assert receipt.submitted == receipt.completed == len(broker.publishes) == 3
         assert receipt.pending_count == 0
+    finally:
+        await client.disconnect()
+
+
+@pytest.mark.parametrize("protocol", [MQTTProtocolVersion.MQTTv311, MQTTProtocolVersion.MQTTv5])
+@pytest.mark.parametrize("notification", ["none", "sync", "async"])
+async def test_batch_registration_precedes_wire_without_unit_receipts(
+    monkeypatch, task_factory, protocol, notification
+):
+    from mqttium.api.models import PublishBatchReceipt
+
+    client = AsyncClient("batch-before-wire", protocol=protocol)
+    broker = _WireBroker(protocol)
+    client._transport_factory = transport_factory(broker)
+    batch_seen, at_wire, notifications = [], [], []
+    original_register = PublishBatchReceipt._register
+
+    def register(batch, mid):
+        batch_seen.append(batch)
+        original_register(batch, mid)
+
+    def callback(mid, reason):
+        assert not client._engine_lock.locked()
+        notifications.append((mid, reason))
+
+    async def async_callback(mid, reason):
+        callback(mid, reason)
+
+    if notification != "none":
+        client.on_publish = callback if notification == "sync" else async_callback
+
+    def no_unit(*args, **kwargs):
+        raise AssertionError("QoS 0 batch allocated an individual receipt")
+
+    def no_general(*args, **kwargs):
+        raise AssertionError("ready batch item used general publication effects")
+
+    await client.connect("fake")
+    try:
+        monkeypatch.setattr(PublishBatchReceipt, "_register", register)
+        monkeypatch.setattr(client_module, "PublishReceipt", no_unit)
+        monkeypatch.setattr(type(client._engine.outbound), "queue_publish", no_general)
+        broker.on_wire = lambda: at_wire.append(batch_seen[-1].submitted)
+        receipt = await client.publish_many(PublishMessage("t", bytes([i])) for i in range(8))
+        assert notifications == []
+        await client._write_pump.join()
+        await client._delivery.callback_queue.join()
+        assert receipt.submitted == receipt.completed == 8
+        assert all(batch is receipt for batch in batch_seen)
+        assert all(count >= index for index, count in enumerate(at_wire, 1))
+        assert len(at_wire) == 8
+        assert [packet.payload for packet in broker.publishes] == [bytes([i]) for i in range(8)]
+        assert notifications == ([] if notification == "none" else [(None, None)] * 8)
+    finally:
+        await client.disconnect()
+
+
+@pytest.mark.parametrize("fault", [FlowControlError, OSError])
+async def test_batch_partial_handoff_failure_keeps_prefix_and_never_retries(
+    monkeypatch, task_factory, fault
+):
+    from mqttium.errors import PublishBatchError
+
+    client = AsyncClient("batch-partial-write")
+    broker = _WireBroker()
+    client._transport_factory = transport_factory(broker)
+    consumed, attempts, notifications = [], [], []
+    client.on_publish = lambda *args: notifications.append(args)
+
+    def messages():
+        for index in range(4):
+            consumed.append(index)
+            yield PublishMessage("t", bytes([index]))
+
+    await client.connect("fake")
+    try:
+        original = client._write_pump.try_enqueue
+        cause = fault("ambiguous write")
+
+        def handoff_then_raise(item, *, epoch=None):
+            attempts.append(item)
+            accepted = original(item, epoch=epoch)
+            assert accepted
+            if len(attempts) == 2:
+                raise cause
+            return accepted
+
+        with monkeypatch.context() as patch:
+            patch.setattr(client._write_pump, "try_enqueue", handoff_then_raise)
+            with pytest.raises(PublishBatchError) as caught:
+                await client.publish_many(messages())
+        receipt = caught.value.receipt
+        assert caught.value.cause is cause
+        assert receipt.submitted == receipt.completed == 2
+        assert consumed == [0, 1]
+        assert len(attempts) == 2
+        await client._write_pump.join()
+        await client._delivery.callback_queue.join()
+        assert [packet.payload for packet in broker.publishes] == [b"\x00", b"\x01"]
+        assert notifications == [(None, None)]
+        # The raised submission error reports the ambiguous handoff; the
+        # attached receipt describes its already committed prefix, as before.
+        await receipt.wait()
+    finally:
+        await client.disconnect()
+
+
+async def test_batch_clean_refusal_rolls_back_registration_before_fallback(monkeypatch):
+    from mqttium.api.models import PublishBatchReceipt
+
+    protocol = MQTTProtocolVersion.MQTTv5
+    client = AsyncClient("batch-clean-refusal", protocol=protocol)
+    broker = _WireBroker(protocol)
+    client._transport_factory = transport_factory(broker)
+    batch_seen, attempts = [], []
+    original_register = PublishBatchReceipt._register
+
+    def register(batch, mid):
+        original_register(batch, mid)
+        batch_seen.append(batch)
+
+    await client.connect("fake")
+    try:
+        client._engine.negotiated = replace(client.negotiated, topic_alias_maximum=2)
+        original_enqueue = client._write_pump.try_enqueue
+        original_queue = type(client._engine.outbound).queue_publish
+
+        def enqueue(item, *, epoch=None):
+            attempts.append(item)
+            if len(attempts) == 1:
+                assert batch_seen[-1].submitted == 1
+                assert client._engine.outbound._topic_aliases == {}
+                return False
+            return original_enqueue(item, epoch=epoch)
+
+        def general(session, *args, **kwargs):
+            assert batch_seen[-1].submitted == 0
+            assert session._topic_aliases == {}
+            return original_queue(session, *args, **kwargs)
+
+        monkeypatch.setattr(PublishBatchReceipt, "_register", register)
+        monkeypatch.setattr(client._write_pump, "try_enqueue", enqueue)
+        monkeypatch.setattr(type(client._engine.outbound), "queue_publish", general)
+        receipt = await client.publish_many(
+            [
+                PublishMessage("alias/topic", b"first", properties=Properties({"topic_alias": 1})),
+                PublishMessage("", b"second", properties=Properties({"topic_alias": 1})),
+            ]
+        )
+        await receipt.wait()
+        await client._write_pump.join()
+        assert receipt.submitted == receipt.completed == 2
+        assert len(attempts) == 3
+        assert len(broker.publishes) == 2
+        assert client._engine.outbound._topic_aliases == {1: "alias/topic"}
+    finally:
+        await client.disconnect()
+
+
+@pytest.mark.parametrize("protocol", [MQTTProtocolVersion.MQTTv311, MQTTProtocolVersion.MQTTv5])
+async def test_direct_batch_keeps_mixed_qos_order_with_tight_bounds(task_factory, protocol):
+    from tests.unit.test_publish_many import BatchBrokerTransport
+
+    client = AsyncClient(
+        "mixed-direct",
+        protocol=protocol,
+        max_outbound_inflight=1,
+        max_outbound_messages=1,
+        max_outbound_bytes=64,
+    )
+    broker = BatchBrokerTransport(protocol)
+    client._transport_factory = transport_factory(broker)
+    await client.connect("fake")
+    try:
+        requests = [PublishMessage("mixed", bytes([i]), qos=i % 3) for i in range(18)]
+        receipt = await asyncio.wait_for(client.publish_many(requests), 2)
+        await asyncio.wait_for(receipt.wait(), 2)
+        await client._write_pump.join()
+        assert [message.payload for message in broker.publishes] == [bytes([i]) for i in range(18)]
+        assert receipt.submitted == receipt.completed == 18
+        assert receipt.pending_count == 0
+        assert client.stats().outbound.pending_messages == 0
     finally:
         await client.disconnect()

@@ -27,6 +27,11 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Changed — lean native experiment
 
+- Share ready QoS 0 writer handoff between unit and aggregate publication,
+  registering aggregate ownership before wire without per-item receipts.
+  Clean writer refusal rolls back only the tentative batch registration;
+  ambiguous write exceptions keep the committed prefix and are never retried.
+
 - Remove `ReconnectPolicy.follow_server_reference`, which retried the original
   endpoint instead of following the advertised reference. MQTT 5 redirect
   reasons are terminal. Expose nonzero broker DISCONNECT details through
