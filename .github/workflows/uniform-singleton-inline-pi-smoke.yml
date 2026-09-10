@@ -1,5 +1,5 @@
-name: Uniform singleton-inline ARM64 RTT smoke
-run-name: "Uniform singleton-inline RTT smoke"
+name: Uniform singleton-inline ARM64 RTT standard
+run-name: "Uniform singleton-inline RTT standard"
 
 on:
   push:
@@ -27,7 +27,7 @@ jobs:
   smoke:
     if: github.repository == 'yoch/mqttium' && github.ref == 'refs/heads/bench/uniform-singleton-inline-ablation-fd37'
     runs-on: [self-hosted, linux, ARM64]
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - name: Validate runner and isolate output
         shell: bash
@@ -168,7 +168,7 @@ jobs:
               --worker-aslr system --entrypoint version_compare -- \
               --client mqttium --baseline-path slot-a --candidate-path "$other" \
               --scenario application_rtt_fixed_rate --variant-index 0 --target-rate 3942 \
-              --pacer-mode external --blocks 2 --max-block-retries 0 --profile smoke \
+              --pacer-mode external --blocks 4 --max-block-retries 0 --profile standard \
               --broker "127.0.0.1:$port" --broker-pid "$broker_pid" \
               --output "$out/$phase.json" 2>&1 | tee "$out/$phase.log"
             rc=${PIPESTATUS[0]}
