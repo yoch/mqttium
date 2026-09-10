@@ -234,6 +234,47 @@ async def test_shutdown_refuses_waiters_and_reopen_preserves_only_new_jobs(sched
         await finish(client)
 
 
+async def test_explicit_stream_reset_retires_old_callback_generation(scheduler):
+    client = AsyncClient(message_delivery="callback", max_pending_callbacks=1)
+    d = client._delivery
+    entered, release = asyncio.Event(), asyncio.Event()
+    seen = []
+
+    async def active():
+        seen.append("active")
+        entered.set()
+        await release.wait()
+
+    stale = None
+    try:
+        d.spawn_callback(active)
+        await entered.wait()
+        d.spawn_callback(lambda: seen.append("old"))
+        stale = asyncio.create_task(d.enqueue_callback(lambda: seen.append("stale")))
+        for _ in range(3):
+            await asyncio.sleep(0)
+        assert not stale.done()
+
+        # This is the application-delivery reset used by explicit connect
+        # takeover. The active callback may finish, but old queued work and a
+        # blocked old-generation admission must not cross into the replacement.
+        await client._reset_message_stream()
+        d.reopen()
+        d.spawn_callback(lambda: seen.append("new"))
+        with pytest.raises(MessageDeliveryError, match="retired generation"):
+            await asyncio.wait_for(stale, 1)
+
+        release.set()
+        await asyncio.wait_for(d.callback_queue.join(), 1)
+        assert seen == ["active", "new"]
+        bound(client, 1)
+    finally:
+        release.set()
+        if stale is not None:
+            await asyncio.gather(stale, return_exceptions=True)
+        await finish(client)
+
+
 async def test_worker_cannot_wait_for_its_own_full_queue(scheduler):
     client = AsyncClient(message_delivery="callback", max_pending_callbacks=1)
     seen = []

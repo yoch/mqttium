@@ -133,7 +133,7 @@ class ApplicationDelivery:
         )
         self.message_ready = asyncio.Event()
         self.closed = asyncio.Event()
-        self._stream_generation = 0
+        self._delivery_generation = 0
         self.callback_task: asyncio.Task[None] | None = None
         # True while either the worker or the opportunistic reader/effect path
         # is executing user code. It is also the reentrancy guard: a callback
@@ -141,7 +141,6 @@ class ApplicationDelivery:
         # bounded queue instead of nesting user callbacks.
         self._callback_active = False
         self._callback_state: Literal["open", "draining", "closed"] = "open"
-        self._callback_generation = 0
         self.callback_space = asyncio.Event()
         self.delivery_timeout = delivery_timeout
         self.callback_shutdown_timeout = callback_shutdown_timeout
@@ -353,7 +352,7 @@ class ApplicationDelivery:
         No reservation is taken, so there is nothing to roll back: a failure
         here leaves only whatever the queues already accepted.
         """
-        generation = self._callback_generation
+        generation = self._delivery_generation
         if callback is not None:
             self.ensure_callback_worker()
         if iterator_delivery:
@@ -364,7 +363,7 @@ class ApplicationDelivery:
             else:
                 self.message_ready.set()
         if callback is not None:
-            if generation != self._callback_generation:
+            if generation != self._delivery_generation:
                 raise MessageDeliveryError("Callback admission belongs to a retired generation")
             self.ensure_callback_worker()
             job: CallbackJob = (callback, (message,), None)
@@ -389,7 +388,7 @@ class ApplicationDelivery:
         slow-path entries — `acceptor()` / `decoded_acceptor()` hand the common
         case to the specialised `_accept_*` acceptors.
         """
-        generation = self._callback_generation
+        generation = self._delivery_generation
         callback_delivery = callback is not None and self.callback_mode
         iterator_delivery = self.iterator_mode or (self.auto_mode and callback is None)
         references = int(iterator_delivery) + int(callback_delivery)
@@ -419,7 +418,7 @@ class ApplicationDelivery:
                     callback_generation=generation if callback_delivery else None,
                 )
         try:
-            if callback_delivery and generation != self._callback_generation:
+            if callback_delivery and generation != self._delivery_generation:
                 raise MessageDeliveryError("Callback admission belongs to a retired generation")
             if iterator_delivery:
                 item: IteratorQueueItem = (message, token) if token is not None else message
@@ -432,7 +431,7 @@ class ApplicationDelivery:
                 iterator_enqueued = True
             if callback_delivery:
                 assert callback is not None
-                if generation != self._callback_generation:
+                if generation != self._delivery_generation:
                     raise MessageDeliveryError("Callback admission belongs to a retired generation")
                 self.ensure_callback_worker()
                 job = (callback, (message,), token)
@@ -481,10 +480,8 @@ class ApplicationDelivery:
     def reopen(self) -> None:
         self.closed.clear()
         if self._callback_state != "open":
-            # Keep a callback which is reconnecting as the sole consumer. Only
-            # unstarted notifications of the old generation are abandoned.
-            self._discard_callback_queue()
-            self._callback_generation += 1
+            # The explicit reset already retired the prior delivery generation.
+            # A callback which reconnects remains the sole worker incarnation.
             self._callback_state = "open"
             self.callback_space.set()
             self.space.set()
@@ -603,9 +600,9 @@ class ApplicationDelivery:
         return applied
 
     async def messages(self) -> AsyncIterator[Message]:
-        generation = self._stream_generation
+        generation = self._delivery_generation
         while True:
-            if generation != self._stream_generation:
+            if generation != self._delivery_generation:
                 return
             try:
                 item = self.messages_queue.get_nowait()
@@ -627,7 +624,14 @@ class ApplicationDelivery:
     def reset_stream(self) -> None:
         if not self.closed.is_set():
             return
-        self._stream_generation += 1
+        # An explicit connection takeover starts one new application-delivery
+        # generation for both iterator and callback consumers. Active callback
+        # code may finish; no unstarted notification or blocked admission from
+        # the retired generation may cross into the replacement connection.
+        self._delivery_generation += 1
+        self._discard_callback_queue()
+        self.callback_space.set()
+        self.space.set()
         while True:
             try:
                 item = self.messages_queue.get_nowait()
@@ -672,7 +676,7 @@ class ApplicationDelivery:
         try:
             while True:
                 if callback_generation is not None and (
-                    callback_generation != self._callback_generation
+                    callback_generation != self._delivery_generation
                     or self._callback_state != "open"
                 ):
                     raise MessageDeliveryError("Callback delivery generation is closing")
@@ -871,11 +875,11 @@ class ApplicationDelivery:
             await self.enqueue_callback_job_slow(job)
 
     async def enqueue_callback_job_slow(self, job: CallbackJob) -> None:
-        generation = self._callback_generation
+        generation = self._delivery_generation
         try:
             async with asyncio.timeout(self.delivery_timeout):
                 while True:
-                    if generation != self._callback_generation:
+                    if generation != self._delivery_generation:
                         raise MessageDeliveryError(
                             "Callback admission belongs to a retired generation"
                         )
@@ -925,7 +929,7 @@ class ApplicationDelivery:
             if self._callback_state == "draining" and queue.empty():
                 return
             job = await queue.get()
-            generation = self._callback_generation
+            generation = self._delivery_generation
             remaining = 1 + queue.qsize()
             while True:
                 self.callback_space.set()
@@ -955,7 +959,7 @@ class ApplicationDelivery:
                 if self._callback_state == "closed":
                     return
                 remaining -= 1
-                if not remaining or generation != self._callback_generation:
+                if not remaining or generation != self._delivery_generation:
                     break
                 job = queue.get_nowait()
             # Reentrant arrivals cannot extend a round indefinitely. All
@@ -988,7 +992,7 @@ class ApplicationDelivery:
         )
 
     async def shutdown_callbacks(self, *, drain: bool) -> None:
-        generation = self._callback_generation
+        generation = self._delivery_generation
         if self._callback_state != "closed":
             self._callback_state = "draining" if drain else "closed"
         self.callback_space.set()
@@ -1009,7 +1013,7 @@ class ApplicationDelivery:
                 except TimeoutError:
                     pass
         finally:
-            if generation == self._callback_generation:
+            if generation == self._delivery_generation:
                 self._callback_state = "closed"
                 self._discard_callback_queue()
                 task = self.callback_task

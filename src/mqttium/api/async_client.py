@@ -1649,12 +1649,15 @@ class AsyncClient:
             callbacks = (callback,)
         task = asyncio.current_task()
         for callback in callbacks:
-            try:
-                await self._invoke(callback, message)
-            except asyncio.CancelledError as exc:
-                self._delivery._propagate_callback_cancellation(callback, exc)
-            except Exception as exc:
-                self._report_callback_error(callback, exc)
+            if self._delivery._is_async_callback(callback):
+                try:
+                    await callback(message)
+                except asyncio.CancelledError as exc:
+                    self._delivery._propagate_callback_cancellation(callback, exc)
+                except Exception as exc:
+                    self._report_callback_error(callback, exc)
+            else:
+                self._run_sync_callback(callback, message)
             if task is not None and task.cancelling():
                 await asyncio.sleep(0)
 
