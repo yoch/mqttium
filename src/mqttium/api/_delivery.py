@@ -181,10 +181,12 @@ class ApplicationDelivery:
             if reserved:
                 self.release(size)
 
-    async def messages(self) -> AsyncIterator[Message]:
+    def messages(self) -> AsyncIterator[Message]:
+        return self._messages(self._stream_generation)
+
+    async def _messages(self, generation: int) -> AsyncIterator[Message]:
         if self.mode != "iterator":
             raise MQTTError("messages() requires message_delivery='iterator'")
-        generation = self._stream_generation
         while generation == self._stream_generation:
             try:
                 message, size = self.messages_queue.get_nowait()

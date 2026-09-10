@@ -8,6 +8,9 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed — lean native experiment
 
+- Bind message iterators to their generation at creation, including iterators
+  never advanced before an explicit disconnect/reconnect.
+
 - Bind manual acknowledgement handles to their active inbound exchange, so
   a stale or foreign message cannot acknowledge a reused packet identifier.
   Handles remain valid when a reconnect resumes the same logical session.

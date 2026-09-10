@@ -1286,7 +1286,7 @@ class AsyncClient:
             raise MQTTTimeoutError(f"{ack_name} timed out for mid={mid}") from exc
 
     def messages(self) -> AsyncIterator[Message]:
-        """Return the delivered-message iterator for the current generation.
+        """Return an iterator bound to the generation when this method is called.
 
         Automatic reconnect keeps the current iterator alive on the replacement
         transport. A terminal disconnect ends it. A later explicit

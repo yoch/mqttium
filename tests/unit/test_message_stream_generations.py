@@ -70,3 +70,35 @@ async def test_reset_releases_discarded_accounting_exactly_once() -> None:
 
     assert delivery.pending_bytes == 0
     assert delivery.messages_queue.empty()
+
+
+@pytest.mark.parametrize("created_after_close", (False, True))
+async def test_never_started_iterator_cannot_consume_replacement_generation(created_after_close):
+    delivery = _delivery(max_pending_delivery_bytes=4096)
+    if created_after_close:
+        delivery.close()
+    old = delivery.messages()
+    delivery.close()
+    delivery.reset_stream()
+    message = Message(topic="new", payload=b"value")
+    await delivery.accept(message, None)
+    charged = delivery.pending_bytes
+    with pytest.raises(StopAsyncIteration):
+        await asyncio.wait_for(anext(old), 1)
+    assert delivery.pending_bytes == charged
+    assert delivery.messages_queue.qsize() == 1
+    assert await anext(delivery.messages()) is message
+    assert delivery.pending_bytes == 0
+
+
+async def test_iterator_paused_after_yield_stays_in_old_generation():
+    delivery = _delivery()
+    old = delivery.messages()
+    await delivery.accept(Message(topic="old", payload=b"first"), None)
+    assert (await anext(old)).topic == "old"
+    delivery.close()
+    delivery.reset_stream()
+    await delivery.accept(Message(topic="new", payload=b"second"), None)
+    with pytest.raises(StopAsyncIteration):
+        await anext(old)
+    assert (await anext(delivery.messages())).topic == "new"
