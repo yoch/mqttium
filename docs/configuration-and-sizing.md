@@ -111,8 +111,10 @@ second and capped at 60 seconds. Set `max_retries=None` for an unbounded retry
 count only when the surrounding service is expected to remain alive. Terminal
 authentication, authorization, and protocol errors are not retried.
 
-`follow_server_reference=False` avoids connecting to a broker-selected endpoint
-unless the application explicitly opts into that trust decision.
+MQTT 5 `Use another server` and `Server moved` are terminal. The application
+chooses any replacement endpoint explicitly. Broker DISCONNECT details arrive
+through `on_disconnect` as `BrokerDisconnectError` when there is no more specific
+failure; its properties retain the server reference.
 
 ## Validate the result
 

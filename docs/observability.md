@@ -26,7 +26,7 @@ no sampler, logging, or formatting cost.
 | Incoming messages | `on_message`, `message_callback_add`, or `async for message in client.messages()` |
 | Current state | `client.is_connected`, `client.state`, `client.negotiated` |
 | Protocol failures | typed exceptions such as `ProtocolError` and `MQTTTimeoutError` |
-| Broker disconnect details | `DisconnectInfo` |
+| Nonzero broker disconnect details | `BrokerDisconnectError.reason_code` and `.properties` through `on_disconnect`, unless a more specific failure is present |
 | Queue and resource pressure | `client.stats()` |
 
 ## Add application-level instrumentation

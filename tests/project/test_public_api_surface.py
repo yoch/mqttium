@@ -20,6 +20,7 @@ from mqttium.api.models import (
 )
 from mqttium.api.stats import ClientStats
 from mqttium.errors import (
+    BrokerDisconnectError,
     FlowControlError,
     MQTTError,
     MQTTTimeoutError,
@@ -39,6 +40,7 @@ from mqttium.types import Message, Properties
 
 
 STABLE_ROOT_EXPORTS = {
+    "BrokerDisconnectError": BrokerDisconnectError,
     "ConnectionState": ConnectionState,
     "FlowControlError": FlowControlError,
     "MQTTError": MQTTError,

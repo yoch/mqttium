@@ -3,10 +3,23 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from mqttium.types import Properties
 
 
 class MQTTError(Exception):
     """Base error for mqttium."""
+
+
+class BrokerDisconnectError(MQTTError):
+    """Broker's nonzero MQTT 5 DISCONNECT, with its immutable properties."""
+
+    def __init__(self, reason_code: int, properties: Properties | None = None) -> None:
+        self.reason_code = reason_code
+        self.properties = properties
+        super().__init__(f"Broker disconnected with reason code 0x{reason_code:02x}")
 
 
 class MalformedPacketError(MQTTError):

@@ -126,6 +126,15 @@ task still propagates normally.
 
 ## Server references
 
-MQTT 5 can ask a client to use another server. `ReconnectPolicy` does not follow
-that reference by default. Enabling `follow_server_reference` is a deployment
-trust decision; validate the target and its TLS identity.
+MQTT 5 can ask a client to use another server. `Use another server` (`0x9C`)
+and `Server moved` (`0x9D`) are terminal; MQTTium does not automatically select
+a new endpoint. `ReconnectPolicy.follow_server_reference` has been removed:
+the old flag retried the original endpoint rather than following the reference.
+
+A nonzero broker DISCONNECT produces `BrokerDisconnectError` through
+`on_disconnect(error)` when no more specific failure is already known. Read
+`error.reason_code` and `error.properties.get("server_reference")` (if properties
+are present), then explicitly choose the destination, credentials and TLS
+configuration for any new connection. The property mapping is immutable.
+Earlier protocol, transport and local failures remain authoritative. Normal
+disconnect and refused-CONNACK exception behavior is unchanged.

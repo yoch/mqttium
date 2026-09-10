@@ -24,7 +24,7 @@ _V5_TERMINAL = frozenset(
         0x99,  # Payload format invalid (Will Payload)
         0x9A,  # Retain not supported
         0x9B,  # QoS not supported
-        0x9C,  # Use another server (unless following Server Reference)
+        0x9C,  # Use another server
         0x9D,  # Server moved
     }
 )
@@ -42,8 +42,6 @@ class ReconnectPolicy:
         max_retries: Maximum attempts, or ``None`` for no count limit.
         stable_after: Connected duration after which attempt state resets.
         connect_timeout: Deadline for each transport and CONNACK attempt.
-        follow_server_reference: Whether MQTT 5 ``Use another server`` may be
-            retried when a server reference is available.
 
     Delays use full bounded jitter in the range 50–100% of the current base.
     Terminal authentication, protocol, and capability failures are not retried.
@@ -56,7 +54,6 @@ class ReconnectPolicy:
     max_retries: int | None = None
     stable_after: float = 30.0
     connect_timeout: float = 30.0
-    follow_server_reference: bool = False
 
     def __post_init__(self) -> None:
         if self.initial_delay < 0:
@@ -106,8 +103,6 @@ class _ReconnectState:
             return True
         if protocol == MQTTProtocolVersion.MQTTv5:
             if reason_code in _V5_TERMINAL:
-                if reason_code == 0x9C and self.policy.follow_server_reference:
-                    return True
                 return False
             return True
         return reason_code not in _V311_TERMINAL
@@ -124,7 +119,7 @@ def is_terminal_connack(reason_code: int, protocol: MQTTProtocolVersion) -> bool
     Reads the terminal sets directly. Answering this by constructing a default
     `ReconnectPolicy` and inverting `should_retry` also ran that dataclass's
     `__post_init__` validation on every call, and tied the answer to policy
-    fields (`max_retries`, `follow_server_reference`) that have nothing to do
+    fields such as `max_retries` that have nothing to do
     with whether the reason code itself is terminal.
     """
     if protocol == MQTTProtocolVersion.MQTTv5:

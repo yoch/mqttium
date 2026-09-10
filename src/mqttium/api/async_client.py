@@ -44,6 +44,7 @@ from mqttium.codec.buffer import DEFAULT_MAX_PACKET_SIZE, IncrementalDecoder
 from mqttium.dispatch.matcher import TopicMatcher
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, QoS
 from mqttium.errors import (
+    BrokerDisconnectError,
     FlowControlError,
     MQTTError,
     MQTTTimeoutError,
@@ -1520,7 +1521,16 @@ class AsyncClient:
             except (Exception, asyncio.CancelledError):
                 pass
             if self._disconnect_exc is None:
-                self._disconnect_exc = MQTTError("Connection closed")
+                info = self._last_disconnect
+                if (
+                    self._local_terminal_failure is None
+                    and info is not None
+                    and info.from_broker
+                    and info.reason_code != 0
+                ):
+                    self._disconnect_exc = BrokerDisconnectError(info.reason_code, info.properties)
+                else:
+                    self._disconnect_exc = MQTTError("Connection closed")
             # A latched local-terminal failure is authoritative: a secondary
             # writer/keepalive error that overwrote _disconnect_exc must never
             # replace it for settlement and callbacks. The explicit None test

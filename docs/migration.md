@@ -22,8 +22,20 @@ upgrade of applications or historical databases.
 | `set_auth_handler()` / assignment to `auth_handler` | Supply `auth_handler` at construction |
 | CONNECT property keys duplicating limit arguments | Use the dedicated constructor arguments |
 | Shared mutable reconnect policy | Immutable policy with private state per client |
+| `ReconnectPolicy.follow_server_reference` | Removed; inspect `BrokerDisconnectError` and explicitly choose a replacement endpoint |
 | Delivery small-message diagnostic fields | Uniform `stats().delivery.pending_bytes` / `max_bytes` |
 | Custom engine/store/transport integration guarantees | Internal implementation interfaces |
+
+## Delivery handles and disconnect diagnostics
+
+Manual acknowledgement requires a delivered handle from the active logical
+exchange. Reconstructing a `Message` from its fields no longer authorizes an
+acknowledgement; stale and foreign handles raise `ProtocolError`. Handles survive
+a transport reconnect that resumes the same session, including an explicit one.
+
+Nonzero broker DISCONNECT information is available as `BrokerDisconnectError`
+through the existing `on_disconnect(error)` signature. It carries `reason_code`
+and immutable `properties`, and replaces only an otherwise generic closure.
 
 ## Properties
 

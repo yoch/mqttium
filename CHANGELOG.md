@@ -27,6 +27,11 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Changed — lean native experiment
 
+- Remove `ReconnectPolicy.follow_server_reference`, which retried the original
+  endpoint instead of following the advertised reference. MQTT 5 redirect
+  reasons are terminal. Expose nonzero broker DISCONNECT details through
+  `BrokerDisconnectError` when no more specific failure is available.
+
 - Transfer ready deliveries without timeout contexts or deferred effect work,
   classify frozen message callbacks once, and hand ready unit QoS 0 publishes
   to the existing writer without general publication effects. Byte/count bounds,

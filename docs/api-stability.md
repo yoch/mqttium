@@ -69,6 +69,16 @@ binary data. `ReconnectPolicy` is immutable configuration; each client owns its
 retry progression. CONNECT limits use dedicated constructor arguments, never
 precedence between duplicate property keys and arguments.
 
+Manual `ack(message)` validates the delivered handle's active logical exchange.
+Foreign, reconstructed and completed handles raise `ProtocolError`. A reconnect
+that resumes the same session preserves active handles. `messages()` binds an
+iterator to its generation when called, before its first advancement.
+
+Nonzero broker DISCONNECT details use `BrokerDisconnectError` with `reason_code`
+and immutable `properties` through `on_disconnect`, when no more specific cause
+exists. Server-reference reason codes are terminal; there is no automatic
+redirection option.
+
 ## Resource and documentation contracts
 
 Protocol, writer, ingress and delivery budgets represent different lifetimes.
