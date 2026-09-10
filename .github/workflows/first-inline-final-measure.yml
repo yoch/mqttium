@@ -1,5 +1,5 @@
 name: First-inline corrected runtime Pi qualification
-run-name: First-inline final b0440f5a network qualification
+run-name: First-inline final b8a70b09 network qualification
 on:
   push:
     branches: [bench/first-inline-final-b0440f5a]
@@ -11,7 +11,7 @@ concurrency:
   cancel-in-progress: false
 env:
   A_SHA: 9ad1f01857306ac5079ffb1d073a59fdb60e1931
-  B_SHA: b0440f5a8570665da3d919a9e263eee416beae90
+  B_SHA: b8a70b09a4202278d3c5811be2e7f6b375e716e2
   H_SHA: 37160eed99b50d1f384e1565a16d0346eb01ca56
   PYTHONUNBUFFERED: '1'
   PIP_DISABLE_PIP_VERSION_CHECK: '1'
@@ -86,7 +86,7 @@ jobs:
         run: |
           set -euo pipefail
           cd arm-b
-          "$JOB_ROOT/venv/bin/python" -m pytest -q tests/unit/test_first_inline_bursts.py tests/unit/test_first_inline_ownership.py -W error | tee "$JOB_ROOT/results/focused-tests.log"
+          "$JOB_ROOT/venv/bin/python" -m pytest -q tests/unit/test_first_inline_bursts.py tests/unit/test_first_inline_ownership.py tests/unit/test_effect_eager_ownership.py -W error | tee "$JOB_ROOT/results/focused-tests.log"
       - name: Run reference A/A then A/B and fixed-work controls
         shell: bash
         run: |
@@ -122,7 +122,7 @@ jobs:
           done
           (echo > "/dev/tcp/127.0.0.1/$port") >/dev/null 2>&1
           export PYTHONPATH="$PWD/harness/src"
-          # Qualify the new diagnostic runner before collecting full samples.
+          # Qualify the diagnostic runner before collecting full samples.
           for arm in a b; do
             "$py" "$probe" --worker "$PWD/arm-$arm" --kind network --port "$port" --batches 20 --warmup 5 > "$out/probe-sanity-$arm.json"
           done
