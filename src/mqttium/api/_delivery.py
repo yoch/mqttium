@@ -26,6 +26,7 @@ class _ClassifiedCallback:
 CallbackTarget = Callable[..., Any] | _ClassifiedCallback
 CallbackJob = tuple[CallbackTarget, tuple[Any, ...], int | None]
 IteratorQueueItem = tuple[Message, int]
+_CALLBACK_QUANTUM = 64
 
 
 class ApplicationDelivery:
@@ -306,6 +307,7 @@ class ApplicationDelivery:
         # Even an eager task factory must not invoke user code from an engine
         # critical section that synchronously enqueues a notification.
         await asyncio.sleep(0)
+        completed = 0
         try:
             while not self._callback_stop:
                 callback, args, size = await self.callback_queue.get()
@@ -315,6 +317,11 @@ class ApplicationDelivery:
                     if size is not None:
                         self.release(size)
                     self.callback_queue.task_done()
+                completed += 1
+                if completed == _CALLBACK_QUANTUM:
+                    completed = 0
+                    if not self._callback_stop and not self.callback_queue.empty():
+                        await asyncio.sleep(0)
         finally:
             self._discard_callback_queue()
 

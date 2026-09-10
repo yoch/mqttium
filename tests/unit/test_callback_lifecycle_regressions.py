@@ -53,8 +53,9 @@ class _InboundBroker(ScriptedBrokerTransport):
 
 @pytest.mark.parametrize("protocol", [MQTTProtocolVersion.MQTTv311, MQTTProtocolVersion.MQTTv5])
 @pytest.mark.parametrize("qos", [0, 1, 2])
+@pytest.mark.parametrize("prefix_jobs", [0, 63])
 async def test_callback_reopen_retires_old_jobs_but_delivers_replacement(
-    task_factory, protocol, qos
+    task_factory, protocol, qos, prefix_jobs
 ):
     client = AsyncClient("callback-reopen", message_delivery="callback", protocol=protocol)
     brokers = [_InboundBroker(protocol), _InboundBroker(protocol)]
@@ -85,6 +86,9 @@ async def test_callback_reopen_retires_old_jobs_but_delivers_replacement(
     client.on_message = callback
     try:
         await client.connect("fake")
+        for _ in range(prefix_jobs):
+            await client._delivery.enqueue_callback(lambda: None)
+        await client._delivery.callback_queue.join()
         brokers[0].publish(b"old")
         await asyncio.wait_for(started.wait(), 1)
         await client._delivery.accept(Message(topic="t", payload=b"stale"), callback)

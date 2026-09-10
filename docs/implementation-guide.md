@@ -203,6 +203,9 @@ bounds waiting jobs, with at most one active worker job. A producer waiting for
 a queue slot retains its byte reservation under the same byte budget.
 
 There are no inline user notifications or physical callback batches.
+The worker counts completed jobs and yields after a quantum of 64 when more
+work remains. It releases byte credits and finishes queue accounting before
+yielding, preserving stop/reopen ownership at the boundary.
 `on_connect`, `on_publish` and messages use the worker. `on_disconnect` and
 authentication remain directly awaited outside critical sections. Callback
 errors are isolated; real task cancellation propagates. Shutdown from the

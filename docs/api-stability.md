@@ -51,6 +51,10 @@ notifications run in the bounded worker. `on_disconnect` remains awaited by
 teardown outside locks. Authentication is awaited with `auth_timeout` because
 its result participates in the protocol exchange.
 
+The worker yields between bounded groups of jobs when more work is queued.
+Its internal quantum is 64 jobs; this is not a public tuning option or a time
+limit on user code. A callback that blocks the event loop is not preempted.
+
 ## Admission and ownership
 
 `publish()` waits for admission and bounded effect transfer. `publish_nowait()`

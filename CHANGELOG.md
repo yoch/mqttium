@@ -8,6 +8,9 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed — lean native experiment
 
+- Yield the callback worker after 64 completed jobs when work remains, so
+  ready reader, writer and application tasks progress during synchronous bursts.
+
 - Bind message iterators to their generation at creation, including iterators
   never advanced before an explicit disconnect/reconnect.
 
