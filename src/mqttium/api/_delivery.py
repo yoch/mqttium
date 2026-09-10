@@ -25,6 +25,18 @@ from mqttium.types import Message
 MessageDelivery = Literal["auto", "iterator", "callback", "both"]
 
 
+class _CallbackHandoff(Exception):
+    """Internal pre-invocation redirect, never an application callback failure.
+
+    A live route changed from sync to async after its callback was captured.
+    Carries an uncalled dispatcher, not an awaitable or a started continuation.
+    """
+
+    def __init__(self, callback: Callable[..., Awaitable[Any]]) -> None:
+        self.callback = callback
+        super().__init__()
+
+
 class _SharedDeliveryReservation:
     """One exact byte reservation shared by callback and iterator delivery."""
 
@@ -471,6 +483,12 @@ class ApplicationDelivery:
         )
 
     def reopen(self) -> None:
+        if self._callback_stop:
+            # A callback can disconnect and reconnect before its own job ends.
+            # Retire only the old queued work now; the same worker must not
+            # discard deliveries admitted by the replacement connection.
+            self._discard_callback_queue()
+            self._callback_stop = False
         self.closed.clear()
 
     def close(self) -> None:
@@ -846,6 +864,8 @@ class ApplicationDelivery:
         """Invoke one declared-sync callback and isolate application failures."""
         try:
             result = callback(*args)
+        except _CallbackHandoff:
+            raise
         except asyncio.CancelledError as exc:
             self._propagate_callback_cancellation(callback, exc)
         except Exception as exc:
@@ -874,20 +894,51 @@ class ApplicationDelivery:
         """
         self._reserve_callback_batch(2)
         self._callback_active = True
+        index = 0
         try:
-            self.run_sync_callback(callback, messages[0])
-            self.run_sync_callback(callback, messages[1])
-        finally:
-            self._callback_active = False
-            self._release_callback_batch(2)
+            try:
+                self.run_sync_callback(callback, messages[0])
+                index = 1
+                self.run_sync_callback(callback, messages[1])
+            finally:
+                self._callback_active = False
+                self._release_callback_batch(2)
+        except _CallbackHandoff as handoff:
+            # The tail already precedes anything admitted by the first
+            # callback. Transfer its reservation to a real front-of-queue job.
+            tail = messages[index:]
+            self._prepend_callback_job((handoff.callback, (tail,), _CALLBACK_MESSAGE_BATCH))
 
     def dispatch_callback_inline(self, callback: Callable[..., Any], *args: Any) -> None:
         """Invoke a callback after the caller established inline eligibility."""
         self._callback_active = True
         try:
-            self.run_sync_callback(callback, *args)
-        finally:
-            self._callback_active = False
+            try:
+                self.run_sync_callback(callback, *args)
+            finally:
+                self._callback_active = False
+        except _CallbackHandoff as handoff:
+            self._prepend_callback_job((handoff.callback, args, None))
+
+    def _prepend_callback_job(self, job: CallbackJob) -> None:
+        """Transfer unstarted inline work ahead of reentrant admissions.
+
+        Only the cold route-change path uses this operation. Queue.put_nowait
+        retains capacity, join and wakeup accounting. Rotating the just-added
+        item is synchronous, so no awakened getter can observe the old order.
+        The caller has released the inline reservation. Start an idle worker
+        before admission so an eager task factory parks on the empty queue,
+        rather than executing user code before its task ownership is installed.
+        """
+        # Derive logical capacity from the job, never from a second count that
+        # could disagree with the worker/discard path's release accounting.
+        count = len(job[1][0]) if job[2] is _CALLBACK_MESSAGE_BATCH else 1
+        if not 0 < count <= self._callback_batch_capacity(False):
+            raise RuntimeError("callback handoff exceeds its reserved capacity")
+        self.ensure_callback_worker()
+        self.callback_queue.put_nowait(job)
+        self.callback_queue._queue.rotate(1)  # type: ignore[attr-defined]
+        self._reserve_callback_batch(count)
 
     def has_callback_capacity(self, count: int = 1) -> bool:
         """Whether ``count`` callbacks can be admitted without suspending."""
@@ -992,7 +1043,11 @@ class ApplicationDelivery:
             return None
         if cls._is_async_callback(callback):
             return await callback(*args)
-        result = callback(*args)
+        try:
+            result = callback(*args)
+        except _CallbackHandoff as handoff:
+            # Already on the bounded worker: no new admission or queue hop.
+            return await handoff.callback(*args)
         if result is not None and inspect.isawaitable(result):
             raise cls._sync_awaitable_error(result)
         return result

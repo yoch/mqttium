@@ -57,8 +57,21 @@ loop's exception handler without silently changing protocol state.
 
 Matching `message_callback_add` filters run instead of `on_message`, in
 registration order. Shared-subscription filters match the filter string
-literally, as in Paho. Iterator-only delivery ignores callbacks, including
+literally, as in Paho. Each routed message resolves the live configuration when
+its dispatcher starts and keeps that message's matching callbacks across awaits.
+Later routed messages, including already queued messages, see updated filters
+and fallback. Eligible synchronous routes remain inline. If an inline burst's
+route becomes asynchronous, only its unstarted tail transfers to the bounded
+worker, ahead of work admitted reentrantly by the earlier callback. No callback
+prefix is replayed. Direct callbacks captured without a router keep their
+existing batch semantics. Iterator-only delivery ignores callbacks, including
 topic filters.
+
+When a callback disconnects and reconnects the client before returning, the
+current worker job finishes normally. Jobs still queued for the terminally
+closed connection are discarded before the replacement connection is reopened;
+its newly admitted callbacks use the existing worker and are not discarded by
+the previous shutdown request. Already-active batch semantics are unchanged.
 
 ## Loop confinement
 

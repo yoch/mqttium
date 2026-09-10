@@ -150,6 +150,16 @@ no longer implicitly handed to the callback worker; it is reported as a callback
 `TypeError`. Convert such callbacks to `async def`. This removes hidden scheduling
 state and makes callback execution mode explicit from the callable itself.
 
+### Topic-route reconfiguration
+
+Live topic-filter or fallback changes no longer cause a captured synchronous
+router to reject a newly registered `async def` callback. Synchronous routes
+retain their inline fast paths; there is no mandatory worker hop for stable
+filtered traffic. A route that becomes asynchronous hands off only work that has
+not started, with its existing delivery order and bounds. Matches are captured
+per message, not for the whole burst. No callback signature or setting changes,
+and user `def` callbacks returning awaitables are still rejected.
+
 ## Durable sessions
 
 ```python

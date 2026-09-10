@@ -6,6 +6,21 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- Keep replacement-connection callbacks alive when a callback disconnects and
+  reconnects before its own worker job returns (#455). Reopening retires the old
+  queued work and its reservations before admitting the new connection, without
+  replacing the active worker or changing steady-state callback dispatch.
+
+- Preserve delivery across live sync-to-async topic-callback reconfiguration
+  without disabling eligible synchronous inline dispatch (#453). A captured sync
+  router checks its current execution mode before invoking user callbacks. Only
+  unstarted work whose route became asynchronous transfers to the bounded worker,
+  retaining FIFO ahead of reentrant admissions and the callback queue bound.
+  Queued work redirects within its existing worker job. User synchronous callbacks
+  returning awaitables remain contract violations.
+
 ### Changed
 
 - Receive cleartext TCP straight into the decoder's own storage on CPython selector event loops. `asyncio.BufferedProtocol.get_buffer()` returns a window carved out of `IncrementalDecoder`'s own slab, so received bytes are no longer copied through an intermediate receive buffer before reaching the parser. Storage is adaptive: it starts at 16 KiB, the receive window starts at 64 KiB and is promoted toward 256 KiB only under sustained full windows, a known large frame caps progressive growth at its exact extent without reserving the entire announced body, and an enlarged slab is retired once large frames stop arriving. TLS, WebSocket, Proactor, non-CPython runtimes and third-party event loops keep the `read()` + `feed()` path.
