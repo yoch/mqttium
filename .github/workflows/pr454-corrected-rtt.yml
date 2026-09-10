@@ -1,228 +1,48 @@
-name: PR454 corrected-harness fixed-rate rerun
-run-name: "PR454 / corrected harness ef2382cf / RPi5 / 3942"
+name: Retire unstarted duplicate PR454 campaign
 on:
   push:
     branches: [work/pr454-corrected-rtt-20260910-a7c1]
 permissions:
   contents: read
-concurrency:
-  group: mqttium-arm64-runner
-  cancel-in-progress: false
+  actions: write
 jobs:
-  fixed-rate:
-    runs-on: [self-hosted, linux, ARM64]
-    timeout-minutes: 120
-    env:
-      PYTHONUNBUFFERED: '1'
-      PYTHONDONTWRITEBYTECODE: '1'
-      PIP_DISABLE_PIP_VERSION_CHECK: '1'
-    defaults:
-      run:
-        shell: bash
+  retire-duplicate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
-      - name: Create isolated run workspace
+      - name: Cancel only the verified unstarted duplicate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
-          set -euo pipefail
-          root=$(mktemp -d "$RUNNER_TEMP/pr454-corrected-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-XXXXXX")
-          mkdir -p "$root/evidence"
-          echo "JOB_ROOT=$root" >> "$GITHUB_ENV"
-          echo "RESULTS_DIR=$root/evidence" >> "$GITHUB_ENV"
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: 9ad1f01857306ac5079ffb1d073a59fdb60e1931
-          path: arm-a
-          persist-credentials: false
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: 9ad1f01857306ac5079ffb1d073a59fdb60e1931
-          path: arm-aa
-          persist-credentials: false
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: 636de564dc2c92822a8361050cc24e369fe027d4
-          path: arm-b
-          persist-credentials: false
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: yoch/mqtt-python-client-bench
-          ref: ef2382cf8ed20e5df4288102c1ae17e791a25d68
-          path: harness
-          persist-credentials: false
-          sparse-checkout-cone-mode: false
-          sparse-checkout: |
-            src
-            tests
-            hosts
-            mosquitto
-            README.md
-            pyproject.toml
-            LICENSE
-      - name: Verify runner and immutable sources
-        run: |
-          set -euo pipefail
-          test "$RUNNER_NAME" = rpi5
-          test "$(uname -m)" = aarch64
-          command -v python3
-          command -v mosquitto
-          command -v taskset
-          if pgrep -a -x mosquitto; then
-            echo 'Pre-existing broker: refuse a contaminated campaign; do not kill it.' >&2
-            exit 1
-          fi
           python3 - <<'PY'
-          import json, os, pathlib, subprocess
-          expected = {
-              'arm-a': ('9ad1f01857306ac5079ffb1d073a59fdb60e1931', '271fd75325f24852a298845f6a7ef005e684cb46'),
-              'arm-aa': ('9ad1f01857306ac5079ffb1d073a59fdb60e1931', '271fd75325f24852a298845f6a7ef005e684cb46'),
-              'arm-b': ('636de564dc2c92822a8361050cc24e369fe027d4', '7bac7c5fdfa7bd435d1e32cd48d8e178359300cd'),
-              'harness': ('ef2382cf8ed20e5df4288102c1ae17e791a25d68', 'e746db63c093bbb26ca90bca1df76e8cf5300b06'),
-          }
-          observed = {}
-          for name, (commit, tree) in expected.items():
-              def git(*args):
-                  return subprocess.check_output(['git', '-C', name, *args], text=True).strip()
-              row = {'commit': git('rev-parse', 'HEAD'), 'tree': git('rev-parse', 'HEAD^{tree}'),
-                     'tracked_dirty': git('status', '--porcelain', '--untracked-files=no'),
-                     'path': str(pathlib.Path(name).resolve())}
-              assert (row['commit'], row['tree'], row['tracked_dirty']) == (commit, tree, ''), row
-              observed[name] = row
-          out = pathlib.Path(os.environ['RESULTS_DIR'])
-          (out / 'sources-before.json').write_text(json.dumps(observed, indent=2))
+          import json, os, time, urllib.request
+          root = 'https://api.github.com/repos/yoch/mqttium'
+          target = root + '/actions/runs/34426065968'
+          def api(url, method='GET'):
+              request = urllib.request.Request(url, method=method,
+                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                           'Accept': 'application/vnd.github+json'},
+                  data=b'' if method == 'POST' else None)
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  data = response.read()
+                  return json.loads(data) if data else None
+          run = api(target)
+          assert run['head_sha'] == '61b8c19a04bc6822a74d37d9e5d057233e9f58f6', run['head_sha']
+          assert run['head_branch'] == 'work/pr454-corrected-rtt-20260910-a7c1', run['head_branch']
+          assert run['status'] in ('pending', 'queued', 'waiting', 'requested', 'completed'), run['status']
+          jobs = api(target + '/jobs?per_page=100')['jobs']
+          assert not any(j.get('started_at') for j in jobs), 'Duplicate already started; refuse automatic cancellation'
+          if run['status'] != 'completed':
+              api(target + '/cancel', 'POST')
+          for attempt in range(15):
+              run = api(target)
+              if run['status'] == 'completed':
+                  break
+              time.sleep(2)
+          assert run['status'] == 'completed' and run['conclusion'] == 'cancelled', run
+          print(json.dumps({'duplicate': run['id'], 'status': run['status'],
+                            'conclusion': run['conclusion'], 'active_campaign_untouched': 34425765949}))
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write('Cancelled unstarted duplicate 34426065968. Active corrected-harness campaign 34425765949 was not modified.\n')
           PY
-          { uname -a; lscpu; python3 -V; cat /proc/sys/kernel/randomize_va_space; } > "$RESULTS_DIR/machine-before.txt"
-          for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor /sys/class/thermal/thermal_zone*/temp; do
-            if test -r "$f"; then printf '%s=' "$f" >> "$RESULTS_DIR/machine-before.txt"; cat "$f" >> "$RESULTS_DIR/machine-before.txt"; fi
-          done
-          (mosquitto -h || true) > "$RESULTS_DIR/broker-version.txt" 2>&1
-          python3 -m venv "$JOB_ROOT/venv"
-          echo "$JOB_ROOT/venv/bin" >> "$GITHUB_PATH"
-      - name: Install isolated dependencies and test harness fixes
-        run: |
-          set -euo pipefail
-          python -m pip install -e 'harness[paho]' -e arm-b 'psutil>=6,<8'
-          python -m pip freeze > "$RESULTS_DIR/pip-freeze.txt"
-          (cd harness && PYTHONPATH=src python -W error -m unittest tests.test_rtt_cooperation tests.test_rtt_trace_reservations -v) > "$RESULTS_DIR/fix-tests.txt" 2>&1
-          cat "$RESULTS_DIR/fix-tests.txt"
-          python - <<'PY'
-          import json, os, pathlib
-          from mqtt_client_bench.harness import HARNESS_FINGERPRINT
-          from mqtt_client_bench.scenarios import SCENARIO_BY_NAME, expand_scenario
-          from mqtt_client_bench.telemetry import allocate_cpuset
-          from mqtt_client_bench.workloads import encode_header
-          point = expand_scenario(SCENARIO_BY_NAME['application_rtt_fixed_rate'], 'standard')[0]
-          assert point['protocol'] == 'MQTTv311' and point['qos_publish'] == point['qos_subscribe'] == 1, point
-          assert point['duration_s'] == 12 and point['warmup_s'] == 3 and point['drain_s'] == 6, point
-          assert len(encode_header(b'12345678', 1, 1, 1, 1)) == 40
-          sets = allocate_cpuset(['sut', 'broker', 'loadgen', 'orch'], profile='standard')
-          policy = {'baseline_sha': '9ad1f01857306ac5079ffb1d073a59fdb60e1931',
-                    'candidate_sha': '636de564dc2c92822a8361050cc24e369fe027d4',
-                    'harness_sha': 'ef2382cf8ed20e5df4288102c1ae17e791a25d68',
-                    'harness_fingerprint': HARNESS_FINGERPRINT,
-                    'target_rate': 3942, 'scenario': 'application_rtt_fixed_rate',
-                    'pacer': 'external', 'profile': 'standard', 'variant_index': 0,
-                    'actual_payload_bytes': 40, 'scenario_payload_label': point['payload'],
-                    'timings': {k: point[k] for k in ('duration_s', 'warmup_s', 'drain_s')},
-                    'phases': ['same-source-AA', 'baseline-candidate-AB'],
-                    'blocks_per_phase': 12, 'complementary_pair_units_per_phase': 6,
-                    'max_whole_block_stimulus_environment_retries': 1,
-                    'practical_margin_percent': 3, 'cpusets': sets,
-                    'estimator': 'unchanged frozen harness; nearest-rank blocks and complementary log-domain pairs',
-                    'tail_analysis': 'p50/p95/p99; retain distributions and all attempts; inspect A/A separately',
-                    'no_strace': True, 'no_runtime_patch': True, 'no_aslr_or_governor_change': True,
-                    'pool_historical_results': False, 'exit_zero_is_acceptance': False,
-                    'stop_rule': 'fixed 12+12 blocks; no outcome-driven campaign rerun or early stop',
-                    'scope': 're-run the unresolved fixed-rate gate, not the separate static-route micro/network suite'}
-          out = pathlib.Path(os.environ['RESULTS_DIR'])
-          (out / 'policy.json').write_text(json.dumps(policy, indent=2))
-          with open(os.environ['GITHUB_ENV'], 'a') as f:
-              f.write('BROKER_CPUSET=' + str(sets['broker']) + '\n')
-          PY
-      - name: Start only the owned low-latency broker
-        run: |
-          set -euo pipefail
-          cat > "$JOB_ROOT/broker.conf" <<'EOF'
-          listener 18893 127.0.0.1
-          allow_anonymous true
-          persistence false
-          set_tcp_nodelay true
-          max_inflight_messages 1000
-          max_queued_messages 100000
-          log_type error
-          EOF
-          cp "$JOB_ROOT/broker.conf" "$RESULTS_DIR/"
-          taskset -c "$BROKER_CPUSET" mosquitto -c "$JOB_ROOT/broker.conf" > "$RESULTS_DIR/broker.log" 2>&1 &
-          echo "$!" > "$JOB_ROOT/broker.pid"
-          python arm-a/tools/ci/wait_for_endpoints.py --tcp 127.0.0.1:18893
-          kill -0 "$(cat "$JOB_ROOT/broker.pid")"
-          sleep 15
-      - name: Same-source A/A - 12 alternating ABBA/BAAB blocks
-        run: |
-          set -euo pipefail
-          python -m mqtt_client_bench.version_compare \
-            --client mqttium --baseline-path arm-a --candidate-path arm-aa \
-            --scenario application_rtt_fixed_rate --variant-index 0 \
-            --target-rate 3942 --pacer-mode external --profile standard \
-            --broker 127.0.0.1:18893 --broker-pid "$(cat "$JOB_ROOT/broker.pid")" \
-            --blocks 12 --max-block-retries 1 \
-            --output "$RESULTS_DIR/fixed-rate-aa.json" 2>&1 | tee "$RESULTS_DIR/fixed-rate-aa.log"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        if: always()
-        with:
-          name: pr454-corrected-aa-${{ github.run_id }}
-          path: ${{ env.RESULTS_DIR }}/
-          retention-days: 30
-      - name: Baseline/candidate A/B - 12 alternating ABBA/BAAB blocks
-        run: |
-          set -euo pipefail
-          python -m mqtt_client_bench.version_compare \
-            --client mqttium --baseline-path arm-a --candidate-path arm-b \
-            --scenario application_rtt_fixed_rate --variant-index 0 \
-            --target-rate 3942 --pacer-mode external --profile standard \
-            --broker 127.0.0.1:18893 --broker-pid "$(cat "$JOB_ROOT/broker.pid")" \
-            --blocks 12 --max-block-retries 1 \
-            --output "$RESULTS_DIR/fixed-rate-ab.json" 2>&1 | tee "$RESULTS_DIR/fixed-rate-ab.log"
-      - name: Verify final source identity and stop owned broker
-        if: always()
-        run: |
-          set -euo pipefail
-          if test -f "$JOB_ROOT/broker.pid"; then
-            pid=$(cat "$JOB_ROOT/broker.pid")
-            if test -r "/proc/$pid/cmdline" && grep -Fzq -- "$JOB_ROOT/broker.conf" "/proc/$pid/cmdline"; then
-              kill "$pid" 2>/dev/null || true
-            fi
-          fi
-          python - <<'PY'
-          import json, os, pathlib, subprocess
-          out = pathlib.Path(os.environ['RESULTS_DIR'])
-          before_path = out / 'sources-before.json'
-          if before_path.exists():
-              before = json.loads(before_path.read_text())
-              after = {}
-              for name, old in before.items():
-                  def git(*args):
-                      return subprocess.check_output(['git', '-C', name, *args], text=True).strip()
-                  after[name] = {'commit': git('rev-parse', 'HEAD'), 'tree': git('rev-parse', 'HEAD^{tree}'),
-                                 'tracked_dirty': git('status', '--porcelain', '--untracked-files=no'),
-                                 'path': str(pathlib.Path(name).resolve())}
-              (out / 'sources-after.json').write_text(json.dumps(after, indent=2))
-              assert before == after, 'Sources changed during the experiment'
-          PY
-          { date -u; cat /proc/loadavg; } > "$RESULTS_DIR/machine-after.txt"
-          for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor /sys/class/thermal/thermal_zone*/temp; do
-            if test -r "$f"; then printf '%s=' "$f" >> "$RESULTS_DIR/machine-after.txt"; cat "$f" >> "$RESULTS_DIR/machine-after.txt"; fi
-          done
-          echo 'Fixed-rate experiment only. Job success is not a performance-acceptance verdict. Inspect A/A and A/B validity, tails, sample coverage and source identity. No merge or release.' >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        if: always()
-        with:
-          name: pr454-corrected-complete-${{ github.run_id }}
-          path: ${{ env.RESULTS_DIR }}/
-          retention-days: 30
-      - name: Remove isolated temporary workspace
-        if: always()
-        run: |
-          set -euo pipefail
-          case "${JOB_ROOT:-}" in
-            "$RUNNER_TEMP"/pr454-corrected-*) rm -rf -- "$JOB_ROOT" ;;
-            *) echo 'No owned temporary workspace to remove' ;;
-          esac
