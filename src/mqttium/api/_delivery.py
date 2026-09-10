@@ -25,6 +25,15 @@ from mqttium.types import Message
 MessageDelivery = Literal["auto", "iterator", "callback", "both"]
 
 
+class _MessageBatchCancelled(asyncio.CancelledError):
+    """Tell the effect owner which admitted prefix must never be retried."""
+
+    def __init__(self, count: int, original: asyncio.CancelledError) -> None:
+        super().__init__(*original.args)
+        self.count = count
+        self.original = original
+
+
 class _SharedDeliveryReservation:
     """One exact byte reservation shared by callback and iterator delivery."""
 
@@ -562,8 +571,11 @@ class ApplicationDelivery:
                         return False
                 elif not self._is_small_decoded(message, wire_size):
                     return False
-        if len(messages) == 1 and self.can_dispatch_callback_inline(callback):
-            self.dispatch_callback_inline(callback, messages[0])
+        if messages and self.can_dispatch_callback_inline(callback):
+            if len(messages) == 1:
+                self.dispatch_callback_inline(callback, messages[0])
+            else:
+                self._dispatch_sync_message_burst_inline(callback, messages)
             return True
         self._enqueue_message_batch(callback, messages, iterator_delivery=False)
         return True
@@ -572,6 +584,7 @@ class ApplicationDelivery:
         self,
         effects: deque[EngineEffect],
         callback: Callable[[Message], Any] | None,
+        allow_inline: bool = True,
     ) -> int:
         """Deliver a consecutive small-message effect prefix without suspending.
 
@@ -587,12 +600,21 @@ class ApplicationDelivery:
         if callback_delivery and len(effects) > 1:
             assert callback is not None
             capacity = self._callback_batch_capacity(iterator_delivery)
+            inline = (
+                allow_inline
+                and not iterator_delivery
+                and self.can_dispatch_callback_inline(callback)
+            )
+            # The running first callback needs no queue slot. Inspect one more
+            # eligible effect to detect a burst whose tail cannot all fit;
+            # that burst keeps bounded worker admission instead of running A
+            # ahead of an unreserved suffix.
+            scan_capacity = capacity + int(inline)
             messages: list[Message] = []
+            complete = True
             for effect in effects:
                 kind = effect.kind
-                if len(messages) >= capacity or (
-                    kind is not EffectKind.MESSAGE and kind is not EffectKind.DECODED_MESSAGE
-                ):
+                if kind is not EffectKind.MESSAGE and kind is not EffectKind.DECODED_MESSAGE:
                     break
                 message: Message = effect.data
                 property_wire_size = effect.decoded_property_wire_size
@@ -603,16 +625,24 @@ class ApplicationDelivery:
                 )
                 if effect.requires_delivery_mark or not small:
                     break
+                if len(messages) >= scan_capacity:
+                    complete = False
+                    break
                 messages.append(message)
-            if len(messages) > 1:
-                if (
-                    len(messages) == 2
-                    and not iterator_delivery
-                    and self.can_dispatch_callback_inline(callback)
-                ):
-                    self._dispatch_sync_message_pair_inline(callback, messages)
-                    return 2
-                self._enqueue_message_batch(callback, messages, iterator_delivery=iterator_delivery)
+            if len(messages) > 1 or (inline and messages and not complete):
+                if inline and complete:
+                    try:
+                        self._dispatch_sync_message_burst_inline(callback, messages)
+                    except asyncio.CancelledError as exc:
+                        raise _MessageBatchCancelled(len(messages), exc) from exc
+                else:
+                    if len(messages) > capacity:
+                        messages.pop()
+                    if not messages:
+                        return 0
+                    self._enqueue_message_batch(
+                        callback, messages, iterator_delivery=iterator_delivery
+                    )
                 return len(messages)
 
         # Bind the callback once instead of re-testing `callback_delivery` and
@@ -641,7 +671,11 @@ class ApplicationDelivery:
                 break
             if iterator_delivery and self.messages_queue.full():
                 break
-            dispatch_inline = cb is not None and self.can_dispatch_callback_inline(cb)
+            dispatch_inline = (
+                cb is not None
+                and (iterator_delivery or (allow_inline and applied == 0))
+                and self.can_dispatch_callback_inline(cb)
+            )
             if cb is not None and not dispatch_inline and self.callback_queue.full():
                 break
             if iterator_delivery:
@@ -652,7 +686,10 @@ class ApplicationDelivery:
                 # `_callback_active`; that nested work and any queued burst
                 # retain the bounded worker semantics.
                 if dispatch_inline:
-                    self.dispatch_callback_inline(cb, message)
+                    try:
+                        self.dispatch_callback_inline(cb, message)
+                    except asyncio.CancelledError as exc:
+                        raise _MessageBatchCancelled(applied + 1, exc) from exc
                 else:
                     if not callback_worker_ready:
                         self.ensure_callback_worker()
@@ -793,11 +830,24 @@ class ApplicationDelivery:
         return logical_bytes
 
     def ensure_callback_worker(self) -> None:
-        if self.callback_task is None or self.callback_task.done():
+        task = self.callback_task
+        if task is None or task.done():
+            if task is not None:
+                self._callback_worker_done(task)
             self._callback_stop = False
             self.callback_task = asyncio.create_task(
-                self._callback_worker(), name="mqttium-callback-worker"
+                self._callback_worker(defer_start=not self.callback_queue.empty()),
+                name="mqttium-callback-worker",
             )
+            self.callback_task.add_done_callback(self._callback_worker_done)
+
+    def _callback_worker_done(self, task: asyncio.Task[None]) -> None:
+        # A task cancelled before its coroutine starts never enters a finally
+        # block. Retire its queued ownership here as well as active-job cleanup
+        # in the worker. A delayed callback must not touch a replacement worker.
+        if self.callback_task is task:
+            self.callback_task = None
+            self._discard_callback_queue()
 
     def spawn_callback(self, callback: Callable[..., Any], *args: Any) -> None:
         self.ensure_callback_worker()
@@ -861,25 +911,31 @@ class ApplicationDelivery:
         self.dispatch_callback_inline(callback, *args)
         return True
 
-    def _dispatch_sync_message_pair_inline(
+    def _dispatch_sync_message_burst_inline(
         self,
         callback: Callable[[Message], Any],
         messages: list[Message],
     ) -> None:
-        """Run one eligible two-message synchronous burst inline.
+        """Pre-admit the tail, then run only the first synchronous delivery.
 
-        The second message remains reserved in the existing logical callback
-        bound while the first callback runs, so reentrant admissions queue
-        behind the pair without weakening ``max_pending_callbacks``.
+        Entry requires idle delivery and enough capacity for the whole tail.
+        Starting the idle worker BEFORE enqueue also makes eager task factories
+        safe: it blocks on the empty queue. No await occurs before this helper
+        returns, so the tail remains at the queue head, ahead of reentrant work.
         """
-        self._reserve_callback_batch(2)
-        self._callback_active = True
+        tail = messages[1:]
+        self._enqueue_message_batch(callback, tail, iterator_delivery=False)
         try:
-            self.run_sync_callback(callback, messages[0])
-            self.run_sync_callback(callback, messages[1])
-        finally:
-            self._callback_active = False
-            self._release_callback_batch(2)
+            self.dispatch_callback_inline(callback, messages[0])
+        except BaseException:
+            # Ordinary errors and self-raised CancelledError are isolated by
+            # run_sync_callback. A propagated interruption abandons only this
+            # unstarted tail, not any work admitted reentrantly behind it.
+            _callback, args, token = self.callback_queue.get_nowait()
+            assert token is _CALLBACK_MESSAGE_BATCH and args[0] is tail
+            self._release_callback_batch(len(tail))
+            self.callback_queue.task_done()
+            raise
 
     def dispatch_callback_inline(self, callback: Callable[..., Any], *args: Any) -> None:
         """Invoke a callback after the caller established inline eligibility."""
@@ -926,6 +982,7 @@ class ApplicationDelivery:
                 self.callback_queue.put(job),
                 timeout=self.delivery_timeout,
             )
+            self.ensure_callback_worker()
         except TimeoutError as exc:
             raise MessageDeliveryError(
                 f"Callback delivery queue remained full for {self.delivery_timeout:.3f}s"
@@ -954,37 +1011,48 @@ class ApplicationDelivery:
                 self.release_nowait(cast(AccountedDeliveryToken, token))
             self.callback_queue.task_done()
 
-    async def _callback_worker(self) -> None:
-        while not self._callback_stop:
-            callback, args, token = await self.callback_queue.get()
-            self._callback_active = True
-            try:
-                if token is _CALLBACK_MESSAGE_BATCH:
-                    messages = args[0]
-                    try:
-                        for message in messages:
-                            try:
-                                await self.invoke(callback, message)
-                            except asyncio.CancelledError as exc:
-                                self._propagate_callback_cancellation(callback, exc)
-                            except Exception as exc:
-                                self.report_callback_error(callback, exc)
-                    finally:
-                        self._release_callback_batch(len(messages))
-                else:
-                    try:
-                        await self.invoke(callback, *args)
-                    except asyncio.CancelledError as exc:
-                        self._propagate_callback_cancellation(callback, exc)
-                    except Exception as exc:
-                        self.report_callback_error(callback, exc)
-                    finally:
-                        if token is not None:
-                            self.release_nowait(cast(AccountedDeliveryToken, token))
-            finally:
-                self._callback_active = False
-                self.callback_queue.task_done()
-        self._discard_callback_queue()
+    async def _callback_worker(self, *, defer_start: bool = False) -> None:
+        # Only a replacement created with queued work needs this handoff.
+        # Ordinary workers start on an empty queue, including eager factories.
+        if defer_start:
+            await asyncio.sleep(0)
+        try:
+            while not self._callback_stop:
+                callback, args, token = await self.callback_queue.get()
+                self._callback_active = True
+                try:
+                    if token is _CALLBACK_MESSAGE_BATCH:
+                        messages = args[0]
+                        try:
+                            for message in messages:
+                                try:
+                                    await self.invoke(callback, message)
+                                except asyncio.CancelledError as exc:
+                                    self._propagate_callback_cancellation(callback, exc)
+                                except Exception as exc:
+                                    self.report_callback_error(callback, exc)
+                        finally:
+                            self._release_callback_batch(len(messages))
+                    else:
+                        try:
+                            await self.invoke(callback, *args)
+                        except asyncio.CancelledError as exc:
+                            self._propagate_callback_cancellation(callback, exc)
+                        except Exception as exc:
+                            self.report_callback_error(callback, exc)
+                        finally:
+                            if token is not None:
+                                self.release_nowait(cast(AccountedDeliveryToken, token))
+                finally:
+                    self._callback_active = False
+                    self.callback_queue.task_done()
+        finally:
+            # Retire before putters awakened by active-job cleanup can resume.
+            # A done callback alone runs too late and could discard their newly
+            # admitted work. It remains the fallback for pre-entry cancellation.
+            task = asyncio.current_task()
+            if task is not None:
+                self._callback_worker_done(task)
 
     @classmethod
     async def invoke(cls, callback: Callable[..., Any] | None, *args: Any) -> Any:
@@ -1032,5 +1100,8 @@ class ApplicationDelivery:
                 await task
             except asyncio.CancelledError:
                 pass
-        self.callback_task = None
-        self._discard_callback_queue()
+        # Another producer may already own a successor after the awaited task
+        # retired itself. This shutdown owns only the task captured above.
+        if self.callback_task is task:
+            self.callback_task = None
+            self._discard_callback_queue()

@@ -16,7 +16,7 @@ def _effect(i: int) -> EngineEffect:
     )
 
 
-async def test_idle_sync_pair_runs_inline_without_public_option() -> None:
+async def test_idle_sync_pair_runs_first_inline_without_public_option() -> None:
     client = AsyncClient(message_delivery="callback")
     seen: list[str] = []
     client.on_message = lambda message: seen.append(message.payload.decode())
@@ -26,9 +26,13 @@ async def test_idle_sync_pair_runs_inline_without_public_option() -> None:
     )
 
     assert applied == 2
+    assert seen == ["0"]
+    assert client._callback_worker_task is not None
+    assert client.stats().delivery.callback_queued == 1
+    await client._callback_queue.join()
     assert seen == ["0", "1"]
-    assert client._callback_worker_task is None
     assert client.stats().delivery.callback_queued == 0
+    await client._shutdown_callback_worker(drain=False)
 
 
 async def test_sync_pair_reserves_tail_and_keeps_reentrant_fifo() -> None:
@@ -51,7 +55,7 @@ async def test_sync_pair_reserves_tail_and_keeps_reentrant_fifo() -> None:
         )
         == 2
     )
-    assert seen == ["0", "1"]
+    assert seen == ["0"]
     assert client._callback_queue.maxsize == 2
     await client._callback_queue.join()
     assert seen == ["0", "1", "reentrant"]
@@ -79,10 +83,13 @@ async def test_sync_pair_keeps_captured_callback_for_tail() -> None:
         )
         == 2
     )
+    assert seen == ["old:0"]
+    await client._callback_queue.join()
     assert seen == ["old:0", "old:1"]
+    await client._shutdown_callback_worker(drain=False)
 
 
-async def test_larger_sync_burst_keeps_worker_fairness_path() -> None:
+async def test_larger_sync_burst_runs_only_first_inline() -> None:
     client = AsyncClient(message_delivery="callback")
     seen: list[str] = []
     client.on_message = lambda message: seen.append(message.payload.decode())
@@ -93,7 +100,7 @@ async def test_larger_sync_burst_keeps_worker_fairness_path() -> None:
         )
         == 3
     )
-    assert seen == []
+    assert seen == ["0"]
     await client._callback_queue.join()
     assert seen == ["0", "1", "2"]
     await client._shutdown_callback_worker(drain=False)
@@ -159,9 +166,12 @@ async def test_sync_pair_isolates_exception_and_continues() -> None:
         )
         == 2
     )
+    assert seen == ["0"]
+    await client._callback_queue.join()
     assert seen == ["0", "1"]
     assert len(errors) == 1
     assert isinstance(errors[0], RuntimeError)
+    await client._shutdown_callback_worker(drain=False)
 
 
 async def test_sync_returning_coroutine_is_rejected_inline_and_closed() -> None:
@@ -194,7 +204,8 @@ async def test_sync_returning_coroutine_is_rejected_inline_and_closed() -> None:
     assert len(errors) == 1
     assert isinstance(errors[0], TypeError)
     assert "async def" in str(errors[0])
-    assert client._callback_worker_task is None
+    assert client._callback_worker_task is not None
+    await client._shutdown_callback_worker(drain=False)
 
 
 async def test_sync_returning_coroutine_is_rejected_on_worker_too() -> None:
@@ -241,10 +252,13 @@ async def test_sync_returning_future_is_rejected_without_taking_ownership() -> N
         == 2
     )
 
+    assert len(errors) == 1
+    await client._callback_queue.join()
     assert len(errors) == 2
     assert all(isinstance(error, TypeError) for error in errors)
     assert not future.done()
     future.cancel()
+    await client._shutdown_callback_worker(drain=False)
 
 
 async def test_real_task_cancellation_restores_pair_bound() -> None:
@@ -277,4 +291,5 @@ async def test_real_task_cancellation_restores_pair_bound() -> None:
     assert seen == ["0"]
     assert client.stats().delivery.callback_queued == 0
     assert client._callback_queue.maxsize == 2
-    assert client._callback_worker_task is None
+    assert client._callback_worker_task is not None
+    await client._shutdown_callback_worker(drain=False)

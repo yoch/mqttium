@@ -44,7 +44,9 @@ class _Owner:
         del effect, epoch
         return False
 
-    def _apply_message_effect_batch_inline(self, effects: deque[EngineEffect], epoch: int) -> int:
+    def _apply_message_effect_batch_inline(
+        self, effects: deque[EngineEffect], epoch: int, allow_inline: bool = True
+    ) -> int:
         del effects, epoch
         return 0
 

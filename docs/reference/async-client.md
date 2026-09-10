@@ -49,11 +49,37 @@ as a callback `TypeError` rather than being scheduled implicitly. Synchronous
 callbacks must not block the event loop.
 
 Eligible idle `on_publish` and message callbacks may execute inline. For
-callback-only message delivery, an adjacent pair of small synchronous messages may
-run in the same effect-drain turn while retaining the hard
-`max_pending_callbacks` bound. Larger bursts, declared-async callbacks, and
-queued/reentrant delivery use the bounded worker. Callback failures go to the event
-loop's exception handler without silently changing protocol state.
+callback-only message delivery (including `auto` while a callback is installed),
+at most the first delivery of an eligible small-message burst runs inline. Its
+entire tail is first admitted to the existing bounded callback queue, preserving
+FIFO ahead of reentrant admissions and the hard `max_pending_callbacks` bound.
+If that tail cannot all fit, the burst keeps bounded worker admission. A single
+effect-drain invocation permits only its first eligible message prefix to use
+inline delivery. Declared-async and queued/reentrant deliveries use the worker;
+`iterator`, `both`, and publish-completion scheduling retain their existing rules.
+
+An ordinary callback exception or a callback-raised `CancelledError` without a
+pending task cancellation is reported to the event loop and does not discard the
+tail. A propagated task cancellation abandons only the unstarted tail of the same
+admission and releases its capacity. Calling `Task.cancel()` then returning
+normally is not an interruption of the synchronous callback. Since the first
+callback now runs on the reader/effect task rather than the worker for larger
+bursts, cancelling the current task there can terminate reception. Use `disconnect()` to request connection shutdown; use an `async def` callback
+when callback work needs its own worker context. MQTTium does not call
+`Task.uncancel()` or suppress real task cancellation to simulate another owner.
+The selected task is an implementation detail, not a callback-local cancellation
+scope.
+
+Cancelling the private callback worker retires its active and queued callback
+ownership, including queued jobs whose worker never started. It does not cancel
+the reader. Queue admission after retirement starts a new worker when needed.
+This is cleanup of an internal task, not a new public shutdown API.
+
+The inline budget counts message dispatches: all matching synchronous topic
+callbacks for one message remain a single dispatch in registration order, not a
+promise of at most one matching filter invocation. The per-message match snapshot
+is retained; later routed messages still resolve the then-current configuration.
+A directly captured `on_message` callable is retained for the whole admitted burst.
 
 Matching `message_callback_add` filters run instead of `on_message`, in
 registration order. Shared-subscription filters match the filter string

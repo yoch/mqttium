@@ -12,6 +12,7 @@ from collections import deque
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Protocol
 
+from mqttium.api._delivery import _MessageBatchCancelled
 from mqttium.api.stats import EffectStats
 from mqttium.protocol.effects import EffectKind, EngineEffect
 
@@ -31,7 +32,7 @@ class EffectOwner(Protocol):
     def _apply_effect_inline(self, effect: EngineEffect, epoch: int) -> bool: ...
 
     def _apply_message_effect_batch_inline(
-        self, effects: deque[EngineEffect], epoch: int
+        self, effects: deque[EngineEffect], epoch: int, allow_inline: bool = True
     ) -> int: ...
 
     async def _apply_effect(
@@ -179,8 +180,9 @@ class EffectPump:
 
     def _consume_batch(
         self,
-        apply: Callable[[deque[EngineEffect], int], int],
+        apply: Callable[[deque[EngineEffect], int, bool], int],
         epoch: int,
+        allow_inline: bool,
     ) -> bool:
         """Apply a consecutive non-persisted small-message prefix.
 
@@ -188,13 +190,29 @@ class EffectPump:
         which one is bound differs between the two kinds. One call per batch,
         not per message.
         """
-        applied = apply(self.pending, epoch)
+        cancelled: asyncio.CancelledError | None = None
+        try:
+            applied = apply(self.pending, epoch, allow_inline)
+        except _MessageBatchCancelled as exc:
+            # Admission already happened; A ran and its tail was discarded.
+            # Consume that prefix before propagating cancellation, otherwise
+            # a reentrant flush request can replay A and resurrect its tail.
+            applied = exc.count
+            cancelled = exc.original
         if not applied:
             return False
         for _ in range(applied):
             self.pending.popleft()
             self.inline_effects += 1
             self._complete()
+        if cancelled is not None:
+            if self.pending:
+                # Keep the unconsumed suffix owned even if this drain exits by
+                # cancellation. A scheduled owner sets flush_requested; an
+                # inline owner schedules a successor. Epoch checks still retire
+                # dead-connection work, and external shutdown is not retried.
+                self.schedule()
+            raise cancelled
         return True
 
     def drain_inline(self) -> None:
@@ -209,12 +227,16 @@ class EffectPump:
                 return
             epoch = self.pending_epoch
         self.draining_inline = True
+        allow_inline = True
         try:
             while self.pending:
                 effect = self.pending[0]
                 kind = effect.kind
                 if kind is EffectKind.MESSAGE or kind is EffectKind.DECODED_MESSAGE:
-                    if self._consume_batch(self.owner._apply_message_effect_batch_inline, epoch):
+                    if self._consume_batch(
+                        self.owner._apply_message_effect_batch_inline, epoch, allow_inline
+                    ):
+                        allow_inline = False
                         continue
                     break
                 if not self.owner._apply_effect_inline(effect, epoch):
@@ -237,7 +259,14 @@ class EffectPump:
         task.add_done_callback(self._done)
 
     async def _run_scheduled(self) -> None:  # noqa: C901
+        # Eager startup must suspend until schedule() registers this task.
+        # Otherwise cancellation can create an unowned successor while the
+        # first create_task() call is still on the stack. Ordinary task startup
+        # already has its identity, so this adds no scheduling hop there.
+        if self.draining_inline or self.task is None or self.task.done():
+            await asyncio.sleep(0)
         async with self.lock:
+            allow_inline = True
             while True:
                 self.flush_requested = False
                 while self.pending:
@@ -249,8 +278,9 @@ class EffectPump:
                     kind = effect.kind
                     if kind is EffectKind.MESSAGE or kind is EffectKind.DECODED_MESSAGE:
                         if self._consume_batch(
-                            self.owner._apply_message_effect_batch_inline, epoch
+                            self.owner._apply_message_effect_batch_inline, epoch, allow_inline
                         ):
+                            allow_inline = False
                             continue
                     try:
                         await self.owner._apply_effect(effect, nowait=False, epoch=epoch)

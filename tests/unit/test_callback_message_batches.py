@@ -26,7 +26,8 @@ async def test_message_callback_batch_is_one_physical_job_with_logical_stats() -
 
     assert applied == 4
     assert len(client._callback_queue._queue) == 1  # type: ignore[attr-defined]
-    assert client.stats().delivery.callback_queued == 4
+    assert seen == [b"0"]
+    assert client.stats().delivery.callback_queued == 3
     await client._callback_queue.join()
     assert seen == [b"0", b"1", b"2", b"3"]
     assert client.stats().delivery.callback_queued == 0
@@ -106,7 +107,7 @@ async def test_shutdown_releases_reserved_batch_capacity() -> None:
         )
         == 4
     )
-    assert client._callback_queue.maxsize == 5
+    assert client._callback_queue.maxsize == 6
 
     await client._shutdown_callback_worker(drain=False)
 
@@ -174,7 +175,8 @@ async def test_decoded_message_callbacks_batch_as_one_physical_job() -> None:
 
     assert applied == 4
     assert len(client._callback_queue._queue) == 1  # type: ignore[attr-defined]
-    assert client.stats().delivery.callback_queued == 4
+    assert seen == [b"0"]
+    assert client.stats().delivery.callback_queued == 3
     await client._callback_queue.join()
     assert seen == [b"0", b"1", b"2", b"3"]
     await client._shutdown_callback_worker(drain=False)

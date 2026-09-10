@@ -2060,17 +2060,22 @@ class AsyncClient:
                             effects.extend(kept)
                             self._engine.notify_transport_closed()
                             raise
-                        if captured:
-                            if self._delivery.deliver_callback_messages_inline(
-                                captured, self._message_callback, captured_property_sizes
-                            ):
-                                self._effect_pump.record_inline_batch(len(captured))
-                            else:
+                        if handled and self._engine.has_pending_effects:
+                            self._collect_effects_locked()
+                    # The store transaction and engine lock must both be closed
+                    # before invoking any captured user callback. No suspension
+                    # separates capture from this first admission attempt.
+                    if captured:
+                        if self._delivery.deliver_callback_messages_inline(
+                            captured, self._message_callback, captured_property_sizes
+                        ):
+                            self._effect_pump.record_inline_batch(len(captured))
+                        else:
+                            async with self._engine_lock:
                                 _extend_message_effects(
                                     self._engine._effects, captured, captured_property_sizes
                                 )
-                        if handled and self._engine.has_pending_effects:
-                            self._collect_effects_locked()
+                                self._collect_effects_locked()
                     if self._effect_pump.pending:
                         await self._drain_effects()
                     # A batch that stopped short of both bounds emptied the
@@ -2516,10 +2521,13 @@ class AsyncClient:
         self,
         effects: deque[EngineEffect],
         epoch: int,
+        allow_inline: bool = True,
     ) -> int:
         if epoch != self._connection_epoch or self._engine_lock.locked():
             return 0
-        return self._delivery.deliver_message_batch_inline(effects, self._message_callback)
+        return self._delivery.deliver_message_batch_inline(
+            effects, self._message_callback, allow_inline
+        )
 
     async def _flush_effects(self) -> None:
         async with self._engine_lock:
