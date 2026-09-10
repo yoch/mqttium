@@ -1,0 +1,61 @@
+diff --git a/src/mqttium/api/_delivery.py b/src/mqttium/api/_delivery.py
+--- a/src/mqttium/api/_delivery.py
++++ b/src/mqttium/api/_delivery.py
+@@ -640,6 +640,6 @@ class ApplicationDelivery:
+-        # Keep the queue/event objects stable. Slow admissions wait on the
+-        # controller-owned space event, so reset can wake every old producer;
+-        # the generation check rejects them before they enqueue stale work.
+-        self.message_ready.clear()
++        # Slow admissions wait on `space`, not Queue.put(), so reset may keep
++        # the established fresh queue/event boundary without stranding a putter.
++        self.messages_queue = _DeliveryQueue(maxsize=self.max_pending_messages)
++        self.message_ready = asyncio.Event()
+         self.closed.clear()
+         self.space.set()
+diff --git a/tests/unit/test_uniform_callbacks.py b/tests/unit/test_uniform_callbacks.py
+--- a/tests/unit/test_uniform_callbacks.py
++++ b/tests/unit/test_uniform_callbacks.py
+@@ -304,8 +304,9 @@ async def test_explicit_stream_reset_rejects_all_old_iterator_queue_waiters(scheduler):
+             and "retired generation" in str(exc)
+             for exc in results
+         )
+-        assert d.messages_queue is queue
+-        assert d.message_ready is ready
++        assert d.messages_queue is not queue
++        assert d.message_ready is not ready
++        assert queue.empty()
+         assert d.messages_queue.empty()
+ 
+         fresh = Message(topic="uniform/x", payload=b"fresh")
+@@ -320,6 +321,31 @@ async def test_explicit_stream_reset_rejects_all_old_iterator_queue_waiters(scheduler):
+         await finish(client)
+ 
+ 
++async def test_explicit_stream_reset_wakes_old_iterator_without_fresh_message(scheduler):
++    client = AsyncClient(message_delivery="iterator", max_pending_messages=1)
++    d = client._delivery
++    stream = client.messages()
++    waiting = asyncio.create_task(anext(stream))
++    try:
++        for _ in range(3):
++            await asyncio.sleep(0)
++        assert not waiting.done()
++
++        await client._reset_message_stream()
++
++        with pytest.raises(StopAsyncIteration):
++            await asyncio.wait_for(waiting, 1)
++        fresh = Message(topic="uniform/x", payload=b"fresh")
++        await d.accept(fresh, None)
++        assert await asyncio.wait_for(anext(client.messages()), 1) is fresh
++    finally:
++        if not waiting.done():
++            waiting.cancel()
++        await asyncio.gather(waiting, return_exceptions=True)
++        await stream.aclose()
++        await finish(client)
++
++
+ async def test_explicit_stream_reset_rejects_old_iterator_byte_waiter(scheduler):
+     client = AsyncClient(
+         message_delivery="iterator",
