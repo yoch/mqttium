@@ -1,0 +1,180 @@
+name: PR454 event-driven pacer qualification
+on:
+  push:
+    branches: [work/pr454-native-pacer-20260910]
+permissions:
+  contents: read
+concurrency:
+  group: mqttium-arm64-runner
+  cancel-in-progress: false
+jobs:
+  qualify:
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 50
+    env:
+      PYTHONUNBUFFERED: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+      PIP_DISABLE_PIP_VERSION_CHECK: '1'
+      BASE_SHA: 9ad1f01857306ac5079ffb1d073a59fdb60e1931
+      CANDIDATE_SHA: 636de564dc2c92822a8361050cc24e369fe027d4
+      HARNESS_SHA: 86fdc7cd78c0961204e4e1890f1ac0449ad04d2a
+    steps:
+      - name: Unique work and result directories
+        run: |
+          set -euo pipefail
+          test "$RUNNER_NAME" = rpi5
+          ROOT=$(mktemp -d "$RUNNER_TEMP/pr454-readiness-${GITHUB_RUN_ID}-XXXXXX")
+          echo "JOB_ROOT=$ROOT" >> "$GITHUB_ENV"
+          mkdir "$ROOT/out"
+          echo "OUT=$ROOT/out" >> "$GITHUB_ENV"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 9ad1f01857306ac5079ffb1d073a59fdb60e1931
+          persist-credentials: false
+          path: readiness-base
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 636de564dc2c92822a8361050cc24e369fe027d4
+          persist-credentials: false
+          path: readiness-candidate
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: yoch/mqtt-python-client-bench
+          ref: 86fdc7cd78c0961204e4e1890f1ac0449ad04d2a
+          persist-credentials: false
+          path: readiness-harness
+      - name: Freeze exact sources and policy
+        run: |
+          set -euo pipefail
+          test "$(git -C readiness-base rev-parse HEAD)" = "$BASE_SHA"
+          test "$(git -C readiness-candidate rev-parse HEAD)" = "$CANDIDATE_SHA"
+          test "$(git -C readiness-harness rev-parse HEAD)" = "$HARNESS_SHA"
+          test "$(git -C readiness-harness rev-parse HEAD^{tree})" = 297c754b5b9ebea961526bee7001577c85dbed24
+          cp -a readiness-base "$JOB_ROOT/slot-a"
+          cp -a readiness-base "$JOB_ROOT/slot-b"
+          python3 -m venv "$JOB_ROOT/venv"
+          echo "$JOB_ROOT/venv/bin" >> "$GITHUB_PATH"
+          uname -a > "$OUT/machine.txt"
+          lscpu >> "$OUT/machine.txt"
+          python3 -V >> "$OUT/machine.txt"
+          (mosquitto -h || true) > "$OUT/broker-version.txt" 2>&1
+          cat /proc/sys/kernel/randomize_va_space >> "$OUT/machine.txt"
+          for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor /sys/class/thermal/thermal_zone*/temp; do
+            if test -f "$f"; then printf '%s=' "$f" >> "$OUT/machine.txt"; cat "$f" >> "$OUT/machine.txt"; fi
+          done
+          printf '%s\n' 'One preregistered campaign. Fixed3942/s; external absolute calendar; real40byte RTT payload; MQTT3.1.1 QoS1; outstanding32; standard3s warmup/12s measure. Same paths throughout. AA4blocks then AB4blocks and reversed physical source placement AB4blocks. Existing full-block stimulus/environment retry<=1; every attempt retained. No result-based repeat or A/A subtraction. Primary+deadline RTT, release delay, CPU, faults and all offer/completion denominators. Margin3% descriptive bootstrap of complementary units, not messages. Old/new harness results never pooled. No merge.' > "$OUT/policy.txt"
+          printf 'base=%s\ncandidate=%s\nharness=%s\n' "$BASE_SHA" "$CANDIDATE_SHA" "$HARNESS_SHA" > "$OUT/sources.txt"
+      - name: Install and revalidate native admission on ARM64
+        run: |
+          set -euo pipefail
+          python -m pip install -e 'readiness-harness[paho]'
+          (cd readiness-harness; python -W error -m unittest tests.test_external_admission tests.test_rtt_cooperation tests.test_rtt_trace_reservations -v) > "$OUT/arm-tests.txt" 2>&1
+          cat "$OUT/arm-tests.txt"
+      - name: Start only this run's broker
+        run: |
+          set -euo pipefail
+          cat > "$JOB_ROOT/mosquitto.conf" <<'EOF'
+          listener 18896 127.0.0.1
+          allow_anonymous true
+          persistence false
+          set_tcp_nodelay true
+          max_inflight_messages 1000
+          max_queued_messages 100000
+          connection_messages false
+          log_type error
+          EOF
+          cp "$JOB_ROOT/mosquitto.conf" "$OUT/"
+          taskset -c 1 mosquitto -c "$JOB_ROOT/mosquitto.conf" > "$OUT/broker.log" 2>&1 &
+          echo $! > "$JOB_ROOT/broker.pid"
+          python readiness-base/tools/ci/wait_for_endpoints.py --tcp 127.0.0.1:18896
+          kill -0 "$(cat "$JOB_ROOT/broker.pid")"
+          python - <<'PY'
+          import json,os,pathlib
+          from mqtt_client_bench.telemetry import allocate_cpuset
+          sets=allocate_cpuset(['sut','broker','loadgen','orch'],profile='standard')
+          assert sets['broker']=='1', sets
+          p=pathlib.Path(os.environ['JOB_ROOT'])
+          pathlib.Path(os.environ['OUT'],'cpusets.json').write_text(json.dumps(sets,indent=2))
+          assert len(str(p/'slot-a'))==len(str(p/'slot-b'))
+          pathlib.Path(os.environ['OUT'],'paths.txt').write_text(str(p/'slot-a')+'\n'+str(p/'slot-b')+'\n')
+          PY
+      - name: Same-source AA, four balanced blocks
+        run: |
+          python -m mqtt_client_bench.version_compare --client mqttium \
+            --baseline-path "$JOB_ROOT/slot-a" --candidate-path "$JOB_ROOT/slot-b" \
+            --scenario application_rtt_fixed_rate --variant-index 0 --target-rate 3942 --pacer-mode external \
+            --broker 127.0.0.1:18896 --broker-pid "$(cat "$JOB_ROOT/broker.pid")" \
+            --blocks 4 --max-block-retries 1 --profile standard --output "$OUT/aa.json" > "$OUT/aa.log" 2>&1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: pr454-readiness-aa
+          path: ${{ env.OUT }}/
+          retention-days: 30
+      - name: AB first orientation, four balanced blocks
+        run: |
+          set -euo pipefail
+          rm -rf "$JOB_ROOT/slot-b"
+          cp -a readiness-candidate "$JOB_ROOT/slot-b"
+          test "$(git -C "$JOB_ROOT/slot-a" rev-parse HEAD)" = "$BASE_SHA"
+          test "$(git -C "$JOB_ROOT/slot-b" rev-parse HEAD)" = "$CANDIDATE_SHA"
+          python -m mqtt_client_bench.version_compare --client mqttium \
+            --baseline-path "$JOB_ROOT/slot-a" --candidate-path "$JOB_ROOT/slot-b" \
+            --scenario application_rtt_fixed_rate --variant-index 0 --target-rate 3942 --pacer-mode external \
+            --broker 127.0.0.1:18896 --broker-pid "$(cat "$JOB_ROOT/broker.pid")" \
+            --blocks 4 --max-block-retries 1 --profile standard --output "$OUT/ab-forward.json" > "$OUT/ab-forward.log" 2>&1
+      - name: AB physical source swap, four balanced blocks
+        run: |
+          set -euo pipefail
+          mv "$JOB_ROOT/slot-a" "$JOB_ROOT/slot-t"
+          mv "$JOB_ROOT/slot-b" "$JOB_ROOT/slot-a"
+          mv "$JOB_ROOT/slot-t" "$JOB_ROOT/slot-b"
+          test "$(git -C "$JOB_ROOT/slot-a" rev-parse HEAD)" = "$CANDIDATE_SHA"
+          test "$(git -C "$JOB_ROOT/slot-b" rev-parse HEAD)" = "$BASE_SHA"
+          python -m mqtt_client_bench.version_compare --client mqttium \
+            --baseline-path "$JOB_ROOT/slot-b" --candidate-path "$JOB_ROOT/slot-a" \
+            --scenario application_rtt_fixed_rate --variant-index 0 --target-rate 3942 --pacer-mode external \
+            --broker 127.0.0.1:18896 --broker-pid "$(cat "$JOB_ROOT/broker.pid")" \
+            --blocks 4 --max-block-retries 1 --profile standard --output "$OUT/ab-reverse.json" > "$OUT/ab-reverse.log" 2>&1
+      - name: Verify actual driver and preserve every measurement
+        run: |
+          python - <<'PY'
+          import json,os,pathlib
+          out=pathlib.Path(os.environ['OUT']); result={}
+          for name in ('aa','ab-forward','ab-reverse'):
+              d=json.loads((out/(name+'.json')).read_text())
+              rows=[]
+              for r in d['runs']:
+                  w=next(w for w in r['workers'] if w.get('role')=='rtt_initiator')
+                  assert w.get('external_admission',{}).get('driver')=='readiness_one_token'
+                  assert w.get('rtt_publish_path')=='native_async'
+                  rows.append({'block':r['logical_block'],'slot':r['block_slot'],'arm':r['ab_label'],
+                      'active':r.get('active_for_verdict'),'source':r['version_source'],
+                      'offered':w.get('offered'),'completed':w.get('completed_in_window'),
+                      'missed':w.get('missed_due_to_backpressure'),'timeouts':w.get('timeouts'),
+                      'latency':w.get('latency_summary'),'scheduled':w.get('scheduled_response_latency'),
+                      'admission_delay':w.get('scheduled_admission_delay'),'driver':w['external_admission']})
+              result[name]={'qualification':d['qualification'],'verdict':d['verdict'],'rows':rows}
+          (out/'readback.json').write_text(json.dumps(result,indent=2))
+          PY
+      - name: Final source identity and owned broker cleanup
+        if: always()
+        run: |
+          set -euo pipefail
+          if test -f "$JOB_ROOT/broker.pid"; then kill "$(cat "$JOB_ROOT/broker.pid")" 2>/dev/null || true; fi
+          for d in readiness-base readiness-candidate readiness-harness; do
+            git -C "$d" rev-parse HEAD > "$OUT/final-$d.txt"
+            git -C "$d" status --porcelain >> "$OUT/final-$d.txt"
+            test -z "$(git -C "$d" status --porcelain --untracked-files=no)"
+          done
+          cat /proc/sys/kernel/randomize_va_space > "$OUT/final-aslr.txt"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: pr454-readiness-complete
+          path: ${{ env.OUT }}/
+          retention-days: 30
+      - name: Remove run-specific temporary files
+        if: always()
+        run: |
+          if test -n "${JOB_ROOT:-}"; then rm -rf "$JOB_ROOT"; fi
