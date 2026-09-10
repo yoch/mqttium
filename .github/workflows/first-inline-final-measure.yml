@@ -1,5 +1,5 @@
-name: First-inline corrected runtime Pi qualification
-run-name: First-inline final b8a70b09 network qualification
+name: First-inline batch diagnostics only
+run-name: First-inline b8a70b09 batch counters (not timing evidence)
 on:
   push:
     branches: [bench/first-inline-final-b0440f5a]
@@ -9,26 +9,18 @@ permissions:
 concurrency:
   group: mqttium-arm64-runner
   cancel-in-progress: false
-env:
-  A_SHA: 9ad1f01857306ac5079ffb1d073a59fdb60e1931
-  B_SHA: b8a70b09a4202278d3c5811be2e7f6b375e716e2
-  H_SHA: ef2382cf8ed20e5df4288102c1ae17e791a25d68
-  PYTHONUNBUFFERED: '1'
-  PIP_DISABLE_PIP_VERSION_CHECK: '1'
 jobs:
-  measure:
+  diagnose:
     if: github.repository == 'yoch/mqttium' && github.ref == 'refs/heads/bench/first-inline-final-b0440f5a'
     runs-on: [self-hosted, linux, ARM64]
-    timeout-minutes: 50
+    timeout-minutes: 12
     steps:
-      - name: Isolated run paths and prerequisites
-        shell: bash
+      - name: Isolated prerequisites
         run: |
           set -euo pipefail
           test "$(uname -m)" = aarch64
-          for cmd in python3 mosquitto git taskset; do command -v "$cmd"; done
-          if pgrep -x mosquitto; then echo 'Refusing to interfere with an existing broker'; exit 1; fi
-          echo "JOB_ROOT=$RUNNER_TEMP/first-inline-final-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+          if pgrep -x mosquitto; then echo 'Existing broker: refusing interference'; exit 1; fi
+          echo "JOB_ROOT=$RUNNER_TEMP/first-inline-diag-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ github.sha }}
@@ -36,177 +28,109 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ env.A_SHA }}
+          ref: 9ad1f01857306ac5079ffb1d073a59fdb60e1931
           path: arm-a
           persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ env.A_SHA }}
-          path: arm-c
-          persist-credentials: false
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ env.B_SHA }}
+          ref: b8a70b09a4202278d3c5811be2e7f6b375e716e2
           path: arm-b
           persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: yoch/mqtt-python-client-bench
-          ref: ${{ env.H_SHA }}
+          ref: ef2382cf8ed20e5df4288102c1ae17e791a25d68
           path: harness
           persist-credentials: false
-      - name: Freeze provenance and install isolated dependencies
-        shell: bash
+      - name: Install explicit diagnostic hook in private environment
         run: |
           set -euo pipefail
           mkdir -p "$JOB_ROOT/results"
-          python3 - <<'PY' > "$JOB_ROOT/results/provenance.json"
-          import hashlib,json,os,platform,subprocess
-          from pathlib import Path
-          def git(root,*args):return subprocess.check_output(['git','-C',root,*args],text=True).strip()
-          sources={}
-          for name,sha in [('arm-a',os.environ['A_SHA']),('arm-c',os.environ['A_SHA']),('arm-b',os.environ['B_SHA']),('harness',os.environ['H_SHA']),('measure-tools',os.environ['GITHUB_SHA'])]:
-              assert git(name,'rev-parse','HEAD')==sha
-              assert not git(name,'status','--porcelain','--untracked-files=no')
-              sources[name]={'sha':sha,'tree':git(name,'rev-parse','HEAD^{tree}'),'src_tree':git(name,'rev-parse','HEAD:src')}
-          for name in ['arm-a','arm-b','arm-c']:
-              sources[name]['runtime']={p:hashlib.sha256((Path(name)/p).read_bytes()).hexdigest() for p in ['src/mqttium/api/'+f for f in ['_delivery.py','_effects.py','async_client.py']]}
-          governors={str(p):p.read_text().strip() for p in Path('/sys/devices/system/cpu').glob('cpu*/cpufreq/scaling_governor')}
-          assert governors and set(governors.values())=={'performance'},governors
-          print(json.dumps({'sources':sources,'python':platform.python_version(),'machine':platform.machine(),'kernel':platform.release(),'governors':governors,'temperature_start':{str(p):p.read_text().strip() for p in Path('/sys/class/thermal').glob('thermal_zone*/temp')},'cpu_affinity':{'sut':0,'broker':1,'loadgen':2,'orchestrator':3},'reference':{'profile':'standard','rate':3942,'blocks_each_phase':8,'max_block_retries':0},'micro':{'pairs_each_phase':12,'batches':4000,'warmup':200},'broker_bursts':{'pairs_each_phase':8,'batches':500,'warmup':100,'payload_bytes':64},'diagnostics':'separate, never used as timing evidence'},indent=2))
-          PY
-          cat "$JOB_ROOT/results/provenance.json"
           python3 -m venv --system-site-packages "$JOB_ROOT/venv"
-          "$JOB_ROOT/venv/bin/python" -m pip install -e './arm-b[dev]' 'psutil>=6,<8' 'paho-mqtt==2.1.0'
-          "$JOB_ROOT/venv/bin/python" -m pip freeze > "$JOB_ROOT/results/dependencies.txt"
-          cp measure-tools/.github/first-inline-measure/probe.py "$JOB_ROOT/results/"
-          cp measure-tools/.github/first-inline-measure/sitecustomize.py "$JOB_ROOT/results/diagnostic-hook.py"
-      - name: Recheck focused correctness before measurement
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd arm-b
-          "$JOB_ROOT/venv/bin/python" -m pytest -q tests/unit/test_first_inline_bursts.py tests/unit/test_first_inline_ownership.py tests/unit/test_effect_eager_ownership.py -W error | tee "$JOB_ROOT/results/focused-tests.log"
-      - name: Run reference A/A then A/B and fixed-work controls
-        shell: bash
-        run: |
-          set -euo pipefail
-          out="$JOB_ROOT/results"
           py="$JOB_ROOT/venv/bin/python"
+          "$py" -m pip install --no-deps ./arm-b
+          "$py" -m pip install 'psutil>=6,<8' 'paho-mqtt==2.1.0'
+          export DIAG_HOOK="$PWD/measure-tools/.github/first-inline-measure/sitecustomize.py"
+          "$py" - <<'PY'
+          import json, os, sys, sysconfig
+          from pathlib import Path
+          root=Path(os.environ['JOB_ROOT'])
+          origin=getattr(sys.modules.get('sitecustomize'),'__file__',None)
+          (root/'results/hook-environment.json').write_text(json.dumps({'python':sys.version,'sitecustomize_origin':origin,'sys_path':sys.path,'purelib':sysconfig.get_paths()['purelib']},indent=2)+'\n')
+          code='import sys, runpy; not getattr(sys, "_mqttium_diag_installed", False) and runpy.run_path('+repr(os.environ['DIAG_HOOK'])+', run_name="mqttium_batch_diagnostic"); sys._mqttium_diag_installed = True\n'
+          (Path(sysconfig.get_paths()['purelib'])/'mqttium_batch_diagnostic.pth').write_text(code)
+          PY
+          export MQTTIUM_BATCH_DIAG="$JOB_ROOT/results/hook-probe"
+          "$py" - <<'PY'
+          import sys
+          from mqttium.api import AsyncClient
+          assert getattr(sys,'_mqttium_diag_installed',False)
+          c=AsyncClient(message_delivery='callback')
+          c._delivery.deliver_callback_messages_inline([],None)
+          PY
+          "$py" - <<'PY'
+          import json,os
+          from pathlib import Path
+          files=list((Path(os.environ['JOB_ROOT'])/'results/hook-probe').glob('*.json'))
+          assert files and any(json.loads(p.read_text())['counts'] for p in files), 'hook produced no counters'
+          PY
+      - name: Collect only separate diagnostic counters
+        run: |
+          set -euo pipefail
+          py="$JOB_ROOT/venv/bin/python"
+          out="$JOB_ROOT/results"
           probe="$PWD/measure-tools/.github/first-inline-measure/probe.py"
           port="$($py -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
-          cat > "$out/mosquitto.conf" <<EOF
-          listener $port 127.0.0.1
-          protocol mqtt
-          set_tcp_nodelay true
-          allow_anonymous true
-          persistence false
-          connection_messages false
-          log_dest stdout
-          log_type error
-          max_inflight_messages 1000
-          max_queued_messages 10000
-          max_packet_size 16777216
-          EOF
-          (mosquitto -h || true) > "$out/mosquitto-version.txt" 2>&1
+          printf 'listener %s 127.0.0.1\nset_tcp_nodelay true\nallow_anonymous true\npersistence false\nconnection_messages false\nlog_type error\nmax_inflight_messages 1000\nmax_queued_messages 10000\n' "$port" > "$out/mosquitto.conf"
           taskset -c 1 mosquitto -c "$out/mosquitto.conf" > "$out/mosquitto.log" 2>&1 &
-          broker_pid=$!
-          cleanup() { kill "$broker_pid" 2>/dev/null || true; wait "$broker_pid" 2>/dev/null || true; }
+          pid=$!
+          cleanup() { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; }
           trap cleanup EXIT
           trap 'exit 130' INT
           trap 'exit 143' TERM
           for _ in $(seq 1 50); do
-            kill -0 "$broker_pid"
+            kill -0 "$pid"
             if (echo > "/dev/tcp/127.0.0.1/$port") >/dev/null 2>&1; then break; fi
             sleep 0.1
           done
           (echo > "/dev/tcp/127.0.0.1/$port") >/dev/null 2>&1
           export PYTHONPATH="$PWD/harness/src"
-          for arm in a b; do
-            "$py" "$probe" --worker "$PWD/arm-$arm" --kind network --port "$port" --batches 20 --warmup 5 > "$out/probe-sanity-$arm.json"
-          done
-          # Collect A/B even if A/A is noisy, but then use it descriptively only.
-          # No latency-based retries, omitted runs, or noise subtraction.
-          overall=0
-          for phase in aa ab; do
-            other=arm-c
-            [ "$phase" = ab ] && other=arm-b
-            set +e
-            "$py" -m mqtt_client_bench.layout_runner --worker-aslr system --entrypoint version_compare -- \
-              --client mqttium --baseline-path arm-a --candidate-path "$other" \
-              --scenario application_rtt_fixed_rate --variant-index 0 --target-rate 3942 \
-              --pacer-mode external --blocks 8 --max-block-retries 0 --profile standard \
-              --broker "127.0.0.1:$port" --broker-pid "$broker_pid" --output "$out/$phase.json" \
-              2>&1 | tee "$out/$phase.log"
-            rc=${PIPESTATUS[0]}
-            set -e
-            echo "$rc" > "$out/$phase.exitcode"
-            [ "$rc" -eq 0 ] || overall=1
-            test -s "$out/$phase.json"
-          done
-          "$py" - <<'PY' > "$out/aa-quality.json"
-          import json,os
-          from pathlib import Path
-          from mqtt_client_bench.quality import classify_aa_quality
-          r=json.loads((Path(os.environ['JOB_ROOT'])/'results/aa.json').read_text())
-          runs=[dict(x,slot=x['logical_slot']) for x in r['runs'] if x.get('active_for_verdict',True)]
-          doc=dict(r,points=[{'runs':runs,'verdict':r['verdict']}])
-          print(json.dumps(classify_aa_quality(doc),indent=2))
-          PY
-          "$py" "$probe" --base "$PWD/arm-a" --candidate "$PWD/arm-b" --output "$out/micro" \
-            --kind micro --pairs 12 --batches 4000 --warmup 200 | tee "$out/micro.log"
-          "$py" "$probe" --base "$PWD/arm-a" --candidate "$PWD/arm-b" --output "$out/network" \
-            --kind network --port "$port" --pairs 8 --batches 500 --warmup 100 | tee "$out/network.log"
-          # Instrument only separate diagnostic processes, after ALL timings.
-          site="$($py -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')/sitecustomize.py"
-          test ! -e "$site"
-          cp measure-tools/.github/first-inline-measure/sitecustomize.py "$site"
-          export MQTTIUM_BATCH_DIAG="$out/batch-diagnostic"
-          set +e
+          export MQTTIUM_BATCH_DIAG="$out/reference-counts"
           "$py" -m mqtt_client_bench.layout_runner --worker-aslr system --entrypoint version_compare -- \
             --client mqttium --baseline-path arm-a --candidate-path arm-b \
             --scenario application_rtt_fixed_rate --variant-index 0 --target-rate 3942 \
             --pacer-mode external --blocks 2 --max-block-retries 0 --profile smoke \
-            --broker "127.0.0.1:$port" --broker-pid "$broker_pid" --output "$out/diagnostic.json" \
-            > "$out/diagnostic.log" 2>&1
-          rc=$?
-          set -e
-          echo "$rc" > "$out/diagnostic.exitcode"
+            --broker "127.0.0.1:$port" --broker-pid "$pid" --output "$out/diagnostic-not-timing.json" > "$out/reference.log" 2>&1
+          export MQTTIUM_BATCH_DIAG="$out/fixed-counts"
           for arm in a b; do
-            "$py" "$probe" --worker "$PWD/arm-$arm" --kind network --port "$port" --batches 100 --warmup 20 > "$out/probe-diagnostic-$arm.json"
+            "$py" "$probe" --worker "$PWD/arm-$arm" --kind network --port "$port" --batches 100 --warmup 20 > "$out/fixed-diagnostic-$arm.json"
           done
-          rm "$site"
-          unset MQTTIUM_BATCH_DIAG
-          echo "$overall" > "$out/reference-overall.exitcode"
-      - name: Verify sources did not change
-        if: always() && env.JOB_ROOT != ''
-        shell: bash
-        run: |
-          python3 - <<'PY'
+          "$py" - <<'PY'
           import hashlib,json,os,subprocess
           from pathlib import Path
           out=Path(os.environ['JOB_ROOT'])/'results'
-          if not (out/'provenance.json').exists():raise SystemExit('No initial provenance')
-          p=json.loads((out/'provenance.json').read_text())
-          for root,r in p['sources'].items():
+          for name in ['reference-counts','fixed-counts']:
+              docs=[json.loads(p.read_text()) for p in (out/name).glob('*.json')]
+              assert docs and any(d['counts'] for d in docs),name
+              for arm in ['arm-a','arm-b']:
+                  assert any(d['counts'] and any('/'+arm+'/' in origin for origin in d['origins']) for d in docs),(name,arm)
+          sources={}
+          for root,expected in [('arm-a','9ad1f01857306ac5079ffb1d073a59fdb60e1931'),('arm-b','b8a70b09a4202278d3c5811be2e7f6b375e716e2'),('harness','ef2382cf8ed20e5df4288102c1ae17e791a25d68')]:
               def git(*args):return subprocess.check_output(['git','-C',root,*args],text=True).strip()
-              assert git('rev-parse','HEAD')==r['sha']
-              assert git('rev-parse','HEAD:src')==r['src_tree']
-              assert not git('status','--porcelain','--untracked-files=no'),root
-              for path,h in r.get('runtime',{}).items():assert hashlib.sha256((Path(root)/path).read_bytes()).hexdigest()==h
-          (out/'source-verification.json').write_text(json.dumps({'unchanged':True,'sources':p['sources']},indent=2)+'\n')
+              assert git('rev-parse','HEAD')==expected
+              assert not git('status','--porcelain','--untracked-files=no')
+              sources[root]={'sha':expected,'src_tree':git('rev-parse','HEAD:src')}
+          (out/'verification.json').write_text(json.dumps({'diagnostic_only':True,'timings_must_not_be_used':True,'sources':sources,'tooling_sha':os.environ['GITHUB_SHA']},indent=2)+'\n')
           PY
-      - name: Retain every sample and diagnostic
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always() && env.JOB_ROOT != ''
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: first-inline-final-${{ github.run_id }}
+          name: first-inline-batch-diagnostic-${{ github.run_id }}
           path: ${{ env.JOB_ROOT }}/results/
-          if-no-files-found: warn
           retention-days: 30
+          if-no-files-found: warn
       - name: Clean this run only
         if: always() && env.JOB_ROOT != ''
-        shell: bash
         run: |
-          test "$JOB_ROOT" = "$RUNNER_TEMP/first-inline-final-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          test "$JOB_ROOT" = "$RUNNER_TEMP/first-inline-diag-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           rm -rf -- "$JOB_ROOT"
