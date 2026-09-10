@@ -5,7 +5,10 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 
+import pytest
+
 from mqttium.api import AsyncClient
+from mqttium.errors import MessageDeliveryError
 from mqttium.protocol.effects import EffectKind, EngineEffect
 from mqttium.types import Message
 
@@ -107,4 +110,22 @@ async def test_direct_qos0_starts_worker_and_disables_later_effect_inline() -> N
     await asyncio.wait_for(client._callback_queue.join(), 1)
     assert seen == [b"qos0", b"qos1"]
     assert client._callback_worker_task is worker
+    await stop(client)
+
+
+@pytest.mark.parametrize("state", ["draining", "closed"])
+async def test_non_open_callback_state_never_falls_back_to_inline(state: str) -> None:
+    client = AsyncClient(message_delivery="callback")
+    seen: list[bytes] = []
+
+    def callback(message: Message) -> None:
+        seen.append(message.payload)
+
+    client._delivery._callback_state = state
+    effects = deque([effect(b"late")])
+    with pytest.raises(MessageDeliveryError, match="Callback delivery is closing"):
+        client._delivery.deliver_message_batch_inline(effects, callback)
+    assert seen == []
+    assert client._callback_worker_task is None
+    client._delivery._callback_state = "open"
     await stop(client)
