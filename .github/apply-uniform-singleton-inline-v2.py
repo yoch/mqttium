@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Apply the no-helper singleton-message-run inline ablation to exact fd37."""
+"""Apply the narrow singleton-message-run inline ablation to exact fd37."""
 
 from __future__ import annotations
 
@@ -15,10 +15,16 @@ if actual != EXPECTED_SHA256:
     raise SystemExit(f"unexpected _delivery.py source: {actual}")
 
 text = path.read_text()
-anchor = """        cb = callback if callback_delivery else None\n        capacity = len(effects)\n"""
-replacement = """        cb = callback if callback_delivery else None\n\n        # Keep the ordinary worker path below unchanged. Only an idle sync\n        # callback at the head of a one-message eligible run may avoid the\n        # queue hop; async, reentrant, `both`, and consecutive message bursts\n        # retain the uniform bounded worker.\n        if (\n            cb is not None\n            and not iterator_delivery\n            and effects\n            and self.can_dispatch_callback_inline(cb)\n        ):\n            first = effects[0]\n            if first.kind in (EffectKind.MESSAGE, EffectKind.DECODED_MESSAGE):\n                first_message: Message = first.data\n                first_size = first.decoded_property_wire_size\n                first_small = (\n                    self._is_small(first_message)\n                    if first_size is None\n                    else self._is_small_decoded(first_message, first_size)\n                )\n                if not first.requires_delivery_mark and first_small:\n                    second_eligible_message = False\n                    if len(effects) > 1:\n                        second = effects[1]\n                        if second.kind in (EffectKind.MESSAGE, EffectKind.DECODED_MESSAGE):\n                            second_message: Message = second.data\n                            second_size = second.decoded_property_wire_size\n                            second_small = (\n                                self._is_small(second_message)\n                                if second_size is None\n                                else self._is_small_decoded(second_message, second_size)\n                            )\n                            second_eligible_message = (\n                                not second.requires_delivery_mark and second_small\n                            )\n                    if not second_eligible_message:\n                        self.dispatch_callback_inline(cb, first_message)\n                        return 1\n\n        capacity = len(effects)\n"""
-if text.count(anchor) != 1:
+method_anchor = """    def deliver_message_batch_inline(\n        self,\n        effects: deque[EngineEffect],\n"""
+method_replacement = """    def _inline_message_candidate(self, effect: EngineEffect) -> Message | None:\n        \"\"\"Return one cheap, non-persisted message eligible for inline dispatch.\"\"\"\n        if effect.kind not in (EffectKind.MESSAGE, EffectKind.DECODED_MESSAGE):\n            return None\n        message: Message = effect.data\n        size = effect.decoded_property_wire_size\n        if effect.requires_delivery_mark or not (\n            self._is_small(message) if size is None else self._is_small_decoded(message, size)\n        ):\n            return None\n        return message\n\n    def deliver_message_batch_inline(\n        self,\n        effects: deque[EngineEffect],\n"""
+if text.count(method_anchor) != 1:
+    raise SystemExit("helper insertion anchor did not match exactly once")
+text = text.replace(method_anchor, method_replacement)
+
+body_anchor = """        cb = callback if callback_delivery else None\n        capacity = len(effects)\n"""
+body_replacement = """        cb = callback if callback_delivery else None\n\n        # Keep the ordinary worker loop below unchanged. Only the head of a\n        # one-message eligible run may avoid the queue hop.\n        if (\n            cb is not None\n            and not iterator_delivery\n            and effects\n            and self.can_dispatch_callback_inline(cb)\n        ):\n            first = self._inline_message_candidate(effects[0])\n            if first is not None and (\n                len(effects) == 1 or self._inline_message_candidate(effects[1]) is None\n            ):\n                self.dispatch_callback_inline(cb, first)\n                return 1\n\n        capacity = len(effects)\n"""
+if text.count(body_anchor) != 1:
     raise SystemExit("singleton inline insertion anchor did not match exactly once")
-text = text.replace(anchor, replacement)
+text = text.replace(body_anchor, body_replacement)
 path.write_text(text)
 print(hashlib.sha256(path.read_bytes()).hexdigest())
