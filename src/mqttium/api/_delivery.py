@@ -104,6 +104,43 @@ class ApplicationDelivery:
         if self.waiters:
             self.space.set()
 
+    def try_accept(
+        self,
+        message: Message,
+        callback: Callable[[Message], Any] | None,
+        property_wire_size: int | None = None,
+        *,
+        size: int | None = None,
+    ) -> bool:
+        """Transfer one message to its bounded destination without suspending."""
+        if self.mode == "callback" and callback is None:
+            return True
+        if size is None:
+            size = self.logical_size(message, property_wire_size)
+        limit = self.max_pending_delivery_bytes
+        if limit is not None and size > limit:
+            raise MessageDeliveryError(
+                f"Message requires {size} delivery bytes, exceeding limit {limit}"
+            )
+        queue = self.messages_queue if self.mode == "iterator" else self.callback_queue
+        if queue.full() or (limit is not None and self.pending_bytes + size > limit):
+            return False
+        if self.mode == "callback":
+            self.ensure_callback_worker()
+        self.pending_bytes += size
+        self.pending_high_water_bytes = max(self.pending_high_water_bytes, self.pending_bytes)
+        try:
+            if self.mode == "iterator":
+                self.messages_queue.put_nowait((message, size))
+                self.message_ready.set()
+            else:
+                assert callback is not None
+                self.callback_queue.put_nowait((callback, (message,), size))
+        except BaseException:
+            self.release(size)
+            raise
+        return True
+
     async def accept(
         self,
         message: Message,
@@ -113,6 +150,8 @@ class ApplicationDelivery:
         if self.mode == "callback" and callback is None:
             return
         size = self.logical_size(message, property_wire_size)
+        if self.try_accept(message, callback, size=size):
+            return
         reserved = False
         try:
             async with asyncio.timeout(self.delivery_timeout):
