@@ -226,7 +226,11 @@ Store transitions accept both expected and new states. A mismatch is a protocol
 or concurrency error, not a request to overwrite newer state.
 
 SQLite schema 5 accepts only fresh databases and that exact format. Historical,
-future and inconsistent schemas are refused before write-affecting operations. Metadata-only acknowledgement must not read payload BLOBs.
+future and inconsistent schemas are refused without changing committed schema or
+data. Validation uses one SQLite read transaction, ends it before journal setup,
+and revalidates a fresh database under its creation write lock. Normal recovery
+and checkpointing may change physical files. Metadata-only acknowledgement must
+not read payload BLOBs.
 
 Paged replay preserves insertion order without duplicates or resurrection. A
 page may be shorter when records were acknowledged after the ordered snapshot;

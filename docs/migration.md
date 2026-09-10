@@ -92,8 +92,9 @@ See the [cookbook](cookbook.md) for that pattern.
 Use a new database path. This experiment writes **schema 5** and can reopen its
 own databases. Historical schemas 0–4 containing data, future versions and
 inconsistent schemas are explicitly refused. Validation precedes write-affecting
-pragmas, so refusal leaves historical databases unchanged. There is no migration
-or silent reset.
+pragmas. Refusal preserves committed schema and data; SQLite may still recover,
+checkpoint, or coordinate its main database and journal files. File-byte identity
+is not promised. There is no migration or silent reset.
 
 The measured payload-last layout, lazy transactions, metadata transitions and
 paged replay remain. Logical record sizes are persisted at initial admission;

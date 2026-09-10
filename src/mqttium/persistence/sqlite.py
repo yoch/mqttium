@@ -16,8 +16,6 @@ import base64
 import binascii
 import json
 import sqlite3
-import shutil
-import tempfile
 import threading
 from array import array
 from collections.abc import Callable, Iterator, Sequence, Mapping
@@ -246,10 +244,6 @@ class SqliteInflightStore:
 
     def __init__(self, path: str | Path) -> None:
         self._path = Path(path)
-        # Read-only validation comes before WAL or creation; rejected databases
-        # retain their format and contents even when journal mode was DELETE.
-        if self._path.exists() and self._path.stat().st_size:
-            self._probe_schema(self._path)
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._batch_depth = 0
@@ -263,9 +257,6 @@ class SqliteInflightStore:
         self._conn.row_factory = sqlite3.Row
         self._closed = False
         try:
-            self._validate_schema(self._conn)
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA synchronous=NORMAL")
             self._prepare_schema()
             self._out_seq = self._max_seq("outbound")
             self._in_seq = self._max_seq("inbound")
@@ -276,34 +267,6 @@ class SqliteInflightStore:
             raise
 
     # --- schema ------------------------------------------------------------
-
-    @classmethod
-    def _probe_schema(cls, path: Path) -> None:
-        """Validate without creating or updating journal files beside the source.
-
-        SQLite mode=ro can still write WAL coordination files. An immutable
-        connection avoids that when no WAL exists. A live WAL requires a private
-        disk snapshot so validation includes its committed schema changes.
-        Concurrent external schema changes are not a supported lifecycle.
-        """
-        path = path.resolve()
-        wal = Path(str(path) + "-wal")
-        if wal.exists() and wal.stat().st_size:
-            with tempfile.TemporaryDirectory(prefix="mqttium-schema-") as directory:
-                snapshot = Path(directory) / "inflight.sqlite"
-                shutil.copyfile(path, snapshot)
-                shutil.copyfile(wal, Path(str(snapshot) + "-wal"))
-                probe = sqlite3.connect(snapshot)
-                try:
-                    cls._validate_schema(probe)
-                finally:
-                    probe.close()
-        else:
-            probe = sqlite3.connect(path.resolve().as_uri() + "?mode=ro&immutable=1", uri=True)
-            try:
-                cls._validate_schema(probe)
-            finally:
-                probe.close()
 
     @classmethod
     def _validate_schema(cls, conn: sqlite3.Connection) -> bool:
@@ -346,12 +309,23 @@ class SqliteInflightStore:
         return False
 
     def _prepare_schema(self) -> None:
-        if not self._validate_schema(self._conn):
-            return
-        with self._conn:
-            self._conn.execute("BEGIN IMMEDIATE")
-            self._create_schema()
-            self._conn.execute(f"PRAGMA user_version={SQLITE_SCHEMA_VERSION}")
+        # All metadata queries must observe one WAL-aware SQLite snapshot.
+        # Normal journal recovery/checkpointing is allowed; an unsupported
+        # database must retain its committed schema and data, not its bytes.
+        self._conn.execute("BEGIN")
+        try:
+            empty = self._validate_schema(self._conn)
+        finally:
+            self._conn.rollback()
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        if empty:
+            with self._conn:
+                self._conn.execute("BEGIN IMMEDIATE")
+                # Another initializer may have committed since our read snapshot.
+                if self._validate_schema(self._conn):
+                    self._create_schema()
+                    self._conn.execute(f"PRAGMA user_version={SQLITE_SCHEMA_VERSION}")
 
     # Column order is a storage decision, not a cosmetic one. SQLite reaches a
     # column by walking the ones declared before it, and a payload past a few

@@ -205,7 +205,9 @@ sessions own legal transitions and compensation. Extension protocols and
 records are internal, with no supported third-party implementation contract.
 
 SQLite schema 5 accepts new databases and this exact format. Older, future and
-inconsistent formats are refused before WAL or other write-affecting operations.
+inconsistent formats are refused after validation in one WAL-aware read transaction,
+before configuring journal mode. Refusal preserves committed schema and data;
+normal SQLite recovery and checkpointing may change physical files.
 Write batches start lazily on the first mutation. Memory batches only group
 internal operations; they do not promise application-level rollback.
 

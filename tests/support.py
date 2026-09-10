@@ -162,3 +162,20 @@ async def wait_until(predicate, *, timeout=2.0):
     async with asyncio.timeout(timeout):
         while not predicate():
             await asyncio.sleep(0)
+
+
+def sqlite_logical_snapshot(path):
+    """Compare committed schema/data while allowing SQLite journal housekeeping."""
+    import sqlite3
+    from contextlib import closing
+
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("BEGIN")
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        journal = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        schema = conn.execute(
+            "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
+        ).fetchall()
+        outbound = conn.execute("SELECT * FROM outbound ORDER BY mid").fetchall()
+        inbound = conn.execute("SELECT * FROM inbound ORDER BY mid").fetchall()
+        return version, journal, schema, outbound, inbound

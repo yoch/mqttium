@@ -8,6 +8,10 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed — lean native experiment
 
+- Validate SQLite format in one WAL-aware read transaction without manual
+  database/WAL copies or their final-close race. Normal SQLite journal recovery
+  and checkpointing may change physical files on a refused open.
+
 - Preserve replacement-connection delivery when an active message callback
   disconnects and reconnects; retire old queued jobs without stopping the worker.
 - Isolate cancellation originating in `on_disconnect` so notification failure
@@ -27,7 +31,7 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   to each client, authentication is configured at construction, and CONNECT
   limits have one source.
 - SQLite schema 5 accepts fresh/current experimental databases only, preserving
-  rejected historical files. Individual admission rollback and durable
+  committed schema and data in rejected databases. Individual admission rollback and durable
   transitions remain; generic cross-backend batch atomicity is not promised.
 
 ### Removed — lean native experiment

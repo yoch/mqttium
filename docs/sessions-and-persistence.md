@@ -129,13 +129,17 @@ active store batch is rejected.
 
 The database uses WAL mode and experimental schema 5, recorded by
 `PRAGMA user_version`. Only new databases and schema 5 are accepted. Historical,
-future and inconsistent schemas are refused before operations that could
-modify them. No migration or historical size backfill is performed.
+future and inconsistent schemas are refused without migrating, resetting, or
+changing their committed schema and data. No historical size backfill is performed.
 
-Validation uses an immutable read-only probe when no nonempty WAL exists. With
-a live WAL, it probes a private database/WAL copy so even a refused open cannot
-create or change source journal files. Concurrent external schema changes are
-unsupported.
+Validation reads one coherent, WAL-aware SQLite transaction through the store's
+connection, without copying database or journal files. Normal SQLite recovery,
+checkpointing and journal coordination are allowed, including physical changes to
+the main database and creation/removal of WAL or SHM files. Validation ends before
+configuring journal mode or creating a fresh schema. Fresh creation revalidates
+under the write lock and commits atomically. Concurrent external schema changes
+are unsupported; ordinary SQLite locking failures retain the existing five-second
+busy timeout and native exception boundary.
 
 `SqliteInflightStore` follows Python's synchronous filesystem, DB-API, and data
 conversion boundaries. It does not wrap them in a second MQTTium exception
@@ -143,7 +147,7 @@ hierarchy:
 
 | Failure boundary | Exception exposed |
 | --- | --- |
-| Creating the database's parent directory, or reading/copying database/WAL files for validation | `OSError`, including `PermissionError` |
+| Creating the database's parent directory | `OSError`, including `PermissionError` |
 | Opening, locking, querying, committing, or using a closed SQLite connection | the relevant `sqlite3.Error` subclass |
 | A historical, future or structurally inconsistent MQTTium schema; invalid batch/close lifecycle | `RuntimeError` |
 | Invalid persisted storage classes, enum/flag/size values, JSON syntax, or MQTTium JSON markers | `ValueError` (including `json.JSONDecodeError`) |
