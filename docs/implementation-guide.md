@@ -214,9 +214,17 @@ message raises `MessageDeliveryError`, releases acquired credits and leaves
 persisted delivery state unmarked. A delivered mark denotes queue acceptance,
 not completed application processing.
 
+When byte and queue capacity are immediately available, `try_accept()` performs
+the same reservation and queue transfer without creating a timeout context.
+MESSAGE effects that require no durable delivery mark may use it directly in
+the effect drain. Persisted marks retain the existing asynchronous lock and
+fail-stop path; callbacks still execute only on the worker.
+
 Topic routing belongs exclusively to `AsyncClient`. The fallback and routes
 freeze on the first connection attempt, permanently for the instance. MQTT
-subscriptions remain mutable. Waiting for capacity or ACKs from a saturated
+subscriptions remain mutable. Callable forms are classified once at this freeze;
+mutable lifecycle callbacks keep their invocation-time classification.
+Waiting for capacity or ACKs from a saturated
 worker can create a circular dependency; use nonblocking publication or a
 separate bounded producer as shown in the migration guide.
 
@@ -299,6 +307,15 @@ Covered by `tests/unit/test_ingress_failure_semantics.py`.
   exception.
 - Transport loss fails work only after reconnect policy becomes terminal.
 - Public exceptions must not shadow Python built-ins.
+
+Unit QoS 0 publication may bypass general effect creation only with the current
+writer epoch, no terminal failure, no pending effects or active effect/engine
+lock, and enough callback capacity. It reuses outbound preparation, creates the
+receipt before handing bytes to `WritePump`, and commits any Topic Alias after
+acceptance. A clean writer refusal may fall back for awaited publication;
+exceptions propagate without retry because handoff may already have occurred.
+`publish_many()` retains ordinary progressive admission. The effect drain before
+awaited admission remains necessary for receipt settlement before MID reuse.
 
 ## Required validation
 

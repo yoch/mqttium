@@ -132,7 +132,7 @@ async def test_scheduled_flush_records_wakeup_while_active() -> None:
     client._apply_effect = controlled_apply  # type: ignore[method-assign]
     client._engine._emit(
         EffectKind.MESSAGE,
-        Message(topic="first", payload=b"1"),
+        Message(topic="first", payload=b"1", qos=1, mid=1),
         requires_delivery_mark=True,
     )
     client._effect_pump.collect_from_engine()
@@ -141,7 +141,7 @@ async def test_scheduled_flush_records_wakeup_while_active() -> None:
 
     client._engine._emit(
         EffectKind.MESSAGE,
-        Message(topic="second", payload=b"2"),
+        Message(topic="second", payload=b"2", qos=1, mid=2),
         requires_delivery_mark=True,
     )
     client._effect_pump.collect_from_engine()

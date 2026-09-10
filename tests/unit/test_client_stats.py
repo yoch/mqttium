@@ -61,7 +61,8 @@ def test_stats_reports_current_state_and_lifetime_high_water_marks() -> None:
     assert client._write_pump.try_enqueue(b"abcd")
     client._engine._emit(
         EffectKind.MESSAGE,
-        Message(topic="in", payload=b"payload", qos=QoS.AT_MOST_ONCE),
+        Message(topic="in", payload=b"payload", qos=QoS.AT_LEAST_ONCE, mid=1),
+        requires_delivery_mark=True,
     )
     client._effect_pump.collect_from_engine()
 

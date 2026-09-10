@@ -20,6 +20,10 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Changed — lean native experiment
 
+- Transfer ready deliveries without timeout contexts or deferred effect work,
+  classify frozen message callbacks once, and hand ready unit QoS 0 publishes
+  to the existing writer without general publication effects. Byte/count bounds,
+  receipt ordering, durable delivery marks and serial callbacks remain intact.
 - Incompatible experimental native API: explicit iterator/callback delivery;
   message routes freeze permanently at the first connection attempt.
 - All message and connect/publish notifications use a bounded serial worker;

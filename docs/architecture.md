@@ -53,13 +53,18 @@ tested without a broker.
 flush worker. A single immediately applicable effect is handled inline; it does
 not allocate a task or enter the deque. Suspended work is tagged with the
 connection epoch so effects from an old transport cannot modify a new session.
-For QoS 0 writer admission and terminal QoS 1/2 publishes, inline application
-settles the receipt immediately. If callback delivery is idle and `on_publish`
-is synchronous, user code may run in that same turn; async, reentrant, occupied
-or full-queue delivery uses the bounded callback worker and its existing
-backpressure. The guard also prevents callbacks from running while the engine
-lock is held. QoS 0 batches preflight capacity for every callback before
-admitting any write, so the direct path cannot split a batch across paths.
+Ready message effects transfer directly to their bounded destination when no
+durable delivery mark is required. Full destinations and persisted delivery
+marks retain asynchronous transfer. All message and publish notifications run
+on the serial callback worker, outside engine critical sections.
+
+Ready unit QoS 0 publications can use outbound validation and writer admission
+without creating general effects. This requires a current connection and empty
+effect pipeline, and reserves callback capacity before handoff. The receipt
+exists before the writer can send bytes; topic aliases commit only after writer
+acceptance. An asynchronous clean refusal falls back to ordinary admission;
+writer exceptions propagate without retry. Batch publication retains its
+progressive unit admission path.
 
 ### Network writes
 
@@ -80,21 +85,22 @@ does not own MQTT state, transport state, or reconnect policy.
 
 Topic-filtered callbacks live on `AsyncClient`. `TopicMatcher` chooses which
 application callable receives a delivered message; the protocol engine still
-emits undifferentiated MESSAGE effects and never imports dispatch or compat
-code. Inbound delivery reads an installed `_message_callback` pointer:
-`on_message` or `None` while no filter exists, and the topic router only while
-filters are registered. The unused-filter hot path therefore has no matcher
-branch.
+emits undifferentiated MESSAGE effects and never imports dispatch code.
+Routes and the fallback freeze at the first connection attempt. Their callable
+forms are classified once; matching routes execute in registration order within
+one worker job, with the fallback used when no route matches.
 
-The delivery mode is selected when the client is constructed. Specialised
-admission functions avoid repeated mode branches on every incoming message
-while preserving one authoritative owner for reservations and lifecycle.
+The construction-time delivery mode selects either iterator or callback
+delivery. Every message has one byte charge and one queue item. Immediate
+admission checks the same byte/count bounds as waiting admission and avoids a
+timeout context when capacity is already available. Waiting admission uses one
+deadline across byte reservation and queue insertion.
 
-Idle synchronous callbacks may run directly in the reader/effect-drain turn;
-the worker remains the bounded fallback for async callbacks, reentrancy and
-bursts. Callback exceptions are isolated from protocol state. A message
-delivered to both a callback and an iterator releases its byte reservation only
-after both references are gone.
+All message, connect and publish callbacks use one serial worker, including
+synchronous callables. Callback exceptions are isolated from protocol state;
+message bytes remain reserved until all matching callbacks finish. An active
+callback may disconnect and reconnect: reopening discards old queued work and
+lets the same worker serve the replacement connection.
 
 ### Ingress
 
