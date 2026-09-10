@@ -2,7 +2,7 @@ name: Uniform worker final lifecycle qualification
 on:
   push:
     branches: [work/uniform-v4-final]
-    paths: [.github/uniform-final-lifecycle-test.py, .github/workflows/uniform-v4-final-qualify.yml]
+    paths: [.github/uniform-final-lifecycle-test.py, .github/uniform-saturation-diagnostic.py, .github/workflows/uniform-v4-final-qualify.yml]
 permissions:
   contents: write
 concurrency:
@@ -14,6 +14,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
+      MAIN_SHA: 9ad1f01857306ac5079ffb1d073a59fdb60e1931
       BASE_SHA: 01aa8614da6ee13d33f0a6c4ff183cf65cfd3677
       PRODUCT_BRANCH: experiment/uniform-message-worker
     steps:
@@ -27,13 +28,15 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
           python-version: '3.13.5'
-      - name: Freeze held product ref
+      - name: Freeze held product ref and exact main control
         shell: bash
         run: |
           set -euo pipefail
           test "$(git ls-remote origin "refs/heads/$PRODUCT_BRANCH" | cut -f1)" = "$BASE_SHA"
           git worktree add --detach "$JOB_ROOT/candidate" "$BASE_SHA"
+          git worktree add --detach "$JOB_ROOT/main" "$MAIN_SHA"
           test -z "$(git -C "$JOB_ROOT/candidate" status --porcelain --untracked-files=no)"
+          test -z "$(git -C "$JOB_ROOT/main" status --porcelain --untracked-files=no)"
       - name: Preserve red-before proof of v2 stale byte admission
         shell: bash
         run: |
@@ -60,7 +63,13 @@ jobs:
               print('REPRODUCED: old byte-budget waiter crossed into the replacement delivery generation')
           asyncio.run(main())
           PY
-      - name: Apply final candidate and materialize lifecycle tests
+      - name: Classify saturated callback receipt waiting on current main and v2
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd "$JOB_ROOT/main" && PYTHONPATH=src python "$GITHUB_WORKSPACE/.github/uniform-saturation-diagnostic.py") | tee "$JOB_ROOT/saturation-main.json"
+          (cd "$JOB_ROOT/candidate" && PYTHONPATH=src python "$GITHUB_WORKSPACE/.github/uniform-saturation-diagnostic.py") | tee "$JOB_ROOT/saturation-v2.json"
+      - name: Apply final candidate and materialize lifecycle test
         shell: bash
         run: |
           set -euo pipefail
@@ -72,6 +81,24 @@ jobs:
           cp "$GITHUB_WORKSPACE/.github/uniform-final-lifecycle-test.py" tests/unit/test_uniform_final_lifecycle.py
           test "$(git status --short | awk '{print $2}' | sort)" = $'CHANGELOG.md\nsrc/mqttium/api/_delivery.py\ntests/unit/test_message_delivery.py\ntests/unit/test_uniform_callbacks.py\ntests/unit/test_uniform_final_lifecycle.py'
           git diff --check
+      - name: Classify same saturated receipt scenario on final candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd "$JOB_ROOT/candidate" && PYTHONPATH=src python "$GITHUB_WORKSPACE/.github/uniform-saturation-diagnostic.py") | tee "$JOB_ROOT/saturation-candidate.json"
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          root=Path(os.environ['JOB_ROOT'])
+          docs={name:json.loads((root/f'saturation-{name}.json').read_text()) for name in ['main','v2','candidate']}
+          assert all(d['queue_full_seen'] for d in docs.values()), docs
+          # A finite callback-delivery bound can head-of-line block the reader
+          # while an active callback waits for protocol progress. Reject a new
+          # regression, but do not manufacture a stronger guarantee than main.
+          if docs['main']['reply_progressed_with_full_callback_queue'] and not docs['candidate']['reply_progressed_with_full_callback_queue']:
+              raise SystemExit('candidate introduces a saturated receipt-progress regression')
+          print(json.dumps(docs,indent=2))
+          PY
       - name: Install qualification dependencies
         run: python -m pip install -e "$JOB_ROOT/candidate[dev,fuzz,security,docs]"
       - name: Format exact candidate and run focused adversarial gates
@@ -118,7 +145,7 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add CHANGELOG.md src/mqttium/api/_delivery.py tests/unit/test_uniform_callbacks.py tests/unit/test_message_delivery.py tests/unit/test_uniform_final_lifecycle.py
-          git commit -m 'fix: make all blocked delivery admissions generation-safe' -m 'Use one controller-owned delivery generation and one shared capacity event for byte, iterator-slot and callback-slot waiters. Slow iterator admission waits on delivery capacity rather than inside Queue.put, so explicit takeover wakes and rejects every stale producer. Keep queue/event identity stable across reset; already-woken old iterators observe the generation change and terminate. Remove callback_space. Cover byte/queue waiters, old anext wakeup, eager scheduling and saturated QoS1 callback progress. No new queue, task or public option.'
+          git commit -m 'fix: make all blocked delivery admissions generation-safe' -m 'Use one controller-owned delivery generation and one shared capacity event for byte, iterator-slot and callback-slot waiters. Slow iterator admission waits on delivery capacity rather than inside Queue.put, so explicit takeover wakes and rejects every stale producer. Keep queue/event identity stable across reset; already-woken old iterators observe the generation change and terminate. Remove callback_space. Cover byte/queue waiters, old anext wakeup and eager scheduling. The finite-bound callback-awaits-receipt cycle is separately classified against main rather than misrepresented as newly solved. No new queue, task or public option.'
           tested=$(git rev-parse HEAD)
           tree=$(git rev-parse 'HEAD^{tree}')
           src=$(git rev-parse 'HEAD:src')
@@ -131,13 +158,19 @@ jobs:
           name: uniform-final-${{ github.run_id }}
           path: |
             ${{ env.JOB_ROOT }}/red-before.txt
+            ${{ env.JOB_ROOT }}/saturation-main.json
+            ${{ env.JOB_ROOT }}/saturation-v2.json
+            ${{ env.JOB_ROOT }}/saturation-candidate.json
             ${{ env.JOB_ROOT }}/provenance.json
             .github/uniform-v4.patch
             .github/uniform-v4-doc.patch
             .github/uniform-v4-test.patch
             .github/uniform-final-lifecycle-test.py
+            .github/uniform-saturation-diagnostic.py
           retention-days: 30
           if-no-files-found: warn
-      - name: Clean isolated worktree
+      - name: Clean isolated worktrees
         if: always()
-        run: git worktree remove --force "$JOB_ROOT/candidate" || true
+        run: |
+          git worktree remove --force "$JOB_ROOT/candidate" || true
+          git worktree remove --force "$JOB_ROOT/main" || true
