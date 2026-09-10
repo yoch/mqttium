@@ -1,0 +1,191 @@
+name: PR454 readiness-pacer RPi5 qualification
+on:
+  push:
+    branches: [work/pr454-readiness-pacer-rpi5-20260910]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mqttium-arm64-runner
+  cancel-in-progress: false
+
+jobs:
+  qualify:
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 55
+    env:
+      PYTHONUNBUFFERED: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+      PIP_DISABLE_PIP_VERSION_CHECK: '1'
+      BASE_SHA: 9ad1f01857306ac5079ffb1d073a59fdb60e1931
+      CANDIDATE_SHA: 636de564dc2c92822a8361050cc24e369fe027d4
+      HARNESS_SHA: 86fdc7cd78c0961204e4e1890f1ac0449ad04d2a
+      HARNESS_TREE: 297c754b5b9ebea961526bee7001577c85dbed24
+      TARGET_RATE: '3942'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          ref: 9ad1f01857306ac5079ffb1d073a59fdb60e1931
+          path: seed-base
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          ref: 636de564dc2c92822a8361050cc24e369fe027d4
+          path: seed-candidate
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          repository: yoch/mqtt-python-client-bench
+          ref: 86fdc7cd78c0961204e4e1890f1ac0449ad04d2a
+          path: bench
+      - name: Freeze identity and isolated sibling paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C seed-base rev-parse HEAD)" = "$BASE_SHA"
+          test "$(git -C seed-candidate rev-parse HEAD)" = "$CANDIDATE_SHA"
+          test "$(git -C bench rev-parse HEAD)" = "$HARNESS_SHA"
+          test "$(git -C bench rev-parse HEAD^{tree})" = "$HARNESS_TREE"
+          ROOT=$(mktemp -d "$RUNNER_TEMP/pr454-ready-${GITHUB_RUN_ID}-XXXX")
+          echo "JOB_ROOT=$ROOT" >> "$GITHUB_ENV"
+          mkdir -p results
+          cp -a seed-base "$ROOT/slot-a"; cp -a seed-base "$ROOT/slot-b"
+          test "${#ROOT/slot-a}" -eq "${#ROOT/slot-b}"
+          printf 'base=%s\ncandidate=%s\nharness=%s\nharness_tree=%s\nslot_a=%s\nslot_b=%s\n' "$BASE_SHA" "$CANDIDATE_SHA" "$HARNESS_SHA" "$HARNESS_TREE" "$ROOT/slot-a" "$ROOT/slot-b" > results/identity.txt
+          uname -a > results/machine.txt; lscpu >> results/machine.txt; python3 -V >> results/machine.txt
+          printf 'governors:\n' >> results/machine.txt; cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor >> results/machine.txt 2>/dev/null || true
+          printf 'aslr=' >> results/machine.txt; cat /proc/sys/kernel/randomize_va_space >> results/machine.txt
+          python3 -m venv "$ROOT/venv"; echo "$ROOT/venv/bin" >> "$GITHUB_PATH"
+      - name: Install exact candidate harness
+        run: python -m pip install -e 'bench[paho]'
+      - name: RPi adverse tests for readiness driver
+        working-directory: bench
+        env:
+          PYTHONWARNINGS: error
+        run: |
+          PYTHONPATH=src python -m unittest -v tests.test_external_admission tests.test_rtt_cooperation | tee ../results/harness-focused-tests.txt
+      - name: Start isolated broker and pin cores
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$JOB_ROOT/mosquitto.conf" <<'EOF'
+          listener 18898 127.0.0.1
+          allow_anonymous true
+          persistence false
+          set_tcp_nodelay true
+          max_inflight_messages 1000
+          max_queued_messages 100000
+          log_type error
+          EOF
+          mosquitto -c "$JOB_ROOT/mosquitto.conf" > results/mosquitto.log 2>&1 &
+          echo $! > "$JOB_ROOT/broker.pid"
+          python seed-base/tools/ci/wait_for_endpoints.py --tcp 127.0.0.1:18898
+          python - <<'PY'
+          import json, os, pathlib
+          from mqtt_client_bench.telemetry import allocate_cpuset
+          sets=allocate_cpuset(['sut','broker','loadgen','orch'], profile='standard')
+          pathlib.Path('results/cpusets.json').write_text(json.dumps(sets, indent=2))
+          ids=[]
+          for part in sets['broker'].split(','):
+              if '-' in part:
+                  a,b=map(int,part.split('-')); ids.extend(range(a,b+1))
+              else: ids.append(int(part))
+          pid=int((pathlib.Path(os.environ['JOB_ROOT'])/'broker.pid').read_text()); os.sched_setaffinity(pid,set(ids))
+          PY
+      - name: Same-source A/A — four blocks
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C "$JOB_ROOT/slot-a" rev-parse HEAD)" = "$BASE_SHA"; test "$(git -C "$JOB_ROOT/slot-b" rev-parse HEAD)" = "$BASE_SHA"
+          python -m mqtt_client_bench.version_compare --client mqttium --baseline-path "$JOB_ROOT/slot-a" --candidate-path "$JOB_ROOT/slot-b" --scenario application_rtt_fixed_rate --variant-index 0 --target-rate "$TARGET_RATE" --pacer-mode external --broker 127.0.0.1:18898 --broker-pid "$(cat "$JOB_ROOT/broker.pid")" --blocks 4 --max-block-retries 1 --profile standard --output results/aa.json | tee results/aa.log
+      - name: Gate A/A p95 before spending A/B
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, math, pathlib, statistics, sys
+          from mqtt_client_bench.metrics import abba_block_records
+          d=json.loads(pathlib.Path('results/aa.json').read_text()); rows=[r for r in d['runs'] if r.get('active_for_verdict')]; problems=[]
+          if not d.get('qualification',{}).get('ok'): problems.append('existing qualification failed')
+          vals=[]; scheduled=[]; admission=[]; nvcsw=[]
+          for r in rows:
+              w=next(x for x in r['workers'] if x.get('role')=='rtt_initiator'); vals.append(float(w['latency_summary']['p95_ms']))
+              ext=w.get('external_admission') or {}; pace=w.get('pacing') or {}; expected=int(pace.get('tokens_expected_in_measure_window') or -1)
+              if ext.get('driver') != 'readiness_one_token': problems.append('wrong external driver')
+              if int(ext.get('tokens_received') or -1) != expected or int(pace.get('tokens_received') or -2) != expected: problems.append(f"token count driver={ext.get('tokens_received')} pacing={pace.get('tokens_received')} expected={expected}")
+              if not pace.get('stimulus_valid'): problems.append('pacer stimulus invalid')
+              if int(w.get('missed_due_to_backpressure') or 0) != 0: problems.append('backpressure miss')
+              if int(w.get('timeouts') or 0) != 0: problems.append('timeout')
+              sr=w.get('scheduled_response_latency') or {}; sa=w.get('scheduled_admission_delay') or {}
+              if sr.get('p95_ms') is not None: scheduled.append(float(sr['p95_ms']))
+              if sa.get('p95_ms') is not None: admission.append(float(sa['p95_ms']))
+              md=(w.get('runtime') or {}).get('measure_delta') or {}
+              if md.get('ru_nvcsw') is not None: nvcsw.append(float(md['ru_nvcsw'])/max(1,int(w.get('completed_in_window') or 0)))
+          records=abba_block_records(d['order'], vals); ratios=[float(x['ratio']) for x in records]; centres=[math.sqrt(float(x['a_median'])*float(x['b_median'])) for x in records]
+          effect=(math.exp(statistics.mean(math.log(x) for x in ratios))-1)*100 if ratios else None; centre=math.exp(statistics.mean(math.log(x) for x in centres)) if centres else None
+          drift=max((math.exp(abs(math.log(x/centre)))-1)*100 for x in centres) if centres else None; max_ratio=max(abs((x-1)*100) for x in ratios) if ratios else None
+          if len(records) != 4: problems.append(f'complete p95 blocks={len(records)}')
+          if effect is None or abs(effect) > 3.0: problems.append(f'p95 AA effect={effect}')
+          if max_ratio is None or max_ratio > 3.0: problems.append(f'p95 block ratio max={max_ratio}')
+          if drift is None or drift > 3.0: problems.append(f'p95 block-centre drift={drift}')
+          summary={'active_runs':len(rows),'p95_ms':vals,'p95_block_ratios':ratios,'p95_effect_pct':effect,'p95_block_centres_ms':centres,'p95_max_centre_drift_pct':drift,'p95_max_block_ratio_pct':max_ratio,'scheduled_response_p95_ms':scheduled,'scheduled_admission_p95_ms':admission,'nvcsw_per_completion':nvcsw,'problems':problems}
+          pathlib.Path('results/aa-gate.json').write_text(json.dumps(summary,indent=2,sort_keys=True)); print(json.dumps(summary,indent=2,sort_keys=True))
+          if problems: sys.exit(2)
+          PY
+      - name: Orientation 1 — base slot-a, candidate slot-b
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$JOB_ROOT/slot-b"; cp -a seed-candidate "$JOB_ROOT/slot-b"
+          test "$(git -C "$JOB_ROOT/slot-a" rev-parse HEAD)" = "$BASE_SHA"; test "$(git -C "$JOB_ROOT/slot-b" rev-parse HEAD)" = "$CANDIDATE_SHA"
+          python -m mqtt_client_bench.version_compare --client mqttium --baseline-path "$JOB_ROOT/slot-a" --candidate-path "$JOB_ROOT/slot-b" --scenario application_rtt_fixed_rate --variant-index 0 --target-rate "$TARGET_RATE" --pacer-mode external --broker 127.0.0.1:18898 --broker-pid "$(cat "$JOB_ROOT/broker.pid")" --blocks 6 --max-block-retries 1 --profile standard --output results/ab-forward.json | tee results/ab-forward.log
+      - name: Orientation 2 — candidate slot-a, base slot-b
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$JOB_ROOT/slot-a" "$JOB_ROOT/slot-b"; cp -a seed-candidate "$JOB_ROOT/slot-a"; cp -a seed-base "$JOB_ROOT/slot-b"
+          test "$(git -C "$JOB_ROOT/slot-a" rev-parse HEAD)" = "$CANDIDATE_SHA"; test "$(git -C "$JOB_ROOT/slot-b" rev-parse HEAD)" = "$BASE_SHA"
+          python -m mqtt_client_bench.version_compare --client mqttium --baseline-path "$JOB_ROOT/slot-a" --candidate-path "$JOB_ROOT/slot-b" --scenario application_rtt_fixed_rate --variant-index 0 --target-rate "$TARGET_RATE" --pacer-mode external --broker 127.0.0.1:18898 --broker-pid "$(cat "$JOB_ROOT/broker.pid")" --blocks 6 --max-block-retries 1 --profile standard --output results/ab-reverse.json | tee results/ab-reverse.log
+      - name: Normalize code effects and deadline metrics
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, math, pathlib, random, statistics
+          from mqtt_client_bench.metrics import abba_block_records, complementary_pair_units
+          def worker(r): return next(x for x in r['workers'] if x.get('role')=='rtt_initiator')
+          def metric(r, name):
+              w=worker(r)
+              if name in ('p50','p95','p99'): return float(w['latency_summary'][name+'_ms'])
+              prefix,q=name.rsplit('_',1); src=w['scheduled_response_latency'] if prefix=='scheduled_response' else w['scheduled_admission_delay']; return float(src[q+'_ms'])
+          def units(path,name,invert=False):
+              d=json.loads(pathlib.Path(path).read_text()); rows=[r for r in d['runs'] if r.get('active_for_verdict')]
+              recs=abba_block_records(d['order'],[metric(r,name) for r in rows]); xs=complementary_pair_units([float(x['ratio']) for x in recs],[x['design'] for x in recs]); return [1/x for x in xs] if invert else xs
+          def summarize(xs):
+              c=math.exp(statistics.mean(math.log(x) for x in xs)); rng=random.Random(45435); boots=[]
+              for _ in range(20000):
+                  s=[xs[rng.randrange(len(xs))] for _ in xs]; boots.append(math.exp(statistics.mean(math.log(x) for x in s)))
+              boots.sort(); lo=boots[int(.025*(len(boots)-1))]; hi=boots[int(.975*(len(boots)-1))]
+              return {'n_units':len(xs),'effect_pct':(c-1)*100,'ci95_pct':[(lo-1)*100,(hi-1)*100],'units':xs}
+          names=['p50','p95','p99','scheduled_response_p50','scheduled_response_p95','scheduled_response_p99','scheduled_admission_p50','scheduled_admission_p95','scheduled_admission_p99']
+          out={name:summarize(units('results/ab-forward.json',name)+units('results/ab-reverse.json',name,True)) for name in names}
+          runs=[]
+          for path in ('results/ab-forward.json','results/ab-reverse.json'):
+              d=json.loads(pathlib.Path(path).read_text()); runs.extend(r for r in d['runs'] if r.get('active_for_verdict'))
+          out['integrity']={'active_runs':len(runs),'all_qualified':all(r.get('status')=='valid' and (worker(r).get('external_admission') or {}).get('driver')=='readiness_one_token' and int(worker(r).get('missed_due_to_backpressure') or 0)==0 and int(worker(r).get('timeouts') or 0)==0 and bool((worker(r).get('pacing') or {}).get('stimulus_valid')) for r in runs)}
+          pathlib.Path('results/final-summary.json').write_text(json.dumps(out,indent=2,sort_keys=True)); print(json.dumps(out,indent=2,sort_keys=True))
+          PY
+      - name: Final source readback and cleanup
+        if: always()
+        shell: bash
+        run: |
+          { echo "base=$(git -C seed-base rev-parse HEAD)"; echo "candidate=$(git -C seed-candidate rev-parse HEAD)"; echo "harness=$(git -C bench rev-parse HEAD)"; echo "harness_tree=$(git -C bench rev-parse HEAD^{tree})"; } > results/final-identity.txt
+          git -C seed-base status --porcelain > results/base-status.txt; git -C seed-candidate status --porcelain > results/candidate-status.txt; git -C bench status --porcelain > results/harness-status.txt
+          if test -n "${JOB_ROOT:-}" && test -f "$JOB_ROOT/broker.pid"; then kill "$(cat "$JOB_ROOT/broker.pid")" 2>/dev/null || true; fi
+          if test -n "${JOB_ROOT:-}"; then rm -rf "$JOB_ROOT"; fi
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: pr454-readiness-pacer-rpi5
+          path: results/
+          retention-days: 30
