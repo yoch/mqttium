@@ -30,6 +30,10 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Changed — lean native experiment
 
+- Remove unused private atomic writer admission, synthetic inline-batch
+  accounting and borrowed QoS 0 decoders. Active writer bounds, segmented
+  ordering and owned specialized decoding remain covered by regression tests.
+
 - Share ready QoS 0 writer handoff between unit and aggregate publication,
   registering aggregate ownership before wire without per-item receipts.
   Clean writer refusal rolls back only the tentative batch registration;

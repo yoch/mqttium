@@ -2,15 +2,13 @@ from __future__ import annotations
 
 import pytest
 
-from mqttium.api import AsyncClient
-from mqttium.enums import ConnectionState, MQTTProtocolVersion, QoS
+from mqttium.enums import PacketType
 from mqttium.errors import MalformedPacketError
-from mqttium.packets import PublishPacket
 from mqttium.packets._publish import (
-    decode_qos0_message_v311_borrowed,
-    decode_qos0_message_v5_borrowed,
+    decode_qos0_message_v311,
+    decode_qos0_message_v5,
 )
-from mqttium.types import Properties
+from mqttium.codec.buffer import RawPacket
 
 
 @pytest.mark.parametrize(
@@ -23,9 +21,9 @@ from mqttium.types import Properties
         (b"\x00\x00", 0, "PUBLISH topic must not be empty"),
     ],
 )
-def test_borrowed_v311_rejects_malformed_fields(body: bytes, flags: int, error_text: str) -> None:
+def test_owned_v311_rejects_malformed_fields(body: bytes, flags: int, error_text: str) -> None:
     with pytest.raises(MalformedPacketError) as error:
-        decode_qos0_message_v311_borrowed(bytearray(body), 0, len(body), flags)
+        decode_qos0_message_v311(RawPacket(PacketType.PUBLISH, flags, body))
     assert error_text in str(error.value)
 
 
@@ -43,29 +41,7 @@ def test_borrowed_v311_rejects_malformed_fields(body: bytes, flags: int, error_t
         (b"\x00\x01a\xff\xff\xff\xff\x01", 0, "Malformed Variable Byte Integer"),
     ],
 )
-def test_borrowed_v5_rejects_malformed_fields(body: bytes, flags: int, error_text: str) -> None:
+def test_owned_v5_rejects_malformed_fields(body: bytes, flags: int, error_text: str) -> None:
     with pytest.raises(MalformedPacketError) as error:
-        decode_qos0_message_v5_borrowed(bytearray(body), 0, len(body), flags)
+        decode_qos0_message_v5(RawPacket(PacketType.PUBLISH, flags, body))
     assert error_text in str(error.value)
-
-
-def _v5_client() -> AsyncClient:
-    client = AsyncClient(
-        protocol=MQTTProtocolVersion.MQTTv5,
-        message_delivery="callback",
-        max_pending_callbacks=8,
-    )
-    client._engine.state = ConnectionState.CONNECTED
-    client.on_message = lambda _message: None
-    return client
-
-
-def _publish_v5(properties: Properties | None = None) -> bytes:
-    return PublishPacket(
-        topic="coverage/topic",
-        payload=b"x",
-        qos=QoS.AT_MOST_ONCE,
-        retain=False,
-        dup=False,
-        properties=properties,
-    ).encode(MQTTProtocolVersion.MQTTv5)

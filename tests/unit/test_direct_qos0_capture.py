@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import asyncio
-
 import pytest
 
 from mqttium.api import AsyncClient
@@ -30,32 +28,6 @@ def _client(*, max_pending_callbacks: int = 1024) -> AsyncClient:
     return client
 
 
-def test_record_inline_batch_uses_logical_message_count() -> None:
-    client = _client()
-
-    client._effect_pump.record_inline_batch(3)
-
-    stats = client._effect_pump.stats()
-    assert stats.batches == 1
-    assert stats.multi_effect_batches == 1
-    assert stats.enqueued == 3
-    assert stats.applied == 3
-    assert stats.inline_effects == 3
-
-
-@pytest.mark.asyncio
-async def test_record_inline_batch_unblocks_existing_drain_target() -> None:
-    client = _client()
-    client._effect_pump.enqueued = 2
-    waiter = asyncio.create_task(client._effect_pump.drain())
-    await asyncio.sleep(0)
-    assert not waiter.done()
-
-    client._effect_pump.record_inline_batch(2)
-
-    await waiter
-
-
 def test_decoder_header_peek_does_not_consume_data() -> None:
     client = _client()
     wire = _publish("one")
@@ -63,29 +35,6 @@ def test_decoder_header_peek_does_not_consume_data() -> None:
 
     assert client._decoder.next_header_byte == wire[0]
     assert client._decoder.buffered == len(wire)
-
-
-def _publish_v5(topic: str, *, payload: bytes = b"x", properties=None) -> bytes:
-    return PublishPacket(
-        topic=topic,
-        payload=payload,
-        qos=QoS.AT_MOST_ONCE,
-        retain=False,
-        dup=False,
-        properties=properties,
-    ).encode(MQTTProtocolVersion.MQTTv5)
-
-
-def _client_v5(*, max_pending_callbacks: int = 1024, topic_alias_maximum: int = 0) -> AsyncClient:
-    client = AsyncClient(
-        protocol=MQTTProtocolVersion.MQTTv5,
-        message_delivery="callback",
-        max_pending_callbacks=max_pending_callbacks,
-        topic_alias_maximum=topic_alias_maximum,
-    )
-    client._engine.state = ConnectionState.CONNECTED
-    client.on_message = lambda _message: None
-    return client
 
 
 def test_peek_packet_bounds_waits_for_fragment_and_does_not_consume() -> None:
