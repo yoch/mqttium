@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import asyncio
+from mqttium.api.async_client import _fifo_register
+
 
 import pytest
 
 from mqttium.api.async_client import AsyncClient
 from mqttium.api.models import PublishBatchReceipt, PublishReceipt
-from mqttium.compat.paho import Client
 from mqttium.enums import MQTTProtocolVersion, QoS
 from mqttium.errors import PublishBatchError
 from mqttium.protocol.engine import (
@@ -30,8 +30,8 @@ def _register_publish_handles(
     batch = PublishBatchReceipt()
     batch._register(mid)
     batch._seal()
-    client._register_publish_receipt(mid, receipt)
-    client._register_batch_receipt(mid, batch)
+    _fifo_register(client._receipts, mid, receipt)
+    _fifo_register(client._batch_receipts, mid, batch)
     return receipt, batch
 
 
@@ -45,23 +45,25 @@ async def test_terminal_publish_effect_survives_connection_epoch_change() -> Non
     # transport epoch changes, the terminal result must still settle locally.
     client._engine._emit(EffectKind.PUBLISH_COMPLETE, 7)
     client._engine._emit(EffectKind.SEND, b"next")
-    client._collect_effects_locked()
-    assert [effect.kind for effect in client._pending_effects] == [
+    client._effect_pump.collect_from_engine()
+    assert [effect.kind for effect in client._effect_pump.pending] == [
         EffectKind.SEND,
         EffectKind.PUBLISH_COMPLETE,
     ]
 
     await client._invalidate_connection_epoch()
     client._engine._emit(EffectKind.PINGRESP, None)
-    client._collect_effects_locked()
-    assert [effect.kind for effect in client._pending_effects] == [
+    client._effect_pump.collect_from_engine()
+    assert [effect.kind for effect in client._effect_pump.pending] == [
         EffectKind.PUBLISH_COMPLETE,
         EffectKind.PINGRESP,
     ]
-    assert client._effect_enqueued == client._effect_applied + len(client._pending_effects)
+    assert client._effect_pump.enqueued == client._effect_pump.applied + len(
+        client._effect_pump.pending
+    )
 
-    await client._drain_effects()
-    await asyncio.sleep(0)
+    await client._effect_pump.drain()
+    await client._delivery.callback_queue.join()
 
     assert receipt.is_done()
     assert batch.is_done()
@@ -83,7 +85,7 @@ async def test_final_teardown_settles_a_pending_publish_failure() -> None:
         PublishFailure(mid=9, reason=failure),
     )
     client._engine._emit(EffectKind.SEND, b"blocked")
-    client._collect_effects_locked()
+    client._effect_pump.collect_from_engine()
 
     await client._force_close()
 
@@ -95,47 +97,19 @@ async def test_final_teardown_settles_a_pending_publish_failure() -> None:
     assert callbacks == [(9, failure)]
 
 
-def test_engine_config_update_rolls_back_type_errors() -> None:
+def test_engine_config_is_immutable() -> None:
     config = EngineConfig(keepalive=60)
-
-    with pytest.raises(TypeError):
-        config.update(keepalive=None)
+    with pytest.raises(AttributeError):
+        config.keepalive = 30
     assert config.keepalive == 60
 
 
-def test_engine_config_update_is_atomic_across_multiple_fields() -> None:
-    config = EngineConfig(
-        keepalive=60,
-        max_pending_outbound_bytes=1024,
-    )
-
-    with pytest.raises(ValueError):
-        config.update(
-            keepalive=30,
-            max_pending_outbound_bytes=-1,
-        )
-
-    assert config.keepalive == 60
-    assert config.max_pending_outbound_bytes == 1024
-
-
-def test_attached_config_rejects_changes_with_derived_engine_state() -> None:
+def test_attached_config_is_immutable() -> None:
     engine = ProtocolEngine()
-    original_protocol = engine.config.protocol
-    with pytest.raises(AttributeError, match="new ProtocolEngine"):
-        engine.config.update(protocol=MQTTProtocolVersion.MQTTv5)
-    assert engine.config.protocol is original_protocol
-
-
-@pytest.mark.parametrize("keepalive", [-1, 65_536])
-def test_paho_connect_validates_keepalive_before_starting_the_loop(keepalive: int) -> None:
-    client = Client()
-
-    with pytest.raises(ValueError):
-        client.connect("unused", keepalive=keepalive)
-
-    assert client._loop is None
-    assert client._async._engine.config.keepalive == 60
+    original = engine.config.protocol
+    with pytest.raises(AttributeError):
+        engine.config.protocol = MQTTProtocolVersion.MQTTv5
+    assert engine.config.protocol is original
 
 
 def test_outbound_reservation_underflow_raises_without_corrupting_counters() -> None:

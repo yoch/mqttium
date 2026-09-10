@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from mqttium.api.async_client import _fifo_register
+
 import asyncio
 from collections import deque
 
@@ -16,32 +18,22 @@ from mqttium.types import Message
 def test_effect_operations_are_bound_directly_to_the_pump() -> None:
     client = AsyncClient(client_id="effect-owner")
 
-    assert client._collect_effects_locked.__self__ is client._effect_pump
-    assert client._drain_effects_inline.__self__ is client._effect_pump
-    assert client._schedule_effect_flush.__self__ is client._effect_pump
-    assert client._drain_effects.__self__ is client._effect_pump
-    assert client._discard_connection_effects.__self__ is client._effect_pump
-
-
-def test_effect_diagnostic_attributes_are_views() -> None:
-    client = AsyncClient(client_id="effect-views")
-
-    assert client._pending_effects is client._effect_pump.pending
-    assert client._pending_effect_epoch is client._effect_pump.pending_epoch
-    assert client._effect_enqueued == client._effect_pump.enqueued
-    assert client._effect_applied == client._effect_pump.applied
-    assert client._effect_flush_task is client._effect_pump.task
+    assert client._effect_pump.collect_from_engine.__self__ is client._effect_pump
+    assert client._effect_pump.drain_inline.__self__ is client._effect_pump
+    assert client._effect_pump.schedule.__self__ is client._effect_pump
+    assert client._effect_pump.drain.__self__ is client._effect_pump
+    assert client._effect_pump.discard_connection_effects.__self__ is client._effect_pump
 
 
 @pytest.mark.parametrize("qos", (QoS.AT_LEAST_ONCE, QoS.EXACTLY_ONCE))
-async def test_qosn_completion_with_idle_sync_callback_runs_inline(qos: QoS) -> None:
+async def test_qosn_completion_with_idle_sync_callback_runs_on_worker(qos: QoS) -> None:
     client = AsyncClient(client_id=f"effect-qos{int(qos)}-callback")
     receipt = PublishReceipt(mid=7, qos=qos)
     batch = PublishBatchReceipt()
     batch._register(7)
     batch._seal()
-    client._register_publish_receipt(7, receipt)
-    client._register_batch_receipt(7, batch)
+    _fifo_register(client._receipts, 7, receipt)
+    _fifo_register(client._batch_receipts, 7, batch)
     seen: list[tuple[int | None, BaseException | None, bool, bool]] = []
 
     def on_publish(mid: int | None, reason: BaseException | None) -> None:
@@ -49,20 +41,22 @@ async def test_qosn_completion_with_idle_sync_callback_runs_inline(qos: QoS) -> 
 
     client.on_publish = on_publish
     client._engine._emit(EffectKind.PUBLISH_COMPLETE, 7)
-    client._collect_effects_locked()
+    client._effect_pump.collect_from_engine()
 
     assert receipt.is_done()
     assert batch.is_done()
-    assert not client._pending_effects
+    assert not client._effect_pump.pending
     assert client._effect_pump.enqueued == 0
+    assert seen == []
+    await client._delivery.callback_queue.join()
     assert seen == [(7, None, True, True)]
-    assert client._callback_worker_task is None
+    await client._delivery.shutdown_callbacks(drain=False)
 
 
 async def test_inline_completion_keeps_callback_exceptions_isolated() -> None:
     client = AsyncClient(client_id="effect-callback-error")
     receipt = PublishReceipt(mid=8, qos=QoS.AT_LEAST_ONCE)
-    client._register_publish_receipt(8, receipt)
+    _fifo_register(client._receipts, 8, receipt)
     reported: list[dict[str, object]] = []
     loop = asyncio.get_running_loop()
     previous_handler = loop.get_exception_handler()
@@ -74,11 +68,11 @@ async def test_inline_completion_keeps_callback_exceptions_isolated() -> None:
     try:
         client.on_publish = on_publish
         client._engine._emit(EffectKind.PUBLISH_COMPLETE, 8)
-        client._collect_effects_locked()
-        await asyncio.wait_for(client._callback_queue.join(), timeout=1.0)
+        client._effect_pump.collect_from_engine()
+        await asyncio.wait_for(client._delivery.callback_queue.join(), timeout=1.0)
     finally:
         loop.set_exception_handler(previous_handler)
-        await client._shutdown_callback_worker(drain=False)
+        await client._delivery.shutdown_callbacks(drain=False)
 
     assert receipt.is_done()
     assert len(reported) == 1
@@ -94,36 +88,40 @@ async def test_sync_callback_never_runs_under_engine_lock() -> None:
 
     async with client._engine_lock:
         client._engine._emit(EffectKind.PUBLISH_COMPLETE, 31)
-        client._collect_effects_locked()
+        client._effect_pump.collect_from_engine()
         assert seen_lock_states == []
 
-    client._drain_effects_inline()
+    client._effect_pump.drain_inline()
+    await client._delivery.callback_queue.join()
     assert seen_lock_states == [False]
+    await client._delivery.shutdown_callbacks(drain=False)
 
 
-async def test_idle_sync_publish_failure_callback_runs_inline() -> None:
+async def test_idle_sync_publish_failure_callback_runs_on_worker() -> None:
     client = AsyncClient(client_id="effect-failure-callback")
     receipt = PublishReceipt(mid=9, qos=QoS.AT_LEAST_ONCE)
-    client._register_publish_receipt(9, receipt)
+    _fifo_register(client._receipts, 9, receipt)
     failure = RuntimeError("publish failed")
     seen: list[tuple[int | None, BaseException | None]] = []
     client.on_publish = lambda mid, reason: seen.append((mid, reason))
     client._engine._emit(EffectKind.PUBLISH_FAILED, PublishFailure(9, failure))
 
-    client._collect_effects_locked()
+    client._effect_pump.collect_from_engine()
 
     assert receipt.is_done()
     assert receipt._error is failure
-    assert not client._pending_effects
+    assert not client._effect_pump.pending
     assert client._effect_pump.enqueued == 0
+    assert seen == []
+    await client._delivery.callback_queue.join()
     assert seen == [(9, failure)]
-    assert client._callback_worker_task is None
+    await client._delivery.shutdown_callbacks(drain=False)
 
 
 async def test_async_publish_callback_stays_on_bounded_worker() -> None:
     client = AsyncClient(client_id="effect-async-callback")
     receipt = PublishReceipt(mid=10, qos=QoS.AT_LEAST_ONCE)
-    client._register_publish_receipt(10, receipt)
+    _fifo_register(client._receipts, 10, receipt)
     seen: list[int | None] = []
 
     async def on_publish(mid: int | None, _reason: BaseException | None) -> None:
@@ -131,17 +129,17 @@ async def test_async_publish_callback_stays_on_bounded_worker() -> None:
 
     client.on_publish = on_publish
     client._engine._emit(EffectKind.PUBLISH_COMPLETE, 10)
-    client._collect_effects_locked()
+    client._effect_pump.collect_from_engine()
 
     assert receipt.is_done()
     assert seen == []
-    assert client._callback_queue.qsize() == 1
-    await client._callback_queue.join()
+    assert client._delivery.callback_queue.qsize() == 1
+    await client._delivery.callback_queue.join()
     assert seen == [10]
-    await client._shutdown_callback_worker(drain=False)
+    await client._delivery.shutdown_callbacks(drain=False)
 
 
-async def test_idle_sync_message_callback_runs_inline_after_engine_lock() -> None:
+async def test_idle_sync_message_callback_runs_on_worker_after_engine_lock() -> None:
     client = AsyncClient(client_id="effect-inline-message", message_delivery="callback")
     seen: list[tuple[str, bool]] = []
     client.on_message = lambda message: seen.append((message.topic, client._engine_lock.locked()))
@@ -151,12 +149,14 @@ async def test_idle_sync_message_callback_runs_inline_after_engine_lock() -> Non
             EffectKind.MESSAGE,
             Message(topic="inline/message", payload=b"x"),
         )
-        client._collect_effects_locked()
+        client._effect_pump.collect_from_engine()
         assert seen == []
 
-    client._drain_effects_inline()
+    client._effect_pump.drain_inline()
+    await client._effect_pump.drain()
+    await client._delivery.callback_queue.join()
     assert seen == [("inline/message", False)]
-    assert client._callback_worker_task is None
+    await client._delivery.shutdown_callbacks(drain=False)
 
 
 async def test_full_callback_queue_retains_async_completion_backpressure() -> None:
@@ -174,39 +174,39 @@ async def test_full_callback_queue_retains_async_completion_backpressure() -> No
         await release.wait()
         seen.append(value)
 
-    await client._enqueue_callback(blocker, "running")
+    await client._delivery.enqueue_callback(blocker, "running")
     await started.wait()
-    await client._enqueue_callback(lambda value: seen.append(value), "queued")
+    await client._delivery.enqueue_callback(lambda value: seen.append(value), "queued")
 
     receipt = PublishReceipt(mid=11, qos=QoS.AT_LEAST_ONCE)
-    client._register_publish_receipt(11, receipt)
+    _fifo_register(client._receipts, 11, receipt)
     client.on_publish = lambda mid, _reason: seen.append(mid if mid is not None else -1)
     client._engine._emit(EffectKind.PUBLISH_COMPLETE, 11)
-    client._collect_effects_locked()
+    client._effect_pump.collect_from_engine()
 
     assert not receipt.is_done()
-    assert [effect.kind for effect in client._pending_effects] == [EffectKind.PUBLISH_COMPLETE]
+    assert [effect.kind for effect in client._effect_pump.pending] == [EffectKind.PUBLISH_COMPLETE]
     assert client._effect_pump.enqueued == 1
 
-    client._drain_effects_inline()
+    client._effect_pump.drain_inline()
     await asyncio.sleep(0)
     assert receipt.is_done(), "the slow path settles before waiting for callback capacity"
     assert client._effect_pump.apply_suspensions == 0
 
     release.set()
-    await client._drain_effects()
-    await asyncio.wait_for(client._callback_queue.join(), timeout=1.0)
+    await client._effect_pump.drain()
+    await asyncio.wait_for(client._delivery.callback_queue.join(), timeout=1.0)
     assert seen == ["running", "queued", 11]
-    assert not client._pending_effects
+    assert not client._effect_pump.pending
     assert client._effect_pump.enqueued == client._effect_pump.applied
-    await client._shutdown_callback_worker(drain=False)
+    await client._delivery.shutdown_callbacks(drain=False)
 
 
-async def test_inline_publish_callback_reentrancy_falls_back_to_bounded_worker() -> None:
+async def test_publish_callback_reentrancy_uses_bounded_worker() -> None:
     client = AsyncClient(client_id="effect-reentrant", max_pending_callbacks=2)
     client._engine.state = ConnectionState.CONNECTED
     receipt = PublishReceipt(mid=17, qos=QoS.AT_LEAST_ONCE)
-    client._register_publish_receipt(17, receipt)
+    _fifo_register(client._receipts, 17, receipt)
     seen: list[int | None] = []
 
     def on_publish(mid: int | None, _reason: BaseException | None) -> None:
@@ -216,14 +216,14 @@ async def test_inline_publish_callback_reentrancy_falls_back_to_bounded_worker()
 
     client.on_publish = on_publish
     client._engine._emit(EffectKind.PUBLISH_COMPLETE, 17)
-    client._collect_effects_locked()
+    client._effect_pump.collect_from_engine()
 
     assert receipt.is_done()
-    assert seen == [17]
-    assert client._callback_queue.qsize() == 1
-    await client._callback_queue.join()
+    assert seen == []
+    assert client._delivery.callback_queue.qsize() == 1
+    await client._delivery.callback_queue.join()
     assert seen == [17, None]
-    await client._shutdown_callback_worker(drain=False)
+    await client._delivery.shutdown_callbacks(drain=False)
 
 
 async def test_cancelled_flush_honours_a_deferred_reschedule() -> None:
@@ -251,16 +251,16 @@ async def test_cancelled_flush_honours_a_deferred_reschedule() -> None:
     old_task.cancel()
     await cancellation_started.wait()
 
-    client._pending_effects.append(EngineEffect(EffectKind.PINGRESP, None))
+    client._effect_pump.pending.append(EngineEffect(EffectKind.PINGRESP, None))
     client._effect_pump.enqueued = 1
-    client._schedule_effect_flush()
+    client._effect_pump.schedule()
     cancellation_release.set()
 
     await asyncio.wait_for(applied.wait(), timeout=1.0)
-    flush_task = client._effect_flush_task
+    flush_task = client._effect_pump.task
     if flush_task is not None:
         await flush_task
-    assert not client._pending_effects
+    assert not client._effect_pump.pending
     assert client._effect_pump.applied == client._effect_pump.enqueued
 
 
@@ -268,13 +268,13 @@ async def test_single_send_effect_bypasses_queue_and_accounting() -> None:
     client = AsyncClient(client_id="effect-fast-path")
     client._engine._emit(EffectKind.SEND, b"payload")
 
-    client._collect_effects_locked()
+    client._effect_pump.collect_from_engine()
 
-    assert client._pending_effects == deque()
-    assert client._effect_enqueued == 0
-    assert client._effect_applied == 0
-    assert client._outbound.get_nowait() == b"payload"
-    client._outbound.task_done()
+    assert client._effect_pump.pending == deque()
+    assert client._effect_pump.enqueued == 0
+    assert client._effect_pump.applied == 0
+    assert client._write_pump.queue.get_nowait() == b"payload"
+    client._write_pump.queue.task_done()
 
 
 async def test_discard_preserves_terminal_publish_order() -> None:
@@ -283,22 +283,22 @@ async def test_discard_preserves_terminal_publish_order() -> None:
     complete = EngineEffect(EffectKind.PUBLISH_COMPLETE, 41)
     failed = EngineEffect(EffectKind.PUBLISH_FAILED, object())
     send = EngineEffect(EffectKind.SEND, b"stale")
-    client._pending_effects.extend((send, complete, failed))
+    client._effect_pump.pending.extend((send, complete, failed))
     client._effect_pump.pending_epoch = 1
     client._effect_pump.enqueued = 3
 
-    client._discard_connection_effects()
+    client._effect_pump.discard_connection_effects()
 
-    assert list(client._pending_effects) == [complete, failed]
-    assert client._pending_effect_epoch == 2
-    assert client._effect_applied == 1
+    assert list(client._effect_pump.pending) == [complete, failed]
+    assert client._effect_pump.pending_epoch == 2
+    assert client._effect_pump.applied == 1
 
 
 def _collect(client: AsyncClient, kinds: list[EffectKind]) -> list[EffectKind]:
     """Emit one batch through the pump and report the order it queued."""
     for kind in kinds:
         client._engine._emit(kind, None)
-    client._collect_effects_locked()
+    client._effect_pump.collect_from_engine()
     return [effect.kind for effect in client._effect_pump.pending]
 
 

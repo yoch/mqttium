@@ -166,7 +166,8 @@ async def test_many_waiters_all_complete_while_writer_drains() -> None:
 
 async def test_capacity_release_notifies_at_most_the_freed_slots() -> None:
     pump = _pump(max_messages=2)
-    assert pump.try_enqueue_many([b"a", b"b"]) is True
+    assert pump.try_enqueue(b"a") is True
+    assert pump.try_enqueue(b"b") is True
     waiters = await _park_waiters(pump, [f"w{i}".encode() for i in range(8)])
 
     notifies: list[int] = []
@@ -204,7 +205,8 @@ async def test_epoch_advance_wakes_all_waiters() -> None:
 
 async def test_discard_and_wake_unblocks_waiters() -> None:
     pump = _pump(max_messages=2)
-    assert pump.try_enqueue_many([b"hold-a", b"hold-b"]) is True
+    assert pump.try_enqueue(b"hold-a") is True
+    assert pump.try_enqueue(b"hold-b") is True
     waiters = await _park_waiters(pump, [b"a", b"b"])
 
     pump.discard()
@@ -309,7 +311,8 @@ async def test_cancelled_waiter_while_still_parked_does_not_strand_peer() -> Non
 
 async def test_no_waiter_starves_while_capacity_keeps_being_released() -> None:
     pump = _pump(max_messages=2)
-    assert pump.try_enqueue_many([b"a", b"b"]) is True
+    assert pump.try_enqueue(b"a") is True
+    assert pump.try_enqueue(b"b") is True
     payloads = [f"w{i:02d}".encode() for i in range(16)]
     waiters = await _park_waiters(pump, payloads)
 

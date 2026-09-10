@@ -10,6 +10,8 @@ retransmit a settled publication. Found by
 
 from __future__ import annotations
 
+from tests.support import stored_record
+
 from pathlib import Path
 
 import pytest
@@ -49,13 +51,15 @@ def _resume_with_parked_wait_puback(store: InflightStore) -> ProtocolEngine:
     """Resume a session whose second WAIT_PUBACK cannot fit the send quota."""
     for mid in (1, 2):
         store.put_out(
-            OutboundMessage(
-                mid=mid,
-                topic=f"t/{mid}",
-                payload=b"payload",
-                qos=QoS.AT_LEAST_ONCE,
-                retain=False,
-                state=OutboundQoSState.WAIT_PUBACK,
+            stored_record(
+                OutboundMessage(
+                    mid=mid,
+                    topic=f"t/{mid}",
+                    payload=b"payload",
+                    qos=QoS.AT_LEAST_ONCE,
+                    retain=False,
+                    state=OutboundQoSState.WAIT_PUBACK,
+                )
             )
         )
     engine = ProtocolEngine(

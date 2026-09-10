@@ -19,7 +19,7 @@ The default policy waits for protocol or writer capacity. Inspect:
 - `stats().delivery` for a slow callback or iterator;
 - `stats().tasks` and `reconnect_attempt` for active recovery.
 
-If waiting is unacceptable, choose `publish_backpressure="error"` and implement
+If waiting is unacceptable, use `publish_nowait()` and implement
 a shed, retry, or spill policy. Do not simply remove the bounds.
 
 ## `publish_nowait()` raises `FlowControlError`
@@ -54,11 +54,10 @@ automatically a WebSocket endpoint.
 
 ## Messages are not delivered
 
-With `message_delivery="auto"`, assigning `on_message` or registering a
-topic-filtered callback with `message_callback_add` selects callback
-delivery; otherwise the iterator is used. With `"both"`, both consumers retain
-capacity. Check callback exceptions through the event loop exception handler
-and inspect delivery queue counts and bytes.
+The default `message_delivery="iterator"` requires consuming `messages()`.
+Callbacks require explicit `message_delivery="callback"`. Set `on_message` and
+all routes before the first connection attempt. Check callback exceptions
+through the event loop exception handler and inspect delivery counts and bytes.
 
 With `manual_ack=True`, call `await client.ack(message)` after durable
 application processing. Duplicate delivery remains possible after failure and

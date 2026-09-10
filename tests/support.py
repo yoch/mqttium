@@ -140,3 +140,42 @@ def write_item_bytes(data: object) -> bytes:
         return data
     assert isinstance(data, tuple)
     return data[0] + data[1]
+
+
+def stored_record(message):
+    """Build a persisted test/benchmark record with its mandatory logical size."""
+    from mqttium.protocol._sizing import publish_logical_size
+
+    if message.logical_size > 0:
+        return message
+    message.logical_size = publish_logical_size(
+        bool(message.properties),
+        message.topic,
+        len(message.payload),
+        message.properties,
+    )
+    return message
+
+
+async def wait_until(predicate, *, timeout=2.0):
+    """Wait for an observable test condition with a finite deadline."""
+    async with asyncio.timeout(timeout):
+        while not predicate():
+            await asyncio.sleep(0)
+
+
+def sqlite_logical_snapshot(path):
+    """Compare committed schema/data while allowing SQLite journal housekeeping."""
+    import sqlite3
+    from contextlib import closing
+
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("BEGIN")
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        journal = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        schema = conn.execute(
+            "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
+        ).fetchall()
+        outbound = conn.execute("SELECT * FROM outbound ORDER BY mid").fetchall()
+        inbound = conn.execute("SELECT * FROM inbound ORDER BY mid").fetchall()
+        return version, journal, schema, outbound, inbound

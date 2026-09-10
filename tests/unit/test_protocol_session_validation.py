@@ -67,7 +67,7 @@ def test_disconnect_packet_parsed() -> None:
 
 def test_session_resume_uses_clean_start_false() -> None:
     props = Properties()
-    props.set("session_expiry_interval", 3600)
+    props = Properties({**props.values, "session_expiry_interval": 3600})
     engine = ProtocolEngine(
         EngineConfig(
             client_id="c",
@@ -114,7 +114,7 @@ def test_offline_qos_rejected_after_max_qos_connack() -> None:
     assert handle.mid is not None
     engine.begin_connect()
     props = Properties()
-    props.set("maximum_qos", 1)
+    props = Properties({**props.values, "maximum_qos": 1})
     body = bytes((0x00, 0x00)) + encode_properties(props, "CONNACK")
     _feed(engine, encode_frame(PacketType.CONNACK, 0, body))
     effects = engine.take_effects()

@@ -124,7 +124,7 @@ async def test_cancelled_connect_closes_transport_and_tasks() -> None:
     assert transport.is_closing()
     assert client._transport is None
     assert client._reader_task is None
-    assert client._writer_task is None
+    assert client._write_pump.task is None
     assert client._keepalive_task is None
     assert client._reconnect_task is None
     assert client.state is ConnectionState.DISCONNECTED

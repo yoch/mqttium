@@ -117,13 +117,10 @@ async def run_publisher(args: argparse.Namespace, topic: str) -> tuple[float, fl
             while pending:
                 await pending.popleft().wait()
     else:
-        receipt = await client.publish_many(
-            messages,
-            chunk_size=CHUNK,
-        )
+        receipt = await client.publish_many(messages)
         await receipt.wait()
 
-    await client._outbound.join()
+    await client._write_pump.queue.join()
     elapsed = time.perf_counter() - started
     cpu = time.process_time() - cpu_started
     await client.disconnect()

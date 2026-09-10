@@ -22,7 +22,7 @@ async def run(
     timeout: float,
 ) -> None:
     received: asyncio.Future[Message] = asyncio.get_running_loop().create_future()
-    client = AsyncClient(f"mqttium-pubsub-{uuid.uuid4().hex}", protocol=protocol)
+    client = AsyncClient(f'mqttium-pubsub-{uuid.uuid4().hex}', protocol=protocol, message_delivery='callback')
 
     async def on_message(message: Message) -> None:
         if message.topic == topic and not received.done():

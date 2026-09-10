@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests.support import stored_record
+
 
 from mqttium.api.async_client import AsyncClient
 from mqttium.enums import (
@@ -19,15 +21,17 @@ from mqttium.codec.buffer import RawPacket
 
 
 def _inbound(mid: int, *, state=InboundQoSState.WAIT_PUBREL, delivered=True, user_acked=False):
-    return InboundMessage(
-        mid=mid,
-        topic=f"recover/{mid}",
-        payload=str(mid).encode(),
-        qos=QoS.EXACTLY_ONCE if state is not InboundQoSState.WAIT_PUBACK else QoS.AT_LEAST_ONCE,
-        retain=False,
-        state=state,
-        delivered=delivered,
-        user_acked=user_acked,
+    return stored_record(
+        InboundMessage(
+            mid=mid,
+            topic=f"recover/{mid}",
+            payload=str(mid).encode(),
+            qos=QoS.EXACTLY_ONCE if state is not InboundQoSState.WAIT_PUBACK else QoS.AT_LEAST_ONCE,
+            retain=False,
+            state=state,
+            delivered=delivered,
+            user_acked=user_acked,
+        )
     )
 
 
@@ -138,5 +142,5 @@ async def test_client_marks_persisted_message_delivered_after_api_delivery() -> 
 
     persisted = store.get_in(9)
     assert persisted is not None and persisted.delivered is True
-    queued = client._messages.get_nowait()
+    queued = await anext(client.messages())
     assert isinstance(queued, Message) and queued.mid == 9

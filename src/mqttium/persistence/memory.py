@@ -20,15 +20,17 @@ from mqttium.types import (
 class InflightStore(Protocol):
     """Persistence contract required by the MQTT state machine.
 
-    Stores provide atomic batches, bounded replay, payload-free metadata reads,
+    Stores provide atomic mutations, bounded replay, payload-free metadata reads,
     and conditional transitions.  These are correctness/resource guarantees,
     not optional optimisations: the runtime has one persistence state-machine
     path and never falls back to eager whole-store hydration or read/modify/write
     settlement.
 
     Storage/backend failures must use backend-native or ordinary Python
-    exceptions rather than ``MQTTError`` subclasses.  ``batch()`` must roll back
-    prior mutations when its body fails and must not suppress that failure.
+    exceptions rather than ``MQTTError`` subclasses. ``batch()`` groups writes:
+    SQLite uses a transaction, memory uses a no-op context. The engine owns
+    per-publication compensation; no cross-backend application transaction is
+    promised. Neither backend suppresses a failure.
     """
 
     def batch(self) -> AbstractContextManager[None]: ...
@@ -41,7 +43,6 @@ class InflightStore(Protocol):
     def out_summary_pages(
         self, page_size: int = 256
     ) -> Iterator[tuple[OutboundMessageSummary, ...]]: ...
-    def set_out_logical_size(self, mid: int, logical_size: int) -> bool: ...
     def out_meta(self, mid: int) -> OutboundRecordMeta | None: ...
     def complete_out(
         self, mid: int, expected_state: OutboundQoSState
@@ -67,7 +68,6 @@ class InflightStore(Protocol):
         max_messages: int = 64,
         max_bytes: int = 1 << 20,
     ) -> Iterator[tuple[InboundMessage, ...]]: ...
-    def set_in_logical_size(self, mid: int, logical_size: int) -> bool: ...
     def in_meta(self, mid: int) -> InboundRecordMeta | None: ...
     def in_index_pages(self, page_size: int = 256) -> Iterator[tuple[InboundRecordMeta, ...]]: ...
     def mark_in_delivered(self, mid: int) -> bool: ...
@@ -101,6 +101,8 @@ class MemoryInflightStore:
         return nullcontext()
 
     def put_out(self, msg: OutboundMessage) -> None:
+        if msg.logical_size <= 0:
+            raise ValueError("logical_size must be positive")
         self._out[msg.mid] = msg
 
     def get_out(self, mid: int) -> OutboundMessage | None:
@@ -149,13 +151,6 @@ class MemoryInflightStore:
 
     # --- conditional transitions (TransitionInflightStore) ------------------
 
-    def set_out_logical_size(self, mid: int, logical_size: int) -> bool:
-        msg = self._out.get(mid)
-        if msg is None:
-            return False
-        msg.logical_size = logical_size
-        return True
-
     def out_meta(self, mid: int) -> OutboundRecordMeta | None:
         msg = self._out.get(mid)
         if msg is None:
@@ -195,6 +190,8 @@ class MemoryInflightStore:
         return OutboundRecordMeta(mid=mid, state=new_state, logical_size=msg.logical_size)
 
     def put_in(self, msg: InboundMessage) -> None:
+        if msg.logical_size <= 0:
+            raise ValueError("logical_size must be positive")
         self._in[msg.mid] = msg
 
     def get_in(self, mid: int) -> InboundMessage | None:
@@ -250,13 +247,6 @@ class MemoryInflightStore:
         self._in = {}
 
     # --- conditional transitions (TransitionInflightStore) ------------------
-
-    def set_in_logical_size(self, mid: int, logical_size: int) -> bool:
-        msg = self._in.get(mid)
-        if msg is None:
-            return False
-        msg.logical_size = logical_size
-        return True
 
     def in_meta(self, mid: int) -> InboundRecordMeta | None:
         msg = self._in.get(mid)

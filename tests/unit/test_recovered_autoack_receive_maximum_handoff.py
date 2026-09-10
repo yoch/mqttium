@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests.support import stored_record
+
 from mqttium.codec.buffer import IncrementalDecoder
 from mqttium.codec.properties import CONNACK, encode_properties
 from mqttium.enums import (
@@ -42,24 +44,28 @@ def _publish(mid: int, *, qos: QoS = QoS.AT_LEAST_ONCE, dup: bool = False) -> by
 def _recovered_engine(receive_maximum: int) -> ProtocolEngine:
     store = MemoryInflightStore()
     store.put_out(
-        OutboundMessage(
-            mid=99,
-            topic="resume/state",
-            payload=b"x",
-            qos=QoS.AT_LEAST_ONCE,
-            retain=False,
-            state=OutboundQoSState.WAIT_PUBACK,
+        stored_record(
+            OutboundMessage(
+                mid=99,
+                topic="resume/state",
+                payload=b"x",
+                qos=QoS.AT_LEAST_ONCE,
+                retain=False,
+                state=OutboundQoSState.WAIT_PUBACK,
+            )
         )
     )
     store.put_in(
-        InboundMessage(
-            mid=7,
-            topic="recover/window",
-            payload=b"old",
-            qos=QoS.AT_LEAST_ONCE,
-            retain=False,
-            state=InboundQoSState.WAIT_PUBACK,
-            delivered=True,
+        stored_record(
+            InboundMessage(
+                mid=7,
+                topic="recover/window",
+                payload=b"old",
+                qos=QoS.AT_LEAST_ONCE,
+                retain=False,
+                state=InboundQoSState.WAIT_PUBACK,
+                delivered=True,
+            )
         )
     )
     engine = ProtocolEngine(

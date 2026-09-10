@@ -9,7 +9,7 @@ from mqttium.codec.buffer import IncrementalDecoder
 from mqttium.codec.primitives import unpack_utf8
 from mqttium.codec.properties import CONNECT, decode_properties
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, PacketType, QoS
-from mqttium.errors import PacketTooLargeError
+from mqttium.errors import ProtocolError
 from mqttium.packets import PublishPacket, encode_frame
 from mqttium.protocol.config import EngineConfig
 from mqttium.protocol.effects import EffectKind
@@ -50,15 +50,14 @@ def _qos1_publish(mid: int) -> bytes:
     ).encode(MQTTProtocolVersion.MQTTv5)
 
 
-def test_connect_receive_maximum_override_is_the_inbound_limit() -> None:
+def test_connect_receive_maximum_is_the_inbound_limit() -> None:
     connect_properties = Properties({"receive_maximum": 10})
     engine = ProtocolEngine(
         EngineConfig(
             client_id="rm-override",
             protocol=MQTTProtocolVersion.MQTTv5,
-            local_receive_maximum=2,
+            local_receive_maximum=10,
             manual_ack=True,
-            connect_properties=connect_properties,
         )
     )
 
@@ -69,7 +68,7 @@ def test_connect_receive_maximum_override_is_the_inbound_limit() -> None:
 
     # The application-owned property bag is no longer connection state after
     # CONNECT: enforcement must keep using the value that went on the wire.
-    connect_properties.set("receive_maximum", 1)
+    connect_properties = Properties({**connect_properties.values, "receive_maximum": 1})
     for mid in range(1, 11):
         _feed(engine, _qos1_publish(mid))
         effects = engine.take_effects()
@@ -88,12 +87,11 @@ def test_connect_receive_maximum_override_is_the_inbound_limit() -> None:
     assert disconnect[2] == 0x93
 
 
-def test_connect_maximum_packet_size_override_is_the_decoder_limit() -> None:
+def test_connect_maximum_packet_size_is_the_decoder_limit() -> None:
     client = AsyncClient(
         client_id="mps-override",
         protocol=MQTTProtocolVersion.MQTTv5,
-        maximum_packet_size=32,
-        connect_properties=Properties({"maximum_packet_size": 64}),
+        maximum_packet_size=64,
     )
 
     connect = client._engine.begin_connect()
@@ -106,33 +104,21 @@ def test_connect_maximum_packet_size_override_is_the_decoder_limit() -> None:
     assert client._decoder.next_packet() is not None
 
 
-def test_connect_maximum_packet_size_one_is_enforced_exactly() -> None:
+@pytest.mark.parametrize(
+    "name,value", [("receive_maximum", 10), ("maximum_packet_size", 64), ("topic_alias_maximum", 2)]
+)
+def test_connect_properties_cannot_duplicate_dedicated_limits(name, value) -> None:
+    with pytest.raises(ProtocolError, match="dedicated"):
+        AsyncClient(connect_properties=Properties({name: value}))
+
+
+async def test_connect_keeps_its_packet_limit_on_reconnect() -> None:
     client = AsyncClient(
-        protocol=MQTTProtocolVersion.MQTTv5,
-        connect_properties=Properties({"maximum_packet_size": 1}),
+        client_id="limit", protocol=MQTTProtocolVersion.MQTTv5, maximum_packet_size=96
     )
-
-    assert client._decoder.max_packet_size == 1
-    client._decoder.feed(encode_frame(PacketType.PINGRESP, 0, b""))
-    with pytest.raises(PacketTooLargeError, match="exceeds maximum 1"):
-        client._decoder.next_packet()
-
-
-async def test_connect_resnapshots_mutated_maximum_packet_size_property() -> None:
-    connect_properties = Properties({"maximum_packet_size": 64})
-    client = AsyncClient(
-        client_id="mps-snapshot",
-        protocol=MQTTProtocolVersion.MQTTv5,
-        maximum_packet_size=32,
-        connect_properties=connect_properties,
-    )
-    transport = ScriptedBrokerTransport(protocol=MQTTProtocolVersion.MQTTv5)
-    client._transport_factory = transport_factory(transport)
-
-    connect_properties.set("maximum_packet_size", 96)
-    await client.connect("fake", 1883, timeout=1.0)
-    assert client._decoder.max_packet_size == 96
-
-    connect_properties.set("maximum_packet_size", 16)
-    assert client._decoder.max_packet_size == 96
-    await client.disconnect()
+    for _ in range(2):
+        transport = ScriptedBrokerTransport(protocol=MQTTProtocolVersion.MQTTv5)
+        client._transport_factory = transport_factory(transport)
+        await client.connect("fake", 1883, timeout=1.0)
+        assert client._decoder.max_packet_size == 96
+        await client.disconnect()

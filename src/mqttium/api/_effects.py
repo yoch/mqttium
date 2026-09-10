@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from collections.abc import Callable
 from typing import TYPE_CHECKING, Protocol
 
 from mqttium.api.stats import EffectStats
@@ -29,10 +28,6 @@ class EffectOwner(Protocol):
     _engine: ProtocolEngine
 
     def _apply_effect_inline(self, effect: EngineEffect, epoch: int) -> bool: ...
-
-    def _apply_message_effect_batch_inline(
-        self, effects: deque[EngineEffect], epoch: int
-    ) -> int: ...
 
     async def _apply_effect(
         self,
@@ -145,17 +140,6 @@ class EffectPump:
         if pending > self.pending_high_water:
             self.pending_high_water = pending
 
-    def record_inline_batch(self, count: int) -> None:
-        """Record logical effects delivered without entering the pending deque."""
-        self.batches += 1
-        if count > 1:
-            self.multi_effect_batches += 1
-        self.enqueued += count
-        self.applied += count
-        self.inline_effects += count
-        if self.waiters:
-            self.progress.set()
-
     def stats(self) -> EffectStats:
         """Snapshot the deque and the ordering decisions taken so far."""
         pending = len(self.pending)
@@ -177,26 +161,6 @@ class EffectPump:
         if self.waiters:
             self.progress.set()
 
-    def _consume_batch(
-        self,
-        apply: Callable[[deque[EngineEffect], int], int],
-        epoch: int,
-    ) -> bool:
-        """Apply a consecutive non-persisted small-message prefix.
-
-        `apply` is the owner's MESSAGE or DECODED_MESSAGE batch acceptor; only
-        which one is bound differs between the two kinds. One call per batch,
-        not per message.
-        """
-        applied = apply(self.pending, epoch)
-        if not applied:
-            return False
-        for _ in range(applied):
-            self.pending.popleft()
-            self.inline_effects += 1
-            self._complete()
-        return True
-
     def drain_inline(self) -> None:
         if self.draining_inline or self.lock.locked():
             return
@@ -212,11 +176,6 @@ class EffectPump:
         try:
             while self.pending:
                 effect = self.pending[0]
-                kind = effect.kind
-                if kind is EffectKind.MESSAGE or kind is EffectKind.DECODED_MESSAGE:
-                    if self._consume_batch(self.owner._apply_message_effect_batch_inline, epoch):
-                        continue
-                    break
                 if not self.owner._apply_effect_inline(effect, epoch):
                     break
                 self.pending.popleft()
@@ -246,12 +205,6 @@ class EffectPump:
                     if epoch != self.owner._connection_epoch:
                         self.discard_connection_effects()
                         continue
-                    kind = effect.kind
-                    if kind is EffectKind.MESSAGE or kind is EffectKind.DECODED_MESSAGE:
-                        if self._consume_batch(
-                            self.owner._apply_message_effect_batch_inline, epoch
-                        ):
-                            continue
                     try:
                         await self.owner._apply_effect(effect, nowait=False, epoch=epoch)
                     except asyncio.CancelledError:

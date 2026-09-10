@@ -19,6 +19,8 @@ exclude_docs: |
   experiments/
   reports/*.md
   !reports/README.md
+  !reports/LEAN-NATIVE-EXPERIMENT-2026-09-10.md
+  !reports/LEAN-NATIVE-FOLLOWUP-2026-09-10.md
 
 theme:
   name: material
@@ -60,7 +62,7 @@ plugins:
         API-STABILITY.md: api-stability.md
         BENCHMARKING.md: benchmarking.md
         BETA-REPORTING.md: reporting-issues.md
-        COMPAT.md: paho-compatibility.md
+        COMPAT.md: migration.md
         COMPATIBILITY.md: compatibility.md
         CONFIGURATION.md: configuration-and-sizing.md
         CONFORMANCE.md: conformance.md
@@ -103,8 +105,8 @@ plugins:
       markdown_description: >-
         MQTTium is a dependency-free, async-native MQTT 3.1.1 and MQTT 5.0
         client for production Python services, gateways, and IoT systems.
-        Prefer the Stable AsyncClient API. The Paho-compatible API is a
-        Provisional migration aid with documented limitations.
+        This branch experiments with an incompatible, smaller native AsyncClient
+        API. Paho and one-shot helpers are removed.
       sections:
         Get started:
           - index.md: Product overview and documentation map
@@ -121,14 +123,12 @@ plugins:
           - cookbook.md
         Migration and compatibility:
           - migration.md
-          - paho-compatibility.md
           - compatibility.md
-        Stable API reference:
+        Native API reference:
           - reference/index.md
           - reference/async-client.md
           - reference/models.md
           - reference/errors-and-enums.md
-          - reference/helpers.md
           - api-stability.md
         Design and conformance:
           - architecture.md
@@ -184,13 +184,11 @@ nav:
       - Cookbook: cookbook.md
   - Migration:
       - Migrating to MQTTium: migration.md
-      - Paho VERSION2 compatibility (Provisional): paho-compatibility.md
   - Reference:
-      - Stable API: reference/index.md
+      - Native API: reference/index.md
       - AsyncClient: reference/async-client.md
       - Models and settings: reference/models.md
       - Errors and enums: reference/errors-and-enums.md
-      - Helpers: reference/helpers.md
       - Compatibility and validation: compatibility.md
       - API stability policy: api-stability.md
   - Concepts:

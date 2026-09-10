@@ -150,3 +150,18 @@ def evaluate_preflight(sample: dict[str, Any], limits: PreflightLimits) -> list[
                 f"CPU governors {governors!r} do not match {limits.required_governor!r}"
             )
     return failures
+
+
+def stored_record(message):
+    """Build a persisted test/benchmark record with its mandatory logical size."""
+    from mqttium.protocol._sizing import publish_logical_size
+
+    if message.logical_size > 0:
+        return message
+    message.logical_size = publish_logical_size(
+        bool(message.properties),
+        message.topic,
+        len(message.payload),
+        message.properties,
+    )
+    return message

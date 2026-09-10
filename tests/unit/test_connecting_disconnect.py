@@ -79,7 +79,7 @@ async def test_runtime_disconnect_connecting_writes_terminal_packet(protocol):
         await connecting
     assert t.packet_types[:2] == [PacketType.CONNECT, PacketType.DISCONNECT]
     assert t.closing and c.state is ConnectionState.DISCONNECTED
-    assert c._transport is None and c._reader_task is None and c._writer_task is None
+    assert c._transport is None and c._reader_task is None and c._write_pump.task is None
     assert c._connect_disconnect_fut is None
 
 

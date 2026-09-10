@@ -40,30 +40,6 @@ class PacketIdPool:
     def available(self) -> int:
         return self._MAX_ID - len(self)
 
-    @property
-    def _used(self) -> set[int]:
-        """Materialize live MIDs for invariant/debug tooling.
-
-        Production paths never retain this compatibility view. Existing fuzz
-        checks historically inspected the old private set directly.
-        """
-        used = set(range(1, self._next))
-        if self._free_one:
-            used.discard(self._free_one)
-        if self._free_many is not None:
-            used.difference_update(self._free_many)
-        if self._reserved is not None:
-            used.update(self._reserved)
-        return used
-
-    @property
-    def _free(self) -> list[int]:
-        """Materialize released MIDs for legacy memory-cleanup tests."""
-        free = [] if not self._free_one else [self._free_one]
-        if self._free_many is not None:
-            free.extend(self._free_many)
-        return free
-
     def allocate(self) -> int:
         mid = self._free_one
         if mid:

@@ -55,9 +55,9 @@ clock access, or user callbacks into `protocol/`.
 - `api/_effects.py` owns the connection-scoped effect deque and deferred effect
   processing. The client interprets effects because it owns runtime objects.
 
-The native API must not accommodate the Paho façade. `compat/paho.py` is a
-Provisional consumer that runs `AsyncClient` on a dedicated thread and loop;
-the core never imports it.
+This is the incompatible lean-native experiment. Paho and one-shot helpers
+are removed. Native APIs and the two supplied stores are the supported
+experimental surface; engine, codecs and extension protocols are Internal.
 
 ## Load-bearing invariants
 
@@ -99,10 +99,12 @@ pump `continue_inbound_replay()` while replay remains pending.
 
 ## Persistence
 
-`InflightStore` is the base protocol. Memory and SQLite stores also expose
-optional paged and conditional-transition capabilities detected once by the
-directional sessions. The store guarantees atomic mutation; it never owns the
-MQTT state machine.
+`InflightStore` is a complete internal protocol with required paged replay and
+conditional metadata transitions. Both stores guarantee atomic mutation.
+`batch()` groups writes: SQLite uses a transaction, memory a no-op context.
+The engine owns per-publication rollback, not an application transaction.
+Schema 5 only accepts fresh or current experimental databases; historical and
+future formats are refused before write-affecting pragmas.
 
 SQLite schema changes are transactional and versioned with
 `PRAGMA user_version`. Preserve these measured design choices unless new A/B
@@ -133,8 +135,9 @@ evidence justifies a change:
 
 ## API and documentation contracts
 
-API tiers are defined by the API stability document, not by importability or
-`__all__`:
+This branch revises the pre-v1 Stable API deliberately. Its experimental native
+contract is defined by the API stability document, not importability or
+`__all__`. The general project tier definitions are:
 
 - **Stable** follows SemVer and the documented deprecation process.
 - **Provisional** is supported and tested but may evolve with changelog and
@@ -165,5 +168,5 @@ document.
 - Self-hosted workflows execute only trusted code, serialize access to the
   persistent runner, use run-specific temporary state, and clean up on failure.
 - Benchmark scripts emit artifacts; public cross-client evidence belongs in the
-  independent benchmark repository and never includes the Paho façade as the
+  independent benchmark repository and describes the native
   MQTTium product.

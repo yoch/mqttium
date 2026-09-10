@@ -4,57 +4,60 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any
+from collections.abc import Mapping
+from types import MappingProxyType
+
+from mqttium.errors import ProtocolError
 
 from mqttium.enums import InboundQoSState, OutboundQoSState, QoS
 
 
-def _freeze_property_signature(value: Any) -> Any:
-    """Snapshot mutable property values before using them as a cache signature."""
-    if isinstance(value, bytearray):
+def _owned_payload(payload: bytes | str) -> bytes:
+    if isinstance(payload, str):
+        return payload.encode("utf-8")
+    if isinstance(payload, bytes):
+        return payload
+    if isinstance(payload, (bytearray, memoryview)):
+        return bytes(payload)
+    raise TypeError("payload must be bytes or str")
+
+
+def _freeze_property_value(value: Any) -> Any:
+    if isinstance(value, (bytearray, memoryview)):
         return bytes(value)
-    if isinstance(value, list):
-        return tuple(_freeze_property_signature(item) for item in value)
-    if isinstance(value, tuple):
-        return tuple(_freeze_property_signature(item) for item in value)
-    return value
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_property_value(item) for item in value)
+    if value is None or isinstance(value, (str, bytes, int, float)):
+        return value
+    raise ProtocolError(f"Unsupported property value type: {type(value).__name__}")
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, frozen=True)
 class Properties:
-    """Minimal MQTT 5 property bag.
+    """Owned, immutable MQTT 5 properties.
 
-    Values that may repeat (user properties, subscription identifiers) are lists.
-    Singletons are stored directly; packet encoders and decoders validate which
-    properties are legal for each MQTT packet type.
+    Construct from a mapping. Repeated values become tuples; user properties
+    are ordered tuples of string pairs. Packet codecs validate context and
+    value constraints before admitting an operation.
     """
 
-    values: dict[str, Any] = field(default_factory=dict)
-    # packet context -> (structural signature, encoded property table).
-    # The signature snapshots mutable values, so direct/in-place mutations remain safe.
-    # Created on first encode: every decoded inbound packet builds a Properties
-    # and never encodes it, so allocating the cache eagerly would double the
-    # dict allocations on the ingress path.
-    _encoded: dict[str, tuple[tuple[tuple[str, Any], ...], bytes]] | None = field(
-        default=None, init=False, repr=False, compare=False
-    )
+    values: Mapping[str, Any] = field(default_factory=dict)
+    _encoded: dict[str, bytes] | None = field(default=None, init=False, repr=False, compare=False)
 
-    def _signature(self) -> tuple[tuple[str, Any], ...]:
-        return tuple(
-            (name, _freeze_property_signature(value)) for name, value in self.values.items()
-        )
+    def __post_init__(self) -> None:
+        values = {}
+        for name, value in self.values.items():
+            if not isinstance(name, str):
+                raise ProtocolError("Property names must be strings")
+            frozen = _freeze_property_value(value)
+            if name == "user_property" and isinstance(frozen, tuple):
+                if len(frozen) == 2 and all(isinstance(item, str) for item in frozen):
+                    frozen = (frozen,)
+            values[name] = frozen
+        object.__setattr__(self, "values", MappingProxyType(values))
 
     def get(self, name: str, default: Any = None) -> Any:
-        """Return a property value or ``default`` when it is absent."""
         return self.values.get(name, default)
-
-    def set(self, name: str, value: Any) -> None:
-        """Set or replace a singleton property value."""
-        self.values[name] = value
-
-    def add_user_property(self, key: str, value: str) -> None:
-        """Append one ordered MQTT 5 user-property pair."""
-        items = self.values.setdefault("user_property", [])
-        items.append((key, value))
 
     def __bool__(self) -> bool:
         return bool(self.values)
@@ -81,6 +84,10 @@ class Message:
     dup: bool = False
     mid: int | None = None
     properties: Properties | None = None
+    _ack_token: object | None = field(default=None, init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "payload", _owned_payload(self.payload))
 
 
 @dataclass(slots=True)

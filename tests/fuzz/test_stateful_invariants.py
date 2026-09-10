@@ -95,9 +95,9 @@ def _check_invariants(engine: ProtocolEngine, step: int, history: list[str]) -> 
     )
     pool = engine.packet_ids
 
-    # The pool's own two views of "live" must agree.
-    if len(pool) != len(pool._used):
-        fail(f"packet id pool: len()={len(pool)} but |_used|={len(pool._used)}")
+    expected_mids = {record.mid for record in records} | set(engine._pending_sub_mids)
+    if len(pool) != len(expected_mids):
+        fail(f"packet id pool: len()={len(pool)} but owners={len(expected_mids)}")
 
     for record in records:
         if not pool.in_use(record.mid):
@@ -298,7 +298,9 @@ def _make_out(rng: random.Random, mid: int) -> OutboundMessage:
     properties = None
     if rng.random() < 0.3:
         properties = Properties()
-        properties.set("message_expiry_interval", rng.randint(0, 1000))
+        properties = Properties(
+            {**properties.values, "message_expiry_interval": rng.randint(0, 1000)}
+        )
     return OutboundMessage(
         mid=mid,
         topic=f"t/{rng.randint(0, 4)}",
@@ -308,7 +310,7 @@ def _make_out(rng: random.Random, mid: int) -> OutboundMessage:
         state=rng.choice(_OUT_STATES),
         dup=rng.random() < 0.3,
         properties=properties,
-        logical_size=rng.choice([0, rng.randint(1, 500)]),
+        logical_size=rng.randint(1, 500),
     )
 
 
@@ -322,7 +324,7 @@ def _make_in(rng: random.Random, mid: int) -> InboundMessage:
         state=rng.choice(_IN_STATES),
         delivered=rng.random() < 0.5,
         user_acked=rng.random() < 0.3,
-        logical_size=rng.choice([0, rng.randint(1, 500)]),
+        logical_size=rng.randint(1, 500),
     )
 
 
@@ -347,7 +349,6 @@ def _store_operations(rng: random.Random) -> tuple[str, Callable[[Any], object]]
     out_expected = rng.choice(_OUT_STATES)
     out_old, out_new = rng.choice(_OUT_STATES), rng.choice(_OUT_STATES)
     compact = rng.random() < 0.5
-    logical_size = rng.randint(1, 900)
     in_expected = rng.choice(_IN_STATES)
     in_old, in_new = rng.choice(_IN_STATES), rng.choice(_IN_STATES)
     user_acked = rng.choice([None, True, False])
@@ -373,10 +374,6 @@ def _store_operations(rng: random.Random) -> tuple[str, Callable[[Any], object]]
         (
             f"transition_out({mid}, {out_old.name}->{out_new.name}, compact={compact})",
             lambda s: _norm_meta(s.transition_out(mid, out_old, out_new, compact=compact)),
-        ),
-        (
-            f"set_out_logical_size({mid}, {logical_size})",
-            lambda s: s.set_out_logical_size(mid, logical_size),
         ),
         (f"put_in(mid={mid})", lambda s: s.put_in(inbound_message)),
         (f"get_in({mid})", lambda s: _norm_in(s.get_in(mid))),

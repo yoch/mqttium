@@ -24,9 +24,9 @@ properties = Properties(
     {
         "content_type": "application/json",
         "payload_format_indicator": 1,
+        "user_property": (("schema", "telemetry-v1"),),
     }
 )
-properties.add_user_property("schema", "telemetry-v1")
 
 receipt = await client.publish(
     "telemetry/device-1",
@@ -37,8 +37,9 @@ receipt = await client.publish(
 await receipt.wait()
 ```
 
-Repeated properties such as user properties are stored as lists. Do not reuse a
-mutable property bag concurrently while another operation may encode it.
+Properties deeply own their input. Repeated values become tuples and binary
+values become owned bytes. Reusing a `Properties` instance is safe; create a
+new instance when different values are needed.
 
 ## Session expiry
 
@@ -112,7 +113,7 @@ async def on_auth(packet):
         properties=response,
     )
 
-client.set_auth_handler(on_auth)
+client = AsyncClient("authenticated", protocol=MQTTProtocolVersion.MQTTv5, auth_handler=on_auth)
 ```
 
 The application must verify the authentication method and protect challenge
@@ -125,6 +126,15 @@ task still propagates normally.
 
 ## Server references
 
-MQTT 5 can ask a client to use another server. `ReconnectPolicy` does not follow
-that reference by default. Enabling `follow_server_reference` is a deployment
-trust decision; validate the target and its TLS identity.
+MQTT 5 can ask a client to use another server. `Use another server` (`0x9C`)
+and `Server moved` (`0x9D`) are terminal; MQTTium does not automatically select
+a new endpoint. `ReconnectPolicy.follow_server_reference` has been removed:
+the old flag retried the original endpoint rather than following the reference.
+
+A nonzero broker DISCONNECT produces `BrokerDisconnectError` through
+`on_disconnect(error)` when no more specific failure is already known. Read
+`error.reason_code` and `error.properties.get("server_reference")` (if properties
+are present), then explicitly choose the destination, credentials and TLS
+configuration for any new connection. The property mapping is immutable.
+Earlier protocol, transport and local failures remain authoritative. Normal
+disconnect and refused-CONNACK exception behavior is unchanged.

@@ -1,19 +1,18 @@
-# Stable API reference
+# Native API reference
 
-This reference covers the canonical Stable MQTTium imports. Importability from
+This reference covers the canonical experimental MQTTium imports. Importability from
 another module does not grant the same stability tier.
 
 ## Canonical entry points
 
-| Entry point | Stable names |
+| Entry point | Native names |
 | --- | --- |
 | `mqttium` | `MQTTError`, `MalformedPacketError`, `ProtocolError`, `PacketTooLargeError`, `FlowControlError`, `MessageDeliveryError`, `NotConnectedError`, `MQTTTimeoutError`, `SessionDiscardedError`, `PublishBatchError`, `MQTTProtocolVersion`, `QoS`, `ConnectionState`, `__version__` |
-| `mqttium.api` | `AsyncClient`, `Message`, `Properties`, `PublishMessage`, `PublishReceipt`, `PublishBatchReceipt`, `SubscribeResult`, `UnsubscribeResult`, `SubscribeOptions`, `ConnAckPacket`, `AuthPacket`, `NegotiatedSettings`, `ReconnectPolicy`, `MessageDelivery`, `PublishBackpressure` |
-| `mqttium.helpers` | `publish`, `subscribe` |
+| `mqttium.api` | `AsyncClient`, `Message`, `Properties`, `PublishMessage`, `PublishReceipt`, `PublishBatchReceipt`, `SubscribeResult`, `UnsubscribeResult`, `SubscribeOptions`, `ConnAckPacket`, `AuthPacket`, `NegotiatedSettings`, `ReconnectPolicy`, `MessageDelivery`, `ClientStats` |
 
-`ClientStats` is available from `mqttium.api` but remains Provisional because
-new diagnostic fields may be added. `PacketType` remains importable from
-`mqttium` for alpha-series compatibility but is a Provisional low-level enum.
+`mqttium.persistence` supports `MemoryInflightStore` and `SqliteInflightStore`.
+Statistics are immutable diagnostic snapshots. Low-level packet enums and
+extension protocols are internal; the root `PacketType` export is removed.
 
 ## Reference pages
 
@@ -21,9 +20,8 @@ new diagnostic fields may be added. `PacketType` remains importable from
   subscriptions, delivery, MQTT 5 authentication, state, and callbacks.
 - [Models and Settings](models.md) — messages, properties, receipts, results,
   negotiated settings, reconnect, and API mode literals.
-- [Errors and Enums](errors-and-enums.md) — the Stable exception hierarchy and
+- [Errors and Enums](errors-and-enums.md) — the native exception hierarchy and
   common protocol/state enums.
-- [Helpers](helpers.md) — one-shot publish and subscribe operations.
 
 ## Completion conventions
 
@@ -42,9 +40,6 @@ See [Core Concepts](../core-concepts.md) before choosing timeouts or retry logic
 
 ## Stability rules
 
-Stable names follow SemVer and the deprecation policy. New optional parameters
-and fields may be added compatibly. Provisional changes still require a
-changelog entry and migration guidance; Internal names have no compatibility
-guarantee.
-
-The complete policy is [API Stability](../api-stability.md).
+This branch intentionally revises the pre-v1 API. See the
+[experimental contract](../api-stability.md) and [migration guide](../migration.md)
+for supported interfaces and incompatible changes.

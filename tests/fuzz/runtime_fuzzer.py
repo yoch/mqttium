@@ -959,7 +959,7 @@ class _RuntimeHarness:
             self.fail_effect_once = True
         elif (actor, action) == ("effect", "drain_failure"):
             self._spawn_application_task(
-                self.client._drain_effects(),
+                self.client._effect_pump.drain(),
                 label="effect-drain",
                 expected_exceptions=(RuntimeError,),
             )
@@ -971,7 +971,7 @@ class _RuntimeHarness:
                         encode_frame(PacketType.PINGREQ, 0, b""),
                     )
                 )
-                self.client._collect_effects_locked()
+                self.client._effect_pump.collect_from_engine()
         elif actor == "checkpoint":
             await self._checkpoint(action, value)
         else:
@@ -1126,7 +1126,7 @@ class _RuntimeHarness:
             )
         assert 0 <= stats.inbound.inflight <= stats.inbound.receive_maximum
         assert stats.delivery.pending_bytes >= 0
-        callback_task = self.client._callback_worker_task
+        callback_task = self.client._delivery.callback_task
         if self.callback_epoch == stats.connection_epoch and self.client.is_connected:
             assert callback_task is not None and not callback_task.done(), (
                 "callback self-cancellation terminated the connection callback worker"
@@ -1271,7 +1271,7 @@ class _RuntimeHarness:
                 self.client._reconnect_task,
                 self.client._effect_pump.task,
                 self.client._write_pump.task,
-                self.client._callback_worker_task,
+                self.client._delivery.callback_task,
             )
             if task is not None and task is not asyncio.current_task()
         }

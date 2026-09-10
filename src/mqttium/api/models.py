@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from types import MappingProxyType
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 
 from mqttium.enums import QoS
 from mqttium.errors import PublishBatchError
 from mqttium.packets import ConnAckPacket, SubAckPacket, UnsubAckPacket
-from mqttium.types import Message, Properties
+from mqttium.types import Message, Properties, _owned_payload
 
 
 @dataclass(slots=True, frozen=True)
@@ -22,6 +22,10 @@ class PublishMessage:
     qos: QoS | int = QoS.AT_MOST_ONCE
     retain: bool = False
     properties: Properties | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.payload, (bytes, str)):
+            object.__setattr__(self, "payload", _owned_payload(self.payload))
 
 
 class PublishBatchReceipt:
@@ -37,7 +41,6 @@ class PublishBatchReceipt:
         "_failures",
         "_failure_counts",
         "_max_failure_details",
-        "_failure_sink",
         "_done",
         "_progress",
         "_sealed",
@@ -48,11 +51,10 @@ class PublishBatchReceipt:
     def __init__(
         self,
         *,
-        max_failure_details: int | None = 128,
-        failure_sink: Callable[[int, BaseException], None] | None = None,
+        max_failure_details: int = 128,
     ) -> None:
-        if max_failure_details is not None and max_failure_details < 0:
-            raise ValueError("max_failure_details must be non-negative or None")
+        if type(max_failure_details) is not int or max_failure_details < 0:
+            raise ValueError("max_failure_details must be a non-negative integer")
         # At most the client's bounded pending window is retained. MQTT
         # packet identifiers may be reused during a long batch, so failures are
         # keyed by the stable zero-based input index stored as the value.
@@ -60,7 +62,6 @@ class PublishBatchReceipt:
         self._failures: dict[int, BaseException] = {}
         self._failure_counts: dict[str, int] = {}
         self._max_failure_details = max_failure_details
-        self._failure_sink = failure_sink
         self._done = asyncio.Event()
         self._progress = asyncio.Event()
         self._sealed = False
@@ -132,6 +133,11 @@ class PublishBatchReceipt:
         if mid is not None:
             self._pending[mid] = index
 
+    def _rollback_qos0_registration(self) -> None:
+        """Undo the last QoS 0 registration after a synchronous clean refusal."""
+        assert not self._sealed and self._submitted > 0
+        self._submitted -= 1
+
     def _complete(self, mid: int, error: BaseException | None = None) -> None:
         index = self._pending.pop(mid, None)
         if index is None:
@@ -158,10 +164,8 @@ class PublishBatchReceipt:
         name = type(error).__name__
         self._failure_counts[name] = self._failure_counts.get(name, 0) + 1
         limit = self._max_failure_details
-        if limit is None or len(self._failures) < limit:
+        if len(self._failures) < limit:
             self._failures[index] = error
-        if self._failure_sink is not None:
-            self._failure_sink(index, error)
 
     async def _wait_pending_at_most(self, limit: int) -> None:
         while len(self._pending) > limit:
@@ -192,11 +196,6 @@ class PublishReceipt:
     never awaited cannot leave an unretrieved exception behind -- which matters
     here, because the library installs no logging to absorb one.
 
-    ``_on_settle`` is an internal, optional synchronous observer for adapters
-    that must retire bookkeeping at the exact receipt lifetime boundary. It is
-    cleared before invocation so a defensive duplicate settlement cannot run it
-    twice. Native receipts leave it as ``None`` and pay only one predictable
-    branch on completion.
     """
 
     mid: int | None
@@ -204,17 +203,10 @@ class PublishReceipt:
     _waiters: list[asyncio.Future[None]] | None = None
     _error: BaseException | None = None
     _settled: bool = False
-    _on_settle: Callable[[PublishReceipt], None] | None = field(
-        default=None, init=False, repr=False, compare=False
-    )
 
     def _settle(self) -> None:
         """Mark completion and wake every parked waiter."""
         self._settled = True
-        on_settle = self._on_settle
-        if on_settle is not None:
-            self._on_settle = None
-            on_settle(self)
         waiters = self._waiters
         if waiters is not None:
             # Release the collection before resolving so a defensive duplicate

@@ -59,21 +59,13 @@ def test_engine_config_rejects_invalid_ranges(field: str, value: int) -> None:
         EngineConfig(**{field: value})
 
 
-def test_engine_config_runtime_mutability_is_explicit_and_exhaustive() -> None:
-    config_fields = {field.name for field in fields(EngineConfig) if field.init}
-    assert config_fields == set(_ENGINE_CONFIG_RUNTIME_MUTABILITY)
-
+def test_engine_configuration_is_frozen() -> None:
     config = EngineConfig()
     ProtocolEngine(config)
-    assert config._attached
-
-    for name, runtime_mutable in _ENGINE_CONFIG_RUNTIME_MUTABILITY.items():
-        current = getattr(config, name)
-        if runtime_mutable:
-            config.update(**{name: current})
-        else:
-            with pytest.raises(AttributeError, match="require a new ProtocolEngine"):
-                config.update(**{name: current})
+    for field in fields(config):
+        with pytest.raises(AttributeError):
+            setattr(config, field.name, getattr(config, field.name))
+    assert not hasattr(config, "update")
 
 
 @pytest.mark.parametrize(

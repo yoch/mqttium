@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests.support import stored_record
+
 from pathlib import Path
 
 import pytest
@@ -9,7 +11,7 @@ import pytest
 from mqttium.codec.buffer import IncrementalDecoder
 from mqttium.codec.properties import PUBLISH, encode_properties
 from mqttium.enums import MQTTProtocolVersion, OutboundQoSState, PacketType, QoS
-from mqttium.errors import FlowControlError, MQTTError
+from mqttium.errors import FlowControlError
 from mqttium.packets import PubAckPacket, PubCompPacket, PubRecPacket, encode_frame
 from mqttium.persistence.memory import MemoryInflightStore
 from mqttium.persistence.sqlite import SqliteInflightStore
@@ -112,7 +114,12 @@ def test_none_disables_both_admission_limits() -> None:
 
 def test_byte_limit_counts_payload_topic_and_non_empty_encoded_properties() -> None:
     properties = Properties()
-    properties.add_user_property("source", "benchmark")
+    properties = Properties(
+        {
+            **properties.values,
+            "user_property": (*properties.get("user_property", ()), ("source", "benchmark")),
+        }
+    )
     topic = "admission/properties"
     payload = b"payload"
     logical_size = len(payload) + len(topic.encode()) + len(encode_properties(properties, PUBLISH))
@@ -187,79 +194,19 @@ def test_qos2_drops_contiguous_frame_on_launch_but_keeps_budget_to_pubcomp() -> 
     assert engine.pending_outbound_bytes == 0
 
 
-@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
-def test_publish_many_rollback_restores_admission_counters(store_kind: str, tmp_path: Path) -> None:
-    store = _make_store(store_kind, tmp_path)
-    engine = ProtocolEngine(
-        EngineConfig(
-            max_pending_outbound_messages=2,
-            max_pending_outbound_bytes=None,
-        ),
-        store=store,
-    )
-
-    with pytest.raises(FlowControlError):
-        engine.queue_publish_many(
-            [
-                ("admission/1", b"1", QoS.AT_LEAST_ONCE, False, None),
-                ("admission/2", b"2", QoS.AT_LEAST_ONCE, False, None),
-                ("admission/3", b"3", QoS.AT_LEAST_ONCE, False, None),
-            ]
-        )
-
-    assert engine.pending_outbound_messages == 0
-    assert engine.pending_outbound_bytes == 0
-    assert len(engine.packet_ids) == 0
-    assert (
-        list(
-            engine.store.get_out(summary.mid)
-            for page in engine.store.out_summary_pages()
-            for summary in page
-        )
-        == []
-    )
-
-
-@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
-def test_publish_many_rollback_after_validation_failure_frees_bytes(
-    store_kind: str, tmp_path: Path
-) -> None:
-    """A transactional store rolls its batch back before the engine's except
-    clause runs, so per-record sizes are gone; the byte budget must still clear.
-    """
-    store = _make_store(store_kind, tmp_path)
-    engine = ProtocolEngine(
-        EngineConfig(max_pending_outbound_bytes=4096),
-        store=store,
-    )
-
-    for _ in range(3):
-        with pytest.raises(MQTTError):
-            engine.queue_publish_many(
-                [
-                    ("admission/valid", b"payload", QoS.AT_LEAST_ONCE, False, None),
-                    ("admission/+/invalid", b"payload", QoS.AT_LEAST_ONCE, False, None),
-                ]
-            )
-        assert engine.pending_outbound_messages == 0
-        assert engine.pending_outbound_bytes == 0
-
-    # The budget must still admit a full-size publish after the failed batches.
-    handle = engine.queue_publish("admission/after", b"x" * 4000, qos=1)
-    assert handle.mid is not None
-
-
 def test_hydrated_records_are_counted_even_above_new_limits() -> None:
     store = MemoryInflightStore()
     for mid in range(1, 4):
         store.put_out(
-            OutboundMessage(
-                mid=mid,
-                topic="admission/hydrated",
-                payload=b"payload",
-                qos=QoS.AT_LEAST_ONCE,
-                retain=False,
-                state=OutboundQoSState.QUEUED,
+            stored_record(
+                OutboundMessage(
+                    mid=mid,
+                    topic="admission/hydrated",
+                    payload=b"payload",
+                    qos=QoS.AT_LEAST_ONCE,
+                    retain=False,
+                    state=OutboundQoSState.QUEUED,
+                )
             )
         )
     engine = ProtocolEngine(

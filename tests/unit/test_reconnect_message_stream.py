@@ -414,3 +414,26 @@ async def test_on_disconnect_explicit_connect_owns_replacement_connection() -> N
         assert client._reconnect_task is None or client._reconnect_task.done()
     finally:
         await _cleanup(client)
+
+
+async def test_never_started_public_iterator_stays_terminal_after_explicit_reconnect():
+    brokers = []
+    client = AsyncClient("never-started", reconnect=ReconnectPolicy(enabled=False))
+
+    async def factory(*args, **kwargs):
+        broker = _Broker()
+        brokers.append(broker)
+        return broker
+
+    client._transport_factory = factory
+    try:
+        await client.connect("fake")
+        old = client.messages()
+        await client.disconnect()
+        await client.connect("fake")
+        brokers[-1].publish("new/generation", b"new")
+        with pytest.raises(StopAsyncIteration):
+            await asyncio.wait_for(anext(old), 1)
+        assert (await asyncio.wait_for(anext(client.messages()), 1)).topic == "new/generation"
+    finally:
+        await _cleanup(client)

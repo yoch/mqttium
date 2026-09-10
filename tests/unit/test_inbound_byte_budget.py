@@ -9,7 +9,6 @@ import pytest
 from mqttium.api import AsyncClient
 from mqttium.codec.buffer import IncrementalDecoder
 from mqttium.codec.properties import PUBLISH, encode_properties
-from mqttium.compat.paho import CallbackAPIVersion, Client
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, QoS
 from mqttium.packets import PubRelPacket, PublishPacket, encode_disconnect
 from mqttium.persistence import MemoryInflightStore, SqliteInflightStore
@@ -115,7 +114,7 @@ def test_qos2_quota_exceeded_disconnects_with_mqtt5_reason() -> None:
         mid=1,
     )
     properties = Properties()
-    properties.set("content_type", "text/plain")
+    properties = Properties({**properties.values, "content_type": "text/plain"})
     second = PublishPacket(
         topic="quota",
         payload=b"x",
@@ -151,7 +150,7 @@ def test_qos2_quota_exceeded_disconnects_with_mqtt5_reason() -> None:
 def test_mqtt5_property_bytes_are_included_in_the_reservation() -> None:
     protocol = MQTTProtocolVersion.MQTTv5
     properties = Properties()
-    properties.set("content_type", "application/json")
+    properties = Properties({**properties.values, "content_type": "application/json"})
     packet = PublishPacket(
         topic="sized/v5",
         payload=b"{}",
@@ -296,13 +295,9 @@ def test_sqlite_reopen_restores_and_releases_bytes_without_payload_read(tmp_path
 
 def test_none_disables_limit_and_configuration_is_forwarded() -> None:
     async_client = AsyncClient(max_pending_inbound_bytes=None)
-    compat_client = Client(
-        CallbackAPIVersion.VERSION2,
-        max_pending_inbound_bytes=None,
-    )
+    assert async_client._engine.config.max_pending_inbound_bytes is None
 
     assert async_client._engine.config.max_pending_inbound_bytes is None
-    assert compat_client._async._engine.config.max_pending_inbound_bytes is None
 
 
 @pytest.mark.parametrize("value", [-1])

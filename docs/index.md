@@ -38,8 +38,8 @@ recovery.
 
     ---
 
-    Move from Paho or gmqtt with the [migration guide](migration.md). The Paho
-    VERSION2 facade is a Provisional transition surface, not the native API.
+    Review the incompatible experimental changes in the [migration guide](migration.md).
+    The experiment removes the Paho façade and one-shot helpers.
 
 </div>
 
@@ -63,7 +63,7 @@ backpressure model that distinguishes MQTTium from a minimal MQTT wrapper.
 
 - **Guides** solve application tasks: configuration, sessions, transports,
   MQTT 5, operations, troubleshooting, and complete recipes.
-- **Reference** records the Stable public imports, signatures, defaults,
+- **Reference** records the experimental native imports, signatures, defaults,
   exceptions, compatibility tiers, and validated environments.
 - **Concepts** explain architecture, protocol ownership, conformance, and the
   no-library-logging decision.
@@ -74,13 +74,10 @@ backpressure model that distinguishes MQTTium from a minimal MQTT wrapper.
 
 ## API support tiers
 
-The native entry points in `mqttium`, `mqttium.api`, and `mqttium.helpers` are
-the Stable public contract. Persistence, transports, protocol integrations,
-diagnostic snapshots, and Paho compatibility are Provisional. Implementation
-modules and underscore-prefixed objects are Internal.
-
-See the [API Stability Policy](api-stability.md) before depending on an advanced
-integration surface.
+The experiment supports native client operations, models, receipts, results,
+statistics and the two shipped stores. Engine, codecs, transport implementations,
+records and extension protocols are internal. See the [API Stability Policy](api-stability.md)
+for exact tiers and import paths.
 
 ## Trust and evidence
 

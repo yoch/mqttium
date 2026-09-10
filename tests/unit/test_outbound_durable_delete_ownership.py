@@ -296,5 +296,5 @@ def test_admission_rollback_still_preserves_primary_failure(
     assert engine.pending_outbound_messages == 0
     assert engine.pending_outbound_bytes == 0
     assert engine.flow.inflight == 0
-    assert engine.packet_ids._used == set()
+    assert len(engine.packet_ids) == 0
     assert list(engine.outbound._queued) == []

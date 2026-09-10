@@ -49,21 +49,18 @@ not a first response to saturation.
 The default native publish policy waits for protocol and writer capacity. This
 propagates backpressure to an async producer without blocking the event loop.
 
-Use `publish_backpressure="error"`, `publish(..., nowait=True)` or
-`publish_nowait()` when the application has a defined shed, retry or spill
+Use `publish_nowait()` when the application has a defined shed, retry or spill
 policy. Saturation raises `FlowControlError` before allocating a packet
 identifier or committing store state.
 
-The Paho facade cannot suspend a synchronous caller for writer progress. It
-returns `MQTT_ERR_QUEUE_SIZE` when its cross-thread handoff or native unfinished
-publication budget is full. Configure its request and byte limits separately.
+
 
 ### QoS 0 completion is writer admission
 
 MQTT has no broker acknowledgement for QoS 0. MQTTium therefore completes the
 `PublishReceipt` and dispatches `on_publish` after the encoded packet has been
-admitted to the writer queue. An idle synchronous callback may run inline;
-otherwise dispatch uses the bounded callback worker. This boundary does **not**
+admitted to the writer. All `on_publish` notifications use the bounded callback
+worker. This boundary does **not**
 mean that the transport has written the bytes, that the socket send buffer has
 drained, or that the broker has received the publication.
 
@@ -78,7 +75,7 @@ A `publish_nowait()` producer sending large payloads will saturate the writer
 byte budget (`max_outbound_bytes`, 1 MiB by default) long before it exhausts the
 message count, and a producer that merely retries on `FlowControlError` will
 busy-spin against it. Shed, slow down, or spill instead — or use
-`publish_backpressure="wait"` (the default) with `await client.publish(...)` and
+`await client.publish(...)` and
 let the client apply the backpressure for you. Do **not** set the pending bounds
 to `None` to make the error go away: unbounded queues move the failure from a
 catchable exception to memory exhaustion.
@@ -160,9 +157,8 @@ concurrency must raise it explicitly:
 client = AsyncClient(local_receive_maximum=1000)
 ```
 
-The two defaults differ deliberately and both are part of the public contract: the engine
-default is the protocol maximum, and the client default is a bounded
-application-facing window. Raising it increases the memory the inbound path may
+The supported client default is a bounded application-facing window. The
+engine is internal. Raising it increases the memory the inbound path may
 hold. It is unrelated to `max_outbound_inflight`, which bounds *outbound*
 unfinished publications and is capped by the broker's own Receive Maximum.
 
@@ -174,7 +170,8 @@ Timeouts protect different boundaries:
 - `ReconnectPolicy.connect_timeout` applies to automatic attempts;
 - `ping_timeout` limits the wait for PINGRESP;
 - `ack_timeout` is the default SUBACK/UNSUBACK deadline;
-- `delivery_timeout` limits waiting for application delivery capacity;
+- `delivery_timeout=None` waits indefinitely; a positive value covers byte
+  reservation and queue admission with one deadline;
 - `callback_shutdown_timeout` limits callback draining during shutdown.
 
 Publication receipts intentionally follow reconnect policy and session outcome
@@ -226,9 +223,10 @@ sections. An exception is sent to the event loop's exception handler and does
 not terminate the reader or leak a delivery reservation.
 
 Install an application exception handler if callback failures need structured
-reporting. Do not call blocking compatibility methods from a Paho network-thread
-callback; that would wait on the same loop. Schedule work onto another thread or
-migrate the callback path to `AsyncClient`.
+reporting. With saturated delivery and no timeout, waiting for publication
+capacity or an ACK from the callback worker can create a circular dependency.
+Use `publish_nowait()` with an explicit refusal policy or a separate bounded
+application producer; see the [migration guide](migration.md).
 
 ## Graceful shutdown
 

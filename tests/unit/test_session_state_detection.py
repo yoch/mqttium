@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests.support import stored_record
+
 from pathlib import Path
 
 import pytest
@@ -96,13 +98,15 @@ def test_mqtt311_session_present_with_empty_client_state_remains_accepted() -> N
 def test_session_present_accepted_with_incomplete_outbound_exchange(state) -> None:
     store = MemoryInflightStore()
     store.put_out(
-        OutboundMessage(
-            mid=1,
-            topic="out",
-            payload=b"x",
-            qos=QoS.AT_LEAST_ONCE,
-            retain=False,
-            state=state,
+        stored_record(
+            OutboundMessage(
+                mid=1,
+                topic="out",
+                payload=b"x",
+                qos=QoS.AT_LEAST_ONCE,
+                retain=False,
+                state=state,
+            )
         )
     )
     engine = _engine(store)
@@ -113,13 +117,15 @@ def test_session_present_accepted_with_incomplete_outbound_exchange(state) -> No
 def test_queued_but_never_sent_outbound_is_not_client_session_state() -> None:
     store = MemoryInflightStore()
     store.put_out(
-        OutboundMessage(
-            mid=1,
-            topic="out",
-            payload=b"x",
-            qos=QoS.AT_LEAST_ONCE,
-            retain=False,
-            state=OutboundQoSState.QUEUED,
+        stored_record(
+            OutboundMessage(
+                mid=1,
+                topic="out",
+                payload=b"x",
+                qos=QoS.AT_LEAST_ONCE,
+                retain=False,
+                state=OutboundQoSState.QUEUED,
+            )
         )
     )
     engine = _engine(store)
@@ -133,13 +139,15 @@ def test_queued_but_never_sent_outbound_is_not_client_session_state() -> None:
 def test_session_present_accepted_with_incomplete_inbound_qos2(state) -> None:
     store = MemoryInflightStore()
     store.put_in(
-        InboundMessage(
-            mid=2,
-            topic="in",
-            payload=b"x",
-            qos=QoS.EXACTLY_ONCE,
-            retain=False,
-            state=state,
+        stored_record(
+            InboundMessage(
+                mid=2,
+                topic="in",
+                payload=b"x",
+                qos=QoS.EXACTLY_ONCE,
+                retain=False,
+                state=state,
+            )
         )
     )
     engine = _engine(store)
@@ -150,13 +158,15 @@ def test_session_present_accepted_with_incomplete_inbound_qos2(state) -> None:
 def test_manual_qos1_inbound_record_is_not_client_session_state() -> None:
     store = MemoryInflightStore()
     store.put_in(
-        InboundMessage(
-            mid=2,
-            topic="in",
-            payload=b"x",
-            qos=QoS.AT_LEAST_ONCE,
-            retain=False,
-            state=InboundQoSState.WAIT_PUBACK,
+        stored_record(
+            InboundMessage(
+                mid=2,
+                topic="in",
+                payload=b"x",
+                qos=QoS.AT_LEAST_ONCE,
+                retain=False,
+                state=InboundQoSState.WAIT_PUBACK,
+            )
         )
     )
     engine = _engine(store)
@@ -168,13 +178,15 @@ def test_manual_qos1_inbound_record_is_not_client_session_state() -> None:
 def test_session_present_zero_still_discards_stale_state() -> None:
     store = MemoryInflightStore()
     store.put_out(
-        OutboundMessage(
-            mid=1,
-            topic="out",
-            payload=b"x",
-            qos=QoS.AT_LEAST_ONCE,
-            retain=False,
-            state=OutboundQoSState.WAIT_PUBACK,
+        stored_record(
+            OutboundMessage(
+                mid=1,
+                topic="out",
+                payload=b"x",
+                qos=QoS.AT_LEAST_ONCE,
+                retain=False,
+                state=OutboundQoSState.WAIT_PUBACK,
+            )
         )
     )
     engine = _engine(store)

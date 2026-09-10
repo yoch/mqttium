@@ -6,6 +6,72 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed — lean native experiment
+
+- Yield the callback worker after 64 completed jobs when work remains, so
+  ready reader, writer and application tasks progress during synchronous bursts.
+
+- Bind message iterators to their generation at creation, including iterators
+  never advanced before an explicit disconnect/reconnect.
+
+- Bind manual acknowledgement handles to their active inbound exchange, so
+  a stale or foreign message cannot acknowledge a reused packet identifier.
+  Handles remain valid when a reconnect resumes the same logical session.
+
+- Validate SQLite format in one WAL-aware read transaction without manual
+  database/WAL copies or their final-close race. Normal SQLite journal recovery
+  and checkpointing may change physical files on a refused open.
+
+- Preserve replacement-connection delivery when an active message callback
+  disconnects and reconnects; retire old queued jobs without stopping the worker.
+- Isolate cancellation originating in `on_disconnect` so notification failure
+  does not suppress automatic reconnect or terminal cleanup. Actual reader-task
+  cancellation still propagates.
+
+### Changed — lean native experiment
+
+- Remove unused private atomic writer admission, synthetic inline-batch
+  accounting and borrowed QoS 0 decoders. Active writer bounds, segmented
+  ordering and owned specialized decoding remain covered by regression tests.
+
+- Share ready QoS 0 writer handoff between unit and aggregate publication,
+  registering aggregate ownership before wire without per-item receipts.
+  Clean writer refusal rolls back only the tentative batch registration;
+  ambiguous write exceptions keep the committed prefix and are never retried.
+
+- Remove `ReconnectPolicy.follow_server_reference`, which retried the original
+  endpoint instead of following the advertised reference. MQTT 5 redirect
+  reasons are terminal. Expose nonzero broker DISCONNECT details through
+  `BrokerDisconnectError` when no more specific failure is available.
+
+- Transfer ready deliveries without timeout contexts or deferred effect work,
+  classify frozen message callbacks once, and hand ready unit QoS 0 publishes
+  to the existing writer without general publication effects. Byte/count bounds,
+  receipt ordering, durable delivery marks and serial callbacks remain intact.
+- Incompatible experimental native API: explicit iterator/callback delivery;
+  message routes freeze permanently at the first connection attempt.
+- All message and connect/publish notifications use a bounded serial worker;
+  uniform delivery byte accounting and an optional whole-admission timeout
+  replace inline callbacks, shared fan-out and small-message special cases.
+- Progressive `publish_many()` retains a bounded receipt for the committed
+  prefix; cancellation seals it without rolling back admitted publications.
+- `Properties` and reconnect configuration are immutable, retry state belongs
+  to each client, authentication is configured at construction, and CONNECT
+  limits have one source.
+- SQLite schema 5 accepts fresh/current experimental databases only, preserving
+  committed schema and data in rejected databases. Individual admission rollback and durable
+  transitions remain; generic cross-backend batch atomicity is not promised.
+
+### Removed — lean native experiment
+
+- Paho façade, one-shot helpers, root `PacketType`, public extension guarantees,
+  legacy private client views, SQLite migrations and historical size backfill.
+- Delivery `auto`/`both`, `publish_backpressure`, `publish(nowait=...)`, batch
+  `chunk_size`/`nowait`/`failure_sink`, property mutators and `set_auth_handler()`.
+
+See [experimental migration](docs/migration.md). This branch is not a release.
+
+
 ### Changed
 
 - Receive cleartext TCP straight into the decoder's own storage on CPython selector event loops. `asyncio.BufferedProtocol.get_buffer()` returns a window carved out of `IncrementalDecoder`'s own slab, so received bytes are no longer copied through an intermediate receive buffer before reaching the parser. Storage is adaptive: it starts at 16 KiB, the receive window starts at 64 KiB and is promoted toward 256 KiB only under sustained full windows, a known large frame caps progressive growth at its exact extent without reserving the entire announced body, and an enlarged slab is retired once large frames stop arriving. TLS, WebSocket, Proactor, non-CPython runtimes and third-party event loops keep the `read()` + `feed()` path.

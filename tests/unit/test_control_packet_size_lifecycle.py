@@ -80,20 +80,18 @@ async def test_disconnect_packet_size_fallback_still_reports_clean_callback() ->
 async def test_missing_auth_handler_effect_failure_closes_active_connection() -> None:
     client = AsyncClient(
         protocol=MQTTProtocolVersion.MQTTv5,
-        auth_handler=lambda challenge: challenge,
     )
     transport = _BlockingTransport()
     client._transport = transport
     client._engine.state = ConnectionState.CONNECTED
     client._engine.negotiated = NegotiatedSettings(maximum_packet_size=3)
-    client.auth_handler = None
     client._reader_task = asyncio.create_task(client._read_loop())
     await asyncio.sleep(0)
 
     client._engine._emit(EffectKind.AUTH, AuthPacket(reason_code=0x18))
-    client._collect_effects_locked()
+    client._effect_pump.collect_from_engine()
     with pytest.raises(MQTTError, match="no longer available"):
-        await client._drain_effects()
+        await client._effect_pump.drain()
     reader = client._reader_task
     if reader is not None:
         await asyncio.wait_for(reader, timeout=1.0)

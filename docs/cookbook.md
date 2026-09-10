@@ -56,7 +56,7 @@ from mqttium import FlowControlError
 
 async def offer_sample(client, sample: bytes) -> bool:
     try:
-        await client.publish("telemetry", sample, qos=1, nowait=True)
+        client.publish_nowait("telemetry", sample, qos=1)
     except FlowControlError:
         return False
     return True
@@ -64,6 +64,38 @@ async def offer_sample(client, sample: bytes) -> bool:
 
 Returning `False` is useful only if the caller actually sheds, aggregates,
 retries later, or persists the sample elsewhere.
+
+## Publishing from a message callback
+
+With saturated delivery and `delivery_timeout=None`, awaiting publication
+capacity or an ACK inside the serial worker can create a circular wait. The
+ACK may sit behind an incoming message waiting for that same worker. Use a
+nonblocking offer with an explicit refusal policy:
+
+```python
+from mqttium import FlowControlError
+from mqttium.api import AsyncClient
+
+client = AsyncClient("responder", message_delivery="callback")
+refused_replies = 0
+
+
+def on_command(message) -> None:
+    global refused_replies
+    try:
+        client.publish_nowait("replies/service-a", message.payload, qos=1)
+    except FlowControlError:
+        refused_replies += 1
+
+
+client.message_callback_add("commands/service-a", on_command)
+# Configure routes before the first connection attempt.
+```
+
+This example explicitly sheds a refused reply and counts it. It never waits
+for an ACK inside the handler. If every reply must be retained, hand work to a
+separate application producer with its own queue/byte bounds and an explicit
+overflow policy; the callback must not wait on a full application queue either.
 
 ## Bounded batch publication
 
@@ -77,13 +109,14 @@ async def publish_batch(client, samples) -> None:
             PublishMessage("telemetry", sample, qos=1)
             for sample in samples
         ),
-        chunk_size=256,
     )
     await receipt.wait()
 ```
 
-Use `failure_sink` when every individual batch failure must be retained outside
-the receipt's bounded detail set.
+`max_failure_details` bounds retained error objects (default 128, optionally
+zero). Failure counts remain exact. An ordinary admission or generator error
+raises `PublishBatchError` carrying the committed prefix receipt. Cancellation
+propagates and seals the aggregate; committed publications remain active.
 
 ## Manual acknowledgement after durable work
 

@@ -6,6 +6,8 @@ ordered callback delivery, iterator backpressure, and inflight persistence.
 
 from __future__ import annotations
 
+from benchmarks.benchmark_support import stored_record
+
 import argparse
 import asyncio
 import importlib.metadata
@@ -103,7 +105,7 @@ async def callback_delivery(count: int, delay: float) -> Sample:
     cpu_started = time.process_time()
     for sequence in range(count):
         await client._apply_effect(message_effect(sequence), nowait=False)
-    await client._callback_queue.join()
+    await client._delivery.callback_queue.join()
     result = sample(
         f"callback_delay_{delay * 1000:g}ms",
         count,
@@ -113,7 +115,7 @@ async def callback_delivery(count: int, delay: float) -> Sample:
     )
     if seen != list(range(count)):
         raise RuntimeError("callback ordering or completeness violation")
-    await client._shutdown_callback_worker(drain=False)
+    await client._delivery.shutdown_callbacks(drain=False)
     return result
 
 
@@ -154,13 +156,15 @@ async def iterator_delivery(count: int, delay: float) -> Sample:
 def messages(count: int) -> list[OutboundMessage]:
     payload = b"x" * 64
     return [
-        OutboundMessage(
-            mid=mid,
-            topic="bench/persistence",
-            payload=payload,
-            qos=QoS.AT_LEAST_ONCE,
-            retain=False,
-            state=OutboundQoSState.WAIT_PUBACK,
+        stored_record(
+            OutboundMessage(
+                mid=mid,
+                topic="bench/persistence",
+                payload=payload,
+                qos=QoS.AT_LEAST_ONCE,
+                retain=False,
+                state=OutboundQoSState.WAIT_PUBACK,
+            )
         )
         for mid in range(1, count + 1)
     ]

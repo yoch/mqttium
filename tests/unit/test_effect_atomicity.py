@@ -19,29 +19,29 @@ async def test_cancelled_backpressure_keeps_send_effect_for_same_connection() ->
         max_outbound_bytes=1,
     )
     client._engine.state = ConnectionState.CONNECTED
-    await client._enqueue_outbound(b"x")
+    await client._write_pump.enqueue(b"x")
 
     publishing = asyncio.create_task(client.publish("effect/t", b"payload", qos=0))
     for _ in range(100):
-        if client._outbound_waiters:
+        if client._write_pump.waiters:
             break
         await asyncio.sleep(0)
-    assert client._outbound_waiters == 1
+    assert client._write_pump.waiters == 1
 
     publishing.cancel()
     with pytest.raises(asyncio.CancelledError):
         await publishing
-    assert any(effect.kind is EffectKind.SEND for effect in client._pending_effects)
+    assert any(effect.kind is EffectKind.SEND for effect in client._effect_pump.pending)
 
-    blocked = client._outbound.get_nowait()
-    client._outbound.task_done()
-    client._outbound_bytes -= len(blocked)
-    async with client._outbound_space:
-        client._outbound_space.notify_all()
+    blocked = client._write_pump.queue.get_nowait()
+    client._write_pump.queue.task_done()
+    client._write_pump.queued_bytes -= len(blocked)
+    async with client._write_pump.space:
+        client._write_pump.space.notify_all()
 
-    await client._drain_effects()
-    assert not client._pending_effects
-    assert client._outbound.qsize() == 1
+    await client._effect_pump.drain()
+    assert not client._effect_pump.pending
+    assert client._write_pump.queue.qsize() == 1
 
 
 async def test_callback_exception_reaches_loop_exception_handler() -> None:
@@ -55,14 +55,14 @@ async def test_callback_exception_reaches_loop_exception_handler() -> None:
         raise RuntimeError("callback failed")
 
     try:
-        await client._enqueue_callback(fail, Message(topic="t", payload=b"x"))
-        await asyncio.wait_for(client._callback_queue.join(), timeout=1.0)
+        await client._delivery.enqueue_callback(fail, Message(topic="t", payload=b"x"))
+        await asyncio.wait_for(client._delivery.callback_queue.join(), timeout=1.0)
         assert len(contexts) == 1
         assert isinstance(contexts[0].get("exception"), RuntimeError)
         assert contexts[0].get("callback") is fail
     finally:
         loop.set_exception_handler(previous)
-        await client._shutdown_callback_worker(drain=False)
+        await client._delivery.shutdown_callbacks(drain=False)
 
 
 async def test_force_close_stops_callback_worker() -> None:
@@ -77,12 +77,12 @@ async def test_force_close_stops_callback_worker() -> None:
         started.set()
         await release.wait()
 
-    await client._enqueue_callback(slow, Message(topic="t", payload=b"x"))
+    await client._delivery.enqueue_callback(slow, Message(topic="t", payload=b"x"))
     await started.wait()
-    assert client._callback_worker_task is not None
+    assert client._delivery.callback_task is not None
 
     await client._force_close()
-    assert client._callback_worker_task is None
+    assert client._delivery.callback_task is None
 
 
 async def test_force_close_requests_all_task_cancellations_before_awaiting() -> None:
@@ -132,27 +132,27 @@ async def test_scheduled_flush_records_wakeup_while_active() -> None:
     client._apply_effect = controlled_apply  # type: ignore[method-assign]
     client._engine._emit(
         EffectKind.MESSAGE,
-        Message(topic="first", payload=b"1"),
+        Message(topic="first", payload=b"1", qos=1, mid=1),
         requires_delivery_mark=True,
     )
-    client._collect_effects_locked()
-    client._schedule_effect_flush()
+    client._effect_pump.collect_from_engine()
+    client._effect_pump.schedule()
     await started.wait()
 
     client._engine._emit(
         EffectKind.MESSAGE,
-        Message(topic="second", payload=b"2"),
+        Message(topic="second", payload=b"2", qos=1, mid=2),
         requires_delivery_mark=True,
     )
-    client._collect_effects_locked()
-    client._schedule_effect_flush()
+    client._effect_pump.collect_from_engine()
+    client._effect_pump.schedule()
     release.set()
 
-    task = client._effect_flush_task
+    task = client._effect_pump.task
     assert task is not None
     await task
     assert calls == 2
-    assert client._effect_applied == 2
+    assert client._effect_pump.applied == 2
 
 
 def test_effect_collection_stably_prioritizes_sends() -> None:
@@ -162,9 +162,9 @@ def test_effect_collection_stably_prioritizes_sends() -> None:
     client._engine._emit(EffectKind.PINGRESP)
     client._engine._send(b"send-2")
 
-    client._collect_effects_locked()
+    client._effect_pump.collect_from_engine()
 
-    assert [(effect.kind, effect.data) for effect in client._pending_effects] == [
+    assert [(effect.kind, effect.data) for effect in client._effect_pump.pending] == [
         (EffectKind.SEND, b"send-1"),
         (EffectKind.SEND, b"send-2"),
         (EffectKind.MESSAGE, Message(topic="first", payload=b"1")),

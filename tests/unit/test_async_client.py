@@ -79,10 +79,10 @@ async def test_full_message_queue_close_loses_nothing() -> None:
             ).encode()
         )
     for _ in range(100):
-        if client._messages.qsize() == 4:
+        if client._delivery.messages_queue.qsize() == 4:
             break
         await asyncio.sleep(0.01)
-    assert client._messages.qsize() == 4
+    assert client._delivery.messages_queue.qsize() == 4
 
     await fake.close()
     # Wait for the reader's cleanup so the sentinel is inserted while the

@@ -127,29 +127,6 @@
         "receipts": 1
       }
     },
-    "paho_saturation_4k": {
-      "max_traced_peak_mib": 3.5,
-      "logical": {
-        "attempted_messages": 5000,
-        "accepted_messages": 512,
-        "rejected_messages": 4488,
-        "configured_message_limit": 512,
-        "pending_messages": 512,
-        "packet_ids": 512,
-        "store_records": 512,
-        "pending_handoff": false
-      }
-    },
-    "shared_delivery_both_4k": {
-      "max_traced_peak_mib": 8.2,
-      "logical": {
-        "iterator_messages": 1500,
-        "callback_queued": 1499,
-        "callback_active": true,
-        "pending_logical_bytes": 6162000,
-        "shared_references": 3000
-      }
-    },
     "websocket_batching_4k": {
       "max_traced_peak_mib": 1.4,
       "logical": {

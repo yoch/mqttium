@@ -127,10 +127,19 @@ finally:
 structure makes that convenient. `close()` is idempotent, but closing inside an
 active store batch is rejected.
 
-The database uses WAL mode. Its schema is versioned with SQLite
-`PRAGMA user_version`; supported older schemas migrate atomically on open. A
-database written by a newer MQTTium schema is refused rather than interpreted
-unsafely.
+The database uses WAL mode and experimental schema 5, recorded by
+`PRAGMA user_version`. Only new databases and schema 5 are accepted. Historical,
+future and inconsistent schemas are refused without migrating, resetting, or
+changing their committed schema and data. No historical size backfill is performed.
+
+Validation reads one coherent, WAL-aware SQLite transaction through the store's
+connection, without copying database or journal files. Normal SQLite recovery,
+checkpointing and journal coordination are allowed, including physical changes to
+the main database and creation/removal of WAL or SHM files. Validation ends before
+configuring journal mode or creating a fresh schema. Fresh creation revalidates
+under the write lock and commits atomically. Concurrent external schema changes
+are unsupported; ordinary SQLite locking failures retain the existing five-second
+busy timeout and native exception boundary.
 
 `SqliteInflightStore` follows Python's synchronous filesystem, DB-API, and data
 conversion boundaries. It does not wrap them in a second MQTTium exception
@@ -140,16 +149,16 @@ hierarchy:
 | --- | --- |
 | Creating the database's parent directory | `OSError`, including `PermissionError` |
 | Opening, locking, querying, committing, or using a closed SQLite connection | the relevant `sqlite3.Error` subclass |
-| A future or structurally inconsistent MQTTium schema; invalid batch/close lifecycle | `RuntimeError` |
+| A historical, future or structurally inconsistent MQTTium schema; invalid batch/close lifecycle | `RuntimeError` |
 | Invalid persisted storage classes, enum/flag/size values, JSON syntax, or MQTTium JSON markers | `ValueError` (including `json.JSONDecodeError`) |
 | Updating metadata for an outbound or inbound record that is absent | `KeyError` |
 | A non-positive page, message, or byte bound | `ValueError` |
 
 Page and replay iterators execute SQL and hydrate rows lazily, so these failures
 may be raised by `next()` rather than when the iterator is created. Invalid
-record values supplied by the application can likewise fail during JSON
-serialization or SQLite parameter binding. These Provisional persistence
-exceptions are separate from the Stable asynchronous client's `MQTTError`
+internal record values can likewise fail during JSON
+serialization or SQLite parameter binding. These synchronous persistence
+exceptions are separate from the asynchronous client's `MQTTError`
 hierarchy. Catch only the specific failure the application can recover from;
 do not retry schema incompatibility, data corruption, or `ProgrammingError` as
 a transient lock or broker failure.
@@ -166,33 +175,15 @@ already above a newly reduced outbound limit, MQTTium permits it to drain but
 does not admit more work until usage falls below the limit. Inbound replay is
 also accounted against the configured inbound byte budget.
 
-Third-party `InflightStore` implementations remain supported through one complete
-Provisional contract. MQTTium does not detect persistence capabilities at runtime
-and there is no weaker eager-replay or read/mutate/write fallback. A custom store
-must provide the same semantic guarantees used by the shipped stores:
+The store interface, records, paging and transitions are internal. Only the
+shipped `MemoryInflightStore` and `SqliteInflightStore` are supported. Their
+mutations are atomic. Internal `batch()` groups protocol operations: SQLite
+uses a lazy transaction, while the engine compensates its own acquisitions.
+Memory `batch()` does not provide universal application rollback.
 
-| Required part of `InflightStore` | Guarantee | Operational consequence |
-| --- | --- | --- |
-| `batch()`, point reads/writes/deletes, and clear operations | atomic mutation groups and durable record ownership | rollback and session cleanup have one store path |
-| `out_summary_pages()` and `in_index_pages()` | ordered payload-free metadata pages | recovery accounting does not hydrate every payload |
-| `in_replay_pages()` and `in_count()` | message/byte-bounded inbound hydration | large inbound sessions replay with bounded resident payload memory |
-| `out_meta()` / `in_meta()`, `transition_*()`, and `complete_*()` | conditional metadata-only state changes | ACK handling avoids payload reads and QoS state changes remain atomic |
-| logical-size and delivered-state metadata updates | restart-safe admission accounting and inbound delivery state | recovered byte limits match durable ownership |
-
-The former `PagedInflightStore`, `BoundedInboundReplayStore`, and
-`TransitionInflightStore` capability protocols are removed. So are the shipped
-stores' legacy whole-object iteration/update helpers. Code that needs a full
-record after reading a metadata page should call `get_out()` or `get_in()` for
-that identifier.
-
-A third-party store MUST NOT report storage, backend, integrity, or
-lifecycle failures with `MQTTError` or any of its subclasses: `MQTTError`
-is reserved for MQTT/client-layer semantics, and using it for store failures
-makes classification unsupported and ambiguous. Use backend-native or
-ordinary Python exceptions (`OSError`, `RuntimeError`, `ValueError`,
-`KeyError`, DB-API errors) instead. Likewise, `batch()` must not suppress
-an exception raised by its body or by batch close; the runtime observes the
-original failure to fail-stop the connection.
+Backend failures retain their native exception boundary and must not be
+classified as MQTT protocol errors. A batch must not suppress an exception
+from its body or commit; the runtime needs that cause to fail-stop safely.
 
 ## Reconnect policy
 
@@ -220,6 +211,18 @@ discarded instead of being applied to the replacement transport.
 With `manual_ack=True`, inbound QoS 1 acknowledgement and the final QoS 2
 acknowledgement wait for `await client.ack(message)`. This lets an application
 align MQTT acknowledgement with its own durable operation.
+
+Pass the delivered `Message` itself. Its private handle identifies the client
+and active logical exchange, not just the reusable packet identifier. Duplicate
+deliveries of that exchange share the identity. Reconstructed, foreign and
+completed handles raise `ProtocolError`; an already requested acknowledgement
+may be repeated while its exchange still awaits ordered completion or PUBREL.
+
+A transport reconnect, automatic or explicit, preserves handles when CONNACK
+resumes the same session. A replacement session invalidates them. Process/store
+recovery creates fresh handles on redelivery; the identities are not persisted.
+Only active manual exchanges occupy the identity index, and auto acknowledgement
+does not allocate that index. QoS 0 acknowledgement remains a no-op.
 
 It does not create exactly-once business processing. A crash can occur after
 the business transaction commits but before the acknowledgement reaches the

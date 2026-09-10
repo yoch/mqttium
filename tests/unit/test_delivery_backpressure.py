@@ -18,9 +18,9 @@ async def test_iterator_queue_timeout_is_explicit() -> None:
         max_pending_messages=1,
         delivery_timeout=0.01,
     )
-    client._messages.put_nowait(Message(topic="full", payload=b"x"))
+    client._delivery.messages_queue.put_nowait(Message(topic="full", payload=b"x"))
 
-    with pytest.raises(MessageDeliveryError, match="Iterator delivery queue"):
+    with pytest.raises(MessageDeliveryError, match="Application delivery capacity"):
         await client._apply_effect(
             EngineEffect(
                 kind=EffectKind.MESSAGE,
@@ -44,13 +44,13 @@ async def test_callback_queue_timeout_is_explicit_and_bounded() -> None:
         started.set()
         await release.wait()
 
-    await client._enqueue_callback(slow, Message(topic="one", payload=b"x"))
+    await client._delivery.enqueue_callback(slow, Message(topic="one", payload=b"x"))
     await started.wait()
-    await client._enqueue_callback(slow, Message(topic="two", payload=b"x"))
+    await client._delivery.enqueue_callback(slow, Message(topic="two", payload=b"x"))
 
-    with pytest.raises(MessageDeliveryError, match="Callback delivery queue"):
-        await client._enqueue_callback(slow, Message(topic="three", payload=b"x"))
-    await client._shutdown_callback_worker(drain=False)
+    with pytest.raises(MessageDeliveryError, match="Callback delivery capacity"):
+        await client._delivery.enqueue_callback(slow, Message(topic="three", payload=b"x"))
+    await client._delivery.shutdown_callbacks(drain=False)
 
 
 async def test_callback_worker_preserves_order() -> None:
@@ -62,16 +62,16 @@ async def test_callback_worker_preserves_order() -> None:
         seen.append(value)
 
     for value in range(8):
-        await client._enqueue_callback(callback, value)
-    await asyncio.wait_for(client._callback_queue.join(), timeout=1.0)
+        await client._delivery.enqueue_callback(callback, value)
+    await asyncio.wait_for(client._delivery.callback_queue.join(), timeout=1.0)
 
     assert seen == list(range(8))
-    await client._shutdown_callback_worker(drain=False)
+    await client._delivery.shutdown_callbacks(drain=False)
 
 
 async def test_force_close_discards_all_old_connection_effects() -> None:
     client = AsyncClient(message_delivery="iterator")
-    client._pending_effects.extend(
+    client._effect_pump.pending.extend(
         [
             EngineEffect(
                 kind=EffectKind.MESSAGE,
@@ -81,7 +81,7 @@ async def test_force_close_discards_all_old_connection_effects() -> None:
         ]
     )
     await client._force_close()
-    assert not client._pending_effects
+    assert not client._effect_pump.pending
 
 
 async def test_delivery_queue_fast_paths_avoid_timeout_task(
@@ -94,15 +94,15 @@ async def test_delivery_queue_fast_paths_avoid_timeout_task(
 
     monkeypatch.setattr(asyncio, "wait_for", unexpected_wait_for)
     message = Message(topic="fast", payload=b"x")
-    await client._put_message(message)
-    assert client._messages.get_nowait() is message
+    await client._delivery.accept(message, None)
+    assert await anext(client.messages()) is message
 
     called = asyncio.Event()
 
     def callback(_message: Message) -> None:
         called.set()
 
-    await client._enqueue_callback(callback, message)
-    await asyncio.sleep(0)
+    await client._delivery.enqueue_callback(callback, message)
+    await client._delivery.callback_queue.join()
     assert called.is_set()
-    await client._shutdown_callback_worker(drain=False)
+    await client._delivery.shutdown_callbacks(drain=False)

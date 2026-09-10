@@ -4,15 +4,13 @@ from __future__ import annotations
 
 import inspect
 from pathlib import Path
-from types import ModuleType
 
 import pytest
 
 import mqttium
 import mqttium.api as api
-import mqttium.helpers as helpers
 import mqttium.protocol as protocol
-from mqttium.api.async_client import AsyncClient, MessageDelivery, PublishBackpressure
+from mqttium.api.async_client import AsyncClient, MessageDelivery
 from mqttium.api.models import (
     PublishBatchReceipt,
     PublishMessage,
@@ -22,6 +20,7 @@ from mqttium.api.models import (
 )
 from mqttium.api.stats import ClientStats
 from mqttium.errors import (
+    BrokerDisconnectError,
     FlowControlError,
     MQTTError,
     MQTTTimeoutError,
@@ -33,7 +32,7 @@ from mqttium.errors import (
     PublishBatchError,
     SessionDiscardedError,
 )
-from mqttium.enums import ConnectionState, MQTTProtocolVersion, PacketType, QoS
+from mqttium.enums import ConnectionState, MQTTProtocolVersion, QoS
 from mqttium.packets import AuthPacket, ConnAckPacket, SubscribeOptions
 from mqttium.protocol.negotiated import NegotiatedSettings
 from mqttium.protocol.reconnect import ReconnectPolicy
@@ -41,6 +40,7 @@ from mqttium.types import Message, Properties
 
 
 STABLE_ROOT_EXPORTS = {
+    "BrokerDisconnectError": BrokerDisconnectError,
     "ConnectionState": ConnectionState,
     "FlowControlError": FlowControlError,
     "MQTTError": MQTTError,
@@ -64,7 +64,6 @@ STABLE_API_EXPORTS = {
     "MessageDelivery": MessageDelivery,
     "NegotiatedSettings": NegotiatedSettings,
     "Properties": Properties,
-    "PublishBackpressure": PublishBackpressure,
     "PublishBatchReceipt": PublishBatchReceipt,
     "PublishMessage": PublishMessage,
     "PublishReceipt": PublishReceipt,
@@ -76,7 +75,7 @@ STABLE_API_EXPORTS = {
 
 
 def test_root_exports_operational_errors_and_connection_state() -> None:
-    assert set(mqttium.__all__) == {*STABLE_ROOT_EXPORTS, "PacketType", "__version__"}
+    assert set(mqttium.__all__) == {*STABLE_ROOT_EXPORTS, "__version__"}
     for name, value in STABLE_ROOT_EXPORTS.items():
         assert getattr(mqttium, name) is value
     assert isinstance(mqttium.__version__, str)
@@ -93,20 +92,6 @@ def test_api_exports_every_type_used_by_supported_signatures() -> None:
         assert getattr(api, name) is value
 
 
-def test_helpers_export_exact_stable_surface() -> None:
-    assert helpers.__all__ == ["publish", "subscribe"]
-    assert isinstance(helpers.publish, ModuleType)
-    assert isinstance(helpers.subscribe, ModuleType)
-    assert callable(helpers.publish.single)
-    assert callable(helpers.publish.multiple)
-    assert callable(helpers.subscribe.simple)
-    assert callable(helpers.subscribe.callback)
-
-
-def test_explicitly_retained_alpha_packet_type_import() -> None:
-    assert mqttium.PacketType is PacketType
-
-
 def test_async_client_constructor_keywords_and_defaults() -> None:
     expected_defaults = {
         "client_id": "",
@@ -120,7 +105,6 @@ def test_async_client_constructor_keywords_and_defaults() -> None:
         "max_pending_outbound_messages": 10_000,
         "max_pending_outbound_bytes": 64 * 1024 * 1024,
         "max_pending_inbound_bytes": 64 * 1024 * 1024,
-        "publish_backpressure": "wait",
         "connect_properties": None,
         "will": None,
         "will_properties": None,
@@ -135,9 +119,9 @@ def test_async_client_constructor_keywords_and_defaults() -> None:
         "max_pending_messages": 65_536,
         "max_pending_callbacks": 1_024,
         "max_pending_delivery_bytes": 64 * 1024 * 1024,
-        "delivery_timeout": 1.0,
+        "delivery_timeout": None,
         "callback_shutdown_timeout": 5.0,
-        "message_delivery": "auto",
+        "message_delivery": "iterator",
         "manual_ack": False,
         "store": None,
         "auth_handler": None,
@@ -161,22 +145,18 @@ def test_async_client_stable_method_parameter_contract() -> None:
         "connect_unix": ("self", "path", "timeout"),
         "connect_ws": ("self", "url", "ssl", "extra_headers", "timeout"),
         "disconnect": ("self", "reason_code"),
-        "publish": ("self", "topic", "payload", "qos", "retain", "properties", "nowait"),
+        "publish": ("self", "topic", "payload", "qos", "retain", "properties"),
         "publish_nowait": ("self", "topic", "payload", "qos", "retain", "properties"),
         "publish_many": (
             "self",
             "messages",
-            "chunk_size",
-            "nowait",
             "max_failure_details",
-            "failure_sink",
         ),
         "subscribe": ("self", "topics", "qos", "properties", "timeout"),
         "unsubscribe": ("self", "topics", "timeout"),
         "messages": ("self",),
         "ack": ("self", "message"),
         "auth": ("self", "reason_code", "properties"),
-        "set_auth_handler": ("self", "handler"),
         "message_callback_add": ("self", "topic_filter", "callback"),
         "message_callback_remove": ("self", "topic_filter"),
         "stats": ("self",),
@@ -219,3 +199,13 @@ def test_protocol_and_dispatch_do_not_import_compat() -> None:
     if "mqttium.dispatch" in engine:
         offenders.append("protocol/engine.py")
     assert not offenders
+
+
+def test_retired_entry_points_are_absent() -> None:
+    import importlib.util
+
+    assert importlib.util.find_spec("mqttium.compat") is None
+    assert importlib.util.find_spec("mqttium.helpers") is None
+    assert not hasattr(mqttium, "PacketType")
+    assert not hasattr(api, "PublishBackpressure")
+    assert not hasattr(AsyncClient, "set_auth_handler")

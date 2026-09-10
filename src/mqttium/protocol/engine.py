@@ -46,7 +46,7 @@ from mqttium.protocol.outbound import OutboundSession
 from mqttium.protocol.packet_ids import PacketIdPool
 from mqttium.topics import validate_publish_topic, validate_subscribe_filter
 from mqttium.transport.writes import WriteItem, item_size
-from mqttium.types import Properties
+from mqttium.types import Message, Properties
 from mqttium.errors import (
     MalformedPacketError,
     MandatoryResponseTooLargeError,
@@ -69,7 +69,6 @@ class ProtocolEngine:
         store: InflightStore | None = None,
     ) -> None:
         self.config = config or EngineConfig()
-        self.config._attached = True
         self.store = store or MemoryInflightStore()
         self.state = ConnectionState.NEW
         self.session_present = False
@@ -154,10 +153,6 @@ class ProtocolEngine:
     def has_pending_effects(self) -> bool:
         return bool(self._effects)
 
-    def reconfigure(self, **changes: Any) -> None:
-        """Validate and apply fields that are safe to change after construction."""
-        self.config.update(**changes)
-
     # --- outbound facade ---------------------------------------------------
     # The session owns this state. These views keep the engine's public surface
     # (and the tests, benchmarks and fuzzer that use it) exactly as it was when
@@ -205,12 +200,6 @@ class ProtocolEngine:
         properties: Properties | None = None,
     ) -> bool:
         return self.outbound.can_ever_admit(topic, payload, qos, properties)
-
-    def can_ever_admit_publish_many(
-        self,
-        messages: Iterable[tuple[str, bytes, QoS | int, bool, Properties | None]],
-    ) -> bool:
-        return self.outbound.can_ever_admit_many(messages)
 
     def _emit(
         self,
@@ -305,19 +294,13 @@ class ProtocolEngine:
 
         connect_props = self.config.connect_properties
         if self.config.protocol == MQTTProtocolVersion.MQTTv5:
-            connect_props = Properties(values=dict(connect_props.values) if connect_props else {})
-            if "receive_maximum" not in connect_props.values:
-                connect_props.set("receive_maximum", self.config.local_receive_maximum)
-            if (
-                self.config.maximum_packet_size is not None
-                and "maximum_packet_size" not in connect_props.values
-            ):
-                connect_props.set("maximum_packet_size", self.config.maximum_packet_size)
-            if (
-                self.config.topic_alias_maximum
-                and "topic_alias_maximum" not in connect_props.values
-            ):
-                connect_props.set("topic_alias_maximum", self.config.topic_alias_maximum)
+            values = dict(connect_props.values) if connect_props else {}
+            values["receive_maximum"] = self.config.local_receive_maximum
+            if self.config.maximum_packet_size is not None:
+                values["maximum_packet_size"] = self.config.maximum_packet_size
+            if self.config.topic_alias_maximum:
+                values["topic_alias_maximum"] = self.config.topic_alias_maximum
+            connect_props = Properties(values)
 
         will = self.config.will
         if will is not None:
@@ -405,13 +388,6 @@ class ProtocolEngine:
         return self.outbound.queue_publish(
             topic, payload, qos=qos, retain=retain, properties=properties
         )
-
-    def queue_publish_many(
-        self,
-        messages: Iterable[tuple[str, bytes, QoS | int, bool, Properties | None]],
-    ) -> list[PublishHandle]:
-        """Provisional facade; the guard lives in the session (see queue_publish)."""
-        return self.outbound.queue_publish_many(messages)
 
     def queue_subscribe(
         self,
@@ -748,11 +724,11 @@ class ProtocolEngine:
     def mark_inbound_delivered(self, mid: int) -> None:
         self.inbound.mark_delivered(mid)
 
-    def ack(self, mid: int) -> None:
+    def ack(self, mid: int, *, message: Message | None = None) -> None:
         """Complete a deferred inbound ACK in manual-ack mode."""
         if self.state is not ConnectionState.CONNECTED:
             raise NotConnectedError("ack requires an active connection")
-        self.inbound.ack(mid)
+        self.inbound.ack(mid, message=message)
 
     def _on_suback(self, raw: RawPacket) -> None:
         mid, reason_codes, properties = self.codec.decode_suback(raw.remaining)
@@ -963,7 +939,9 @@ class ProtocolEngine:
         if method is not None and method != self._auth_method:
             raise ProtocolError("AUTH authentication_method does not match CONNECT")
         if method is None:
-            auth_properties.set("authentication_method", self._auth_method)
+            auth_properties = Properties(
+                {**auth_properties.values, "authentication_method": self._auth_method}
+            )
         wire = AuthPacket(
             reason_code=reason_code,
             properties=auth_properties,

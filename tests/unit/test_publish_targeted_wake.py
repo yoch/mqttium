@@ -196,7 +196,7 @@ async def test_terminal_wakeup_fails_every_parked_publisher() -> None:
     assert client._publish_waiters == 0
 
 
-async def test_publish_many_waits_for_one_slot_then_admits_the_chunk() -> None:
+async def test_publish_many_waits_for_one_slot() -> None:
     client = _parked_client()
     first = await client.publish("wake/held", b"one", qos=1)
     assert first.mid is not None
@@ -213,7 +213,7 @@ async def test_publish_many_waits_for_one_slot_then_admits_the_chunk() -> None:
     assert client._publish_wakeups == 1
 
 
-async def test_publish_many_is_woken_once_per_ack_until_the_chunk_fits() -> None:
+async def test_publish_many_admits_one_element_per_released_slot() -> None:
     client = _parked_client(max_pending_outbound_messages=2)
     held = [
         await client.publish("wake/held-a", b"a", qos=1),
@@ -238,10 +238,10 @@ async def test_publish_many_is_woken_once_per_ack_until_the_chunk_fits() -> None
         await asyncio.sleep(0)
     else:
         raise AssertionError("batch did not re-park after the first slot opened")
-    assert not batch.done(), "chunk of 2 still needs the second slot"
+    assert not batch.done(), "the second element still needs a slot"
     assert client._publish_waiters == 1
     assert client._publish_wakeups == 1
-    assert client._engine.pending_outbound_messages == 1
+    assert client._engine.pending_outbound_messages == 2
 
     await _complete(client, held[1].mid)
     receipt = await asyncio.wait_for(batch, timeout=1.0)

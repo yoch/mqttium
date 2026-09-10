@@ -51,7 +51,6 @@ def test_on_message_assignment_updates_fallback_without_replacing_router() -> No
     assert client.on_message is fallback
     assert client._message_callback is not fallback
     assert client._message_callback is not None
-    assert not client._delivery._is_async_callback(client._message_callback)
 
     client.message_callback_remove("sensors/#")
     assert client._message_callback is fallback
@@ -67,12 +66,12 @@ async def test_captured_router_survives_last_filter_removal() -> None:
 
     client.message_callback_remove("sensors/#")
     assert client._topic_callbacks is None
-    await client._invoke(routed, Message(topic="sensors/1", payload=b"x"))
+    await client._delivery.invoke(routed, Message(topic="sensors/1", payload=b"x"))
 
     assert seen == ["default:sensors/1"]
 
 
-async def test_overlapping_sync_callbacks_remain_inline() -> None:
+async def test_overlapping_sync_callbacks_use_worker() -> None:
     client = AsyncClient(client_id="topic-overlap-inline", message_delivery="callback")
     seen: list[str] = []
     client.message_callback_add("inline/#", lambda _message: seen.append("hash"))
@@ -83,12 +82,14 @@ async def test_overlapping_sync_callbacks_remain_inline() -> None:
             EffectKind.MESSAGE,
             Message(topic="inline/message", payload=b"x"),
         )
-        client._collect_effects_locked()
+        client._effect_pump.collect_from_engine()
         assert seen == []
 
-    client._drain_effects_inline()
+    await client._effect_pump.drain()
+    await client._delivery.callback_queue.join()
     assert seen == ["hash", "plus"]
-    assert client._callback_worker_task is None
+    await client._delivery.shutdown_callbacks(drain=False)
+    assert client._delivery.callback_task is None
 
 
 async def test_sync_failure_does_not_suppress_later_match() -> None:
@@ -111,7 +112,7 @@ async def test_sync_failure_does_not_suppress_later_match() -> None:
         client.message_callback_add("sensors/+", good)
         callback = client._message_callback
         assert callback is not None
-        await client._invoke(callback, Message(topic="sensors/1", payload=b"x"))
+        await client._delivery.invoke(callback, Message(topic="sensors/1", payload=b"x"))
     finally:
         loop.set_exception_handler(previous)
 
@@ -142,7 +143,7 @@ async def test_async_failure_does_not_suppress_later_match() -> None:
         client.message_callback_add("sensors/+", good)
         callback = client._message_callback
         assert callback is not None
-        await client._invoke(callback, Message(topic="sensors/1", payload=b"x"))
+        await client._delivery.invoke(callback, Message(topic="sensors/1", payload=b"x"))
     finally:
         loop.set_exception_handler(previous)
 
@@ -172,7 +173,7 @@ async def test_callback_self_cancellation_is_reported_and_sequence_continues() -
         client.message_callback_add("sensors/+", good)
         callback = client._message_callback
         assert callback is not None
-        await client._invoke(callback, Message(topic="sensors/1", payload=b"x"))
+        await client._delivery.invoke(callback, Message(topic="sensors/1", payload=b"x"))
     finally:
         loop.set_exception_handler(previous)
 
@@ -198,25 +199,15 @@ async def test_real_task_cancellation_stops_callback_sequence() -> None:
     client.message_callback_add("sensors/+", later)
     callback = client._message_callback
     assert callback is not None
-    task = asyncio.create_task(client._invoke(callback, Message(topic="sensors/1", payload=b"x")))
+    task = asyncio.create_task(
+        client._delivery.invoke(callback, Message(topic="sensors/1", payload=b"x"))
+    )
     await started.wait()
     task.cancel()
 
     with pytest.raises(asyncio.CancelledError):
         await task
     assert seen == []
-
-
-async def test_auto_returns_to_iterator_after_last_filter_without_fallback() -> None:
-    client = AsyncClient(client_id="topic-auto-restore")
-    client.message_callback_add("sensors/#", lambda _message: None)
-    client.message_callback_remove("sensors/#")
-
-    assert client._topic_callbacks is None
-    assert client._message_callback is None
-    await _deliver(client, "sensors/1")
-
-    assert client._messages.get_nowait().topic == "sensors/1"
 
 
 async def test_sync_fallback_failure_is_reported_as_fallback() -> None:
@@ -234,7 +225,7 @@ async def test_sync_fallback_failure_is_reported_as_fallback() -> None:
         client.message_callback_add("sensors/#", lambda _message: None)
         callback = client._message_callback
         assert callback is not None
-        await client._invoke(callback, Message(topic="other", payload=b"x"))
+        await client._delivery.invoke(callback, Message(topic="other", payload=b"x"))
     finally:
         loop.set_exception_handler(previous)
 
@@ -259,7 +250,7 @@ async def test_async_fallback_failure_is_reported_as_fallback() -> None:
         client.message_callback_add("sensors/#", lambda _message: None)
         callback = client._message_callback
         assert callback is not None
-        await client._invoke(callback, Message(topic="other", payload=b"x"))
+        await client._delivery.invoke(callback, Message(topic="other", payload=b"x"))
     finally:
         loop.set_exception_handler(previous)
 
@@ -283,7 +274,7 @@ async def test_fallback_self_cancellation_is_reported() -> None:
         client.message_callback_add("sensors/#", lambda _message: None)
         callback = client._message_callback
         assert callback is not None
-        await client._invoke(callback, Message(topic="other", payload=b"x"))
+        await client._delivery.invoke(callback, Message(topic="other", payload=b"x"))
     finally:
         loop.set_exception_handler(previous)
 
@@ -317,7 +308,7 @@ async def test_later_sync_failure_after_async_match_is_isolated() -> None:
         client.message_callback_add("sensors/1", good)
         callback = client._message_callback
         assert callback is not None
-        await client._invoke(callback, Message(topic="sensors/1", payload=b"x"))
+        await client._delivery.invoke(callback, Message(topic="sensors/1", payload=b"x"))
     finally:
         loop.set_exception_handler(previous)
 
@@ -357,7 +348,7 @@ async def test_later_async_failure_and_self_cancellation_are_isolated() -> None:
         client.message_callback_add("+/1", good)
         callback = client._message_callback
         assert callback is not None
-        await client._invoke(callback, Message(topic="sensors/1", payload=b"x"))
+        await client._delivery.invoke(callback, Message(topic="sensors/1", payload=b"x"))
     finally:
         loop.set_exception_handler(previous)
 
@@ -365,44 +356,6 @@ async def test_later_async_failure_and_self_cancellation_are_isolated() -> None:
     assert len(errors) == 2
     assert errors[0]["callback"] is bad
     assert errors[1]["callback"] is cancelling
-
-
-def test_topic_router_switches_between_sync_and_async_configuration() -> None:
-    client = AsyncClient(message_delivery="callback")
-
-    def sync_callback(_message: Message) -> None:
-        pass
-
-    async def async_callback(_message: Message) -> None:
-        pass
-
-    client.message_callback_add("sync/#", sync_callback)
-    assert client._message_callback is not None
-    assert not client._delivery._is_async_callback(client._message_callback)
-
-    client.message_callback_add("async/#", async_callback)
-    assert client._message_callback is not None
-    assert client._delivery._is_async_callback(client._message_callback)
-
-    client.message_callback_remove("async/#")
-    assert client._message_callback is not None
-    assert not client._delivery._is_async_callback(client._message_callback)
-
-
-def test_async_fallback_makes_topic_router_async_until_replaced() -> None:
-    client = AsyncClient(message_delivery="callback")
-    client.message_callback_add("sync/#", lambda _message: None)
-
-    async def async_fallback(_message: Message) -> None:
-        pass
-
-    client.on_message = async_fallback
-    assert client._message_callback is not None
-    assert client._delivery._is_async_callback(client._message_callback)
-
-    client.on_message = lambda _message: None
-    assert client._message_callback is not None
-    assert not client._delivery._is_async_callback(client._message_callback)
 
 
 async def test_mixed_topic_route_is_one_worker_job_and_keeps_registration_order() -> None:
@@ -423,11 +376,11 @@ async def test_mixed_topic_route_is_one_worker_job_and_keeps_registration_order(
     assert callback is not None
     assert client._delivery._is_async_callback(callback)
 
-    client._delivery.spawn_callback(callback, Message(topic="outer/x", payload=b"x"))
-    await client._callback_queue.join()
+    await client._delivery.accept(Message(topic="outer/x", payload=b"x"), callback)
+    await client._delivery.callback_queue.join()
 
     assert seen == ["first", "second", "reentrant"]
-    await client._shutdown_callback_worker(drain=False)
+    await client._delivery.shutdown_callbacks(drain=False)
 
 
 async def test_filter_mutation_during_dispatch_does_not_change_current_matches() -> None:
@@ -447,7 +400,7 @@ async def test_filter_mutation_during_dispatch_does_not_change_current_matches()
     client.message_callback_add("sensors/+", second)
     callback = client._message_callback
     assert callback is not None
-    await client._invoke(callback, Message(topic="sensors/1", payload=b"x"))
+    await client._delivery.invoke(callback, Message(topic="sensors/1", payload=b"x"))
 
     assert seen == ["first", "second"]
 
@@ -469,6 +422,6 @@ async def test_async_filter_mutation_during_dispatch_keeps_captured_matches() ->
     client.message_callback_add("sensors/+", second)
     callback = client._message_callback
     assert callback is not None
-    await client._invoke(callback, Message(topic="sensors/1", payload=b"x"))
+    await client._delivery.invoke(callback, Message(topic="sensors/1", payload=b"x"))
 
     assert seen == ["first", "second"]

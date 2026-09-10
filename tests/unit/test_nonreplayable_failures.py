@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from mqttium.api.async_client import _fifo_register
+
 import asyncio
 import gc
 
@@ -54,7 +56,7 @@ async def test_transport_loss_fails_subscriptions_but_preserves_publish_receipt(
         mid=13,
         qos=QoS.AT_LEAST_ONCE,
     )
-    client._register_publish_receipt(13, receipt)
+    _fifo_register(client._receipts, 13, receipt)
 
     await client._read_loop()
 
@@ -82,7 +84,7 @@ async def test_fail_pending_still_fails_all_operation_types() -> None:
     client._sub_futs[1] = sub
     client._unsub_futs[2] = unsub
     receipt = PublishReceipt(mid=3, qos=QoS.AT_LEAST_ONCE)
-    client._register_publish_receipt(3, receipt)
+    _fifo_register(client._receipts, 3, receipt)
     error = MQTTError("terminal")
 
     client._fail_pending(error)
@@ -105,7 +107,7 @@ async def test_failed_receipt_that_is_never_awaited_stays_silent() -> None:
 
     client = AsyncClient(client_id="silent-receipt")
     receipt = PublishReceipt(mid=41, qos=QoS.AT_LEAST_ONCE)
-    client._register_publish_receipt(41, receipt)
+    _fifo_register(client._receipts, 41, receipt)
 
     client._fail_pending(MQTTError("terminal"))
     assert receipt.is_done()

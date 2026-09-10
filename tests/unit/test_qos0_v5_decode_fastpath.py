@@ -85,7 +85,7 @@ def test_v5_qos0_direct_decode_matches_generic_packet(
 @pytest.mark.parametrize("size", [1, 200])
 def test_v5_qos0_direct_decode_preserves_properties_and_exact_wire_size(size: int) -> None:
     properties = Properties()
-    properties.set("correlation_data", b"x" * size)
+    properties = Properties({**properties.values, "correlation_data": b"x" * size})
     table = encode_properties(properties, PUBLISH)
     raw = _raw("bench/v5/props", b"body", properties)
 
@@ -110,7 +110,7 @@ def test_v5_qos0_engine_skips_generic_decoder_and_preserves_size_handoff(monkeyp
 
     monkeypatch.setattr(inbound_module, "decode_publish_fields_v5", counted)
     properties = Properties()
-    properties.set("content_type", "text/plain")
+    properties = Properties({**properties.values, "content_type": "text/plain"})
     table = encode_properties(properties, PUBLISH)
     engine = _connected()
     engine.handle_raw(_raw("bench/direct", b"payload", properties))
@@ -165,7 +165,7 @@ def test_v5_qos0_non_alias_properties_skip_resolution_and_keep_hint(monkeypatch)
 
     monkeypatch.setattr(InboundSession, "_resolve_topic_fields", counted)
     properties = Properties()
-    properties.set("content_type", "text/plain")
+    properties = Properties({**properties.values, "content_type": "text/plain"})
     table = encode_properties(properties, PUBLISH)
     engine = _connected()
     engine.handle_raw(_raw("bench/typed", b"x", properties))
@@ -237,7 +237,7 @@ def test_v5_qos0_empty_topic_without_alias_is_protocol_error() -> None:
 def test_v5_qos0_topic_alias_establish_and_reuse_preserve_hint() -> None:
     engine = _connected(alias_maximum=10)
     properties = Properties()
-    properties.set("topic_alias", 1)
+    properties = Properties({**properties.values, "topic_alias": 1})
     table = encode_properties(properties, PUBLISH)
 
     engine.handle_raw(_raw("sensors/temp", b"first", properties))
@@ -257,7 +257,7 @@ def test_v5_qos0_topic_alias_establish_and_reuse_preserve_hint() -> None:
 @pytest.mark.parametrize(("alias", "maximum"), [(2, 1)])
 def test_v5_qos0_invalid_topic_alias_never_delivers(alias: int, maximum: int) -> None:
     properties = Properties()
-    properties.set("topic_alias", alias)
+    properties = Properties({**properties.values, "topic_alias": alias})
     engine = _connected(alias_maximum=maximum)
     engine.handle_raw(_raw("sensors/temp", b"x", properties))
     effects = engine.take_effects()

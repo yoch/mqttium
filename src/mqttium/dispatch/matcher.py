@@ -59,11 +59,21 @@ class TopicMatcher:
     def __bool__(self) -> bool:
         return bool(self._entries)
 
+    def items(self) -> Iterator[tuple[str, Any]]:
+        """Iterate registered filters and values in registration order."""
+        for topic_filter, (_sequence, _levels, value) in self._entries.items():
+            yield topic_filter, value
+
     def iter_match(self, topic: str) -> Iterator[Any]:
         """Yield values whose MQTT filters match ``topic`` in insertion order."""
 
-        candidates: list[tuple[int, Any]] = []
         exact_entry = self._entries.get(topic)
+        if not self._wildcards:
+            if exact_entry is not None and exact_entry[1] is None:
+                yield exact_entry[2]
+            return
+
+        candidates: list[tuple[int, Any]] = []
         if exact_entry is not None and exact_entry[1] is None:
             sequence, _levels, value = exact_entry
             candidates.append((sequence, value))

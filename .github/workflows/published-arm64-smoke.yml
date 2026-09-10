@@ -122,7 +122,7 @@ jobs:
             --expected-version "$MQTTIUM_VERSION" \
             --database "$root/inflight.sqlite"
 
-      - name: Exercise transports, Paho migration, cancellation, and shutdown
+      - name: Exercise transports, cancellation, and shutdown
         run: |
           root="$JOB_ROOT"
           python -I tests/installed_distribution_extended_smoke.py websocket \
@@ -131,9 +131,6 @@ jobs:
           python -I tests/installed_distribution_extended_smoke.py unix \
             --expected-version "$MQTTIUM_VERSION" \
             --socket "$root/mqttium.sock"
-          python -I tests/installed_distribution_extended_smoke.py paho \
-            --expected-version "$MQTTIUM_VERSION" \
-            --host 127.0.0.1 --port 11886
           python -I tests/installed_distribution_extended_smoke.py shutdown \
             --expected-version "$MQTTIUM_VERSION" \
             --host 127.0.0.1 --port 11886

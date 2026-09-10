@@ -9,7 +9,7 @@ import pytest
 from mqttium.api import PublishMessage
 from mqttium.api.async_client import AsyncClient
 from mqttium.enums import ConnectionState, PacketType
-from mqttium.errors import FlowControlError, PublishBatchError
+from mqttium.errors import FlowControlError
 from mqttium.packets import encode_frame
 from mqttium.protocol.reconnect import ReconnectPolicy
 
@@ -29,7 +29,7 @@ async def test_nowait_rejection_is_atomic() -> None:
     )
 
     with pytest.raises(FlowControlError):
-        await client.publish("admission/rejected", b"two", qos=1, nowait=True)
+        client.publish_nowait("admission/rejected", b"two", qos=1)
 
     assert client._engine.pending_outbound_messages == 1
     assert len(client._engine.packet_ids) == before_ids
@@ -42,21 +42,12 @@ async def test_nowait_rejection_is_atomic() -> None:
         == before_records
     )
     assert len(client._receipts) == 1
-    assert not client._pending_effects
+    assert not client._effect_pump.pending
 
 
-async def test_error_mode_refuses_without_waiting() -> None:
-    client = AsyncClient(
-        max_pending_outbound_messages=1,
-        max_pending_outbound_bytes=None,
-        publish_backpressure="error",
-    )
-    await client.publish("admission/first", b"one", qos=1)
-
-    with pytest.raises(FlowControlError):
-        await client.publish("admission/rejected", b"two", qos=1)
-
-    assert client._engine.pending_outbound_messages == 1
+def test_global_publish_backpressure_option_is_removed() -> None:
+    with pytest.raises(TypeError):
+        AsyncClient(publish_backpressure="error")
 
 
 async def test_cancellation_while_waiting_leaves_no_publication_state() -> None:
@@ -98,11 +89,11 @@ async def test_nowait_writer_rejection_is_atomic_for_qos0() -> None:
     assert client._write_pump.try_enqueue(b"occupied") is True
 
     with pytest.raises(FlowControlError):
-        await client.publish("admission/writer", b"payload", qos=0, nowait=True)
+        client.publish_nowait("admission/writer", b"payload", qos=0)
 
-    assert client._outbound.qsize() == 1
-    assert client._outbound_bytes == len(b"occupied")
-    assert not client._pending_effects
+    assert client._write_pump.queue.qsize() == 1
+    assert client._write_pump.queued_bytes == len(b"occupied")
+    assert not client._effect_pump.pending
     assert not client._engine.take_effects()
 
 
@@ -118,7 +109,7 @@ async def test_nowait_writer_rejection_is_atomic_for_qos1() -> None:
     )
 
     with pytest.raises(FlowControlError):
-        await client.publish("admission/writer", b"payload", qos=1, nowait=True)
+        client.publish_nowait("admission/writer", b"payload", qos=1)
 
     assert client._engine.pending_outbound_messages == 0
     assert len(client._engine.packet_ids) == before_ids
@@ -131,7 +122,7 @@ async def test_nowait_writer_rejection_is_atomic_for_qos1() -> None:
         == before_records
     )
     assert not client._receipts
-    assert not client._pending_effects
+    assert not client._effect_pump.pending
 
 
 async def test_publish_nowait_writer_rejection_is_atomic_for_qos1() -> None:
@@ -159,30 +150,24 @@ async def test_publish_nowait_writer_rejection_is_atomic_for_qos1() -> None:
         == before_records
     )
     assert not client._receipts
-    assert not client._pending_effects
+    assert not client._effect_pump.pending
 
 
-async def test_nowait_batch_writer_rejection_is_atomic() -> None:
+async def test_cancelled_batch_waiting_for_writer_keeps_committed_prefix() -> None:
     client = AsyncClient(max_outbound_messages=1, max_outbound_bytes=1024)
     client._engine.state = ConnectionState.CONNECTED
-    assert client._write_pump.try_enqueue(b"occupied") is True
-
-    with pytest.raises(PublishBatchError) as exc_info:
-        await client.publish_many(
-            [PublishMessage("admission/batch", b"payload", qos=1)],
-            nowait=True,
-        )
-    assert isinstance(exc_info.value.cause, FlowControlError)
-
-    assert client._engine.pending_outbound_messages == 0
-    assert not client._engine.packet_ids
-    assert not list(
-        client._engine.store.get_out(summary.mid)
-        for page in client._engine.store.out_summary_pages()
-        for summary in page
-    )
-    assert not client._batch_receipts
-    assert not client._pending_effects
+    assert client._write_pump.try_enqueue(b"occupied")
+    pending = asyncio.create_task(client.publish_many([PublishMessage("batch", b"x", qos=1)]))
+    await asyncio.sleep(0)
+    assert client._engine.pending_outbound_messages == 1
+    receipt = next(iter(client._batch_receipts.values()))
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+    assert receipt.submitted == 1
+    assert receipt._sealed
+    assert client._engine.pending_outbound_messages == 1
+    await client._force_close()
 
 
 class _ClosingTransport:
@@ -272,21 +257,3 @@ async def test_flow_control_error_names_the_byte_bound() -> None:
     message = str(excinfo.value)
     assert "max_outbound_bytes=4096" in message
     assert "already queued" in message
-
-
-async def test_batch_refusal_names_the_bound_the_batch_actually_hit() -> None:
-    """publish_many admits against running totals, not the live queue.
-
-    With an empty writer, the message bound is only reached part-way through
-    the batch, so the error must not describe the byte bound it never hit.
-    """
-    client = AsyncClient(max_outbound_messages=3, max_outbound_bytes=64 * 1024 * 1024)
-    client._engine.state = ConnectionState.CONNECTED
-
-    requests = [PublishMessage("bound/batch", b"x", 0) for _ in range(8)]
-    with pytest.raises(PublishBatchError) as excinfo:
-        await client.publish_many(requests, nowait=True)
-
-    message = str(excinfo.value.cause)
-    assert "max_outbound_messages=3" in message
-    assert "max_outbound_bytes" not in message

@@ -5,11 +5,9 @@ thread. A re-entrant lock protects accidental cross-thread access, while
 ``batch()`` groups protocol transitions into one durable transaction before
 generated wire effects are released.
 
-The durable format is versioned through ``PRAGMA user_version``. A database
-written by an older MQTTium is migrated in one transaction on open, so an
-interrupted migration leaves the previous version intact rather than a half
-schema. A database written by a *newer* MQTTium is refused instead of being
-silently reinterpreted.
+The experimental durable format is schema 5. Older, future and inconsistent
+schemas are refused before write-affecting pragmas. Each mutation is atomic;
+internal batches group durable protocol transitions before their effects escape.
 """
 
 from __future__ import annotations
@@ -20,12 +18,13 @@ import json
 import sqlite3
 import threading
 from array import array
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Literal, TypeVar
 
 from mqttium.enums import InboundQoSState, OutboundQoSState, QoS
+from mqttium.errors import ProtocolError
 from mqttium.types import (
     InboundMessage,
     InboundRecordMeta,
@@ -66,28 +65,16 @@ _IN_REPLAY_INDEX_SQL = (
     " FROM inbound ORDER BY seq"
 )
 
-SQLITE_SCHEMA_VERSION = 4
-"""Durable schema revision stored in ``PRAGMA user_version``.
-
-* 1 — the original schema, which carried no version marker at all.
-* 2 — adds ``outbound.logical_size``, drops the never-read ``extra`` column,
-  and moves ``payload`` last so metadata reads never traverse BLOB overflow
-  pages.
-* 3 — compacts outbound QoS 2 records already in ``WAIT_PUBCOMP`` by removing
-  topic, payload and PUBLISH properties while preserving settlement metadata.
-* 4 — adds ``inbound.logical_size`` ahead of application data so persisted
-  inbound byte reservations survive restarts and settle without reading BLOBs.
-"""
+SQLITE_SCHEMA_VERSION = 5
+"""Experimental native-only format; historical formats are not migrated."""
 
 
 def _json_sanitize(value: Any) -> Any:
     if isinstance(value, bytes):
         return {"__mqttium_bytes__": base64.b64encode(value).decode("ascii")}
-    if isinstance(value, tuple):
-        return {"__mqttium_tuple__": [_json_sanitize(v) for v in value]}
-    if isinstance(value, list):
+    if isinstance(value, (tuple, list)):
         return [_json_sanitize(v) for v in value]
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
         return {str(k): _json_sanitize(v) for k, v in value.items()}
     return value
 
@@ -102,21 +89,9 @@ def _json_revive(value: Any) -> Any:
                 return base64.b64decode(encoded.encode("ascii"), validate=True)
             except (UnicodeEncodeError, binascii.Error) as exc:
                 raise ValueError("Invalid persisted properties byte marker") from exc
-        if "__mqttium_tuple__" in value and len(value) == 1:
-            items = value["__mqttium_tuple__"]
-            if not isinstance(items, list):
-                raise ValueError("Invalid persisted properties tuple marker")
-            return tuple(_json_revive(v) for v in items)
         return {k: _json_revive(v) for k, v in value.items()}
     if isinstance(value, list):
-        revived = [_json_revive(v) for v in value]
-        if (
-            revived
-            and all(isinstance(item, list) and len(item) == 2 for item in revived)
-            and all(isinstance(item[0], str) for item in revived)
-        ):
-            return [tuple(item) for item in revived]
-        return revived
+        return [_json_revive(v) for v in value]
     return value
 
 
@@ -132,7 +107,10 @@ def _props_from_json(raw: str | None) -> Properties | None:
     values = _json_revive(json.loads(raw))
     if not isinstance(values, dict):
         raise ValueError("Invalid properties JSON payload")
-    return Properties(values=values)
+    try:
+        return Properties(values=values)
+    except ProtocolError as exc:
+        raise ValueError("Invalid persisted properties value") from exc
 
 
 def _stored(row: sqlite3.Row, column: str, expected: type[_RecordT]) -> _RecordT:
@@ -167,6 +145,13 @@ def _stored_non_negative(row: sqlite3.Row, column: str) -> int:
     return value
 
 
+def _stored_logical_size(row: sqlite3.Row) -> int:
+    size = _stored(row, "logical_size", int)
+    if size <= 0:
+        raise ValueError("Invalid persisted logical_size: expected a positive integer")
+    return size
+
+
 def _stored_mid(row: sqlite3.Row) -> int:
     value = _stored(row, "mid", int)
     if not 1 <= value <= 65_535:
@@ -184,7 +169,7 @@ def _stored_out_transition(
 ) -> tuple[OutboundQoSState, int, int]:
     return (
         OutboundQoSState(_stored(row, "state", int)),
-        _stored_non_negative(row, "logical_size"),
+        _stored_logical_size(row),
         _stored_non_negative(row, "seq"),
     )
 
@@ -196,7 +181,7 @@ def _stored_in_transition(
         InboundQoSState(_stored(row, "state", int)),
         _stored_bool(row, "user_acked"),
         _stored_bool(row, "delivered"),
-        _stored_non_negative(row, "logical_size"),
+        _stored_logical_size(row),
         _stored_non_negative(row, "seq"),
     )
 
@@ -211,10 +196,7 @@ def _row_to_out(row: sqlite3.Row) -> OutboundMessage:
         state=OutboundQoSState(_stored(row, "state", int)),
         dup=_stored_bool(row, "dup"),
         properties=_props_from_json(_stored_optional_text(row, "properties")),
-        # Rows migrated from schema 1 carry 0, which the outbound session reads
-        # as "unknown" and recomputes once, exactly as it did before the column
-        # existed.
-        logical_size=_stored_non_negative(row, "logical_size"),
+        logical_size=_stored_logical_size(row),
     )
 
 
@@ -228,7 +210,7 @@ def _row_to_out_summary(row: sqlite3.Row) -> OutboundMessageSummary:
         state=OutboundQoSState(_stored(row, "state", int)),
         dup=_stored_bool(row, "dup"),
         properties=_props_from_json(_stored_optional_text(row, "properties")),
-        logical_size=_stored_non_negative(row, "logical_size"),
+        logical_size=_stored_logical_size(row),
     )
 
 
@@ -238,7 +220,7 @@ def _row_to_in_meta(row: sqlite3.Row) -> InboundRecordMeta:
         state=InboundQoSState(_stored(row, "state", int)),
         user_acked=_stored_bool(row, "user_acked"),
         delivered=_stored_bool(row, "delivered"),
-        logical_size=_stored_non_negative(row, "logical_size"),
+        logical_size=_stored_logical_size(row),
     )
 
 
@@ -253,7 +235,7 @@ def _row_to_in(row: sqlite3.Row) -> InboundMessage:
         delivered=_stored_bool(row, "delivered"),
         properties=_props_from_json(_stored_optional_text(row, "properties")),
         user_acked=_stored_bool(row, "user_acked"),
-        logical_size=_stored_non_negative(row, "logical_size"),
+        logical_size=_stored_logical_size(row),
     )
 
 
@@ -275,8 +257,6 @@ class SqliteInflightStore:
         self._conn.row_factory = sqlite3.Row
         self._closed = False
         try:
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA synchronous=NORMAL")
             self._prepare_schema()
             self._out_seq = self._max_seq("outbound")
             self._in_seq = self._max_seq("inbound")
@@ -288,61 +268,64 @@ class SqliteInflightStore:
 
     # --- schema ------------------------------------------------------------
 
-    def _prepare_schema(self) -> None:
-        """Create, verify or migrate the durable schema, atomically."""
-        conn = self._conn
+    @classmethod
+    def _validate_schema(cls, conn: sqlite3.Connection) -> bool:
+        """Return whether the database is empty; otherwise require our format."""
         version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-        if version > SQLITE_SCHEMA_VERSION:
-            conn.close()
-            self._closed = True
-            raise RuntimeError(
-                f"{self._path} was written by a newer MQTTium "
-                f"(schema {version} > {SQLITE_SCHEMA_VERSION})"
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
             )
-        if version == SQLITE_SCHEMA_VERSION:
-            missing = [table for table in ("outbound", "inbound") if not self._table_exists(table)]
-            if missing:
-                names = ", ".join(missing)
-                raise RuntimeError(
-                    f"{self._path} has schema version {version} but is missing table(s): {names}"
-                )
-            for table in ("outbound", "inbound"):
-                missing_columns = self._missing_required_columns(table)
-                if missing_columns:
-                    names = ", ".join(missing_columns)
-                    raise RuntimeError(
-                        f"{self._path} has schema version {version} but table {table} "
-                        f"is missing required column(s): {names}"
-                    )
-            return
-        # A pre-versioning database reports 0 while already holding tables; a
-        # genuinely empty file reports 0 with nothing in sqlite_master.
-        conn.execute("BEGIN IMMEDIATE")
+        }
+        if (
+            version == 0
+            and not tables
+            and not conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+        ):
+            return True
+        if version != SQLITE_SCHEMA_VERSION:
+            raise RuntimeError(
+                f"Unsupported SQLite schema {version}; this experiment requires schema {SQLITE_SCHEMA_VERSION}"
+            )
+        if tables != {"outbound", "inbound"}:
+            raise RuntimeError("Inconsistent SQLite schema: expected outbound and inbound tables")
+        for table, statement in cls._TABLE_INFO_SQL.items():
+            columns = tuple(row[1] for row in conn.execute(statement))
+            if columns != cls._REQUIRED_COLUMNS[table]:
+                raise RuntimeError(f"Inconsistent SQLite schema: invalid columns for {table}")
+        objects = list(conn.execute("SELECT type, name, sql FROM sqlite_master"))
+        expected = {
+            "outbound": f"CREATE TABLE outbound ({cls.OUTBOUND_COLUMNS})",
+            "inbound": f"CREATE TABLE inbound ({cls.INBOUND_COLUMNS})",
+        }
+        if len(objects) != 2 or any(
+            kind != "table"
+            or name not in expected
+            or "".join(statement.lower().split()) != "".join(expected[name].lower().split())
+            for kind, name, statement in objects
+        ):
+            raise RuntimeError("Inconsistent SQLite schema: unexpected definitions or objects")
+        return False
+
+    def _prepare_schema(self) -> None:
+        # All metadata queries must observe one WAL-aware SQLite snapshot.
+        # Normal journal recovery/checkpointing is allowed; an unsupported
+        # database must retain its committed schema and data, not its bytes.
+        self._conn.execute("BEGIN")
         try:
-            legacy = self._table_exists("outbound") or self._table_exists("inbound")
-            self._create_schema()
-            if legacy:
-                # Each rebuild below recreates its table from the *current*
-                # column constants, not from the schema of the version it is
-                # upgrading to -- there is only ever one target, the schema this
-                # build declares. So the gates say which tables still need
-                # rebuilding, not which historical shape to produce:
-                #   outbound gained logical_size and payload-last order in v2;
-                #   inbound gained logical_size in v4 and needs no other change,
-                #   which is why one rebuild covers every version below it.
-                if version < 2:
-                    self._rebuild_outbound()
-                if version < 4:
-                    self._rebuild_inbound()
-                if version < 3:
-                    self._compact_wait_pubcomp_records()
-            conn.execute(f"PRAGMA user_version={SQLITE_SCHEMA_VERSION}")
-        except BaseException:
-            # One transaction for the whole upgrade: an interrupted migration
-            # reopens as the version it started from, never as half of two.
-            conn.rollback()
-            raise
-        conn.commit()
+            empty = self._validate_schema(self._conn)
+        finally:
+            self._conn.rollback()
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        if empty:
+            with self._conn:
+                self._conn.execute("BEGIN IMMEDIATE")
+                # Another initializer may have committed since our read snapshot.
+                if self._validate_schema(self._conn):
+                    self._create_schema()
+                    self._conn.execute(f"PRAGMA user_version={SQLITE_SCHEMA_VERSION}")
 
     # Column order is a storage decision, not a cosmetic one. SQLite reaches a
     # column by walking the ones declared before it, and a payload past a few
@@ -359,7 +342,7 @@ class SqliteInflightStore:
         retain INTEGER NOT NULL,
         state INTEGER NOT NULL,
         dup INTEGER NOT NULL,
-        logical_size INTEGER NOT NULL DEFAULT 0,
+        logical_size INTEGER NOT NULL CHECK(logical_size > 0),
         topic TEXT NOT NULL,
         properties TEXT,
         payload BLOB NOT NULL
@@ -372,7 +355,7 @@ class SqliteInflightStore:
         state INTEGER NOT NULL,
         delivered INTEGER NOT NULL,
         user_acked INTEGER NOT NULL,
-        logical_size INTEGER NOT NULL DEFAULT 0,
+        logical_size INTEGER NOT NULL CHECK(logical_size > 0),
         topic TEXT NOT NULL,
         properties TEXT,
         payload BLOB NOT NULL
@@ -413,86 +396,6 @@ class SqliteInflightStore:
         conn = self._conn
         conn.execute(f"CREATE TABLE IF NOT EXISTS outbound ({self.OUTBOUND_COLUMNS})")
         conn.execute(f"CREATE TABLE IF NOT EXISTS inbound ({self.INBOUND_COLUMNS})")
-
-    def _rebuild_outbound(self) -> None:
-        """Rebuild `outbound` in the current column order (schema 1 -> 2 and on).
-
-        Reordering columns requires a table rebuild, which is also the cheapest
-        moment to add `logical_size`. Migrated rows keep it at 0, which the
-        outbound session already treats as "not computed yet" and backfills once
-        at hydration.
-
-        Deliberately no `seq` index: ordered pagination is served by one sorted
-        metadata pass (see `_ordered_mids`), which measured faster than the
-        indexed page-per-query form while costing nothing on every INSERT and
-        DELETE of the publish hot path. Rebuilding drops the old table, and with
-        it any index a previous build had created on it.
-        """
-        self._rebuild_table(
-            "outbound",
-            f"CREATE TABLE outbound__new ({self.OUTBOUND_COLUMNS})",
-            # The literal `0` supplies `logical_size` for rows written before
-            # the column existed.
-            "INSERT INTO outbound__new SELECT mid, seq, qos, retain, state, dup,"
-            " 0, topic, properties, payload FROM outbound",
-            "DROP TABLE outbound",
-            "ALTER TABLE outbound__new RENAME TO outbound",
-        )
-
-    def _rebuild_inbound(self) -> None:
-        """Rebuild `inbound` in the current column order (durable byte accounting).
-
-        Every pre-4 schema stores the same inbound columns, so one rebuild
-        serves schema 1, 2 and 3 alike; this was previously written out twice,
-        identically, once under a "to v2" name and once under a "to v4" name.
-        """
-        self._rebuild_table(
-            "inbound",
-            f"CREATE TABLE inbound__new ({self.INBOUND_COLUMNS})",
-            "INSERT INTO inbound__new SELECT mid, seq, qos, retain, state,"
-            " delivered, user_acked, 0, topic, properties, payload FROM inbound",
-            "DROP TABLE inbound",
-            "ALTER TABLE inbound__new RENAME TO inbound",
-        )
-
-    def _compact_wait_pubcomp_records(self) -> None:
-        """Discard PUBLISH application data after the QoS 2 PUBREC phase (schema 3).
-
-        A ``WAIT_PUBCOMP`` record only retransmits PUBREL. Its original logical
-        size remains durable so the admission budget is released exactly once
-        when PUBCOMP eventually settles the record.
-        """
-        self._conn.execute(
-            """
-            UPDATE outbound
-            SET topic='', properties=NULL, payload=X''
-            WHERE state=?
-            """,
-            (int(OutboundQoSState.WAIT_PUBCOMP),),
-        )
-
-    def _rebuild_table(self, table: str, *statements: str) -> None:
-        """Recreate one table in the current column order, preserving its rows.
-
-        The statements are passed in already written out rather than assembled
-        from the table name, so no SQL text here is derived from a value.
-        """
-        if not self._table_exists(table):
-            return
-        for statement in statements:
-            self._conn.execute(statement)
-
-    def _table_exists(self, table: str) -> bool:
-        row = self._conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
-        ).fetchone()
-        return row is not None
-
-    def _missing_required_columns(self, table: str) -> tuple[str, ...]:
-        """Required current-schema columns absent from one known table."""
-        rows = self._conn.execute(self._TABLE_INFO_SQL[table]).fetchall()
-        present = {str(row["name"]) for row in rows}
-        return tuple(name for name in self._REQUIRED_COLUMNS[table] if name not in present)
 
     # Complete, literal SQL selected by table. Nothing in this module builds a
     # statement out of a runtime value: the only text ever appended to a query
@@ -626,6 +529,8 @@ class SqliteInflightStore:
         self.close()
 
     def put_out(self, msg: OutboundMessage) -> None:
+        if msg.logical_size <= 0:
+            raise ValueError("logical_size must be positive")
         with self._lock:
             self._ensure_write_transaction()
             self._out_seq += 1
@@ -697,16 +602,6 @@ class SqliteInflightStore:
         return self._conn.execute(
             "SELECT state, logical_size, seq FROM outbound WHERE mid=?", (mid,)
         ).fetchone()
-
-    def set_out_logical_size(self, mid: int, logical_size: int) -> bool:
-        with self._lock:
-            self._ensure_write_transaction()
-            cursor = self._conn.execute(
-                "UPDATE outbound SET logical_size=? WHERE mid=?",
-                (int(logical_size), mid),
-            )
-            self._commit_if_needed()
-            return cursor.rowcount > 0
 
     def out_meta(self, mid: int) -> OutboundRecordMeta | None:
         with self._lock:
@@ -788,6 +683,8 @@ class SqliteInflightStore:
             )
 
     def put_in(self, msg: InboundMessage) -> None:
+        if msg.logical_size <= 0:
+            raise ValueError("logical_size must be positive")
         with self._lock:
             self._ensure_write_transaction()
             self._in_seq += 1
@@ -912,16 +809,6 @@ class SqliteInflightStore:
             "SELECT state, user_acked, delivered, logical_size, seq FROM inbound WHERE mid=?",
             (mid,),
         ).fetchone()
-
-    def set_in_logical_size(self, mid: int, logical_size: int) -> bool:
-        with self._lock:
-            self._ensure_write_transaction()
-            cursor = self._conn.execute(
-                "UPDATE inbound SET logical_size=? WHERE mid=?",
-                (int(logical_size), mid),
-            )
-            self._commit_if_needed()
-            return cursor.rowcount > 0
 
     def in_meta(self, mid: int) -> InboundRecordMeta | None:
         with self._lock:

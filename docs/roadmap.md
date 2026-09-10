@@ -20,7 +20,7 @@ promise or release date.
 
 - Improve the native `AsyncClient` from real service and gateway feedback.
 - Expand cookbook and troubleshooting material from reproducible issues.
-- Keep protocol conformance, hostile-broker tests, and persistence migrations
+- Keep protocol conformance, hostile-broker tests, and persistence format validation
   current as defects are discovered.
 - Extend broker, platform, and architecture validation where maintainable
   runners and concrete user demand exist.
@@ -29,18 +29,13 @@ promise or release date.
 
 ## Paho compatibility policy
 
-The Paho VERSION2 facade remains Provisional, tested, and de-emphasized. It is a
-transition surface for existing synchronous applications, not a second product
-direction. Add compatibility features only for demonstrated migration needs
-with behavioral and lifecycle tests. Do not promise drop-in or performance
-parity.
-
-If maintenance cost or concurrency risk grows without corresponding adoption,
-deprecation must follow the published API policy and include migration guidance.
+This branch evaluates an incompatible native-only API. The façade and helpers
+are removed. Assess the simplification and measured performance changes before
+any separate decision to merge or publish the experiment.
 
 ## Documentation and ecosystem
 
-- Maintain one authoritative Stable API reference and one compatibility matrix.
+- Maintain one authoritative native API reference and one compatibility matrix.
 - Keep dated reports immutable and classify every report as current evidence,
   superseded, or retracted in the archive index.
 - Keep project metadata, issue forms, support policy, and release instructions
