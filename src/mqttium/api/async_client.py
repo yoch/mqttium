@@ -1722,6 +1722,14 @@ class AsyncClient:
             return self._write_pump.try_enqueue(effect.data, epoch=epoch)
         if kind is EffectKind.SEND_ACK:
             return self._write_pump.try_enqueue_ack(effect.data, epoch=epoch)
+        if kind is EffectKind.MESSAGE or kind is EffectKind.DECODED_MESSAGE:
+            message: Message = effect.data
+            if message.mid is not None and effect.requires_delivery_mark:
+                # Durable marking retains its async lock and fail-stop boundary.
+                return False
+            return self._delivery.try_accept(
+                message, self._message_callback, effect.decoded_property_wire_size
+            )
         if kind is EffectKind.CONNACK and self.on_connect is None:
             connack: ConnAckPacket = effect.data
             self._resolve_connack(connack)

@@ -89,3 +89,88 @@ async def test_impossible_delivery_is_rejected_before_worker_or_reservation():
         await client._delivery.accept(Message(topic="t", payload=b"xx"), lambda _: None)
     assert client.stats().delivery.pending_bytes == 0
     assert client._delivery.callback_task is None
+
+
+@pytest.mark.parametrize("kind", ["MESSAGE", "DECODED_MESSAGE"])
+@pytest.mark.parametrize("eager", [False, True])
+async def test_inline_message_enqueue_keeps_callbacks_outside_engine_lock(kind, eager):
+    from mqttium.protocol.effects import EffectKind
+
+    if eager and not hasattr(asyncio, "eager_task_factory"):
+        pytest.skip("eager task factory requires Python 3.12")
+    loop = asyncio.get_running_loop()
+    previous = loop.get_task_factory()
+    if eager:
+        loop.set_task_factory(asyncio.eager_task_factory)
+    client = AsyncClient(message_delivery="callback")
+    observed = []
+    client.on_message = lambda message: observed.append(
+        (message.payload, client._engine_lock.locked())
+    )
+    try:
+        async with client._engine_lock:
+            client._engine._emit(EffectKind[kind], Message(topic="t", payload=b"x"))
+            client._effect_pump.collect_from_engine()
+            assert not client._effect_pump.pending
+            assert client._delivery.callback_queue.qsize() == 1
+            assert not observed
+        await client._delivery.callback_queue.join()
+        assert observed == [(b"x", False)]
+        assert client.stats().delivery.pending_bytes == 0
+    finally:
+        await client._delivery.shutdown_callbacks(drain=False)
+        loop.set_task_factory(previous)
+
+
+@pytest.mark.parametrize("mark", [False, True])
+async def test_delivery_mark_keeps_existing_lock_and_failure_boundary(monkeypatch, mark):
+    from mqttium.enums import QoS
+    from mqttium.protocol.effects import EffectKind, EngineEffect
+
+    client = AsyncClient()
+    message = Message(topic="t", payload=b"x", mid=7, qos=QoS.AT_LEAST_ONCE)
+    effect = EngineEffect(EffectKind.MESSAGE, message, requires_delivery_mark=mark)
+    observed = []
+    failure = OSError("durable mark failed")
+
+    def mark_delivered(self, mid):
+        assert self is client._engine.inbound
+        observed.append(
+            (mid, client._engine_lock.locked(), client._delivery.messages_queue.qsize())
+        )
+        raise failure
+
+    monkeypatch.setattr(type(client._engine.inbound), "mark_delivered", mark_delivered)
+    if mark:
+        assert not client._apply_effect_inline(effect, client._connection_epoch)
+        assert client._delivery.pending_bytes == 0
+        with pytest.raises(OSError) as caught:
+            await client._apply_effect(effect, nowait=False, epoch=client._connection_epoch)
+        assert caught.value is failure
+        assert client._local_terminal_failure is failure
+        assert observed == [(7, True, 1)]
+    else:
+        assert client._apply_effect_inline(effect, client._connection_epoch)
+        assert not observed
+        assert client._local_terminal_failure is None
+    assert await anext(client.messages()) is message
+    assert client.stats().delivery.pending_bytes == 0
+
+
+async def test_inline_pressure_falls_back_in_order_and_stale_epochs_are_ignored():
+    from mqttium.protocol.effects import EffectKind, EngineEffect
+
+    client = AsyncClient(max_pending_messages=1)
+    first, second = Message(topic="t", payload=b"a"), Message(topic="t", payload=b"b")
+    await client._delivery.accept(first, None)
+    client._engine._emit(EffectKind.MESSAGE, second)
+    client._effect_pump.collect_from_engine()
+    assert len(client._effect_pump.pending) == 1
+    stale = EngineEffect(EffectKind.MESSAGE, Message(topic="t", payload=b"old"))
+    assert client._apply_effect_inline(stale, client._connection_epoch - 1)
+    assert client._delivery.pending_bytes == 2
+    assert await anext(client.messages()) is first
+    await client._effect_pump.drain()
+    assert await anext(client.messages()) is second
+    assert client._delivery.pending_bytes == 0
+    assert not client._effect_pump.pending
