@@ -48,12 +48,39 @@ callable that returns an awaitable violates the callback contract and is reporte
 as a callback `TypeError` rather than being scheduled implicitly. Synchronous
 callbacks must not block the event loop.
 
-Eligible idle `on_publish` and message callbacks may execute inline. For
-callback-only message delivery, an adjacent pair of small synchronous messages may
-run in the same effect-drain turn while retaining the hard
-`max_pending_callbacks` bound. Larger bursts, declared-async callbacks, and
-queued/reentrant delivery use the bounded worker. Callback failures go to the event
-loop's exception handler without silently changing protocol state.
+Message callbacks use a single bounded worker, independent of whether their
+callable is synchronous or asynchronous and of the received burst size. Admission
+may complete synchronously, but never invokes message callback code. One ordinary
+queue entry represents one notification; `callback_queued` is the actual queue
+length, excluding the active notification. The queue's configured maximum never
+changes. A worker turn processes only the notifications already present when it
+starts; later arrivals wait for a subsequent turn. This is a count bound, not a
+time bound on blocking user code or on individual matching topic filters.
+
+A direct `on_message` is captured at admission. A topic notification snapshots its
+ordered live matches when execution begins; changes affect later notifications,
+not the current match chain. The topic dispatcher has a stable async form even
+when all matches are synchronous. The user-facing `def`/`async def` contract and
+rejection of dynamically returned awaitables are unchanged.
+
+Ordinary callback errors, including self-raised `CancelledError` without task
+cancellation, are reported and isolated. A real cancellation interrupts the active
+notification (including any remaining topic matches), never the reader. Unstarted
+notifications remain owned by the delivery controller and are resumed by its
+replacement worker. Explicit shutdown, not cancellation of a private task,
+chooses whether to drain or discard queued work. Reopen discards the retired
+generation's queued work; an active reconnecting callback remains the single
+consumer. Admissions already waiting for the retired generation are rejected.
+
+An idle synchronous `on_publish` may still execute inline after receipt settlement,
+outside the engine lock. This publish-only policy is deliberately independent of
+the message-delivery policy. Iterator byte accounting and `both` destination
+ordering are retained; the callback leg of `both` is always worker-owned.
+Synchronous callbacks must not block the event loop. A callback cannot wait to
+admit more work into its own full queue. Also avoid application dependency cycles
+where a callback waits for an operation whose network progress requires that
+same saturated delivery queue to drain; worker isolation is not an unbounded
+read-ahead guarantee.
 
 Matching `message_callback_add` filters run instead of `on_message`, in
 registration order. Shared-subscription filters match the filter string

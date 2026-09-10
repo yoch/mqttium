@@ -271,6 +271,15 @@ def _wrap_callbacks(patches: _PatchSet, counters: PathCounters) -> None:
         counters.callback_worker_jobs += len(messages)
         orig_batch(self, callback, messages, **kwargs)
 
+    orig_admit = ApplicationDelivery.deliver_message_batch_inline
+
+    def admit(self: ApplicationDelivery, *args: Any, **kwargs: Any) -> int:
+        before = self.callback_queue.qsize()
+        applied = orig_admit(self, *args, **kwargs)
+        counters.callback_worker_jobs += self.callback_queue.qsize() - before
+        return applied
+
+    patches.bind(ApplicationDelivery, "deliver_message_batch_inline", admit)
     patches.bind(ApplicationDelivery, "dispatch_callback_inline", inline_cb)
     patches.bind(ApplicationDelivery, "try_enqueue_callback", enqueue_cb)
     patches.bind(ApplicationDelivery, "_enqueue_message_batch", enqueue_batch)

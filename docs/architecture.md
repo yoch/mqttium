@@ -90,9 +90,11 @@ The delivery mode is selected when the client is constructed. Specialised
 admission functions avoid repeated mode branches on every incoming message
 while preserving one authoritative owner for reservations and lifecycle.
 
-Idle synchronous callbacks may run directly in the reader/effect-drain turn;
-the worker remains the bounded fallback for async callbacks, reentrancy and
-bursts. Callback exceptions are isolated from protocol state. A message
+Message notifications are admitted quickly but executed only by one bounded
+callback worker. Each notification is one ordinary queue entry; no batch reserve
+changes the queue capacity. A turn snapshots its pending count, so reentrant
+arrivals cannot extend it indefinitely. Idle synchronous publish completions
+retain their separate inline path. Callback exceptions are isolated from protocol state. A message
 delivered to both a callback and an iterator releases its byte reservation only
 after both references are gone.
 

@@ -90,6 +90,13 @@ Callback form is part of that contract: declare synchronous callbacks with
 not dynamically return an awaitable; MQTTium reports that as a callback
 `TypeError` instead of scheduling hidden continuation work.
 
+The experimental uniform-delivery branch changes message callback scheduling:
+admission is synchronous when capacity permits, execution is always worker-owned,
+and pending work belongs to the controller across private-worker cancellation.
+Public arguments, constructor defaults, FIFO and protocol boundaries are retained;
+callback timing and task identity are not claimed compatible. See the migration
+note. The usual release/deprecation process still applies before stable adoption.
+
 `publish_nowait()` and `stats()` are synchronous but loop-confined. They are not
 cross-thread APIs. Threaded migration code should use
 `mqttium.compat.paho.Client`.

@@ -203,10 +203,12 @@ The small-message reserve prevents one large payload from starving telemetry.
 It is disabled when it would make a single otherwise valid packet impossible to
 admit.
 
-User callbacks run outside engine critical sections. When callback delivery is
-idle, a plain synchronous `on_publish` or eligible `on_message` callback may run
-in the reader/effect-drain turn. A reentrancy guard sends callback-initiated
-delivery, async callbacks, and occupied-queue bursts through the bounded worker.
+User callbacks run outside engine critical sections. Message notifications always
+execute in the single callback worker; the reader/effect drain only admits them.
+One queue entry is one notification, with fixed capacity and no detached tails.
+The worker bounds each turn by its initial queue length. A plain synchronous
+`on_publish` can still run in the idle reader/effect-drain path; its reentrancy
+guard and receipt-before-callback ordering are unchanged.
 Exceptions are isolated and reported through the established callback policy;
 they do not stop the protocol reader or leak delivery capacity. Consecutive
 small MESSAGE effects that require no persisted delivery mark (QoS 0 and fresh

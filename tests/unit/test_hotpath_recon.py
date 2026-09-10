@@ -61,7 +61,7 @@ async def test_qos0_burst_eager_is_one_per_turn() -> None:
     assert counters["eager_data_hit_rate"] == 0.125
 
 
-async def test_qos1_inbound_reply_serial_uses_inline_callback() -> None:
+async def test_qos1_inbound_reply_serial_uses_uniform_worker() -> None:
     result = await _run_qos1_inbound_reply(
         protocol=MQTTProtocolVersion.MQTTv311,
         outstanding=1,
@@ -72,11 +72,13 @@ async def test_qos1_inbound_reply_serial_uses_inline_callback() -> None:
     )
     counters = result["counters"]
     assert counters["qos1_v311_field_decodes"] == 40
-    assert counters["callback_inline_rate"] == 1.0
+    assert counters["callback_inline_rate"] == 0.0
     assert counters["send_ack_effects"] == 40
     assert counters["message_effects"] == 40
     assert counters["effect_multi_batches"] == 40
-    assert counters["effect_collect_single_inline"] == 40
+    # The queued responder emits SEND after the original MESSAGE drain ended;
+    # SEND and terminal ACK now each use an independent single-effect admission.
+    assert counters["effect_collect_single_inline"] == 80
     assert result["operations"] == 40
 
 
@@ -95,11 +97,8 @@ async def test_qos1_coalesced_inbound_keeps_window() -> None:
     assert counters["send_ack_effects"] == 64
     assert counters["message_effects"] == 64
     assert counters["effect_multi_batches"] > 0
-    # Current main may inline eligible exact pairs while the rest of a
-    # coalesced burst retains the bounded callback worker path.
-    assert 0.0 < counters["callback_inline_rate"] < 1.0
-    # Exact eager hit ratios are scheduler-shape observations, not invariants:
-    # pair-inline delivery can create additional turns/reentrant publications.
+    assert counters["callback_inline_rate"] == 0.0
+    # Writer batching remains a separate scheduling policy.
     assert 0.0 < counters["eager_data_hit_rate"] < 1.0
     assert 0.0 < counters["eager_ack_hit_rate"] < 1.0
 

@@ -150,6 +150,29 @@ no longer implicitly handed to the callback worker; it is reported as a callback
 `TypeError`. Convert such callbacks to `async def`. This removes hidden scheduling
 state and makes callback execution mode explicit from the callable itself.
 
+## Experimental uniform message callbacks
+
+This experimental branch makes every message notification worker-owned, including
+formerly inline synchronous singletons and pairs and the callback leg of `both`.
+The argument signatures, constructor options/default values, sync/async callable
+contract, FIFO, QoS acknowledgement rules and byte budgets are unchanged. Code
+must no longer assume a message callback has already run when admission returns.
+Use an application event/future when completion of callback work matters.
+
+Cancelling the callback worker no longer discards unrelated queued notifications:
+the controller replaces the worker and retains all unstarted jobs. The active
+notification is not replayed. Use `disconnect()` for client shutdown, not
+`asyncio.current_task().cancel()` as a callback-local abort API. An async callback
+can await `disconnect()` without self-joining. Reconnect from that callback keeps
+the same consumer, retires old queued jobs and accepts a new generation.
+
+`both` still admits iterator copies before their callback counterparts and releases
+shared bytes only after both references are retired. Its formerly-inline singleton
+callback is now queued. `on_publish` retains its existing separate inline policy.
+This scheduling change is disclosed as an experimental contract change, not a
+claim of strict timing/task-identity compatibility with every existing caller.
+No stable release, version bump or deprecation waiver follows from this branch.
+
 ## Durable sessions
 
 ```python
