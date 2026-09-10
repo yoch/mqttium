@@ -141,7 +141,6 @@ class ApplicationDelivery:
         # bounded queue instead of nesting user callbacks.
         self._callback_active = False
         self._callback_state: Literal["open", "draining", "closed"] = "open"
-        self.callback_space = asyncio.Event()
         self.delivery_timeout = delivery_timeout
         self.callback_shutdown_timeout = callback_shutdown_timeout
 
@@ -173,10 +172,11 @@ class ApplicationDelivery:
     def _accept_iterator_unaccounted(
         self, message: Message, _callback: Callable[[Message], Any] | None
     ) -> Awaitable[None] | None:
+        generation = self._delivery_generation
         try:
             self.messages_queue.put_nowait(message)
         except asyncio.QueueFull:
-            return self.put_message(message)
+            return self.put_message(message, generation=generation)
         self.message_ready.set()
         return None
 
@@ -359,7 +359,7 @@ class ApplicationDelivery:
             try:
                 self.messages_queue.put_nowait(message)
             except asyncio.QueueFull:
-                await self.put_message(message)
+                await self.put_message(message, generation=generation)
             else:
                 self.message_ready.set()
         if callback is not None:
@@ -415,7 +415,8 @@ class ApplicationDelivery:
                 token = await self.reserve_slow(
                     logical_bytes,
                     references,
-                    callback_generation=generation if callback_delivery else None,
+                    generation=generation,
+                    require_callback_open=callback_delivery,
                 )
         try:
             if callback_delivery and generation != self._delivery_generation:
@@ -425,7 +426,7 @@ class ApplicationDelivery:
                 try:
                     self.messages_queue.put_nowait(item)
                 except asyncio.QueueFull:
-                    await self.put_message(item)
+                    await self.put_message(item, generation=generation)
                 else:
                     self.message_ready.set()
                 iterator_enqueued = True
@@ -483,12 +484,12 @@ class ApplicationDelivery:
             # The explicit reset already retired the prior delivery generation.
             # A callback which reconnects remains the sole worker incarnation.
             self._callback_state = "open"
-            self.callback_space.set()
             self.space.set()
 
     def close(self) -> None:
         self.closed.set()
         self.message_ready.set()
+        self.space.set()
 
     def _modes(self, callback: Callable[[Message], Any] | None) -> tuple[bool, bool]:
         """Resolve the two delivery destinations from the modes cached at init."""
@@ -606,6 +607,7 @@ class ApplicationDelivery:
                 return
             try:
                 item = self.messages_queue.get_nowait()
+                self.space.set()
                 if isinstance(item, tuple):
                     message, token = item
                     self.release_nowait(token)
@@ -630,8 +632,6 @@ class ApplicationDelivery:
         # the retired generation may cross into the replacement connection.
         self._delivery_generation += 1
         self._discard_callback_queue()
-        self.callback_space.set()
-        self.space.set()
         while True:
             try:
                 item = self.messages_queue.get_nowait()
@@ -640,24 +640,33 @@ class ApplicationDelivery:
             if isinstance(item, tuple):
                 _message, token = item
                 self.release_nowait(token)
-        self.messages_queue = _DeliveryQueue(maxsize=self.max_pending_messages)
-        self.message_ready = asyncio.Event()
+        # Keep the queue/event objects stable. Slow admissions wait on the
+        # controller-owned space event, so reset can wake every old producer;
+        # the generation check rejects them before they enqueue stale work.
+        self.message_ready.clear()
         self.closed.clear()
+        self.space.set()
 
-    async def put_message(self, item: IteratorQueueItem) -> None:
+    async def put_message(self, item: IteratorQueueItem, *, generation: int | None = None) -> None:
+        if generation is None:
+            generation = self._delivery_generation
         try:
-            self.messages_queue.put_nowait(item)
-        except asyncio.QueueFull:
-            try:
-                await asyncio.wait_for(
-                    self.messages_queue.put(item),
-                    timeout=self.delivery_timeout,
-                )
-            except TimeoutError as exc:
-                raise MessageDeliveryError(
-                    f"Iterator delivery queue remained full for {self.delivery_timeout:.3f}s"
-                ) from exc
-        self.message_ready.set()
+            async with asyncio.timeout(self.delivery_timeout):
+                while True:
+                    if generation != self._delivery_generation or self.closed.is_set():
+                        raise MessageDeliveryError(
+                            "Iterator admission belongs to a retired generation"
+                        )
+                    if not self.messages_queue.full():
+                        self.messages_queue.put_nowait(item)
+                        self.message_ready.set()
+                        return
+                    self.space.clear()
+                    await self.space.wait()
+        except TimeoutError as exc:
+            raise MessageDeliveryError(
+                f"Iterator delivery queue remained full for {self.delivery_timeout:.3f}s"
+            ) from exc
 
     def try_reserve(self, logical_bytes: int, references: int) -> DeliveryToken:
         limit = self.accounted_limit
@@ -670,15 +679,19 @@ class ApplicationDelivery:
         return _SharedDeliveryReservation(logical_bytes)
 
     async def reserve_slow(
-        self, logical_bytes: int, references: int, *, callback_generation: int | None = None
+        self,
+        logical_bytes: int,
+        references: int,
+        *,
+        generation: int,
+        require_callback_open: bool,
     ) -> DeliveryToken:
         self.waiters += 1
         try:
             while True:
-                if callback_generation is not None and (
-                    callback_generation != self._delivery_generation
-                    or self._callback_state != "open"
-                ):
+                if generation != self._delivery_generation or self.closed.is_set():
+                    raise MessageDeliveryError("Delivery admission belongs to a retired generation")
+                if require_callback_open and self._callback_state != "open":
                     raise MessageDeliveryError("Callback delivery generation is closing")
                 self.space.clear()
                 token = self.try_reserve(logical_bytes, references)
@@ -889,8 +902,8 @@ class ApplicationDelivery:
                         return
                     if asyncio.current_task() is self.callback_task:
                         raise MessageDeliveryError("A callback cannot wait for its own full queue")
-                    self.callback_space.clear()
-                    await self.callback_space.wait()
+                    self.space.clear()
+                    await self.space.wait()
         except TimeoutError as exc:
             raise MessageDeliveryError(
                 f"Callback delivery queue remained full for {self.delivery_timeout:.3f}s"
@@ -913,7 +926,7 @@ class ApplicationDelivery:
             if token is not None:
                 self.release_nowait(token)
             self.callback_queue.task_done()
-        self.callback_space.set()
+        self.space.set()
 
     async def _callback_worker(self) -> None:
         # Cold entry only: register ownership before an eager factory can call
@@ -932,7 +945,7 @@ class ApplicationDelivery:
             generation = self._delivery_generation
             remaining = 1 + queue.qsize()
             while True:
-                self.callback_space.set()
+                self.space.set()
                 callback, args, token = job
                 self._callback_active = True
                 try:
@@ -995,7 +1008,6 @@ class ApplicationDelivery:
         generation = self._delivery_generation
         if self._callback_state != "closed":
             self._callback_state = "draining" if drain else "closed"
-        self.callback_space.set()
         self.space.set()
         if self._callback_state == "closed":
             self._discard_callback_queue()

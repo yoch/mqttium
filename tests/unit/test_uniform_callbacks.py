@@ -275,6 +275,84 @@ async def test_explicit_stream_reset_retires_old_callback_generation(scheduler):
         await finish(client)
 
 
+async def test_explicit_stream_reset_rejects_all_old_iterator_queue_waiters(scheduler):
+    client = AsyncClient(message_delivery="iterator", max_pending_messages=1)
+    d = client._delivery
+    queue = d.messages_queue
+    ready = d.message_ready
+    stale = []
+    try:
+        await d.accept(Message(topic="uniform/x", payload=b"first"), None)
+        assert d.messages_queue.qsize() == 1
+        stale = [
+            asyncio.create_task(
+                d.accept(Message(topic="uniform/x", payload=f"stale-{i}".encode()), None)
+            )
+            for i in range(3)
+        ]
+        for _ in range(3):
+            await asyncio.sleep(0)
+        assert all(not task.done() for task in stale)
+
+        await client._reset_message_stream()
+        results = await asyncio.wait_for(asyncio.gather(*stale, return_exceptions=True), 1)
+        assert all(
+            isinstance(exc, MessageDeliveryError) and "retired generation" in str(exc)
+            for exc in results
+        )
+        assert d.messages_queue is queue
+        assert d.message_ready is ready
+        assert d.messages_queue.empty()
+
+        fresh = Message(topic="uniform/x", payload=b"fresh")
+        await d.accept(fresh, None)
+        assert await anext(client.messages()) is fresh
+        assert d.messages_queue.empty()
+    finally:
+        for task in stale:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*stale, return_exceptions=True)
+        await finish(client)
+
+
+async def test_explicit_stream_reset_rejects_old_iterator_byte_waiter(scheduler):
+    client = AsyncClient(
+        message_delivery="iterator",
+        max_pending_messages=1,
+        max_pending_delivery_bytes=8192,
+    )
+    d = client._delivery
+    first = Message(topic="x", payload=b"a" * 5000)
+    stale_message = Message(topic="x", payload=b"b" * 5000)
+    stale = None
+    try:
+        await d.accept(first, None)
+        assert d.pending_bytes == 5001
+        stale = asyncio.create_task(d.accept(stale_message, None))
+        for _ in range(3):
+            await asyncio.sleep(0)
+        assert d.waiters == 1
+        assert not stale.done()
+
+        await client._reset_message_stream()
+        with pytest.raises(MessageDeliveryError, match="retired generation"):
+            await asyncio.wait_for(stale, 1)
+        assert d.waiters == 0
+        assert d.pending_bytes == 0
+        assert d.messages_queue.empty()
+
+        fresh = Message(topic="x", payload=b"c" * 5000)
+        await d.accept(fresh, None)
+        assert d.pending_bytes == 5001
+        assert await anext(client.messages()) is fresh
+        assert d.pending_bytes == 0
+    finally:
+        if stale is not None:
+            await asyncio.gather(stale, return_exceptions=True)
+        await finish(client)
+
+
 async def test_worker_cannot_wait_for_its_own_full_queue(scheduler):
     client = AsyncClient(message_delivery="callback", max_pending_callbacks=1)
     seen = []
