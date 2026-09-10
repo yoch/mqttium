@@ -1,0 +1,89 @@
+name: Uniform singleton-inline hysteresis qualification
+on:
+  push:
+    branches: [bench/uniform-singleton-inline-hysteresis-fd37]
+    paths:
+      - .github/apply-uniform-singleton-inline-hysteresis.py
+      - .github/uniform-singleton-inline-hysteresis-test.py
+      - .github/workflows/uniform-singleton-inline-hysteresis-qualify.yml
+permissions:
+  contents: read
+jobs:
+  qualify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.13.5'
+      - name: Apply exact one-file runtime ablation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git merge-base HEAD fd37ed3fff3895adca0e33c3eacc34e611e7a316)" = fd37ed3fff3895adca0e33c3eacc34e611e7a316
+          python .github/apply-uniform-singleton-inline-hysteresis.py src/mqttium/api/_delivery.py > /tmp/preformat-sha256.txt
+          cp .github/uniform-singleton-inline-hysteresis-test.py tests/unit/test_singleton_inline_hysteresis.py
+          git diff --check
+          test "$(git diff --name-only)" = src/mqttium/api/_delivery.py
+      - name: Lint focused semantics and hotpath ownership rates
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install -e '.[dev]'
+          ruff format src/mqttium/api/_delivery.py tests/unit/test_singleton_inline_hysteresis.py
+          ruff format --check src/mqttium/api/_delivery.py tests/unit/test_singleton_inline_hysteresis.py
+          ruff check src/mqttium/api/_delivery.py tests/unit/test_singleton_inline_hysteresis.py
+          sha256sum src/mqttium/api/_delivery.py | tee /tmp/runtime-sha256.txt
+          python -m pytest -q tests/unit/test_singleton_inline_hysteresis.py -W error
+          python - <<'PY' | tee /tmp/hotpath-rates.json
+          import asyncio, json, sys
+          from pathlib import Path
+          bench = Path('benchmarks').resolve()
+          sys.path.insert(0, str(bench))
+          from hotpath_recon import _run_qos1_inbound_reply
+          from mqttium.enums import MQTTProtocolVersion
+
+          async def main():
+              serial = await _run_qos1_inbound_reply(
+                  protocol=MQTTProtocolVersion.MQTTv311,
+                  outstanding=1, count=40, warmup=4, coalesce=False, instrument=True,
+              )
+              burst = await _run_qos1_inbound_reply(
+                  protocol=MQTTProtocolVersion.MQTTv311,
+                  outstanding=8, count=64, warmup=8, coalesce=True, instrument=True,
+              )
+              out = {
+                  'serial_inline_rate': serial['counters']['callback_inline_rate'],
+                  'coalesced_inline_rate': burst['counters']['callback_inline_rate'],
+                  'serial_ops_per_s': serial['ops_per_s'],
+                  'coalesced_ops_per_s': burst['ops_per_s'],
+              }
+              print(json.dumps(out, sort_keys=True))
+              assert out['serial_inline_rate'] == 1.0
+              assert out['coalesced_inline_rate'] <= 1.0 / 64.0
+          asyncio.run(main())
+          PY
+      - name: Record exact diff
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff -- src/mqttium/api/_delivery.py > /tmp/hysteresis.diff
+          git diff --check
+          git diff --stat -- src/mqttium/api/_delivery.py
+          sha256sum /tmp/hysteresis.diff /tmp/runtime-sha256.txt
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: singleton-inline-hysteresis-${{ github.run_id }}
+          path: |
+            /tmp/hysteresis.diff
+            /tmp/preformat-sha256.txt
+            /tmp/runtime-sha256.txt
+            /tmp/hotpath-rates.json
+          retention-days: 14
+          if-no-files-found: warn
