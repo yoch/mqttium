@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests.support import stored_record
+
 from mqttium.codec.buffer import IncrementalDecoder
 from mqttium.codec.properties import encode_properties
 from mqttium.enums import MQTTProtocolVersion, OutboundQoSState, PacketType, QoS
@@ -24,23 +26,28 @@ def _feed(engine: ProtocolEngine, wire: bytes) -> None:
 def test_resumed_session_replays_pubrel_when_send_quota_is_exhausted() -> None:
     store = MemoryInflightStore()
     store.put_out(
-        OutboundMessage(
-            mid=1,
-            topic="t/1",
-            payload=b"publish",
-            qos=QoS.EXACTLY_ONCE,
-            retain=False,
-            state=OutboundQoSState.WAIT_PUBREC,
+        stored_record(
+            OutboundMessage(
+                mid=1,
+                topic="t/1",
+                payload=b"publish",
+                qos=QoS.EXACTLY_ONCE,
+                retain=False,
+                state=OutboundQoSState.WAIT_PUBREC,
+            )
         )
     )
     store.put_out(
-        OutboundMessage(
-            mid=2,
-            topic="",
-            payload=b"",
-            qos=QoS.EXACTLY_ONCE,
-            retain=False,
-            state=OutboundQoSState.WAIT_PUBCOMP,
+        stored_record(
+            OutboundMessage(
+                mid=2,
+                topic="",
+                payload=b"",
+                qos=QoS.EXACTLY_ONCE,
+                retain=False,
+                state=OutboundQoSState.WAIT_PUBCOMP,
+                logical_size=15,  # charge retained from the original publication
+            )
         )
     )
 

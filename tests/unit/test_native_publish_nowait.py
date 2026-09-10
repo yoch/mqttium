@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 
 import pytest
 
-import mqttium.compat.paho as paho_compat
 import mqttium.packets._publish as publish_v5_module
 from mqttium.api import AsyncClient
 from mqttium.api.models import PublishMessage
@@ -54,7 +52,7 @@ async def test_publish_nowait_registers_qos1_receipt() -> None:
     receipt = client.publish_nowait("native/qos1", b"x", qos=1)
     assert receipt.qos is QoS.AT_LEAST_ONCE
     assert receipt.mid is not None
-    assert client._pop_publish_receipt(receipt.mid) is receipt
+    assert client._receipts[receipt.mid] is receipt
 
 
 async def test_publish_nowait_callback_uses_direct_writer_admission() -> None:
@@ -66,11 +64,11 @@ async def test_publish_nowait_callback_uses_direct_writer_admission() -> None:
     for _ in range(100):
         client.publish_nowait("native/qos0", b"x", qos=0)
 
-    assert client._effect_pump.enqueued == 0
-    assert client._effect_flush_task is None
     assert client.stats().writer.queued_messages == 100
+    assert seen == []
+    await client._delivery.callback_queue.join()
     assert seen == [None] * 100
-    assert client._callback_worker_task is None
+    await client._delivery.shutdown_callbacks(drain=False)
 
 
 async def test_qos0_callback_marks_writer_admission_not_transport_drain() -> None:
@@ -80,8 +78,7 @@ async def test_qos0_callback_marks_writer_admission_not_transport_drain() -> Non
     client.on_publish = lambda mid, error: seen.append((mid, error))
 
     receipt = client.publish_nowait("native/qos0-boundary", b"first", qos=0)
-    assert client._effect_flush_task is None
-    await client._callback_queue.join()
+    await client._delivery.callback_queue.join()
 
     assert receipt.is_done()
     assert seen == [(None, None)]
@@ -95,36 +92,22 @@ async def test_qos0_callback_marks_writer_admission_not_transport_drain() -> Non
     assert client.stats().writer.queued_bytes == queued_bytes
     assert not client._engine.has_pending_effects
     assert not client._effect_pump.pending
-    await client._shutdown_callback_worker(drain=False)
-
-
-def test_paho_uses_the_async_client_adapter_boundary() -> None:
-    source = inspect.getsource(paho_compat.Client)
-    for forbidden in (
-        "self._async._engine",
-        "self._async._register_publish_receipt",
-        "self._async._collect_effects_locked",
-        "self._async._drain_effects_inline",
-    ):
-        assert forbidden not in source
+    await client._delivery.shutdown_callbacks(drain=False)
 
 
 def test_disconnect_metadata_boundary_is_private() -> None:
     assert not hasattr(AsyncClient, "last_disconnect")
-    assert hasattr(AsyncClient, "_last_disconnect_info")
 
 
-async def test_await_publish_qos0_uses_the_direct_path() -> None:
+async def test_await_publish_qos0_uses_engine_admission() -> None:
     client = AsyncClient(max_outbound_messages=8)
     client._engine.state = ConnectionState.CONNECTED
 
     receipt = await client.publish("native/await-qos0", b"x", qos=0)
 
     assert receipt.mid is None
-    assert client._effect_pump.batches == 0
-    assert client._effect_pump.enqueued == 0
     assert not client._engine.has_pending_effects
-    assert isinstance(client._outbound.get_nowait(), bytes)
+    assert isinstance(client._write_pump.queue.get_nowait(), bytes)
 
 
 async def test_direct_qos0_path_commits_outbound_alias_after_writer_admission() -> None:
@@ -137,8 +120,8 @@ async def test_direct_qos0_path_commits_outbound_alias_after_writer_admission() 
     await client.publish("", b"reuse", properties=properties)
 
     decoder = IncrementalDecoder()
-    decoder.feed(client._outbound.get_nowait())
-    decoder.feed(client._outbound.get_nowait())
+    decoder.feed(client._write_pump.queue.get_nowait())
+    decoder.feed(client._write_pump.queue.get_nowait())
     publishes = [
         PublishPacket.decode(raw.flags, raw.remaining, MQTTProtocolVersion.MQTTv5)
         for raw in decoder.drain_packets()
@@ -154,25 +137,20 @@ async def test_refused_direct_qos0_write_does_not_establish_alias() -> None:
     )
     client._engine.state = ConnectionState.CONNECTED
     client._engine.negotiated = NegotiatedSettings(topic_alias_maximum=2)
-    client._outbound.put_nowait(b"occupied")
+    client._write_pump.queue.put_nowait(b"occupied")
     client._write_pump.queued_bytes = len(b"occupied")
     client._write_pump._admit_queued()
     properties = Properties({"topic_alias": 1})
 
     with pytest.raises(FlowControlError):
-        await client.publish(
-            "canonical/topic",
-            b"seed",
-            properties=properties,
-            nowait=True,
-        )
+        client.publish_nowait("canonical/topic", b"seed", properties=properties)
 
     client._write_pump.discard()
     with pytest.raises(ProtocolError, match="Unknown outbound topic alias"):
         await client.publish("", b"reuse", properties=properties)
 
 
-async def test_await_publish_qos0_callback_keeps_the_direct_path() -> None:
+async def test_await_publish_qos0_callback_uses_worker_notifications() -> None:
     client = AsyncClient(max_outbound_messages=8)
     client._engine.state = ConnectionState.CONNECTED
     seen: list[tuple[int | None, BaseException | None]] = []
@@ -180,14 +158,13 @@ async def test_await_publish_qos0_callback_keeps_the_direct_path() -> None:
 
     await client.publish("native/await-qos0", b"x", qos=0)
 
-    assert client._effect_pump.batches == 0
     assert seen == []
-    await client._callback_queue.join()
+    await client._delivery.callback_queue.join()
     assert seen == [(None, None)]
-    await client._shutdown_callback_worker(drain=False)
+    await client._delivery.shutdown_callbacks(drain=False)
 
 
-async def test_publish_many_qos0_uses_the_direct_path() -> None:
+async def test_publish_many_qos0_uses_engine_admission() -> None:
     client = AsyncClient(max_outbound_messages=8)
     client._engine.state = ConnectionState.CONNECTED
 
@@ -197,13 +174,12 @@ async def test_publish_many_qos0_uses_the_direct_path() -> None:
 
     assert receipt.submitted == 2
     assert receipt.completed == 2
-    assert client._effect_pump.batches == 0
     assert not client._engine.has_pending_effects
-    assert isinstance(client._outbound.get_nowait(), bytes)
-    assert isinstance(client._outbound.get_nowait(), bytes)
+    assert isinstance(client._write_pump.queue.get_nowait(), bytes)
+    assert isinstance(client._write_pump.queue.get_nowait(), bytes)
 
 
-async def test_publish_many_callback_keeps_the_direct_path() -> None:
+async def test_publish_many_callback_uses_worker_notifications() -> None:
     client = AsyncClient(max_outbound_messages=8)
     client._engine.state = ConnectionState.CONNECTED
     seen: list[tuple[int | None, BaseException | None]] = []
@@ -215,12 +191,11 @@ async def test_publish_many_callback_keeps_the_direct_path() -> None:
 
     assert receipt.submitted == 2
     assert receipt.completed == 2
-    assert client._effect_pump.batches == 0
     assert client.stats().writer.queued_messages == 2
     assert seen == []
-    await client._callback_queue.join()
+    await client._delivery.callback_queue.join()
     assert seen == [(None, None), (None, None)]
-    await client._shutdown_callback_worker(drain=False)
+    await client._delivery.shutdown_callbacks(drain=False)
 
 
 async def test_publish_many_mixed_qos_keeps_the_effect_path() -> None:
@@ -236,46 +211,33 @@ async def test_publish_many_mixed_qos_keeps_the_effect_path() -> None:
     assert client._effect_pump.batches > 0
 
 
-async def test_direct_path_is_gated_on_drained_effect_queues() -> None:
-    """Both pending-effect gates must independently disable the direct path."""
-    client = AsyncClient(max_outbound_messages=8)
+@pytest.mark.parametrize("owner", ["engine", "pump"])
+async def test_nowait_refuses_pending_effects_before_mutation(owner) -> None:
+    client = AsyncClient()
     client._engine.state = ConnectionState.CONNECTED
-
-    assert client._direct_qos0_ready() is True
-
-    client._engine._emit(EffectKind.SUBACK, None)
-    assert client._engine.has_pending_effects
-    assert client._direct_qos0_ready() is False
-
-    client._engine.take_effects()
-    assert client._direct_qos0_ready() is True
-
-    client._effect_pump.pending.append(EngineEffect(kind=EffectKind.SUBACK, data=None))
-    assert client._direct_qos0_ready() is False
-
-    client._effect_pump.pending.clear()
-    assert client._direct_qos0_ready() is True
+    effect = EngineEffect(EffectKind.SEND, b"older")
+    if owner == "engine":
+        client._engine._emit(effect.kind, effect.data)
+    else:
+        client._effect_pump.pending.append(effect)
+    with pytest.raises(FlowControlError):
+        client.publish_nowait("t", b"x", qos=1)
+    assert not client._engine.packet_ids
+    assert not client._receipts
+    assert client._engine.pending_outbound_messages == 0
+    assert client._write_pump.queue.empty()
 
 
-async def test_direct_path_requires_capacity_for_every_publish_callback() -> None:
-    """A full callback queue sends the entire operation through the effect pump."""
-    client = AsyncClient(max_outbound_messages=32, max_pending_callbacks=1)
+async def test_nowait_refuses_full_callback_queue_before_mutation() -> None:
+    client = AsyncClient(max_pending_callbacks=1)
     client._engine.state = ConnectionState.CONNECTED
-    blocker_seen: list[str] = []
-    client._callback_queue.put_nowait((lambda: blocker_seen.append("blocker"), (), None))
-
-    seen: list[tuple[int | None, BaseException | None]] = []
-    client.on_publish = lambda mid, error: seen.append((mid, error))
-    assert client._direct_qos0_ready() is False
-    receipt = client.publish_nowait("native/gate", b"x", qos=0)
-    assert client._effect_pump.enqueued > 0
-
-    await client._drain_effects()
-    await client._callback_queue.join()
-    assert receipt.is_done()
-    assert blocker_seen == ["blocker"]
-    assert seen == [(None, None)]
-    await client._shutdown_callback_worker(drain=False)
+    client._delivery.callback_queue.put_nowait((lambda: None, (), None))
+    client.on_publish = lambda *_: None
+    with pytest.raises(FlowControlError):
+        client.publish_nowait("t", b"x")
+    assert client._write_pump.queue.empty()
+    assert not client._engine.has_pending_effects
+    assert not client._effect_pump.pending
 
 
 async def test_direct_path_writer_refusal_does_not_enqueue_a_callback() -> None:
@@ -290,18 +252,20 @@ async def test_direct_path_writer_refusal_does_not_enqueue_a_callback() -> None:
         client.publish_nowait("native/full", b"second", qos=0)
 
     assert client.stats().writer.queued_messages == 1
-    assert client._callback_queue.qsize() == 0
+    assert client._delivery.callback_queue.qsize() == 1
     assert not client._engine.has_pending_effects
     assert not client._effect_pump.pending
+    await client._delivery.callback_queue.join()
     assert seen == [(None, None)]
+    await client._delivery.shutdown_callbacks(drain=False)
 
 
-async def test_publish_many_callback_capacity_falls_back_atomically() -> None:
+async def test_publish_many_waits_for_callback_capacity_progressively() -> None:
     """Insufficient callback capacity must not split a batch across paths."""
     client = AsyncClient(max_outbound_messages=8, max_pending_callbacks=2)
     client._engine.state = ConnectionState.CONNECTED
     blocker_seen: list[str] = []
-    client._callback_queue.put_nowait((lambda: blocker_seen.append("blocker"), (), None))
+    client._delivery.callback_queue.put_nowait((lambda: blocker_seen.append("blocker"), (), None))
     seen: list[tuple[int | None, BaseException | None]] = []
     client.on_publish = lambda mid, error: seen.append((mid, error))
 
@@ -310,19 +274,24 @@ async def test_publish_many_callback_capacity_falls_back_atomically() -> None:
     )
 
     assert client._effect_pump.batches > 0
-    await client._drain_effects()
-    await client._callback_queue.join()
+    await client._effect_pump.drain()
+    await client._delivery.callback_queue.join()
     assert receipt.submitted == 2
     assert receipt.completed == 2
     assert blocker_seen == ["blocker"]
     assert seen == [(None, None), (None, None)]
-    await client._shutdown_callback_worker(drain=False)
+    await client._delivery.shutdown_callbacks(drain=False)
 
 
 async def test_publish_nowait_direct_path_encodes_mqtt5_properties(monkeypatch) -> None:
     properties = Properties()
-    properties.set("content_type", "application/json")
-    properties.add_user_property("source", "native-fast-path")
+    properties = Properties({**properties.values, "content_type": "application/json"})
+    properties = Properties(
+        {
+            **properties.values,
+            "user_property": (*properties.get("user_property", ()), ("source", "native-fast-path")),
+        }
+    )
     client = AsyncClient(protocol=MQTTProtocolVersion.MQTTv5, max_outbound_messages=8)
     client._engine.state = ConnectionState.CONNECTED
     original_encode = publish_v5_module.encode_publish_item_v5
@@ -345,10 +314,8 @@ async def test_publish_nowait_direct_path_encodes_mqtt5_properties(monkeypatch) 
 
     assert receipt.mid is None
     assert encode_calls == 1
-    assert client._effect_pump.batches == 0
-    assert client._effect_pump.enqueued == 0
     assert not client._engine.has_pending_effects
-    item = client._outbound.get_nowait()
+    item = client._write_pump.queue.get_nowait()
     assert isinstance(item, bytes)
     decoder = IncrementalDecoder()
     decoder.feed(item)
@@ -373,31 +340,9 @@ async def test_invalid_qos_still_raises_value_error(qos: int) -> None:
         client.publish_nowait("native/invalid", b"x", qos=qos)
 
 
-async def test_qos1_rejection_constructs_no_qos_enum(monkeypatch) -> None:
-    """QoS 1/2 publishes reach the direct-path gate and must not pay for it."""
-    client = AsyncClient(max_outbound_messages=8)
-    client._engine.state = ConnectionState.CONNECTED
-
-    calls = 0
-    original_new = QoS.__new__
-
-    def counted_new(cls, value):
-        nonlocal calls
-        calls += 1
-        return original_new(cls, value)
-
-    monkeypatch.setattr(QoS, "__new__", counted_new)
-    client._try_direct_qos0_publish(
-        "native/qos1", b"x", qos=1, retain=False, properties=None, nowait=True
-    )
-
-    assert calls == 0
-
-
 async def test_int_and_enum_qos0_both_take_the_direct_path() -> None:
     for level in (0, QoS.AT_MOST_ONCE):
         client = AsyncClient(max_outbound_messages=8)
         client._engine.state = ConnectionState.CONNECTED
         receipt = client.publish_nowait("native/qos0", b"x", qos=level)
         assert receipt.mid is None
-        assert client._effect_pump.enqueued == 0

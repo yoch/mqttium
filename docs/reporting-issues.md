@@ -38,9 +38,7 @@ Include a complete executable program with:
 - the smallest topic and payload that still fail;
 - a `finally` block that disconnects or records why shutdown failed.
 
-For Paho compatibility, include `CallbackAPIVersion.VERSION2`, loop ownership,
-callback signatures, and whether publication originates inside or outside a
-callback.
+
 
 ## Environment
 

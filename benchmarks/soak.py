@@ -249,15 +249,10 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
             measurement_started = time.perf_counter()
         while not _measurement_done(args, measured_cycles, measurement_started):
             batch = await publisher.publish_many(
-                (
-                    PublishMessage(
-                        topic,
-                        cycle.to_bytes(4, "big") + index.to_bytes(4, "big") + payload,
-                        qos=1,
-                    )
-                    for index in range(args.messages_per_cycle)
-                ),
-                chunk_size=min(256, args.messages_per_cycle),
+                PublishMessage(
+                    topic, cycle.to_bytes(4, "big") + index.to_bytes(4, "big") + payload, qos=1
+                )
+                for index in range(args.messages_per_cycle)
             )
             await asyncio.wait_for(batch.wait(), timeout=args.timeout)
             expected += args.messages_per_cycle

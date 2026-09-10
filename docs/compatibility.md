@@ -45,15 +45,12 @@ support or conformance claim for MQTT 3.1.
 
 ## Transports
 
-| Transport | Native `AsyncClient` | Paho facade |
-| --- | :---: | :---: |
-| TCP | Yes | Yes |
-| TLS | Yes | No |
-| WebSocket | Yes | No |
-| Unix-domain socket | Yes | No |
-
-The Paho column describes only the documented Provisional VERSION2 subset. It
-does not imply general Paho API parity.
+| Transport | Native `AsyncClient` |
+| --- | :---: |
+| TCP | Yes |
+| TLS | Yes |
+| WebSocket | Yes |
+| Unix-domain socket | Yes |
 
 ## Brokers used by project gates
 
@@ -70,21 +67,15 @@ and a minimal reproducer.
 
 ## API stability
 
-- **Stable:** canonical native imports in `mqttium`, `mqttium.api`, and
-  `mqttium.helpers`.
-- **Provisional:** diagnostics, persistence, transports, advanced protocol
-  integrations, packet/codec helpers, and Paho compatibility.
-- **Internal:** underscore modules, directional sessions, pumps, records, and
-  effects.
-
-Only the canonical path receives the stated tier. For example,
-`mqttium.api.ReconnectPolicy` is Stable while direct advanced protocol imports
-remain Provisional. See [API Stability](api-stability.md).
+The experiment supports native client operations, models, receipts, results,
+statistics and the supplied memory/SQLite stores. The engine, codecs,
+transports, records and extension protocols are internal. See
+[API Stability](api-stability.md) for exact import paths and tiers.
 
 ## What is not claimed
 
 - certification for every broker feature or managed-service configuration;
-- compatibility with Paho VERSION1 callbacks or every Paho attribute;
+- a Paho compatibility API;
 - process-wide thread safety for `AsyncClient`;
 - durable storage of arbitrary application work;
 - performance parity across clients with different completion semantics;

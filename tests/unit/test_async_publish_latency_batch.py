@@ -24,7 +24,7 @@ async def test_latency_batch_trigger_is_awaited_qos_only(monkeypatch: pytest.Mon
     calls.clear()
     nowait_qos1 = AsyncClient()
     nowait_qos1._engine.state = ConnectionState.CONNECTED
-    await nowait_qos1.publish("latency/nowait", b"x", qos=1, nowait=True)
+    nowait_qos1.publish_nowait("latency/nowait", b"x", qos=1)
     assert calls == []
 
     awaited_qos0 = AsyncClient()

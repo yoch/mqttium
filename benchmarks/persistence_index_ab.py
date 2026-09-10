@@ -14,6 +14,8 @@ variant order rotated between repeats and medians reported, per
 
 from __future__ import annotations
 
+from benchmarks.benchmark_support import stored_record
+
 import argparse
 import asyncio
 import json
@@ -164,14 +166,16 @@ def seed_session(
     with store.batch():
         for mid in range(1, inbound_records + 1):
             store.put_in(
-                InboundMessage(
-                    mid=mid,
-                    topic="bench/inbound",
-                    payload=payload,
-                    qos=QoS.EXACTLY_ONCE,
-                    retain=False,
-                    state=InboundQoSState.WAIT_PUBREL,
-                    delivered=False,
+                stored_record(
+                    InboundMessage(
+                        mid=mid,
+                        topic="bench/inbound",
+                        payload=payload,
+                        qos=QoS.EXACTLY_ONCE,
+                        retain=False,
+                        state=InboundQoSState.WAIT_PUBREL,
+                        delivered=False,
+                    )
                 )
             )
 

@@ -24,9 +24,9 @@ properties = Properties(
     {
         "content_type": "application/json",
         "payload_format_indicator": 1,
+        "user_property": (("schema", "telemetry-v1"),),
     }
 )
-properties.add_user_property("schema", "telemetry-v1")
 
 receipt = await client.publish(
     "telemetry/device-1",
@@ -37,8 +37,9 @@ receipt = await client.publish(
 await receipt.wait()
 ```
 
-Repeated properties such as user properties are stored as lists. Do not reuse a
-mutable property bag concurrently while another operation may encode it.
+Properties deeply own their input. Repeated values become tuples and binary
+values become owned bytes. Reusing a `Properties` instance is safe; create a
+new instance when different values are needed.
 
 ## Session expiry
 
@@ -112,7 +113,7 @@ async def on_auth(packet):
         properties=response,
     )
 
-client.set_auth_handler(on_auth)
+client = AsyncClient("authenticated", protocol=MQTTProtocolVersion.MQTTv5, auth_handler=on_auth)
 ```
 
 The application must verify the authentication method and protect challenge

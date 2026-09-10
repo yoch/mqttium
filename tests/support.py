@@ -140,3 +140,25 @@ def write_item_bytes(data: object) -> bytes:
         return data
     assert isinstance(data, tuple)
     return data[0] + data[1]
+
+
+def stored_record(message):
+    """Build a persisted test/benchmark record with its mandatory logical size."""
+    from mqttium.protocol._sizing import publish_logical_size
+
+    if message.logical_size > 0:
+        return message
+    message.logical_size = publish_logical_size(
+        bool(message.properties),
+        message.topic,
+        len(message.payload),
+        message.properties,
+    )
+    return message
+
+
+async def wait_until(predicate, *, timeout=2.0):
+    """Wait for an observable test condition with a finite deadline."""
+    async with asyncio.timeout(timeout):
+        while not predicate():
+            await asyncio.sleep(0)

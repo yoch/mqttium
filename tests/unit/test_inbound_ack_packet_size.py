@@ -34,7 +34,7 @@ def _feed(engine: ProtocolEngine, wire: bytes) -> None:
 
 def _connack(maximum_packet_size: int, *, session_present: bool = False) -> bytes:
     properties = Properties()
-    properties.set("maximum_packet_size", maximum_packet_size)
+    properties = Properties({**properties.values, "maximum_packet_size": maximum_packet_size})
     body = bytearray((int(session_present), 0))
     body.extend(encode_properties(properties, CONNACK))
     return encode_frame(PacketType.CONNACK, 0, body)

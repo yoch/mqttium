@@ -9,7 +9,7 @@ import random
 import time
 from collections import Counter
 from collections.abc import Iterable, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
 from pathlib import Path
 from types import MethodType
@@ -595,7 +595,7 @@ class _CompositionHarness(v1._RuntimeHarness):
                     await keepalive
                 except asyncio.CancelledError:
                     pass
-            self.client._reconfigure(keepalive=1)
+            self.client._engine.config = replace(self.client._engine.config, keepalive=1)
             self.client._ping_pending = True
             self.client._ping_deadline = 0.0
             self.client._keepalive_task = asyncio.create_task(

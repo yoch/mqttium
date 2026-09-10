@@ -184,9 +184,7 @@ async def test_callback_connect_takes_over_keepalive_close_before_reader_finally
     callback_done = asyncio.Event()
     callback_errors: list[BaseException] = []
     client = AsyncClient(
-        "keepalive-callback-takeover",
-        keepalive=1,
-        reconnect=_policy(),
+        "keepalive-callback-takeover", keepalive=1, reconnect=_policy(), message_delivery="callback"
     )
 
     async def factory(host: str, port: int, *, ssl=None):
@@ -383,7 +381,7 @@ async def test_eof_retires_connected_state_before_joining_keepalive() -> None:
 
 async def test_tiny_peer_limit_fails_before_keepalive_owner_starts() -> None:
     properties = Properties()
-    properties.set("maximum_packet_size", 1)
+    properties = Properties({**properties.values, "maximum_packet_size": 1})
     connack = encode_frame(
         PacketType.CONNACK,
         0,

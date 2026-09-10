@@ -8,11 +8,11 @@ is under load.
 
 | Area | Goal |
 | --- | --- |
-| Runtime | Native `asyncio`; a dedicated thread exists only in the Paho adapter |
+| Runtime | Native `asyncio` on one application event loop |
 | Protocols | MQTT 3.1.1 and MQTT 5 with complete QoS 0/1/2 transitions |
 | Memory | Bounded admission, writer, ingress, persistence, and delivery queues |
 | Recovery | Reconnect and incremental durable-session replay |
-| API | A small native client, explicit receipts, immutable diagnostics, optional Paho bridge |
+| API | A native client, explicit receipts, immutable diagnostics and two stores |
 | Performance | Fast common paths without weakening ownership or fairness |
 
 ## Architecture
@@ -166,8 +166,9 @@ Outbound QoS 1/2 work is admitted in this order:
 5. write the inflight record;
 6. emit effects.
 
-Failure before commit unwinds every acquired resource. Batched operations take a
-counter snapshot and restore it as a unit if their transaction rolls back.
+Failure before commit unwinds every acquired resource. `publish_many()` shares
+the unit admission path and commits a progressive prefix. It drains effects
+between elements and limits pending aggregate QoS 1/2 work to the flow window.
 
 Applications wait for capacity by default. Immediate mode raises
 `FlowControlError`. A terminal disconnect wakes blocked publishers with an
@@ -195,28 +196,20 @@ acknowledgement from completing a later publication that reused the same ID.
 
 ## Persistence
 
-`InflightStore` exposes the correctness-oriented object interface. Optional
-paged and transition protocols provide efficient replay and acknowledgement
-without changing protocol ownership.
+The internal store interface includes bounded pages and conditional metadata
+transitions. The two shipped stores own atomic mutations; the directional
+sessions own legal transitions and compensation. Extension protocols and
+records are internal, with no supported third-party implementation contract.
 
-Conditional transitions include the expected state. The store guarantees
-atomicity; the session decides which transition is legal. Third-party stores
-without the optional protocols use a correct eager fallback.
+SQLite schema 5 accepts new databases and this exact format. Older, future and
+inconsistent formats are refused before WAL or other write-affecting operations.
+Write batches start lazily on the first mutation. Memory batches only group
+internal operations; they do not promise application-level rollback.
 
-`SqliteInflightStore` versions its schema with `PRAGMA user_version`. Migrations
-run in one transaction, newer unknown schemas are rejected, and write batches
-start lazily only when the first mutation occurs.
-
-Metadata needed for acknowledgement appears before payload BLOBs in the schema.
-This lets a PUBACK settle a large publication without reading its payload.
-Replay snapshots ordered identifiers once and loads bounded pages by primary
-key, avoiding repeated full-table sorts.
-
-Incoming replay first restores accounting from metadata and then emits bounded
-batches. Built-in stores hydrate one fresh page per effect batch; legacy paged
-stores revalidate payload-free metadata before emission when a larger page can
-span continuations. A continuation effect carries the connection epoch, so
-disconnecting mid-replay safely abandons the old cursor.
+Metadata columns precede payload BLOBs. Replay snapshots ordered identifiers and
+loads bounded pages by primary key. Inbound replay restores accounting from
+metadata before emitting bounded batches. Connection epochs prevent an abandoned
+replay from affecting a replacement transport.
 
 ## Reconnect and sessions
 
@@ -234,16 +227,15 @@ MQTT 3.1.1 and later do not require timer-based retransmission on a healthy
 connection. MQTTium replays PUBLISH and PUBREL only after reconnect, setting DUP
 where required.
 
-## Native and compatibility APIs
+## Native API
 
 `AsyncClient.publish_nowait()` is synchronous but event-loop-bound, like
 `asyncio.Queue.put_nowait()`. It shares native admission and receipt creation
 without pretending to be thread-safe.
 
-The Paho façade owns a bounded cross-thread ingress queue and commits work on the
-client loop. It never mutates the protocol engine, receipt registry, or effect
-pump directly. Compatibility stops where historical behaviour would violate
-MQTT correctness, ordering, or bounded-resource guarantees.
+`publish_nowait()` refuses before mutation if pending effects or full bounded
+queues prevent immediate transfer. `publish()` waits for bounded transfer;
+cancellation after commitment can leave a publication active.
 
 ## Observability
 

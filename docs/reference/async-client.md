@@ -1,6 +1,6 @@
 # `AsyncClient`
 
-`AsyncClient` is the Stable, async-native MQTTium API. One instance belongs to
+`AsyncClient` is the experimental async-native MQTTium API. One instance belongs to
 one asyncio event loop. It owns transport lifecycle, reader/writer work,
 keepalive, reconnect, receipts, and application delivery; it does not create a
 background thread.
@@ -20,14 +20,13 @@ background thread.
         - messages
         - ack
         - auth
-        - set_auth_handler
         - message_callback_add
         - message_callback_remove
         - stats
       inherited_members: false
       heading_level: 2
 
-## Stable state and callbacks
+## State and callbacks
 
 | Member | Meaning |
 | --- | --- |
@@ -40,7 +39,7 @@ background thread.
 | `on_message` | Sync or async message callback |
 | `message_callback_add` / `message_callback_remove` | Topic-filtered message callbacks; matching filters run instead of `on_message` |
 | `on_publish` | Sync or async publish-completion callback |
-| `auth_handler` | MQTT 5 enhanced-authentication handler |
+| `auth_handler` | Read-only MQTT 5 enhanced-authentication handler supplied at construction |
 
 Callbacks execute outside protocol-engine critical sections. Declare synchronous
 callbacks with `def` and asynchronous callbacks with `async def`; a synchronous
@@ -48,27 +47,26 @@ callable that returns an awaitable violates the callback contract and is reporte
 as a callback `TypeError` rather than being scheduled implicitly. Synchronous
 callbacks must not block the event loop.
 
-Eligible idle `on_publish` and message callbacks may execute inline. For
-callback-only message delivery, an adjacent pair of small synchronous messages may
-run in the same effect-drain turn while retaining the hard
-`max_pending_callbacks` bound. Larger bursts, declared-async callbacks, and
-queued/reentrant delivery use the bounded worker. Callback failures go to the event
-loop's exception handler without silently changing protocol state.
+`on_connect`, `on_publish` and messages always use one bounded worker. Each
+message occupies one job and holds its delivery bytes until its routes finish.
+Callback failures go to the event loop exception handler. `on_disconnect` and
+authentication are directly awaited outside critical sections.
 
 Matching `message_callback_add` filters run instead of `on_message`, in
 registration order. Shared-subscription filters match the filter string
-literally, as in Paho. Iterator-only delivery ignores callbacks, including
-topic filters.
+literally. Iterator-only delivery ignores callbacks, including
+topic filters. `on_message` and routes are frozen permanently on the first
+connection attempt; subscriptions can still change.
 
 ## Loop confinement
 
 `publish_nowait()` and `stats()` are synchronous but must run on the owning
-event-loop thread. They are not cross-thread methods. Use the Provisional Paho
-facade only when an existing synchronous application needs a transition path.
+event-loop thread. Cross-thread handoff belongs to the application and requires
+its own bound.
 
 ## Constructor settings
 
-Constructor keywords and Stable defaults are part of the public contract. The
+Constructor keywords and defaults are recorded in the experimental contract. The
 generated signature above is authoritative for spelling and defaults;
 [Configuration and Sizing](../configuration-and-sizing.md) groups them by responsibility
 and explains how to choose values.

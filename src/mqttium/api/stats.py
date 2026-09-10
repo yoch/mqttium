@@ -85,9 +85,7 @@ class DeliveryStats:
     callback_limit: int
     pending_bytes: int
     pending_high_water_bytes: int
-    accounted_limit: int | None
-    small_budget_bytes: int
-    small_message_limit: int | None
+    max_bytes: int | None
     waiters: int
 
 

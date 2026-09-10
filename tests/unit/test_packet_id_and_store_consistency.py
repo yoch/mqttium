@@ -7,6 +7,8 @@ The harnesses that found them live in ``tests/fuzz/test_stateful_invariants.py``
 
 from __future__ import annotations
 
+from tests.support import stored_record
+
 import asyncio
 
 import pytest
@@ -55,7 +57,8 @@ def test_duplicate_reserve_at_the_frontier_is_idempotent() -> None:
     pool.reserve(7)  # duplicate reserve, this time *at* the frontier
 
     live = {1, 2, 3, 4, 5, 6, 7}
-    assert pool._used == live
+    assert len(pool) == len(live)
+    assert all(pool.in_use(mid) for mid in live)
     assert len(pool) == len(live)
     assert pool.available == PacketIdPool._MAX_ID - len(live)
 
@@ -70,7 +73,7 @@ def test_pool_returns_to_empty_after_duplicate_frontier_reserve() -> None:
         pool.release(mid)
 
     assert len(pool) == 0
-    assert pool._used == set()
+    assert len(pool) == 0
     assert not pool.in_use(7)
 
 
@@ -389,13 +392,15 @@ def test_transition_out_preserves_retransmission_order(tmp_path) -> None:  # noq
     try:
         for mid in (1, 2, 3):
             sqlite.put_out(
-                OutboundMessage(
-                    mid=mid,
-                    topic=f"t/{mid}",
-                    payload=b"p",
-                    qos=QoS.AT_LEAST_ONCE,
-                    retain=False,
-                    state=OutboundQoSState.WAIT_PUBACK,
+                stored_record(
+                    OutboundMessage(
+                        mid=mid,
+                        topic=f"t/{mid}",
+                        payload=b"p",
+                        qos=QoS.AT_LEAST_ONCE,
+                        retain=False,
+                        state=OutboundQoSState.WAIT_PUBACK,
+                    )
                 )
             )
         changed = sqlite.transition_out(

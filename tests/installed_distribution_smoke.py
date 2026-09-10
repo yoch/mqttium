@@ -30,7 +30,6 @@ from mqttium.api import (
     MessageDelivery,
     NegotiatedSettings,
     Properties,
-    PublishBackpressure,
     PublishBatchReceipt,
     PublishMessage,
     PublishReceipt,
@@ -39,8 +38,6 @@ from mqttium.api import (
     SubscribeResult,
     UnsubscribeResult,
 )
-from mqttium.helpers import publish as helper_publish
-from mqttium.helpers import subscribe as helper_subscribe
 
 _STABLE_IMPORTS = (
     ConnectionState,
@@ -63,7 +60,6 @@ _STABLE_IMPORTS = (
     MessageDelivery,
     NegotiatedSettings,
     Properties,
-    PublishBackpressure,
     PublishBatchReceipt,
     PublishMessage,
     PublishReceipt,
@@ -71,8 +67,6 @@ _STABLE_IMPORTS = (
     SubscribeOptions,
     SubscribeResult,
     UnsubscribeResult,
-    helper_publish,
-    helper_subscribe,
 )
 
 
@@ -82,7 +76,9 @@ async def _roundtrip(host: str, port: int, protocol: MQTTProtocolVersion) -> Non
     payload = f"installed-artifact-{int(protocol)}".encode()
     received: asyncio.Future[bytes] = asyncio.get_running_loop().create_future()
 
-    subscriber = AsyncClient(f"mqttium-dist-sub-{suffix}", protocol=protocol)
+    subscriber = AsyncClient(
+        f"mqttium-dist-sub-{suffix}", protocol=protocol, message_delivery="callback"
+    )
     publisher = AsyncClient(f"mqttium-dist-pub-{suffix}", protocol=protocol)
 
     def on_message(message: Message) -> None:

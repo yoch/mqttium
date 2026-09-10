@@ -15,7 +15,7 @@ from mqttium.types import Properties
 
 def _props(method: str = "demo") -> Properties:
     properties = Properties()
-    properties.set("authentication_method", method)
+    properties = Properties({**properties.values, "authentication_method": method})
     return properties
 
 

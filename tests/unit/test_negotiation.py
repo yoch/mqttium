@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests.support import stored_record
+
 from mqttium.codec.buffer import IncrementalDecoder
 from mqttium.codec.properties import encode_properties
 from mqttium.enums import ConnectionState, InboundQoSState, MQTTProtocolVersion, QoS
@@ -11,7 +13,7 @@ from mqttium.enums import PacketType
 from mqttium.persistence.memory import MemoryInflightStore
 from mqttium.protocol.engine import EffectKind, EngineConfig, ProtocolEngine
 from mqttium.protocol.negotiated import NegotiatedSettings
-from mqttium.protocol.reconnect import ReconnectPolicy, is_terminal_connack
+from mqttium.protocol.reconnect import ReconnectPolicy, _ReconnectState, is_terminal_connack
 from mqttium.types import InboundMessage, Properties
 import pytest
 
@@ -41,13 +43,13 @@ def test_negotiated_settings_applied() -> None:
     )
     engine.begin_connect()
     props = Properties()
-    props.set("receive_maximum", 5)
-    props.set("maximum_qos", 1)
-    props.set("retain_available", 0)
-    props.set("maximum_packet_size", 200)
-    props.set("topic_alias_maximum", 3)
-    props.set("server_keep_alive", 25)
-    props.set("assigned_client_identifier", "broker-id")
+    props = Properties({**props.values, "receive_maximum": 5})
+    props = Properties({**props.values, "maximum_qos": 1})
+    props = Properties({**props.values, "retain_available": 0})
+    props = Properties({**props.values, "maximum_packet_size": 200})
+    props = Properties({**props.values, "topic_alias_maximum": 3})
+    props = Properties({**props.values, "server_keep_alive": 25})
+    props = Properties({**props.values, "assigned_client_identifier": "broker-id"})
     _feed(engine, _connack_v5(props))
     engine.take_effects()
 
@@ -71,7 +73,7 @@ def test_maximum_packet_size_enforced() -> None:
     engine = ProtocolEngine(EngineConfig(client_id="c", protocol=MQTTProtocolVersion.MQTTv5))
     engine.begin_connect()
     props = Properties()
-    props.set("maximum_packet_size", 20)
+    props = Properties({**props.values, "maximum_packet_size": 20})
     _feed(engine, _connack_v5(props))
     engine.take_effects()
     with pytest.raises(PacketTooLargeError):
@@ -84,13 +86,15 @@ def test_queued_qos_rejected_on_resumed_session_connack() -> None:
     # Keep Session Present=1 valid: queued outbound work alone is not Client
     # Session State, so seed an independent incomplete inbound QoS 2 exchange.
     store.put_in(
-        InboundMessage(
-            mid=42,
-            topic="resume/state",
-            payload=b"x",
-            qos=QoS.EXACTLY_ONCE,
-            retain=False,
-            state=InboundQoSState.WAIT_PUBREL,
+        stored_record(
+            InboundMessage(
+                mid=42,
+                topic="resume/state",
+                payload=b"x",
+                qos=QoS.EXACTLY_ONCE,
+                retain=False,
+                state=InboundQoSState.WAIT_PUBREL,
+            )
         )
     )
     engine = ProtocolEngine(
@@ -101,7 +105,7 @@ def test_queued_qos_rejected_on_resumed_session_connack() -> None:
     assert handle.mid is not None
     engine.begin_connect()
     props = Properties()
-    props.set("maximum_qos", 1)
+    props = Properties({**props.values, "maximum_qos": 1})
     _feed(engine, _connack_v5(props, session_present=True))
     effects = engine.take_effects()
 
@@ -115,11 +119,11 @@ def test_maximum_packet_size_applies_to_disconnect_before_state_change() -> None
     engine = ProtocolEngine(EngineConfig(client_id="c", protocol=MQTTProtocolVersion.MQTTv5))
     engine.begin_connect()
     connack = Properties()
-    connack.set("maximum_packet_size", 10)
+    connack = Properties({**connack.values, "maximum_packet_size": 10})
     _feed(engine, _connack_v5(connack))
     engine.take_effects()
     disconnect = Properties()
-    disconnect.set("reason_string", "x" * 50)
+    disconnect = Properties({**disconnect.values, "reason_string": "x" * 50})
 
     with pytest.raises(PacketTooLargeError):
         engine.begin_disconnect(properties=disconnect)
@@ -153,12 +157,13 @@ def test_reconnect_policy_terminal_codes() -> None:
     assert not is_terminal_connack(0x89, MQTTProtocolVersion.MQTTv5)
 
     policy = ReconnectPolicy(enabled=True, initial_delay=1.0, max_delay=10.0, multiplier=2.0)
-    d1 = policy.next_delay()
+    state = _ReconnectState(policy)
+    d1 = state.next_delay()
     assert 0.5 <= d1 <= 1.0
-    d2 = policy.next_delay()
+    d2 = state.next_delay()
     assert 1.0 <= d2 <= 2.0
-    policy.reset()
-    assert policy.attempt == 0
+    state.reset()
+    assert state.attempt == 0
 
 
 def test_negotiated_from_empty_props_defaults() -> None:

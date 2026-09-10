@@ -24,7 +24,7 @@ def _feed(engine: ProtocolEngine, wire: bytes) -> list:
 def _connack(*, response_information: str | None = "resp/") -> bytes:
     props = Properties()
     if response_information is not None:
-        props.set("response_information", response_information)
+        props = Properties({**props.values, "response_information": response_information})
     body = bytearray([0x00, 0x00])
     body.extend(encode_properties(props, "CONNACK"))
     return encode_frame(PacketType.CONNACK, 0, body)
@@ -77,5 +77,5 @@ def test_connect_snapshot_is_not_changed_by_later_properties_mutation() -> None:
     engine, props = _engine(0)
     assert props is not None
     engine.begin_connect()
-    props.set("request_response_information", 1)
+    props = Properties({**props.values, "request_response_information": 1})
     _assert_rejected(engine, _feed(engine, _connack()))

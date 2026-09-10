@@ -37,7 +37,12 @@ def test_publish_admission_encodes_properties_once(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(outbound_module, "encode_properties", counting)
 
     properties = Properties()
-    properties.add_user_property("source", "contract")
+    properties = Properties(
+        {
+            **properties.values,
+            "user_property": (*properties.get("user_property", ()), ("source", "contract")),
+        }
+    )
     engine = ProtocolEngine(
         EngineConfig(protocol=MQTTProtocolVersion.MQTTv5, max_pending_outbound_bytes=None)
     )
@@ -69,8 +74,13 @@ def test_connected_qos1_launch_reuses_cached_property_body(monkeypatch: pytest.M
 
     monkeypatch.setattr(properties_module, "_encode_properties_uncached", counting)
     properties = Properties()
-    properties.add_user_property("source", "contract")
-    properties.set("content_type", "application/octet-stream")
+    properties = Properties(
+        {
+            **properties.values,
+            "user_property": (*properties.get("user_property", ()), ("source", "contract")),
+        }
+    )
+    properties = Properties({**properties.values, "content_type": "application/octet-stream"})
     engine = ProtocolEngine(EngineConfig(protocol=MQTTProtocolVersion.MQTTv5))
     engine.state = ConnectionState.CONNECTED
 
@@ -101,7 +111,12 @@ async def test_nowait_publish_encodes_properties_once(monkeypatch) -> None:
     monkeypatch.setattr(outbound_module, "encode_properties", counting)
 
     properties = Properties()
-    properties.add_user_property("source", "contract")
+    properties = Properties(
+        {
+            **properties.values,
+            "user_property": (*properties.get("user_property", ()), ("source", "contract")),
+        }
+    )
     client = AsyncClient(protocol=MQTTProtocolVersion.MQTTv5, max_outbound_messages=64)
     client._engine.state = ConnectionState.CONNECTED
     client._engine.negotiated = replace(client._engine.negotiated, maximum_packet_size=1_000_000)
@@ -157,7 +172,7 @@ def test_acks_with_reason_or_properties_keep_the_full_encoding() -> None:
     assert with_reason[2:4] == (9).to_bytes(2, "big")
 
     properties = Properties()
-    properties.set("reason_string", "no matching subscribers")
+    properties = Properties({**properties.values, "reason_string": "no matching subscribers"})
     with_props = PubAckPacket(mid=9, properties=properties).encode(MQTTProtocolVersion.MQTTv5)
     assert len(with_props) > 4
 

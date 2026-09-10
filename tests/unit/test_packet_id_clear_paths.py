@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import pytest
 
 from mqttium.codec.buffer import RawPacket
 from mqttium.enums import ConnectionState, OutboundQoSState, PacketType, QoS
-from mqttium.errors import ProtocolError
 from mqttium.persistence.memory import MemoryInflightStore
 from mqttium.protocol.engine import ProtocolEngine
 from mqttium.protocol.packet_ids import PacketIdPool
@@ -45,51 +43,6 @@ def _outbound(mid: int, state: OutboundQoSState) -> OutboundMessage:
         state=state,
         logical_size=2,
     )
-
-
-def test_failed_batch_clears_packet_ids_when_pool_started_empty() -> None:
-    engine, pool = _tracking_engine()
-
-    with pytest.raises(ProtocolError):
-        engine.queue_publish_many(
-            [
-                ("ok", b"x", QoS.AT_LEAST_ONCE, False, None),
-                ("bad/#", b"x", QoS.AT_LEAST_ONCE, False, None),
-            ]
-        )
-
-    assert pool.release_calls == 0
-    assert pool.clear_calls == 1
-    assert len(pool) == 0
-    assert pool.allocate() == 1
-    assert engine.pending_outbound_messages == 0
-    assert engine.pending_outbound_bytes == 0
-    assert (
-        tuple(
-            engine.store.get_out(summary.mid)
-            for page in engine.store.out_summary_pages()
-            for summary in page
-        )
-        == ()
-    )
-
-
-def test_failed_batch_preserves_packet_ids_that_predate_it() -> None:
-    engine, pool = _tracking_engine()
-    existing_mid = pool.allocate()
-
-    with pytest.raises(ProtocolError):
-        engine.queue_publish_many(
-            [
-                ("ok", b"x", QoS.AT_LEAST_ONCE, False, None),
-                ("bad/#", b"x", QoS.AT_LEAST_ONCE, False, None),
-            ]
-        )
-
-    assert pool.clear_calls == 0
-    assert pool.release_calls == 1
-    assert pool.in_use(existing_mid)
-    assert len(pool) == 1
 
 
 def test_transport_close_clears_a_sub_only_pool() -> None:

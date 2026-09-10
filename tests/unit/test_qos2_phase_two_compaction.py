@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import sqlite3
 from pathlib import Path
 
 import pytest
@@ -10,7 +9,7 @@ import pytest
 from mqttium.enums import MQTTProtocolVersion, OutboundQoSState, PacketType, QoS
 from mqttium.packets import PubCompPacket, PubRecPacket, PubRelPacket, encode_frame
 from mqttium.persistence.memory import MemoryInflightStore
-from mqttium.persistence.sqlite import SQLITE_SCHEMA_VERSION, SqliteInflightStore
+from mqttium.persistence.sqlite import SqliteInflightStore
 from mqttium.protocol.engine import EffectKind, EngineConfig, ProtocolEngine
 from mqttium.types import OutboundMessage, Properties
 from tests.support import feed_engine, write_item_bytes
@@ -45,8 +44,13 @@ def sent_packets(engine: ProtocolEngine) -> list[bytes]:
 
 def make_properties() -> Properties:
     properties = Properties()
-    properties.set("message_expiry_interval", 60)
-    properties.add_user_property("trace", "phase-two")
+    properties = Properties({**properties.values, "message_expiry_interval": 60})
+    properties = Properties(
+        {
+            **properties.values,
+            "user_property": (*properties.get("user_property", ()), ("trace", "phase-two")),
+        }
+    )
     return properties
 
 
@@ -140,38 +144,6 @@ def test_compacted_sqlite_record_restarts_with_pubrel_only(tmp_path: Path) -> No
     assert reopened.get_out(mid) is None
     assert recovered.pending_outbound_bytes == 0
     reopened.close()
-
-
-def test_schema_v2_migration_compacts_existing_wait_pubcomp_row(tmp_path: Path) -> None:
-    path = tmp_path / "schema-v2.db"
-    conn = sqlite3.connect(path)
-    conn.execute(f"CREATE TABLE outbound ({SqliteInflightStore.OUTBOUND_COLUMNS})")
-    conn.execute(
-        """
-        INSERT INTO outbound(
-            mid, seq, qos, retain, state, dup, logical_size, topic, properties, payload
-        ) VALUES (7, 1, 2, 0, ?, 0, 4242, 'legacy/topic', ?, ?)
-        """,
-        (
-            int(OutboundQoSState.WAIT_PUBCOMP),
-            '{"user_property":[["legacy","yes"]]}',
-            sqlite3.Binary(b"legacy payload"),
-        ),
-    )
-    conn.execute("PRAGMA user_version=2")
-    conn.commit()
-    conn.close()
-
-    store = SqliteInflightStore(path)
-    assert int(store._conn.execute("PRAGMA user_version").fetchone()[0]) == SQLITE_SCHEMA_VERSION
-    record = store.get_out(7)
-    assert record is not None
-    assert record.state is OutboundQoSState.WAIT_PUBCOMP
-    assert record.topic == ""
-    assert record.payload == b""
-    assert record.properties is None
-    assert record.logical_size == 4242
-    store.close()
 
 
 def test_direct_transition_keeps_logical_size_while_compacting() -> None:

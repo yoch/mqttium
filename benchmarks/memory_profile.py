@@ -8,6 +8,8 @@ logical MQTTium queue/store counters.
 
 from __future__ import annotations
 
+from benchmarks.benchmark_support import stored_record
+
 import argparse
 import asyncio
 import ctypes
@@ -38,8 +40,6 @@ except ImportError as exc:  # pragma: no cover - actionable local error
 
 from mqttium.api import AsyncClient
 from mqttium.codec.buffer import IncrementalDecoder
-from mqttium.compat.paho import Client as PahoClient
-from mqttium.compat.paho import MQTT_ERR_QUEUE_SIZE, MQTT_ERR_SUCCESS
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, OutboundQoSState, QoS
 from mqttium.packets import PublishPacket
 from mqttium.persistence.memory import MemoryInflightStore
@@ -140,20 +140,6 @@ SCENARIOS = (
         notes="Publish callers cancelled while waiting immediately before protocol commit.",
     ),
     ScenarioSpec(
-        name="paho_saturation_4k",
-        runner="paho_saturation",
-        count=5_000,
-        payload_size=4_096,
-        notes="Paho-compatible cross-thread publication saturated at 512 queued messages.",
-    ),
-    ScenarioSpec(
-        name="shared_delivery_both_4k",
-        runner="shared_delivery_both",
-        count=1_500,
-        payload_size=4_096,
-        notes="Iterator and callback delivery share each payload and charge it once.",
-    ),
-    ScenarioSpec(
         name="websocket_batching_4k",
         runner="websocket_batching",
         count=300,
@@ -252,13 +238,15 @@ def _logical_message_bytes(payload_size: int) -> int:
 
 
 def _outbound_message(mid: int, payload_size: int) -> OutboundMessage:
-    return OutboundMessage(
-        mid=mid,
-        topic=_TOPIC,
-        payload=_payload(mid, payload_size),
-        qos=QoS.AT_LEAST_ONCE,
-        retain=False,
-        state=OutboundQoSState.QUEUED,
+    return stored_record(
+        OutboundMessage(
+            mid=mid,
+            topic=_TOPIC,
+            payload=_payload(mid, payload_size),
+            qos=QoS.AT_LEAST_ONCE,
+            retain=False,
+            state=OutboundQoSState.QUEUED,
+        )
     )
 
 
@@ -448,17 +436,17 @@ async def _run_iterator_delivery_queue(spec: ScenarioSpec) -> dict[str, Any]:
     snapshots.append(
         probe.snapshot(
             "loaded",
-            iterator_messages=client._messages.qsize(),
+            iterator_messages=client._delivery.messages_queue.qsize(),
             iterator_logical_bytes=(
-                client._messages.qsize() * _logical_message_bytes(spec.payload_size)
+                client._delivery.messages_queue.qsize() * _logical_message_bytes(spec.payload_size)
             ),
         )
     )
-    while not client._messages.empty():
-        item = client._messages.get_nowait()
+    while not client._delivery.messages_queue.empty():
+        item = client._delivery.messages_queue.get_nowait()
         if isinstance(item, tuple):
             _message, delivery_token = item
-            await client._release_delivery_reference(delivery_token)
+            await client._delivery.release(delivery_token)
     del client
     snapshots.append(probe.snapshot("released"))
     trimmed = _malloc_trim()
@@ -495,9 +483,9 @@ async def _run_iterator_delivery_budget(spec: ScenarioSpec) -> dict[str, Any]:
         probe.snapshot(
             "loaded",
             attempted_messages=capacity + 1,
-            accepted_messages=client._messages.qsize(),
+            accepted_messages=client._delivery.messages_queue.qsize(),
             blocked_message=not blocked.done(),
-            pending_logical_bytes=client.pending_delivery_bytes,
+            pending_logical_bytes=client.stats().delivery.pending_bytes,
             configured_byte_limit=byte_limit,
         )
     )
@@ -506,11 +494,11 @@ async def _run_iterator_delivery_budget(spec: ScenarioSpec) -> dict[str, Any]:
         await blocked
     except asyncio.CancelledError:
         pass
-    while not client._messages.empty():
-        item = client._messages.get_nowait()
+    while not client._delivery.messages_queue.empty():
+        item = client._delivery.messages_queue.get_nowait()
         if isinstance(item, tuple):
             _message, delivery_token = item
-            await client._release_delivery_reference(delivery_token)
+            await client._delivery.release(delivery_token)
     del client
     snapshots.append(probe.snapshot("released"))
     trimmed = _malloc_trim()
@@ -589,14 +577,24 @@ def run_sqlite_hydration(spec: ScenarioSpec) -> dict[str, Any]:
 
 def _property_heavy_properties(index: int) -> Properties:
     properties = Properties()
-    properties.set("message_expiry_interval", 3_600)
-    properties.set("content_type", "application/octet-stream")
-    properties.set("response_topic", f"bench/replies/{index}")
-    properties.set("correlation_data", index.to_bytes(8, "little") * 8)
+    properties = Properties({**properties.values, "message_expiry_interval": 3600})
+    properties = Properties({**properties.values, "content_type": "application/octet-stream"})
+    properties = Properties({**properties.values, "response_topic": f"bench/replies/{index}"})
+    properties = Properties(
+        {**properties.values, "correlation_data": index.to_bytes(8, "little") * 8}
+    )
     for property_index in range(16):
-        properties.add_user_property(
-            f"key-{property_index:02d}",
-            f"value-{index:05d}-{property_index:02d}-" + "x" * 24,
+        properties = Properties(
+            {
+                **properties.values,
+                "user_property": (
+                    *properties.get("user_property", ()),
+                    (
+                        f"key-{property_index:02d}",
+                        f"value-{index:05d}-{property_index:02d}-" + "x" * 24,
+                    ),
+                ),
+            }
         )
     return properties
 
@@ -744,131 +742,6 @@ def run_cancelled_admission(spec: ScenarioSpec) -> dict[str, Any]:
     return asyncio.run(_run_cancelled_admission(spec))
 
 
-def run_paho_saturation(spec: ScenarioSpec) -> dict[str, Any]:
-    probe = MemoryProbe()
-    snapshots = [probe.snapshot("baseline")]
-    probe.reset_python_peak()
-    started = time.perf_counter()
-    queue_limit = 512
-    client = PahoClient(
-        client_id="memory-paho",
-        max_pending_outbound_messages=queue_limit,
-        max_pending_outbound_bytes=None,
-    )
-    client.loop_start()
-    accepted = 0
-    rejected = 0
-    for index in range(spec.count):
-        info = client.publish(_TOPIC, _payload(index, spec.payload_size), qos=1)
-        # publish() intentionally returns before loop-side admission. This
-        # memory scenario predates that handoff optimization and is meant to
-        # measure the 512-message native queue at saturation, not a transient
-        # producer/loop scheduling backlog. Observe each admission before
-        # classifying its Paho return code so the logical workload stays fixed.
-        assert info._handoff is not None
-        info._handoff.result(timeout=30.0)
-        if info.rc == MQTT_ERR_SUCCESS:
-            accepted += 1
-        elif info.rc == MQTT_ERR_QUEUE_SIZE:
-            rejected += 1
-        else:
-            raise AssertionError(f"unexpected Paho publish rc={info.rc}")
-    snapshots.append(
-        probe.snapshot(
-            "loaded",
-            attempted_messages=spec.count,
-            accepted_messages=accepted,
-            rejected_messages=rejected,
-            configured_message_limit=queue_limit,
-            pending_messages=client._async._engine.pending_outbound_messages,
-            packet_ids=len(client._async._engine.packet_ids),
-            store_records=_out_record_count(client._async._engine.store),
-            pending_handoff=client._publish_spillover is not None,
-        )
-    )
-
-    def cleanup(paho: PahoClient = client) -> None:
-        engine = paho._async._engine
-        engine.outbound._queued.clear()
-        engine.store.clear_out()
-        engine.packet_ids.clear()
-        paho._async._receipts.clear()
-
-    client._run_loop_mutation(cleanup)
-    client.loop_stop()
-    del client
-    snapshots.append(probe.snapshot("released"))
-    trimmed = _malloc_trim()
-    snapshots.append(probe.snapshot("released_after_malloc_trim", malloc_trim=trimmed))
-    return _finalize(spec, started, snapshots)
-
-
-async def _run_shared_delivery_both(spec: ScenarioSpec) -> dict[str, Any]:
-    probe = MemoryProbe()
-    snapshots = [probe.snapshot("baseline")]
-    probe.reset_python_peak()
-    started = time.perf_counter()
-    callback_started = asyncio.Event()
-    callback_release = asyncio.Event()
-    client = AsyncClient(
-        message_delivery="both",
-        max_pending_messages=spec.count,
-        max_pending_callbacks=spec.count,
-        max_pending_delivery_bytes=8 * _MIB,
-        delivery_timeout=30.0,
-    )
-
-    async def callback(_message: Message) -> None:
-        callback_started.set()
-        await callback_release.wait()
-
-    client.on_message = callback
-    messages = [
-        Message(topic=_TOPIC, payload=_payload(index, spec.payload_size))
-        for index in range(spec.count)
-    ]
-    for message in messages:
-        await client._apply_effect(
-            EngineEffect(kind=EffectKind.MESSAGE, data=message),
-            nowait=False,
-        )
-    await callback_started.wait()
-    shared_references = 0
-    for item in client._messages._queue:
-        if not isinstance(item, tuple):
-            continue
-        delivery_token = item[1]
-        shared_references += 1 if isinstance(delivery_token, int) else delivery_token.remaining
-    snapshots.append(
-        probe.snapshot(
-            "loaded",
-            iterator_messages=client._messages.qsize(),
-            callback_queued=client._callback_queue.qsize(),
-            callback_active=True,
-            pending_logical_bytes=client.pending_delivery_bytes,
-            shared_references=shared_references,
-        )
-    )
-    while not client._messages.empty():
-        item = client._messages.get_nowait()
-        if isinstance(item, tuple):
-            _message, delivery_token = item
-            await client._release_delivery_reference(delivery_token)
-    callback_release.set()
-    await client._callback_queue.join()
-    await client._shutdown_callback_worker(drain=False)
-    del messages
-    del client
-    snapshots.append(probe.snapshot("released"))
-    trimmed = _malloc_trim()
-    snapshots.append(probe.snapshot("released_after_malloc_trim", malloc_trim=trimmed))
-    return _finalize(spec, started, snapshots)
-
-
-def run_shared_delivery_both(spec: ScenarioSpec) -> dict[str, Any]:
-    return asyncio.run(_run_shared_delivery_both(spec))
-
-
 class _WriteBufferTransport:
     def get_write_buffer_size(self) -> int:
         return 0
@@ -947,7 +820,7 @@ async def _run_reconnect_epoch_cleanup(spec: ScenarioSpec) -> dict[str, Any]:
     )
     payloads = [_payload(index, spec.payload_size) for index in range(spec.count)]
     for payload in payloads:
-        assert client._try_enqueue_outbound(payload)
+        assert client._write_pump.try_enqueue(payload)
     client._effect_pump.pending.extend(
         EngineEffect(kind=EffectKind.SEND, data=payload) for payload in payloads
     )
@@ -959,9 +832,9 @@ async def _run_reconnect_epoch_cleanup(spec: ScenarioSpec) -> dict[str, Any]:
     snapshots.append(
         probe.snapshot(
             "saturated",
-            writer_messages=client._outbound.qsize(),
-            writer_bytes=client._outbound_bytes,
-            pending_effects=len(client._pending_effects),
+            writer_messages=client._write_pump.queue.qsize(),
+            writer_bytes=client._write_pump.queued_bytes,
+            pending_effects=len(client._effect_pump.pending),
             decoder_bytes=client._decoder.buffered,
             connection_epoch=old_epoch,
         )
@@ -976,9 +849,9 @@ async def _run_reconnect_epoch_cleanup(spec: ScenarioSpec) -> dict[str, Any]:
             writer_messages_before=spec.count,
             pending_effects_before=spec.count,
             decoder_bytes_before=spec.payload_size,
-            writer_messages_after=client._outbound.qsize(),
-            writer_bytes_after=client._outbound_bytes,
-            pending_effects_after=len(client._pending_effects),
+            writer_messages_after=client._write_pump.queue.qsize(),
+            writer_bytes_after=client._write_pump.queued_bytes,
+            pending_effects_after=len(client._effect_pump.pending),
             decoder_bytes_after=client._decoder.buffered,
             epoch_advanced=client._connection_epoch > old_epoch,
         )
@@ -1005,8 +878,6 @@ RUNNERS: dict[str, Callable[[ScenarioSpec], dict[str, Any]]] = {
     "property_heavy_outbound": run_property_heavy_outbound,
     "immediate_refusal": run_immediate_refusal,
     "cancelled_admission": run_cancelled_admission,
-    "paho_saturation": run_paho_saturation,
-    "shared_delivery_both": run_shared_delivery_both,
     "websocket_batching": run_websocket_batching,
     "reconnect_epoch_cleanup": run_reconnect_epoch_cleanup,
 }

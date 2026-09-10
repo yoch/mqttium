@@ -38,7 +38,7 @@ evaluator commit, and policy-source digest. Retain both artifacts.
 
 The same profile builds and validates the wheel and sdist, installs the wheel
 without source-tree imports, imports every packaged module and exercises TCP,
-TLS, WebSocket, Unix, SQLite restart, Paho VERSION2 and clean shutdown. It never
+TLS, WebSocket, Unix, SQLite restart and clean shutdown. It never
 contacts PyPI.
 
 Then update `src/mqttium/__init__.py`, `CHANGELOG.md`, status documentation, and

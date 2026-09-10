@@ -55,8 +55,7 @@ The transport uses RFC 6455 binary frames and requests the MQTT subprotocol.
 Use `wss://` outside a trusted local environment. Extra headers are visible to
 the WebSocket endpoint; do not place long-lived secrets in source code or logs.
 
-The native WebSocket transport is not exposed through the Paho compatibility
-facade.
+
 
 ## Unix-domain sockets
 

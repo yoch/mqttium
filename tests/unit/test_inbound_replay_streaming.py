@@ -276,12 +276,12 @@ async def test_client_replays_every_message_through_the_effect_pump() -> None:
 
     async with client._engine_lock:
         resume(client._engine)
-        client._collect_effects_locked()
-    await client._drain_effects()
+        client._effect_pump.collect_from_engine()
+    await client._effect_pump.drain()
 
     received = []
-    while not client._messages.empty():
-        item = client._messages.get_nowait()
+    while not client._delivery.messages_queue.empty():
+        item = client._delivery.messages_queue.get_nowait()
         received.append(item.mid if hasattr(item, "mid") else item[0].mid)
     assert received == list(range(1, 401))
     assert client._engine.inbound.replay_pending is False
@@ -322,8 +322,8 @@ async def test_replay_peak_memory_stays_proportional_to_one_batch(tmp_path: Path
     try:
         async with client._engine_lock:
             resume(client._engine)
-            client._collect_effects_locked()
-        await client._drain_effects()
+            client._effect_pump.collect_from_engine()
+        await client._effect_pump.drain()
         await asyncio.wait_for(consumer, timeout=30.0)
         _current, peak = tracemalloc.get_traced_memory()
     finally:

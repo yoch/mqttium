@@ -127,10 +127,10 @@ finally:
 structure makes that convenient. `close()` is idempotent, but closing inside an
 active store batch is rejected.
 
-The database uses WAL mode. Its schema is versioned with SQLite
-`PRAGMA user_version`; supported older schemas migrate atomically on open. A
-database written by a newer MQTTium schema is refused rather than interpreted
-unsafely.
+The database uses WAL mode and experimental schema 5, recorded by
+`PRAGMA user_version`. Only new databases and schema 5 are accepted. Historical,
+future and inconsistent schemas are refused before operations that could
+modify them. No migration or historical size backfill is performed.
 
 `SqliteInflightStore` follows Python's synchronous filesystem, DB-API, and data
 conversion boundaries. It does not wrap them in a second MQTTium exception
@@ -140,7 +140,7 @@ hierarchy:
 | --- | --- |
 | Creating the database's parent directory | `OSError`, including `PermissionError` |
 | Opening, locking, querying, committing, or using a closed SQLite connection | the relevant `sqlite3.Error` subclass |
-| A future or structurally inconsistent MQTTium schema; invalid batch/close lifecycle | `RuntimeError` |
+| A historical, future or structurally inconsistent MQTTium schema; invalid batch/close lifecycle | `RuntimeError` |
 | Invalid persisted storage classes, enum/flag/size values, JSON syntax, or MQTTium JSON markers | `ValueError` (including `json.JSONDecodeError`) |
 | Updating metadata for an outbound or inbound record that is absent | `KeyError` |
 | A non-positive page, message, or byte bound | `ValueError` |
@@ -166,33 +166,15 @@ already above a newly reduced outbound limit, MQTTium permits it to drain but
 does not admit more work until usage falls below the limit. Inbound replay is
 also accounted against the configured inbound byte budget.
 
-Third-party `InflightStore` implementations remain supported through one complete
-Provisional contract. MQTTium does not detect persistence capabilities at runtime
-and there is no weaker eager-replay or read/mutate/write fallback. A custom store
-must provide the same semantic guarantees used by the shipped stores:
+The store interface, records, paging and transitions are internal. Only the
+shipped `MemoryInflightStore` and `SqliteInflightStore` are supported. Their
+mutations are atomic. Internal `batch()` groups protocol operations: SQLite
+uses a lazy transaction, while the engine compensates its own acquisitions.
+Memory `batch()` does not provide universal application rollback.
 
-| Required part of `InflightStore` | Guarantee | Operational consequence |
-| --- | --- | --- |
-| `batch()`, point reads/writes/deletes, and clear operations | atomic mutation groups and durable record ownership | rollback and session cleanup have one store path |
-| `out_summary_pages()` and `in_index_pages()` | ordered payload-free metadata pages | recovery accounting does not hydrate every payload |
-| `in_replay_pages()` and `in_count()` | message/byte-bounded inbound hydration | large inbound sessions replay with bounded resident payload memory |
-| `out_meta()` / `in_meta()`, `transition_*()`, and `complete_*()` | conditional metadata-only state changes | ACK handling avoids payload reads and QoS state changes remain atomic |
-| logical-size and delivered-state metadata updates | restart-safe admission accounting and inbound delivery state | recovered byte limits match durable ownership |
-
-The former `PagedInflightStore`, `BoundedInboundReplayStore`, and
-`TransitionInflightStore` capability protocols are removed. So are the shipped
-stores' legacy whole-object iteration/update helpers. Code that needs a full
-record after reading a metadata page should call `get_out()` or `get_in()` for
-that identifier.
-
-A third-party store MUST NOT report storage, backend, integrity, or
-lifecycle failures with `MQTTError` or any of its subclasses: `MQTTError`
-is reserved for MQTT/client-layer semantics, and using it for store failures
-makes classification unsupported and ambiguous. Use backend-native or
-ordinary Python exceptions (`OSError`, `RuntimeError`, `ValueError`,
-`KeyError`, DB-API errors) instead. Likewise, `batch()` must not suppress
-an exception raised by its body or by batch close; the runtime observes the
-original failure to fail-stop the connection.
+Backend failures retain their native exception boundary and must not be
+classified as MQTT protocol errors. A batch must not suppress an exception
+from its body or commit; the runtime needs that cause to fail-stop safely.
 
 ## Reconnect policy
 

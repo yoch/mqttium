@@ -10,8 +10,8 @@
     options:
       heading_level: 3
 
-`Message` is immutable. `Properties` is mutable; avoid mutating the same bag
-concurrently while another operation may encode it.
+`Message` and `Properties` are immutable and own their data. Construct a new
+`Properties` from a mapping to change values; repeated properties are tuples.
 
 ## Publication input and receipts
 
@@ -28,8 +28,8 @@ concurrently while another operation may encode it.
       heading_level: 3
 
 A batch receipt keeps exact aggregate counts while retaining at most the
-configured number of individual failures. Use `failure_sink` when every detail
-must be copied to application-owned storage.
+configured finite number of individual failures. Admissions are progressive;
+a submission error carries a receipt for the committed prefix.
 
 ## Subscription results and options
 
@@ -76,18 +76,11 @@ connection-scoped settings must not be carried across reconnect manually.
 Automatic reconnect is opt-in by passing a policy to `AsyncClient`. Terminal
 authentication, authorization, and protocol responses stop retrying.
 
-## Delivery and backpressure modes
+## Delivery mode
 
-`MessageDelivery` accepts:
+`MessageDelivery` accepts `"iterator"` (default) or `"callback"`. The two modes
+are exclusive. Callback routes are configured before the first connection
+attempt and then permanently frozen for that client.
 
-- `"auto"` — use the callback when assigned, otherwise the iterator;
-- `"callback"` — callback delivery only;
-- `"iterator"` — async iterator delivery only;
-- `"both"` — independently bounded callback and iterator delivery.
-
-`PublishBackpressure` accepts:
-
-- `"wait"` — suspend the producer until capacity is available;
-- `"error"` — raise `FlowControlError` without partially admitting the publish.
-
-These aliases are Stable when imported from `mqttium.api`.
+Use `publish()` to wait for admission or `publish_nowait()` to refuse immediately.
+`ReconnectPolicy` is immutable; sharing it never shares retry progression.

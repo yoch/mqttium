@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests.support import stored_record
+
 import sqlite3
 from pathlib import Path
 
@@ -164,13 +166,15 @@ def outbound(mid: int, state: OutboundQoSState) -> OutboundMessage:
 
 
 def inbound(mid: int, state: InboundQoSState) -> InboundMessage:
-    return InboundMessage(
-        mid=mid,
-        topic="a/b",
-        payload=b"payload",
-        qos=QoS.EXACTLY_ONCE,
-        retain=False,
-        state=state,
+    return stored_record(
+        InboundMessage(
+            mid=mid,
+            topic="a/b",
+            payload=b"payload",
+            qos=QoS.EXACTLY_ONCE,
+            retain=False,
+            state=state,
+        )
     )
 
 

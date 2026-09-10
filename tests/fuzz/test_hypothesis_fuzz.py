@@ -130,7 +130,7 @@ def test_publish_frame_roundtrip_or_clean_error(topic, payload, qos, mid, mutati
     props = None
     if seed % 3 == 0:
         props = Properties()
-        props.set("topic_alias", (seed % 3))
+        props = Properties({**props.values, "topic_alias": seed % 3})
     wire = _build_publish(topic, payload, qos, mid, props)
     assume(wire)
     rng = random.Random(seed)
@@ -203,7 +203,8 @@ def _engine_invariants(engine: ProtocolEngine) -> None:
         for summary in page
     )
     expected_mids = {msg.mid for msg in outbound} | set(engine._pending_sub_mids)
-    assert set(engine.packet_ids._used) == expected_mids
+    assert len(engine.packet_ids) == len(expected_mids)
+    assert all(engine.packet_ids.in_use(mid) for mid in expected_mids)
 
     queued_mids = {msg.mid for msg in engine.outbound._queued}
     expected_flow = sum(

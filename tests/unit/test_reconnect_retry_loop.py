@@ -71,7 +71,7 @@ async def test_reconnect_retries_transport_failures_until_success() -> None:
 
     assert calls == 3
     assert client.is_connected
-    assert policy.attempt == 0  # stable success resets backoff state
+    assert client.stats().reconnect_attempt == 0  # stable success resets backoff state
     await client.disconnect()
 
 

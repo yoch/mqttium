@@ -169,7 +169,6 @@ class InboundSession:
         recovered_qos1: list[int] = []
         pending_bytes = 0
         session_state_qos2 = 0
-        unknown_sizes: list[int] = []
         for page in self.store.in_index_pages(REPLAY_PAGE_SIZE):
             for meta in page:
                 mids.add(meta.mid)
@@ -180,18 +179,9 @@ class InboundSession:
                     session_state_qos2 += 1
                 if meta.state is InboundQoSState.WAIT_PUBACK:
                     recovered_qos1.append(meta.mid)
-                if meta.logical_size > 0:
-                    pending_bytes += meta.logical_size
-                else:
-                    unknown_sizes.append(meta.mid)
-        for mid in unknown_sizes:
-            message = self.store.get_in(mid)
-            if message is None:
-                raise RuntimeError(f"Inbound mid={mid} disappeared while restoring byte accounting")
-            size = self.logical_size(message.topic, message.payload, message.properties)
-            if not self.store.set_in_logical_size(mid, size):
-                raise RuntimeError(f"Inbound mid={mid} disappeared while restoring byte accounting")
-            pending_bytes += size
+                if meta.logical_size <= 0:
+                    raise ValueError("Persisted inbound logical_size must be positive")
+                pending_bytes += meta.logical_size
         return mids, pending_bytes, session_state_qos2, tuple(recovered_qos1)
 
     # --- lifecycle ---------------------------------------------------------
@@ -791,13 +781,8 @@ class InboundSession:
         )
 
     def stored_logical_size(self, message: InboundMessage) -> int:
-        if message.logical_size > 0:
-            return message.logical_size
-        message.logical_size = self.logical_size(
-            message.topic,
-            message.payload,
-            message.properties,
-        )
+        if message.logical_size <= 0:
+            raise ValueError("Persisted inbound logical_size must be positive")
         return message.logical_size
 
     def _validate_slot_capacity(self, logical_size: int | None = None) -> None:

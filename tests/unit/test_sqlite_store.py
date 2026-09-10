@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests.support import stored_record
+
 from pathlib import Path
 
 from mqttium.enums import InboundQoSState, OutboundQoSState, QoS
@@ -11,14 +13,16 @@ from mqttium.types import InboundMessage, OutboundMessage, Properties
 
 
 def outbound(mid: int = 7) -> OutboundMessage:
-    return OutboundMessage(
-        mid=mid,
-        topic="a/b",
-        payload=b"payload",
-        qos=QoS.AT_LEAST_ONCE,
-        retain=False,
-        state=OutboundQoSState.WAIT_PUBACK,
-        dup=False,
+    return stored_record(
+        OutboundMessage(
+            mid=mid,
+            topic="a/b",
+            payload=b"payload",
+            qos=QoS.AT_LEAST_ONCE,
+            retain=False,
+            state=OutboundQoSState.WAIT_PUBACK,
+            dup=False,
+        )
     )
 
 
@@ -65,19 +69,25 @@ def test_batch_commits_once(tmp_path: Path) -> None:
 def test_sqlite_properties_binary_and_user_property(tmp_path: Path) -> None:
     store = SqliteInflightStore(tmp_path / "props.db")
     props = Properties()
-    props.set("correlation_data", b"\x00\xffbinary")
-    props.set("content_type", "application/octet-stream")
-    props.add_user_property("k", "v")
-    props.add_user_property("k2", "v2")
-    props.values["subscription_identifier"] = [11, 22]
-    msg = OutboundMessage(
-        mid=9,
-        topic="p",
-        payload=b"x",
-        qos=QoS.EXACTLY_ONCE,
-        retain=False,
-        state=OutboundQoSState.WAIT_PUBREC,
-        properties=props,
+    props = Properties({**props.values, "correlation_data": b"\x00\xffbinary"})
+    props = Properties({**props.values, "content_type": "application/octet-stream"})
+    props = Properties(
+        {**props.values, "user_property": (*props.get("user_property", ()), ("k", "v"))}
+    )
+    props = Properties(
+        {**props.values, "user_property": (*props.get("user_property", ()), ("k2", "v2"))}
+    )
+    props = Properties({**props.values, "subscription_identifier": [11, 22]})
+    msg = stored_record(
+        OutboundMessage(
+            mid=9,
+            topic="p",
+            payload=b"x",
+            qos=QoS.EXACTLY_ONCE,
+            retain=False,
+            state=OutboundQoSState.WAIT_PUBREC,
+            properties=props,
+        )
     )
     store.put_out(msg)
     got = store.get_out(9)
@@ -85,22 +95,24 @@ def test_sqlite_properties_binary_and_user_property(tmp_path: Path) -> None:
     assert got.properties is not None
     assert got.properties.get("correlation_data") == b"\x00\xffbinary"
     assert got.properties.get("content_type") == "application/octet-stream"
-    assert got.properties.get("user_property") == [("k", "v"), ("k2", "v2")]
-    assert got.properties.get("subscription_identifier") == [11, 22]
+    assert got.properties.get("user_property") == (("k", "v"), ("k2", "v2"))
+    assert got.properties.get("subscription_identifier") == (11, 22)
     store.close()
 
 
 def test_sqlite_inbound_manual_ack_flag(tmp_path: Path) -> None:
     store = SqliteInflightStore(tmp_path / "in.db")
-    msg = InboundMessage(
-        mid=3,
-        topic="t",
-        payload=b"x",
-        qos=QoS.EXACTLY_ONCE,
-        retain=False,
-        state=InboundQoSState.WAIT_PUBREL,
-        delivered=True,
-        user_acked=True,
+    msg = stored_record(
+        InboundMessage(
+            mid=3,
+            topic="t",
+            payload=b"x",
+            qos=QoS.EXACTLY_ONCE,
+            retain=False,
+            state=InboundQoSState.WAIT_PUBREL,
+            delivered=True,
+            user_acked=True,
+        )
     )
     store.put_in(msg)
     got = store.get_in(3)
@@ -237,6 +249,7 @@ def test_engine_sqlite_hydration_keeps_payloads_lazy(tmp_path: Path) -> None:
             message = outbound(mid)
             message.state = OutboundQoSState.QUEUED
             message.payload = bytes([mid]) * 4096
+            message.logical_size = len(message.topic.encode()) + len(message.payload)
             store.put_out(message)
 
     engine = ProtocolEngine(EngineConfig(clean_start=False), store=store)

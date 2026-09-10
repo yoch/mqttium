@@ -74,7 +74,6 @@ body:
       label: API surface
       options:
         - Native AsyncClient
-        - Paho compatibility facade
         - Helpers
         - Persistence
         - Transport or protocol extension

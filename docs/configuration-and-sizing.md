@@ -18,7 +18,7 @@ the process memory budget.
 | `username`, `password` | `None` | CONNECT credentials |
 | `connect_properties` | `None` | MQTT 5 CONNECT properties |
 | `will`, `will_properties` | `None` | Last Will message and MQTT 5 properties |
-| `store` | `None` | Optional Provisional inflight store |
+| `store` | `None` | Optional supplied memory or SQLite store |
 
 ### Broker-facing protocol limits
 
@@ -32,13 +32,10 @@ the process memory budget.
 `local_receive_maximum` controls inbound work. `max_outbound_inflight` controls
 outbound work. Neither changes the MQTT packet-identifier range.
 
-For MQTT 5, an explicit `receive_maximum`, `maximum_packet_size`, or
-`topic_alias_maximum` in `connect_properties` overrides the corresponding
-dedicated constructor setting. MQTTium snapshots the value encoded in each
-CONNECT and enforces that same value for the resulting network connection;
-later mutation of the application-owned `Properties` object affects only a
-future connection. Prefer the dedicated settings unless direct property control
-is needed.
+Use dedicated constructor arguments for Receive Maximum, Maximum Packet Size
+and Topic Alias Maximum. Supplying any of those names in `connect_properties`
+raises `ProtocolError` before creating protocol state. Configuration is fixed
+for the client instance.
 
 ### Outbound protocol admission
 
@@ -46,7 +43,6 @@ is needed.
 | --- | ---: | --- |
 | `max_pending_outbound_messages` | `10_000` | Unfinished outbound publications retained by protocol state |
 | `max_pending_outbound_bytes` | `64 MiB` | Logical topic, payload, and property bytes retained by outbound state |
-| `publish_backpressure` | `"wait"` | Wait for capacity or raise `FlowControlError` |
 
 ### Writer and ingress
 
@@ -65,12 +61,12 @@ until capacity returns.
 
 | Setting | Default | Purpose |
 | --- | ---: | --- |
-| `message_delivery` | `"auto"` | Choose callback, iterator, or both |
+| `message_delivery` | `"iterator"` | Choose iterator or callback delivery |
 | `manual_ack` | `False` | Let the application control inbound QoS acknowledgement timing |
 | `max_pending_messages` | `65_536` | Iterator queue count bound |
 | `max_pending_callbacks` | `1_024` | Callback queue count bound |
-| `max_pending_delivery_bytes` | `64 MiB` | Payload bytes retained for application delivery |
-| `delivery_timeout` | `1.0` | Maximum wait for delivery capacity before failure |
+| `max_pending_delivery_bytes` | `64 MiB` | Topic, payload and property bytes retained for application delivery |
+| `delivery_timeout` | `None` | Optional positive deadline across byte and queue waits |
 | `callback_shutdown_timeout` | `5.0` | Callback drain allowance during shutdown |
 
 ### Connection and authentication
@@ -80,7 +76,7 @@ until capacity returns.
 | `reconnect` | disabled | Opt-in `ReconnectPolicy` |
 | `ping_timeout` | derived | PINGRESP deadline; derived from keepalive when omitted |
 | `ack_timeout` | `30.0` | Default SUBACK and UNSUBACK deadline |
-| `auth_handler` | `None` | MQTT 5 enhanced-authentication callback |
+| `auth_handler` | `None` | MQTT 5 enhanced-authentication callback, fixed at construction |
 | `auth_timeout` | `10.0` | Deadline for each enhanced-authentication callback invocation |
 
 ## A sizing method
@@ -101,9 +97,9 @@ different queues.
 ## Wait, refuse, or batch
 
 - Use the default `await client.publish(...)` to propagate pressure naturally.
-- Use `publish_backpressure="error"`, `nowait=True`, or `publish_nowait()` only
+- Use `publish_nowait()` only
   when the application has an explicit shed, retry, or spill policy.
-- Use `publish_many()` to consume large iterables in bounded chunks and retain
+- Use `publish_many()` to consume large iterables progressively and retain
   aggregate completion without one task per message.
 - Avoid immediate retry loops after `FlowControlError`; they can busy-spin while
   no capacity is released.

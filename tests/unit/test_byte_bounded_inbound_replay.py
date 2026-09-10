@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests.support import stored_record
+
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -18,14 +20,16 @@ from mqttium.types import InboundMessage, InboundRecordMeta
 
 
 def inbound(mid: int, payload: bytes) -> InboundMessage:
-    return InboundMessage(
-        mid=mid,
-        topic=f"recover/{mid}",
-        payload=payload,
-        qos=QoS.EXACTLY_ONCE,
-        retain=False,
-        state=InboundQoSState.WAIT_PUBREL,
-        delivered=False,
+    return stored_record(
+        InboundMessage(
+            mid=mid,
+            topic=f"recover/{mid}",
+            payload=payload,
+            qos=QoS.EXACTLY_ONCE,
+            retain=False,
+            state=InboundQoSState.WAIT_PUBREL,
+            delivered=False,
+        )
     )
 
 

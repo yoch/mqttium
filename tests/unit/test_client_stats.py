@@ -63,7 +63,7 @@ def test_stats_reports_current_state_and_lifetime_high_water_marks() -> None:
         EffectKind.MESSAGE,
         Message(topic="in", payload=b"payload", qos=QoS.AT_MOST_ONCE),
     )
-    client._collect_effects_locked()
+    client._effect_pump.collect_from_engine()
 
     loaded = client.stats()
     assert loaded.outbound.pending_messages == 1
@@ -83,7 +83,7 @@ def test_stats_reports_current_state_and_lifetime_high_water_marks() -> None:
 
     client._write_pump.discard()
     client._decoder.clear()
-    client._discard_connection_effects()
+    client._effect_pump.discard_connection_effects()
 
     drained = client.stats()
     assert drained.writer.queued_messages == 0
@@ -121,7 +121,7 @@ async def test_writer_worker_records_lifetime_high_water_without_enqueue_overhea
     transport = _RecordingTransport()
     client._write_pump.start(transport)
     try:
-        await client._enqueue_outbound(b"abcd")
+        await client._write_pump.enqueue(b"abcd")
         await client._write_pump.join()
     finally:
         await client._write_pump.stop()
@@ -170,9 +170,9 @@ async def test_writer_decision_counters_describe_the_batches_it_wrote() -> None:
     client._write_pump.start(transport)
     try:
         # A segmented item is written apart from the coalesced run around it.
-        await client._enqueue_outbound(b"aa")
-        await client._enqueue_outbound((b"header", b"payload"))
-        await client._enqueue_outbound(b"bb")
+        await client._write_pump.enqueue(b"aa")
+        await client._write_pump.enqueue((b"header", b"payload"))
+        await client._write_pump.enqueue(b"bb")
         await client._write_pump.join()
     finally:
         await client._write_pump.stop()
@@ -190,7 +190,7 @@ def test_effect_counters_separate_inline_from_reordered_batches() -> None:
 
     # One effect, applied inline: no deque, no reordering.
     client._engine._emit(EffectKind.SEND, b"x")
-    client._collect_effects_locked()
+    client._effect_pump.collect_from_engine()
     inline = client.stats().effects
     assert inline.batches == 1
     assert inline.inline_effects == 1
@@ -203,7 +203,7 @@ def test_effect_counters_separate_inline_from_reordered_batches() -> None:
         Message(topic="in", payload=b"payload", qos=QoS.AT_MOST_ONCE),
     )
     client._engine._emit(EffectKind.SEND, b"y")
-    client._collect_effects_locked()
+    client._effect_pump.collect_from_engine()
     reordered = client.stats().effects
     assert reordered.batches == 2
     assert reordered.multi_effect_batches == 1
@@ -219,7 +219,7 @@ def test_an_already_ordered_batch_is_counted_but_not_reordered() -> None:
         EffectKind.MESSAGE,
         Message(topic="in", payload=b"payload", qos=QoS.AT_MOST_ONCE),
     )
-    client._collect_effects_locked()
+    client._effect_pump.collect_from_engine()
 
     effects = client.stats().effects
     assert effects.multi_effect_batches == 1

@@ -44,7 +44,7 @@ def test_connect_properties_topic_alias_maximum_is_the_inbound_limit() -> None:
         EngineConfig(
             client_id="alias-override",
             protocol=MQTTProtocolVersion.MQTTv5,
-            connect_properties=connect_properties,
+            topic_alias_maximum=5,
         ),
         MemoryInflightStore(),
     )
@@ -54,7 +54,7 @@ def test_connect_properties_topic_alias_maximum_is_the_inbound_limit() -> None:
     # The advertised value is connection state. Mutating the application-owned
     # Properties object after CONNECT must not change what the peer is allowed
     # to send on the already-established connection.
-    connect_properties.set("topic_alias_maximum", 0)
+    connect_properties = Properties({**connect_properties.values, "topic_alias_maximum": 0})
     _feed(engine, _alias_publish(1))
     effects = engine.take_effects()
 
@@ -93,8 +93,7 @@ def test_alias_above_effective_advertised_maximum_is_still_rejected() -> None:
         EngineConfig(
             client_id="alias-bound",
             protocol=MQTTProtocolVersion.MQTTv5,
-            connect_properties=Properties({"topic_alias_maximum": 2}),
-            topic_alias_maximum=7,
+            topic_alias_maximum=2,
         ),
         MemoryInflightStore(),
     )

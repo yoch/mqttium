@@ -26,7 +26,12 @@ def _decode_publish_wire(wire: bytes, protocol: MQTTProtocolVersion) -> PublishP
 
 def test_ufeff_round_trips_in_publish_topic_and_user_property() -> None:
     properties = Properties()
-    properties.add_user_property("bom", "before\ufeffafter")
+    properties = Properties(
+        {
+            **properties.values,
+            "user_property": (*properties.get("user_property", ()), ("bom", "before\ufeffafter")),
+        }
+    )
     packet = PublishPacket(
         topic="legal/\ufeff/topic",
         payload=b"payload",
@@ -40,7 +45,7 @@ def test_ufeff_round_trips_in_publish_topic_and_user_property() -> None:
 
     assert decoded.topic == packet.topic
     assert decoded.properties is not None
-    assert decoded.properties.get("user_property") == [("bom", "before\ufeffafter")]
+    assert decoded.properties.get("user_property") == (("bom", "before\ufeffafter"),)
 
 
 def test_v311_inbound_publish_rejects_empty_topic() -> None:
@@ -88,7 +93,7 @@ def test_connect_rejects_semantic_will_fields_without_will_topic() -> None:
         ConnectPacket(client_id="c", will_payload=b"not-empty").encode()
 
     properties = Properties()
-    properties.set("will_delay_interval", 1)
+    properties = Properties({**properties.values, "will_delay_interval": 1})
     with pytest.raises(ProtocolError, match="Will payload/properties require a Will topic"):
         ConnectPacket(
             client_id="c",

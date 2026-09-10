@@ -29,7 +29,7 @@ def test_append_utf8_uses_same_validation() -> None:
 
 def test_string_property_rejects_surrogate_as_protocol_error() -> None:
     properties = Properties()
-    properties.set("content_type", "\ud800")
+    properties = Properties({**properties.values, "content_type": "\ud800"})
     with pytest.raises(ProtocolError):
         encode_properties(properties, PUBLISH)
 

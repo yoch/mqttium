@@ -40,7 +40,7 @@ from mqttium.api import AsyncClient, Message
 
 async def main() -> None:
     received: asyncio.Future[Message] = asyncio.get_running_loop().create_future()
-    client = AsyncClient("getting-started")
+    client = AsyncClient("getting-started", message_delivery="callback")
 
     async def on_message(message: Message) -> None:
         if not received.done():
@@ -95,14 +95,13 @@ receipt = await client.publish_many(
 await receipt.wait()
 ```
 
-The iterable is consumed in bounded chunks. The aggregate receipt retains exact
+The iterable is consumed progressively, with at most one element read ahead. The aggregate receipt retains exact
 completion and failure counts without creating one task per publication.
 
 ## Choosing inbound delivery
 
-The default `message_delivery="auto"` chooses callback delivery when
-`on_message` is assigned or a topic-filtered callback is registered, and
-iterator delivery otherwise.
+The default `message_delivery="iterator"` delivers through `messages()`.
+Select `message_delivery="callback"` explicitly to enable message callbacks.
 
 Iterator delivery keeps control flow in the consuming task:
 
@@ -118,6 +117,7 @@ async def on_message(message) -> None:
     await process(message)
 
 
+client = AsyncClient(message_delivery="callback")
 client.on_message = on_message
 ```
 
@@ -132,9 +132,9 @@ def on_sensor(message) -> None:
 client.message_callback_add("sensors/+", on_sensor)
 ```
 
-Use `message_delivery="both"` only when two independent application consumers
-really need the same message. Both queues retain a reference and participate in
-delivery backpressure.
+Set `on_message` and register all routes before the first connection attempt.
+They remain frozen after disconnect and throughout reconnect. Subscriptions
+can still change. Each matching route runs serially in the bounded worker.
 
 With `manual_ack=True`, inbound QoS 1 and the final QoS 2 acknowledgement wait
 for the application:
@@ -161,21 +161,19 @@ from mqttium import FlowControlError
 
 client = AsyncClient(
     "bounded-producer",
-    publish_backpressure="error",
     max_pending_outbound_messages=2_000,
     max_pending_outbound_bytes=16 * 1024**2,
 )
 
 try:
-    receipt = await client.publish("telemetry", payload, qos=1)
+    receipt = client.publish_nowait("telemetry", payload, qos=1)
 except FlowControlError:
     await shed_or_retry(payload)
 ```
 
 `publish_nowait()` provides the same immediate-refusal behaviour without a
 coroutine suspension, but it must run on the client's owning event-loop thread.
-It is not a thread-safe producer API. Threaded applications migrating from Paho
-should use the [VERSION2 compatibility facade](paho-compatibility.md).
+Cross-thread applications must arrange their own bounded handoff to that loop.
 
 ## MQTT versions and transports
 
@@ -202,35 +200,7 @@ silently sending unsupported QoS, retain or packet sizes.
 
 ## One-shot operations
 
-Small async programs do not need to manage a client directly:
-
-```python
-from mqttium.helpers import publish, subscribe
-
-try:
-    await publish.single(
-        "events/ready",
-        b"ready",
-        qos=1,
-        retain=True,
-        hostname="127.0.0.1",
-    )
-    message = await subscribe.simple("events/ready", hostname="127.0.0.1")
-finally:
-    # A retained publication with an empty payload clears the broker entry.
-    await publish.single(
-        "events/ready",
-        b"",
-        qos=1,
-        retain=True,
-        hostname="127.0.0.1",
-    )
-```
-
-The helpers connect, complete the requested operation and disconnect. A
-retained message makes this sequential demonstration deterministic; normal
-subscriber processes usually start before their publishers. A long-lived
-client is more efficient when an application sends or receives repeatedly.
+Use the same explicit connect, operation and disconnect lifecycle for short programs. The experimental branch does not ship one-shot helpers.
 
 ## Errors and shutdown
 
@@ -249,5 +219,5 @@ Next steps:
 - [Sessions and Persistence](sessions-and-persistence.md) for reconnect and
   restart recovery;
 - [Operations](operations.md) for sizing and diagnostics;
-- [Migrating to MQTTium](migration.md) for Paho and gmqtt applications;
+- [Migrating to MQTTium](migration.md) for the incompatible experiment;
 - [API Stability](api-stability.md) for the supported public contract.

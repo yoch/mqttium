@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests.support import stored_record
+
 import asyncio
 from pathlib import Path
 
@@ -47,7 +49,7 @@ def _connect_identity(wire: bytes) -> tuple[str, bool]:
 def _connack(*, assigned: str | None = None, session_present: bool = False) -> bytes:
     properties = Properties()
     if assigned is not None:
-        properties.set("assigned_client_identifier", assigned)
+        properties = Properties({**properties.values, "assigned_client_identifier": assigned})
     body = bytearray((int(session_present), 0x00))
     body.extend(encode_properties(properties, CONNACK))
     return encode_frame(PacketType.CONNACK, 0, body)
@@ -176,13 +178,15 @@ def test_non_durable_reconnect_does_not_reuse_stale_assignment() -> None:
 def test_restart_with_unaddressable_persisted_session_fails_closed(tmp_path: Path) -> None:
     store = SqliteInflightStore(tmp_path / "assigned-session.db")
     store.put_out(
-        OutboundMessage(
-            mid=7,
-            topic="out",
-            payload=b"payload",
-            qos=QoS.AT_LEAST_ONCE,
-            retain=False,
-            state=OutboundQoSState.WAIT_PUBACK,
+        stored_record(
+            OutboundMessage(
+                mid=7,
+                topic="out",
+                payload=b"payload",
+                qos=QoS.AT_LEAST_ONCE,
+                retain=False,
+                state=OutboundQoSState.WAIT_PUBACK,
+            )
         )
     )
     engine = ProtocolEngine(_durable_config(clean_start=False), store)
@@ -199,13 +203,15 @@ def test_restart_with_unaddressable_persisted_session_fails_closed(tmp_path: Pat
 def test_restart_with_explicit_stable_client_id_can_resume(tmp_path: Path) -> None:
     store = SqliteInflightStore(tmp_path / "stable-session.db")
     store.put_out(
-        OutboundMessage(
-            mid=8,
-            topic="out",
-            payload=b"payload",
-            qos=QoS.AT_LEAST_ONCE,
-            retain=False,
-            state=OutboundQoSState.WAIT_PUBACK,
+        stored_record(
+            OutboundMessage(
+                mid=8,
+                topic="out",
+                payload=b"payload",
+                qos=QoS.AT_LEAST_ONCE,
+                retain=False,
+                state=OutboundQoSState.WAIT_PUBACK,
+            )
         )
     )
     engine = ProtocolEngine(_durable_config(client_id="stable-client", clean_start=False), store)

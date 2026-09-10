@@ -4,6 +4,26 @@ Benchmark results are build artefacts, not permanent source-code claims. Raw
 outputs belong under `/tmp` or another external artefact directory and must not
 be committed.
 
+## Lean-native experiment
+
+`lean_native_compare.py` compares exact commits in fresh interpreters using
+complete ABBA cycles and same-code A/A controls. Its self-subscribed native
+client exercises both MQTT directions, QoS 0/1/2, memory/SQLite, iterator/callback,
+and bursts of 1/2/8 or a long progressive lot. A phase requires ordered,
+payload-verified delivery, publication receipts and final inbound handshakes.
+CPU covers the combined client process; the broker runs separately.
+
+Per-message latency starts when the producer constructs the element immediately
+before admission, so it includes prefetch queue residence. A long batch's overall
+elapsed time also reports work waiting before an element is read. Timing runs
+exclude tracemalloc; a separate phase measures Python peak allocations. RSS is
+diagnostic. Topic, payload, flow and queue limits are identical across arms.
+
+This explicitly authorized experiment has no performance acceptance threshold.
+Functional correctness and resource bounds remain mandatory. Record all ratios
+and A/A noise, and label results diagnostic if the runner is ineligible. These
+measurements are not release qualification or public cross-client evidence.
+
 ## What each benchmark answers
 
 - `hotpath_profile.py` counts calls, primitive calls, and allocations. These

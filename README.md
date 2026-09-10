@@ -94,10 +94,10 @@ shed, retry, or spill policy can request immediate refusal:
 from mqttium import FlowControlError
 from mqttium.api import AsyncClient
 
-client = AsyncClient(publish_backpressure="error")
+client = AsyncClient()
 
 try:
-    receipt = await client.publish("telemetry", payload, qos=1)
+    receipt = client.publish_nowait("telemetry", payload, qos=1)
 except FlowControlError:
     await shed_or_retry(payload)
 ```
@@ -106,8 +106,7 @@ Outbound protocol state, encoded writes, inbound protocol state, and delivery
 queues have independent bounds because they have different lifetimes. Passing
 `None` disables an optional bound and should be a deliberate capacity decision.
 
-For a sustained producer, `publish_many()` consumes an iterable in bounded
-chunks and returns one aggregate receipt:
+For a sustained producer, `publish_many()` consumes an iterable progressively, with at most one element read ahead and returns one aggregate receipt:
 
 ```python
 from mqttium.api import PublishMessage
@@ -147,12 +146,7 @@ owns the store and must close it after the client has shut down.
 
 ## Paho migration
 
-New async applications should use `AsyncClient`. MQTTium also ships a
-**Provisional**, Paho-shaped `CallbackAPIVersion.VERSION2` facade for existing
-synchronous applications that need an incremental migration path. It is tested
-and bounded, but it is not a drop-in promise, a performance-parity promise, or
-a second native API. See [Migrating from Paho](https://mqttium.readthedocs.io/en/stable/migration/)
-and the [exact compatibility matrix](https://mqttium.readthedocs.io/en/stable/paho-compatibility/).
+This incompatible branch supports only the native API. See the [experimental migration guide](https://mqttium.readthedocs.io/en/stable/migration/) for removed interfaces, frozen configuration, progressive batches and SQLite schema 5.
 
 ## Documentation
 

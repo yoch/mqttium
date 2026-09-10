@@ -126,7 +126,7 @@ async def test_runtime_invariant_failure_is_terminal_without_reconnect() -> None
     assert client._disconnect_exc is failure
     assert client._reconnect_task is None
     assert transport.is_closing()
-    assert client._writer_task is None or client._writer_task.done()
+    assert client._write_pump.task is None or client._write_pump.task.done()
     assert receipt.is_done()
     with pytest.raises(AssertionError, match="reader invariant"):
         await receipt.wait()

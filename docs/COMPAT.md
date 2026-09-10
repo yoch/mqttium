@@ -1,4 +1,3 @@
-# Moved
+# Experimental compatibility changes
 
-The Provisional Paho compatibility guide is at
-[paho-compatibility.md](paho-compatibility.md).
+See the [migration guide](migration.md) for the native-only experiment.

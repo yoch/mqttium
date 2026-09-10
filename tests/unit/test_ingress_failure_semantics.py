@@ -11,6 +11,8 @@ refuses silent reuse.
 
 from __future__ import annotations
 
+from tests.support import stored_record
+
 import asyncio
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -372,6 +374,7 @@ def _failing_client(
     policy = ReconnectPolicy(enabled=True, initial_delay=0.05, max_delay=0.05)
     client = AsyncClient(
         client_id="ingress-failure",
+        message_delivery="callback",
         store=store,
         reconnect=policy,
         clean_start=clean_start,
@@ -635,12 +638,12 @@ async def test_effect_failure_retires_before_close_completes() -> None:
     from mqttium.errors import NotConnectedError
 
     try:
-        with pytest.raises(NotConnectedError):
+        with pytest.raises(MQTTError):
             client.publish_nowait("failure/retire", b"y", qos=0)
         with pytest.raises(NotConnectedError):
             await client.subscribe("failure/retire")
-        with pytest.raises(NotConnectedError):
-            client._queue_qos0_on_loop("failure/retire", b"y", retain=False)
+        with pytest.raises(MQTTError):
+            client.publish_nowait("failure/retire", b"y", retain=False)
         assert len(client._engine.packet_ids) == mids_before
         # Exactly one legitimate new frame: the lot's own PUBREC handshake.
         # Nothing admitted afterwards may write or allocate. (The pending
@@ -712,7 +715,7 @@ async def test_no_admission_after_fail_stop() -> None:
     with pytest.raises(MQTTError, match="local terminal failure"):
         await client.publish_many([PublishMessage("failure/admission", b"z", qos=1)])
     with pytest.raises(MQTTError, match="local terminal failure"):
-        client._queue_qosn_on_loop("failure/admission", b"z", qos=QoS.AT_LEAST_ONCE, retain=False)
+        client.publish_nowait("failure/admission", b"z", qos=QoS.AT_LEAST_ONCE, retain=False)
     assert len(client._engine.packet_ids) == mids_before
     assert (
         sorted(
@@ -907,10 +910,9 @@ async def test_parked_publish_many_fails_after_fail_stop() -> None:
     assert isinstance(failed.value.__cause__, MQTTError)
     await asyncio.wait_for(disconnected.wait(), timeout=5.0)
     await asyncio.wait_for(first.wait(), timeout=5.0)
-    assert (
-        list(store.get_out(summary.mid) for page in store.out_summary_pages() for summary in page)
-        == []
-    )
+    remaining = [store.get_out(meta.mid) for page in store.out_summary_pages() for meta in page]
+    assert [record.topic for record in remaining] == ["failure/many-b1"]
+    assert failed.value.receipt.submitted == 1
     await asyncio.sleep(0.4)
     assert calls() == 1
     await client.disconnect()
@@ -926,13 +928,15 @@ async def test_connack_restore_failure_fails_fast_with_original_cause() -> None:
     store = _FailReplayStore()
     sentinel = OSError("restore failed")
     store.restore_error = sentinel
-    record = OutboundMessage(
-        mid=9,
-        topic="held/restore",
-        payload=b"x",
-        qos=QoS.AT_LEAST_ONCE,
-        retain=False,
-        state=OutboundQoSState.WAIT_PUBACK,
+    record = stored_record(
+        OutboundMessage(
+            mid=9,
+            topic="held/restore",
+            payload=b"x",
+            qos=QoS.AT_LEAST_ONCE,
+            retain=False,
+            state=OutboundQoSState.WAIT_PUBACK,
+        )
     )
     store.put_out(record)
     transport = _ManualBrokerTransport()
@@ -1082,13 +1086,15 @@ async def test_replay_continuation_failure_latches() -> None:
     store.page_error = sentinel
     for mid in range(1, 71):
         store.put_in(
-            InboundMessage(
-                mid=mid,
-                topic=f"failure/replay-{mid}",
-                payload=b"x",
-                qos=QoS.EXACTLY_ONCE,
-                retain=False,
-                state=InboundQoSState.WAIT_PUBREL,
+            stored_record(
+                InboundMessage(
+                    mid=mid,
+                    topic=f"failure/replay-{mid}",
+                    payload=b"x",
+                    qos=QoS.EXACTLY_ONCE,
+                    retain=False,
+                    state=InboundQoSState.WAIT_PUBREL,
+                )
             )
         )
     transport = _ManualBrokerTransport()
@@ -1185,23 +1191,27 @@ async def test_replay_failure_during_stable_after_stops_reconnect() -> None:
     store.fail_later_calls = True
     for mid in range(1, 71):
         store.put_in(
-            InboundMessage(
-                mid=mid,
-                topic=f"failure/stable-{mid}",
-                payload=b"x",
-                qos=QoS.EXACTLY_ONCE,
-                retain=False,
-                state=InboundQoSState.WAIT_PUBREL,
+            stored_record(
+                InboundMessage(
+                    mid=mid,
+                    topic=f"failure/stable-{mid}",
+                    payload=b"x",
+                    qos=QoS.EXACTLY_ONCE,
+                    retain=False,
+                    state=InboundQoSState.WAIT_PUBREL,
+                )
             )
         )
     store.put_out(
-        OutboundMessage(
-            mid=9,
-            topic="failure/stable-held",
-            payload=b"x",
-            qos=QoS.AT_LEAST_ONCE,
-            retain=False,
-            state=OutboundQoSState.WAIT_PUBACK,
+        stored_record(
+            OutboundMessage(
+                mid=9,
+                topic="failure/stable-held",
+                payload=b"x",
+                qos=QoS.AT_LEAST_ONCE,
+                retain=False,
+                state=OutboundQoSState.WAIT_PUBACK,
+            )
         )
     )
     first_transport = _ManualBrokerTransport()
@@ -1217,6 +1227,7 @@ async def test_replay_failure_during_stable_after_stops_reconnect() -> None:
         store=store,
         reconnect=policy,
         clean_start=False,
+        message_delivery="callback",
     )
     client.on_message = lambda message: received.append(message.payload)
     calls = 0

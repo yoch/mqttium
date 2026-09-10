@@ -1,29 +1,15 @@
-"""Engine configuration and the rules for changing it at runtime."""
+"""Immutable internal protocol configuration."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, fields, replace
-from typing import Any
+from dataclasses import dataclass, field
 
 from mqttium.enums import MQTTProtocolVersion
+from mqttium.errors import ProtocolError
 from mqttium.types import Message, Properties
 
-_RUNTIME_MUTABLE_ENGINE_CONFIG_FIELDS = frozenset(
-    {
-        "keepalive",
-        "username",
-        "password",
-        "will",
-        "will_properties",
-        "max_pending_outbound_messages",
-        "max_pending_outbound_bytes",
-        "max_pending_inbound_bytes",
-        "accept_auth",
-    }
-)
 
-
-@dataclass
+@dataclass(frozen=True)
 class EngineConfig:
     client_id: str = ""
     protocol: MQTTProtocolVersion = MQTTProtocolVersion.MQTTv311
@@ -52,7 +38,6 @@ class EngineConfig:
     # When False, inbound AUTH is rejected with DISCONNECT 0x82. AsyncClient
     # derives this capability from whether an auth_handler is registered.
     accept_auth: bool = False
-    _attached: bool = field(default=False, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.protocol not in (
@@ -84,24 +69,7 @@ class EngineConfig:
         if not 0 <= self.topic_alias_maximum <= 65535:
             raise ValueError("topic_alias_maximum must be between 0 and 65535")
 
-    def update(self, **changes: Any) -> None:
-        """Validate a candidate configuration, then commit its changed fields.
-
-        No mutation occurs when validation raises, including type errors. Once
-        attached to a ProtocolEngine, only fields without derived engine state
-        may be changed through this method.
-        """
-        known = {f.name for f in fields(self) if f.init}
-        unknown = set(changes) - known
-        if unknown:
-            raise AttributeError(f"unknown EngineConfig fields: {sorted(unknown)}")
-        if self._attached:
-            unsafe = set(changes) - _RUNTIME_MUTABLE_ENGINE_CONFIG_FIELDS
-            if unsafe:
-                raise AttributeError(
-                    "EngineConfig fields require a new ProtocolEngine once attached: "
-                    f"{sorted(unsafe)}"
-                )
-        candidate = replace(self, **changes)
-        for name in changes:
-            setattr(self, name, getattr(candidate, name))
+        if self.connect_properties is not None:
+            reserved = {"receive_maximum", "maximum_packet_size", "topic_alias_maximum"}
+            if reserved.intersection(self.connect_properties.values):
+                raise ProtocolError("CONNECT limits must use the dedicated constructor arguments")

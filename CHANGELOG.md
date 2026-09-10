@@ -6,6 +6,32 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Changed — lean native experiment
+
+- Incompatible experimental native API: explicit iterator/callback delivery;
+  message routes freeze permanently at the first connection attempt.
+- All message and connect/publish notifications use a bounded serial worker;
+  uniform delivery byte accounting and an optional whole-admission timeout
+  replace inline callbacks, shared fan-out and small-message special cases.
+- Progressive `publish_many()` retains a bounded receipt for the committed
+  prefix; cancellation seals it without rolling back admitted publications.
+- `Properties` and reconnect configuration are immutable, retry state belongs
+  to each client, authentication is configured at construction, and CONNECT
+  limits have one source.
+- SQLite schema 5 accepts fresh/current experimental databases only, preserving
+  rejected historical files. Individual admission rollback and durable
+  transitions remain; generic cross-backend batch atomicity is not promised.
+
+### Removed — lean native experiment
+
+- Paho façade, one-shot helpers, root `PacketType`, public extension guarantees,
+  legacy private client views, SQLite migrations and historical size backfill.
+- Delivery `auto`/`both`, `publish_backpressure`, `publish(nowait=...)`, batch
+  `chunk_size`/`nowait`/`failure_sink`, property mutators and `set_auth_handler()`.
+
+See [experimental migration](docs/migration.md). This branch is not a release.
+
+
 ### Changed
 
 - Receive cleartext TCP straight into the decoder's own storage on CPython selector event loops. `asyncio.BufferedProtocol.get_buffer()` returns a window carved out of `IncrementalDecoder`'s own slab, so received bytes are no longer copied through an intermediate receive buffer before reaching the parser. Storage is adaptive: it starts at 16 KiB, the receive window starts at 64 KiB and is promoted toward 256 KiB only under sustained full windows, a known large frame caps progressive growth at its exact extent without reserving the entire announced body, and an enlarged slab is retired once large frames stop arriving. TLS, WebSocket, Proactor, non-CPython runtimes and third-party event loops keep the `read()` + `feed()` path.

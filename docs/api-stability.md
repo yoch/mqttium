@@ -1,175 +1,83 @@
-# Public API stability policy
+# Native API contract for the lean experiment
 
-This document defines MQTTium's Stable public API and separates that contract
-from Provisional and Internal objects that remain importable in Python.
+This branch intentionally revises the pre-v1 Stable contract. It is an
+incompatible experiment, not a release or a deprecation bridge. The migration
+guide records the differences from `main@9ad1f018`; there are no compatibility
+wrappers for removed APIs.
 
-## Support tiers
-
-Python importability and `__all__` are not stability promises. `__all__` controls
-wildcard-import ergonomics only. Support is determined by the tables below.
-
-### Stable
-
-Stable names are the native user-facing contract. Incompatible changes to these
-names follow SemVer and the deprecation policy below.
+## Supported experimental surface
 
 | Entry point | Supported names |
 | --- | --- |
-| `mqttium` | `MQTTError`, `MalformedPacketError`, `ProtocolError`, `PacketTooLargeError`, `FlowControlError`, `MessageDeliveryError`, `NotConnectedError`, `MQTTTimeoutError`, `SessionDiscardedError`, `PublishBatchError`, `MQTTProtocolVersion`, `QoS`, `ConnectionState`, `__version__` |
-| `mqttium.api` | `AsyncClient`, `Message`, `Properties`, `PublishMessage`, `PublishReceipt`, `PublishBatchReceipt`, `SubscribeResult`, `UnsubscribeResult`, `SubscribeOptions`, `ConnAckPacket`, `AuthPacket`, `NegotiatedSettings`, `ReconnectPolicy`, `MessageDelivery`, `PublishBackpressure` |
-| `mqttium.helpers` | `publish`, `subscribe` |
+| `mqttium` | Operational `MQTTError` subclasses, `MQTTProtocolVersion`, `QoS`, `ConnectionState`, `__version__` |
+| `mqttium.api` | `AsyncClient`, `Message`, `Properties`, `PublishMessage`, `PublishReceipt`, `PublishBatchReceipt`, `SubscribeResult`, `UnsubscribeResult`, `SubscribeOptions`, `ConnAckPacket`, `AuthPacket`, `NegotiatedSettings`, `ReconnectPolicy`, `MessageDelivery`, `ClientStats` |
+| `mqttium.persistence` | `MemoryInflightStore`, `SqliteInflightStore` |
 
-`PacketType` remains available from `mqttium` for compatibility with the alpha
-series, but it is a low-level provisional enum rather than part of the stable
-native-client contract.
+The engine, codecs, packet plumbing, directional sessions, transport extension
+protocols, store implementation protocol and persistence records are Internal.
+Importability and `__all__` are not support promises. Packet models needed by
+the native API have their canonical imports in `mqttium.api`.
 
-### Provisional
+Paho, one-shot helpers and the root `PacketType` import are removed. The native
+client belongs to one event loop. Synchronous methods are loop-confined, not
+cross-thread entry points.
 
-Provisional APIs are supported and tested, but may gain fields or be revised in
-a future minor release with a changelog entry and migration guidance:
+## Client operations
 
-- `ClientStats` and its nested immutable snapshot dataclasses;
-- `mqttium.compat` and the documented Paho VERSION2 subset;
-- `mqttium.persistence.InflightStore` and the shipped persistence implementations;
-- `mqttium.transport` transport protocols and concrete transports. Receiving is
-  a capability, not part of the common contract: `AsyncTransport` covers write,
-  close and `is_closing`, while a transport offers exactly one of
-  `PullTransport` (`read()`) or `DecoderPushTransport` (`attach_decoder()` +
-  `receive()`). The two are mutually exclusive, so a structural check cannot
-  misclassify one as the other;
-- `mqttium.protocol.ProtocolEngine`, `EngineConfig`, `NegotiatedSettings`,
-  `ReconnectPolicy`, `FlowControl`, `PublishHandle`, `PublishFailure` and
-  `DisconnectInfo` for advanced integrations;
-- `mqttium.packets` typed packet views;
-- `mqttium.codec` framing and codec helpers.
+- Lifecycle: `connect`, `connect_unix`, `connect_ws`, `disconnect`.
+- Publication: `publish`, `publish_nowait`, `publish_many`.
+- Subscriptions: `subscribe`, `unsubscribe`.
+- Delivery: `messages`, `ack`, `message_callback_add`, `message_callback_remove`.
+- Authentication: `auth`, with `auth_handler` fixed at construction.
+- State and diagnostics: `state`, `is_connected`, `negotiated`,
+  `effective_client_id`, `stats`.
+- Notifications: `on_connect`, `on_disconnect`, `on_message`, `on_publish`.
 
-A Provisional designation is not permission for silent breakage. An incompatible
-change still requires a changelog entry and migration guidance. The persistence
-contract is one complete `InflightStore` interface: bounded replay and conditional
-metadata transitions are required capabilities, not optional runtime-detected
-extensions.
+`message_delivery` is explicitly `"iterator"` (default) or `"callback"`.
+`on_message` and the topic route registry are permanently frozen at the first
+connection attempt, including an unsuccessful attempt. Later changes raise
+`MQTTError`; use another client instance to install another route configuration.
+MQTT subscriptions remain independent and can change while connected.
 
-### Internal
+Matched callbacks run in registration order instead of the `on_message`
+fallback. Replacing a filter before connection keeps its position. Every
+message is one worker job even when several filters match. Each callback failure
+is isolated so subsequent matches can still run.
 
-Internal objects have no compatibility guarantee even when an implementation
-module makes them importable:
+Declare synchronous callbacks with `def` and asynchronous callbacks with
+`async def`; a synchronous function returning an awaitable is reported as a
+callback `TypeError`. Message callbacks and `on_connect`/`on_publish`
+notifications run in the bounded worker. `on_disconnect` remains awaited by
+teardown outside locks. Authentication is awaited with `auth_timeout` because
+its result participates in the protocol exchange.
 
-- `InboundSession` and `OutboundSession`;
-- `EffectPump` and `WritePump`;
-- delivery reservations, callback jobs and queue item wrappers;
-- persistence records and transition helpers not exported by
-  `mqttium.persistence`;
-- `EngineEffect`, `EffectKind`, `PacketIdPool`, `WriteItem`, `item_size` and
-  batching/segmentation constants;
-- any name beginning with `_`;
-- direct imports from implementation modules such as `mqttium.api._writer` or
-  `mqttium.transport.writes`.
+## Admission and ownership
 
-These names may change when correctness, memory bounds or measured performance
-requires it. Their presence in a module namespace or historical `__all__` does
-not make them supported.
+`publish()` waits for admission and bounded effect transfer. `publish_nowait()`
+refuses before mutation when immediate transfer is unavailable. Cancelling a
+publication call before commitment admits nothing; after commitment the
+publication may remain active. Cancelling `receipt.wait()` affects only that
+waiter, not the MQTT exchange or other waiters.
 
-## Native async client contract
+`publish_many()` admits in input order, one publication at a time. A failed
+submission exposes its committed prefix through `PublishBatchError.receipt`.
+Cancellation leaves that prefix active and seals its aggregate receipt. Failure
+details have a finite configured limit, default 128, while totals stay exact.
 
-The stable `AsyncClient` surface is:
+`Properties` owns an immutable copy of its input mapping, repeated values and
+binary data. `ReconnectPolicy` is immutable configuration; each client owns its
+retry progression. CONNECT limits use dedicated constructor arguments, never
+precedence between duplicate property keys and arguments.
 
-- lifecycle: `connect`, `connect_unix`, `connect_ws`, `disconnect`;
-- publication: `publish`, `publish_nowait`, `publish_many`;
-- subscriptions: `subscribe`, `unsubscribe`;
-- inbound delivery: `messages`, `ack`, `message_callback_add`,
-  `message_callback_remove`;
-- MQTT 5 authentication: `auth`, `set_auth_handler`;
-- state: `state`, `is_connected`, `negotiated`, `effective_client_id`;
-- diagnostics: `stats` and the immutable `ClientStats` tree;
-- callbacks: `on_connect`, `on_disconnect`, `on_message`, `on_publish`,
-  `auth_handler`, and topic-filtered callbacks registered with
-  `message_callback_add`.
+## Resource and documentation contracts
 
-Callback form is part of that contract: declare synchronous callbacks with
-`def` and asynchronous callbacks with `async def`. A synchronous callable must
-not dynamically return an awaitable; MQTTium reports that as a callback
-`TypeError` instead of scheduling hidden continuation work.
+Protocol, writer, ingress and delivery budgets represent different lifetimes.
+Their bounds remain independent. `delivery_timeout=None` waits for application
+capacity without a deadline; a positive value covers the entire byte-and-queue
+admission with one deadline. A message that cannot ever fit fails immediately.
 
-`publish_nowait()` and `stats()` are synchronous but loop-confined. They are not
-cross-thread APIs. Threaded migration code should use
-`mqttium.compat.paho.Client`.
-
-Constructor keyword arguments are part of the native contract. New optional
-keywords may be added compatibly. Existing Stable defaults will not change
-without the SemVer and deprecation process below.
-
-`EngineConfig.local_receive_maximum` intentionally defaults to `65535`, while
-`AsyncClient.local_receive_maximum` defaults to `100`. The engine default is the
-protocol maximum for advanced direct-engine consumers; the client default is a
-bounded application-facing inbound concurrency window. Aligning them would
-silently change memory and backpressure behaviour, so both defaults are part of
-the supported contract.
-
-`tests/project/test_public_api_surface.py` is the executable contract for the
-canonical Stable exports, the retained alpha `PacketType` root import, all
-supported constructor keywords and defaults, and the parameter lists of Stable
-`AsyncClient` methods. Update the policy, changelog and migration guide before
-intentionally changing that snapshot.
-
-## Canonical imports
-
-Use the supported entry points rather than implementation-module paths:
-
-```python
-from mqttium import FlowControlError, MQTTProtocolVersion, QoS
-from mqttium.api import (
-    AsyncClient,
-    Message,
-    Properties,
-    ReconnectPolicy,
-    SubscribeOptions,
-)
-```
-
-Existing alpha import paths remain importable. This policy does not remove or
-deprecate them; it defines which paths new external code should depend on.
-
-## Statistics compatibility
-
-`ClientStats` and its nested frozen dataclasses are immutable point-in-time
-snapshots. Existing fields retain their meaning within the Provisional tier. New
-fields may be added in minor releases. High-water fields cover the client or
-engine lifetime; calling `stats()` does not start sampling, reset counters, or
-emit logs.
-
-The snapshot is diagnostic rather than transactional: related counters are read
-consecutively on the owning loop and represent one practically consistent view,
-not a lock-free cross-thread atomic transaction.
-
-Each section is produced by the component that owns the state, and `stats()`
-only assembles them. Use `ClientStats.outbound` and `ClientStats.inbound` for
-directional protocol state; historical field migrations are recorded in the
-changelog.
-
-## Compatibility façade
-
-`mqttium.compat` follows the narrower Provisional policy in
-[`paho-compatibility.md`](paho-compatibility.md). Only Paho callback API VERSION2 is targeted.
-Unsupported Paho behaviour is not promised merely because Paho exposes a
-similarly named attribute. The facade is a migration tool, not a performance-
-parity promise or a second native API.
-
-## Deprecation policy
-
-For Stable names:
-
-1. a replacement is documented first;
-2. the old surface remains available for at least one minor release when
-   technically possible;
-3. removal occurs only in a major release;
-4. correctness or security fixes may tighten invalid behaviour immediately,
-   with the behavioural change documented.
-
-Internal names have no deprecation guarantee.
-
-## Change-control gate
-
-The executable public-surface test protects canonical exports, constructor
-keywords and defaults, and Stable method parameters. A deliberate change must
-update that test, this policy, the changelog, and migration guidance in the same
-change. Release evidence must also satisfy [`stability.md`](stability.md).
+Statistics are immutable diagnostic snapshots. Counters for removed internal
+optimizations are removed with those mechanisms. `tests/project/test_public_api_surface.py`
+records the experimental names, signatures and defaults. Intentional changes
+update that test, maintained documentation, changelog and migration guidance.
+Historical reports remain evidence of the commits they describe.

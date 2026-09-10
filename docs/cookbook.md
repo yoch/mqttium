@@ -56,7 +56,7 @@ from mqttium import FlowControlError
 
 async def offer_sample(client, sample: bytes) -> bool:
     try:
-        await client.publish("telemetry", sample, qos=1, nowait=True)
+        client.publish_nowait("telemetry", sample, qos=1)
     except FlowControlError:
         return False
     return True
@@ -77,13 +77,14 @@ async def publish_batch(client, samples) -> None:
             PublishMessage("telemetry", sample, qos=1)
             for sample in samples
         ),
-        chunk_size=256,
     )
     await receipt.wait()
 ```
 
-Use `failure_sink` when every individual batch failure must be retained outside
-the receipt's bounded detail set.
+`max_failure_details` bounds retained error objects (default 128, optionally
+zero). Failure counts remain exact. An ordinary admission or generator error
+raises `PublishBatchError` carrying the committed prefix receipt. Cancellation
+propagates and seals the aggregate; committed publications remain active.
 
 ## Manual acknowledgement after durable work
 

@@ -12,6 +12,8 @@ for what is and is not covered.
 
 from __future__ import annotations
 
+from tests.support import stored_record
+
 import json
 import re
 from pathlib import Path
@@ -76,7 +78,7 @@ def test_mqtt_3_3_4_6_outbound_publish_rejects_a_subscription_identifier() -> No
     rather than on the packet type.
     """
     properties = Properties()
-    properties.set("subscription_identifier", 7)
+    properties = Properties({**properties.values, "subscription_identifier": 7})
 
     for qos in (QoS.AT_MOST_ONCE, QoS.AT_LEAST_ONCE, QoS.EXACTLY_ONCE):
         engine = _connected()
@@ -95,7 +97,7 @@ def test_inbound_publish_still_carries_a_subscription_identifier() -> None:
     subscription identifier must be delivered to the application untouched."""
     engine = _connected()
     properties = Properties()
-    properties.set("subscription_identifier", 7)
+    properties = Properties({**properties.values, "subscription_identifier": 7})
     _feed(
         engine,
         PublishPacket(
@@ -116,7 +118,7 @@ def test_inbound_publish_still_carries_a_subscription_identifier() -> None:
     ]
     assert len(messages) == 1
     assert messages[0].properties is not None
-    assert messages[0].properties.get("subscription_identifier") == [7]
+    assert messages[0].properties.get("subscription_identifier") == (7,)
 
 
 def test_mqtt_3_8_3_2_subscribe_requires_at_least_one_filter() -> None:
@@ -324,13 +326,15 @@ def test_clean_start_does_not_replay_stale_local_session_state() -> None:
     """Local records cannot override the clean session requested on the wire."""
     store = MemoryInflightStore()
     store.put_out(
-        OutboundMessage(
-            mid=1,
-            topic="t",
-            payload=b"x",
-            qos=QoS.EXACTLY_ONCE,
-            retain=False,
-            state=OutboundQoSState.WAIT_PUBCOMP,
+        stored_record(
+            OutboundMessage(
+                mid=1,
+                topic="t",
+                payload=b"x",
+                qos=QoS.EXACTLY_ONCE,
+                retain=False,
+                state=OutboundQoSState.WAIT_PUBCOMP,
+            )
         )
     )
     engine = ProtocolEngine(
@@ -361,7 +365,7 @@ def test_mqtt_3_3_2_8_topic_alias_zero_is_refused() -> None:
     Alias which has the value 0."""
     engine = _connected()
     properties = Properties()
-    properties.set("topic_alias", 0)
+    properties = Properties({**properties.values, "topic_alias": 0})
     with pytest.raises(ProtocolError):
         engine.queue_publish("t/x", b"v", qos=QoS.AT_MOST_ONCE, properties=properties)
 
@@ -377,7 +381,7 @@ def test_mqtt_3_15_1_1_auth_reserved_flags_are_validated() -> None:
     """[MQTT-3.15.1-1] Bits 3,2,1 and 0 of the Fixed Header of the AUTH packet
     are reserved and MUST all be set to 0."""
     properties = Properties()
-    properties.set("authentication_method", "M")
+    properties = Properties({**properties.values, "authentication_method": "M"})
     engine = ProtocolEngine(
         EngineConfig(
             client_id="c",
@@ -442,7 +446,9 @@ def test_mqtt5_disconnect_cannot_extend_a_session_that_was_never_durable(
     connect_properties = None
     if connect_expiry is not None:
         connect_properties = Properties()
-        connect_properties.set("session_expiry_interval", connect_expiry)
+        connect_properties = Properties(
+            {**connect_properties.values, "session_expiry_interval": connect_expiry}
+        )
 
     engine = ProtocolEngine(
         EngineConfig(
@@ -457,7 +463,9 @@ def test_mqtt5_disconnect_cannot_extend_a_session_that_was_never_durable(
     engine.take_effects()
 
     disconnect_properties = Properties()
-    disconnect_properties.set("session_expiry_interval", disconnect_expiry)
+    disconnect_properties = Properties(
+        {**disconnect_properties.values, "session_expiry_interval": disconnect_expiry}
+    )
     if allowed:
         assert engine.begin_disconnect(properties=disconnect_properties)
     else:
@@ -483,7 +491,9 @@ def test_disconnect_uses_the_session_expiry_actually_sent_on_connect(
         MemoryInflightStore(),
     )
     engine.begin_connect()
-    connect_properties.set("session_expiry_interval", mutated_expiry)
+    connect_properties = Properties(
+        {**connect_properties.values, "session_expiry_interval": mutated_expiry}
+    )
     _feed(engine, encode_frame(PacketType.CONNACK, 0, b"\x00\x00\x00"))
     engine.take_effects()
 
@@ -526,13 +536,15 @@ def test_mqtt_4_3_3_6_replay_sends_pubrel_not_publish() -> None:
     corresponding PUBREL packet."""
     store = MemoryInflightStore()
     store.put_out(
-        OutboundMessage(
-            mid=4,
-            topic="t",
-            payload=b"x",
-            qos=QoS.EXACTLY_ONCE,
-            retain=False,
-            state=OutboundQoSState.WAIT_PUBCOMP,
+        stored_record(
+            OutboundMessage(
+                mid=4,
+                topic="t",
+                payload=b"x",
+                qos=QoS.EXACTLY_ONCE,
+                retain=False,
+                state=OutboundQoSState.WAIT_PUBCOMP,
+            )
         )
     )
     engine = ProtocolEngine(
@@ -611,7 +623,7 @@ def test_mqtt_4_8_2_2_share_name_rules(topic_filter: str, legal: bool) -> None:
 
 def _auth_engine(*, connected: bool) -> ProtocolEngine:
     connect_properties = Properties()
-    connect_properties.set("authentication_method", "M")
+    connect_properties = Properties({**connect_properties.values, "authentication_method": "M"})
     engine = ProtocolEngine(
         EngineConfig(
             client_id="c",

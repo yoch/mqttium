@@ -181,65 +181,61 @@ Logical outbound size is payload bytes plus encoded topic and properties. The
 admission sequence is validation, size calculation, reservation, packet-ID
 allocation, store mutation, and effect emission.
 
-Every failure path reverses acquisitions in the opposite order. A transactional
-batch restores the counter snapshot as one unit because the store may already
-have rolled back individual rows.
+Every unit failure reverses acquisitions through outbound rollback. Batch
+publication commits elements progressively and preserves its committed prefix
+on errors or cancellation; there are no chunk snapshots.
 
 Writer, outbound inflight, inbound persistence, ingress, and application
 delivery budgets are independent. Do not reuse one counter as a proxy for
 another lifetime. `max_outbound_messages` bounds writer-resident admitted
 frames, including the writer's active batch, not only `queue.qsize()`.
 
-`can_ever_admit_publish()` considers configured limits, not current occupancy.
+`outbound.can_ever_admit()` considers configured limits, not current occupancy.
 It distinguishes work that should wait from work that can never fit.
 
 ## Application delivery
 
-`ApplicationDelivery` is the only owner of callback and iterator queues,
-delivery bytes, user-worker state, and delivery counters. A message routed to
-multiple consumers is charged once and released after the final reference.
+`ApplicationDelivery` owns delivery queues, byte reservations and one serial
+callback worker. Iterator (default) and callback are exclusive. Each message
+has one byte charge and one queue job; matching routes run in registration
+order within that job and release bytes after all routes finish. Queue capacity
+bounds waiting jobs, with at most one active worker job. A producer waiting for
+a queue slot retains its byte reservation under the same byte budget.
 
-The small-message reserve prevents one large payload from starving telemetry.
-It is disabled when it would make a single otherwise valid packet impossible to
-admit.
+There are no inline user notifications or physical callback batches.
+`on_connect`, `on_publish` and messages use the worker. `on_disconnect` and
+authentication remain directly awaited outside critical sections. Callback
+errors are isolated; real task cancellation propagates. Shutdown from the
+worker never joins itself.
 
-User callbacks run outside engine critical sections. When callback delivery is
-idle, a plain synchronous `on_publish` or eligible `on_message` callback may run
-in the reader/effect-drain turn. A reentrancy guard sends callback-initiated
-delivery, async callbacks, and occupied-queue bursts through the bounded worker.
-Exceptions are isolated and reported through the established callback policy;
-they do not stop the protocol reader or leak delivery capacity. Consecutive
-small MESSAGE effects that require no persisted delivery mark (QoS 0 and fresh
-automatic QoS 1) may be applied during the inline effect drain. Persisted QoS 1,
-QoS 2 and replay deliveries keep the established awaited path and are marked
-only after application delivery accepts them.
+`delivery_timeout=None` has no deadline. A positive timeout covers both byte
+reservation and queue insertion with one deadline. Timeout or an impossible
+message raises `MessageDeliveryError`, releases acquired credits and leaves
+persisted delivery state unmarked. A delivered mark denotes queue acceptance,
+not completed application processing.
 
-Topic-filtered callbacks are an `AsyncClient` concern. `TopicMatcher` selects
-application callbacks after the engine has already emitted MESSAGE effects; the
-protocol layer never sees filters or user callables. The matcher exists only
-while at least one filter is registered. Inbound delivery consults an installed
-`_message_callback` pointer (`on_message`, the topic router, or `None`) so the
-unused-filter path has no matcher branch.
+Topic routing belongs exclusively to `AsyncClient`. The fallback and routes
+freeze on the first connection attempt, permanently for the instance. MQTT
+subscriptions remain mutable. Waiting for capacity or ACKs from a saturated
+worker can create a circular dependency; use nonblocking publication or a
+separate bounded producer as shown in the migration guide.
 
 ## Persistence
 
 Store transitions accept both expected and new states. A mismatch is a protocol
 or concurrency error, not a request to overwrite newer state.
 
-SQLite migrations are atomic and schema-versioned. Unknown newer schemas are
-rejected. Metadata-only acknowledgement must not read payload BLOBs.
+SQLite schema 5 accepts only fresh databases and that exact format. Historical,
+future and inconsistent schemas are refused before write-affecting operations. Metadata-only acknowledgement must not read payload BLOBs.
 
 Paged replay preserves insertion order without duplicates or resurrection. A
 page may be shorter when records were acknowledged after the ordered snapshot;
 callers must continue until the iterator ends rather than assuming fixed page
 length.
 
-The built-in memory store's eager ``out_items()`` and ``in_items()`` iterators
-snapshot membership when they are created, while retaining references to the
-record objects rather than deep-copying them. Paged iterators in both built-in
-stores snapshot ordered identifiers when iteration starts and look up each page
-when it is consumed, so records deleted before that lookup are omitted. Runtime
-replay uses the paged interface for both built-in stores.
+Paged iterators in both stores snapshot ordered identifiers when iteration
+starts and look up each page as it is consumed. Records deleted before that
+lookup are omitted. Runtime replay uses this internal interface.
 
 ## Failure semantics
 
@@ -289,11 +285,9 @@ Covered by `tests/unit/test_ingress_failure_semantics.py`.
 
 ## API completion and errors
 
-- QoS 0 receipts complete at writer admission. When callback capacity is
-  immediately available, an idle synchronous `on_publish` may run inline;
-  otherwise it is admitted to the isolated bounded worker in the same loop
-  turn. A batch must preflight every callback before any direct writer
-  admission.
+- QoS 0 receipts complete at writer admission. `on_publish` uses the bounded
+  worker. `publish_nowait()` preflights immediate writer and callback capacity;
+  asynchronous publication waits for bounded transfer.
 - QoS 1 receipts complete at PUBACK.
 - QoS 2 receipts complete at PUBCOMP.
 - SUBACK and UNSUBACK return all per-filter reason codes; a reason code at or
@@ -313,7 +307,7 @@ as well as the successful path. The minimum relevant matrix includes:
 - reconnect with `session_present` both true and false;
 - memory and SQLite stores, including injected rollback failures;
 - bounded and immediate-refusal admission;
-- callback, iterator, and combined delivery;
+- exclusive callback and iterator delivery;
 - cancellation and shutdown with blocked producers;
 - malformed properties, topics, filters, and aliases.
 

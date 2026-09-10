@@ -129,7 +129,7 @@ def test_session_loss_with_blocked_replay_queue() -> None:
     longer owns.
     """
     connect_props = Properties()
-    connect_props.set("session_expiry_interval", 60)
+    connect_props = Properties({**connect_props.values, "session_expiry_interval": 60})
     engine = ProtocolEngine(
         EngineConfig(
             client_id="c1",

@@ -316,22 +316,22 @@ def _encode_properties_uncached(props: Properties, packet: str) -> bytes:
         if packet not in spec.packets:
             raise ProtocolError(f"Property {name!r} not allowed on {packet}")
 
-        values: list[Any]
+        values: list[Any] | tuple[Any, ...]
         if spec.multiple:
             if spec.subscribe_singleton and packet == SUBSCRIBE:
                 # SUBSCRIBE: single value only (guide §2).
-                if isinstance(value, list):
+                if isinstance(value, (list, tuple)):
                     if len(value) != 1:
                         raise ProtocolError("SUBSCRIBE allows one subscription_identifier")
                     values = value
                 else:
                     values = [value]
-            elif isinstance(value, list):
+            elif isinstance(value, (list, tuple)):
                 values = value
             else:
                 values = [value]
         else:
-            if isinstance(value, list):
+            if isinstance(value, (list, tuple)):
                 raise ProtocolError(f"Property {name!r} is not repeatable")
             values = [value]
 
@@ -349,28 +349,16 @@ def _encode_properties_uncached(props: Properties, packet: str) -> bytes:
 
 
 def encode_properties(props: Properties | None, packet: str) -> bytes:
-    """Encode a property bag for *packet* (including WILL context).
-
-    Empty / None → single ``0x00`` length byte (fast path). Non-empty results
-    are cached by packet context and a structural value signature, so repeated
-    sizing/encoding reuses bytes even when callers mutate ``props.values``
-    directly between calls.
-    """
-    if not props or not props.values:
+    """Encode immutable properties, caching by packet context."""
+    if not props:
         return b"\x00"
-
-    signature = props._signature()
     cache = props._encoded
     if cache is None:
-        cache = props._encoded = {}
-    else:
-        cached = cache.get(packet)
-        if cached is not None and cached[0] == signature:
-            return cached[1]
-
-    encoded = _encode_properties_uncached(props, packet)
-    cache[packet] = (signature, encoded)
-    return encoded
+        cache = {}
+        object.__setattr__(props, "_encoded", cache)
+    if packet not in cache:
+        cache[packet] = _encode_properties_uncached(props, packet)
+    return cache[packet]
 
 
 def decode_properties(
@@ -392,10 +380,7 @@ def decode_properties(
     if end > len(buf):
         raise MalformedPacketError("Properties length exceeds remaining data")
 
-    result = Properties()
-    # `result.values` is the seen-set: every branch below that records a name
-    # also inserts it there, so a separate set would track the same keys.
-    seen = result.values
+    seen: dict[str, Any] = {}
     while pos < end:
         prop_id = buf[pos]
         pos += 1
@@ -416,15 +401,15 @@ def decode_properties(
             if spec.subscribe_singleton and packet == SUBSCRIBE:
                 if spec.name in seen:
                     raise MalformedPacketError("Duplicate subscription_identifier on SUBSCRIBE")
-                result.set(spec.name, value)
+                seen[spec.name] = value
             else:
                 items = seen.setdefault(spec.name, [])
                 items.append(value)
         else:
             if spec.name in seen:
                 raise MalformedPacketError(f"Duplicate property {spec.name}")
-            result.set(spec.name, value)
+            seen[spec.name] = value
 
     if pos != end:
         raise MalformedPacketError("Properties length does not match consumed bytes")
-    return result, end
+    return Properties(seen), end

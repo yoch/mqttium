@@ -13,7 +13,7 @@ from mqttium.protocol.config import EngineConfig
 from mqttium.protocol.effects import EffectKind
 from mqttium.protocol.engine import ProtocolEngine
 from mqttium.protocol.negotiated import NegotiatedSettings
-from mqttium.protocol.reconnect import ReconnectPolicy
+from mqttium.protocol.reconnect import ReconnectPolicy, _ReconnectState
 from mqttium.types import Properties
 from tests.support import QueueTransport, feed_engine
 
@@ -196,13 +196,13 @@ def test_request_problem_information_zero_rejects_suback_without_settling() -> N
 )
 def test_reconnect_stops_on_permanent_v5_connack_refusals(reason_code: int) -> None:
     policy = ReconnectPolicy(enabled=True)
-    assert not policy.should_retry(reason_code, MQTTProtocolVersion.MQTTv5)
+    assert not _ReconnectState(policy).should_retry(reason_code, MQTTProtocolVersion.MQTTv5)
 
 
 @pytest.mark.parametrize("reason_code", [0x80, 0x83, 0x88, 0x89, 0x97, 0x9F])
 def test_reconnect_keeps_transient_v5_failures_retryable(reason_code: int) -> None:
     policy = ReconnectPolicy(enabled=True)
-    assert policy.should_retry(reason_code, MQTTProtocolVersion.MQTTv5)
+    assert _ReconnectState(policy).should_retry(reason_code, MQTTProtocolVersion.MQTTv5)
 
 
 class _OrderedCloseTransport(QueueTransport):
@@ -233,8 +233,8 @@ async def test_local_protocol_disconnect_writes_before_transport_close() -> None
 
     try:
         client._engine._protocol_disconnect(0x82)
-        client._collect_effects_locked()
-        await client._drain_effects()
+        client._effect_pump.collect_from_engine()
+        await client._effect_pump.drain()
 
         assert transport.events == [
             ("write", encode_disconnect(0x82, MQTTProtocolVersion.MQTTv5)),

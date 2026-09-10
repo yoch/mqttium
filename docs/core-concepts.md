@@ -10,9 +10,8 @@ important than memorising individual methods.
 publish, consume, and disconnect it from that loop. The native client does not
 start a background thread.
 
-Existing synchronous Paho applications can use the Provisional compatibility
-facade, which deliberately owns a separate thread and loop. New async code
-should not use that extra boundary.
+Applications own any cross-thread handoff into the native event loop. Such a
+handoff needs its own resource bounds.
 
 ## Admission and completion are different
 
@@ -40,7 +39,7 @@ application delivery. Each has a count or byte bound appropriate to its
 lifetime. This avoids one misleading “queue size” setting and makes pressure
 visible in `client.stats()`.
 
-The default publish policy waits for capacity. Immediate modes raise
+The default publish policy waits for capacity. `publish_nowait()` raises
 `FlowControlError` before a packet identifier or persistent record is committed.
 Disabling a bound with `None` transfers responsibility for that resource to the
 application.
@@ -70,7 +69,7 @@ old inflight exchanges safely and fails them explicitly. See
 
 ## Application delivery is bounded too
 
-Messages can be delivered through an async iterator, a callback, or both. Slow
+Messages can be delivered through an async iterator (default) or callbacks. Slow
 application code consumes delivery capacity and eventually propagates pressure
 instead of growing memory without limit.
 
