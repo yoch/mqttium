@@ -8,6 +8,10 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed — lean native experiment
 
+- Bind manual acknowledgement handles to their active inbound exchange, so
+  a stale or foreign message cannot acknowledge a reused packet identifier.
+  Handles remain valid when a reconnect resumes the same logical session.
+
 - Validate SQLite format in one WAL-aware read transaction without manual
   database/WAL copies or their final-close race. Normal SQLite journal recovery
   and checkpointing may change physical files on a refused open.

@@ -1303,6 +1303,10 @@ class AsyncClient:
         """Acknowledge an inbound QoS>0 message when ``manual_ack=True``.
 
         Defers PUBACK (QoS 1) or PUBCOMP (QoS 2). PUBREC is always immediate.
+        The handle identifies its logical exchange, even after a transport
+        reconnect resumes the same session. It cannot acknowledge a later
+        exchange that reuses the packet identifier. Repeated acknowledgements
+        are accepted while completion is pending, then rejected after completion.
 
         Args:
             message: Message previously delivered by this client's current
@@ -1311,8 +1315,8 @@ class AsyncClient:
         Raises:
             NotConnectedError: If a message with a packet identifier is
                 acknowledged without an active connection.
-            ProtocolError: If manual acknowledgement is disabled or the packet
-                identifier is not awaiting application acknowledgement.
+            ProtocolError: If manual acknowledgement is disabled, or the handle
+                is foreign, reconstructed, stale, or no longer awaiting completion.
             PacketTooLargeError: If the broker's negotiated packet limit cannot
                 carry the mandatory acknowledgement. The connection is closed.
             asyncio.CancelledError: If the caller is cancelled while effects are
@@ -1323,7 +1327,7 @@ class AsyncClient:
             return
         try:
             async with self._engine_lock:
-                self._engine.ack(message.mid)
+                self._engine.ack(message.mid, message=message)
                 self._effect_pump.collect_from_engine()
         except PacketTooLargeError as exc:
             # A broker limit below the mandatory ACK size makes this QoS

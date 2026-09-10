@@ -212,6 +212,18 @@ With `manual_ack=True`, inbound QoS 1 acknowledgement and the final QoS 2
 acknowledgement wait for `await client.ack(message)`. This lets an application
 align MQTT acknowledgement with its own durable operation.
 
+Pass the delivered `Message` itself. Its private handle identifies the client
+and active logical exchange, not just the reusable packet identifier. Duplicate
+deliveries of that exchange share the identity. Reconstructed, foreign and
+completed handles raise `ProtocolError`; an already requested acknowledgement
+may be repeated while its exchange still awaits ordered completion or PUBREL.
+
+A transport reconnect, automatic or explicit, preserves handles when CONNACK
+resumes the same session. A replacement session invalidates them. Process/store
+recovery creates fresh handles on redelivery; the identities are not persisted.
+Only active manual exchanges occupy the identity index, and auto acknowledgement
+does not allocate that index. QoS 0 acknowledgement remains a no-op.
+
 It does not create exactly-once business processing. A crash can occur after
 the business transaction commits but before the acknowledgement reaches the
 broker. The broker may then redeliver. Use an application key, transaction or

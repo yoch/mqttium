@@ -46,7 +46,7 @@ from mqttium.protocol.outbound import OutboundSession
 from mqttium.protocol.packet_ids import PacketIdPool
 from mqttium.topics import validate_publish_topic, validate_subscribe_filter
 from mqttium.transport.writes import WriteItem, item_size
-from mqttium.types import Properties
+from mqttium.types import Message, Properties
 from mqttium.errors import (
     MalformedPacketError,
     MandatoryResponseTooLargeError,
@@ -724,11 +724,11 @@ class ProtocolEngine:
     def mark_inbound_delivered(self, mid: int) -> None:
         self.inbound.mark_delivered(mid)
 
-    def ack(self, mid: int) -> None:
+    def ack(self, mid: int, *, message: Message | None = None) -> None:
         """Complete a deferred inbound ACK in manual-ack mode."""
         if self.state is not ConnectionState.CONNECTED:
             raise NotConnectedError("ack requires an active connection")
-        self.inbound.ack(mid)
+        self.inbound.ack(mid, message=message)
 
     def _on_suback(self, raw: RawPacket) -> None:
         mid, reason_codes, properties = self.codec.decode_suback(raw.remaining)

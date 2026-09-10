@@ -84,6 +84,7 @@ class Message:
     dup: bool = False
     mid: int | None = None
     properties: Properties | None = None
+    _ack_token: object | None = field(default=None, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "payload", _owned_payload(self.payload))
