@@ -1,0 +1,120 @@
+name: Uniform RC14 hosted stability screening
+run-name: "Uniform RC14 6x5s A/A + A/B stability"
+
+on:
+  push:
+    branches: [bench/uniform-rc14-stability-fb619a27]
+    paths: [.github/workflows/uniform-rc14-stability.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: uniform-rc14-hosted-stability
+  cancel-in-progress: false
+
+env:
+  BASE_SHA: c194597bcf5af4951fbec2b560600eef3cb84b3c
+  CANDIDATE_SHA: fb619a27b866c5db869508e6a226db0080e668c7
+  PYTHONUNBUFFERED: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  screen:
+    if: github.repository == 'yoch/mqttium' && github.ref == 'refs/heads/bench/uniform-rc14-stability-fb619a27'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          path: tooling
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.BASE_SHA }}
+          path: slot-a
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.BASE_SHA }}
+          path: slot-c
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+          path: slot-b
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.13.5'
+      - name: Install broker and freeze source identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y mosquitto
+          for s in slot-a slot-b slot-c; do test -z "$(git -C "$s" status --porcelain --untracked-files=no)"; done
+          test "$(git -C slot-a rev-parse HEAD)" = "$BASE_SHA"
+          test "$(git -C slot-c rev-parse HEAD)" = "$BASE_SHA"
+          test "$(git -C slot-b rev-parse HEAD)" = "$CANDIDATE_SHA"
+          echo "JOB_ROOT=$RUNNER_TEMP/uniform-rc14-stability-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+      - name: Run six paired 5s A/A then A/B cells
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$JOB_ROOT/results"
+          read -r client_cpu broker_cpu < <(python - <<'PY'
+          import os
+          cpus=sorted(os.sched_getaffinity(0))
+          assert len(cpus)>=2,cpus
+          print(cpus[0],cpus[1])
+          PY
+          )
+          port=$(python -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+          cat > "$JOB_ROOT/results/mosquitto.conf" <<EOF
+          listener $port 127.0.0.1
+          protocol mqtt
+          set_tcp_nodelay true
+          allow_anonymous true
+          persistence false
+          connection_messages false
+          log_dest stdout
+          log_type error
+          max_inflight_messages 1000
+          max_queued_messages 10000
+          EOF
+          taskset -c "$broker_cpu" mosquitto -c "$JOB_ROOT/results/mosquitto.conf" > "$JOB_ROOT/results/mosquitto.log" 2>&1 &
+          broker_pid=$!
+          cleanup() { kill "$broker_pid" 2>/dev/null || true; wait "$broker_pid" 2>/dev/null || true; }
+          trap cleanup EXIT
+          for _ in $(seq 1 50); do
+            kill -0 "$broker_pid" 2>/dev/null || { cat "$JOB_ROOT/results/mosquitto.log"; exit 1; }
+            if (echo > "/dev/tcp/127.0.0.1/$port") >/dev/null 2>&1; then break; fi
+            sleep 0.1
+          done
+          (echo > "/dev/tcp/127.0.0.1/$port") >/dev/null 2>&1
+          python tooling/benchmarks/uniform_callback_probe.py \
+            --base "$PWD/slot-a" --control "$PWD/slot-c" --candidate "$PWD/slot-b" \
+            --output "$JOB_ROOT/results/samples" --port "$port" --cpu "$client_cpu" \
+            --seconds 5 --pairs 6 | tee "$JOB_ROOT/results/progress.log"
+          python - <<'PY' > "$JOB_ROOT/results/provenance.json"
+          import hashlib,json,os,platform,subprocess
+          from pathlib import Path
+          files=['src/mqttium/api/_delivery.py','src/mqttium/api/async_client.py','src/mqttium/api/_effects.py']
+          out={'run':os.environ['GITHUB_RUN_ID'],'tooling':os.environ['GITHUB_SHA'],'python':platform.python_version(),'sources':{}}
+          for slot,expected in [('slot-a',os.environ['BASE_SHA']),('slot-c',os.environ['BASE_SHA']),('slot-b',os.environ['CANDIDATE_SHA'])]:
+              def git(*args): return subprocess.check_output(['git','-C',slot,*args],text=True).strip()
+              assert git('rev-parse','HEAD')==expected
+              assert not git('status','--porcelain','--untracked-files=no')
+              p=Path(slot)
+              out['sources'][slot]={'sha':expected,'src_tree':git('rev-parse','HEAD:src'),'runtime_sha256':{f:hashlib.sha256((p/f).read_bytes()).hexdigest() for f in files}}
+          print(json.dumps(out,indent=2,sort_keys=True))
+          PY
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always() && env.JOB_ROOT != ''
+        with:
+          name: uniform-rc14-stability-${{ github.run_id }}
+          path: ${{ env.JOB_ROOT }}/results/
+          retention-days: 30
+          if-no-files-found: warn
