@@ -1,0 +1,111 @@
+name: Uniform runtime current-main semantic validation
+
+on:
+  push:
+    branches: [work/uniform-main-sync-validation]
+    paths:
+      - .github/workflows/uniform-main-sync-validation.yml
+
+permissions:
+  contents: read
+
+env:
+  MAIN_SHA: 6471c3f8e66bfaaccec1251289605c374e8ec100
+  PRODUCT_SHA: 37248378205f6eadb1c62ae5392a6853b9a1db63
+
+jobs:
+  classify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.13.5'
+
+      - name: Build deliberate synthesis in working tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git merge-base HEAD "$PRODUCT_SHA")" = "$PRODUCT_SHA"
+          git config user.name 'mqttium sync validation'
+          git config user.email 'sync-validation@invalid.local'
+          set +e
+          git merge --no-commit --no-ff "$MAIN_SHA" > /tmp/merge.stdout 2> /tmp/merge.stderr
+          rc=$?
+          set -e
+          test "$rc" -ne 0
+          test "$(git diff --name-only --diff-filter=U | sort)" = $'docs/migration.md\nsrc/mqttium/api/_delivery.py\nsrc/mqttium/api/async_client.py'
+          # First synthesis hypothesis: keep the simpler live-dispatcher runtime.
+          git checkout --ours -- docs/migration.md src/mqttium/api/_delivery.py src/mqttium/api/async_client.py
+          git add docs/migration.md src/mqttium/api/_delivery.py src/mqttium/api/async_client.py
+          test -z "$(git diff --name-only --diff-filter=U)"
+          git diff --check
+          git status --short | tee /tmp/status.txt
+          git diff --cached --stat | tee /tmp/merge-stat.txt
+
+      - name: Install development dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install -e '.[dev]'
+          ruff check src/mqttium/api/_delivery.py src/mqttium/api/async_client.py
+
+      - name: Classify PR454 behavioral tests
+        shell: bash
+        run: |
+          set +e
+          python -m pytest -q -W error \
+            tests/unit/test_callback_route_handoff.py \
+            tests/unit/test_callback_route_lifecycle.py \
+            tests/unit/test_callback_route_pressure.py \
+            tests/unit/test_callback_route_qos.py \
+            tests/unit/test_callback_route_reconfiguration.py \
+            2>&1 | tee /tmp/pr454-tests.log
+          rc=${PIPESTATUS[0]}
+          printf '%s\n' "$rc" > /tmp/pr454-tests.rc
+          exit 0
+
+      - name: Run full suite for unexpected regressions
+        shell: bash
+        run: |
+          set +e
+          python -m pytest -q -W error 2>&1 | tee /tmp/full-suite.log
+          rc=${PIPESTATUS[0]}
+          printf '%s\n' "$rc" > /tmp/full-suite.rc
+          exit 0
+
+      - name: Summarize failures
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY' | tee /tmp/failure-summary.txt
+          from pathlib import Path
+          for name in ('pr454-tests','full-suite'):
+              text=Path(f'/tmp/{name}.log').read_text(errors='replace')
+              failures=[line for line in text.splitlines() if line.startswith('FAILED ')]
+              print(f'[{name}] rc={Path(f"/tmp/{name}.rc").read_text().strip()} failures={len(failures)}')
+              for line in failures:
+                  print(line)
+          PY
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: uniform-main-sync-validation-${{ github.run_id }}
+          path: |
+            /tmp/merge.stdout
+            /tmp/merge.stderr
+            /tmp/status.txt
+            /tmp/merge-stat.txt
+            /tmp/pr454-tests.log
+            /tmp/pr454-tests.rc
+            /tmp/full-suite.log
+            /tmp/full-suite.rc
+            /tmp/failure-summary.txt
+          retention-days: 14
+          if-no-files-found: warn
