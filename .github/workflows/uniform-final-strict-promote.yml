@@ -1,0 +1,106 @@
+name: Qualify final sole-pending callback candidate
+on:
+  push:
+    branches: [work/uniform-final-strict-stage]
+    paths: [.github/workflows/uniform-final-strict-promote.yml]
+permissions:
+  contents: write
+concurrency:
+  group: uniform-final-strict-promote
+  cancel-in-progress: false
+jobs:
+  qualify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.13.5'
+      - name: Reconstruct exact final candidate from fd37
+        shell: bash
+        run: |
+          set -euo pipefail
+          git worktree add --detach "$RUNNER_TEMP/candidate" fd37ed3fff3895adca0e33c3eacc34e611e7a316
+          git show origin/bench/uniform-singleton-inline-v2-fd37:.github/apply-uniform-singleton-inline-v2.py > "$RUNNER_TEMP/apply.py"
+          git show origin/bench/uniform-singleton-inline-v2-fd37:.github/uniform-singleton-inline-v2-test.py > "$RUNNER_TEMP/strict-test.py"
+          python "$RUNNER_TEMP/apply.py" "$RUNNER_TEMP/candidate/src/mqttium/api/_delivery.py"
+          cp "$RUNNER_TEMP/strict-test.py" "$RUNNER_TEMP/candidate/tests/unit/test_message_callback_singleton_inline.py"
+          CANDIDATE="$RUNNER_TEMP/candidate" python - <<'PY'
+          import os
+          from pathlib import Path
+          root=Path(os.environ['CANDIDATE'])
+          def rep(rel, old, new):
+              p=root/rel; text=p.read_text()
+              if text.count(old)!=1:
+                  raise SystemExit(f'{rel}: anchor count {text.count(old)}')
+              p.write_text(text.replace(old,new,1))
+          rep('src/mqttium/api/_delivery.py',
+              '            and not iterator_delivery\n            and len(effects) == 1\n',
+              '            and not iterator_delivery\n            and self._callback_state == "open"\n            and len(effects) == 1\n')
+          rep('tests/unit/test_effect_pump.py',
+          '''async def test_idle_sync_message_callback_runs_in_worker_after_engine_lock() -> None:\n    client = AsyncClient(client_id="effect-inline-message", message_delivery="callback")\n    seen: list[tuple[str, bool]] = []\n    client.on_message = lambda message: seen.append((message.topic, client._engine_lock.locked()))\n\n    async with client._engine_lock:\n        client._engine._emit(\n            EffectKind.MESSAGE,\n            Message(topic="inline/message", payload=b"x"),\n        )\n        client._collect_effects_locked()\n        assert seen == []\n\n    client._drain_effects_inline()\n    assert seen == []\n    await client._callback_queue.join()\n    assert seen == [("inline/message", False)]\n    await client._shutdown_callback_worker(drain=False)\n''',
+          '''async def test_idle_sync_message_singleton_runs_inline_after_engine_lock() -> None:\n    client = AsyncClient(client_id="effect-inline-message", message_delivery="callback")\n    seen: list[tuple[str, bool]] = []\n    client.on_message = lambda message: seen.append((message.topic, client._engine_lock.locked()))\n\n    async with client._engine_lock:\n        client._engine._emit(\n            EffectKind.MESSAGE,\n            Message(topic="inline/message", payload=b"x"),\n        )\n        client._collect_effects_locked()\n        assert seen == []\n\n    client._drain_effects_inline()\n    assert seen == [("inline/message", False)]\n    assert client._callback_queue.empty()\n    assert client._callback_worker_task is None\n    await client._shutdown_callback_worker(drain=False)\n''')
+          rep('tests/unit/test_hotpath_recon.py',
+              'async def test_qos1_inbound_reply_serial_uses_uniform_worker() -> None:\n',
+              'async def test_qos1_inbound_reply_serial_uses_singleton_inline() -> None:\n')
+          rep('tests/unit/test_hotpath_recon.py',
+              '    assert counters["qos1_v311_field_decodes"] == 40\n    assert counters["callback_inline_rate"] == 0.0\n    assert counters["send_ack_effects"] == 40\n',
+              '    assert counters["qos1_v311_field_decodes"] == 40\n    assert counters["callback_inline_rate"] == 1.0\n    assert counters["send_ack_effects"] == 40\n')
+          rep('tests/unit/test_uniform_callbacks.py',
+              '"""Uniform message callback ownership, bounded rounds, and lifecycle regressions."""',
+              '"""Bounded message callback ownership, rounds, and lifecycle regressions."""')
+          rep('tests/unit/test_uniform_callbacks.py',
+          '''        assert seen == []\n        bound(client, 64)\n        assert client._callback_queue.qsize() == count\n        await asyncio.wait_for(client._callback_queue.join(), 1)\n        assert seen == [str(i).encode() for i in range(count)]\n        assert all(t is client._callback_worker_task and t is not caller for t in owners)\n        if mode == "both":\n            assert client._messages.qsize() == count\n''',
+          '''        inline = not direct and mode in ("callback", "auto") and count == 1\n        bound(client, 64)\n        if inline:\n            assert seen == [b"0"]\n            assert owners == [caller]\n            assert client._callback_queue.empty()\n            assert client._callback_worker_task is None\n        else:\n            assert seen == []\n            assert client._callback_queue.qsize() == count\n            await asyncio.wait_for(client._callback_queue.join(), 1)\n            assert seen == [str(i).encode() for i in range(count)]\n            assert all(t is client._callback_worker_task and t is not caller for t in owners)\n        if mode == "both":\n            assert client._messages.qsize() == count\n''')
+          test=root/'tests/unit/test_message_callback_singleton_inline.py'
+          text=test.read_text()
+          text += '''\n\nimport pytest\nfrom mqttium.errors import MessageDeliveryError\n\n@pytest.mark.parametrize("state", ["draining", "closed"])\nasync def test_non_open_delivery_never_uses_inline(state: str) -> None:\n    client = AsyncClient(message_delivery="callback")\n    seen = []\n    callback = lambda m: seen.append(m.payload)\n    client._delivery._callback_state = state\n    with pytest.raises(MessageDeliveryError, match="Callback delivery is closing"):\n        client._delivery.deliver_message_batch_inline(deque([effect(b"late")]), callback)\n    assert seen == []\n    client._delivery._callback_state = "open"\n    await stop(client)\n'''
+          test.write_text(text)
+          PY
+          cd "$RUNNER_TEMP/candidate"
+          git diff --check
+          python -m pip install -e '.[dev,fuzz,security,docs]'
+          ruff format src/mqttium/api/_delivery.py tests/unit/test_effect_pump.py tests/unit/test_hotpath_recon.py tests/unit/test_uniform_callbacks.py tests/unit/test_message_callback_singleton_inline.py
+          ruff format --check src tests benchmarks tools
+          ruff check src tests benchmarks tools
+      - name: Focused and full correctness gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/candidate"
+          python -m pytest -q -W error \
+            tests/unit/test_message_callback_singleton_inline.py \
+            tests/unit/test_effect_pump.py \
+            tests/unit/test_hotpath_recon.py \
+            tests/unit/test_uniform_callbacks.py \
+            tests/unit/test_sync_callback_contract.py \
+            tests/unit/test_topic_callback_dispatch_contract.py
+          python -m pytest -q tests/unit tests/project tests/resilience -W error --cov=mqttium
+          mypy src/mqttium
+          bandit -q -ll -r src
+          mkdocs build --strict
+          python -m pytest -q tests/fuzz -W error
+          python tests/fuzz/fuzz.py --seed 1 --iterations 20000
+      - name: Freeze and publish candidate branch only
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/candidate"
+          git status --short
+          git add src/mqttium/api/_delivery.py \
+            tests/unit/test_effect_pump.py \
+            tests/unit/test_hotpath_recon.py \
+            tests/unit/test_uniform_callbacks.py \
+            tests/unit/test_message_callback_singleton_inline.py
+          git config user.name 'mqttium qualification'
+          git config user.email 'qualification@invalid.local'
+          git commit -m 'experiment: restore sole-pending post-lock sync callback fast path' -m 'Keep the simplified ordinary bounded callback queue and worker ownership for async, bursts, reentrance, direct QoS0 and both. Permit only one sole pending eligible MESSAGE effect to execute an idle sync callback after the engine lock. No batching, hidden reservations or queue-capacity mutation.'
+          test "$(git rev-parse HEAD^)" = fd37ed3fff3895adca0e33c3eacc34e611e7a316
+          git diff --check HEAD^
+          git push origin HEAD:refs/heads/work/uniform-final-strict-candidate
+          printf 'candidate=%s\ntree=%s\nsrc_tree=%s\ndelivery_sha256=' "$(git rev-parse HEAD)" "$(git rev-parse HEAD^{tree})" "$(git rev-parse HEAD:src)"
+          sha256sum src/mqttium/api/_delivery.py | awk '{print $1}'
