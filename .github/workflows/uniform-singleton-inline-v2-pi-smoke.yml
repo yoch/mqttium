@@ -1,5 +1,5 @@
-name: Uniform sole-pending singleton ARM64 RTT smoke
-run-name: "Uniform sole-pending singleton RTT smoke"
+name: Uniform sole-pending singleton ARM64 RTT standard
+run-name: "Uniform sole-pending singleton RTT standard"
 
 on:
   push:
@@ -24,10 +24,10 @@ env:
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
 jobs:
-  smoke:
+  standard:
     if: github.repository == 'yoch/mqttium' && github.ref == 'refs/heads/bench/uniform-singleton-inline-v2-fd37'
     runs-on: [self-hosted, linux, ARM64]
-    timeout-minutes: 16
+    timeout-minutes: 25
     steps:
       - name: Validate runner and isolate output
         shell: bash
@@ -41,7 +41,7 @@ jobs:
             echo "Pre-existing Mosquitto would contaminate the persistent runner; refusing without killing it." >&2
             exit 1
           fi
-          echo "JOB_ROOT=$RUNNER_TEMP/mqttium-sole-pending-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+          echo "JOB_ROOT=$RUNNER_TEMP/mqttium-sole-pending-standard-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
 
       - name: Checkout tooling and exact sources
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -116,7 +116,7 @@ jobs:
           print(json.dumps(out,indent=2,sort_keys=True))
           PY
 
-      - name: Run frozen two-block A/B smoke without retries
+      - name: Run frozen four-block A/B standard with stimulus-only block retry
         shell: bash
         run: |
           set -euo pipefail
@@ -153,7 +153,7 @@ jobs:
             --worker-aslr system --entrypoint version_compare -- \
             --client mqttium --baseline-path slot-a --candidate-path slot-b \
             --scenario application_rtt_fixed_rate --variant-index 0 --target-rate 3942 \
-            --pacer-mode external --blocks 2 --max-block-retries 0 --profile smoke \
+            --pacer-mode external --blocks 4 --max-block-retries 1 --profile standard \
             --broker "127.0.0.1:$port" --broker-pid "$broker_pid" \
             --output "$out/ab.json" 2>&1 | tee "$out/ab.log"
 
@@ -173,7 +173,7 @@ jobs:
         if: always() && env.JOB_ROOT != ''
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: uniform-sole-pending-pi-${{ github.run_id }}
+          name: uniform-sole-pending-standard-${{ github.run_id }}
           path: ${{ env.JOB_ROOT }}/results/
           if-no-files-found: warn
           retention-days: 14
@@ -183,5 +183,5 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$JOB_ROOT" = "$RUNNER_TEMP/mqttium-sole-pending-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          test "$JOB_ROOT" = "$RUNNER_TEMP/mqttium-sole-pending-standard-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           rm -rf -- "$JOB_ROOT"
