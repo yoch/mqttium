@@ -94,6 +94,26 @@ jobs:
           )
           if text.count(old) != 1:
               raise SystemExit(f'queue accounting anchor count={text.count(old)}')
+          text = text.replace(old, new)
+          old = (
+              '            if burst == 2:\n'
+              '                assert client._delivery.try_enqueue_callback(lambda: seen.append("refill"))\n'
+              '            assert client.stats().delivery.callback_queued == burst\n'
+              '            assert not client._delivery.try_enqueue_callback(lambda: seen.append("overflow"))\n'
+          )
+          new = (
+              '            # One queue slot is free because the active callback is not queued.\n'
+              '            assert client._delivery.try_enqueue_callback(lambda: seen.append("refill"))\n'
+              '            assert client.stats().delivery.callback_queued == burst\n'
+              '            assert not client._delivery.try_enqueue_callback(lambda: seen.append("overflow"))\n'
+          )
+          if text.count(old) != 1:
+              raise SystemExit(f'refill anchor count={text.count(old)}')
+          text = text.replace(old, new)
+          old = '            assert seen == expected + ["reentrant"] + (["refill"] if burst == 2 else [])\n'
+          new = '            assert seen == expected + ["reentrant", "refill"]\n'
+          if text.count(old) != 1:
+              raise SystemExit(f'fifo expectation anchor count={text.count(old)}')
           p.write_text(text.replace(old, new))
           PY
 
