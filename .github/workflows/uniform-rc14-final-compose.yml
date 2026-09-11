@@ -1,0 +1,147 @@
+name: Compose and qualify strict uniform delivery on RC14
+on:
+  push:
+    branches: [work/uniform-rc14-final-stage]
+    paths:
+      - .github/uniform-rc14-compose.py
+      - .github/workflows/uniform-rc14-final-compose.yml
+permissions:
+  contents: write
+concurrency:
+  group: uniform-rc14-final-compose
+  cancel-in-progress: false
+env:
+  PRODUCT_SHA: 37248378205f6eadb1c62ae5392a6853b9a1db63
+  MAIN_SHA: c194597bcf5af4951fbec2b560600eef3cb84b3c
+jobs:
+  qualify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: true
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.13.5'
+      - name: Merge current main into qualified product and resolve architectural overlaps
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/uniform-rc14-final"
+          echo "CANDIDATE_ROOT=$root" >> "$GITHUB_ENV"
+          git worktree add --detach "$root" "$PRODUCT_SHA"
+          cd "$root"
+          git config user.name 'mqttium RC14 qualification'
+          git config user.email 'qualification@invalid.local'
+          test "$(git rev-parse HEAD)" = "$PRODUCT_SHA"
+          git cat-file -e "$MAIN_SHA^{commit}"
+          set +e
+          git merge --no-commit --no-ff "$MAIN_SHA" > /tmp/merge.stdout 2> /tmp/merge.stderr
+          merge_rc=$?
+          set -e
+          if [ "$merge_rc" -ne 0 ]; then
+            git diff --name-only --diff-filter=U | sort | tee /tmp/conflicts.txt
+            while IFS= read -r path; do
+              [ -n "$path" ] || continue
+              case "$path" in
+                src/mqttium/api/_delivery.py|src/mqttium/api/async_client.py|docs/migration.md)
+                  git checkout --ours -- "$path"
+                  git add "$path"
+                  ;;
+                CHANGELOG.md)
+                  git checkout --theirs -- "$path"
+                  git add "$path"
+                  ;;
+                *)
+                  echo "Unexpected merge conflict: $path" >&2
+                  exit 1
+                  ;;
+              esac
+            done < /tmp/conflicts.txt
+          fi
+          test -z "$(git diff --name-only --diff-filter=U)"
+          python "$GITHUB_WORKSPACE/.github/uniform-rc14-compose.py" "$root"
+          git add -A
+          git diff --check
+          test -z "$(git diff --name-only --diff-filter=U)"
+          git status --short | tee /tmp/status-before-tests.txt
+          git diff --cached --stat | tee /tmp/candidate-stat.txt
+      - name: Install, format and lint exact composed tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$CANDIDATE_ROOT"
+          python -m pip install -e '.[dev,fuzz,security,docs]'
+          ruff format \
+            src/mqttium/api/_delivery.py \
+            tests/unit/test_callback_route_lifecycle.py \
+            tests/unit/test_callback_route_reconfiguration.py \
+            tests/unit/test_strict_singleton_message_inline.py
+          ruff format --check src tests benchmarks tools
+          ruff check src tests benchmarks tools
+          git add -A
+          git diff --check
+      - name: Focused strict policy and retained RC14 route obligations
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$CANDIDATE_ROOT"
+          python -m pytest -q -W error \
+            tests/unit/test_strict_singleton_message_inline.py \
+            tests/unit/test_effect_pump.py \
+            tests/unit/test_hotpath_recon.py \
+            tests/unit/test_uniform_callbacks.py \
+            tests/unit/test_sync_callback_contract.py \
+            tests/unit/test_topic_callback_dispatch_contract.py \
+            tests/unit/test_callback_route_lifecycle.py \
+            tests/unit/test_callback_route_pressure.py \
+            tests/unit/test_callback_route_qos.py \
+            tests/unit/test_callback_route_reconfiguration.py
+      - name: Full correctness quality docs and fuzz gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$CANDIDATE_ROOT"
+          python -m pytest -q tests/unit tests/project tests/resilience -W error --cov=mqttium
+          mypy src/mqttium
+          bandit -q -ll -r src
+          mkdocs build --strict
+          python -m pytest -q tests/fuzz -W error
+          python tests/fuzz/fuzz.py --seed 1 --iterations 20000
+      - name: Freeze exact merge commit and publish isolated candidate branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$CANDIDATE_ROOT"
+          git add -A
+          test -z "$(git status --porcelain --untracked-files=no | grep '^.[^ ]' || true)" || true
+          git diff --check
+          git commit -m 'experiment: compose simplified callback delivery with RC14' -m 'Merge current RC14 main into the qualified simplified delivery model. Preserve live route/reconnect behavior through the stable per-notification dispatcher instead of the old handoff bridge. Keep ordinary bounded queue entries and a single worker for general delivery; allow only a sole pending eligible post-lock synchronous MESSAGE effect to bypass one queue hop. Direct QoS0, async, bursts, both, reentrant, persisted and replay work remain worker/slow-path owned.'
+          parents=$(git show -s --format='%P' HEAD)
+          test "$parents" = "$PRODUCT_SHA $MAIN_SHA"
+          git diff --check HEAD^
+          git push origin HEAD:refs/heads/work/uniform-rc14-final-candidate
+          printf 'candidate=%s\ntree=%s\nsrc_tree=%s\n' \
+            "$(git rev-parse HEAD)" "$(git rev-parse HEAD^{tree})" "$(git rev-parse HEAD:src)" | tee /tmp/final-identity.txt
+          sha256sum src/mqttium/api/_delivery.py src/mqttium/api/async_client.py | tee /tmp/runtime-sha256.txt
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: uniform-rc14-final-compose-${{ github.run_id }}
+          path: |
+            /tmp/merge.stdout
+            /tmp/merge.stderr
+            /tmp/conflicts.txt
+            /tmp/status-before-tests.txt
+            /tmp/candidate-stat.txt
+            /tmp/final-identity.txt
+            /tmp/runtime-sha256.txt
+          retention-days: 14
+          if-no-files-found: warn
+      - name: Remove isolated worktree
+        if: always() && env.CANDIDATE_ROOT != ''
+        shell: bash
+        run: git worktree remove --force "$CANDIDATE_ROOT" || true
