@@ -1,0 +1,168 @@
+name: Uniform RC14 final ARM64 qualification
+run-name: "Uniform RC14 final A/A + A/B standard"
+on:
+  push:
+    branches: [bench/uniform-rc14-final-pi]
+    paths: [.github/workflows/uniform-rc14-final-pi.yml]
+permissions:
+  contents: read
+concurrency:
+  group: mqttium-arm64-runner
+  cancel-in-progress: false
+env:
+  BASE_SHA: c194597bcf5af4951fbec2b560600eef3cb84b3c
+  CANDIDATE_SHA: fb619a27b866c5db869508e6a226db0080e668c7
+  HARNESS_SHA: ef2382cf8ed20e5df4288102c1ae17e791a25d68
+  PYTHONUNBUFFERED: '1'
+  PIP_DISABLE_PIP_VERSION_CHECK: '1'
+jobs:
+  qualify:
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 40
+    steps:
+      - name: Validate isolated Pi runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          python3 -c 'import sys; assert sys.version_info[:3] == (3,14,7), sys.version'
+          test "$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)" = performance
+          for cmd in python3 mosquitto git taskset; do command -v "$cmd" >/dev/null; done
+          if pgrep -x mosquitto >/dev/null; then
+            echo 'Existing broker would contaminate the persistent runner; refusing.' >&2
+            exit 1
+          fi
+          echo "JOB_ROOT=$RUNNER_TEMP/uniform-rc14-final-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          path: tooling
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.BASE_SHA }}
+          path: slot-a
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.BASE_SHA }}
+          path: slot-c
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+          path: slot-b
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: yoch/mqtt-python-client-bench
+          ref: ${{ env.HARNESS_SHA }}
+          path: harness
+          persist-credentials: false
+      - name: Freeze provenance and start broker
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$JOB_ROOT/results"
+          python3 -m venv --system-site-packages "$JOB_ROOT/venv"
+          "$JOB_ROOT/venv/bin/python" -m pip install 'psutil>=6,<8' 'paho-mqtt==2.1.0'
+          "$JOB_ROOT/venv/bin/python" -m pip install --no-deps ./slot-a
+          "$JOB_ROOT/venv/bin/python" -m pip freeze > "$JOB_ROOT/results/dependencies.txt"
+          python3 - <<'PY' > "$JOB_ROOT/results/provenance.json"
+          import hashlib,json,os,platform,subprocess
+          from pathlib import Path
+          files=['src/mqttium/api/_delivery.py','src/mqttium/api/async_client.py','src/mqttium/api/_effects.py']
+          out={'run':os.environ['GITHUB_RUN_ID'],'python':platform.python_version(),'machine':platform.machine(),'kernel':platform.release(),'sources':{}}
+          for slot,sha in [('slot-a',os.environ['BASE_SHA']),('slot-c',os.environ['BASE_SHA']),('slot-b',os.environ['CANDIDATE_SHA']),('harness',os.environ['HARNESS_SHA'])]:
+              def git(*args):return subprocess.check_output(['git','-C',slot,*args],text=True).strip()
+              assert git('rev-parse','HEAD')==sha
+              assert not git('status','--porcelain','--untracked-files=no')
+              rec={'sha':sha,'tree':git('rev-parse','HEAD^{tree}')}
+              if slot!='harness':
+                  rec['src_tree']=git('rev-parse','HEAD:src')
+                  rec['runtime_sha256']={p:hashlib.sha256((Path(slot)/p).read_bytes()).hexdigest() for p in files}
+              out['sources'][slot]=rec
+          governors={str(p):p.read_text().strip() for p in Path('/sys/devices/system/cpu').glob('cpu*/cpufreq/scaling_governor')}
+          assert governors and set(governors.values())=={'performance'},governors
+          out['governors']=governors
+          out['temperature_start']={str(p):p.read_text().strip() for p in Path('/sys/class/thermal').glob('thermal_zone*/temp')}
+          print(json.dumps(out,indent=2,sort_keys=True))
+          PY
+          py="$JOB_ROOT/venv/bin/python"
+          port="$($py -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
+          echo "BROKER_PORT=$port" >> "$GITHUB_ENV"
+          cat > "$JOB_ROOT/results/mosquitto.conf" <<EOF
+          listener $port 127.0.0.1
+          protocol mqtt
+          set_tcp_nodelay true
+          allow_anonymous true
+          persistence false
+          connection_messages false
+          log_dest stdout
+          log_type error
+          max_inflight_messages 1000
+          max_queued_messages 10000
+          max_packet_size 16777216
+          EOF
+          taskset -c 1 mosquitto -c "$JOB_ROOT/results/mosquitto.conf" > "$JOB_ROOT/results/mosquitto.log" 2>&1 &
+          echo "$!" > "$JOB_ROOT/broker.pid"
+          for _ in $(seq 1 50); do
+            kill -0 "$(cat "$JOB_ROOT/broker.pid")"
+            if (echo > "/dev/tcp/127.0.0.1/$port") >/dev/null 2>&1; then break; fi
+            sleep 0.1
+          done
+          (echo > "/dev/tcp/127.0.0.1/$port") >/dev/null 2>&1
+      - name: Standard A/A then A/B, four blocks each
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$JOB_ROOT/results"
+          py="$JOB_ROOT/venv/bin/python"
+          broker_pid="$(cat "$JOB_ROOT/broker.pid")"
+          export PYTHONPATH="$PWD/harness/src"
+          for phase in aa ab; do
+            other=slot-c
+            [ "$phase" = ab ] && other=slot-b
+            "$py" -m mqtt_client_bench.layout_runner \
+              --worker-aslr system --entrypoint version_compare -- \
+              --client mqttium --baseline-path slot-a --candidate-path "$other" \
+              --scenario application_rtt_fixed_rate --variant-index 0 --target-rate 3942 \
+              --pacer-mode external --blocks 4 --max-block-retries 1 --profile standard \
+              --broker "127.0.0.1:$BROKER_PORT" --broker-pid "$broker_pid" \
+              --output "$out/$phase.json" 2>&1 | tee "$out/$phase.log"
+          done
+      - name: Verify immutable sources and stop broker
+        if: always() && env.JOB_ROOT != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib,json,os,subprocess
+          from pathlib import Path
+          root=Path(os.environ['JOB_ROOT'])/'results'
+          p=json.loads((root/'provenance.json').read_text())
+          for slot,rec in p['sources'].items():
+              def git(*args):return subprocess.check_output(['git','-C',slot,*args],text=True).strip()
+              assert git('rev-parse','HEAD')==rec['sha']
+              assert not git('status','--porcelain','--untracked-files=no')
+              for path,digest in rec.get('runtime_sha256',{}).items():
+                  assert hashlib.sha256((Path(slot)/path).read_bytes()).hexdigest()==digest
+          (root/'source-verification.txt').write_text('exact sources unchanged\n')
+          PY
+          if [ -f "$JOB_ROOT/broker.pid" ]; then
+            kill "$(cat "$JOB_ROOT/broker.pid")" 2>/dev/null || true
+            wait "$(cat "$JOB_ROOT/broker.pid")" 2>/dev/null || true
+          fi
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always() && env.JOB_ROOT != ''
+        with:
+          name: uniform-rc14-final-pi-${{ github.run_id }}
+          path: ${{ env.JOB_ROOT }}/results/
+          retention-days: 30
+          if-no-files-found: warn
+      - name: Clean run directory
+        if: always() && env.JOB_ROOT != ''
+        shell: bash
+        run: |
+          test "$JOB_ROOT" = "$RUNNER_TEMP/uniform-rc14-final-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          rm -rf -- "$JOB_ROOT"
