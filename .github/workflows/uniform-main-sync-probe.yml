@@ -1,0 +1,61 @@
+name: Uniform callback main sync probe
+
+on:
+  push:
+    branches: [work/uniform-singleton-main-sync-probe]
+    paths:
+      - .github/workflows/uniform-main-sync-probe.yml
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      MAIN_SHA: 6471c3f8e66bfaaccec1251289605c374e8ec100
+      PRODUCT_SHA: 37248378205f6eadb1c62ae5392a6853b9a1db63
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Dry-run exact main merge
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git merge-base HEAD "$PRODUCT_SHA")" = "$PRODUCT_SHA"
+          git cat-file -e "$MAIN_SHA^{commit}"
+          mkdir -p /tmp/sync-probe/stages
+          set +e
+          git merge --no-commit --no-ff "$MAIN_SHA" > /tmp/sync-probe/merge.stdout 2> /tmp/sync-probe/merge.stderr
+          rc=$?
+          set -e
+          printf '%s\n' "$rc" > /tmp/sync-probe/merge.rc
+          git status --short > /tmp/sync-probe/status.txt
+          git diff --name-only --diff-filter=U | sort > /tmp/sync-probe/conflicts.txt
+          git diff --stat > /tmp/sync-probe/diff-stat.txt || true
+          if [ "$rc" -ne 0 ]; then
+            while IFS= read -r path; do
+              [ -n "$path" ] || continue
+              safe=$(printf '%s' "$path" | tr '/' '_')
+              git show ":1:$path" > "/tmp/sync-probe/stages/${safe}.base" 2>/dev/null || true
+              git show ":2:$path" > "/tmp/sync-probe/stages/${safe}.ours" 2>/dev/null || true
+              git show ":3:$path" > "/tmp/sync-probe/stages/${safe}.theirs" 2>/dev/null || true
+            done < /tmp/sync-probe/conflicts.txt
+            echo 'Merge conflicts:'
+            cat /tmp/sync-probe/conflicts.txt
+          else
+            git diff --check
+            echo 'Merge is textually clean.'
+          fi
+          git merge --abort || true
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: uniform-main-sync-probe-${{ github.run_id }}
+          path: /tmp/sync-probe/
+          retention-days: 14
+          if-no-files-found: error
