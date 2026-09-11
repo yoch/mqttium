@@ -27,7 +27,7 @@ jobs:
         with:
           python-version: '3.13.5'
 
-      - name: Build deliberate synthesis in working tree
+      - name: Build live-dispatcher synthesis in working tree
         shell: bash
         run: |
           set -euo pipefail
@@ -40,27 +40,105 @@ jobs:
           set -e
           test "$rc" -ne 0
           test "$(git diff --name-only --diff-filter=U | sort)" = $'docs/migration.md\nsrc/mqttium/api/_delivery.py\nsrc/mqttium/api/async_client.py'
-          # First synthesis hypothesis: keep the simpler live-dispatcher runtime.
+          # Keep the simpler uniform runtime: one live topic dispatcher and the
+          # generation/state lifecycle replace PR454's stale-router handoff.
           git checkout --ours -- docs/migration.md src/mqttium/api/_delivery.py src/mqttium/api/async_client.py
           git add docs/migration.md src/mqttium/api/_delivery.py src/mqttium/api/async_client.py
           test -z "$(git diff --name-only --diff-filter=U)"
+
+          python - <<'PY'
+          from pathlib import Path
+
+          # Preserve #455 semantics without restoring _callback_stop: a terminal
+          # disconnect requested by the active callback finishes that callback,
+          # but retires every unstarted job. A replacement connection may then
+          # reopen the same worker incarnation.
+          p = Path('src/mqttium/api/_delivery.py')
+          text = p.read_text()
+          old = '''        if self.callback_task is asyncio.current_task():
+              # An own-worker shutdown cannot join itself. Return to finish the
+              # active notification; a reconnect may reopen the same consumer.
+              return
+          '''
+          new = '''        if self.callback_task is asyncio.current_task():
+              # An own-worker shutdown cannot join itself. Retire unstarted work
+              # now; the active notification may finish and a reconnect may reopen
+              # the same worker incarnation for the replacement generation.
+              self._callback_state = "closed"
+              self._discard_callback_queue()
+              return
+          '''
+          if text.count(old) != 1:
+              raise SystemExit(f'shutdown anchor count={text.count(old)}')
+          p.write_text(text.replace(old, new))
+
+          # PR454's handoff-specific file pins pair-inline, private batch tokens,
+          # prepend/queue rotation and captured sync routers. Those mechanisms do
+          # not exist in the uniform live-dispatcher architecture; the behavioral
+          # reconfiguration, pressure, QoS and lifecycle suites remain below.
+          Path('tests/unit/test_callback_route_handoff.py').unlink()
+
+          p = Path('tests/unit/test_callback_route_lifecycle.py')
+          text = p.read_text()
+          old = '        assert not delivery._callback_stop\n'
+          new = '        assert delivery._callback_state == "open"\n'
+          if text.count(old) != 1:
+              raise SystemExit(f'lifecycle state anchor count={text.count(old)}')
+          p.write_text(text.replace(old, new))
+
+          p = Path('tests/unit/test_callback_route_reconfiguration.py')
+          text = p.read_text()
+          old = '''            # An inline pair transfers only its unstarted tail. The completed
+              # first callback no longer reserves a slot while the tail awaits.
+              expected_pending = 1 if burst == 2 else burst
+              assert client.stats().delivery.callback_queued == expected_pending
+          '''
+          new = '''            # The uniform worker reports only queued notifications; the
+              # currently active callback is deliberately excluded from qsize.
+              expected_pending = burst - 1
+              assert client.stats().delivery.callback_queued == expected_pending
+          '''
+          if text.count(old) != 1:
+              raise SystemExit(f'queue accounting anchor count={text.count(old)}')
+          p.write_text(text.replace(old, new))
+          PY
+
+          git add -A \
+            src/mqttium/api/_delivery.py \
+            tests/unit/test_callback_route_handoff.py \
+            tests/unit/test_callback_route_lifecycle.py \
+            tests/unit/test_callback_route_reconfiguration.py
           git diff --check
           git status --short | tee /tmp/status.txt
           git diff --cached --stat | tee /tmp/merge-stat.txt
 
-      - name: Install development dependencies
+      - name: Install and lint synthesized runtime
         shell: bash
         run: |
           set -euo pipefail
           python -m pip install -e '.[dev]'
-          ruff check src/mqttium/api/_delivery.py src/mqttium/api/async_client.py
+          ruff format \
+            src/mqttium/api/_delivery.py \
+            tests/unit/test_callback_route_lifecycle.py \
+            tests/unit/test_callback_route_reconfiguration.py
+          ruff format --check \
+            src/mqttium/api/_delivery.py \
+            tests/unit/test_callback_route_lifecycle.py \
+            tests/unit/test_callback_route_reconfiguration.py
+          ruff check \
+            src/mqttium/api/_delivery.py \
+            src/mqttium/api/async_client.py \
+            tests/unit/test_callback_route_lifecycle.py \
+            tests/unit/test_callback_route_pressure.py \
+            tests/unit/test_callback_route_qos.py \
+            tests/unit/test_callback_route_reconfiguration.py
+          git diff --check
 
-      - name: Classify PR454 behavioral tests
+      - name: Run retained PR454 behavioral obligations
         shell: bash
         run: |
           set +e
           python -m pytest -q -W error \
-            tests/unit/test_callback_route_handoff.py \
             tests/unit/test_callback_route_lifecycle.py \
             tests/unit/test_callback_route_pressure.py \
             tests/unit/test_callback_route_qos.py \
