@@ -40,8 +40,6 @@ jobs:
           set -e
           test "$rc" -ne 0
           test "$(git diff --name-only --diff-filter=U | sort)" = $'docs/migration.md\nsrc/mqttium/api/_delivery.py\nsrc/mqttium/api/async_client.py'
-          # Keep the simpler uniform runtime: one live topic dispatcher and the
-          # generation/state lifecycle replace PR454's stale-router handoff.
           git checkout --ours -- docs/migration.md src/mqttium/api/_delivery.py src/mqttium/api/async_client.py
           git add docs/migration.md src/mqttium/api/_delivery.py src/mqttium/api/async_client.py
           test -z "$(git diff --name-only --diff-filter=U)"
@@ -49,33 +47,27 @@ jobs:
           python - <<'PY'
           from pathlib import Path
 
-          # Preserve #455 semantics without restoring _callback_stop: a terminal
-          # disconnect requested by the active callback finishes that callback,
-          # but retires every unstarted job. A replacement connection may then
-          # reopen the same worker incarnation.
           p = Path('src/mqttium/api/_delivery.py')
           text = p.read_text()
-          old = '''        if self.callback_task is asyncio.current_task():
-              # An own-worker shutdown cannot join itself. Return to finish the
-              # active notification; a reconnect may reopen the same consumer.
-              return
-          '''
-          new = '''        if self.callback_task is asyncio.current_task():
-              # An own-worker shutdown cannot join itself. Retire unstarted work
-              # now; the active notification may finish and a reconnect may reopen
-              # the same worker incarnation for the replacement generation.
-              self._callback_state = "closed"
-              self._discard_callback_queue()
-              return
-          '''
+          old = (
+              '        if self.callback_task is asyncio.current_task():\n'
+              '            # An own-worker shutdown cannot join itself. Return to finish the\n'
+              '            # active notification; a reconnect may reopen the same consumer.\n'
+              '            return\n'
+          )
+          new = (
+              '        if self.callback_task is asyncio.current_task():\n'
+              '            # An own-worker shutdown cannot join itself. Retire unstarted work\n'
+              '            # now; the active notification may finish and a reconnect may reopen\n'
+              '            # the same worker incarnation for the replacement generation.\n'
+              '            self._callback_state = "closed"\n'
+              '            self._discard_callback_queue()\n'
+              '            return\n'
+          )
           if text.count(old) != 1:
               raise SystemExit(f'shutdown anchor count={text.count(old)}')
           p.write_text(text.replace(old, new))
 
-          # PR454's handoff-specific file pins pair-inline, private batch tokens,
-          # prepend/queue rotation and captured sync routers. Those mechanisms do
-          # not exist in the uniform live-dispatcher architecture; the behavioral
-          # reconfiguration, pressure, QoS and lifecycle suites remain below.
           Path('tests/unit/test_callback_route_handoff.py').unlink()
 
           p = Path('tests/unit/test_callback_route_lifecycle.py')
@@ -88,16 +80,18 @@ jobs:
 
           p = Path('tests/unit/test_callback_route_reconfiguration.py')
           text = p.read_text()
-          old = '''            # An inline pair transfers only its unstarted tail. The completed
-              # first callback no longer reserves a slot while the tail awaits.
-              expected_pending = 1 if burst == 2 else burst
-              assert client.stats().delivery.callback_queued == expected_pending
-          '''
-          new = '''            # The uniform worker reports only queued notifications; the
-              # currently active callback is deliberately excluded from qsize.
-              expected_pending = burst - 1
-              assert client.stats().delivery.callback_queued == expected_pending
-          '''
+          old = (
+              '            # An inline pair transfers only its unstarted tail. The completed\n'
+              '            # first callback no longer reserves a slot while the tail awaits.\n'
+              '            expected_pending = 1 if burst == 2 else burst\n'
+              '            assert client.stats().delivery.callback_queued == expected_pending\n'
+          )
+          new = (
+              '            # The uniform worker reports only queued notifications; the\n'
+              '            # currently active callback is deliberately excluded from qsize.\n'
+              '            expected_pending = burst - 1\n'
+              '            assert client.stats().delivery.callback_queued == expected_pending\n'
+          )
           if text.count(old) != 1:
               raise SystemExit(f'queue accounting anchor count={text.count(old)}')
           p.write_text(text.replace(old, new))
