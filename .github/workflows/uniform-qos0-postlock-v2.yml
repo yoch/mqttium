@@ -1,0 +1,137 @@
+name: Uniform post-lock QoS0 singleton qualification v2
+run-name: "Uniform QoS0 post-lock v2 A/A + A/B"
+
+on:
+  push:
+    branches: [bench/uniform-qos0-postlock-fb619a27]
+    paths: [.github/workflows/uniform-qos0-postlock-v2.yml]
+
+permissions:
+  contents: read
+concurrency:
+  group: uniform-qos0-postlock-hosted-v2
+  cancel-in-progress: false
+
+env:
+  BASE_SHA: c194597bcf5af4951fbec2b560600eef3cb84b3c
+  PRODUCT_SHA: fb619a27b866c5db869508e6a226db0080e668c7
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  qualify:
+    if: github.repository == 'yoch/mqttium' && github.ref == 'refs/heads/bench/uniform-qos0-postlock-fb619a27'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 22
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          path: tooling
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.BASE_SHA }}
+          path: slot-a
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.BASE_SHA }}
+          path: slot-c
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.PRODUCT_SHA }}
+          path: slot-b
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.13.5'
+
+      - name: Apply the already-tested exact runtime patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C slot-b rev-parse HEAD)" = "$PRODUCT_SHA"
+          test "$(git -C slot-b hash-object src/mqttium/api/_delivery.py)" = f1a87b6bf277da843f94cd0b7d14cab02a604a92
+          test "$(git -C slot-b hash-object src/mqttium/api/async_client.py)" = 0c3d831880381cb61b693ba5a3683e1610530602
+          python tooling/.github/apply-uniform-qos0-postlock.py slot-b | tee /tmp/preformat-sha256.txt
+          python -m pip install -e './slot-b[dev]'
+          ruff format slot-b/src/mqttium/api/_delivery.py slot-b/src/mqttium/api/async_client.py
+          ruff format --check slot-b/src/mqttium/api/_delivery.py slot-b/src/mqttium/api/async_client.py
+          ruff check slot-b/src/mqttium/api/_delivery.py slot-b/src/mqttium/api/async_client.py
+          git -C slot-b diff --check
+          test "$(git -C slot-b diff --name-only | sort | tr '\n' ' ')" = "src/mqttium/api/_delivery.py src/mqttium/api/async_client.py "
+          sha256sum slot-b/src/mqttium/api/_delivery.py slot-b/src/mqttium/api/async_client.py | tee /tmp/runtime-sha256.txt
+          grep -q '^45c379db532d1b9ce66854231a342f22173316fdd7190c354bc353e1ba4a5ea3 ' /tmp/runtime-sha256.txt
+          grep -q '^b6a598b8ec74fa8dcb2e03be33f6dd4857705e544a3b15be4f33efc50423f928 ' /tmp/runtime-sha256.txt
+
+      - name: Full suite must fail only on the six superseded QoS0 ownership assertions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd slot-b
+          set +e
+          python -m pytest -q -W error 2>&1 | tee /tmp/full-suite.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          python - <<'PY'
+          from pathlib import Path
+          failures=[line.split(' - ',1)[0] for line in Path('/tmp/full-suite.log').read_text().splitlines() if line.startswith('FAILED ')]
+          expected={
+            'FAILED tests/unit/test_direct_qos0_capture.py::test_single_callback_message_is_queued_when_delivery_is_idle',
+            'FAILED tests/unit/test_uniform_callbacks.py::test_message_callback_ownership_policy[normal-True-callback-1]',
+            'FAILED tests/unit/test_uniform_callbacks.py::test_message_callback_ownership_policy[normal-True-auto-1]',
+            'FAILED tests/unit/test_uniform_callbacks.py::test_message_callback_ownership_policy[eager-True-callback-1]',
+            'FAILED tests/unit/test_uniform_callbacks.py::test_message_callback_ownership_policy[eager-True-auto-1]',
+            'FAILED tests/unit/test_uniform_callbacks.py::test_direct_qos0_and_persisted_singletons_remain_worker_or_slow_path',
+          }
+          if set(failures) != expected or len(failures) != 6:
+              raise SystemExit(f'unexpected failure set ({len(failures)}): {failures}')
+          print('Only the six exact superseded direct-QoS0 singleton ownership assertions failed.')
+          PY
+          test "$rc" -eq 1
+
+      - name: Run six paired 3s QoS0 A/A then A/B cells
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y mosquitto
+          ROOT="$RUNNER_TEMP/uniform-qos0-postlock-v2-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -p "$ROOT/results"
+          cp tooling/benchmarks/uniform_callback_probe.py "$ROOT/qos0_probe.py"
+          PROBE="$ROOT/qos0_probe.py" python - <<'PY'
+          import os
+          from pathlib import Path
+          p=Path(os.environ['PROBE']); text=p.read_text()
+          old='''CELLS = [("callback", n) for n in (1, 2, 8, 32)] + [\n    ("async", 8),\n    ("filtered", 8),\n    ("iterator", 8),\n    ("both", 8),\n    ("publish", 8),\n]\n'''
+          assert text.count(old)==1
+          text=text.replace(old,'CELLS = [("callback", n) for n in (1, 2, 8, 32)]\n')
+          assert text.count('receipts.append(pub.publish_nowait(topic, payload, qos=1))')==1
+          text=text.replace('receipts.append(pub.publish_nowait(topic, payload, qos=1))','receipts.append(pub.publish_nowait(topic, payload, qos=0))')
+          text=text.replace('"workload": "closed_loop_qos1_64B"','"workload": "closed_loop_qos0_64B"')
+          p.write_text(text)
+          PY
+          read -r client_cpu broker_cpu < <(python - <<'PY'
+          import os
+          cpus=sorted(os.sched_getaffinity(0)); assert len(cpus)>=2; print(cpus[0],cpus[1])
+          PY
+          )
+          port=$(python -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+          printf 'listener %s 127.0.0.1\nprotocol mqtt\nset_tcp_nodelay true\nallow_anonymous true\npersistence false\nconnection_messages false\nlog_type error\nmax_queued_messages 10000\n' "$port" > "$ROOT/results/mosquitto.conf"
+          taskset -c "$broker_cpu" mosquitto -c "$ROOT/results/mosquitto.conf" > "$ROOT/results/mosquitto.log" 2>&1 &
+          pid=$!; cleanup() { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; }; trap cleanup EXIT
+          for _ in $(seq 1 50); do if (echo > "/dev/tcp/127.0.0.1/$port") >/dev/null 2>&1; then break; fi; sleep 0.1; done
+          python "$ROOT/qos0_probe.py" --base "$PWD/slot-a" --control "$PWD/slot-c" --candidate "$PWD/slot-b" --output "$ROOT/results/samples" --port "$port" --cpu "$client_cpu" --seconds 3 --pairs 6 | tee "$ROOT/results/progress.log"
+          cp /tmp/runtime-sha256.txt "$ROOT/results/runtime-sha256.txt"
+          cp /tmp/full-suite.log "$ROOT/results/full-suite.log"
+          cp /tmp/preformat-sha256.txt "$ROOT/results/preformat-sha256.txt"
+          echo "JOB_ROOT=$ROOT" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always() && env.JOB_ROOT != ''
+        with:
+          name: uniform-qos0-postlock-v2-${{ github.run_id }}
+          path: ${{ env.JOB_ROOT }}/results/
+          retention-days: 30
+          if-no-files-found: warn
