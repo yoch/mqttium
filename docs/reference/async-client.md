@@ -88,20 +88,22 @@ drain; worker isolation is not an unbounded read-ahead guarantee.
 Matching `message_callback_add` filters run instead of `on_message`, in
 registration order. Shared-subscription filters match the filter string
 literally, as in Paho. Each routed message resolves the live configuration when
-its dispatcher starts and keeps that message's matching callbacks across awaits.
-Later routed messages, including already queued messages, see updated filters
-and fallback. Eligible synchronous routes remain inline. If an inline burst's
-route becomes asynchronous, only its unstarted tail transfers to the bounded
-worker, ahead of work admitted reentrantly by the earlier callback. No callback
-prefix is replayed. Direct callbacks captured without a router keep their
-existing batch semantics. Iterator-only delivery ignores callbacks, including
-topic filters.
+its dispatcher starts and keeps that message's ordered matching-callback snapshot
+across awaits. The dispatcher itself has a stable async form, so routed topic
+notifications are worker-owned even when all current matches are synchronous.
+Later routed messages, including messages already queued, see updated filters and
+fallback. When no filter matches, the dispatcher falls back to the current
+`on_message`. There is no started-prefix/tail handoff or exceptional queue
+prepend. A direct `on_message` remains distinct and may use the narrow singleton
+post-lock fast path described above. Iterator-only delivery ignores callbacks,
+including topic filters.
 
 When a callback disconnects and reconnects the client before returning, the
-current worker job finishes normally. Jobs still queued for the terminally
-closed connection are discarded before the replacement connection is reopened;
-its newly admitted callbacks use the existing worker and are not discarded by
-the previous shutdown request. Already-active batch semantics are unchanged.
+current worker notification finishes normally. Jobs still queued for the
+terminally closed connection are discarded before the replacement connection is
+reopened; its newly admitted callbacks use the existing worker and are not
+discarded by the previous shutdown request. The active notification is not
+replayed.
 
 ## Loop confinement
 
