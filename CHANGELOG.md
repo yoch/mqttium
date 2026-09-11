@@ -6,6 +6,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [1.0.0rc14] - 2026-09-11
+
 ### Fixed
 
 - Keep replacement-connection callbacks alive when a callback disconnects and
@@ -1094,7 +1096,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - Pre-spin-out comparative analysis and generated coverage data from the
   published source tree.
 
-[Unreleased]: https://github.com/yoch/mqttium/compare/v1.0.0rc13...HEAD
+[Unreleased]: https://github.com/yoch/mqttium/compare/v1.0.0rc14...HEAD
+[1.0.0rc14]: https://github.com/yoch/mqttium/compare/v1.0.0rc13...v1.0.0rc14
 [1.0.0rc13]: https://github.com/yoch/mqttium/compare/v1.0.0rc12...v1.0.0rc13
 [1.0.0rc12]: https://github.com/yoch/mqttium/compare/v1.0.0rc11...v1.0.0rc12
 [1.0.0rc11]: https://github.com/yoch/mqttium/compare/v1.0.0rc10...v1.0.0rc11
