@@ -90,13 +90,17 @@ The delivery mode is selected when the client is constructed. Specialised
 admission functions avoid repeated mode branches on every incoming message
 while preserving one authoritative owner for reservations and lifecycle.
 
-Message notifications are admitted quickly but executed only by one bounded
-callback worker. Each notification is one ordinary queue entry; no batch reserve
-changes the queue capacity. A turn snapshots its pending count, so reentrant
-arrivals cannot extend it indefinitely. Idle synchronous publish completions
-retain their separate inline path. Callback exceptions are isolated from protocol state. A message
-delivered to both a callback and an iterator releases its byte reservation only
-after both references are gone.
+Message notifications normally execute on one bounded callback worker. Each
+worker-owned notification is one ordinary queue entry; no batch reserve changes
+the queue capacity. A callback-only run containing exactly one eligible small,
+non-persisted MESSAGE effect may execute an idle synchronous callback inline,
+but only after `AsyncClient` has left the engine lock. A second eligible MESSAGE,
+an async or reentrant callback, direct-decode QoS 0, or `both` delivery uses the
+worker. A worker turn snapshots its pending count, so reentrant arrivals cannot
+extend it indefinitely. Idle synchronous publish completions retain their
+separate inline path. Callback exceptions are isolated from protocol state. A
+message delivered to both a callback and an iterator releases its byte
+reservation only after both references are gone.
 
 ### Ingress
 

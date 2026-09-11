@@ -553,6 +553,18 @@ class ApplicationDelivery:
         self._enqueue_message_batch(callback, messages, iterator_delivery=False)
         return True
 
+    def _inline_message_candidate(self, effect: EngineEffect) -> Message | None:
+        """Return one non-persisted small message eligible for sync inline."""
+        if effect.kind not in (EffectKind.MESSAGE, EffectKind.DECODED_MESSAGE):
+            return None
+        message: Message = effect.data
+        size = effect.decoded_property_wire_size
+        if effect.requires_delivery_mark or not (
+            self._is_small(message) if size is None else self._is_small_decoded(message, size)
+        ):
+            return None
+        return message
+
     def deliver_message_batch_inline(
         self,
         effects: deque[EngineEffect],
@@ -570,6 +582,25 @@ class ApplicationDelivery:
         if not callback_delivery and not iterator_delivery:
             return 0
         cb = callback if callback_delivery else None
+
+        # Keep the ordinary worker loop below unchanged. An idle synchronous
+        # callback-only run containing exactly one eligible MESSAGE may avoid
+        # the queue hop. A second eligible MESSAGE makes the entire message run
+        # worker-owned; non-message effects behind a singleton do not.
+        if (
+            cb is not None
+            and not iterator_delivery
+            and self._callback_state == "open"
+            and effects
+            and self.can_dispatch_callback_inline(cb)
+        ):
+            first = self._inline_message_candidate(effects[0])
+            if first is not None and (
+                len(effects) == 1 or self._inline_message_candidate(effects[1]) is None
+            ):
+                self.dispatch_callback_inline(cb, first)
+                return 1
+
         capacity = len(effects)
         if iterator_delivery:
             capacity = min(capacity, self.messages_queue.maxsize - self.messages_queue.qsize())

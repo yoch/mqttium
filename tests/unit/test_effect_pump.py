@@ -141,7 +141,7 @@ async def test_async_publish_callback_stays_on_bounded_worker() -> None:
     await client._shutdown_callback_worker(drain=False)
 
 
-async def test_idle_sync_message_callback_runs_in_worker_after_engine_lock() -> None:
+async def test_idle_sync_message_singleton_runs_inline_after_engine_lock() -> None:
     client = AsyncClient(client_id="effect-inline-message", message_delivery="callback")
     seen: list[tuple[str, bool]] = []
     client.on_message = lambda message: seen.append((message.topic, client._engine_lock.locked()))
@@ -155,9 +155,9 @@ async def test_idle_sync_message_callback_runs_in_worker_after_engine_lock() -> 
         assert seen == []
 
     client._drain_effects_inline()
-    assert seen == []
-    await client._callback_queue.join()
     assert seen == [("inline/message", False)]
+    assert client._callback_queue.empty()
+    assert client._callback_worker_task is None
     await client._shutdown_callback_worker(drain=False)
 
 

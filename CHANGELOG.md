@@ -8,12 +8,16 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Changed
 
-- Experimental uniform message callback scheduling: admit without suspension when
-  capacity permits, then execute all message notifications on one bounded worker.
-  One queue entry represents one notification; remove physical callback batches,
-  queue-capacity mutation and synchronous pair-inline scheduling. Bound worker
-  turns by their starting queue occupancy. Keep the separate `on_publish` fast
-  path, strict sync/async callable contract and shared iterator byte accounting.
+- Experimental message callback scheduling keeps one ordinary bounded worker
+  for async callbacks, bursts, reentrant/queued work, direct-decode QoS 0 and the
+  callback leg of `both`. One eligible idle synchronous callback-only MESSAGE
+  effect may execute inline after the engine lock is released; a second eligible
+  MESSAGE keeps the whole message run worker-owned. One queue entry represents
+  each worker-owned notification; physical callback batches, queue-capacity
+  mutation and synchronous pair-inline scheduling remain removed. Worker turns
+  stay bounded by their starting queue occupancy. The separate `on_publish` fast
+  path, strict sync/async callable contract and shared iterator byte accounting
+  are unchanged.
 - Use a stable topic dispatcher with a per-message live route snapshot. Private
   worker cancellation retires its active notification without losing queued work;
   explicit shutdown/reopen governs queue retirement and stale admission rejection.

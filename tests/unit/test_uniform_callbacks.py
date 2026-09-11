@@ -1,4 +1,4 @@
-"""Uniform message callback ownership, bounded rounds, and lifecycle regressions."""
+"""Bounded message callback ownership, rounds, and lifecycle regressions."""
 
 from __future__ import annotations
 
@@ -65,7 +65,7 @@ def bound(client, limit):
 @pytest.mark.parametrize("count", [1, 2, 3, 8, 32])
 @pytest.mark.parametrize("mode", ["callback", "auto", "both"])
 @pytest.mark.parametrize("direct", [False, True])
-async def test_all_message_callbacks_are_worker_owned(scheduler, count, mode, direct):
+async def test_message_callback_ownership_policy(scheduler, count, mode, direct):
     client = AsyncClient(message_delivery=mode, max_pending_callbacks=64, max_pending_messages=64)
     seen, owners = [], []
     caller = asyncio.current_task()
@@ -86,12 +86,19 @@ async def test_all_message_callbacks_are_worker_owned(scheduler, count, mode, di
             assert (
                 client._apply_message_effect_batch_inline(items, client._connection_epoch) == count
             )
-        assert seen == []
+        inline = not direct and mode in ("callback", "auto") and count == 1
         bound(client, 64)
-        assert client._callback_queue.qsize() == count
-        await asyncio.wait_for(client._callback_queue.join(), 1)
-        assert seen == [str(i).encode() for i in range(count)]
-        assert all(t is client._callback_worker_task and t is not caller for t in owners)
+        if inline:
+            assert seen == [b"0"]
+            assert owners == [caller]
+            assert client._callback_queue.empty()
+            assert client._callback_worker_task is None
+        else:
+            assert seen == []
+            assert client._callback_queue.qsize() == count
+            await asyncio.wait_for(client._callback_queue.join(), 1)
+            assert seen == [str(i).encode() for i in range(count)]
+            assert all(t is client._callback_worker_task and t is not caller for t in owners)
         if mode == "both":
             assert client._messages.qsize() == count
     finally:
@@ -597,3 +604,69 @@ async def test_persisted_delivery_ack_and_byte_accounting(
         await finish(client)
         if sqlite:
             store.close()
+
+
+async def test_singleton_inline_reentrance_and_lifecycle_guards() -> None:
+    client = AsyncClient(message_delivery="callback")
+    seen = []
+
+    def one(payload):
+        return deque(
+            [
+                EngineEffect(
+                    EffectKind.MESSAGE,
+                    Message(topic="uniform/x", payload=payload),
+                    requires_delivery_mark=False,
+                )
+            ]
+        )
+
+    def callback(message):
+        seen.append(message.payload)
+        if message.payload == b"outer":
+            assert client._delivery.deliver_message_batch_inline(one(b"nested"), callback) == 1
+            assert seen == [b"outer"]
+
+    try:
+        assert client._delivery.deliver_message_batch_inline(one(b"outer"), callback) == 1
+        assert seen == [b"outer"]
+        assert client._callback_queue.qsize() == 1
+        await asyncio.wait_for(client._callback_queue.join(), 1)
+        assert seen == [b"outer", b"nested"]
+
+        for state in ("draining", "closed"):
+            client._delivery._callback_state = state
+            with pytest.raises(MessageDeliveryError, match="Callback delivery is closing"):
+                client._delivery.deliver_message_batch_inline(one(b"late"), callback)
+            client._delivery._callback_state = "open"
+    finally:
+        await finish(client)
+
+
+async def test_direct_qos0_and_persisted_singletons_remain_worker_or_slow_path() -> None:
+    client = AsyncClient(message_delivery="callback")
+    seen = []
+
+    def callback(message):
+        seen.append(message.payload)
+
+    try:
+        direct = Message(topic="uniform/x", payload=b"qos0")
+        assert client._delivery.deliver_callback_messages_inline([direct], callback)
+        assert seen == []
+        await asyncio.wait_for(client._callback_queue.join(), 1)
+        assert seen == [b"qos0"]
+
+        persisted = deque(
+            [
+                EngineEffect(
+                    EffectKind.MESSAGE,
+                    Message(topic="uniform/x", payload=b"persisted"),
+                    requires_delivery_mark=True,
+                )
+            ]
+        )
+        assert client._delivery.deliver_message_batch_inline(persisted, callback) == 0
+        assert seen == [b"qos0"]
+    finally:
+        await finish(client)

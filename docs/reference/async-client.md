@@ -48,14 +48,17 @@ callable that returns an awaitable violates the callback contract and is reporte
 as a callback `TypeError` rather than being scheduled implicitly. Synchronous
 callbacks must not block the event loop.
 
-Message callbacks use a single bounded worker, independent of whether their
-callable is synchronous or asynchronous and of the received burst size. Admission
-may complete synchronously, but never invokes message callback code. One ordinary
-queue entry represents one notification; `callback_queued` is the actual queue
-length, excluding the active notification. The queue's configured maximum never
-changes. A worker turn processes only the notifications already present when it
-starts; later arrivals wait for a subsequent turn. This is a count bound, not a
-time bound on blocking user code or on individual matching topic filters.
+Message callbacks use one bounded worker for the general case. An eligible
+small, non-persisted MESSAGE effect may execute an idle synchronous callback
+inline only when it is the sole eligible MESSAGE at the head of a callback-only
+run and `AsyncClient` has already released the engine lock. A second eligible
+MESSAGE, an async callback, reentrant/queued delivery, direct-decode QoS 0 or
+`both` delivery uses the worker. One ordinary queue entry represents each
+worker-owned notification; `callback_queued` is the actual queue length,
+excluding the active notification. The queue's configured maximum never changes.
+A worker turn processes only the notifications already present when it starts;
+later arrivals wait for a subsequent turn. This is a count bound, not a time
+bound on blocking user code or on individual matching topic filters.
 
 A direct `on_message` is captured at admission. A topic notification snapshots its
 ordered live matches when execution begins; changes affect later notifications,
@@ -72,15 +75,15 @@ chooses whether to drain or discard queued work. Reopen discards the retired
 generation's queued work; an active reconnecting callback remains the single
 consumer. Admissions already waiting for the retired generation are rejected.
 
-An idle synchronous `on_publish` may still execute inline after receipt settlement,
-outside the engine lock. This publish-only policy is deliberately independent of
-the message-delivery policy. Iterator byte accounting and `both` destination
-ordering are retained; the callback leg of `both` is always worker-owned.
-Synchronous callbacks must not block the event loop. A callback cannot wait to
-admit more work into its own full queue. Also avoid application dependency cycles
-where a callback waits for an operation whose network progress requires that
-same saturated delivery queue to drain; worker isolation is not an unbounded
-read-ahead guarantee.
+An idle synchronous `on_publish` may still execute inline after receipt
+settlement, outside the engine lock. This publish-completion policy is separate
+from the narrow singleton MESSAGE-effect policy above. Iterator byte accounting
+and `both` destination ordering are retained; the callback leg of `both` and the
+direct-decode QoS 0 path are worker-owned. Synchronous callbacks must not block
+the event loop. A callback cannot wait to admit more work into its own full
+queue. Also avoid application dependency cycles where a callback waits for an
+operation whose network progress requires that same saturated delivery queue to
+drain; worker isolation is not an unbounded read-ahead guarantee.
 
 Matching `message_callback_add` filters run instead of `on_message`, in
 registration order. Shared-subscription filters match the filter string

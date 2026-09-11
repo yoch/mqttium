@@ -150,14 +150,22 @@ no longer implicitly handed to the callback worker; it is reported as a callback
 `TypeError`. Convert such callbacks to `async def`. This removes hidden scheduling
 state and makes callback execution mode explicit from the callable itself.
 
-## Experimental uniform message callbacks
+## Experimental message callback scheduling
 
-This experimental branch makes every message notification worker-owned, including
-formerly inline synchronous singletons and pairs and the callback leg of `both`.
+This experimental branch keeps the simplified single-worker queue representation
+but restores one deliberately narrow latency path. An eligible small,
+non-persisted MESSAGE effect may execute an idle synchronous callback inline when
+it is the only eligible MESSAGE at the head of a callback-only run and the engine
+lock has already been released. A second eligible MESSAGE makes the whole run
+worker-owned. Async callbacks, reentrant or queued work, direct-decode QoS 0 and
+the callback leg of `both` remain worker-owned. The old pair-inline helper,
+physical callback batches, logical batch reservations and queue-capacity mutation
+remain removed.
+
 The argument signatures, constructor options/default values, sync/async callable
 contract, FIFO, QoS acknowledgement rules and byte budgets are unchanged. Code
-must no longer assume a message callback has already run when admission returns.
-Use an application event/future when completion of callback work matters.
+that requires callback completion should still use an application event/future;
+timing and task identity are not Stable contracts.
 
 Cancelling the callback worker no longer discards unrelated queued notifications:
 the controller replaces the worker and retains all unstarted jobs. The active
@@ -167,11 +175,12 @@ can await `disconnect()` without self-joining. Reconnect from that callback keep
 the same consumer, retires old queued jobs and accepts a new generation.
 
 `both` still admits iterator copies before their callback counterparts and releases
-shared bytes only after both references are retired. Its formerly-inline singleton
-callback is now queued. `on_publish` retains its existing separate inline policy.
-This scheduling change is disclosed as an experimental contract change, not a
-claim of strict timing/task-identity compatibility with every existing caller.
-No stable release, version bump or deprecation waiver follows from this branch.
+shared bytes only after both references are retired. `on_publish` retains its
+existing separate inline policy. Direct-decode QoS 0 remains worker-owned so user
+code is never reintroduced inside the reader's engine-lock section. This
+scheduling change is disclosed as an experimental contract change, not a claim
+of strict timing/task-identity compatibility with every existing caller. No
+stable release, version bump or deprecation waiver follows from this branch.
 
 ## Durable sessions
 

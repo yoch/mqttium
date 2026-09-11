@@ -161,3 +161,44 @@ The workload is closed-loop burst delivery, not an externally paced 3942 RTT/s
 comparison or a library saturation ceiling. Any positive conclusion needs longer
 independent controls and the reference workload afterward. No performance outcome
 is predicted in this report.
+
+## ARM64 qualification and revised conclusion
+
+The uniform worker-only runtime was not performance-neutral on the reference
+Raspberry Pi application-RTT workload. With MQTT 3.1.1, QoS 1, the frozen
+external pacer at 3942 messages/s and the frozen benchmark harness
+`37160eed99b50d1f384e1565a16d0346eb01ca56`, the worker-only candidate showed a
+repeatable roughly +15.5% p50 RTT regression relative to base
+`9ad1f01857306ac5079ffb1d073a59fdb60e1931`. That cost is too large for the
+simplification objective and rejects the strict worker-only conclusion above.
+
+A minimal ablation identified the missing queue/event-loop hop as the dominant
+cause. The final candidate therefore keeps the simplified ordinary queue and
+bounded worker from this experiment, but permits one eligible idle synchronous
+callback-only MESSAGE effect to run inline after the engine lock is released.
+It does **not** restore physical callback batches, logical batch reservations,
+private queue-capacity mutation, synchronous pair-inline scheduling or a second
+scheduler. Async callbacks, runs containing two eligible MESSAGE effects,
+reentrant/queued work, persisted/replay delivery, direct-decode QoS 0 and `both`
+delivery remain worker-owned.
+
+Two independent standard ARM64 comparisons support the correction. The first
+singleton-inline recheck (Actions run `34541183821`) measured about -1.55% p50
+RTT versus base after an allowed stimulus-only block retry. The exact cleaned
+runtime (`src/mqttium/api/_delivery.py` SHA-256
+`fa0401951a03d9efa8a15259efcc5d5981248652038f5a7daebde3951fe435eb`) was then
+remeasured in Actions run `34574325167`: four selected standard blocks, target
+rate unchanged at about 3940.36 completed RTT/s, zero timeouts and zero
+backpressure misses. The paired p50 effect was -1.45%; the two ABBA/BAAB pair
+units were -1.53% and -1.37%, with the computed effect interval wholly below
+zero. Median p95 improved by roughly 3.2%, p99 was essentially flat, and memory
+was unchanged at the scale of the run. One initial block was rejected for an
+external-pacer catch-up violation and was replayed by the harness' predefined
+stimulus-only retry rule.
+
+The harness still labels this four-block result statistically `inconclusive`
+because it contains only two pair units. That prevents overclaiming a precise
+speedup; it does not resurrect the +15.5% worker-only regression. The engineering
+conclusion is narrower: the singleton post-lock fast path removes the measured
+regression while retaining the structural simplifications that motivated the
+experiment.
