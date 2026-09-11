@@ -1,0 +1,94 @@
+name: Uniform RC14 final hosted stability
+run-name: "Uniform RC14 final stability 6x5s"
+on:
+  push:
+    branches: [bench/uniform-rc14-final-stability]
+    paths: [.github/workflows/uniform-rc14-final-stability.yml]
+permissions:
+  contents: read
+env:
+  BASE_SHA: c194597bcf5af4951fbec2b560600eef3cb84b3c
+  CANDIDATE_SHA: fb619a27b866c5db869508e6a226db0080e668c7
+  PYTHONUNBUFFERED: '1'
+jobs:
+  stability:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+          path: tooling
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.BASE_SHA }}
+          path: slot-a
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.BASE_SHA }}
+          path: slot-c
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+          path: slot-b
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.13.5'
+      - name: Install broker and pin identities
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y mosquitto
+          python -m pip install 'psutil>=6,<8'
+          echo "JOB_ROOT=$RUNNER_TEMP/uniform-rc14-stability-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+          for slot in a b c; do test -z "$(git -C slot-$slot status --porcelain --untracked-files=no)"; done
+          test "$(git -C slot-a rev-parse HEAD)" = "$BASE_SHA"
+          test "$(git -C slot-c rev-parse HEAD)" = "$BASE_SHA"
+          test "$(git -C slot-b rev-parse HEAD)" = "$CANDIDATE_SHA"
+      - name: Run preregistered A/A then A/B temporal screening
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$JOB_ROOT/results"
+          read -r sut broker_cpu < <(python -c 'import os; c=sorted(os.sched_getaffinity(0)); assert len(c)>=2; print(c[0],c[1])')
+          port=$(python -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+          printf 'listener %s 127.0.0.1\nallow_anonymous true\npersistence false\nset_tcp_nodelay true\nconnection_messages false\nlog_type error\nmax_inflight_messages 1000\nmax_queued_messages 10000\n' "$port" > "$JOB_ROOT/results/mosquitto.conf"
+          taskset -c "$broker_cpu" mosquitto -c "$JOB_ROOT/results/mosquitto.conf" > "$JOB_ROOT/results/broker.log" 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 50); do
+            kill -0 "$pid"
+            if (echo > "/dev/tcp/127.0.0.1/$port") >/dev/null 2>&1; then break; fi
+            sleep 0.1
+          done
+          (echo > "/dev/tcp/127.0.0.1/$port") >/dev/null 2>&1
+          uname -a > "$JOB_ROOT/results/host.txt"
+          lscpu >> "$JOB_ROOT/results/host.txt"
+          printf 'sut=%s\nbroker=%s\n' "$sut" "$broker_cpu" > "$JOB_ROOT/results/cpus.txt"
+          (mosquitto -h || true) > "$JOB_ROOT/results/broker-version.txt" 2>&1
+          python tooling/benchmarks/uniform_callback_probe.py \
+            --base "$PWD/slot-a" --control "$PWD/slot-c" --candidate "$PWD/slot-b" \
+            --output "$JOB_ROOT/results/samples" --port "$port" --cpu "$sut" \
+            --seconds 5 --pairs 6 | tee "$JOB_ROOT/results/progress.log"
+          for slot in a b c; do test -z "$(git -C slot-$slot status --porcelain --untracked-files=no)"; done
+          kill "$pid" 2>/dev/null || true
+          wait "$pid" 2>/dev/null || true
+          trap - EXIT
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always() && env.JOB_ROOT != ''
+        with:
+          name: uniform-rc14-final-stability-${{ github.run_id }}
+          path: ${{ env.JOB_ROOT }}/results/
+          retention-days: 30
+          if-no-files-found: warn
+      - name: Clean isolated output
+        if: always() && env.JOB_ROOT != ''
+        shell: bash
+        run: |
+          test "$JOB_ROOT" = "$RUNNER_TEMP/uniform-rc14-stability-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          rm -rf -- "$JOB_ROOT"
