@@ -1,0 +1,102 @@
+name: Uniform RC14 QoS0 direct-decode control
+run-name: "Uniform RC14 QoS0 callback control 4x3s"
+on:
+  push:
+    branches: [bench/uniform-rc14-qos0-control]
+    paths: [.github/workflows/uniform-rc14-qos0-control.yml]
+permissions:
+  contents: read
+env:
+  BASE_SHA: c194597bcf5af4951fbec2b560600eef3cb84b3c
+  CANDIDATE_SHA: fb619a27b866c5db869508e6a226db0080e668c7
+  PYTHONUNBUFFERED: '1'
+jobs:
+  qos0:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+          path: tooling
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.BASE_SHA }}
+          path: slot-a
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.BASE_SHA }}
+          path: slot-c
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+          path: slot-b
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.13.5'
+      - name: Install broker and create QoS0-only probe from retained benchmark
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y mosquitto
+          python -m pip install 'psutil>=6,<8'
+          echo "JOB_ROOT=$RUNNER_TEMP/uniform-qos0-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/qos0-probe"
+          cp tooling/benchmarks/uniform_callback_probe.py "$RUNNER_TEMP/qos0-probe/probe.py"
+          PROBE="$RUNNER_TEMP/qos0-probe/probe.py" python - <<'PY'
+          import os
+          from pathlib import Path
+          p=Path(os.environ['PROBE']); text=p.read_text()
+          old='receipts.append(pub.publish_nowait(topic, payload, qos=1))'
+          assert text.count(old)==1
+          text=text.replace(old,'receipts.append(pub.publish_nowait(topic, payload, qos=0))')
+          old='"workload": "closed_loop_qos1_64B"'
+          assert text.count(old)==1
+          text=text.replace(old,'"workload": "closed_loop_qos0_64B"')
+          p.write_text(text)
+          PY
+      - name: A/A then A/B QoS0 control
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$JOB_ROOT/results"
+          read -r sut broker_cpu < <(python -c 'import os; c=sorted(os.sched_getaffinity(0)); assert len(c)>=2; print(c[0],c[1])')
+          port=$(python -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+          printf 'listener %s 127.0.0.1\nallow_anonymous true\npersistence false\nset_tcp_nodelay true\nconnection_messages false\nlog_type error\nmax_inflight_messages 1000\nmax_queued_messages 10000\n' "$port" > "$JOB_ROOT/results/mosquitto.conf"
+          taskset -c "$broker_cpu" mosquitto -c "$JOB_ROOT/results/mosquitto.conf" > "$JOB_ROOT/results/broker.log" 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 50); do
+            kill -0 "$pid"
+            if (echo > "/dev/tcp/127.0.0.1/$port") >/dev/null 2>&1; then break; fi
+            sleep 0.1
+          done
+          (echo > "/dev/tcp/127.0.0.1/$port") >/dev/null 2>&1
+          python "$RUNNER_TEMP/qos0-probe/probe.py" \
+            --base "$PWD/slot-a" --control "$PWD/slot-c" --candidate "$PWD/slot-b" \
+            --output "$JOB_ROOT/results/samples" --port "$port" --cpu "$sut" \
+            --seconds 3 --pairs 4 | tee "$JOB_ROOT/results/progress.log"
+          for slot in a b c; do test -z "$(git -C slot-$slot status --porcelain --untracked-files=no)"; done
+          uname -a > "$JOB_ROOT/results/host.txt"
+          printf 'sut=%s\nbroker=%s\n' "$sut" "$broker_cpu" > "$JOB_ROOT/results/cpus.txt"
+          kill "$pid" 2>/dev/null || true
+          wait "$pid" 2>/dev/null || true
+          trap - EXIT
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always() && env.JOB_ROOT != ''
+        with:
+          name: uniform-rc14-qos0-control-${{ github.run_id }}
+          path: ${{ env.JOB_ROOT }}/results/
+          retention-days: 30
+          if-no-files-found: warn
+      - name: Clean isolated output
+        if: always() && env.JOB_ROOT != ''
+        shell: bash
+        run: |
+          test "$JOB_ROOT" = "$RUNNER_TEMP/uniform-qos0-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          rm -rf -- "$JOB_ROOT"
