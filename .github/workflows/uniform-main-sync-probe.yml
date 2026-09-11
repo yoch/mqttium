@@ -28,6 +28,8 @@ jobs:
           set -euo pipefail
           test "$(git merge-base HEAD "$PRODUCT_SHA")" = "$PRODUCT_SHA"
           git cat-file -e "$MAIN_SHA^{commit}"
+          git config user.name 'mqttium merge probe'
+          git config user.email 'merge-probe@invalid.local'
           mkdir -p /tmp/sync-probe/stages
           set +e
           git merge --no-commit --no-ff "$MAIN_SHA" > /tmp/sync-probe/merge.stdout 2> /tmp/sync-probe/merge.stderr
