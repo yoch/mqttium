@@ -570,34 +570,31 @@ class ApplicationDelivery:
         effects: deque[EngineEffect],
         callback: Callable[[Message], Any] | None,
     ) -> int:
-        """Admit a consecutive eligible prefix; never run application code.
+        """Admit a consecutive eligible prefix with one narrow sync fast path.
 
-        The effect owner may finish admission synchronously without creating a
-        flusher. User execution belongs exclusively to the callback worker.
-        Iterator/callback capacity is preflighted once for the whole prefix.
-        No user code or suspension can invalidate that preflight.
-        Persisted deliveries and exact-byte reservations retain the slow path.
+        A sole pending eligible callback-only MESSAGE may execute an idle declared-sync
+        callback inline. Async, multi-effect, reentrant, iterator/both and persisted
+        work remains worker/slow-path owned. AsyncClient refuses this method while
+        holding the engine lock, so the inline exception never runs user code in that
+        critical section. Iterator/callback capacity stays ordinary queue capacity.
         """
         callback_delivery, iterator_delivery = self._modes(callback)
         if not callback_delivery and not iterator_delivery:
             return 0
         cb = callback if callback_delivery else None
 
-        # Keep the ordinary worker loop below unchanged. An idle synchronous
-        # callback-only run containing exactly one eligible MESSAGE may avoid
-        # the queue hop. A second eligible MESSAGE makes the entire message run
-        # worker-owned; non-message effects behind a singleton do not.
+        # Keep the ordinary worker loop below unchanged. Only a sole pending
+        # eligible MESSAGE may avoid the queue hop. If any other effect is already
+        # owned by the pump, user code cannot overtake it.
         if (
             cb is not None
             and not iterator_delivery
             and self._callback_state == "open"
-            and effects
+            and len(effects) == 1
             and self.can_dispatch_callback_inline(cb)
         ):
             first = self._inline_message_candidate(effects[0])
-            if first is not None and (
-                len(effects) == 1 or self._inline_message_candidate(effects[1]) is None
-            ):
+            if first is not None:
                 self.dispatch_callback_inline(cb, first)
                 return 1
 
@@ -1043,8 +1040,11 @@ class ApplicationDelivery:
         if self._callback_state == "closed":
             self._discard_callback_queue()
         if self.callback_task is asyncio.current_task():
-            # An own-worker shutdown cannot join itself. Return to finish the
-            # active notification; a reconnect may reopen the same consumer.
+            # An own-worker shutdown cannot join itself. Retire unstarted work
+            # now; the active notification may finish and a reconnect may reopen
+            # the same worker incarnation for the replacement generation.
+            self._callback_state = "closed"
+            self._discard_callback_queue()
             return
         try:
             if drain and self._callback_state == "draining":

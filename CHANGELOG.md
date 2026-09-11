@@ -6,6 +6,23 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [1.0.0rc14] - 2026-09-11
+
+### Fixed
+
+- Keep replacement-connection callbacks alive when a callback disconnects and
+  reconnects before its own worker job returns (#455). Reopening retires the old
+  queued work and its reservations before admitting the new connection, without
+  replacing the active worker or changing steady-state callback dispatch.
+
+- Preserve delivery across live sync-to-async topic-callback reconfiguration
+  without disabling eligible synchronous inline dispatch (#453). A captured sync
+  router checks its current execution mode before invoking user callbacks. Only
+  unstarted work whose route became asynchronous transfers to the bounded worker,
+  retaining FIFO ahead of reentrant admissions and the callback queue bound.
+  Queued work redirects within its existing worker job. User synchronous callbacks
+  returning awaitables remain contract violations.
+
 ### Changed
 
 - Experimental message callback scheduling keeps one ordinary bounded worker
@@ -1094,7 +1111,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - Pre-spin-out comparative analysis and generated coverage data from the
   published source tree.
 
-[Unreleased]: https://github.com/yoch/mqttium/compare/v1.0.0rc13...HEAD
+[Unreleased]: https://github.com/yoch/mqttium/compare/v1.0.0rc14...HEAD
+[1.0.0rc14]: https://github.com/yoch/mqttium/compare/v1.0.0rc13...v1.0.0rc14
 [1.0.0rc13]: https://github.com/yoch/mqttium/compare/v1.0.0rc12...v1.0.0rc13
 [1.0.0rc12]: https://github.com/yoch/mqttium/compare/v1.0.0rc11...v1.0.0rc12
 [1.0.0rc11]: https://github.com/yoch/mqttium/compare/v1.0.0rc10...v1.0.0rc11
