@@ -38,7 +38,7 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
           python-version: '3.13.5'
-      - name: Install broker and create QoS0-only probe from retained benchmark
+      - name: Install broker and create QoS0-only receive probe
         shell: bash
         run: |
           set -euo pipefail
@@ -58,9 +58,15 @@ jobs:
           old='"workload": "closed_loop_qos1_64B"'
           assert text.count(old)==1
           text=text.replace(old,'"workload": "closed_loop_qos0_64B"')
+          # Publish-only has no subscriber callback barrier at QoS0 and can fill
+          # the writer while receipts are already settled. It does not measure
+          # the inbound direct-decode policy under test, so omit that cell.
+          old='    ("publish", 8),\n'
+          assert text.count(old)==1
+          text=text.replace(old,'')
           p.write_text(text)
           PY
-      - name: A/A then A/B QoS0 control
+      - name: A/A then A/B QoS0 receive control
         shell: bash
         run: |
           set -euo pipefail
