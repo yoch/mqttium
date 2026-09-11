@@ -1,0 +1,65 @@
+name: RC14 release prep
+
+on:
+  push:
+    branches: [release/v1.0.0rc14]
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: true
+      - name: Prepare RC14 metadata
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          version_file = Path("src/mqttium/__init__.py")
+          text = version_file.read_text(encoding="utf-8")
+          old = '__version__ = "1.0.0rc13"'
+          new = '__version__ = "1.0.0rc14"'
+          if text.count(old) != 1:
+              raise SystemExit(f"expected exactly one {old!r}")
+          version_file.write_text(text.replace(old, new), encoding="utf-8")
+
+          changelog = Path("CHANGELOG.md")
+          text = changelog.read_text(encoding="utf-8")
+          top = "## [Unreleased]\n\n"
+          if text.count(top) != 1:
+              raise SystemExit("unexpected Unreleased heading count")
+          text = text.replace(
+              top,
+              "## [Unreleased]\n\n## [1.0.0rc14] - 2026-09-11\n\n",
+              1,
+          )
+          old_links = (
+              "[Unreleased]: https://github.com/yoch/mqttium/compare/v1.0.0rc13...HEAD\n"
+              "[1.0.0rc13]: https://github.com/yoch/mqttium/compare/v1.0.0rc12...v1.0.0rc13"
+          )
+          new_links = (
+              "[Unreleased]: https://github.com/yoch/mqttium/compare/v1.0.0rc14...HEAD\n"
+              "[1.0.0rc14]: https://github.com/yoch/mqttium/compare/v1.0.0rc13...v1.0.0rc14\n"
+              "[1.0.0rc13]: https://github.com/yoch/mqttium/compare/v1.0.0rc12...v1.0.0rc13"
+          )
+          if text.count(old_links) != 1:
+              raise SystemExit("unexpected changelog comparison links")
+          changelog.write_text(text.replace(old_links, new_links), encoding="utf-8")
+          PY
+          python tools/ci/release_metadata.py --tag v1.0.0rc14 --prerelease true
+          git diff --check
+      - name: Commit clean release-prep tree
+        run: |
+          set -euo pipefail
+          rm .github/workflows/rc14-release-prep.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "chore: prepare v1.0.0rc14"
+          git push origin HEAD:release/v1.0.0rc14
