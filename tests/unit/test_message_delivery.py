@@ -140,12 +140,14 @@ async def test_stream_drains_messages_before_closed() -> None:
 async def test_explicit_reconnect_resets_closed_message_stream() -> None:
     client = AsyncClient(client_id="delivery-reset", max_pending_messages=2)
     original = client._messages
+    ready = client._message_ready
     client._closed.set()
     client._message_ready.set()
 
     await client._reset_message_stream()
 
-    assert client._messages is not original
+    assert client._messages is original
+    assert client._message_ready is ready
     assert client._messages.maxsize == 2
     assert client._messages.empty()
     assert not client._closed.is_set()

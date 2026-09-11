@@ -16,7 +16,7 @@ def _effect(i: int) -> EngineEffect:
     )
 
 
-async def test_idle_sync_pair_runs_inline_without_public_option() -> None:
+async def test_idle_sync_pair_is_admitted_without_public_option() -> None:
     client = AsyncClient(message_delivery="callback")
     seen: list[str] = []
     client.on_message = lambda message: seen.append(message.payload.decode())
@@ -26,12 +26,16 @@ async def test_idle_sync_pair_runs_inline_without_public_option() -> None:
     )
 
     assert applied == 2
+    assert seen == []
+    assert client._callback_worker_task is not None
+    assert client.stats().delivery.callback_queued == 2
+    await client._callback_queue.join()
     assert seen == ["0", "1"]
-    assert client._callback_worker_task is None
     assert client.stats().delivery.callback_queued == 0
+    await client._shutdown_callback_worker(drain=False)
 
 
-async def test_sync_pair_reserves_tail_and_keeps_reentrant_fifo() -> None:
+async def test_sync_pair_counts_tail_and_keeps_reentrant_fifo() -> None:
     client = AsyncClient(message_delivery="callback", max_pending_callbacks=2)
     seen: list[str] = []
 
@@ -51,7 +55,7 @@ async def test_sync_pair_reserves_tail_and_keeps_reentrant_fifo() -> None:
         )
         == 2
     )
-    assert seen == ["0", "1"]
+    assert seen == []
     assert client._callback_queue.maxsize == 2
     await client._callback_queue.join()
     assert seen == ["0", "1", "reentrant"]
@@ -79,7 +83,10 @@ async def test_sync_pair_keeps_captured_callback_for_tail() -> None:
         )
         == 2
     )
+    assert seen == []
+    await client._callback_queue.join()
     assert seen == ["old:0", "old:1"]
+    await client._shutdown_callback_worker(drain=False)
 
 
 async def test_larger_sync_burst_keeps_worker_fairness_path() -> None:
@@ -159,12 +166,15 @@ async def test_sync_pair_isolates_exception_and_continues() -> None:
         )
         == 2
     )
+    assert seen == []
+    await client._callback_queue.join()
     assert seen == ["0", "1"]
     assert len(errors) == 1
     assert isinstance(errors[0], RuntimeError)
+    await client._shutdown_callback_worker(drain=False)
 
 
-async def test_sync_returning_coroutine_is_rejected_inline_and_closed() -> None:
+async def test_sync_message_returning_coroutine_is_rejected_and_closed() -> None:
     client = AsyncClient(message_delivery="callback")
     seen: list[str] = []
     errors: list[BaseException] = []
@@ -188,13 +198,13 @@ async def test_sync_returning_coroutine_is_rejected_inline_and_closed() -> None:
         )
         == 2
     )
-    await asyncio.sleep(0)
+    await client._callback_queue.join()
 
     assert seen == ["call:0", "call:1"]
     assert len(errors) == 1
     assert isinstance(errors[0], TypeError)
     assert "async def" in str(errors[0])
-    assert client._callback_worker_task is None
+    await client._shutdown_callback_worker(drain=False)
 
 
 async def test_sync_returning_coroutine_is_rejected_on_worker_too() -> None:
@@ -241,40 +251,39 @@ async def test_sync_returning_future_is_rejected_without_taking_ownership() -> N
         == 2
     )
 
+    await client._callback_queue.join()
     assert len(errors) == 2
     assert all(isinstance(error, TypeError) for error in errors)
     assert not future.done()
     future.cancel()
+    await client._shutdown_callback_worker(drain=False)
 
 
-async def test_real_task_cancellation_restores_pair_bound() -> None:
+async def test_real_worker_cancellation_does_not_cancel_admission_or_queued_work() -> None:
     client = AsyncClient(message_delivery="callback", max_pending_callbacks=2)
     seen: list[str] = []
+    caller = asyncio.current_task()
 
-    async def run_delivery() -> None:
-        def callback(message: Message) -> None:
-            value = message.payload.decode()
-            seen.append(value)
-            if value == "0":
-                task = asyncio.current_task()
-                assert task is not None
-                task.cancel()
-                raise asyncio.CancelledError
+    def callback(message: Message) -> None:
+        value = message.payload.decode()
+        seen.append(value)
+        if value == "0":
+            task = asyncio.current_task()
+            assert task is client._callback_worker_task and task is not caller
+            task.cancel()
+            raise asyncio.CancelledError
 
-        client.on_message = callback
-        client._apply_message_effect_batch_inline(
-            deque([_effect(0), _effect(1)]), client._connection_epoch
-        )
-
-    task = asyncio.create_task(run_delivery())
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
-    else:
-        raise AssertionError("real task cancellation did not propagate")
-
-    assert seen == ["0"]
+    client.on_message = callback
+    client._apply_message_effect_batch_inline(
+        deque([_effect(0), _effect(1)]), client._connection_epoch
+    )
+    worker = client._callback_worker_task
+    assert worker is not None
+    await asyncio.gather(worker, return_exceptions=True)
+    assert worker.cancelled()
+    await asyncio.wait_for(client._callback_queue.join(), 1)
+    assert seen == ["0", "1"]
+    assert caller is not None and not caller.cancelling()
     assert client.stats().delivery.callback_queued == 0
     assert client._callback_queue.maxsize == 2
-    assert client._callback_worker_task is None
+    await client._shutdown_callback_worker(drain=False)

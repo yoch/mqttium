@@ -15,7 +15,7 @@ def _effect(i: int) -> EngineEffect:
     )
 
 
-async def test_message_callback_batch_is_one_physical_job_with_logical_stats() -> None:
+async def test_message_callback_batch_is_ordinary_jobs_with_exact_stats() -> None:
     client = AsyncClient(message_delivery="callback", max_pending_callbacks=8)
     seen: list[bytes] = []
     client.on_message = lambda message: seen.append(message.payload)
@@ -25,7 +25,7 @@ async def test_message_callback_batch_is_one_physical_job_with_logical_stats() -
     )
 
     assert applied == 4
-    assert len(client._callback_queue._queue) == 1  # type: ignore[attr-defined]
+    assert client._callback_queue.qsize() == 4
     assert client.stats().delivery.callback_queued == 4
     await client._callback_queue.join()
     assert seen == [b"0", b"1", b"2", b"3"]
@@ -106,7 +106,7 @@ async def test_shutdown_releases_reserved_batch_capacity() -> None:
         )
         == 4
     )
-    assert client._callback_queue.maxsize == 5
+    assert client._callback_queue.maxsize == 8
 
     await client._shutdown_callback_worker(drain=False)
 
@@ -138,9 +138,8 @@ async def test_active_async_batch_keeps_remaining_callbacks_reserved() -> None:
     )
     await entered.wait()
 
-    # Removing the physical batch from asyncio.Queue frees one slot, exactly as
-    # dequeuing the first of three ordinary callback jobs would. The other two
-    # callbacks remain logically queued while the first async callback is active.
+    # Only the active callback leaves the queue. The remaining two notifications
+    # are ordinary queue entries, so capacity and visible length stay identical.
     assert client.stats().delivery.callback_queued == 2
     assert client._delivery.try_enqueue_callback(lambda: seen.append("generic"))
     assert client.stats().delivery.callback_queued == 3
@@ -163,7 +162,7 @@ def _decoded_effect(i: int) -> EngineEffect:
     )
 
 
-async def test_decoded_message_callbacks_batch_as_one_physical_job() -> None:
+async def test_decoded_message_callbacks_batch_as_individual_jobs() -> None:
     client = AsyncClient(message_delivery="callback", max_pending_callbacks=8)
     seen: list[bytes] = []
     client.on_message = lambda message: seen.append(message.payload)
@@ -173,7 +172,7 @@ async def test_decoded_message_callbacks_batch_as_one_physical_job() -> None:
     )
 
     assert applied == 4
-    assert len(client._callback_queue._queue) == 1  # type: ignore[attr-defined]
+    assert client._callback_queue.qsize() == 4
     assert client.stats().delivery.callback_queued == 4
     await client._callback_queue.join()
     assert seen == [b"0", b"1", b"2", b"3"]

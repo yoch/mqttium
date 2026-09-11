@@ -13,7 +13,7 @@ import inspect
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable
 from types import FunctionType, MethodType
-from typing import Any, Literal, cast
+from typing import Any, Literal
 
 from mqttium.api.stats import DeliveryStats
 from mqttium.codec.properties import PUBLISH, encode_properties
@@ -23,18 +23,6 @@ from mqttium.protocol.effects import EffectKind, EngineEffect
 from mqttium.types import Message
 
 MessageDelivery = Literal["auto", "iterator", "callback", "both"]
-
-
-class _CallbackHandoff(Exception):
-    """Internal pre-invocation redirect, never an application callback failure.
-
-    A live route changed from sync to async after its callback was captured.
-    Carries an uncalled dispatcher, not an awaitable or a started continuation.
-    """
-
-    def __init__(self, callback: Callable[..., Awaitable[Any]]) -> None:
-        self.callback = callback
-        super().__init__()
 
 
 class _SharedDeliveryReservation:
@@ -51,13 +39,7 @@ AccountedDeliveryToken = int | _SharedDeliveryReservation
 DeliveryToken = AccountedDeliveryToken | None
 
 
-class _CallbackMessageBatchToken:
-    __slots__ = ()
-
-
-_CALLBACK_MESSAGE_BATCH = _CallbackMessageBatchToken()
-CallbackQueueToken = DeliveryToken | _CallbackMessageBatchToken
-CallbackJob = tuple[Callable[..., Any], tuple[Any, ...], CallbackQueueToken]
+CallbackJob = tuple[Callable[..., Any], tuple[Any, ...], DeliveryToken]
 TrackedIteratorMessage = tuple[Message, AccountedDeliveryToken]
 IteratorQueueItem = Message | TrackedIteratorMessage
 MessageAcceptor = Callable[[Message, Callable[[Message], Any] | None], Awaitable[None] | None]
@@ -149,18 +131,16 @@ class ApplicationDelivery:
         self.callback_queue: asyncio.Queue[CallbackJob] = asyncio.Queue(
             maxsize=max_pending_callbacks
         )
-        self._callback_limit = max_pending_callbacks
-        self._callback_batch_reserved = 0
         self.message_ready = asyncio.Event()
         self.closed = asyncio.Event()
-        self._stream_generation = 0
+        self._delivery_generation = 0
         self.callback_task: asyncio.Task[None] | None = None
         # True while either the worker or the opportunistic reader/effect path
         # is executing user code. It is also the reentrancy guard: a callback
         # that publishes or causes another delivery always falls back to the
         # bounded queue instead of nesting user callbacks.
         self._callback_active = False
-        self._callback_stop = False
+        self._callback_state: Literal["open", "draining", "closed"] = "open"
         self.delivery_timeout = delivery_timeout
         self.callback_shutdown_timeout = callback_shutdown_timeout
 
@@ -192,10 +172,11 @@ class ApplicationDelivery:
     def _accept_iterator_unaccounted(
         self, message: Message, _callback: Callable[[Message], Any] | None
     ) -> Awaitable[None] | None:
+        generation = self._delivery_generation
         try:
             self.messages_queue.put_nowait(message)
         except asyncio.QueueFull:
-            return self.put_message(message)
+            return self.put_message(message, generation=generation)
         self.message_ready.set()
         return None
 
@@ -217,12 +198,12 @@ class ApplicationDelivery:
     ) -> Awaitable[None] | None:
         if callback is None:
             return self.accept(message, callback)
+        self.ensure_callback_worker()
         try:
             self.messages_queue.put_nowait(message)
         except asyncio.QueueFull:
             return self.accept(message, callback)
         self.message_ready.set()
-        self.ensure_callback_worker()
         job: CallbackJob = (callback, (message,), None)
         try:
             self.callback_queue.put_nowait(job)
@@ -285,9 +266,9 @@ class ApplicationDelivery:
             or self.callback_queue.full()
         ):
             return self.accept(message, callback)
+        self.ensure_callback_worker()
         self.messages_queue.put_nowait(message)
         self.message_ready.set()
-        self.ensure_callback_worker()
         self.callback_queue.put_nowait((callback, (message,), None))
         return None
 
@@ -337,9 +318,9 @@ class ApplicationDelivery:
             or self.callback_queue.full()
         ):
             return self.accept(message, callback, property_wire_size)
+        self.ensure_callback_worker()
         self.messages_queue.put_nowait(message)
         self.message_ready.set()
-        self.ensure_callback_worker()
         self.callback_queue.put_nowait((callback, (message,), None))
         return None
 
@@ -371,14 +352,19 @@ class ApplicationDelivery:
         No reservation is taken, so there is nothing to roll back: a failure
         here leaves only whatever the queues already accepted.
         """
+        generation = self._delivery_generation
+        if callback is not None:
+            self.ensure_callback_worker()
         if iterator_delivery:
             try:
                 self.messages_queue.put_nowait(message)
             except asyncio.QueueFull:
-                await self.put_message(message)
+                await self.put_message(message, generation=generation)
             else:
                 self.message_ready.set()
         if callback is not None:
+            if generation != self._delivery_generation:
+                raise MessageDeliveryError("Callback admission belongs to a retired generation")
             self.ensure_callback_worker()
             job: CallbackJob = (callback, (message,), None)
             try:
@@ -402,6 +388,7 @@ class ApplicationDelivery:
         slow-path entries — `acceptor()` / `decoded_acceptor()` hand the common
         case to the specialised `_accept_*` acceptors.
         """
+        generation = self._delivery_generation
         callback_delivery = callback is not None and self.callback_mode
         iterator_delivery = self.iterator_mode or (self.auto_mode and callback is None)
         references = int(iterator_delivery) + int(callback_delivery)
@@ -425,19 +412,28 @@ class ApplicationDelivery:
             logical_bytes = self._reservable_size(message, property_wire_size)
             token = self.try_reserve(logical_bytes, references)
             if token is None:
-                token = await self.reserve_slow(logical_bytes, references)
+                token = await self.reserve_slow(
+                    logical_bytes,
+                    references,
+                    generation=generation,
+                    require_callback_open=callback_delivery,
+                )
         try:
+            if callback_delivery and generation != self._delivery_generation:
+                raise MessageDeliveryError("Callback admission belongs to a retired generation")
             if iterator_delivery:
                 item: IteratorQueueItem = (message, token) if token is not None else message
                 try:
                     self.messages_queue.put_nowait(item)
                 except asyncio.QueueFull:
-                    await self.put_message(item)
+                    await self.put_message(item, generation=generation)
                 else:
                     self.message_ready.set()
                 iterator_enqueued = True
             if callback_delivery:
                 assert callback is not None
+                if generation != self._delivery_generation:
+                    raise MessageDeliveryError("Callback admission belongs to a retired generation")
                 self.ensure_callback_worker()
                 job = (callback, (message,), token)
                 try:
@@ -472,8 +468,8 @@ class ApplicationDelivery:
         return DeliveryStats(
             iterator_queued=self.messages_queue.qsize(),
             iterator_limit=self.messages_queue.maxsize,
-            callback_queued=self.callback_queue.qsize() + self._callback_batch_reserved,
-            callback_limit=self._callback_limit,
+            callback_queued=self.callback_queue.qsize(),
+            callback_limit=self.callback_queue.maxsize,
             pending_bytes=self.pending_bytes,
             pending_high_water_bytes=self.pending_high_water_bytes,
             accounted_limit=self.accounted_limit,
@@ -483,17 +479,17 @@ class ApplicationDelivery:
         )
 
     def reopen(self) -> None:
-        if self._callback_stop:
-            # A callback can disconnect and reconnect before its own job ends.
-            # Retire only the old queued work now; the same worker must not
-            # discard deliveries admitted by the replacement connection.
-            self._discard_callback_queue()
-            self._callback_stop = False
         self.closed.clear()
+        if self._callback_state != "open":
+            # The explicit reset already retired the prior delivery generation.
+            # A callback which reconnects remains the sole worker incarnation.
+            self._callback_state = "open"
+            self.space.set()
 
     def close(self) -> None:
         self.closed.set()
         self.message_ready.set()
+        self.space.set()
 
     def _modes(self, callback: Callable[[Message], Any] | None) -> tuple[bool, bool]:
         """Resolve the two delivery destinations from the modes cached at init."""
@@ -514,33 +510,6 @@ class ApplicationDelivery:
     def _is_small_decoded(self, message: Message, property_wire_size: int) -> bool:
         return _fits_small_limit(message, self.small_message_limit, property_wire_size)
 
-    def _reserve_callback_batch(self, count: int) -> None:
-        extra = count - 1
-        if extra <= 0:
-            return
-        self._callback_batch_reserved += extra
-        self.callback_queue._maxsize -= extra  # type: ignore[attr-defined]
-
-    def _release_callback_batch(self, count: int) -> None:
-        extra = count - 1
-        if extra <= 0:
-            return
-        assert self._callback_batch_reserved >= extra
-        self._callback_batch_reserved -= extra
-        self.callback_queue._maxsize += extra  # type: ignore[attr-defined]
-        putters = self.callback_queue._putters  # type: ignore[attr-defined]
-        for _ in range(min(extra, len(putters))):
-            self.callback_queue._wakeup_next(putters)  # type: ignore[attr-defined]
-
-    def _callback_batch_capacity(self, iterator_delivery: bool) -> int:
-        capacity = self.callback_queue.maxsize - self.callback_queue.qsize()
-        if iterator_delivery:
-            capacity = min(
-                capacity,
-                self.messages_queue.maxsize - self.messages_queue.qsize(),
-            )
-        return max(0, capacity)
-
     def _enqueue_message_batch(
         self,
         callback: Callable[[Message], Any],
@@ -548,14 +517,15 @@ class ApplicationDelivery:
         *,
         iterator_delivery: bool,
     ) -> None:
+        """Admit a preflighted prefix, with one ordinary queue entry per message."""
+        self.ensure_callback_worker()
         if iterator_delivery:
             for message in messages:
                 self.messages_queue.put_nowait(message)
             self.message_ready.set()
-        self.ensure_callback_worker()
-        job: Any = (callback, (messages,), _CALLBACK_MESSAGE_BATCH)
-        self.callback_queue.put_nowait(job)
-        self._reserve_callback_batch(len(messages))
+        put = self.callback_queue.put_nowait
+        for message in messages:
+            put((callback, (message,), None))
 
     def deliver_callback_messages_inline(
         self,
@@ -565,7 +535,7 @@ class ApplicationDelivery:
     ) -> bool:
         if callback is None:
             return True
-        if self._callback_batch_capacity(False) < len(messages):
+        if not self.has_callback_capacity(len(messages)):
             return False
         if decoded_property_wire_sizes is None:
             for message in messages:
@@ -580,114 +550,92 @@ class ApplicationDelivery:
                         return False
                 elif not self._is_small_decoded(message, wire_size):
                     return False
-        if len(messages) == 1 and self.can_dispatch_callback_inline(callback):
-            self.dispatch_callback_inline(callback, messages[0])
-            return True
         self._enqueue_message_batch(callback, messages, iterator_delivery=False)
         return True
 
-    def deliver_message_batch_inline(  # noqa: C901
+    def _inline_message_candidate(self, effect: EngineEffect) -> Message | None:
+        """Return one non-persisted small message eligible for sync inline."""
+        if effect.kind not in (EffectKind.MESSAGE, EffectKind.DECODED_MESSAGE):
+            return None
+        message: Message = effect.data
+        size = effect.decoded_property_wire_size
+        if effect.requires_delivery_mark or not (
+            self._is_small(message) if size is None else self._is_small_decoded(message, size)
+        ):
+            return None
+        return message
+
+    def deliver_message_batch_inline(
         self,
         effects: deque[EngineEffect],
         callback: Callable[[Message], Any] | None,
     ) -> int:
-        """Deliver a consecutive small-message effect prefix without suspending.
+        """Admit a consecutive eligible prefix with one narrow sync fast path.
 
-        Handles MESSAGE and DECODED_MESSAGE effects in one pass: each effect's
-        own ``decoded_property_wire_size`` selects the smallness test, exactly
-        as the two per-kind copies this replaces did. Producers pair the size
-        with DECODED_MESSAGE and leave it ``None`` on MESSAGE, so a mixed
-        prefix no longer splits the batch at the kind boundary.
+        A sole pending eligible callback-only MESSAGE may execute an idle declared-sync
+        callback inline. Async, multi-effect, reentrant, iterator/both and persisted
+        work remains worker/slow-path owned. AsyncClient refuses this method while
+        holding the engine lock, so the inline exception never runs user code in that
+        critical section. Iterator/callback capacity stays ordinary queue capacity.
         """
         callback_delivery, iterator_delivery = self._modes(callback)
         if not callback_delivery and not iterator_delivery:
             return 0
-        if callback_delivery and len(effects) > 1:
-            assert callback is not None
-            capacity = self._callback_batch_capacity(iterator_delivery)
-            messages: list[Message] = []
-            for effect in effects:
-                kind = effect.kind
-                if len(messages) >= capacity or (
-                    kind is not EffectKind.MESSAGE and kind is not EffectKind.DECODED_MESSAGE
-                ):
-                    break
-                message: Message = effect.data
-                property_wire_size = effect.decoded_property_wire_size
-                small = (
-                    self._is_small(message)
-                    if property_wire_size is None
-                    else self._is_small_decoded(message, property_wire_size)
-                )
-                if effect.requires_delivery_mark or not small:
-                    break
-                messages.append(message)
-            if len(messages) > 1:
-                if (
-                    len(messages) == 2
-                    and not iterator_delivery
-                    and self.can_dispatch_callback_inline(callback)
-                ):
-                    self._dispatch_sync_message_pair_inline(callback, messages)
-                    return 2
-                self._enqueue_message_batch(callback, messages, iterator_delivery=iterator_delivery)
-                return len(messages)
-
-        # Bind the callback once instead of re-testing `callback_delivery` and
-        # asserting non-None per message; `cb is not None` carries both facts.
         cb = callback if callback_delivery else None
-        callback_worker_ready = False
+
+        # Keep the ordinary worker loop below unchanged. Only a sole pending
+        # eligible MESSAGE may avoid the queue hop. If any other effect is already
+        # owned by the pump, user code cannot overtake it.
+        if (
+            cb is not None
+            and not iterator_delivery
+            and self._callback_state == "open"
+            and len(effects) == 1
+            and self.can_dispatch_callback_inline(cb)
+        ):
+            first = self._inline_message_candidate(effects[0])
+            if first is not None:
+                self.dispatch_callback_inline(cb, first)
+                return 1
+
+        capacity = len(effects)
+        if iterator_delivery:
+            capacity = min(capacity, self.messages_queue.maxsize - self.messages_queue.qsize())
+        if cb is not None:
+            capacity = min(capacity, self.callback_queue.maxsize - self.callback_queue.qsize())
+        ready = False
         applied = 0
-        # Fix the bound before invoking user code. An inline callback may call
-        # publish_nowait(), which appends SEND to this same EffectPump deque.
-        # Deque indexing remains valid across appends; its iterator does not.
-        # Newly appended effects stay behind this prefix and are applied by the
-        # owning pump after it removes the delivered messages.
-        for index in range(len(effects)):
-            effect = effects[index]
-            kind = effect.kind
-            if kind is not EffectKind.MESSAGE and kind is not EffectKind.DECODED_MESSAGE:
+        for effect in effects:
+            if applied >= capacity:
                 break
-            message = effect.data
-            property_wire_size = effect.decoded_property_wire_size
-            small = (
-                self._is_small(message)
-                if property_wire_size is None
-                else self._is_small_decoded(message, property_wire_size)
-            )
-            if effect.requires_delivery_mark or not small:
+            if effect.kind not in (EffectKind.MESSAGE, EffectKind.DECODED_MESSAGE):
                 break
-            if iterator_delivery and self.messages_queue.full():
+            message: Message = effect.data
+            size = effect.decoded_property_wire_size
+            if effect.requires_delivery_mark or not (
+                self._is_small(message) if size is None else self._is_small_decoded(message, size)
+            ):
                 break
-            dispatch_inline = cb is not None and self.can_dispatch_callback_inline(cb)
-            if cb is not None and not dispatch_inline and self.callback_queue.full():
-                break
+            if cb is not None and not ready:
+                self.ensure_callback_worker()
+                ready = True
             if iterator_delivery:
                 self.messages_queue.put_nowait(message)
             if cb is not None:
-                # The idle synchronous case stays in the reader/effect-drain
-                # turn. A callback that causes another delivery trips
-                # `_callback_active`; that nested work and any queued burst
-                # retain the bounded worker semantics.
-                if dispatch_inline:
-                    self.dispatch_callback_inline(cb, message)
-                else:
-                    if not callback_worker_ready:
-                        self.ensure_callback_worker()
-                        callback_worker_ready = True
-                    self.callback_queue.put_nowait((cb, (message,), None))
+                self.callback_queue.put_nowait((cb, (message,), None))
             applied += 1
         if applied and iterator_delivery:
             self.message_ready.set()
         return applied
 
     async def messages(self) -> AsyncIterator[Message]:
-        generation = self._stream_generation
+        generation = self._delivery_generation
         while True:
-            if generation != self._stream_generation:
+            if generation != self._delivery_generation:
                 return
             try:
                 item = self.messages_queue.get_nowait()
+                self.space.set()
                 if isinstance(item, tuple):
                     message, token = item
                     self.release_nowait(token)
@@ -706,7 +654,12 @@ class ApplicationDelivery:
     def reset_stream(self) -> None:
         if not self.closed.is_set():
             return
-        self._stream_generation += 1
+        # An explicit connection takeover starts one new application-delivery
+        # generation for both iterator and callback consumers. Active callback
+        # code may finish; no unstarted notification or blocked admission from
+        # the retired generation may cross into the replacement connection.
+        self._delivery_generation += 1
+        self._discard_callback_queue()
         while True:
             try:
                 item = self.messages_queue.get_nowait()
@@ -715,24 +668,33 @@ class ApplicationDelivery:
             if isinstance(item, tuple):
                 _message, token = item
                 self.release_nowait(token)
-        self.messages_queue = _DeliveryQueue(maxsize=self.max_pending_messages)
-        self.message_ready = asyncio.Event()
+        # Keep the queue/event objects stable. Slow admissions wait on the
+        # controller-owned space event, so reset can wake every old producer;
+        # the generation check rejects them before they enqueue stale work.
+        self.message_ready.clear()
         self.closed.clear()
+        self.space.set()
 
-    async def put_message(self, item: IteratorQueueItem) -> None:
+    async def put_message(self, item: IteratorQueueItem, *, generation: int | None = None) -> None:
+        if generation is None:
+            generation = self._delivery_generation
         try:
-            self.messages_queue.put_nowait(item)
-        except asyncio.QueueFull:
-            try:
-                await asyncio.wait_for(
-                    self.messages_queue.put(item),
-                    timeout=self.delivery_timeout,
-                )
-            except TimeoutError as exc:
-                raise MessageDeliveryError(
-                    f"Iterator delivery queue remained full for {self.delivery_timeout:.3f}s"
-                ) from exc
-        self.message_ready.set()
+            async with asyncio.timeout(self.delivery_timeout):
+                while True:
+                    if generation != self._delivery_generation or self.closed.is_set():
+                        raise MessageDeliveryError(
+                            "Iterator admission belongs to a retired generation"
+                        )
+                    if not self.messages_queue.full():
+                        self.messages_queue.put_nowait(item)
+                        self.message_ready.set()
+                        return
+                    self.space.clear()
+                    await self.space.wait()
+        except TimeoutError as exc:
+            raise MessageDeliveryError(
+                f"Iterator delivery queue remained full for {self.delivery_timeout:.3f}s"
+            ) from exc
 
     def try_reserve(self, logical_bytes: int, references: int) -> DeliveryToken:
         limit = self.accounted_limit
@@ -744,20 +706,28 @@ class ApplicationDelivery:
             return logical_bytes
         return _SharedDeliveryReservation(logical_bytes)
 
-    async def reserve_slow(self, logical_bytes: int, references: int) -> DeliveryToken:
-        while True:
-            self.waiters += 1
-            try:
+    async def reserve_slow(
+        self,
+        logical_bytes: int,
+        references: int,
+        *,
+        generation: int,
+        require_callback_open: bool,
+    ) -> DeliveryToken:
+        self.waiters += 1
+        try:
+            while True:
+                if generation != self._delivery_generation or self.closed.is_set():
+                    raise MessageDeliveryError("Delivery admission belongs to a retired generation")
+                if require_callback_open and self._callback_state != "open":
+                    raise MessageDeliveryError("Callback delivery generation is closing")
                 self.space.clear()
                 token = self.try_reserve(logical_bytes, references)
                 if token is not None:
                     return token
                 await self.space.wait()
-            finally:
-                self.waiters -= 1
-            token = self.try_reserve(logical_bytes, references)
-            if token is not None:
-                return token
+        finally:
+            self.waiters -= 1
 
     def release_nowait(self, token: AccountedDeliveryToken) -> None:
         if isinstance(token, int):
@@ -811,11 +781,38 @@ class ApplicationDelivery:
         return logical_bytes
 
     def ensure_callback_worker(self) -> None:
-        if self.callback_task is None or self.callback_task.done():
-            self._callback_stop = False
-            self.callback_task = asyncio.create_task(
-                self._callback_worker(), name="mqttium-callback-worker"
-            )
+        if self._callback_state != "open":
+            raise MessageDeliveryError("Callback delivery is closing")
+        self._start_callback_worker()
+
+    def _start_callback_worker(self) -> None:
+        task = self.callback_task
+        if task is not None and task.done():
+            self._callback_worker_done(task)
+        if self._callback_state == "closed":
+            raise MessageDeliveryError("Callback delivery is closed")
+        if self.callback_task is None:
+            coro = self._callback_worker()
+            try:
+                task = asyncio.create_task(coro, name="mqttium-callback-worker")
+            except BaseException:
+                coro.close()
+                raise
+            self.callback_task = task
+            task.add_done_callback(self._callback_worker_done)
+
+    def _callback_worker_done(self, task: asyncio.Task[None]) -> None:
+        if self.callback_task is not task:
+            return
+        self.callback_task = None
+        if not task.cancelled() and (exc := task.exception()) is not None:
+            # An internal failure must not cause an infinite restart loop.
+            self._callback_state = "closed"
+            self._discard_callback_queue()
+            self.report_callback_error(None, exc)
+        elif self._callback_state != "closed" and not self.callback_queue.empty():
+            # The controller, not a task incarnation, owns unstarted jobs.
+            self._start_callback_worker()
 
     def spawn_callback(self, callback: Callable[..., Any], *args: Any) -> None:
         self.ensure_callback_worker()
@@ -864,8 +861,6 @@ class ApplicationDelivery:
         """Invoke one declared-sync callback and isolate application failures."""
         try:
             result = callback(*args)
-        except _CallbackHandoff:
-            raise
         except asyncio.CancelledError as exc:
             self._propagate_callback_cancellation(callback, exc)
         except Exception as exc:
@@ -881,64 +876,13 @@ class ApplicationDelivery:
         self.dispatch_callback_inline(callback, *args)
         return True
 
-    def _dispatch_sync_message_pair_inline(
-        self,
-        callback: Callable[[Message], Any],
-        messages: list[Message],
-    ) -> None:
-        """Run one eligible two-message synchronous burst inline.
-
-        The second message remains reserved in the existing logical callback
-        bound while the first callback runs, so reentrant admissions queue
-        behind the pair without weakening ``max_pending_callbacks``.
-        """
-        self._reserve_callback_batch(2)
-        self._callback_active = True
-        index = 0
-        try:
-            try:
-                self.run_sync_callback(callback, messages[0])
-                index = 1
-                self.run_sync_callback(callback, messages[1])
-            finally:
-                self._callback_active = False
-                self._release_callback_batch(2)
-        except _CallbackHandoff as handoff:
-            # The tail already precedes anything admitted by the first
-            # callback. Transfer its reservation to a real front-of-queue job.
-            tail = messages[index:]
-            self._prepend_callback_job((handoff.callback, (tail,), _CALLBACK_MESSAGE_BATCH))
-
     def dispatch_callback_inline(self, callback: Callable[..., Any], *args: Any) -> None:
         """Invoke a callback after the caller established inline eligibility."""
         self._callback_active = True
         try:
-            try:
-                self.run_sync_callback(callback, *args)
-            finally:
-                self._callback_active = False
-        except _CallbackHandoff as handoff:
-            self._prepend_callback_job((handoff.callback, args, None))
-
-    def _prepend_callback_job(self, job: CallbackJob) -> None:
-        """Transfer unstarted inline work ahead of reentrant admissions.
-
-        Only the cold route-change path uses this operation. Queue.put_nowait
-        retains capacity, join and wakeup accounting. Rotating the just-added
-        item is synchronous, so no awakened getter can observe the old order.
-        The caller has released the inline reservation. Start an idle worker
-        before admission so an eager task factory parks on the empty queue,
-        rather than executing user code before its task ownership is installed.
-        """
-        # Derive logical capacity from the job, never from a second count that
-        # could disagree with the worker/discard path's release accounting.
-        count = len(job[1][0]) if job[2] is _CALLBACK_MESSAGE_BATCH else 1
-        if not 0 < count <= self._callback_batch_capacity(False):
-            raise RuntimeError("callback handoff exceeds its reserved capacity")
-        self.ensure_callback_worker()
-        self.callback_queue.put_nowait(job)
-        self.callback_queue._queue.rotate(1)  # type: ignore[attr-defined]
-        self._reserve_callback_batch(count)
+            self.run_sync_callback(callback, *args)
+        finally:
+            self._callback_active = False
 
     def has_callback_capacity(self, count: int = 1) -> bool:
         """Whether ``count`` callbacks can be admitted without suspending."""
@@ -972,11 +916,22 @@ class ApplicationDelivery:
             await self.enqueue_callback_job_slow(job)
 
     async def enqueue_callback_job_slow(self, job: CallbackJob) -> None:
+        generation = self._delivery_generation
         try:
-            await asyncio.wait_for(
-                self.callback_queue.put(job),
-                timeout=self.delivery_timeout,
-            )
+            async with asyncio.timeout(self.delivery_timeout):
+                while True:
+                    if generation != self._delivery_generation:
+                        raise MessageDeliveryError(
+                            "Callback admission belongs to a retired generation"
+                        )
+                    self.ensure_callback_worker()
+                    if not self.callback_queue.full():
+                        self.callback_queue.put_nowait(job)
+                        return
+                    if asyncio.current_task() is self.callback_task:
+                        raise MessageDeliveryError("A callback cannot wait for its own full queue")
+                    self.space.clear()
+                    await self.space.wait()
         except TimeoutError as exc:
             raise MessageDeliveryError(
                 f"Callback delivery queue remained full for {self.delivery_timeout:.3f}s"
@@ -994,48 +949,64 @@ class ApplicationDelivery:
         self.report_callback_error(callback, exc)
 
     def _discard_callback_queue(self) -> None:
-        while True:
-            try:
-                _callback, args, token = self.callback_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            if token is _CALLBACK_MESSAGE_BATCH:
-                self._release_callback_batch(len(args[0]))
-            elif token is not None:
-                self.release_nowait(cast(AccountedDeliveryToken, token))
+        while not self.callback_queue.empty():
+            _callback, _args, token = self.callback_queue.get_nowait()
+            if token is not None:
+                self.release_nowait(token)
             self.callback_queue.task_done()
+        self.space.set()
 
     async def _callback_worker(self) -> None:
-        while not self._callback_stop:
-            callback, args, token = await self.callback_queue.get()
-            self._callback_active = True
-            try:
-                if token is _CALLBACK_MESSAGE_BATCH:
-                    messages = args[0]
-                    try:
-                        for message in messages:
-                            try:
-                                await self.invoke(callback, message)
-                            except asyncio.CancelledError as exc:
-                                self._propagate_callback_cancellation(callback, exc)
-                            except Exception as exc:
-                                self.report_callback_error(callback, exc)
-                    finally:
-                        self._release_callback_batch(len(messages))
-                else:
-                    try:
-                        await self.invoke(callback, *args)
-                    except asyncio.CancelledError as exc:
-                        self._propagate_callback_cancellation(callback, exc)
-                    except Exception as exc:
-                        self.report_callback_error(callback, exc)
-                    finally:
-                        if token is not None:
-                            self.release_nowait(cast(AccountedDeliveryToken, token))
-            finally:
-                self._callback_active = False
-                self.callback_queue.task_done()
-        self._discard_callback_queue()
+        # Cold entry only: register ownership before an eager factory can call
+        # user code. No task is allocated for an individual notification.
+        if self.callback_task is None or self.callback_task.done():
+            await asyncio.sleep(0)
+        queue = self.callback_queue
+        task = asyncio.current_task()
+        assert task is not None
+        previous: Callable[..., Any] | None = None
+        asynchronous = False
+        while self._callback_state != "closed":
+            if self._callback_state == "draining" and queue.empty():
+                return
+            job = await queue.get()
+            generation = self._delivery_generation
+            remaining = 1 + queue.qsize()
+            while True:
+                self.space.set()
+                callback, args, token = job
+                self._callback_active = True
+                try:
+                    if callback is not previous:
+                        asynchronous = self._is_async_callback(callback)
+                        previous = callback
+                    if asynchronous:
+                        try:
+                            await callback(*args)
+                        except asyncio.CancelledError as exc:
+                            self._propagate_callback_cancellation(callback, exc)
+                        except Exception as exc:
+                            self.report_callback_error(callback, exc)
+                    else:
+                        self.run_sync_callback(callback, *args)
+                finally:
+                    self._callback_active = False
+                    if token is not None:
+                        self.release_nowait(token)
+                    queue.task_done()
+                del job, args, token
+                if task.cancelling():
+                    await asyncio.sleep(0)
+                if self._callback_state == "closed":
+                    return
+                remaining -= 1
+                if not remaining or generation != self._delivery_generation:
+                    break
+                job = queue.get_nowait()
+            # Reentrant arrivals cannot extend a round indefinitely. All
+            # unstarted jobs remain counted in the queue, never in a side list.
+            if not queue.empty():
+                await asyncio.sleep(0)
 
     @classmethod
     async def invoke(cls, callback: Callable[..., Any] | None, *args: Any) -> Any:
@@ -1043,11 +1014,7 @@ class ApplicationDelivery:
             return None
         if cls._is_async_callback(callback):
             return await callback(*args)
-        try:
-            result = callback(*args)
-        except _CallbackHandoff as handoff:
-            # Already on the bounded worker: no new admission or queue hop.
-            return await handoff.callback(*args)
+        result = callback(*args)
         if result is not None and inspect.isawaitable(result):
             raise cls._sync_awaitable_error(result)
         return result
@@ -1066,26 +1033,34 @@ class ApplicationDelivery:
         )
 
     async def shutdown_callbacks(self, *, drain: bool) -> None:
-        task = self.callback_task
-        if task is None:
+        generation = self._delivery_generation
+        if self._callback_state != "closed":
+            self._callback_state = "draining" if drain else "closed"
+        self.space.set()
+        if self._callback_state == "closed":
+            self._discard_callback_queue()
+        if self.callback_task is asyncio.current_task():
+            # An own-worker shutdown cannot join itself. Retire unstarted work
+            # now; the active notification may finish and a reconnect may reopen
+            # the same worker incarnation for the replacement generation.
+            self._callback_state = "closed"
+            self._discard_callback_queue()
             return
-        if task is asyncio.current_task():
-            # A callback may call disconnect(). Joining or cancelling the
-            # callback worker from its own current job would deadlock.
-            self._callback_stop = True
-            return
-        if drain and not task.done():
-            try:
-                await asyncio.wait_for(
-                    self.callback_queue.join(), timeout=self.callback_shutdown_timeout
-                )
-            except TimeoutError:
-                pass
-        if not task.done():
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-        self.callback_task = None
-        self._discard_callback_queue()
+        try:
+            if drain and self._callback_state == "draining":
+                if not self.callback_queue.empty():
+                    self._start_callback_worker()
+                try:
+                    async with asyncio.timeout(self.callback_shutdown_timeout):
+                        await self.callback_queue.join()
+                except TimeoutError:
+                    pass
+        finally:
+            if generation == self._delivery_generation:
+                self._callback_state = "closed"
+                self._discard_callback_queue()
+                task = self.callback_task
+                if task is not None:
+                    if not task.done():
+                        task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)

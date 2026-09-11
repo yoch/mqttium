@@ -182,12 +182,12 @@ async def test_reconfigured_tail_keeps_fifo_and_hard_callback_bound(
             )
             await asyncio.wait_for(entered.wait(), timeout=2)
             assert seen == ["old:0", "start:1"]
-            # An inline pair transfers only its unstarted tail. The completed
-            # first callback no longer reserves a slot while the tail awaits.
-            expected_pending = 1 if burst == 2 else burst
+            # The ordinary queue reports only unstarted notifications; the
+            # currently active callback is deliberately excluded from qsize.
+            expected_pending = burst - 1
             assert client.stats().delivery.callback_queued == expected_pending
-            if burst == 2:
-                assert client._delivery.try_enqueue_callback(lambda: seen.append("refill"))
+            # Exactly one queue slot is free because the active callback is not queued.
+            assert client._delivery.try_enqueue_callback(lambda: seen.append("refill"))
             assert client.stats().delivery.callback_queued == burst
             assert not client._delivery.try_enqueue_callback(lambda: seen.append("overflow"))
             release.set()
@@ -195,7 +195,7 @@ async def test_reconfigured_tail_keeps_fifo_and_hard_callback_bound(
             expected = ["old:0"]
             for i in range(1, burst):
                 expected.extend([f"start:{i}", f"end:{i}"])
-            assert seen == expected + ["reentrant"] + (["refill"] if burst == 2 else [])
+            assert seen == expected + ["reentrant", "refill"]
             assert client.stats().delivery.callback_queued == 0
             assert client._callback_queue.maxsize == burst
             assert errors == []

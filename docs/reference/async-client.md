@@ -48,30 +48,62 @@ callable that returns an awaitable violates the callback contract and is reporte
 as a callback `TypeError` rather than being scheduled implicitly. Synchronous
 callbacks must not block the event loop.
 
-Eligible idle `on_publish` and message callbacks may execute inline. For
-callback-only message delivery, an adjacent pair of small synchronous messages may
-run in the same effect-drain turn while retaining the hard
-`max_pending_callbacks` bound. Larger bursts, declared-async callbacks, and
-queued/reentrant delivery use the bounded worker. Callback failures go to the event
-loop's exception handler without silently changing protocol state.
+Message callbacks use one bounded worker for the general case. An eligible
+small, non-persisted MESSAGE effect may execute an idle synchronous callback
+inline only when it is the sole eligible MESSAGE at the head of a callback-only
+run and `AsyncClient` has already released the engine lock. A second eligible
+MESSAGE, an async callback, reentrant/queued delivery, direct-decode QoS 0 or
+`both` delivery uses the worker. One ordinary queue entry represents each
+worker-owned notification; `callback_queued` is the actual queue length,
+excluding the active notification. The queue's configured maximum never changes.
+A worker turn processes only the notifications already present when it starts;
+later arrivals wait for a subsequent turn. This is a count bound, not a time
+bound on blocking user code or on individual matching topic filters.
+
+A direct `on_message` is captured at admission. A topic notification snapshots its
+ordered live matches when execution begins; changes affect later notifications,
+not the current match chain. The topic dispatcher has a stable async form even
+when all matches are synchronous. The user-facing `def`/`async def` contract and
+rejection of dynamically returned awaitables are unchanged.
+
+Ordinary callback errors, including self-raised `CancelledError` without task
+cancellation, are reported and isolated. A real cancellation interrupts the active
+notification (including any remaining topic matches), never the reader. Unstarted
+notifications remain owned by the delivery controller and are resumed by its
+replacement worker. Explicit shutdown, not cancellation of a private task,
+chooses whether to drain or discard queued work. Reopen discards the retired
+generation's queued work; an active reconnecting callback remains the single
+consumer. Admissions already waiting for the retired generation are rejected.
+
+An idle synchronous `on_publish` may still execute inline after receipt
+settlement, outside the engine lock. This publish-completion policy is separate
+from the narrow singleton MESSAGE-effect policy above. Iterator byte accounting
+and `both` destination ordering are retained; the callback leg of `both` and the
+direct-decode QoS 0 path are worker-owned. Synchronous callbacks must not block
+the event loop. A callback cannot wait to admit more work into its own full
+queue. Also avoid application dependency cycles where a callback waits for an
+operation whose network progress requires that same saturated delivery queue to
+drain; worker isolation is not an unbounded read-ahead guarantee.
 
 Matching `message_callback_add` filters run instead of `on_message`, in
 registration order. Shared-subscription filters match the filter string
 literally, as in Paho. Each routed message resolves the live configuration when
-its dispatcher starts and keeps that message's matching callbacks across awaits.
-Later routed messages, including already queued messages, see updated filters
-and fallback. Eligible synchronous routes remain inline. If an inline burst's
-route becomes asynchronous, only its unstarted tail transfers to the bounded
-worker, ahead of work admitted reentrantly by the earlier callback. No callback
-prefix is replayed. Direct callbacks captured without a router keep their
-existing batch semantics. Iterator-only delivery ignores callbacks, including
-topic filters.
+its dispatcher starts and keeps that message's ordered matching-callback snapshot
+across awaits. The dispatcher itself has a stable async form, so routed topic
+notifications are worker-owned even when all current matches are synchronous.
+Later routed messages, including messages already queued, see updated filters and
+fallback. When no filter matches, the dispatcher falls back to the current
+`on_message`. There is no started-prefix/tail handoff or exceptional queue
+prepend. A direct `on_message` remains distinct and may use the narrow singleton
+post-lock fast path described above. Iterator-only delivery ignores callbacks,
+including topic filters.
 
 When a callback disconnects and reconnects the client before returning, the
-current worker job finishes normally. Jobs still queued for the terminally
-closed connection are discarded before the replacement connection is reopened;
-its newly admitted callbacks use the existing worker and are not discarded by
-the previous shutdown request. Already-active batch semantics are unchanged.
+current worker notification finishes normally. Jobs still queued for the
+terminally closed connection are discarded before the replacement connection is
+reopened; its newly admitted callbacks use the existing worker and are not
+discarded by the previous shutdown request. The active notification is not
+replayed.
 
 ## Loop confinement
 

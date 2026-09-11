@@ -203,16 +203,24 @@ The small-message reserve prevents one large payload from starving telemetry.
 It is disabled when it would make a single otherwise valid packet impossible to
 admit.
 
-User callbacks run outside engine critical sections. When callback delivery is
-idle, a plain synchronous `on_publish` or eligible `on_message` callback may run
-in the reader/effect-drain turn. A reentrancy guard sends callback-initiated
-delivery, async callbacks, and occupied-queue bursts through the bounded worker.
-Exceptions are isolated and reported through the established callback policy;
-they do not stop the protocol reader or leak delivery capacity. Consecutive
-small MESSAGE effects that require no persisted delivery mark (QoS 0 and fresh
-automatic QoS 1) may be applied during the inline effect drain. Persisted QoS 1,
-QoS 2 and replay deliveries keep the established awaited path and are marked
-only after application delivery accepts them.
+User callbacks run outside engine critical sections. Message notifications
+normally execute in the single callback worker. The narrow exception is an idle
+synchronous callback-only run with exactly one eligible small, non-persisted
+MESSAGE effect: after the engine lock has been released, the effect drain may
+invoke that callback inline and avoid one queue/event-loop hop. A second eligible
+MESSAGE makes the whole run worker-owned. Async callbacks, reentrant/queued work,
+direct-decode QoS 0 and `both` delivery also remain worker-owned.
+
+One queue entry is one worker-owned notification, with fixed capacity and no
+detached tails. The worker bounds each turn by its initial queue length. A plain
+synchronous `on_publish` keeps its separate idle inline path; its reentrancy
+guard and receipt-before-callback ordering are unchanged. Exceptions are isolated
+and reported through the established callback policy; they do not stop the
+protocol reader or leak delivery capacity. Consecutive small MESSAGE effects that
+require no persisted delivery mark (QoS 0 and fresh automatic QoS 1) may be
+admitted during the inline effect drain. Persisted QoS 1, QoS 2 and replay
+deliveries keep the established awaited path and are marked only after
+application delivery accepts them.
 
 Topic-filtered callbacks are an `AsyncClient` concern. `TopicMatcher` selects
 application callbacks after the engine has already emitted MESSAGE effects; the
