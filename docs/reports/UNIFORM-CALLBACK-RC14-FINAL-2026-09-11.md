@@ -2,17 +2,20 @@
 
 ## Decision
 
-The retained runtime is `fb619a27b866c5db869508e6a226db0080e668c7`, composed on RC14 main `c194597bcf5af4951fbec2b560600eef3cb84b3c`. Later commits on the product branch are documentation-only.
+The retained runtime is `fb619a27b866c5db869508e6a226db0080e668c7`, composed on RC14 main `c194597bcf5af4951fbec2b560600eef3cb84b3c`. Later branch commits are documentation and regression-test follow-up only; the scheduler/runtime bytes remain the measured candidate.
 
 The selected architecture is **strict sole-pending synchronous inline + one ordinary callback worker for everything else**:
 
 - a sole pending eligible callback-only `MESSAGE` may execute an idle declared-sync callback inline;
 - multi-message bursts, async callbacks, iterator/both delivery, persisted delivery, reentrant work and routed async work remain worker/slow-path owned;
+- direct-decoded QoS0 delivery remains worker-owned;
 - no physical callback batches;
 - no mutation of asyncio queue private `_maxsize` / `_putters` state;
 - no pair-inline special case;
 - no started-tail handoff between reader/effect ownership and worker ownership;
 - one ordinary queue entry represents one queued message notification.
+
+This is the final scheduler policy for PR #458. The measured QoS0 singleton and QoS1 tail-latency costs are accepted as explicit trade-offs rather than hidden behind additional ownership heuristics.
 
 ## Structural result vs RC14 main
 
@@ -28,9 +31,9 @@ The more important simplification is qualitative: callback-batch reservation, pr
 
 The composed RC14 candidate passed the normal CI matrix, cross-platform jobs, fuzz, resilience, distribution smoke and soak. Dedicated tests cover normal/eager task factories, cancellation, worker replacement, generation reset, reconnect/reopen, live routing changes, iterator wake-up semantics and the strict singleton fast path.
 
-The explicit stream-generation regression verifies that an old `anext()` waiter terminates on reset without requiring a fresh message, while the replacement generation still accepts fresh delivery.
+The explicit stream-generation regression verifies that an old `anext()` waiter terminates on reset without requiring a fresh message, while the replacement generation still accepts fresh delivery. A post-measurement regression test also locks the direct-QoS0 ownership boundary: successive singleton captures from a transport-fragmented burst remain worker-owned.
 
-Codecov reports patch coverage around **88.7%** and project coverage about **0.21 percentage point lower** than main. The missing lines are not concentrated in the strict singleton fast path; the lifecycle invariants found during the adverse audit have dedicated regression tests.
+Codecov reports patch coverage around **88.7%** and project coverage roughly **0.1 percentage point lower** than main. The missing lines are not concentrated in the strict singleton fast path; lifecycle invariants found during the adverse audit have dedicated regression tests.
 
 ## Raspberry Pi RC14 fixed-rate RTT qualification
 
@@ -71,7 +74,7 @@ The result is a trade-off, not a universal win:
 
 Interpretation: the simplified worker materially shortens long event-loop occupations under larger synchronous bursts, at the cost of a few percent of peak closed-loop capacity on some sync/filtered cells. This is a fairness / maintainability trade-off, not a blanket performance improvement.
 
-## QoS0 finding
+## QoS0 follow-up
 
 A dedicated hosted QoS0 screen on the retained runtime found a localized regression for direct-decode synchronous singleton callback delivery:
 
@@ -81,9 +84,14 @@ A dedicated hosted QoS0 screen on the retained runtime found a localized regress
 - first-callback latency about **+10%**;
 - loop-lag p95 about **-13%**.
 
-A two-file post-lock singleton ablation was built to recover this cost without restoring batching or adding scheduler state. Its focused ownership tests passed. On the full suite, only the six assertions that explicitly encoded the old policy "direct QoS0 singleton is worker-owned" failed; the remaining **2323 tests passed** with 17 skips in the final qualification attempt.
+The first post-lock A/B attempt (`34592683137`) was invalid because the benchmark identity check correctly rejected a dirty candidate tree; it was a workflow problem, not a runtime failure.
 
-However, the preregistered paired performance run `34592683137` failed before producing A/B evidence: all six A/A control pairs completed, then the candidate process exited during the first A/B execution. Because the candidate did not complete its benchmark, this ablation is **rejected / not promoted**. It is not part of the retained runtime.
+Two corrected ablations were then measured:
+
+1. A broad generic-inline ablation (`34777598305`) recovered most singleton throughput but widened inline ownership and worsened loop lag across measured QoS0 cells. Rejected.
+2. A narrow reader-only ablation (`34777729652`) was functionally clean and made batch1 essentially neutral, but transport fragmentation caused larger bursts to regain reader ownership. Batch8 loop-lag moved from retained **-1.43%** to **+3.48%**, and batch32 from **-1.84%** to **+4.62%**. Rejected.
+
+There is no stateless local fact that reliably distinguishes a genuinely isolated QoS0 PUBLISH from one packet of a fragmented network burst. Adding a timer, streak counter, hysteresis bit or transport peek would recreate scheduler state for a localized benchmark gain. The detailed stopping rule and measurements are recorded in `UNIFORM-CALLBACK-FOLLOWUP-2026-09-13.md`.
 
 ## Final assessment
 
@@ -94,12 +102,17 @@ The strict sole-pending architecture succeeds at the simplification goal:
 - no private asyncio queue mutation;
 - no pair/tail transfer protocol;
 - fixed-rate QoS1 p50 and CPU essentially neutral on the RC14 Raspberry Pi reference workload;
-- measurable event-loop fairness improvement under larger synchronous bursts.
+- measurable event-loop fairness improvement under larger synchronous bursts;
+- explicit bounded worker ownership for fragmented direct-QoS0 bursts.
 
 It is not performance-free:
 
 - fixed-rate QoS1 p95/p99 are modestly worse;
 - large synchronous hosted cells lose up to a few percent of closed-loop capacity;
-- direct QoS0 singleton callback delivery currently loses about 6% throughput.
+- direct QoS0 singleton callback delivery loses about 6% throughput.
 
-Therefore PR #458 should remain a **draft experiment**. The architecture is credible and materially simpler, but it should not be presented as a release-ready no-regression win until the QoS0 and tail-latency costs are either explicitly accepted/documented or removed by a separately qualified optimization that preserves the simplified ownership model.
+These costs are now **accepted and documented** for this candidate. Chasing either with broader inline dispatch, longer worker rounds or a burst detector would directly weaken the fairness/simplicity objective and add scheduling policy that the evidence does not justify.
+
+## Final disposition
+
+PR #458 is **implementation-complete and ready for review**. No further scheduler heuristic is planned. The branch should remain unmerged until the explicit merge decision is made, but there is no remaining technical blocker inside the scope of this scheduler simplification.
