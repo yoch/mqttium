@@ -202,8 +202,10 @@ async def test_idle_sync_topic_callback_runs_inline() -> None:
         assert seen == []
 
     client._drain_effects_inline()
+    assert seen == []
+    await client._callback_queue.join()
     assert seen == [("inline/message", False)]
-    assert client._callback_worker_task is None
+    await client._shutdown_callback_worker(drain=False)
 
 
 async def test_overlapping_async_topic_callbacks_run_in_order() -> None:

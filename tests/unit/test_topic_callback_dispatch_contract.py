@@ -51,7 +51,7 @@ def test_on_message_assignment_updates_fallback_without_replacing_router() -> No
     assert client.on_message is fallback
     assert client._message_callback is not fallback
     assert client._message_callback is not None
-    assert not client._delivery._is_async_callback(client._message_callback)
+    assert client._delivery._is_async_callback(client._message_callback)
 
     client.message_callback_remove("sensors/#")
     assert client._message_callback is fallback
@@ -72,7 +72,7 @@ async def test_captured_router_survives_last_filter_removal() -> None:
     assert seen == ["default:sensors/1"]
 
 
-async def test_overlapping_sync_callbacks_remain_inline() -> None:
+async def test_overlapping_sync_callbacks_remain_grouped_in_worker() -> None:
     client = AsyncClient(client_id="topic-overlap-inline", message_delivery="callback")
     seen: list[str] = []
     client.message_callback_add("inline/#", lambda _message: seen.append("hash"))
@@ -87,8 +87,10 @@ async def test_overlapping_sync_callbacks_remain_inline() -> None:
         assert seen == []
 
     client._drain_effects_inline()
+    assert seen == []
+    await client._callback_queue.join()
     assert seen == ["hash", "plus"]
-    assert client._callback_worker_task is None
+    await client._shutdown_callback_worker(drain=False)
 
 
 async def test_sync_failure_does_not_suppress_later_match() -> None:
@@ -367,7 +369,7 @@ async def test_later_async_failure_and_self_cancellation_are_isolated() -> None:
     assert errors[1]["callback"] is cancelling
 
 
-def test_topic_router_switches_between_sync_and_async_configuration() -> None:
+def test_topic_router_keeps_async_shape_across_configuration_changes() -> None:
     client = AsyncClient(message_delivery="callback")
 
     def sync_callback(_message: Message) -> None:
@@ -378,7 +380,7 @@ def test_topic_router_switches_between_sync_and_async_configuration() -> None:
 
     client.message_callback_add("sync/#", sync_callback)
     assert client._message_callback is not None
-    assert not client._delivery._is_async_callback(client._message_callback)
+    assert client._delivery._is_async_callback(client._message_callback)
 
     client.message_callback_add("async/#", async_callback)
     assert client._message_callback is not None
@@ -386,10 +388,10 @@ def test_topic_router_switches_between_sync_and_async_configuration() -> None:
 
     client.message_callback_remove("async/#")
     assert client._message_callback is not None
-    assert not client._delivery._is_async_callback(client._message_callback)
+    assert client._delivery._is_async_callback(client._message_callback)
 
 
-def test_async_fallback_makes_topic_router_async_until_replaced() -> None:
+def test_topic_router_keeps_async_shape_across_fallback_changes() -> None:
     client = AsyncClient(message_delivery="callback")
     client.message_callback_add("sync/#", lambda _message: None)
 
@@ -402,7 +404,7 @@ def test_async_fallback_makes_topic_router_async_until_replaced() -> None:
 
     client.on_message = lambda _message: None
     assert client._message_callback is not None
-    assert not client._delivery._is_async_callback(client._message_callback)
+    assert client._delivery._is_async_callback(client._message_callback)
 
 
 async def test_mixed_topic_route_is_one_worker_job_and_keeps_registration_order() -> None:

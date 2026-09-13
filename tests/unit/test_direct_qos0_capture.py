@@ -171,7 +171,7 @@ def test_callback_messages_without_callback_are_consumed_inline() -> None:
     assert client._delivery.deliver_callback_messages_inline(captured, None) is True
 
 
-def test_single_callback_message_runs_inline_when_delivery_is_idle() -> None:
+async def test_single_callback_message_is_queued_when_delivery_is_idle() -> None:
     client = _client()
     seen: list[str] = []
     client.on_message = lambda message: seen.append(message.topic)
@@ -179,8 +179,10 @@ def test_single_callback_message_runs_inline_when_delivery_is_idle() -> None:
     _, _, _, captured, sizes = client._process_direct_qos0_batch()
 
     assert client._delivery.deliver_callback_messages_inline(captured, client.on_message, sizes)
+    assert seen == []
+    await client._callback_queue.join()
     assert seen == ["one"]
-    assert client._callback_worker_task is None
+    await client._shutdown_callback_worker(drain=False)
 
 
 def test_callback_messages_reject_non_small_message() -> None:

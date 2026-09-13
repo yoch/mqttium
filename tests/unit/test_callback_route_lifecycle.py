@@ -163,7 +163,7 @@ async def test_reopen_releases_old_accounting_without_replacing_active_worker(ea
         delivery.reopen()
         assert delivery.pending_bytes == 0
         assert delivery.callback_task is asyncio.current_task()
-        assert not delivery._callback_stop
+        assert delivery._callback_state == "open"
         await delivery.enqueue_callback(lambda: seen.append("new"))
         entered.set()
         await release.wait()
