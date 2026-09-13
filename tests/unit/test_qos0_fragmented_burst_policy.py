@@ -49,9 +49,7 @@ async def test_successive_singleton_qos0_captures_remain_worker_owned() -> None:
             assert handled == 1
             assert handoff is False
             assert [message.topic for message in captured] == [topic]
-            assert client._delivery.deliver_callback_messages_inline(
-                captured, callback, sizes
-            )
+            assert client._delivery.deliver_callback_messages_inline(captured, callback, sizes)
 
         assert seen == []
         assert client._callback_queue.qsize() == 3
