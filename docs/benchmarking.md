@@ -37,12 +37,17 @@ It freezes rates at 50/75/90% of the reference long-lot A/A median before compar
 the two source revisions. This calibration is a fraction of that measured
 workload, not a separately established sustainable open-loop capacity. A separate
 process emits scheduled tokens; the client loop does not sleep to pace itself.
-The harness retains planned arrival, pacer emission, publication call, admission
-return, delivery, and observed receipt-completion clocks in hashed companion
-files. Include those files with the result JSON. Admission return is an API
+The harness retains planned arrival, the pacer's pre-send timestamp, publication
+call, admission return, delivery, and observed receipt-completion clocks in hashed
+companion files. Include those files with the result JSON. Admission return is an API
 observation, not the internal commit instant. Report deliveries before return
 explicitly; residual latency clamps those observations to zero. Scheduled-to-call
 and scheduled-to-delivery latency retain producer backlog and pacer lateness.
+The pacer's token socket is blocking: a full buffer may delay subsequent
+emissions. The offered rate defines the fixed schedule, not guaranteed actual
+emission under overload. Inspect pre-send lateness alongside planned-to-call
+delay rather than assuming that moving the clock to another process removes
+all backpressure from the load generator.
 
 `lean_native_diagnostics.py` separates publication, ingress with iterator or
 callback delivery, callback queue execution, and routed dispatch. Its existing
