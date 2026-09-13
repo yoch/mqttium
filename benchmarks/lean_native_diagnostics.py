@@ -45,6 +45,14 @@ async def _phase(scenario: str, count: int) -> dict[str, Any]:  # noqa: C901 - s
     from mqttium.packets import PublishPacket
     from tests.support import ScriptedBrokerTransport, transport_factory
 
+    class DiagnosticBroker(ScriptedBrokerTransport):
+        async def write(self, data: bytes) -> None:
+            # A writer batch can contain more than drain_packets()'s default
+            # limit. Consume every complete frame before reporting completion.
+            self.decoder.feed(data)
+            while (raw := self.decoder.next_packet()) is not None:
+                self.handle_packet(raw)
+
     mode = "iterator" if scenario == "receive_iterator" else "callback"
     client = AsyncClient(
         "lean-diagnostic",
@@ -53,7 +61,7 @@ async def _phase(scenario: str, count: int) -> dict[str, Any]:  # noqa: C901 - s
         max_pending_messages=1024,
         keepalive=0,
     )
-    broker = ScriptedBrokerTransport()
+    broker = DiagnosticBroker()
     client._transport_factory = transport_factory(broker)
     seen = 0
     prefix: list[int] = []
@@ -139,7 +147,7 @@ async def _phase(scenario: str, count: int) -> dict[str, Any]:  # noqa: C901 - s
             await receipt.wait()
             await client._write_pump.join()
             if len(broker.publishes) != count:
-                raise AssertionError("publication count mismatch")
+                raise AssertionError(f"publication count mismatch: {len(broker.publishes)}/{count}")
         elif scenario == "callback_only":
             for _ in range(count):
                 await client._delivery.accept(message, client._message_callback)
