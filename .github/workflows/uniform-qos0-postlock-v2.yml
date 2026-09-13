@@ -47,7 +47,7 @@ jobs:
         with:
           python-version: '3.13.5'
 
-      - name: Apply the already-tested exact runtime patch
+      - name: Apply and materialize the already-tested exact runtime patch
         shell: bash
         run: |
           set -euo pipefail
@@ -64,6 +64,10 @@ jobs:
           sha256sum slot-b/src/mqttium/api/_delivery.py slot-b/src/mqttium/api/async_client.py | tee /tmp/runtime-sha256.txt
           grep -q '^45c379db532d1b9ce66854231a342f22173316fdd7190c354bc353e1ba4a5ea3 ' /tmp/runtime-sha256.txt
           grep -q '^b6a598b8ec74fa8dcb2e03be33f6dd4857705e544a3b15be4f33efc50423f928 ' /tmp/runtime-sha256.txt
+          git -C slot-b add src/mqttium/api/_delivery.py src/mqttium/api/async_client.py
+          git -C slot-b -c user.name='MQTTium benchmark' -c user.email='benchmark@example.invalid' commit -m 'bench: materialize post-lock QoS0 singleton candidate'
+          test -z "$(git -C slot-b status --porcelain --untracked-files=no)"
+          git -C slot-b rev-parse HEAD | tee /tmp/candidate-sha.txt
 
       - name: Full suite must fail only on the six superseded QoS0 ownership assertions
         shell: bash
@@ -98,6 +102,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y mosquitto
           ROOT="$RUNNER_TEMP/uniform-qos0-postlock-v2-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          echo "JOB_ROOT=$ROOT" >> "$GITHUB_ENV"
           mkdir -p "$ROOT/results"
           cp tooling/benchmarks/uniform_callback_probe.py "$ROOT/qos0_probe.py"
           PROBE="$ROOT/qos0_probe.py" python - <<'PY'
@@ -126,7 +131,7 @@ jobs:
           cp /tmp/runtime-sha256.txt "$ROOT/results/runtime-sha256.txt"
           cp /tmp/full-suite.log "$ROOT/results/full-suite.log"
           cp /tmp/preformat-sha256.txt "$ROOT/results/preformat-sha256.txt"
-          echo "JOB_ROOT=$ROOT" >> "$GITHUB_ENV"
+          cp /tmp/candidate-sha.txt "$ROOT/results/candidate-sha.txt"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always() && env.JOB_ROOT != ''
