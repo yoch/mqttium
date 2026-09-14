@@ -135,7 +135,8 @@ client.message_callback_add("sensors/+", on_sensor)
 
 Set `on_message` and register all routes before the first connection attempt.
 They remain frozen after disconnect and throughout reconnect. Subscriptions
-can still change. Each matching route runs serially in the bounded worker.
+can still change. Each matching route runs serially on the delivering reader,
+so the reader decodes no further packet until the routes for a message return.
 
 With `manual_ack=True`, inbound QoS 1 and the final QoS 2 acknowledgement wait
 for the application:

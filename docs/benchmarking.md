@@ -50,7 +50,7 @@ delay rather than assuming that moving the clock to another process removes
 all backpressure from the load generator.
 
 `lean_native_diagnostics.py` separates publication, ingress with iterator or
-callback delivery, callback queue execution, and routed dispatch. Its existing
+callback delivery, callback invocation alone, and routed dispatch. Its existing
 packet-aware test transport isolates local orchestration; publication includes
 the transport's broker emulation and is not a network capacity result. Fresh
 processes run A/A and ABBA trials. Optional profiles run in separate phases and

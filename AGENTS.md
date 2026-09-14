@@ -56,9 +56,11 @@ clock access, or user callbacks into `protocol/`.
   deferred processing. `api/_delivery_lane.py` retains each reader-owned
   delivery lot behind its fixed protocol fence. The client interprets effects
   because it owns runtime objects.
-- `api/_delivery.py` runs short synchronous message callbacks on a bounded
-  worker; `api/_lifecycle.py` serializes asynchronous lifecycle hooks after
-  their triggering protocol transition and transport cleanup.
+- `api/_delivery.py` runs short synchronous message callbacks inline on the
+  delivering reader, outside every protocol lock, or parks messages in the
+  bounded iterator queue; `api/_lifecycle.py` serializes asynchronous
+  lifecycle hooks after their triggering protocol transition and transport
+  cleanup.
 
 This is the incompatible lean-native experiment. Paho and one-shot helpers
 are removed. Native APIs and the two supplied stores are the supported
