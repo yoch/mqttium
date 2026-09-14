@@ -26,7 +26,6 @@ async def test_callback_mode_runs_each_message_inline_in_fifo_order(burst) -> No
 
     assert seen == list(range(burst))
     assert delivery.callback_invocations == burst
-    assert delivery.stats().callback_invocations == burst
     assert delivery.pending_bytes == 0
     assert delivery.messages_queue.empty()
 

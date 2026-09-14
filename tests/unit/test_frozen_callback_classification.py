@@ -151,7 +151,7 @@ async def test_receipts_complete_without_invoking_message_callbacks():
             receipt = await client.publish("t", b"x", qos=qos)
             await asyncio.wait_for(receipt.wait(), 1)
         assert client._delivery.callback_invocations == 0
-        assert client.stats().delivery.callback_invocations == 0
+        assert client._delivery.callback_invocations == 0
     finally:
         await client.disconnect()
 

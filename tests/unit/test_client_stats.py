@@ -33,7 +33,7 @@ def test_initial_stats_snapshot_is_immutable_and_side_effect_free() -> None:
     assert snapshot.writer.max_messages == 7
     assert snapshot.writer.max_bytes == 1234
     assert snapshot.delivery.iterator_limit == 11
-    assert snapshot.delivery.callback_invocations == 0
+    assert snapshot.delivery.iterator_queued == 0
     assert snapshot.decoder.buffered_bytes == 0
     assert snapshot.receipts.publish == 0
     assert snapshot.transport.kind is None

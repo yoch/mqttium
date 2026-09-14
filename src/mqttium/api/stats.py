@@ -43,8 +43,8 @@ class DecoderStats:
 class DeliveryStats:
     """Messages held for the application, against the iterator bounds.
 
-    ``callback_invocations`` counts synchronous message callbacks run by the
-    reader over the client's lifetime, including topic-route fan-out.
+    Callback delivery retains nothing, so every field stays at its idle value
+    in that mode.
     """
 
     iterator_queued: int
@@ -52,7 +52,6 @@ class DeliveryStats:
     iterator_bytes: int
     iterator_high_water_bytes: int
     iterator_byte_limit: int | None
-    callback_invocations: int
     waiters: int
 
 

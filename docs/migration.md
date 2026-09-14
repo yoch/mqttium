@@ -16,7 +16,8 @@ upgrade of applications or historical databases.
 | Async `on_message` or topic callbacks | Short synchronous callbacks, or asynchronous processing through `messages()` |
 | `on_publish` | `PublishReceipt` / `PublishBatchReceipt` |
 | Connect/publish notifications sharing the message worker | Separate lifecycle hooks; publication uses receipts |
-| Bounded callback worker: `max_pending_callbacks`, `callback_shutdown_timeout`, `DeliveryStats.callback_queued`/`callback_limit`, `TaskStats.callback_worker` | Callbacks run inline on the reader; `DeliveryStats.callback_invocations` |
+| Bounded callback worker: `max_pending_callbacks`, `callback_shutdown_timeout`, `DeliveryStats.callback_queued`/`callback_limit`, `TaskStats.callback_worker` | Callbacks run inline on the reader; count invocations in your own callback if needed |
+| `manual_ack=True` with `message_delivery="callback"` | `ValueError`; use `messages()` with `await client.ack(message)` |
 | Callback route changes during/after connection | Configure before first attempt; a new client is required for different routes |
 | `publish(..., nowait=True)` | Synchronous `publish_nowait(...)`, without `await` |
 | `publish_backpressure` / `PublishBackpressure` | Choose `publish()` or `publish_nowait()` per operation |
@@ -149,11 +150,15 @@ Callback messages are no longer queued: matching synchronous callbacks run on
 the delivering reader, and the reader decodes no further packet until they
 return. `max_pending_callbacks` and `callback_shutdown_timeout` are removed from
 the constructor; `DeliveryStats.callback_queued` and `callback_limit` are
-replaced by `callback_invocations`, and `TaskStats.callback_worker` by
-`lifecycle`. Fairness still counts callback invocations inside each message's
-route fan-out. Iterator delivery charges each message once and releases the
-charge when the iterator yields it. A positive `delivery_timeout` covers
-iterator byte reservation and queue admission; `None` has no deadline.
+removed without a public replacement, since the snapshot describes retained
+state and callback delivery retains nothing. All routes matching one message
+run contiguously; the reader yields at a message boundary once its invocation
+budget is reached and carries the excess over. `manual_ack=True` now requires
+iterator delivery: synchronous callbacks cannot await `ack()`, so acknowledge
+from the `messages()` consumer. Iterator delivery charges each message once and
+releases the charge when the iterator yields it. A positive
+`iterator_admission_timeout` covers iterator byte reservation and queue
+admission; `None` has no deadline.
 `MessageDeliveryError` reports timeout or an impossible message size.
 
 Replace `on_publish` with receipt observation. Keep lifecycle setup asynchronous:

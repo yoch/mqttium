@@ -213,7 +213,6 @@ def test_client_stats_fields_follow_the_constructor_vocabulary() -> None:
         "iterator_bytes",
         "iterator_high_water_bytes",
         "iterator_byte_limit",
-        "callback_invocations",
         "waiters",
     )
     assert names(ReceiptStats) == (

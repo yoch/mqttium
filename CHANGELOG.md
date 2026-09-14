@@ -17,8 +17,11 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   active lifecycle hook or changing connection and reconnect intent.
 - Preserve lifecycle ownership across overlapping connection attempts,
   cancelled takeovers, and failures of connections awaited directly by a hook.
-- Bound synchronous message callback work by actual invocation count, including
-  all matching topic routes within one message, and yield between groups.
+- Charge synchronous message callback work by actual invocation count,
+  including all matching topic routes within one message. Routes of one
+  message run contiguously; the reader yields at the next message boundary
+  once the budget is reached and carries the excess over instead of resetting
+  it, so a wide fan-out cannot consume budget for free.
 - Separate protocol effects from the reader-owned bounded delivery/replay lane,
   so a full application queue does not block outgoing admission or already
   decoded completion results. Unread ACKs retain bounded-ingress pressure.
@@ -53,7 +56,9 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   `ReconnectPolicy.enabled` is removed (`reconnect=None` disables).
   `max_ingress_batch_bytes` is removed; the 1 MiB / 256-packet decode quantum
   is a fixed fairness constant. The constructor now refuses configuration
-  without effect: iterator bounds with callback delivery raise `ValueError`,
+  without effect or without a natural use: iterator bounds with callback
+  delivery raise `ValueError`, `manual_ack=True` with callback delivery raises
+  `ValueError` (synchronous callbacks cannot await `ack()`; use `messages()`),
   MQTT 5 options (`connect_properties`, `will_properties`,
   `topic_alias_maximum`, `auth_handler`) with MQTT 3.1.1 raise
   `ProtocolError` at construction rather than at `connect()`.
@@ -70,13 +75,14 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - Run synchronous message callbacks inline on the delivering reader instead of
   a bounded callback worker task and queue. The reader hands each decoded lot
   to the application before decoding further, so callback cost is the
-  backpressure; fairness still yields after a bounded number of invocations,
-  counting topic-route fan-out. Removed: constructor parameters
+  backpressure; fairness charges every invocation, counting topic-route
+  fan-out, and yields at message boundaries. Removed: constructor parameters
   `max_pending_callbacks` and `callback_shutdown_timeout`,
   `DeliveryStats.callback_queued`/`callback_limit` and
-  `TaskStats.callback_worker`. Added: `DeliveryStats.callback_invocations` and
-  `TaskStats.lifecycle`. Immediate iterator admission and QoS 1/2 delivery
-  marks no longer create a coroutine per message. See the migration guide.
+  `TaskStats.callback_worker`, without a public replacement: `DeliveryStats`
+  describes retained iterator state only, and callback delivery retains
+  nothing. Immediate iterator admission and QoS 1/2 delivery marks no longer
+  create a coroutine per message. See the migration guide.
 - Construct the internal decoded-frame container without frozen-dataclass
   field assignment. The decoder still hands the engine owned bytes; the
   container is never mutated or hashed, and every inbound packet paid the

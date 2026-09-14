@@ -59,7 +59,7 @@ async def test_callback_mode_delivers_inline_without_sizing_or_reservation(monke
     assert delivery.pending_bytes == 0
     assert delivery.messages_queue.empty()
     assert delivery.callback_invocations == 1
-    assert client.stats().delivery.callback_invocations == 1
+    assert client._delivery.callback_invocations == 1
 
 
 @pytest.mark.parametrize("bound", ["count", "bytes"])
@@ -107,7 +107,7 @@ async def test_reader_message_delivery_keeps_callbacks_outside_engine_lock(kind)
         assert not observed
     await client._delivery_lane.drain()
     assert observed == [(b"x", False)]
-    assert client.stats().delivery.callback_invocations == 1
+    assert client._delivery.callback_invocations == 1
     assert client.stats().delivery.iterator_bytes == 0
 
 

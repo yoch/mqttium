@@ -535,7 +535,7 @@ async def test_application_reconnect_keeps_fresh_callbacks_and_retires_old_deliv
         assert all(payload.startswith(b"old") for payload in old)
         assert all(payload.startswith(b"fresh") for payload in fresh)
         assert len(fresh) == 3 and len(set(fresh)) == 3
-        assert client.stats().delivery.callback_invocations == len(seen)
+        assert client._delivery.callback_invocations == len(seen)
         assert client.stats().delivery.iterator_bytes == 0
         assert client.stats().inbound.inflight == 0
     finally:

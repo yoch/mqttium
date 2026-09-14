@@ -59,7 +59,7 @@ async def test_callback_delivery_charges_no_bytes() -> None:
     assert finished.is_set()
     await deliver_message(client, message)
 
-    assert client.stats().delivery.callback_invocations == 2
+    assert client._delivery.callback_invocations == 2
     assert client.stats().delivery.iterator_bytes == 0
     assert client.stats().delivery.iterator_high_water_bytes == 0
     assert client.stats().delivery.waiters == 0

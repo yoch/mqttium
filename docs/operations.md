@@ -121,7 +121,7 @@ in the same vocabulary as the constructor bound it is measured against:
 | `inbound` | `inflight`, `inflight_limit`, `inflight_bytes`, `inflight_high_water_bytes`, `inflight_byte_limit`, `topic_aliases`, `replay_pending` | `max_inbound_inflight`, `max_inbound_inflight_bytes` |
 | `writer` | `queued_messages`, `queued_bytes`, `high_water_*`, `max_messages`, `max_bytes`, `waiters`, `last_outbound` | `max_write_queue_*` |
 | `decoder` | `buffered_bytes`, `high_water_bytes`, `max_packet_size` | `maximum_packet_size` |
-| `delivery` | `iterator_queued`, `iterator_limit`, `iterator_bytes`, `iterator_high_water_bytes`, `iterator_byte_limit`, `callback_invocations`, `waiters` | `max_iterator_*` |
+| `delivery` | `iterator_queued`, `iterator_limit`, `iterator_bytes`, `iterator_high_water_bytes`, `iterator_byte_limit`, `waiters` | `max_iterator_*` |
 | `receipts` | `publish`, `publish_batches`, `subscribe`, `unsubscribe`, `publish_waiters` | — |
 | `transport` | `kind`, `closing`, `pending_write_bytes`, `buffered_read_bytes` | — |
 

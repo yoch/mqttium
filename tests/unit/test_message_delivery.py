@@ -25,7 +25,7 @@ async def test_callback_does_not_fill_iterator_queue() -> None:
 
     assert received == [b"0", b"1", b"2", b"3", b"4"]
     assert client._delivery.messages_queue.empty()
-    assert client.stats().delivery.callback_invocations == 5
+    assert client._delivery.callback_invocations == 5
     assert client.stats().delivery.iterator_bytes == 0
 
 

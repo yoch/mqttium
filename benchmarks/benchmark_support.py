@@ -43,7 +43,7 @@ _ITERATOR_ONLY_OPTIONS = frozenset(
 
 # Current ``client.stats()`` field -> the reference source's field for the same
 # quantity, per snapshot section. Fields without an exact reference
-# counterpart (``callback_invocations``, ``iterator_byte_limit``) are absent.
+# counterpart (``iterator_byte_limit``) are absent.
 STATS_FIELD_ALIASES: dict[str, dict[str, str]] = {
     "outbound": {
         "unacknowledged_messages": "pending_messages",
