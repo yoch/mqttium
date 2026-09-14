@@ -1097,77 +1097,32 @@ class AsyncClient:
         batch: PublishBatchReceipt,
         limit: int,
     ) -> tuple[PublishMessage | None, bool]:
-        """Transfer a bounded ready prefix; return one uncommitted fallback item.
+        """Transfer ready QoS 0; return the fallback and whether source ended.
 
-        No lock or untransferred payload spans next(source), which is user code.
-        Protocol terminal effects must already be settled before this entry.
+        Each item has writer ownership before next(source), which is user code.
+        Pressure or a different QoS returns to the ordinary admission path.
         """
-        message: PublishMessage | None = first
-        exhausted = False
-        qos1_admitted = False
-        pump = self._effect_pump
-        writer = self._write_pump
-        engine = self._engine
+        message = first
         for index in range(limit):
             if not isinstance(message, PublishMessage):
                 raise TypeError("publish_many entries must be PublishMessage instances")
-            qos = QoS(message.qos)
-            if qos is QoS.EXACTLY_ONCE:
-                break
-            data = _owned_payload(message.payload)
-            if qos is QoS.AT_MOST_ONCE:
-                if not self._try_direct_qos0_publish(
-                    message.topic,
-                    data,
-                    retain=message.retain,
-                    properties=message.properties,
-                    batch=batch,
-                ):
-                    break
-            else:
-                if (
-                    engine.state is not ConnectionState.CONNECTED
-                    or self._local_terminal_failure is not None
-                    or writer.epoch != self._connection_epoch
-                    or engine.flow.available <= 0
-                    or batch.pending_count >= max(1, engine.flow.limit)
-                ):
-                    break
-                try:
-                    prepared = self._check_nowait_publish_capacity(
-                        message.topic, data, qos, message.retain, message.properties
-                    )
-                    self._commit_publish(
-                        message.topic,
-                        data,
-                        qos=qos,
-                        retain=message.retain,
-                        properties=message.properties,
-                        batch=batch,
-                        prepared=prepared,
-                    )
-                except FlowControlError:
-                    # Only precommit refusal falls back. Effect/writer errors
-                    # below may already own bytes and must never retry the item.
-                    break
-                pump.collect_from_engine()
-                pump.drain_inline()
-                qos1_admitted = True
-            # The current element committed independently. Even an unexpected
-            # deferred SEND must transfer before reading another source item.
-            message = None
-            if pump.pending or index + 1 == limit:
-                break
+            if QoS(message.qos) != QoS.AT_MOST_ONCE:
+                return message, False
+            if not self._try_direct_qos0_publish(
+                message.topic,
+                _owned_payload(message.payload),
+                retain=message.retain,
+                properties=message.properties,
+                batch=batch,
+            ):
+                return message, False
+            if index + 1 == limit:
+                return None, False
             try:
                 message = next(source)
             except StopIteration:
-                exhausted = True
-                break
-        # Failure paths leave committed frames with their existing writer owner;
-        # do not mask an iteration/admission exception with a latency shortcut.
-        if qos1_admitted and not pump.pending:
-            writer._try_flush_latency_batch()
-        return message, exhausted
+                return None, True
+        return None, False
 
     async def publish_many(
         self,
@@ -1185,19 +1140,21 @@ class AsyncClient:
         receipt = PublishBatchReceipt(max_failure_details=max_failure_details)
         try:
             source = iter(messages)
-            while True:
-                try:
-                    message = next(source)
-                except StopIteration:
-                    break
-                # Re-establish terminal ownership after any prior suspension
-                # or reentrant source operation, before another MID can commit.
-                await self._effect_pump.drain()
-                pending, exhausted = self._publish_ready_prefix(
-                    source, message, receipt, min(64, 256 - receipt.submitted % 256)
-                )
+            for message in source:
+                if not isinstance(message, PublishMessage):
+                    raise TypeError("publish_many entries must be PublishMessage instances")
+                pending: PublishMessage | None = message
+                qos = QoS(message.qos)
+                if qos == QoS.AT_MOST_ONCE:
+                    pending, exhausted = self._publish_ready_prefix(
+                        source, message, receipt, min(64, 256 - receipt.submitted % 256)
+                    )
+                    if exhausted:
+                        break
+                    if pending is not None:
+                        qos = QoS(pending.qos)
                 if pending is not None:
-                    if QoS(pending.qos) != QoS.AT_MOST_ONCE:
+                    if qos != QoS.AT_MOST_ONCE:
                         await receipt._wait_pending_at_most(max(1, self._engine.flow.limit) - 1)
                     await self._publish_one(
                         pending.topic,
@@ -1207,12 +1164,8 @@ class AsyncClient:
                         properties=pending.properties,
                         batch=receipt,
                     )
-                if self._effect_pump.pending:
-                    await self._effect_pump.drain()
                 if receipt.submitted % 256 == 0:
                     await asyncio.sleep(0)
-                if exhausted:
-                    break
         except asyncio.CancelledError:
             raise
         except Exception as exc:

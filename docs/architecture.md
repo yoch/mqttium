@@ -211,9 +211,13 @@ Outbound QoS 1/2 work is admitted in this order:
 5. write the inflight record;
 6. emit effects.
 
-Failure before commit unwinds every acquired resource. `publish_many()` shares
-the unit admission path and commits a progressive prefix. It drains effects
-between elements and limits pending aggregate QoS 1/2 work to the flow window.
+Failure before commit unwinds every acquired resource. `publish_many()` commits
+each element independently. QoS 1/2 use the unit admission path, draining
+protocol effects before packet-identifier reuse and limiting pending aggregate
+work to the flow window. Ready QoS 0 items share a bounded private driver: each
+item transfers to the existing writer before the source iterator advances.
+Pressure or a change of QoS returns to ordinary admission; no retained payload
+prefix or input chunk sits outside resource accounting.
 
 Applications wait for capacity by default. Immediate mode raises
 `FlowControlError`. A terminal disconnect wakes blocked publishers with an

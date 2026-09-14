@@ -1,4 +1,4 @@
-"""Independent commitment and user-iterator reentry across ready prefixes."""
+"""Independent commitment and source reentry across ready QoS 0 prefixes."""
 
 from __future__ import annotations
 
@@ -110,5 +110,104 @@ async def test_qos1_effect_handoff_exception_keeps_prefix_without_retry(monkeypa
         await asyncio.wait_for(receipt.wait(), 2)
         assert receipt.completed == 2
         assert [packet.payload for packet in broker.publishes] == [b"\x00", b"\x01"]
+    finally:
+        await client.disconnect()
+
+
+async def test_mixed_qos_keeps_wire_order_and_yields_within_a_long_source():
+    from tests.unit.test_publish_many import BatchBrokerTransport
+
+    client = AsyncClient("prefix-mixed-qos", max_outbound_inflight=20)
+    broker = BatchBrokerTransport()
+    client._transport_factory = transport_factory(broker)
+    consumed = []
+    heartbeat = []
+    levels = [0] * 63 + [1, 0, 2] + [0] * 234
+
+    def messages():
+        for index, qos in enumerate(levels):
+            consumed.append(index)
+            yield PublishMessage("batch", str(index), qos=qos)
+
+    await client.connect("fake")
+    try:
+        # The source stays ready across both QoS transitions. A cooperative
+        # boundary must still let already scheduled loop work run before the
+        # remaining source is consumed.
+        asyncio.get_running_loop().call_soon(lambda: heartbeat.append(len(consumed)))
+        receipt = await client.publish_many(messages())
+        await asyncio.wait_for(receipt.wait(), 2)
+        await client._write_pump.join()
+        assert heartbeat == [256]
+        assert receipt.submitted == receipt.completed == len(levels)
+        assert [packet.payload for packet in broker.publishes] == [
+            str(index).encode() for index in range(len(levels))
+        ]
+        assert [int(packet.qos) for packet in broker.publishes] == levels
+        assert not client._receipts and not client._batch_receipts
+    finally:
+        await client.disconnect()
+
+
+@pytest.mark.parametrize("failure_index", [0, 63, 64])
+@pytest.mark.parametrize("invalid", [None, PublishMessage("batch", b"invalid", qos=3)])
+async def test_validation_failure_does_not_advance_beyond_committed_prefix(failure_index, invalid):
+    client = AsyncClient("prefix-invalid", max_outbound_messages=128)
+    broker = _WireBroker()
+    client._transport_factory = transport_factory(broker)
+    consumed = []
+
+    def messages():
+        for index in range(failure_index):
+            consumed.append(index)
+            yield PublishMessage("batch", str(index))
+        consumed.append("invalid")
+        yield invalid
+        consumed.append("must remain unread")
+        yield PublishMessage("batch", b"late")
+
+    await client.connect("fake")
+    try:
+        with pytest.raises(PublishBatchError) as caught:
+            await client.publish_many(messages())
+        assert isinstance(caught.value.cause, TypeError if invalid is None else ValueError)
+        receipt = caught.value.receipt
+        assert receipt._sealed
+        assert receipt.submitted == receipt.completed == failure_index
+        await receipt.wait()
+        await client._write_pump.join()
+        assert consumed == [*range(failure_index), "invalid"]
+        assert [packet.payload for packet in broker.publishes] == [
+            str(index).encode() for index in range(failure_index)
+        ]
+    finally:
+        await client.disconnect()
+
+
+async def test_source_is_not_called_again_after_its_first_exhaustion():
+    class CountingSource:
+        def __init__(self):
+            self.calls = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            self.calls += 1
+            if self.calls > 65:
+                raise StopIteration
+            return PublishMessage("batch", str(self.calls))
+
+    source = CountingSource()
+    client = AsyncClient("prefix-exhaustion")
+    broker = _WireBroker()
+    client._transport_factory = transport_factory(broker)
+    await client.connect("fake")
+    try:
+        receipt = await client.publish_many(source)
+        await receipt.wait()
+        await client._write_pump.join()
+        assert source.calls == 66
+        assert receipt.submitted == receipt.completed == len(broker.publishes) == 65
     finally:
         await client.disconnect()

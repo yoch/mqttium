@@ -343,7 +343,10 @@ Batch admission does not allocate a unit receipt. Topic Aliases commit after
 acceptance. A clean writer refusal rolls back only that batch registration and
 may fall back for awaited publication; writer exceptions retain the registered
 prefix and propagate without retry because handoff may already have occurred.
-`publish_many()` retains progressive admission and its existing fairness points.
+`publish_many()` amortizes ready QoS 0 orchestration with a bounded private
+driver while retaining progressive admission and its existing fairness points.
+It transfers each item before advancing the source, without holding an engine
+lock across source iteration. QoS 1/2 retain ordinary per-item admission.
 The protocol-effect drain before awaited admission remains necessary for
 receipt settlement before MID reuse; it never drains application delivery.
 
