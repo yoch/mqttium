@@ -4,9 +4,11 @@
 The callback suite measures the writer scheduling policy without a broker or
 socket: one persistent client receives a paced QoS 1 PUBLISH, auto-ACKs it,
 and synchronously publishes a QoS 1 reply from ``on_message``.  The measured
-interval starts immediately before the callback returns and ends when the
-reply reaches the transport.  A fake broker schedules reply PUBACKs with
-``call_soon`` so receipt completion cannot re-enter the writer synchronously.
+interval starts immediately before ``publish_nowait()`` and ends when the
+reply reaches the transport, including admission and any writer scheduling.
+This differs from historical callback-return-to-transport samples. A fake broker
+schedules reply PUBACKs with ``call_soon`` so receipt completion cannot re-enter
+the writer synchronously.
 
 The parent runs fresh source-isolated workers in ABBA order.  Deterministic
 writer-policy counters are collected once per root.  The microbatch suite is
@@ -28,6 +30,8 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+
+_CALLBACK_LATENCY_INTERVAL = "publish_nowait_call_to_transport"
 
 
 def percentile(values: list[float], pct: float) -> float:
@@ -60,6 +64,7 @@ class CallbackResult:
     queued_replies: int
     eager_acks: int
     queued_acks: int
+    latency_interval: str = _CALLBACK_LATENCY_INTERVAL
 
 
 @dataclass(slots=True)
@@ -175,11 +180,10 @@ async def _callback_sample(*, warmup: int, count: int, timeout: float) -> Callba
 
     def on_message(message: Any) -> None:
         sequence = int.from_bytes(message.payload, "big")
-        receipt = client.publish_nowait("bench/reply", message.payload, qos=1)
-        # Nested effect collection has completed, but the callback has not yet
-        # returned to the owning EffectPump.  This is the scheduling interval
-        # the candidate policies are intended to shorten.
+        # The message worker may publish eagerly before this callback returns.
+        # Install the clock before admission can expose the reply to transport.
         broker.reply_started_ns[sequence] = time.perf_counter_ns()
+        receipt = client.publish_nowait("bench/reply", message.payload, qos=1)
         receipts.put_nowait(receipt)
 
     client.on_message = on_message
@@ -537,6 +541,7 @@ def _callback_parent(args: argparse.Namespace) -> int:
     invalidations.extend(invariant_failures)
     payload = {
         "suite": "callback",
+        "latency_interval": _CALLBACK_LATENCY_INTERVAL,
         "base_root": str(roots["base"]),
         "candidate_root": str(roots["candidate"]),
         "repeat": args.repeat,

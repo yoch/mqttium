@@ -97,6 +97,11 @@ remain separate evidence.
   against a tight writer message window. It is the contention harness for the
   targeted-wake experiment; default concurrency is 1/4/16 (64/256 are opt-in).
   It does not replace `paired_writer_capacity.py`.
+- `paired_qos1_rtt.py` measures a synchronous message handler's QoS 1 reply
+  from immediately before `publish_nowait()` to transport exposure. The
+  `publish_nowait_call_to_transport` interval includes admission and writer
+  scheduling. Historical callback-return-to-transport results use a different
+  starting point and require separate controls.
 - `application_stress.py` exercises callbacks, iterators, backpressure, memory,
   and SQLite persistence.
 - `memory_profile.py` enforces versioned tracemalloc and logical-counter limits.
@@ -189,9 +194,10 @@ five rules to prevent that:
    calibration.
 4. Open-loop calibration runs the same subscriber, completion tracking, and
    telemetry path as the paced sample. The only difference is pacing itself.
-5. Callback completion timestamps are correlated FIFO per MQTT packet
-   identifier. Packet identifiers may be reused before the observer consumes an
-   earlier queued callback, so one timestamp slot per MID is not sufficient.
+5. Each publication's start timestamp stays paired with its own receipt.
+   Receipt identity distinguishes publications even when a packet identifier
+   is reused before the observer runs. Tracking uses neither publication
+   callbacks nor a single timestamp slot per MID.
 
 When a CPU is selected, the publisher worker is pinned only after the subscriber
 and observer have started. The observer therefore does not inherit the
@@ -210,10 +216,9 @@ time. PUBACK proves broker acceptance; independent subscriber completion proves
 delivery to the observer.
 
 Receipt completion is observed by an awaiting task, so its timestamp includes
-that task's scheduling delay. At high rates this can have substantially higher
-CV than callback observation and must not be used as a neutral latency control
-unless its own A/A cell passes. Exact call/allocation profiles are the preferred
-neutral control for changes limited to callback handoff.
+that task's scheduling delay. Its own A/A cell must pass before it supports a
+latency comparison. Exact call/allocation profiles complement these timings
+when isolating changes to publication orchestration.
 
 Larger inflight windows can improve throughput through batching while increasing
 latency. Sweep the window before calling a high-window latency change a protocol

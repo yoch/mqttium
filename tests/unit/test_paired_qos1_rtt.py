@@ -10,6 +10,8 @@ if str(_BENCHMARKS) not in sys.path:
     sys.path.insert(0, str(_BENCHMARKS))
 
 from paired_qos1_rtt import (  # noqa: E402
+    _FakeBroker,
+    _callback_sample,
     _writer_policy_counters,
     assess_callback_pairs,
     percentile,
@@ -99,3 +101,20 @@ async def test_policy_counters_preserve_one_eager_qos0_write() -> None:
 
     assert counters["qos0_burst"] == {"burst": 16, "eager": 1, "queued": 15}
     assert len(counters["ack_bursts"]) == 6
+
+
+@pytest.mark.parametrize("eager", [False, True])
+async def test_callback_sample_observes_every_reply_before_or_after_callback_return(
+    monkeypatch, eager
+) -> None:
+    if not eager:
+        monkeypatch.setattr(_FakeBroker, "write_nowait", lambda self, data: False)
+
+    result = await _callback_sample(warmup=2, count=8, timeout=2)
+
+    assert result.samples == 8
+    assert result.eager_replies == (8 if eager else 0)
+    assert result.queued_replies == (0 if eager else 8)
+    assert result.eager_acks + result.queued_acks == 8
+    assert result.latency_p50_ns > 0
+    assert result.latency_interval == "publish_nowait_call_to_transport"

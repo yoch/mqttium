@@ -332,7 +332,10 @@ Covered by `tests/unit/test_ingress_failure_semantics.py`.
 - SUBACK and UNSUBACK return all per-filter reason codes; a reason code at or
   above `0x80` remains data in the result rather than becoming a blanket
   exception.
-- Transport loss fails work only after reconnect policy becomes terminal.
+- Each transport loss fails pending SUBSCRIBE/UNSUBSCRIBE futures; those
+  requests are not replayed. Replayable QoS 1/2 publication receipts survive
+  retry attempts but fail when retry becomes terminal or the broker session
+  cannot be resumed.
 - Public exceptions must not shadow Python built-ins.
 
 QoS 0 publication may bypass general effect creation only with the current
