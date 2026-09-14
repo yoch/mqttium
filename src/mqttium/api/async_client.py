@@ -219,8 +219,11 @@ class AsyncClient:
         max_write_queue_messages: Encoded frames resident in the writer.
         max_write_queue_bytes: Encoded bytes resident in the writer.
         message_delivery: Explicit ``"iterator"`` (default) or ``"callback"`` delivery.
+            Callback delivery notifies synchronously and acknowledges
+            automatically; iterator delivery is the asynchronous processing
+            mode and the only one that supports ``manual_ack``.
         manual_ack: Defer terminal acknowledgement of inbound QoS messages
-            until :meth:`ack` is called.
+            until :meth:`ack` is called. Requires iterator delivery.
         max_iterator_messages: Iterator queue count bound.
         max_iterator_bytes: Logical bytes retained in the iterator queue;
             ``None`` disables the bound.
@@ -243,7 +246,7 @@ class AsyncClient:
 
     Raises:
         ValueError: If a limit or constructor option is invalid, or an
-            iterator bound is given with callback delivery.
+            iterator bound or ``manual_ack`` is given with callback delivery.
         ProtocolError: If an MQTT 5 option is given with MQTT 3.1.1.
 
     Note:
@@ -320,6 +323,11 @@ class AsyncClient:
                 "max_iterator_messages, max_iterator_bytes and "
                 "iterator_admission_timeout apply to iterator delivery only"
             )
+        if message_delivery == "callback" and manual_ack:
+            # Message callbacks are synchronous and ack() is awaited, so the
+            # only way to acknowledge from a callback would be a detached task;
+            # messages() is the delivery mode built for that processing shape.
+            raise ValueError("manual_ack requires iterator delivery; use messages() and ack()")
         effective_max_packet_size = (
             maximum_packet_size if maximum_packet_size is not None else DEFAULT_MAX_PACKET_SIZE
         )

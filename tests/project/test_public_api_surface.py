@@ -237,6 +237,11 @@ def test_constructor_refuses_configuration_without_effect() -> None:
     with pytest.raises(ValueError, match="iterator delivery only"):
         AsyncClient("c", message_delivery="callback", iterator_admission_timeout=1.0)
     AsyncClient("c", message_delivery="callback")
+    # Synchronous callbacks cannot await ack(); manual acknowledgement belongs
+    # to the asynchronous processing mode.
+    with pytest.raises(ValueError, match="manual_ack requires iterator delivery"):
+        AsyncClient("c", message_delivery="callback", manual_ack=True)
+    AsyncClient("c", manual_ack=True)
     for option in (
         {"connect_properties": Properties({"session_expiry_interval": 10})},
         {"will_properties": Properties({"message_expiry_interval": 10}), "will": Message("w", b"")},

@@ -93,7 +93,7 @@ a memory bound, and is not configurable.
 | Setting | Default | Purpose |
 | --- | ---: | --- |
 | `message_delivery` | `"iterator"` | Choose iterator or callback delivery |
-| `manual_ack` | `False` | Let the application control inbound QoS acknowledgement timing |
+| `manual_ack` | `False` | Let the application control inbound QoS acknowledgement timing; iterator delivery only |
 | `max_iterator_messages` | `65_536` | Iterator queue count bound |
 | `max_iterator_bytes` | `64 MiB` | Topic, payload and property bytes retained in the iterator queue |
 | `iterator_admission_timeout` | `None` | Optional positive deadline for admitting one message into the iterator queue |
@@ -103,7 +103,9 @@ application's behalf, so its three bounds only exist in iterator mode. In
 callback mode the reader hands each message to the synchronous callback and
 retains nothing; backpressure is the callback's own duration. Passing a
 non-default iterator bound with `message_delivery="callback"` raises
-`ValueError` at construction.
+`ValueError` at construction, and so does `manual_ack=True`: callbacks are
+synchronous and acknowledge automatically, while `ack()` is awaited from the
+asynchronous `messages()` consumer.
 
 ### Connection and authentication
 

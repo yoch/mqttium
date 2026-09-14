@@ -13,7 +13,6 @@ from mqttium.errors import NotConnectedError, ProtocolError
 from mqttium.packets import PublishPacket, encode_frame
 from mqttium.persistence.memory import MemoryInflightStore
 from mqttium.protocol.reconnect import ReconnectPolicy
-from mqttium.types import Message
 from tests.support import wait_until
 
 
@@ -245,22 +244,15 @@ async def test_ack_after_transport_drop_preserves_durable_inbound_record() -> No
         protocol=MQTTProtocolVersion.MQTTv5,
         clean_start=False,
         manual_ack=True,
-        message_delivery="callback",
         store=store,
     )
-    delivered: list[Message] = []
-    message_ready = asyncio.Event()
 
     async def factory(host: str, port: int, *, ssl: object = None) -> _Transport:
         return transport
 
-    def on_message(message: Message) -> None:
-        delivered.append(message)
-        message_ready.set()
-
     client._transport_factory = factory
-    client.on_message = on_message
     await client.connect("fake", timeout=2.0)
+    stream = client.messages()
     transport._rx.put_nowait(
         PublishPacket(
             topic="manual/ack",
@@ -271,7 +263,7 @@ async def test_ack_after_transport_drop_preserves_durable_inbound_record() -> No
             mid=7,
         ).encode(MQTTProtocolVersion.MQTTv5)
     )
-    await asyncio.wait_for(message_ready.wait(), timeout=1.0)
+    delivered = [await asyncio.wait_for(anext(stream), timeout=1.0)]
     assert store.get_in(7) is not None
 
     await transport.close()
