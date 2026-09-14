@@ -53,9 +53,14 @@ critical sections and without any intermediate queue: the reader decodes no
 further packet until the current lot has been handed to the application, so
 callback cost is the natural backpressure. A callback exception is reported to
 the loop's exception handler and delivery continues with the next callback or
-message. The reader counts callback invocations, including route fan-out, and
-yields to the event loop after each bounded group. That private quantum is not a
+message. All routes matching one message run contiguously; the reader counts
+every invocation and yields to the event loop at the next message boundary once
+its private budget is reached, carrying the excess over. That budget is not a
 time limit: synchronous user code cannot be preempted.
+
+Callback delivery acknowledges automatically once the callbacks return.
+`manual_ack=True` requires iterator delivery and raises `ValueError` with
+`message_delivery="callback"`.
 
 Matching topic filters run in registration order instead of `on_message`.
 Shared-subscription filters match the filter string literally. Iterator mode

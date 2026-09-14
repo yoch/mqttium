@@ -48,10 +48,16 @@ Each callback failure is isolated so subsequent matches can still run.
 Message callbacks are synchronous-only. Async functions and async callable
 objects are rejected before registration changes; a synchronous function that
 returns an awaitable is reported as a callback `TypeError`. Message callbacks
-run synchronously on the delivering reader outside protocol locks. The reader's
-private fairness quantum counts actual callback invocations, including matching
-routes inside one message.
+run synchronously on the delivering reader outside protocol locks. All routes
+matching one message run contiguously; the reader yields to the loop at a
+message boundary once its private invocation budget is reached, counting every
+route invocation and carrying any excess over to the next yield.
 A synchronous callback that blocks the event loop cannot be preempted.
+
+Callback delivery notifies synchronously and acknowledges automatically.
+`manual_ack=True` requires iterator delivery, because `ack()` is awaited and
+`messages()` is the asynchronous processing mode; the combination with
+`message_delivery="callback"` raises `ValueError`.
 
 `on_publish` is removed; individual and aggregate receipts are the publication
 completion contract. `on_connect` and `on_disconnect` remain sync-or-async
@@ -96,7 +102,7 @@ keys and arguments.
 The constructor refuses configuration that would have no effect instead of
 accepting it: MQTT 5 options (`connect_properties`, `will_properties`,
 `topic_alias_maximum`, `auth_handler`) with MQTT 3.1.1 raise `ProtocolError`;
-iterator bounds with callback delivery raise `ValueError`.
+iterator bounds or `manual_ack` with callback delivery raise `ValueError`.
 
 Manual `ack(message)` validates the delivered handle's active logical exchange.
 Foreign, reconstructed and completed handles raise `ProtocolError`. A reconnect

@@ -208,9 +208,10 @@ Registration rejects async functions and async callable objects before
 mutation. Returning an awaitable is reported as a callback `TypeError`; MQTTium
 does not await it or create a detached task. Ordinary failures are isolated per
 invocation; a `CancelledError` raised by user code is reported unless the reader
-itself is being cancelled. The private fairness quantum counts actual callback
+itself is being cancelled. The private fairness budget counts actual callback
 invocations, including routes inside one message, and yields at the following
-message boundary. Synchronous user code cannot be preempted.
+message boundary; invocations beyond the budget are carried over to the next
+yield rather than reset. Synchronous user code cannot be preempted.
 
 `on_publish` is removed: receipts settle without message-queue admission.
 `on_connect` and `on_disconnect` use separate bounded lifecycle ownership, after

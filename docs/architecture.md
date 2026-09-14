@@ -119,10 +119,11 @@ Message callbacks run synchronously on the delivering reader, with no queue,
 worker task or byte reservation in between: the reader hands the current lot
 to the application before it decodes the next batch, so callback cost is the
 backpressure. Exceptions and invalid awaitable returns are reported to the
-loop's exception handler and delivery continues. The reader counts callback
-invocations, including fan-out inside one message, and yields to the loop
-after each bounded group. The quantum is private and cannot preempt synchronous
-user code. Lifecycle hooks and publication receipts never touch delivery.
+loop's exception handler and delivery continues. All routes matching one
+message run contiguously; the reader charges every invocation against a private
+budget and yields to the loop at the next message boundary once it is reached,
+carrying any excess over. The budget cannot preempt synchronous user code.
+Lifecycle hooks and publication receipts never touch delivery.
 
 Lifecycle hooks have one retained supervisor, one active child and at most one
 pending latest-state notification. Setup/teardown holds and a released lifecycle

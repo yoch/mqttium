@@ -27,8 +27,9 @@ class MessageRoute:
 
 CallbackTarget = Callable[..., Any] | MessageRoute
 IteratorQueueItem = tuple[Message, int]
-# Synchronous callback invocations, including route fan-out, between two
-# cooperative yields of the delivering reader. It cannot preempt user code.
+# Synchronous callback invocations, including route fan-out, charged between
+# two cooperative yields of the delivering reader. The yield happens at a
+# message boundary, so one message's routes always run contiguously.
 _CALLBACK_QUANTUM = 128
 
 
@@ -75,7 +76,6 @@ class ApplicationDelivery:
             iterator_bytes=self.pending_bytes,
             iterator_high_water_bytes=self.pending_high_water_bytes,
             iterator_byte_limit=self.max_iterator_bytes,
-            callback_invocations=self.callback_invocations,
             waiters=self.waiters,
         )
 
@@ -115,10 +115,13 @@ class ApplicationDelivery:
     ) -> Awaitable[None] | None:
         """Hand one message to its destination now, or return the waiting path.
 
-        Callback mode runs the matching synchronous callbacks before returning
-        and only yields an awaitable when the fairness quantum is exhausted.
-        Iterator mode returns ``None`` after an immediate bounded enqueue and
-        otherwise the coroutine that waits for queue and byte capacity.
+        Callback mode runs every matching synchronous callback contiguously
+        before returning, and yields an awaitable at this message boundary
+        once the invocation budget is reached. Invocations beyond the budget
+        stay charged to the next yield, so a wide fan-out cannot consume
+        budget for free. Iterator mode returns ``None`` after an immediate
+        bounded enqueue and otherwise the coroutine that waits for queue and
+        byte capacity.
         """
         if self.mode == "callback":
             if callback is not None:
@@ -128,7 +131,7 @@ class ApplicationDelivery:
                 else:
                     self.invoke_sync_isolated(callback, message)
                 if self._since_yield >= _CALLBACK_QUANTUM:
-                    self._since_yield = 0
+                    self._since_yield %= _CALLBACK_QUANTUM
                     return asyncio.sleep(0)
             return None
         size = self.logical_size(message, property_wire_size)

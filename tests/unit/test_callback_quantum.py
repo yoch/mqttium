@@ -1,9 +1,11 @@
-"""Synchronous callback invocations, including route fan-out, share a bounded quantum.
+"""Synchronous callback invocations, including route fan-out, share one budget.
 
-The delivering reader runs callbacks directly. ``accept()`` hands back a
-cooperative yield once the private quantum of invocations is reached, and the
-reader-owned lane awaits it between messages, so a long incoming lot cannot
-monopolise the loop without a scheduling point.
+The delivering reader runs callbacks directly. All routes of one message run
+contiguously; ``accept()`` hands back a cooperative yield at the message
+boundary once the private invocation budget is reached, and the reader-owned
+lane awaits it between messages, so a long incoming lot cannot monopolise the
+loop without a scheduling point. Invocations beyond the budget are carried
+over rather than forgiven.
 """
 
 from __future__ import annotations
@@ -85,13 +87,22 @@ async def test_route_fanout_counts_every_invocation_toward_the_quantum(fanout):
     client._freeze_message_routes()
     pending = client._delivery.accept(message, client._message_callback)
     # Fan-out is never preempted inside one message, but its invocations are
-    # charged, so the reader yields at the next message boundary.
+    # charged, so the reader yields at this message boundary.
     assert seen == list(range(fanout))
     assert pending is not None
     await pending
     assert client._delivery.callback_invocations == fanout
-    assert client._delivery.accept(Message("t", b"next"), lambda _m: seen.append(-1)) is None
+    # The excess over the budget is carried over: the next yield comes after
+    # only the missing complement, not after a fresh full quantum.
+    carried = fanout % _CALLBACK_QUANTUM
+    yields = []
+    for index in range(_CALLBACK_QUANTUM):
+        pending = client._delivery.accept(Message("t", b"next"), lambda _m: seen.append(-1))
+        if pending is not None:
+            yields.append(index)
+            await pending
     assert seen[-1] == -1
+    assert yields == [_CALLBACK_QUANTUM - carried - 1]
     assert client._delivery.pending_bytes == 0
 
 
@@ -120,7 +131,7 @@ async def test_reader_yields_between_quantum_groups_of_one_lot():
         # heartbeat after exactly one quantum of synchronous invocations.
         assert await asyncio.wait_for(heartbeat, 1) == _CALLBACK_QUANTUM
         await asyncio.wait_for(_wait_seen(lambda: len(seen) == total), 1)
-        assert client.stats().delivery.callback_invocations == total
+        assert client._delivery.callback_invocations == total
     finally:
         await client.disconnect()
 
