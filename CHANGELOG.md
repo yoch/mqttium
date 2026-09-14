@@ -36,6 +36,10 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Changed — lean native experiment
 
+- Amortize ready QoS 0/1 `publish_many()` orchestration over bounded private
+  prefixes. Each item still commits independently and transfers to the writer
+  before the source iterator advances; pressure and QoS 2 use the existing
+  admission path.
 - Remove unused private atomic writer admission, synthetic inline-batch
   accounting and borrowed QoS 0 decoders. Active writer bounds, segmented
   ordering and owned specialized decoding remain covered by regression tests.
