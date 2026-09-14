@@ -8,8 +8,6 @@ logical MQTTium queue/store counters.
 
 from __future__ import annotations
 
-from benchmarks.benchmark_support import stored_record
-
 import argparse
 import asyncio
 import ctypes
@@ -38,6 +36,7 @@ try:
 except ImportError as exc:  # pragma: no cover - actionable local error
     raise SystemExit("memory_profile.py requires psutil>=6") from exc
 
+from benchmark_support import stored_record
 from mqttium.api import AsyncClient
 from mqttium.codec.buffer import IncrementalDecoder
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, OutboundQoSState, QoS
@@ -257,6 +256,20 @@ def _message_effect(sequence: int, payload_size: int) -> EngineEffect:
     )
 
 
+async def _deliver(client: AsyncClient, effect: EngineEffect) -> None:
+    """Hand one message effect to the application queue as the reader would."""
+    pending = client._apply_delivery_effect(effect, client._connection_epoch)
+    if pending is not None:
+        await pending
+
+
+def _drain_iterator_queue(client: AsyncClient) -> None:
+    queue = client._delivery.messages_queue
+    while not queue.empty():
+        _message, size = queue.get_nowait()
+        client._delivery.release(size)
+
+
 def _finalize(
     spec: ScenarioSpec,
     started: float,
@@ -290,8 +303,8 @@ def run_protocol_qos_queue(spec: ScenarioSpec) -> dict[str, Any]:
     started = time.perf_counter()
     engine = ProtocolEngine(
         EngineConfig(
-            max_pending_outbound_messages=None,
-            max_pending_outbound_bytes=None,
+            max_unacknowledged_messages=None,
+            max_unacknowledged_bytes=None,
         )
     )
     for index in range(spec.count):
@@ -333,8 +346,8 @@ def run_protocol_bounded_queue(spec: ScenarioSpec) -> dict[str, Any]:
     byte_limit = max(logical_size, min(8 * _MIB, (spec.count // 2) * logical_size))
     engine = ProtocolEngine(
         EngineConfig(
-            max_pending_outbound_messages=None,
-            max_pending_outbound_bytes=byte_limit,
+            max_unacknowledged_messages=None,
+            max_unacknowledged_bytes=byte_limit,
         )
     )
     rejected = 0
@@ -351,9 +364,9 @@ def run_protocol_bounded_queue(spec: ScenarioSpec) -> dict[str, Any]:
         probe.snapshot(
             "loaded",
             attempted_messages=spec.count,
-            accepted_messages=engine.pending_outbound_messages,
+            accepted_messages=engine.unacknowledged_messages,
             rejected_messages=rejected,
-            pending_logical_bytes=engine.pending_outbound_bytes,
+            pending_logical_bytes=engine.unacknowledged_bytes,
             configured_byte_limit=byte_limit,
         )
     )
@@ -374,7 +387,7 @@ def run_inbound_bounded_persistence(spec: ScenarioSpec) -> dict[str, Any]:
     started = time.perf_counter()
     logical_size = _logical_message_bytes(spec.payload_size)
     byte_limit = max(logical_size, min(8 * _MIB, (spec.count // 2) * logical_size))
-    engine = ProtocolEngine(EngineConfig(max_pending_inbound_bytes=byte_limit))
+    engine = ProtocolEngine(EngineConfig(max_inbound_inflight_bytes=byte_limit))
     engine.state = ConnectionState.CONNECTED
     decoder = IncrementalDecoder()
     attempted = 0
@@ -404,11 +417,11 @@ def run_inbound_bounded_persistence(spec: ScenarioSpec) -> dict[str, Any]:
             attempted_messages=attempted,
             accepted_messages=accepted,
             rejected_messages=attempted - accepted,
-            pending_logical_bytes=stats.pending_bytes,
-            pending_high_water_bytes=stats.pending_high_water_bytes,
+            pending_logical_bytes=stats.inflight_bytes,
+            pending_high_water_bytes=stats.inflight_high_water_bytes,
             configured_byte_limit=byte_limit,
             store_records=accepted,
-            limit_respected=stats.pending_bytes <= byte_limit,
+            limit_respected=stats.inflight_bytes <= byte_limit,
         )
     )
     engine.store.clear_in()
@@ -428,11 +441,11 @@ async def _run_iterator_delivery_queue(spec: ScenarioSpec) -> dict[str, Any]:
     started = time.perf_counter()
     client = AsyncClient(
         message_delivery="iterator",
-        max_pending_messages=spec.count,
-        delivery_timeout=30.0,
+        max_iterator_messages=spec.count,
+        iterator_admission_timeout=30.0,
     )
     for index in range(spec.count):
-        await client._apply_effect(_message_effect(index, spec.payload_size), nowait=False)
+        await _deliver(client, _message_effect(index, spec.payload_size))
     snapshots.append(
         probe.snapshot(
             "loaded",
@@ -442,11 +455,7 @@ async def _run_iterator_delivery_queue(spec: ScenarioSpec) -> dict[str, Any]:
             ),
         )
     )
-    while not client._delivery.messages_queue.empty():
-        item = client._delivery.messages_queue.get_nowait()
-        if isinstance(item, tuple):
-            _message, delivery_token = item
-            await client._delivery.release(delivery_token)
+    _drain_iterator_queue(client)
     del client
     snapshots.append(probe.snapshot("released"))
     trimmed = _malloc_trim()
@@ -469,15 +478,13 @@ async def _run_iterator_delivery_budget(spec: ScenarioSpec) -> dict[str, Any]:
     byte_limit = capacity * logical_size
     client = AsyncClient(
         message_delivery="iterator",
-        max_pending_messages=spec.count,
-        max_pending_delivery_bytes=byte_limit,
-        delivery_timeout=30.0,
+        max_iterator_messages=spec.count,
+        max_iterator_bytes=byte_limit,
+        iterator_admission_timeout=30.0,
     )
     for index in range(capacity):
-        await client._apply_effect(_message_effect(index, spec.payload_size), nowait=False)
-    blocked = asyncio.create_task(
-        client._apply_effect(_message_effect(capacity, spec.payload_size), nowait=False)
-    )
+        await _deliver(client, _message_effect(index, spec.payload_size))
+    blocked = asyncio.create_task(_deliver(client, _message_effect(capacity, spec.payload_size)))
     await asyncio.sleep(0)
     snapshots.append(
         probe.snapshot(
@@ -485,7 +492,7 @@ async def _run_iterator_delivery_budget(spec: ScenarioSpec) -> dict[str, Any]:
             attempted_messages=capacity + 1,
             accepted_messages=client._delivery.messages_queue.qsize(),
             blocked_message=not blocked.done(),
-            pending_logical_bytes=client.stats().delivery.pending_bytes,
+            pending_logical_bytes=client.stats().delivery.iterator_bytes,
             configured_byte_limit=byte_limit,
         )
     )
@@ -494,11 +501,7 @@ async def _run_iterator_delivery_budget(spec: ScenarioSpec) -> dict[str, Any]:
         await blocked
     except asyncio.CancelledError:
         pass
-    while not client._delivery.messages_queue.empty():
-        item = client._delivery.messages_queue.get_nowait()
-        if isinstance(item, tuple):
-            _message, delivery_token = item
-            await client._delivery.release(delivery_token)
+    _drain_iterator_queue(client)
     del client
     snapshots.append(probe.snapshot("released"))
     trimmed = _malloc_trim()
@@ -607,8 +610,8 @@ def run_property_heavy_outbound(spec: ScenarioSpec) -> dict[str, Any]:
     engine = ProtocolEngine(
         EngineConfig(
             protocol=MQTTProtocolVersion.MQTTv5,
-            max_pending_outbound_messages=None,
-            max_pending_outbound_bytes=None,
+            max_unacknowledged_messages=None,
+            max_unacknowledged_bytes=None,
         )
     )
     for index in range(spec.count):
@@ -622,7 +625,7 @@ def run_property_heavy_outbound(spec: ScenarioSpec) -> dict[str, Any]:
         probe.snapshot(
             "loaded",
             queued_messages=len(engine.outbound._queued),
-            pending_logical_bytes=engine.pending_outbound_bytes,
+            pending_logical_bytes=engine.unacknowledged_bytes,
             property_records=_out_property_record_count(engine.store),
             packet_ids=len(engine.packet_ids),
             store_records=_out_record_count(engine.store),
@@ -647,8 +650,8 @@ def run_immediate_refusal(spec: ScenarioSpec) -> dict[str, Any]:
     started = time.perf_counter()
     engine = ProtocolEngine(
         EngineConfig(
-            max_pending_outbound_messages=1,
-            max_pending_outbound_bytes=None,
+            max_unacknowledged_messages=1,
+            max_unacknowledged_bytes=None,
         )
     )
     engine.queue_publish(_TOPIC, _payload(0, spec.payload_size), qos=QoS.AT_LEAST_ONCE)
@@ -666,11 +669,11 @@ def run_immediate_refusal(spec: ScenarioSpec) -> dict[str, Any]:
         probe.snapshot(
             "loaded",
             attempted_messages=spec.count,
-            accepted_messages=engine.pending_outbound_messages,
+            accepted_messages=engine.unacknowledged_messages,
             rejected_messages=rejected,
             packet_ids=len(engine.packet_ids),
             store_records=_out_record_count(engine.store),
-            pending_logical_bytes=engine.pending_outbound_bytes,
+            pending_logical_bytes=engine.unacknowledged_bytes,
         )
     )
     engine.outbound._queued.clear()
@@ -689,8 +692,8 @@ async def _run_cancelled_admission(spec: ScenarioSpec) -> dict[str, Any]:
     probe.reset_python_peak()
     started = time.perf_counter()
     client = AsyncClient(
-        max_pending_outbound_messages=1,
-        max_pending_outbound_bytes=None,
+        max_unacknowledged_messages=1,
+        max_unacknowledged_bytes=None,
     )
     await client.publish(_TOPIC, _payload(0, spec.payload_size), qos=1)
     waiters = [
@@ -718,7 +721,7 @@ async def _run_cancelled_admission(spec: ScenarioSpec) -> dict[str, Any]:
             attempted_messages=spec.count,
             cancelled_messages=cancelled,
             publish_waiters=client._publish_waiters,
-            pending_messages=client._engine.pending_outbound_messages,
+            pending_messages=client._engine.unacknowledged_messages,
             packet_ids=len(client._engine.packet_ids),
             store_records=_out_record_count(client._engine.store),
             receipts=len(client._receipts),
@@ -815,8 +818,8 @@ async def _run_reconnect_epoch_cleanup(spec: ScenarioSpec) -> dict[str, Any]:
     probe.reset_python_peak()
     started = time.perf_counter()
     client = AsyncClient(
-        max_outbound_messages=spec.count + 1,
-        max_outbound_bytes=(spec.count + 1) * spec.payload_size,
+        max_write_queue_messages=spec.count + 1,
+        max_write_queue_bytes=(spec.count + 1) * spec.payload_size,
     )
     payloads = [_payload(index, spec.payload_size) for index in range(spec.count)]
     for payload in payloads:

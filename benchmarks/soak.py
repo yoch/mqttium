@@ -88,23 +88,24 @@ def _protocol(value: str) -> MQTTProtocolVersion:
 
 def _idle_violations(client: AsyncClient) -> list[str]:
     stats = client.stats()
+    effects = client._effect_pump.counters()
     checks = {
-        "outbound.pending_messages": stats.outbound.pending_messages,
-        "outbound.pending_bytes": stats.outbound.pending_bytes,
-        "outbound.queued_messages": stats.outbound.queued_messages,
-        "outbound.flow_inflight": stats.outbound.flow_inflight,
+        "outbound.unacknowledged_messages": stats.outbound.unacknowledged_messages,
+        "outbound.unacknowledged_bytes": stats.outbound.unacknowledged_bytes,
+        "outbound.awaiting_slot": stats.outbound.awaiting_slot,
+        "outbound.inflight": stats.outbound.inflight,
         "outbound.packet_ids_in_use": stats.outbound.packet_ids_in_use,
         "inbound.inflight": stats.inbound.inflight,
-        "inbound.pending_bytes": stats.inbound.pending_bytes,
+        "inbound.inflight_bytes": stats.inbound.inflight_bytes,
         "inbound.replay_pending": stats.inbound.replay_pending,
         "delivery.iterator_queued": stats.delivery.iterator_queued,
-        "delivery.pending_bytes": stats.delivery.pending_bytes,
+        "delivery.iterator_bytes": stats.delivery.iterator_bytes,
         "delivery.waiters": stats.delivery.waiters,
         "writer.queued_messages": stats.writer.queued_messages,
         "writer.queued_bytes": stats.writer.queued_bytes,
         "writer.waiters": stats.writer.waiters,
-        "effects.pending": stats.effects.pending,
-        "effects.waiters": stats.effects.waiters,
+        "effects.pending": effects["pending"],
+        "effects.waiters": effects["waiters"],
         "receipts.publish": stats.receipts.publish,
         "receipts.publish_batches": stats.receipts.publish_batches,
         "receipts.subscribe": stats.receipts.subscribe,
@@ -144,8 +145,8 @@ async def _force_reconnect(client: AsyncClient, *, cycle: int, timeout: float) -
     await _wait_until(
         lambda: (
             client.is_connected
-            and (stats := client.stats()).connection_epoch > previous_epoch
-            and not stats.tasks.reconnect
+            and client.stats().connection_epoch > previous_epoch
+            and not client._running_tasks()["reconnect"]
         ),
         timeout=timeout,
         description=f"settled automatic reconnect after cycle {cycle}",
@@ -193,26 +194,25 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
         f"mqttium-soak-sub-{run_id}",
         protocol=args.protocol,
         message_delivery="iterator",
-        max_pending_messages=max(args.messages_per_cycle * 2, 1024),
-        max_pending_delivery_bytes=max(args.payload_size * args.messages_per_cycle * 4, 1 << 20),
+        max_iterator_messages=max(args.messages_per_cycle * 2, 1024),
+        max_iterator_bytes=max(args.payload_size * args.messages_per_cycle * 4, 1 << 20),
     )
     publisher = AsyncClient(
         f"mqttium-soak-pub-{run_id}",
         protocol=args.protocol,
         clean_start=True,
         reconnect=ReconnectPolicy(
-            enabled=True,
             initial_delay=0.05,
             multiplier=1.5,
             max_delay=0.5,
             max_retries=100,
             stable_after=0.05,
-            connect_timeout=args.timeout,
         ),
-        max_pending_outbound_messages=max(args.messages_per_cycle * 2, 1024),
-        max_pending_outbound_bytes=max(args.payload_size * args.messages_per_cycle * 4, 1 << 20),
-        max_outbound_messages=max(args.messages_per_cycle * 2, 1024),
-        max_outbound_bytes=max(args.payload_size * args.messages_per_cycle * 2, 1 << 20),
+        connect_timeout=args.timeout,
+        max_unacknowledged_messages=max(args.messages_per_cycle * 2, 1024),
+        max_unacknowledged_bytes=max(args.payload_size * args.messages_per_cycle * 4, 1 << 20),
+        max_write_queue_messages=max(args.messages_per_cycle * 2, 1024),
+        max_write_queue_bytes=max(args.payload_size * args.messages_per_cycle * 2, 1 << 20),
     )
 
     received = 0
@@ -307,14 +307,14 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
             "resource_snapshots": snapshots,
             "resource_assessment": assessment,
             "publisher_high_water": {
-                "pending_messages": publisher_stats.outbound.pending_high_water_messages,
-                "pending_bytes": publisher_stats.outbound.pending_high_water_bytes,
+                "pending_messages": publisher_stats.outbound.unacknowledged_high_water_messages,
+                "pending_bytes": publisher_stats.outbound.unacknowledged_high_water_bytes,
                 "writer_messages": publisher_stats.writer.high_water_messages,
                 "writer_bytes": publisher_stats.writer.high_water_bytes,
                 "decoder_bytes": publisher_stats.decoder.high_water_bytes,
             },
             "subscriber_high_water": {
-                "delivery_bytes": subscriber_stats.delivery.pending_high_water_bytes,
+                "delivery_bytes": subscriber_stats.delivery.iterator_high_water_bytes,
                 "decoder_bytes": subscriber_stats.decoder.high_water_bytes,
             },
             "publisher_idle_violations": _idle_violations(publisher),

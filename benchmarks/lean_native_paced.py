@@ -27,8 +27,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from benchmark_support import client_options, stats_counter
 from external_pacer import TOKEN_STRUCT, configure_dgram, emit_tokens
-from lean_native_compare import _callback_bound, _git
+from lean_native_compare import _git
 
 
 def _percentiles(ns: list[int]) -> dict[str, float]:
@@ -75,17 +76,21 @@ async def _sample(args: argparse.Namespace) -> dict[str, Any]:  # noqa: C901 - o
     client = AsyncClient(
         f"lean-paced-{os.getpid()}",
         protocol=protocol,
-        message_delivery=spec["mode"],
         max_outbound_inflight=20,
-        max_pending_outbound_messages=10_000,
-        max_pending_outbound_bytes=64 * 1024**2,
-        max_outbound_messages=10_000,
-        max_outbound_bytes=1024**2,
-        max_pending_messages=1024,
-        max_pending_delivery_bytes=64 * 1024**2,
-        delivery_timeout=5,
         keepalive=0,
-        **_callback_bound(AsyncClient),
+        **client_options(
+            AsyncClient,
+            message_delivery=spec["mode"],
+            max_unacknowledged_messages=10_000,
+            max_unacknowledged_bytes=64 * 1024**2,
+            max_write_queue_messages=10_000,
+            max_write_queue_bytes=1024**2,
+            max_iterator_messages=1024,
+            max_iterator_bytes=64 * 1024**2,
+            iterator_admission_timeout=5,
+            # The reference source still owns a callback worker with a bound.
+            max_pending_callbacks=1024,
+        ),
     )
     if spec["mode"] == "callback":
         client.on_message = observe
@@ -172,7 +177,10 @@ async def _sample(args: argparse.Namespace) -> dict[str, Any]:  # noqa: C901 - o
             for row in clocks
         ):
             raise AssertionError("missing or inconsistent message clocks")
-        if client.stats().outbound.pending_messages or client.stats().inbound.inflight:
+        if (
+            stats_counter(client, "outbound", "unacknowledged_messages")
+            or client.stats().inbound.inflight
+        ):
             raise AssertionError("pending protocol state after completion")
         # The pacer has emitted every token before the last receive; reading its
         # final tiny report cannot delay a timed publication or delivery.

@@ -22,6 +22,11 @@ from dataclasses import asdict, dataclass
 from itertools import product
 from pathlib import Path
 
+try:
+    from benchmark_support import runtime_counters
+except ImportError:  # imported as ``benchmarks.paired_network`` by the test suite
+    from benchmarks.benchmark_support import runtime_counters
+
 
 HEADER_HEX_BYTES = 32
 
@@ -171,7 +176,6 @@ async def publish(
 ) -> tuple[float, dict[str, int], list[float]]:
     from mqttium.api import AsyncClient, PublishReceipt
     from mqttium.enums import MQTTProtocolVersion
-    from mqttium.protocol.reconnect import ReconnectPolicy
 
     if completion != "receipt":
         raise ValueError("publication completion requires receipts")
@@ -179,7 +183,7 @@ async def publish(
         client_id=f"paired-net-{os.getpid()}-{time.time_ns()}",
         protocol=(MQTTProtocolVersion.MQTTv5 if protocol == "5" else MQTTProtocolVersion.MQTTv311),
         max_outbound_inflight=window,
-        reconnect=ReconnectPolicy(enabled=False),
+        reconnect=None,
     )
     await client.connect(host, port, timeout=10.0)
     pending: deque[tuple[PublishReceipt, int]] = deque()
@@ -197,14 +201,14 @@ async def publish(
         await receipt.wait()
         ack_latencies.append((time.monotonic_ns() - sent_ns) / 1_000_000)
     elapsed = time.perf_counter() - started
-    effects = client.stats().effects
+    effects = runtime_counters(client, "effects")
     await client.disconnect()
     return (
         elapsed,
         {
-            "inline": effects.inline_effects,
-            "enqueued": effects.enqueued,
-            "suspensions": effects.apply_suspensions,
+            "inline": effects["inline_effects"],
+            "enqueued": effects["enqueued"],
+            "suspensions": effects["apply_suspensions"],
         },
         ack_latencies,
     )

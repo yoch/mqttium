@@ -25,6 +25,7 @@ from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from benchmark_support import client_options
 from paired_network import InvalidMeasurement, _eligibility, _evaluation, _write_evaluation
 
 
@@ -115,16 +116,18 @@ async def _run_phase(
 async def _sample(args: argparse.Namespace) -> CapacityResult:
     from mqttium.api import AsyncClient
     from mqttium.enums import MQTTProtocolVersion
-    from mqttium.protocol.reconnect import ReconnectPolicy
 
     protocol = MQTTProtocolVersion.MQTTv5 if args.protocol == "5" else MQTTProtocolVersion.MQTTv311
     client = AsyncClient(
         client_id=f"writer-capacity-{os.getpid()}-{time.time_ns()}",
         protocol=protocol,
         max_outbound_inflight=args.inflight,
-        max_pending_outbound_messages=args.max_queued,
-        max_pending_outbound_bytes=64 << 20,
-        reconnect=ReconnectPolicy(enabled=False),
+        reconnect=None,
+        **client_options(
+            AsyncClient,
+            max_unacknowledged_messages=args.max_queued,
+            max_unacknowledged_bytes=64 << 20,
+        ),
     )
     await client.connect(args.host, args.port, timeout=args.timeout)
     payload = b"x" * args.payload_bytes

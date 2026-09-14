@@ -23,7 +23,6 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from mqttium.api import AsyncClient, PublishMessage
-from mqttium.protocol.reconnect import ReconnectPolicy
 
 WINDOW = 100
 CHUNK = 256
@@ -84,7 +83,7 @@ async def run_publisher(args: argparse.Namespace, topic: str) -> tuple[float, fl
     client = AsyncClient(
         client_id=f"publish-many-ab-{args.method}-{os.getpid()}",
         max_outbound_inflight=WINDOW,
-        reconnect=ReconnectPolicy(enabled=False),
+        reconnect=None,
     )
     await client.connect(args.host, args.port, timeout=10.0)
     cpu_started = time.process_time()

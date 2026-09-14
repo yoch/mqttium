@@ -14,8 +14,6 @@ variant order rotated between repeats and medians reported, per
 
 from __future__ import annotations
 
-from benchmarks.benchmark_support import stored_record
-
 import argparse
 import asyncio
 import json
@@ -27,6 +25,7 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from benchmark_support import stored_record
 from mqttium.codec.buffer import IncrementalDecoder
 from mqttium.enums import InboundQoSState, MQTTProtocolVersion, PacketType, QoS
 from mqttium.packets import PubAckPacket, encode_frame
@@ -72,8 +71,8 @@ def connected_engine(store: SqliteInflightStore, *, session_present: bool) -> Pr
             client_id="persistence-ab",
             protocol=MQTTProtocolVersion.MQTTv311,
             clean_start=False,
-            max_pending_outbound_messages=None,
-            max_pending_outbound_bytes=None,
+            max_unacknowledged_messages=None,
+            max_unacknowledged_bytes=None,
         ),
         store=store,
     )

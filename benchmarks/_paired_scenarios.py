@@ -5,7 +5,6 @@ from __future__ import annotations
 from mqttium.api.async_client import _fifo_register
 
 import asyncio
-import inspect
 import shutil
 import tempfile
 import time
@@ -13,6 +12,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from benchmark_support import client_options
 
 
 TOPIC = "bench/sensors/temp"
@@ -125,8 +126,11 @@ def _persistence_cycle(scenario: str) -> ScenarioMeasurement:
         EngineConfig(
             client_id="paired-cycle",
             protocol=MQTTProtocolVersion.MQTTv311,
-            max_pending_outbound_messages=None,
-            max_pending_outbound_bytes=None,
+            **client_options(
+                EngineConfig,
+                max_unacknowledged_messages=None,
+                max_unacknowledged_bytes=None,
+            ),
         ),
         store=store,
     )
@@ -177,8 +181,11 @@ def _mqtt5_puback_reason_cycle(_scenario: str) -> ScenarioMeasurement:
         EngineConfig(
             client_id="paired-mqtt5-puback",
             protocol=MQTTProtocolVersion.MQTTv5,
-            max_pending_outbound_messages=None,
-            max_pending_outbound_bytes=None,
+            **client_options(
+                EngineConfig,
+                max_unacknowledged_messages=None,
+                max_unacknowledged_bytes=None,
+            ),
         )
     )
     engine.state = ConnectionState.CONNECTED
@@ -316,12 +323,6 @@ def _effects(scenario: str) -> ScenarioMeasurement:
     return _measure(collect_ordered, operations=30_000, warmup=2_000)
 
 
-def _client_options(client_type: type, **wanted: Any) -> dict[str, Any]:
-    """Drop constructor options the measured source no longer accepts."""
-    parameters = inspect.signature(client_type).parameters
-    return {name: value for name, value in wanted.items() if name in parameters}
-
-
 async def _finish_callbacks(client: Any) -> None:
     """Drain a callback worker when the measured source still owns one."""
     delivery = client._delivery
@@ -340,12 +341,15 @@ def _delivery(scenario: str) -> ScenarioMeasurement:
 
     mode: Any = scenario.removeprefix("delivery_")
     client = AsyncClient(
-        message_delivery=mode,
-        max_pending_messages=100_000,
-        # Delivery dispatch is measured independently from byte-accounting;
-        # bounded-memory costs have dedicated scenarios and profiles.
-        max_pending_delivery_bytes=None,
-        **_client_options(AsyncClient, max_pending_callbacks=100_000),
+        **client_options(
+            AsyncClient,
+            message_delivery=mode,
+            max_iterator_messages=100_000,
+            # Delivery dispatch is measured independently from byte-accounting;
+            # bounded-memory costs have dedicated scenarios and profiles.
+            max_iterator_bytes=None,
+            max_pending_callbacks=100_000,
+        )
     )
     if mode == "callback":
         client.on_message = lambda _message: None
@@ -382,9 +386,12 @@ def _single_message_effect(_scenario: str) -> ScenarioMeasurement:
     from mqttium.types import Message
 
     client = AsyncClient(
-        message_delivery="callback",
-        max_pending_delivery_bytes=None,
-        **_client_options(AsyncClient, max_pending_callbacks=4_096),
+        **client_options(
+            AsyncClient,
+            message_delivery="callback",
+            max_iterator_bytes=None,
+            max_pending_callbacks=4_096,
+        )
     )
     client.on_message = lambda _message: None
     message = Message(topic=TOPIC, payload=b"x")

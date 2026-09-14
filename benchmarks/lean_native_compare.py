@@ -14,7 +14,6 @@ import argparse
 import asyncio
 import gc
 import hashlib
-import inspect
 import itertools
 import json
 import math
@@ -33,20 +32,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from benchmark_support import client_options, runtime_counters
+
 
 def _git(root: Path, *args: str) -> str:
     return subprocess.check_output(["git", "-C", str(root), *args], text=True).strip()
-
-
-def _callback_bound(client_type: type) -> dict[str, int]:
-    """Keep the arm-independent harness constructible on both sources.
-
-    Sources that still own a callback worker accept its bound; sources that run
-    synchronous callbacks on the reader have no such parameter.
-    """
-    if "max_pending_callbacks" in inspect.signature(client_type).parameters:
-        return {"max_pending_callbacks": 1024}
-    return {}
 
 
 def _percentile(values: list[int], percentile: float) -> float:
@@ -114,17 +104,21 @@ async def _phase(  # noqa: C901 - one lifecycle brackets each measured phase
             f"lean-{os.getpid()}",
             protocol=protocol,
             store=store,
-            message_delivery=spec["mode"],
             max_outbound_inflight=20,
-            max_pending_outbound_messages=10_000,
-            max_pending_outbound_bytes=64 * 1024**2,
-            max_outbound_messages=10_000,
-            max_outbound_bytes=1024**2,
-            max_pending_messages=1024,
-            max_pending_delivery_bytes=64 * 1024**2,
-            delivery_timeout=5.0,
             keepalive=0,
-            **_callback_bound(AsyncClient),
+            **client_options(
+                AsyncClient,
+                message_delivery=spec["mode"],
+                max_unacknowledged_messages=10_000,
+                max_unacknowledged_bytes=64 * 1024**2,
+                max_write_queue_messages=10_000,
+                max_write_queue_bytes=1024**2,
+                max_iterator_messages=1024,
+                max_iterator_bytes=64 * 1024**2,
+                iterator_admission_timeout=5.0,
+                # The reference source still owns a callback worker with a bound.
+                max_pending_callbacks=1024,
+            ),
         )
         if spec["mode"] == "callback":
             client.on_message = observe
@@ -186,7 +180,9 @@ async def _phase(  # noqa: C901 - one lifecycle brackets each measured phase
             if received != total or errors:
                 raise AssertionError(f"delivery mismatch: {received}/{total}: {errors}")
             snapshot = client.stats()
-            if snapshot.outbound.pending_messages or snapshot.inbound.inflight:
+            outbound = runtime_counters(client, "outbound")
+            delivery = runtime_counters(client, "delivery")
+            if outbound["unacknowledged_messages"] or snapshot.inbound.inflight:
                 raise AssertionError("receipts completed with protocol records still pending")
             ordered = sorted(latencies[warmup:])
             return {
@@ -201,10 +197,10 @@ async def _phase(  # noqa: C901 - one lifecycle brackets each measured phase
                 "latency_p99_us": _percentile(ordered, 0.99),
                 "rss_peak_kib": _rss_peak_kib(),
                 "python_peak_bytes": traced_peak,
-                "outbound_high_water_messages": snapshot.outbound.pending_high_water_messages,
-                "outbound_high_water_bytes": snapshot.outbound.pending_high_water_bytes,
+                "outbound_high_water_messages": outbound["unacknowledged_high_water_messages"],
+                "outbound_high_water_bytes": outbound["unacknowledged_high_water_bytes"],
                 "writer_high_water_bytes": snapshot.writer.high_water_bytes,
-                "delivery_high_water_bytes": snapshot.delivery.pending_high_water_bytes,
+                "delivery_high_water_bytes": delivery["iterator_high_water_bytes"],
             }
         finally:
             if tracemalloc.is_tracing():

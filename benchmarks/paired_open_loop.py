@@ -15,6 +15,7 @@ from dataclasses import asdict, dataclass
 from itertools import product
 from pathlib import Path
 
+from benchmark_support import client_options, runtime_counters
 from paired_network import (
     InvalidMeasurement,
     _eligibility,
@@ -79,15 +80,17 @@ def _payload(sequence: int, size: int) -> bytes:
 async def _connected_client(protocol: str, window: int):
     from mqttium.api import AsyncClient
     from mqttium.enums import MQTTProtocolVersion
-    from mqttium.protocol.reconnect import ReconnectPolicy
 
     client = AsyncClient(
         client_id=f"open-loop-{os.getpid()}-{time.time_ns()}",
         protocol=(MQTTProtocolVersion.MQTTv5 if protocol == "5" else MQTTProtocolVersion.MQTTv311),
         max_outbound_inflight=window,
-        max_pending_outbound_messages=None,
-        max_pending_outbound_bytes=None,
-        reconnect=ReconnectPolicy(enabled=False),
+        reconnect=None,
+        **client_options(
+            AsyncClient,
+            max_unacknowledged_messages=None,
+            max_unacknowledged_bytes=None,
+        ),
     )
     return client
 
@@ -130,9 +133,8 @@ async def sample(args: argparse.Namespace, topic: str) -> OpenLoopResult:
         offered_elapsed = max(loop.time() - offered_started, 1e-9)
         await asyncio.gather(*receipt_tasks)
         completed_elapsed = max(loop.time() - offered_started, 1e-9)
-        snapshot = client.stats()
-        effects = snapshot.effects
-        writer = snapshot.writer
+        effects = runtime_counters(client, "effects")
+        writer = runtime_counters(client, "writer")
         return OpenLoopResult(
             mode="sample",
             completion=args.completion,
@@ -153,19 +155,19 @@ async def sample(args: argparse.Namespace, topic: str) -> OpenLoopResult:
             loop_lag_p95_ms=percentile(schedule_lag, 0.95),
             loop_lag_p99_ms=percentile(schedule_lag, 0.99),
             cpu_seconds=time.process_time() - cpu_started,
-            effect_inline=effects.inline_effects,
-            effect_enqueued=effects.enqueued,
-            effect_suspensions=effects.apply_suspensions,
-            writer_batches=writer.batches,
-            writer_batched_items=writer.batched_items,
-            writer_eager_writes=writer.eager_writes,
-            writer_high_water_messages=writer.high_water_messages,
-            writer_enqueue_suspensions=writer.enqueue_suspensions,
-            effect_batches=effects.batches,
-            effect_multi_batches=effects.multi_effect_batches,
-            effect_reordered_batches=effects.reordered_batches,
-            effect_pending_high_water=effects.pending_high_water,
-            effect_applied=effects.applied,
+            effect_inline=effects["inline_effects"],
+            effect_enqueued=effects["enqueued"],
+            effect_suspensions=effects["apply_suspensions"],
+            writer_batches=writer["batches"],
+            writer_batched_items=writer["batched_items"],
+            writer_eager_writes=writer["eager_writes"],
+            writer_high_water_messages=writer["high_water_messages"],
+            writer_enqueue_suspensions=writer["enqueue_suspensions"],
+            effect_batches=effects["batches"],
+            effect_multi_batches=effects["multi_effect_batches"],
+            effect_reordered_batches=effects["reordered_batches"],
+            effect_pending_high_water=effects["pending_high_water"],
+            effect_applied=effects["applied"],
         )
     finally:
         await client.disconnect()

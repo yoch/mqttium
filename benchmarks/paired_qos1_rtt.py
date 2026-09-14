@@ -31,6 +31,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from benchmark_support import client_options
+
 _CALLBACK_LATENCY_INTERVAL = "publish_nowait_call_to_transport"
 
 
@@ -173,7 +175,7 @@ async def _callback_sample(*, warmup: int, count: int, timeout: float) -> Callba
         client_id=f"paired-qos1-rtt-{os.getpid()}",
         message_delivery="callback",
         max_outbound_inflight=1,
-        max_pending_outbound_messages=128,
+        **client_options(AsyncClient, max_unacknowledged_messages=128),
     )
     client._transport_factory = factory  # type: ignore[assignment]
     receipts: asyncio.Queue[Any] = asyncio.Queue()
@@ -326,7 +328,7 @@ async def _microbatch_sample(
         client = AsyncClient(
             client_id=f"microbatch-{os.getpid()}-{trial}",
             max_outbound_inflight=max(20, burst),
-            max_pending_outbound_messages=burst + 32,
+            **client_options(AsyncClient, max_unacknowledged_messages=burst + 32),
         )
         client._transport_factory = factory  # type: ignore[assignment]
         await client.connect("in-process", 1883, timeout=timeout)

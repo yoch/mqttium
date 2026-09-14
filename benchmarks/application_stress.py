@@ -6,8 +6,6 @@ ordered callback delivery, iterator backpressure, and inflight persistence.
 
 from __future__ import annotations
 
-from benchmarks.benchmark_support import stored_record
-
 import argparse
 import asyncio
 import importlib.metadata
@@ -20,6 +18,7 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from benchmark_support import stored_record
 from mqttium.api import AsyncClient
 from mqttium.enums import OutboundQoSState, QoS
 from mqttium.persistence.memory import MemoryInflightStore
@@ -87,7 +86,7 @@ def message_effect(sequence: int) -> EngineEffect:
 
 
 async def callback_delivery(count: int) -> Sample:
-    client = AsyncClient(message_delivery="callback", delivery_timeout=10.0)
+    client = AsyncClient(message_delivery="callback")
     seen: list[int] = []
 
     def callback(message: Message) -> None:
@@ -115,8 +114,8 @@ async def callback_delivery(count: int) -> Sample:
 async def iterator_delivery(count: int, delay: float) -> Sample:
     client = AsyncClient(
         message_delivery="iterator",
-        max_pending_messages=128,
-        delivery_timeout=10.0,
+        max_iterator_messages=128,
+        iterator_admission_timeout=10.0,
     )
     seen: list[int] = []
 

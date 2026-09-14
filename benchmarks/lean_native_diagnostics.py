@@ -12,7 +12,6 @@ import argparse
 import asyncio
 import cProfile
 import hashlib
-import inspect
 import json
 import math
 import os
@@ -24,6 +23,8 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+from benchmark_support import client_options, stats_counter
 
 SCENARIOS = (
     "publish",
@@ -59,18 +60,19 @@ async def _phase(scenario: str, count: int) -> dict[str, Any]:  # noqa: C901 - s
 
     qos1_publication = scenario in ("publish_qos1_individual", "publish_qos1_batch")
     mode = "iterator" if scenario == "receive_iterator" else "callback"
-    options: dict[str, Any] = {"max_pending_messages": 1024}
-    if qos1_publication:
-        options["max_outbound_inflight"] = 20
-    # Sources that still own a callback worker accept its bound; sources that
-    # run synchronous callbacks on the reader have no such parameter.
-    if "max_pending_callbacks" in inspect.signature(AsyncClient).parameters:
-        options["max_pending_callbacks"] = 1024
+    options: dict[str, Any] = {"max_outbound_inflight": 20} if qos1_publication else {}
     client = AsyncClient(
         "lean-diagnostic",
-        message_delivery=mode,
         keepalive=0,
         **options,
+        # The iterator bound applies to iterator delivery only; the reference
+        # source additionally bounds its callback worker.
+        **client_options(
+            AsyncClient,
+            message_delivery=mode,
+            max_iterator_messages=1024,
+            max_pending_callbacks=1024,
+        ),
     )
     broker = DiagnosticBroker()
     client._transport_factory = transport_factory(broker)
@@ -220,11 +222,11 @@ async def _phase(scenario: str, count: int) -> dict[str, Any]:  # noqa: C901 - s
                 or batch_receipt.failure_count
             ):
                 raise AssertionError("batch receipt completion mismatch")
-            stats = client.stats()
+            receipts = client.stats().receipts
             if (
-                stats.receipts.publish
-                or stats.receipts.publish_batches
-                or stats.outbound.pending_messages
+                receipts.publish
+                or receipts.publish_batches
+                or stats_counter(client, "outbound", "unacknowledged_messages")
             ):
                 raise AssertionError("publication completion retained pending state")
         if route:
@@ -243,7 +245,7 @@ async def _phase(scenario: str, count: int) -> dict[str, Any]:  # noqa: C901 - s
             raise AssertionError(unexpected)
         if errors != (count if scenario == "route_error" else 0):
             raise AssertionError("callback error isolation mismatch")
-        if client.stats().delivery.pending_bytes:
+        if stats_counter(client, "delivery", "iterator_bytes"):
             raise AssertionError("delivery bytes retained")
         result = {
             "count": count,
