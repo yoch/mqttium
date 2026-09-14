@@ -8,6 +8,11 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed — lean native experiment
 
+- Preserve writer ownership when a short queued write raises after possible
+  wire exposure. Retire that generation through the existing writer without
+  retrying ambiguous bytes, and keep `join()` pending across queue restoration.
+- Reject invalid explicit connect/disconnect requests before superseding the
+  active lifecycle hook or changing connection and reconnect intent.
 - Bound synchronous message callback work by actual invocation count, including
   all matching topic routes within one message, and yield between groups.
 - Separate protocol effects from the reader-owned bounded delivery/replay lane,
