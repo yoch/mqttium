@@ -81,6 +81,12 @@ directly by that same hook preserves its caller, so `on_connect` can await
 application-created task is a separate caller. Hooks must cooperate with
 cancellation; the next hook starts only after the previous hook has ended.
 
+Overlapping explicit connection attempts are rejected before changing the
+endpoint or lifecycle ownership. Cancelling a takeover while it is waiting
+does not suppress later notifications from the surviving connection. A hook
+awaiting its own connection attempt receives that operation's failure normally;
+this caller preservation ends when the connection call exits.
+
 `on_disconnect` runs after the old connection resources are retired, with the
 original cause or `None` for clean closure. Automatic retry waits for that
 hook to finish, then rechecks explicit user intent. Hook exceptions and a

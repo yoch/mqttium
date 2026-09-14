@@ -308,6 +308,7 @@ class AsyncClient:
         self._reader_task: asyncio.Task[None] | None = None
         self._keepalive_task: asyncio.Task[None] | None = None
         self._reconnect_task: asyncio.Task[None] | None = None
+        self._explicit_connect_task: asyncio.Task[Any] | None = None
         self._lifecycle_lock = asyncio.Lock()
         self._lifecycle_hooks = LifecycleHooks(self)
         self._disconnect_hook_origin: asyncio.Task[None] | None = None
@@ -688,41 +689,53 @@ class AsyncClient:
                 "Client is unusable after a local terminal failure; "
                 "create a new AsyncClient instead of reusing this one"
             )
-        if self.is_connected and self._has_active_explicit_connection():
+        if self._explicit_connect_task is not None or (
+            self.is_connected and self._has_active_explicit_connection()
+        ):
             raise ProtocolError("Already connected or connecting")
-        self._freeze_message_routes()
-        self._lifecycle_hooks.begin_operation()
-        lifecycle_token = self._lifecycle_hooks.token
-        async with self._lifecycle_lock:
-            await self._prepare_explicit_connect()
-            # Rechecked, not just entry-checked: the latch is set-once, so a
-            # failure that landed while waiting on the lock is observed here.
-            if self._local_terminal_failure is not None:
-                raise MQTTError(
-                    "Client is unusable after a local terminal failure; "
-                    "create a new AsyncClient instead of reusing this one"
-                )
-            was_alt = self._unix_path is not None or self._ws_url is not None
-            self._unix_path = unix_path
-            self._ws_url = ws_url
-            self._ws_headers = ws_headers
-            self._host = host
-            self._port = port
-            self._ssl = ssl
-            if factory is not None:
-                self._transport_factory = factory
-            elif was_alt:
-                # Reclaim the default TCP factory only when leaving an
-                # alternative endpoint: an injected factory must survive a
-                # plain TCP connect (custom transports rely on this seam).
-                self._transport_factory = TcpTransport.connect
-            self._intentional_disconnect = False
-            timeout = timeout if timeout is not None else self._reconnect.policy.connect_timeout
-            self._reconnect.reset()
-            connack = await self._connect_once_locked(host, port, ssl=ssl, timeout=timeout)
-        if self.is_connected:
-            self._lifecycle_hooks.connected(connack, lifecycle_token)
-        return connack
+        task = asyncio.current_task()
+        assert task is not None
+        self._explicit_connect_task = task
+        try:
+            self._freeze_message_routes()
+            # Cancel obsolete hook work immediately, but keep the live reader's
+            # token valid if this caller is cancelled while waiting for the lock.
+            self._lifecycle_hooks.begin_operation(replace_connection=False)
+            async with self._lifecycle_lock:
+                await self._prepare_explicit_connect()
+                # Rechecked, not just entry-checked: the latch is set-once, so a
+                # failure that landed while waiting on the lock is observed here.
+                if self._local_terminal_failure is not None:
+                    raise MQTTError(
+                        "Client is unusable after a local terminal failure; "
+                        "create a new AsyncClient instead of reusing this one"
+                    )
+                self._lifecycle_hooks.begin_operation()
+                lifecycle_token = self._lifecycle_hooks.token
+                was_alt = self._unix_path is not None or self._ws_url is not None
+                self._unix_path = unix_path
+                self._ws_url = ws_url
+                self._ws_headers = ws_headers
+                self._host = host
+                self._port = port
+                self._ssl = ssl
+                if factory is not None:
+                    self._transport_factory = factory
+                elif was_alt:
+                    # Reclaim the default TCP factory only when leaving an
+                    # alternative endpoint: an injected factory must survive a
+                    # plain TCP connect (custom transports rely on this seam).
+                    self._transport_factory = TcpTransport.connect
+                self._intentional_disconnect = False
+                timeout = timeout if timeout is not None else self._reconnect.policy.connect_timeout
+                self._reconnect.reset()
+                connack = await self._connect_once_locked(host, port, ssl=ssl, timeout=timeout)
+            if self.is_connected:
+                self._lifecycle_hooks.connected(connack, lifecycle_token)
+            return connack
+        finally:
+            if self._explicit_connect_task is task:
+                self._explicit_connect_task = None
 
     async def _connect_once_locked(
         self,
@@ -1558,7 +1571,13 @@ class AsyncClient:
                 and self._engine.state in (ConnectionState.CONNECTED, ConnectionState.DISCONNECTING)
                 and self._disconnect_exc is None
             )
-            self._lifecycle_hooks.retiring(lifecycle_token, self._disconnect_hook_origin)
+            hook_origin = self._disconnect_hook_origin
+            connect_owner = self._explicit_connect_task
+            if connect_owner is not None and connect_owner is self._lifecycle_hooks.hook_task:
+                # Failure of a directly awaited connect belongs to its caller.
+                # Once that call exits, later external loss cancels it normally.
+                hook_origin = connect_owner
+            self._lifecycle_hooks.retiring(lifecycle_token, hook_origin)
             await self._invalidate_connection_epoch()
             # Retire protocol-visible ownership before joining any child task.
             # Keepalive cancellation can suspend, and while it does callers
@@ -1625,7 +1644,7 @@ class AsyncClient:
             self._lifecycle_hooks.disconnected(
                 None if clean_disconnect else terminal_cause,
                 lifecycle_token,
-                self._disconnect_hook_origin,
+                hook_origin,
             )
             if will_reconnect and (self._reconnect_task is None or self._reconnect_task.done()):
                 self._reconnect_task = asyncio.create_task(

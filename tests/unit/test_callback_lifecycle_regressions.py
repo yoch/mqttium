@@ -8,7 +8,7 @@ import pytest
 
 from mqttium.api import AsyncClient, ReconnectPolicy
 from mqttium.enums import MQTTProtocolVersion, PacketType, QoS
-from mqttium.errors import ProtocolError
+from mqttium.errors import MQTTTimeoutError, ProtocolError
 from mqttium.packets import PublishPacket, encode_frame
 from tests.support import ScriptedBrokerTransport, wait_until
 
@@ -237,6 +237,143 @@ async def test_redundant_connect_does_not_supersede_active_connect_hook(task_fac
 
 
 @pytest.mark.parametrize("protocol", [MQTTProtocolVersion.MQTTv311, MQTTProtocolVersion.MQTTv5])
+@pytest.mark.parametrize("phase", ["factory", "connack", "lock"])
+async def test_overlapping_explicit_connect_preserves_first_attempt(task_factory, protocol, phase):
+    factory_entered, release_factory, connect_written = (asyncio.Event() for _ in range(3))
+    connected, disconnected = [], []
+    calls = 0
+
+    class GatedBroker(ScriptedBrokerTransport):
+        def handle_packet(self, raw):
+            if raw.packet_type is PacketType.CONNECT:
+                connect_written.set()
+                if phase == "connack":
+                    return
+            super().handle_packet(raw)
+
+    broker = GatedBroker(protocol=protocol)
+    client = AsyncClient("overlapping-connect", protocol=protocol)
+
+    async def factory(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        factory_entered.set()
+        if phase == "factory":
+            await release_factory.wait()
+        return broker
+
+    client._transport_factory = factory
+    client.on_connect = connected.append
+    client.on_disconnect = disconnected.append
+    lock_held = phase == "lock"
+    if lock_held:
+        await client._lifecycle_lock.acquire()
+    first = asyncio.create_task(client.connect("original", 1883))
+    try:
+        if phase == "factory":
+            await asyncio.wait_for(factory_entered.wait(), 1)
+        elif phase == "connack":
+            await asyncio.wait_for(connect_written.wait(), 1)
+        else:
+            await wait_until(lambda: client._explicit_connect_task is first)
+        token = client._lifecycle_hooks.token
+        endpoint = (client._host, client._port, client._ssl, client._transport_factory)
+        with pytest.raises(ProtocolError, match="Already connected"):
+            await client.connect("rejected", 2883, ssl=True)
+        assert client._explicit_connect_task is first
+        assert client._lifecycle_hooks.token == token
+        assert (client._host, client._port, client._ssl, client._transport_factory) == endpoint
+        assert calls == (0 if phase == "lock" else 1)
+        assert not first.cancelling()
+        release_factory.set()
+        if lock_held:
+            client._lifecycle_lock.release()
+            lock_held = False
+        if phase == "connack":
+            body = b"\x00\x00" + (b"\x00" if protocol is MQTTProtocolVersion.MQTTv5 else b"")
+            broker.push_rx(encode_frame(PacketType.CONNACK, 0, body))
+        await asyncio.wait_for(first, 1)
+        await wait_until(lambda: len(connected) == 1)
+        assert client._explicit_connect_task is None
+        assert client._host == "original" and client._port == 1883
+        assert calls == 1 and client.is_connected
+        await client.disconnect()
+        await wait_until(lambda: disconnected == [None])
+    finally:
+        release_factory.set()
+        if lock_held:
+            client._lifecycle_lock.release()
+        if not first.done():
+            first.cancel()
+        await asyncio.gather(first, return_exceptions=True)
+        await finish(client)
+
+
+@pytest.mark.parametrize("phase", ["factory", "connack"])
+async def test_cancelled_waiting_takeover_preserves_automatic_reader_hooks(task_factory, phase):
+    entered, release = asyncio.Event(), asyncio.Event()
+    client = AsyncClient(
+        "cancelled-takeover",
+        reconnect=ReconnectPolicy(initial_delay=0, max_delay=0, stable_after=0),
+    )
+    brokers, connected, disconnected = [], [], []
+
+    class GatedBroker(ScriptedBrokerTransport):
+        def handle_packet(self, raw):
+            if raw.packet_type is PacketType.CONNECT and phase == "connack":
+                entered.set()
+                return
+            super().handle_packet(raw)
+
+    async def factory(*args, **kwargs):
+        broker = GatedBroker() if len(brokers) == 1 else ScriptedBrokerTransport()
+        brokers.append(broker)
+        if len(brokers) == 2 and phase == "factory":
+            entered.set()
+            await release.wait()
+        return broker
+
+    client._transport_factory = factory
+    client.on_connect = lambda _packet: connected.append(len(brokers))
+    client.on_disconnect = lambda _error: disconnected.append(len(brokers))
+    takeover = None
+    try:
+        await client.connect("original")
+        await wait_until(lambda: connected == [1])
+        await brokers[0].close()
+        await asyncio.wait_for(entered.wait(), 1)
+        token = client._lifecycle_hooks.token
+        automatic = client._reconnect_task
+        assert automatic is not None and not automatic.done()
+        takeover = asyncio.create_task(client.connect("cancelled", 2883, ssl=True))
+        await wait_until(lambda: client._explicit_connect_task is takeover)
+        assert client._lifecycle_hooks.token == token
+        takeover.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await takeover
+        assert client._explicit_connect_task is None
+        assert client._lifecycle_hooks.token == token
+        assert client._host == "original" and client._port == 1883
+        assert client._ssl is None
+        assert not automatic.cancelling()
+        release.set()
+        if phase == "connack":
+            brokers[1].push_rx(encode_frame(PacketType.CONNACK, 0, b"\x00\x00"))
+        await wait_until(lambda: connected == [1, 2])
+        await brokers[1].close()
+        await wait_until(lambda: connected == [1, 2, 3])
+        assert disconnected == [1, 2]
+        assert client._transport is brokers[2]
+    finally:
+        release.set()
+        if takeover is not None:
+            if not takeover.done():
+                takeover.cancel()
+            await asyncio.gather(takeover, return_exceptions=True)
+        await finish(client)
+
+
+@pytest.mark.parametrize("protocol", [MQTTProtocolVersion.MQTTv311, MQTTProtocolVersion.MQTTv5])
 @pytest.mark.parametrize("automatic_connection", [False, True])
 async def test_invalid_disconnect_preserves_active_hook_and_retry(
     task_factory, protocol, automatic_connection
@@ -432,6 +569,134 @@ async def test_disconnect_hook_can_connect_and_publish_itself(task_factory):
         assert len(brokers) == 2
         assert len(brokers[1].publishes) == 1
         assert client._reconnect_task is None or client._reconnect_task.done()
+    finally:
+        await finish(client)
+
+
+@pytest.mark.parametrize("protocol", [MQTTProtocolVersion.MQTTv311, MQTTProtocolVersion.MQTTv5])
+@pytest.mark.parametrize("failure_kind", ["transport", "refusal", "timeout", "cancel"])
+async def test_hook_owned_connect_preserves_operation_failure(task_factory, protocol, failure_kind):
+    client = AsyncClient("hook-connect-failure", protocol=protocol)
+    brokers, caught, reports = [], [], []
+    handshake, finished = asyncio.Event(), asyncio.Event()
+    attempted = False
+    calls = 0
+    failure = OSError("replacement transport failed")
+
+    class FailingBroker(ScriptedBrokerTransport):
+        def handle_packet(self, raw):
+            if raw.packet_type is PacketType.CONNECT:
+                handshake.set()
+                if failure_kind == "refusal":
+                    reason = 0x87 if protocol is MQTTProtocolVersion.MQTTv5 else 5
+                    body = bytes((0, reason))
+                    if protocol is MQTTProtocolVersion.MQTTv5:
+                        body += b"\x00"
+                    self.push_rx(encode_frame(PacketType.CONNACK, 0, body))
+                return
+            super().handle_packet(raw)
+
+    async def factory(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2 and failure_kind == "transport":
+            raise failure
+        broker = (
+            FailingBroker(protocol=protocol)
+            if calls == 2
+            else ScriptedBrokerTransport(protocol=protocol)
+        )
+        brokers.append(broker)
+        return broker
+
+    async def disconnected(_error):
+        nonlocal attempted
+        if attempted:
+            return
+        attempted = True
+        try:
+            await client.connect("replacement", timeout=0.02 if failure_kind == "timeout" else 2)
+        except BaseException as exc:
+            caught.append(exc)
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+        finally:
+            finished.set()
+
+    client._transport_factory = factory
+    client.on_disconnect = disconnected
+    loop = asyncio.get_running_loop()
+    previous = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: reports.append(context))
+    try:
+        await client.connect("original")
+        await brokers[0].close()
+        if failure_kind == "cancel":
+            await asyncio.wait_for(handshake.wait(), 1)
+            hook = client._lifecycle_hooks.hook_task
+            assert hook is not None and client._explicit_connect_task is hook
+            hook.cancel()
+        await asyncio.wait_for(finished.wait(), 1)
+        await wait_until(lambda: client._lifecycle_hooks.task is None)
+        assert len(caught) == 1
+        expected = {
+            "transport": OSError,
+            "refusal": ProtocolError,
+            "timeout": MQTTTimeoutError,
+            "cancel": asyncio.CancelledError,
+        }[failure_kind]
+        assert isinstance(caught[0], expected)
+        if failure_kind == "transport":
+            assert caught[0] is failure
+        assert not reports
+        assert client._explicit_connect_task is None
+        assert client._transport is None
+        assert client._reader_task is None
+        assert client._write_pump.task is None
+        # Failure/cancellation releases attempt ownership for a later request.
+        await client.connect("recovered")
+        receipt = await client.publish("recovered", b"alive", qos=1)
+        await receipt.wait()
+        assert client.is_connected
+    finally:
+        await finish(client)
+        loop.set_exception_handler(previous)
+
+
+@pytest.mark.parametrize("transition", ["disconnect", "loss"])
+async def test_hook_connect_origin_expires_after_return(task_factory, transition):
+    client = AsyncClient("hook-connect-origin-expiry")
+    brokers = install_brokers(client)
+    entered, cancelled = asyncio.Event(), asyncio.Event()
+    attempted = False
+
+    async def disconnected(_error):
+        nonlocal attempted
+        if attempted:
+            return
+        attempted = True
+        await client.connect("replacement")
+        assert client._explicit_connect_task is None
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    client.on_disconnect = disconnected
+    try:
+        await client.connect("original")
+        await brokers[0].close()
+        await asyncio.wait_for(entered.wait(), 1)
+        if transition == "disconnect":
+            await client.disconnect()
+        else:
+            await brokers[1].close()
+        await asyncio.wait_for(cancelled.wait(), 1)
+        await wait_until(lambda: client._lifecycle_hooks.task is None)
+        assert client._explicit_connect_task is None
+        await client.connect("external")
+        assert client._transport is brokers[2]
     finally:
         await finish(client)
 

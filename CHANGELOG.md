@@ -13,6 +13,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   retrying ambiguous bytes, and keep `join()` pending across queue restoration.
 - Reject invalid explicit connect/disconnect requests before superseding the
   active lifecycle hook or changing connection and reconnect intent.
+- Preserve lifecycle ownership across overlapping connection attempts,
+  cancelled takeovers, and failures of connections awaited directly by a hook.
 - Bound synchronous message callback work by actual invocation count, including
   all matching topic routes within one message, and yield between groups.
 - Separate protocol effects from the reader-owned bounded delivery/replay lane,
