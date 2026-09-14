@@ -28,7 +28,7 @@ class MessageRoute:
 CallbackTarget = Callable[..., Any] | MessageRoute
 CallbackJob = tuple[CallbackTarget, Message, int]
 IteratorQueueItem = tuple[Message, int]
-_CALLBACK_QUANTUM = 64
+_CALLBACK_QUANTUM = 128
 
 
 class ApplicationDelivery:
