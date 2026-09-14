@@ -1,4 +1,4 @@
-"""Atomic effect transfer and bounded callback lifecycle."""
+"""Atomic effect transfer and isolated inline callback failures."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from mqttium.api.async_client import AsyncClient
 from mqttium.enums import ConnectionState
 from mqttium.protocol.engine import EffectKind
 from mqttium.types import Message
+from tests.support import accept_message
 
 
 async def test_cancelled_backpressure_keeps_send_effect_for_same_connection() -> None:
@@ -54,34 +55,20 @@ async def test_callback_exception_reaches_loop_exception_handler() -> None:
     def fail(_message: Message) -> None:
         raise RuntimeError("callback failed")
 
+    seen: list[Message] = []
+    failing = Message(topic="t", payload=b"x")
+    following = Message(topic="t", payload=b"y")
     try:
-        await client._delivery.accept(Message(topic="t", payload=b"x"), fail)
-        await asyncio.wait_for(client._delivery.callback_queue.join(), timeout=1.0)
+        await accept_message(client._delivery, failing, fail)
         assert len(contexts) == 1
         assert isinstance(contexts[0].get("exception"), RuntimeError)
         assert contexts[0].get("callback") is fail
+        await accept_message(client._delivery, following, seen.append)
+        assert seen == [following]
+        assert len(contexts) == 1
+        assert client._delivery.callback_invocations == 2
     finally:
         loop.set_exception_handler(previous)
-        await client._delivery.shutdown_callbacks(drain=False)
-
-
-async def test_force_close_stops_callback_worker() -> None:
-    client = AsyncClient(
-        client_id="callback-close",
-        message_delivery="callback",
-        callback_shutdown_timeout=0.05,
-    )
-    started = asyncio.Event()
-
-    def callback(_message: Message) -> None:
-        started.set()
-
-    await client._delivery.accept(Message(topic="t", payload=b"x"), callback)
-    await started.wait()
-    assert client._delivery.callback_task is not None
-
-    await client._force_close()
-    assert client._delivery.callback_task is None
 
 
 async def test_force_close_requests_all_task_cancellations_before_awaiting() -> None:

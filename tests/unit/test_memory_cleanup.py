@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from tests.support import stored_record
+from tests.support import deliver_message, stored_record
 
 from mqttium.enums import InboundQoSState, OutboundQoSState, QoS
 from mqttium.persistence.memory import MemoryInflightStore
@@ -133,7 +133,6 @@ async def test_force_close_discards_writer_queue_and_decoder_buffer() -> None:
 
 async def test_reset_message_stream_releases_abandoned_iterator_delivery() -> None:
     from mqttium.api import AsyncClient
-    from mqttium.protocol.engine import EffectKind, EngineEffect
     from mqttium.types import Message
 
     client = AsyncClient(
@@ -141,9 +140,7 @@ async def test_reset_message_stream_releases_abandoned_iterator_delivery() -> No
         max_pending_delivery_bytes=1024,
     )
     message = Message(topic="reset", payload=b"payload")
-    await client._apply_delivery_effect(
-        EngineEffect(EffectKind.MESSAGE, message), client._connection_epoch
-    )
+    await deliver_message(client, message)
     assert client.stats().delivery.pending_bytes > 0
     client._delivery.closed.set()
 

@@ -64,10 +64,8 @@ until capacity returns.
 | `message_delivery` | `"iterator"` | Choose iterator or callback delivery |
 | `manual_ack` | `False` | Let the application control inbound QoS acknowledgement timing |
 | `max_pending_messages` | `65_536` | Iterator queue count bound |
-| `max_pending_callbacks` | `1_024` | Waiting message-callback jobs; lifecycle hooks use separate ownership |
 | `max_pending_delivery_bytes` | `64 MiB` | Topic, payload and property bytes retained for application delivery |
-| `delivery_timeout` | `None` | Optional positive deadline across byte and queue waits |
-| `callback_shutdown_timeout` | `5.0` | Message-callback drain allowance during shutdown |
+| `delivery_timeout` | `None` | Optional positive deadline across iterator byte and queue waits |
 
 ### Connection and authentication
 

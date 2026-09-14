@@ -485,12 +485,11 @@ async def test_application_reconnect_keeps_fresh_callbacks_and_retires_old_deliv
         protocol=protocol,
         local_receive_maximum=256,
         message_delivery="callback",
-        max_pending_callbacks=1,
-        max_pending_delivery_bytes=1024,
     )
     brokers = []
     work: asyncio.Task[None] | None = None
-    old_worker = None
+    old_reader = None
+    old_delivered = []
     seen = []
     completed = asyncio.Event()
 
@@ -500,17 +499,18 @@ async def test_application_reconnect_keeps_fresh_callbacks_and_retires_old_deliv
         return broker
 
     async def reconnect():
-        nonlocal old_worker
-        old_worker = client._delivery.callback_task
+        nonlocal old_reader
+        old_reader = client._reader_task
         await client.disconnect()
-        assert old_worker is not None and old_worker.done()
-        assert client._delivery.callback_queue.empty()
+        assert old_reader is not None and old_reader.done()
+        old_delivered.append(len(seen))
         assert client.stats().delivery.pending_bytes == 0
         await client.connect("fake")
         brokers[1].publish(b"fresh", 3)
 
     def on_message(message):
         nonlocal work
+        assert asyncio.current_task() is client._reader_task
         seen.append(message.payload)
         if message.payload.startswith(b"old") and work is None:
             work = asyncio.create_task(reconnect())
@@ -527,12 +527,15 @@ async def test_application_reconnect_keeps_fresh_callbacks_and_retires_old_deliv
         await work
         if qos:
             await wait_until(lambda: len(brokers[1].acknowledged) == 3)
-        await client._delivery.callback_queue.join()
         assert client.is_connected
-        assert client._delivery.callback_task is not old_worker
-        assert len([payload for payload in seen if payload.startswith(b"old")]) < 256
-        assert all(payload.startswith(b"fresh") for payload in seen[-3:])
-        assert len({payload for payload in seen[-3:]}) == 3
+        assert client._reader_task is not old_reader
+        # The retired connection delivers nothing after disconnect() returns.
+        assert len(old_delivered) == 1
+        old, fresh = seen[: old_delivered[0]], seen[old_delivered[0] :]
+        assert all(payload.startswith(b"old") for payload in old)
+        assert all(payload.startswith(b"fresh") for payload in fresh)
+        assert len(fresh) == 3 and len(set(fresh)) == 3
+        assert client.stats().delivery.callback_invocations == len(seen)
         assert client.stats().delivery.pending_bytes == 0
         assert client.stats().inbound.inflight == 0
     finally:

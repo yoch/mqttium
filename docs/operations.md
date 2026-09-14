@@ -30,7 +30,7 @@ MQTTium keeps separate budgets because each resource has a different lifetime:
 | Inbound persisted protocol state | `max_pending_inbound_bytes` |
 | Encoded writer queue | `max_outbound_messages`, `max_outbound_bytes` |
 | Reader processing batch | `max_ingress_batch_bytes` |
-| Iterator and callback queues | `max_pending_messages`, `max_pending_callbacks` |
+| Iterator queue | `max_pending_messages` |
 | Retained application-delivery data | `max_pending_delivery_bytes` |
 | Broker-facing QoS concurrency | `local_receive_maximum`, `max_outbound_inflight` and negotiated limits |
 
@@ -109,11 +109,11 @@ print("receipts", snapshot.receipts.publish, snapshot.receipts.publish_batches)
 The immutable snapshot contains:
 
 - connection state, epoch and reconnect attempt;
-- reader, writer, keepalive, reconnect, effect and callback-worker tasks;
+- reader, writer, keepalive, reconnect, effect and lifecycle-hook tasks;
 - outbound and inbound protocol state and packet identifiers;
 - effect-pump and writer queue usage, waiters and high-water marks;
 - decoder buffering and ingress limit;
-- iterator/callback queue and delivery byte usage;
+- iterator queue occupancy, callback invocation count and delivery byte usage;
 - pending publish, batch, subscribe and unsubscribe receipts;
 - transport buffers and counters where the transport can report them.
 
@@ -166,10 +166,10 @@ Timeouts protect different boundaries:
 - `ReconnectPolicy.connect_timeout` applies to automatic attempts;
 - `ping_timeout` limits the wait for PINGRESP;
 - `ack_timeout` is the default SUBACK/UNSUBACK deadline;
-- `delivery_timeout=None` waits indefinitely; a positive value covers byte
-  reservation and queue admission with one deadline;
-- `callback_shutdown_timeout` limits message-callback draining during shutdown;
-  it does not time out lifecycle hooks or preempt synchronous application code.
+- `delivery_timeout=None` waits indefinitely; a positive value covers iterator
+  byte reservation and queue admission with one deadline. Callback delivery has
+  no queue: synchronous callbacks run on the reader and are never timed out or
+  preempted.
 
 Lifecycle hooks have no implicit deadline. Automatic retry waits for the current
 `on_disconnect` hook; give the hook an application deadline when needed and
@@ -220,10 +220,10 @@ See [Logging and Observability](observability.md) for an application wrapper exa
 
 ## Callback failures
 
-Message callbacks must be short synchronous functions. They run in the bounded
-message worker outside protocol-engine critical sections. Exceptions and invalid
-awaitable returns are sent to the event loop's exception handler without leaking
-delivery reservations. Lifecycle hooks may be asynchronous and have separate
+Message callbacks must be short synchronous functions. They run on the
+delivering reader outside protocol-engine critical sections. Exceptions and
+invalid awaitable returns are sent to the event loop's exception handler and
+delivery continues with the next callback or message. Lifecycle hooks may be asynchronous and have separate
 ownership; see their [ordering and cancellation rules](reference/async-client.md#lifecycle-hooks).
 
 ## Bidirectional pressure
@@ -253,7 +253,8 @@ Keep disconnect and store closure in `finally` blocks. A normal disconnect:
 1. stops reconnect attempts;
 2. sends DISCONNECT when the transport is connected;
 3. allows the writer to drain within its shutdown boundary;
-4. closes transport, reader, writer, keepalive, effects and message-callback work.
+4. closes transport, reader, writer, keepalive and effect work; the reader
+   finishes any callback it is already running.
 
 Lifecycle-hook completion is separate: `disconnect()` can return before
 `on_disconnect` finishes. Hook cancellation is cooperative; hooks must release

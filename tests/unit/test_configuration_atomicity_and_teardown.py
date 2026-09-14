@@ -66,7 +66,7 @@ async def test_terminal_publish_effect_survives_connection_epoch_change() -> Non
     assert batch.is_done()
     await receipt.wait()
     await batch.wait()
-    assert client._delivery.callback_task is None
+    assert client._delivery.callback_invocations == 0
     assert 7 not in client._receipts
     assert 7 not in client._batch_receipts
     await client._force_close()
@@ -94,7 +94,7 @@ async def test_final_teardown_settles_a_pending_publish_failure() -> None:
     with pytest.raises(RuntimeError) as receipt_failure:
         await receipt.wait()
     assert receipt_failure.value is failure
-    assert client._delivery.callback_task is None
+    assert client._delivery.callback_invocations == 0
 
 
 def test_engine_config_is_immutable() -> None:

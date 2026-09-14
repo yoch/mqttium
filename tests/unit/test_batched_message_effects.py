@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-from tests.support import stored_record
-
-
 from mqttium.api import AsyncClient
 from mqttium.enums import InboundQoSState, QoS
 from mqttium.persistence.memory import MemoryInflightStore
 from mqttium.protocol.engine import EffectKind, EngineEffect
 from mqttium.types import InboundMessage, Message
+from tests.support import apply_delivery_effect, stored_record
 
 
 def _effect(
@@ -23,16 +21,19 @@ def _effect(
     )
 
 
-async def test_auto_qos1_single_effect_skips_absent_delivery_mark() -> None:
+async def test_auto_qos1_single_effect_skips_absent_delivery_mark(monkeypatch) -> None:
     client = AsyncClient(message_delivery="iterator")
     marked: list[int] = []
-    client._engine.mark_inbound_delivered = marked.append  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        type(client._engine.inbound), "mark_delivered", lambda _self, mid: marked.append(mid)
+    )
 
-    await client._apply_delivery_effect(
+    pending = client._apply_delivery_effect(
         _effect(qos=QoS.AT_LEAST_ONCE, mid=7),
         epoch=client._connection_epoch,
     )
 
+    assert pending is None
     assert marked == []
     assert client._delivery.messages_queue.qsize() == 1
 
@@ -63,10 +64,7 @@ async def test_replayed_persisted_qos1_marks_even_when_current_mode_is_auto_ack(
     message_effect = next(effect for effect in effects if effect.kind is EffectKind.MESSAGE)
     assert message_effect.requires_delivery_mark is True
 
-    await client._apply_delivery_effect(
-        message_effect,
-        epoch=client._connection_epoch,
-    )
+    await apply_delivery_effect(client, message_effect)
 
     record = store.get_in(7)
     assert record is not None

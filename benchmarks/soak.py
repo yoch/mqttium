@@ -98,7 +98,6 @@ def _idle_violations(client: AsyncClient) -> list[str]:
         "inbound.pending_bytes": stats.inbound.pending_bytes,
         "inbound.replay_pending": stats.inbound.replay_pending,
         "delivery.iterator_queued": stats.delivery.iterator_queued,
-        "delivery.callback_queued": stats.delivery.callback_queued,
         "delivery.pending_bytes": stats.delivery.pending_bytes,
         "delivery.waiters": stats.delivery.waiters,
         "writer.queued_messages": stats.writer.queued_messages,

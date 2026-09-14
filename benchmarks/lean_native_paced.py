@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from external_pacer import TOKEN_STRUCT, configure_dgram, emit_tokens
-from lean_native_compare import _git
+from lean_native_compare import _callback_bound, _git
 
 
 def _percentiles(ns: list[int]) -> dict[str, float]:
@@ -82,10 +82,10 @@ async def _sample(args: argparse.Namespace) -> dict[str, Any]:  # noqa: C901 - o
         max_outbound_messages=10_000,
         max_outbound_bytes=1024**2,
         max_pending_messages=1024,
-        max_pending_callbacks=1024,
         max_pending_delivery_bytes=64 * 1024**2,
         delivery_timeout=5,
         keepalive=0,
+        **_callback_bound(AsyncClient),
     )
     if spec["mode"] == "callback":
         client.on_message = observe

@@ -2,26 +2,19 @@
 
 from __future__ import annotations
 
-import asyncio
-
 import pytest
 
 from mqttium.api.async_client import AsyncClient
 from mqttium.errors import ProtocolError
-from mqttium.protocol.engine import EffectKind, EngineEffect
+from mqttium.protocol.engine import EffectKind
 from mqttium.types import Message
+from tests.support import deliver_message
 
 
 async def _deliver(
     client: AsyncClient, topic: str = "delivery/test", payload: bytes = b"x"
 ) -> None:
-    await client._apply_delivery_effect(
-        EngineEffect(
-            kind=EffectKind.MESSAGE,
-            data=Message(topic=topic, payload=payload),
-        ),
-        epoch=client._connection_epoch,
-    )
+    await deliver_message(client, Message(topic=topic, payload=payload))
 
 
 async def test_topic_callback_takes_precedence_over_on_message() -> None:
@@ -33,11 +26,10 @@ async def test_topic_callback_takes_precedence_over_on_message() -> None:
 
     await _deliver(client, "sensors/1")
     await _deliver(client, "other")
-    await asyncio.wait_for(client._delivery.callback_queue.join(), timeout=1.0)
 
     assert matched == ["sensors/1"]
     assert defaults == ["other"]
-    await client._delivery.shutdown_callbacks(drain=False)
+    assert client._delivery.callback_invocations == 2
 
 
 async def test_topic_callback_uses_explicit_callback_delivery() -> None:
@@ -46,11 +38,9 @@ async def test_topic_callback_uses_explicit_callback_delivery() -> None:
     client.message_callback_add("sensors/+", lambda message: seen.append(message.topic))
 
     await _deliver(client, "sensors/1")
-    await asyncio.wait_for(client._delivery.callback_queue.join(), timeout=1.0)
 
     assert seen == ["sensors/1"]
     assert client._delivery.messages_queue.empty()
-    await client._delivery.shutdown_callbacks(drain=False)
 
 
 async def test_unmatched_topic_callback_does_not_fill_iterator() -> None:
@@ -59,11 +49,10 @@ async def test_unmatched_topic_callback_does_not_fill_iterator() -> None:
     client.message_callback_add("sensors/+", lambda message: seen.append(message.topic))
 
     await _deliver(client, "other")
-    await asyncio.wait_for(client._delivery.callback_queue.join(), timeout=1.0)
 
     assert seen == []
+    assert client._delivery.callback_invocations == 0
     assert client._delivery.messages_queue.empty()
-    await client._delivery.shutdown_callbacks(drain=False)
 
 
 async def test_overlapping_filters_run_in_registration_order() -> None:
@@ -74,10 +63,9 @@ async def test_overlapping_filters_run_in_registration_order() -> None:
     client.message_callback_add("sensors/+/temp", lambda _message: seen.append("plus"))
 
     await _deliver(client, "sensors/kitchen/temp")
-    await asyncio.wait_for(client._delivery.callback_queue.join(), timeout=1.0)
 
     assert seen == ["hash", "exact", "plus"]
-    await client._delivery.shutdown_callbacks(drain=False)
+    assert client._delivery.callback_invocations == 3
 
 
 async def test_replace_keeps_filter_order() -> None:
@@ -88,10 +76,8 @@ async def test_replace_keeps_filter_order() -> None:
     client.message_callback_add("sensors/temp", lambda _message: seen.append("new"))
 
     await _deliver(client, "sensors/temp")
-    await asyncio.wait_for(client._delivery.callback_queue.join(), timeout=1.0)
 
     assert seen == ["hash", "new"]
-    await client._delivery.shutdown_callbacks(drain=False)
 
 
 async def test_remove_restores_on_message_and_clears_matcher() -> None:
@@ -104,10 +90,8 @@ async def test_remove_restores_on_message_and_clears_matcher() -> None:
     assert client._topic_callbacks is None
 
     await _deliver(client, "sensors/1")
-    await asyncio.wait_for(client._delivery.callback_queue.join(), timeout=1.0)
 
     assert seen == ["default:sensors/1"]
-    await client._delivery.shutdown_callbacks(drain=False)
 
 
 async def test_remove_unknown_filter_is_a_no_op() -> None:
@@ -140,10 +124,8 @@ async def test_shared_subscription_filter_matches_literally() -> None:
     client.message_callback_add("sensors/#", lambda _message: seen.append("normal"))
 
     await _deliver(client, "sensors/temp")
-    await asyncio.wait_for(client._delivery.callback_queue.join(), timeout=1.0)
 
     assert seen == ["normal"]
-    await client._delivery.shutdown_callbacks(drain=False)
 
 
 async def test_iterator_mode_ignores_topic_callbacks() -> None:
@@ -154,6 +136,7 @@ async def test_iterator_mode_ignores_topic_callbacks() -> None:
     await _deliver(client, "sensors/1")
 
     assert seen == []
+    assert client._delivery.callback_invocations == 0
     assert (await anext(client.messages())).topic == "sensors/1"
 
 
@@ -170,7 +153,7 @@ async def test_async_topic_callback_is_rejected_before_route_mutation() -> None:
     assert seen == []
 
 
-async def test_sync_topic_callback_runs_in_worker_outside_engine_lock() -> None:
+async def test_sync_topic_callback_runs_on_reader_outside_engine_lock() -> None:
     client = AsyncClient(client_id="topic-inline", message_delivery="callback")
     seen: list[tuple[str, bool]] = []
     client.message_callback_add(
@@ -190,10 +173,8 @@ async def test_sync_topic_callback_runs_in_worker_outside_engine_lock() -> None:
     assert seen == []
     await client._effect_pump.drain()
     await client._delivery_lane.drain()
-    await client._delivery.callback_queue.join()
     assert seen == [("inline/message", False)]
-    assert client._delivery.callback_task is not None
-    await client._delivery.shutdown_callbacks(drain=False)
+    assert client._delivery.callback_invocations == 1
 
 
 async def test_async_replacement_preserves_existing_sync_route() -> None:
@@ -210,7 +191,5 @@ async def test_async_replacement_preserves_existing_sync_route() -> None:
     with pytest.raises(TypeError, match="synchronous"):
         client.message_callback_add("sensors/#", on_plus)
     await _deliver(client, "sensors/1")
-    await asyncio.wait_for(client._delivery.callback_queue.join(), timeout=1.0)
 
     assert seen == ["hash:sensors/1"]
-    await client._delivery.shutdown_callbacks(drain=False)

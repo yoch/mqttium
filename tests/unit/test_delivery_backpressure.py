@@ -10,6 +10,7 @@ from mqttium.api.async_client import AsyncClient
 from mqttium.errors import MessageDeliveryError
 from mqttium.protocol.engine import EffectKind, EngineEffect
 from mqttium.types import Message
+from tests.support import accept_message, apply_delivery_effect
 
 
 async def test_iterator_queue_timeout_is_explicit() -> None:
@@ -18,52 +19,32 @@ async def test_iterator_queue_timeout_is_explicit() -> None:
         max_pending_messages=1,
         delivery_timeout=0.01,
     )
-    client._delivery.messages_queue.put_nowait(Message(topic="full", payload=b"x"))
+    await accept_message(client._delivery, Message(topic="full", payload=b"x"))
 
     with pytest.raises(MessageDeliveryError, match="Application delivery capacity"):
-        await client._apply_delivery_effect(
+        await apply_delivery_effect(
+            client,
             EngineEffect(
                 kind=EffectKind.MESSAGE,
                 data=Message(topic="overflow", payload=b"x"),
             ),
-            epoch=client._connection_epoch,
         )
+    assert client._delivery.waiters == 0
+    assert client._delivery.messages_queue.qsize() == 1
 
 
-async def test_callback_queue_timeout_is_explicit_and_bounded(monkeypatch) -> None:
-    client = AsyncClient(
-        message_delivery="callback",
-        max_pending_callbacks=1,
-        delivery_timeout=0.01,
-        callback_shutdown_timeout=0.01,
-    )
-    # Isolate admission from the worker: the queue remains saturated until the
-    # timeout, without requiring a suspending user callback.
-    monkeypatch.setattr(client._delivery, "ensure_callback_worker", lambda: None)
-    first = Message(topic="one", payload=b"x")
-    client.on_message = lambda _message: None
-    await client._delivery.accept(first, client._message_callback)
-    with pytest.raises(MessageDeliveryError, match="Application delivery capacity"):
-        await client._delivery.accept(Message("two", b"x"), client._message_callback)
-    assert client._delivery.callback_queue.qsize() == 1
-    assert client._delivery.pending_bytes == client._delivery.logical_size(first)
-    client._delivery._discard_callback_queue()
-    assert client._delivery.pending_bytes == 0
-
-
-async def test_callback_worker_preserves_order() -> None:
-    client = AsyncClient(message_delivery="callback", max_pending_callbacks=8)
+async def test_inline_callbacks_preserve_order() -> None:
+    client = AsyncClient(message_delivery="callback")
     seen: list[int] = []
 
     def callback(message: Message) -> None:
         seen.append(int(message.payload))
 
     for value in range(8):
-        await client._delivery.accept(Message("t", str(value).encode()), callback)
-    await asyncio.wait_for(client._delivery.callback_queue.join(), timeout=1.0)
+        await accept_message(client._delivery, Message("t", str(value).encode()), callback)
 
     assert seen == list(range(8))
-    await client._delivery.shutdown_callbacks(drain=False)
+    assert client._delivery.callback_invocations == 8
 
 
 async def test_force_close_discards_all_old_connection_effects() -> None:
@@ -81,17 +62,17 @@ async def test_force_close_discards_all_old_connection_effects() -> None:
     assert not client._effect_pump.pending
 
 
-async def test_delivery_queue_fast_paths_avoid_timeout_task(
+async def test_delivery_fast_paths_complete_synchronously(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = AsyncClient(message_delivery="iterator")
 
-    async def unexpected_wait_for(*_args: object, **_kwargs: object) -> None:
-        raise AssertionError("wait_for must only be used after queue saturation")
+    def unexpected_timeout(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("timeouts must only be armed after queue saturation")
 
-    monkeypatch.setattr(asyncio, "wait_for", unexpected_wait_for)
+    monkeypatch.setattr(asyncio, "timeout", unexpected_timeout)
     message = Message(topic="fast", payload=b"x")
-    await client._delivery.accept(message, None)
+    assert client._delivery.accept(message, None) is None
     assert await anext(client.messages()) is message
 
     called = asyncio.Event()
@@ -100,7 +81,5 @@ async def test_delivery_queue_fast_paths_avoid_timeout_task(
         called.set()
 
     client._delivery.mode = "callback"
-    await client._delivery.accept(message, callback)
-    await client._delivery.callback_queue.join()
+    assert client._delivery.accept(message, callback) is None
     assert called.is_set()
-    await client._delivery.shutdown_callbacks(drain=False)

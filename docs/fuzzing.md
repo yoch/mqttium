@@ -123,7 +123,7 @@ inside the test harness only:
 - writer failure advances its epoch without waking admission waiters;
 - connection setup/teardown does not invalidate the epoch;
 - an applied effect does not advance its settlement target;
-- message-invocation cancellation incorrectly terminates the callback worker;
+- message-invocation cancellation incorrectly terminates the delivering reader;
 - an effect collected during the failing-close window is not settled;
 - an automatically established connection defeats an already-waiting explicit
   user takeover.
@@ -173,7 +173,7 @@ real application publisher behind saturated outbound admission and qualify ACK
 release, cancellation, terminal teardown, and reconnect ownership transition.
 
 Four more families compose pressure separately with reader teardown, reconnect
-factory, callback worker, and EffectPump ownership. An overlap counts only
+factory, inline callback delivery, and EffectPump ownership. An overlap counts only
 while both owners are observable at the same checkpoint. Campaign coverage is
 mandatory by default and requires a `write_many` call carrying at least four
 PUBLISH frames, rather than mono-frame capability use or an unrelated control

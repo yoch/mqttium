@@ -4,6 +4,7 @@ from dataclasses import asdict
 
 from mqttium.api import AsyncClient
 from mqttium.types import Message
+from tests.support import accept_message
 
 
 def test_message_keeps_delivery_accounting_external() -> None:
@@ -27,8 +28,8 @@ def test_message_keeps_delivery_accounting_external() -> None:
 async def test_same_message_has_independent_queue_reservations() -> None:
     client = AsyncClient(max_pending_delivery_bytes=1024)
     message = Message(topic="t", payload=b"data")
-    await client._delivery.accept(message, None)
-    await client._delivery.accept(message, None)
+    await accept_message(client._delivery, message)
+    await accept_message(client._delivery, message)
     assert client.stats().delivery.pending_bytes == 10
     stream = client.messages()
     assert await anext(stream) is message

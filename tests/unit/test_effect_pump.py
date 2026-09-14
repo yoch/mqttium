@@ -1,18 +1,18 @@
 from __future__ import annotations
 
-from mqttium.api.async_client import _fifo_register
-
 import asyncio
 from collections import deque
 
 import pytest
 
 from mqttium.api import AsyncClient
+from mqttium.api.async_client import _fifo_register
 from mqttium.api.models import PublishBatchReceipt, PublishReceipt
 from mqttium.enums import QoS
 from mqttium.protocol.engine import PublishFailure
 from mqttium.protocol.effects import EffectKind, EngineEffect
 from mqttium.types import Message
+from tests.support import accept_message
 
 
 def test_effect_operations_are_bound_directly_to_the_pump() -> None:
@@ -44,8 +44,7 @@ async def test_terminal_result_settles_receipts_without_callback_work(qos, faile
     assert receipt._error is error
     assert not client._effect_pump.pending
     assert client._effect_pump.enqueued == 0
-    assert client._delivery.callback_task is None
-    assert client._delivery.callback_queue.empty()
+    assert client._delivery.callback_invocations == 0
 
 
 async def test_reader_delivery_runs_sync_callback_outside_engine_lock() -> None:
@@ -58,16 +57,15 @@ async def test_reader_delivery_runs_sync_callback_outside_engine_lock() -> None:
         assert not states
         assert not client._effect_pump.pending
     await client._delivery_lane.drain()
-    await client._delivery.callback_queue.join()
     assert states == [False]
-    await client._delivery.shutdown_callbacks(drain=False)
+    assert client._delivery.callback_invocations == 1
 
 
 async def test_terminal_result_is_independent_of_pending_reader_delivery() -> None:
     client = AsyncClient(max_pending_messages=1)
     first = Message("first", b"one")
     second = Message("second", b"two")
-    await client._delivery.accept(first, None)
+    await accept_message(client._delivery, first, None)
     receipt = PublishReceipt(mid=7, qos=QoS.AT_LEAST_ONCE)
     _fifo_register(client._receipts, 7, receipt)
     client._engine._emit(EffectKind.MESSAGE, second)

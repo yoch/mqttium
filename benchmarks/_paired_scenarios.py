@@ -5,6 +5,7 @@ from __future__ import annotations
 from mqttium.api.async_client import _fifo_register
 
 import asyncio
+import inspect
 import shutil
 import tempfile
 import time
@@ -315,6 +316,23 @@ def _effects(scenario: str) -> ScenarioMeasurement:
     return _measure(collect_ordered, operations=30_000, warmup=2_000)
 
 
+def _client_options(client_type: type, **wanted: Any) -> dict[str, Any]:
+    """Drop constructor options the measured source no longer accepts."""
+    parameters = inspect.signature(client_type).parameters
+    return {name: value for name, value in wanted.items() if name in parameters}
+
+
+async def _finish_callbacks(client: Any) -> None:
+    """Drain a callback worker when the measured source still owns one."""
+    delivery = client._delivery
+    queue = getattr(delivery, "callback_queue", None)
+    if queue is not None:
+        await queue.join()
+    shutdown = getattr(delivery, "shutdown_callbacks", None)
+    if shutdown is not None:
+        await shutdown(drain=False)
+
+
 def _delivery(scenario: str) -> ScenarioMeasurement:
     from mqttium.api import AsyncClient
     from mqttium.protocol.effects import EffectKind, EngineEffect
@@ -324,10 +342,10 @@ def _delivery(scenario: str) -> ScenarioMeasurement:
     client = AsyncClient(
         message_delivery=mode,
         max_pending_messages=100_000,
-        max_pending_callbacks=100_000,
         # Delivery dispatch is measured independently from byte-accounting;
         # bounded-memory costs have dedicated scenarios and profiles.
         max_pending_delivery_bytes=None,
+        **_client_options(AsyncClient, max_pending_callbacks=100_000),
     )
     if mode == "callback":
         client.on_message = lambda _message: None
@@ -340,15 +358,19 @@ def _delivery(scenario: str) -> ScenarioMeasurement:
         for index in range(warmup + operations):
             if index == warmup:
                 started = time.perf_counter()
-            await client._apply_delivery_effect(effect, client._connection_epoch)
+            pending = client._apply_delivery_effect(effect, client._connection_epoch)
+            if pending is not None:
+                await pending
             if mode == "iterator":
                 _message, size = client._delivery.messages_queue.get_nowait()
                 client._delivery.messages_queue.task_done()
                 client._delivery.release(size)
         if mode == "callback":
-            await client._delivery.callback_queue.join()
+            queue = getattr(client._delivery, "callback_queue", None)
+            if queue is not None:
+                await queue.join()
         elapsed = time.perf_counter() - started
-        await client._delivery.shutdown_callbacks(drain=False)
+        await _finish_callbacks(client)
         return ScenarioMeasurement(elapsed, operations, operations / elapsed)
 
     return asyncio.run(run())
@@ -361,8 +383,8 @@ def _single_message_effect(_scenario: str) -> ScenarioMeasurement:
 
     client = AsyncClient(
         message_delivery="callback",
-        max_pending_callbacks=4_096,
         max_pending_delivery_bytes=None,
+        **_client_options(AsyncClient, max_pending_callbacks=4_096),
     )
     client.on_message = lambda _message: None
     message = Message(topic=TOPIC, payload=b"x")
@@ -382,9 +404,11 @@ def _single_message_effect(_scenario: str) -> ScenarioMeasurement:
             client._effect_pump.collect_from_engine()
             await client._effect_pump.drain()
             await client._delivery_lane.drain()
-        await client._delivery.callback_queue.join()
+        queue = getattr(client._delivery, "callback_queue", None)
+        if queue is not None:
+            await queue.join()
         elapsed = time.perf_counter() - started
-        await client._delivery.shutdown_callbacks(drain=False)
+        await _finish_callbacks(client)
         return ScenarioMeasurement(elapsed, operations, operations / elapsed)
 
     return asyncio.run(run())

@@ -12,6 +12,7 @@ import argparse
 import asyncio
 import cProfile
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -58,14 +59,18 @@ async def _phase(scenario: str, count: int) -> dict[str, Any]:  # noqa: C901 - s
 
     qos1_publication = scenario in ("publish_qos1_individual", "publish_qos1_batch")
     mode = "iterator" if scenario == "receive_iterator" else "callback"
-    publication_options = {"max_outbound_inflight": 20} if qos1_publication else {}
+    options: dict[str, Any] = {"max_pending_messages": 1024}
+    if qos1_publication:
+        options["max_outbound_inflight"] = 20
+    # Sources that still own a callback worker accept its bound; sources that
+    # run synchronous callbacks on the reader have no such parameter.
+    if "max_pending_callbacks" in inspect.signature(AsyncClient).parameters:
+        options["max_pending_callbacks"] = 1024
     client = AsyncClient(
         "lean-diagnostic",
         message_delivery=mode,
-        max_pending_callbacks=1024,
-        max_pending_messages=1024,
         keepalive=0,
-        **publication_options,
+        **options,
     )
     broker = DiagnosticBroker()
     client._transport_factory = transport_factory(broker)
@@ -141,9 +146,18 @@ async def _phase(scenario: str, count: int) -> dict[str, Any]:  # noqa: C901 - s
         cpu_start = time.process_time_ns()
         started = time.perf_counter_ns()
         if route or scenario == "callback_only":
+            # Reader-inline sources return None (or a fairness yield) from
+            # accept(); worker-owned sources return the enqueue coroutine and
+            # complete their callbacks on the worker task.
+            accept = client._delivery.accept
+            target = client._message_callback
             for _ in range(count):
-                await client._delivery.accept(message, client._message_callback)
-            await client._delivery.callback_queue.join()
+                pending = accept(message, target)
+                if pending is not None:
+                    await pending
+            callback_queue = getattr(client._delivery, "callback_queue", None)
+            if callback_queue is not None:
+                await callback_queue.join()
         elif scenario == "publish":
             receipt = await client.publish_many(
                 PublishMessage("a/b", message.payload) for _ in range(count)
@@ -357,7 +371,7 @@ def main():
         "ab_cycles": args.cycles,
         "aa_cycles": args.aa_cycles,
         "interpretation": "packet-aware in-memory diagnostics, not network measurements",
-        "routing_delivery": "synchronous routes in the bounded message callback worker",
+        "routing_delivery": "synchronous routes on the delivering reader (source-dependent)",
     }
     output = {"metadata": metadata, "cells": []}
     args.output.parent.mkdir(parents=True, exist_ok=True)

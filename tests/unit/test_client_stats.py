@@ -7,7 +7,7 @@ from mqttium.api import AsyncClient, ClientStats
 from mqttium.enums import ConnectionState, QoS
 from mqttium.protocol.effects import EffectKind
 from mqttium.types import Message
-from tests.support import wait_until
+from tests.support import accept_message, wait_until
 
 
 def test_initial_stats_snapshot_is_immutable_and_side_effect_free() -> None:
@@ -16,7 +16,6 @@ def test_initial_stats_snapshot_is_immutable_and_side_effect_free() -> None:
         max_outbound_bytes=1234,
         max_ingress_batch_bytes=2048,
         max_pending_messages=11,
-        max_pending_callbacks=13,
     )
 
     snapshot = client.stats()
@@ -33,7 +32,7 @@ def test_initial_stats_snapshot_is_immutable_and_side_effect_free() -> None:
     assert snapshot.writer.max_messages == 7
     assert snapshot.writer.max_bytes == 1234
     assert snapshot.delivery.iterator_limit == 11
-    assert snapshot.delivery.callback_limit == 13
+    assert snapshot.delivery.callback_invocations == 0
     assert snapshot.decoder.buffered_bytes == 0
     assert snapshot.decoder.ingress_batch_limit_bytes == 2048
     assert snapshot.receipts.publish == 0
@@ -45,7 +44,7 @@ def test_initial_stats_snapshot_is_immutable_and_side_effect_free() -> None:
             snapshot.tasks.keepalive,
             snapshot.tasks.reconnect,
             snapshot.tasks.effect_flush,
-            snapshot.tasks.callback_worker,
+            snapshot.tasks.lifecycle,
         )
     )
 
@@ -232,7 +231,7 @@ def test_an_already_ordered_batch_is_counted_but_not_reordered() -> None:
 
 async def test_effect_high_water_retains_combined_protocol_and_delivery_peak() -> None:
     client = AsyncClient(max_pending_messages=1, max_outbound_messages=1)
-    await client._delivery.accept(Message("in", b"first"), None)
+    await accept_message(client._delivery, Message("in", b"first"))
     for body in (b"second", b"third"):
         client._engine._emit(EffectKind.MESSAGE, Message("in", body))
     client._effect_pump.collect_from_engine()

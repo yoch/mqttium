@@ -8,6 +8,7 @@ from mqttium.codec.buffer import IncrementalDecoder, RawPacket
 from mqttium.codec.primitives import pack_u16
 from mqttium.enums import MQTTProtocolVersion, PacketType, QoS
 from mqttium.packets import PubAckPacket, PublishPacket, encode_frame, encode_pingresp
+from mqttium.protocol.effects import EffectKind, EngineEffect
 
 
 class QueueTransport:
@@ -162,6 +163,31 @@ async def wait_until(predicate, *, timeout=2.0):
     async with asyncio.timeout(timeout):
         while not predicate():
             await asyncio.sleep(0)
+
+
+async def accept_message(delivery, message, callback=None, property_wire_size=None):
+    """Hand one message to ``ApplicationDelivery`` and finish any waiting path.
+
+    ``accept`` returns ``None`` after an immediate handoff and an awaitable
+    only when the caller must wait (capacity or the fairness yield).
+    """
+    pending = delivery.accept(message, callback, property_wire_size)
+    if pending is not None:
+        await pending
+
+
+async def apply_delivery_effect(client, effect, epoch=None):
+    """Apply one reader-lane delivery effect exactly as ``DeliveryLane`` does."""
+    if epoch is None:
+        epoch = client._connection_epoch
+    pending = client._apply_delivery_effect(effect, epoch)
+    if pending is not None:
+        await pending
+
+
+async def deliver_message(client, message, *, epoch=None):
+    """Apply a ``MESSAGE`` effect for ``message`` through the client's delivery path."""
+    await apply_delivery_effect(client, EngineEffect(EffectKind.MESSAGE, message), epoch)
 
 
 def sqlite_logical_snapshot(path):

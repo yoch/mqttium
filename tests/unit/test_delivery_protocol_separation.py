@@ -10,7 +10,12 @@ from mqttium.api import AsyncClient, Message
 from mqttium.enums import MQTTProtocolVersion
 from mqttium.packets import PublishPacket
 from mqttium.protocol.effects import EffectKind
-from tests.support import ScriptedBrokerTransport, transport_factory, wait_until
+from tests.support import (
+    ScriptedBrokerTransport,
+    accept_message,
+    transport_factory,
+    wait_until,
+)
 
 
 @pytest.mark.parametrize("protocol", (MQTTProtocolVersion.MQTTv311, MQTTProtocolVersion.MQTTv5))
@@ -21,13 +26,13 @@ async def test_publication_admission_preserves_a_full_iterator_queue(protocol, q
     client._transport_factory = transport_factory(broker)
     await client.connect("test")
     first = Message("incoming", b"first")
-    await client._delivery.accept(first, None)
+    await accept_message(client._delivery, first, None)
     entered = asyncio.Event()
     accept = client._delivery.accept
 
-    async def observe_accept(message, callback, property_wire_size=None):
+    def observe_accept(message, callback, property_wire_size=None):
         entered.set()
-        await accept(message, callback, property_wire_size)
+        return accept(message, callback, property_wire_size)
 
     client._delivery.accept = observe_accept
     stream = client.messages()
@@ -37,7 +42,8 @@ async def test_publication_admission_preserves_a_full_iterator_queue(protocol, q
         receipt = await asyncio.wait_for(client.publish("outgoing", b"reply", qos=qos), 1)
         await wait_until(lambda: len(broker.publishes) == 1)
         assert client._delivery.messages_queue.qsize() == 1
-        assert client._delivery.pending_bytes == len("incomingfirstincomingsecond")
+        # The waiting publication charges no bytes until it is enqueued.
+        assert client._delivery.pending_bytes == len("incomingfirst")
         if qos:
             # An ACK still on the transport is deliberately not read through
             # full delivery. Admission and receipt completion are distinct.
@@ -57,13 +63,13 @@ async def test_failure_interrupts_reader_delivery_and_releases_its_reservation()
     client._transport_factory = transport_factory(broker)
     await client.connect("test")
     first = Message("in", b"first")
-    await client._delivery.accept(first, None)
+    await accept_message(client._delivery, first, None)
     entered = asyncio.Event()
     accept = client._delivery.accept
 
-    async def observe_accept(message, callback, property_wire_size=None):
+    def observe_accept(message, callback, property_wire_size=None):
         entered.set()
-        await accept(message, callback, property_wire_size)
+        return accept(message, callback, property_wire_size)
 
     client._delivery.accept = observe_accept
     broker.push_rx(

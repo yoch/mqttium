@@ -40,6 +40,16 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Changed — lean native experiment
 
+- Run synchronous message callbacks inline on the delivering reader instead of
+  a bounded callback worker task and queue. The reader hands each decoded lot
+  to the application before decoding further, so callback cost is the
+  backpressure; fairness still yields after a bounded number of invocations,
+  counting topic-route fan-out. Removed: constructor parameters
+  `max_pending_callbacks` and `callback_shutdown_timeout`,
+  `DeliveryStats.callback_queued`/`callback_limit` and
+  `TaskStats.callback_worker`. Added: `DeliveryStats.callback_invocations` and
+  `TaskStats.lifecycle`. Immediate iterator admission and QoS 1/2 delivery
+  marks no longer create a coroutine per message. See the migration guide.
 - Amortize ready QoS 0 `publish_many()` orchestration over bounded private
   prefixes. Each item still commits independently and transfers to the writer
   before the source iterator advances; pressure and QoS 1/2 use the existing

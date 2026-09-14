@@ -18,11 +18,8 @@ def _publish(topic: str, *, qos: QoS = QoS.AT_MOST_ONCE, mid: int | None = None)
     ).encode(MQTTProtocolVersion.MQTTv311)
 
 
-def _client(*, max_pending_callbacks: int = 1024) -> AsyncClient:
-    client = AsyncClient(
-        message_delivery="callback",
-        max_pending_callbacks=max_pending_callbacks,
-    )
+def _client() -> AsyncClient:
+    client = AsyncClient(message_delivery="callback")
     client._engine.state = ConnectionState.CONNECTED
     client.on_message = lambda _message: None
     return client

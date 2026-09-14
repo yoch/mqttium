@@ -176,8 +176,9 @@ class AsyncClient:
     """Asyncio-native MQTT 3.1.1 and MQTT 5 client.
 
     The client owns one event loop, one protocol engine, and at most one active
-    transport. It provides bounded outbound, inbound, writer, callback, and
+    transport. It provides bounded outbound, inbound, writer, and iterator
     delivery queues; limits can be tuned explicitly through the constructor.
+    Synchronous message callbacks run directly on the delivering reader.
 
     Instances are loop-confined and are not thread-safe. Use the native async
     methods from the owning loop.
@@ -239,10 +240,8 @@ class AsyncClient:
         max_outbound_messages: int = 10_000,
         max_ingress_batch_bytes: int = 1 * 1024 * 1024,
         max_pending_messages: int = 65_536,
-        max_pending_callbacks: int = 1_024,
         max_pending_delivery_bytes: int | None = 64 * 1024 * 1024,
         delivery_timeout: float | None = None,
-        callback_shutdown_timeout: float = 5.0,
         message_delivery: MessageDelivery = "iterator",
         manual_ack: bool = False,
         store: InflightStore | None = None,
@@ -262,8 +261,6 @@ class AsyncClient:
             ),
             positive_bounds=(
                 ("max_pending_messages", max_pending_messages),
-                ("max_pending_callbacks", max_pending_callbacks),
-                ("callback_shutdown_timeout", callback_shutdown_timeout),
                 ("max_outbound_messages", max_outbound_messages),
                 ("max_outbound_bytes", max_outbound_bytes),
                 ("max_ingress_batch_bytes", max_ingress_batch_bytes),
@@ -326,10 +323,8 @@ class AsyncClient:
             mode=message_delivery,
             protocol=protocol,
             max_pending_messages=max_pending_messages,
-            max_pending_callbacks=max_pending_callbacks,
             max_pending_delivery_bytes=max_pending_delivery_bytes,
             delivery_timeout=delivery_timeout,
-            callback_shutdown_timeout=callback_shutdown_timeout,
         )
         self._publish_waiters = 0
         self._publish_waiter_futs: deque[asyncio.Future[None]] = deque()
@@ -417,7 +412,7 @@ class AsyncClient:
                 keepalive=running(self._keepalive_task),
                 reconnect=running(self._reconnect_task),
                 effect_flush=running(effect_pump.task),
-                callback_worker=running(self._delivery.callback_task),
+                lifecycle=running(self._lifecycle_hooks.task),
             ),
             outbound=outbound_stats,
             inbound=inbound_stats,
@@ -826,7 +821,7 @@ class AsyncClient:
                 self._connack_fut.cancel()
             try:
                 # A failed attempt inside an active retry loop is transient:
-                # keep the application stream and callback worker alive.
+                # keep the application stream alive.
                 await self._force_close(preserve_reconnect=reconnect_attempt)
             except BaseException:
                 pass
@@ -925,7 +920,7 @@ class AsyncClient:
                 # application stream, which the reconnect loop would otherwise
                 # keep alive.
                 if not self._will_reconnect():
-                    await self._terminal_shutdown(self._disconnect_exc or MQTTError("Disconnected"))
+                    self._terminal_shutdown(self._disconnect_exc or MQTTError("Disconnected"))
                 return
             # Preserve validation semantics: an invalid reason code must fail
             # before teardown, just as it did before shutdown became bounded.
@@ -1643,7 +1638,6 @@ class AsyncClient:
                 # A reconnectable loss must not terminate the application
                 # message stream: the same iterator resumes after reconnect.
                 self._delivery.close()
-                await self._delivery.shutdown_callbacks(drain=True)
             self._lifecycle_hooks.disconnected(
                 None if clean_disconnect else terminal_cause,
                 lifecycle_token,
@@ -1654,15 +1648,13 @@ class AsyncClient:
                     self._reconnect_loop(), name="mqttium-reconnect"
                 )
 
-    async def _terminal_shutdown(self, exc: BaseException) -> None:
+    def _terminal_shutdown(self, exc: BaseException) -> None:
         """Fail pending work and close the application stream, terminally.
 
         ``_fail_pending`` already marks teardown final and wakes parked
-        publishers; this adds the callback-worker drain and stream close that
-        every terminal path shares.
+        publishers; this adds the stream close that every terminal path shares.
         """
         self._fail_pending(exc)
-        await self._delivery.shutdown_callbacks(drain=True)
         self._delivery.close()
 
     def _retry_reason(self) -> int | None:
@@ -1825,7 +1817,7 @@ class AsyncClient:
                 if not self._reconnect.should_retry(reason, self._engine.config.protocol):
                     # Retry budget exhausted: the stream must terminate, not
                     # park forever now that transient paths keep it open.
-                    await self._terminal_shutdown(
+                    self._terminal_shutdown(
                         self._disconnect_exc or MQTTError("Reconnect exhausted")
                     )
                     return
@@ -1833,7 +1825,7 @@ class AsyncClient:
                 await asyncio.sleep(delay)
                 cause = self._local_terminal_failure
                 if cause is not None:
-                    await self._terminal_shutdown(cause)
+                    self._terminal_shutdown(cause)
                     return
                 try:
                     async with self._lifecycle_lock:
@@ -1857,7 +1849,7 @@ class AsyncClient:
                     if cause is not None:
                         # A local-terminal failure landed while this attempt
                         # was proving itself stable: never start another one.
-                        await self._terminal_shutdown(cause)
+                        self._terminal_shutdown(cause)
                         return
                     if self.is_connected:
                         self._reconnect.reset()
@@ -1872,7 +1864,7 @@ class AsyncClient:
                         # violation — or after any latched local-terminal
                         # failure, including one raised during reconnect. The
                         # first latched cause wins over the current exception.
-                        await self._terminal_shutdown(cause if cause is not None else exc)
+                        self._terminal_shutdown(cause if cause is not None else exc)
                         return
                     continue
         except asyncio.CancelledError:
@@ -2014,46 +2006,67 @@ class AsyncClient:
         else:
             raise MQTTError(f"Non-protocol effect in protocol pump: {kind!r}")
 
-    async def _apply_delivery_effect(self, effect: EngineEffect, epoch: int) -> None:
-        """Apply the reader's current delivery lot outside protocol locks."""
-        if epoch != self._connection_epoch:
-            return
+    def _apply_delivery_effect(self, effect: EngineEffect, epoch: int) -> Awaitable[None] | None:
+        """Apply one effect of the reader's delivery lot outside protocol locks.
+
+        The common case -- a message handed to its destination immediately --
+        completes synchronously and returns ``None``. Waiting for delivery
+        capacity, the fairness yield, durable delivery marks and replay
+        continuation return the awaitable that finishes the effect.
+        """
         kind = effect.kind
         if kind is EffectKind.MESSAGE or kind is EffectKind.DECODED_MESSAGE:
             message: Message = effect.data
-            await self._delivery.accept(
+            pending = self._delivery.accept(
                 message, self._message_callback, effect.decoded_property_wire_size
             )
             if effect.requires_delivery_mark and message.mid is not None:
-                async with self._engine_lock:
-                    if epoch != self._connection_epoch:
-                        return
-                    try:
-                        self._engine.inbound.mark_delivered(message.mid)
-                    except Exception as exc:
-                        # Queue acceptance is observable, but failed durable
-                        # completion must retire this session before any new
-                        # admission. Reader teardown preserves this first cause.
-                        if self._local_terminal_failure is None:
-                            self._local_terminal_failure = exc
-                        self._engine.notify_transport_closed()
-                        raise
-        elif kind is EffectKind.CONTINUE_INBOUND_REPLAY:
-            # This marker follows its messages in the reader-owned lane. Only
-            # their completed handoff may hydrate the next bounded replay lot.
-            async with self._engine_lock:
-                if epoch != self._connection_epoch:
-                    return
-                try:
-                    self._engine.continue_inbound_replay()
-                except Exception as exc:
-                    if self._local_terminal_failure is None:
-                        self._local_terminal_failure = exc
-                    self._engine.notify_transport_closed()
-                    raise
-                self._effect_pump.collect_from_engine()
-        else:
-            raise MQTTError(f"Non-delivery effect in reader lane: {kind!r}")
+                if pending is None and not self._engine_lock.locked():
+                    # No await separates the handoff from this mark, so the
+                    # free lock cannot be contended before the mark completes.
+                    self._mark_delivered_locked(message.mid)
+                    return None
+                return self._mark_delivered(message.mid, epoch, pending)
+            return pending
+        if kind is EffectKind.CONTINUE_INBOUND_REPLAY:
+            return self._continue_inbound_replay(epoch)
+        raise MQTTError(f"Non-delivery effect in reader lane: {kind!r}")
+
+    def _mark_delivered_locked(self, mid: int) -> None:
+        """Record delivery of ``mid`` while the engine is exclusively owned."""
+        try:
+            self._engine.inbound.mark_delivered(mid)
+        except Exception as exc:
+            # Queue acceptance is observable, but failed durable completion
+            # must retire this session before any new admission. Reader
+            # teardown preserves this first cause.
+            if self._local_terminal_failure is None:
+                self._local_terminal_failure = exc
+            self._engine.notify_transport_closed()
+            raise
+
+    async def _mark_delivered(self, mid: int, epoch: int, pending: Awaitable[None] | None) -> None:
+        if pending is not None:
+            await pending
+        async with self._engine_lock:
+            if epoch != self._connection_epoch:
+                return
+            self._mark_delivered_locked(mid)
+
+    async def _continue_inbound_replay(self, epoch: int) -> None:
+        # This marker follows its messages in the reader-owned lane. Only
+        # their completed handoff may hydrate the next bounded replay lot.
+        async with self._engine_lock:
+            if epoch != self._connection_epoch:
+                return
+            try:
+                self._engine.continue_inbound_replay()
+            except Exception as exc:
+                if self._local_terminal_failure is None:
+                    self._local_terminal_failure = exc
+                self._engine.notify_transport_closed()
+                raise
+            self._effect_pump.collect_from_engine()
 
     def _settle_publish(self, mid: int | None, reason: BaseException | None) -> None:
         """Retire the receipt and batch entry for one publication.
@@ -2343,6 +2356,5 @@ class AsyncClient:
                 pass
             self._transport = None
         if not preserve_reconnect:
-            await self._delivery.shutdown_callbacks(drain=True)
             # Only the really-terminal teardown closes the application stream.
             self._delivery.close()

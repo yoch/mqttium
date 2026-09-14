@@ -7,18 +7,12 @@ import asyncio
 import pytest
 
 from mqttium.api.async_client import AsyncClient
-from mqttium.protocol.engine import EffectKind, EngineEffect
 from mqttium.types import Message
+from tests.support import deliver_message
 
 
 async def _deliver(client: AsyncClient, payload: bytes = b"x") -> None:
-    await client._apply_delivery_effect(
-        EngineEffect(
-            kind=EffectKind.MESSAGE,
-            data=Message(topic="delivery/test", payload=payload),
-        ),
-        epoch=client._connection_epoch,
-    )
+    await deliver_message(client, Message(topic="delivery/test", payload=payload))
 
 
 async def test_callback_does_not_fill_iterator_queue() -> None:
@@ -32,15 +26,15 @@ async def test_callback_does_not_fill_iterator_queue() -> None:
 
     for index in range(5):
         await _deliver(client, str(index).encode())
-    await asyncio.wait_for(client._delivery.callback_queue.join(), timeout=1.0)
 
     assert received == [b"0", b"1", b"2", b"3", b"4"]
     assert client._delivery.messages_queue.empty()
-    await client._delivery.shutdown_callbacks(drain=False)
+    assert client.stats().delivery.callback_invocations == 5
+    assert client.stats().delivery.pending_bytes == 0
 
 
-async def test_callback_self_cancellation_does_not_stop_worker() -> None:
-    client = AsyncClient(message_delivery="callback", max_pending_callbacks=4)
+async def test_callback_self_cancellation_does_not_stop_inline_delivery() -> None:
+    client = AsyncClient(message_delivery="callback")
     received: list[bytes] = []
     reported: list[dict[str, object]] = []
     loop = asyncio.get_running_loop()
@@ -56,16 +50,13 @@ async def test_callback_self_cancellation_does_not_stop_worker() -> None:
     try:
         await _deliver(client, b"cancel-self")
         await _deliver(client, b"after")
-        await asyncio.wait_for(client._delivery.callback_queue.join(), timeout=1)
 
         assert received == [b"after"]
-        assert client._delivery.callback_task is not None
-        assert not client._delivery.callback_task.done()
+        assert client._delivery.callback_invocations == 2
         assert len(reported) == 1
         assert isinstance(reported[0].get("exception"), asyncio.CancelledError)
     finally:
         loop.set_exception_handler(previous_handler)
-        await client._delivery.shutdown_callbacks(drain=False)
 
 
 async def test_unlimited_bytes_keeps_selected_destination() -> None:
@@ -77,9 +68,7 @@ async def test_unlimited_bytes_keeps_selected_destination() -> None:
     received: list[bytes] = []
     callback_client.on_message = lambda message: received.append(message.payload)
     await _deliver(callback_client, b"callback")
-    await callback_client._delivery.callback_queue.join()
     assert received == [b"callback"]
-    await callback_client._delivery.shutdown_callbacks(drain=False)
 
 
 @pytest.mark.parametrize("mode", ["iterator", "callback"])
@@ -92,11 +81,11 @@ async def test_unaccounted_specialized_delivery_modes(mode: str) -> None:
     client.on_message = lambda message: received.append(message.payload)
 
     await _deliver(client, mode.encode())
-    if mode in ("callback", "both"):
-        await client._delivery.callback_queue.join()
+    if mode == "callback":
         assert received == [mode.encode()]
-        await client._delivery.shutdown_callbacks(drain=False)
-    if mode in ("iterator", "both"):
+        assert client._delivery.messages_queue.empty()
+    else:
+        assert received == []
         assert (await anext(client.messages())).payload == mode.encode()
 
 

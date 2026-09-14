@@ -14,6 +14,7 @@ import argparse
 import asyncio
 import gc
 import hashlib
+import inspect
 import itertools
 import json
 import math
@@ -35,6 +36,17 @@ from typing import Any
 
 def _git(root: Path, *args: str) -> str:
     return subprocess.check_output(["git", "-C", str(root), *args], text=True).strip()
+
+
+def _callback_bound(client_type: type) -> dict[str, int]:
+    """Keep the arm-independent harness constructible on both sources.
+
+    Sources that still own a callback worker accept its bound; sources that run
+    synchronous callbacks on the reader have no such parameter.
+    """
+    if "max_pending_callbacks" in inspect.signature(client_type).parameters:
+        return {"max_pending_callbacks": 1024}
+    return {}
 
 
 def _percentile(values: list[int], percentile: float) -> float:
@@ -109,10 +121,10 @@ async def _phase(  # noqa: C901 - one lifecycle brackets each measured phase
             max_outbound_messages=10_000,
             max_outbound_bytes=1024**2,
             max_pending_messages=1024,
-            max_pending_callbacks=1024,
             max_pending_delivery_bytes=64 * 1024**2,
             delivery_timeout=5.0,
             keepalive=0,
+            **_callback_bound(AsyncClient),
         )
         if spec["mode"] == "callback":
             client.on_message = observe

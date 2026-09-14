@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Awaitable
 from typing import TYPE_CHECKING, Protocol
 
 from mqttium.protocol.effects import EngineEffect
@@ -15,7 +16,9 @@ class DeliveryOwner(Protocol):
     _connection_epoch: int
     _effect_pump: EffectPump
 
-    async def _apply_delivery_effect(self, effect: EngineEffect, epoch: int) -> None: ...
+    def _apply_delivery_effect(
+        self, effect: EngineEffect, epoch: int
+    ) -> Awaitable[None] | None: ...
 
 
 class DeliveryLane:
@@ -42,6 +45,7 @@ class DeliveryLane:
         self.high_water = max(self.high_water, self.pending_count)
 
     async def drain(self) -> None:
+        owner = self.owner
         while self.pending:
             epoch, target, effects = self.pending.popleft()
             # Remove ownership from the lane before suspending. Its reader now
@@ -49,14 +53,18 @@ class DeliveryLane:
             self.pending_count -= len(effects)
             self.active_count = len(effects)
             try:
-                if epoch != self.owner._connection_epoch:
+                if epoch != owner._connection_epoch:
                     continue
-                await self.owner._effect_pump.drain(target=target)
+                await owner._effect_pump.drain(target=target)
                 while effects:
-                    if epoch != self.owner._connection_epoch:
+                    if epoch != owner._connection_epoch:
                         break
                     effect = effects.popleft()
-                    await self.owner._apply_delivery_effect(effect, epoch)
+                    # Immediate handoff is the common case and creates no
+                    # coroutine; only waiting work returns something to await.
+                    pending = owner._apply_delivery_effect(effect, epoch)
+                    if pending is not None:
+                        await pending
                     self.active_count -= 1
                     self.applied += 1
             finally:

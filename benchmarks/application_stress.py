@@ -87,12 +87,7 @@ def message_effect(sequence: int) -> EngineEffect:
 
 
 async def callback_delivery(count: int) -> Sample:
-    client = AsyncClient(
-        message_delivery="callback",
-        max_pending_callbacks=128,
-        delivery_timeout=10.0,
-        callback_shutdown_timeout=10.0,
-    )
+    client = AsyncClient(message_delivery="callback", delivery_timeout=10.0)
     seen: list[int] = []
 
     def callback(message: Message) -> None:
@@ -102,18 +97,18 @@ async def callback_delivery(count: int) -> Sample:
     started = time.perf_counter()
     cpu_started = time.process_time()
     for sequence in range(count):
-        await client._apply_delivery_effect(message_effect(sequence), client._connection_epoch)
-    await client._delivery.callback_queue.join()
+        pending = client._apply_delivery_effect(message_effect(sequence), client._connection_epoch)
+        if pending is not None:
+            await pending
     result = sample(
         "callback_sync",
         count,
         started,
         cpu_started,
-        notes="bounded queue=128; synchronous callbacks in one ordered worker",
+        notes="synchronous callbacks run inline on the delivering reader",
     )
     if seen != list(range(count)):
         raise RuntimeError("callback ordering or completeness violation")
-    await client._delivery.shutdown_callbacks(drain=False)
     return result
 
 
@@ -137,7 +132,9 @@ async def iterator_delivery(count: int, delay: float) -> Sample:
     started = time.perf_counter()
     cpu_started = time.process_time()
     for sequence in range(count):
-        await client._apply_delivery_effect(message_effect(sequence), client._connection_epoch)
+        pending = client._apply_delivery_effect(message_effect(sequence), client._connection_epoch)
+        if pending is not None:
+            await pending
     await consumer
     result = sample(
         f"iterator_delay_{delay * 1000:g}ms",

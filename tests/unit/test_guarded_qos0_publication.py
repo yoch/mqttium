@@ -73,7 +73,7 @@ async def test_unit_qos0_skips_general_effects_and_receipt_precedes_wire(
         await client._write_pump.join()
         assert len(broker.publishes) == 1
         assert at_wire == [1]
-        assert client._delivery.callback_task is None
+        assert client._delivery.callback_invocations == 0
     finally:
         await client.disconnect()
 
@@ -102,7 +102,7 @@ async def test_writer_exception_after_handoff_is_never_retried(monkeypatch, nowa
                     await client.publish("t", b"one")
         await client._write_pump.join()
         assert len(calls) == len(broker.publishes) == 1
-        assert client._delivery.callback_task is None
+        assert client._delivery.callback_invocations == 0
         assert not client._engine.has_pending_effects
         assert not client._effect_pump.pending
     finally:
@@ -147,8 +147,7 @@ async def test_nowait_clean_refusal_does_not_commit_alias_or_wire(monkeypatch):
         assert not broker.publishes
         assert not client._engine.has_pending_effects
         assert not client._effect_pump.pending
-        assert client._delivery.callback_queue.empty()
-        assert client._delivery.callback_task is None
+        assert client._delivery.callback_invocations == 0
     finally:
         await client.disconnect()
 
@@ -256,7 +255,7 @@ async def test_batch_registration_precedes_wire_without_unit_receipts(
         assert all(count >= index for index, count in enumerate(at_wire, 1))
         assert len(at_wire) == 8
         assert [packet.payload for packet in broker.publishes] == [bytes([i]) for i in range(8)]
-        assert client._delivery.callback_task is None
+        assert client._delivery.callback_invocations == 0
     finally:
         await client.disconnect()
 
@@ -301,7 +300,7 @@ async def test_batch_partial_handoff_failure_keeps_prefix_and_never_retries(
         assert len(attempts) == 2
         await client._write_pump.join()
         assert [packet.payload for packet in broker.publishes] == [b"\x00", b"\x01"]
-        assert client._delivery.callback_task is None
+        assert client._delivery.callback_invocations == 0
         # The raised submission error reports the ambiguous handoff; the
         # attached receipt describes its already committed prefix, as before.
         await receipt.wait()

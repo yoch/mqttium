@@ -15,7 +15,7 @@ from mqttium.errors import FlowControlError, ProtocolError
 from mqttium.packets import PublishPacket
 from mqttium.protocol.effects import EffectKind, EngineEffect
 from mqttium.protocol.negotiated import NegotiatedSettings
-from mqttium.types import Message, Properties
+from mqttium.types import Properties
 
 
 def test_publish_nowait_requires_a_running_loop() -> None:
@@ -62,8 +62,7 @@ async def test_publish_nowait_receipts_use_direct_writer_admission() -> None:
 
     assert client.stats().writer.queued_messages == 100
     assert all(receipt.is_done() for receipt in receipts)
-    assert client._delivery.callback_queue.empty()
-    assert client._delivery.callback_task is None
+    assert client._delivery.callback_invocations == 0
 
 
 async def test_qos0_receipt_marks_writer_admission_not_transport_drain() -> None:
@@ -81,7 +80,7 @@ async def test_qos0_receipt_marks_writer_admission_not_transport_drain() -> None
     assert client.stats().writer.queued_bytes == queued_bytes
     assert not client._engine.has_pending_effects
     assert not client._effect_pump.pending
-    assert client._delivery.callback_task is None
+    assert client._delivery.callback_invocations == 0
 
 
 def test_disconnect_metadata_boundary_is_private() -> None:
@@ -139,15 +138,14 @@ async def test_refused_direct_qos0_write_does_not_establish_alias() -> None:
         await client.publish("", b"reuse", properties=properties)
 
 
-async def test_await_publish_qos0_completes_without_callback_worker() -> None:
+async def test_await_publish_qos0_completes_without_message_callbacks() -> None:
     client = AsyncClient(max_outbound_messages=8)
     client._engine.state = ConnectionState.CONNECTED
     receipt = await client.publish("native/await-qos0", b"x", qos=0)
 
     await receipt.wait()
     assert receipt.is_done()
-    assert client._delivery.callback_queue.empty()
-    assert client._delivery.callback_task is None
+    assert client._delivery.callback_invocations == 0
 
 
 async def test_publish_many_qos0_uses_engine_admission() -> None:
@@ -165,7 +163,7 @@ async def test_publish_many_qos0_uses_engine_admission() -> None:
     assert isinstance(client._write_pump.queue.get_nowait(), bytes)
 
 
-async def test_publish_many_completion_does_not_start_callback_worker() -> None:
+async def test_publish_many_completion_invokes_no_message_callbacks() -> None:
     client = AsyncClient(max_outbound_messages=8)
     client._engine.state = ConnectionState.CONNECTED
     receipt = await client.publish_many(
@@ -175,8 +173,7 @@ async def test_publish_many_completion_does_not_start_callback_worker() -> None:
     await receipt.wait()
     assert receipt.submitted == receipt.completed == 2
     assert client.stats().writer.queued_messages == 2
-    assert client._delivery.callback_queue.empty()
-    assert client._delivery.callback_task is None
+    assert client._delivery.callback_invocations == 0
 
 
 async def test_publish_many_mixed_qos_keeps_the_effect_path() -> None:
@@ -209,29 +206,8 @@ async def test_nowait_refuses_pending_effects_before_mutation(owner) -> None:
     assert client._write_pump.queue.empty()
 
 
-async def test_nowait_admission_is_independent_of_full_message_callback_queue(monkeypatch) -> None:
-    client = AsyncClient(max_pending_callbacks=1, message_delivery="callback")
-    client._engine.state = ConnectionState.CONNECTED
-    monkeypatch.setattr(client._delivery, "ensure_callback_worker", lambda: None)
-    message = Message("incoming", b"retained")
-    assert client._delivery.try_accept(message, lambda _message: None)
-    job = client._delivery.callback_queue._queue[0]
-    charge = client._delivery.logical_size(message)
-
-    receipt = client.publish_nowait("t", b"x")
-    assert receipt.is_done()
-    assert client._write_pump.queue.qsize() == 1
-    assert list(client._delivery.callback_queue._queue) == [job]
-    assert client._delivery.callback_task is None
-    assert client._delivery.pending_bytes == charge
-    assert not client._engine.has_pending_effects
-    assert not client._effect_pump.pending
-    client._delivery._discard_callback_queue()
-    assert client._delivery.pending_bytes == 0
-
-
 async def test_direct_path_writer_refusal_preserves_first_receipt() -> None:
-    client = AsyncClient(max_outbound_messages=1, max_pending_callbacks=8)
+    client = AsyncClient(max_outbound_messages=1)
     client._engine.state = ConnectionState.CONNECTED
     first = client.publish_nowait("native/full", b"first", qos=0)
     with pytest.raises(FlowControlError):
@@ -239,36 +215,9 @@ async def test_direct_path_writer_refusal_preserves_first_receipt() -> None:
 
     await first.wait()
     assert client.stats().writer.queued_messages == 1
-    assert client._delivery.callback_queue.empty()
-    assert client._delivery.callback_task is None
+    assert client._delivery.callback_invocations == 0
     assert not client._engine.has_pending_effects
     assert not client._effect_pump.pending
-
-
-async def test_publish_many_progress_is_independent_of_full_message_callback_queue(
-    monkeypatch,
-) -> None:
-    client = AsyncClient(
-        max_outbound_messages=8, max_pending_callbacks=1, message_delivery="callback"
-    )
-    client._engine.state = ConnectionState.CONNECTED
-    monkeypatch.setattr(client._delivery, "ensure_callback_worker", lambda: None)
-    message = Message("incoming", b"retained")
-    assert client._delivery.try_accept(message, lambda _message: None)
-    job = client._delivery.callback_queue._queue[0]
-    charge = client._delivery.logical_size(message)
-
-    receipt = await client.publish_many(
-        [PublishMessage("native/batch", b"a", 0), PublishMessage("native/batch", b"b", 0)]
-    )
-    await receipt.wait()
-    assert receipt.submitted == receipt.completed == 2
-    assert client._write_pump.queue.qsize() == 2
-    assert list(client._delivery.callback_queue._queue) == [job]
-    assert client._delivery.callback_task is None
-    assert client._delivery.pending_bytes == charge
-    client._delivery._discard_callback_queue()
-    assert client._delivery.pending_bytes == 0
 
 
 async def test_publish_nowait_direct_path_encodes_mqtt5_properties(monkeypatch) -> None:

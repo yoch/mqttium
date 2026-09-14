@@ -1,10 +1,10 @@
-"""Bounded application delivery and serial user notifications."""
+"""Bounded application delivery: one iterator queue or synchronous callbacks."""
 
 from __future__ import annotations
 
 import asyncio
 import inspect
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from typing import Any, Literal
 from dataclasses import dataclass
 from functools import partial
@@ -26,13 +26,22 @@ class MessageRoute:
 
 
 CallbackTarget = Callable[..., Any] | MessageRoute
-CallbackJob = tuple[CallbackTarget, Message, int]
 IteratorQueueItem = tuple[Message, int]
+# Synchronous callback invocations, including route fan-out, between two
+# cooperative yields of the delivering reader. It cannot preempt user code.
 _CALLBACK_QUANTUM = 128
 
 
 class ApplicationDelivery:
-    """Own one destination per message, its byte charge, and callback worker."""
+    """Own the message destination: a bounded iterator queue or direct callbacks.
+
+    Callback mode invokes synchronous application callbacks from the reader
+    that delivers the message, outside every protocol lock, so it needs no
+    queue, worker task or byte reservation: the reader does not decode more
+    until the current lot has been handed to the application. Iterator mode
+    parks messages in a bounded queue for an independent consumer and charges
+    their logical size against ``max_pending_delivery_bytes``.
+    """
 
     def __init__(
         self,
@@ -40,10 +49,8 @@ class ApplicationDelivery:
         mode: MessageDelivery,
         protocol: MQTTProtocolVersion,
         max_pending_messages: int,
-        max_pending_callbacks: int,
         max_pending_delivery_bytes: int | None,
         delivery_timeout: float | None,
-        callback_shutdown_timeout: float,
     ) -> None:
         self.mode = mode
         self.protocol = protocol
@@ -54,20 +61,18 @@ class ApplicationDelivery:
         self.space = asyncio.Event()
         self.waiters = 0
         self.messages_queue: asyncio.Queue[IteratorQueueItem] = asyncio.Queue(max_pending_messages)
-        self.callback_queue: asyncio.Queue[CallbackJob] = asyncio.Queue(max_pending_callbacks)
         self.message_ready = asyncio.Event()
         self.closed = asyncio.Event()
         self._stream_generation = 0
-        self.callback_task: asyncio.Task[None] | None = None
         self.delivery_timeout = delivery_timeout
-        self.callback_shutdown_timeout = callback_shutdown_timeout
+        self.callback_invocations = 0
+        self._since_yield = 0
 
     def stats(self) -> DeliveryStats:
         return DeliveryStats(
             iterator_queued=self.messages_queue.qsize(),
             iterator_limit=self.messages_queue.maxsize,
-            callback_queued=self.callback_queue.qsize(),
-            callback_limit=self.callback_queue.maxsize,
+            callback_invocations=self.callback_invocations,
             pending_bytes=self.pending_bytes,
             pending_high_water_bytes=self.pending_high_water_bytes,
             max_bytes=self.max_pending_delivery_bytes,
@@ -90,93 +95,73 @@ class ApplicationDelivery:
             )
         return len(message.payload) + len(message.topic.encode("utf-8")) + property_wire_size
 
-    async def _reserve(self, size: int) -> None:
-        limit = self.max_pending_delivery_bytes
-        if limit is not None and size > limit:
-            raise MessageDeliveryError(
-                f"Message requires {size} delivery bytes, exceeding limit {limit}"
-            )
-        while limit is not None and self.pending_bytes + size > limit:
-            self.space.clear()
-            self.waiters += 1
-            try:
-                await self.space.wait()
-            finally:
-                self.waiters -= 1
-        self.pending_bytes += size
-        self.pending_high_water_bytes = max(self.pending_high_water_bytes, self.pending_bytes)
-
     def release(self, size: int) -> None:
         self.pending_bytes -= size
         if self.waiters:
             self.space.set()
 
-    def try_accept(
-        self,
-        message: Message,
-        callback: CallbackTarget | None,
-        property_wire_size: int | None = None,
-        *,
-        size: int | None = None,
-    ) -> bool:
-        """Transfer one message to its bounded destination without suspending."""
-        if self.mode == "callback" and callback is None:
-            return True
-        if size is None:
-            size = self.logical_size(message, property_wire_size)
-        limit = self.max_pending_delivery_bytes
-        if limit is not None and size > limit:
-            raise MessageDeliveryError(
-                f"Message requires {size} delivery bytes, exceeding limit {limit}"
-            )
-        queue = self.messages_queue if self.mode == "iterator" else self.callback_queue
-        if queue.full() or (limit is not None and self.pending_bytes + size > limit):
-            return False
-        if self.mode == "callback":
-            self.ensure_callback_worker()
+    def _enqueue(self, message: Message, size: int) -> None:
         self.pending_bytes += size
-        self.pending_high_water_bytes = max(self.pending_high_water_bytes, self.pending_bytes)
-        try:
-            if self.mode == "iterator":
-                self.messages_queue.put_nowait((message, size))
-                self.message_ready.set()
-            else:
-                assert callback is not None
-                self.callback_queue.put_nowait((callback, message, size))
-        except BaseException:
-            self.release(size)
-            raise
-        return True
+        if self.pending_bytes > self.pending_high_water_bytes:
+            self.pending_high_water_bytes = self.pending_bytes
+        self.messages_queue.put_nowait((message, size))
+        self.message_ready.set()
 
-    async def accept(
+    def accept(
         self,
         message: Message,
         callback: CallbackTarget | None,
         property_wire_size: int | None = None,
-    ) -> None:
-        if self.mode == "callback" and callback is None:
-            return
+    ) -> Awaitable[None] | None:
+        """Hand one message to its destination now, or return the waiting path.
+
+        Callback mode runs the matching synchronous callbacks before returning
+        and only yields an awaitable when the fairness quantum is exhausted.
+        Iterator mode returns ``None`` after an immediate bounded enqueue and
+        otherwise the coroutine that waits for queue and byte capacity.
+        """
+        if self.mode == "callback":
+            if callback is not None:
+                if isinstance(callback, MessageRoute):
+                    for selected in callback.select(message):
+                        self.invoke_sync_isolated(selected, message)
+                else:
+                    self.invoke_sync_isolated(callback, message)
+                if self._since_yield >= _CALLBACK_QUANTUM:
+                    self._since_yield = 0
+                    return asyncio.sleep(0)
+            return None
         size = self.logical_size(message, property_wire_size)
-        if self.try_accept(message, callback, size=size):
-            return
-        reserved = False
+        limit = self.max_pending_delivery_bytes
+        if limit is not None:
+            if size > limit:
+                raise MessageDeliveryError(
+                    f"Message requires {size} delivery bytes, exceeding limit {limit}"
+                )
+            if self.pending_bytes + size > limit:
+                return self._accept_waiting(message, size)
+        if self.messages_queue.full():
+            return self._accept_waiting(message, size)
+        self._enqueue(message, size)
+        return None
+
+    async def _accept_waiting(self, message: Message, size: int) -> None:
+        """Wait for byte and queue capacity under one shared deadline."""
+        limit = self.max_pending_delivery_bytes
         try:
             async with asyncio.timeout(self.delivery_timeout):
-                await self._reserve(size)
-                reserved = True
-                if self.mode == "iterator":
-                    await self.messages_queue.put((message, size))
-                    self.message_ready.set()
-                else:
-                    assert callback is not None
-                    self.ensure_callback_worker()
-                    await self.callback_queue.put((callback, message, size))
-                reserved = False  # the queue now owns the reservation
+                while (limit is not None and self.pending_bytes + size > limit) or (
+                    self.messages_queue.full()
+                ):
+                    self.space.clear()
+                    self.waiters += 1
+                    try:
+                        await self.space.wait()
+                    finally:
+                        self.waiters -= 1
         except TimeoutError as exc:
             raise MessageDeliveryError("Application delivery capacity timed out") from exc
-        finally:
-            if reserved:
-                self.release(size)
+        self._enqueue(message, size)
 
     def messages(self) -> AsyncIterator[Message]:
         return self._messages(self._stream_generation)
@@ -193,7 +178,6 @@ class ApplicationDelivery:
                 self.message_ready.clear()
                 await self.message_ready.wait()
             else:
-                self.messages_queue.task_done()
                 self.release(size)
                 yield message
 
@@ -203,19 +187,12 @@ class ApplicationDelivery:
         self._stream_generation += 1
         while not self.messages_queue.empty():
             _message, size = self.messages_queue.get_nowait()
-            self.messages_queue.task_done()
             self.release(size)
         # Wake iterators that belong to the retired stream before replacing it.
         self.message_ready.set()
         self.messages_queue = asyncio.Queue(self.max_pending_messages)
         self.message_ready = asyncio.Event()
         self.closed.clear()
-
-    def ensure_callback_worker(self) -> None:
-        if self.callback_task is None or self.callback_task.done():
-            self.callback_task = asyncio.create_task(
-                self._callback_worker(), name="mqttium-callbacks"
-            )
 
     @staticmethod
     def _is_async_callback(callback: Callable[..., Any]) -> bool:
@@ -269,6 +246,8 @@ class ApplicationDelivery:
         self.report_callback_error(callback, exc)
 
     def invoke_sync_isolated(self, callback: Callable[[Message], Any], message: Message) -> None:
+        self.callback_invocations += 1
+        self._since_yield += 1
         try:
             result = callback(message)
             if result is not None and inspect.isawaitable(result):
@@ -281,55 +260,3 @@ class ApplicationDelivery:
             self._propagate_callback_cancellation(callback, exc)
         except Exception as exc:
             self.report_callback_error(callback, exc)
-
-    def _discard_callback_queue(self) -> None:
-        while not self.callback_queue.empty():
-            _callback, _message, size = self.callback_queue.get_nowait()
-            self.release(size)
-            self.callback_queue.task_done()
-
-    async def _callback_worker(self) -> None:
-        # Even an eager task factory must not invoke user code from an engine
-        # critical section that synchronously enqueues a notification.
-        await asyncio.sleep(0)
-        completed = 0
-        try:
-            while True:
-                target, message, size = await self.callback_queue.get()
-                try:
-                    if isinstance(target, MessageRoute):
-                        for callback in target.select(message):
-                            if completed == _CALLBACK_QUANTUM:
-                                completed = 0
-                                await asyncio.sleep(0)
-                            self.invoke_sync_isolated(callback, message)
-                            completed += 1
-                    else:
-                        if completed == _CALLBACK_QUANTUM:
-                            completed = 0
-                            await asyncio.sleep(0)
-                        self.invoke_sync_isolated(target, message)
-                        completed += 1
-                finally:
-                    self.release(size)
-                    self.callback_queue.task_done()
-        finally:
-            self._discard_callback_queue()
-
-    async def shutdown_callbacks(self, *, drain: bool) -> None:
-        task = self.callback_task
-        if task is None:
-            return
-        if drain and not task.done():
-            try:
-                await asyncio.wait_for(self.callback_queue.join(), self.callback_shutdown_timeout)
-            except TimeoutError:
-                pass
-        if not task.done():
-            task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-        self.callback_task = None
-        self._discard_callback_queue()

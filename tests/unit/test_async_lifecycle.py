@@ -175,7 +175,7 @@ async def test_intentional_disconnect_callback_receives_none() -> None:
     assert errors == [None]
 
 
-async def test_on_connect_can_disconnect_without_joining_its_callback_worker() -> None:
+async def test_on_connect_can_disconnect_without_joining_its_lifecycle_task() -> None:
     client = AsyncClient(client_id="on-connect-disconnect")
     transport = _Transport(connack=True)
     callback_finished = asyncio.Event()
@@ -194,9 +194,9 @@ async def test_on_connect_can_disconnect_without_joining_its_callback_worker() -
 
     await asyncio.wait_for(client.connect("fake", timeout=1), timeout=1)
     await asyncio.wait_for(callback_finished.wait(), timeout=1)
-    worker = client._delivery.callback_task
-    if worker is not None:
-        await asyncio.wait_for(worker, timeout=1)
+    lifecycle = client._lifecycle_hooks.task
+    if lifecycle is not None:
+        await asyncio.wait_for(lifecycle, timeout=1)
 
     assert not client.is_connected
     assert client._transport is None

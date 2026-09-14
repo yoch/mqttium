@@ -16,6 +16,7 @@ from mqttium.errors import PacketTooLargeError
 from mqttium.packets import PublishPacket, encode_frame
 from mqttium.protocol.reconnect import ReconnectPolicy
 from mqttium.types import Properties
+from tests.support import wait_until
 
 
 class _Broker:
@@ -419,12 +420,13 @@ async def test_tiny_peer_limit_fails_before_keepalive_owner_starts() -> None:
                 stats.tasks.keepalive,
                 stats.tasks.reconnect,
                 stats.tasks.effect_flush,
-                stats.tasks.callback_worker,
             )
         )
         assert stats.writer.waiters == 0
         assert stats.effects.waiters == 0
         assert stats.delivery.waiters == 0
+        # The disconnect notification owner retires by itself without a hook.
+        await wait_until(lambda: not client.stats().tasks.lifecycle)
     finally:
         await _cleanup(client)
 

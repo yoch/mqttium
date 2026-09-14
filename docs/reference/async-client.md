@@ -47,12 +47,15 @@ and QoS 2 PUBCOMP.
 Declare message callbacks with `def`. Async functions and async callable objects
 are rejected before registration changes. A synchronous callback returning an
 awaitable violates the contract and is reported as a `TypeError`; MQTTium does
-not await or implicitly schedule that result. Message callbacks run only in one
-bounded worker, outside protocol critical sections. Each message occupies one
-job and retains its delivery bytes until all matching routes finish. The
-worker counts actual callback invocations, including route fan-out, and yields
-between bounded groups when work remains. Its private quantum is not a time
-limit: synchronous user code cannot be preempted.
+not await or implicitly schedule that result. Message callbacks run
+synchronously on the reader that delivered the message, outside protocol
+critical sections and without any intermediate queue: the reader decodes no
+further packet until the current lot has been handed to the application, so
+callback cost is the natural backpressure. A callback exception is reported to
+the loop's exception handler and delivery continues with the next callback or
+message. The reader counts callback invocations, including route fan-out, and
+yields to the event loop after each bounded group. That private quantum is not a
+time limit: synchronous user code cannot be preempted.
 
 Matching topic filters run in registration order instead of `on_message`.
 Shared-subscription filters match the filter string literally. Iterator mode
@@ -69,7 +72,7 @@ synchronous hook returning an awaitable is reported as a `TypeError`; MQTTium
 does not await or implicitly schedule that result.
 
 The callback reference is captured when the lifecycle notification is recorded.
-They execute separately from the message worker, after the triggering protocol
+They execute on their own serialized task, after the triggering protocol
 effect and connection locks have been released. A successful `connect()` and
 `disconnect()` complete their network operation without waiting for hook
 completion. `on_connect` may subscribe or publish normally; it is not a barrier
@@ -99,8 +102,7 @@ hook to finish, then rechecks explicit user intent. Hook exceptions and a
 manually raised `CancelledError` are reported to the event loop's exception
 handler; actual task cancellation retires the hook.
 
-Lifecycle hooks have no implicit execution deadline. `callback_shutdown_timeout`
-applies only to message-callback draining. An unfinished `on_disconnect` can
+Lifecycle hooks have no implicit execution deadline. An unfinished `on_disconnect` can
 delay automatic retry; an explicit replacement can still proceed without waiting
 for that hook. Use an application deadline when a hook must finish within a
 fixed interval, and allow cancellation to propagate.

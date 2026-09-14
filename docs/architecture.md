@@ -95,30 +95,34 @@ stream. Capacity is returned after the corresponding queued data is drained.
 
 ### Application delivery
 
-`ApplicationDelivery` owns callback and iterator queues, byte reservations, the
-user-callback worker, shutdown/reset, and delivery statistics. It deliberately
-does not own MQTT state, transport state, or reconnect policy.
+`ApplicationDelivery` owns the bounded iterator queue, its byte reservations,
+inline synchronous callback invocation, stream close/reset, and delivery
+statistics. It deliberately does not own MQTT state, transport state, or
+reconnect policy.
 
 Topic-filtered callbacks live on `AsyncClient`. `TopicMatcher` chooses which
 application callable receives a delivered message; the protocol engine still
 emits undifferentiated MESSAGE effects and never imports dispatch code.
 Routes and the fallback freeze at the first connection attempt. Registration
 rejects async message callbacks before mutation. Matching synchronous routes
-execute in registration order within one worker job, with the fallback used
-when no route matches.
+execute in registration order for one message, with the fallback used when no
+route matches.
 
 The construction-time delivery mode selects either iterator or callback
-delivery. Every message has one byte charge and one queue item. Immediate
-admission checks the same byte/count bounds as waiting admission and avoids a
-timeout context when capacity is already available. Waiting admission uses one
-deadline across byte reservation and queue insertion.
+delivery. In iterator mode every message has one byte charge and one queue
+item. Immediate admission checks the same byte/count bounds as waiting
+admission and creates neither a coroutine nor a timeout context when capacity
+is already available. Waiting admission uses one deadline across byte
+reservation and queue insertion.
 
-Message callbacks use one serial worker. Exceptions and invalid awaitable
-returns are reported to the loop's exception handler; message bytes remain
-reserved until all matching callbacks finish. The worker counts actual callback
-invocations, including fan-out inside one message, and yields between bounded
-groups. The quantum is private and cannot preempt synchronous user code.
-Lifecycle hooks and publication receipts do not occupy the message queue.
+Message callbacks run synchronously on the delivering reader, with no queue,
+worker task or byte reservation in between: the reader hands the current lot
+to the application before it decodes the next batch, so callback cost is the
+backpressure. Exceptions and invalid awaitable returns are reported to the
+loop's exception handler and delivery continues. The reader counts callback
+invocations, including fan-out inside one message, and yields to the loop
+after each bounded group. The quantum is private and cannot preempt synchronous
+user code. Lifecycle hooks and publication receipts never touch delivery.
 
 Lifecycle hooks have one retained supervisor, one active child and at most one
 pending latest-state notification. Setup/teardown holds and a released lifecycle

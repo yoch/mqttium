@@ -9,6 +9,7 @@ import pytest
 from mqttium.api._delivery import ApplicationDelivery
 from mqttium.enums import MQTTProtocolVersion
 from mqttium.types import Message
+from tests.support import accept_message
 
 
 def _delivery(*, max_pending_delivery_bytes: int | None = None) -> ApplicationDelivery:
@@ -16,10 +17,8 @@ def _delivery(*, max_pending_delivery_bytes: int | None = None) -> ApplicationDe
         mode="iterator",
         protocol=MQTTProtocolVersion.MQTTv311,
         max_pending_messages=8,
-        max_pending_callbacks=1,
         max_pending_delivery_bytes=max_pending_delivery_bytes,
         delivery_timeout=1.0,
-        callback_shutdown_timeout=1.0,
     )
 
 
@@ -35,7 +34,7 @@ async def test_suspended_iterator_does_not_cross_explicit_stream_reset() -> None
     delivery.reset_stream()
 
     new_message = Message(topic="new/generation", payload=b"new")
-    await delivery.accept(new_message, None)
+    await accept_message(delivery, new_message)
 
     with pytest.raises(StopAsyncIteration):
         await asyncio.wait_for(pending, timeout=1.0)
@@ -55,14 +54,14 @@ async def test_reopen_without_reset_keeps_the_same_stream_generation() -> None:
     delivery.close()
     delivery.reopen()
     message = Message(topic="same/generation", payload=b"resume")
-    await delivery.accept(message, None)
+    await accept_message(delivery, message)
 
     assert await asyncio.wait_for(pending, timeout=1.0) == message
 
 
 async def test_reset_releases_discarded_accounting_exactly_once() -> None:
     delivery = _delivery(max_pending_delivery_bytes=4096)
-    await delivery.accept(Message(topic="old", payload=b"x"), None)
+    await accept_message(delivery, Message(topic="old", payload=b"x"))
     assert delivery.pending_bytes == 4
 
     delivery.close()
@@ -81,7 +80,7 @@ async def test_never_started_iterator_cannot_consume_replacement_generation(crea
     delivery.close()
     delivery.reset_stream()
     message = Message(topic="new", payload=b"value")
-    await delivery.accept(message, None)
+    await accept_message(delivery, message)
     charged = delivery.pending_bytes
     with pytest.raises(StopAsyncIteration):
         await asyncio.wait_for(anext(old), 1)
@@ -94,11 +93,11 @@ async def test_never_started_iterator_cannot_consume_replacement_generation(crea
 async def test_iterator_paused_after_yield_stays_in_old_generation():
     delivery = _delivery()
     old = delivery.messages()
-    await delivery.accept(Message(topic="old", payload=b"first"), None)
+    await accept_message(delivery, Message(topic="old", payload=b"first"))
     assert (await anext(old)).topic == "old"
     delivery.close()
     delivery.reset_stream()
-    await delivery.accept(Message(topic="new", payload=b"second"), None)
+    await accept_message(delivery, Message(topic="new", payload=b"second"))
     with pytest.raises(StopAsyncIteration):
         await anext(old)
     assert (await anext(delivery.messages())).topic == "new"

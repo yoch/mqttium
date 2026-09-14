@@ -96,9 +96,16 @@ async def _cancellation_and_shutdown_smoke(host: str, port: int) -> None:
             snapshot.tasks.keepalive,
             snapshot.tasks.reconnect,
             snapshot.tasks.effect_flush,
-            snapshot.tasks.callback_worker,
         )
     )
+    # The lifecycle supervisor runs after the disconnect transition by contract
+    # and retires itself once the (absent) hook has been dispatched.
+    for _ in range(100):
+        if not client.stats().tasks.lifecycle:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("lifecycle supervisor did not retire after disconnect")
     assert snapshot.receipts.publish == 0
     assert snapshot.receipts.subscribe == 0
     assert snapshot.receipts.unsubscribe == 0

@@ -598,7 +598,6 @@ class _RuntimeHarness:
             ),
             "max_outbound_messages": 1,
             "max_outbound_bytes": 4096,
-            "max_pending_callbacks": 4,
             "message_delivery": "callback",
             "keepalive": 0,
         }
@@ -1070,13 +1069,10 @@ class _RuntimeHarness:
             )
         elif action == "callbacks_drained":
             await self._wait_until(
-                lambda: (
-                    self.client.stats().delivery.callback_queued == 0
-                    and all(
-                        tracked.task.done()
-                        for tracked in self.tasks
-                        if tracked.label == "callback-application"
-                    )
+                lambda: all(
+                    tracked.task.done()
+                    for tracked in self.tasks
+                    if tracked.label == "callback-application"
                 ),
                 "callback queue did not drain",
             )
@@ -1149,10 +1145,10 @@ class _RuntimeHarness:
             )
         assert 0 <= stats.inbound.inflight <= stats.inbound.receive_maximum
         assert stats.delivery.pending_bytes >= 0
-        callback_task = self.client._delivery.callback_task
         if self.callback_epoch == stats.connection_epoch and self.client.is_connected:
-            assert callback_task is not None and not callback_task.done(), (
-                "callback self-cancellation terminated the connection callback worker"
+            reader = self.client._reader_task
+            assert reader is not None and not reader.done(), (
+                "callback self-cancellation terminated the delivering reader"
             )
 
         if self.transports:
@@ -1316,7 +1312,6 @@ class _RuntimeHarness:
                 self.client._reconnect_task,
                 self.client._effect_pump.task,
                 self.client._write_pump.task,
-                self.client._delivery.callback_task,
                 self.client._lifecycle_hooks.task,
                 self.client._lifecycle_hooks.hook_task,
             )

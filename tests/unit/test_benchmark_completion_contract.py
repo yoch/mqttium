@@ -54,7 +54,7 @@ async def test_writer_capacity_phase_completes_exact_receipt_count(qos, monkeypa
         assert len(broker.publishes) == 129
         assert all(packet.qos == qos and packet.payload == b"owned" for packet in broker.publishes)
         assert not client._receipts
-        assert client._delivery.callback_task is None
+        assert client._delivery.callback_invocations == 0
         assert client._write_pump.queued_bytes == 0
     finally:
         await client.disconnect()

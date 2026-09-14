@@ -11,6 +11,7 @@ from mqttium.enums import MQTTProtocolVersion
 from mqttium.errors import MessageDeliveryError
 from mqttium.protocol.engine import EffectKind, EngineEffect
 from mqttium.types import Message, Properties
+from tests.support import apply_delivery_effect, deliver_message
 
 
 def _effect(topic: str, payload: bytes) -> EngineEffect:
@@ -26,17 +27,12 @@ async def test_iterator_delivery_waits_for_shared_byte_capacity() -> None:
         max_pending_delivery_bytes=logical_size,
     )
 
-    await client._apply_delivery_effect(
-        EngineEffect(EffectKind.MESSAGE, first), epoch=client._connection_epoch
-    )
-    blocked = asyncio.create_task(
-        client._apply_delivery_effect(
-            _effect("delivery/other", b"x"), epoch=client._connection_epoch
-        )
-    )
+    await deliver_message(client, first)
+    blocked = asyncio.create_task(apply_delivery_effect(client, _effect("delivery/other", b"x")))
     await asyncio.sleep(0)
 
     assert not blocked.done()
+    assert client.stats().delivery.waiters == 1
     assert client.stats().delivery.pending_bytes == logical_size
     assert client._delivery.messages_queue.qsize() == 1
 
@@ -49,13 +45,13 @@ async def test_iterator_delivery_waits_for_shared_byte_capacity() -> None:
     await stream.aclose()
 
 
-async def test_callback_delivery_releases_bytes_after_callback_finishes() -> None:
+async def test_callback_delivery_charges_no_bytes() -> None:
     finished = asyncio.Event()
     message = Message(topic="delivery/callback", payload=b"payload")
     logical_size = len(message.topic) + len(message.payload)
     client = AsyncClient(
         message_delivery="callback",
-        max_pending_delivery_bytes=logical_size,
+        max_pending_delivery_bytes=logical_size - 1,
     )
 
     def callback(received: Message) -> None:
@@ -63,15 +59,14 @@ async def test_callback_delivery_releases_bytes_after_callback_finishes() -> Non
         finished.set()
 
     client.on_message = callback
-    await client._apply_delivery_effect(
-        EngineEffect(EffectKind.MESSAGE, message), epoch=client._connection_epoch
-    )
-    await finished.wait()
-    await asyncio.wait_for(client._delivery.callback_queue.join(), timeout=1.0)
+    await deliver_message(client, message)
+    assert finished.is_set()
+    await deliver_message(client, message)
 
+    assert client.stats().delivery.callback_invocations == 2
     assert client.stats().delivery.pending_bytes == 0
-    assert client.stats().delivery.pending_high_water_bytes == logical_size
-    await client._delivery.shutdown_callbacks(drain=False)
+    assert client.stats().delivery.pending_high_water_bytes == 0
+    assert client.stats().delivery.waiters == 0
 
 
 async def test_single_message_larger_than_delivery_budget_fails_explicitly() -> None:
@@ -81,9 +76,7 @@ async def test_single_message_larger_than_delivery_budget_fails_explicitly() -> 
     )
 
     with pytest.raises(MessageDeliveryError, match="exceeding limit"):
-        await client._apply_delivery_effect(
-            _effect("topic", b"payload"), epoch=client._connection_epoch
-        )
+        await apply_delivery_effect(client, _effect("topic", b"payload"))
 
     assert client.stats().delivery.pending_bytes == 0
     assert client._delivery.messages_queue.empty()
@@ -98,19 +91,11 @@ async def test_delivery_budget_wakes_multiple_waiters_without_overcommit() -> No
         max_pending_delivery_bytes=logical_size,
     )
 
-    await client._apply_delivery_effect(
-        EngineEffect(EffectKind.MESSAGE, messages[0]), epoch=client._connection_epoch
-    )
-    blocked = {
-        asyncio.create_task(
-            client._apply_delivery_effect(
-                EngineEffect(EffectKind.MESSAGE, message), epoch=client._connection_epoch
-            )
-        )
-        for message in messages[1:]
-    }
+    await deliver_message(client, messages[0])
+    blocked = {asyncio.create_task(deliver_message(client, message)) for message in messages[1:]}
     await asyncio.sleep(0)
     assert not any(task.done() for task in blocked)
+    assert client.stats().delivery.waiters == 2
 
     stream = client.messages()
     assert await anext(stream) is messages[0]
@@ -151,9 +136,7 @@ async def test_mqtt5_publish_without_properties_is_accounted() -> None:
     client = _byte_budget_client(MQTTProtocolVersion.MQTTv5)
     message = Message(topic="small/topic", payload=b"payload", properties=Properties())
 
-    await client._apply_delivery_effect(
-        EngineEffect(EffectKind.MESSAGE, message), epoch=client._connection_epoch
-    )
+    await deliver_message(client, message)
 
     assert client.stats().delivery.pending_bytes == len(message.topic) + len(message.payload)
     assert client._delivery.messages_queue.qsize() == 1
@@ -167,9 +150,7 @@ async def test_mqtt5_publish_with_properties_stays_exactly_accounted() -> None:
     )
     message = Message(topic="small/topic", payload=b"payload", properties=properties)
 
-    await client._apply_delivery_effect(
-        EngineEffect(EffectKind.MESSAGE, message), epoch=client._connection_epoch
-    )
+    await deliver_message(client, message)
 
     assert client.stats().delivery.pending_bytes == client._delivery.logical_size(message)
     assert client.stats().delivery.pending_bytes > len(message.topic) + len(message.payload)
@@ -179,9 +160,7 @@ async def test_mqtt311_delivery_is_accounted() -> None:
     client = _byte_budget_client(MQTTProtocolVersion.MQTTv311)
     message = Message(topic="small/topic", payload=b"payload")
 
-    await client._apply_delivery_effect(
-        EngineEffect(EffectKind.MESSAGE, message), epoch=client._connection_epoch
-    )
+    await deliver_message(client, message)
 
     assert client.stats().delivery.pending_bytes == len(message.topic) + len(message.payload)
     assert client._delivery.messages_queue.qsize() == 1
@@ -195,8 +174,6 @@ async def test_small_budget_accounts_property_less_mqtt5() -> None:
     )
     message = Message(topic="small/topic", payload=b"payload", properties=Properties())
 
-    await client._apply_delivery_effect(
-        EngineEffect(EffectKind.MESSAGE, message), epoch=client._connection_epoch
-    )
+    await deliver_message(client, message)
 
     assert client.stats().delivery.pending_bytes == len(message.topic) + len(message.payload)

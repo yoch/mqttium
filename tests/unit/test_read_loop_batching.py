@@ -209,7 +209,8 @@ async def test_qos2_filling_window_after_autoack_forces_handoff() -> None:
 
     assert handled == 3
     assert next_calls == 4
-    # Two handoff boundaries, the confirming empty decode and QoS 2's
-    # persisted delivery mark each acquire the engine lock before teardown.
-    assert acquisitions == 4 + TEARDOWN_ACQUISITIONS
+    # Two handoff boundaries and the confirming empty decode each acquire the
+    # engine lock before teardown. QoS 2's persisted delivery mark runs on the
+    # reader while the lock is free, so it costs no acquisition.
+    assert acquisitions == 3 + TEARDOWN_ACQUISITIONS
     assert not isinstance(client._disconnect_exc, ProtocolError)

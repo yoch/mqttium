@@ -195,21 +195,22 @@ It distinguishes work that should wait from work that can never fit.
 
 ## Application delivery
 
-`ApplicationDelivery` owns delivery queues, byte reservations and one serial
-callback worker. Iterator (default) and callback are exclusive. Each message
-has one byte charge and one queue job; matching routes run in registration
-order within that job and release bytes after all routes finish. Queue capacity
-bounds waiting jobs, with at most one active worker job. A producer waiting for
-a queue slot retains its byte reservation under the same byte budget.
+`ApplicationDelivery` owns the bounded iterator queue and its byte
+reservations, and runs synchronous callbacks inline. Iterator (default) and
+callback are exclusive. In iterator mode each message has one byte charge and
+one queue item, released when the iterator yields the message; the reader
+waits for byte and queue capacity under one `delivery_timeout` deadline.
 
-Message callbacks are synchronous-only and execute exclusively in the bounded
-message worker. Registration rejects async functions and async callable objects
-before mutation. Returning an awaitable is reported as a callback `TypeError`;
-MQTTium does not await it or create a detached task. Ordinary failures are
-isolated per invocation. The private fairness quantum counts actual callback
-invocations, including routes inside one message. A partially dispatched message
-retains its reservation until all routes finish; completed messages release
-credits before a boundary yield. Synchronous user code cannot be preempted.
+Message callbacks are synchronous-only and execute on the reader that delivered
+the message, after the protocol lock is released and before the reader decodes
+further packets. There is no callback queue, worker task or byte reservation.
+Registration rejects async functions and async callable objects before
+mutation. Returning an awaitable is reported as a callback `TypeError`; MQTTium
+does not await it or create a detached task. Ordinary failures are isolated per
+invocation; a `CancelledError` raised by user code is reported unless the reader
+itself is being cancelled. The private fairness quantum counts actual callback
+invocations, including routes inside one message, and yields at the following
+message boundary. Synchronous user code cannot be preempted.
 
 `on_publish` is removed: receipts settle without message-queue admission.
 `on_connect` and `on_disconnect` use separate bounded lifecycle ownership, after
@@ -225,13 +226,14 @@ Authentication alone remains awaited as protocol work with `auth_timeout`.
 `delivery_timeout=None` has no deadline. A positive timeout covers both byte
 reservation and queue insertion with one deadline. Timeout or an impossible
 message raises `MessageDeliveryError`, releases acquired credits and leaves
-persisted delivery state unmarked. A delivered mark denotes queue acceptance,
-not completed application processing.
+persisted delivery state unmarked. A delivered mark denotes queue acceptance
+in iterator mode and completed callback invocation in callback mode.
 
-When byte and queue capacity are immediately available, `try_accept()` performs
-the same reservation and queue transfer without a timeout context. Persisted
-marks follow queue acceptance under the engine lock and retain fail-stop
-semantics; no user callback executes under that lock.
+`accept()` returns `None` after an immediate handoff and an awaitable only for
+the waiting path or the fairness yield, so the common case creates no
+coroutine. Persisted marks follow the handoff and retain fail-stop semantics;
+they run synchronously when the engine lock is free and otherwise acquire it.
+No user callback executes under that lock.
 
 `EffectPump` owns only protocol work. A reader-owned `DeliveryLane` holds MESSAGE,
 DECODED_MESSAGE and CONTINUE_INBOUND_REPLAY. Each bounded lot records an epoch

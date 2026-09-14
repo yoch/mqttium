@@ -741,10 +741,7 @@ class _PressureHarness(v1._RuntimeHarness):
             self.operations.append(operation.render())
             self.checkpoints.append("callbacks_drained")
             await self._wait_until(
-                lambda: (
-                    self.callback_attempted == self.callback_expected
-                    and self.client.stats().delivery.callback_queued == 0
-                ),
+                lambda: self.callback_attempted == self.callback_expected,
                 "callback deliveries did not drain",
             )
         elif actor == "checkpoint" and action in (

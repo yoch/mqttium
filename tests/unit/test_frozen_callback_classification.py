@@ -10,9 +10,8 @@ import pytest
 from mqttium.api import AsyncClient
 from mqttium.enums import PacketType, QoS
 from mqttium.packets import PubCompPacket, PublishPacket, PubRecPacket
-from mqttium.protocol.effects import EffectKind, EngineEffect
 from mqttium.types import Message
-from tests.support import ScriptedBrokerTransport, transport_factory
+from tests.support import ScriptedBrokerTransport, deliver_message, transport_factory
 
 
 @pytest.mark.parametrize(
@@ -78,11 +77,7 @@ async def test_frozen_callbacks_are_not_reclassified_after_connect(monkeypatch, 
         for _ in range(2):
             assert client.on_message is callback
             for topic in ("t/exact", "fallback"):
-                await client._apply_delivery_effect(
-                    EngineEffect(EffectKind.MESSAGE, Message(topic=topic, payload=topic.encode())),
-                    epoch=client._connection_epoch,
-                )
-            await client._delivery.callback_queue.join()
+                await deliver_message(client, Message(topic=topic, payload=topic.encode()))
             await client.disconnect()
             client._transport_factory = transport_factory(ScriptedBrokerTransport())
             await client.connect("fake")
@@ -122,11 +117,7 @@ async def test_frozen_bad_callback_is_isolated_with_original_identity(kind):
     client._transport_factory = transport_factory(ScriptedBrokerTransport())
     try:
         await client.connect("fake")
-        await client._apply_delivery_effect(
-            EngineEffect(EffectKind.MESSAGE, Message(topic="t/a", payload=b"x")),
-            epoch=client._connection_epoch,
-        )
-        await client._delivery.callback_queue.join()
+        await deliver_message(client, Message(topic="t/a", payload=b"x"))
         assert seen == ["later route"]
         assert len(errors) == 1
         assert errors[0]["callback"] is bad
@@ -138,7 +129,7 @@ async def test_frozen_bad_callback_is_isolated_with_original_identity(kind):
         loop.set_exception_handler(previous)
 
 
-async def test_receipts_complete_without_starting_callback_worker():
+async def test_receipts_complete_without_invoking_message_callbacks():
     class CompletionBroker(ScriptedBrokerTransport):
         def handle_packet(self, raw):
             super().handle_packet(raw)
@@ -159,8 +150,8 @@ async def test_receipts_complete_without_starting_callback_worker():
         for qos in (0, 1, 2):
             receipt = await client.publish("t", b"x", qos=qos)
             await asyncio.wait_for(receipt.wait(), 1)
-        assert client._delivery.callback_task is None
-        assert client._delivery.callback_queue.empty()
+        assert client._delivery.callback_invocations == 0
+        assert client.stats().delivery.callback_invocations == 0
     finally:
         await client.disconnect()
 

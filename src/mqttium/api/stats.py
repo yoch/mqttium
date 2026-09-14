@@ -18,7 +18,7 @@ class TaskStats:
     keepalive: bool
     reconnect: bool
     effect_flush: bool
-    callback_worker: bool
+    lifecycle: bool
 
 
 @dataclass(slots=True, frozen=True)
@@ -77,12 +77,15 @@ class DecoderStats:
 
 @dataclass(slots=True, frozen=True)
 class DeliveryStats:
-    """Application-delivery queue occupancy, limits, and high-water values."""
+    """Application-delivery queue occupancy, limits, and high-water values.
+
+    ``callback_invocations`` counts synchronous message callbacks run by the
+    reader over the client's lifetime, including topic-route fan-out.
+    """
 
     iterator_queued: int
     iterator_limit: int
-    callback_queued: int
-    callback_limit: int
+    callback_invocations: int
     pending_bytes: int
     pending_high_water_bytes: int
     max_bytes: int | None

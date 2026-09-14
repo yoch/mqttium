@@ -8,17 +8,16 @@ import pytest
 
 from mqttium.api._delivery import MessageRoute
 from mqttium.api.async_client import AsyncClient
-from mqttium.protocol.engine import EffectKind, EngineEffect
 from mqttium.types import Message
+from tests.support import accept_message
 
 
 async def _deliver(client: AsyncClient, topic: str, target=None) -> None:
-    await client._delivery.accept(
+    await accept_message(
+        client._delivery,
         Message(topic=topic, payload=b"x"),
         client._message_callback if target is None else target,
     )
-    await client._delivery.callback_queue.join()
-    await client._delivery.shutdown_callbacks(drain=False)
 
 
 def test_inactive_filters_keep_direct_on_message_pointer() -> None:
@@ -62,24 +61,24 @@ async def test_captured_router_survives_last_filter_removal() -> None:
     assert seen == ["default:sensors/1"]
 
 
-async def test_overlapping_sync_callbacks_use_worker() -> None:
+async def test_overlapping_sync_callbacks_run_inline_on_delivering_task() -> None:
     client = AsyncClient(message_delivery="callback")
     seen = []
+    delivering = asyncio.current_task()
 
     def callback(message):
         assert not client._engine_lock.locked()
-        assert asyncio.current_task() is client._delivery.callback_task
+        assert asyncio.current_task() is delivering
         seen.append(message.topic)
 
     client.message_callback_add("inline/#", callback)
     client.message_callback_add("inline/+", callback)
-    async with client._engine_lock:
-        effect = EngineEffect(EffectKind.MESSAGE, Message("inline/message", b"x"))
-        assert client._delivery.try_accept(effect.data, client._message_callback)
-        assert seen == []
-    await client._delivery.callback_queue.join()
+    pending = client._delivery.accept(Message("inline/message", b"x"), client._message_callback)
+    assert pending is None
     assert seen == ["inline/message", "inline/message"]
-    await client._delivery.shutdown_callbacks(drain=False)
+    assert client._delivery.callback_invocations == 2
+    assert client._delivery.pending_bytes == 0
+    assert client._delivery.messages_queue.empty()
 
 
 @pytest.mark.parametrize("kind", ["error", "cancelled", "awaitable"])
@@ -140,22 +139,6 @@ async def test_failure_reports_original_callback_and_continues(kind, position) -
         }[kind],
     )
     assert all(coroutine.cr_frame is None for coroutine in returned)
-
-
-async def test_route_fanout_is_one_owned_worker_job_in_registration_order() -> None:
-    client = AsyncClient(message_delivery="callback")
-    seen = []
-    inner = Message("inner", b"next")
-
-    def first(_message):
-        seen.append("first")
-        assert client._delivery.try_accept(inner, lambda _: seen.append("reentrant"))
-
-    client.message_callback_add("outer/#", first)
-    client.message_callback_add("outer/+", lambda _: seen.append("second"))
-    await _deliver(client, "outer/x")
-    assert seen == ["first", "second", "reentrant"]
-    assert client._delivery.pending_bytes == 0
 
 
 async def test_filter_mutation_before_connection_keeps_current_match_snapshot() -> None:

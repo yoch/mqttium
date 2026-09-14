@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from tests.support import stored_record
+from tests.support import deliver_message, stored_record
 
 
 from mqttium.api.async_client import AsyncClient
@@ -15,7 +15,7 @@ from mqttium.enums import (
 )
 from mqttium.persistence.memory import MemoryInflightStore
 from mqttium.persistence.sqlite import SqliteInflightStore
-from mqttium.protocol.engine import EffectKind, EngineConfig, EngineEffect, ProtocolEngine
+from mqttium.protocol.engine import EffectKind, EngineConfig, ProtocolEngine
 from mqttium.types import InboundMessage, Message
 from mqttium.codec.buffer import RawPacket
 
@@ -135,10 +135,7 @@ async def test_client_marks_persisted_message_delivered_after_api_delivery() -> 
         dup=True,
     )
 
-    await client._apply_delivery_effect(
-        EngineEffect(EffectKind.MESSAGE, message),
-        epoch=client._connection_epoch,
-    )
+    await deliver_message(client, message)
 
     persisted = store.get_in(9)
     assert persisted is not None and persisted.delivered is True

@@ -42,14 +42,15 @@ MQTT subscriptions remain independent and can change while connected.
 
 Matched callbacks run in registration order instead of the `on_message`
 fallback. Replacing a filter before connection keeps its position. Every
-message is one worker job even when several filters match. Each callback failure
-is isolated so subsequent matches can still run.
+matching callback runs for one message before the next message is delivered.
+Each callback failure is isolated so subsequent matches can still run.
 
 Message callbacks are synchronous-only. Async functions and async callable
 objects are rejected before registration changes; a synchronous function that
 returns an awaitable is reported as a callback `TypeError`. Message callbacks
-run in one bounded worker outside protocol locks. The worker's private quantum
-counts actual callback invocations, including matching routes inside one job.
+run synchronously on the delivering reader outside protocol locks. The reader's
+private fairness quantum counts actual callback invocations, including matching
+routes inside one message.
 A synchronous callback that blocks the event loop cannot be preempted.
 
 `on_publish` is removed; individual and aggregate receipts are the publication

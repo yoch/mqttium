@@ -16,6 +16,7 @@ upgrade of applications or historical databases.
 | Async `on_message` or topic callbacks | Short synchronous callbacks, or asynchronous processing through `messages()` |
 | `on_publish` | `PublishReceipt` / `PublishBatchReceipt` |
 | Connect/publish notifications sharing the message worker | Separate lifecycle hooks; publication uses receipts |
+| Bounded callback worker: `max_pending_callbacks`, `callback_shutdown_timeout`, `DeliveryStats.callback_queued`/`callback_limit`, `TaskStats.callback_worker` | Callbacks run inline on the reader; `DeliveryStats.callback_invocations`, `TaskStats.lifecycle` |
 | Callback route changes during/after connection | Configure before first attempt; a new client is required for different routes |
 | `publish(..., nowait=True)` | Synchronous `publish_nowait(...)`, without `await` |
 | `publish_backpressure` / `PublishBackpressure` | Choose `publish()` or `publish_nowait()` per operation |
@@ -108,13 +109,16 @@ overflow policy, or separate receiving and publishing connections. A bounded
 queue whose consumer stops draining while waiting for publication can recreate
 the same dependency. See [bidirectional pressure](operations.md#bidirectional-pressure).
 
-Every callback message is charged once until all matching handlers finish.
-The queue holds at most `max_pending_callbacks` waiting jobs plus one active
-job. Fairness counts callback invocations inside each message's route fan-out.
-Iterator delivery releases the charge when the iterator yields the message.
-A positive `delivery_timeout` covers byte reservation and queue admission;
-`None` has no deadline. `MessageDeliveryError` reports timeout or an impossible
-message size.
+Callback messages are no longer queued: matching synchronous callbacks run on
+the delivering reader, and the reader decodes no further packet until they
+return. `max_pending_callbacks` and `callback_shutdown_timeout` are removed from
+the constructor; `DeliveryStats.callback_queued` and `callback_limit` are
+replaced by `callback_invocations`, and `TaskStats.callback_worker` by
+`lifecycle`. Fairness still counts callback invocations inside each message's
+route fan-out. Iterator delivery charges each message once and releases the
+charge when the iterator yields it. A positive `delivery_timeout` covers
+iterator byte reservation and queue admission; `None` has no deadline.
+`MessageDeliveryError` reports timeout or an impossible message size.
 
 Replace `on_publish` with receipt observation. Keep lifecycle setup asynchronous:
 
