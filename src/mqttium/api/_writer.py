@@ -583,7 +583,5 @@ class WritePump:
         # capacity usable. Invalidate this writer generation and wake all
         # parked producers so they fail instead of waiting on a task that
         # has already exited.
-        if self._latency_failure is None:
-            self.epoch += 1
-        await self.wake_waiters()
+        await self.advance_epoch(self.epoch + (1 if self._latency_failure is None else 0))
         await self.on_failure(failure)
