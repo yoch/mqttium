@@ -20,7 +20,7 @@ Status meanings:
 
 | Report | Status | Use instead or interpretation |
 | --- | --- | --- |
-| [INLINE-CALLBACK-DELIVERY-2026-09-14](INLINE-CALLBACK-DELIVERY-2026-09-14.md) | Current evidence | Callback worker removal, coroutine-free delivery handoff, decode/publish hot-path trim, open-PR disposition, RSS bytecode harness bias, and RC14 diagnostics/network comparison on a cloud host; no parity or merge claim |
+| [INLINE-CALLBACK-DELIVERY-2026-09-14](INLINE-CALLBACK-DELIVERY-2026-09-14.md) | Current evidence | Callback worker removal, coroutine-free delivery handoff, decode/publish hot-path trim, open-PR disposition, RSS bytecode harness bias, and RC14 diagnostics/network comparison on a cloud host; no parity or merge claim. Addendum: profiler-free receive-path stage decomposition, plain `RawPacket` prototype, and closure of the receive hot-path question |
 | [DATA-PLANE-LIFECYCLE-2026-09-14](DATA-PLANE-LIFECYCLE-2026-09-14.md) | Superseded | Synchronous callbacks, separate lifecycle ownership and progressive QoS0 admission remain the accepted contract; its runtime, worker-based delivery and RC14 performance figures are superseded by the inline callback delivery report |
 | [LEAN-NATIVE-API-AND-FAIRNESS-2026-09-13](LEAN-NATIVE-API-AND-FAIRNESS-2026-09-13.md) | Superseded | Earlier callback contract and source; use the data-plane/lifecycle follow-up for the current candidate and direct RC14 comparison. This report remains the historical original-main comparison |
 | [LEAN-NATIVE-FOLLOWUP-2026-09-10](LEAN-NATIVE-FOLLOWUP-2026-09-10.md) | Superseded | Earlier source and measurements; use the API and fairness follow-up for the corrected candidate and new post-interruption evidence |

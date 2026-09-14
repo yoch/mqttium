@@ -203,3 +203,66 @@ For long lots the profile of the network worker (MQTT 3.1.1, QoS 0, callback, on
 - The bytecode RSS bias in `lean_native_compare.py` is fixed and recorded in harness metadata. Earlier RSS figures from any campaign that mixed cached and uncached checkouts under this harness should be treated as suspect; rate, CPU and latency figures are unaffected.
 - Not established: parity with RC14. Long-lot `publish_many()` throughput remains 12–32% below RC14 on this host with wide AA ranges in the QoS 0 cells, and callback reception remains about one third slower in the in-memory diagnostic. The maintainer's calibrated host and the 96-cell grid should be rerun on the pushed tree before any merge decision; the previous report's paced QoS 0 overload failure was not re-executed here and stays open.
 - Candidate next step with the best evidence-to-risk ratio: decode QoS 0 PUBLISH bodies inside the engine's raw-packet path so no intermediate `RawPacket` copy is made for the most common inbound packet, measured with the same two harnesses.
+
+## 11. Addendum, same day: receive-path stage decomposition and one prototype
+
+An external review of sections 1–10 asked for three things: freeze the architecture listed in section 1 (synchronous message callbacks and routes, `messages()` for asynchronous consumption, receipts instead of `on_publish`, the separate asynchronous lifecycle supervisor, `DeliveryLane`, frozen routing, immutable properties, progressive prefixes); explain the callback-reception deficit stage by stage, `decoder → packet → inbound engine → effect creation and separation → DeliveryLane → ApplicationDelivery`, without a second scheduler, without borrowed payloads crossing layers and without a second reception model, keeping at most two or three local prototypes that each show a gain clearly outside noise behind a simple invariant; and stop work on QoS 1 prefix batching and on a 256 quantum. The first and third are adopted as the branch's working rule. This addendum records the second.
+
+The review also listed "reader-inline callbacks" among the prohibitions. Section 1's design is kept: it removes the callback scheduler rather than adding one beside it, which is what the hybrid proposals in section 2 did. The property given up is stated once more so it is not lost: with a worker, decoding could run up to 1,024 queued invocations ahead of application callbacks; without it, a lot's callbacks return before the next lot is decoded. For synchronous callbacks that buffer carried no throughput (a blocked event loop is blocked whichever task runs the callback), and the already-decoded protocol effects of a lot are still applied before its messages (section 1, `DeliveryLane` fence).
+
+### Method
+
+Stage times were taken without a profiler: one 256-message lot of MQTT 3.1.1 QoS 0 PUBLISH packets (topic `a/b`, 256-byte payload, 261-byte remaining length, 264 bytes on the wire), repeated 300 times, median per message, worker pinned to logical CPU 1. Stages are measured on their real objects: a fresh `IncrementalDecoder`, a connected `AsyncClient` in callback mode with a counting `on_message`, the client's own engine, pump and lane. The full-path row pushes the lot through the scripted transport and waits for the 256th callback, which is the same measurement as the `receive_callback` diagnostic. Single-object costs were taken with `timeit` (minimum of five rounds of 200,000). Trees: the section 7 candidate `05ab4657` and RC14 `c194597`.
+
+### Decomposition
+
+| Stage (ns per message) | Candidate `05ab4657` | RC14 `c194597` |
+| --- | ---: | ---: |
+| A. `decoder.feed` + `next_packet`: VBI, bounds, owned body copy, `RawPacket` | 1,060 | 1,058 |
+| B. `decode_qos0_message_v311(RawPacket)`: topic, payload copy, `Message` | 1,157 | 1,357 |
+| C. `engine.handle_raw` + `take_effects` (includes B; dispatch, `EngineEffect`) | 1,620 | 1,848 |
+| A′. RC14 direct path: `peek_packet_bounds` + borrowed decode + consume | — | 1,546 |
+| D. `collect_from_engine` + `DeliveryLane.collect` (partition), as C+D − C | 113 | — |
+| E. `DeliveryLane.drain`: no-op pump drain, `_apply_delivery_effect`, `accept`, callback | 388 | — |
+| F. Full reader path, transport read to callback | 3,414 | 2,208 |
+
+A + C + D + E = 3,181 ns; the 230 ns to F is the reader loop itself (engine lock, store batch context, pump drain, event wake). RC14's F − A′ = 662 ns is its batch enqueue, worker round and loop.
+
+Against RC14 the 1,206 ns difference decomposes as: A + B versus A′, **+671 ns** (materialising an owned `RawPacket` and decoding it in a second pass, against one borrowed pass with a single payload copy); dispatch, effect object and partition, C − B + D, **+576 ns** (RC14's direct path bypasses the engine entirely); delivery and loop, E + 230 versus 662, **−44 ns** (the inline handoff is cheaper than RC14's batch enqueue and worker). No stage is anomalous; each is a few Python calls. Section 9's attribution stands, now with numbers that carry no profiler weighting.
+
+Single-object costs behind the stages: `Message(...)` **651 ns**; `RawPacket(...)` **270 ns** frozen against **88 ns** as a plain slotted dataclass; `unpack_utf8` 243 ns; `bytes()` of a 265-byte `bytearray` slice 81 ns; `PacketType.from_byte` 62 ns; `validate_received_publish_topic` 45 ns; payload slice 28 ns. A frozen dataclass assigns each field through `object.__setattr__`, so its construction costs about three times a plain one.
+
+Two findings follow. The largest single cost, `Message` construction, is common to both arms (19% of the candidate path, 29% of RC14's) and is the public immutability contract; it is not part of the deficit and is not changed under the freeze. The second, `RawPacket`, is an Internal container built once per inbound packet of any type that paid the same premium with no contract behind it: nothing mutates or hashes it, and the owned-bytes guarantee (invariant 3) is a property of `remaining`, not of the container.
+
+### Prototype: plain `RawPacket`
+
+Commit `0b3c467` drops `frozen=True` from `RawPacket` and keeps `slots=True`; the branch `src` tree becomes `0e80e4a1f9570adc46cfb9ac55e4ef1cbfffd1e3` (measurement snapshot `8408c0d`, byte-identical excluding `__pycache__`). Stage A in three alternated pairs against `05ab4657`: 940–958 → 705–725 ns; full path 3,300–3,331 → 3,075–3,141 ns, **−6% to −7%** with pair spreads of about 30 ns. Diagnostics (`diag_rawpacket.json`, SHA256 `730fd3ee637736051d4aaaf7740e38dec84aa1d7430ee2c5f4082c06ae66ef1a`, 3 AB / 1 AA, 08:29 UTC), A = `05ab4657`, B = `0e80e4a1`:
+
+| Scenario | Count | Rate change | Cycle ratios | CPU/operation change |
+| --- | ---: | ---: | --- | ---: |
+| Callback reception | 136,226 | **+9.83%** | 1.075, 1.149, 1.073 | −8.92% |
+| Iterator reception | 113,065 | **+6.37%** | 1.067, 1.064, 1.061 | −5.98% |
+| QoS 0 batch publication | 80,075 | +6.21% | 1.046, 1.084, 1.057 | −5.84% |
+| QoS 1 batch publication | 19,463 | +2.19% | 1.035, 1.012, 1.019 | −2.14% |
+
+Every cycle ratio is above 1. Publication improves because the scripted transport's broker emulation decodes with the same decoder (section 6, scenario semantics); on a real broker only the ACK decode benefits, which is the QoS 1 row. Unit and project suites (1,861), the three fuzzers at 20,000 iterations, the Hypothesis and stateful suites, `ruff`, `mypy` and `bandit` pass on the tree.
+
+Against RC14 (`diag_rc14_vs_cand3.json`, SHA256 `eb19b8b5061734122ae20b1773d34200f7bb18f945543369ad55ef5153404f22`, 08:34 UTC), same method as section 7:
+
+| Scenario | Count | Rate change | AA | CPU/operation change | Section 7 |
+| --- | ---: | ---: | --- | ---: | ---: |
+| Callback reception | 196,291 | **−28.78%** | 0.998 | +40.42% | −33.41% |
+| Iterator reception | 112,342 | **+7.95%** | 0.994 | −7.37% | +0.99% |
+| QoS 0 batch publication | 85,654 | −1.12% | 1.005 | +1.13% | −6.49% |
+| QoS 1 batch publication | 20,199 | −5.24% | 0.998 | +5.52% | −6.37% |
+| Callback delivery only | 200,000 | +610.09% | 1.009 | −85.92% | +602.69% |
+
+### Prototypes considered and not taken
+
+- Inlining `validate_raw_packet`'s PUBLISH branch into `handle_raw`, or removing the `_emit` indirection: about 90 ns each, bought with a duplicated validation rule or a second effect-construction site. Below the bar.
+- Section 10's suggested next step, decoding QoS 0 PUBLISH bodies inside the engine's raw-packet path so no `RawPacket` is built for that type: it is a second decode entry into the engine for one packet type, which is a second reception model by another name. Withdrawn.
+- A borrowed `RawPacket.remaining` view into the decoder buffer: violates invariant 3. Not attempted.
+
+### Position
+
+The receive hot-path question is closed on this branch. The remaining callback-reception deficit against RC14, about 29% on this host, is accounted for to within 50 ns by the two invariant-bearing steps RC14's direct path skips: the owned packet boundary (+671 ns) and the engine dispatch with its effect object (+576 ns). The delivery side is already cheaper than RC14's. No further local prototype shows a gain outside noise behind an invariant simpler than the one it replaces. The `Message` construction cost is recorded as the one item that would pay on both arms if its contract were ever revisited; that is a separate decision, not part of this branch.
