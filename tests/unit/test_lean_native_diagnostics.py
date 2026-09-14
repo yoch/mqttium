@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import importlib
+import importlib.util
+import sys
 from pathlib import Path
 
 import pytest
@@ -14,6 +16,23 @@ from tests.support import ScriptedBrokerTransport
 def diagnostics(monkeypatch):
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "benchmarks"))
     return importlib.import_module("lean_native_diagnostics")
+
+
+def test_diagnostic_import_does_not_require_unix_resource(monkeypatch):
+    benchmarks = Path(__file__).resolve().parents[2] / "benchmarks"
+    monkeypatch.syspath_prepend(str(benchmarks))
+    monkeypatch.setitem(sys.modules, "resource", None)
+    # Re-execute the diagnostic and any network harness import, even if another
+    # test already loaded them on a platform that provides resource.
+    monkeypatch.delitem(sys.modules, "lean_native_compare", raising=False)
+    spec = importlib.util.spec_from_file_location(
+        "portable_lean_native_diagnostics", benchmarks / "lean_native_diagnostics.py"
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert callable(module._phase)
+    assert "lean_native_compare" not in sys.modules
 
 
 @pytest.mark.parametrize("scenario", ["publish_qos1_individual", "publish_qos1_batch"])

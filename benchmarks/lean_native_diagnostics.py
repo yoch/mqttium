@@ -24,8 +24,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from lean_native_compare import _git
-
 SCENARIOS = (
     "publish",
     "receive_iterator",
@@ -38,6 +36,10 @@ SCENARIOS = (
     "publish_qos1_individual",
     "publish_qos1_batch",
 )
+
+
+def _git(root: Path, *args: str) -> str:
+    return subprocess.check_output(["git", "-C", str(root), *args], text=True).strip()
 
 
 async def _phase(scenario: str, count: int) -> dict[str, Any]:  # noqa: C901 - scenarios share teardown
