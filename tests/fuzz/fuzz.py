@@ -469,7 +469,17 @@ def _check_engine_invariants(engine: ProtocolEngine) -> None:
         for page in engine.store.out_summary_pages()
         for summary in page
     )
-    assert all(message.topic for message in outbound), "durable alias record lost canonical topic"
+    # Only records still in their PUBLISH phase carry application data: the
+    # store compacts topic, payload and properties away once PUBREC arrives,
+    # because a PUBREL replay needs the packet identifier alone.
+    publish_phase = (
+        OutboundQoSState.QUEUED,
+        OutboundQoSState.WAIT_PUBACK,
+        OutboundQoSState.WAIT_PUBREC,
+    )
+    assert all(message.topic for message in outbound if message.state in publish_phase), (
+        "durable alias record lost canonical topic"
+    )
     outbound_mids = {msg.mid for msg in outbound}
     expected_mids = outbound_mids | set(engine._pending_sub_mids)
     assert len(engine.packet_ids) == len(expected_mids), "packet-id count mismatch"
