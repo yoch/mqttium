@@ -12,12 +12,12 @@ from mqttium.types import Message
 
 
 async def _deliver(client: AsyncClient, payload: bytes = b"x") -> None:
-    await client._apply_effect(
+    await client._apply_delivery_effect(
         EngineEffect(
             kind=EffectKind.MESSAGE,
             data=Message(topic="delivery/test", payload=payload),
         ),
-        nowait=False,
+        epoch=client._connection_epoch,
     )
 
 

@@ -15,12 +15,12 @@ from mqttium.types import Message
 async def _deliver(
     client: AsyncClient, topic: str = "delivery/test", payload: bytes = b"x"
 ) -> None:
-    await client._apply_effect(
+    await client._apply_delivery_effect(
         EngineEffect(
             kind=EffectKind.MESSAGE,
             data=Message(topic=topic, payload=payload),
         ),
-        nowait=False,
+        epoch=client._connection_epoch,
     )
 
 
@@ -157,19 +157,17 @@ async def test_iterator_mode_ignores_topic_callbacks() -> None:
     assert (await anext(client.messages())).topic == "sensors/1"
 
 
-async def test_async_topic_callback() -> None:
+async def test_async_topic_callback_is_rejected_before_route_mutation() -> None:
     client = AsyncClient(client_id="topic-async", message_delivery="callback")
     seen: list[str] = []
 
     async def on_sensor(message: Message) -> None:
         seen.append(message.topic)
 
-    client.message_callback_add("sensors/+", on_sensor)
-    await _deliver(client, "sensors/1")
-    await asyncio.wait_for(client._delivery.callback_queue.join(), timeout=1.0)
-
-    assert seen == ["sensors/1"]
-    await client._delivery.shutdown_callbacks(drain=False)
+    with pytest.raises(TypeError, match=r"synchronous; use messages\(\)"):
+        client.message_callback_add("sensors/+", on_sensor)
+    assert client._topic_callbacks is None
+    assert seen == []
 
 
 async def test_sync_topic_callback_runs_in_worker_outside_engine_lock() -> None:
@@ -191,26 +189,28 @@ async def test_sync_topic_callback_runs_in_worker_outside_engine_lock() -> None:
     client._effect_pump.drain_inline()
     assert seen == []
     await client._effect_pump.drain()
+    await client._delivery_lane.drain()
     await client._delivery.callback_queue.join()
     assert seen == [("inline/message", False)]
     assert client._delivery.callback_task is not None
     await client._delivery.shutdown_callbacks(drain=False)
 
 
-async def test_overlapping_async_topic_callbacks_run_in_order() -> None:
+async def test_async_replacement_preserves_existing_sync_route() -> None:
     client = AsyncClient(client_id="topic-overlap-async", message_delivery="callback")
     seen: list[str] = []
 
-    async def on_hash(message: Message) -> None:
+    def on_hash(message: Message) -> None:
         seen.append(f"hash:{message.topic}")
 
     async def on_plus(message: Message) -> None:
         seen.append(f"plus:{message.topic}")
 
     client.message_callback_add("sensors/#", on_hash)
-    client.message_callback_add("sensors/+", on_plus)
+    with pytest.raises(TypeError, match="synchronous"):
+        client.message_callback_add("sensors/#", on_plus)
     await _deliver(client, "sensors/1")
     await asyncio.wait_for(client._delivery.callback_queue.join(), timeout=1.0)
 
-    assert seen == ["hash:sensors/1", "plus:sensors/1"]
+    assert seen == ["hash:sensors/1"]
     await client._delivery.shutdown_callbacks(drain=False)

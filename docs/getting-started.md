@@ -42,7 +42,7 @@ async def main() -> None:
     received: asyncio.Future[Message] = asyncio.get_running_loop().create_future()
     client = AsyncClient("getting-started", message_delivery="callback")
 
-    async def on_message(message: Message) -> None:
+    def on_message(message: Message) -> None:
         if not received.done():
             received.set_result(message)
 
@@ -65,10 +65,11 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-The callback may be synchronous or asynchronous. MQTTium isolates callback
-exceptions from protocol processing and reports them to the event loop's
-exception handler. A callback should still avoid blocking the loop; move
-blocking work to an executor or another service boundary.
+Message callbacks must be short synchronous functions. MQTTium rejects async
+message handlers at registration and reports callback failures to the event
+loop's exception handler. Use `messages()` for asynchronous processing; a sync
+callback may offer work to an application queue with an explicit overflow policy.
+A synchronous callback cannot be preempted, so it must not block the event loop.
 
 ## What a publish receipt means
 
@@ -110,11 +111,11 @@ async for message in client.messages():
     await process(message)
 ```
 
-Callback delivery is useful for event-oriented applications:
+Callback delivery is useful for short synchronous handlers:
 
 ```python
-async def on_message(message) -> None:
-    await process(message)
+def on_message(message) -> None:
+    record_message(message)
 
 
 client = AsyncClient(message_delivery="callback")

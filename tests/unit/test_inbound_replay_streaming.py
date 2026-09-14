@@ -263,7 +263,7 @@ def test_delivered_cursor_held_record_is_consistent_across_stores(
         store.close()
 
 
-async def test_client_replays_every_message_through_the_effect_pump() -> None:
+async def test_reader_delivers_every_replay_message_in_bounded_batches() -> None:
     store = MemoryInflightStore()
     fill(store, 400)
     client = AsyncClient(
@@ -278,6 +278,7 @@ async def test_client_replays_every_message_through_the_effect_pump() -> None:
         resume(client._engine)
         client._effect_pump.collect_from_engine()
     await client._effect_pump.drain()
+    await client._delivery_lane.drain()
 
     received = []
     while not client._delivery.messages_queue.empty():
@@ -324,6 +325,7 @@ async def test_replay_peak_memory_stays_proportional_to_one_batch(tmp_path: Path
             resume(client._engine)
             client._effect_pump.collect_from_engine()
         await client._effect_pump.drain()
+        await client._delivery_lane.drain()
         await asyncio.wait_for(consumer, timeout=30.0)
         _current, peak = tracemalloc.get_traced_memory()
     finally:

@@ -1,4 +1,4 @@
-"""Bounded callback work gives other ready tasks a turn without losing jobs."""
+"""Actual callback invocations, including route fan-out, share a bounded quantum."""
 
 from __future__ import annotations
 
@@ -6,7 +6,8 @@ import asyncio
 
 import pytest
 
-from mqttium.api._delivery import ApplicationDelivery
+from mqttium.api import AsyncClient
+from mqttium.api._delivery import ApplicationDelivery, _CALLBACK_QUANTUM
 from mqttium.enums import MQTTProtocolVersion
 from mqttium.types import Message
 from tests.unit.test_callback_lifecycle_regressions import task_factory as task_factory
@@ -25,122 +26,106 @@ def _delivery():
 
 
 @pytest.mark.parametrize("jobs", [63, 64, 65, 1025])
-@pytest.mark.parametrize("kind", ["sync", "async", "error", "cancelled"])
+@pytest.mark.parametrize("kind", ["sync", "error", "cancelled"])
 async def test_ready_heartbeat_runs_within_one_quantum(task_factory, jobs, kind):
     delivery = _delivery()
-    gate, entered, ready = (asyncio.Event() for _ in range(3))
-    seen, heartbeat_counts, errors = [], [], []
+    seen, errors = [], []
     loop = asyncio.get_running_loop()
-    old_handler = loop.get_exception_handler()
+    heartbeat = loop.create_future()
+    previous = loop.get_exception_handler()
     loop.set_exception_handler(lambda _, context: errors.append(context["exception"]))
-
-    async def first():
-        entered.set()
-        await gate.wait()
 
     def callback(message):
         seen.append(int(message.payload))
+        if len(seen) == 1:
+            loop.call_soon(lambda: heartbeat.set_result(len(seen)))
         if len(seen) == 63 and kind == "error":
             raise ValueError("isolated callback fault")
         if len(seen) == 63 and kind == "cancelled":
             raise asyncio.CancelledError("user callback cancellation")
 
-    async def async_callback(message):
-        callback(message)
-
-    async def heartbeat():
-        await ready.wait()
-        heartbeat_counts.append(len(seen))
-
-    task = None
     try:
-        await delivery.enqueue_callback(first)
-        await asyncio.wait_for(entered.wait(), 1)
-        for index in range(jobs - 1):
-            await delivery.accept(
-                Message("t", str(index).encode()), async_callback if kind == "async" else callback
-            )
-        task = asyncio.create_task(heartbeat())
-        await asyncio.sleep(0)  # Both task factories have parked the heartbeat.
-        gate.set()  # Queue the worker before the heartbeat.
-        ready.set()
-        await asyncio.wait_for(task, 1)
-        assert heartbeat_counts == [min(jobs - 1, 63)]
+        for index in range(jobs):
+            assert delivery.try_accept(Message("t", str(index).encode()), callback)
+        assert seen == []  # Also true with eager task creation.
+        assert await asyncio.wait_for(heartbeat, 1) == min(jobs, _CALLBACK_QUANTUM)
         await asyncio.wait_for(delivery.callback_queue.join(), 1)
-        assert seen == list(range(jobs - 1))
+        assert seen == list(range(jobs))
         assert delivery.pending_bytes == 0
-        assert len(errors) == int(jobs >= 64 and kind in ("error", "cancelled"))
+        assert len(errors) == int(kind in ("error", "cancelled"))
     finally:
-        gate.set()
-        ready.set()
-        if task is not None and not task.done():
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
         await delivery.shutdown_callbacks(drain=False)
-        loop.set_exception_handler(old_handler)
-    assert delivery.callback_task is None
+        loop.set_exception_handler(previous)
 
 
-async def test_worker_cancelled_at_quantum_releases_remaining_jobs(task_factory):
-    delivery = _delivery()
-    gate, entered, ready = (asyncio.Event() for _ in range(3))
+@pytest.mark.parametrize("fanout", [_CALLBACK_QUANTUM + 1, 500])
+async def test_route_fanout_yields_and_retains_message_bytes(task_factory, fanout):
+    client = AsyncClient(message_delivery="callback")
+    loop = asyncio.get_running_loop()
+    heartbeat = loop.create_future()
+    seen, charges = [], []
+    message = Message("/".join(["t"] * 9), b"owned")
+    logical_size = client._delivery.logical_size(message)
+
+    def callback(_message):
+        seen.append(len(seen))
+        charges.append(client._delivery.pending_bytes)
+        if len(seen) == 1:
+            loop.call_soon(
+                lambda: heartbeat.set_result((len(seen), client._delivery.pending_bytes))
+            )
+
+    for index in range(fanout):
+        topic_filter = "/".join("+" if index & (1 << bit) else "t" for bit in range(9))
+        client.message_callback_add(topic_filter, callback)
+    client._freeze_message_routes()
+    assert client._delivery.try_accept(message, client._message_callback)
+    assert await asyncio.wait_for(heartbeat, 1) == (_CALLBACK_QUANTUM, logical_size)
+    await asyncio.wait_for(client._delivery.callback_queue.join(), 1)
+    assert seen == list(range(fanout))
+    assert charges == [logical_size] * fanout
+    assert client._delivery.pending_bytes == 0
+    await client._delivery.shutdown_callbacks(drain=False)
+
+
+@pytest.mark.parametrize("routed", [False, True])
+async def test_worker_cancelled_at_quantum_releases_current_and_queued_work(task_factory, routed):
+    client = AsyncClient(message_delivery="callback")
+    delivery = client._delivery
+    loop = asyncio.get_running_loop()
+    cancelled = loop.create_future()
     seen = []
 
-    async def first():
-        entered.set()
-        await gate.wait()
-
-    async def cancel_at_yield():
-        await ready.wait()
-        assert len(seen) == 63
+    def cancel_worker():
+        assert len(seen) == _CALLBACK_QUANTUM
         delivery.callback_task.cancel()
+        cancelled.set_result(None)
 
-    await delivery.enqueue_callback(first)
-    await asyncio.wait_for(entered.wait(), 1)
-    for index in range(128):
-        await delivery.accept(Message("t", bytes([index])), lambda message: seen.append(message))
-    canceller = asyncio.create_task(cancel_at_yield())
-    await asyncio.sleep(0)
-    gate.set()
-    ready.set()
-    await asyncio.wait_for(canceller, 1)
+    def callback(_message):
+        seen.append(len(seen))
+        if len(seen) == 1:
+            loop.call_soon(cancel_worker)
+
+    if routed:
+        for index in range(_CALLBACK_QUANTUM * 2):
+            topic_filter = "/".join("+" if index & (1 << bit) else "t" for bit in range(9))
+            client.message_callback_add(topic_filter, callback)
+        message = Message("/".join(["t"] * 9), b"payload")
+        assert delivery.try_accept(message, client._message_callback)
+        assert delivery.try_accept(message, client._message_callback)
+    else:
+        for index in range(_CALLBACK_QUANTUM * 2):
+            assert delivery.try_accept(Message("t", str(index).encode()), callback)
+    await asyncio.wait_for(cancelled, 1)
     await delivery.shutdown_callbacks(drain=False)
     await asyncio.wait_for(delivery.callback_queue.join(), 1)
-    assert len(seen) == 63
+    assert len(seen) == _CALLBACK_QUANTUM
     assert delivery.pending_bytes == 0
     assert delivery.callback_task is None
-
-
-@pytest.mark.parametrize("reopen", [False, True])
-async def test_self_stop_at_quantum_preserves_reopen_ownership(task_factory, reopen):
-    delivery = _delivery()
-    entered, gate = asyncio.Event(), asyncio.Event()
-    seen = []
-
-    async def callback(message):
-        index = int(message.payload)
-        seen.append(index)
-        if index == 0:
-            entered.set()
-            await gate.wait()
-        if index == 63:
-            worker = asyncio.current_task()
-            await delivery.shutdown_callbacks(drain=False)
-            if reopen:
-                delivery.reopen()
-                assert delivery.callback_task is worker
-                await delivery.accept(Message("t", b"999"), callback)
-
-    await delivery.accept(Message("t", b"0"), callback)
-    await asyncio.wait_for(entered.wait(), 1)
-    for index in range(1, 129):
-        await delivery.accept(Message("t", str(index).encode()), callback)
-    gate.set()
+    delivery.reopen()
+    replacement = []
+    assert delivery.try_accept(Message("t", b"new"), lambda message: replacement.append(message))
     await asyncio.wait_for(delivery.callback_queue.join(), 1)
-    await delivery.shutdown_callbacks(drain=False)
-    assert seen == list(range(64)) + ([999] if reopen else [])
+    assert [message.payload for message in replacement] == [b"new"]
     assert delivery.pending_bytes == 0
-    assert delivery.callback_task is None
+    await delivery.shutdown_callbacks(drain=False)

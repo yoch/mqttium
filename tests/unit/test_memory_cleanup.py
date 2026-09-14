@@ -141,7 +141,9 @@ async def test_reset_message_stream_releases_abandoned_iterator_delivery() -> No
         max_pending_delivery_bytes=1024,
     )
     message = Message(topic="reset", payload=b"payload")
-    await client._apply_effect(EngineEffect(EffectKind.MESSAGE, message), nowait=False)
+    await client._apply_delivery_effect(
+        EngineEffect(EffectKind.MESSAGE, message), client._connection_epoch
+    )
     assert client.stats().delivery.pending_bytes > 0
     client._delivery.closed.set()
 

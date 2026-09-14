@@ -24,7 +24,11 @@ Application
 AsyncClient ─────────────── ApplicationDelivery
     │                         callbacks, iterator queues, delivery budget
     ├── EffectPump
-    │     ordered application of protocol effects
+    │     ordered protocol work and completion fences
+    ├── DeliveryLane
+    │     reader-owned bounded message/replay lot
+    ├── LifecycleHooks
+    │     one active hook and one latest pending notification
     ├── WritePump
     │     bounded, single-owner transport writer
     └── ProtocolEngine
@@ -49,24 +53,34 @@ tested without a broker.
 
 ### Effects
 
-`EffectPump` owns the effect deque, connection epoch, progress counters, and
-flush worker. A single immediately applicable effect is handled inline; it does
-not allocate a task or enter the deque. Suspended work is tagged with the
-connection epoch so effects from an old transport cannot modify a new session.
-Ready message effects transfer directly to their bounded destination when no
-durable delivery mark is required. Full destinations and persisted delivery
-marks retain asynchronous transfer. All message and publish notifications run
-on the serial callback worker, outside engine critical sections.
+`EffectPump` owns protocol-effect ordering, connection epochs, completion
+counters and its flush task. SEND/SEND_ACK keep wire order before dependent
+application-visible work. A ready single protocol effect can apply inline.
+MESSAGE, DECODED_MESSAGE and CONTINUE_INBOUND_REPLAY belong to a separate
+reader-owned `DeliveryLane`, which creates no task of its own.
 
-Ready QoS 0 publications can use outbound validation and writer admission
-without creating general effects. This requires a current connection and empty
-effect pipeline, and reserves callback capacity before handoff. The receipt
-exists before the writer can send bytes; topic aliases commit only after writer
-acceptance. An asynchronous clean refusal falls back to ordinary admission;
-writer exceptions propagate without retry. Batch publication shares this path
-without a unit receipt: its aggregate receipt registers the element before
-handoff. Only a clean refusal rolls back the registration; an exception retains
-the committed prefix. Admission remains progressive.
+Each delivery lot carries its epoch and the protocol completion target captured
+at collection. The reader waits for that target before accepting the lot;
+unrelated later protocol work does not extend the barrier. Delivery then runs
+outside engine and effect locks. The reader completes its bounded lot before
+reading or decoding another, so queue and byte pressure still reaches the
+transport. A replay continuation follows the preceding MESSAGE batch and may
+request only the next bounded page after those messages are accepted and marked.
+Direct engine consumers retain their existing continuation-pumping contract.
+
+Outgoing publication, manual acknowledgements and subscription/authentication
+operations wait for protocol work only. A full delivery queue cannot block
+already-decoded terminal results or queue outgoing SENDs behind MESSAGE. An ACK
+not yet read remains subject to bounded ingress pressure; the reader does not
+scan ahead or retain an unbounded message backlog to find it.
+
+Ready QoS 0 publications use outbound validation and writer admission without
+general effects when the current protocol/writer state permits it. A full
+application-delivery queue alone does not disable this path. The receipt or
+aggregate entry exists before bytes reach the writer; topic aliases commit only
+after writer acceptance. A clean refusal can fall back to ordinary admission.
+An ambiguous write exception retains the registered prefix and is never retried.
+Batch publication does not allocate per-item receipts.
 
 ### Network writes
 
@@ -88,9 +102,10 @@ does not own MQTT state, transport state, or reconnect policy.
 Topic-filtered callbacks live on `AsyncClient`. `TopicMatcher` chooses which
 application callable receives a delivered message; the protocol engine still
 emits undifferentiated MESSAGE effects and never imports dispatch code.
-Routes and the fallback freeze at the first connection attempt. Their callable
-forms are classified once; matching routes execute in registration order within
-one worker job, with the fallback used when no route matches.
+Routes and the fallback freeze at the first connection attempt. Registration
+rejects async message callbacks before mutation. Matching synchronous routes
+execute in registration order within one worker job, with the fallback used
+when no route matches.
 
 The construction-time delivery mode selects either iterator or callback
 delivery. Every message has one byte charge and one queue item. Immediate
@@ -98,14 +113,22 @@ admission checks the same byte/count bounds as waiting admission and avoids a
 timeout context when capacity is already available. Waiting admission uses one
 deadline across byte reservation and queue insertion.
 
-All message, connect and publish callbacks use one serial worker, including
-synchronous callables. Callback exceptions are isolated from protocol state;
-message bytes remain reserved until all matching callbacks finish. An active
-callback may disconnect and reconnect: reopening discards old queued work and
-lets the same worker serve the replacement connection.
-After every 64 completed jobs, the worker explicitly yields if queued work
-remains. It releases the completed job's bytes and queue credit before yielding;
-the initial suspension and connection ownership rules still apply.
+Message callbacks use one serial worker. Exceptions and invalid awaitable
+returns are reported to the loop's exception handler; message bytes remain
+reserved until all matching callbacks finish. The worker counts actual callback
+invocations, including fan-out inside one message, and yields between bounded
+groups. The quantum is private and cannot preempt synchronous user code.
+Lifecycle hooks and publication receipts do not occupy the message queue.
+
+Lifecycle hooks have one retained supervisor, one active child and at most one
+pending latest-state notification. Setup/teardown holds and a released lifecycle
+lock prevent hook start inside the triggering connection operation. New states
+replace obsolete pending states. External lifecycle operations cancel obsolete
+active hooks; an operation awaited directly by the current hook preserves its
+caller. The supervisor reaps the old child before invoking its successor.
+Network operations do not wait for hook completion, and `on_connect` does not
+hold incoming delivery. Automatic reconnect waits for `on_disconnect`, then
+rechecks explicit intent. AUTH retains its separate protocol timeout.
 
 `messages()` captures the delivery generation when called, even if its returned
 iterator is never advanced. Closing and reopening delivery leaves old iterators
@@ -137,8 +160,12 @@ The lifecycle preserves these generation invariants:
 - only the reader performs application-visible teardown for a live generation;
 - the reader retires that generation's keepalive task before reconnect can
   install a replacement task reference;
-- every deferred effect and writer admission is tagged with that generation's
-  epoch and is discarded or rejected after an epoch advance;
+- every deferred protocol/delivery effect and writer admission is tagged with
+  its epoch and is discarded or rejected after an epoch advance;
+- teardown cancels the reader if it is waiting for delivery capacity, releases
+  its untransferred reservation and discards unaccepted delivery effects;
+- protocol/writer failure preserves its first cause and wakes delivery-bound
+  readers; closing only the transport cannot release a queue-capacity wait;
 - terminal teardown settles each receipt at most once and wakes every producer
   blocked on protocol or writer capacity;
 - reconnectable loss keeps the application message stream open, while terminal
@@ -209,11 +236,12 @@ reason code.
 - QoS 2: PUBCOMP received.
 
 A receipt is registered before effects can reach the writer. An ACK can free
-a packet identifier while its completion effect still waits behind delivery.
-The adapter drains old effects before another awaited publication can commit;
-`publish_nowait()` refuses while effects remain pending. This settles the old
-receipt before the identifier is registered for a later publication, including
-within one aggregate batch receipt.
+a packet identifier before the adapter applies its terminal result. The
+adapter drains prior protocol effects before another awaited publication can
+commit; `publish_nowait()` refuses pending protocol transfer. This preserves
+settlement before MID reuse, including within one aggregate. Individual and
+batch MID receipt registries remain separate. Unrelated application delivery
+cannot hold these terminal results behind a MESSAGE effect.
 
 ## Persistence
 
@@ -256,8 +284,8 @@ where required.
 `asyncio.Queue.put_nowait()`. It shares native admission and receipt creation
 without pretending to be thread-safe.
 
-`publish_nowait()` refuses before mutation if pending effects or full bounded
-queues prevent immediate transfer. `publish()` waits for bounded transfer;
+`publish_nowait()` refuses before mutation if pending protocol effects or
+protocol/writer capacity prevent immediate transfer. `publish()` waits for bounded transfer;
 cancellation after commitment can leave a publication active.
 
 ## Observability
@@ -286,7 +314,9 @@ Optimisation is allowed only after correctness and ownership are preserved.
 Changes to the engine or client must cover malformed incremental input, all QoS
 transitions and duplicates, packet-identifier exhaustion and reuse, reconnect
 with and without a broker session, persistence rollback, bounded admission,
-callback reentrancy, transport failure, and clean shutdown.
+sync callback error/fan-out isolation, lifecycle-hook reentrancy and
+coalescing, blocked delivery with independent protocol progress, transport
+failure, and clean shutdown.
 
 Protocol fuzzing, memory thresholds, broker integration, and installed-artifact
 smokes complement the unit suite. See [`stability.md`](stability.md).

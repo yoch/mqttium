@@ -35,23 +35,13 @@ class _WireBroker(ScriptedBrokerTransport):
 
 @pytest.mark.parametrize("nowait", [False, True])
 @pytest.mark.parametrize("protocol", [MQTTProtocolVersion.MQTTv311, MQTTProtocolVersion.MQTTv5])
-@pytest.mark.parametrize("notification", ["none", "sync", "async"])
 async def test_unit_qos0_skips_general_effects_and_receipt_precedes_wire(
-    monkeypatch, task_factory, nowait, protocol, notification
+    monkeypatch, task_factory, nowait, protocol
 ):
     client = AsyncClient("direct-unit", protocol=protocol)
     broker = _WireBroker(protocol)
     client._transport_factory = transport_factory(broker)
-    seen, created, at_wire = [], [], []
-
-    async def async_callback(mid, error):
-        await asyncio.sleep(0)
-        seen.append((mid, error))
-
-    if notification == "sync":
-        client.on_publish = lambda mid, error: seen.append((mid, error))
-    elif notification == "async":
-        client.on_publish = async_callback
+    created, at_wire = [], []
     real_receipt = client_module.PublishReceipt
 
     def create_receipt(*args, **kwargs):
@@ -66,7 +56,7 @@ async def test_unit_qos0_skips_general_effects_and_receipt_precedes_wire(
         await client.connect("fake")
         monkeypatch.setattr(client_module, "PublishReceipt", create_receipt)
         monkeypatch.setattr(type(client._engine.outbound), "queue_publish", forbid_general_queue)
-        broker.on_wire = lambda: at_wire.append((len(created), list(seen)))
+        broker.on_wire = lambda: at_wire.append(len(created))
         properties = (
             Properties({"user_property": (("key", "value"),)})
             if protocol == MQTTProtocolVersion.MQTTv5
@@ -76,16 +66,14 @@ async def test_unit_qos0_skips_general_effects_and_receipt_precedes_wire(
             receipt = client.publish_nowait("t", b"x", properties=properties)
         else:
             receipt = await client.publish("t", b"x", properties=properties)
-        assert seen == []
         assert created == [receipt]
         assert receipt.mid is None and receipt.is_done()
         assert not client._engine.has_pending_effects
         assert not client._effect_pump.pending
         await client._write_pump.join()
-        await client._delivery.callback_queue.join()
         assert len(broker.publishes) == 1
-        assert at_wire == [(1, [])]
-        assert seen == ([] if notification == "none" else [(None, None)])
+        assert at_wire == [1]
+        assert client._delivery.callback_task is None
     finally:
         await client.disconnect()
 
@@ -96,8 +84,6 @@ async def test_writer_exception_after_handoff_is_never_retried(monkeypatch, nowa
     broker = _WireBroker()
     client._transport_factory = transport_factory(broker)
     calls = []
-    seen = []
-    client.on_publish = lambda *args: seen.append(args)
     try:
         await client.connect("fake")
         enqueue = client._write_pump.try_enqueue
@@ -116,7 +102,7 @@ async def test_writer_exception_after_handoff_is_never_retried(monkeypatch, nowa
                     await client.publish("t", b"one")
         await client._write_pump.join()
         assert len(calls) == len(broker.publishes) == 1
-        assert not seen
+        assert client._delivery.callback_task is None
         assert not client._engine.has_pending_effects
         assert not client._effect_pump.pending
     finally:
@@ -146,12 +132,10 @@ async def test_async_clean_writer_refusal_uses_existing_admission_path(monkeypat
         await client.disconnect()
 
 
-async def test_nowait_clean_refusal_does_not_commit_alias_or_notification(monkeypatch):
+async def test_nowait_clean_refusal_does_not_commit_alias_or_wire(monkeypatch):
     client = AsyncClient("nowait-clean-refusal", protocol=MQTTProtocolVersion.MQTTv5)
     broker = _WireBroker(MQTTProtocolVersion.MQTTv5)
     client._transport_factory = transport_factory(broker)
-    notifications = []
-    client.on_publish = lambda *args: notifications.append(args)
     try:
         await client.connect("fake")
         client._engine.negotiated = replace(client.negotiated, topic_alias_maximum=2)
@@ -164,7 +148,7 @@ async def test_nowait_clean_refusal_does_not_commit_alias_or_notification(monkey
         assert not client._engine.has_pending_effects
         assert not client._effect_pump.pending
         assert client._delivery.callback_queue.empty()
-        assert not notifications
+        assert client._delivery.callback_task is None
     finally:
         await client.disconnect()
 
@@ -238,31 +222,20 @@ async def test_publish_many_shares_direct_path_without_unit_receipts(monkeypatch
 
 
 @pytest.mark.parametrize("protocol", [MQTTProtocolVersion.MQTTv311, MQTTProtocolVersion.MQTTv5])
-@pytest.mark.parametrize("notification", ["none", "sync", "async"])
 async def test_batch_registration_precedes_wire_without_unit_receipts(
-    monkeypatch, task_factory, protocol, notification
+    monkeypatch, task_factory, protocol
 ):
     from mqttium.api.models import PublishBatchReceipt
 
     client = AsyncClient("batch-before-wire", protocol=protocol)
     broker = _WireBroker(protocol)
     client._transport_factory = transport_factory(broker)
-    batch_seen, at_wire, notifications = [], [], []
+    batch_seen, at_wire = [], []
     original_register = PublishBatchReceipt._register
 
     def register(batch, mid):
         batch_seen.append(batch)
         original_register(batch, mid)
-
-    def callback(mid, reason):
-        assert not client._engine_lock.locked()
-        notifications.append((mid, reason))
-
-    async def async_callback(mid, reason):
-        callback(mid, reason)
-
-    if notification != "none":
-        client.on_publish = callback if notification == "sync" else async_callback
 
     def no_unit(*args, **kwargs):
         raise AssertionError("QoS 0 batch allocated an individual receipt")
@@ -277,15 +250,13 @@ async def test_batch_registration_precedes_wire_without_unit_receipts(
         monkeypatch.setattr(type(client._engine.outbound), "queue_publish", no_general)
         broker.on_wire = lambda: at_wire.append(batch_seen[-1].submitted)
         receipt = await client.publish_many(PublishMessage("t", bytes([i])) for i in range(8))
-        assert notifications == []
         await client._write_pump.join()
-        await client._delivery.callback_queue.join()
         assert receipt.submitted == receipt.completed == 8
         assert all(batch is receipt for batch in batch_seen)
         assert all(count >= index for index, count in enumerate(at_wire, 1))
         assert len(at_wire) == 8
         assert [packet.payload for packet in broker.publishes] == [bytes([i]) for i in range(8)]
-        assert notifications == ([] if notification == "none" else [(None, None)] * 8)
+        assert client._delivery.callback_task is None
     finally:
         await client.disconnect()
 
@@ -299,8 +270,7 @@ async def test_batch_partial_handoff_failure_keeps_prefix_and_never_retries(
     client = AsyncClient("batch-partial-write")
     broker = _WireBroker()
     client._transport_factory = transport_factory(broker)
-    consumed, attempts, notifications = [], [], []
-    client.on_publish = lambda *args: notifications.append(args)
+    consumed, attempts = [], []
 
     def messages():
         for index in range(4):
@@ -330,9 +300,8 @@ async def test_batch_partial_handoff_failure_keeps_prefix_and_never_retries(
         assert consumed == [0, 1]
         assert len(attempts) == 2
         await client._write_pump.join()
-        await client._delivery.callback_queue.join()
         assert [packet.payload for packet in broker.publishes] == [b"\x00", b"\x01"]
-        assert notifications == [(None, None)]
+        assert client._delivery.callback_task is None
         # The raised submission error reports the ambiguous handoff; the
         # attached receipt describes its already committed prefix, as before.
         await receipt.wait()

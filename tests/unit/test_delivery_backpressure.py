@@ -21,48 +21,45 @@ async def test_iterator_queue_timeout_is_explicit() -> None:
     client._delivery.messages_queue.put_nowait(Message(topic="full", payload=b"x"))
 
     with pytest.raises(MessageDeliveryError, match="Application delivery capacity"):
-        await client._apply_effect(
+        await client._apply_delivery_effect(
             EngineEffect(
                 kind=EffectKind.MESSAGE,
                 data=Message(topic="overflow", payload=b"x"),
             ),
-            nowait=False,
+            epoch=client._connection_epoch,
         )
 
 
-async def test_callback_queue_timeout_is_explicit_and_bounded() -> None:
+async def test_callback_queue_timeout_is_explicit_and_bounded(monkeypatch) -> None:
     client = AsyncClient(
         message_delivery="callback",
         max_pending_callbacks=1,
         delivery_timeout=0.01,
         callback_shutdown_timeout=0.01,
     )
-    started = asyncio.Event()
-    release = asyncio.Event()
-
-    async def slow(_message: Message) -> None:
-        started.set()
-        await release.wait()
-
-    await client._delivery.enqueue_callback(slow, Message(topic="one", payload=b"x"))
-    await started.wait()
-    await client._delivery.enqueue_callback(slow, Message(topic="two", payload=b"x"))
-
-    with pytest.raises(MessageDeliveryError, match="Callback delivery capacity"):
-        await client._delivery.enqueue_callback(slow, Message(topic="three", payload=b"x"))
-    await client._delivery.shutdown_callbacks(drain=False)
+    # Isolate admission from the worker: the queue remains saturated until the
+    # timeout, without requiring a suspending user callback.
+    monkeypatch.setattr(client._delivery, "ensure_callback_worker", lambda: None)
+    first = Message(topic="one", payload=b"x")
+    client.on_message = lambda _message: None
+    await client._delivery.accept(first, client._message_callback)
+    with pytest.raises(MessageDeliveryError, match="Application delivery capacity"):
+        await client._delivery.accept(Message("two", b"x"), client._message_callback)
+    assert client._delivery.callback_queue.qsize() == 1
+    assert client._delivery.pending_bytes == client._delivery.logical_size(first)
+    client._delivery._discard_callback_queue()
+    assert client._delivery.pending_bytes == 0
 
 
 async def test_callback_worker_preserves_order() -> None:
-    client = AsyncClient(max_pending_callbacks=8)
+    client = AsyncClient(message_delivery="callback", max_pending_callbacks=8)
     seen: list[int] = []
 
-    async def callback(value: int) -> None:
-        await asyncio.sleep(0)
-        seen.append(value)
+    def callback(message: Message) -> None:
+        seen.append(int(message.payload))
 
     for value in range(8):
-        await client._delivery.enqueue_callback(callback, value)
+        await client._delivery.accept(Message("t", str(value).encode()), callback)
     await asyncio.wait_for(client._delivery.callback_queue.join(), timeout=1.0)
 
     assert seen == list(range(8))
@@ -102,7 +99,8 @@ async def test_delivery_queue_fast_paths_avoid_timeout_task(
     def callback(_message: Message) -> None:
         called.set()
 
-    await client._delivery.enqueue_callback(callback, message)
+    client._delivery.mode = "callback"
+    await client._delivery.accept(message, callback)
     await client._delivery.callback_queue.join()
     assert called.is_set()
     await client._delivery.shutdown_callbacks(drain=False)

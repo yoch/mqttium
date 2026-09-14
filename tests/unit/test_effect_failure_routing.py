@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 
+from mqttium.api._delivery_lane import DeliveryLane
 from mqttium.api._effects import EffectPump
 from mqttium.errors import ProtocolError
 from mqttium.protocol.effects import EffectKind, EngineEffect
@@ -35,6 +36,7 @@ class _Owner:
         self._disconnect_exc: BaseException | None = None
         self._engine = _Engine(effects)
         self._connack_fut = None
+        self._delivery_lane = DeliveryLane(self)  # type: ignore[arg-type]
         self.failure = failure
         self.block_first = block_first
         self.applies = 0

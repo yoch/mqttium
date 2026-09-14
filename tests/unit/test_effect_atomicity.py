@@ -45,7 +45,7 @@ async def test_cancelled_backpressure_keeps_send_effect_for_same_connection() ->
 
 
 async def test_callback_exception_reaches_loop_exception_handler() -> None:
-    client = AsyncClient(client_id="callback-error")
+    client = AsyncClient(client_id="callback-error", message_delivery="callback")
     loop = asyncio.get_running_loop()
     contexts: list[dict[str, object]] = []
     previous = loop.get_exception_handler()
@@ -55,7 +55,7 @@ async def test_callback_exception_reaches_loop_exception_handler() -> None:
         raise RuntimeError("callback failed")
 
     try:
-        await client._delivery.enqueue_callback(fail, Message(topic="t", payload=b"x"))
+        await client._delivery.accept(Message(topic="t", payload=b"x"), fail)
         await asyncio.wait_for(client._delivery.callback_queue.join(), timeout=1.0)
         assert len(contexts) == 1
         assert isinstance(contexts[0].get("exception"), RuntimeError)
@@ -68,16 +68,15 @@ async def test_callback_exception_reaches_loop_exception_handler() -> None:
 async def test_force_close_stops_callback_worker() -> None:
     client = AsyncClient(
         client_id="callback-close",
+        message_delivery="callback",
         callback_shutdown_timeout=0.05,
     )
     started = asyncio.Event()
-    release = asyncio.Event()
 
-    async def slow(_message: Message) -> None:
+    def callback(_message: Message) -> None:
         started.set()
-        await release.wait()
 
-    await client._delivery.enqueue_callback(slow, Message(topic="t", payload=b"x"))
+    await client._delivery.accept(Message(topic="t", payload=b"x"), callback)
     await started.wait()
     assert client._delivery.callback_task is not None
 
@@ -130,20 +129,13 @@ async def test_scheduled_flush_records_wakeup_while_active() -> None:
             await release.wait()
 
     client._apply_effect = controlled_apply  # type: ignore[method-assign]
-    client._engine._emit(
-        EffectKind.MESSAGE,
-        Message(topic="first", payload=b"1", qos=1, mid=1),
-        requires_delivery_mark=True,
-    )
+    client._apply_effect_inline = lambda _effect, _epoch: False  # type: ignore[method-assign]
+    client._engine._emit(EffectKind.PINGRESP)
     client._effect_pump.collect_from_engine()
     client._effect_pump.schedule()
     await started.wait()
 
-    client._engine._emit(
-        EffectKind.MESSAGE,
-        Message(topic="second", payload=b"2", qos=1, mid=2),
-        requires_delivery_mark=True,
-    )
+    client._engine._emit(EffectKind.PINGRESP)
     client._effect_pump.collect_from_engine()
     client._effect_pump.schedule()
     release.set()
@@ -167,6 +159,11 @@ def test_effect_collection_stably_prioritizes_sends() -> None:
     assert [(effect.kind, effect.data) for effect in client._effect_pump.pending] == [
         (EffectKind.SEND, b"send-1"),
         (EffectKind.SEND, b"send-2"),
-        (EffectKind.MESSAGE, Message(topic="first", payload=b"1")),
         (EffectKind.PINGRESP, None),
+    ]
+    epoch, protocol_target, deliveries = client._delivery_lane.pending[0]
+    assert epoch == client._connection_epoch
+    assert protocol_target == 3
+    assert [(effect.kind, effect.data) for effect in deliveries] == [
+        (EffectKind.MESSAGE, Message(topic="first", payload=b"1"))
     ]

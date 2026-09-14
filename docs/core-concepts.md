@@ -69,9 +69,13 @@ old inflight exchanges safely and fails them explicitly. See
 
 ## Application delivery is bounded too
 
-Messages can be delivered through an async iterator (default) or callbacks. Slow
+Messages can be delivered through an async iterator (default) or short
+synchronous callbacks. Use the iterator for asynchronous processing. Slow
 application code consumes delivery capacity and eventually propagates pressure
-instead of growing memory without limit.
+instead of growing memory without limit. Already-decoded protocol completions
+and outgoing admission progress independently of a full delivery queue. An ACK
+still unread behind incoming data remains subject to transport backpressure;
+see [bidirectional pressure](operations.md#bidirectional-pressure).
 
 `manual_ack=True` delays inbound MQTT acknowledgement until
 `await client.ack(message)`. Manual MQTT acknowledgement is not an application

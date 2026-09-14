@@ -26,7 +26,7 @@ background thread.
       inherited_members: false
       heading_level: 2
 
-## State and callbacks
+## State, message callbacks and lifecycle hooks
 
 | Member | Meaning |
 | --- | --- |
@@ -34,29 +34,62 @@ background thread.
 | `is_connected` | Whether the client is currently connected |
 | `negotiated` | Broker-negotiated MQTT settings after CONNACK |
 | `effective_client_id` | Requested or broker-assigned client identifier |
-| `on_connect` | Sync or async callback after successful connection |
-| `on_disconnect` | Sync or async callback for disconnection |
-| `on_message` | Sync or async message callback |
-| `message_callback_add` / `message_callback_remove` | Topic-filtered message callbacks; matching filters run instead of `on_message` |
-| `on_publish` | Sync or async publish-completion callback |
-| `auth_handler` | Read-only MQTT 5 enhanced-authentication handler supplied at construction |
+| `on_connect` | Sync or async lifecycle hook after successful connection setup |
+| `on_disconnect` | Sync or async lifecycle hook after connection teardown |
+| `on_message` | Short synchronous message callback |
+| `message_callback_add` / `message_callback_remove` | Synchronous topic callbacks; matching filters run instead of `on_message` |
+| `auth_handler` | Read-only MQTT 5 protocol handler supplied at construction; sync or async |
 
-Callbacks execute outside protocol-engine critical sections. Declare synchronous
-callbacks with `def` and asynchronous callbacks with `async def`; a synchronous
-callable that returns an awaitable violates the callback contract and is reported
-as a callback `TypeError` rather than being scheduled implicitly. Synchronous
-callbacks must not block the event loop.
+`on_publish` is removed. Observe publication through `PublishReceipt` or
+`PublishBatchReceipt`; QoS 0 completion means writer admission, QoS 1 PUBACK,
+and QoS 2 PUBCOMP.
 
-`on_connect`, `on_publish` and messages always use one bounded worker. Each
-message occupies one job and holds its delivery bytes until its routes finish.
-Callback failures go to the event loop exception handler. `on_disconnect` and
-authentication are directly awaited outside critical sections.
+Declare message callbacks with `def`. Async functions and async callable objects
+are rejected before registration changes. A synchronous callback returning an
+awaitable violates the contract and is reported as a `TypeError`; MQTTium does
+not await or implicitly schedule that result. Message callbacks run only in one
+bounded worker, outside protocol critical sections. Each message occupies one
+job and retains its delivery bytes until all matching routes finish. The
+worker counts actual callback invocations, including route fan-out, and yields
+between bounded groups when work remains. Its private quantum is not a time
+limit: synchronous user code cannot be preempted.
 
-Matching `message_callback_add` filters run instead of `on_message`, in
-registration order. Shared-subscription filters match the filter string
-literally. Iterator-only delivery ignores callbacks, including
-topic filters. `on_message` and routes are frozen permanently on the first
-connection attempt; subscriptions can still change.
+Matching topic filters run in registration order instead of `on_message`.
+Shared-subscription filters match the filter string literally. Iterator mode
+ignores message callbacks and routes. `on_message` and the routes freeze
+permanently on the first connection attempt; subscriptions remain mutable.
+Use `messages()` for asynchronous processing or explicitly manage application
+work with its own bounds and overflow policy.
+
+### Lifecycle hooks
+
+`on_connect` and `on_disconnect` remain assignable sync-or-async hooks. Their
+callback reference is captured when the lifecycle notification is recorded.
+They execute separately from the message worker, after the triggering protocol
+effect and connection locks have been released. A successful `connect()` and
+`disconnect()` complete their network operation without waiting for hook
+completion. `on_connect` may subscribe or publish normally; it is not a barrier
+that delays already-available incoming messages until initialization finishes.
+Use an application signal if processing depends on that initialization.
+
+Lifecycle notifications describe the latest state, not a lossless transition
+log. MQTTium retains one active hook and at most one pending notification;
+newer state replaces obsolete pending state. An external connection replacement
+or disconnect cancels an obsolete active hook. A lifecycle operation awaited
+directly by that same hook preserves its caller, so `on_connect` can await
+`disconnect()` and `on_disconnect` can await a replacement `connect()`. An
+application-created task is a separate caller. Hooks must cooperate with
+cancellation; the next hook starts only after the previous hook has ended.
+
+`on_disconnect` runs after the old connection resources are retired, with the
+original cause or `None` for clean closure. Automatic retry waits for that
+hook to finish, then rechecks explicit user intent. Hook exceptions and a
+manually raised `CancelledError` are reported to the event loop's exception
+handler; actual task cancellation retires the hook.
+
+`auth_handler` is different: its response participates in AUTH, so MQTTium
+awaits it with `auth_timeout` and the existing protocol rules. Lifecycle
+reentrancy does not promise arbitrary reentrant operations from AUTH.
 
 ## Loop confinement
 

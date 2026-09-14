@@ -257,48 +257,22 @@ def _writer(scenario: str) -> ScenarioMeasurement:
     return asyncio.run(enqueue_async())
 
 
-def _native_publish(scenario: str) -> ScenarioMeasurement:
+def _native_publish(_scenario: str) -> ScenarioMeasurement:
     from mqttium.api.async_client import AsyncClient
     from mqttium.enums import ConnectionState
 
-    callback = scenario == "native_publish_nowait_qos0_callback"
-    client = AsyncClient(
-        client_id="paired-native-publish",
-        max_pending_callbacks=4_096,
-    )
+    client = AsyncClient(client_id="paired-native-publish")
     _install_discard_writer(client)
     client._engine.state = ConnectionState.CONNECTED
-    if callback:
-        client.on_publish = lambda _mid, _reason: None
 
     async def run() -> ScenarioMeasurement:
-        if callback:
-            batch_size = 64
-            warmup_batches = 32
-            measured_batches = 2_000
-            started = 0.0
-            for batch in range(warmup_batches + measured_batches):
-                if batch == warmup_batches:
-                    started = time.perf_counter()
-                for _ in range(batch_size):
-                    client.publish_nowait(TOPIC, b"x", qos=0)
-                await client._effect_pump.drain()
-                await client._delivery.callback_queue.join()
-            elapsed = time.perf_counter() - started
-            await client._delivery.shutdown_callbacks(drain=False)
-            operations = measured_batches * batch_size
-            return ScenarioMeasurement(elapsed, operations, operations / elapsed)
-
         warmup = 2_000
         operations = 60_000
         started = 0.0
         for index in range(warmup + operations):
             if index == warmup:
                 started = time.perf_counter()
-            if scenario == "native_publish_nowait_qos0" and hasattr(client, "publish_nowait"):
-                client.publish_nowait(TOPIC, b"x", qos=0)
-            else:
-                client.publish_nowait(TOPIC, b"x", qos=0)
+            client.publish_nowait(TOPIC, b"x", qos=0)
         elapsed = time.perf_counter() - started
         return ScenarioMeasurement(elapsed, operations, operations / elapsed)
 
@@ -366,9 +340,11 @@ def _delivery(scenario: str) -> ScenarioMeasurement:
         for index in range(warmup + operations):
             if index == warmup:
                 started = time.perf_counter()
-            await client._apply_effect(effect, nowait=False)
+            await client._apply_delivery_effect(effect, client._connection_epoch)
             if mode == "iterator":
-                client._delivery.messages_queue.get_nowait()
+                _message, size = client._delivery.messages_queue.get_nowait()
+                client._delivery.messages_queue.task_done()
+                client._delivery.release(size)
         if mode == "callback":
             await client._delivery.callback_queue.join()
         elapsed = time.perf_counter() - started
@@ -405,6 +381,7 @@ def _single_message_effect(_scenario: str) -> ScenarioMeasurement:
             )
             client._effect_pump.collect_from_engine()
             await client._effect_pump.drain()
+            await client._delivery_lane.drain()
         await client._delivery.callback_queue.join()
         elapsed = time.perf_counter() - started
         await client._delivery.shutdown_callbacks(drain=False)
@@ -468,49 +445,23 @@ def _receipt_wait(scenario: str) -> ScenarioMeasurement:
     return asyncio.run(run())
 
 
-def _publish_completion(scenario: str) -> ScenarioMeasurement:
+def _publish_completion(_scenario: str) -> ScenarioMeasurement:
     from mqttium.api import AsyncClient
     from mqttium.api.models import PublishReceipt
     from mqttium.enums import QoS
     from mqttium.protocol.effects import EffectKind
 
-    client = AsyncClient(
-        client_id="paired-publish-completion",
-        max_pending_callbacks=4_096,
-    )
-    callback = scenario.endswith("callback")
-    if callback:
-        client.on_publish = lambda _mid, _reason: None
+    client = AsyncClient(client_id="paired-publish-completion")
 
     def complete() -> None:
         receipt = PublishReceipt(mid=1, qos=QoS.AT_LEAST_ONCE)
         _fifo_register(client._receipts, 1, receipt)
         client._engine._emit(EffectKind.PUBLISH_COMPLETE, 1)
         client._effect_pump.collect_from_engine()
-        if not callback and not receipt.is_done():
+        if not receipt.is_done():
             raise RuntimeError("inline receipt completion did not settle")
 
-    if not callback:
-        return _measure(complete, operations=100_000, warmup=2_000)
-
-    async def run_callback() -> ScenarioMeasurement:
-        batch_size = 64
-        warmup_batches = 32
-        measured_batches = 2_000
-        started = 0.0
-        for batch in range(warmup_batches + measured_batches):
-            if batch == warmup_batches:
-                started = time.perf_counter()
-            for _ in range(batch_size):
-                complete()
-            await client._effect_pump.drain()
-            await client._delivery.callback_queue.join()
-        elapsed = time.perf_counter() - started
-        await client._delivery.shutdown_callbacks(drain=False)
-        operations = measured_batches * batch_size
-        return ScenarioMeasurement(elapsed, operations, operations / elapsed)
-
-    return asyncio.run(run_callback())
+    return _measure(complete, operations=100_000, warmup=2_000)
 
 
 def _prime_process_wide_tables() -> None:
@@ -546,7 +497,6 @@ REGISTRY: dict[str, Callable[[str], ScenarioMeasurement]] = {
     "writer_enqueue_async": _writer,
     "async_publish_nowait_qos0": _native_publish,
     "native_publish_nowait_qos0": _native_publish,
-    "native_publish_nowait_qos0_callback": _native_publish,
     "effect_send_inline": _effects,
     "effect_batch_inline": _effects,
     "effect_batch_ordered": _effects,
@@ -559,7 +509,6 @@ REGISTRY: dict[str, Callable[[str], ScenarioMeasurement]] = {
     "receipt_wait_single": _receipt_wait,
     "receipt_wait_concurrent": _receipt_wait,
     "publish_complete_receipt": _publish_completion,
-    "publish_complete_callback": _publish_completion,
 }
 
 

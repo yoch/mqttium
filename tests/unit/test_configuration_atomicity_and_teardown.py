@@ -37,8 +37,6 @@ def _register_publish_handles(
 
 async def test_terminal_publish_effect_survives_connection_epoch_change() -> None:
     client = AsyncClient()
-    callbacks: list[tuple[int | None, BaseException | None]] = []
-    client.on_publish = lambda mid, error: callbacks.append((mid, error))
     receipt, batch = _register_publish_handles(client, 7)
 
     # SEND is intentionally ordered ahead of completion. If it blocks until the
@@ -63,11 +61,12 @@ async def test_terminal_publish_effect_survives_connection_epoch_change() -> Non
     )
 
     await client._effect_pump.drain()
-    await client._delivery.callback_queue.join()
 
     assert receipt.is_done()
     assert batch.is_done()
-    assert callbacks == [(7, None)]
+    await receipt.wait()
+    await batch.wait()
+    assert client._delivery.callback_task is None
     assert 7 not in client._receipts
     assert 7 not in client._batch_receipts
     await client._force_close()
@@ -75,8 +74,6 @@ async def test_terminal_publish_effect_survives_connection_epoch_change() -> Non
 
 async def test_final_teardown_settles_a_pending_publish_failure() -> None:
     client = AsyncClient()
-    callbacks: list[tuple[int | None, BaseException | None]] = []
-    client.on_publish = lambda mid, error: callbacks.append((mid, error))
     receipt, batch = _register_publish_handles(client, 9)
     failure = RuntimeError("broker rejected publication")
 
@@ -94,7 +91,10 @@ async def test_final_teardown_settles_a_pending_publish_failure() -> None:
     with pytest.raises(PublishBatchError) as exc_info:
         await batch.wait()
     assert exc_info.value.failures[0] is failure
-    assert callbacks == [(9, failure)]
+    with pytest.raises(RuntimeError) as receipt_failure:
+        await receipt.wait()
+    assert receipt_failure.value is failure
+    assert client._delivery.callback_task is None
 
 
 def test_engine_config_is_immutable() -> None:

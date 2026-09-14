@@ -15,7 +15,7 @@ from mqttium.errors import FlowControlError, ProtocolError
 from mqttium.packets import PublishPacket
 from mqttium.protocol.effects import EffectKind, EngineEffect
 from mqttium.protocol.negotiated import NegotiatedSettings
-from mqttium.types import Properties
+from mqttium.types import Message, Properties
 
 
 def test_publish_nowait_requires_a_running_loop() -> None:
@@ -55,44 +55,33 @@ async def test_publish_nowait_registers_qos1_receipt() -> None:
     assert client._receipts[receipt.mid] is receipt
 
 
-async def test_publish_nowait_callback_uses_direct_writer_admission() -> None:
+async def test_publish_nowait_receipts_use_direct_writer_admission() -> None:
     client = AsyncClient(max_outbound_messages=512)
     client._engine.state = ConnectionState.CONNECTED
-    seen: list[int | None] = []
-    client.on_publish = lambda mid, _error: seen.append(mid)
-
-    for _ in range(100):
-        client.publish_nowait("native/qos0", b"x", qos=0)
+    receipts = [client.publish_nowait("native/qos0", b"x", qos=0) for _ in range(100)]
 
     assert client.stats().writer.queued_messages == 100
-    assert seen == []
-    await client._delivery.callback_queue.join()
-    assert seen == [None] * 100
-    await client._delivery.shutdown_callbacks(drain=False)
+    assert all(receipt.is_done() for receipt in receipts)
+    assert client._delivery.callback_queue.empty()
+    assert client._delivery.callback_task is None
 
 
-async def test_qos0_callback_marks_writer_admission_not_transport_drain() -> None:
+async def test_qos0_receipt_marks_writer_admission_not_transport_drain() -> None:
     client = AsyncClient(max_outbound_messages=1, max_outbound_bytes=1024)
     client._engine.state = ConnectionState.CONNECTED
-    seen: list[tuple[int | None, BaseException | None]] = []
-    client.on_publish = lambda mid, error: seen.append((mid, error))
-
     receipt = client.publish_nowait("native/qos0-boundary", b"first", qos=0)
-    await client._delivery.callback_queue.join()
 
     assert receipt.is_done()
-    assert seen == [(None, None)]
+    await receipt.wait()
     assert client.stats().writer.queued_messages == 1
     queued_bytes = client.stats().writer.queued_bytes
-
     with pytest.raises(FlowControlError):
         client.publish_nowait("native/qos0-boundary", b"second", qos=0)
-
     assert client.stats().writer.queued_messages == 1
     assert client.stats().writer.queued_bytes == queued_bytes
     assert not client._engine.has_pending_effects
     assert not client._effect_pump.pending
-    await client._delivery.shutdown_callbacks(drain=False)
+    assert client._delivery.callback_task is None
 
 
 def test_disconnect_metadata_boundary_is_private() -> None:
@@ -150,18 +139,15 @@ async def test_refused_direct_qos0_write_does_not_establish_alias() -> None:
         await client.publish("", b"reuse", properties=properties)
 
 
-async def test_await_publish_qos0_callback_uses_worker_notifications() -> None:
+async def test_await_publish_qos0_completes_without_callback_worker() -> None:
     client = AsyncClient(max_outbound_messages=8)
     client._engine.state = ConnectionState.CONNECTED
-    seen: list[tuple[int | None, BaseException | None]] = []
-    client.on_publish = lambda mid, error: seen.append((mid, error))
+    receipt = await client.publish("native/await-qos0", b"x", qos=0)
 
-    await client.publish("native/await-qos0", b"x", qos=0)
-
-    assert seen == []
-    await client._delivery.callback_queue.join()
-    assert seen == [(None, None)]
-    await client._delivery.shutdown_callbacks(drain=False)
+    await receipt.wait()
+    assert receipt.is_done()
+    assert client._delivery.callback_queue.empty()
+    assert client._delivery.callback_task is None
 
 
 async def test_publish_many_qos0_uses_engine_admission() -> None:
@@ -179,27 +165,22 @@ async def test_publish_many_qos0_uses_engine_admission() -> None:
     assert isinstance(client._write_pump.queue.get_nowait(), bytes)
 
 
-async def test_publish_many_callback_uses_worker_notifications() -> None:
+async def test_publish_many_completion_does_not_start_callback_worker() -> None:
     client = AsyncClient(max_outbound_messages=8)
     client._engine.state = ConnectionState.CONNECTED
-    seen: list[tuple[int | None, BaseException | None]] = []
-    client.on_publish = lambda mid, error: seen.append((mid, error))
-
     receipt = await client.publish_many(
         [PublishMessage("native/batch", b"a", 0), PublishMessage("native/batch", b"b", 0)]
     )
 
-    assert receipt.submitted == 2
-    assert receipt.completed == 2
+    await receipt.wait()
+    assert receipt.submitted == receipt.completed == 2
     assert client.stats().writer.queued_messages == 2
-    assert seen == []
-    await client._delivery.callback_queue.join()
-    assert seen == [(None, None), (None, None)]
-    await client._delivery.shutdown_callbacks(drain=False)
+    assert client._delivery.callback_queue.empty()
+    assert client._delivery.callback_task is None
 
 
 async def test_publish_many_mixed_qos_keeps_the_effect_path() -> None:
-    """One non-QoS-0 request disqualifies the whole batch."""
+    """QoS 1 uses protocol effects while QoS 0 retains independent admission."""
     client = AsyncClient(max_outbound_messages=8)
     client._engine.state = ConnectionState.CONNECTED
 
@@ -228,59 +209,66 @@ async def test_nowait_refuses_pending_effects_before_mutation(owner) -> None:
     assert client._write_pump.queue.empty()
 
 
-async def test_nowait_refuses_full_callback_queue_before_mutation() -> None:
-    client = AsyncClient(max_pending_callbacks=1)
+async def test_nowait_admission_is_independent_of_full_message_callback_queue(monkeypatch) -> None:
+    client = AsyncClient(max_pending_callbacks=1, message_delivery="callback")
     client._engine.state = ConnectionState.CONNECTED
-    client._delivery.callback_queue.put_nowait((lambda: None, (), None))
-    client.on_publish = lambda *_: None
-    with pytest.raises(FlowControlError):
-        client.publish_nowait("t", b"x")
-    assert client._write_pump.queue.empty()
+    monkeypatch.setattr(client._delivery, "ensure_callback_worker", lambda: None)
+    message = Message("incoming", b"retained")
+    assert client._delivery.try_accept(message, lambda _message: None)
+    job = client._delivery.callback_queue._queue[0]
+    charge = client._delivery.logical_size(message)
+
+    receipt = client.publish_nowait("t", b"x")
+    assert receipt.is_done()
+    assert client._write_pump.queue.qsize() == 1
+    assert list(client._delivery.callback_queue._queue) == [job]
+    assert client._delivery.callback_task is None
+    assert client._delivery.pending_bytes == charge
     assert not client._engine.has_pending_effects
     assert not client._effect_pump.pending
+    client._delivery._discard_callback_queue()
+    assert client._delivery.pending_bytes == 0
 
 
-async def test_direct_path_writer_refusal_does_not_enqueue_a_callback() -> None:
-    """Writer admission remains the atomic boundary for callback completion."""
+async def test_direct_path_writer_refusal_preserves_first_receipt() -> None:
     client = AsyncClient(max_outbound_messages=1, max_pending_callbacks=8)
     client._engine.state = ConnectionState.CONNECTED
-    seen: list[tuple[int | None, BaseException | None]] = []
-    client.on_publish = lambda mid, error: seen.append((mid, error))
-
-    client.publish_nowait("native/full", b"first", qos=0)
+    first = client.publish_nowait("native/full", b"first", qos=0)
     with pytest.raises(FlowControlError):
         client.publish_nowait("native/full", b"second", qos=0)
 
+    await first.wait()
     assert client.stats().writer.queued_messages == 1
-    assert client._delivery.callback_queue.qsize() == 1
+    assert client._delivery.callback_queue.empty()
+    assert client._delivery.callback_task is None
     assert not client._engine.has_pending_effects
     assert not client._effect_pump.pending
-    await client._delivery.callback_queue.join()
-    assert seen == [(None, None)]
-    await client._delivery.shutdown_callbacks(drain=False)
 
 
-async def test_publish_many_waits_for_callback_capacity_progressively() -> None:
-    """Insufficient callback capacity must not split a batch across paths."""
-    client = AsyncClient(max_outbound_messages=8, max_pending_callbacks=2)
+async def test_publish_many_progress_is_independent_of_full_message_callback_queue(
+    monkeypatch,
+) -> None:
+    client = AsyncClient(
+        max_outbound_messages=8, max_pending_callbacks=1, message_delivery="callback"
+    )
     client._engine.state = ConnectionState.CONNECTED
-    blocker_seen: list[str] = []
-    client._delivery.callback_queue.put_nowait((lambda: blocker_seen.append("blocker"), (), None))
-    seen: list[tuple[int | None, BaseException | None]] = []
-    client.on_publish = lambda mid, error: seen.append((mid, error))
+    monkeypatch.setattr(client._delivery, "ensure_callback_worker", lambda: None)
+    message = Message("incoming", b"retained")
+    assert client._delivery.try_accept(message, lambda _message: None)
+    job = client._delivery.callback_queue._queue[0]
+    charge = client._delivery.logical_size(message)
 
     receipt = await client.publish_many(
         [PublishMessage("native/batch", b"a", 0), PublishMessage("native/batch", b"b", 0)]
     )
-
-    assert client._effect_pump.batches > 0
-    await client._effect_pump.drain()
-    await client._delivery.callback_queue.join()
-    assert receipt.submitted == 2
-    assert receipt.completed == 2
-    assert blocker_seen == ["blocker"]
-    assert seen == [(None, None), (None, None)]
-    await client._delivery.shutdown_callbacks(drain=False)
+    await receipt.wait()
+    assert receipt.submitted == receipt.completed == 2
+    assert client._write_pump.queue.qsize() == 2
+    assert list(client._delivery.callback_queue._queue) == [job]
+    assert client._delivery.callback_task is None
+    assert client._delivery.pending_bytes == charge
+    client._delivery._discard_callback_queue()
+    assert client._delivery.pending_bytes == 0
 
 
 async def test_publish_nowait_direct_path_encodes_mqtt5_properties(monkeypatch) -> None:

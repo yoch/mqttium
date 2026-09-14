@@ -193,8 +193,9 @@ async def test_callback_connect_takes_over_keepalive_close_before_reader_finally
         brokers.append(broker)
         return broker
 
-    async def on_message(message: object) -> None:
-        del message
+    work: asyncio.Task[None] | None = None
+
+    async def reconnect_from_application() -> None:
         callback_entered.set()
         await release_callback.wait()
         try:
@@ -203,6 +204,11 @@ async def test_callback_connect_takes_over_keepalive_close_before_reader_finally
             callback_errors.append(exc)
         finally:
             callback_done.set()
+
+    def on_message(message: object) -> None:
+        nonlocal work
+        del message
+        work = asyncio.create_task(reconnect_from_application())
 
     client._transport_factory = factory
     client.on_message = on_message
@@ -235,7 +241,7 @@ async def test_callback_connect_takes_over_keepalive_close_before_reader_finally
     finally:
         release_callback.set()
         first.release_close.set()
-        await _cleanup(client)
+        await _cleanup(client, work)
 
 
 async def test_disconnect_in_reconnect_gap_wakes_logical_publish_waiter() -> None:

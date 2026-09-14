@@ -93,7 +93,7 @@ async def test_impossible_delivery_is_rejected_before_worker_or_reservation():
 
 @pytest.mark.parametrize("kind", ["MESSAGE", "DECODED_MESSAGE"])
 @pytest.mark.parametrize("eager", [False, True])
-async def test_inline_message_enqueue_keeps_callbacks_outside_engine_lock(kind, eager):
+async def test_reader_message_enqueue_keeps_callbacks_outside_engine_lock(kind, eager):
     from mqttium.protocol.effects import EffectKind
 
     if eager and not hasattr(asyncio, "eager_task_factory"):
@@ -112,8 +112,10 @@ async def test_inline_message_enqueue_keeps_callbacks_outside_engine_lock(kind, 
             client._engine._emit(EffectKind[kind], Message(topic="t", payload=b"x"))
             client._effect_pump.collect_from_engine()
             assert not client._effect_pump.pending
-            assert client._delivery.callback_queue.qsize() == 1
+            assert client._delivery.callback_queue.qsize() == 0
+            assert client._delivery_lane.pending_count == 1
             assert not observed
+        await client._delivery_lane.drain()
         await client._delivery.callback_queue.join()
         assert observed == [(b"x", False)]
         assert client.stats().delivery.pending_bytes == 0
@@ -145,12 +147,12 @@ async def test_delivery_mark_keeps_existing_lock_and_failure_boundary(monkeypatc
         assert not client._apply_effect_inline(effect, client._connection_epoch)
         assert client._delivery.pending_bytes == 0
         with pytest.raises(OSError) as caught:
-            await client._apply_effect(effect, nowait=False, epoch=client._connection_epoch)
+            await client._apply_delivery_effect(effect, client._connection_epoch)
         assert caught.value is failure
         assert client._local_terminal_failure is failure
         assert observed == [(7, True, 1)]
     else:
-        assert client._apply_effect_inline(effect, client._connection_epoch)
+        await client._apply_delivery_effect(effect, client._connection_epoch)
         assert not observed
         assert client._local_terminal_failure is None
     assert await anext(client.messages()) is message
@@ -165,12 +167,13 @@ async def test_inline_pressure_falls_back_in_order_and_stale_epochs_are_ignored(
     await client._delivery.accept(first, None)
     client._engine._emit(EffectKind.MESSAGE, second)
     client._effect_pump.collect_from_engine()
-    assert len(client._effect_pump.pending) == 1
+    assert not client._effect_pump.pending
+    assert client._delivery_lane.pending_count == 1
     stale = EngineEffect(EffectKind.MESSAGE, Message(topic="t", payload=b"old"))
-    assert client._apply_effect_inline(stale, client._connection_epoch - 1)
+    await client._apply_delivery_effect(stale, client._connection_epoch - 1)
     assert client._delivery.pending_bytes == 2
     assert await anext(client.messages()) is first
-    await client._effect_pump.drain()
+    await client._delivery_lane.drain()
     assert await anext(client.messages()) is second
     assert client._delivery.pending_bytes == 0
     assert not client._effect_pump.pending

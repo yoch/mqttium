@@ -23,7 +23,7 @@ def test_empty_fast_path() -> None:
     assert end == 1
 
 
-def test_roundtrip_common_publish_props() -> None:
+def test_roundtrip_publish_properties() -> None:
     props = Properties()
     props = Properties({**props.values, "payload_format_indicator": 1})
     props = Properties({**props.values, "message_expiry_interval": 60})

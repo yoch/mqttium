@@ -34,7 +34,7 @@ native API and SQLite format differ from the published release; consult
 | Explicit completion | Publish receipts that separate local admission from the relevant MQTT acknowledgement exchange |
 | Controlled load | Message and byte budgets, wait-or-refuse backpressure, bounded ingress, writes, and application delivery |
 | Session continuity | Jittered reconnect plus in-memory or SQLite-backed inflight state with incremental replay |
-| Delivery choices | Exclusive async iteration or sync/async callbacks, plus manual acknowledgement |
+| Delivery choices | Exclusive async iteration or short synchronous callbacks, plus manual acknowledgement |
 | Transports | TCP, TLS, WebSocket, and Unix-domain sockets |
 | Operations | Immutable runtime snapshots, queue high-water marks, and broker-negotiated limits |
 | Efficient production | Bounded `publish_many()` and loop-bound `publish_nowait()` without changing delivery semantics |

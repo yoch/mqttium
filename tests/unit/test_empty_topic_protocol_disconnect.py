@@ -95,7 +95,10 @@ async def test_runtime_writes_empty_topic_disconnect_before_close() -> None:
 
     reader = client._reader_task
     assert reader is not None
-    await asyncio.wait_for(reader, timeout=1.0)
+    try:
+        await asyncio.wait_for(reader, timeout=1.0)
+    except asyncio.CancelledError:
+        pass
 
     disconnect_index = next(
         index

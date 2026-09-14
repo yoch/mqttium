@@ -135,9 +135,9 @@ async def test_client_marks_persisted_message_delivered_after_api_delivery() -> 
         dup=True,
     )
 
-    await client._apply_effect(
+    await client._apply_delivery_effect(
         EngineEffect(EffectKind.MESSAGE, message),
-        nowait=False,
+        epoch=client._connection_epoch,
     )
 
     persisted = store.get_in(9)

@@ -167,7 +167,14 @@ def test_async_client_stable_method_parameter_contract() -> None:
 
 
 def test_internal_pumps_are_not_promoted_to_supported_entry_points() -> None:
-    for name in ("EffectPump", "WritePump", "InboundSession", "OutboundSession"):
+    for name in (
+        "EffectPump",
+        "DeliveryLane",
+        "LifecycleHooks",
+        "WritePump",
+        "InboundSession",
+        "OutboundSession",
+    ):
         assert name not in mqttium.__all__
         assert name not in api.__all__
         assert not hasattr(api, name)
@@ -209,3 +216,4 @@ def test_retired_entry_points_are_absent() -> None:
     assert not hasattr(mqttium, "PacketType")
     assert not hasattr(api, "PublishBackpressure")
     assert not hasattr(AsyncClient, "set_auth_handler")
+    assert not hasattr(AsyncClient(), "on_publish")

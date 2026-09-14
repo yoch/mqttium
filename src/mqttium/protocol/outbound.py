@@ -517,8 +517,8 @@ class OutboundSession:
                 self._engine._send(item)
                 if properties is not None and properties.get("topic_alias") is not None:
                     self.commit_topic_alias(topic, properties)
-                # Completion follows SEND so on_publish cannot run
-                # before the outbound queue has accepted the frame.
+                # Local completion follows SEND so the outbound queue accepts
+                # the frame before the completion effect can be applied.
                 self._engine._emit(EffectKind.PUBLISH_COMPLETE, None)
                 return PublishHandle(mid=None, qos=level)
             prepared = self._prepare_publish_request(topic, payload, level, retain, properties)

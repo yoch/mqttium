@@ -231,7 +231,7 @@ python benchmarks/runner_probe.py \
 python benchmarks/paired_open_loop.py \
   --base-root . --candidate-root . \
   --protocols 311 --payloads 64,4096 \
-  --completions receipt,callback --windows 8,32,64,128 \
+  --completions receipt --windows 8,32,64,128 \
   --target-rates 5000,10000 --repeat 12 \
   --policy strict --preflight-report /tmp/mqttium-runner.json \
   --output /tmp/mqttium-open-loop-aa.json

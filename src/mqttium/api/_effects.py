@@ -15,7 +15,34 @@ from mqttium.api.stats import EffectStats
 from mqttium.protocol.effects import EffectKind, EngineEffect
 
 if TYPE_CHECKING:
+    from mqttium.api._delivery_lane import DeliveryLane
     from mqttium.protocol.engine import ProtocolEngine
+
+
+def _partition_effects(
+    effects: list[EngineEffect],
+) -> tuple[list[EngineEffect], list[EngineEffect], bool]:
+    """Preserve wire/result order while separating reader-owned delivery."""
+    sends: list[EngineEffect] = []
+    others: list[EngineEffect] = []
+    deliveries: list[EngineEffect] = []
+    reordered = False
+    for effect in effects:
+        if effect.kind is EffectKind.SEND or effect.kind is EffectKind.SEND_ACK:
+            if others or deliveries:
+                reordered = True
+            sends.append(effect)
+        elif effect.kind in (
+            EffectKind.MESSAGE,
+            EffectKind.DECODED_MESSAGE,
+            EffectKind.CONTINUE_INBOUND_REPLAY,
+        ):
+            deliveries.append(effect)
+        else:
+            others.append(effect)
+    if reordered or deliveries:
+        effects = sends + others
+    return effects, deliveries, reordered
 
 
 class StaleConnectionEffect(Exception):
@@ -26,6 +53,7 @@ class EffectOwner(Protocol):
     _connection_epoch: int
     _disconnect_exc: BaseException | None
     _engine: ProtocolEngine
+    _delivery_lane: DeliveryLane
 
     def _apply_effect_inline(self, effect: EngineEffect, epoch: int) -> bool: ...
 
@@ -101,53 +129,48 @@ class EffectPump:
             self.discard_connection_effects(settle_publish=True)
             return
 
-        if len(effects) == 1 and not self.pending:
-            if self.owner._apply_effect_inline(effects[0], epoch):
+        deliveries: list[EngineEffect] = []
+        if len(effects) == 1:
+            effect = effects[0]
+            if effect.kind in (
+                EffectKind.MESSAGE,
+                EffectKind.DECODED_MESSAGE,
+                EffectKind.CONTINUE_INBOUND_REPLAY,
+            ):
+                self.owner._delivery_lane.collect(effects, epoch, self.enqueued)
+                self.pending_high_water = max(
+                    self.pending_high_water,
+                    len(self.pending) + self.owner._delivery_lane.outstanding,
+                )
+                return
+            if not self.pending and self.owner._apply_effect_inline(effect, epoch):
                 self.inline_effects += 1
                 return
 
         if len(effects) > 1:
             self.multi_effect_batches += 1
-            # Partition wire effects first in one pass, and let that same pass answer
-            # whether the batch needed it: SEND/SEND_ACK after a non-wire effect is
-            # exactly the condition. The two-generator form this replaces walked
-            # the batch twice and always rebuilt the list, even for the common
-            # batch that was already ordered.
-            #
-            # Splitting this into a detect pass followed by a partition pass
-            # was tried and reverted: it saves two list allocations on an
-            # already-ordered batch but adds a scan to the batch that must be
-            # reordered, and the paired microbenchmark did not support the
-            # trade. See docs/reports/PERFORMANCE-AUDIT-0.2.0b4.md.
-            sends: list[EngineEffect] = []
-            others: list[EngineEffect] = []
-            out_of_order = False
-            for effect in effects:
-                if effect.kind is EffectKind.SEND or effect.kind is EffectKind.SEND_ACK:
-                    if others:
-                        out_of_order = True
-                    sends.append(effect)
-                else:
-                    others.append(effect)
-            if out_of_order:
-                self.reordered_batches += 1
-                effects = sends + others
+            effects, deliveries, reordered = _partition_effects(effects)
+            self.reordered_batches += reordered
         if not self.pending:
             self.pending_epoch = epoch
         self.pending.extend(effects)
         self.enqueued += len(effects)
-        pending = len(self.pending)
-        if pending > self.pending_high_water:
-            self.pending_high_water = pending
+        if deliveries:
+            self.owner._delivery_lane.collect(deliveries, epoch, self.enqueued)
+        self.pending_high_water = max(
+            self.pending_high_water,
+            len(self.pending) + self.owner._delivery_lane.outstanding,
+        )
 
     def stats(self) -> EffectStats:
         """Snapshot the deque and the ordering decisions taken so far."""
-        pending = len(self.pending)
+        lane = self.owner._delivery_lane
+        pending = len(self.pending) + lane.outstanding
         return EffectStats(
             pending=pending,
             pending_high_water=max(self.pending_high_water, pending),
-            enqueued=self.enqueued,
-            applied=self.applied,
+            enqueued=self.enqueued + lane.enqueued,
+            applied=self.applied + lane.applied,
             waiters=self.waiters,
             batches=self.batches,
             multi_effect_batches=self.multi_effect_batches,
@@ -161,7 +184,7 @@ class EffectPump:
         if self.waiters:
             self.progress.set()
 
-    def drain_inline(self) -> None:
+    def drain_inline(self, *, target: int | None = None) -> None:
         if self.draining_inline or self.lock.locked():
             return
         if not self.pending:
@@ -174,7 +197,7 @@ class EffectPump:
             epoch = self.pending_epoch
         self.draining_inline = True
         try:
-            while self.pending:
+            while self.pending and (target is None or self.applied < target):
                 effect = self.pending[0]
                 if not self.owner._apply_effect_inline(effect, epoch):
                     break
@@ -274,13 +297,14 @@ class EffectPump:
         if owned and self.flush_requested and self.pending:
             self.schedule()
 
-    async def drain(self, *, nowait: bool = False) -> None:
-        self.drain_inline()
+    async def drain(self, *, nowait: bool = False, target: int | None = None) -> None:
+        self.drain_inline(target=target)
         if nowait:
             if self.pending:
                 self.schedule()
             return
-        target = self.enqueued
+        if target is None:
+            target = self.enqueued
         if self.applied >= target:
             return
 

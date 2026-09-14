@@ -26,9 +26,13 @@ async def test_iterator_delivery_waits_for_shared_byte_capacity() -> None:
         max_pending_delivery_bytes=logical_size,
     )
 
-    await client._apply_effect(EngineEffect(EffectKind.MESSAGE, first), nowait=False)
+    await client._apply_delivery_effect(
+        EngineEffect(EffectKind.MESSAGE, first), epoch=client._connection_epoch
+    )
     blocked = asyncio.create_task(
-        client._apply_effect(_effect("delivery/other", b"x"), nowait=False)
+        client._apply_delivery_effect(
+            _effect("delivery/other", b"x"), epoch=client._connection_epoch
+        )
     )
     await asyncio.sleep(0)
 
@@ -54,12 +58,14 @@ async def test_callback_delivery_releases_bytes_after_callback_finishes() -> Non
         max_pending_delivery_bytes=logical_size,
     )
 
-    async def callback(received: Message) -> None:
+    def callback(received: Message) -> None:
         assert received is message
         finished.set()
 
     client.on_message = callback
-    await client._apply_effect(EngineEffect(EffectKind.MESSAGE, message), nowait=False)
+    await client._apply_delivery_effect(
+        EngineEffect(EffectKind.MESSAGE, message), epoch=client._connection_epoch
+    )
     await finished.wait()
     await asyncio.wait_for(client._delivery.callback_queue.join(), timeout=1.0)
 
@@ -75,7 +81,9 @@ async def test_single_message_larger_than_delivery_budget_fails_explicitly() -> 
     )
 
     with pytest.raises(MessageDeliveryError, match="exceeding limit"):
-        await client._apply_effect(_effect("topic", b"payload"), nowait=False)
+        await client._apply_delivery_effect(
+            _effect("topic", b"payload"), epoch=client._connection_epoch
+        )
 
     assert client.stats().delivery.pending_bytes == 0
     assert client._delivery.messages_queue.empty()
@@ -90,10 +98,14 @@ async def test_delivery_budget_wakes_multiple_waiters_without_overcommit() -> No
         max_pending_delivery_bytes=logical_size,
     )
 
-    await client._apply_effect(EngineEffect(EffectKind.MESSAGE, messages[0]), nowait=False)
+    await client._apply_delivery_effect(
+        EngineEffect(EffectKind.MESSAGE, messages[0]), epoch=client._connection_epoch
+    )
     blocked = {
         asyncio.create_task(
-            client._apply_effect(EngineEffect(EffectKind.MESSAGE, message), nowait=False)
+            client._apply_delivery_effect(
+                EngineEffect(EffectKind.MESSAGE, message), epoch=client._connection_epoch
+            )
         )
         for message in messages[1:]
     }
@@ -139,7 +151,9 @@ async def test_mqtt5_publish_without_properties_is_accounted() -> None:
     client = _byte_budget_client(MQTTProtocolVersion.MQTTv5)
     message = Message(topic="small/topic", payload=b"payload", properties=Properties())
 
-    await client._apply_effect(EngineEffect(EffectKind.MESSAGE, message), nowait=False)
+    await client._apply_delivery_effect(
+        EngineEffect(EffectKind.MESSAGE, message), epoch=client._connection_epoch
+    )
 
     assert client.stats().delivery.pending_bytes == len(message.topic) + len(message.payload)
     assert client._delivery.messages_queue.qsize() == 1
@@ -153,7 +167,9 @@ async def test_mqtt5_publish_with_properties_stays_exactly_accounted() -> None:
     )
     message = Message(topic="small/topic", payload=b"payload", properties=properties)
 
-    await client._apply_effect(EngineEffect(EffectKind.MESSAGE, message), nowait=False)
+    await client._apply_delivery_effect(
+        EngineEffect(EffectKind.MESSAGE, message), epoch=client._connection_epoch
+    )
 
     assert client.stats().delivery.pending_bytes == client._delivery.logical_size(message)
     assert client.stats().delivery.pending_bytes > len(message.topic) + len(message.payload)
@@ -163,7 +179,9 @@ async def test_mqtt311_delivery_is_accounted() -> None:
     client = _byte_budget_client(MQTTProtocolVersion.MQTTv311)
     message = Message(topic="small/topic", payload=b"payload")
 
-    await client._apply_effect(EngineEffect(EffectKind.MESSAGE, message), nowait=False)
+    await client._apply_delivery_effect(
+        EngineEffect(EffectKind.MESSAGE, message), epoch=client._connection_epoch
+    )
 
     assert client.stats().delivery.pending_bytes == len(message.topic) + len(message.payload)
     assert client._delivery.messages_queue.qsize() == 1
@@ -177,6 +195,8 @@ async def test_small_budget_accounts_property_less_mqtt5() -> None:
     )
     message = Message(topic="small/topic", payload=b"payload", properties=Properties())
 
-    await client._apply_effect(EngineEffect(EffectKind.MESSAGE, message), nowait=False)
+    await client._apply_delivery_effect(
+        EngineEffect(EffectKind.MESSAGE, message), epoch=client._connection_epoch
+    )
 
     assert client.stats().delivery.pending_bytes == len(message.topic) + len(message.payload)

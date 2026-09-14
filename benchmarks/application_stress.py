@@ -86,7 +86,7 @@ def message_effect(sequence: int) -> EngineEffect:
     )
 
 
-async def callback_delivery(count: int, delay: float) -> Sample:
+async def callback_delivery(count: int) -> Sample:
     client = AsyncClient(
         message_delivery="callback",
         max_pending_callbacks=128,
@@ -95,23 +95,21 @@ async def callback_delivery(count: int, delay: float) -> Sample:
     )
     seen: list[int] = []
 
-    async def callback(message: Message) -> None:
-        if delay:
-            await asyncio.sleep(delay)
+    def callback(message: Message) -> None:
         seen.append(int(message.payload))
 
     client.on_message = callback
     started = time.perf_counter()
     cpu_started = time.process_time()
     for sequence in range(count):
-        await client._apply_effect(message_effect(sequence), nowait=False)
+        await client._apply_delivery_effect(message_effect(sequence), client._connection_epoch)
     await client._delivery.callback_queue.join()
     result = sample(
-        f"callback_delay_{delay * 1000:g}ms",
+        "callback_sync",
         count,
         started,
         cpu_started,
-        notes="bounded queue=128; single ordered worker",
+        notes="bounded queue=128; synchronous callbacks in one ordered worker",
     )
     if seen != list(range(count)):
         raise RuntimeError("callback ordering or completeness violation")
@@ -139,7 +137,7 @@ async def iterator_delivery(count: int, delay: float) -> Sample:
     started = time.perf_counter()
     cpu_started = time.process_time()
     for sequence in range(count):
-        await client._apply_effect(message_effect(sequence), nowait=False)
+        await client._apply_delivery_effect(message_effect(sequence), client._connection_epoch)
     await consumer
     result = sample(
         f"iterator_delay_{delay * 1000:g}ms",
@@ -180,7 +178,7 @@ def persistence_cycle(name: str, store, count: int, *, batched: bool) -> Sample:
             store.put_out(record)
         for record in records:
             record.dup = True
-            store.update_out(record)
+            store.put_out(record)
         for record in records:
             if not store.delete_out(record.mid):
                 raise RuntimeError(f"missing persistence record mid={record.mid}")
@@ -189,7 +187,7 @@ def persistence_cycle(name: str, store, count: int, *, batched: bool) -> Sample:
         count * 3,
         started,
         cpu_started,
-        notes=f"{count} put + update + pop operations",
+        notes=f"{count} insert + replace + delete operations",
     )
 
 
@@ -203,12 +201,11 @@ class _NoopContext:
 
 async def run(args: argparse.Namespace) -> list[Sample]:
     samples = [
-        await callback_delivery(args.count, 0.0),
-        await callback_delivery(min(500, args.count), 0.001),
-        await callback_delivery(min(100, args.count), 0.010),
-        await callback_delivery(min(20, args.count), 0.100),
+        await callback_delivery(args.count),
         await iterator_delivery(args.count, 0.0),
         await iterator_delivery(min(500, args.count), 0.001),
+        await iterator_delivery(min(100, args.count), 0.010),
+        await iterator_delivery(min(20, args.count), 0.100),
     ]
 
     persistence_count = min(args.sqlite_count, 20_000)

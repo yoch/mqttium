@@ -8,8 +8,11 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed — lean native experiment
 
-- Yield the callback worker after 64 completed jobs when work remains, so
-  ready reader, writer and application tasks progress during synchronous bursts.
+- Bound synchronous message callback work by actual invocation count, including
+  all matching topic routes within one message, and yield between groups.
+- Separate protocol effects from the reader-owned bounded delivery/replay lane,
+  so a full application queue does not block outgoing admission or already
+  decoded completion results. Unread ACKs retain bounded-ingress pressure.
 
 - Bind message iterators to their generation at creation, including iterators
   never advanced before an explicit disconnect/reconnect.
@@ -22,11 +25,9 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   database/WAL copies or their final-close race. Normal SQLite journal recovery
   and checkpointing may change physical files on a refused open.
 
-- Preserve replacement-connection delivery when an active message callback
-  disconnects and reconnects; retire old queued jobs without stopping the worker.
-- Isolate cancellation originating in `on_disconnect` so notification failure
-  does not suppress automatic reconnect or terminal cleanup. Actual reader-task
-  cancellation still propagates.
+- Preserve replacement-connection delivery through lifecycle reentry and
+  retire obsolete queued work by epoch. Report hook exceptions and manually
+  raised cancellation without suppressing reconnect or terminal cleanup.
 
 ### Changed — lean native experiment
 
@@ -44,15 +45,20 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   reasons are terminal. Expose nonzero broker DISCONNECT details through
   `BrokerDisconnectError` when no more specific failure is available.
 
-- Transfer ready deliveries without timeout contexts or deferred effect work,
-  classify frozen message callbacks once, and hand ready unit QoS 0 publishes
+- Transfer ready deliveries without timeout contexts, validate synchronous
+  message callbacks before registration, and hand ready unit QoS 0 publishes
   to the existing writer without general publication effects. Byte/count bounds,
   receipt ordering, durable delivery marks and serial callbacks remain intact.
 - Incompatible experimental native API: explicit iterator/callback delivery;
   message routes freeze permanently at the first connection attempt.
-- All message and connect/publish notifications use a bounded serial worker;
-  uniform delivery byte accounting and an optional whole-admission timeout
-  replace inline callbacks, shared fan-out and small-message special cases.
+- Message and topic callbacks are synchronous-only and use a bounded serial
+  worker. Async message processing uses `messages()`; delivery byte accounting
+  and a whole-admission timeout remain independent of lifecycle notifications.
+- Keep sync/async connection hooks outside their triggering protocol path.
+  Network operations do not await hook completion; incoming delivery does not
+  await `on_connect`. Hooks retain the latest pending lifecycle state, cancel
+  obsolete active hooks on external transitions, and preserve direct self-reentry.
+  Automatic retry waits for `on_disconnect` and then rechecks explicit intent.
 - Progressive `publish_many()` retains a bounded receipt for the committed
   prefix; cancellation seals it without rolling back admitted publications.
 - `Properties` and reconnect configuration are immutable, retry state belongs
@@ -64,6 +70,10 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Removed — lean native experiment
 
+- `on_publish`; publication completion and failure use individual or aggregate
+  receipts without consuming message-callback capacity.
+- Async message/topic callbacks and their per-message classification/invocation
+  branches; lifecycle hooks and protocol authentication remain async-capable.
 - Paho façade, one-shot helpers, root `PacketType`, public extension guarantees,
   legacy private client views, SQLite migrations and historical size backfill.
 - Delivery `auto`/`both`, `publish_backpressure`, `publish(nowait=...)`, batch

@@ -14,6 +14,7 @@ from mqttium.packets import PublishPacket, encode_frame
 from mqttium.persistence.memory import MemoryInflightStore
 from mqttium.protocol.reconnect import ReconnectPolicy
 from mqttium.types import Message
+from tests.support import wait_until
 
 
 class _Transport:
@@ -170,6 +171,7 @@ async def test_intentional_disconnect_callback_receives_none() -> None:
     await client.connect("fake", timeout=2.0)
     await client.disconnect()
 
+    await wait_until(lambda: bool(errors))
     assert errors == [None]
 
 

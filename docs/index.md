@@ -51,7 +51,7 @@ recovery.
 | Completion | Per-message and aggregate receipts tied to MQTT semantics |
 | Flow control | Independent message and byte bounds for protocol, writer, ingress, and delivery state |
 | Recovery | Jittered reconnect, broker-session resumption, and optional persistent inflight state |
-| Delivery | Async iterator, synchronous or asynchronous callbacks, and manual acknowledgement |
+| Delivery | Async iterator, short synchronous callbacks, and manual acknowledgement |
 | Transports | TCP, TLS, WebSocket, and Unix-domain sockets |
 | Operations | Immutable snapshots and broker-negotiated limits without a background sampler |
 | Packaging | Typed Python package with no runtime dependencies |

@@ -1,3 +1,4 @@
+import asyncio
 from dataclasses import FrozenInstanceError
 
 import pytest
@@ -6,6 +7,7 @@ from mqttium.api import AsyncClient, ClientStats
 from mqttium.enums import ConnectionState, QoS
 from mqttium.protocol.effects import EffectKind
 from mqttium.types import Message
+from tests.support import wait_until
 
 
 def test_initial_stats_snapshot_is_immutable_and_side_effect_free() -> None:
@@ -85,6 +87,7 @@ def test_stats_reports_current_state_and_lifetime_high_water_marks() -> None:
     client._write_pump.discard()
     client._decoder.clear()
     client._effect_pump.discard_connection_effects()
+    client._delivery_lane.discard()
 
     drained = client.stats()
     assert drained.writer.queued_messages == 0
@@ -225,3 +228,23 @@ def test_an_already_ordered_batch_is_counted_but_not_reordered() -> None:
     effects = client.stats().effects
     assert effects.multi_effect_batches == 1
     assert effects.reordered_batches == 0
+
+
+async def test_effect_high_water_retains_combined_protocol_and_delivery_peak() -> None:
+    client = AsyncClient(max_pending_messages=1, max_outbound_messages=1)
+    await client._delivery.accept(Message("in", b"first"), None)
+    for body in (b"second", b"third"):
+        client._engine._emit(EffectKind.MESSAGE, Message("in", body))
+    client._effect_pump.collect_from_engine()
+    delivery = asyncio.create_task(client._delivery_lane.drain())
+    await wait_until(lambda: client._delivery_lane.active_count == 2)
+    assert client._write_pump.try_enqueue(b"occupied")
+    client._engine._emit(EffectKind.SEND, b"later")
+    client._effect_pump.collect_from_engine()
+    delivery.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await delivery
+    client._effect_pump.discard_connection_effects()
+    assert client.stats().effects.pending == 0
+    assert client.stats().effects.pending_high_water == 3
+    await client._force_close()

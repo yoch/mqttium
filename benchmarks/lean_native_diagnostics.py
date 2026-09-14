@@ -32,10 +32,11 @@ SCENARIOS = (
     "receive_callback",
     "callback_only",
     "route_exact",
-    "route_async",
     "route_overlap",
     "route_fallback",
     "route_error",
+    "publish_qos1_individual",
+    "publish_qos1_batch",
 )
 
 
@@ -53,13 +54,16 @@ async def _phase(scenario: str, count: int) -> dict[str, Any]:  # noqa: C901 - s
             while (raw := self.decoder.next_packet()) is not None:
                 self.handle_packet(raw)
 
+    qos1_publication = scenario in ("publish_qos1_individual", "publish_qos1_batch")
     mode = "iterator" if scenario == "receive_iterator" else "callback"
+    publication_options = {"max_outbound_inflight": 20} if qos1_publication else {}
     client = AsyncClient(
         "lean-diagnostic",
         message_delivery=mode,
         max_pending_callbacks=1024,
         max_pending_messages=1024,
         keepalive=0,
+        **publication_options,
     )
     broker = DiagnosticBroker()
     client._transport_factory = transport_factory(broker)
@@ -96,9 +100,6 @@ async def _phase(scenario: str, count: int) -> dict[str, Any]:  # noqa: C901 - s
 
         return handle
 
-    async def async_callback(_message):
-        callback_zero(_message)
-
     callback_zero = callback(0)
     if route:
         client.on_message = callback(9)
@@ -111,12 +112,12 @@ async def _phase(scenario: str, count: int) -> dict[str, Any]:  # noqa: C901 - s
             client.message_callback_add("a/+", callback_zero)
             client.message_callback_add("a/b", callback(1))
         else:
-            client.message_callback_add(
-                "a/b", async_callback if scenario == "route_async" else callback_zero
-            )
+            client.message_callback_add("a/b", callback_zero)
     elif mode == "callback":
         client.on_message = observe
     consumer = None
+    individual_receipts = []
+    batch_receipt = None
     loop.set_exception_handler(report)
 
     async def consume():
@@ -137,9 +138,10 @@ async def _phase(scenario: str, count: int) -> dict[str, Any]:  # noqa: C901 - s
         ).encode()
         cpu_start = time.process_time_ns()
         started = time.perf_counter_ns()
-        if route:
+        if route or scenario == "callback_only":
             for _ in range(count):
-                await client._dispatch_topic_message(message)
+                await client._delivery.accept(message, client._message_callback)
+            await client._delivery.callback_queue.join()
         elif scenario == "publish":
             receipt = await client.publish_many(
                 PublishMessage("a/b", message.payload) for _ in range(count)
@@ -148,10 +150,18 @@ async def _phase(scenario: str, count: int) -> dict[str, Any]:  # noqa: C901 - s
             await client._write_pump.join()
             if len(broker.publishes) != count:
                 raise AssertionError(f"publication count mismatch: {len(broker.publishes)}/{count}")
-        elif scenario == "callback_only":
-            for _ in range(count):
-                await client._delivery.accept(message, client._message_callback)
-            await client._delivery.callback_queue.join()
+        elif qos1_publication:
+            if scenario == "publish_qos1_individual":
+                for _ in range(count):
+                    individual_receipts.append(await client.publish("a/b", message.payload, qos=1))
+                for receipt in individual_receipts:
+                    await receipt.wait()
+            else:
+                batch_receipt = await client.publish_many(
+                    PublishMessage("a/b", message.payload, qos=1) for _ in range(count)
+                )
+                await batch_receipt.wait()
+            await client._write_pump.join()
         else:
             for start in range(0, count, 256):
                 stop = min(start + 256, count)
@@ -160,8 +170,47 @@ async def _phase(scenario: str, count: int) -> dict[str, Any]:  # noqa: C901 - s
         elapsed = (time.perf_counter_ns() - started) / 1e9
         cpu = (time.process_time_ns() - cpu_start) / count / 1000
         matches = 3 if scenario == "route_overlap" else 2 if scenario == "route_error" else 1
-        if scenario != "publish" and seen != count * (matches if route else 1):
+        if (
+            scenario != "publish"
+            and not qos1_publication
+            and seen != count * (matches if route else 1)
+        ):
             raise AssertionError("callback/delivery count mismatch")
+        if qos1_publication:
+            if len(broker.publishes) != count:
+                raise AssertionError(f"publication count mismatch: {len(broker.publishes)}/{count}")
+            if any(
+                packet.qos is not QoS.AT_LEAST_ONCE
+                or packet.mid is None
+                or packet.topic != "a/b"
+                or packet.payload != message.payload
+                for packet in broker.publishes
+            ):
+                raise AssertionError("QoS 1 publication content mismatch")
+            if scenario == "publish_qos1_individual":
+                if len(individual_receipts) != count or any(
+                    not receipt.is_done()
+                    or receipt.qos is not QoS.AT_LEAST_ONCE
+                    or receipt.mid != packet.mid
+                    for receipt, packet in zip(individual_receipts, broker.publishes, strict=True)
+                ):
+                    raise AssertionError("individual receipt completion mismatch")
+            elif (
+                batch_receipt is None
+                or not batch_receipt.is_done()
+                or batch_receipt.submitted != count
+                or batch_receipt.completed != count
+                or batch_receipt.pending_count
+                or batch_receipt.failure_count
+            ):
+                raise AssertionError("batch receipt completion mismatch")
+            stats = client.stats()
+            if (
+                stats.receipts.publish
+                or stats.receipts.publish_batches
+                or stats.outbound.pending_messages
+            ):
+                raise AssertionError("publication completion retained pending state")
         if route:
             expected = (
                 [0, 1, 2]
@@ -180,7 +229,7 @@ async def _phase(scenario: str, count: int) -> dict[str, Any]:  # noqa: C901 - s
             raise AssertionError("callback error isolation mismatch")
         if client.stats().delivery.pending_bytes:
             raise AssertionError("delivery bytes retained")
-        return {
+        result = {
             "count": count,
             "operations_per_s": count / elapsed,
             "cpu_us_per_message": cpu,
@@ -188,6 +237,15 @@ async def _phase(scenario: str, count: int) -> dict[str, Any]:  # noqa: C901 - s
             "callbacks": seen,
             "errors": errors,
         }
+        if qos1_publication:
+            result.update(
+                qos=1,
+                max_outbound_inflight=20,
+                submitted=count,
+                completed=count,
+                wire_count=len(broker.publishes),
+            )
+        return result
     finally:
         await client.disconnect()
         if consumer is not None:
@@ -297,6 +355,7 @@ def main():
         "ab_cycles": args.cycles,
         "aa_cycles": args.aa_cycles,
         "interpretation": "packet-aware in-memory diagnostics, not network measurements",
+        "routing_delivery": "synchronous routes in the bounded message callback worker",
     }
     output = {"metadata": metadata, "cells": []}
     args.output.parent.mkdir(parents=True, exist_ok=True)

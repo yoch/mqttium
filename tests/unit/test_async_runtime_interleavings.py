@@ -13,7 +13,7 @@ from mqttium.errors import MQTTError
 from mqttium.packets import PublishPacket, encode_frame
 from mqttium.protocol.reconnect import ReconnectPolicy
 
-from tests.support import QueueTransport, transport_factory, write_item_bytes
+from tests.support import QueueTransport, transport_factory, wait_until, write_item_bytes
 
 
 class _ControlledTransport(QueueTransport):
@@ -77,7 +77,11 @@ async def test_writer_failure_racing_broker_disconnect_has_one_logical_teardown(
     transport.fail_publish_write = True
     transport.push_rx(encode_frame(PacketType.DISCONNECT, 0, b""))
     transport.release_publish_write.set()
-    await asyncio.wait_for(reader, timeout=1)
+    try:
+        await asyncio.wait_for(reader, timeout=1)
+    except asyncio.CancelledError:
+        pass
+    await wait_until(lambda: bool(disconnects))
 
     assert len(disconnects) == 1
     assert receipt.is_done()

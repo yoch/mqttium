@@ -630,24 +630,39 @@ class _RuntimeHarness:
         self.transports.append(transport)
         return transport
 
-    async def _on_message(self, _message: object) -> None:
+    def _on_message(self, _message: object) -> None:
         self.callback_attempted += 1
         self.callback_epoch = self.client._connection_epoch
-        if self.block_callback_once:
-            self.block_callback_once = False
-            self.callback_entered.set()
-            await self.callback_gate.wait()
         if self.cancel_callback_once:
             self.cancel_callback_once = False
             raise asyncio.CancelledError("runtime fuzzer callback self-cancellation")
         if self.raise_callback_once:
             self.raise_callback_once = False
             raise RuntimeError("runtime fuzzer callback failure")
-        if self.disconnect_callback_once:
-            self.disconnect_callback_once = False
+        block = self.block_callback_once
+        disconnect = self.disconnect_callback_once
+        connect = self.connect_callback_once
+        self.block_callback_once = False
+        self.disconnect_callback_once = False
+        self.connect_callback_once = False
+        if block or disconnect or connect:
+            # Only an explicit schedule action starts async application work.
+            # Ordinary messages remain synchronous; the harness retains and
+            # checks this task using the same oracle as other app operations.
+            self._spawn_application_task(
+                self._message_application_work(block=block, disconnect=disconnect, connect=connect),
+                label="callback-application",
+            )
+
+    async def _message_application_work(
+        self, *, block: bool, disconnect: bool, connect: bool
+    ) -> None:
+        if block:
+            self.callback_entered.set()
+            await self.callback_gate.wait()
+        if disconnect:
             await self.client.disconnect()
-        if self.connect_callback_once:
-            self.connect_callback_once = False
+        if connect:
             await self.client.connect("runtime.invalid", timeout=self.connect_timeout_seconds)
 
     async def _on_disconnect(self, _error: BaseException | None) -> None:
@@ -1055,7 +1070,14 @@ class _RuntimeHarness:
             )
         elif action == "callbacks_drained":
             await self._wait_until(
-                lambda: self.client.stats().delivery.callback_queued == 0,
+                lambda: (
+                    self.client.stats().delivery.callback_queued == 0
+                    and all(
+                        tracked.task.done()
+                        for tracked in self.tasks
+                        if tracked.label == "callback-application"
+                    )
+                ),
                 "callback queue did not drain",
             )
             if self.callback_attempted != self.callback_expected:
@@ -1068,6 +1090,7 @@ class _RuntimeHarness:
                 lambda: (
                     self.client.stats().state is ConnectionState.DISCONNECTED
                     and not any(asdict(self.client.stats().tasks).values())
+                    and self.client._lifecycle_hooks.task is None
                 ),
                 "terminal teardown did not settle",
             )
@@ -1160,9 +1183,19 @@ class _RuntimeHarness:
             assert pump.resident_messages == 0, "writer retained a message after teardown"
             assert stats.writer.queued_bytes == 0, "writer retained bytes after teardown"
             assert stats.effects.pending == 0, "effect survived terminal teardown"
+            assert self.client._delivery_lane.pending_count == 0, (
+                "reader delivery effect survived terminal teardown"
+            )
+            assert stats.delivery.pending_bytes == 0, "message bytes survived terminal teardown"
             assert stats.receipts.publish == 0, "publish receipt survived terminal teardown"
             assert not any(asdict(stats.tasks).values()), (
                 "connection-scoped task survived terminal teardown"
+            )
+            assert self.client._lifecycle_hooks.task is None, (
+                "lifecycle notification owner survived terminal teardown"
+            )
+            assert self.client._lifecycle_hooks.hook_task is None, (
+                "lifecycle hook survived terminal teardown"
             )
             if self.transports:
                 assert stats.connection_epoch > self.transport.owner_epoch, (
@@ -1175,6 +1208,16 @@ class _RuntimeHarness:
         stats["writer"].pop("last_outbound", None)
         return {
             "client": stats,
+            "delivery_lane": {
+                "pending": self.client._delivery_lane.pending_count,
+                "enqueued": self.client._delivery_lane.enqueued,
+                "applied": self.client._delivery_lane.applied,
+            },
+            "lifecycle": {
+                "supervisor_active": self.client._lifecycle_hooks.task is not None,
+                "hook_active": self.client._lifecycle_hooks.hook_task is not None,
+                "notification_pending": self.client._lifecycle_hooks.pending is not None,
+            },
             "writer": {
                 "epoch": self.client._write_pump.epoch,
                 "resident_messages": self.client._write_pump.resident_messages,
@@ -1210,6 +1253,8 @@ class _RuntimeHarness:
             "callbacks": {
                 "expected": self.callback_expected,
                 "attempted": self.callback_attempted,
+                "delivery": "synchronous",
+                "suspending_work": "explicit retained application task",
             },
             "factory": {
                 "attempts": self.factory_attempts,
@@ -1272,6 +1317,8 @@ class _RuntimeHarness:
                 self.client._effect_pump.task,
                 self.client._write_pump.task,
                 self.client._delivery.callback_task,
+                self.client._lifecycle_hooks.task,
+                self.client._lifecycle_hooks.hook_task,
             )
             if task is not None and task is not asyncio.current_task()
         }

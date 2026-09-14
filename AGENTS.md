@@ -52,8 +52,13 @@ clock access, or user callbacks into `protocol/`.
   timers, callbacks, receipts, delivery queues, and reconnect policy.
 - `api/_writer.py` owns every transport write, the writer queue, batching, and
   writer-side byte/count backpressure.
-- `api/_effects.py` owns the connection-scoped effect deque and deferred effect
-  processing. The client interprets effects because it owns runtime objects.
+- `api/_effects.py` owns the connection-scoped protocol effect deque and
+  deferred processing. `api/_delivery_lane.py` retains each reader-owned
+  delivery lot behind its fixed protocol fence. The client interprets effects
+  because it owns runtime objects.
+- `api/_delivery.py` runs short synchronous message callbacks on a bounded
+  worker; `api/_lifecycle.py` serializes asynchronous lifecycle hooks after
+  their triggering protocol transition and transport cleanup.
 
 This is the incompatible lean-native experiment. Paho and one-shot helpers
 are removed. Native APIs and the two supplied stores are the supported
@@ -76,7 +81,9 @@ These invariants have regression coverage and must remain explicit in reviews:
    session states. Compatibility attributes and ordered queues are views or
    indexes and must stay synchronized with their owner.
 6. **Callbacks outside critical sections.** No engine lock is held while user
-   code runs. Callback-initiated publication must not deadlock.
+   code runs. Message callbacks are synchronous; asynchronous application work
+   uses `messages()` or explicitly owned application tasks. Lifecycle hooks may
+   await the client API without waiting for their own triggering effect.
 7. **No in-session retransmission.** PUBLISH and PUBREL replay only after a
    reconnect with a present session; there is no retransmission timer.
 
@@ -90,7 +97,9 @@ step is added.
 The common single-effect case is applied inline. Deferred effects live in the
 `EffectPump`; SEND effects retain wire order before application-visible events.
 Every connection-scoped effect carries an epoch, and stale effects from a dead
-connection must not affect a new one.
+connection must not affect a new one. Application delivery pressure must not
+block already-decoded protocol work or extend an earlier collection's fence.
+The bounded reader still cannot process an ACK it has not read.
 
 `CONTINUE_INBOUND_REPLAY` is answered by re-entering the engine for the next
 bounded replay batch. This places delivery backpressure between batches and

@@ -305,9 +305,6 @@ class _RudeBrokerTransport:
 async def test_unowned_protocol_error_terminates_the_active_connection() -> None:
     transport = _RudeBrokerTransport()
     client = AsyncClient(client_id="rc-stale")
-    # on_publish pushes PUBLISH_COMPLETE onto the async slow path, so publish()
-    # genuinely suspends inside drain() instead of finishing inline.
-    client.on_publish = lambda mid, reason: None
 
     async def factory(*args: object, **kwargs: object) -> _RudeBrokerTransport:
         return transport

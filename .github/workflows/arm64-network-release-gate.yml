@@ -142,7 +142,7 @@ jobs:
             --engine harness/benchmarks/paired_network.py \
             --runner-probe harness/benchmarks/runner_probe.py \
             --protocols 311 \
-            --completions callback \
+            --completions receipt \
             --payloads 64 \
             --windows 1,20,64 \
             --control-blocks 2 \

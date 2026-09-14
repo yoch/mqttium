@@ -131,7 +131,7 @@ class ProbeResult:
     effects: dict[str, float] = field(default_factory=dict)
 
 
-async def _run(args: argparse.Namespace, topic: str) -> ProbeResult:  # noqa: C901 -- one paced loop plus three completion modes, kept in one frame on purpose
+async def _run(args: argparse.Namespace, topic: str) -> ProbeResult:  # noqa: C901 -- one paced loop plus two receipt observation modes, kept in one frame on purpose
     from mqttium.api import AsyncClient
     from mqttium.enums import MQTTProtocolVersion
     from mqttium.protocol.reconnect import ReconnectPolicy
@@ -158,18 +158,6 @@ async def _run(args: argparse.Namespace, topic: str) -> ProbeResult:  # noqa: C9
     async def observe(receipt: Any, seq: int, sent_ns: int) -> None:
         await receipt.wait()
         ack_ms[seq] = (time.monotonic_ns() - sent_ns) / 1_000_000
-
-    completed = asyncio.Queue[tuple[int, int]]()
-    pending_mid: dict[int, tuple[int, int]] = {}
-    if args.completion == "callback":
-
-        def on_publish(mid: int | None, *_unused: object) -> None:
-            assert mid is not None
-            entry = pending_mid.pop(mid, None)
-            if entry is not None:
-                completed.put_nowait((entry[0], time.monotonic_ns() - entry[1]))
-
-        client.on_publish = on_publish
 
     await client.connect(args.host, args.port, timeout=args.timeout)
     loop = asyncio.get_running_loop()
@@ -199,19 +187,12 @@ async def _run(args: argparse.Namespace, topic: str) -> ProbeResult:  # noqa: C9
         receipt = await client.publish(topic, header + payload_tail, qos=1)
         if args.completion == "receipt":
             tasks.append(loop.create_task(observe(receipt, seq, sent_ns)))
-        elif args.completion == "callback":
-            assert receipt.mid is not None
-            pending_mid[receipt.mid] = (seq, sent_ns)
         else:  # late attachment: hold the receipts, await them after the offered phase
             receipts.append((receipt, seq, sent_ns))
     offered_elapsed = max(loop.time() - offered_started, 1e-9)
 
     if args.completion == "receipt":
         await asyncio.gather(*tasks)
-    elif args.completion == "callback":
-        for _ in range(count):
-            seq, delta_ns = await completed.get()
-            ack_ms[seq] = delta_ns / 1_000_000
     else:
         for receipt, seq, sent_ns in receipts:
             await receipt.wait()
@@ -491,7 +472,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--protocol", choices=("311", "5"), default="311")
     parser.add_argument("--payload-bytes", type=int, default=64)
     parser.add_argument("--window", type=int, default=32)
-    parser.add_argument("--completion", choices=("receipt", "callback", "late"), default="receipt")
+    parser.add_argument("--completion", choices=("receipt", "late"), default="receipt")
     parser.add_argument("--rate", type=float, default=0.0)
     parser.add_argument(
         "--rates", default="3000,3250,3500,3750,4000,4250,4500,4750,5000,5250,5500,6000"

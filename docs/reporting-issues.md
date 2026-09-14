@@ -80,7 +80,7 @@ the outbound, writer, effect, receipt, and reconnect snapshot sections.
 
 ### Delivery or acknowledgement
 
-Include delivery mode, manual acknowledgement, callback sync/async shape, queue
+Include delivery mode, manual acknowledgement, message callback or lifecycle-hook identity, queue
 limits, last observed event, and shutdown outcome.
 
 ### Persistence or session replay

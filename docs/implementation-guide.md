@@ -202,14 +202,25 @@ order within that job and release bytes after all routes finish. Queue capacity
 bounds waiting jobs, with at most one active worker job. A producer waiting for
 a queue slot retains its byte reservation under the same byte budget.
 
-There are no inline user notifications or physical callback batches.
-The worker counts completed jobs and yields after a quantum of 64 when more
-work remains. It releases byte credits and finishes queue accounting before
-yielding, preserving stop/reopen ownership at the boundary.
-`on_connect`, `on_publish` and messages use the worker. `on_disconnect` and
-authentication remain directly awaited outside critical sections. Callback
-errors are isolated; real task cancellation propagates. Shutdown from the
-worker never joins itself.
+Message callbacks are synchronous-only and execute exclusively in the bounded
+message worker. Registration rejects async functions and async callable objects
+before mutation. Returning an awaitable is reported as a callback `TypeError`;
+MQTTium does not await it or create a detached task. Ordinary failures are
+isolated per invocation. The private fairness quantum counts actual callback
+invocations, including routes inside one message. A partially dispatched message
+retains its reservation until all routes finish; completed messages release
+credits before a boundary yield. Synchronous user code cannot be preempted.
+
+`on_publish` is removed: receipts settle without message-queue admission.
+`on_connect` and `on_disconnect` use separate bounded lifecycle ownership, after
+the triggering effect and connection locks. There is one active hook and one
+latest pending state; obsolete states may be coalesced. External lifecycle
+operations cancel obsolete hooks, while an operation directly awaited by the
+current hook preserves its caller. Network operation completion does not await
+hook completion. `on_connect` is not an incoming-data readiness barrier.
+Automatic retry awaits the current disconnect hook and rechecks user intent.
+Authentication alone remains awaited as protocol work with `auth_timeout`.
+
 
 `delivery_timeout=None` has no deadline. A positive timeout covers both byte
 reservation and queue insertion with one deadline. Timeout or an impossible
@@ -218,18 +229,31 @@ persisted delivery state unmarked. A delivered mark denotes queue acceptance,
 not completed application processing.
 
 When byte and queue capacity are immediately available, `try_accept()` performs
-the same reservation and queue transfer without creating a timeout context.
-MESSAGE effects that require no durable delivery mark may use it directly in
-the effect drain. Persisted marks retain the existing asynchronous lock and
-fail-stop path; callbacks still execute only on the worker.
+the same reservation and queue transfer without a timeout context. Persisted
+marks follow queue acceptance under the engine lock and retain fail-stop
+semantics; no user callback executes under that lock.
 
-Topic routing belongs exclusively to `AsyncClient`. The fallback and routes
-freeze on the first connection attempt, permanently for the instance. MQTT
-subscriptions remain mutable. Callable forms are classified once at this freeze;
-mutable lifecycle callbacks keep their invocation-time classification.
-Waiting for capacity or ACKs from a saturated
-worker can create a circular dependency; use nonblocking publication or a
-separate bounded producer as shown in the migration guide.
+`EffectPump` owns only protocol work. A reader-owned `DeliveryLane` holds MESSAGE,
+DECODED_MESSAGE and CONTINUE_INBOUND_REPLAY. Each bounded lot records an epoch
+and its protocol completion target. The reader applies that target before
+message delivery; later unrelated protocol work does not extend it. Reader
+input pauses until the current delivery lot progresses. Replay continuation
+stays behind its prior MESSAGE batch and requests only the next bounded page.
+This does not change direct `ProtocolEngine` consumers' continuation obligation.
+
+Publication and already-decoded completions therefore progress independently
+of application delivery. The pre-admission protocol drain still settles old
+receipt ownership before MID reuse. An ACK unread behind incoming traffic can
+still be delayed by bounded ingress; no speculative scanning or unbounded
+side queue is introduced. On epoch retirement, cancel the reader's delivery
+wait, release untransferred reservations and discard unaccepted effects while
+preserving accepted-queue and durable-session semantics. A protocol/writer
+failure must wake that reader without joining it from the failing task.
+
+Topic routing belongs to `AsyncClient`. The fallback and routes freeze
+permanently on the first connection attempt; MQTT subscriptions remain mutable.
+For sustained bidirectional workloads, see the explicit application overflow
+policies in [Operations](operations.md#bidirectional-pressure).
 
 ## Persistence
 
@@ -300,9 +324,9 @@ Covered by `tests/unit/test_ingress_failure_semantics.py`.
 
 ## API completion and errors
 
-- QoS 0 receipts complete at writer admission. `on_publish` uses the bounded
-  worker. `publish_nowait()` preflights immediate writer and callback capacity;
-  asynchronous publication waits for bounded transfer.
+- QoS 0 receipts complete at writer admission. `publish_nowait()` preflights
+  immediate protocol/writer capacity; awaited publication waits for bounded
+  transfer independently of application-delivery capacity.
 - QoS 1 receipts complete at PUBACK.
 - QoS 2 receipts complete at PUBCOMP.
 - SUBACK and UNSUBACK return all per-filter reason codes; a reason code at or
@@ -312,16 +336,16 @@ Covered by `tests/unit/test_ingress_failure_semantics.py`.
 - Public exceptions must not shadow Python built-ins.
 
 QoS 0 publication may bypass general effect creation only with the current
-writer epoch, no terminal failure, no pending effects or active effect/engine
-lock, and enough callback capacity. It reuses outbound preparation and registers
+writer epoch, no terminal failure, no pending protocol effects or active
+protocol-effect/engine lock. It reuses outbound preparation and registers
 the unit receipt or aggregate batch element before handing bytes to `WritePump`.
 Batch admission does not allocate a unit receipt. Topic Aliases commit after
 acceptance. A clean writer refusal rolls back only that batch registration and
 may fall back for awaited publication; writer exceptions retain the registered
 prefix and propagate without retry because handoff may already have occurred.
 `publish_many()` retains progressive admission and its existing fairness points.
-The effect drain before awaited admission remains necessary for receipt
-settlement before MID reuse.
+The protocol-effect drain before awaited admission remains necessary for
+receipt settlement before MID reuse; it never drains application delivery.
 
 ## Required validation
 

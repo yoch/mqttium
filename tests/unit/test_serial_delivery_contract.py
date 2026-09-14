@@ -12,38 +12,30 @@ from mqttium.types import Message
 
 
 @pytest.mark.parametrize("burst", [1, 2, 8])
-async def test_each_message_is_one_job_in_fifo_order(burst) -> None:
+async def test_each_message_is_one_job_in_fifo_order(burst, monkeypatch) -> None:
     client = AsyncClient(message_delivery="callback", max_pending_callbacks=2)
     delivery = client._delivery
-    started = asyncio.Event()
-    release = asyncio.Event()
     seen = []
-
-    async def active():
-        started.set()
-        await release.wait()
-        seen.append("connect")
-
-    await delivery.enqueue_callback(active)
-    await started.wait()
+    ensure_worker = delivery.ensure_callback_worker
+    monkeypatch.setattr(delivery, "ensure_callback_worker", lambda: None)
 
     async def produce():
         for index in range(burst):
             await delivery.accept(
                 Message(topic="t", payload=bytes([index])), lambda m: seen.append(m.payload[0])
             )
-        await delivery.enqueue_callback(lambda: seen.append("publish"))
 
     producer = asyncio.create_task(produce())
     await asyncio.sleep(0)
-    assert delivery.callback_queue.qsize() == min(2, burst + 1)
+    assert delivery.callback_queue.qsize() == min(2, burst)
     # At most one additional producer-owned reservation waits for queue capacity.
     assert delivery.pending_bytes == min(3, burst) * 2
     assert seen == []
-    release.set()
+    monkeypatch.setattr(delivery, "ensure_callback_worker", ensure_worker)
+    delivery.ensure_callback_worker()
     await asyncio.wait_for(producer, 1)
     await delivery.callback_queue.join()
-    assert seen == ["connect", *range(burst), "publish"]
+    assert seen == list(range(burst))
     assert delivery.pending_bytes == 0
     await delivery.shutdown_callbacks(drain=False)
 
@@ -131,37 +123,36 @@ async def test_worker_isolates_invalid_sync_callback_and_continues(kind) -> None
         await delivery.shutdown_callbacks(drain=False)
 
 
-async def test_worker_cancellation_releases_active_and_queued_charges() -> None:
+async def test_worker_cancellation_before_initial_turn_releases_queued_charges() -> None:
     client = AsyncClient(message_delivery="callback")
     delivery = client._delivery
-    started = asyncio.Event()
-
-    async def active(_message):
-        started.set()
-        await asyncio.Event().wait()
-
-    await delivery.accept(Message(topic="a", payload=b"x"), active)
-    await started.wait()
-    await delivery.accept(Message(topic="b", payload=b"y"), active)
+    seen = []
+    await delivery.accept(Message(topic="a", payload=b"x"), lambda message: seen.append(message))
+    await delivery.accept(Message(topic="b", payload=b"y"), lambda message: seen.append(message))
     assert delivery.pending_bytes == 4
     await delivery.shutdown_callbacks(drain=False)
+    assert seen == []
     assert delivery.pending_bytes == 0
     assert delivery.callback_queue.empty()
     await delivery.callback_queue.join()
 
 
-async def test_reentrant_worker_shutdown_does_not_wait_on_itself() -> None:
+async def test_sync_callback_can_schedule_explicit_application_owned_shutdown() -> None:
     client = AsyncClient(message_delivery="callback")
     delivery = client._delivery
     seen = []
+    tasks = []
 
-    async def stop(_message):
+    async def shutdown():
         await client.disconnect()
         seen.append("stopped")
 
-    await delivery.accept(Message(topic="a", payload=b"x"), stop)
-    await delivery.accept(Message(topic="b", payload=b"y"), lambda _: seen.append("discarded"))
+    def callback(_message):
+        tasks.append(asyncio.create_task(shutdown()))
+
+    await delivery.accept(Message(topic="a", payload=b"x"), callback)
     await asyncio.wait_for(delivery.callback_queue.join(), 1)
+    await asyncio.wait_for(tasks[0], 1)
     assert seen == ["stopped"]
     assert delivery.pending_bytes == 0
     await delivery.shutdown_callbacks(drain=False)

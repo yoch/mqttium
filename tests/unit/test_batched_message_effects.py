@@ -28,9 +28,8 @@ async def test_auto_qos1_single_effect_skips_absent_delivery_mark() -> None:
     marked: list[int] = []
     client._engine.mark_inbound_delivered = marked.append  # type: ignore[method-assign]
 
-    await client._apply_effect(
+    await client._apply_delivery_effect(
         _effect(qos=QoS.AT_LEAST_ONCE, mid=7),
-        nowait=False,
         epoch=client._connection_epoch,
     )
 
@@ -64,9 +63,8 @@ async def test_replayed_persisted_qos1_marks_even_when_current_mode_is_auto_ack(
     message_effect = next(effect for effect in effects if effect.kind is EffectKind.MESSAGE)
     assert message_effect.requires_delivery_mark is True
 
-    await client._apply_effect(
+    await client._apply_delivery_effect(
         message_effect,
-        nowait=False,
         epoch=client._connection_epoch,
     )
 

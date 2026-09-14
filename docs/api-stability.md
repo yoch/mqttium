@@ -31,7 +31,8 @@ cross-thread entry points.
 - Authentication: `auth`, with `auth_handler` fixed at construction.
 - State and diagnostics: `state`, `is_connected`, `negotiated`,
   `effective_client_id`, `stats`.
-- Notifications: `on_connect`, `on_disconnect`, `on_message`, `on_publish`.
+- Lifecycle hooks: `on_connect`, `on_disconnect`.
+- Synchronous message callback: `on_message`; completion uses receipts.
 
 `message_delivery` is explicitly `"iterator"` (default) or `"callback"`.
 `on_message` and the topic route registry are permanently frozen at the first
@@ -44,21 +45,32 @@ fallback. Replacing a filter before connection keeps its position. Every
 message is one worker job even when several filters match. Each callback failure
 is isolated so subsequent matches can still run.
 
-Declare synchronous callbacks with `def` and asynchronous callbacks with
-`async def`; a synchronous function returning an awaitable is reported as a
-callback `TypeError`. Message callbacks and `on_connect`/`on_publish`
-notifications run in the bounded worker. `on_disconnect` remains awaited by
-teardown outside locks. Authentication is awaited with `auth_timeout` because
-its result participates in the protocol exchange.
+Message callbacks are synchronous-only. Async functions and async callable
+objects are rejected before registration changes; a synchronous function that
+returns an awaitable is reported as a callback `TypeError`. Message callbacks
+run in one bounded worker outside protocol locks. The worker's private quantum
+counts actual callback invocations, including matching routes inside one job.
+A synchronous callback that blocks the event loop cannot be preempted.
 
-The worker yields between bounded groups of jobs when more work is queued.
-Its internal quantum is 64 jobs; this is not a public tuning option or a time
-limit on user code. A callback that blocks the event loop is not preempted.
+`on_publish` is removed; individual and aggregate receipts are the publication
+completion contract. `on_connect` and `on_disconnect` remain sync-or-async
+lifecycle hooks with separate bounded ownership. Network operations do not wait
+for hook completion, and incoming delivery does not wait for `on_connect`.
+Obsolete pending lifecycle states are coalesced. External lifecycle operations
+cancel obsolete active hooks; direct self-reentry preserves the invoking hook.
+Automatic retry waits for the current disconnect hook, then rechecks intent.
+See the [hook contract](reference/async-client.md#lifecycle-hooks) for ordering,
+cancellation and error behavior. Authentication remains protocol-specific and
+is awaited with `auth_timeout`.
+
 
 ## Admission and ownership
 
 `publish()` waits for admission and bounded effect transfer. `publish_nowait()`
-refuses before mutation when immediate transfer is unavailable. Cancelling a
+refuses before mutation when immediate protocol/writer transfer is unavailable.
+Unrelated inbound delivery does not block already-decoded protocol completions
+or outgoing admission. Bounded ingress can still leave an ACK unread behind
+incoming traffic. Cancelling a
 publication call before commitment admits nothing; after commitment the
 publication may remain active. Cancelling `receipt.wait()` affects only that
 waiter, not the MQTT exchange or other waiters.
@@ -93,8 +105,9 @@ Their bounds remain independent. `delivery_timeout=None` waits for application
 capacity without a deadline; a positive value covers the entire byte-and-queue
 admission with one deadline. A message that cannot ever fit fails immediately.
 
-Statistics are immutable diagnostic snapshots. Counters for removed internal
-optimizations are removed with those mechanisms. `tests/project/test_public_api_surface.py`
+Statistics remain immutable diagnostic snapshots with the existing public
+fields; this change does not move them to a new debug API or add constructor
+tuning objects. `tests/project/test_public_api_surface.py`
 records the experimental names, signatures and defaults. Intentional changes
 update that test, maintained documentation, changelog and migration guidance.
 Historical reports remain evidence of the commits they describe.

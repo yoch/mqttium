@@ -58,18 +58,14 @@ identifier or committing store state.
 ### QoS 0 completion is writer admission
 
 MQTT has no broker acknowledgement for QoS 0. MQTTium therefore completes the
-`PublishReceipt` and dispatches `on_publish` after the encoded packet has been
-admitted to the writer. All `on_publish` notifications use the bounded callback
-worker. This boundary does **not**
-mean that the transport has written the bytes, that the socket send buffer has
-drained, or that the broker has received the publication.
+`PublishReceipt` after the encoded packet is admitted to the writer. This does
+not mean the transport has written the bytes, the socket send buffer has
+drained, or the broker has received the publication.
 
-Consequently, an `on_publish` counter is not a socket-level outstanding-byte
-limit for QoS 0: incrementing before `publish_nowait()` and decrementing in the
-callback can happen within the same event-loop turn while the writer queue keeps
-growing. Use `await client.publish(...)` when the producer should wait for
-writer capacity. A `publish_nowait()` producer must catch `FlowControlError` and
-apply its own shed, retry or spill policy.
+Receipt completion is consequently not a socket-level outstanding-byte limit.
+Use `await client.publish(...)` when a producer should wait for writer capacity.
+A `publish_nowait()` producer must catch `FlowControlError` and apply its own
+shed, retry or spill policy.
 
 A `publish_nowait()` producer sending large payloads will saturate the writer
 byte budget (`max_outbound_bytes`, 1 MiB by default) long before it exhausts the
@@ -218,15 +214,31 @@ See [Logging and Observability](observability.md) for an application wrapper exa
 
 ## Callback failures
 
-Synchronous and asynchronous callbacks run outside protocol-engine critical
-sections. An exception is sent to the event loop's exception handler and does
-not terminate the reader or leak a delivery reservation.
+Message callbacks must be short synchronous functions. They run in the bounded
+message worker outside protocol-engine critical sections. Exceptions and invalid
+awaitable returns are sent to the event loop's exception handler without leaking
+delivery reservations. Lifecycle hooks may be asynchronous and have separate
+ownership; see their [ordering and cancellation rules](reference/async-client.md#lifecycle-hooks).
 
-Install an application exception handler if callback failures need structured
-reporting. With saturated delivery and no timeout, waiting for publication
-capacity or an ACK from the callback worker can create a circular dependency.
-Use `publish_nowait()` with an explicit refusal policy or a separate bounded
-application producer; see the [migration guide](migration.md).
+## Bidirectional pressure
+
+Publication admission and already-decoded protocol completions do not wait for
+unrelated inbound application delivery. Incoming messages still obey bounded
+queue, byte and ingress limits. The reader stops taking more input when its
+current delivery lot cannot progress. An ACK later in the network stream can
+therefore remain unread behind incoming traffic.
+
+An iterator consumer that awaits outgoing capacity or an ACK while its own
+input queue is saturated can still prevent the needed read. Use an independently
+draining consumer plus an application producer with explicit queue/byte bounds
+and a nonblocking overflow policy, or separate receiving and publishing
+connections. Simply inserting another bounded queue and waiting when it is full
+does not remove that dependency. A finite `delivery_timeout` provides bounded
+failure, not a promise to sustain an arbitrary offered rate.
+
+Synchronous message callbacks can use `publish_nowait()` with an explicit
+refusal policy. Avoid unbounded task creation or busy retry loops. The
+[cookbook](cookbook.md#publishing-from-a-message-callback) shows a short handler.
 
 ## Graceful shutdown
 
@@ -235,7 +247,11 @@ Keep disconnect and store closure in `finally` blocks. A normal disconnect:
 1. stops reconnect attempts;
 2. sends DISCONNECT when the transport is connected;
 3. allows the writer to drain within its shutdown boundary;
-4. closes transport, reader, writer, keepalive, effects and callback work.
+4. closes transport, reader, writer, keepalive, effects and message-callback work.
+
+Lifecycle-hook completion is separate: `disconnect()` can return before
+`on_disconnect` finishes. Hook cancellation is cooperative; hooks must release
+application resources in `finally` blocks.
 
 After shutdown, a diagnostic snapshot should show `DISCONNECTED`, no active
 tasks, no pending subscribe/unsubscribe receipts and no publish waiters. Durable

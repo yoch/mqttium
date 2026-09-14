@@ -67,10 +67,8 @@ retries later, or persists the sample elsewhere.
 
 ## Publishing from a message callback
 
-With saturated delivery and `delivery_timeout=None`, awaiting publication
-capacity or an ACK inside the serial worker can create a circular wait. The
-ACK may sit behind an incoming message waiting for that same worker. Use a
-nonblocking offer with an explicit refusal policy:
+Message callbacks are synchronous and must finish promptly. Use a nonblocking
+publication offer with an explicit refusal policy:
 
 ```python
 from mqttium import FlowControlError
@@ -94,8 +92,11 @@ client.message_callback_add("commands/service-a", on_command)
 
 This example explicitly sheds a refused reply and counts it. It never waits
 for an ACK inside the handler. If every reply must be retained, hand work to a
-separate application producer with its own queue/byte bounds and an explicit
+separate application producer with its own queue/byte bounds and a nonblocking
 overflow policy; the callback must not wait on a full application queue either.
+For asynchronous message processing use `messages()`. A single iterator consumer
+awaiting outgoing capacity or receipts can still stall if the required ACK is
+unread behind a full input queue; see [bidirectional pressure](operations.md#bidirectional-pressure).
 
 ## Bounded batch publication
 

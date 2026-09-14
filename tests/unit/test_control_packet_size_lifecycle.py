@@ -12,6 +12,7 @@ from mqttium.errors import MQTTError, ProtocolError
 from mqttium.packets import AuthPacket
 from mqttium.protocol.effects import EffectKind
 from mqttium.protocol.negotiated import NegotiatedSettings
+from tests.support import wait_until
 
 
 class _Transport:
@@ -74,6 +75,7 @@ async def test_disconnect_packet_size_fallback_still_reports_clean_callback() ->
 
     assert transport.closed
     assert client.state is ConnectionState.DISCONNECTED
+    await wait_until(lambda: bool(errors))
     assert errors == [None]
 
 
@@ -94,7 +96,10 @@ async def test_missing_auth_handler_effect_failure_closes_active_connection() ->
         await client._effect_pump.drain()
     reader = client._reader_task
     if reader is not None:
-        await asyncio.wait_for(reader, timeout=1.0)
+        try:
+            await asyncio.wait_for(reader, timeout=1.0)
+        except asyncio.CancelledError:
+            pass
 
     assert transport.closed
     assert client.state is ConnectionState.DISCONNECTED

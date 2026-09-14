@@ -53,29 +53,6 @@ def test_load_points_reject_non_positive_or_non_finite_rates(open_loop, value: s
         open_loop._load_points(None, value)
 
 
-async def test_callback_completion_tracker_preserves_reused_mid_fifo(open_loop) -> None:
-    tracker = open_loop.CallbackCompletionTracker()
-
-    tracker.record_publish(1, 100)
-    tracker.record_publish(1, 200)
-    tracker.record_completion(1, 130)
-    tracker.record_completion(1, 250)
-
-    assert await tracker.next_latency_ms(0.1) == 0.00003
-    assert await tracker.next_latency_ms(0.1) == 0.00005
-    assert tracker.published_ns == {}
-
-
-async def test_callback_completion_tracker_matches_early_callback(open_loop) -> None:
-    tracker = open_loop.CallbackCompletionTracker()
-
-    tracker.record_completion(7, 150)
-    tracker.record_publish(7, 100)
-
-    assert await tracker.next_latency_ms(0.1) == 0.00005
-    assert tracker.early == {}
-
-
 def test_run_worker_surfaces_subprocess_failure(
     open_loop, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -94,7 +71,7 @@ def test_run_worker_surfaces_subprocess_failure(
             mode="sample",
             protocol="311",
             payload_bytes=64,
-            completion="callback",
+            completion="receipt",
             window=64,
             count=10,
             target_rate=5000.0,
@@ -189,7 +166,7 @@ def test_parent_invalidates_candidate_only_variability(
         candidate_root=candidate_root,
         protocols="311",
         payloads="64",
-        completions="callback",
+        completions="receipt",
         window=64,
         windows=None,
         fractions=None,

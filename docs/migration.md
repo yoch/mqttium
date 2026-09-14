@@ -13,6 +13,9 @@ upgrade of applications or historical databases.
 | `mqttium.helpers` | Explicit connect, operation and disconnect on `AsyncClient` |
 | `mqttium.PacketType` | Internal protocol tests can import `mqttium.enums.PacketType`; applications use native models |
 | `message_delivery="auto"` or `"both"` | Explicit `"iterator"` (default) or `"callback"` |
+| Async `on_message` or topic callbacks | Short synchronous callbacks, or asynchronous processing through `messages()` |
+| `on_publish` | `PublishReceipt` / `PublishBatchReceipt` |
+| Connect/publish notifications sharing the message worker | Separate lifecycle hooks; publication uses receipts |
 | Callback route changes during/after connection | Configure before first attempt; a new client is required for different routes |
 | `publish(..., nowait=True)` | Synchronous `publish_nowait(...)`, without `await` |
 | `publish_backpressure` / `PublishBackpressure` | Choose `publish()` or `publish_nowait()` per operation |
@@ -65,7 +68,8 @@ receipt = client.publish_nowait("telemetry", b"sample", qos=1)
 ```
 
 The nonblocking method can raise `FlowControlError` for protocol/writer pressure,
-a pending effect transfer, or an unavailable immediate completion notification.
+a pending protocol-effect transfer. A full application-delivery queue alone is
+not a publication refusal.
 Choose an application retry, rejection or spill policy; never busy-spin.
 
 A cancelled `publish()` may already be committed. Cancellation stops the Python
@@ -78,26 +82,62 @@ the input iterator fails. Catch `PublishBatchError` and inspect `receipt`,
 the internally registered aggregate is sealed and its admitted exchanges remain
 owned by the client. There is no rollback of a committed prefix.
 
-## Callback delivery and pressure
+## Message delivery and lifecycle hooks
 
-Set `message_delivery="callback"` and register routes before calling any
-`connect*` method. All message callbacks run in the serial worker, including
-synchronous handlers. Tests and applications must not depend on an inline call
-or a particular event-loop turn. Await application signals to observe delivery.
+Set `message_delivery="callback"` and register short `def` handlers before the
+first connection attempt. Async message functions and async callable objects
+are rejected before changing registration. Returning an awaitable from a sync
+handler is an error, not an implicit task handoff. A handler may explicitly
+create an application-owned task, but the application must retain it and bound
+the amount of pending work.
 
-A message is charged once until all matching handlers finish. The callback
-queue holds at most `max_pending_callbacks` waiting jobs plus one active job.
-For iterator delivery, the charge ends when the iterator yields the message.
+For asynchronous message processing, move the body to the iterator:
 
-`delivery_timeout` now defaults to `None`. A positive timeout covers byte
-reservation and queue admission together. `MessageDeliveryError` reports an
-expired deadline or a message too large for its delivery budget.
+```python
+async for message in client.messages():
+    result = await process(message)
+    await client.publish("result", result)
+```
 
-With an indefinitely backpressured receiver, awaiting outgoing capacity or an
-ACK inside the serial callback can create a circular wait: the needed ACK may
-follow an incoming message that cannot yet be delivered. Keep a handler's
-publication nonblocking, or hand work to a separate bounded application producer.
-See the [cookbook](cookbook.md) for that pattern.
+This pattern can use outgoing capacity while an unrelated delivery is queued.
+It is not an unlimited-pressure guarantee: an ACK not yet read can be behind
+incoming messages whose queue is full. If a sole consumer must await outgoing
+capacity or receipts during sustained bidirectional traffic, use an independently
+draining consumer and a bounded application producer with a nonblocking
+overflow policy, or separate receiving and publishing connections. A bounded
+queue whose consumer stops draining while waiting for publication can recreate
+the same dependency. See [bidirectional pressure](operations.md#bidirectional-pressure).
+
+Every callback message is charged once until all matching handlers finish.
+The queue holds at most `max_pending_callbacks` waiting jobs plus one active
+job. Fairness counts callback invocations inside each message's route fan-out.
+Iterator delivery releases the charge when the iterator yields the message.
+A positive `delivery_timeout` covers byte reservation and queue admission;
+`None` has no deadline. `MessageDeliveryError` reports timeout or an impossible
+message size.
+
+Replace `on_publish` with receipt observation. Keep lifecycle setup asynchronous:
+
+```python
+async def on_connect(connack):
+    if not connack.session_present:
+        await client.subscribe("commands/#", qos=1)
+    await client.publish("status", b"online")
+
+client.on_connect = on_connect
+```
+
+Lifecycle hooks execute after the triggering effect and connection locks are
+released. `connect()` and `disconnect()` return after the network operation,
+not after the hook; incoming messages do not wait for `on_connect` to finish.
+Use an application readiness signal when necessary. Hooks describe the latest
+state: obsolete pending notifications are coalesced, and external lifecycle
+operations cancel obsolete active hooks. A lifecycle operation awaited directly
+by the hook itself preserves that caller. Automatic retry waits for the current
+`on_disconnect` hook, then rechecks user intent. See the full
+[hook contract](reference/async-client.md#lifecycle-hooks).
+
+`auth_handler` retains its timeout and protocol-specific async behavior.
 
 ## SQLite format
 

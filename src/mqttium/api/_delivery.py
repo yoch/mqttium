@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterator
 from typing import Any, Literal
 from dataclasses import dataclass
+from functools import partial
 
 from mqttium.api.stats import DeliveryStats
 from mqttium.codec.properties import PUBLISH, encode_properties
@@ -18,13 +19,14 @@ MessageDelivery = Literal["iterator", "callback"]
 
 
 @dataclass(frozen=True, slots=True)
-class _ClassifiedCallback:
-    callback: Callable[..., Any]
-    is_async: bool
+class MessageRoute:
+    """Select synchronous callbacks without invoking application code."""
+
+    select: Callable[[Message], Iterator[Callable[..., Any]]]
 
 
-CallbackTarget = Callable[..., Any] | _ClassifiedCallback
-CallbackJob = tuple[CallbackTarget, tuple[Any, ...], int | None]
+CallbackTarget = Callable[..., Any] | MessageRoute
+CallbackJob = tuple[CallbackTarget, Message, int]
 IteratorQueueItem = tuple[Message, int]
 _CALLBACK_QUANTUM = 64
 
@@ -57,7 +59,6 @@ class ApplicationDelivery:
         self.closed = asyncio.Event()
         self._stream_generation = 0
         self.callback_task: asyncio.Task[None] | None = None
-        self._callback_stop = False
         self.delivery_timeout = delivery_timeout
         self.callback_shutdown_timeout = callback_shutdown_timeout
 
@@ -74,11 +75,6 @@ class ApplicationDelivery:
         )
 
     def reopen(self) -> None:
-        if self._callback_stop:
-            # A callback may reconnect while its worker is still active.
-            # Retire old queued work before that same worker can resume.
-            self._discard_callback_queue()
-            self._callback_stop = False
         self.closed.clear()
 
     def close(self) -> None:
@@ -146,7 +142,7 @@ class ApplicationDelivery:
                 self.message_ready.set()
             else:
                 assert callback is not None
-                self.callback_queue.put_nowait((callback, (message,), size))
+                self.callback_queue.put_nowait((callback, message, size))
         except BaseException:
             self.release(size)
             raise
@@ -174,7 +170,7 @@ class ApplicationDelivery:
                 else:
                     assert callback is not None
                     self.ensure_callback_worker()
-                    await self.callback_queue.put((callback, (message,), size))
+                    await self.callback_queue.put((callback, message, size))
                 reserved = False  # the queue now owns the reservation
         except TimeoutError as exc:
             raise MessageDeliveryError("Application delivery capacity timed out") from exc
@@ -217,47 +213,33 @@ class ApplicationDelivery:
 
     def ensure_callback_worker(self) -> None:
         if self.callback_task is None or self.callback_task.done():
-            self._callback_stop = False
             self.callback_task = asyncio.create_task(
                 self._callback_worker(), name="mqttium-callbacks"
             )
 
-    def try_enqueue_callback(self, callback: Callable[..., Any], *args: Any) -> bool:
-        if self.callback_queue.full():
-            return False
-        self.ensure_callback_worker()
-        self.callback_queue.put_nowait((callback, args, None))
-        return True
-
-    async def enqueue_callback(self, callback: Callable[..., Any], *args: Any) -> None:
-        self.ensure_callback_worker()
-        try:
-            async with asyncio.timeout(self.delivery_timeout):
-                await self.callback_queue.put((callback, args, None))
-        except TimeoutError as exc:
-            raise MessageDeliveryError("Callback delivery capacity timed out") from exc
-
     @staticmethod
     def _is_async_callback(callback: Callable[..., Any]) -> bool:
-        return inspect.iscoroutinefunction(callback) or inspect.iscoroutinefunction(
-            type(callback).__call__
+        while isinstance(callback, partial):
+            callback = callback.func
+        return (
+            inspect.iscoroutinefunction(callback)
+            or inspect.iscoroutinefunction(type(callback).__call__)
+            or inspect.isasyncgenfunction(callback)
+            or inspect.isasyncgenfunction(type(callback).__call__)
         )
 
     @classmethod
-    def classify(cls, callback: Callable[..., Any]) -> _ClassifiedCallback:
-        """Capture invocation mode once for a frozen message route."""
-        return _ClassifiedCallback(callback, cls._is_async_callback(callback))
+    def validate_message_callback(cls, callback: Callable[..., Any]) -> None:
+        if not callable(callback):
+            raise TypeError("callback must be callable")
+        if cls._is_async_callback(callback):
+            raise TypeError("message callbacks must be synchronous; use messages() for async work")
 
     @classmethod
-    async def invoke(cls, callback: CallbackTarget | None, *args: Any) -> Any:
+    async def invoke(cls, callback: Callable[..., Any] | None, *args: Any) -> Any:
         if callback is None:
             return None
-        if isinstance(callback, _ClassifiedCallback):
-            is_async = callback.is_async
-            callback = callback.callback
-        else:
-            is_async = cls._is_async_callback(callback)
-        if is_async:
+        if cls._is_async_callback(callback):
             return await callback(*args)
         result = callback(*args)
         if inspect.isawaitable(result):
@@ -269,9 +251,7 @@ class ApplicationDelivery:
         return result
 
     @staticmethod
-    def report_callback_error(callback: CallbackTarget | None, exc: BaseException) -> None:
-        if isinstance(callback, _ClassifiedCallback):
-            callback = callback.callback
+    def report_callback_error(callback: Callable[..., Any] | None, exc: BaseException) -> None:
         asyncio.get_running_loop().call_exception_handler(
             {
                 "message": "mqttium user callback failed",
@@ -281,16 +261,22 @@ class ApplicationDelivery:
         )
 
     def _propagate_callback_cancellation(
-        self, callback: CallbackTarget | None, exc: asyncio.CancelledError
+        self, callback: Callable[..., Any] | None, exc: asyncio.CancelledError
     ) -> None:
         task = asyncio.current_task()
         if task is None or task.cancelling():
             raise exc
         self.report_callback_error(callback, exc)
 
-    async def invoke_isolated(self, callback: CallbackTarget, *args: Any) -> None:
+    def invoke_sync_isolated(self, callback: Callable[[Message], Any], message: Message) -> None:
         try:
-            await self.invoke(callback, *args)
+            result = callback(message)
+            if result is not None and inspect.isawaitable(result):
+                if inspect.iscoroutine(result):
+                    result.close()
+                raise TypeError(
+                    "message callbacks must not return awaitables; use messages() for async work"
+                )
         except asyncio.CancelledError as exc:
             self._propagate_callback_cancellation(callback, exc)
         except Exception as exc:
@@ -298,9 +284,8 @@ class ApplicationDelivery:
 
     def _discard_callback_queue(self) -> None:
         while not self.callback_queue.empty():
-            _callback, _args, size = self.callback_queue.get_nowait()
-            if size is not None:
-                self.release(size)
+            _callback, _message, size = self.callback_queue.get_nowait()
+            self.release(size)
             self.callback_queue.task_done()
 
     async def _callback_worker(self) -> None:
@@ -309,28 +294,31 @@ class ApplicationDelivery:
         await asyncio.sleep(0)
         completed = 0
         try:
-            while not self._callback_stop:
-                callback, args, size = await self.callback_queue.get()
+            while True:
+                target, message, size = await self.callback_queue.get()
                 try:
-                    await self.invoke_isolated(callback, *args)
+                    if isinstance(target, MessageRoute):
+                        for callback in target.select(message):
+                            if completed == _CALLBACK_QUANTUM:
+                                completed = 0
+                                await asyncio.sleep(0)
+                            self.invoke_sync_isolated(callback, message)
+                            completed += 1
+                    else:
+                        if completed == _CALLBACK_QUANTUM:
+                            completed = 0
+                            await asyncio.sleep(0)
+                        self.invoke_sync_isolated(target, message)
+                        completed += 1
                 finally:
-                    if size is not None:
-                        self.release(size)
+                    self.release(size)
                     self.callback_queue.task_done()
-                completed += 1
-                if completed == _CALLBACK_QUANTUM:
-                    completed = 0
-                    if not self._callback_stop and not self.callback_queue.empty():
-                        await asyncio.sleep(0)
         finally:
             self._discard_callback_queue()
 
     async def shutdown_callbacks(self, *, drain: bool) -> None:
         task = self.callback_task
         if task is None:
-            return
-        if task is asyncio.current_task():
-            self._callback_stop = True
             return
         if drain and not task.done():
             try:

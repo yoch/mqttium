@@ -84,7 +84,7 @@ async def test_routes_stay_frozen_through_automatic_reconnect() -> None:
     client.on_connect = on_connect
     try:
         await client.connect("fake")
-        await client._delivery.callback_queue.join()
+        await wait_until(lambda: seen == 1)
         await brokers[0].close()
         await asyncio.wait_for(connected.wait(), 2)
         assert calls == 2
@@ -307,20 +307,17 @@ async def test_batch_settles_old_completion_before_mid_reuse_across_blocked_deli
         broker.push_rx(
             PubAckPacket(first.mid).encode() + inbound + PubAckPacket(second.mid).encode()
         )
-        # The first terminal effect wakes batch admission. Delivery blocks the
-        # second, although the protocol engine has already released both IDs.
-        await wait_until(lambda: client.stats().outbound.pending_messages == 0)
-        await asyncio.sleep(0)
-        assert len(broker.publishes) == 2
-        assert not task.done()
-        stream = client.messages()
-        assert (await anext(stream)).payload == b"occupied"
+        # Both parsed terminal results settle before admitting another item,
+        # without waiting for unrelated incoming delivery capacity.
         await wait_until(lambda: len(broker.publishes) == 3)
         receipt = await asyncio.wait_for(task, 2)
         assert receipt.submitted == 3
         assert receipt.pending_count == 1
         assert not receipt.is_done()
         assert client.stats().outbound.pending_messages == 1
+        assert client.stats().delivery.iterator_queued == 1
+        stream = client.messages()
+        assert (await anext(stream)).payload == b"occupied"
         assert (await anext(stream)).payload == b"occupied"
         broker.ack(2)
         await asyncio.wait_for(receipt.wait(), 2)

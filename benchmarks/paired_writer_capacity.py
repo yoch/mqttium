@@ -21,6 +21,7 @@ import statistics
 import subprocess
 import sys
 import time
+from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -42,44 +43,6 @@ class CapacityResult:
     drain_seconds: float
 
 
-@dataclass(slots=True)
-class _PhaseState:
-    submitted: int = 0
-    completed: int = 0
-    sync_rejected: int = 0
-
-
-def _configure_completion_tracking(
-    client, *, qos: int, state: _PhaseState, progress: asyncio.Event
-) -> None:
-    if qos:
-
-        def on_publish(mid: int | None, *_unused: object) -> None:
-            if mid is None:
-                return
-            state.completed += 1
-            progress.set()
-
-        client.on_publish = on_publish
-    else:
-        # Installing on_publish disables the native direct-QoS0 fast path.
-        client.on_publish = None
-
-
-async def _wait_outstanding_below(
-    state: _PhaseState,
-    progress: asyncio.Event,
-    limit: int,
-) -> None:
-    while state.submitted - state.completed >= limit:
-        # A completion can race the clear. Recheck afterwards, exactly as other
-        # event-based progress waits in the client do.
-        progress.clear()
-        if state.submitted - state.completed < limit:
-            break
-        await progress.wait()
-
-
 async def _run_phase(
     client,
     *,
@@ -93,52 +56,37 @@ async def _run_phase(
     """Run one fixed-work capacity phase on the already-connected client."""
     from mqttium.errors import FlowControlError
 
-    state = _PhaseState()
-    progress = asyncio.Event()
-    _configure_completion_tracking(client, qos=qos, state=state, progress=progress)
-
-    loop = asyncio.get_running_loop()
+    pending = deque()
+    submitted = 0
+    sync_rejected = 0
     cpu_started = time.process_time()
     started = time.perf_counter()
     since_yield = 0
-    while state.submitted < count:
-        if qos and state.submitted - state.completed >= outstanding:
-            await _wait_outstanding_below(state, progress, outstanding)
-            since_yield = 0
-            continue
-        try:
-            client.publish_nowait(topic, payload, qos=qos)
-        except FlowControlError:
-            # Closed-loop backpressure means "not admitted yet", not a failed
-            # publication. Yield once so the reader/writer can make progress,
-            # then retry the same unit of work.
-            state.sync_rejected += 1
-            await asyncio.sleep(0)
-            since_yield = 0
-            continue
-
-        state.submitted += 1
-        if qos == 0:
-            # MQTTium's native QoS0 completion contract is successful local
-            # admission/handoff, which is also what the external capacity
-            # harness counts. The untimed drain below verifies that queued
-            # writes are nevertheless drainable.
-            state.completed += 1
-        since_yield += 1
-        if since_yield >= outstanding:
-            since_yield = 0
-            await asyncio.sleep(0)
-
-    if qos:
-        deadline = loop.time() + timeout
-        while state.completed < count:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                raise TimeoutError(f"QoS {qos} completion timeout {state.completed}/{count}")
-            progress.clear()
-            if state.completed >= count:
-                break
-            await asyncio.wait_for(progress.wait(), timeout=remaining)
+    async with asyncio.timeout(timeout):
+        while submitted < count:
+            if qos and len(pending) >= outstanding:
+                await pending.popleft().wait()
+                continue
+            try:
+                receipt = client.publish_nowait(topic, payload, qos=qos)
+            except FlowControlError:
+                # Refused admission is retried for the same publication after
+                # the reader and writer have had an opportunity to progress.
+                sync_rejected += 1
+                await asyncio.sleep(0)
+                since_yield = 0
+                continue
+            submitted += 1
+            if qos:
+                # Bound completion observation by the application window and
+                # preserve receipt identity even when packet IDs are reused.
+                pending.append(receipt)
+            since_yield += 1
+            if since_yield >= outstanding:
+                since_yield = 0
+                await asyncio.sleep(0)
+        while pending:
+            await pending.popleft().wait()
 
     elapsed = time.perf_counter() - started
     cpu_seconds = time.process_time() - cpu_started
@@ -159,7 +107,7 @@ async def _run_phase(
         elapsed_seconds=elapsed,
         completed_rate=count / max(elapsed, 1e-9),
         cpu_seconds=cpu_seconds,
-        sync_rejected=state.sync_rejected,
+        sync_rejected=sync_rejected,
         drain_seconds=drain_seconds,
     )
 

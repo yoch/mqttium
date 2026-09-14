@@ -11,7 +11,6 @@ import statistics
 import subprocess
 import sys
 import time
-from collections import deque
 from dataclasses import asdict, dataclass
 from itertools import product
 from pathlib import Path
@@ -34,37 +33,6 @@ DEFAULT_FRACTIONS = (0.50, 0.75, 0.90, 1.00)
 class LoadPoint:
     mode: str
     value: float
-
-
-class CallbackCompletionTracker:
-    """Correlate callbacks with publishes while packet identifiers are reused."""
-
-    def __init__(self) -> None:
-        self.completions: asyncio.Queue[tuple[int, int]] = asyncio.Queue()
-        self.published_ns: dict[int, deque[int]] = {}
-        self.early: dict[int, deque[int]] = {}
-
-    def record_publish(self, mid: int, sent_ns: int) -> None:
-        self.published_ns.setdefault(mid, deque()).append(sent_ns)
-        early = self.early.get(mid)
-        if early:
-            self.completions.put_nowait((mid, early.popleft()))
-            if not early:
-                del self.early[mid]
-
-    def record_completion(self, mid: int, finished_ns: int) -> None:
-        if mid in self.published_ns:
-            self.completions.put_nowait((mid, finished_ns))
-        else:
-            self.early.setdefault(mid, deque()).append(finished_ns)
-
-    async def next_latency_ms(self, timeout: float) -> float:
-        mid, finished_ns = await asyncio.wait_for(self.completions.get(), timeout=timeout)
-        sent = self.published_ns[mid]
-        sent_ns = sent.popleft()
-        if not sent:
-            del self.published_ns[mid]
-        return (finished_ns - sent_ns) / 1_000_000
 
 
 @dataclass
@@ -126,7 +94,6 @@ async def _connected_client(protocol: str, window: int):
 
 async def sample(args: argparse.Namespace, topic: str) -> OpenLoopResult:
     client = await _connected_client(args.protocol, args.window)
-    callback_tracker = CallbackCompletionTracker()
     latencies: list[float] = []
     receipt_tasks: list[asyncio.Task[None]] = []
 
@@ -134,13 +101,8 @@ async def sample(args: argparse.Namespace, topic: str) -> OpenLoopResult:
         await receipt.wait()
         latencies.append((time.monotonic_ns() - sent_ns) / 1_000_000)
 
-    if args.completion == "callback":
-
-        def on_publish(mid: int | None, *_unused: object) -> None:
-            assert mid is not None
-            callback_tracker.record_completion(mid, time.monotonic_ns())
-
-        client.on_publish = on_publish
+    if args.completion != "receipt":
+        raise ValueError("publication completion requires receipts")
 
     await client.connect(args.host, args.port, timeout=args.timeout)
     loop = asyncio.get_running_loop()
@@ -164,16 +126,9 @@ async def sample(args: argparse.Namespace, topic: str) -> OpenLoopResult:
             sent_ns = time.monotonic_ns()
             receipt = await client.publish(topic, _payload(sequence, args.payload_bytes), qos=1)
             assert receipt.mid is not None
-            if args.completion == "receipt":
-                receipt_tasks.append(asyncio.create_task(observe_receipt(receipt, sent_ns)))
-            else:
-                callback_tracker.record_publish(receipt.mid, sent_ns)
+            receipt_tasks.append(asyncio.create_task(observe_receipt(receipt, sent_ns)))
         offered_elapsed = max(loop.time() - offered_started, 1e-9)
-        if args.completion == "receipt":
-            await asyncio.gather(*receipt_tasks)
-        else:
-            for _ in range(args.count):
-                latencies.append(await callback_tracker.next_latency_ms(args.timeout))
+        await asyncio.gather(*receipt_tasks)
         completed_elapsed = max(loop.time() - offered_started, 1e-9)
         snapshot = client.stats()
         effects = snapshot.effects
@@ -590,8 +545,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--protocols", default="311,5")
     parser.add_argument("--payload-bytes", type=int, default=64)
     parser.add_argument("--payloads", default="64,4096")
-    parser.add_argument("--completion", choices=("receipt", "callback"), default="receipt")
-    parser.add_argument("--completions", default="receipt,callback")
+    parser.add_argument("--completion", choices=("receipt",), default="receipt")
+    parser.add_argument("--completions", default="receipt")
     parser.add_argument("--fractions")
     parser.add_argument("--target-rates")
     parser.add_argument("--count", type=int, default=1_000)
@@ -614,6 +569,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, default=Path("/tmp/paired-open-loop.json"))
     parser.add_argument("--summary-output", type=Path)
     args = parser.parse_args()
+    if any(value != "receipt" for value in args.completions.split(",")):
+        parser.error("--completions accepts receipt only")
     if not args.worker and (args.base_root is None or args.candidate_root is None):
         parser.error("--base-root and --candidate-root are required")
     if args.repeat <= 0 or args.repeat % 2:
