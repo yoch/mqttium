@@ -168,7 +168,13 @@ Timeouts protect different boundaries:
 - `ack_timeout` is the default SUBACK/UNSUBACK deadline;
 - `delivery_timeout=None` waits indefinitely; a positive value covers byte
   reservation and queue admission with one deadline;
-- `callback_shutdown_timeout` limits callback draining during shutdown.
+- `callback_shutdown_timeout` limits message-callback draining during shutdown;
+  it does not time out lifecycle hooks or preempt synchronous application code.
+
+Lifecycle hooks have no implicit deadline. Automatic retry waits for the current
+`on_disconnect` hook; give the hook an application deadline when needed and
+cooperate with cancellation. See the
+[lifecycle contract](reference/async-client.md#lifecycle-hooks).
 
 Publication receipts intentionally follow reconnect policy and session outcome
 rather than a fixed acknowledgement timer. Add an application deadline with

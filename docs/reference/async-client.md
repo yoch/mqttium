@@ -63,8 +63,12 @@ work with its own bounds and overflow policy.
 
 ### Lifecycle hooks
 
-`on_connect` and `on_disconnect` remain assignable sync-or-async hooks. Their
-callback reference is captured when the lifecycle notification is recorded.
+`on_connect` and `on_disconnect` remain assignable sync-or-async hooks.
+Declare `async def` for a hook that awaits application or MQTT work. A
+synchronous hook returning an awaitable is reported as a `TypeError`; MQTTium
+does not await or implicitly schedule that result.
+
+The callback reference is captured when the lifecycle notification is recorded.
 They execute separately from the message worker, after the triggering protocol
 effect and connection locks have been released. A successful `connect()` and
 `disconnect()` complete their network operation without waiting for hook
@@ -82,10 +86,12 @@ application-created task is a separate caller. Hooks must cooperate with
 cancellation; the next hook starts only after the previous hook has ended.
 
 Overlapping explicit connection attempts are rejected before changing the
-endpoint or lifecycle ownership. Cancelling a takeover while it is waiting
-does not suppress later notifications from the surviving connection. A hook
-awaiting its own connection attempt receives that operation's failure normally;
-this caller preservation ends when the connection call exits.
+endpoint or lifecycle ownership. Cancelling a takeover while it waits for the
+connection lock preserves future notifications from the surviving connection.
+It does not restore an obsolete hook already cancelled or a pending notification
+already replaced when the takeover began. A hook awaiting its own connection
+attempt receives that operation's failure normally; this caller preservation
+ends when the connection call exits.
 
 `on_disconnect` runs after the old connection resources are retired, with the
 original cause or `None` for clean closure. Automatic retry waits for that
@@ -93,9 +99,18 @@ hook to finish, then rechecks explicit user intent. Hook exceptions and a
 manually raised `CancelledError` are reported to the event loop's exception
 handler; actual task cancellation retires the hook.
 
-`auth_handler` is different: its response participates in AUTH, so MQTTium
-awaits it with `auth_timeout` and the existing protocol rules. Lifecycle
-reentrancy does not promise arbitrary reentrant operations from AUTH.
+Lifecycle hooks have no implicit execution deadline. `callback_shutdown_timeout`
+applies only to message-callback draining. An unfinished `on_disconnect` can
+delay automatic retry; an explicit replacement can still proceed without waiting
+for that hook. Use an application deadline when a hook must finish within a
+fixed interval, and allow cancellation to propagate.
+
+`auth_handler` accepts synchronous or asynchronous functions. Its response
+participates in AUTH, so MQTTium invokes it with `auth_timeout` and the existing
+protocol rules. Return an `AuthPacket` for a challenge response; use `async def`
+if producing it requires asynchronous work. Lifecycle reentrancy does not
+promise arbitrary reentrant operations from AUTH. See
+[enhanced authentication](../mqtt-5.md#enhanced-authentication).
 
 ## Loop confinement
 

@@ -8,6 +8,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed — lean native experiment
 
+- Correct the enhanced-authentication and long-lived-service examples to return
+  AUTH responses and restore subscriptions through the connection hook.
 - Preserve writer ownership when a short queued write raises after possible
   wire exposure. Retire that generation through the existing writer without
   retrying ambiguous bytes, and keep `join()` pending across queue restoration.

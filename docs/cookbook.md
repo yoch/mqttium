@@ -16,9 +16,14 @@ async def run_service() -> None:
         "service-a",
         reconnect=ReconnectPolicy(max_retries=None),
     )
+
+    async def on_connect(connack):
+        if not connack.session_present:
+            await client.subscribe("commands/service-a", qos=1)
+
+    client.on_connect = on_connect
     try:
         await client.connect("broker.example", 8883, ssl=True)
-        await client.subscribe("commands/service-a", qos=1)
 
         async for message in client.messages():
             await handle_command(message)
@@ -28,6 +33,16 @@ async def run_service() -> None:
 
 asyncio.run(run_service())
 ```
+
+Use `on_connect` to restore subscriptions when the broker starts a new session,
+including after automatic reconnect. MQTTium does not retain application
+subscription intent. A resumed session already contains its subscriptions;
+`clean_start=True`, the default, requests a new session.
+
+`connect()` does not wait for this hook to finish. Incoming processing also
+does not wait for it; add an application readiness signal if processing depends
+on additional hook initialization. Hook failures are reported to the event
+loop's exception handler, so services should define their own failure policy.
 
 Keep blocking application work out of the event loop. If processing must be
 durable before MQTT acknowledgement, enable `manual_ack` and acknowledge only
