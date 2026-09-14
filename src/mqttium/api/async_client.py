@@ -1119,11 +1119,14 @@ class AsyncClient:
         for index in range(limit):
             if not isinstance(message, PublishMessage):
                 raise TypeError("publish_many entries must be PublishMessage instances")
-            if QoS(message.qos) != QoS.AT_MOST_ONCE:
+            # Only an exact QoS 0 stays on the ready path; anything else,
+            # including an invalid level, is validated by ordinary admission.
+            if message.qos != 0:
                 return message, False
+            payload = message.payload
             if not self._try_direct_qos0_publish(
                 message.topic,
-                _owned_payload(message.payload),
+                payload if type(payload) is bytes else _owned_payload(payload),
                 retain=message.retain,
                 properties=message.properties,
                 batch=batch,

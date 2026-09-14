@@ -87,7 +87,10 @@ class Message:
     _ack_token: object | None = field(default=None, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "payload", _owned_payload(self.payload))
+        # Decoded messages already carry owned bytes; only foreign payloads
+        # pay the coercion.
+        if type(self.payload) is not bytes:
+            object.__setattr__(self, "payload", _owned_payload(self.payload))
 
 
 @dataclass(slots=True)

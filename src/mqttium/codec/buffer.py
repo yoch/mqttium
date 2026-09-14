@@ -467,7 +467,7 @@ class IncrementalDecoder:
             self._end = 0
             if self._capacity > self._target_window:
                 self._retire_oversize()
-        return RawPacket(packet_type=packet_type, flags=flags, remaining=body)
+        return RawPacket(packet_type, flags, body)
 
     def drain_packets(self, limit: int = 100) -> list[RawPacket]:
         packets: list[RawPacket] = []

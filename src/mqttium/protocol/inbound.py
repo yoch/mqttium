@@ -306,7 +306,7 @@ class InboundSession:
     def _on_publish_v311(self, raw: RawPacket) -> None:
         engine = self._engine
         qos_raw = (raw.flags >> 1) & 0x03
-        if qos_raw == int(QoS.AT_MOST_ONCE):
+        if qos_raw == 0:
             engine._emit(EffectKind.MESSAGE, decode_qos0_message_v311(raw))
             return
         if qos_raw == 3:
@@ -324,7 +324,7 @@ class InboundSession:
 
     def _on_publish_v5(self, raw: RawPacket) -> None:
         qos_raw = (raw.flags >> 1) & 0x03
-        if qos_raw == int(QoS.AT_MOST_ONCE):
+        if qos_raw == 0:
             message, property_wire_size = decode_qos0_message_v5(raw)
             properties = message.properties
             assert properties is not None

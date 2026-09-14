@@ -27,13 +27,13 @@ def decode_qos0_message_v311(raw: RawPacket) -> Message:
         raise MalformedPacketError("PUBLISH topic must not be empty")
     validate_received_publish_topic(topic, utf8_validated=True)
     return Message(
-        topic=topic,
-        payload=raw.remaining[payload_pos:],
-        qos=QoS.AT_MOST_ONCE,
-        retain=bool(raw.flags & 0x01),
-        dup=False,
-        mid=None,
-        properties=None,
+        topic,
+        raw.remaining[payload_pos:],
+        QoS.AT_MOST_ONCE,
+        bool(raw.flags & 0x01),
+        False,
+        None,
+        None,
     )
 
 
@@ -48,13 +48,13 @@ def decode_qos0_message_v5(raw: RawPacket) -> tuple[Message, int]:
     validate_received_publish_topic(topic, utf8_validated=True)
     return (
         Message(
-            topic=topic,
-            payload=raw.remaining[pos:],
-            qos=QoS.AT_MOST_ONCE,
-            retain=bool(raw.flags & 0x01),
-            dup=False,
-            mid=None,
-            properties=properties,
+            topic,
+            raw.remaining[pos:],
+            QoS.AT_MOST_ONCE,
+            bool(raw.flags & 0x01),
+            False,
+            None,
+            properties,
         ),
         property_wire_size,
     )
