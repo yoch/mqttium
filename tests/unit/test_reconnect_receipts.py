@@ -51,9 +51,7 @@ async def test_receipt_survives_and_completes_after_reconnect() -> None:
     client = AsyncClient(
         "re",
         clean_start=False,
-        reconnect=ReconnectPolicy(
-            enabled=True, initial_delay=0.05, max_delay=0.1, stable_after=0.05
-        ),
+        reconnect=ReconnectPolicy(initial_delay=0.05, max_delay=0.1, stable_after=0.05),
     )
 
     async def factory(host: str, port: int, *, ssl=None):

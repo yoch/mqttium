@@ -85,7 +85,7 @@ def test_mqtt_3_3_4_6_outbound_publish_rejects_a_subscription_identifier() -> No
         with pytest.raises(ProtocolError, match="subscription_identifier"):
             engine.queue_publish("t/x", b"hi", qos=qos, properties=properties)
         assert engine.take_effects() == [], "nothing may reach the wire"
-        assert engine.outbound.pending_messages == 0, "nothing may be queued"
+        assert engine.outbound.unacknowledged_messages == 0, "nothing may be queued"
 
     engine = _connected()
     with pytest.raises(ProtocolError, match="subscription_identifier"):

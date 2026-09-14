@@ -46,8 +46,8 @@ def _feed(engine: ProtocolEngine, wire: bytes) -> None:
 def test_message_limit_rejects_before_packet_id_or_store_mutation() -> None:
     engine = ProtocolEngine(
         EngineConfig(
-            max_pending_outbound_messages=1,
-            max_pending_outbound_bytes=None,
+            max_unacknowledged_messages=1,
+            max_unacknowledged_bytes=None,
         )
     )
 
@@ -56,8 +56,8 @@ def test_message_limit_rejects_before_packet_id_or_store_mutation() -> None:
         engine.queue_publish("admission/second", b"two", qos=1)
 
     assert first.mid == 1
-    assert engine.pending_outbound_messages == 1
-    assert engine.pending_outbound_bytes == len(b"one") + len("admission/first")
+    assert engine.unacknowledged_messages == 1
+    assert engine.unacknowledged_bytes == len(b"one") + len("admission/first")
     assert len(engine.packet_ids) == 1
     assert (
         sum(
@@ -75,16 +75,16 @@ def test_message_limit_rejects_before_packet_id_or_store_mutation() -> None:
 def test_zero_capacity_rejects_without_allocating_state() -> None:
     engine = ProtocolEngine(
         EngineConfig(
-            max_pending_outbound_messages=0,
-            max_pending_outbound_bytes=0,
+            max_unacknowledged_messages=0,
+            max_unacknowledged_bytes=0,
         )
     )
 
     with pytest.raises(FlowControlError):
         engine.queue_publish("admission/zero", b"payload", qos=1)
 
-    assert engine.pending_outbound_messages == 0
-    assert engine.pending_outbound_bytes == 0
+    assert engine.unacknowledged_messages == 0
+    assert engine.unacknowledged_bytes == 0
     assert len(engine.packet_ids) == 0
     assert (
         list(
@@ -100,15 +100,15 @@ def test_zero_capacity_rejects_without_allocating_state() -> None:
 def test_none_disables_both_admission_limits() -> None:
     engine = ProtocolEngine(
         EngineConfig(
-            max_pending_outbound_messages=None,
-            max_pending_outbound_bytes=None,
+            max_unacknowledged_messages=None,
+            max_unacknowledged_bytes=None,
         )
     )
 
     for index in range(20):
         engine.queue_publish(f"admission/{index}", b"payload", qos=1)
 
-    assert engine.pending_outbound_messages == 20
+    assert engine.unacknowledged_messages == 20
     assert len(engine.packet_ids) == 20
 
 
@@ -126,8 +126,8 @@ def test_byte_limit_counts_payload_topic_and_non_empty_encoded_properties() -> N
     engine = ProtocolEngine(
         EngineConfig(
             protocol=MQTTProtocolVersion.MQTTv5,
-            max_pending_outbound_messages=None,
-            max_pending_outbound_bytes=logical_size,
+            max_unacknowledged_messages=None,
+            max_unacknowledged_bytes=logical_size,
         )
     )
 
@@ -135,15 +135,15 @@ def test_byte_limit_counts_payload_topic_and_non_empty_encoded_properties() -> N
     with pytest.raises(FlowControlError, match="byte limit"):
         engine.queue_publish("x", b"", qos=1)
 
-    assert engine.pending_outbound_bytes == logical_size
+    assert engine.unacknowledged_bytes == logical_size
     assert len(engine.packet_ids) == 1
 
 
 def test_puback_releases_message_and_byte_reservations() -> None:
     engine = ProtocolEngine(
         EngineConfig(
-            max_pending_outbound_messages=1,
-            max_pending_outbound_bytes=128,
+            max_unacknowledged_messages=1,
+            max_unacknowledged_bytes=128,
         )
     )
     engine.begin_connect()
@@ -151,12 +151,12 @@ def test_puback_releases_message_and_byte_reservations() -> None:
 
     handle = engine.queue_publish("admission/release", b"payload", qos=1)
     assert handle.mid is not None
-    assert engine.pending_outbound_messages == 1
+    assert engine.unacknowledged_messages == 1
 
     _feed(engine, PubAckPacket(mid=handle.mid).encode())
 
-    assert engine.pending_outbound_messages == 0
-    assert engine.pending_outbound_bytes == 0
+    assert engine.unacknowledged_messages == 0
+    assert engine.unacknowledged_bytes == 0
     replacement = engine.queue_publish("admission/next", b"payload", qos=1)
     assert replacement.mid is not None
 
@@ -164,8 +164,8 @@ def test_puback_releases_message_and_byte_reservations() -> None:
 def test_qos2_drops_contiguous_frame_on_launch_but_keeps_budget_to_pubcomp() -> None:
     engine = ProtocolEngine(
         EngineConfig(
-            max_pending_outbound_messages=1,
-            max_pending_outbound_bytes=128,
+            max_unacknowledged_messages=1,
+            max_unacknowledged_bytes=128,
         )
     )
     engine.begin_connect()
@@ -178,7 +178,7 @@ def test_qos2_drops_contiguous_frame_on_launch_but_keeps_budget_to_pubcomp() -> 
     # Admission tracks logical topic-plus-payload size, not the optional cached
     # transport representation. A small contiguous frame is already gone.
     assert stored.encoded_publish is None
-    retained_bytes = engine.pending_outbound_bytes
+    retained_bytes = engine.unacknowledged_bytes
 
     _feed(engine, PubRecPacket(mid=handle.mid).encode())
 
@@ -186,12 +186,12 @@ def test_qos2_drops_contiguous_frame_on_launch_but_keeps_budget_to_pubcomp() -> 
     assert stored is not None
     assert stored.state is OutboundQoSState.WAIT_PUBCOMP
     assert stored.encoded_publish is None
-    assert engine.pending_outbound_messages == 1
-    assert engine.pending_outbound_bytes == retained_bytes
+    assert engine.unacknowledged_messages == 1
+    assert engine.unacknowledged_bytes == retained_bytes
 
     _feed(engine, PubCompPacket(mid=handle.mid).encode())
-    assert engine.pending_outbound_messages == 0
-    assert engine.pending_outbound_bytes == 0
+    assert engine.unacknowledged_messages == 0
+    assert engine.unacknowledged_bytes == 0
 
 
 def test_hydrated_records_are_counted_even_above_new_limits() -> None:
@@ -211,13 +211,13 @@ def test_hydrated_records_are_counted_even_above_new_limits() -> None:
         )
     engine = ProtocolEngine(
         EngineConfig(
-            max_pending_outbound_messages=1,
-            max_pending_outbound_bytes=None,
+            max_unacknowledged_messages=1,
+            max_unacknowledged_bytes=None,
         ),
         store=store,
     )
 
-    assert engine.pending_outbound_messages == 3
+    assert engine.unacknowledged_messages == 3
     with pytest.raises(FlowControlError):
         engine.queue_publish("admission/new", b"payload", qos=1)
     assert len(engine.packet_ids) == 3
@@ -226,8 +226,8 @@ def test_hydrated_records_are_counted_even_above_new_limits() -> None:
 def test_sustained_qos1_load_returns_admission_counters_to_zero() -> None:
     engine = ProtocolEngine(
         EngineConfig(
-            max_pending_outbound_messages=100,
-            max_pending_outbound_bytes=1024 * 1024,
+            max_unacknowledged_messages=100,
+            max_unacknowledged_bytes=1024 * 1024,
         )
     )
     engine.begin_connect()
@@ -247,8 +247,8 @@ def test_sustained_qos1_load_returns_admission_counters_to_zero() -> None:
             assert handle.mid is not None
             _feed(engine, PubAckPacket(mid=handle.mid).encode())
         engine.take_effects()
-        assert engine.pending_outbound_messages == 0
-        assert engine.pending_outbound_bytes == 0
+        assert engine.unacknowledged_messages == 0
+        assert engine.unacknowledged_bytes == 0
         assert engine.flow.inflight == 0
         assert len(engine.packet_ids) == 0
         assert (
@@ -260,5 +260,5 @@ def test_sustained_qos1_load_returns_admission_counters_to_zero() -> None:
             == []
         )
 
-    assert engine.outbound.pending_high_water_messages == 50
-    assert engine.outbound.pending_high_water_bytes > 0
+    assert engine.outbound.unacknowledged_high_water_messages == 50
+    assert engine.outbound.unacknowledged_high_water_bytes > 0

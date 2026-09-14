@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from mqttium.api import AsyncClient
+from mqttium.api import async_client as async_client_module
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, QoS
 from mqttium.errors import ProtocolError
 from mqttium.packets import PublishPacket
@@ -95,14 +98,10 @@ TEARDOWN_ACQUISITIONS = 1
 async def _run_reads(
     reads: list[bytes],
     *,
-    max_ingress_batch_bytes: int = 1024 * 1024,
-    local_receive_maximum: int = 100,
+    max_inbound_inflight: int = 100,
     initial_inflight: int = 0,
 ):
-    client = AsyncClient(
-        max_ingress_batch_bytes=max_ingress_batch_bytes,
-        local_receive_maximum=local_receive_maximum,
-    )
+    client = AsyncClient(max_inbound_inflight=max_inbound_inflight)
     client._engine.state = ConnectionState.CONNECTED
     client._engine.inbound._inflight = initial_inflight
     client._transport = _ScriptedTransport(reads)
@@ -142,12 +141,17 @@ async def test_full_count_batch_re_enters_to_find_the_buffer_empty() -> None:
     assert acquisitions == 2 + TEARDOWN_ACQUISITIONS
 
 
-async def test_byte_bounded_batch_re_enters_until_the_buffer_drains() -> None:
-    """Each PUBACK charges len(remaining) + 5, so 20 bytes admits three."""
+async def test_byte_bounded_batch_re_enters_until_the_buffer_drains(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each PUBACK charges len(remaining) + 5, so 20 bytes admits three.
+
+    The byte quantum is a fixed module constant; it is lowered here so the
+    bound is reachable with a handful of packets.
+    """
+    monkeypatch.setattr(async_client_module, "_MAX_INGRESS_BATCH_BYTES", 20)
     wire = b"".join(puback(mid) for mid in range(1, 7))
-    next_calls, acquisitions, handled, _client = await _run_reads(
-        [wire], max_ingress_batch_bytes=20
-    )
+    next_calls, acquisitions, handled, _client = await _run_reads([wire])
 
     assert handled == 6
     assert next_calls == 7
@@ -167,7 +171,7 @@ async def test_packet_split_across_reads_is_completed() -> None:
 async def test_receive_maximum_only_bounds_autoack_publish_batches() -> None:
     next_calls, acquisitions, handled, client = await _run_reads(
         [pingresp() * 256],
-        local_receive_maximum=1,
+        max_inbound_inflight=1,
     )
 
     assert handled == 256
@@ -179,7 +183,7 @@ async def test_receive_maximum_only_bounds_autoack_publish_batches() -> None:
 async def test_autoack_batch_hands_off_before_receive_maximum_is_exceeded() -> None:
     next_calls, acquisitions, handled, client = await _run_reads(
         [publish(1) + publish(2) + publish(3)],
-        local_receive_maximum=2,
+        max_inbound_inflight=2,
     )
 
     assert handled == 3
@@ -191,7 +195,7 @@ async def test_autoack_batch_hands_off_before_receive_maximum_is_exceeded() -> N
 async def test_autoack_batch_uses_only_the_remaining_receive_maximum_window() -> None:
     next_calls, acquisitions, handled, client = await _run_reads(
         [publish(1) + publish(2)],
-        local_receive_maximum=2,
+        max_inbound_inflight=2,
         initial_inflight=1,
     )
 
@@ -204,7 +208,7 @@ async def test_autoack_batch_uses_only_the_remaining_receive_maximum_window() ->
 async def test_qos2_filling_window_after_autoack_forces_handoff() -> None:
     next_calls, acquisitions, handled, client = await _run_reads(
         [publish(1) + publish(2, QoS.EXACTLY_ONCE) + publish(3)],
-        local_receive_maximum=2,
+        max_inbound_inflight=2,
     )
 
     assert handled == 3

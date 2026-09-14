@@ -62,7 +62,7 @@ async def test_reader_delivery_runs_sync_callback_outside_engine_lock() -> None:
 
 
 async def test_terminal_result_is_independent_of_pending_reader_delivery() -> None:
-    client = AsyncClient(max_pending_messages=1)
+    client = AsyncClient(max_iterator_messages=1)
     first = Message("first", b"one")
     second = Message("second", b"two")
     await accept_message(client._delivery, first, None)

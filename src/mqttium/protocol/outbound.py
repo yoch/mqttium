@@ -119,7 +119,7 @@ class OutboundSession:
         self._encode_publish = codec.encode_publish_item
         self._encode_pubrel = codec.encode_pubrel
         self.packet_ids = PacketIdPool()
-        self.flow = FlowControl(self.config.local_receive_maximum)
+        self.flow = FlowControl(self.config.max_inbound_inflight)
         self._queued: deque[OutboundMessage | OutboundMessageSummary] = deque()
         # Replay-parked WAIT_* entries currently in `_queued` (see
         # `_unpark_settled`). Zero on every path that does not involve a
@@ -171,19 +171,19 @@ class OutboundSession:
     # --- admission ---------------------------------------------------------
 
     @property
-    def pending_messages(self) -> int:
+    def unacknowledged_messages(self) -> int:
         return self._pending_messages
 
     @property
-    def pending_bytes(self) -> int:
+    def unacknowledged_bytes(self) -> int:
         return self._pending_bytes
 
     @property
-    def pending_high_water_messages(self) -> int:
+    def unacknowledged_high_water_messages(self) -> int:
         return self._pending_high_water_messages
 
     @property
-    def pending_high_water_bytes(self) -> int:
+    def unacknowledged_high_water_bytes(self) -> int:
         return self._pending_high_water_bytes
 
     def _resolved_alias_topic_for_sizing(self, properties: Properties) -> str:
@@ -201,20 +201,20 @@ class OutboundSession:
     ) -> bool:
         if QoS(qos) == QoS.AT_MOST_ONCE:
             return True
-        message_limit = self.config.max_pending_outbound_messages
+        message_limit = self.config.max_unacknowledged_messages
         if message_limit is not None and message_limit < 1:
             return False
-        byte_limit = self.config.max_pending_outbound_bytes
+        byte_limit = self.config.max_unacknowledged_bytes
         if not topic and properties is not None:
             topic = self._resolved_alias_topic_for_sizing(properties)
         logical_size = self.logical_size(topic, payload, properties)
         return byte_limit is None or logical_size <= byte_limit
 
     def _reserve(self, logical_size: int) -> None:
-        message_limit = self.config.max_pending_outbound_messages
+        message_limit = self.config.max_unacknowledged_messages
         if message_limit is not None and self._pending_messages >= message_limit:
             raise FlowControlError("Pending outbound message limit reached")
-        byte_limit = self.config.max_pending_outbound_bytes
+        byte_limit = self.config.max_unacknowledged_bytes
         if byte_limit is not None and self._pending_bytes + logical_size > byte_limit:
             raise FlowControlError("Pending outbound byte limit reached")
         self._pending_messages += 1
@@ -243,15 +243,17 @@ class OutboundSession:
         """
         flow = self.flow
         return OutboundStats(
-            pending_messages=self._pending_messages,
-            pending_bytes=self._pending_bytes,
-            pending_high_water_messages=max(
+            unacknowledged_messages=self._pending_messages,
+            unacknowledged_bytes=self._pending_bytes,
+            unacknowledged_high_water_messages=max(
                 self._pending_high_water_messages, self._pending_messages
             ),
-            pending_high_water_bytes=max(self._pending_high_water_bytes, self._pending_bytes),
-            queued_messages=len(self._queued),
-            flow_inflight=flow.inflight,
-            flow_limit=flow.limit,
+            unacknowledged_high_water_bytes=max(
+                self._pending_high_water_bytes, self._pending_bytes
+            ),
+            awaiting_slot=len(self._queued),
+            inflight=flow.inflight,
+            inflight_limit=flow.limit,
             packet_ids_in_use=len(self.packet_ids),
         )
 

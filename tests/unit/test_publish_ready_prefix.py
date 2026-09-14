@@ -46,7 +46,7 @@ async def test_source_reentry_preserves_writer_order_and_separate_receipts(qos, 
 
 @pytest.mark.parametrize("failure_index", [0, 1, 63, 64, 65])
 async def test_iterator_failure_seals_only_committed_prefix_at_driver_boundaries(failure_index):
-    client = AsyncClient("prefix-source-failure", max_outbound_messages=128)
+    client = AsyncClient("prefix-source-failure", max_write_queue_messages=128)
     broker = _WireBroker()
     client._transport_factory = transport_factory(broker)
     failure = ValueError("source failed")
@@ -152,7 +152,7 @@ async def test_mixed_qos_keeps_wire_order_and_yields_within_a_long_source():
 @pytest.mark.parametrize("failure_index", [0, 63, 64])
 @pytest.mark.parametrize("invalid", [None, PublishMessage("batch", b"invalid", qos=3)])
 async def test_validation_failure_does_not_advance_beyond_committed_prefix(failure_index, invalid):
-    client = AsyncClient("prefix-invalid", max_outbound_messages=128)
+    client = AsyncClient("prefix-invalid", max_write_queue_messages=128)
     broker = _WireBroker()
     client._transport_factory = transport_factory(broker)
     consumed = []

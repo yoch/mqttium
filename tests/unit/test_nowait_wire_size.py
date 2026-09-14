@@ -89,7 +89,7 @@ async def test_publish_nowait_encodes_only_the_real_frame(monkeypatch) -> None:
 
     monkeypatch.setattr(PublishPacket, "encode_write_item", counted_packet)
     monkeypatch.setattr(publish_v311_module, "encode_publish_item_v311", counted_item)
-    client = AsyncClient(max_outbound_messages=8)
+    client = AsyncClient(max_write_queue_messages=8)
     client._engine.state = ConnectionState.CONNECTED
 
     receipt = client.publish_nowait("bench/nowait", b"payload", qos=1)
@@ -117,8 +117,8 @@ async def test_nowait_qos1_prepares_properties_once_with_resident_writer(
     monkeypatch.setattr(outbound_module, "encode_properties", counted)
     client = AsyncClient(
         protocol=MQTTProtocolVersion.MQTTv5,
-        max_outbound_messages=8,
-        max_outbound_bytes=4096,
+        max_write_queue_messages=8,
+        max_write_queue_bytes=4096,
     )
     client._engine.state = ConnectionState.CONNECTED
     assert client._write_pump.try_enqueue(b"occupied") is True
@@ -162,7 +162,7 @@ async def test_nowait_qos1_sizes_v311_once_with_resident_writer(
         return original(self, *args, **kwargs)
 
     monkeypatch.setattr(outbound_module.OutboundSession, "size_parts", counted)
-    client = AsyncClient(max_outbound_messages=8, max_outbound_bytes=4096)
+    client = AsyncClient(max_write_queue_messages=8, max_write_queue_bytes=4096)
     client._engine.state = ConnectionState.CONNECTED
     assert client._write_pump.try_enqueue(b"occupied") is True
 

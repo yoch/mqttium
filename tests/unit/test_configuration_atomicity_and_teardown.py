@@ -117,12 +117,12 @@ def test_outbound_reservation_underflow_raises_without_corrupting_counters() -> 
 
     with pytest.raises(AssertionError, match="message reservation underflow"):
         engine.outbound._release_reservation(0)
-    assert engine.pending_outbound_messages == 0
-    assert engine.pending_outbound_bytes == 0
+    assert engine.unacknowledged_messages == 0
+    assert engine.unacknowledged_bytes == 0
 
     engine.outbound._pending_messages = 1
     engine.outbound._pending_bytes = 4
     with pytest.raises(AssertionError, match="byte reservation underflow"):
         engine.outbound._release_reservation(5)
-    assert engine.pending_outbound_messages == 1
-    assert engine.pending_outbound_bytes == 4
+    assert engine.unacknowledged_messages == 1
+    assert engine.unacknowledged_bytes == 4

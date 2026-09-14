@@ -589,15 +589,16 @@ class _RuntimeHarness:
             "client_id": f"runtime-fuzz-{self.schedule.seed}",
             "protocol": MQTTProtocolVersion.MQTTv5,
             "reconnect": ReconnectPolicy(
-                enabled=self.schedule.auto_reconnect,
                 initial_delay=0,
                 max_delay=0,
                 max_retries=3,
                 stable_after=0.05,
-                connect_timeout=self.connect_timeout_seconds,
-            ),
-            "max_outbound_messages": 1,
-            "max_outbound_bytes": 4096,
+            )
+            if self.schedule.auto_reconnect
+            else None,
+            "connect_timeout": self.connect_timeout_seconds,
+            "max_write_queue_messages": 1,
+            "max_write_queue_bytes": 4096,
             "message_delivery": "callback",
             "keepalive": 0,
         }
@@ -1085,7 +1086,7 @@ class _RuntimeHarness:
             await self._wait_until(
                 lambda: (
                     self.client.stats().state is ConnectionState.DISCONNECTED
-                    and not any(asdict(self.client.stats().tasks).values())
+                    and not any(self.client._running_tasks().values())
                     and self.client._lifecycle_hooks.task is None
                 ),
                 "terminal teardown did not settle",
@@ -1121,30 +1122,31 @@ class _RuntimeHarness:
         if writer_task is not None and writer_task.done():
             assert stats.writer.waiters == 0, "writer admission waiter survived a dead writer"
 
-        assert stats.effects.applied <= stats.effects.enqueued, (
+        effects = self.client._effect_pump.counters()
+        assert effects["applied"] <= effects["enqueued"], (
             "effect pump applied more effects than it enqueued"
         )
-        assert stats.effects.pending == stats.effects.enqueued - stats.effects.applied, (
+        assert effects["pending"] == effects["enqueued"] - effects["applied"], (
             "effect pump settlement counters cannot reach their drain target"
         )
         if self.client._effect_pump._failing_close:
-            assert stats.effects.pending == 0, (
+            assert effects["pending"] == 0, (
                 "effect collected during failing-close was left without an owner"
             )
 
         outbound = stats.outbound
-        assert 0 <= outbound.flow_inflight <= outbound.flow_limit
-        assert outbound.queued_messages + outbound.flow_inflight <= outbound.pending_messages
-        assert outbound.packet_ids_in_use == outbound.pending_messages
+        assert 0 <= outbound.inflight <= outbound.inflight_limit
+        assert outbound.awaiting_slot + outbound.inflight <= outbound.unacknowledged_messages
+        assert outbound.packet_ids_in_use == outbound.unacknowledged_messages
         if not self.client._teardown_final:
             # Receipts mirror unfinished engine records only until terminal
             # teardown fails them; durable session records legitimately
             # outlive their receipts so a present session can be resumed.
-            assert stats.receipts.publish == outbound.pending_messages, (
+            assert stats.receipts.publish == outbound.unacknowledged_messages, (
                 "publish receipts diverged from unfinished engine records"
             )
-        assert 0 <= stats.inbound.inflight <= stats.inbound.receive_maximum
-        assert stats.delivery.pending_bytes >= 0
+        assert 0 <= stats.inbound.inflight <= stats.inbound.inflight_limit
+        assert stats.delivery.iterator_bytes >= 0
         if self.callback_epoch == stats.connection_epoch and self.client.is_connected:
             reader = self.client._reader_task
             assert reader is not None and not reader.done(), (
@@ -1173,18 +1175,18 @@ class _RuntimeHarness:
                     f"expected={target} observed={observed}"
                 )
             assert stats.writer.waiters == 0, "writer waiter survived terminal teardown"
-            assert stats.effects.waiters == 0, "effect drain waiter survived terminal teardown"
+            assert effects["waiters"] == 0, "effect drain waiter survived terminal teardown"
             assert stats.delivery.waiters == 0, "delivery waiter survived terminal teardown"
             assert stats.receipts.publish_waiters == 0, "publish waiter survived terminal teardown"
             assert pump.resident_messages == 0, "writer retained a message after teardown"
             assert stats.writer.queued_bytes == 0, "writer retained bytes after teardown"
-            assert stats.effects.pending == 0, "effect survived terminal teardown"
+            assert effects["pending"] == 0, "effect survived terminal teardown"
             assert self.client._delivery_lane.pending_count == 0, (
                 "reader delivery effect survived terminal teardown"
             )
-            assert stats.delivery.pending_bytes == 0, "message bytes survived terminal teardown"
+            assert stats.delivery.iterator_bytes == 0, "message bytes survived terminal teardown"
             assert stats.receipts.publish == 0, "publish receipt survived terminal teardown"
-            assert not any(asdict(stats.tasks).values()), (
+            assert not any(self.client._running_tasks().values()), (
                 "connection-scoped task survived terminal teardown"
             )
             assert self.client._lifecycle_hooks.task is None, (
@@ -1202,6 +1204,7 @@ class _RuntimeHarness:
         stats = asdict(self.client.stats())
         stats["state"] = self.client.stats().state.name
         stats["writer"].pop("last_outbound", None)
+        stats["tasks"] = self.client._running_tasks()
         return {
             "client": stats,
             "delivery_lane": {
@@ -1224,6 +1227,7 @@ class _RuntimeHarness:
                 ),
             },
             "effects": {
+                **self.client._effect_pump.counters(),
                 "pending_epoch": self.client._effect_pump.pending_epoch,
                 "failing_close": self.client._effect_pump._failing_close,
                 "failure_owner": type(self.client._effect_pump.error).__name__

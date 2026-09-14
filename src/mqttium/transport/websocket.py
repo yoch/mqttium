@@ -196,19 +196,9 @@ class WebSocketTransport:
 
     @property
     def buffered_read_bytes(self) -> int:
-        return len(self._recv_buf)
-
-    @property
-    def fragmented_read_bytes(self) -> int:
-        return 0 if self._fragment is None else len(self._fragment)
-
-    @property
-    def pending_control_frames(self) -> int:
-        return len(self._pending_control)
-
-    @property
-    def pending_control_bytes(self) -> int:
-        return sum(map(len, self._pending_control))
+        # A fragmented message under reassembly is received but not yet readable.
+        fragment = 0 if self._fragment is None else len(self._fragment)
+        return len(self._recv_buf) + fragment
 
     def stats(self) -> TransportStats:
         return TransportStats(
@@ -216,9 +206,6 @@ class WebSocketTransport:
             closing=self.is_closing(),
             pending_write_bytes=self.pending_write_bytes,
             buffered_read_bytes=self.buffered_read_bytes,
-            fragmented_read_bytes=self.fragmented_read_bytes,
-            pending_control_frames=self.pending_control_frames,
-            pending_control_bytes=self.pending_control_bytes,
         )
 
     async def _flush_control(self) -> None:

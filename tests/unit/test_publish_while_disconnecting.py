@@ -46,5 +46,5 @@ def test_qos1_publish_is_rejected_after_disconnect_begins() -> None:
         tuple(store.get_out(summary.mid) for page in store.out_summary_pages() for summary in page)
         == ()
     )
-    assert engine.pending_outbound_messages == 0
+    assert engine.unacknowledged_messages == 0
     assert len(engine.packet_ids) == 0

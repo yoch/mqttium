@@ -72,8 +72,8 @@ def _packets(written: list[bytes]):
 async def test_clean_reconnect_does_not_send_failed_old_publish() -> None:
     client = AsyncClient(
         client_id="audit-clean",
-        max_outbound_messages=1,
-        max_outbound_bytes=1,
+        max_write_queue_messages=1,
+        max_write_queue_bytes=1,
     )
     mid = await _cancel_send_under_backpressure(client)
     transport = ConnackTransport(session_present=False)
@@ -94,8 +94,8 @@ async def test_resumed_session_rebuilds_exactly_one_publish() -> None:
     client = AsyncClient(
         client_id="audit-resume",
         clean_start=False,
-        max_outbound_messages=1,
-        max_outbound_bytes=1,
+        max_write_queue_messages=1,
+        max_write_queue_bytes=1,
     )
     await _cancel_send_under_backpressure(client)
     transport = ConnackTransport(session_present=True)

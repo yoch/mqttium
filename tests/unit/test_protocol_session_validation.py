@@ -95,7 +95,7 @@ def test_session_resume_uses_clean_start_false() -> None:
 
 
 def test_inbound_receive_maximum() -> None:
-    engine = ProtocolEngine(EngineConfig(client_id="c", local_receive_maximum=1, manual_ack=True))
+    engine = ProtocolEngine(EngineConfig(client_id="c", max_inbound_inflight=1, manual_ack=True))
     engine.begin_connect()
     _feed(engine, encode_frame(PacketType.CONNACK, 0, b"\x00\x00"))
     engine.take_effects()

@@ -111,7 +111,7 @@ def test_auth_handler_is_read_only() -> None:
     async def handler(_packet):
         return None
 
-    client = AsyncClient(auth_handler=handler)
+    client = AsyncClient(protocol=MQTTProtocolVersion.MQTTv5, auth_handler=handler)
     with pytest.raises(AttributeError):
         client.auth_handler = None
     assert client.auth_handler is handler
@@ -139,9 +139,7 @@ async def test_progressive_batch_reads_one_ahead_and_can_exceed_one_message_budg
     store = (
         MemoryInflightStore() if backend == "memory" else SqliteInflightStore(tmp_path / "one.db")
     )
-    client = AsyncClient(
-        "one", store=store, max_outbound_inflight=1, max_pending_outbound_messages=1
-    )
+    client = AsyncClient("one", store=store, max_outbound_inflight=1, max_unacknowledged_messages=1)
     broker = HeldAckBroker()
     client._transport_factory = transport_factory(broker)
     consumed = []
@@ -157,7 +155,7 @@ async def test_progressive_batch_reads_one_ahead_and_can_exceed_one_message_budg
         for index in range(8):
             await wait_until(lambda index=index: len(broker.publishes) == index + 1)
             assert len(consumed) <= index + 2
-            assert client.stats().outbound.pending_messages == 1
+            assert client.stats().outbound.unacknowledged_messages == 1
             assert client.stats().receipts.publish == 0
             broker.ack(index)
         receipt = await asyncio.wait_for(task, 2)
@@ -214,7 +212,7 @@ async def test_batch_cancellation_during_flow_wait_seals_active_prefix() -> None
             await task
         assert receipt._sealed
         assert receipt.submitted == 1
-        assert client.stats().outbound.pending_messages == 1
+        assert client.stats().outbound.unacknowledged_messages == 1
         broker.ack(0)
         await asyncio.wait_for(receipt.wait(), 2)
         assert len(broker.publishes) == 1
@@ -282,7 +280,7 @@ async def test_properties_and_payload_keep_owned_values_through_restart(tmp_path
         assert packet.payload == b"payload"
         assert packet.properties.get("correlation_data") == b"original"
         assert packet.properties.get("user_property") == (("key", "value"),)
-        await wait_until(lambda: recovered.stats().outbound.pending_messages == 0)
+        await wait_until(lambda: recovered.stats().outbound.unacknowledged_messages == 0)
     finally:
         await recovered.disconnect()
         if backend == "sqlite":
@@ -290,7 +288,7 @@ async def test_properties_and_payload_keep_owned_values_through_restart(tmp_path
 
 
 async def test_batch_settles_old_completion_before_mid_reuse_across_blocked_delivery() -> None:
-    client = AsyncClient("mid-reuse", max_outbound_inflight=2, max_pending_messages=1)
+    client = AsyncClient("mid-reuse", max_outbound_inflight=2, max_iterator_messages=1)
     broker = HeldAckBroker()
     client._transport_factory = transport_factory(broker)
     await client.connect("fake")
@@ -314,14 +312,14 @@ async def test_batch_settles_old_completion_before_mid_reuse_across_blocked_deli
         assert receipt.submitted == 3
         assert receipt.pending_count == 1
         assert not receipt.is_done()
-        assert client.stats().outbound.pending_messages == 1
+        assert client.stats().outbound.unacknowledged_messages == 1
         assert client.stats().delivery.iterator_queued == 1
         stream = client.messages()
         assert (await anext(stream)).payload == b"occupied"
         assert (await anext(stream)).payload == b"occupied"
         broker.ack(2)
         await asyncio.wait_for(receipt.wait(), 2)
-        assert client.stats().outbound.pending_messages == 0
+        assert client.stats().outbound.unacknowledged_messages == 0
         await stream.aclose()
     finally:
         if not task.done():

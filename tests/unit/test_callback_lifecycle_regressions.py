@@ -483,7 +483,7 @@ async def test_application_reconnect_keeps_fresh_callbacks_and_retires_old_deliv
     client = AsyncClient(
         "application-reconnect-delivery",
         protocol=protocol,
-        local_receive_maximum=256,
+        max_inbound_inflight=256,
         message_delivery="callback",
     )
     brokers = []
@@ -504,7 +504,7 @@ async def test_application_reconnect_keeps_fresh_callbacks_and_retires_old_deliv
         await client.disconnect()
         assert old_reader is not None and old_reader.done()
         old_delivered.append(len(seen))
-        assert client.stats().delivery.pending_bytes == 0
+        assert client.stats().delivery.iterator_bytes == 0
         await client.connect("fake")
         brokers[1].publish(b"fresh", 3)
 
@@ -536,7 +536,7 @@ async def test_application_reconnect_keeps_fresh_callbacks_and_retires_old_deliv
         assert all(payload.startswith(b"fresh") for payload in fresh)
         assert len(fresh) == 3 and len(set(fresh)) == 3
         assert client.stats().delivery.callback_invocations == len(seen)
-        assert client.stats().delivery.pending_bytes == 0
+        assert client.stats().delivery.iterator_bytes == 0
         assert client.stats().inbound.inflight == 0
     finally:
         if work is not None:

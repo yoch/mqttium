@@ -37,7 +37,7 @@ def test_negotiated_settings_applied() -> None:
         EngineConfig(
             client_id="c",
             protocol=MQTTProtocolVersion.MQTTv5,
-            local_receive_maximum=1000,
+            max_inbound_inflight=1000,
             keepalive=60,
         )
     )
@@ -156,7 +156,7 @@ def test_reconnect_policy_terminal_codes() -> None:
     assert is_terminal_connack(0x87, MQTTProtocolVersion.MQTTv5)
     assert not is_terminal_connack(0x89, MQTTProtocolVersion.MQTTv5)
 
-    policy = ReconnectPolicy(enabled=True, initial_delay=1.0, max_delay=10.0, multiplier=2.0)
+    policy = ReconnectPolicy(initial_delay=1.0, max_delay=10.0, multiplier=2.0)
     state = _ReconnectState(policy)
     d1 = state.next_delay()
     assert 0.5 <= d1 <= 1.0

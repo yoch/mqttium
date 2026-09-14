@@ -62,7 +62,7 @@ async def test_qos0_receipt_immediate() -> None:
 
 async def test_full_message_queue_close_loses_nothing() -> None:
     """P1.7: the end-of-stream sentinel must never evict a queued message."""
-    client = AsyncClient(client_id="test", max_pending_messages=4, message_delivery="iterator")
+    client = AsyncClient(client_id="test", max_iterator_messages=4, message_delivery="iterator")
     fake = ScriptedBrokerTransport()
     client._transport_factory = transport_factory(fake)
     await client.connect("fake", 1883, timeout=2.0)

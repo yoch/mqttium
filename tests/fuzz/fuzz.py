@@ -277,12 +277,17 @@ def fuzz_engine(  # noqa: C901
             connect_properties = Properties(
                 {**connect_properties.values, "authentication_method": auth_method}
             )
+    # Drawn for every protocol so a seed replays the same stream; MQTT 3.1.1
+    # refuses a non-zero alias maximum at configuration time.
+    topic_alias_maximum = rng.choice([0, 2])
+    if proto is not MQTTProtocolVersion.MQTTv5:
+        topic_alias_maximum = 0
     engine = ProtocolEngine(
         EngineConfig(
             client_id="fuzz",
             protocol=proto,
-            local_receive_maximum=rng.choice([1, 4, 100]),
-            topic_alias_maximum=rng.choice([0, 2]),
+            max_inbound_inflight=rng.choice([1, 4, 100]),
+            topic_alias_maximum=topic_alias_maximum,
             manual_ack=bool(rng.random() < 0.5),
             connect_properties=connect_properties,
             accept_auth=auth_method is not None,
@@ -481,8 +486,10 @@ def _check_engine_invariants(engine: ProtocolEngine) -> None:
     assert engine.flow.inflight == expected_flow, (
         f"flow mismatch: actual={engine.flow.inflight} expected={expected_flow}"
     )
-    assert engine.outbound.pending_messages == len(outbound), "outbound message budget mismatch"
-    assert engine.outbound.pending_bytes == sum(
+    assert engine.outbound.unacknowledged_messages == len(outbound), (
+        "outbound message budget mismatch"
+    )
+    assert engine.outbound.unacknowledged_bytes == sum(
         engine.outbound.stored_logical_size(message) for message in outbound
     ), "outbound byte budget mismatch"
     inbound = list(

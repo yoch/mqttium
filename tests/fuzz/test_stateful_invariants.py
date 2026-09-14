@@ -103,15 +103,17 @@ def _check_invariants(engine: ProtocolEngine, step: int, history: list[str]) -> 
         if not pool.in_use(record.mid):
             fail(f"durable record mid={record.mid} ({record.state.name}) is not held in the pool")
 
-    if outbound.pending_messages != len(records):
+    if outbound.unacknowledged_messages != len(records):
         fail(
-            f"pending_messages={outbound.pending_messages} but the store holds "
+            f"pending_messages={outbound.unacknowledged_messages} but the store holds "
             f"{len(records)} records"
         )
 
     expected_bytes = sum(outbound.stored_logical_size(r) for r in records)
-    if outbound.pending_bytes != expected_bytes:
-        fail(f"pending_bytes={outbound.pending_bytes} but the records sum to {expected_bytes}")
+    if outbound.unacknowledged_bytes != expected_bytes:
+        fail(
+            f"pending_bytes={outbound.unacknowledged_bytes} but the records sum to {expected_bytes}"
+        )
 
     # Send Quota is connection-scoped credit, not durable-record occupancy.
     # A resumed WAIT_PUBCOMP retransmits PUBREL without consuming quota, while
@@ -150,9 +152,9 @@ def test_engine_invariants_hold(protocol: MQTTProtocolVersion, seed: int) -> Non
             protocol=protocol,
             clean_start=False,
             max_outbound_inflight=rng.choice([1, 2, 4]),
-            local_receive_maximum=rng.choice([2, 5, 20]),
-            max_pending_outbound_messages=rng.choice([None, 6, 12]),
-            max_pending_outbound_bytes=rng.choice([None, 4096]),
+            max_inbound_inflight=rng.choice([2, 5, 20]),
+            max_unacknowledged_messages=rng.choice([None, 6, 12]),
+            max_unacknowledged_bytes=rng.choice([None, 4096]),
         ),
         MemoryInflightStore(),
     )

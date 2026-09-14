@@ -40,6 +40,29 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Changed — lean native experiment
 
+- Freeze the native constructor and statistics vocabulary. Every bound is
+  named after what it bounds: `max_inbound_inflight` (was
+  `local_receive_maximum`), `max_inbound_inflight_bytes` (was
+  `max_pending_inbound_bytes`), `max_unacknowledged_messages`/`_bytes` (was
+  `max_pending_outbound_*`), `max_write_queue_messages`/`_bytes` (was
+  `max_outbound_*`), `max_iterator_messages`/`max_iterator_bytes`/
+  `iterator_admission_timeout` (was `max_pending_messages`/
+  `max_pending_delivery_bytes`/`delivery_timeout`), `subscribe_timeout` (was
+  `ack_timeout`). `connect_timeout` moves from `ReconnectPolicy` to the
+  client and is the default for explicit and automatic attempts;
+  `ReconnectPolicy.enabled` is removed (`reconnect=None` disables).
+  `max_ingress_batch_bytes` is removed; the 1 MiB / 256-packet decode quantum
+  is a fixed fairness constant. The constructor now refuses configuration
+  without effect: iterator bounds with callback delivery raise `ValueError`,
+  MQTT 5 options (`connect_properties`, `will_properties`,
+  `topic_alias_maximum`, `auth_handler`) with MQTT 3.1.1 raise
+  `ProtocolError` at construction rather than at `connect()`.
+  `ClientStats` drops runtime scheduling detail (`tasks`, `effects`, writer
+  batching counters, `decoder.ingress_batch_limit_bytes`, WebSocket control
+  frame fields) and renames its sections' fields after the constructor bounds
+  (`outbound.unacknowledged_*`, `awaiting_slot`, `inflight`, `inflight_limit`;
+  `inbound.inflight_*`; `delivery.iterator_*`). See the migration guide for
+  the full mapping.
 - Run synchronous message callbacks inline on the delivering reader instead of
   a bounded callback worker task and queue. The reader hands each decoded lot
   to the application before decoding further, so callback cost is the

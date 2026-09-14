@@ -57,7 +57,7 @@ def connected_engine(
         EngineConfig(
             protocol=protocol,
             manual_ack=manual_ack,
-            max_pending_inbound_bytes=byte_limit,
+            max_inbound_inflight_bytes=byte_limit,
         ),
         store=store,
     )
@@ -94,7 +94,7 @@ def test_qos2_duplicate_does_not_reserve_bytes_twice(
     )
     feed(engine, duplicate.encode())
 
-    assert engine.inbound.stats().pending_bytes == expected
+    assert engine.inbound.stats().inflight_bytes == expected
     assert store.in_count() == 1
     stored = store.get_in(7)
     assert stored is not None
@@ -134,7 +134,7 @@ def test_qos2_quota_exceeded_disconnects_with_mqtt5_reason() -> None:
     effects = engine.take_effects()
 
     assert engine.state is ConnectionState.DISCONNECTED
-    assert engine.inbound.stats().pending_bytes == limit
+    assert engine.inbound.stats().inflight_bytes == limit
     assert any(
         effect.kind is EffectKind.SEND
         and write_bytes(effect.data) == encode_disconnect(0x97, protocol)
@@ -165,7 +165,7 @@ def test_mqtt5_property_bytes_are_included_in_the_reservation() -> None:
 
     feed(engine, packet.encode(protocol))
 
-    assert engine.inbound.stats().pending_bytes == expected
+    assert engine.inbound.stats().inflight_bytes == expected
     stored = engine.store.get_in(3)
     assert stored is not None
     assert stored.logical_size == expected
@@ -187,7 +187,7 @@ def test_v311_quota_exceeded_closes_without_disconnect_packet() -> None:
 
     assert engine.state is ConnectionState.DISCONNECTED
     assert not any(effect.kind is EffectKind.SEND for effect in effects)
-    assert engine.inbound.stats().pending_bytes == 0
+    assert engine.inbound.stats().inflight_bytes == 0
 
 
 def test_manual_qos1_ack_releases_reserved_bytes() -> None:
@@ -203,13 +203,13 @@ def test_manual_qos1_ack_releases_reserved_bytes() -> None:
     expected = len(packet.topic) + len(packet.payload)
 
     feed(engine, packet.encode())
-    assert engine.inbound.stats().pending_bytes == expected
+    assert engine.inbound.stats().inflight_bytes == expected
 
     engine.ack(11)
 
     snapshot = engine.inbound.stats()
-    assert snapshot.pending_bytes == 0
-    assert snapshot.pending_high_water_bytes == expected
+    assert snapshot.inflight_bytes == 0
+    assert snapshot.inflight_high_water_bytes == expected
 
 
 def test_qos2_pubrel_releases_reserved_bytes() -> None:
@@ -224,12 +224,12 @@ def test_qos2_pubrel_releases_reserved_bytes() -> None:
     )
 
     feed(engine, packet.encode())
-    assert engine.inbound.stats().pending_bytes > 0
+    assert engine.inbound.stats().inflight_bytes > 0
     engine.take_effects()
 
     feed(engine, PubRelPacket(mid=12).encode())
 
-    assert engine.inbound.stats().pending_bytes == 0
+    assert engine.inbound.stats().inflight_bytes == 0
     assert engine.store.get_in(12) is None
 
 
@@ -255,7 +255,7 @@ def test_persistence_failure_rolls_back_reservation_before_delivery(
 
     snapshot = engine.inbound.stats()
     assert snapshot.inflight == 0
-    assert snapshot.pending_bytes == 0
+    assert snapshot.inflight_bytes == 0
     assert not any(effect.kind is EffectKind.MESSAGE for effect in effects)
     assert effects == []
 
@@ -273,7 +273,7 @@ def test_sqlite_reopen_restores_and_releases_bytes_without_payload_read(tmp_path
         mid=19,
     )
     feed(first, packet.encode())
-    expected = first.inbound.stats().pending_bytes
+    expected = first.inbound.stats().inflight_bytes
     first_store.close()
 
     reopened = SqliteInflightStore(path)
@@ -282,25 +282,25 @@ def test_sqlite_reopen_restores_and_releases_bytes_without_payload_read(tmp_path
     second = connected_engine(byte_limit=1, store=reopened)
     reopened._conn.set_trace_callback(None)
 
-    assert second.inbound.stats().pending_bytes == expected
+    assert second.inbound.stats().inflight_bytes == expected
     selects = [line for line in trace if line.lstrip().startswith("SELECT")]
     assert selects
     assert all("payload" not in line for line in selects)
 
     feed(second, PubRelPacket(mid=19).encode())
-    assert second.inbound.stats().pending_bytes == 0
+    assert second.inbound.stats().inflight_bytes == 0
     assert reopened.get_in(19) is None
     reopened.close()
 
 
 def test_none_disables_limit_and_configuration_is_forwarded() -> None:
-    async_client = AsyncClient(max_pending_inbound_bytes=None)
-    assert async_client._engine.config.max_pending_inbound_bytes is None
+    async_client = AsyncClient(max_inbound_inflight_bytes=None)
+    assert async_client._engine.config.max_inbound_inflight_bytes is None
 
-    assert async_client._engine.config.max_pending_inbound_bytes is None
+    assert async_client._engine.config.max_inbound_inflight_bytes is None
 
 
 @pytest.mark.parametrize("value", [-1])
 def test_negative_limit_is_rejected(value: int) -> None:
-    with pytest.raises(ValueError, match="max_pending_inbound_bytes"):
-        AsyncClient(max_pending_inbound_bytes=value)
+    with pytest.raises(ValueError, match="max_inbound_inflight_bytes"):
+        AsyncClient(max_inbound_inflight_bytes=value)

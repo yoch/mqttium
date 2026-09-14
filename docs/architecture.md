@@ -86,7 +86,7 @@ Batch publication does not allocate per-item receipts.
 
 `WritePump` is the only component that writes to the transport. It owns its byte
 and message budgets, wake-up condition, batching, and writer task. Wire order is
-therefore the same as engine effect order. `max_outbound_messages` counts
+therefore the same as engine effect order. `max_write_queue_messages` counts
 writer-resident admitted frames, including the writer's active batch, not only
 `queue.qsize()`. Eager writes do not consume that count.
 

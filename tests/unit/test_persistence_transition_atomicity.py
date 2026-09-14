@@ -95,7 +95,7 @@ def test_pubrec_emits_no_pubrel_when_the_conditional_transition_is_refused() -> 
     assert record is not None
     assert record.state is OutboundQoSState.WAIT_PUBREC
     assert engine.flow.inflight == 1
-    assert engine.pending_outbound_messages == 1
+    assert engine.unacknowledged_messages == 1
 
 
 def test_manual_ack_releases_nothing_when_conditional_completion_is_refused() -> None:

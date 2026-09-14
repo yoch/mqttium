@@ -16,7 +16,7 @@ upgrade of applications or historical databases.
 | Async `on_message` or topic callbacks | Short synchronous callbacks, or asynchronous processing through `messages()` |
 | `on_publish` | `PublishReceipt` / `PublishBatchReceipt` |
 | Connect/publish notifications sharing the message worker | Separate lifecycle hooks; publication uses receipts |
-| Bounded callback worker: `max_pending_callbacks`, `callback_shutdown_timeout`, `DeliveryStats.callback_queued`/`callback_limit`, `TaskStats.callback_worker` | Callbacks run inline on the reader; `DeliveryStats.callback_invocations`, `TaskStats.lifecycle` |
+| Bounded callback worker: `max_pending_callbacks`, `callback_shutdown_timeout`, `DeliveryStats.callback_queued`/`callback_limit`, `TaskStats.callback_worker` | Callbacks run inline on the reader; `DeliveryStats.callback_invocations` |
 | Callback route changes during/after connection | Configure before first attempt; a new client is required for different routes |
 | `publish(..., nowait=True)` | Synchronous `publish_nowait(...)`, without `await` |
 | `publish_backpressure` / `PublishBackpressure` | Choose `publish()` or `publish_nowait()` per operation |
@@ -27,8 +27,43 @@ upgrade of applications or historical databases.
 | CONNECT property keys duplicating limit arguments | Use the dedicated constructor arguments |
 | Shared mutable reconnect policy | Immutable policy with private state per client |
 | `ReconnectPolicy.follow_server_reference` | Removed; inspect `BrokerDisconnectError` and explicitly choose a replacement endpoint |
-| Delivery small-message diagnostic fields | Uniform `stats().delivery.pending_bytes` / `max_bytes` |
+| Delivery small-message diagnostic fields | Uniform `stats().delivery.iterator_bytes` / `iterator_byte_limit` |
 | Custom engine/store/transport integration guarantees | Internal implementation interfaces |
+
+## Frozen constructor and snapshot vocabulary
+
+The constructor names every bound after the thing it bounds and refuses
+configuration that would have no effect. The signature and defaults are
+recorded in `tests/project/test_public_api_surface.py`.
+
+| Previous name | Frozen name | Note |
+| --- | --- | --- |
+| `local_receive_maximum` | `max_inbound_inflight` | Advertised as Receive Maximum on MQTT 5; enforced locally on both protocols |
+| `max_pending_inbound_bytes` | `max_inbound_inflight_bytes` | Exceeding either inbound bound ends the connection (DISCONNECT `0x93` / `0x97`) |
+| `max_pending_outbound_messages` / `_bytes` | `max_unacknowledged_messages` / `_bytes` | Admitted QoS 1/2 publications not yet completed, including those awaiting an inflight slot |
+| `max_outbound_messages` / `_bytes` | `max_write_queue_messages` / `_bytes` | Encoded frames resident in the writer |
+| `max_pending_messages`, `max_pending_delivery_bytes`, `delivery_timeout` | `max_iterator_messages`, `max_iterator_bytes`, `iterator_admission_timeout` | Iterator-only; a non-default value with `message_delivery="callback"` raises `ValueError` |
+| `ack_timeout` | `subscribe_timeout` | Default SUBACK/UNSUBACK deadline |
+| `ReconnectPolicy.connect_timeout` | `AsyncClient(connect_timeout=...)` | One deadline for explicit `connect*()` calls without `timeout` and for automatic attempts |
+| `ReconnectPolicy(enabled=False)` | `reconnect=None` | Passing a policy enables reconnection |
+| `max_ingress_batch_bytes` | removed | The 1 MiB / 256-packet decode quantum is a fairness constant |
+| MQTT 5 options accepted by an MQTT 3.1.1 client until `connect()` | `ProtocolError` from the constructor | `connect_properties`, `will_properties`, `topic_alias_maximum`, `auth_handler` |
+
+`ClientStats` keeps the same shape (state, epoch, reconnect attempt, one
+section per queue or window) with renamed fields and without runtime
+scheduling detail:
+
+| Previous field | Frozen field |
+| --- | --- |
+| `stats().tasks` (`TaskStats`) | removed; `state` and `reconnect_attempt` describe recovery |
+| `stats().effects` (`EffectStats`) | removed |
+| `writer.batches`, `batched_items`, `batched_bytes`, `segmented_writes`, `enqueue_suspensions`, `eager_writes`, `eager_bytes` | removed; `queued_*`, `high_water_*`, `max_*`, `waiters`, `last_outbound` remain |
+| `decoder.ingress_batch_limit_bytes` | removed |
+| `outbound.pending_messages` / `pending_bytes` / `pending_high_water_*` | `outbound.unacknowledged_messages` / `unacknowledged_bytes` / `unacknowledged_high_water_*` |
+| `outbound.queued_messages`, `flow_inflight`, `flow_limit` | `outbound.awaiting_slot`, `inflight`, `inflight_limit` |
+| `inbound.receive_maximum`, `pending_bytes`, `pending_high_water_bytes`, `pending_byte_limit` | `inbound.inflight_limit`, `inflight_bytes`, `inflight_high_water_bytes`, `inflight_byte_limit` |
+| `delivery.pending_bytes`, `pending_high_water_bytes`, `max_bytes` | `delivery.iterator_bytes`, `iterator_high_water_bytes`, `iterator_byte_limit` |
+| `transport.fragmented_read_bytes`, `pending_control_frames`, `pending_control_bytes` | removed; `buffered_read_bytes` includes a fragment under reassembly |
 
 ## Delivery handles and disconnect diagnostics
 

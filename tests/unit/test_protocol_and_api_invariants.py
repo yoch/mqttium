@@ -104,7 +104,7 @@ def test_duplicate_connack_rejected() -> None:
 
 
 def test_replay_deferred_reencodes_dup() -> None:
-    engine = ProtocolEngine(EngineConfig(client_id="c", clean_start=False, local_receive_maximum=1))
+    engine = ProtocolEngine(EngineConfig(client_id="c", clean_start=False, max_inbound_inflight=1))
     engine.begin_connect()
     engine.take_effects()
     # CONNACK session_present=0, then publish 2 QoS1 (second queued).

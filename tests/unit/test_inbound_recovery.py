@@ -73,7 +73,7 @@ def test_session_resume_restores_receive_window_count() -> None:
     store.put_in(_inbound(1))
     store.put_in(_inbound(2))
     engine = ProtocolEngine(
-        EngineConfig(client_id="recovery", clean_start=False, local_receive_maximum=2),
+        EngineConfig(client_id="recovery", clean_start=False, max_inbound_inflight=2),
         store=store,
     )
 

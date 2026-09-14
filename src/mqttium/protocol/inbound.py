@@ -140,7 +140,7 @@ class InboundSession:
         self._aliases: dict[int, str] = {}
         self._ack_tokens: dict[int, object] | None = {} if self.config.manual_ack else None
         self._topic_alias_maximum = self.config.topic_alias_maximum
-        self._receive_maximum = self.config.local_receive_maximum
+        self._receive_maximum = self.config.max_inbound_inflight
         self._inflight = 0
         self._autoack_handoff_required = False
         # Auto-ACK QoS 1 identifiers whose PUBACK is still inside the current
@@ -253,15 +253,12 @@ class InboundSession:
         """Snapshot this session's own accounting."""
         return InboundStats(
             inflight=self._inflight,
-            receive_maximum=self._receive_maximum,
+            inflight_limit=self._receive_maximum,
+            inflight_bytes=self._pending_bytes,
+            inflight_high_water_bytes=max(self._pending_high_water_bytes, self._pending_bytes),
+            inflight_byte_limit=self.config.max_inbound_inflight_bytes,
             topic_aliases=len(self._aliases),
             replay_pending=self._replay is not None,
-            pending_bytes=self._pending_bytes,
-            pending_high_water_bytes=max(
-                self._pending_high_water_bytes,
-                self._pending_bytes,
-            ),
-            pending_byte_limit=self.config.max_pending_inbound_bytes,
         )
 
     def _lookup_stored_inbound(self, mid: int) -> InboundRecordMeta | None:
@@ -827,7 +824,7 @@ class InboundSession:
         if self._inflight >= self._receive_maximum:
             self._protocol_disconnect(0x93)
             raise ProtocolError("Receive Maximum exceeded")
-        byte_limit = self.config.max_pending_inbound_bytes
+        byte_limit = self.config.max_inbound_inflight_bytes
         if (
             logical_size is not None
             and byte_limit is not None
@@ -843,7 +840,7 @@ class InboundSession:
             # MQTT 5 §3.3.4: DISCONNECT 0x93 (Receive Maximum exceeded).
             self._protocol_disconnect(0x93)
             raise ProtocolError("Receive Maximum exceeded")
-        byte_limit = self.config.max_pending_inbound_bytes
+        byte_limit = self.config.max_inbound_inflight_bytes
         if (
             logical_size is not None
             and byte_limit is not None

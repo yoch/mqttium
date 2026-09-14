@@ -93,7 +93,7 @@ A broker-assigned MQTT 5 ClientID is retained by the engine as the Session
 identity for same-instance durable reconnects. It is not part of the inflight
 store contract; process-restart recovery requires a stable configured ClientID.
 
-`EngineConfig.local_receive_maximum` defaults to 65535 because the standalone
+`EngineConfig.max_inbound_inflight` defaults to 65535 because the standalone
 engine follows the protocol maximum. `AsyncClient` intentionally defaults to
 100 to provide an operationally bounded application client. The native default remains supported; the standalone
 engine configuration is internal.
@@ -187,7 +187,7 @@ on errors or cancellation; there are no chunk snapshots.
 
 Writer, outbound inflight, inbound persistence, ingress, and application
 delivery budgets are independent. Do not reuse one counter as a proxy for
-another lifetime. `max_outbound_messages` bounds writer-resident admitted
+another lifetime. `max_write_queue_messages` bounds writer-resident admitted
 frames, including the writer's active batch, not only `queue.qsize()`.
 
 `outbound.can_ever_admit()` considers configured limits, not current occupancy.
@@ -199,7 +199,7 @@ It distinguishes work that should wait from work that can never fit.
 reservations, and runs synchronous callbacks inline. Iterator (default) and
 callback are exclusive. In iterator mode each message has one byte charge and
 one queue item, released when the iterator yields the message; the reader
-waits for byte and queue capacity under one `delivery_timeout` deadline.
+waits for byte and queue capacity under one `iterator_admission_timeout` deadline.
 
 Message callbacks are synchronous-only and execute on the reader that delivered
 the message, after the protocol lock is released and before the reader decodes
@@ -223,7 +223,7 @@ Automatic retry awaits the current disconnect hook and rechecks user intent.
 Authentication alone remains awaited as protocol work with `auth_timeout`.
 
 
-`delivery_timeout=None` has no deadline. A positive timeout covers both byte
+`iterator_admission_timeout=None` has no deadline. A positive timeout covers both byte
 reservation and queue insertion with one deadline. Timeout or an impossible
 message raises `MessageDeliveryError`, releases acquired credits and leaves
 persisted delivery state unmarked. A delivered mark denotes queue acceptance

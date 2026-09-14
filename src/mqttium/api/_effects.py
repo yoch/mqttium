@@ -11,7 +11,6 @@ import asyncio
 from collections import deque
 from typing import TYPE_CHECKING, Protocol
 
-from mqttium.api.stats import EffectStats
 from mqttium.protocol.effects import EffectKind, EngineEffect
 
 if TYPE_CHECKING:
@@ -162,22 +161,26 @@ class EffectPump:
             len(self.pending) + self.owner._delivery_lane.outstanding,
         )
 
-    def stats(self) -> EffectStats:
-        """Snapshot the deque and the ordering decisions taken so far."""
+    def counters(self) -> dict[str, int]:
+        """Deque occupancy and the scheduling decisions taken so far.
+
+        Maintainer diagnostics for tests and benchmarks; not part of the
+        application snapshot, which describes queues the application can size.
+        """
         lane = self.owner._delivery_lane
         pending = len(self.pending) + lane.outstanding
-        return EffectStats(
-            pending=pending,
-            pending_high_water=max(self.pending_high_water, pending),
-            enqueued=self.enqueued + lane.enqueued,
-            applied=self.applied + lane.applied,
-            waiters=self.waiters,
-            batches=self.batches,
-            multi_effect_batches=self.multi_effect_batches,
-            reordered_batches=self.reordered_batches,
-            inline_effects=self.inline_effects,
-            apply_suspensions=self.apply_suspensions,
-        )
+        return {
+            "pending": pending,
+            "pending_high_water": max(self.pending_high_water, pending),
+            "enqueued": self.enqueued + lane.enqueued,
+            "applied": self.applied + lane.applied,
+            "waiters": self.waiters,
+            "batches": self.batches,
+            "multi_effect_batches": self.multi_effect_batches,
+            "reordered_batches": self.reordered_batches,
+            "inline_effects": self.inline_effects,
+            "apply_suspensions": self.apply_suspensions,
+        }
 
     def _complete(self) -> None:
         self.applied += 1

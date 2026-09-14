@@ -22,7 +22,7 @@ from tests.support import (
 @pytest.mark.parametrize("qos", (0, 1))
 async def test_publication_admission_preserves_a_full_iterator_queue(protocol, qos):
     broker = ScriptedBrokerTransport(protocol=protocol)
-    client = AsyncClient("delivery-separation", protocol=protocol, max_pending_messages=1)
+    client = AsyncClient("delivery-separation", protocol=protocol, max_iterator_messages=1)
     client._transport_factory = transport_factory(broker)
     await client.connect("test")
     first = Message("incoming", b"first")
@@ -59,7 +59,7 @@ async def test_publication_admission_preserves_a_full_iterator_queue(protocol, q
 
 async def test_failure_interrupts_reader_delivery_and_releases_its_reservation():
     broker = ScriptedBrokerTransport()
-    client = AsyncClient(max_pending_messages=1)
+    client = AsyncClient(max_iterator_messages=1)
     client._transport_factory = transport_factory(broker)
     await client.connect("test")
     first = Message("in", b"first")

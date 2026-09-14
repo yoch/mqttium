@@ -12,13 +12,13 @@ from mqttium.types import Message
 from tests.support import accept_message
 
 
-def _delivery(*, max_pending_delivery_bytes: int | None = None) -> ApplicationDelivery:
+def _delivery(*, max_iterator_bytes: int | None = None) -> ApplicationDelivery:
     return ApplicationDelivery(
         mode="iterator",
         protocol=MQTTProtocolVersion.MQTTv311,
-        max_pending_messages=8,
-        max_pending_delivery_bytes=max_pending_delivery_bytes,
-        delivery_timeout=1.0,
+        max_iterator_messages=8,
+        max_iterator_bytes=max_iterator_bytes,
+        iterator_admission_timeout=1.0,
     )
 
 
@@ -60,7 +60,7 @@ async def test_reopen_without_reset_keeps_the_same_stream_generation() -> None:
 
 
 async def test_reset_releases_discarded_accounting_exactly_once() -> None:
-    delivery = _delivery(max_pending_delivery_bytes=4096)
+    delivery = _delivery(max_iterator_bytes=4096)
     await accept_message(delivery, Message(topic="old", payload=b"x"))
     assert delivery.pending_bytes == 4
 
@@ -73,7 +73,7 @@ async def test_reset_releases_discarded_accounting_exactly_once() -> None:
 
 @pytest.mark.parametrize("created_after_close", (False, True))
 async def test_never_started_iterator_cannot_consume_replacement_generation(created_after_close):
-    delivery = _delivery(max_pending_delivery_bytes=4096)
+    delivery = _delivery(max_iterator_bytes=4096)
     if created_after_close:
         delivery.close()
     old = delivery.messages()

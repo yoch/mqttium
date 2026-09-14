@@ -25,9 +25,9 @@ def _delivery():
     return ApplicationDelivery(
         mode="callback",
         protocol=MQTTProtocolVersion.MQTTv311,
-        max_pending_messages=2048,
-        max_pending_delivery_bytes=65536,
-        delivery_timeout=1,
+        max_iterator_messages=2048,
+        max_iterator_bytes=65536,
+        iterator_admission_timeout=1,
     )
 
 

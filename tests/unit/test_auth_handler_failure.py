@@ -100,13 +100,12 @@ async def test_self_cancelled_reauth_handler_is_a_reconnectable_failure() -> Non
         connect_properties=props,
         auth_handler=cancel_auth,
         reconnect=ReconnectPolicy(
-            enabled=True,
             initial_delay=0,
             max_delay=0,
             max_retries=2,
             stable_after=0,
-            connect_timeout=0.2,
         ),
+        connect_timeout=0.2,
     )
 
     def on_disconnect(error: BaseException | None) -> None:

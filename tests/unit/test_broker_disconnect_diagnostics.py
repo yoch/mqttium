@@ -102,7 +102,7 @@ async def test_refused_connack_keeps_protocol_error_and_does_not_redirect(reason
 @pytest.mark.parametrize("kind", ("zero", "eof", "explicit", "malformed", "prior", "local"))
 async def test_specific_failure_and_normal_disconnect_semantics_are_preserved(kind):
     broker = ScriptedBrokerTransport(protocol=V5)
-    client = AsyncClient("cause-priority", protocol=V5, reconnect=ReconnectPolicy(enabled=False))
+    client = AsyncClient("cause-priority", protocol=V5, reconnect=None)
     observed = []
     client.on_disconnect = observed.append
 

@@ -40,7 +40,7 @@ class ApplicationDelivery:
     queue, worker task or byte reservation: the reader does not decode more
     until the current lot has been handed to the application. Iterator mode
     parks messages in a bounded queue for an independent consumer and charges
-    their logical size against ``max_pending_delivery_bytes``.
+    their logical size against ``max_iterator_bytes``.
     """
 
     def __init__(
@@ -48,23 +48,23 @@ class ApplicationDelivery:
         *,
         mode: MessageDelivery,
         protocol: MQTTProtocolVersion,
-        max_pending_messages: int,
-        max_pending_delivery_bytes: int | None,
-        delivery_timeout: float | None,
+        max_iterator_messages: int,
+        max_iterator_bytes: int | None,
+        iterator_admission_timeout: float | None,
     ) -> None:
         self.mode = mode
         self.protocol = protocol
-        self.max_pending_messages = max_pending_messages
-        self.max_pending_delivery_bytes = max_pending_delivery_bytes
+        self.max_iterator_messages = max_iterator_messages
+        self.max_iterator_bytes = max_iterator_bytes
         self.pending_bytes = 0
         self.pending_high_water_bytes = 0
         self.space = asyncio.Event()
         self.waiters = 0
-        self.messages_queue: asyncio.Queue[IteratorQueueItem] = asyncio.Queue(max_pending_messages)
+        self.messages_queue: asyncio.Queue[IteratorQueueItem] = asyncio.Queue(max_iterator_messages)
         self.message_ready = asyncio.Event()
         self.closed = asyncio.Event()
         self._stream_generation = 0
-        self.delivery_timeout = delivery_timeout
+        self.iterator_admission_timeout = iterator_admission_timeout
         self.callback_invocations = 0
         self._since_yield = 0
 
@@ -72,10 +72,10 @@ class ApplicationDelivery:
         return DeliveryStats(
             iterator_queued=self.messages_queue.qsize(),
             iterator_limit=self.messages_queue.maxsize,
+            iterator_bytes=self.pending_bytes,
+            iterator_high_water_bytes=self.pending_high_water_bytes,
+            iterator_byte_limit=self.max_iterator_bytes,
             callback_invocations=self.callback_invocations,
-            pending_bytes=self.pending_bytes,
-            pending_high_water_bytes=self.pending_high_water_bytes,
-            max_bytes=self.max_pending_delivery_bytes,
             waiters=self.waiters,
         )
 
@@ -132,7 +132,7 @@ class ApplicationDelivery:
                     return asyncio.sleep(0)
             return None
         size = self.logical_size(message, property_wire_size)
-        limit = self.max_pending_delivery_bytes
+        limit = self.max_iterator_bytes
         if limit is not None:
             if size > limit:
                 raise MessageDeliveryError(
@@ -147,9 +147,9 @@ class ApplicationDelivery:
 
     async def _accept_waiting(self, message: Message, size: int) -> None:
         """Wait for byte and queue capacity under one shared deadline."""
-        limit = self.max_pending_delivery_bytes
+        limit = self.max_iterator_bytes
         try:
-            async with asyncio.timeout(self.delivery_timeout):
+            async with asyncio.timeout(self.iterator_admission_timeout):
                 while (limit is not None and self.pending_bytes + size > limit) or (
                     self.messages_queue.full()
                 ):
@@ -190,7 +190,7 @@ class ApplicationDelivery:
             self.release(size)
         # Wake iterators that belong to the retired stream before replacing it.
         self.message_ready.set()
-        self.messages_queue = asyncio.Queue(self.max_pending_messages)
+        self.messages_queue = asyncio.Queue(self.max_iterator_messages)
         self.message_ready = asyncio.Event()
         self.closed.clear()
 

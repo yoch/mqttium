@@ -81,7 +81,7 @@ async def test_responder_callback_publishes_from_one_delivery_lot(
         ]
         stats = client.stats()
         assert stats.delivery.callback_invocations == 5
-        assert stats.outbound.pending_messages == 0
+        assert stats.outbound.unacknowledged_messages == 0
         await wait_until(lambda: client.stats().inbound.inflight == 0)
         assert client.is_connected
     finally:

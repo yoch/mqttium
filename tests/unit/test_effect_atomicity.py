@@ -16,8 +16,8 @@ from tests.support import accept_message
 async def test_cancelled_backpressure_keeps_send_effect_for_same_connection() -> None:
     client = AsyncClient(
         client_id="effect-cancel",
-        max_outbound_messages=1,
-        max_outbound_bytes=1,
+        max_write_queue_messages=1,
+        max_write_queue_bytes=1,
     )
     client._engine.state = ConnectionState.CONNECTED
     await client._write_pump.enqueue(b"x")

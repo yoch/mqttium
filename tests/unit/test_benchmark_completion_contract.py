@@ -37,7 +37,7 @@ async def test_writer_capacity_phase_completes_exact_receipt_count(qos, monkeypa
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "benchmarks"))
     module = importlib.import_module("paired_writer_capacity")
     broker = ScriptedBrokerTransport()
-    client = AsyncClient(max_outbound_messages=16)
+    client = AsyncClient(max_write_queue_messages=16)
     client._transport_factory = transport_factory(broker)
     await client.connect("fake")
     try:

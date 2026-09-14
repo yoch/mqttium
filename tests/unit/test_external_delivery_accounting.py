@@ -26,14 +26,14 @@ def test_message_keeps_delivery_accounting_external() -> None:
 
 
 async def test_same_message_has_independent_queue_reservations() -> None:
-    client = AsyncClient(max_pending_delivery_bytes=1024)
+    client = AsyncClient(max_iterator_bytes=1024)
     message = Message(topic="t", payload=b"data")
     await accept_message(client._delivery, message)
     await accept_message(client._delivery, message)
-    assert client.stats().delivery.pending_bytes == 10
+    assert client.stats().delivery.iterator_bytes == 10
     stream = client.messages()
     assert await anext(stream) is message
-    assert client.stats().delivery.pending_bytes == 5
+    assert client.stats().delivery.iterator_bytes == 5
     assert await anext(stream) is message
-    assert client.stats().delivery.pending_bytes == 0
+    assert client.stats().delivery.iterator_bytes == 0
     await stream.aclose()

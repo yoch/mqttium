@@ -85,9 +85,18 @@ Their aggregate registration precedes wire exposure. An explicit clean refusal
 can fall back to ordinary admission; an exception after handoff is never retried.
 
 `Properties` owns an immutable copy of its input mapping, repeated values and
-binary data. `ReconnectPolicy` is immutable configuration; each client owns its
-retry progression. CONNECT limits use dedicated constructor arguments, never
-precedence between duplicate property keys and arguments.
+binary data. `ReconnectPolicy` is immutable retry-progression configuration;
+passing one enables reconnection, `None` disables it, and each client owns its
+retry state. Every default deadline (`connect_timeout`, `ping_timeout`,
+`subscribe_timeout`, `auth_timeout`) is a constructor argument; `connect*()`,
+`subscribe()` and `unsubscribe()` take a per-call override. CONNECT limits use
+dedicated constructor arguments, never precedence between duplicate property
+keys and arguments.
+
+The constructor refuses configuration that would have no effect instead of
+accepting it: MQTT 5 options (`connect_properties`, `will_properties`,
+`topic_alias_maximum`, `auth_handler`) with MQTT 3.1.1 raise `ProtocolError`;
+iterator bounds with callback delivery raise `ValueError`.
 
 Manual `ack(message)` validates the delivered handle's active logical exchange.
 Foreign, reconstructed and completed handles raise `ProtocolError`. A reconnect
@@ -101,14 +110,23 @@ redirection option.
 
 ## Resource and documentation contracts
 
-Protocol, writer, ingress and delivery budgets represent different lifetimes.
-Their bounds remain independent. `delivery_timeout=None` waits for application
-capacity without a deadline; a positive value covers the entire byte-and-queue
-admission with one deadline. A message that cannot ever fit fails immediately.
+Protocol, writer and delivery budgets represent different lifetimes. Their
+bounds remain independent and are named after what they bound:
+`max_unacknowledged_*` for retained outbound QoS 1/2 publications,
+`max_outbound_inflight` and `max_inbound_inflight(_bytes)` for the Receive
+Maximum windows, `max_write_queue_*` for encoded frames, `max_iterator_*` for
+the application queue. Outbound bounds refuse or park the producer; inbound
+bounds end the connection. The reader's decode quantum is a fixed constant.
+`iterator_admission_timeout=None` waits for application capacity without a
+deadline; a positive value covers the entire byte-and-queue admission with one
+deadline. A message that cannot ever fit fails immediately.
 
-Statistics remain immutable diagnostic snapshots with the existing public
-fields; this change does not move them to a new debug API or add constructor
-tuning objects. `tests/project/test_public_api_surface.py`
-records the experimental names, signatures and defaults. Intentional changes
-update that test, maintained documentation, changelog and migration guidance.
-Historical reports remain evidence of the commits they describe.
+`ClientStats` is an immutable snapshot of what the client is doing for the
+application without a logger: connection state and epoch, and for each
+sizeable queue or window its occupancy, high-water mark, limit and parked
+waiters, in the constructor's vocabulary. Runtime scheduling (task liveness,
+effect and writer batching decisions) is not part of the snapshot.
+`tests/project/test_public_api_surface.py` records the experimental names,
+signatures, defaults and snapshot fields. Intentional changes update that
+test, maintained documentation, changelog and migration guidance. Historical
+reports remain evidence of the commits they describe.

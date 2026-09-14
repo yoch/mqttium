@@ -126,12 +126,12 @@ def _inbound_publish(engine: ProtocolEngine, mid: int, qos: QoS, payload: bytes)
     )
 
 
-def _manual_ack_engine(local_receive_maximum: int = 8) -> ProtocolEngine:
+def _manual_ack_engine(max_inbound_inflight: int = 8) -> ProtocolEngine:
     config = EngineConfig(
         client_id="rc",
         protocol=MQTTProtocolVersion.MQTTv5,
         manual_ack=True,
-        local_receive_maximum=local_receive_maximum,
+        max_inbound_inflight=max_inbound_inflight,
     )
     engine = ProtocolEngine(config, MemoryInflightStore())
     _connect(engine)
@@ -219,7 +219,7 @@ def test_auto_ack_qos1_refuses_identifier_owned_by_qos2(
 def test_inbound_collision_never_reports_a_full_window_while_holding_nothing() -> None:
     """The leak used to be cumulative: with Receive Maximum 4 the client tore a
     healthy connection down reporting 0x93 while the store was empty."""
-    engine = _manual_ack_engine(local_receive_maximum=4)
+    engine = _manual_ack_engine(max_inbound_inflight=4)
 
     _inbound_publish(engine, 9, QoS.EXACTLY_ONCE, b"A" * 10)
     _inbound_publish(engine, 9, QoS.AT_LEAST_ONCE, b"B" * 2)

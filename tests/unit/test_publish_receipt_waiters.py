@@ -22,7 +22,7 @@ from mqttium.errors import MQTTError
 
 
 def _connected_client(client_id: str) -> AsyncClient:
-    client = AsyncClient(client_id=client_id, max_outbound_messages=256)
+    client = AsyncClient(client_id=client_id, max_write_queue_messages=256)
     client._engine.state = ConnectionState.CONNECTED
     return client
 

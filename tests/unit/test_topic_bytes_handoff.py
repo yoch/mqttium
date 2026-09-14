@@ -163,7 +163,7 @@ def test_saturated_flow_does_not_discard_preencoded_topic_bytes(
     queued = engine.queue_publish(topic, b"two", qos=qos)
 
     assert queued.mid is not None
-    assert engine.outbound.stats().queued_messages == 1
+    assert engine.outbound.stats().awaiting_slot == 1
     assert len(encodes) == encodes_while_queued
 
     feed_engine(engine, PubAckPacket(mid=blocker.mid).encode(engine.config.protocol))

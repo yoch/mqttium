@@ -110,7 +110,11 @@ class WritePump:
         self._resident_messages -= n
 
     def stats(self) -> WriterStats:
-        """Snapshot the queue and the batching decisions taken so far."""
+        """Snapshot queue occupancy against its bounds.
+
+        The batching decision counters stay on the pump itself: they describe
+        how the writer schedules, not what the application can observe or size.
+        """
         queued_messages = self.queue.qsize()
         return WriterStats(
             queued_messages=queued_messages,
@@ -121,13 +125,6 @@ class WritePump:
             max_bytes=self.max_bytes,
             waiters=self.waiters,
             last_outbound=self.last_outbound,
-            batches=self.batches,
-            batched_items=self.batched_items,
-            batched_bytes=self.batched_bytes,
-            segmented_writes=self.segmented_writes,
-            enqueue_suspensions=self.enqueue_suspensions,
-            eager_writes=self.eager_writes,
-            eager_bytes=self.eager_bytes,
         )
 
     def _sample_high_water(self, queued_messages: int | None = None) -> None:
@@ -244,11 +241,11 @@ class WritePump:
         if self._resident_messages >= self.max_messages:
             return (
                 "Outbound backpressure limit reached: "
-                f"max_outbound_messages={self.max_messages} is full"
+                f"max_write_queue_messages={self.max_messages} is full"
             )
         return (
             "Outbound backpressure limit reached: "
-            f"max_outbound_bytes={self.max_bytes} would be exceeded by a "
+            f"max_write_queue_bytes={self.max_bytes} would be exceeded by a "
             f"{size}-byte write with {self.queued_bytes} bytes already queued"
         )
 

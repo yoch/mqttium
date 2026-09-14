@@ -56,7 +56,7 @@ def test_connect_receive_maximum_is_the_inbound_limit() -> None:
         EngineConfig(
             client_id="rm-override",
             protocol=MQTTProtocolVersion.MQTTv5,
-            local_receive_maximum=10,
+            max_inbound_inflight=10,
             manual_ack=True,
         )
     )
@@ -74,7 +74,7 @@ def test_connect_receive_maximum_is_the_inbound_limit() -> None:
         effects = engine.take_effects()
         assert not any(effect.kind is EffectKind.PROTOCOL_ERROR for effect in effects)
 
-    assert engine.inbound.stats().receive_maximum == 10
+    assert engine.inbound.stats().inflight_limit == 10
     assert engine.state is ConnectionState.CONNECTED
 
     _feed(engine, _qos1_publish(11))
@@ -109,7 +109,9 @@ def test_connect_maximum_packet_size_is_the_decoder_limit() -> None:
 )
 def test_connect_properties_cannot_duplicate_dedicated_limits(name, value) -> None:
     with pytest.raises(ProtocolError, match="dedicated"):
-        AsyncClient(connect_properties=Properties({name: value}))
+        AsyncClient(
+            protocol=MQTTProtocolVersion.MQTTv5, connect_properties=Properties({name: value})
+        )
 
 
 async def test_connect_keeps_its_packet_limit_on_reconnect() -> None:

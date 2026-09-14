@@ -35,7 +35,6 @@ class _ClosedTransport:
 
 async def test_transport_loss_fails_subscriptions_but_preserves_publish_receipt() -> None:
     reconnect = ReconnectPolicy(
-        enabled=True,
         initial_delay=60.0,
         max_delay=60.0,
         stable_after=60.0,
@@ -121,7 +120,7 @@ async def test_failed_receipt_that_is_never_awaited_stays_silent() -> None:
 
 async def test_receipt_never_awaited_allocates_no_completion_primitive() -> None:
     """publish_nowait's whole point: nobody waits, so nothing is built."""
-    client = AsyncClient(client_id="lazy-receipt", max_outbound_messages=8)
+    client = AsyncClient(client_id="lazy-receipt", max_write_queue_messages=8)
     client._engine.state = ConnectionState.CONNECTED
 
     receipt = client.publish_nowait("lazy/qos1", b"x", qos=1)
@@ -136,7 +135,7 @@ async def test_receipt_never_awaited_allocates_no_completion_primitive() -> None
 
 
 async def test_receipt_awaited_before_completion_resolves_once() -> None:
-    client = AsyncClient(client_id="await-receipt", max_outbound_messages=8)
+    client = AsyncClient(client_id="await-receipt", max_write_queue_messages=8)
     client._engine.state = ConnectionState.CONNECTED
     receipt = client.publish_nowait("lazy/qos1", b"x", qos=1)
 

@@ -23,8 +23,8 @@ async def test_iterator_delivery_waits_for_shared_byte_capacity() -> None:
     logical_size = len(first.topic) + len(first.payload)
     client = AsyncClient(
         message_delivery="iterator",
-        max_pending_messages=4,
-        max_pending_delivery_bytes=logical_size,
+        max_iterator_messages=4,
+        max_iterator_bytes=logical_size,
     )
 
     await deliver_message(client, first)
@@ -33,7 +33,7 @@ async def test_iterator_delivery_waits_for_shared_byte_capacity() -> None:
 
     assert not blocked.done()
     assert client.stats().delivery.waiters == 1
-    assert client.stats().delivery.pending_bytes == logical_size
+    assert client.stats().delivery.iterator_bytes == logical_size
     assert client._delivery.messages_queue.qsize() == 1
 
     stream = client.messages()
@@ -41,18 +41,14 @@ async def test_iterator_delivery_waits_for_shared_byte_capacity() -> None:
     await asyncio.wait_for(blocked, timeout=1.0)
 
     assert client._delivery.messages_queue.qsize() == 1
-    assert client.stats().delivery.pending_bytes == len("delivery/other") + 1
+    assert client.stats().delivery.iterator_bytes == len("delivery/other") + 1
     await stream.aclose()
 
 
 async def test_callback_delivery_charges_no_bytes() -> None:
     finished = asyncio.Event()
     message = Message(topic="delivery/callback", payload=b"payload")
-    logical_size = len(message.topic) + len(message.payload)
-    client = AsyncClient(
-        message_delivery="callback",
-        max_pending_delivery_bytes=logical_size - 1,
-    )
+    client = AsyncClient(message_delivery="callback")
 
     def callback(received: Message) -> None:
         assert received is message
@@ -64,21 +60,21 @@ async def test_callback_delivery_charges_no_bytes() -> None:
     await deliver_message(client, message)
 
     assert client.stats().delivery.callback_invocations == 2
-    assert client.stats().delivery.pending_bytes == 0
-    assert client.stats().delivery.pending_high_water_bytes == 0
+    assert client.stats().delivery.iterator_bytes == 0
+    assert client.stats().delivery.iterator_high_water_bytes == 0
     assert client.stats().delivery.waiters == 0
 
 
 async def test_single_message_larger_than_delivery_budget_fails_explicitly() -> None:
     client = AsyncClient(
         message_delivery="iterator",
-        max_pending_delivery_bytes=4,
+        max_iterator_bytes=4,
     )
 
     with pytest.raises(MessageDeliveryError, match="exceeding limit"):
         await apply_delivery_effect(client, _effect("topic", b"payload"))
 
-    assert client.stats().delivery.pending_bytes == 0
+    assert client.stats().delivery.iterator_bytes == 0
     assert client._delivery.messages_queue.empty()
 
 
@@ -87,8 +83,8 @@ async def test_delivery_budget_wakes_multiple_waiters_without_overcommit() -> No
     logical_size = len(messages[0].topic) + len(messages[0].payload)
     client = AsyncClient(
         message_delivery="iterator",
-        max_pending_messages=4,
-        max_pending_delivery_bytes=logical_size,
+        max_iterator_messages=4,
+        max_iterator_bytes=logical_size,
     )
 
     await deliver_message(client, messages[0])
@@ -106,16 +102,16 @@ async def test_delivery_budget_wakes_multiple_waiters_without_overcommit() -> No
     )
     assert len(done) == 1
     assert len(pending) == 1
-    assert client.stats().delivery.pending_bytes == logical_size
+    assert client.stats().delivery.iterator_bytes == logical_size
     assert client._delivery.messages_queue.qsize() == 1
 
     assert await anext(stream) in messages[1:]
     await asyncio.wait_for(next(iter(pending)), timeout=1.0)
-    assert client.stats().delivery.pending_bytes == logical_size
+    assert client.stats().delivery.iterator_bytes == logical_size
     assert client._delivery.messages_queue.qsize() == 1
 
     assert await anext(stream) in messages[1:]
-    assert client.stats().delivery.pending_bytes == 0
+    assert client.stats().delivery.iterator_bytes == 0
     await stream.aclose()
 
 
@@ -123,8 +119,8 @@ def _byte_budget_client(protocol: MQTTProtocolVersion) -> AsyncClient:
     """A client whose small-message fast path is enabled (see the test above)."""
     return AsyncClient(
         message_delivery="iterator",
-        max_pending_messages=4,
-        max_pending_delivery_bytes=64 * 1024 * 1024,
+        max_iterator_messages=4,
+        max_iterator_bytes=64 * 1024 * 1024,
         protocol=protocol,
     )
 
@@ -138,7 +134,7 @@ async def test_mqtt5_publish_without_properties_is_accounted() -> None:
 
     await deliver_message(client, message)
 
-    assert client.stats().delivery.pending_bytes == len(message.topic) + len(message.payload)
+    assert client.stats().delivery.iterator_bytes == len(message.topic) + len(message.payload)
     assert client._delivery.messages_queue.qsize() == 1
 
 
@@ -152,8 +148,8 @@ async def test_mqtt5_publish_with_properties_stays_exactly_accounted() -> None:
 
     await deliver_message(client, message)
 
-    assert client.stats().delivery.pending_bytes == client._delivery.logical_size(message)
-    assert client.stats().delivery.pending_bytes > len(message.topic) + len(message.payload)
+    assert client.stats().delivery.iterator_bytes == client._delivery.logical_size(message)
+    assert client.stats().delivery.iterator_bytes > len(message.topic) + len(message.payload)
 
 
 async def test_mqtt311_delivery_is_accounted() -> None:
@@ -162,18 +158,18 @@ async def test_mqtt311_delivery_is_accounted() -> None:
 
     await deliver_message(client, message)
 
-    assert client.stats().delivery.pending_bytes == len(message.topic) + len(message.payload)
+    assert client.stats().delivery.iterator_bytes == len(message.topic) + len(message.payload)
     assert client._delivery.messages_queue.qsize() == 1
 
 
 async def test_small_budget_accounts_property_less_mqtt5() -> None:
     client = AsyncClient(
         message_delivery="iterator",
-        max_pending_delivery_bytes=8 * 1024 * 1024,
+        max_iterator_bytes=8 * 1024 * 1024,
         protocol=MQTTProtocolVersion.MQTTv5,
     )
     message = Message(topic="small/topic", payload=b"payload", properties=Properties())
 
     await deliver_message(client, message)
 
-    assert client.stats().delivery.pending_bytes == len(message.topic) + len(message.payload)
+    assert client.stats().delivery.iterator_bytes == len(message.topic) + len(message.payload)

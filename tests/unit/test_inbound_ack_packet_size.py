@@ -186,16 +186,15 @@ class _TinyLimitTransport:
 
 async def test_runtime_tiny_limit_fails_connect_without_reconnect_or_disconnect() -> None:
     reconnect = ReconnectPolicy(
-        enabled=True,
         initial_delay=0.0,
         max_delay=0.0,
         stable_after=0.0,
-        connect_timeout=0.1,
     )
     client = AsyncClient(
         client_id="tiny-limit-runtime",
         protocol=MQTTProtocolVersion.MQTTv5,
         reconnect=reconnect,
+        connect_timeout=0.1,
         keepalive=0,
     )
     transport = _TinyLimitTransport()

@@ -39,7 +39,6 @@ from mqttium.api.stats import (
     ClientStats,
     DecoderStats,
     ReceiptStats,
-    TaskStats,
     TransportStats,
 )
 from mqttium.codec.buffer import DEFAULT_MAX_PACKET_SIZE, IncrementalDecoder
@@ -92,6 +91,12 @@ OnAuth = Callable[[AuthPacket], Any]
 
 _GRACEFUL_DISCONNECT_DRAIN_TIMEOUT = 5.0
 _FATAL_DISCONNECT_DRAIN_TIMEOUT = 0.25
+# Reader fairness quantum: decoded bytes handled between two effect handoffs.
+# Together with the 256-packet bound it caps the size of one delivery lot; it is
+# not an application memory bound and is deliberately not configurable.
+_MAX_INGRESS_BATCH_BYTES = 1 * 1024 * 1024
+_DEFAULT_MAX_ITERATOR_MESSAGES = 65_536
+_DEFAULT_MAX_ITERATOR_BYTES = 64 * 1024 * 1024
 
 _ReceiptT = TypeVar("_ReceiptT", "PublishReceipt", "PublishBatchReceipt")
 _AckResultT = TypeVar("_AckResultT", "SubscribeResult", "UnsubscribeResult")
@@ -191,14 +196,44 @@ class AsyncClient:
         keepalive: Keep-alive interval in seconds; zero disables keep-alive.
         username: Optional CONNECT username.
         password: Optional CONNECT password. Strings are encoded as UTF-8.
-        local_receive_maximum: Maximum concurrent inbound QoS 1/2 exchanges.
+        connect_properties: MQTT 5 CONNECT properties.
+        will: Last Will message.
+        will_properties: MQTT 5 Will properties.
+        maximum_packet_size: Largest inbound packet accepted by the decoder;
+            advertised to an MQTT 5 broker. Larger packets end the connection.
+        topic_alias_maximum: Inbound topic aliases accepted from an MQTT 5
+            broker.
+        max_inbound_inflight: Concurrent inbound QoS 1/2 exchanges accepted;
+            advertised as Receive Maximum on MQTT 5. A broker that exceeds it
+            is disconnected.
+        max_inbound_inflight_bytes: Logical bytes retained for inbound QoS 1/2
+            exchanges; ``None`` disables the bound. A broker that exceeds it is
+            disconnected with reason 0x97.
         max_outbound_inflight: Optional local cap on concurrent outbound QoS
             1/2 exchanges, additionally bounded by broker negotiation.
-        reconnect: Reconnection policy. The default disables reconnection.
+        max_unacknowledged_messages: Outbound QoS 1/2 publications admitted
+            and not yet completed, including those waiting for an inflight
+            slot; ``None`` disables the bound.
+        max_unacknowledged_bytes: Logical bytes of those publications; ``None``
+            disables the bound.
+        max_write_queue_messages: Encoded frames resident in the writer.
+        max_write_queue_bytes: Encoded bytes resident in the writer.
         message_delivery: Explicit ``"iterator"`` (default) or ``"callback"`` delivery.
         manual_ack: Defer terminal acknowledgement of inbound QoS messages
             until :meth:`ack` is called.
-        store: Optional inflight store used for durable QoS state.
+        max_iterator_messages: Iterator queue count bound.
+        max_iterator_bytes: Logical bytes retained in the iterator queue;
+            ``None`` disables the bound.
+        iterator_admission_timeout: Optional deadline for admitting one
+            message into the iterator queue; ``None`` waits without deadline.
+        store: Optional inflight store used for durable QoS state. Combine it
+            with ``clean_start=False`` to resume the session it holds.
+        reconnect: Reconnection policy. ``None`` disables reconnection.
+        connect_timeout: Transport and CONNACK deadline for explicit and
+            automatic connection attempts when a call does not override it.
+        ping_timeout: PINGRESP deadline; derived from ``keepalive`` when omitted.
+        subscribe_timeout: SUBACK and UNSUBACK deadline when a call does not
+            override it.
         auth_handler: Optional MQTT 5 enhanced-authentication callback. A
             callback-raised :class:`asyncio.CancelledError` is treated as an
             authentication failure; cancellation requested on MQTTium's
@@ -207,11 +242,14 @@ class AsyncClient:
             callback invocation.
 
     Raises:
-        ValueError: If a limit or constructor option is invalid.
+        ValueError: If a limit or constructor option is invalid, or an
+            iterator bound is given with callback delivery.
+        ProtocolError: If an MQTT 5 option is given with MQTT 3.1.1.
 
     Note:
-        Remaining ``max_*`` arguments are explicit memory and queue bounds.
-        See the configuration guide for sizing rules and interactions.
+        The iterator bounds describe the only queue kept on the application's
+        behalf; callback delivery retains nothing and refuses them. See the
+        configuration guide for sizing rules and interactions.
     """
 
     def __init__(
@@ -223,28 +261,28 @@ class AsyncClient:
         keepalive: int = 60,
         username: str | None = None,
         password: bytes | str | None = None,
-        local_receive_maximum: int = 100,
-        max_outbound_inflight: int | None = None,
-        max_pending_outbound_messages: int | None = 10_000,
-        max_pending_outbound_bytes: int | None = 64 * 1024 * 1024,
-        max_pending_inbound_bytes: int | None = 64 * 1024 * 1024,
         connect_properties: Properties | None = None,
         will: Message | None = None,
         will_properties: Properties | None = None,
         maximum_packet_size: int | None = None,
         topic_alias_maximum: int = 0,
-        reconnect: ReconnectPolicy | None = None,
-        ping_timeout: float | None = None,
-        ack_timeout: float = 30.0,
-        max_outbound_bytes: int = 1 * 1024 * 1024,
-        max_outbound_messages: int = 10_000,
-        max_ingress_batch_bytes: int = 1 * 1024 * 1024,
-        max_pending_messages: int = 65_536,
-        max_pending_delivery_bytes: int | None = 64 * 1024 * 1024,
-        delivery_timeout: float | None = None,
+        max_inbound_inflight: int = 100,
+        max_inbound_inflight_bytes: int | None = 64 * 1024 * 1024,
+        max_outbound_inflight: int | None = None,
+        max_unacknowledged_messages: int | None = 10_000,
+        max_unacknowledged_bytes: int | None = 64 * 1024 * 1024,
+        max_write_queue_messages: int = 10_000,
+        max_write_queue_bytes: int = 1 * 1024 * 1024,
         message_delivery: MessageDelivery = "iterator",
         manual_ack: bool = False,
+        max_iterator_messages: int = _DEFAULT_MAX_ITERATOR_MESSAGES,
+        max_iterator_bytes: int | None = _DEFAULT_MAX_ITERATOR_BYTES,
+        iterator_admission_timeout: float | None = None,
         store: InflightStore | None = None,
+        reconnect: ReconnectPolicy | None = None,
+        connect_timeout: float = 30.0,
+        ping_timeout: float | None = None,
+        subscribe_timeout: float = 30.0,
         auth_handler: OnAuth | None = None,
         auth_timeout: float = 10.0,
     ) -> None:
@@ -254,23 +292,34 @@ class AsyncClient:
             password=password,
             message_delivery=message_delivery,
             optional_bounds=(
-                ("max_pending_outbound_messages", max_pending_outbound_messages),
-                ("max_pending_outbound_bytes", max_pending_outbound_bytes),
-                ("max_pending_inbound_bytes", max_pending_inbound_bytes),
-                ("max_pending_delivery_bytes", max_pending_delivery_bytes),
+                ("max_unacknowledged_messages", max_unacknowledged_messages),
+                ("max_unacknowledged_bytes", max_unacknowledged_bytes),
+                ("max_inbound_inflight_bytes", max_inbound_inflight_bytes),
+                ("max_iterator_bytes", max_iterator_bytes),
             ),
             positive_bounds=(
-                ("max_pending_messages", max_pending_messages),
-                ("max_outbound_messages", max_outbound_messages),
-                ("max_outbound_bytes", max_outbound_bytes),
-                ("max_ingress_batch_bytes", max_ingress_batch_bytes),
-                ("ack_timeout", ack_timeout),
+                ("max_iterator_messages", max_iterator_messages),
+                ("max_write_queue_messages", max_write_queue_messages),
+                ("max_write_queue_bytes", max_write_queue_bytes),
+                ("connect_timeout", connect_timeout),
+                ("subscribe_timeout", subscribe_timeout),
                 ("auth_timeout", auth_timeout),
             ),
             ping_timeout=ping_timeout,
         )
-        if delivery_timeout is not None:
-            _positive("delivery_timeout", delivery_timeout)
+        if iterator_admission_timeout is not None:
+            _positive("iterator_admission_timeout", iterator_admission_timeout)
+        if message_delivery == "callback" and (
+            max_iterator_messages != _DEFAULT_MAX_ITERATOR_MESSAGES
+            or max_iterator_bytes != _DEFAULT_MAX_ITERATOR_BYTES
+            or iterator_admission_timeout is not None
+        ):
+            # Callback delivery retains nothing on the application's behalf, so
+            # an iterator bound would describe a queue that does not exist.
+            raise ValueError(
+                "max_iterator_messages, max_iterator_bytes and "
+                "iterator_admission_timeout apply to iterator delivery only"
+            )
         effective_max_packet_size = (
             maximum_packet_size if maximum_packet_size is not None else DEFAULT_MAX_PACKET_SIZE
         )
@@ -284,11 +333,11 @@ class AsyncClient:
                 keepalive=keepalive,
                 username=username,
                 password=pwd,
-                local_receive_maximum=local_receive_maximum,
+                max_inbound_inflight=max_inbound_inflight,
+                max_inbound_inflight_bytes=max_inbound_inflight_bytes,
                 max_outbound_inflight=max_outbound_inflight,
-                max_pending_outbound_messages=max_pending_outbound_messages,
-                max_pending_outbound_bytes=max_pending_outbound_bytes,
-                max_pending_inbound_bytes=max_pending_inbound_bytes,
+                max_unacknowledged_messages=max_unacknowledged_messages,
+                max_unacknowledged_bytes=max_unacknowledged_bytes,
                 connect_properties=connect_properties,
                 will=will,
                 will_properties=will_properties,
@@ -300,7 +349,6 @@ class AsyncClient:
             store=store,
         )
         self._decoder = IncrementalDecoder(max_packet_size=initial_decoder_max_packet_size)
-        self._max_ingress_batch_bytes = max_ingress_batch_bytes
         self._transport: AsyncTransport | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._keepalive_task: asyncio.Task[None] | None = None
@@ -315,16 +363,16 @@ class AsyncClient:
         self._effect_pump = EffectPump(self)
         self._delivery_lane = DeliveryLane(self)
         self._write_pump = WritePump(
-            max_bytes=max_outbound_bytes,
-            max_messages=max_outbound_messages,
+            max_bytes=max_write_queue_bytes,
+            max_messages=max_write_queue_messages,
             on_failure=self._writer_failed,
         )
         self._delivery = ApplicationDelivery(
             mode=message_delivery,
             protocol=protocol,
-            max_pending_messages=max_pending_messages,
-            max_pending_delivery_bytes=max_pending_delivery_bytes,
-            delivery_timeout=delivery_timeout,
+            max_iterator_messages=max_iterator_messages,
+            max_iterator_bytes=max_iterator_bytes,
+            iterator_admission_timeout=iterator_admission_timeout,
         )
         self._publish_waiters = 0
         self._publish_waiter_futs: deque[asyncio.Future[None]] = deque()
@@ -355,11 +403,10 @@ class AsyncClient:
         self._unix_path: str | None = None
         self._ws_url: str | None = None
         self._ws_headers: dict[str, str] | None = None
-        self._reconnect = _ReconnectState(
-            reconnect if reconnect is not None else ReconnectPolicy(enabled=False)
-        )
+        self._reconnect = _ReconnectState(reconnect)
+        self._connect_timeout = connect_timeout
         self._ping_timeout = ping_timeout
-        self._ack_timeout = ack_timeout
+        self._subscribe_timeout = subscribe_timeout
         self._auth_timeout = auth_timeout
         self._intentional_disconnect = False
         self._transport_factory: Callable[..., Awaitable[AsyncTransport]] = TcpTransport.connect
@@ -383,9 +430,6 @@ class AsyncClient:
         owning event-loop thread.
         """
 
-        def running(task: asyncio.Task[Any] | None) -> bool:
-            return task is not None and not task.done()
-
         publish_receipts = sum(
             len(current) if isinstance(current, deque) else 1 for current in self._receipts.values()
         )
@@ -398,31 +442,17 @@ class AsyncClient:
         report = getattr(transport, "stats", None)
         transport_stats = report() if report is not None else TransportStats.unavailable(transport)
         engine = self._engine
-        outbound_stats = engine.outbound.stats()
-        inbound_stats = engine.inbound.stats()
-        effect_pump = self._effect_pump
-        write_pump = self._write_pump
         return ClientStats(
-            state=self._engine.state,
+            state=engine.state,
             connection_epoch=self._connection_epoch,
             reconnect_attempt=self._reconnect.attempt,
-            tasks=TaskStats(
-                reader=running(self._reader_task),
-                writer=running(write_pump.task),
-                keepalive=running(self._keepalive_task),
-                reconnect=running(self._reconnect_task),
-                effect_flush=running(effect_pump.task),
-                lifecycle=running(self._lifecycle_hooks.task),
-            ),
-            outbound=outbound_stats,
-            inbound=inbound_stats,
-            effects=effect_pump.stats(),
-            writer=write_pump.stats(),
+            outbound=engine.outbound.stats(),
+            inbound=engine.inbound.stats(),
+            writer=self._write_pump.stats(),
             decoder=DecoderStats(
                 buffered_bytes=self._decoder.buffered,
                 high_water_bytes=self._decoder.high_water,
                 max_packet_size=self._decoder.max_packet_size,
-                ingress_batch_limit_bytes=self._max_ingress_batch_bytes,
             ),
             delivery=self._delivery.stats(),
             receipts=ReceiptStats(
@@ -434,6 +464,21 @@ class AsyncClient:
             ),
             transport=transport_stats,
         )
+
+    def _running_tasks(self) -> dict[str, bool]:
+        """Which client-owned background tasks are alive; maintainer diagnostics."""
+
+        def running(task: asyncio.Task[Any] | None) -> bool:
+            return task is not None and not task.done()
+
+        return {
+            "reader": running(self._reader_task),
+            "writer": running(self._write_pump.task),
+            "keepalive": running(self._keepalive_task),
+            "reconnect": running(self._reconnect_task),
+            "effect_flush": running(self._effect_pump.task),
+            "lifecycle": running(self._lifecycle_hooks.task),
+        }
 
     @property
     def state(self) -> ConnectionState:
@@ -555,8 +600,8 @@ class AsyncClient:
             port: Broker TCP port.
             ssl: TLS context, ``True`` for a default context, or ``None`` for
                 clear-text TCP.
-            timeout: Transport and CONNACK deadline. The reconnect policy's
-                connection timeout is used when omitted.
+            timeout: Transport and CONNACK deadline; ``connect_timeout`` is
+                used when omitted.
 
         Returns:
             The successful CONNACK packet and its negotiated properties.
@@ -722,7 +767,7 @@ class AsyncClient:
                     # plain TCP connect (custom transports rely on this seam).
                     self._transport_factory = TcpTransport.connect
                 self._intentional_disconnect = False
-                timeout = timeout if timeout is not None else self._reconnect.policy.connect_timeout
+                timeout = timeout if timeout is not None else self._connect_timeout
                 self._reconnect.reset()
                 connack = await self._connect_once_locked(host, port, ssl=ssl, timeout=timeout)
             if self.is_connected:
@@ -1288,7 +1333,7 @@ class AsyncClient:
             topics: One filter, an iterable of filters, or filter/options pairs.
             qos: Default maximum QoS for plain string filters.
             properties: MQTT 5 SUBSCRIBE properties.
-            timeout: SUBACK deadline; ``ack_timeout`` is used when omitted.
+            timeout: SUBACK deadline; ``subscribe_timeout`` is used when omitted.
 
         Returns:
             Packet identifier and broker reason codes in request order.
@@ -1321,7 +1366,7 @@ class AsyncClient:
 
         Args:
             topics: One topic filter or an iterable of filters.
-            timeout: UNSUBACK deadline; ``ack_timeout`` is used when omitted.
+            timeout: UNSUBACK deadline; ``subscribe_timeout`` is used when omitted.
 
         Returns:
             Packet identifier and MQTT 5 reason codes. MQTT 3.1.1 returns an
@@ -1352,7 +1397,7 @@ class AsyncClient:
         await self._effect_pump.drain()
         try:
             return await asyncio.wait_for(
-                fut, timeout=timeout if timeout is not None else self._ack_timeout
+                fut, timeout=timeout if timeout is not None else self._subscribe_timeout
             )
         except TimeoutError as exc:
             futs.pop(mid, None)
@@ -1417,7 +1462,7 @@ class AsyncClient:
         engine = self._engine
         handle_raw = engine.handle_raw
         inbound = engine.inbound
-        max_bytes = self._max_ingress_batch_bytes
+        max_bytes = _MAX_INGRESS_BATCH_BYTES
         count = 0
         decoded_bytes = 0
         for _ in range(256):
@@ -1533,7 +1578,7 @@ class AsyncClient:
                     if (
                         not handoff_required
                         and handled < 256
-                        and handled_bytes < self._max_ingress_batch_bytes
+                        and handled_bytes < _MAX_INGRESS_BATCH_BYTES
                     ):
                         break
                     await asyncio.sleep(0)
@@ -1672,7 +1717,6 @@ class AsyncClient:
                 (MessageDeliveryError, MandatoryResponseTooLargeError, AssertionError),
             )
             and not self._intentional_disconnect
-            and self._reconnect.policy.enabled
             and self._reconnect.should_retry(reason, self._engine.config.protocol)
         )
 
@@ -1809,7 +1853,7 @@ class AsyncClient:
 
     async def _reconnect_loop(self) -> None:
         try:
-            while self._reconnect.policy.enabled and not self._intentional_disconnect:
+            while self._reconnect.enabled and not self._intentional_disconnect:
                 await self._lifecycle_hooks.wait_reconnect()
                 if self._intentional_disconnect or self.is_connected:
                     return
@@ -1838,13 +1882,15 @@ class AsyncClient:
                             self._host,
                             self._port,
                             ssl=self._ssl,
-                            timeout=self._reconnect.policy.connect_timeout,
+                            timeout=self._connect_timeout,
                             reconnect_attempt=True,
                         )
                     if self.is_connected:
                         self._lifecycle_hooks.connected(connack, lifecycle_token)
                     # Only clear backoff after the connection stays up.
-                    await asyncio.sleep(self._reconnect.policy.stable_after)
+                    policy = self._reconnect.policy
+                    assert policy is not None
+                    await asyncio.sleep(policy.stable_after)
                     cause = self._local_terminal_failure
                     if cause is not None:
                         # A local-terminal failure landed while this attempt

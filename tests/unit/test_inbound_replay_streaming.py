@@ -271,7 +271,7 @@ async def test_reader_delivers_every_replay_message_in_bounded_batches() -> None
         clean_start=False,
         store=store,
         message_delivery="iterator",
-        max_pending_messages=1024,
+        max_iterator_messages=1024,
     )
 
     async with client._engine_lock:
@@ -302,7 +302,7 @@ async def test_replay_peak_memory_stays_proportional_to_one_batch(tmp_path: Path
         clean_start=False,
         store=reopened,
         message_delivery="iterator",
-        max_pending_messages=64,
+        max_iterator_messages=64,
     )
     consumed = 0
 

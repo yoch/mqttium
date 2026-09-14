@@ -256,7 +256,7 @@ def test_engine_sqlite_hydration_keeps_payloads_lazy(tmp_path: Path) -> None:
 
     assert len(engine.outbound._queued) == 4
     assert all(isinstance(item, OutboundMessageSummary) for item in engine.outbound._queued)
-    assert engine.pending_outbound_bytes == 4 * (4096 + len("a/b"))
+    assert engine.unacknowledged_bytes == 4 * (4096 + len("a/b"))
     store.close()
 
 

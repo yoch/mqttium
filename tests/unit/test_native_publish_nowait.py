@@ -25,7 +25,7 @@ def test_publish_nowait_requires_a_running_loop() -> None:
 
 
 async def test_publish_nowait_rejects_a_different_running_loop() -> None:
-    client = AsyncClient(max_outbound_messages=8)
+    client = AsyncClient(max_write_queue_messages=8)
     client._engine.state = ConnectionState.CONNECTED
     client.publish_nowait("native/owner", b"x", qos=0)
 
@@ -56,7 +56,7 @@ async def test_publish_nowait_registers_qos1_receipt() -> None:
 
 
 async def test_publish_nowait_receipts_use_direct_writer_admission() -> None:
-    client = AsyncClient(max_outbound_messages=512)
+    client = AsyncClient(max_write_queue_messages=512)
     client._engine.state = ConnectionState.CONNECTED
     receipts = [client.publish_nowait("native/qos0", b"x", qos=0) for _ in range(100)]
 
@@ -66,7 +66,7 @@ async def test_publish_nowait_receipts_use_direct_writer_admission() -> None:
 
 
 async def test_qos0_receipt_marks_writer_admission_not_transport_drain() -> None:
-    client = AsyncClient(max_outbound_messages=1, max_outbound_bytes=1024)
+    client = AsyncClient(max_write_queue_messages=1, max_write_queue_bytes=1024)
     client._engine.state = ConnectionState.CONNECTED
     receipt = client.publish_nowait("native/qos0-boundary", b"first", qos=0)
 
@@ -88,7 +88,7 @@ def test_disconnect_metadata_boundary_is_private() -> None:
 
 
 async def test_await_publish_qos0_uses_engine_admission() -> None:
-    client = AsyncClient(max_outbound_messages=8)
+    client = AsyncClient(max_write_queue_messages=8)
     client._engine.state = ConnectionState.CONNECTED
 
     receipt = await client.publish("native/await-qos0", b"x", qos=0)
@@ -99,7 +99,7 @@ async def test_await_publish_qos0_uses_engine_admission() -> None:
 
 
 async def test_direct_qos0_path_commits_outbound_alias_after_writer_admission() -> None:
-    client = AsyncClient(protocol=MQTTProtocolVersion.MQTTv5, max_outbound_messages=8)
+    client = AsyncClient(protocol=MQTTProtocolVersion.MQTTv5, max_write_queue_messages=8)
     client._engine.state = ConnectionState.CONNECTED
     client._engine.negotiated = NegotiatedSettings(topic_alias_maximum=2)
     properties = Properties({"topic_alias": 1})
@@ -120,8 +120,8 @@ async def test_direct_qos0_path_commits_outbound_alias_after_writer_admission() 
 async def test_refused_direct_qos0_write_does_not_establish_alias() -> None:
     client = AsyncClient(
         protocol=MQTTProtocolVersion.MQTTv5,
-        max_outbound_messages=1,
-        max_outbound_bytes=1024,
+        max_write_queue_messages=1,
+        max_write_queue_bytes=1024,
     )
     client._engine.state = ConnectionState.CONNECTED
     client._engine.negotiated = NegotiatedSettings(topic_alias_maximum=2)
@@ -139,7 +139,7 @@ async def test_refused_direct_qos0_write_does_not_establish_alias() -> None:
 
 
 async def test_await_publish_qos0_completes_without_message_callbacks() -> None:
-    client = AsyncClient(max_outbound_messages=8)
+    client = AsyncClient(max_write_queue_messages=8)
     client._engine.state = ConnectionState.CONNECTED
     receipt = await client.publish("native/await-qos0", b"x", qos=0)
 
@@ -149,7 +149,7 @@ async def test_await_publish_qos0_completes_without_message_callbacks() -> None:
 
 
 async def test_publish_many_qos0_uses_engine_admission() -> None:
-    client = AsyncClient(max_outbound_messages=8)
+    client = AsyncClient(max_write_queue_messages=8)
     client._engine.state = ConnectionState.CONNECTED
 
     receipt = await client.publish_many(
@@ -164,7 +164,7 @@ async def test_publish_many_qos0_uses_engine_admission() -> None:
 
 
 async def test_publish_many_completion_invokes_no_message_callbacks() -> None:
-    client = AsyncClient(max_outbound_messages=8)
+    client = AsyncClient(max_write_queue_messages=8)
     client._engine.state = ConnectionState.CONNECTED
     receipt = await client.publish_many(
         [PublishMessage("native/batch", b"a", 0), PublishMessage("native/batch", b"b", 0)]
@@ -178,7 +178,7 @@ async def test_publish_many_completion_invokes_no_message_callbacks() -> None:
 
 async def test_publish_many_mixed_qos_keeps_the_effect_path() -> None:
     """QoS 1 uses protocol effects while QoS 0 retains independent admission."""
-    client = AsyncClient(max_outbound_messages=8)
+    client = AsyncClient(max_write_queue_messages=8)
     client._engine.state = ConnectionState.CONNECTED
 
     receipt = await client.publish_many(
@@ -202,12 +202,12 @@ async def test_nowait_refuses_pending_effects_before_mutation(owner) -> None:
         client.publish_nowait("t", b"x", qos=1)
     assert not client._engine.packet_ids
     assert not client._receipts
-    assert client._engine.pending_outbound_messages == 0
+    assert client._engine.unacknowledged_messages == 0
     assert client._write_pump.queue.empty()
 
 
 async def test_direct_path_writer_refusal_preserves_first_receipt() -> None:
-    client = AsyncClient(max_outbound_messages=1)
+    client = AsyncClient(max_write_queue_messages=1)
     client._engine.state = ConnectionState.CONNECTED
     first = client.publish_nowait("native/full", b"first", qos=0)
     with pytest.raises(FlowControlError):
@@ -229,7 +229,7 @@ async def test_publish_nowait_direct_path_encodes_mqtt5_properties(monkeypatch) 
             "user_property": (*properties.get("user_property", ()), ("source", "native-fast-path")),
         }
     )
-    client = AsyncClient(protocol=MQTTProtocolVersion.MQTTv5, max_outbound_messages=8)
+    client = AsyncClient(protocol=MQTTProtocolVersion.MQTTv5, max_write_queue_messages=8)
     client._engine.state = ConnectionState.CONNECTED
     original_encode = publish_v5_module.encode_publish_item_v5
     encode_calls = 0
@@ -268,7 +268,7 @@ async def test_publish_nowait_direct_path_encodes_mqtt5_properties(monkeypatch) 
 @pytest.mark.parametrize("qos", [3, -1, 99])
 async def test_invalid_qos_still_raises_value_error(qos: int) -> None:
     """Comparing before converting must not swallow an invalid level."""
-    client = AsyncClient(max_outbound_messages=8)
+    client = AsyncClient(max_write_queue_messages=8)
     client._engine.state = ConnectionState.CONNECTED
 
     with pytest.raises(ValueError):
@@ -279,7 +279,7 @@ async def test_invalid_qos_still_raises_value_error(qos: int) -> None:
 
 async def test_int_and_enum_qos0_both_take_the_direct_path() -> None:
     for level in (0, QoS.AT_MOST_ONCE):
-        client = AsyncClient(max_outbound_messages=8)
+        client = AsyncClient(max_write_queue_messages=8)
         client._engine.state = ConnectionState.CONNECTED
         receipt = client.publish_nowait("native/qos0", b"x", qos=level)
         assert receipt.mid is None

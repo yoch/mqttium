@@ -76,9 +76,7 @@ def _resume(engine, *, present=True):
 @pytest.mark.parametrize("qos", (1, 2))
 @pytest.mark.parametrize("reconnect", (False, True))
 async def test_stale_public_handle_does_not_ack_reused_mid(protocol, qos, reconnect):
-    client = AsyncClient(
-        "ack-identity", protocol=protocol, manual_ack=True, reconnect=ReconnectPolicy(enabled=False)
-    )
+    client = AsyncClient("ack-identity", protocol=protocol, manual_ack=True, reconnect=None)
     brokers = []
 
     async def factory(*args, **kwargs):
@@ -274,7 +272,9 @@ async def test_public_handle_survives_actual_session_resume(protocol, qos, autom
         connect_properties=Properties({"session_expiry_interval": 60})
         if protocol is MQTTProtocolVersion.MQTTv5
         else None,
-        reconnect=ReconnectPolicy(enabled=automatic, initial_delay=0, max_delay=0, stable_after=0),
+        reconnect=ReconnectPolicy(initial_delay=0, max_delay=0, stable_after=0)
+        if automatic
+        else None,
     )
     brokers = []
 

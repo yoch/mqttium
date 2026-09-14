@@ -103,7 +103,7 @@ async def test_concurrent_connects_open_one_transport() -> None:
 
 
 async def test_cancelled_connect_closes_transport_and_tasks() -> None:
-    reconnect = ReconnectPolicy(enabled=True, initial_delay=0.01, max_delay=0.01)
+    reconnect = ReconnectPolicy(initial_delay=0.01, max_delay=0.01)
     client = AsyncClient(client_id="cancel-connect", reconnect=reconnect)
     transport = _Transport(connack=False)
     calls = 0
@@ -205,8 +205,8 @@ async def test_on_connect_can_disconnect_without_joining_its_lifecycle_task() ->
 async def test_disconnect_does_not_wait_for_space_in_saturated_writer_queue() -> None:
     client = AsyncClient(
         client_id="bounded-disconnect",
-        max_outbound_messages=2,
-        max_outbound_bytes=1024,
+        max_write_queue_messages=2,
+        max_write_queue_bytes=1024,
     )
     transport = _BlockedWriterTransport()
 

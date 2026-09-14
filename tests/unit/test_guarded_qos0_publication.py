@@ -176,17 +176,17 @@ async def test_alias_is_committed_only_after_direct_writer_acceptance(monkeypatc
 
 
 async def test_segmented_unit_qos0_stays_in_writer_queue():
-    client = AsyncClient("segmented-direct", max_outbound_bytes=1024)
+    client = AsyncClient("segmented-direct", max_write_queue_bytes=1024)
     broker = _WireBroker()
     client._transport_factory = transport_factory(broker)
     payload = b"x" * (256 * 1024)
     try:
         await client.connect("fake")
-        eager_before = client.stats().writer.eager_writes
+        eager_before = client._write_pump.eager_writes
         broker.written.clear()
         receipt = client.publish_nowait("t", payload)
         assert receipt.is_done()
-        assert client.stats().writer.eager_writes == eager_before
+        assert client._write_pump.eager_writes == eager_before
         assert client._write_pump.resident_messages == 1
         with pytest.raises(FlowControlError):
             client.publish_nowait("t", b"next")
@@ -368,8 +368,8 @@ async def test_direct_batch_keeps_mixed_qos_order_with_tight_bounds(task_factory
         "mixed-direct",
         protocol=protocol,
         max_outbound_inflight=1,
-        max_outbound_messages=1,
-        max_outbound_bytes=64,
+        max_write_queue_messages=1,
+        max_write_queue_bytes=64,
     )
     broker = BatchBrokerTransport(protocol)
     client._transport_factory = transport_factory(broker)
@@ -382,6 +382,6 @@ async def test_direct_batch_keeps_mixed_qos_order_with_tight_bounds(task_factory
         assert [message.payload for message in broker.publishes] == [bytes([i]) for i in range(18)]
         assert receipt.submitted == receipt.completed == 18
         assert receipt.pending_count == 0
-        assert client.stats().outbound.pending_messages == 0
+        assert client.stats().outbound.unacknowledged_messages == 0
     finally:
         await client.disconnect()

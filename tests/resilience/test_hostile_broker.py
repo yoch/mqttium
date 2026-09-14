@@ -236,7 +236,7 @@ SCENARIOS: list[tuple[str, Script, Callable[[AsyncClient], Awaitable[None]], dic
         "QoS 2 PUBLISH storm past Receive Maximum",
         _publish_storm_past_receive_maximum,
         _idle,
-        {"local_receive_maximum": 5},
+        {"max_inbound_inflight": 5},
     ),
     ("reserved packet types 0 and 15", _reserved_packet_types, _idle, {}),
     ("second CONNACK on an established session", _second_connack, _idle, {}),

@@ -163,8 +163,8 @@ from mqttium import FlowControlError
 
 client = AsyncClient(
     "bounded-producer",
-    max_pending_outbound_messages=2_000,
-    max_pending_outbound_bytes=16 * 1024**2,
+    max_unacknowledged_messages=2_000,
+    max_unacknowledged_bytes=16 * 1024**2,
 )
 
 try:

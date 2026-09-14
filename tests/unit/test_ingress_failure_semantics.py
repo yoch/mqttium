@@ -371,7 +371,7 @@ def _failing_client(
     *,
     clean_start: bool = True,
 ) -> AsyncClient:
-    policy = ReconnectPolicy(enabled=True, initial_delay=0.05, max_delay=0.05)
+    policy = ReconnectPolicy(initial_delay=0.05, max_delay=0.05)
     client = AsyncClient(
         client_id="ingress-failure",
         message_delivery="callback",
@@ -803,12 +803,12 @@ def _parked_setup(store, max_pending: int = 1):  # noqa: ANN001, ANN202
     transport = _ManualBrokerTransport()
     disconnected = asyncio.Event()
     errors: list[BaseException | None] = []
-    policy = ReconnectPolicy(enabled=True, initial_delay=0.05, max_delay=0.05)
+    policy = ReconnectPolicy(initial_delay=0.05, max_delay=0.05)
     client = AsyncClient(
         client_id="parked-crossing",
         store=store,
         reconnect=policy,
-        max_pending_outbound_messages=max_pending,
+        max_unacknowledged_messages=max_pending,
     )
     calls = 0
 
@@ -942,7 +942,7 @@ async def test_connack_restore_failure_fails_fast_with_original_cause() -> None:
     transport = _ManualBrokerTransport()
     disconnected = asyncio.Event()
     errors: list[BaseException | None] = []
-    policy = ReconnectPolicy(enabled=True, initial_delay=0.05, max_delay=0.05)
+    policy = ReconnectPolicy(initial_delay=0.05, max_delay=0.05)
     client = AsyncClient(
         client_id="connack-restore", store=store, reconnect=policy, clean_start=False
     )
@@ -997,7 +997,7 @@ async def test_reconnect_in_progress_stops_on_restore_failure() -> None:
     second_transport = _ManualBrokerTransport()
     disconnected = asyncio.Event()
     errors: list[BaseException | None] = []
-    policy = ReconnectPolicy(enabled=True, initial_delay=0.05, max_delay=0.05)
+    policy = ReconnectPolicy(initial_delay=0.05, max_delay=0.05)
     client = AsyncClient(
         client_id="reconnect-stop", store=store, reconnect=policy, clean_start=False
     )
@@ -1221,7 +1221,7 @@ async def test_replay_failure_during_stable_after_stops_reconnect() -> None:
     disconnected = asyncio.Event()
     errors: list[BaseException | None] = []
     received: list[bytes] = []
-    policy = ReconnectPolicy(enabled=True, initial_delay=0.05, max_delay=0.05, stable_after=1.0)
+    policy = ReconnectPolicy(initial_delay=0.05, max_delay=0.05, stable_after=1.0)
     client = AsyncClient(
         client_id="stable-after",
         store=store,
@@ -1287,7 +1287,7 @@ async def test_stable_after_sleep_checks_latched_failure() -> None:
     first_transport = _ManualBrokerTransport()
     second_transport = _ManualBrokerTransport()
     second_transport.connack_override = encode_frame(PacketType.CONNACK, 0, b"\x01\x00")
-    policy = ReconnectPolicy(enabled=True, initial_delay=0.05, max_delay=0.05, stable_after=0.3)
+    policy = ReconnectPolicy(initial_delay=0.05, max_delay=0.05, stable_after=0.3)
     client = AsyncClient(client_id="stable-sleep", store=store, reconnect=policy, clean_start=False)
     calls = 0
 

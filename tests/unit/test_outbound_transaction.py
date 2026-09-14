@@ -78,8 +78,8 @@ class _FailingStore:
 def _snapshot(engine: ProtocolEngine) -> dict[str, Any]:
     """Every piece of state a publish is allowed to touch."""
     return {
-        "pending_messages": engine.pending_outbound_messages,
-        "pending_bytes": engine.pending_outbound_bytes,
+        "pending_messages": engine.unacknowledged_messages,
+        "pending_bytes": engine.unacknowledged_bytes,
         "flow_inflight": engine.flow.inflight,
         "queued_mids": [msg.mid for msg in engine.outbound._queued],
         "used_mids": [mid for mid in range(1, 65536) if engine.packet_ids.in_use(mid)],
@@ -182,8 +182,8 @@ def test_launch_decision_matches_the_validation_snapshot(tmp_path: Path) -> None
     queues and takes none.
     """
     for engine in [
-        _engine(local_receive_maximum=1, max_outbound_inflight=1),
-        _engine(tmp_path / "decision", local_receive_maximum=1, max_outbound_inflight=1),
+        _engine(max_inbound_inflight=1, max_outbound_inflight=1),
+        _engine(tmp_path / "decision", max_inbound_inflight=1, max_outbound_inflight=1),
     ]:
         launched = engine.queue_publish("a/b", b"1", qos=QoS.AT_LEAST_ONCE)
         assert engine.flow.inflight == 1

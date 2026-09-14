@@ -12,7 +12,6 @@ from mqttium.enums import PacketType
 from mqttium.errors import MQTTError
 from mqttium.packets import encode_frame
 from mqttium.protocol.engine import EffectKind, EngineEffect
-from mqttium.protocol.reconnect import ReconnectPolicy
 
 
 async def _complete(client: AsyncClient, mid: int) -> None:
@@ -34,10 +33,10 @@ async def _wait_until_parked(client: AsyncClient, n: int) -> None:
     raise AssertionError(f"expected {n} parked waiters, got {client._publish_waiters}")
 
 
-def _parked_client(*, max_pending_outbound_messages: int = 1) -> AsyncClient:
+def _parked_client(*, max_unacknowledged_messages: int = 1) -> AsyncClient:
     return AsyncClient(
-        max_pending_outbound_messages=max_pending_outbound_messages,
-        max_pending_outbound_bytes=None,
+        max_unacknowledged_messages=max_unacknowledged_messages,
+        max_unacknowledged_bytes=None,
     )
 
 
@@ -89,7 +88,7 @@ async def test_wait_mode_blocks_until_logical_capacity_is_released() -> None:
 
     assert second.mid is not None
     assert client._publish_waiters == 0
-    assert client._engine.pending_outbound_messages == 1
+    assert client._engine.unacknowledged_messages == 1
 
 
 async def test_one_completion_releases_exactly_one_of_two_waiters() -> None:
@@ -114,7 +113,7 @@ async def test_one_completion_releases_exactly_one_of_two_waiters() -> None:
     pending = next(iter(remaining))
     assert not pending.done()
     assert client._publish_waiters == 1
-    assert client._engine.pending_outbound_messages == 1
+    assert client._engine.unacknowledged_messages == 1
     assert client._publish_wakeups == 1
 
     released = next(iter(finished)).result()
@@ -127,7 +126,7 @@ async def test_one_completion_releases_exactly_one_of_two_waiters() -> None:
 
 
 async def test_two_completions_can_release_two_waiters() -> None:
-    client = _parked_client(max_pending_outbound_messages=2)
+    client = _parked_client(max_unacknowledged_messages=2)
     held = [
         await client.publish("wake/held-a", b"a", qos=1),
         await client.publish("wake/held-b", b"b", qos=1),
@@ -146,7 +145,7 @@ async def test_two_completions_can_release_two_waiters() -> None:
     assert all(receipt.mid is not None for receipt in results)
     assert client._publish_waiters == 0
     assert client._publish_wakeups == 2
-    assert client._engine.pending_outbound_messages == 2
+    assert client._engine.unacknowledged_messages == 2
 
 
 async def test_cancelling_one_waiter_does_not_steal_the_wakeup() -> None:
@@ -168,7 +167,7 @@ async def test_cancelling_one_waiter_does_not_steal_the_wakeup() -> None:
     released = await asyncio.wait_for(other, timeout=1.0)
     assert released.mid is not None
     assert client._publish_waiters == 0
-    assert client._engine.pending_outbound_messages == 1
+    assert client._engine.unacknowledged_messages == 1
     assert client._publish_wakeups == 1
 
 
@@ -176,9 +175,9 @@ async def test_terminal_wakeup_fails_every_parked_publisher() -> None:
     client = AsyncClient(
         client_id="c",
         clean_start=False,
-        max_pending_outbound_messages=1,
-        max_pending_outbound_bytes=None,
-        reconnect=ReconnectPolicy(enabled=False),
+        max_unacknowledged_messages=1,
+        max_unacknowledged_bytes=None,
+        reconnect=None,
     )
     transport = await _connect(client)
     await client.publish("wake/first", b"one", qos=1)
@@ -209,12 +208,12 @@ async def test_publish_many_waits_for_one_slot() -> None:
     receipt = await asyncio.wait_for(batch, timeout=1.0)
     assert receipt.submitted == 1
     assert client._publish_waiters == 0
-    assert client._engine.pending_outbound_messages == 1
+    assert client._engine.unacknowledged_messages == 1
     assert client._publish_wakeups == 1
 
 
 async def test_publish_many_admits_one_element_per_released_slot() -> None:
-    client = _parked_client(max_pending_outbound_messages=2)
+    client = _parked_client(max_unacknowledged_messages=2)
     held = [
         await client.publish("wake/held-a", b"a", qos=1),
         await client.publish("wake/held-b", b"b", qos=1),
@@ -241,7 +240,7 @@ async def test_publish_many_admits_one_element_per_released_slot() -> None:
     assert not batch.done(), "the second element still needs a slot"
     assert client._publish_waiters == 1
     assert client._publish_wakeups == 1
-    assert client._engine.pending_outbound_messages == 2
+    assert client._engine.unacknowledged_messages == 2
 
     await _complete(client, held[1].mid)
     receipt = await asyncio.wait_for(batch, timeout=1.0)

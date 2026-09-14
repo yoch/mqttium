@@ -88,20 +88,21 @@ async def _cancellation_and_shutdown_smoke(host: str, port: int) -> None:
     await client.disconnect()
 
     snapshot = client.stats()
+    tasks = client._running_tasks()
     assert snapshot.state is ConnectionState.DISCONNECTED
     assert not any(
         (
-            snapshot.tasks.reader,
-            snapshot.tasks.writer,
-            snapshot.tasks.keepalive,
-            snapshot.tasks.reconnect,
-            snapshot.tasks.effect_flush,
+            tasks["reader"],
+            tasks["writer"],
+            tasks["keepalive"],
+            tasks["reconnect"],
+            tasks["effect_flush"],
         )
     )
     # The lifecycle supervisor runs after the disconnect transition by contract
     # and retires itself once the (absent) hook has been dispatched.
     for _ in range(100):
-        if not client.stats().tasks.lifecycle:
+        if not client._running_tasks()["lifecycle"]:
             break
         await asyncio.sleep(0.01)
     else:

@@ -20,16 +20,31 @@ the process memory budget.
 | `will`, `will_properties` | `None` | Last Will message and MQTT 5 properties |
 | `store` | `None` | Optional supplied memory or SQLite store |
 
+A supplied `store` only resumes the session it holds when `clean_start=False`.
+With the default `clean_start=True` the broker discards its side of the session
+and the client discards the store's unfinished publications at CONNACK; the
+store then only provides durability within one process lifetime. Choose the
+pair deliberately: `store` + `clean_start=False` for restart recovery,
+`clean_start=True` when a fresh session is intended.
+
+### MQTT 5 options on an MQTT 3.1.1 client
+
+`connect_properties`, `will_properties`, `topic_alias_maximum` and
+`auth_handler` describe MQTT 5 features. Passing any of them with the default
+MQTT 3.1.1 protocol raises `ProtocolError` from the constructor: there is no
+wire representation to degrade to, so the client refuses rather than ignores.
+`maximum_packet_size` is protocol-agnostic; see below.
+
 ### Broker-facing protocol limits
 
 | Setting | Default | Purpose |
 | --- | ---: | --- |
-| `local_receive_maximum` | `100` | Maximum unfinished inbound QoS 1/2 publications advertised to the broker |
+| `max_inbound_inflight` | `100` | Concurrent inbound QoS 1/2 exchanges accepted; advertised as Receive Maximum on MQTT 5 |
 | `max_outbound_inflight` | `None` | Optional local cap below the broker's Receive Maximum |
-| `maximum_packet_size` | `None` | MQTT 5 inbound maximum packet size advertised to the broker |
+| `maximum_packet_size` | `None` | Largest inbound packet accepted by the decoder; advertised to an MQTT 5 broker |
 | `topic_alias_maximum` | `0` | Inbound topic aliases accepted from an MQTT 5 broker |
 
-`local_receive_maximum` controls inbound work. `max_outbound_inflight` controls
+`max_inbound_inflight` controls inbound work. `max_outbound_inflight` controls
 outbound work. Neither changes the MQTT packet-identifier range.
 
 Use dedicated constructor arguments for Receive Maximum, Maximum Packet Size
@@ -41,21 +56,37 @@ for the client instance.
 
 | Setting | Default | Purpose |
 | --- | ---: | --- |
-| `max_pending_outbound_messages` | `10_000` | Unfinished outbound publications retained by protocol state |
-| `max_pending_outbound_bytes` | `64 MiB` | Logical topic, payload, and property bytes retained by outbound state |
+| `max_unacknowledged_messages` | `10_000` | Outbound QoS 1/2 publications admitted and not yet completed, including those waiting for an inflight slot |
+| `max_unacknowledged_bytes` | `64 MiB` | Logical topic, payload, and property bytes of those publications |
 
-### Writer and ingress
+Both bounds refuse new admissions with `FlowControlError` (or park an awaiting
+`publish()` until capacity returns); they never disconnect.
+
+### Writer and inbound protocol state
 
 | Setting | Default | Purpose |
 | --- | ---: | --- |
-| `max_outbound_messages` | `10_000` | Encoded frames resident in the writer |
-| `max_outbound_bytes` | `1 MiB` | Encoded bytes resident in the writer |
-| `max_ingress_batch_bytes` | `1 MiB` | Maximum decoded input work in one bounded batch |
-| `max_pending_inbound_bytes` | `64 MiB` | Retained inbound protocol-state bytes |
+| `max_write_queue_messages` | `10_000` | Encoded frames resident in the writer |
+| `max_write_queue_bytes` | `1 MiB` | Encoded bytes resident in the writer |
+| `max_inbound_inflight_bytes` | `64 MiB` | Logical bytes retained for inbound QoS 1/2 exchanges |
 
 The writer admits one oversized item when otherwise empty so a configured byte
 limit cannot permanently block a valid large packet. No second item is admitted
 until capacity returns.
+
+The inbound bounds have a different failure mode from every outbound bound:
+the client cannot refuse a PUBLISH the broker has already sent. When the
+broker exceeds `max_inbound_inflight` the client sends DISCONNECT with reason
+`0x93` (Receive Maximum exceeded); when a retained QoS 1/2 exchange would
+exceed `max_inbound_inflight_bytes` it sends DISCONNECT with reason `0x97`
+(Quota exceeded). Both end the connection and surface through
+`on_disconnect`; a reconnect policy may retry. On MQTT 3.1.1 the broker is not
+told either limit, so size `max_inbound_inflight` at or above the broker's
+own inflight window when using `manual_ack` with slow acknowledgement.
+
+The reader decodes input in fixed lots of at most 256 packets or 1 MiB before
+handing effects to the application; that quantum is a fairness constant, not
+a memory bound, and is not configurable.
 
 ### Application delivery
 
@@ -63,19 +94,31 @@ until capacity returns.
 | --- | ---: | --- |
 | `message_delivery` | `"iterator"` | Choose iterator or callback delivery |
 | `manual_ack` | `False` | Let the application control inbound QoS acknowledgement timing |
-| `max_pending_messages` | `65_536` | Iterator queue count bound |
-| `max_pending_delivery_bytes` | `64 MiB` | Topic, payload and property bytes retained for application delivery |
-| `delivery_timeout` | `None` | Optional positive deadline across iterator byte and queue waits |
+| `max_iterator_messages` | `65_536` | Iterator queue count bound |
+| `max_iterator_bytes` | `64 MiB` | Topic, payload and property bytes retained in the iterator queue |
+| `iterator_admission_timeout` | `None` | Optional positive deadline for admitting one message into the iterator queue |
+
+The iterator queue is the only place where the client retains messages on the
+application's behalf, so its three bounds only exist in iterator mode. In
+callback mode the reader hands each message to the synchronous callback and
+retains nothing; backpressure is the callback's own duration. Passing a
+non-default iterator bound with `message_delivery="callback"` raises
+`ValueError` at construction.
 
 ### Connection and authentication
 
 | Setting | Default | Purpose |
 | --- | ---: | --- |
-| `reconnect` | disabled | Opt-in `ReconnectPolicy` |
+| `reconnect` | `None` | Opt-in `ReconnectPolicy`; `None` disables reconnection |
+| `connect_timeout` | `30.0` | Transport and CONNACK deadline for `connect*()` when the call omits `timeout`, and for every automatic reconnect attempt |
 | `ping_timeout` | derived | PINGRESP deadline; derived from keepalive when omitted |
-| `ack_timeout` | `30.0` | Default SUBACK and UNSUBACK deadline |
+| `subscribe_timeout` | `30.0` | Default SUBACK and UNSUBACK deadline |
 | `auth_handler` | `None` | MQTT 5 enhanced-authentication callback, fixed at construction |
 | `auth_timeout` | `10.0` | Deadline for each enhanced-authentication callback invocation |
+
+Every default deadline lives on the constructor; `connect*()`, `subscribe()`
+and `unsubscribe()` accept a per-call `timeout` override. `ReconnectPolicy`
+only describes the retry progression.
 
 ## A sizing method
 
@@ -105,9 +148,11 @@ different queues.
 ## Reconnect policy
 
 `ReconnectPolicy` defaults to full-jitter exponential backoff starting at one
-second and capped at 60 seconds. Set `max_retries=None` for an unbounded retry
+second and capped at 60 seconds. Passing a policy enables reconnection;
+`reconnect=None` disables it. Set `max_retries=None` for an unbounded retry
 count only when the surrounding service is expected to remain alive. Terminal
-authentication, authorization, and protocol errors are not retried.
+authentication, authorization, and protocol errors are not retried. Each
+attempt uses the client's `connect_timeout`.
 
 MQTT 5 `Use another server` and `Server moved` are terminal. The application
 chooses any replacement endpoint explicitly. Broker DISCONNECT details arrive

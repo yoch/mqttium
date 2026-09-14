@@ -172,12 +172,12 @@ class ProtocolEngine:
         return self.outbound.flow
 
     @property
-    def pending_outbound_messages(self) -> int:
-        return self.outbound.pending_messages
+    def unacknowledged_messages(self) -> int:
+        return self.outbound.unacknowledged_messages
 
     @property
-    def pending_outbound_bytes(self) -> int:
-        return self.outbound.pending_bytes
+    def unacknowledged_bytes(self) -> int:
+        return self.outbound.unacknowledged_bytes
 
     # --- inbound facade ----------------------------------------------------
     # Preserve the diagnostic/test surface that pre-dates InboundSession while
@@ -269,8 +269,6 @@ class ProtocolEngine:
                 "[MQTT-3.1.2-22]; connect with MQTT 5 or supply a username"
             )
         if self.config.accept_auth:
-            if self.config.protocol != MQTTProtocolVersion.MQTTv5:
-                raise ProtocolError("Enhanced authentication requires MQTT 5")
             if not configured_auth_method:
                 raise ProtocolError(
                     "auth_handler requires authentication_method in CONNECT properties"
@@ -295,7 +293,7 @@ class ProtocolEngine:
         connect_props = self.config.connect_properties
         if self.config.protocol == MQTTProtocolVersion.MQTTv5:
             values = dict(connect_props.values) if connect_props else {}
-            values["receive_maximum"] = self.config.local_receive_maximum
+            values["receive_maximum"] = self.config.max_inbound_inflight
             if self.config.maximum_packet_size is not None:
                 values["maximum_packet_size"] = self.config.maximum_packet_size
             if self.config.topic_alias_maximum:
@@ -321,7 +319,7 @@ class ProtocolEngine:
         )
         wire = packet.encode()
 
-        sent_receive_maximum = self.config.local_receive_maximum
+        sent_receive_maximum = self.config.max_inbound_inflight
         sent_topic_alias_maximum = self.config.topic_alias_maximum
         sent_maximum_packet_size = self.config.maximum_packet_size
         if self.config.protocol == MQTTProtocolVersion.MQTTv5:
@@ -507,7 +505,7 @@ class ProtocolEngine:
         """Release connection-scoped SUBSCRIBE/UNSUBSCRIBE packet identifiers."""
         if not self._pending_sub_requests:
             return
-        if self.outbound.pending_messages == 0:
+        if self.outbound.unacknowledged_messages == 0:
             # No publish MID survives this connection: reset in constant time.
             self.outbound.packet_ids.clear()
         else:

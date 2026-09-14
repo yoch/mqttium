@@ -195,13 +195,13 @@ def test_request_problem_information_zero_rejects_suback_without_settling() -> N
     ],
 )
 def test_reconnect_stops_on_permanent_v5_connack_refusals(reason_code: int) -> None:
-    policy = ReconnectPolicy(enabled=True)
+    policy = ReconnectPolicy()
     assert not _ReconnectState(policy).should_retry(reason_code, MQTTProtocolVersion.MQTTv5)
 
 
 @pytest.mark.parametrize("reason_code", [0x80, 0x83, 0x88, 0x89, 0x97, 0x9F])
 def test_reconnect_keeps_transient_v5_failures_retryable(reason_code: int) -> None:
-    policy = ReconnectPolicy(enabled=True)
+    policy = ReconnectPolicy()
     assert _ReconnectState(policy).should_retry(reason_code, MQTTProtocolVersion.MQTTv5)
 
 

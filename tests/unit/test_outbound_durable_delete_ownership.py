@@ -46,7 +46,7 @@ def test_drain_delete_failure_keeps_fifo_ownership_until_retry(
 ) -> None:
     store = _store(kind, tmp_path / f"{kind}-{int(qos)}")
     engine = ProtocolEngine(
-        EngineConfig(local_receive_maximum=1, max_outbound_inflight=1),
+        EngineConfig(max_inbound_inflight=1, max_outbound_inflight=1),
         store,
     )
     engine.state = ConnectionState.CONNECTED
@@ -98,7 +98,7 @@ def test_drain_delete_failure_keeps_fifo_ownership_until_retry(
         for e in effects
     )
     assert store.get_out(second.mid) is not None
-    assert engine.pending_outbound_messages == 2
+    assert engine.unacknowledged_messages == 2
     assert engine.packet_ids.in_use(second.mid)
     assert engine.packet_ids.in_use(third.mid)
     assert [msg.mid for msg in engine.outbound._queued] == [second.mid, third.mid]
@@ -116,7 +116,7 @@ def test_drain_delete_failure_keeps_fifo_ownership_until_retry(
         OutboundQoSState.WAIT_PUBACK if qos is QoS.AT_LEAST_ONCE else OutboundQoSState.WAIT_PUBREC
     )
     assert engine.packet_ids.in_use(second.mid)
-    assert engine.pending_outbound_messages == 2
+    assert engine.unacknowledged_messages == 2
 
     if isinstance(store, SqliteInflightStore):
         store.close()
@@ -160,7 +160,7 @@ def test_replay_delete_failure_keeps_durable_record_and_primary_context(
     assert str(raised.value.__context__) == "replay materialisation failed"
     assert store.get_out(handle.mid) is not None
     assert engine.packet_ids.in_use(handle.mid)
-    assert engine.pending_outbound_messages == 1
+    assert engine.unacknowledged_messages == 1
 
     engine.outbound.replay_session()
     assert any(e.kind is EffectKind.SEND for e in engine.take_effects())
@@ -177,7 +177,7 @@ def test_sqlite_surviving_record_rehydrates_the_same_ownership_after_restart(
 ) -> None:
     path = tmp_path / "restart.db"
     store = SqliteInflightStore(path)
-    config = EngineConfig(local_receive_maximum=1, max_outbound_inflight=1)
+    config = EngineConfig(max_inbound_inflight=1, max_outbound_inflight=1)
     engine = ProtocolEngine(config, store)
     engine.state = ConnectionState.CONNECTED
     first = engine.queue_publish("t/1", b"one", qos=QoS.AT_LEAST_ONCE)
@@ -220,12 +220,12 @@ def test_sqlite_surviving_record_rehydrates_the_same_ownership_after_restart(
     store.close()
     reopened = SqliteInflightStore(path)
     recovered = ProtocolEngine(
-        EngineConfig(local_receive_maximum=1, max_outbound_inflight=1),
+        EngineConfig(max_inbound_inflight=1, max_outbound_inflight=1),
         reopened,
     )
     record = reopened.get_out(second.mid)
     assert record is not None and record.state is OutboundQoSState.QUEUED
-    assert recovered.pending_outbound_messages == 1
+    assert recovered.unacknowledged_messages == 1
     assert recovered.packet_ids.in_use(second.mid)
     assert [msg.mid for msg in recovered.outbound._queued] == [second.mid]
     reopened.close()
@@ -258,7 +258,7 @@ def test_negotiation_discard_failure_keeps_queue_until_delete_recovers(
     assert raised.value.__context__ is not None
     assert store.get_out(handle.mid) is not None
     assert engine.packet_ids.in_use(handle.mid)
-    assert engine.pending_outbound_messages == 1
+    assert engine.unacknowledged_messages == 1
     assert [msg.mid for msg in engine.outbound._queued] == [handle.mid]
     assert engine.take_effects() == []
 
@@ -266,7 +266,7 @@ def test_negotiation_discard_failure_keeps_queue_until_delete_recovers(
     effects = engine.take_effects()
     assert store.get_out(handle.mid) is None
     assert not engine.packet_ids.in_use(handle.mid)
-    assert engine.pending_outbound_messages == 0
+    assert engine.unacknowledged_messages == 0
     assert list(engine.outbound._queued) == []
     assert any(
         e.kind is EffectKind.PUBLISH_FAILED and getattr(e.data, "mid", None) == handle.mid
@@ -293,8 +293,8 @@ def test_admission_rollback_still_preserves_primary_failure(
     with pytest.raises(_Boom, match="primary put failure"):
         engine.queue_publish("t", b"payload", qos=QoS.AT_LEAST_ONCE)
 
-    assert engine.pending_outbound_messages == 0
-    assert engine.pending_outbound_bytes == 0
+    assert engine.unacknowledged_messages == 0
+    assert engine.unacknowledged_bytes == 0
     assert engine.flow.inflight == 0
     assert len(engine.packet_ids) == 0
     assert list(engine.outbound._queued) == []

@@ -16,11 +16,7 @@ async def _deliver(client: AsyncClient, payload: bytes = b"x") -> None:
 
 
 async def test_callback_does_not_fill_iterator_queue() -> None:
-    client = AsyncClient(
-        client_id="delivery-auto",
-        max_pending_messages=1,
-        message_delivery="callback",
-    )
+    client = AsyncClient(client_id="delivery-auto", message_delivery="callback")
     received: list[bytes] = []
     client.on_message = lambda message: received.append(message.payload)
 
@@ -30,7 +26,7 @@ async def test_callback_does_not_fill_iterator_queue() -> None:
     assert received == [b"0", b"1", b"2", b"3", b"4"]
     assert client._delivery.messages_queue.empty()
     assert client.stats().delivery.callback_invocations == 5
-    assert client.stats().delivery.pending_bytes == 0
+    assert client.stats().delivery.iterator_bytes == 0
 
 
 async def test_callback_self_cancellation_does_not_stop_inline_delivery() -> None:
@@ -60,11 +56,11 @@ async def test_callback_self_cancellation_does_not_stop_inline_delivery() -> Non
 
 
 async def test_unlimited_bytes_keeps_selected_destination() -> None:
-    iterator_client = AsyncClient(max_pending_delivery_bytes=None)
+    iterator_client = AsyncClient(max_iterator_bytes=None)
     await _deliver(iterator_client, b"iterator")
     assert (await anext(iterator_client.messages())).payload == b"iterator"
 
-    callback_client = AsyncClient(max_pending_delivery_bytes=None, message_delivery="callback")
+    callback_client = AsyncClient(message_delivery="callback")
     received: list[bytes] = []
     callback_client.on_message = lambda message: received.append(message.payload)
     await _deliver(callback_client, b"callback")
@@ -73,9 +69,11 @@ async def test_unlimited_bytes_keeps_selected_destination() -> None:
 
 @pytest.mark.parametrize("mode", ["iterator", "callback"])
 async def test_unaccounted_specialized_delivery_modes(mode: str) -> None:
+    # Iterator bounds describe a queue callback delivery does not own.
+    bounds = {"max_iterator_bytes": None} if mode == "iterator" else {}
     client = AsyncClient(
         message_delivery=mode,  # type: ignore[arg-type]
-        max_pending_delivery_bytes=None,
+        **bounds,
     )
     received: list[bytes] = []
     client.on_message = lambda message: received.append(message.payload)
@@ -108,7 +106,7 @@ def test_removed_modes_are_rejected(mode) -> None:
 async def test_stream_drains_messages_before_closed() -> None:
     client = AsyncClient(
         client_id="delivery-close",
-        max_pending_messages=2,
+        max_iterator_messages=2,
         message_delivery="iterator",
     )
     await _deliver(client, b"1")
@@ -121,7 +119,7 @@ async def test_stream_drains_messages_before_closed() -> None:
 
 
 async def test_explicit_reconnect_resets_closed_message_stream() -> None:
-    client = AsyncClient(client_id="delivery-reset", max_pending_messages=2)
+    client = AsyncClient(client_id="delivery-reset", max_iterator_messages=2)
     original = client._delivery.messages_queue
     client._delivery.closed.set()
     client._delivery.message_ready.set()

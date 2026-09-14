@@ -67,7 +67,7 @@ def test_empty_outbound_topic_with_alias_is_refused_without_mutation(qos: int) -
         engine.queue_publish("", b"payload", qos=qos, properties=properties)
 
     assert engine.take_effects() == []
-    assert engine.pending_outbound_messages == 0
+    assert engine.unacknowledged_messages == 0
     assert len(engine.packet_ids) == 0
     assert (
         tuple(
@@ -132,7 +132,7 @@ def test_invalid_outbound_alias_is_rejected_before_mutation(alias: int, qos: int
         engine.queue_publish("canonical/topic", qos=qos, properties=_alias(alias))
 
     assert engine.take_effects() == []
-    assert engine.pending_outbound_messages == 0
+    assert engine.unacknowledged_messages == 0
     assert len(engine.packet_ids) == 0
 
 

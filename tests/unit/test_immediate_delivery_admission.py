@@ -16,7 +16,7 @@ from tests.support import accept_message
 
 @pytest.mark.parametrize("deadline", [None, 5.0])
 async def test_available_capacity_avoids_timeout_and_sizes_once(monkeypatch, deadline):
-    client = AsyncClient(delivery_timeout=deadline)
+    client = AsyncClient(iterator_admission_timeout=deadline)
     delivery = client._delivery
     sizes = []
     original = delivery.logical_size
@@ -39,9 +39,8 @@ async def test_available_capacity_avoids_timeout_and_sizes_once(monkeypatch, dea
     assert delivery.pending_bytes == 0
 
 
-@pytest.mark.parametrize("deadline", [None, 5.0])
-async def test_callback_mode_delivers_inline_without_sizing_or_reservation(monkeypatch, deadline):
-    client = AsyncClient(message_delivery="callback", delivery_timeout=deadline)
+async def test_callback_mode_delivers_inline_without_sizing_or_reservation(monkeypatch):
+    client = AsyncClient(message_delivery="callback")
     delivery = client._delivery
     seen = []
 
@@ -66,8 +65,8 @@ async def test_callback_mode_delivers_inline_without_sizing_or_reservation(monke
 @pytest.mark.parametrize("bound", ["count", "bytes"])
 async def test_waiting_path_takes_ownership_only_once_capacity_exists(bound):
     client = AsyncClient(
-        max_pending_messages=1 if bound == "count" else 2,
-        max_pending_delivery_bytes=2 if bound == "bytes" else 100,
+        max_iterator_messages=1 if bound == "count" else 2,
+        max_iterator_bytes=2 if bound == "bytes" else 100,
     )
     delivery = client._delivery
     first, second = Message(topic="t", payload=b"x"), Message(topic="t", payload=b"y")
@@ -85,10 +84,10 @@ async def test_waiting_path_takes_ownership_only_once_capacity_exists(bound):
 
 
 async def test_impossible_delivery_is_rejected_before_reservation():
-    client = AsyncClient(max_pending_delivery_bytes=1)
+    client = AsyncClient(max_iterator_bytes=1)
     with pytest.raises(MessageDeliveryError, match="exceeding limit"):
         client._delivery.accept(Message(topic="t", payload=b"xx"), None)
-    assert client.stats().delivery.pending_bytes == 0
+    assert client.stats().delivery.iterator_bytes == 0
     assert client._delivery.messages_queue.empty()
     assert client._delivery.waiters == 0
 
@@ -109,13 +108,13 @@ async def test_reader_message_delivery_keeps_callbacks_outside_engine_lock(kind)
     await client._delivery_lane.drain()
     assert observed == [(b"x", False)]
     assert client.stats().delivery.callback_invocations == 1
-    assert client.stats().delivery.pending_bytes == 0
+    assert client.stats().delivery.iterator_bytes == 0
 
 
 @pytest.mark.parametrize("path", ["immediate", "locked", "waiting"])
 @pytest.mark.parametrize("mark", [False, True])
 async def test_delivery_mark_keeps_lock_and_failure_boundary(monkeypatch, mark, path):
-    client = AsyncClient(max_pending_messages=1)
+    client = AsyncClient(max_iterator_messages=1)
     delivery = client._delivery
     message = Message(topic="t", payload=b"x", mid=7, qos=QoS.AT_LEAST_ONCE)
     effect = EngineEffect(EffectKind.MESSAGE, message, requires_delivery_mark=mark)
@@ -170,7 +169,7 @@ async def test_delivery_mark_keeps_lock_and_failure_boundary(monkeypatch, mark, 
 
 
 async def test_reader_lane_delivers_in_order_and_skips_stale_epochs():
-    client = AsyncClient(max_pending_messages=1)
+    client = AsyncClient(max_iterator_messages=1)
     first, second = Message(topic="t", payload=b"a"), Message(topic="t", payload=b"b")
     await accept_message(client._delivery, first, None)
     client._engine._emit(EffectKind.MESSAGE, second)

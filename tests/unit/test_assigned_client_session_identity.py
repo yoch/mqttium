@@ -132,12 +132,11 @@ async def test_automatic_reconnect_uses_assigned_session_identity() -> None:
         clean_start=True,
         connect_properties=Properties({"session_expiry_interval": 3600}),
         reconnect=ReconnectPolicy(
-            enabled=True,
             initial_delay=0.0,
             max_delay=0.0,
             stable_after=0.0,
-            connect_timeout=0.2,
         ),
+        connect_timeout=0.2,
     )
 
     async def factory(host: str, port: int, *, ssl: object = None) -> _AssignedSessionTransport:

@@ -137,16 +137,16 @@ async def test_reset_message_stream_releases_abandoned_iterator_delivery() -> No
 
     client = AsyncClient(
         message_delivery="iterator",
-        max_pending_delivery_bytes=1024,
+        max_iterator_bytes=1024,
     )
     message = Message(topic="reset", payload=b"payload")
     await deliver_message(client, message)
-    assert client.stats().delivery.pending_bytes > 0
+    assert client.stats().delivery.iterator_bytes > 0
     client._delivery.closed.set()
 
     await client._reset_message_stream()
 
     assert client._delivery.messages_queue.empty()
-    assert client.stats().delivery.pending_bytes == 0
+    assert client.stats().delivery.iterator_bytes == 0
     assert not hasattr(message, "_delivery_references")
     assert not hasattr(message, "_delivery_logical_bytes")

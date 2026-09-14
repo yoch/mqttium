@@ -101,12 +101,10 @@ class _BlockedCloseBroker(_Broker):
 
 def _policy() -> ReconnectPolicy:
     return ReconnectPolicy(
-        enabled=True,
         initial_delay=0.0,
         max_delay=0.0,
         max_retries=4,
         stable_after=0.0,
-        connect_timeout=0.25,
     )
 
 
@@ -138,6 +136,7 @@ async def test_ping_timeout_reconnect_emits_one_disconnect_and_preserves_stream(
         keepalive=1,
         ping_timeout=0.01,
         reconnect=_policy(),
+        connect_timeout=0.25,
         message_delivery="iterator",
     )
     client.on_disconnect = lambda exc: disconnects.append(exc)
@@ -185,7 +184,11 @@ async def test_callback_connect_takes_over_keepalive_close_before_reader_finally
     callback_done = asyncio.Event()
     callback_errors: list[BaseException] = []
     client = AsyncClient(
-        "keepalive-callback-takeover", keepalive=1, reconnect=_policy(), message_delivery="callback"
+        "keepalive-callback-takeover",
+        keepalive=1,
+        reconnect=_policy(),
+        connect_timeout=0.25,
+        message_delivery="callback",
     )
 
     async def factory(host: str, port: int, *, ssl=None):
@@ -251,6 +254,7 @@ async def test_disconnect_in_reconnect_gap_wakes_logical_publish_waiter() -> Non
     client = AsyncClient(
         "gap-waiter",
         reconnect=_policy(),
+        connect_timeout=0.25,
         message_delivery="iterator",
     )
 
@@ -319,7 +323,7 @@ async def test_terminal_broker_eof_stops_connection_keepalive_task() -> None:
     client = AsyncClient(
         "eof-keepalive-owner",
         keepalive=0,
-        reconnect=ReconnectPolicy(enabled=False),
+        reconnect=None,
     )
 
     async def factory(host: str, port: int, *, ssl=None):
@@ -348,6 +352,7 @@ async def test_eof_retires_connected_state_before_joining_keepalive() -> None:
         "eof-state-owner",
         keepalive=0,
         reconnect=_policy(),
+        connect_timeout=0.25,
     )
 
     async def factory(host: str, port: int, *, ssl=None):
@@ -399,7 +404,7 @@ async def test_tiny_peer_limit_fails_before_keepalive_owner_starts() -> None:
         "tiny-ping-owner",
         protocol=MQTTProtocolVersion.MQTTv5,
         keepalive=1,
-        reconnect=ReconnectPolicy(enabled=False),
+        reconnect=None,
     )
 
     async def factory(host: str, port: int, *, ssl=None):
@@ -410,23 +415,24 @@ async def test_tiny_peer_limit_fails_before_keepalive_owner_starts() -> None:
         with pytest.raises(PacketTooLargeError):
             await client.connect("fake", 1, timeout=1.0)
         stats = client.stats()
+        tasks = client._running_tasks()
         assert not client.is_connected
         assert client._keepalive_task is None
         assert client._reconnect_task is None
         assert not any(
             (
-                stats.tasks.reader,
-                stats.tasks.writer,
-                stats.tasks.keepalive,
-                stats.tasks.reconnect,
-                stats.tasks.effect_flush,
+                tasks["reader"],
+                tasks["writer"],
+                tasks["keepalive"],
+                tasks["reconnect"],
+                tasks["effect_flush"],
             )
         )
         assert stats.writer.waiters == 0
-        assert stats.effects.waiters == 0
+        assert client._effect_pump.counters()["waiters"] == 0
         assert stats.delivery.waiters == 0
         # The disconnect notification owner retires by itself without a hook.
-        await wait_until(lambda: not client.stats().tasks.lifecycle)
+        await wait_until(lambda: not client._running_tasks()["lifecycle"])
     finally:
         await _cleanup(client)
 

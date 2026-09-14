@@ -16,8 +16,8 @@ from tests.support import accept_message, apply_delivery_effect
 async def test_iterator_queue_timeout_is_explicit() -> None:
     client = AsyncClient(
         message_delivery="iterator",
-        max_pending_messages=1,
-        delivery_timeout=0.01,
+        max_iterator_messages=1,
+        iterator_admission_timeout=0.01,
     )
     await accept_message(client._delivery, Message(topic="full", payload=b"x"))
 

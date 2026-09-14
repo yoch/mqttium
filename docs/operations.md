@@ -26,15 +26,19 @@ MQTTium keeps separate budgets because each resource has a different lifetime:
 
 | Boundary | Relevant configuration |
 | --- | --- |
-| Unfinished outbound QoS state | `max_pending_outbound_messages`, `max_pending_outbound_bytes` |
-| Inbound persisted protocol state | `max_pending_inbound_bytes` |
-| Encoded writer queue | `max_outbound_messages`, `max_outbound_bytes` |
-| Reader processing batch | `max_ingress_batch_bytes` |
-| Iterator queue | `max_pending_messages` |
-| Retained application-delivery data | `max_pending_delivery_bytes` |
-| Broker-facing QoS concurrency | `local_receive_maximum`, `max_outbound_inflight` and negotiated limits |
+| Unfinished outbound QoS state | `max_unacknowledged_messages`, `max_unacknowledged_bytes` |
+| Inbound persisted protocol state | `max_inbound_inflight_bytes` |
+| Encoded writer queue | `max_write_queue_messages`, `max_write_queue_bytes` |
+| Iterator queue | `max_iterator_messages`, `max_iterator_bytes` |
+| Broker-facing QoS concurrency | `max_inbound_inflight`, `max_outbound_inflight` and negotiated limits |
 
-`max_outbound_messages` bounds writer-resident admitted frames: items still on
+Outbound bounds refuse or park the local producer. Inbound bounds cannot
+refuse what the broker already sent: exceeding `max_inbound_inflight` or
+`max_inbound_inflight_bytes` ends the connection with DISCONNECT `0x93` or
+`0x97`, reported through `on_disconnect`. The reader's decode quantum (256
+packets or 1 MiB per lot) is a fixed fairness constant, not a bound.
+
+`max_write_queue_messages` bounds writer-resident admitted frames: items still on
 the asyncio queue **and** the writer's active batch (up to 256 frames extracted
 for one write). `client.stats().writer.queued_messages` remains `queue.qsize()`
 and can be lower than the admission count while a batch is in flight. Eager
@@ -68,7 +72,7 @@ A `publish_nowait()` producer must catch `FlowControlError` and apply its own
 shed, retry or spill policy.
 
 A `publish_nowait()` producer sending large payloads will saturate the writer
-byte budget (`max_outbound_bytes`, 1 MiB by default) long before it exhausts the
+byte budget (`max_write_queue_bytes`, 1 MiB by default) long before it exhausts the
 message count, and a producer that merely retries on `FlowControlError` will
 busy-spin against it. Shed, slow down, or spill instead — or use
 `await client.publish(...)` and
@@ -76,7 +80,7 @@ let the client apply the backpressure for you. Do **not** set the pending bounds
 to `None` to make the error go away: unbounded queues move the failure from a
 catchable exception to memory exhaustion.
 
-Size `max_outbound_bytes` from the encoded bytes that may accumulate during the
+Size `max_write_queue_bytes` from the encoded bytes that may accumulate during the
 largest supported burst, not only from the message count. This matters most for
 64 KiB and 1 MiB payloads. To preserve forward progress, an empty writer (no
 resident frames and no charged bytes) admits one item larger than its byte
@@ -96,26 +100,37 @@ print("state", snapshot.state)
 print("reconnect attempt", snapshot.reconnect_attempt)
 print(
     "outbound",
-    snapshot.outbound.pending_messages,
-    snapshot.outbound.pending_bytes,
-    snapshot.outbound.flow_inflight,
-    snapshot.outbound.flow_limit,
+    snapshot.outbound.unacknowledged_messages,
+    snapshot.outbound.unacknowledged_bytes,
+    snapshot.outbound.inflight,
+    snapshot.outbound.inflight_limit,
 )
 print("writer", snapshot.writer.queued_messages, snapshot.writer.queued_bytes)
-print("delivery", snapshot.delivery.pending_bytes)
+print("delivery", snapshot.delivery.iterator_queued, snapshot.delivery.iterator_bytes)
 print("receipts", snapshot.receipts.publish, snapshot.receipts.publish_batches)
 ```
 
-The immutable snapshot contains:
+The snapshot exists so an application can see what its client is doing without
+a logger. Every section describes a queue or window the application can size,
+in the same vocabulary as the constructor bound it is measured against:
 
-- connection state, epoch and reconnect attempt;
-- reader, writer, keepalive, reconnect, effect and lifecycle-hook tasks;
-- outbound and inbound protocol state and packet identifiers;
-- effect-pump and writer queue usage, waiters and high-water marks;
-- decoder buffering and ingress limit;
-- iterator queue occupancy, callback invocation count and delivery byte usage;
-- pending publish, batch, subscribe and unsubscribe receipts;
-- transport buffers and counters where the transport can report them.
+| Section | Fields | Constructor bound |
+| --- | --- | --- |
+| `state`, `connection_epoch`, `reconnect_attempt` | connection state, connection counter, retries issued since the last stable connection | `reconnect` |
+| `outbound` | `unacknowledged_messages`, `unacknowledged_bytes`, their `*_high_water_*`, `awaiting_slot`, `inflight`, `inflight_limit`, `packet_ids_in_use` | `max_unacknowledged_*`, `max_outbound_inflight` |
+| `inbound` | `inflight`, `inflight_limit`, `inflight_bytes`, `inflight_high_water_bytes`, `inflight_byte_limit`, `topic_aliases`, `replay_pending` | `max_inbound_inflight`, `max_inbound_inflight_bytes` |
+| `writer` | `queued_messages`, `queued_bytes`, `high_water_*`, `max_messages`, `max_bytes`, `waiters`, `last_outbound` | `max_write_queue_*` |
+| `decoder` | `buffered_bytes`, `high_water_bytes`, `max_packet_size` | `maximum_packet_size` |
+| `delivery` | `iterator_queued`, `iterator_limit`, `iterator_bytes`, `iterator_high_water_bytes`, `iterator_byte_limit`, `callback_invocations`, `waiters` | `max_iterator_*` |
+| `receipts` | `publish`, `publish_batches`, `subscribe`, `unsubscribe`, `publish_waiters` | — |
+| `transport` | `kind`, `closing`, `pending_write_bytes`, `buffered_read_bytes` | — |
+
+`waiters` fields count producers currently parked on that bound; a non-zero
+value with occupancy at the limit is sustained pressure, a high-water mark at
+the limit with zero waiters is a burst that has drained. How the runtime
+schedules its own work (background tasks, effect batching, writer batching
+decisions) is not part of the snapshot; those counters are maintainer
+diagnostics on the private pumps and may change without notice.
 
 High-water values cover the lifetime of the component. Calling `stats()` does
 not reset them. The snapshot is practically consistent for diagnostics, not a
@@ -142,7 +157,7 @@ raises rather than silently downgrading unsupported work.
 
 ### Inbound concurrency is capped below the protocol maximum
 
-`AsyncClient(local_receive_maximum=...)` defaults to **100**, not to the
+`AsyncClient(max_inbound_inflight=...)` defaults to **100**, not to the
 protocol maximum of 65,535 that `EngineConfig` uses for direct-engine consumers.
 It is the Receive Maximum MQTTium advertises to the broker, so it bounds how
 many inbound QoS 1/2 publications the broker may have unacknowledged at once —
@@ -150,7 +165,7 @@ including automatic acknowledgement. A subscriber that needs more inbound
 concurrency must raise it explicitly:
 
 ```python
-client = AsyncClient(local_receive_maximum=1000)
+client = AsyncClient(max_inbound_inflight=1000)
 ```
 
 The supported client default is a bounded application-facing window. The
@@ -162,11 +177,12 @@ unfinished publications and is capped by the broker's own Receive Maximum.
 
 Timeouts protect different boundaries:
 
-- `connect(..., timeout=...)` limits one connection attempt;
-- `ReconnectPolicy.connect_timeout` applies to automatic attempts;
+- `connect_timeout` limits every connection attempt, explicit or automatic;
+  `connect(..., timeout=...)` overrides it for one explicit call;
 - `ping_timeout` limits the wait for PINGRESP;
-- `ack_timeout` is the default SUBACK/UNSUBACK deadline;
-- `delivery_timeout=None` waits indefinitely; a positive value covers iterator
+- `subscribe_timeout` is the default SUBACK/UNSUBACK deadline; `subscribe()`
+  and `unsubscribe()` accept a per-call override;
+- `iterator_admission_timeout=None` waits indefinitely; a positive value covers iterator
   byte reservation and queue admission with one deadline. Callback delivery has
   no queue: synchronous callbacks run on the reader and are never timed out or
   preempted.
@@ -239,7 +255,7 @@ input queue is saturated can still prevent the needed read. Use an independently
 draining consumer plus an application producer with explicit queue/byte bounds
 and a nonblocking overflow policy, or separate receiving and publishing
 connections. Simply inserting another bounded queue and waiting when it is full
-does not remove that dependency. A finite `delivery_timeout` provides bounded
+does not remove that dependency. A finite `iterator_admission_timeout` provides bounded
 failure, not a promise to sustain an arbitrary offered rate.
 
 Synchronous message callbacks can use `publish_nowait()` with an explicit

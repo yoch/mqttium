@@ -226,7 +226,10 @@ def _engine_invariants(engine: ProtocolEngine) -> None:
 def test_engine_sequence_invariants(ops, proto):
     engine = ProtocolEngine(
         EngineConfig(
-            client_id="hyp", protocol=proto, local_receive_maximum=8, topic_alias_maximum=2
+            client_id="hyp",
+            protocol=proto,
+            max_inbound_inflight=8,
+            topic_alias_maximum=2 if proto == V5 else 0,
         )
     )
     dec = IncrementalDecoder(max_packet_size=DEFAULT_MAX_PACKET_SIZE)

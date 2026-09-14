@@ -71,7 +71,7 @@ def test_pubrec_removes_all_publish_application_data(kind: str, tmp_path: Path) 
             properties=make_properties(),
         )
         mid = handle.mid or 0
-        logical_size = engine.pending_outbound_bytes
+        logical_size = engine.unacknowledged_bytes
         engine.take_effects()
 
         feed_engine(engine, PubRecPacket(mid=mid).encode(MQTTProtocolVersion.MQTTv5))
@@ -84,8 +84,8 @@ def test_pubrec_removes_all_publish_application_data(kind: str, tmp_path: Path) 
         assert stored.payload == b""
         assert stored.properties is None
         assert stored.logical_size == logical_size
-        assert engine.pending_outbound_bytes == logical_size
-        assert engine.pending_outbound_messages == 1
+        assert engine.unacknowledged_bytes == logical_size
+        assert engine.unacknowledged_messages == 1
         assert engine.flow.inflight == 1
 
         feed_engine(engine, PubCompPacket(mid=mid).encode(MQTTProtocolVersion.MQTTv5))
@@ -95,8 +95,8 @@ def test_pubrec_removes_all_publish_application_data(kind: str, tmp_path: Path) 
             for effect in completions
         )
         assert store.get_out(mid) is None
-        assert engine.pending_outbound_bytes == 0
-        assert engine.pending_outbound_messages == 0
+        assert engine.unacknowledged_bytes == 0
+        assert engine.unacknowledged_messages == 0
         assert engine.flow.inflight == 0
     finally:
         if isinstance(store, SqliteInflightStore):
@@ -114,7 +114,7 @@ def test_compacted_sqlite_record_restarts_with_pubrel_only(tmp_path: Path) -> No
         properties=make_properties(),
     )
     mid = handle.mid or 0
-    logical_size = engine.pending_outbound_bytes
+    logical_size = engine.unacknowledged_bytes
     engine.take_effects()
     feed_engine(engine, PubRecPacket(mid=mid).encode(MQTTProtocolVersion.MQTTv5))
     engine.take_effects()
@@ -129,7 +129,7 @@ def test_compacted_sqlite_record_restarts_with_pubrel_only(tmp_path: Path) -> No
         ),
         store=reopened,
     )
-    assert recovered.pending_outbound_bytes == logical_size
+    assert recovered.unacknowledged_bytes == logical_size
     compacted = reopened.get_out(mid)
     assert compacted is not None
     assert compacted.topic == ""
@@ -142,7 +142,7 @@ def test_compacted_sqlite_record_restarts_with_pubrel_only(tmp_path: Path) -> No
     feed_engine(recovered, PubCompPacket(mid=mid).encode(MQTTProtocolVersion.MQTTv5))
     recovered.take_effects()
     assert reopened.get_out(mid) is None
-    assert recovered.pending_outbound_bytes == 0
+    assert recovered.unacknowledged_bytes == 0
     reopened.close()
 
 

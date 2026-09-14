@@ -17,7 +17,7 @@ The default policy waits for protocol or writer capacity. Inspect:
 - `stats().outbound` for unfinished QoS state and broker flow limits;
 - `stats().writer` for encoded write pressure;
 - `stats().delivery` for a slow callback or iterator;
-- `stats().tasks` and `reconnect_attempt` for active recovery.
+- `state` and `reconnect_attempt` for active recovery.
 
 If waiting is unacceptable, use `publish_nowait()` and implement
 a shed, retry, or spill policy. Do not simply remove the bounds.

@@ -159,7 +159,7 @@ def test_queued_publish_keeps_immutable_properties_when_drain_launches(monkeypat
         properties=queued_properties,
     )
     assert queued.mid is not None
-    assert engine.outbound.stats().queued_messages == 1
+    assert engine.outbound.stats().awaiting_slot == 1
     assert encoder_calls == 0
 
     # Direct mutation is part of the Properties cache contract. Keep the encoded

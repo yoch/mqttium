@@ -34,26 +34,26 @@ _V5_TERMINAL = frozenset(
 class ReconnectPolicy:
     """Exponential-backoff and terminal-reason policy for reconnection.
 
+    Passing a policy to ``AsyncClient(reconnect=...)`` enables automatic
+    reconnection; ``reconnect=None`` (the default) disables it. Each attempt's
+    transport and CONNACK deadline is the client's ``connect_timeout``.
+
     Args:
-        enabled: Whether unexpected disconnects may schedule reconnection.
         initial_delay: Base delay before the first retry, in seconds.
         multiplier: Factor applied after each retry.
         max_delay: Maximum base delay before jitter.
         max_retries: Maximum attempts, or ``None`` for no count limit.
         stable_after: Connected duration after which attempt state resets.
-        connect_timeout: Deadline for each transport and CONNACK attempt.
 
     Delays use full bounded jitter in the range 50–100% of the current base.
     Terminal authentication, protocol, and capability failures are not retried.
     """
 
-    enabled: bool = True
     initial_delay: float = 1.0
     multiplier: float = 2.0
     max_delay: float = 60.0
     max_retries: int | None = None
     stable_after: float = 30.0
-    connect_timeout: float = 30.0
 
     def __post_init__(self) -> None:
         if self.initial_delay < 0:
@@ -66,38 +66,45 @@ class ReconnectPolicy:
             raise ValueError("max_retries must be non-negative or None")
         if self.stable_after < 0:
             raise ValueError("stable_after must be non-negative")
-        if self.connect_timeout <= 0:
-            raise ValueError("connect_timeout must be greater than 0")
 
 
 class _ReconnectState:
-    """Mutable retry progression owned by exactly one client."""
+    """Mutable retry progression owned by exactly one client.
 
-    def __init__(self, policy: ReconnectPolicy) -> None:
+    ``policy is None`` means automatic reconnection is disabled; the state then
+    only carries the (always zero) attempt counter.
+    """
+
+    def __init__(self, policy: ReconnectPolicy | None) -> None:
         self.policy = policy
         self._attempt = 0
-        self._current_delay = policy.initial_delay
+        self._current_delay = policy.initial_delay if policy is not None else 0.0
+
+    @property
+    def enabled(self) -> bool:
+        return self.policy is not None
 
     def reset(self) -> None:
         """Reset attempt count and delay to the initial state."""
         self._attempt = 0
-        self._current_delay = self.policy.initial_delay
+        self._current_delay = self.policy.initial_delay if self.policy is not None else 0.0
 
     def next_delay(self) -> float:
         """Return delay for the next retry (with full jitter) and advance state."""
-        base = min(self._current_delay, self.policy.max_delay)
+        policy = self.policy
+        assert policy is not None
+        base = min(self._current_delay, policy.max_delay)
         delay = random.uniform(0.5, 1.0) * base
         self._attempt += 1
-        self._current_delay = min(
-            self._current_delay * self.policy.multiplier, self.policy.max_delay
-        )
+        self._current_delay = min(self._current_delay * policy.multiplier, policy.max_delay)
         return delay
 
     def should_retry(self, reason_code: int | None, protocol: MQTTProtocolVersion) -> bool:
         """Return whether the next attempt is allowed for a disconnect reason."""
-        if not self.policy.enabled:
+        policy = self.policy
+        if policy is None:
             return False
-        if self.policy.max_retries is not None and self._attempt >= self.policy.max_retries:
+        if policy.max_retries is not None and self._attempt >= policy.max_retries:
             return False
         if reason_code is None:
             return True

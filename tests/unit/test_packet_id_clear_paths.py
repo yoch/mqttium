@@ -95,8 +95,8 @@ def test_missing_session_clears_all_abandoned_inflight_packet_ids_once() -> None
         tuple(store.get_out(summary.mid) for page in store.out_summary_pages() for summary in page)
         == ()
     )
-    assert engine.pending_outbound_messages == 0
-    assert engine.pending_outbound_bytes == 0
+    assert engine.unacknowledged_messages == 0
+    assert engine.unacknowledged_bytes == 0
 
 
 def test_missing_session_preserves_queued_packet_ids() -> None:

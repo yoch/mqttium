@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import inspect
 from pathlib import Path
 
@@ -18,7 +19,16 @@ from mqttium.api.models import (
     SubscribeResult,
     UnsubscribeResult,
 )
-from mqttium.api.stats import ClientStats
+from mqttium.api.stats import (
+    ClientStats,
+    DecoderStats,
+    DeliveryStats,
+    InboundStats,
+    OutboundStats,
+    ReceiptStats,
+    TransportStats,
+    WriterStats,
+)
 from mqttium.errors import (
     BrokerDisconnectError,
     FlowControlError,
@@ -100,28 +110,28 @@ def test_async_client_constructor_keywords_and_defaults() -> None:
         "keepalive": 60,
         "username": None,
         "password": None,
-        "local_receive_maximum": 100,
-        "max_outbound_inflight": None,
-        "max_pending_outbound_messages": 10_000,
-        "max_pending_outbound_bytes": 64 * 1024 * 1024,
-        "max_pending_inbound_bytes": 64 * 1024 * 1024,
         "connect_properties": None,
         "will": None,
         "will_properties": None,
         "maximum_packet_size": None,
         "topic_alias_maximum": 0,
-        "reconnect": None,
-        "ping_timeout": None,
-        "ack_timeout": 30.0,
-        "max_outbound_bytes": 1 * 1024 * 1024,
-        "max_outbound_messages": 10_000,
-        "max_ingress_batch_bytes": 1 * 1024 * 1024,
-        "max_pending_messages": 65_536,
-        "max_pending_delivery_bytes": 64 * 1024 * 1024,
-        "delivery_timeout": None,
+        "max_inbound_inflight": 100,
+        "max_inbound_inflight_bytes": 64 * 1024 * 1024,
+        "max_outbound_inflight": None,
+        "max_unacknowledged_messages": 10_000,
+        "max_unacknowledged_bytes": 64 * 1024 * 1024,
+        "max_write_queue_messages": 10_000,
+        "max_write_queue_bytes": 1 * 1024 * 1024,
         "message_delivery": "iterator",
         "manual_ack": False,
+        "max_iterator_messages": 65_536,
+        "max_iterator_bytes": 64 * 1024 * 1024,
+        "iterator_admission_timeout": None,
         "store": None,
+        "reconnect": None,
+        "connect_timeout": 30.0,
+        "ping_timeout": None,
+        "subscribe_timeout": 30.0,
         "auth_handler": None,
         "auth_timeout": 10.0,
     }
@@ -135,6 +145,107 @@ def test_async_client_constructor_keywords_and_defaults() -> None:
         if name != "client_id"
     )
     assert {name: parameter.default for name, parameter in parameters.items()} == expected_defaults
+
+
+def test_reconnect_policy_describes_only_the_retry_progression() -> None:
+    expected_defaults = {
+        "initial_delay": 1.0,
+        "multiplier": 2.0,
+        "max_delay": 60.0,
+        "max_retries": None,
+        "stable_after": 30.0,
+    }
+    parameters = inspect.signature(ReconnectPolicy).parameters
+    assert {name: parameter.default for name, parameter in parameters.items()} == expected_defaults
+
+
+def test_client_stats_fields_follow_the_constructor_vocabulary() -> None:
+    def names(cls: type) -> tuple[str, ...]:
+        return tuple(field.name for field in dataclasses.fields(cls))
+
+    assert names(ClientStats) == (
+        "state",
+        "connection_epoch",
+        "reconnect_attempt",
+        "outbound",
+        "inbound",
+        "writer",
+        "decoder",
+        "delivery",
+        "receipts",
+        "transport",
+    )
+    assert names(OutboundStats) == (
+        "unacknowledged_messages",
+        "unacknowledged_bytes",
+        "unacknowledged_high_water_messages",
+        "unacknowledged_high_water_bytes",
+        "awaiting_slot",
+        "inflight",
+        "inflight_limit",
+        "packet_ids_in_use",
+    )
+    assert names(InboundStats) == (
+        "inflight",
+        "inflight_limit",
+        "inflight_bytes",
+        "inflight_high_water_bytes",
+        "inflight_byte_limit",
+        "topic_aliases",
+        "replay_pending",
+    )
+    assert names(WriterStats) == (
+        "queued_messages",
+        "queued_bytes",
+        "high_water_messages",
+        "high_water_bytes",
+        "max_messages",
+        "max_bytes",
+        "waiters",
+        "last_outbound",
+    )
+    assert names(DecoderStats) == ("buffered_bytes", "high_water_bytes", "max_packet_size")
+    assert names(DeliveryStats) == (
+        "iterator_queued",
+        "iterator_limit",
+        "iterator_bytes",
+        "iterator_high_water_bytes",
+        "iterator_byte_limit",
+        "callback_invocations",
+        "waiters",
+    )
+    assert names(ReceiptStats) == (
+        "publish",
+        "publish_batches",
+        "subscribe",
+        "unsubscribe",
+        "publish_waiters",
+    )
+    assert names(TransportStats) == (
+        "kind",
+        "closing",
+        "pending_write_bytes",
+        "buffered_read_bytes",
+    )
+
+
+def test_constructor_refuses_configuration_without_effect() -> None:
+    with pytest.raises(ValueError, match="iterator delivery only"):
+        AsyncClient("c", message_delivery="callback", max_iterator_messages=10)
+    with pytest.raises(ValueError, match="iterator delivery only"):
+        AsyncClient("c", message_delivery="callback", iterator_admission_timeout=1.0)
+    AsyncClient("c", message_delivery="callback")
+    for option in (
+        {"connect_properties": Properties({"session_expiry_interval": 10})},
+        {"will_properties": Properties({"message_expiry_interval": 10}), "will": Message("w", b"")},
+        {"topic_alias_maximum": 5},
+        {"auth_handler": lambda packet: None},
+    ):
+        with pytest.raises(ProtocolError, match="MQTT 5"):
+            AsyncClient("c", **option)
+        AsyncClient("c", protocol=MQTTProtocolVersion.MQTTv5, **option)
+    with pytest.raises(ValueError, match="connect_timeout"):
+        AsyncClient("c", connect_timeout=0)
 
 
 def test_async_client_stable_method_parameter_contract() -> None:

@@ -84,8 +84,9 @@ storage, and redaction policy. See [MQTT 5](mqtt-5.md).
 
 ## Timeouts and failure handling
 
-A connect timeout covers transport setup and CONNACK. Automatic reconnect uses
-`ReconnectPolicy.connect_timeout`. Treat certificate failures, broker
+A connect timeout covers transport setup and CONNACK; `connect_timeout` on
+the client applies to explicit calls that omit `timeout` and to every
+automatic reconnect attempt. Treat certificate failures, broker
 authorization failures, and malformed protocol traffic as terminal until the
 configuration changes; repeatedly retrying them adds load without improving
 availability.

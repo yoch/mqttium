@@ -32,7 +32,9 @@ async def test_callback_mode_runs_each_message_inline_in_fifo_order(burst) -> No
 
 
 async def test_timeout_is_one_deadline_across_queue_and_byte_waits() -> None:
-    client = AsyncClient(max_pending_messages=1, max_pending_delivery_bytes=5, delivery_timeout=0.2)
+    client = AsyncClient(
+        max_iterator_messages=1, max_iterator_bytes=5, iterator_admission_timeout=0.2
+    )
     delivery = client._delivery
     await accept_message(delivery, Message(topic="a", payload=b""))
     loop = asyncio.get_running_loop()
@@ -62,9 +64,9 @@ async def test_timeout_is_one_deadline_across_queue_and_byte_waits() -> None:
 
 
 async def test_default_delivery_wait_has_no_deadline_and_cancels_cleanly() -> None:
-    client = AsyncClient(max_pending_messages=1, max_pending_delivery_bytes=2)
+    client = AsyncClient(max_iterator_messages=1, max_iterator_bytes=2)
     delivery = client._delivery
-    assert delivery.delivery_timeout is None
+    assert delivery.iterator_admission_timeout is None
     await accept_message(delivery, Message(topic="a", payload=b""))
     waiting = asyncio.create_task(accept_message(delivery, Message(topic="b", payload=b"")))
     await asyncio.sleep(0)

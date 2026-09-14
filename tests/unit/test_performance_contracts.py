@@ -44,7 +44,7 @@ def test_publish_admission_encodes_properties_once(monkeypatch: pytest.MonkeyPat
         }
     )
     engine = ProtocolEngine(
-        EngineConfig(protocol=MQTTProtocolVersion.MQTTv5, max_pending_outbound_bytes=None)
+        EngineConfig(protocol=MQTTProtocolVersion.MQTTv5, max_unacknowledged_bytes=None)
     )
     engine.negotiated = replace(engine.negotiated, maximum_packet_size=1_000_000)
 
@@ -117,7 +117,7 @@ async def test_nowait_publish_encodes_properties_once(monkeypatch) -> None:
             "user_property": (*properties.get("user_property", ()), ("source", "contract")),
         }
     )
-    client = AsyncClient(protocol=MQTTProtocolVersion.MQTTv5, max_outbound_messages=64)
+    client = AsyncClient(protocol=MQTTProtocolVersion.MQTTv5, max_write_queue_messages=64)
     client._engine.state = ConnectionState.CONNECTED
     client._engine.negotiated = replace(client._engine.negotiated, maximum_packet_size=1_000_000)
 
@@ -132,7 +132,7 @@ async def test_nowait_admission_still_refuses_when_the_writer_is_loaded() -> Non
     from mqttium.enums import ConnectionState
     from mqttium.errors import FlowControlError
 
-    client = AsyncClient(max_outbound_messages=10_000, max_outbound_bytes=2048)
+    client = AsyncClient(max_write_queue_messages=10_000, max_write_queue_bytes=2048)
     client._engine.state = ConnectionState.CONNECTED
 
     client.publish_nowait("contract/full", b"x" * 1800, qos=0)
