@@ -57,9 +57,15 @@ _OVERSIZE_RETENTION = 64
 _VIEW_COPY_THRESHOLD = 4096
 
 
-@dataclass(slots=True, frozen=True)
+@dataclass(slots=True)
 class RawPacket:
-    """One decoded MQTT frame (owned bytes, safe to retain)."""
+    """One decoded MQTT frame (owned bytes, safe to retain).
+
+    Not frozen: one is created for every inbound packet, and a frozen
+    dataclass assigns each field through ``object.__setattr__``, which
+    triples construction cost. Ownership of ``remaining`` is what the
+    decoder guarantees; the container itself is never mutated or hashed.
+    """
 
     packet_type: PacketType
     flags: int

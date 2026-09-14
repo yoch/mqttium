@@ -50,6 +50,10 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   `TaskStats.callback_worker`. Added: `DeliveryStats.callback_invocations` and
   `TaskStats.lifecycle`. Immediate iterator admission and QoS 1/2 delivery
   marks no longer create a coroutine per message. See the migration guide.
+- Construct the internal decoded-frame container without frozen-dataclass
+  field assignment. The decoder still hands the engine owned bytes; the
+  container is never mutated or hashed, and every inbound packet paid the
+  tripled construction cost.
 - Amortize ready QoS 0 `publish_many()` orchestration over bounded private
   prefixes. Each item still commits independently and transfers to the writer
   before the source iterator advances; pressure and QoS 1/2 use the existing
