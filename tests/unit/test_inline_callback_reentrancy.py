@@ -22,6 +22,8 @@ from tests.support import ScriptedBrokerTransport, transport_factory, wait_until
 async def task_factory(request):
     loop = asyncio.get_running_loop()
     previous = loop.get_task_factory()
+    if request.param == "eager" and not hasattr(asyncio, "eager_task_factory"):
+        pytest.skip("eager task factory requires Python 3.12+")
     if request.param == "eager":
         loop.set_task_factory(asyncio.eager_task_factory)
     try:
@@ -80,7 +82,7 @@ async def test_responder_callback_publishes_from_one_delivery_lot(
             f"reply/{index}/{qos}" for index in range(5) for qos in ("qos1", "qos0")
         ]
         stats = client.stats()
-        assert stats.delivery.callback_invocations == 5
+        assert client._delivery.callback_invocations == 5
         assert stats.outbound.unacknowledged_messages == 0
         await wait_until(lambda: client.stats().inbound.inflight == 0)
         assert client.is_connected
