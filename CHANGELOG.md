@@ -63,6 +63,10 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   (`outbound.unacknowledged_*`, `awaiting_slot`, `inflight`, `inflight_limit`;
   `inbound.inflight_*`; `delivery.iterator_*`). See the migration guide for
   the full mapping.
+- Export `MandatoryResponseTooLargeError` from `mqttium` alongside the other
+  operational errors, and document it with `BrokerDisconnectError` in the
+  error reference. It is the local terminal failure raised when the broker's
+  Maximum Packet Size cannot carry a mandatory acknowledgement.
 - Run synchronous message callbacks inline on the delivering reader instead of
   a bounded callback worker task and queue. The reader hands each decoded lot
   to the application before decoding further, so callback cost is the

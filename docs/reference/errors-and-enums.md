@@ -20,6 +20,10 @@ All MQTTium-specific public errors derive from `MQTTError`.
     options:
       heading_level: 3
 
+::: mqttium.MandatoryResponseTooLargeError
+    options:
+      heading_level: 3
+
 ::: mqttium.FlowControlError
     options:
       heading_level: 3
@@ -41,6 +45,10 @@ All MQTTium-specific public errors derive from `MQTTError`.
       heading_level: 3
 
 ::: mqttium.PublishBatchError
+    options:
+      heading_level: 3
+
+::: mqttium.BrokerDisconnectError
     options:
       heading_level: 3
 

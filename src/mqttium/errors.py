@@ -35,7 +35,13 @@ class PacketTooLargeError(ProtocolError):
 
 
 class MandatoryResponseTooLargeError(PacketTooLargeError):
-    """A peer limit makes a mandatory local MQTT response impossible to send."""
+    """A peer limit makes a mandatory local MQTT response impossible to send.
+
+    The broker's Maximum Packet Size is below the smallest acknowledgement the
+    client must send, so the connection is ended locally and never retried by
+    a reconnect policy. Reported through ``on_disconnect`` or raised by
+    ``connect()`` when the limit is learned from CONNACK.
+    """
 
 
 class FlowControlError(MQTTError):

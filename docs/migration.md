@@ -48,6 +48,7 @@ recorded in `tests/project/test_public_api_surface.py`.
 | `ReconnectPolicy(enabled=False)` | `reconnect=None` | Passing a policy enables reconnection |
 | `max_ingress_batch_bytes` | removed | The 1 MiB / 256-packet decode quantum is a fairness constant |
 | MQTT 5 options accepted by an MQTT 3.1.1 client until `connect()` | `ProtocolError` from the constructor | `connect_properties`, `will_properties`, `topic_alias_maximum`, `auth_handler` |
+| `MandatoryResponseTooLargeError` importable from `mqttium.errors` only | Exported from `mqttium` | Local terminal failure; never retried |
 
 `ClientStats` keeps the same shape (state, epoch, reconnect attempt, one
 section per queue or window) with renamed fields and without runtime
