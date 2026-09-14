@@ -342,6 +342,14 @@ def main() -> None:
     roots = {"A": args.base_root.resolve(), "B": args.candidate_root.resolve()}
     for root in roots.values():
         _git(root, "diff", "--exit-code", "HEAD", "--", "src")
+        # Workers never write bytecode, so a tree without a cache would compile
+        # every module at import and inflate its RSS high-water by several MiB
+        # relative to an arm measured earlier from the same checkout.
+        subprocess.run(
+            [sys.executable, "-m", "compileall", "-q", str(root / "src")],
+            check=True,
+            capture_output=True,
+        )
     metadata = {
         "started_utc": datetime.now(UTC).isoformat(),
         "commits": {arm: _git(root, "rev-parse", "HEAD") for arm, root in roots.items()},
@@ -357,6 +365,7 @@ def main() -> None:
         "aa_cycles": args.aa_cycles,
         "payload_bytes": 256,
         "flow_limit": 20,
+        "bytecode": "both source trees precompiled before the first worker",
         "broker": f"{args.host}:{args.port}",
         "interpretation": "diagnostic self-subscribed combined native publish/receive workload; no performance gate",
     }
