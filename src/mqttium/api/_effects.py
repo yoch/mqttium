@@ -18,36 +18,24 @@ if TYPE_CHECKING:
     from mqttium.protocol.engine import ProtocolEngine
 
 
-# Reused on the effect hot path. Keeping the three members in one prebuilt
-# tuple avoids constructing a tuple for every single effect and for every
-# non-wire member of a batch; tuple membership is also cheaper here than a
-# three-way Enum identity chain.
-_DELIVERY_EFFECT_KINDS = (
-    EffectKind.MESSAGE,
-    EffectKind.DECODED_MESSAGE,
-    EffectKind.CONTINUE_INBOUND_REPLAY,
-)
-
-
 def _partition_effects(
     effects: list[EngineEffect],
-) -> tuple[list[EngineEffect], list[EngineEffect] | None, bool]:
+) -> tuple[list[EngineEffect], list[EngineEffect], bool]:
     """Preserve wire/result order while separating reader-owned delivery."""
     sends: list[EngineEffect] = []
     others: list[EngineEffect] = []
-    # Most protocol batches contain no application delivery. Allocate this
-    # third list only when the batch actually needs the delivery lane.
-    deliveries: list[EngineEffect] | None = None
+    deliveries: list[EngineEffect] = []
     reordered = False
     for effect in effects:
-        kind = effect.kind
-        if kind is EffectKind.SEND or kind is EffectKind.SEND_ACK:
+        if effect.kind is EffectKind.SEND or effect.kind is EffectKind.SEND_ACK:
             if others or deliveries:
                 reordered = True
             sends.append(effect)
-        elif kind in _DELIVERY_EFFECT_KINDS:
-            if deliveries is None:
-                deliveries = []
+        elif effect.kind in (
+            EffectKind.MESSAGE,
+            EffectKind.DECODED_MESSAGE,
+            EffectKind.CONTINUE_INBOUND_REPLAY,
+        ):
             deliveries.append(effect)
         else:
             others.append(effect)
@@ -140,10 +128,14 @@ class EffectPump:
             self.discard_connection_effects(settle_publish=True)
             return
 
-        deliveries: list[EngineEffect] | None = None
+        deliveries: list[EngineEffect] = []
         if len(effects) == 1:
             effect = effects[0]
-            if effect.kind in _DELIVERY_EFFECT_KINDS:
+            if effect.kind in (
+                EffectKind.MESSAGE,
+                EffectKind.DECODED_MESSAGE,
+                EffectKind.CONTINUE_INBOUND_REPLAY,
+            ):
                 self.owner._delivery_lane.collect(effects, epoch, self.enqueued)
                 self.pending_high_water = max(
                     self.pending_high_water,
