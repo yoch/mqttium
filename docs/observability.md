@@ -29,6 +29,12 @@ no sampler, logging, or formatting cost.
 | Nonzero broker disconnect details | `BrokerDisconnectError.reason_code` and `.properties` through `on_disconnect`, unless a more specific failure is present |
 | Queue and resource pressure | `client.stats()` |
 
+Iterator byte occupancy is measured only when `max_iterator_bytes` is finite.
+Setting that bound to `None` selects the count-bounded unaccounted path, so
+`delivery.iterator_bytes` and `delivery.iterator_high_water_bytes` remain zero;
+`iterator_queued`, `iterator_limit`, and `waiters` continue to report queue
+pressure normally.
+
 ## Add application-level instrumentation
 
 A small wrapper can add the metrics and logs an application actually needs:
