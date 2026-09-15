@@ -338,3 +338,32 @@ On this host the delivered-rate metric of that harness is not usable for the cel
 ### Position
 
 The MQTT 5 reception deficit relative to MQTT 3.1.1 on this branch is explained by one avoidable allocation per packet and is closed by a shared immutable value that the frozen `Properties` contract makes safe. A non-empty table still decodes about 5–7% slower than on RC14 because of the owned copy and the proxy; that is the price of the immutability contract, on a far less frequent case, and is not revisited here. The receive-pipeline position of section 11 is unchanged.
+
+## 14. Addendum, 2026-09-15: external post-fix validation of the two fixes
+
+Sections 12 and 13 close with internal microbenchmarks and one in-repository `lean_native_compare.py` run. The external matrix that first reported both deficits re-ran afterwards, and its results are recorded here so a later reader does not find only the pre-fix runner output and conclude that the RTT question stayed open.
+
+This section transcribes an **external campaign (matrix #39)**. Its raw data is not in this repository and was not reproduced on the hosts used for sections 12 and 13; it is corroborating evidence, not in-repo measurement.
+
+### Results reported
+
+| Workload | Reported outcome |
+| --- | --- |
+| `publish_nowait` QoS 0 | The hole seen on the old candidate is recovered at `c4f477d`; back to approximately RC14. |
+| Exact subscriber, MQTT 5 | About 161k msg/s before, about 190–195k msg/s after; the protocol-specific CPU excess of section 13 is gone. |
+| RTT QoS 1 | Initially looked regressed in the matrix. |
+
+### RTT QoS 1: the matrix drop was environmental
+
+The matrix result was qualified with direct paired runs rather than accepted as reported:
+
+| Pair | MQTT 3.1.1 | MQTT 5 |
+| --- | ---: | ---: |
+| `c4f477d` / `8e29cfa` | 0.999 | 1.039 |
+| `c4f477d` / RC14 | 1.125 | 1.154 |
+
+The candidate is flat against its immediate predecessor, and its standing against RC14 matches the deficit already described in sections 9 and 11. No code regression is attributable to the two fixes; the matrix drop is environmental.
+
+### Position
+
+Both fixes hold outside the hosts that produced them. The open item remains the one stated in section 9 — the protocol-independent callback-reception residual against RC14 — and no new deficit is introduced. The earlier dated reports are left as written; this addendum supersedes their runner-level RTT reading.
