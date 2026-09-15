@@ -1,6 +1,6 @@
 # Native API reference
 
-This reference covers the canonical experimental MQTTium imports. Importability from
+This reference covers the canonical MQTTium imports. Importability from
 another module does not grant the same stability tier.
 
 ## Canonical entry points
@@ -40,6 +40,6 @@ See [Core Concepts](../core-concepts.md) before choosing timeouts or retry logic
 
 ## Stability rules
 
-This branch intentionally revises the pre-v1 API. See the
-[experimental contract](../api-stability.md) and [migration guide](../migration.md)
+The current pre-v1 API intentionally revises the earlier one. See the
+[API contract](../api-stability.md) and [migration guide](../migration.md)
 for supported interfaces and incompatible changes.

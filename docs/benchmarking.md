@@ -4,7 +4,7 @@ Benchmark results are build artefacts, not permanent source-code claims. Raw
 outputs belong under `/tmp` or another external artefact directory and must not
 be committed.
 
-## Lean-native experiment
+## Lean-native comparison harness
 
 `lean_native_compare.py` compares exact commits in fresh interpreters using
 complete ABBA cycles and same-code A/A controls. Its self-subscribed native
@@ -19,10 +19,11 @@ elapsed time also reports work waiting before an element is read. Timing runs
 exclude tracemalloc; a separate phase measures Python peak allocations. RSS is
 diagnostic. Topic, payload, flow and queue limits are identical across arms.
 
-This explicitly authorized experiment has no performance acceptance threshold.
-Functional correctness and resource bounds remain mandatory. Record all ratios
-and A/A noise, and label results diagnostic if the runner is ineligible. These
-measurements are not release qualification or public cross-client evidence.
+This explicitly authorized comparison campaign has no performance acceptance
+threshold. Functional correctness and resource bounds remain mandatory. Record
+all ratios and A/A noise, and label results diagnostic if the runner is
+ineligible. These measurements are not release qualification or public
+cross-client evidence.
 
 Record the broker's TCP settings. Small QoS 0 bursts can alternate between fast
 delivery and roughly 40-ms TCP stalls, including with identical client source;

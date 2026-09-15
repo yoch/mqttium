@@ -1,13 +1,18 @@
-# Migrating to the lean native experiment
+# Migrating from 1.0.0rc14
 
-The `codex/lean-native-experiment` branch deliberately breaks the pre-v1 API at
-`9ad1f018`. It keeps MQTT 3.1.1/5, all QoS levels, TCP/TLS, WebSocket, Unix,
-manual acknowledgement and the memory/SQLite backends. There is no automatic
-upgrade of applications or historical databases.
+The current native API deliberately breaks the pre-v1 contract published as
+**1.0.0rc14** (`c194597`, 2026-09-11), the last released predecessor. It keeps
+MQTT 3.1.1/5, all QoS levels, TCP/TLS, WebSocket, Unix, manual acknowledgement
+and the memory/SQLite backends. There is no automatic upgrade of applications
+or historical databases.
+
+The breaking work began earlier, against `main@9ad1f018`; that commit remains
+the baseline of the historical reports under `docs/reports/`, but `1.0.0rc14`
+is the version an application actually upgrades from.
 
 ## Removed surfaces and replacements
 
-| Previous contract | Experimental replacement |
+| 1.0.0rc14 contract | Current replacement |
 | --- | --- |
 | `mqttium.compat` / Paho façade | A native `AsyncClient` on the application's event loop |
 | `mqttium.helpers` | Explicit connect, operation and disconnect on `AsyncClient` |
@@ -186,9 +191,9 @@ by the hook itself preserves that caller. Automatic retry waits for the current
 
 ## SQLite format
 
-Use a new database path. This experiment writes **schema 5** and can reopen its
-own databases. Historical schemas 0–4 containing data, future versions and
-inconsistent schemas are explicitly refused. Validation precedes write-affecting
+Use a new database path. The current implementation writes **schema 5** and
+can reopen its own databases. Historical schemas 0–4 containing data, future
+versions and inconsistent schemas are explicitly refused. Validation precedes write-affecting
 pragmas. Refusal preserves committed schema and data; SQLite may still recover,
 checkpoint, or coordinate its main database and journal files. File-byte identity
 is not promised. There is no migration or silent reset.
@@ -205,15 +210,15 @@ are not promised.
 
 ## Qualification
 
-The branch must pass protocol, persistence, lifecycle, backpressure, fuzz and
+The tree must pass protocol, persistence, lifecycle, backpressure, fuzz and
 real-broker tests. Performance comparisons use exact baseline/candidate commits
 and the same delivered work and resource bounds. Performance regressions are
-reported rather than used as a gate for this experiment. Historical release
-reports do not qualify this implementation.
+reported rather than used as a release gate. Historical release reports do not
+qualify this implementation.
 
 ## Decoder storage and ingress contract
 
 The decoder owns packet-boundary bytes; no reusable-buffer view escapes into
 protocol state or the application. Ingress remains bounded and connection-scoped.
-The native experiment removes the direct QoS 0 adapter path and uses the common
-engine/effect pipeline for every message.
+The current native API removes the direct QoS 0 adapter path and uses the
+common engine/effect pipeline for every message.

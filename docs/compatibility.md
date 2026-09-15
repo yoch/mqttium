@@ -67,7 +67,7 @@ and a minimal reproducer.
 
 ## API stability
 
-The experiment supports native client operations, models, receipts, results,
+The supported surface is native client operations, models, receipts, results,
 statistics and the supplied memory/SQLite stores. The engine, codecs,
 transports, records and extension protocols are internal. See
 [API Stability](api-stability.md) for exact import paths and tiers.

@@ -1,3 +1,3 @@
-# Experimental compatibility changes
+# Compatibility changes
 
-See the [migration guide](migration.md) for the native-only experiment.
+See the [migration guide](migration.md) for the native-only API.

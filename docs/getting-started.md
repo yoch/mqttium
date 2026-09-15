@@ -202,7 +202,7 @@ silently sending unsupported QoS, retain or packet sizes.
 
 ## One-shot operations
 
-Use the same explicit connect, operation and disconnect lifecycle for short programs. The experimental branch does not ship one-shot helpers.
+Use the same explicit connect, operation and disconnect lifecycle for short programs. MQTTium does not ship one-shot helpers.
 
 ## Errors and shutdown
 
@@ -221,5 +221,5 @@ Next steps:
 - [Sessions and Persistence](sessions-and-persistence.md) for reconnect and
   restart recovery;
 - [Operations](operations.md) for sizing and diagnostics;
-- [Migrating to MQTTium](migration.md) for the incompatible experiment;
+- [Migrating to MQTTium](migration.md) for the breaking changes since `1.0.0rc14`;
 - [API Stability](api-stability.md) for the supported public contract.

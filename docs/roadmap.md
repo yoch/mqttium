@@ -29,9 +29,9 @@ promise or release date.
 
 ## Paho compatibility policy
 
-This branch evaluates an incompatible native-only API. The façade and helpers
-are removed. Assess the simplification and measured performance changes before
-any separate decision to merge or publish the experiment.
+The current pre-v1 API is native-only. The façade and helpers are removed.
+Assess the simplification and measured performance changes before any separate
+decision to publish.
 
 ## Documentation and ecosystem
 

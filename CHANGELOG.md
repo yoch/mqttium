@@ -6,7 +6,7 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
-### Fixed — lean native experiment
+### Fixed
 
 - Correct the enhanced-authentication and long-lived-service examples to return
   AUTH responses and restore subscriptions through the connection hook.
@@ -41,7 +41,7 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   retire obsolete queued work by epoch. Report hook exceptions and manually
   raised cancellation without suppressing reconnect or terminal cleanup.
 
-### Changed — lean native experiment
+### Changed
 
 - Freeze the native constructor and statistics vocabulary. Every bound is
   named after what it bounds: `max_inbound_inflight` (was
@@ -124,11 +124,11 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   message callbacks before registration, and hand ready unit QoS 0 publishes
   to the existing writer without general publication effects. Byte/count bounds,
   receipt ordering, durable delivery marks and serial callbacks remain intact.
-- Incompatible experimental native API: explicit iterator/callback delivery;
+- Breaking pre-v1 native API: explicit iterator/callback delivery;
   message routes freeze permanently at the first connection attempt.
-- Message and topic callbacks are synchronous-only and use a bounded serial
-  worker. Async message processing uses `messages()`; delivery byte accounting
-  and a whole-admission timeout remain independent of lifecycle notifications.
+- Message and topic callbacks are synchronous-only. Async message processing
+  uses `messages()`; delivery byte accounting and a whole-admission timeout
+  remain independent of lifecycle notifications.
 - Keep sync/async connection hooks outside their triggering protocol path.
   Network operations do not await hook completion; incoming delivery does not
   await `on_connect`. Hooks retain the latest pending lifecycle state, cancel
@@ -139,11 +139,16 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - `Properties` and reconnect configuration are immutable, retry state belongs
   to each client, authentication is configured at construction, and CONNECT
   limits have one source.
-- SQLite schema 5 accepts fresh/current experimental databases only, preserving
-  committed schema and data in rejected databases. Individual admission rollback and durable
-  transitions remain; generic cross-backend batch atomicity is not promised.
+- SQLite schema 5 accepts fresh/current databases only, preserving committed
+  schema and data in rejected databases. Individual admission rollback and
+  durable transitions remain; generic cross-backend batch atomicity is not
+  promised.
+- Widen the `FlowControlError` and `MessageDeliveryError` docstrings, which feed
+  the error reference, to the conditions they actually cover: any refused
+  immediate operation against bounded client capacity, and iterator delivery
+  that fits neither its configured bounds nor its deadline.
 
-### Removed — lean native experiment
+### Removed
 
 - `on_publish`; publication completion and failure use individual or aggregate
   receipts without consuming message-callback capacity.
@@ -154,7 +159,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - Delivery `auto`/`both`, `publish_backpressure`, `publish(nowait=...)`, batch
   `chunk_size`/`nowait`/`failure_sink`, property mutators and `set_auth_handler()`.
 
-See [experimental migration](docs/migration.md). This branch is not a release.
+See the [migration guide](docs/migration.md) for the breaking changes since
+`1.0.0rc14`.
 
 ## [1.0.0rc14] - 2026-09-11
 
