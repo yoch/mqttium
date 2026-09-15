@@ -1,9 +1,10 @@
-"""Paired delivery micro/profiling probe across the RC14 and current source trees.
+"""Paired delivery micro/profiling probe across RC14 and the current source tree.
 
-This is deliberately narrower than :mod:`paired_regression`: it decomposes the
-application-delivery cost that can otherwise be misread as an end-to-end network
-ratio. Wall timings are collected without a profiler; cProfile is used only for
-call attribution and counts.
+The existing ``delivery_*`` microbenchmarks are component probes, not network
+benchmarks. This script decomposes them further and, for iterator delivery,
+separates the historical benchmark-consumer bookkeeping from the actual
+``messages()`` consumption shape. Wall timings are collected without a profiler;
+cProfile is used only for call attribution and call counts.
 """
 
 from __future__ import annotations
@@ -27,18 +28,36 @@ from benchmark_support import client_options
 TOPIC = "bench/sensors/temp"
 MESSAGE_PAYLOAD = b"x"
 SCENARIOS = (
-    "handoff_callback",
-    "handoff_iterator_unbounded",
-    "handoff_iterator_bounded",
+    # Direct delivery seam. On RC14 this is the fallback callback queue path,
+    # whereas the real steady-state EffectPump can dispatch sync callbacks inline.
+    "handoff_callback_direct",
+    # Adds the EffectPump / delivery-lane layer and therefore better approximates
+    # the application-delivery slice of the reader path.
     "effect_callback",
-    "effect_iterator_unbounded",
-    "effect_iterator_bounded",
+    # Reproduces paired_regression's historical iterator consumer, including a
+    # candidate-only task_done() call that production messages() does not make.
+    "handoff_iterator_unbounded_benchmark",
+    # Same handoff, but consume exactly like the public iterator: get + release,
+    # no task_done().
+    "handoff_iterator_unbounded_production",
+    "handoff_iterator_bounded_production",
+    # Effect-level iterator probes with production-like consumption.
+    "effect_iterator_unbounded_production",
+    "effect_iterator_bounded_production",
 )
 
 
 def _pin(cpu: int | None) -> None:
     if cpu is not None and hasattr(os, "sched_setaffinity"):
         os.sched_setaffinity(0, {cpu})
+
+
+def _scenario_shape(scenario: str) -> tuple[str, bool, bool, bool]:
+    mode = "callback" if "callback" in scenario else "iterator"
+    bounded = "_bounded_" in scenario
+    use_engine_effect = scenario.startswith("effect_")
+    benchmark_task_done = scenario == "handoff_iterator_unbounded_benchmark"
+    return mode, bounded, use_engine_effect, benchmark_task_done
 
 
 def _make_client(*, mode: str, bounded: bool) -> Any:
@@ -50,13 +69,7 @@ def _make_client(*, mode: str, bounded: bool) -> Any:
     }
     if mode == "iterator":
         wanted["max_iterator_messages"] = 100_000
-        if bounded:
-            # Both RC14 and the current source default to a 64 MiB application
-            # delivery byte bound. Spell it explicitly so this arm is clearly
-            # distinct from the unbounded probe.
-            wanted["max_iterator_bytes"] = 64 * 1024 * 1024
-        else:
-            wanted["max_iterator_bytes"] = None
+        wanted["max_iterator_bytes"] = 64 * 1024 * 1024 if bounded else None
     client = AsyncClient(**client_options(AsyncClient, **wanted))
     if mode == "callback":
         client.on_message = lambda _message: None
@@ -83,22 +96,26 @@ async def _apply_delivery_effect_compat(client: Any, effect: Any) -> None:
     await client._apply_effect(effect, nowait=False, epoch=client._connection_epoch)
 
 
-def _consume_iterator_message(client: Any) -> None:
+def _consume_iterator_message(client: Any, *, benchmark_task_done: bool) -> None:
+    """Consume one iterator item using either benchmark or production semantics."""
     delivery = client._delivery
     queue = delivery.messages_queue
     item = queue.get_nowait()
     release_nowait = getattr(delivery, "release_nowait", None)
     if release_nowait is not None:
-        # RC14: bare Message on the unaccounted path, (Message, token) when
-        # accounted; its _DeliveryQueue has no task_done/join bookkeeping.
+        # RC14: bare Message on its small/unaccounted path and (Message, token)
+        # when exact accounting is used. _DeliveryQueue intentionally has no
+        # join/task_done bookkeeping.
         if isinstance(item, tuple):
             _message, token = item
             release_nowait(token)
         return
-    # Current source: iterator entries are (Message, logical_size) and use a
-    # normal asyncio.Queue.
+
+    # Current source: iterator entries are always (Message, logical_size).
     _message, size = item
-    queue.task_done()
+    if benchmark_task_done:
+        # paired_regression historically does this, but public messages() does not.
+        queue.task_done()
     delivery.release(size)
 
 
@@ -122,12 +139,10 @@ async def _exercise(scenario: str, operations: int) -> None:
     from mqttium.protocol.effects import EffectKind, EngineEffect
     from mqttium.types import Message
 
-    mode = "callback" if "callback" in scenario else "iterator"
-    bounded = scenario.endswith("_bounded") and not scenario.endswith("_unbounded")
+    mode, bounded, use_engine_effect, benchmark_task_done = _scenario_shape(scenario)
     client = _make_client(mode=mode, bounded=bounded)
     message = Message(topic=TOPIC, payload=MESSAGE_PAYLOAD)
     effect = EngineEffect(EffectKind.MESSAGE, message)
-    use_engine_effect = scenario.startswith("effect_")
 
     try:
         for _ in range(operations):
@@ -137,7 +152,7 @@ async def _exercise(scenario: str, operations: int) -> None:
             else:
                 await _apply_delivery_effect_compat(client, effect)
             if mode == "iterator":
-                _consume_iterator_message(client)
+                _consume_iterator_message(client, benchmark_task_done=benchmark_task_done)
         if mode == "callback":
             await _finish_callbacks(client)
     finally:
@@ -190,7 +205,7 @@ def _profile(scenario: str, operations: int) -> dict[str, Any]:
     return {
         "operations": operations,
         "profile_wall_s": elapsed,
-        "top_cumulative": rows[:40],
+        "top_cumulative": rows[:50],
     }
 
 
@@ -263,19 +278,20 @@ def _parent(args: argparse.Namespace) -> None:
                 "candidate": measured["candidate"]["profile"],
             }
         median_ratio = statistics.median(ratios)
-        row = {
-            "name": scenario,
-            "median_candidate_over_base": median_ratio,
-            "min_candidate_over_base": min(ratios),
-            "max_candidate_over_base": max(ratios),
-            "pairs": pairs,
-            "profile": last_profile,
-        }
-        output["scenarios"].append(row)
+        output["scenarios"].append(
+            {
+                "name": scenario,
+                "median_candidate_over_base": median_ratio,
+                "min_candidate_over_base": min(ratios),
+                "max_candidate_over_base": max(ratios),
+                "pairs": pairs,
+                "profile": last_profile,
+            }
+        )
         base_us = statistics.median(pair["base"]["us_per_op"] for pair in pairs)
         cand_us = statistics.median(pair["candidate"]["us_per_op"] for pair in pairs)
         print(
-            f"{scenario:30s} candidate/base={median_ratio:.4f} "
+            f"{scenario:42s} candidate/base={median_ratio:.4f} "
             f"base={base_us:.3f}us candidate={cand_us:.3f}us"
         )
     args.output.parent.mkdir(parents=True, exist_ok=True)
