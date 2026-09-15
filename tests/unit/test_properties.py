@@ -23,6 +23,33 @@ def test_empty_fast_path() -> None:
     assert end == 1
 
 
+def test_empty_decoded_table_is_one_shared_immutable_value() -> None:
+    """Every MQTT 5 PUBLISH and ACK carries a property table, usually empty.
+
+    Decoding must not instantiate ``Properties`` per packet for that case: the
+    class is frozen and its values are a read-only proxy, so one shared value
+    is indistinguishable from a fresh one. The shared value must also stay free
+    of per-instance state, which the encode cache would otherwise introduce.
+    """
+    first, end_first = decode_properties(b"\x00", 0, PUBLISH)
+    second, end_second = decode_properties(b"\x00", 0, CONNACK)
+    assert first is second
+    assert not first
+    assert first.values == {}
+    assert end_first == end_second == 1
+    with pytest.raises(TypeError):
+        first.values["content_type"] = "text/plain"  # type: ignore[index]
+    with pytest.raises(AttributeError):
+        first.values = {}  # type: ignore[misc]
+    assert encode_properties(first, PUBLISH) == b"\x00"
+    assert first._encoded is None
+    # A non-empty table is still a fresh, independent value.
+    encoded = encode_properties(Properties({"content_type": "text/plain"}), PUBLISH)
+    decoded, _ = decode_properties(encoded, 0, PUBLISH)
+    assert decoded is not first
+    assert decoded.get("content_type") == "text/plain"
+
+
 def test_roundtrip_publish_properties() -> None:
     props = Properties()
     props = Properties({**props.values, "payload_format_indicator": 1})

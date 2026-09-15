@@ -361,6 +361,13 @@ def encode_properties(props: Properties | None, packet: str) -> bytes:
     return cache[packet]
 
 
+# Every MQTT 5 PUBLISH and ACK carries a property table, most often empty.
+# Properties is frozen and its values are a read-only proxy, so one shared
+# empty value is indistinguishable from a fresh one, and encode_properties()
+# returns b"\x00" for it before touching the per-instance encode cache.
+_EMPTY_PROPERTIES = Properties()
+
+
 def decode_properties(
     buf: bytes | bytearray,
     offset: int,
@@ -368,13 +375,13 @@ def decode_properties(
 ) -> tuple[Properties, int]:
     """Decode properties starting at *offset*.
 
-    Returns ``(Properties, new_offset)``.
+    Returns ``(Properties, new_offset)``. An empty table returns a shared
+    immutable value rather than a new instance per packet.
     """
     if offset >= len(buf):
         raise MalformedPacketError("Missing properties length")
-    # Fast path: empty property length (single 0x00) — common for PUBLISH/ACK.
     if buf[offset] == 0:
-        return Properties(), offset + 1
+        return _EMPTY_PROPERTIES, offset + 1
     props_len, pos = decode_vbi(buf, offset)
     end = pos + props_len
     if end > len(buf):
