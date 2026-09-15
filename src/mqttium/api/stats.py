@@ -44,7 +44,10 @@ class DeliveryStats:
     """Messages held for the application, against the iterator bounds.
 
     Callback delivery retains nothing, so every field stays at its idle value
-    in that mode.
+    in that mode. Iterator byte occupancy is tracked only when
+    ``max_iterator_bytes`` is finite; when that bound is ``None``,
+    ``iterator_bytes`` and ``iterator_high_water_bytes`` stay at zero and the
+    message-count fields remain authoritative.
     """
 
     iterator_queued: int
