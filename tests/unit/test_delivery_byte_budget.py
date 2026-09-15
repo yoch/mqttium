@@ -18,6 +18,18 @@ def _effect(topic: str, payload: bytes) -> EngineEffect:
     return EngineEffect(EffectKind.MESSAGE, Message(topic=topic, payload=payload))
 
 
+def _counting_topic(value: str) -> tuple[str, list[int]]:
+    original = str.encode
+    encodes: list[int] = []
+
+    class CountingStr(str):
+        def encode(self, *args, **kwargs):  # type: ignore[override]
+            encodes.append(1)
+            return original(self, *args, **kwargs)
+
+    return CountingStr(value), encodes
+
+
 async def test_iterator_delivery_waits_for_shared_byte_capacity() -> None:
     first = Message(topic="delivery/first", payload=b"1234")
     logical_size = len(first.topic) + len(first.payload)
@@ -191,13 +203,45 @@ async def test_delivery_budget_wakes_multiple_waiters_without_overcommit() -> No
 
 
 def _byte_budget_client(protocol: MQTTProtocolVersion) -> AsyncClient:
-    """A client whose small-message fast path is enabled (see the test above)."""
+    """A client whose iterator uses exact finite byte accounting."""
     return AsyncClient(
         message_delivery="iterator",
         max_iterator_messages=4,
         max_iterator_bytes=64 * 1024 * 1024,
         protocol=protocol,
     )
+
+
+@pytest.mark.parametrize("protocol", [MQTTProtocolVersion.MQTTv311, MQTTProtocolVersion.MQTTv5])
+async def test_bounded_iterator_ascii_topic_does_not_encode_for_sizing(
+    protocol: MQTTProtocolVersion,
+) -> None:
+    topic, encodes = _counting_topic("sensors/" + "a" * 256)
+    client = _byte_budget_client(protocol)
+    message = Message(topic=topic, payload=b"payload")
+
+    await deliver_message(client, message)
+
+    assert encodes == []
+    assert client.stats().delivery.iterator_bytes == len(topic) + len(message.payload)
+
+
+@pytest.mark.parametrize("protocol", [MQTTProtocolVersion.MQTTv311, MQTTProtocolVersion.MQTTv5])
+async def test_bounded_iterator_non_ascii_topic_encodes_once_for_sizing(
+    protocol: MQTTProtocolVersion,
+) -> None:
+    topic, encodes = _counting_topic("capteurs/été/température")
+    client = _byte_budget_client(protocol)
+    message = Message(topic=topic, payload=b"payload")
+
+    await deliver_message(client, message)
+
+    assert len(encodes) == 1
+    assert client.stats().delivery.iterator_bytes == len(topic.encode("utf-8")) + len(
+        message.payload
+    )
+    # The assertion's own encode is outside the delivery path.
+    assert len(encodes) == 2
 
 
 async def test_mqtt5_publish_without_properties_is_accounted() -> None:
