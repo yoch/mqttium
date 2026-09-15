@@ -45,11 +45,11 @@ class MandatoryResponseTooLargeError(PacketTooLargeError):
 
 
 class FlowControlError(MQTTError):
-    """Outbound inflight window exhausted (raise mode)."""
+    """Immediate operation refused because bounded client capacity is unavailable."""
 
 
 class MessageDeliveryError(FlowControlError):
-    """Application delivery could not keep up within the configured deadline."""
+    """Iterator delivery cannot be admitted within its configured bounds or deadline."""
 
 
 class NotConnectedError(MQTTError):
