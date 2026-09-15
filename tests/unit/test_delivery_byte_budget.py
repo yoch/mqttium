@@ -35,6 +35,7 @@ async def test_iterator_delivery_waits_for_shared_byte_capacity() -> None:
     assert client.stats().delivery.waiters == 1
     assert client.stats().delivery.iterator_bytes == logical_size
     assert client._delivery.messages_queue.qsize() == 1
+    assert client._delivery.messages_queue._unfinished_tasks == 0
 
     stream = client.messages()
     assert await anext(stream) is first
@@ -43,6 +44,80 @@ async def test_iterator_delivery_waits_for_shared_byte_capacity() -> None:
     assert client._delivery.messages_queue.qsize() == 1
     assert client.stats().delivery.iterator_bytes == len("delivery/other") + 1
     await stream.aclose()
+
+
+async def test_unbounded_iterator_skips_byte_accounting() -> None:
+    client = AsyncClient(
+        message_delivery="iterator",
+        max_iterator_messages=4,
+        max_iterator_bytes=None,
+    )
+    message = Message(topic="delivery/unbounded", payload=b"payload")
+
+    def fail_logical_size(*_args: object, **_kwargs: object) -> int:
+        raise AssertionError("unbounded iterator must not compute logical byte size")
+
+    client._delivery.logical_size = fail_logical_size  # type: ignore[method-assign]
+    await deliver_message(client, message)
+
+    stats = client.stats().delivery
+    assert stats.iterator_byte_limit is None
+    assert stats.iterator_bytes == 0
+    assert stats.iterator_high_water_bytes == 0
+    assert client._delivery.messages_queue.qsize() == 1
+    assert client._delivery.messages_queue._unfinished_tasks == 0
+
+    stream = client.messages()
+    assert await anext(stream) is message
+    assert client.stats().delivery.iterator_bytes == 0
+    assert client.stats().delivery.iterator_high_water_bytes == 0
+    await stream.aclose()
+
+
+async def test_unbounded_iterator_keeps_count_backpressure() -> None:
+    client = AsyncClient(
+        message_delivery="iterator",
+        max_iterator_messages=1,
+        max_iterator_bytes=None,
+    )
+    first = Message(topic="delivery/first", payload=b"1")
+    second = Message(topic="delivery/second", payload=b"2")
+
+    await deliver_message(client, first)
+    blocked = asyncio.create_task(deliver_message(client, second))
+    await asyncio.sleep(0)
+
+    assert not blocked.done()
+    assert client.stats().delivery.waiters == 1
+    assert client.stats().delivery.iterator_bytes == 0
+
+    stream = client.messages()
+    assert await anext(stream) is first
+    await asyncio.wait_for(blocked, timeout=1.0)
+
+    assert client._delivery.messages_queue.qsize() == 1
+    assert client.stats().delivery.iterator_bytes == 0
+    assert await anext(stream) is second
+    await stream.aclose()
+
+
+async def test_unbounded_iterator_reset_discards_bare_messages() -> None:
+    client = AsyncClient(
+        message_delivery="iterator",
+        max_iterator_messages=2,
+        max_iterator_bytes=None,
+    )
+    await deliver_message(client, Message(topic="delivery/reset", payload=b"payload"))
+
+    client._delivery.close()
+    client._delivery.reset_stream()
+
+    stats = client.stats().delivery
+    assert client._delivery.messages_queue.empty()
+    assert stats.iterator_bytes == 0
+    assert stats.iterator_high_water_bytes == 0
+    assert stats.iterator_byte_limit is None
+    assert not client._delivery.closed.is_set()
 
 
 async def test_callback_delivery_charges_no_bytes() -> None:
