@@ -178,7 +178,16 @@ class ApplicationDelivery:
         message: Message,
         property_wire_size: int | None = None,
     ) -> Awaitable[None] | None:
-        size = self.logical_size(message, property_wire_size)
+        # This is the bounded iterator hot path. Call the shared sizing primitive
+        # directly rather than paying a forwarding method frame per message;
+        # logical_size() remains the diagnostic/test surface for the same rule.
+        size = publish_logical_size(
+            self._is_v5,
+            message.topic,
+            len(message.payload),
+            message.properties,
+            property_wire_size,
+        )
         limit = self.max_iterator_bytes
         assert limit is not None
         if size > limit:
