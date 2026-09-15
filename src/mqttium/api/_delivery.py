@@ -10,9 +10,9 @@ from functools import partial
 from typing import Any, Literal, cast
 
 from mqttium.api.stats import DeliveryStats
-from mqttium.codec.properties import PUBLISH, encode_properties
 from mqttium.enums import MQTTProtocolVersion
 from mqttium.errors import MessageDeliveryError, MQTTError
+from mqttium.protocol._sizing import publish_logical_size
 from mqttium.types import Message
 
 MessageDelivery = Literal["iterator", "callback"]
@@ -67,6 +67,7 @@ class ApplicationDelivery:
     ) -> None:
         self.mode = mode
         self.protocol = protocol
+        self._is_v5 = protocol == MQTTProtocolVersion.MQTTv5
         self.max_iterator_messages = max_iterator_messages
         self.max_iterator_bytes = max_iterator_bytes
         self.pending_bytes = 0
@@ -106,13 +107,13 @@ class ApplicationDelivery:
         self.message_ready.set()
 
     def logical_size(self, message: Message, property_wire_size: int | None = None) -> int:
-        if property_wire_size is None:
-            property_wire_size = (
-                len(encode_properties(message.properties, PUBLISH))
-                if self.protocol == MQTTProtocolVersion.MQTTv5 and message.properties
-                else 0
-            )
-        return len(message.payload) + len(message.topic.encode("utf-8")) + property_wire_size
+        return publish_logical_size(
+            self._is_v5,
+            message.topic,
+            len(message.payload),
+            message.properties,
+            property_wire_size,
+        )
 
     def _wake_waiters(self) -> None:
         if self.waiters:
