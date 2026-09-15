@@ -346,24 +346,23 @@ async def _apply_delivery_effect_compat(client: Any, effect: Any) -> None:
 
 
 def _consume_iterator_message(client: Any) -> None:
-    """Consume one iterator delivery from the queue layout owned by the source."""
+    """Consume one iterator delivery using the source's production representation."""
     delivery = client._delivery
-    queue = delivery.messages_queue
-    item = queue.get_nowait()
+    item = delivery.messages_queue.get_nowait()
     release_nowait = getattr(delivery, "release_nowait", None)
     if release_nowait is not None:
-        # RC14 stores small/unaccounted deliveries as bare Message objects and
-        # accounted deliveries as (Message, token). Its _DeliveryQueue also
-        # deliberately skips asyncio.Queue join()/task_done bookkeeping.
+        # RC14: bare Message on the unaccounted path, (Message, token) when
+        # accounted. Its _DeliveryQueue has no join/task_done bookkeeping.
         if isinstance(item, tuple):
             _message, token = item
             release_nowait(token)
         return
-    # The current iterator queue always owns (Message, logical_size) entries
-    # and uses a normal asyncio.Queue, so release both queue and byte capacity.
-    _message, size = item
-    queue.task_done()
-    delivery.release(size)
+    # Current source: max_iterator_bytes=None likewise stores a bare Message;
+    # finite byte bounds store (Message, logical_size). Public messages() never
+    # calls task_done(), so the benchmark must not add that cost either.
+    if isinstance(item, tuple):
+        _message, size = item
+        delivery.release(size)
 
 
 async def _drain_single_message_effect(client: Any) -> None:
