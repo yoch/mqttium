@@ -5,9 +5,9 @@ from __future__ import annotations
 import asyncio
 import inspect
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
-from typing import Any, Literal
 from dataclasses import dataclass
 from functools import partial
+from typing import Any, Literal, cast
 
 from mqttium.api.stats import DeliveryStats
 from mqttium.codec.properties import PUBLISH, encode_properties
@@ -26,11 +26,22 @@ class MessageRoute:
 
 
 CallbackTarget = Callable[..., Any] | MessageRoute
-IteratorQueueItem = tuple[Message, int]
+IteratorQueueItem = Message | tuple[Message, int]
+IteratorAcceptor = Callable[[Message, int | None], Awaitable[None] | None]
 # Synchronous callback invocations, including route fan-out, charged between
 # two cooperative yields of the delivering reader. The yield happens at a
 # message boundary, so one message's routes always run contiguously.
 _CALLBACK_QUANTUM = 128
+
+
+class _DeliveryQueue(asyncio.Queue[IteratorQueueItem]):
+    """Iterator queue without unused ``join()`` / ``task_done()`` bookkeeping."""
+
+    def put_nowait(self, item: IteratorQueueItem) -> None:
+        if self.full():
+            raise asyncio.QueueFull
+        self._put(item)
+        self._wakeup_next(self._getters)  # type: ignore[attr-defined]
 
 
 class ApplicationDelivery:
@@ -40,8 +51,9 @@ class ApplicationDelivery:
     that delivers the message, outside every protocol lock, so it needs no
     queue, worker task or byte reservation: the reader does not decode more
     until the current lot has been handed to the application. Iterator mode
-    parks messages in a bounded queue for an independent consumer and charges
-    their logical size against ``max_iterator_bytes``.
+    always applies its message-count bound. When ``max_iterator_bytes`` is
+    finite it additionally charges exact logical bytes; ``None`` selects an
+    unaccounted fast path and byte occupancy statistics remain zero.
     """
 
     def __init__(
@@ -61,13 +73,20 @@ class ApplicationDelivery:
         self.pending_high_water_bytes = 0
         self.space = asyncio.Event()
         self.waiters = 0
-        self.messages_queue: asyncio.Queue[IteratorQueueItem] = asyncio.Queue(max_iterator_messages)
+        self.messages_queue: asyncio.Queue[IteratorQueueItem] = _DeliveryQueue(
+            max_iterator_messages
+        )
         self.message_ready = asyncio.Event()
         self.closed = asyncio.Event()
         self._stream_generation = 0
         self.iterator_admission_timeout = iterator_admission_timeout
         self.callback_invocations = 0
         self._since_yield = 0
+        self._accept_iterator: IteratorAcceptor = (
+            self._accept_iterator_unaccounted
+            if max_iterator_bytes is None
+            else self._accept_iterator_accounted
+        )
 
     def stats(self) -> DeliveryStats:
         return DeliveryStats(
@@ -93,18 +112,28 @@ class ApplicationDelivery:
                 if self.protocol == MQTTProtocolVersion.MQTTv5 and message.properties
                 else 0
             )
-        return len(message.payload) + len(message.topic.encode("utf-8")) + property_wire_size
+        topic_bytes = (
+            len(message.topic) if message.topic.isascii() else len(message.topic.encode("utf-8"))
+        )
+        return len(message.payload) + topic_bytes + property_wire_size
 
-    def release(self, size: int) -> None:
-        self.pending_bytes -= size
+    def _wake_waiters(self) -> None:
         if self.waiters:
             self.space.set()
 
-    def _enqueue(self, message: Message, size: int) -> None:
+    def release(self, size: int) -> None:
+        self.pending_bytes -= size
+        self._wake_waiters()
+
+    def _enqueue_accounted(self, message: Message, size: int) -> None:
         self.pending_bytes += size
         if self.pending_bytes > self.pending_high_water_bytes:
             self.pending_high_water_bytes = self.pending_bytes
         self.messages_queue.put_nowait((message, size))
+        self.message_ready.set()
+
+    def _enqueue_unaccounted(self, message: Message) -> None:
+        self.messages_queue.put_nowait(message)
         self.message_ready.set()
 
     def accept(
@@ -119,9 +148,9 @@ class ApplicationDelivery:
         before returning, and yields an awaitable at this message boundary
         once the invocation budget is reached. Invocations beyond the budget
         stay charged to the next yield, so a wide fan-out cannot consume
-        budget for free. Iterator mode returns ``None`` after an immediate
-        bounded enqueue and otherwise the coroutine that waits for queue and
-        byte capacity.
+        budget for free. Iterator mode dispatches through the constructor-bound
+        accounted or unaccounted strategy and returns an awaitable only when
+        queue or configured byte capacity is unavailable.
         """
         if self.mode == "callback":
             if callback is not None:
@@ -134,28 +163,40 @@ class ApplicationDelivery:
                     self._since_yield %= _CALLBACK_QUANTUM
                     return asyncio.sleep(0)
             return None
-        size = self.logical_size(message, property_wire_size)
-        limit = self.max_iterator_bytes
-        if limit is not None:
-            if size > limit:
-                raise MessageDeliveryError(
-                    f"Message requires {size} delivery bytes, exceeding limit {limit}"
-                )
-            if self.pending_bytes + size > limit:
-                return self._accept_waiting(message, size)
+        return self._accept_iterator(message, property_wire_size)
+
+    def _accept_iterator_unaccounted(
+        self,
+        message: Message,
+        _property_wire_size: int | None = None,
+    ) -> Awaitable[None] | None:
         if self.messages_queue.full():
-            return self._accept_waiting(message, size)
-        self._enqueue(message, size)
+            return self._accept_waiting_unaccounted(message)
+        self._enqueue_unaccounted(message)
         return None
 
-    async def _accept_waiting(self, message: Message, size: int) -> None:
-        """Wait for byte and queue capacity under one shared deadline."""
+    def _accept_iterator_accounted(
+        self,
+        message: Message,
+        property_wire_size: int | None = None,
+    ) -> Awaitable[None] | None:
+        size = self.logical_size(message, property_wire_size)
         limit = self.max_iterator_bytes
+        assert limit is not None
+        if size > limit:
+            raise MessageDeliveryError(
+                f"Message requires {size} delivery bytes, exceeding limit {limit}"
+            )
+        if self.pending_bytes + size > limit or self.messages_queue.full():
+            return self._accept_waiting_accounted(message, size)
+        self._enqueue_accounted(message, size)
+        return None
+
+    async def _accept_waiting_unaccounted(self, message: Message) -> None:
+        """Wait only for iterator count capacity when byte accounting is disabled."""
         try:
             async with asyncio.timeout(self.iterator_admission_timeout):
-                while (limit is not None and self.pending_bytes + size > limit) or (
-                    self.messages_queue.full()
-                ):
+                while self.messages_queue.full():
                     self.space.clear()
                     self.waiters += 1
                     try:
@@ -164,23 +205,59 @@ class ApplicationDelivery:
                         self.waiters -= 1
         except TimeoutError as exc:
             raise MessageDeliveryError("Application delivery capacity timed out") from exc
-        self._enqueue(message, size)
+        self._enqueue_unaccounted(message)
+
+    async def _accept_waiting_accounted(self, message: Message, size: int) -> None:
+        """Wait for iterator byte and count capacity under one shared deadline."""
+        limit = self.max_iterator_bytes
+        assert limit is not None
+        try:
+            async with asyncio.timeout(self.iterator_admission_timeout):
+                while self.pending_bytes + size > limit or self.messages_queue.full():
+                    self.space.clear()
+                    self.waiters += 1
+                    try:
+                        await self.space.wait()
+                    finally:
+                        self.waiters -= 1
+        except TimeoutError as exc:
+            raise MessageDeliveryError("Application delivery capacity timed out") from exc
+        self._enqueue_accounted(message, size)
 
     def messages(self) -> AsyncIterator[Message]:
-        return self._messages(self._stream_generation)
+        generation = self._stream_generation
+        if self.max_iterator_bytes is None:
+            return self._messages_unaccounted(generation)
+        return self._messages_accounted(generation)
 
-    async def _messages(self, generation: int) -> AsyncIterator[Message]:
+    async def _messages_unaccounted(self, generation: int) -> AsyncIterator[Message]:
         if self.mode != "iterator":
             raise MQTTError("messages() requires message_delivery='iterator'")
         while generation == self._stream_generation:
             try:
-                message, size = self.messages_queue.get_nowait()
+                item = self.messages_queue.get_nowait()
             except asyncio.QueueEmpty:
                 if self.closed.is_set():
                     return
                 self.message_ready.clear()
                 await self.message_ready.wait()
             else:
+                self._wake_waiters()
+                yield cast(Message, item)
+
+    async def _messages_accounted(self, generation: int) -> AsyncIterator[Message]:
+        if self.mode != "iterator":
+            raise MQTTError("messages() requires message_delivery='iterator'")
+        while generation == self._stream_generation:
+            try:
+                item = self.messages_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                if self.closed.is_set():
+                    return
+                self.message_ready.clear()
+                await self.message_ready.wait()
+            else:
+                message, size = cast(tuple[Message, int], item)
                 self.release(size)
                 yield message
 
@@ -188,12 +265,17 @@ class ApplicationDelivery:
         if not self.closed.is_set():
             return
         self._stream_generation += 1
-        while not self.messages_queue.empty():
-            _message, size = self.messages_queue.get_nowait()
-            self.release(size)
+        if self.max_iterator_bytes is None:
+            while not self.messages_queue.empty():
+                self.messages_queue.get_nowait()
+            self._wake_waiters()
+        else:
+            while not self.messages_queue.empty():
+                _message, size = cast(tuple[Message, int], self.messages_queue.get_nowait())
+                self.release(size)
         # Wake iterators that belong to the retired stream before replacing it.
         self.message_ready.set()
-        self.messages_queue = asyncio.Queue(self.max_iterator_messages)
+        self.messages_queue = _DeliveryQueue(self.max_iterator_messages)
         self.message_ready = asyncio.Event()
         self.closed.clear()
 
