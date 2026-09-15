@@ -90,6 +90,9 @@ jobs:
           python3 -m venv "$root/venv"
           echo "$root/venv/bin" >> "$GITHUB_PATH"
 
+      - name: Install probe dependency
+        run: python -m pip install "psutil>=6,<8"
+
       - name: Enforce dedicated-runner preflight
         working-directory: harness
         run: |
