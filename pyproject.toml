@@ -95,24 +95,16 @@ path = "src/mqttium/__init__.py"
 [tool.hatch.build.targets.wheel]
 packages = ["src/mqttium"]
 
+# The source distribution carries only what identifies the project, satisfies
+# the licence obligations and rebuilds the wheel. Tests, benchmarks, docs and
+# examples live in the repository; tools/ci/validate_distribution.py fails the
+# build if any of them reappear here.
 [tool.hatch.build.targets.sdist]
 include = [
     "/src/mqttium",
-    "/tests",
-    "/docs",
-    "/examples",
-    "/benchmarks",
     "/README.md",
-    "/CHANGELOG.md",
-    "/CODE_OF_CONDUCT.md",
-    "/CONTRIBUTING.md",
     "/LICENSE",
     "/NOTICE",
-    "/PROVENANCE.md",
-    "/SECURITY.md",
-    "/SUPPORT.md",
-    "/mkdocs.yml",
-    "/.readthedocs.yaml",
     "/pyproject.toml",
 ]
 

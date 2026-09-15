@@ -41,6 +41,13 @@ without source-tree imports, imports every packaged module and exercises TCP,
 TLS, WebSocket, Unix, SQLite restart and clean shutdown. It never
 contacts PyPI.
 
+Both distributions are minimal. The wheel carries `mqttium/` and its
+`.dist-info/`; the source distribution carries `src/mqttium`, `README.md`,
+`LICENSE`, `NOTICE` and `pyproject.toml`, which is what rebuilds the wheel.
+Tests, benchmarks, documentation, examples and tooling stay in the repository.
+`tools/ci/validate_distribution.py` fails the build if any of them reappear, so
+a future release cannot quietly widen the distributions again.
+
 Then update `src/mqttium/__init__.py`, `CHANGELOG.md`, status documentation, and
 the development-status classifier as appropriate. Confirm the worktree is
 clean and prepare a release evidence report for the exact candidate commit.
