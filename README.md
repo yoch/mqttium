@@ -22,9 +22,9 @@ connection or process fails.
 
 The package has no runtime dependencies and is fully typed.
 
-This checkout is the incompatible `codex/lean-native-experiment` branch. Its
-native API and SQLite format differ from the published release; consult
-`docs/migration.md` before using existing application code or databases.
+This checkout carries the current pre-v1 native API. Its client surface and
+SQLite format are incompatible with `1.0.0rc14`; consult `docs/migration.md`
+before reusing existing application code or databases.
 
 ## Why MQTTium?
 
@@ -34,7 +34,7 @@ native API and SQLite format differ from the published release; consult
 | Explicit completion | Publish receipts that separate local admission from the relevant MQTT acknowledgement exchange |
 | Controlled load | Message and byte budgets, wait-or-refuse backpressure, bounded ingress, writes, and application delivery |
 | Session continuity | Jittered reconnect plus in-memory or SQLite-backed inflight state with incremental replay |
-| Delivery choices | Exclusive async iteration or short synchronous callbacks, plus manual acknowledgement |
+| Delivery choices | Async iterator, with optional manual acknowledgement, or short synchronous auto-ack callbacks |
 | Transports | TCP, TLS, WebSocket, and Unix-domain sockets |
 | Operations | Immutable runtime snapshots, queue high-water marks, and broker-negotiated limits |
 | Efficient production | Bounded `publish_many()` and loop-bound `publish_nowait()` without changing delivery semantics |
@@ -143,17 +143,18 @@ client = AsyncClient(
 )
 ```
 
-`SqliteInflightStore` persists unfinished outbound QoS 1/2 exchanges and
-inbound QoS 2 protocol state. It does not persist arbitrary application work,
-delivered callback/iterator queues, or subscription intent. The application
-owns the store and must close it after the client has shut down.
+`SqliteInflightStore` persists unfinished outbound QoS 1/2 exchanges, inbound
+QoS 1 still awaiting a manual `ack()`, inbound QoS 2 protocol state, and the
+accounting metadata needed to replay them. It does not persist arbitrary
+application work, already-acknowledged messages, or subscription intent. The
+application owns the store and must close it after the client has shut down.
 
-## Experimental migration
+## Migration from 1.0.0rc14
 
-This incompatible branch supports only the native API. See `docs/migration.md`
+The current native API is the only supported surface. See `docs/migration.md`
 in this checkout for removed interfaces, frozen configuration, progressive
-batches and SQLite schema 5. Published stable documentation describes the main
-release line.
+batches and SQLite schema 5. Published stable documentation describes the
+`1.0.0rc14` release line.
 
 ## Documentation
 

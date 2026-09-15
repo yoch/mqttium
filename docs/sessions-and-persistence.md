@@ -16,9 +16,10 @@ unfinished QoS exchanges according to the protocol version and broker policy.
 On reconnect, CONNACK tells MQTTium whether that previous session is present.
 
 When `session_present` is true, MQTTium replays persisted outbound PUBLISH or
-PUBREL state and restores inbound QoS 2 deduplication state. When it is false,
-the broker can no longer complete those old exchanges; MQTTium fails pending
-receipts with `SessionDiscardedError` and releases the stale local state.
+PUBREL state, redelivers inbound QoS 1 still awaiting a manual `ack()`, and
+restores inbound QoS 2 deduplication state. When it is false, the broker can no
+longer complete those old exchanges; MQTTium fails pending receipts with
+`SessionDiscardedError` and releases the stale local state.
 
 MQTTium does not periodically retransmit QoS messages on a healthy connection.
 Protocol replay happens after reconnect, with DUP set where MQTT requires it.
@@ -91,14 +92,16 @@ a process restart:
 
 - outbound QoS 1 PUBLISH while waiting for PUBACK;
 - outbound QoS 2 PUBLISH or PUBREL and its current transition;
+- inbound QoS 1 delivered under `manual_ack` and still awaiting `ack()`, so it
+  can be redelivered after a restart;
 - inbound QoS 2 state used for deduplication and final acknowledgement;
 - logical size and transition metadata needed to restore admission accounting.
 
 It does not persist:
 
 - arbitrary application jobs or business results;
-- messages already handed to a callback or iterator;
-- callback and iterator queues;
+- messages already acknowledged, whether by a callback delivery or by `ack()`;
+- iterator delivery buffers;
 - QoS 0 publications after process loss;
 - subscription intent independently of the broker session;
 - credentials, connection targets or reconnect policy;
@@ -127,7 +130,7 @@ finally:
 structure makes that convenient. `close()` is idempotent, but closing inside an
 active store batch is rejected.
 
-The database uses WAL mode and experimental schema 5, recorded by
+The database uses WAL mode and pre-v1 schema 5, recorded by
 `PRAGMA user_version`. Only new databases and schema 5 are accepted. Historical,
 future and inconsistent schemas are refused without migrating, resetting, or
 changing their committed schema and data. No historical size backfill is performed.
@@ -188,14 +191,17 @@ from its body or commit; the runtime needs that cause to fail-stop safely.
 ## Reconnect policy
 
 The native client does not reconnect unless a `ReconnectPolicy` is supplied.
-The policy provides:
+The policy describes retry progression only:
 
 - jittered exponential backoff;
 - an optional maximum retry count;
-- a connection timeout;
 - reset after a sufficiently stable connection;
 - terminal handling for permanent authentication, authorisation and protocol
   failures.
+
+The transport and CONNACK deadline is not part of the policy: it is the
+client's own `connect_timeout`, and it applies to every attempt, explicit or
+automatic.
 
 Transport loss does not immediately fail pending receipts when a retained
 session can still settle them. They remain pending across reconnect attempts and

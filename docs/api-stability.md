@@ -1,11 +1,11 @@
-# Native API contract for the lean experiment
+# Native API contract
 
-This branch intentionally revises the pre-v1 Stable contract. It is an
-incompatible experiment, not a release or a deprecation bridge. The migration
-guide records the differences from `main@9ad1f018`; there are no compatibility
-wrappers for removed APIs.
+This is the current pre-v1 native contract. It intentionally revises the
+earlier pre-v1 Stable contract and is breaking, not a deprecation bridge. The
+migration guide records the differences from `1.0.0rc14` (`c194597`); there are
+no compatibility wrappers for removed APIs.
 
-## Supported experimental surface
+## Supported surface
 
 | Entry point | Supported names |
 | --- | --- |
@@ -54,7 +54,11 @@ message boundary once its private invocation budget is reached, counting every
 route invocation and carrying any excess over to the next yield.
 A synchronous callback that blocks the event loop cannot be preempted.
 
-Callback delivery notifies synchronously and acknowledges automatically.
+Callback mode always uses automatic acknowledgement, and protocol
+acknowledgement ordering is independent of callback completion: the QoS 1
+PUBACK and the QoS 2 PUBREC are produced before application delivery. Because
+callbacks execute on the reader, later packets are not processed until the
+callback returns.
 `manual_ack=True` requires iterator delivery, because `ack()` is awaited and
 `messages()` is the asynchronous processing mode; the combination with
 `message_delivery="callback"` raises `ValueError`.
@@ -132,7 +136,7 @@ application without a logger: connection state and epoch, and for each
 sizeable queue or window its occupancy, high-water mark, limit and parked
 waiters, in the constructor's vocabulary. Runtime scheduling (task liveness,
 effect and writer batching decisions) is not part of the snapshot.
-`tests/project/test_public_api_surface.py` records the experimental names,
+`tests/project/test_public_api_surface.py` records the supported names,
 signatures, defaults and snapshot fields. Intentional changes update that
 test, maintained documentation, changelog and migration guidance. Historical
 reports remain evidence of the commits they describe.

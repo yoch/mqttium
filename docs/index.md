@@ -38,8 +38,8 @@ recovery.
 
     ---
 
-    Review the incompatible experimental changes in the [migration guide](migration.md).
-    The experiment removes the Paho façade and one-shot helpers.
+    Review the breaking changes in the [migration guide](migration.md).
+    The current native API removes the Paho façade and one-shot helpers.
 
 </div>
 
@@ -51,7 +51,7 @@ recovery.
 | Completion | Per-message and aggregate receipts tied to MQTT semantics |
 | Flow control | Independent message and byte bounds for protocol, writer, ingress, and delivery state |
 | Recovery | Jittered reconnect, broker-session resumption, and optional persistent inflight state |
-| Delivery | Async iterator, short synchronous callbacks, and manual acknowledgement |
+| Delivery | Async iterator, with optional manual acknowledgement, or short synchronous auto-ack callbacks |
 | Transports | TCP, TLS, WebSocket, and Unix-domain sockets |
 | Operations | Immutable snapshots and broker-negotiated limits without a background sampler |
 | Packaging | Typed Python package with no runtime dependencies |
@@ -63,8 +63,8 @@ backpressure model that distinguishes MQTTium from a minimal MQTT wrapper.
 
 - **Guides** solve application tasks: configuration, sessions, transports,
   MQTT 5, operations, troubleshooting, and complete recipes.
-- **Reference** records the experimental native imports, signatures, defaults,
-  exceptions, compatibility tiers, and validated environments.
+- **Reference** records the native imports, signatures, defaults, exceptions,
+  compatibility tiers, and validated environments.
 - **Concepts** explain architecture, protocol ownership, conformance, and the
   no-library-logging decision.
 - **Maintainer material** defines benchmarking, fuzzing, stability, and release
@@ -74,7 +74,7 @@ backpressure model that distinguishes MQTTium from a minimal MQTT wrapper.
 
 ## API support tiers
 
-The experiment supports native client operations, models, receipts, results,
+The supported surface is native client operations, models, receipts, results,
 statistics and the two shipped stores. Engine, codecs, transport implementations,
 records and extension protocols are internal. See the [API Stability Policy](api-stability.md)
 for exact tiers and import paths.

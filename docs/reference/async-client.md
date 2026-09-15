@@ -1,7 +1,7 @@
 # `AsyncClient`
 
-`AsyncClient` is the experimental async-native MQTTium API. One instance belongs to
-one asyncio event loop. It owns transport lifecycle, reader/writer work,
+`AsyncClient` is the async-native MQTTium API. One instance belongs to one
+asyncio event loop. It owns transport lifecycle, reader/writer work,
 keepalive, reconnect, receipts, and application delivery; it does not create a
 background thread.
 
@@ -58,7 +58,10 @@ every invocation and yields to the event loop at the next message boundary once
 its private budget is reached, carrying the excess over. That budget is not a
 time limit: synchronous user code cannot be preempted.
 
-Callback delivery acknowledges automatically once the callbacks return.
+Callback mode always uses automatic acknowledgement. Protocol acknowledgement
+ordering is independent of callback completion: the QoS 1 PUBACK and the QoS 2
+PUBREC are produced before application delivery. Because callbacks execute on
+the reader, later packets are not processed until the callback returns.
 `manual_ack=True` requires iterator delivery and raises `ValueError` with
 `message_delivery="callback"`.
 
@@ -127,7 +130,7 @@ its own bound.
 
 ## Constructor settings
 
-Constructor keywords and defaults are recorded in the experimental contract. The
+Constructor keywords and defaults are recorded in the API contract. The
 generated signature above is authoritative for spelling and defaults;
 [Configuration and Sizing](../configuration-and-sizing.md) groups them by responsibility
 and explains how to choose values.

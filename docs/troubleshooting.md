@@ -87,8 +87,8 @@ messages after the broker discards its session.
 
 Keep disconnect in `finally`, stop new producers first, allow receipts to settle
 according to the service deadline, then disconnect and close the application-
-owned store. Include callback shutdown time and queued writer data in that
-deadline.
+owned store. Include the time for any synchronous callback still executing to
+return, and the queued writer data, in that deadline.
 
 ## Requesting help
 

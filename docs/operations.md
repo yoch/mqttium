@@ -29,7 +29,7 @@ MQTTium keeps separate budgets because each resource has a different lifetime:
 | Unfinished outbound QoS state | `max_unacknowledged_messages`, `max_unacknowledged_bytes` |
 | Inbound persisted protocol state | `max_inbound_inflight_bytes` |
 | Encoded writer queue | `max_write_queue_messages`, `max_write_queue_bytes` |
-| Iterator queue | `max_iterator_messages`, `max_iterator_bytes` |
+| Iterator queue (iterator delivery only) | `max_iterator_messages`, `max_iterator_bytes` |
 | Broker-facing QoS concurrency | `max_inbound_inflight`, `max_outbound_inflight` and negotiated limits |
 
 Outbound bounds refuse or park the local producer. Inbound bounds cannot
@@ -76,9 +76,11 @@ byte budget (`max_write_queue_bytes`, 1 MiB by default) long before it exhausts 
 message count, and a producer that merely retries on `FlowControlError` will
 busy-spin against it. Shed, slow down, or spill instead — or use
 `await client.publish(...)` and
-let the client apply the backpressure for you. Do **not** set the pending bounds
-to `None` to make the error go away: unbounded queues move the failure from a
-catchable exception to memory exhaustion.
+let the client apply the backpressure for you. Do **not** disable the optional
+`max_unacknowledged_*` bounds merely to mask sustained pressure: the writer
+bounds stay finite either way, and removing the optional ones moves the failure
+from a catchable exception towards memory exhaustion. Size the writer bounds
+explicitly instead.
 
 Size `max_write_queue_bytes` from the encoded bytes that may accumulate during the
 largest supported burst, not only from the message count. This matters most for
@@ -276,10 +278,13 @@ Lifecycle-hook completion is separate: `disconnect()` can return before
 `on_disconnect` finishes. Hook cancellation is cooperative; hooks must release
 application resources in `finally` blocks.
 
-After shutdown, a diagnostic snapshot should show `DISCONNECTED`, no active
-tasks, no pending subscribe/unsubscribe receipts and no publish waiters. Durable
-inflight records may remain only when protocol work is intentionally preserved
-for a broker session; close the application-owned store after the client.
+After shutdown, a public `stats()` snapshot should show `DISCONNECTED`, no
+pending subscribe/unsubscribe receipts, no publish waiters, and coherent queues
+and windows. Task residency is not part of that contract: `ClientStats` carries
+no task section, and `_running_tasks()` is a private maintainer diagnostic
+rather than an operational guarantee. Durable inflight records may remain only
+when protocol work is intentionally preserved for a broker session; close the
+application-owned store after the client.
 
 ## Reporting a problem
 
