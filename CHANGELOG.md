@@ -87,6 +87,14 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   field assignment. The decoder still hands the engine owned bytes; the
   container is never mutated or hashed, and every inbound packet paid the
   tripled construction cost.
+- Hand a ready QoS 0 `publish_nowait()` to the writer before the generic
+  capacity preflight, as `publish()` and `publish_many()` already did. The
+  direct path validates and encodes the frame once and the writer admits its
+  exact size; the preflight previously sized the same PUBLISH a second time
+  whenever the writer held a frame, the steady state of a saturated producer.
+  Writer refusal of a QoS 0 frame now follows its validation, so an invalid
+  request raises `ProtocolError`/`PacketTooLargeError` rather than
+  `FlowControlError` when the write queue is also full.
 - Amortize ready QoS 0 `publish_many()` orchestration over bounded private
   prefixes. Each item still commits independently and transfers to the writer
   before the source iterator advances; pressure and QoS 1/2 use the existing

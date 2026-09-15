@@ -266,3 +266,38 @@ Against RC14 (`diag_rc14_vs_cand3.json`, SHA256 `eb19b8b5061734122ae20b1773d3420
 ### Position
 
 The receive hot-path question is closed on this branch. The remaining callback-reception deficit against RC14, about 29% on this host, is accounted for to within 50 ns by the two invariant-bearing steps RC14's direct path skips: the owned packet boundary (+671 ns) and the engine dispatch with its effect object (+576 ns). The delivery side is already cheaper than RC14's. No further local prototype shows a gain outside noise behind an invariant simpler than the one it replaces. The `Message` construction cost is recorded as the one item that would pay on both arms if its contract were ever revisited; that is a separate decision, not part of this branch.
+
+## 12. Addendum, 2026-09-15: `publish_nowait(qos=0)` ran the generic preflight before the direct path
+
+An external review traced the QoS 0 `publish_nowait()` deficit against RC14 to an ordering residue of the lean rewrite rather than to the new architecture. RC14 tried the direct QoS 0 handoff first and fell back to `_check_nowait_publish_capacity()` only when it declined. The rewrite removed the direct path and kept the preflight; when the direct path was rebuilt on the writer-ownership rules (`c14ea0c`, then `41738a6` for `publish_many()`), `publish_nowait()` placed it after the preflight it was meant to short-circuit. `publish()` and `_publish_ready_prefix()` were already direct-first. The result, whenever the writer held a resident frame — the steady state of a saturated producer — was one `publish_wire_size()` preview followed by the real encode of the same PUBLISH in `prepare_qos0()`, and a writer admission on the preview before the writer's own admission on the exact frame.
+
+### Change
+
+Commit `22c56d5` moves the direct QoS 0 attempt ahead of `_check_nowait_publish_capacity()` in `publish_nowait()` and changes nothing else. Every guard of the direct path (connected, no local terminal failure, writer epoch, engine lock, effect-pump lock, no inline drain, no pending effects) still runs before any encoding; `prepare_qos0()` still validates topic, properties, aliases, `retain_available` and the negotiated packet size; `writer.try_enqueue()` still admits on the exact frame size, epoch and bounds. The preflight remains for QoS 1/2 and for QoS 0 the direct path declines. `tests/unit/test_native_publish_nowait.py` now asserts that a ready QoS 0 `publish_nowait()` never enters the preflight or the size preview, with an empty and with a resident writer, and that writer refusal follows frame validation. The one behavioural difference is on the refusal path: with the write queue full, an invalid QoS 0 request now raises `ProtocolError`/`PacketTooLargeError` instead of `FlowControlError`, and a refused valid request pays the encode before the refusal, as it did on RC14.
+
+### Evidence
+
+Microbenchmark (`publish_nowait(qos=0)`, 256-byte payload, one resident writer frame, no transport, pinned CPU, median of 7 × 20,000 calls, two alternated passes):
+
+| Tree | MQTT 3.1.1 | MQTT 5 |
+| --- | ---: | ---: |
+| RC14 `c194597` | 2.31 µs | 2.34–2.58 µs |
+| Branch before (`8e29cfa`) | 3.26–3.47 µs | 3.32–3.48 µs |
+| Branch after (`22c56d5`) | 2.31–2.35 µs | 2.35–2.37 µs |
+
+`benchmarks/paired_writer_capacity.py` (closed-loop `publish_nowait`, QoS 0, 256 bytes, outstanding 64, 60,000 messages, six alternated fresh-process pairs, publisher on CPU 2, Mosquitto 127.0.0.1:11883, advisory policy without runner preflight; JSON under `/tmp/bench/paired_*.json`, SHA256 prefixes `71a8c5fa`, `5a690a08`, `ebd512fc`, `680c4d45`, `85db6f96`, `da857267`):
+
+| Pair | Protocol | Candidate / base completed rate | Base CV | Candidate CV |
+| --- | --- | ---: | ---: | ---: |
+| RC14 → before | 3.1.1 | 0.762 | 15.2% | 11.2% |
+| RC14 → before | 5 | 0.760 | 5.2% | 3.9% |
+| before → after | 3.1.1 | **1.309** | 3.5% | 1.3% |
+| before → after | 5 | **1.285** | 4.1% | 2.0% |
+| RC14 → after | 3.1.1 | 0.975 | 1.5% | 2.7% |
+| RC14 → after | 5 | 0.992 | 0.9% | 0.7% |
+
+No synchronous rejection occurred in any run. The first RC14 → before pair has a high baseline CV and is reported for direction only; the other five are within the harness's advisory thresholds.
+
+### Position
+
+The `publish_nowait(qos=0)` deficit against RC14 in the closed-loop writer regime, about −24% on this host, is recovered to within −2.5% / −0.8%, inside the noise band of the harness. The `_owned_payload(bytes)` shortcut suggested as a second ablation is not taken: the stated stop rule was parity within ±3–5%, and it is met. The in-repository `lean_native_compare.py` and `lean_native_diagnostics.py` publisher cells use `publish_many()`, whose ready path was already direct-first, so they do not move with this change; the external adapter's `publish_nowait` shape is what `paired_writer_capacity.py` protects. Qualification on `22c56d5`: `ruff`, `mypy`, `bandit`; unit, project, integration (Mosquitto, `MQTTIUM_REQUIRE_BROKER=1`) and resilience suites 1,909 passed; Hypothesis and stateful fuzz suites passed.

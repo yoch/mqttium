@@ -327,9 +327,12 @@ Covered by `tests/unit/test_ingress_failure_semantics.py`.
 
 ## API completion and errors
 
-- QoS 0 receipts complete at writer admission. `publish_nowait()` preflights
-  immediate protocol/writer capacity; awaited publication waits for bounded
-  transfer independently of application-delivery capacity.
+- QoS 0 receipts complete at writer admission. A ready QoS 0
+  `publish_nowait()` validates and encodes the frame once and asks the writer
+  to admit its exact size; the generic capacity preflight runs only for QoS 1/2
+  and for QoS 0 the direct path declines, so writer refusal of a QoS 0 frame
+  follows its validation. Awaited publication waits for bounded transfer
+  independently of application-delivery capacity.
 - QoS 1 receipts complete at PUBACK.
 - QoS 2 receipts complete at PUBCOMP.
 - SUBACK and UNSUBACK return all per-filter reason codes; a reason code at or
