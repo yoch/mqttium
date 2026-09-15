@@ -178,7 +178,13 @@ def _profile(scenario: str, operations: int) -> dict[str, Any]:
     elapsed = time.perf_counter() - started
     stats = pstats.Stats(profiler)
     rows: list[dict[str, Any]] = []
-    for (filename, line, name), (primitive, calls, self_s, cumulative_s, _callers) in stats.stats.items():
+    for (filename, line, name), (
+        primitive,
+        calls,
+        self_s,
+        cumulative_s,
+        _callers,
+    ) in stats.stats.items():
         if (
             "mqttium" not in filename
             and "asyncio" not in filename
@@ -215,7 +221,9 @@ def _worker(args: argparse.Namespace) -> None:
     print(json.dumps(payload))
 
 
-def _run_worker(script: Path, root: Path, scenario: str, args: argparse.Namespace) -> dict[str, Any]:
+def _run_worker(
+    script: Path, root: Path, scenario: str, args: argparse.Namespace
+) -> dict[str, Any]:
     env = os.environ.copy()
     env["PYTHONPATH"] = str(root.resolve() / "src")
     command = [
