@@ -95,6 +95,13 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   Writer refusal of a QoS 0 frame now follows its validation, so an invalid
   request raises `ProtocolError`/`PacketTooLargeError` rather than
   `FlowControlError` when the write queue is also full.
+- Decode an empty MQTT 5 property table to one shared immutable `Properties`
+  value instead of a fresh instance per packet. Every MQTT 5 PUBLISH and ACK
+  carries the table and it is usually empty; since `Properties` became frozen
+  with a read-only proxy, building it cost about 0.6 µs per inbound packet,
+  which made MQTT 5 reception measurably slower than MQTT 3.1.1 on the same
+  pipeline. The frozen contract is what makes the shared value safe; no
+  mutable state is attached to it.
 - Amortize ready QoS 0 `publish_many()` orchestration over bounded private
   prefixes. Each item still commits independently and transfers to the writer
   before the source iterator advances; pressure and QoS 1/2 use the existing

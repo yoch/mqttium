@@ -301,3 +301,40 @@ No synchronous rejection occurred in any run. The first RC14 → before pair has
 ### Position
 
 The `publish_nowait(qos=0)` deficit against RC14 in the closed-loop writer regime, about −24% on this host, is recovered to within −2.5% / −0.8%, inside the noise band of the harness. The `_owned_payload(bytes)` shortcut suggested as a second ablation is not taken: the stated stop rule was parity within ±3–5%, and it is met. The in-repository `lean_native_compare.py` and `lean_native_diagnostics.py` publisher cells use `publish_many()`, whose ready path was already direct-first, so they do not move with this change; the external adapter's `publish_nowait` shape is what `paired_writer_capacity.py` protects. Qualification on `22c56d5`: `ruff`, `mypy`, `bandit`; unit, project, integration (Mosquitto, `MQTTIUM_REQUIRE_BROKER=1`) and resilience suites 1,909 passed; Hypothesis and stateful fuzz suites passed.
+
+## 13. Addendum, 2026-09-15: empty MQTT 5 property tables were instantiated per packet
+
+An external subscriber-only campaign (`sub_exact_telemetry`, Mosquitto translating an MQTT 3.1.1 publisher's QoS 0 PUBLISH to an MQTT 5 subscriber) measured the branch at about 6.2 µs CPU per message on MQTT 5 against about 5.0 µs on MQTT 3.1.1 and about 5.0 µs for RC14 on MQTT 5, with the delivered rate sitting at exactly the CPU ceiling. The review traced the difference to `decode_properties()`: every MQTT 5 PUBLISH and ACK carries a property table, in that workload always the single byte `0x00`, and the fast path built `Properties()` for it on every packet. RC14's `Properties` was a mutable dataclass around a dict; the lean rewrite made it frozen with a `MappingProxyType` over an owned copy (commit `6fd09d8`), a contract improvement kept deliberately, but the empty fast path was never adapted to the new construction cost: dataclass, default dict, `__post_init__`, second dict, proxy and `object.__setattr__`, to represent nothing.
+
+### Change
+
+Commit `bef3457` binds one module-level `_EMPTY_PROPERTIES = Properties()` in `codec/properties.py` and returns it for the empty table. Immutability is what makes the value shareable: `Properties` is frozen, `values` is a read-only proxy, and `encode_properties()` returns `b"\x00"` for an empty table before touching the per-instance encode cache, so no state ever attaches to the shared value. No identity-dependent use of decoded properties exists in `src/` or the tests. The non-empty path, `Properties` mutability, the decoder and the receive pipeline are unchanged; the borrowed direct decoder of RC14 is not restored. `tests/unit/test_properties.py` pins identity across two decodes, immutability of the shared value, the absence of cached state after encoding, and independence of non-empty tables.
+
+### Evidence
+
+Microbenchmark on the cloud host (pinned CPU, medians; RC14 `c194597`, before `a4b79a8`, after `bef3457`; QoS 0 PUBLISH, 256-byte payload; the client row uses the scripted in-process transport with a synchronous `on_message`):
+
+| Stage | RC14 | Before | After |
+| --- | ---: | ---: | ---: |
+| `decode_properties(b"\x00")` | 193–222 ns | 570 ns | **67 ns** |
+| `engine.handle_raw` + `take_effects`, MQTT 3.1.1 | 2,251–2,293 ns | 1,766–1,816 ns | 1,784–1,807 ns |
+| `engine.handle_raw` + `take_effects`, MQTT 5 | 2,407–2,662 ns | 2,573–2,649 ns | **2,014–2,017 ns** |
+| reader → callback, MQTT 3.1.1 | 2,457–2,492 ns | 3,091–3,208 ns | 3,146–3,167 ns |
+| reader → callback, MQTT 5 | 2,845–3,003 ns | 4,327–4,518 ns | **3,345–3,364 ns** |
+
+The MQTT 5 excess over MQTT 3.1.1 on the full client path falls from about 1.3 µs to about 0.2 µs per message (RC14: 0.4–0.5 µs); MQTT 3.1.1 does not move. The engine is now faster than RC14 on both protocols; the remaining client-path gap against RC14 is the callback-reception residual of sections 9 and 11, which is protocol-independent.
+
+`lean_native_compare.py` (self-subscribed client against Mosquitto, QoS 0, memory store, `long` bursts, 3 AB cycles and 1 AA cycle, CPU 2; `props_net_before_after.json` SHA256 prefix `95a4297d`, `props_net_rc14_after.json` `2b6d4748`), CPU per message, candidate over base:
+
+| Cell | Before → after | RC14 → after |
+| --- | ---: | ---: |
+| MQTT 3.1.1 callback | 1.003 | 1.278 |
+| MQTT 3.1.1 iterator | 0.990 | 1.017 |
+| MQTT 5 callback | **0.889** | 1.240 |
+| MQTT 5 iterator | 0.967 | 1.053 |
+
+On this host the delivered-rate metric of that harness is not usable for the cells: its A/A control cycles ranged from 0.92 to 1.30, so only the CPU-per-message column, whose base CVs are 0.6–3% except for one cell, is reported. After the change the MQTT 5 cells cost the same relative to RC14 as their MQTT 3.1.1 counterparts, which is the expected shape once the protocol-specific allocation is gone.
+
+### Position
+
+The MQTT 5 reception deficit relative to MQTT 3.1.1 on this branch is explained by one avoidable allocation per packet and is closed by a shared immutable value that the frozen `Properties` contract makes safe. A non-empty table still decodes about 5–7% slower than on RC14 because of the owned copy and the proxy; that is the price of the immutability contract, on a far less frequent case, and is not revisited here. The receive-pipeline position of section 11 is unchanged.
