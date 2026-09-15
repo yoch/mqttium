@@ -1,10 +1,9 @@
 """Paired delivery micro/profiling probe across RC14 and the current source tree.
 
 The existing ``delivery_*`` microbenchmarks are component probes, not network
-benchmarks. This script decomposes them further and, for iterator delivery,
-separates the historical benchmark-consumer bookkeeping from the actual
-``messages()`` consumption shape. Wall timings are collected without a profiler;
-cProfile is used only for call attribution and call counts.
+benchmarks. This script decomposes them further and measures iterator delivery
+with the actual production consumption shape. Wall timings are collected without
+a profiler; cProfile is used only for call attribution and call counts.
 """
 
 from __future__ import annotations
@@ -34,14 +33,11 @@ SCENARIOS = (
     # Adds the EffectPump / delivery-lane layer and therefore better approximates
     # the application-delivery slice of the reader path.
     "effect_callback",
-    # Reproduces paired_regression's historical iterator consumer, including a
-    # candidate-only task_done() call that production messages() does not make.
-    "handoff_iterator_unbounded_benchmark",
-    # Same handoff, but consume exactly like the public iterator: get + release,
-    # no task_done().
+    # Public iterator consumption. Unbounded mode should use each source's
+    # unaccounted queue representation; bounded mode keeps exact byte accounting.
     "handoff_iterator_unbounded_production",
     "handoff_iterator_bounded_production",
-    # Effect-level iterator probes with production-like consumption.
+    # Effect-level iterator probes with the same production-like consumption.
     "effect_iterator_unbounded_production",
     "effect_iterator_bounded_production",
 )
@@ -52,12 +48,11 @@ def _pin(cpu: int | None) -> None:
         os.sched_setaffinity(0, {cpu})
 
 
-def _scenario_shape(scenario: str) -> tuple[str, bool, bool, bool]:
+def _scenario_shape(scenario: str) -> tuple[str, bool, bool]:
     mode = "callback" if "callback" in scenario else "iterator"
     bounded = "_bounded_" in scenario
     use_engine_effect = scenario.startswith("effect_")
-    benchmark_task_done = scenario == "handoff_iterator_unbounded_benchmark"
-    return mode, bounded, use_engine_effect, benchmark_task_done
+    return mode, bounded, use_engine_effect
 
 
 def _make_client(*, mode: str, bounded: bool) -> Any:
@@ -96,27 +91,28 @@ async def _apply_delivery_effect_compat(client: Any, effect: Any) -> None:
     await client._apply_effect(effect, nowait=False, epoch=client._connection_epoch)
 
 
-def _consume_iterator_message(client: Any, *, benchmark_task_done: bool) -> None:
-    """Consume one iterator item using either benchmark or production semantics."""
+def _consume_iterator_message(client: Any) -> None:
+    """Consume one iterator item with the source's production representation."""
     delivery = client._delivery
-    queue = delivery.messages_queue
-    item = queue.get_nowait()
+    item = delivery.messages_queue.get_nowait()
+
     release_nowait = getattr(delivery, "release_nowait", None)
     if release_nowait is not None:
-        # RC14: bare Message on its small/unaccounted path and (Message, token)
-        # when exact accounting is used. _DeliveryQueue intentionally has no
-        # join/task_done bookkeeping.
+        # RC14: unaccounted mode stores a bare Message; accounted mode stores
+        # (Message, token). Its _DeliveryQueue deliberately has no join/task_done
+        # bookkeeping.
         if isinstance(item, tuple):
             _message, token = item
             release_nowait(token)
         return
 
-    # Current source: iterator entries are always (Message, logical_size).
-    _message, size = item
-    if benchmark_task_done:
-        # paired_regression historically does this, but public messages() does not.
-        queue.task_done()
-    delivery.release(size)
+    # Current source follows the same shape after restoring the unaccounted
+    # fast path: a bare Message when max_iterator_bytes=None, otherwise
+    # (Message, logical_size). Neither public messages() implementation calls
+    # task_done().
+    if isinstance(item, tuple):
+        _message, size = item
+        delivery.release(size)
 
 
 async def _drain_effect_compat(client: Any) -> None:
@@ -139,7 +135,7 @@ async def _exercise(scenario: str, operations: int) -> None:
     from mqttium.protocol.effects import EffectKind, EngineEffect
     from mqttium.types import Message
 
-    mode, bounded, use_engine_effect, benchmark_task_done = _scenario_shape(scenario)
+    mode, bounded, use_engine_effect = _scenario_shape(scenario)
     client = _make_client(mode=mode, bounded=bounded)
     message = Message(topic=TOPIC, payload=MESSAGE_PAYLOAD)
     effect = EngineEffect(EffectKind.MESSAGE, message)
@@ -152,7 +148,7 @@ async def _exercise(scenario: str, operations: int) -> None:
             else:
                 await _apply_delivery_effect_compat(client, effect)
             if mode == "iterator":
-                _consume_iterator_message(client, benchmark_task_done=benchmark_task_done)
+                _consume_iterator_message(client)
         if mode == "callback":
             await _finish_callbacks(client)
     finally:
