@@ -334,6 +334,45 @@ async def _finish_callbacks(client: Any) -> None:
         await shutdown(drain=False)
 
 
+async def _apply_delivery_effect_compat(client: Any, effect: Any) -> None:
+    """Apply one delivery effect through the private seam each source exposes."""
+    apply_delivery = getattr(client, "_apply_delivery_effect", None)
+    if apply_delivery is not None:
+        pending = apply_delivery(effect, client._connection_epoch)
+        if pending is not None:
+            await pending
+        return
+    await client._apply_effect(effect, nowait=False, epoch=client._connection_epoch)
+
+
+def _consume_iterator_message(client: Any) -> None:
+    """Consume one iterator delivery from the queue layout owned by the source."""
+    queue = getattr(client._delivery, "messages_queue", None)
+    if queue is None:
+        client._messages.get_nowait()
+        return
+    _message, size = queue.get_nowait()
+    queue.task_done()
+    client._delivery.release(size)
+
+
+async def _drain_single_message_effect(client: Any) -> None:
+    """Drain a synthetic message through either the RC14 or current effect pipeline."""
+    collect = getattr(client, "_collect_effects_locked", None)
+    if collect is not None:
+        collect()
+    else:
+        client._effect_pump.collect_from_engine()
+    drain = getattr(client, "_drain_effects", None)
+    if drain is not None:
+        await drain()
+    else:
+        await client._effect_pump.drain()
+    lane = getattr(client, "_delivery_lane", None)
+    if lane is not None:
+        await lane.drain()
+
+
 def _delivery(scenario: str) -> ScenarioMeasurement:
     from mqttium.api import AsyncClient
     from mqttium.protocol.effects import EffectKind, EngineEffect
@@ -362,13 +401,9 @@ def _delivery(scenario: str) -> ScenarioMeasurement:
         for index in range(warmup + operations):
             if index == warmup:
                 started = time.perf_counter()
-            pending = client._apply_delivery_effect(effect, client._connection_epoch)
-            if pending is not None:
-                await pending
+            await _apply_delivery_effect_compat(client, effect)
             if mode == "iterator":
-                _message, size = client._delivery.messages_queue.get_nowait()
-                client._delivery.messages_queue.task_done()
-                client._delivery.release(size)
+                _consume_iterator_message(client)
         if mode == "callback":
             queue = getattr(client._delivery, "callback_queue", None)
             if queue is not None:
@@ -408,9 +443,7 @@ def _single_message_effect(_scenario: str) -> ScenarioMeasurement:
                 message,
                 requires_delivery_mark=False,
             )
-            client._effect_pump.collect_from_engine()
-            await client._effect_pump.drain()
-            await client._delivery_lane.drain()
+            await _drain_single_message_effect(client)
         queue = getattr(client._delivery, "callback_queue", None)
         if queue is not None:
             await queue.join()
