@@ -112,10 +112,7 @@ class ApplicationDelivery:
                 if self.protocol == MQTTProtocolVersion.MQTTv5 and message.properties
                 else 0
             )
-        topic_bytes = (
-            len(message.topic) if message.topic.isascii() else len(message.topic.encode("utf-8"))
-        )
-        return len(message.payload) + topic_bytes + property_wire_size
+        return len(message.payload) + len(message.topic.encode("utf-8")) + property_wire_size
 
     def _wake_waiters(self) -> None:
         if self.waiters:
