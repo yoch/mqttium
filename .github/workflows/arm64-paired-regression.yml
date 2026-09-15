@@ -30,7 +30,7 @@ concurrency:
 
 jobs:
   paired:
-    if: inputs.confirm_trusted_code && github.ref == 'refs/heads/main'
+    if: inputs.confirm_trusted_code && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/codex/lean-native-experiment')
     runs-on: [self-hosted, linux, ARM64]
     timeout-minutes: 90
     env:
@@ -41,7 +41,7 @@ jobs:
       - name: Check out benchmark harness
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: main
+          ref: ${{ inputs.candidate_ref }}
           path: harness
           persist-credentials: false
       - name: Set run-specific workspace
