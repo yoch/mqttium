@@ -62,9 +62,9 @@ clock access, or user callbacks into `protocol/`.
   lifecycle hooks after their triggering protocol transition and transport
   cleanup.
 
-This is the incompatible lean-native experiment. Paho and one-shot helpers
-are removed. Native APIs and the two supplied stores are the supported
-experimental surface; engine, codecs and extension protocols are Internal.
+This is the current pre-v1 native API. Paho and one-shot helpers are removed.
+Native APIs and the two supplied stores are the supported surface; engine,
+codecs and extension protocols are Internal.
 
 ## Load-bearing invariants
 
@@ -114,7 +114,7 @@ pump `continue_inbound_replay()` while replay remains pending.
 conditional metadata transitions. Both stores guarantee atomic mutation.
 `batch()` groups writes: SQLite uses a transaction, memory a no-op context.
 The engine owns per-publication rollback, not an application transaction.
-Schema 5 only accepts fresh or current experimental databases; historical and
+Schema 5 only accepts fresh or current schema-5 databases; historical and
 future formats are refused before write-affecting pragmas.
 
 SQLite schema changes are transactional and versioned with
@@ -146,7 +146,7 @@ evidence justifies a change:
 
 ## API and documentation contracts
 
-This branch revises the pre-v1 Stable API deliberately. Its experimental native
+The current pre-v1 native API deliberately revises the `1.0.0rc14` surface. Its
 contract is defined by the API stability document, not importability or
 `__all__`. The general project tier definitions are:
 
