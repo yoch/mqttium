@@ -1053,7 +1053,10 @@ class AsyncClient:
         elif owner_loop is not loop:
             raise RuntimeError("AsyncClient is bound to a different event loop")
         data = _owned_payload(payload)
-        prepared = self._check_nowait_publish_capacity(topic, data, qos, retain, properties)
+        # Ready QoS 0 goes to the writer first: it validates and encodes the
+        # real frame once and lets the writer admit its exact size. The
+        # generic preflight below previewed that size a second time on this
+        # path; it remains for QoS 1/2 and for QoS 0 the direct path declines.
         if qos == QoS.AT_MOST_ONCE:
             direct = self._try_direct_qos0_publish(
                 topic, data, retain=retain, properties=properties, nowait=True
@@ -1061,6 +1064,7 @@ class AsyncClient:
             if direct is not False:
                 assert direct is not True
                 return direct
+        prepared = self._check_nowait_publish_capacity(topic, data, qos, retain, properties)
         receipt = self._commit_publish(
             topic,
             data,

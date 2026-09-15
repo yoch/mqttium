@@ -65,6 +65,47 @@ async def test_publish_nowait_receipts_use_direct_writer_admission() -> None:
     assert client._delivery.callback_invocations == 0
 
 
+@pytest.mark.parametrize("protocol", [MQTTProtocolVersion.MQTTv311, MQTTProtocolVersion.MQTTv5])
+async def test_ready_qos0_nowait_skips_the_generic_preflight(
+    protocol: MQTTProtocolVersion, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The direct QoS 0 path encodes the frame once and lets the writer admit
+    its exact size; sizing the same PUBLISH a second time in the generic
+    preflight was the historical hot-path regression against the reference."""
+    client = AsyncClient(protocol=protocol, max_write_queue_messages=64)
+    client._engine.state = ConnectionState.CONNECTED
+
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("ready QoS 0 publish_nowait() must not run the generic preflight")
+
+    monkeypatch.setattr(client, "_check_nowait_publish_capacity", forbidden)
+    monkeypatch.setattr(client, "_preview_publish_size", forbidden)
+    # The first frame finds an empty writer; the second finds a resident frame,
+    # which is the regime where the preflight used to size the PUBLISH again.
+    for index in range(2):
+        receipt = client.publish_nowait("native/qos0-direct", b"x" * 256, qos=0)
+        assert receipt.is_done()
+        assert client.stats().writer.queued_messages == index + 1
+    # QoS 1 and a declined QoS 0 still take the generic path.
+    monkeypatch.undo()
+    receipt = client.publish_nowait("native/qos1-generic", b"x", qos=1)
+    assert receipt.mid is not None
+
+
+async def test_qos0_nowait_writer_refusal_validates_the_frame_first() -> None:
+    client = AsyncClient(max_write_queue_messages=1, max_write_queue_bytes=1024)
+    client._engine.state = ConnectionState.CONNECTED
+    client.publish_nowait("native/qos0-full", b"first", qos=0)
+    with pytest.raises(FlowControlError, match="max_write_queue_messages=1"):
+        client.publish_nowait("native/qos0-full", b"second", qos=0)
+    # An invalid frame is reported as such even when the writer is full: the
+    # direct path validates before asking the writer, so refusal never masks
+    # a request the client could never send.
+    with pytest.raises(ProtocolError):
+        client.publish_nowait("native/#", b"wildcard", qos=0)
+    assert client.stats().writer.queued_messages == 1
+
+
 async def test_qos0_receipt_marks_writer_admission_not_transport_drain() -> None:
     client = AsyncClient(max_write_queue_messages=1, max_write_queue_bytes=1024)
     client._engine.state = ConnectionState.CONNECTED
