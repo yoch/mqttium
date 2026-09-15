@@ -412,28 +412,6 @@ class OutboundSession:
             wire_size,
         )
 
-    def _prepare_qos0_validated(
-        self,
-        topic: str,
-        payload: bytes,
-        *,
-        retain: bool,
-        properties: Properties | None,
-        topic_bytes: bytes,
-    ) -> WriteItem:
-        item = self._encode_publish(
-            topic,
-            payload,
-            qos=QoS.AT_MOST_ONCE,
-            retain=retain,
-            dup=False,
-            mid=None,
-            properties=properties,
-            _topic_bytes=topic_bytes,
-        )
-        self._engine._check_outbound_size(item)
-        return item
-
     def prepare_qos0(
         self,
         topic: str,

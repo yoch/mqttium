@@ -192,15 +192,6 @@ class ProtocolEngine:
         """
         return self._pending_sub_requests.keys()
 
-    def can_ever_admit_publish(
-        self,
-        topic: str,
-        payload: bytes,
-        qos: QoS | int,
-        properties: Properties | None = None,
-    ) -> bool:
-        return self.outbound.can_ever_admit(topic, payload, qos, properties)
-
     def _emit(
         self,
         kind: EffectKind,

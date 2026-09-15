@@ -1990,11 +1990,6 @@ class AsyncClient:
         if unsub_fut is not None and not unsub_fut.done():
             unsub_fut.set_result(unsub_result)
 
-    async def _flush_effects(self) -> None:
-        async with self._engine_lock:
-            self._effect_pump.collect_from_engine()
-        await self._effect_pump.drain()
-
     async def _apply_effect(  # noqa: C901 -- reduced from 44; remaining branches own lifecycle
         self,
         effect: EngineEffect,

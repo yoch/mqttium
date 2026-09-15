@@ -187,7 +187,6 @@ class InboundSession:
         return mids, pending_bytes, session_state_qos2, tuple(recovered_qos1)
 
     # --- lifecycle ---------------------------------------------------------
-    # --- lifecycle ---------------------------------------------------------
 
     def start_connection(self, *, receive_maximum: int, topic_alias_maximum: int) -> None:
         """Reset state scoped to one network connection before CONNECT."""
@@ -297,7 +296,6 @@ class InboundSession:
             object.__setattr__(message, "_ack_token", token)
         return message
 
-    # --- packet handlers ---------------------------------------------------
     # --- packet handlers ---------------------------------------------------
 
     def _on_publish_v311(self, raw: RawPacket) -> None:
@@ -643,7 +641,6 @@ class InboundSession:
         self._release_slot(logical_size)
 
     # --- application acknowledgement and replay ---------------------------
-    # --- application acknowledgement and replay ---------------------------
 
     def mark_delivered(self, mid: int) -> None:
         if self._stored_inbound:
@@ -818,20 +815,6 @@ class InboundSession:
         if message.logical_size <= 0:
             raise ValueError("Persisted inbound logical_size must be positive")
         return message.logical_size
-
-    def _validate_slot_capacity(self, logical_size: int | None = None) -> None:
-        """Validate Receive Maximum/quota without reserving anything."""
-        if self._inflight >= self._receive_maximum:
-            self._protocol_disconnect(0x93)
-            raise ProtocolError("Receive Maximum exceeded")
-        byte_limit = self.config.max_inbound_inflight_bytes
-        if (
-            logical_size is not None
-            and byte_limit is not None
-            and self._pending_bytes + logical_size > byte_limit
-        ):
-            self._protocol_disconnect(0x97)
-            raise ProtocolError("Pending inbound byte limit reached")
 
     def _acquire_slot(self, logical_size: int | None = None) -> None:
         receive_maximum = self._receive_maximum
