@@ -347,13 +347,23 @@ async def _apply_delivery_effect_compat(client: Any, effect: Any) -> None:
 
 def _consume_iterator_message(client: Any) -> None:
     """Consume one iterator delivery from the queue layout owned by the source."""
-    queue = getattr(client._delivery, "messages_queue", None)
-    if queue is None:
-        client._messages.get_nowait()
+    delivery = client._delivery
+    queue = delivery.messages_queue
+    item = queue.get_nowait()
+    release_nowait = getattr(delivery, "release_nowait", None)
+    if release_nowait is not None:
+        # RC14 stores small/unaccounted deliveries as bare Message objects and
+        # accounted deliveries as (Message, token). Its _DeliveryQueue also
+        # deliberately skips asyncio.Queue join()/task_done bookkeeping.
+        if isinstance(item, tuple):
+            _message, token = item
+            release_nowait(token)
         return
-    _message, size = queue.get_nowait()
+    # The current iterator queue always owns (Message, logical_size) entries
+    # and uses a normal asyncio.Queue, so release both queue and byte capacity.
+    _message, size = item
     queue.task_done()
-    client._delivery.release(size)
+    delivery.release(size)
 
 
 async def _drain_single_message_effect(client: Any) -> None:
