@@ -63,14 +63,21 @@ an asyncio simulator. Each seed builds a short operation history and runs it
 through the real `AsyncClient`, `WritePump`, `EffectPump`, and
 `ApplicationDelivery`. Its only fake is a packet-aware transport/broker with an
 ingress queue and explicit gates for transport writes/close, reconnect factory,
-callbacks, and test-wrapped effect application. There are no production
+application-owned callback work, and test-wrapped effect application. There are no production
 scheduling hooks and no changes to runtime hot paths.
+
+Message callbacks are synchronous. Historical `callback_*` operation labels
+remain stable for trace replay, but suspension and lifecycle-reentry gates now
+belong to an explicit application task retained by the test after the sync
+callback schedules it. They do not imply that MQTTium awaits an async message
+callback. Message-invocation failure isolation and async `on_disconnect` hooks
+remain distinct coverage surfaces.
 
 The original three ownership motifs remain fixed regression anchors:
 
 - writer admission while an active write fails and the reader is admitting a
   mandatory PUBACK;
-- callback self-cancellation while the callback worker owns later delivery;
+- callback-originated application-task cancellation while later delivery remains owned;
 - terminal EOF followed by an explicit replacement connection.
 
 A state-aware grammar now spends every `--steps` entry. From the current model
@@ -80,8 +87,8 @@ families:
 
 - automatic reconnect with successful, failed, or blocked factories, including
   disconnect and explicit takeover while the factory owns the lifecycle lock;
-- blocked callback delivery, release ordering, callback disconnect/connect,
-  and cancellation of an application lifecycle operation;
+- blocked application work scheduled by a sync callback, release ordering,
+  disconnect/connect from that work, and cancellation of a lifecycle operation;
 - blocked EffectPump application, concurrent drains, injected failure, and an
   effect collected while the failing close is deliberately held.
 
@@ -116,7 +123,7 @@ inside the test harness only:
 - writer failure advances its epoch without waking admission waiters;
 - connection setup/teardown does not invalidate the epoch;
 - an applied effect does not advance its settlement target;
-- callback self-cancellation terminates the callback worker;
+- message-invocation cancellation incorrectly terminates the delivering reader;
 - an effect collected during the failing-close window is not settled;
 - an automatically established connection defeats an already-waiting explicit
   user takeover.
@@ -166,7 +173,7 @@ real application publisher behind saturated outbound admission and qualify ACK
 release, cancellation, terminal teardown, and reconnect ownership transition.
 
 Four more families compose pressure separately with reader teardown, reconnect
-factory, callback worker, and EffectPump ownership. An overlap counts only
+factory, inline callback delivery, and EffectPump ownership. An overlap counts only
 while both owners are observable at the same checkpoint. Campaign coverage is
 mandatory by default and requires a `write_many` call carrying at least four
 PUBLISH frames, rather than mono-frame capability use or an unrelated control

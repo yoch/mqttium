@@ -589,16 +589,16 @@ class _RuntimeHarness:
             "client_id": f"runtime-fuzz-{self.schedule.seed}",
             "protocol": MQTTProtocolVersion.MQTTv5,
             "reconnect": ReconnectPolicy(
-                enabled=self.schedule.auto_reconnect,
                 initial_delay=0,
                 max_delay=0,
                 max_retries=3,
                 stable_after=0.05,
-                connect_timeout=self.connect_timeout_seconds,
-            ),
-            "max_outbound_messages": 1,
-            "max_outbound_bytes": 4096,
-            "max_pending_callbacks": 4,
+            )
+            if self.schedule.auto_reconnect
+            else None,
+            "connect_timeout": self.connect_timeout_seconds,
+            "max_write_queue_messages": 1,
+            "max_write_queue_bytes": 4096,
             "message_delivery": "callback",
             "keepalive": 0,
         }
@@ -630,24 +630,39 @@ class _RuntimeHarness:
         self.transports.append(transport)
         return transport
 
-    async def _on_message(self, _message: object) -> None:
+    def _on_message(self, _message: object) -> None:
         self.callback_attempted += 1
         self.callback_epoch = self.client._connection_epoch
-        if self.block_callback_once:
-            self.block_callback_once = False
-            self.callback_entered.set()
-            await self.callback_gate.wait()
         if self.cancel_callback_once:
             self.cancel_callback_once = False
             raise asyncio.CancelledError("runtime fuzzer callback self-cancellation")
         if self.raise_callback_once:
             self.raise_callback_once = False
             raise RuntimeError("runtime fuzzer callback failure")
-        if self.disconnect_callback_once:
-            self.disconnect_callback_once = False
+        block = self.block_callback_once
+        disconnect = self.disconnect_callback_once
+        connect = self.connect_callback_once
+        self.block_callback_once = False
+        self.disconnect_callback_once = False
+        self.connect_callback_once = False
+        if block or disconnect or connect:
+            # Only an explicit schedule action starts async application work.
+            # Ordinary messages remain synchronous; the harness retains and
+            # checks this task using the same oracle as other app operations.
+            self._spawn_application_task(
+                self._message_application_work(block=block, disconnect=disconnect, connect=connect),
+                label="callback-application",
+            )
+
+    async def _message_application_work(
+        self, *, block: bool, disconnect: bool, connect: bool
+    ) -> None:
+        if block:
+            self.callback_entered.set()
+            await self.callback_gate.wait()
+        if disconnect:
             await self.client.disconnect()
-        if self.connect_callback_once:
-            self.connect_callback_once = False
+        if connect:
             await self.client.connect("runtime.invalid", timeout=self.connect_timeout_seconds)
 
     async def _on_disconnect(self, _error: BaseException | None) -> None:
@@ -959,7 +974,7 @@ class _RuntimeHarness:
             self.fail_effect_once = True
         elif (actor, action) == ("effect", "drain_failure"):
             self._spawn_application_task(
-                self.client._drain_effects(),
+                self.client._effect_pump.drain(),
                 label="effect-drain",
                 expected_exceptions=(RuntimeError,),
             )
@@ -971,7 +986,7 @@ class _RuntimeHarness:
                         encode_frame(PacketType.PINGREQ, 0, b""),
                     )
                 )
-                self.client._collect_effects_locked()
+                self.client._effect_pump.collect_from_engine()
         elif actor == "checkpoint":
             await self._checkpoint(action, value)
         else:
@@ -1055,7 +1070,11 @@ class _RuntimeHarness:
             )
         elif action == "callbacks_drained":
             await self._wait_until(
-                lambda: self.client.stats().delivery.callback_queued == 0,
+                lambda: all(
+                    tracked.task.done()
+                    for tracked in self.tasks
+                    if tracked.label == "callback-application"
+                ),
                 "callback queue did not drain",
             )
             if self.callback_attempted != self.callback_expected:
@@ -1067,7 +1086,8 @@ class _RuntimeHarness:
             await self._wait_until(
                 lambda: (
                     self.client.stats().state is ConnectionState.DISCONNECTED
-                    and not any(asdict(self.client.stats().tasks).values())
+                    and not any(self.client._running_tasks().values())
+                    and self.client._lifecycle_hooks.task is None
                 ),
                 "terminal teardown did not settle",
             )
@@ -1102,34 +1122,35 @@ class _RuntimeHarness:
         if writer_task is not None and writer_task.done():
             assert stats.writer.waiters == 0, "writer admission waiter survived a dead writer"
 
-        assert stats.effects.applied <= stats.effects.enqueued, (
+        effects = self.client._effect_pump.counters()
+        assert effects["applied"] <= effects["enqueued"], (
             "effect pump applied more effects than it enqueued"
         )
-        assert stats.effects.pending == stats.effects.enqueued - stats.effects.applied, (
+        assert effects["pending"] == effects["enqueued"] - effects["applied"], (
             "effect pump settlement counters cannot reach their drain target"
         )
         if self.client._effect_pump._failing_close:
-            assert stats.effects.pending == 0, (
+            assert effects["pending"] == 0, (
                 "effect collected during failing-close was left without an owner"
             )
 
         outbound = stats.outbound
-        assert 0 <= outbound.flow_inflight <= outbound.flow_limit
-        assert outbound.queued_messages + outbound.flow_inflight <= outbound.pending_messages
-        assert outbound.packet_ids_in_use == outbound.pending_messages
+        assert 0 <= outbound.inflight <= outbound.inflight_limit
+        assert outbound.awaiting_slot + outbound.inflight <= outbound.unacknowledged_messages
+        assert outbound.packet_ids_in_use == outbound.unacknowledged_messages
         if not self.client._teardown_final:
             # Receipts mirror unfinished engine records only until terminal
             # teardown fails them; durable session records legitimately
             # outlive their receipts so a present session can be resumed.
-            assert stats.receipts.publish == outbound.pending_messages, (
+            assert stats.receipts.publish == outbound.unacknowledged_messages, (
                 "publish receipts diverged from unfinished engine records"
             )
-        assert 0 <= stats.inbound.inflight <= stats.inbound.receive_maximum
-        assert stats.delivery.pending_bytes >= 0
-        callback_task = self.client._callback_worker_task
+        assert 0 <= stats.inbound.inflight <= stats.inbound.inflight_limit
+        assert stats.delivery.iterator_bytes >= 0
         if self.callback_epoch == stats.connection_epoch and self.client.is_connected:
-            assert callback_task is not None and not callback_task.done(), (
-                "callback self-cancellation terminated the connection callback worker"
+            reader = self.client._reader_task
+            assert reader is not None and not reader.done(), (
+                "callback self-cancellation terminated the delivering reader"
             )
 
         if self.transports:
@@ -1154,15 +1175,25 @@ class _RuntimeHarness:
                     f"expected={target} observed={observed}"
                 )
             assert stats.writer.waiters == 0, "writer waiter survived terminal teardown"
-            assert stats.effects.waiters == 0, "effect drain waiter survived terminal teardown"
+            assert effects["waiters"] == 0, "effect drain waiter survived terminal teardown"
             assert stats.delivery.waiters == 0, "delivery waiter survived terminal teardown"
             assert stats.receipts.publish_waiters == 0, "publish waiter survived terminal teardown"
             assert pump.resident_messages == 0, "writer retained a message after teardown"
             assert stats.writer.queued_bytes == 0, "writer retained bytes after teardown"
-            assert stats.effects.pending == 0, "effect survived terminal teardown"
+            assert effects["pending"] == 0, "effect survived terminal teardown"
+            assert self.client._delivery_lane.pending_count == 0, (
+                "reader delivery effect survived terminal teardown"
+            )
+            assert stats.delivery.iterator_bytes == 0, "message bytes survived terminal teardown"
             assert stats.receipts.publish == 0, "publish receipt survived terminal teardown"
-            assert not any(asdict(stats.tasks).values()), (
+            assert not any(self.client._running_tasks().values()), (
                 "connection-scoped task survived terminal teardown"
+            )
+            assert self.client._lifecycle_hooks.task is None, (
+                "lifecycle notification owner survived terminal teardown"
+            )
+            assert self.client._lifecycle_hooks.hook_task is None, (
+                "lifecycle hook survived terminal teardown"
             )
             if self.transports:
                 assert stats.connection_epoch > self.transport.owner_epoch, (
@@ -1173,8 +1204,19 @@ class _RuntimeHarness:
         stats = asdict(self.client.stats())
         stats["state"] = self.client.stats().state.name
         stats["writer"].pop("last_outbound", None)
+        stats["tasks"] = self.client._running_tasks()
         return {
             "client": stats,
+            "delivery_lane": {
+                "pending": self.client._delivery_lane.pending_count,
+                "enqueued": self.client._delivery_lane.enqueued,
+                "applied": self.client._delivery_lane.applied,
+            },
+            "lifecycle": {
+                "supervisor_active": self.client._lifecycle_hooks.task is not None,
+                "hook_active": self.client._lifecycle_hooks.hook_task is not None,
+                "notification_pending": self.client._lifecycle_hooks.pending is not None,
+            },
             "writer": {
                 "epoch": self.client._write_pump.epoch,
                 "resident_messages": self.client._write_pump.resident_messages,
@@ -1185,6 +1227,7 @@ class _RuntimeHarness:
                 ),
             },
             "effects": {
+                **self.client._effect_pump.counters(),
                 "pending_epoch": self.client._effect_pump.pending_epoch,
                 "failing_close": self.client._effect_pump._failing_close,
                 "failure_owner": type(self.client._effect_pump.error).__name__
@@ -1210,6 +1253,8 @@ class _RuntimeHarness:
             "callbacks": {
                 "expected": self.callback_expected,
                 "attempted": self.callback_attempted,
+                "delivery": "synchronous",
+                "suspending_work": "explicit retained application task",
             },
             "factory": {
                 "attempts": self.factory_attempts,
@@ -1271,7 +1316,8 @@ class _RuntimeHarness:
                 self.client._reconnect_task,
                 self.client._effect_pump.task,
                 self.client._write_pump.task,
-                self.client._callback_worker_task,
+                self.client._lifecycle_hooks.task,
+                self.client._lifecycle_hooks.hook_task,
             )
             if task is not None and task is not asyncio.current_task()
         }

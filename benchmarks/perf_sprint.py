@@ -198,13 +198,11 @@ def track_B_ingress() -> list[Sample]:
 
 
 async def _e2e_pub(qos: int, count: int, payload: bytes, *, outbound_window: int = 20) -> float:
-    from mqttium.protocol.reconnect import ReconnectPolicy
-
     client = AsyncClient(
         client_id=f"sprint-q{qos}-w{outbound_window}-{time.time_ns() % 1_000_000}",
-        local_receive_maximum=100,
+        max_inbound_inflight=100,
         max_outbound_inflight=outbound_window,
-        reconnect=ReconnectPolicy(enabled=False),
+        reconnect=None,
     )
     await client.connect(*BROKER)
     try:

@@ -151,9 +151,11 @@ def _mutate(rng: random.Random, data: bytes) -> bytes:
 def fuzz_codec(rng: random.Random, iterations: int, logger: FuzzLogger | None = None) -> FuzzResult:
     result = FuzzResult("codec", iterations, 0, 0)
     base_props = Properties()
-    base_props.set("payload_format_indicator", 1)
-    base_props.set("content_type", "text/plain")
-    base_props.add_user_property("k", "v")
+    base_props = Properties({**base_props.values, "payload_format_indicator": 1})
+    base_props = Properties({**base_props.values, "content_type": "text/plain"})
+    base_props = Properties(
+        {**base_props.values, "user_property": (*base_props.get("user_property", ()), ("k", "v"))}
+    )
     base_wire = encode_properties(base_props, PUBLISH)
     base_pub = PublishPacket(
         topic="a/b", payload=b"hello", qos=QoS.AT_LEAST_ONCE, retain=False, dup=False, mid=7
@@ -245,7 +247,7 @@ def _rand_publish_frame(rng: random.Random, proto: MQTTProtocolVersion) -> bytes
     if proto == MQTTProtocolVersion.MQTTv5 and rng.random() < 0.3:
         props = Properties()
         if rng.random() < 0.5:
-            props.set("topic_alias", rng.randrange(0, 3))
+            props = Properties({**props.values, "topic_alias": rng.randrange(0, 3)})
     pkt = PublishPacket(
         topic=topic,
         payload=bytes(rng.randrange(256) for _ in range(rng.randrange(0, 16))),
@@ -272,13 +274,20 @@ def fuzz_engine(  # noqa: C901
         connect_properties = Properties()
         if rng.random() < 0.5:
             auth_method = "fuzz-auth"
-            connect_properties.set("authentication_method", auth_method)
+            connect_properties = Properties(
+                {**connect_properties.values, "authentication_method": auth_method}
+            )
+    # Drawn for every protocol so a seed replays the same stream; MQTT 3.1.1
+    # refuses a non-zero alias maximum at configuration time.
+    topic_alias_maximum = rng.choice([0, 2])
+    if proto is not MQTTProtocolVersion.MQTTv5:
+        topic_alias_maximum = 0
     engine = ProtocolEngine(
         EngineConfig(
             client_id="fuzz",
             protocol=proto,
-            local_receive_maximum=rng.choice([1, 4, 100]),
-            topic_alias_maximum=rng.choice([0, 2]),
+            max_inbound_inflight=rng.choice([1, 4, 100]),
+            topic_alias_maximum=topic_alias_maximum,
             manual_ack=bool(rng.random() < 0.5),
             connect_properties=connect_properties,
             accept_auth=auth_method is not None,
@@ -316,9 +325,11 @@ def fuzz_engine(  # noqa: C901
                 body = bytes([rng.randrange(2), rng.choice([0, 0, 0, 5, 135])])
                 if proto == MQTTProtocolVersion.MQTTv5:
                     properties = Properties()
-                    properties.set("topic_alias_maximum", 2)
+                    properties = Properties({**properties.values, "topic_alias_maximum": 2})
                     if auth_method is not None:
-                        properties.set("authentication_method", auth_method)
+                        properties = Properties(
+                            {**properties.values, "authentication_method": auth_method}
+                        )
                     body += encode_properties(properties, CONNACK)
                 feed(encode_frame(PacketType.CONNACK, 0, body))
             elif op in (1, 2, 3):
@@ -391,7 +402,9 @@ def fuzz_engine(  # noqa: C901
             else:
                 if proto is MQTTProtocolVersion.MQTTv5 and rng.random() < 0.7:
                     properties = Properties()
-                    properties.set("topic_alias", rng.randrange(0, 4))
+                    properties = Properties(
+                        {**properties.values, "topic_alias": rng.randrange(0, 4)}
+                    )
                     engine.queue_publish(
                         rng.choice(["", "alias/a", "alias/b"]),
                         b"alias-payload",
@@ -405,9 +418,13 @@ def fuzz_engine(  # noqa: C901
                         engine.take_effects()
                     else:
                         properties = Properties()
-                        properties.set(
-                            "authentication_method",
-                            auth_method if rng.random() < 0.8 else "wrong-method",
+                        properties = Properties(
+                            {
+                                **properties.values,
+                                "authentication_method": auth_method
+                                if rng.random() < 0.8
+                                else "wrong-method",
+                            }
                         )
                         reason = rng.choice([0x00, 0x18, 0x19])
                         feed(AuthPacket(reason_code=reason, properties=properties).encode(proto))
@@ -452,12 +469,22 @@ def _check_engine_invariants(engine: ProtocolEngine) -> None:
         for page in engine.store.out_summary_pages()
         for summary in page
     )
-    assert all(message.topic for message in outbound), "durable alias record lost canonical topic"
+    # Only records still in their PUBLISH phase carry application data: the
+    # store compacts topic, payload and properties away once PUBREC arrives,
+    # because a PUBREL replay needs the packet identifier alone.
+    publish_phase = (
+        OutboundQoSState.QUEUED,
+        OutboundQoSState.WAIT_PUBACK,
+        OutboundQoSState.WAIT_PUBREC,
+    )
+    assert all(message.topic for message in outbound if message.state in publish_phase), (
+        "durable alias record lost canonical topic"
+    )
     outbound_mids = {msg.mid for msg in outbound}
     expected_mids = outbound_mids | set(engine._pending_sub_mids)
-    actual_mids = set(engine.packet_ids._used)
-    assert actual_mids == expected_mids, (
-        f"packet-id mismatch: actual={sorted(actual_mids)} expected={sorted(expected_mids)}"
+    assert len(engine.packet_ids) == len(expected_mids), "packet-id count mismatch"
+    assert all(engine.packet_ids.in_use(mid) for mid in expected_mids), (
+        "packet-id ownership mismatch"
     )
 
     queued_mids = {msg.mid for msg in engine.outbound._queued}
@@ -469,8 +496,10 @@ def _check_engine_invariants(engine: ProtocolEngine) -> None:
     assert engine.flow.inflight == expected_flow, (
         f"flow mismatch: actual={engine.flow.inflight} expected={expected_flow}"
     )
-    assert engine.outbound.pending_messages == len(outbound), "outbound message budget mismatch"
-    assert engine.outbound.pending_bytes == sum(
+    assert engine.outbound.unacknowledged_messages == len(outbound), (
+        "outbound message budget mismatch"
+    )
+    assert engine.outbound.unacknowledged_bytes == sum(
         engine.outbound.stored_logical_size(message) for message in outbound
     ), "outbound byte budget mismatch"
     inbound = list(

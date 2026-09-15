@@ -27,8 +27,8 @@ concurrency:
 
 jobs:
   release-gate:
+    if: inputs.confirm_trusted_code && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/codex/lean-native-experiment')
     name: Deep network gate (manual only)
-    if: inputs.confirm_trusted_code && github.ref == 'refs/heads/main'
     runs-on: [self-hosted, linux, ARM64]
     timeout-minutes: 45
     env:
@@ -39,7 +39,7 @@ jobs:
       - name: Check out benchmark harness
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: main
+          ref: ${{ inputs.candidate_ref }}
           path: harness
           persist-credentials: false
       - name: Set run-specific workspace
@@ -142,7 +142,7 @@ jobs:
             --engine harness/benchmarks/paired_network.py \
             --runner-probe harness/benchmarks/runner_probe.py \
             --protocols 311 \
-            --completions callback \
+            --completions receipt \
             --payloads 64 \
             --windows 1,20,64 \
             --control-blocks 2 \

@@ -101,6 +101,7 @@ class InboundSession:
 
     __slots__ = (
         "_aliases",
+        "_ack_tokens",
         "_decode_pubrel",
         "_engine",
         "_inflight",
@@ -137,8 +138,9 @@ class InboundSession:
         # runtime-mutable, so the QoS 1 handler does not re-test it per message.
         self._on_qos1 = self._on_qos1_manual if self.config.manual_ack else self._on_qos1_auto
         self._aliases: dict[int, str] = {}
+        self._ack_tokens: dict[int, object] | None = {} if self.config.manual_ack else None
         self._topic_alias_maximum = self.config.topic_alias_maximum
-        self._receive_maximum = self.config.local_receive_maximum
+        self._receive_maximum = self.config.max_inbound_inflight
         self._inflight = 0
         self._autoack_handoff_required = False
         # Auto-ACK QoS 1 identifiers whose PUBACK is still inside the current
@@ -169,7 +171,6 @@ class InboundSession:
         recovered_qos1: list[int] = []
         pending_bytes = 0
         session_state_qos2 = 0
-        unknown_sizes: list[int] = []
         for page in self.store.in_index_pages(REPLAY_PAGE_SIZE):
             for meta in page:
                 mids.add(meta.mid)
@@ -180,21 +181,11 @@ class InboundSession:
                     session_state_qos2 += 1
                 if meta.state is InboundQoSState.WAIT_PUBACK:
                     recovered_qos1.append(meta.mid)
-                if meta.logical_size > 0:
-                    pending_bytes += meta.logical_size
-                else:
-                    unknown_sizes.append(meta.mid)
-        for mid in unknown_sizes:
-            message = self.store.get_in(mid)
-            if message is None:
-                raise RuntimeError(f"Inbound mid={mid} disappeared while restoring byte accounting")
-            size = self.logical_size(message.topic, message.payload, message.properties)
-            if not self.store.set_in_logical_size(mid, size):
-                raise RuntimeError(f"Inbound mid={mid} disappeared while restoring byte accounting")
-            pending_bytes += size
+                if meta.logical_size <= 0:
+                    raise ValueError("Persisted inbound logical_size must be positive")
+                pending_bytes += meta.logical_size
         return mids, pending_bytes, session_state_qos2, tuple(recovered_qos1)
 
-    # --- lifecycle ---------------------------------------------------------
     # --- lifecycle ---------------------------------------------------------
 
     def start_connection(self, *, receive_maximum: int, topic_alias_maximum: int) -> None:
@@ -222,6 +213,8 @@ class InboundSession:
     def discard_session(self) -> None:
         """Drop inbound state after CONNACK reports no previous session."""
         self.store.clear_in()
+        if self._ack_tokens is not None:
+            self._ack_tokens.clear()
         self._recovered_mids.clear()
         self._replay = None
         self._inflight = 0
@@ -259,15 +252,12 @@ class InboundSession:
         """Snapshot this session's own accounting."""
         return InboundStats(
             inflight=self._inflight,
-            receive_maximum=self._receive_maximum,
+            inflight_limit=self._receive_maximum,
+            inflight_bytes=self._pending_bytes,
+            inflight_high_water_bytes=max(self._pending_high_water_bytes, self._pending_bytes),
+            inflight_byte_limit=self.config.max_inbound_inflight_bytes,
             topic_aliases=len(self._aliases),
             replay_pending=self._replay is not None,
-            pending_bytes=self._pending_bytes,
-            pending_high_water_bytes=max(
-                self._pending_high_water_bytes,
-                self._pending_bytes,
-            ),
-            pending_byte_limit=self.config.max_pending_inbound_bytes,
         )
 
     def _lookup_stored_inbound(self, mid: int) -> InboundRecordMeta | None:
@@ -291,15 +281,27 @@ class InboundSession:
         completed = self.store.complete_in(mid, expected_state)
         if completed is None:
             raise RuntimeError(f"Inbound mid={mid} changed while {action}")
+        if self._ack_tokens is not None:
+            self._ack_tokens.pop(mid, None)
         return completed.logical_size
 
-    # --- packet handlers ---------------------------------------------------
+    def _bind_ack_token(self, message: Message) -> Message:
+        """Attach the active exchange identity before application exposure."""
+        tokens = self._ack_tokens
+        if tokens is not None:
+            assert message.mid is not None
+            token = tokens.get(message.mid)
+            if token is None:
+                token = tokens[message.mid] = object()
+            object.__setattr__(message, "_ack_token", token)
+        return message
+
     # --- packet handlers ---------------------------------------------------
 
     def _on_publish_v311(self, raw: RawPacket) -> None:
         engine = self._engine
         qos_raw = (raw.flags >> 1) & 0x03
-        if qos_raw == int(QoS.AT_MOST_ONCE):
+        if qos_raw == 0:
             engine._emit(EffectKind.MESSAGE, decode_qos0_message_v311(raw))
             return
         if qos_raw == 3:
@@ -317,7 +319,7 @@ class InboundSession:
 
     def _on_publish_v5(self, raw: RawPacket) -> None:
         qos_raw = (raw.flags >> 1) & 0x03
-        if qos_raw == int(QoS.AT_MOST_ONCE):
+        if qos_raw == 0:
             message, property_wire_size = decode_qos0_message_v5(raw)
             properties = message.properties
             assert properties is not None
@@ -431,21 +433,24 @@ class InboundSession:
         # Runtime effect application is SEND-first. Produce the protocol ACK in
         # that order here so every QoS2 delivery avoids EffectPump repartition.
         engine._send_ack(_encode_pubrec_success(mid))
+        message = Message(
+            topic=topic,
+            payload=payload,
+            qos=QoS.EXACTLY_ONCE,
+            retain=retain,
+            dup=dup,
+            mid=mid,
+            properties=properties,
+        )
+        if self._ack_tokens is not None:
+            self._bind_ack_token(message)
         engine._emit(
             (
                 EffectKind.DECODED_MESSAGE
                 if decoded_property_wire_size is not None
                 else EffectKind.MESSAGE
             ),
-            Message(
-                topic=topic,
-                payload=payload,
-                qos=QoS.EXACTLY_ONCE,
-                retain=retain,
-                dup=dup,
-                mid=mid,
-                properties=properties,
-            ),
+            message,
             requires_delivery_mark=True,
             decoded_property_wire_size=decoded_property_wire_size,
         )
@@ -554,10 +559,10 @@ class InboundSession:
             # but is surfaced again so an application can complete manual ACK
             # after a reconnect or callback cancellation.
             if existing.state is InboundQoSState.WAIT_PUBACK:
-                message = store.get_in(mid)
-                if message is None:
+                inbound = store.get_in(mid)
+                if inbound is None:
                     raise RuntimeError(f"Inbound mid={mid} disappeared while redelivering")
-                self._emit_message(message, dup=True)
+                self._emit_message(inbound, dup=True)
                 return
             self._reject_packet_id_collision(mid, "QoS 1", "QoS 2")
 
@@ -582,21 +587,24 @@ class InboundSession:
             raise
         self._remember_inbound()
         self._manual_qos1_order.append(mid)
+        message = Message(
+            topic=topic,
+            payload=payload,
+            qos=QoS.AT_LEAST_ONCE,
+            retain=retain,
+            dup=dup,
+            mid=mid,
+            properties=properties,
+        )
+        if self._ack_tokens is not None:
+            self._bind_ack_token(message)
         self._engine._emit(
             (
                 EffectKind.DECODED_MESSAGE
                 if decoded_property_wire_size is not None
                 else EffectKind.MESSAGE
             ),
-            Message(
-                topic=topic,
-                payload=payload,
-                qos=QoS.AT_LEAST_ONCE,
-                retain=retain,
-                dup=dup,
-                mid=mid,
-                properties=properties,
-            ),
+            message,
             requires_delivery_mark=True,
             decoded_property_wire_size=decoded_property_wire_size,
         )
@@ -633,16 +641,26 @@ class InboundSession:
         self._release_slot(logical_size)
 
     # --- application acknowledgement and replay ---------------------------
-    # --- application acknowledgement and replay ---------------------------
 
     def mark_delivered(self, mid: int) -> None:
         if self._stored_inbound:
             self.store.mark_in_delivered(mid)
 
-    def ack(self, mid: int) -> None:
+    def ack(self, mid: int, *, message: Message | None = None) -> None:
         """Complete a deferred PUBACK or PUBCOMP in manual-ack mode."""
         if not self.config.manual_ack:
             raise ProtocolError("manual_ack is disabled")
+        if message is not None:
+            tokens = self._ack_tokens
+            if (
+                message.mid != mid
+                or message._ack_token is None
+                or tokens is None
+                or tokens.get(mid) is not message._ack_token
+            ):
+                raise ProtocolError(
+                    f"Message is not an active inbound acknowledgement for mid={mid}"
+                )
         record = self._lookup_stored_inbound(mid)
         if record is None:
             raise ProtocolError(f"No pending inbound ack for mid={mid}")
@@ -740,17 +758,20 @@ class InboundSession:
         return inbound.state is InboundQoSState.WAIT_PUBREL and not inbound.user_acked
 
     def _emit_message(self, inbound: InboundMessage, *, dup: bool) -> None:
+        message = Message(
+            topic=inbound.topic,
+            payload=inbound.payload,
+            qos=inbound.qos,
+            retain=inbound.retain,
+            dup=dup,
+            mid=inbound.mid,
+            properties=inbound.properties,
+        )
+        if self._ack_tokens is not None:
+            self._bind_ack_token(message)
         self._engine._emit(
             EffectKind.MESSAGE,
-            Message(
-                topic=inbound.topic,
-                payload=inbound.payload,
-                qos=inbound.qos,
-                retain=inbound.retain,
-                dup=dup,
-                mid=inbound.mid,
-                properties=inbound.properties,
-            ),
+            message,
             requires_delivery_mark=True,
         )
 
@@ -791,28 +812,9 @@ class InboundSession:
         )
 
     def stored_logical_size(self, message: InboundMessage) -> int:
-        if message.logical_size > 0:
-            return message.logical_size
-        message.logical_size = self.logical_size(
-            message.topic,
-            message.payload,
-            message.properties,
-        )
+        if message.logical_size <= 0:
+            raise ValueError("Persisted inbound logical_size must be positive")
         return message.logical_size
-
-    def _validate_slot_capacity(self, logical_size: int | None = None) -> None:
-        """Validate Receive Maximum/quota without reserving anything."""
-        if self._inflight >= self._receive_maximum:
-            self._protocol_disconnect(0x93)
-            raise ProtocolError("Receive Maximum exceeded")
-        byte_limit = self.config.max_pending_inbound_bytes
-        if (
-            logical_size is not None
-            and byte_limit is not None
-            and self._pending_bytes + logical_size > byte_limit
-        ):
-            self._protocol_disconnect(0x97)
-            raise ProtocolError("Pending inbound byte limit reached")
 
     def _acquire_slot(self, logical_size: int | None = None) -> None:
         receive_maximum = self._receive_maximum
@@ -821,7 +823,7 @@ class InboundSession:
             # MQTT 5 §3.3.4: DISCONNECT 0x93 (Receive Maximum exceeded).
             self._protocol_disconnect(0x93)
             raise ProtocolError("Receive Maximum exceeded")
-        byte_limit = self.config.max_pending_inbound_bytes
+        byte_limit = self.config.max_inbound_inflight_bytes
         if (
             logical_size is not None
             and byte_limit is not None

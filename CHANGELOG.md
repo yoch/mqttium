@@ -6,6 +6,162 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- Correct the enhanced-authentication and long-lived-service examples to return
+  AUTH responses and restore subscriptions through the connection hook.
+- Preserve writer ownership when a short queued write raises after possible
+  wire exposure. Retire that generation through the existing writer without
+  retrying ambiguous bytes, and keep `join()` pending across queue restoration.
+- Reject invalid explicit connect/disconnect requests before superseding the
+  active lifecycle hook or changing connection and reconnect intent.
+- Preserve lifecycle ownership across overlapping connection attempts,
+  cancelled takeovers, and failures of connections awaited directly by a hook.
+- Charge synchronous message callback work by actual invocation count,
+  including all matching topic routes within one message. Routes of one
+  message run contiguously; the reader yields at the next message boundary
+  once the budget is reached and carries the excess over instead of resetting
+  it, so a wide fan-out cannot consume budget for free.
+- Separate protocol effects from the reader-owned bounded delivery/replay lane,
+  so a full application queue does not block outgoing admission or already
+  decoded completion results. Unread ACKs retain bounded-ingress pressure.
+
+- Bind message iterators to their generation at creation, including iterators
+  never advanced before an explicit disconnect/reconnect.
+
+- Bind manual acknowledgement handles to their active inbound exchange, so
+  a stale or foreign message cannot acknowledge a reused packet identifier.
+  Handles remain valid when a reconnect resumes the same logical session.
+
+- Validate SQLite format in one WAL-aware read transaction without manual
+  database/WAL copies or their final-close race. Normal SQLite journal recovery
+  and checkpointing may change physical files on a refused open.
+
+- Preserve replacement-connection delivery through lifecycle reentry and
+  retire obsolete queued work by epoch. Report hook exceptions and manually
+  raised cancellation without suppressing reconnect or terminal cleanup.
+
+### Changed
+
+- Freeze the native constructor and statistics vocabulary. Every bound is
+  named after what it bounds: `max_inbound_inflight` (was
+  `local_receive_maximum`), `max_inbound_inflight_bytes` (was
+  `max_pending_inbound_bytes`), `max_unacknowledged_messages`/`_bytes` (was
+  `max_pending_outbound_*`), `max_write_queue_messages`/`_bytes` (was
+  `max_outbound_*`), `max_iterator_messages`/`max_iterator_bytes`/
+  `iterator_admission_timeout` (was `max_pending_messages`/
+  `max_pending_delivery_bytes`/`delivery_timeout`), `subscribe_timeout` (was
+  `ack_timeout`). `connect_timeout` moves from `ReconnectPolicy` to the
+  client and is the default for explicit and automatic attempts;
+  `ReconnectPolicy.enabled` is removed (`reconnect=None` disables).
+  `max_ingress_batch_bytes` is removed; the 1 MiB / 256-packet decode quantum
+  is a fixed fairness constant. The constructor now refuses configuration
+  without effect or without a natural use: iterator bounds with callback
+  delivery raise `ValueError`, `manual_ack=True` with callback delivery raises
+  `ValueError` (synchronous callbacks cannot await `ack()`; use `messages()`),
+  MQTT 5 options (`connect_properties`, `will_properties`,
+  `topic_alias_maximum`, `auth_handler`) with MQTT 3.1.1 raise
+  `ProtocolError` at construction rather than at `connect()`.
+  `ClientStats` drops runtime scheduling detail (`tasks`, `effects`, writer
+  batching counters, `decoder.ingress_batch_limit_bytes`, WebSocket control
+  frame fields) and renames its sections' fields after the constructor bounds
+  (`outbound.unacknowledged_*`, `awaiting_slot`, `inflight`, `inflight_limit`;
+  `inbound.inflight_*`; `delivery.iterator_*`). See the migration guide for
+  the full mapping.
+- Export `MandatoryResponseTooLargeError` from `mqttium` alongside the other
+  operational errors, and document it with `BrokerDisconnectError` in the
+  error reference. It is the local terminal failure raised when the broker's
+  Maximum Packet Size cannot carry a mandatory acknowledgement.
+- Run synchronous message callbacks inline on the delivering reader instead of
+  a bounded callback worker task and queue. The reader hands each decoded lot
+  to the application before decoding further, so callback cost is the
+  backpressure; fairness charges every invocation, counting topic-route
+  fan-out, and yields at message boundaries. Removed: constructor parameters
+  `max_pending_callbacks` and `callback_shutdown_timeout`,
+  `DeliveryStats.callback_queued`/`callback_limit` and
+  `TaskStats.callback_worker`, without a public replacement: `DeliveryStats`
+  describes retained iterator state only, and callback delivery retains
+  nothing. Immediate iterator admission and QoS 1/2 delivery marks no longer
+  create a coroutine per message. See the migration guide.
+- Construct the internal decoded-frame container without frozen-dataclass
+  field assignment. The decoder still hands the engine owned bytes; the
+  container is never mutated or hashed, and every inbound packet paid the
+  tripled construction cost.
+- Hand a ready QoS 0 `publish_nowait()` to the writer before the generic
+  capacity preflight, as `publish()` and `publish_many()` already did. The
+  direct path validates and encodes the frame once and the writer admits its
+  exact size; the preflight previously sized the same PUBLISH a second time
+  whenever the writer held a frame, the steady state of a saturated producer.
+  Writer refusal of a QoS 0 frame now follows its validation, so an invalid
+  request raises `ProtocolError`/`PacketTooLargeError` rather than
+  `FlowControlError` when the write queue is also full.
+- Decode an empty MQTT 5 property table to one shared immutable `Properties`
+  value instead of a fresh instance per packet. Every MQTT 5 PUBLISH and ACK
+  carries the table and it is usually empty; since `Properties` became frozen
+  with a read-only proxy, building it cost about 0.6 µs per inbound packet,
+  which made MQTT 5 reception measurably slower than MQTT 3.1.1 on the same
+  pipeline. The frozen contract is what makes the shared value safe; no
+  mutable state is attached to it.
+- Amortize ready QoS 0 `publish_many()` orchestration over bounded private
+  prefixes. Each item still commits independently and transfers to the writer
+  before the source iterator advances; pressure and QoS 1/2 use the existing
+  admission path.
+- Remove unused private atomic writer admission, synthetic inline-batch
+  accounting and borrowed QoS 0 decoders. Active writer bounds, segmented
+  ordering and owned specialized decoding remain covered by regression tests.
+
+- Share ready QoS 0 writer handoff between unit and aggregate publication,
+  registering aggregate ownership before wire without per-item receipts.
+  Clean writer refusal rolls back only the tentative batch registration;
+  ambiguous write exceptions keep the committed prefix and are never retried.
+
+- Remove `ReconnectPolicy.follow_server_reference`, which retried the original
+  endpoint instead of following the advertised reference. MQTT 5 redirect
+  reasons are terminal. Expose nonzero broker DISCONNECT details through
+  `BrokerDisconnectError` when no more specific failure is available.
+
+- Transfer ready deliveries without timeout contexts, validate synchronous
+  message callbacks before registration, and hand ready unit QoS 0 publishes
+  to the existing writer without general publication effects. Byte/count bounds,
+  receipt ordering, durable delivery marks and serial callbacks remain intact.
+- Breaking pre-v1 native API: explicit iterator/callback delivery;
+  message routes freeze permanently at the first connection attempt.
+- Message and topic callbacks are synchronous-only. Async message processing
+  uses `messages()`; delivery byte accounting and a whole-admission timeout
+  remain independent of lifecycle notifications.
+- Keep sync/async connection hooks outside their triggering protocol path.
+  Network operations do not await hook completion; incoming delivery does not
+  await `on_connect`. Hooks retain the latest pending lifecycle state, cancel
+  obsolete active hooks on external transitions, and preserve direct self-reentry.
+  Automatic retry waits for `on_disconnect` and then rechecks explicit intent.
+- Progressive `publish_many()` retains a bounded receipt for the committed
+  prefix; cancellation seals it without rolling back admitted publications.
+- `Properties` and reconnect configuration are immutable, retry state belongs
+  to each client, authentication is configured at construction, and CONNECT
+  limits have one source.
+- SQLite schema 5 accepts fresh/current databases only, preserving committed
+  schema and data in rejected databases. Individual admission rollback and
+  durable transitions remain; generic cross-backend batch atomicity is not
+  promised.
+- Widen the `FlowControlError` and `MessageDeliveryError` docstrings, which feed
+  the error reference, to the conditions they actually cover: any refused
+  immediate operation against bounded client capacity, and iterator delivery
+  that fits neither its configured bounds nor its deadline.
+
+### Removed
+
+- `on_publish`; publication completion and failure use individual or aggregate
+  receipts without consuming message-callback capacity.
+- Async message/topic callbacks and their per-message classification/invocation
+  branches; lifecycle hooks and protocol authentication remain async-capable.
+- Paho façade, one-shot helpers, root `PacketType`, public extension guarantees,
+  legacy private client views, SQLite migrations and historical size backfill.
+- Delivery `auto`/`both`, `publish_backpressure`, `publish(nowait=...)`, batch
+  `chunk_size`/`nowait`/`failure_sink`, property mutators and `set_auth_handler()`.
+
+See the [migration guide](docs/migration.md) for the breaking changes since
+`1.0.0rc14`.
+
 ## [1.0.0rc14] - 2026-09-11
 
 ### Fixed

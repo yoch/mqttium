@@ -110,7 +110,9 @@ async def _run_phase(
         await pump.join()
         elapsed = time.perf_counter() - started
         cpu_seconds = time.process_time() - cpu_started
-        stats = pump.stats()
+        # Both sources count suspensions on the pump; only the reference
+        # snapshot also publishes the figure.
+        enqueue_suspensions = pump.enqueue_suspensions
     finally:
         await pump.stop()
 
@@ -124,7 +126,7 @@ async def _run_phase(
         elapsed_seconds=elapsed,
         completed_rate=count / max(elapsed, 1e-9),
         cpu_seconds=cpu_seconds,
-        enqueue_suspensions=stats.enqueue_suspensions,
+        enqueue_suspensions=enqueue_suspensions,
         wait_p50_ms=_percentile(waits, 0.50),
         wait_p95_ms=_percentile(waits, 0.95),
         wait_p99_ms=_percentile(waits, 0.99),

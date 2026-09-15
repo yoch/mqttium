@@ -70,7 +70,7 @@ def test_offline_queue_survives_clean_connect() -> None:
 def test_clean_reconnect_fails_inflight_keeps_queued() -> None:
     """Inflight from the old session fail on clean CONNACK; queued survive."""
     engine = ProtocolEngine(
-        EngineConfig(client_id="c1", local_receive_maximum=1, max_outbound_inflight=1)
+        EngineConfig(client_id="c1", max_inbound_inflight=1, max_outbound_inflight=1)
     )
     engine.begin_connect()
     _feed(engine, _connack(session_present=False))
@@ -129,7 +129,7 @@ def test_session_loss_with_blocked_replay_queue() -> None:
     longer owns.
     """
     connect_props = Properties()
-    connect_props.set("session_expiry_interval", 60)
+    connect_props = Properties({**connect_props.values, "session_expiry_interval": 60})
     engine = ProtocolEngine(
         EngineConfig(
             client_id="c1",
@@ -170,8 +170,8 @@ def test_session_loss_with_blocked_replay_queue() -> None:
     assert all(isinstance(f.reason, SessionDiscardedError) for f in failures)
     assert len(engine.outbound._queued) == 0
     outbound = engine.outbound
-    assert outbound.pending_messages == 0
-    assert outbound.pending_bytes == 0
+    assert outbound.unacknowledged_messages == 0
+    assert outbound.unacknowledged_bytes == 0
 
     # The engine stays usable: a fresh publication launches on the new session.
     fresh = engine.queue_publish("t/fresh", b"y", qos=1)

@@ -22,6 +22,10 @@ connection or process fails.
 
 The package has no runtime dependencies and is fully typed.
 
+This checkout carries the current pre-v1 native API. Its client surface and
+SQLite format are incompatible with `1.0.0rc14`; consult `docs/migration.md`
+before reusing existing application code or databases.
+
 ## Why MQTTium?
 
 | Need | MQTTium provides |
@@ -30,7 +34,7 @@ The package has no runtime dependencies and is fully typed.
 | Explicit completion | Publish receipts that separate local admission from the relevant MQTT acknowledgement exchange |
 | Controlled load | Message and byte budgets, wait-or-refuse backpressure, bounded ingress, writes, and application delivery |
 | Session continuity | Jittered reconnect plus in-memory or SQLite-backed inflight state with incremental replay |
-| Delivery choices | Async iteration, sync or async callbacks, optional dual delivery, and manual acknowledgement |
+| Delivery choices | Async iterator, with optional manual acknowledgement, or short synchronous auto-ack callbacks |
 | Transports | TCP, TLS, WebSocket, and Unix-domain sockets |
 | Operations | Immutable runtime snapshots, queue high-water marks, and broker-negotiated limits |
 | Efficient production | Bounded `publish_many()` and loop-bound `publish_nowait()` without changing delivery semantics |
@@ -94,10 +98,10 @@ shed, retry, or spill policy can request immediate refusal:
 from mqttium import FlowControlError
 from mqttium.api import AsyncClient
 
-client = AsyncClient(publish_backpressure="error")
+client = AsyncClient()
 
 try:
-    receipt = await client.publish("telemetry", payload, qos=1)
+    receipt = client.publish_nowait("telemetry", payload, qos=1)
 except FlowControlError:
     await shed_or_retry(payload)
 ```
@@ -106,8 +110,7 @@ Outbound protocol state, encoded writes, inbound protocol state, and delivery
 queues have independent bounds because they have different lifetimes. Passing
 `None` disables an optional bound and should be a deliberate capacity decision.
 
-For a sustained producer, `publish_many()` consumes an iterable in bounded
-chunks and returns one aggregate receipt:
+For a sustained producer, `publish_many()` consumes an iterable progressively, with at most one element read ahead and returns one aggregate receipt:
 
 ```python
 from mqttium.api import PublishMessage
@@ -140,19 +143,18 @@ client = AsyncClient(
 )
 ```
 
-`SqliteInflightStore` persists unfinished outbound QoS 1/2 exchanges and
-inbound QoS 2 protocol state. It does not persist arbitrary application work,
-delivered callback/iterator queues, or subscription intent. The application
-owns the store and must close it after the client has shut down.
+`SqliteInflightStore` persists unfinished outbound QoS 1/2 exchanges, inbound
+QoS 1 still awaiting a manual `ack()`, inbound QoS 2 protocol state, and the
+accounting metadata needed to replay them. It does not persist arbitrary
+application work, already-acknowledged messages, or subscription intent. The
+application owns the store and must close it after the client has shut down.
 
-## Paho migration
+## Migration from 1.0.0rc14
 
-New async applications should use `AsyncClient`. MQTTium also ships a
-**Provisional**, Paho-shaped `CallbackAPIVersion.VERSION2` facade for existing
-synchronous applications that need an incremental migration path. It is tested
-and bounded, but it is not a drop-in promise, a performance-parity promise, or
-a second native API. See [Migrating from Paho](https://mqttium.readthedocs.io/en/stable/migration/)
-and the [exact compatibility matrix](https://mqttium.readthedocs.io/en/stable/paho-compatibility/).
+The current native API is the only supported surface. See `docs/migration.md`
+in this checkout for removed interfaces, frozen configuration, progressive
+batches and SQLite schema 5. Published stable documentation describes the
+`1.0.0rc14` release line.
 
 ## Documentation
 

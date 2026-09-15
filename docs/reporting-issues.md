@@ -38,9 +38,7 @@ Include a complete executable program with:
 - the smallest topic and payload that still fail;
 - a `finally` block that disconnects or records why shutdown failed.
 
-For Paho compatibility, include `CallbackAPIVersion.VERSION2`, loop ownership,
-callback signatures, and whether publication originates inside or outside a
-callback.
+
 
 ## Environment
 
@@ -82,7 +80,7 @@ the outbound, writer, effect, receipt, and reconnect snapshot sections.
 
 ### Delivery or acknowledgement
 
-Include delivery mode, manual acknowledgement, callback sync/async shape, queue
+Include delivery mode, manual acknowledgement, message callback or lifecycle-hook identity, queue
 limits, last observed event, and shutdown outcome.
 
 ### Persistence or session replay

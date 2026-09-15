@@ -8,6 +8,7 @@ from mqttium.codec.buffer import IncrementalDecoder, RawPacket
 from mqttium.codec.primitives import pack_u16
 from mqttium.enums import MQTTProtocolVersion, PacketType, QoS
 from mqttium.packets import PubAckPacket, PublishPacket, encode_frame, encode_pingresp
+from mqttium.protocol.effects import EffectKind, EngineEffect
 
 
 class QueueTransport:
@@ -140,3 +141,67 @@ def write_item_bytes(data: object) -> bytes:
         return data
     assert isinstance(data, tuple)
     return data[0] + data[1]
+
+
+def stored_record(message):
+    """Build a persisted test/benchmark record with its mandatory logical size."""
+    from mqttium.protocol._sizing import publish_logical_size
+
+    if message.logical_size > 0:
+        return message
+    message.logical_size = publish_logical_size(
+        bool(message.properties),
+        message.topic,
+        len(message.payload),
+        message.properties,
+    )
+    return message
+
+
+async def wait_until(predicate, *, timeout=2.0):
+    """Wait for an observable test condition with a finite deadline."""
+    async with asyncio.timeout(timeout):
+        while not predicate():
+            await asyncio.sleep(0)
+
+
+async def accept_message(delivery, message, callback=None, property_wire_size=None):
+    """Hand one message to ``ApplicationDelivery`` and finish any waiting path.
+
+    ``accept`` returns ``None`` after an immediate handoff and an awaitable
+    only when the caller must wait (capacity or the fairness yield).
+    """
+    pending = delivery.accept(message, callback, property_wire_size)
+    if pending is not None:
+        await pending
+
+
+async def apply_delivery_effect(client, effect, epoch=None):
+    """Apply one reader-lane delivery effect exactly as ``DeliveryLane`` does."""
+    if epoch is None:
+        epoch = client._connection_epoch
+    pending = client._apply_delivery_effect(effect, epoch)
+    if pending is not None:
+        await pending
+
+
+async def deliver_message(client, message, *, epoch=None):
+    """Apply a ``MESSAGE`` effect for ``message`` through the client's delivery path."""
+    await apply_delivery_effect(client, EngineEffect(EffectKind.MESSAGE, message), epoch)
+
+
+def sqlite_logical_snapshot(path):
+    """Compare committed schema/data while allowing SQLite journal housekeeping."""
+    import sqlite3
+    from contextlib import closing
+
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("BEGIN")
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        journal = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        schema = conn.execute(
+            "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
+        ).fetchall()
+        outbound = conn.execute("SELECT * FROM outbound ORDER BY mid").fetchall()
+        inbound = conn.execute("SELECT * FROM inbound ORDER BY mid").fetchall()
+        return version, journal, schema, outbound, inbound

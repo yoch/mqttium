@@ -241,7 +241,7 @@ async def test_effect_failure_window_settles_late_collected_effect() -> None:
     result = await run_schedule(schedule)
 
     assert result.final_snapshot["effects"]["failing_close"] is False
-    assert result.final_snapshot["client"]["effects"]["pending"] == 0
+    assert result.final_snapshot["effects"]["pending"] == 0
 
 
 async def test_callback_connect_takes_over_automatic_reconnect() -> None:

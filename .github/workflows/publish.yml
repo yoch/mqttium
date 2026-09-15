@@ -240,12 +240,11 @@ jobs:
           python -I tests/installed_distribution_resilience_smoke.py tls --expected-version "$PACKAGE_VERSION" --host localhost --port 18884 --ca-file "$root/tls/ca.crt"
           python -I tests/installed_distribution_resilience_smoke.py sqlite-write --expected-version "$PACKAGE_VERSION" --database "$root/inflight.sqlite"
           python -I tests/installed_distribution_resilience_smoke.py sqlite-read --expected-version "$PACKAGE_VERSION" --database "$root/inflight.sqlite"
-      - name: Exercise transports, Paho migration, cancellation, and shutdown
+      - name: Exercise transports, cancellation, and shutdown
         run: |
           root="$RUNNER_TEMP/mqttium-release"
           python -I tests/installed_distribution_extended_smoke.py websocket --expected-version "$PACKAGE_VERSION" --url ws://127.0.0.1:18083/mqtt
           python -I tests/installed_distribution_extended_smoke.py unix --expected-version "$PACKAGE_VERSION" --socket "$root/mqttium.sock"
-          python -I tests/installed_distribution_extended_smoke.py paho --expected-version "$PACKAGE_VERSION" --host 127.0.0.1 --port 11886
           python -I tests/installed_distribution_extended_smoke.py shutdown --expected-version "$PACKAGE_VERSION" --host 127.0.0.1 --port 11886
 
   publish:

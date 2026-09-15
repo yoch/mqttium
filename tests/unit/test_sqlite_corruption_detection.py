@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests.support import stored_record
+
 import json
 from pathlib import Path
 
@@ -16,25 +18,29 @@ from mqttium.types import InboundMessage, OutboundMessage, Properties
 
 
 def _out(mid: int = 1) -> OutboundMessage:
-    return OutboundMessage(
-        mid=mid,
-        topic="original",
-        payload=b"original",
-        qos=QoS.AT_LEAST_ONCE,
-        retain=False,
-        state=OutboundQoSState.WAIT_PUBACK,
-        properties=Properties({"content_type": "application/octet-stream"}),
+    return stored_record(
+        OutboundMessage(
+            mid=mid,
+            topic="original",
+            payload=b"original",
+            qos=QoS.AT_LEAST_ONCE,
+            retain=False,
+            state=OutboundQoSState.WAIT_PUBACK,
+            properties=Properties({"content_type": "application/octet-stream"}),
+        )
     )
 
 
 def _in(mid: int = 1) -> InboundMessage:
-    return InboundMessage(
-        mid=mid,
-        topic="original",
-        payload=b"original",
-        qos=QoS.EXACTLY_ONCE,
-        retain=False,
-        state=InboundQoSState.WAIT_PUBREL,
+    return stored_record(
+        InboundMessage(
+            mid=mid,
+            topic="original",
+            payload=b"original",
+            qos=QoS.EXACTLY_ONCE,
+            retain=False,
+            state=InboundQoSState.WAIT_PUBREL,
+        )
     )
 
 
@@ -43,6 +49,8 @@ def _corrupt(
     column: str,
     value: object,
 ) -> None:
+    # Bypass the format constraint to exercise detection of externally damaged files.
+    store._conn.execute("PRAGMA ignore_check_constraints=ON")
     # The column is a fixed test parameter, never application input.
     store._conn.execute(  # noqa: SLF001 - intentional durable corruption
         f"UPDATE outbound SET {column}=? WHERE mid=1",

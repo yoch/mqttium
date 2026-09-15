@@ -14,8 +14,8 @@ from mqttium.types import Properties
 
 def test_auth_packet_roundtrip() -> None:
     props = Properties()
-    props.set("authentication_method", "SCRAM-SHA-1")
-    props.set("authentication_data", b"\x01\x02\x03")
+    props = Properties({**props.values, "authentication_method": "SCRAM-SHA-1"})
+    props = Properties({**props.values, "authentication_data": b"\x01\x02\x03"})
     wire = AuthPacket(reason_code=0x18, properties=props).encode()
     assert wire[0] == PacketType.AUTH
     dec = IncrementalDecoder()
@@ -56,7 +56,7 @@ def test_engine_rejects_auth_without_accept() -> None:
 
 def test_engine_emits_auth_when_accepted() -> None:
     connect_props = Properties()
-    connect_props.set("authentication_method", "demo")
+    connect_props = Properties({**connect_props.values, "authentication_method": "demo"})
     engine = ProtocolEngine(
         EngineConfig(
             client_id="c",
@@ -68,7 +68,7 @@ def test_engine_emits_auth_when_accepted() -> None:
     engine.begin_connect()
     engine.take_effects()
     auth_props = Properties()
-    auth_props.set("authentication_method", "demo")
+    auth_props = Properties({**auth_props.values, "authentication_method": "demo"})
     full = AuthPacket(reason_code=0x18, properties=auth_props).encode()
     from mqttium.codec.vbi import decode_vbi
 
@@ -95,7 +95,7 @@ async def test_async_client_auth_handler_exchange() -> None:
                 if raw.packet_type is PacketType.CONNECT:
                     # Challenge then CONNACK success.
                     props = Properties()
-                    props.set("authentication_method", "demo")
+                    props = Properties({**props.values, "authentication_method": "demo"})
                     challenge = AuthPacket(reason_code=0x18, properties=props)
                     self._rx.put_nowait(challenge.encode())
                 elif raw.packet_type is PacketType.AUTH:
@@ -103,7 +103,7 @@ async def test_async_client_auth_handler_exchange() -> None:
                     from mqttium.codec.properties import encode_properties
 
                     props = Properties()
-                    props.set("authentication_method", "demo")
+                    props = Properties({**props.values, "authentication_method": "demo"})
                     body = bytearray([0x00, 0x00])
                     body.extend(encode_properties(props, "CONNACK"))
                     self._rx.put_nowait(encode_frame(PacketType.CONNACK, 0, body))
@@ -121,15 +121,15 @@ async def test_async_client_auth_handler_exchange() -> None:
     def handler(challenge: AuthPacket) -> AuthPacket:
         assert challenge.reason_code == 0x18
         props = Properties()
-        props.set("authentication_method", "demo")
-        props.set("authentication_data", b"token")
+        props = Properties({**props.values, "authentication_method": "demo"})
+        props = Properties({**props.values, "authentication_data": b"token"})
         # [MQTT-4.12.0-3]: a Client answering a Server AUTH must use 0x18. Table
         # 3-11 reserves 0x00 (Success) for the Server, which concludes the
         # exchange with CONNACK rather than with an AUTH of its own.
         return AuthPacket(reason_code=0x18, properties=props)
 
     connect_props = Properties()
-    connect_props.set("authentication_method", "demo")
+    connect_props = Properties({**connect_props.values, "authentication_method": "demo"})
     client = AsyncClient(
         client_id="auth-c",
         protocol=MQTTProtocolVersion.MQTTv5,

@@ -59,7 +59,7 @@ async def test_auth_handler_exception_propagates_from_connect() -> None:
         raise RuntimeError("auth boom")
 
     props = Properties()
-    props.set("authentication_method", "demo")
+    props = Properties({**props.values, "authentication_method": "demo"})
     client = AsyncClient(
         client_id="auth-failure",
         protocol=MQTTProtocolVersion.MQTTv5,
@@ -100,13 +100,12 @@ async def test_self_cancelled_reauth_handler_is_a_reconnectable_failure() -> Non
         connect_properties=props,
         auth_handler=cancel_auth,
         reconnect=ReconnectPolicy(
-            enabled=True,
             initial_delay=0,
             max_delay=0,
             max_retries=2,
             stable_after=0,
-            connect_timeout=0.2,
         ),
+        connect_timeout=0.2,
     )
 
     def on_disconnect(error: BaseException | None) -> None:
@@ -193,7 +192,7 @@ async def test_connect_cancellation_stops_blocked_auth_handler_promptly() -> Non
     assert handler_stopped.is_set()
     assert client.state is ConnectionState.DISCONNECTED
     assert client._transport is None
-    assert client._effect_flush_task is None
+    assert client._effect_pump.task is None
     assert not client._effect_pump.pending
     assert client._effect_pump.applied == client._effect_pump.enqueued
     assert client._effect_pump.waiters == 0

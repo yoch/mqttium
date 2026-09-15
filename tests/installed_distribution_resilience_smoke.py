@@ -41,7 +41,9 @@ async def _tls_protocol_roundtrip(
     topic = f"mqttium/distribution-tls/{int(protocol)}"
     payload = f"tls-{int(protocol)}".encode()
     received: asyncio.Future[bytes] = asyncio.get_running_loop().create_future()
-    subscriber = AsyncClient(f"dist-tls-sub-{int(protocol)}", protocol=protocol)
+    subscriber = AsyncClient(
+        f"dist-tls-sub-{int(protocol)}", protocol=protocol, message_delivery="callback"
+    )
     publisher = AsyncClient(f"dist-tls-pub-{int(protocol)}", protocol=protocol)
 
     def on_message(message: Message) -> None:

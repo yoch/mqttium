@@ -36,7 +36,8 @@ async def run(
         protocol=protocol,
         clean_start=False,
         connect_properties=connect_properties,
-        reconnect=ReconnectPolicy(connect_timeout=timeout),
+        reconnect=ReconnectPolicy(),
+        connect_timeout=timeout,
         store=store,
     )
     try:
@@ -46,7 +47,7 @@ async def run(
         print(
             "connected",
             f"session_present={connack.session_present}",
-            f"pending={client.stats().outbound.pending_messages}",
+            f"pending={client.stats().outbound.unacknowledged_messages}",
         )
     finally:
         await client.disconnect()

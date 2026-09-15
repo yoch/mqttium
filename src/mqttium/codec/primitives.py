@@ -85,17 +85,19 @@ def append_utf8(buf: bytearray, value: str) -> None:
 
 
 def unpack_utf8(buffer: bytes | bytearray | memoryview, offset: int = 0) -> tuple[str, int]:
-    length, pos = unpack_u16(buffer, offset)
-    end = pos + length
+    pos = offset + 2
+    if pos > len(buffer):
+        raise MalformedPacketError("Incomplete uint16")
+    end = pos + ((buffer[offset] << 8) | buffer[offset + 1])
     if end > len(buffer):
         raise MalformedPacketError("Incomplete UTF-8 string")
     try:
-        # bytes/bytearray: decode the slice directly (one owned copy for bytes).
-        # memoryview: tobytes() then decode.
-        if isinstance(buffer, (bytes, bytearray)):
-            text = buffer[pos:end].decode("utf-8")
+        # bytes/bytearray slices decode directly (one owned copy for bytes);
+        # a memoryview slice must materialize first.
+        if type(buffer) is memoryview:
+            text = buffer[pos:end].tobytes().decode("utf-8")
         else:
-            text = memoryview(buffer)[pos:end].tobytes().decode("utf-8")
+            text = buffer[pos:end].decode("utf-8")
     except UnicodeDecodeError as exc:
         raise MalformedPacketError("Invalid UTF-8 data") from exc
     _validate_mqtt_utf8(text)

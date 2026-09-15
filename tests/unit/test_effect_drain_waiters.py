@@ -5,6 +5,7 @@ from collections import deque
 
 import pytest
 
+from mqttium.api._delivery_lane import DeliveryLane
 from mqttium.api._effects import EffectPump
 from mqttium.protocol.effects import EffectKind, EngineEffect
 
@@ -38,6 +39,7 @@ class _Owner:
         self._disconnect_exc: BaseException | None = None
         self._engine = _Engine()
         self._connack_fut = None
+        self._delivery_lane = DeliveryLane(self)  # type: ignore[arg-type]
         self.release = release
 
     def _apply_effect_inline(self, effect: EngineEffect, epoch: int) -> bool:

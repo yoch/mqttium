@@ -25,6 +25,7 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from benchmark_support import stored_record
 from mqttium.codec.buffer import IncrementalDecoder
 from mqttium.enums import InboundQoSState, MQTTProtocolVersion, PacketType, QoS
 from mqttium.packets import PubAckPacket, encode_frame
@@ -70,8 +71,8 @@ def connected_engine(store: SqliteInflightStore, *, session_present: bool) -> Pr
             client_id="persistence-ab",
             protocol=MQTTProtocolVersion.MQTTv311,
             clean_start=False,
-            max_pending_outbound_messages=None,
-            max_pending_outbound_bytes=None,
+            max_unacknowledged_messages=None,
+            max_unacknowledged_bytes=None,
         ),
         store=store,
     )
@@ -164,14 +165,16 @@ def seed_session(
     with store.batch():
         for mid in range(1, inbound_records + 1):
             store.put_in(
-                InboundMessage(
-                    mid=mid,
-                    topic="bench/inbound",
-                    payload=payload,
-                    qos=QoS.EXACTLY_ONCE,
-                    retain=False,
-                    state=InboundQoSState.WAIT_PUBREL,
-                    delivered=False,
+                stored_record(
+                    InboundMessage(
+                        mid=mid,
+                        topic="bench/inbound",
+                        payload=payload,
+                        qos=QoS.EXACTLY_ONCE,
+                        retain=False,
+                        state=InboundQoSState.WAIT_PUBREL,
+                        delivered=False,
+                    )
                 )
             )
 

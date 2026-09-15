@@ -13,7 +13,7 @@ from mqttium.errors import MQTTError
 from mqttium.packets import PublishPacket, encode_frame
 from mqttium.protocol.reconnect import ReconnectPolicy
 
-from tests.support import QueueTransport, transport_factory, write_item_bytes
+from tests.support import QueueTransport, transport_factory, wait_until, write_item_bytes
 
 
 class _ControlledTransport(QueueTransport):
@@ -49,12 +49,10 @@ class _ControlledTransport(QueueTransport):
 
 def _reconnect_policy() -> ReconnectPolicy:
     return ReconnectPolicy(
-        enabled=True,
         initial_delay=0,
         max_delay=0,
         max_retries=2,
         stable_after=0,
-        connect_timeout=1,
     )
 
 
@@ -77,7 +75,11 @@ async def test_writer_failure_racing_broker_disconnect_has_one_logical_teardown(
     transport.fail_publish_write = True
     transport.push_rx(encode_frame(PacketType.DISCONNECT, 0, b""))
     transport.release_publish_write.set()
-    await asyncio.wait_for(reader, timeout=1)
+    try:
+        await asyncio.wait_for(reader, timeout=1)
+    except asyncio.CancelledError:
+        pass
+    await wait_until(lambda: bool(disconnects))
 
     assert len(disconnects) == 1
     assert receipt.is_done()
@@ -92,7 +94,7 @@ async def test_terminal_disconnect_wakes_publish_blocked_on_logical_backpressure
     client = AsyncClient(
         client_id="blocked-publisher-teardown",
         protocol=MQTTProtocolVersion.MQTTv5,
-        max_pending_outbound_messages=1,
+        max_unacknowledged_messages=1,
     )
     client._transport_factory = transport_factory(transport)
 
@@ -124,9 +126,9 @@ async def test_writer_failure_wakes_reader_blocked_on_puback_admission() -> None
     client = AsyncClient(
         client_id="reader-puback-writer-failure",
         protocol=MQTTProtocolVersion.MQTTv5,
-        max_outbound_messages=1,
-        max_outbound_bytes=1024,
-        reconnect=ReconnectPolicy(enabled=False),
+        max_write_queue_messages=1,
+        max_write_queue_bytes=1024,
+        reconnect=None,
     )
     client._transport_factory = transport_factory(transport)
     disconnected = asyncio.Event()
@@ -167,6 +169,7 @@ async def test_user_disconnect_cancels_reconnect_during_transport_setup() -> Non
         client_id="disconnect-reconnect-race",
         protocol=MQTTProtocolVersion.MQTTv5,
         reconnect=_reconnect_policy(),
+        connect_timeout=1,
     )
     reconnect_factory_entered = asyncio.Event()
     calls = 0

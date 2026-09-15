@@ -57,9 +57,15 @@ _OVERSIZE_RETENTION = 64
 _VIEW_COPY_THRESHOLD = 4096
 
 
-@dataclass(slots=True, frozen=True)
+@dataclass(slots=True)
 class RawPacket:
-    """One decoded MQTT frame (owned bytes, safe to retain)."""
+    """One decoded MQTT frame (owned bytes, safe to retain).
+
+    Not frozen: one is created for every inbound packet, and a frozen
+    dataclass assigns each field through ``object.__setattr__``, which
+    triples construction cost. Ownership of ``remaining`` is what the
+    decoder guarantees; the container itself is never mutated or hashed.
+    """
 
     packet_type: PacketType
     flags: int
@@ -467,7 +473,7 @@ class IncrementalDecoder:
             self._end = 0
             if self._capacity > self._target_window:
                 self._retire_oversize()
-        return RawPacket(packet_type=packet_type, flags=flags, remaining=body)
+        return RawPacket(packet_type, flags, body)
 
     def drain_packets(self, limit: int = 100) -> list[RawPacket]:
         packets: list[RawPacket] = []

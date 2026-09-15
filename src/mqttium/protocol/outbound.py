@@ -119,7 +119,7 @@ class OutboundSession:
         self._encode_publish = codec.encode_publish_item
         self._encode_pubrel = codec.encode_pubrel
         self.packet_ids = PacketIdPool()
-        self.flow = FlowControl(self.config.local_receive_maximum)
+        self.flow = FlowControl(self.config.max_inbound_inflight)
         self._queued: deque[OutboundMessage | OutboundMessageSummary] = deque()
         # Replay-parked WAIT_* entries currently in `_queued` (see
         # `_unpark_settled`). Zero on every path that does not involve a
@@ -171,19 +171,19 @@ class OutboundSession:
     # --- admission ---------------------------------------------------------
 
     @property
-    def pending_messages(self) -> int:
+    def unacknowledged_messages(self) -> int:
         return self._pending_messages
 
     @property
-    def pending_bytes(self) -> int:
+    def unacknowledged_bytes(self) -> int:
         return self._pending_bytes
 
     @property
-    def pending_high_water_messages(self) -> int:
+    def unacknowledged_high_water_messages(self) -> int:
         return self._pending_high_water_messages
 
     @property
-    def pending_high_water_bytes(self) -> int:
+    def unacknowledged_high_water_bytes(self) -> int:
         return self._pending_high_water_bytes
 
     def _resolved_alias_topic_for_sizing(self, properties: Properties) -> str:
@@ -201,39 +201,20 @@ class OutboundSession:
     ) -> bool:
         if QoS(qos) == QoS.AT_MOST_ONCE:
             return True
-        message_limit = self.config.max_pending_outbound_messages
+        message_limit = self.config.max_unacknowledged_messages
         if message_limit is not None and message_limit < 1:
             return False
-        byte_limit = self.config.max_pending_outbound_bytes
+        byte_limit = self.config.max_unacknowledged_bytes
         if not topic and properties is not None:
             topic = self._resolved_alias_topic_for_sizing(properties)
         logical_size = self.logical_size(topic, payload, properties)
         return byte_limit is None or logical_size <= byte_limit
 
-    def can_ever_admit_many(
-        self,
-        messages: Iterable[tuple[str, bytes, QoS | int, bool, Properties | None]],
-    ) -> bool:
-        pending_count = 0
-        pending_bytes = 0
-        for topic, payload, qos, _retain, properties in messages:
-            if QoS(qos) == QoS.AT_MOST_ONCE:
-                continue
-            pending_count += 1
-            if not topic and properties is not None:
-                topic = self._resolved_alias_topic_for_sizing(properties)
-            pending_bytes += self.logical_size(topic, payload, properties)
-        message_limit = self.config.max_pending_outbound_messages
-        if message_limit is not None and pending_count > message_limit:
-            return False
-        byte_limit = self.config.max_pending_outbound_bytes
-        return byte_limit is None or pending_bytes <= byte_limit
-
     def _reserve(self, logical_size: int) -> None:
-        message_limit = self.config.max_pending_outbound_messages
+        message_limit = self.config.max_unacknowledged_messages
         if message_limit is not None and self._pending_messages >= message_limit:
             raise FlowControlError("Pending outbound message limit reached")
-        byte_limit = self.config.max_pending_outbound_bytes
+        byte_limit = self.config.max_unacknowledged_bytes
         if byte_limit is not None and self._pending_bytes + logical_size > byte_limit:
             raise FlowControlError("Pending outbound byte limit reached")
         self._pending_messages += 1
@@ -262,15 +243,17 @@ class OutboundSession:
         """
         flow = self.flow
         return OutboundStats(
-            pending_messages=self._pending_messages,
-            pending_bytes=self._pending_bytes,
-            pending_high_water_messages=max(
+            unacknowledged_messages=self._pending_messages,
+            unacknowledged_bytes=self._pending_bytes,
+            unacknowledged_high_water_messages=max(
                 self._pending_high_water_messages, self._pending_messages
             ),
-            pending_high_water_bytes=max(self._pending_high_water_bytes, self._pending_bytes),
-            queued_messages=len(self._queued),
-            flow_inflight=flow.inflight,
-            flow_limit=flow.limit,
+            unacknowledged_high_water_bytes=max(
+                self._pending_high_water_bytes, self._pending_bytes
+            ),
+            awaiting_slot=len(self._queued),
+            inflight=flow.inflight,
+            inflight_limit=flow.limit,
             packet_ids_in_use=len(self.packet_ids),
         )
 
@@ -282,58 +265,15 @@ class OutboundSession:
         messages_start: int,
         bytes_start: int,
         mids: Iterable[int],
-        *,
-        effect_start: int | None = None,
-        queued_start: int | None = None,
-        packet_ids_empty_start: bool = False,
     ) -> None:
-        """Undo every resource a failed admission acquired, in one fixed order.
-
-        Effects, queue index, flow slots, store rows, packet ids, budget. Both
-        `queue_publish` and `queue_publish_many` unwind through here: the callers
-        only snapshot, which is why this costs nothing on the success path and
-        cannot drift between the two.
-
-        `packet_ids_empty_start` says the pool held nothing before the chunk, so
-        every live id was allocated by it and the whole pool is reset in constant
-        time instead of released one id at a time — the pool reclaims its
-        accumulated hashing capacity only on a full clear.
-
-        `effect_start` / `queued_start` are chunk-only. A single publish emits
-        its SEND as the last statement of a successful launch and appends to
-        `_queued` as its last statement overall, so neither can be left behind by
-        one failed message — only by an earlier message of a chunk. Omitting them
-        keeps two attribute reads off the per-message path.
-
-        The budget is restored wholesale from the snapshot rather than released
-        record by record, and store rows go through `delete_record` rather than
-        `discard_record` for the same reason: a transactional store has already
-        rolled its batch back by the time this runs, so the per-record sizes are
-        unrecoverable and a second per-record release would double-count.
-        """
-        if effect_start is not None:
-            del self._engine._effects[effect_start:]
-        if queued_start is not None:
-            queued = self._queued
-            while len(queued) > queued_start:
-                queued.pop()
-        flow = self.flow
-        while flow.inflight > inflight_start:
-            flow.release()
-        packet_ids = self.packet_ids
-        if packet_ids_empty_start:
-            for mid in mids:
-                self.delete_record(mid)
-            # Every live MID was allocated by this failed atomic chunk.
-            packet_ids.clear()
-        else:
-            for mid in mids:
-                self.delete_record(mid)
-                packet_ids.release(mid)
+        """Unwind the resources acquired by one failed publication."""
+        while self.flow.inflight > inflight_start:
+            self.flow.release()
+        for mid in mids:
+            self.delete_record(mid)
+            self.packet_ids.release(mid)
         self._pending_messages = messages_start
         self._pending_bytes = bytes_start
-
-    # --- queueing ----------------------------------------------------------
 
     def _resolve_outbound_alias(
         self,
@@ -472,28 +412,6 @@ class OutboundSession:
             wire_size,
         )
 
-    def _prepare_qos0_validated(
-        self,
-        topic: str,
-        payload: bytes,
-        *,
-        retain: bool,
-        properties: Properties | None,
-        topic_bytes: bytes,
-    ) -> WriteItem:
-        item = self._encode_publish(
-            topic,
-            payload,
-            qos=QoS.AT_MOST_ONCE,
-            retain=retain,
-            dup=False,
-            mid=None,
-            properties=properties,
-            _topic_bytes=topic_bytes,
-        )
-        self._engine._check_outbound_size(item)
-        return item
-
     def prepare_qos0(
         self,
         topic: str,
@@ -579,8 +497,8 @@ class OutboundSession:
                 self._engine._send(item)
                 if properties is not None and properties.get("topic_alias") is not None:
                     self.commit_topic_alias(topic, properties)
-                # Completion follows SEND so compatibility on_publish cannot run
-                # before the outbound queue has accepted the frame.
+                # Local completion follows SEND so the outbound queue accepts
+                # the frame before the completion effect can be applied.
                 self._engine._emit(EffectKind.PUBLISH_COMPLETE, None)
                 return PublishHandle(mid=None, qos=level)
             prepared = self._prepare_publish_request(topic, payload, level, retain, properties)
@@ -589,25 +507,6 @@ class OutboundSession:
             # loop, with no await or callback between the two operations.
             prepared = _prepared
         qos, topic_bytes, canonical_topic, property_bytes, logical_size, _wire_size = prepared
-
-        # Keep compatibility with an already-created internal QoS 0 carrier;
-        # ordinary publication no longer allocates one.
-        if qos == QoS.AT_MOST_ONCE:
-            assert topic_bytes is not None
-            item = self._prepare_qos0_validated(
-                topic,
-                payload,
-                retain=retain,
-                properties=properties,
-                topic_bytes=topic_bytes,
-            )
-            self._engine._send(item)
-            if properties is not None and properties.get("topic_alias") is not None:
-                self.commit_topic_alias(topic, properties)
-            # Completion follows SEND so compatibility on_publish cannot run
-            # before the outbound queue has accepted the frame.
-            self._engine._emit(EffectKind.PUBLISH_COMPLETE, None)
-            return PublishHandle(mid=None, qos=qos)
 
         # Snapshot before the first acquisition. Three local reads is all the
         # success path pays for a shared rollback; _rollback itself is a call
@@ -659,75 +558,6 @@ class OutboundSession:
                 () if mid is None else (mid,),
             )
             raise
-
-    def queue_publish_many(
-        self,
-        messages: Iterable[tuple[str, bytes, QoS | int, bool, Properties | None]],
-    ) -> list[PublishHandle]:
-        """Queue one bounded chunk atomically with respect to engine/store state.
-
-        Admission itself is `queue_publish`, once per message — there is exactly
-        one place that acquires a budget slot, a packet id and a store row. The
-        chunk only widens the rollback scope: the inner call unwinds the message
-        that failed, this one unwinds the messages that had already succeeded.
-
-        A chunk that cannot fit the pending-message limit is rejected up front.
-        That matters because AsyncClient retries the *same* chunk after waiting
-        for space: without this, every retry would re-admit and re-unwind the
-        whole prefix. Only the count is checked, never the byte budget — counting
-        is free, whereas sizing the chunk here would encode every MQTT 5 property
-        table a second time.
-        """
-        batch = messages if isinstance(messages, list) else list(messages)
-        message_limit = self.config.max_pending_outbound_messages
-        if message_limit is not None:
-            reserving = 0
-            for _topic, _payload, qos, _retain, _properties in batch:
-                if qos:  # QoS 0 reserves nothing
-                    reserving += 1
-            if self._pending_messages + reserving > message_limit:
-                raise FlowControlError("Pending outbound message limit reached")
-
-        messages_start = self._pending_messages
-        bytes_start = self._pending_bytes
-        effect_start = len(self._engine._effects)
-        queued_start = len(self._queued)
-        inflight_start = self.flow.inflight
-        packet_ids_empty_start = len(self.packet_ids) == 0
-        alias_snapshot: dict[int, str] | None = None
-        if self._is_v5:
-            for _topic, _payload, _qos, _retain, properties in batch:
-                if properties is not None and properties.get("topic_alias") is not None:
-                    alias_snapshot = self._topic_aliases.copy()
-                    break
-        handles: list[PublishHandle] = []
-        try:
-            with self.store.batch():
-                for topic, payload, qos, retain, properties in batch:
-                    handles.append(
-                        self.queue_publish(
-                            topic,
-                            payload,
-                            qos=qos,
-                            retain=retain,
-                            properties=properties,
-                        )
-                    )
-        except BaseException:
-            self._rollback(
-                inflight_start,
-                messages_start,
-                bytes_start,
-                [h.mid for h in handles if h.mid is not None],
-                effect_start=effect_start,
-                queued_start=queued_start,
-                packet_ids_empty_start=packet_ids_empty_start,
-            )
-            if alias_snapshot is not None:
-                self._topic_aliases.clear()
-                self._topic_aliases.update(alias_snapshot)
-            raise
-        return handles
 
     # --- broker acknowledgements -------------------------------------------
 
@@ -975,8 +805,8 @@ class OutboundSession:
             else:
                 # Segmented frames share the original payload. The first replay
                 # replaces only their small header; later replays reuse the
-                # already-DUP tuple. The bytes branch accepts legacy/custom-store
-                # records and drops their contiguous frame after this send.
+                # already-DUP tuple. A contiguous cached frame is
+                # dropped after this send.
                 wire = _mark_publish_dup(retained)
             self._engine._check_outbound_size(wire)
             msg.encoded_publish = _retain_publish_item(wire)
@@ -1049,8 +879,6 @@ class OutboundSession:
         message = self.store.get_out(stored.mid)
         if message is None:
             raise RuntimeError(f"Missing durable outbound record mid={stored.mid}")
-        if message.logical_size <= 0:
-            message.logical_size = self.stored_logical_size(stored)
         return message
 
     # --- sizing --------------------------------------------------------------
@@ -1072,17 +900,9 @@ class OutboundSession:
         return publish_logical_size(self._is_v5, topic, payload_size, properties)
 
     def stored_logical_size(self, stored: OutboundMessage | OutboundMessageSummary) -> int:
-        if stored.logical_size > 0:
-            return stored.logical_size
-        payload_size = (
-            len(stored.payload) if isinstance(stored, OutboundMessage) else stored.payload_size
-        )
-        logical_size = self.logical_size_from_size(stored.topic, payload_size, stored.properties)
-        if isinstance(stored, OutboundMessage):
-            stored.logical_size = logical_size
-        else:
-            object.__setattr__(stored, "logical_size", logical_size)
-        return logical_size
+        if stored.logical_size <= 0:
+            raise ValueError("Persisted outbound logical_size must be positive")
+        return stored.logical_size
 
     def size_parts(
         self,
@@ -1193,14 +1013,7 @@ class OutboundSession:
 
     def _hydrate_message(self, msg: OutboundMessage | OutboundMessageSummary) -> None:
         self.packet_ids.reserve(msg.mid)
-        unknown_size = msg.logical_size <= 0
         logical_size = self.stored_logical_size(msg)
-        if unknown_size:
-            # Records written before the store persisted logical sizes would
-            # otherwise release nothing from the byte budget when a
-            # metadata-only acknowledgement settles them. One write per legacy
-            # record, inside the hydration batch, and never again.
-            self.store.set_out_logical_size(msg.mid, logical_size)
         self._pending_messages += 1
         self._pending_bytes += logical_size
         if msg.state is OutboundQoSState.QUEUED:

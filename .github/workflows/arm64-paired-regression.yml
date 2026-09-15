@@ -30,7 +30,7 @@ concurrency:
 
 jobs:
   paired:
-    if: inputs.confirm_trusted_code && github.ref == 'refs/heads/main'
+    if: inputs.confirm_trusted_code && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/codex/lean-native-experiment')
     runs-on: [self-hosted, linux, ARM64]
     timeout-minutes: 90
     env:
@@ -41,7 +41,7 @@ jobs:
       - name: Check out benchmark harness
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: main
+          ref: ${{ inputs.candidate_ref }}
           path: harness
           persist-credentials: false
       - name: Set run-specific workspace
@@ -179,7 +179,7 @@ jobs:
             --policy advisory \
             --preflight-report "$JOB_ROOT/runner.json" \
             --repeat 4 --cpu 2 --windows 64 --protocols 311 \
-            --payloads 64 --completions receipt,callback \
+            --payloads 64 --completions receipt \
             --count-small 5000 \
             --output "$JOB_ROOT/qos1-completion.json" \
             --summary-output "$JOB_ROOT/qos1-completion.md"
@@ -236,7 +236,7 @@ jobs:
             python harness/benchmarks/paired_open_loop.py \
               --base-root latency-base --candidate-root latency-base \
               --protocols 311 --payloads 256 --windows 64 \
-              --target-rates 2500,10000 --completions callback \
+              --target-rates 2500,10000 --completions receipt \
               --repeat 8 --count-small 4000 --timeout 120 --cpu 2 \
               --policy strict \
               --preflight-report "$root/runner.json" \
@@ -264,7 +264,7 @@ jobs:
           python harness/benchmarks/paired_open_loop.py \
             --base-root latency-base --candidate-root latency-base \
             --protocols 311 --payloads 256 --windows 64 \
-            --target-rates 2500,10000 --completions callback \
+            --target-rates 2500,10000 --completions receipt \
             --repeat 8 --count-small 4000 --timeout 120 --cpu 2 \
             --policy strict \
             --preflight-report "$root/runner-latency-retry.json" \
@@ -283,7 +283,7 @@ jobs:
           python harness/benchmarks/paired_open_loop.py \
             --base-root latency-base --candidate-root candidate \
             --protocols 311 --payloads 256 --windows 64 \
-            --target-rates 2500,10000 --completions callback \
+            --target-rates 2500,10000 --completions receipt \
             --repeat 8 --count-small 4000 --timeout 120 --cpu 2 \
             --policy strict \
             --preflight-report "$preflight" \

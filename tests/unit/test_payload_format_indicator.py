@@ -45,7 +45,7 @@ def test_pfi_1_rejects_invalid_publish_payload_before_admission(payload: bytes, 
         engine.queue_publish("topic", payload, qos=qos, properties=_pfi(1))
 
     assert engine.take_effects() == []
-    assert engine.outbound.pending_messages == 0
+    assert engine.outbound.unacknowledged_messages == 0
 
 
 def test_pfi_1_rejects_invalid_offline_qos_publish_before_persistence() -> None:

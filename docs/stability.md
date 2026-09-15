@@ -45,7 +45,7 @@ PYTHONPATH=src python benchmarks/soak.py \
 - short resource-aware reconnect soaks for MQTT 3.1.1 and MQTT 5;
 - strict local micro/open-loop performance gates on an eligible machine, plus
   an advisory closed-loop network diagnostic;
-- isolated wheel TCP, TLS, WebSocket, Unix, SQLite, Paho VERSION2 and shutdown
+- isolated wheel TCP, TLS, WebSocket, Unix, SQLite and shutdown
   smokes;
 - manifests, JSON artefacts and broker logs retained outside the repository.
 
@@ -57,7 +57,7 @@ numbers remain advisory.
 Installed-artifact workflows separately install the exact PyPI artifact rather
 than the checkout. Their retained matrix covers wheel/sdist metadata and Stable
 imports on Python 3.11–3.14, TCP and TLS broker round trips, SQLite restart,
-WebSocket and Unix transports, the Paho VERSION2 migration subset, cancellation
+WebSocket and Unix transports, cancellation
 and clean shutdown. They are manually dispatchable for every candidate.
 
 Multi-hour deterministic fuzz and soak campaigns are required release evidence.

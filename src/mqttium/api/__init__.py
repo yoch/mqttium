@@ -3,7 +3,6 @@
 from mqttium.api.async_client import (
     AsyncClient,
     MessageDelivery,
-    PublishBackpressure,
 )
 from mqttium.api.models import (
     PublishBatchReceipt,
@@ -27,7 +26,6 @@ __all__ = [
     "MessageDelivery",
     "NegotiatedSettings",
     "Properties",
-    "PublishBackpressure",
     "PublishBatchReceipt",
     "PublishMessage",
     "PublishReceipt",

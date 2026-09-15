@@ -1,4 +1,11 @@
-"""Immutable runtime statistics for :class:`mqttium.api.AsyncClient`."""
+"""Immutable runtime statistics for :class:`mqttium.api.AsyncClient`.
+
+The snapshot gives the application a view of what the client is doing without
+any logger: connection state, queue occupancy against its configured bound,
+lifetime high-water marks, and whether anyone is currently waiting. Fields
+describe the client's contract with the application and the broker, not how
+the runtime is scheduled internally.
+"""
 
 from __future__ import annotations
 
@@ -10,39 +17,8 @@ from mqttium.transport.stats import TransportStats
 
 
 @dataclass(slots=True, frozen=True)
-class TaskStats:
-    """Running state of each client-owned background task."""
-
-    reader: bool
-    writer: bool
-    keepalive: bool
-    reconnect: bool
-    effect_flush: bool
-    callback_worker: bool
-
-
-@dataclass(slots=True, frozen=True)
-class EffectStats:
-    """Effect-pump queue, high-water, and scheduling counters."""
-
-    pending: int
-    pending_high_water: int
-    enqueued: int
-    applied: int
-    waiters: int
-    # Decision counters: how often several effects arrive together, how often
-    # that actually required reordering, and how much rode the inline fast path.
-    # Effects that did not is `enqueued`, so there is no separate counter.
-    batches: int
-    multi_effect_batches: int
-    reordered_batches: int
-    inline_effects: int
-    apply_suspensions: int
-
-
-@dataclass(slots=True, frozen=True)
 class WriterStats:
-    """Writer queue bounds, high-water values, and batching counters."""
+    """Encoded frames waiting for the transport, against the write-queue bounds."""
 
     queued_messages: int
     queued_bytes: int
@@ -52,42 +28,33 @@ class WriterStats:
     max_bytes: int
     waiters: int
     last_outbound: float
-    # Decision counters: batch count and shape, plus how often a producer had to
-    # wait for queue space.
-    batches: int
-    batched_items: int
-    batched_bytes: int
-    segmented_writes: int
-    enqueue_suspensions: int
-    # Frames written straight to the transport because the writer task would
-    # have added an event-loop turn without doing anything else.
-    eager_writes: int = 0
-    eager_bytes: int = 0
 
 
 @dataclass(slots=True, frozen=True)
 class DecoderStats:
-    """Incremental-decoder occupancy and configured ingress limits."""
+    """Received bytes not yet decoded, against the packet-size bound."""
 
     buffered_bytes: int
     high_water_bytes: int
     max_packet_size: int
-    ingress_batch_limit_bytes: int
 
 
 @dataclass(slots=True, frozen=True)
 class DeliveryStats:
-    """Application-delivery queue occupancy, limits, and high-water values."""
+    """Messages held for the application, against the iterator bounds.
+
+    Callback delivery retains nothing, so every field stays at its idle value
+    in that mode. Iterator byte occupancy is tracked only when
+    ``max_iterator_bytes`` is finite; when that bound is ``None``,
+    ``iterator_bytes`` and ``iterator_high_water_bytes`` stay at zero and the
+    message-count fields remain authoritative.
+    """
 
     iterator_queued: int
     iterator_limit: int
-    callback_queued: int
-    callback_limit: int
-    pending_bytes: int
-    pending_high_water_bytes: int
-    accounted_limit: int | None
-    small_budget_bytes: int
-    small_message_limit: int | None
+    iterator_bytes: int
+    iterator_high_water_bytes: int
+    iterator_byte_limit: int | None
     waiters: int
 
 
@@ -107,19 +74,18 @@ class ClientStats:
     """One point-in-time, side-effect-free runtime snapshot.
 
     Every section is produced by the component that owns the state — the two
-    protocol sessions, the effect pump, the write pump and the transport — so
-    this class only assembles them. High-water fields are measured over the
-    lifetime of the client or protocol engine. Calling :meth:`AsyncClient.stats`
-    does not enable background sampling and does not reset any counter.
+    protocol sessions, the write pump, the decoder, application delivery and
+    the transport — so this class only assembles them. High-water fields are
+    measured over the lifetime of the client or protocol engine. Calling
+    :meth:`AsyncClient.stats` does not enable background sampling and does not
+    reset any counter.
     """
 
     state: ConnectionState
     connection_epoch: int
     reconnect_attempt: int
-    tasks: TaskStats
     outbound: OutboundStats
     inbound: InboundStats
-    effects: EffectStats
     writer: WriterStats
     decoder: DecoderStats
     delivery: DeliveryStats
@@ -131,11 +97,9 @@ __all__ = [
     "ClientStats",
     "DecoderStats",
     "DeliveryStats",
-    "EffectStats",
     "InboundStats",
     "OutboundStats",
     "ReceiptStats",
-    "TaskStats",
     "TransportStats",
     "WriterStats",
 ]

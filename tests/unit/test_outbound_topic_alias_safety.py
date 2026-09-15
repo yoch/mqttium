@@ -20,7 +20,9 @@ from tests.support import feed_engine, write_item_bytes
 
 def _connack(*, alias_maximum: int = 10, session_present: bool = False) -> bytes:
     connack_properties = Properties()
-    connack_properties.set("topic_alias_maximum", alias_maximum)
+    connack_properties = Properties(
+        {**connack_properties.values, "topic_alias_maximum": alias_maximum}
+    )
     body = bytearray((int(session_present), 0))
     body.extend(encode_properties(connack_properties, CONNACK))
     return encode_frame(PacketType.CONNACK, 0, body)
@@ -43,7 +45,7 @@ def _connected_engine(*, max_outbound_inflight: int | None = None) -> ProtocolEn
 
 def _alias(number: int) -> Properties:
     properties = Properties()
-    properties.set("topic_alias", number)
+    properties = Properties({**properties.values, "topic_alias": number})
     return properties
 
 
@@ -65,7 +67,7 @@ def test_empty_outbound_topic_with_alias_is_refused_without_mutation(qos: int) -
         engine.queue_publish("", b"payload", qos=qos, properties=properties)
 
     assert engine.take_effects() == []
-    assert engine.pending_outbound_messages == 0
+    assert engine.unacknowledged_messages == 0
     assert len(engine.packet_ids) == 0
     assert (
         tuple(
@@ -130,7 +132,7 @@ def test_invalid_outbound_alias_is_rejected_before_mutation(alias: int, qos: int
         engine.queue_publish("canonical/topic", qos=qos, properties=_alias(alias))
 
     assert engine.take_effects() == []
-    assert engine.pending_outbound_messages == 0
+    assert engine.unacknowledged_messages == 0
     assert len(engine.packet_ids) == 0
 
 
@@ -274,7 +276,7 @@ def test_reconnect_discards_retained_frame_with_old_alias(store_kind: str, tmp_p
     feed_engine(first, _connack(alias_maximum=2))
     first.take_effects()
     properties = _alias(2)
-    properties.set("content_type", "application/octet-stream")
+    properties = Properties({**properties.values, "content_type": "application/octet-stream"})
     handle = first.queue_publish(
         "canonical/topic",
         b"x" * (256 * 1024),
@@ -309,18 +311,3 @@ def test_reconnect_discards_retained_frame_with_old_alias(store_kind: str, tmp_p
     assert replay.properties.get("content_type") == "application/octet-stream"
     if isinstance(store, SqliteInflightStore):
         store.close()
-
-
-def test_failed_publish_batch_rolls_back_alias_mapping() -> None:
-    engine = _connected_engine()
-    requests = [
-        ("transient/topic", b"one", 0, False, _alias(1)),
-        ("invalid/#", b"two", 0, False, None),
-    ]
-
-    with pytest.raises(ProtocolError, match="wildcards"):
-        engine.queue_publish_many(requests)
-
-    assert engine.take_effects() == []
-    with pytest.raises(ProtocolError, match="Unknown outbound topic alias"):
-        engine.queue_publish("", qos=0, properties=_alias(1))

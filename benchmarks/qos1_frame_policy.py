@@ -62,12 +62,20 @@ def properties_for(protocol: MQTTProtocolVersion, profile: str) -> Properties | 
         return None
     props = Properties()
     if profile == "property-heavy":
-        props.set("message_expiry_interval", 3600)
-        props.set("content_type", "application/octet-stream")
-        props.set("response_topic", "bench/replies/frame-policy")
-        props.set("correlation_data", b"correlation" * 8)
+        props = Properties({**props.values, "message_expiry_interval": 3600})
+        props = Properties({**props.values, "content_type": "application/octet-stream"})
+        props = Properties({**props.values, "response_topic": "bench/replies/frame-policy"})
+        props = Properties({**props.values, "correlation_data": b"correlation" * 8})
         for index in range(24):
-            props.add_user_property(f"key-{index:02d}", "value" * 8)
+            props = Properties(
+                {
+                    **props.values,
+                    "user_property": (
+                        *props.get("user_property", ()),
+                        (f"key-{index:02d}", "value" * 8),
+                    ),
+                }
+            )
     return props
 
 

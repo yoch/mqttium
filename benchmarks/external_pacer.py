@@ -30,6 +30,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from benchmark_support import client_options, runtime_counters
 from paired_network import start_subscriber
 
 
@@ -297,24 +298,24 @@ def _payload(seq: int, sent_ns: int, size: int) -> bytes:
     return header + b"x" * max(0, size - len(header))
 
 
-def _writer_metrics(writer: Any, count: int) -> dict[str, float]:
-    batches = max(writer.batches, 1)
+def _writer_metrics(writer: Mapping[str, Any], count: int) -> dict[str, float]:
+    batches = max(writer["batches"], 1)
     return {
-        "eager_writes_per_msg": writer.eager_writes / count,
-        "batches_per_msg": writer.batches / count,
-        "items_per_batch": writer.batched_items / batches,
-        "enqueue_suspensions_per_msg": writer.enqueue_suspensions / count,
-        "high_water_messages": float(writer.high_water_messages),
-        "high_water_bytes": float(writer.high_water_bytes),
+        "eager_writes_per_msg": writer["eager_writes"] / count,
+        "batches_per_msg": writer["batches"] / count,
+        "items_per_batch": writer["batched_items"] / batches,
+        "enqueue_suspensions_per_msg": writer["enqueue_suspensions"] / count,
+        "high_water_messages": float(writer["high_water_messages"]),
+        "high_water_bytes": float(writer["high_water_bytes"]),
     }
 
 
-def _effect_metrics(effects: Any, count: int) -> dict[str, float]:
+def _effect_metrics(effects: Mapping[str, Any], count: int) -> dict[str, float]:
     return {
-        "enqueued_per_msg": effects.enqueued / count,
-        "multi_batches_per_msg": effects.multi_effect_batches / count,
-        "apply_suspensions": float(effects.apply_suspensions),
-        "pending_high_water": float(effects.pending_high_water),
+        "enqueued_per_msg": effects["enqueued"] / count,
+        "multi_batches_per_msg": effects["multi_effect_batches"] / count,
+        "apply_suspensions": float(effects["apply_suspensions"]),
+        "pending_high_water": float(effects["pending_high_water"]),
     }
 
 
@@ -324,16 +325,18 @@ async def publish_from_tokens(
     # Bind mqttium from PYTHONPATH so one harness can drive both source trees.
     from mqttium.api import AsyncClient
     from mqttium.enums import MQTTProtocolVersion
-    from mqttium.protocol.reconnect import ReconnectPolicy
 
     protocol = MQTTProtocolVersion.MQTTv5 if args.protocol == "5" else MQTTProtocolVersion.MQTTv311
     client = AsyncClient(
         client_id=f"ext-pacer-{os.getpid()}-{time.time_ns()}",
         protocol=protocol,
         max_outbound_inflight=args.window,
-        max_pending_outbound_messages=None,
-        max_pending_outbound_bytes=None,
-        reconnect=ReconnectPolicy(enabled=False),
+        reconnect=None,
+        **client_options(
+            AsyncClient,
+            max_unacknowledged_messages=None,
+            max_unacknowledged_bytes=None,
+        ),
     )
     ack_ms = [math.nan] * args.count
     recv_ns: list[int] = []
@@ -376,7 +379,8 @@ async def publish_from_tokens(
         offered_elapsed = max(time.perf_counter() - offered0, 1e-9)
         await asyncio.gather(*tasks)
         completed_elapsed = max(time.perf_counter() - offered0, 1e-9)
-        snapshot = client.stats()
+        writer = runtime_counters(client, "writer")
+        effects = runtime_counters(client, "effects")
         cpu_seconds = time.process_time() - cpu0
         finite_ack = [value for value in ack_ms if not math.isnan(value)]
         if len(finite_ack) != args.count:
@@ -396,8 +400,8 @@ async def publish_from_tokens(
             "transport_delay_us": pcts_us(transport_ns),
             "token_to_publish_us": pcts_us(token_to_publish_ns),
             "publish_admission_us": pcts_us(admission_ns),
-            "writer": _writer_metrics(snapshot.writer, args.count),
-            "effects": _effect_metrics(snapshot.effects, args.count),
+            "writer": _writer_metrics(writer, args.count),
+            "effects": _effect_metrics(effects, args.count),
             "payload_bytes": args.payload_bytes,
             "window": args.window,
             "protocol": args.protocol,

@@ -151,7 +151,7 @@ def test_mqtt5_qos1_and_qos2_use_direct_fields(monkeypatch) -> None:
     )
     assert calls == 0
 
-    # A fresh engine keeps this test focused on on_publish: otherwise the
+    # A fresh engine keeps this test focused on PUBLISH handling: otherwise the
     # Receive-Maximum preflight intentionally decodes a second PUBLISH while
     # the first auto-PUBACK is still pending in the current effect batch.
     engine = ProtocolEngine(EngineConfig(protocol=MQTTProtocolVersion.MQTTv5))

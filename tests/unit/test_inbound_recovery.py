@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests.support import deliver_message, stored_record
+
 
 from mqttium.api.async_client import AsyncClient
 from mqttium.enums import (
@@ -13,21 +15,23 @@ from mqttium.enums import (
 )
 from mqttium.persistence.memory import MemoryInflightStore
 from mqttium.persistence.sqlite import SqliteInflightStore
-from mqttium.protocol.engine import EffectKind, EngineConfig, EngineEffect, ProtocolEngine
+from mqttium.protocol.engine import EffectKind, EngineConfig, ProtocolEngine
 from mqttium.types import InboundMessage, Message
 from mqttium.codec.buffer import RawPacket
 
 
 def _inbound(mid: int, *, state=InboundQoSState.WAIT_PUBREL, delivered=True, user_acked=False):
-    return InboundMessage(
-        mid=mid,
-        topic=f"recover/{mid}",
-        payload=str(mid).encode(),
-        qos=QoS.EXACTLY_ONCE if state is not InboundQoSState.WAIT_PUBACK else QoS.AT_LEAST_ONCE,
-        retain=False,
-        state=state,
-        delivered=delivered,
-        user_acked=user_acked,
+    return stored_record(
+        InboundMessage(
+            mid=mid,
+            topic=f"recover/{mid}",
+            payload=str(mid).encode(),
+            qos=QoS.EXACTLY_ONCE if state is not InboundQoSState.WAIT_PUBACK else QoS.AT_LEAST_ONCE,
+            retain=False,
+            state=state,
+            delivered=delivered,
+            user_acked=user_acked,
+        )
     )
 
 
@@ -69,7 +73,7 @@ def test_session_resume_restores_receive_window_count() -> None:
     store.put_in(_inbound(1))
     store.put_in(_inbound(2))
     engine = ProtocolEngine(
-        EngineConfig(client_id="recovery", clean_start=False, local_receive_maximum=2),
+        EngineConfig(client_id="recovery", clean_start=False, max_inbound_inflight=2),
         store=store,
     )
 
@@ -131,12 +135,9 @@ async def test_client_marks_persisted_message_delivered_after_api_delivery() -> 
         dup=True,
     )
 
-    await client._apply_effect(
-        EngineEffect(EffectKind.MESSAGE, message),
-        nowait=False,
-    )
+    await deliver_message(client, message)
 
     persisted = store.get_in(9)
     assert persisted is not None and persisted.delivered is True
-    queued = client._messages.get_nowait()
+    queued = await anext(client.messages())
     assert isinstance(queued, Message) and queued.mid == 9

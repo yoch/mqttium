@@ -48,8 +48,16 @@ def build_frame(payload_bytes: int, protocol: MQTTProtocolVersion) -> bytes:
     properties: Properties | None = None
     if protocol == MQTTProtocolVersion.MQTTv5:
         properties = Properties()
-        properties.set("message_expiry_interval", 60)
-        properties.add_user_property("trace", "codec-allocations")
+        properties = Properties({**properties.values, "message_expiry_interval": 60})
+        properties = Properties(
+            {
+                **properties.values,
+                "user_property": (
+                    *properties.get("user_property", ()),
+                    ("trace", "codec-allocations"),
+                ),
+            }
+        )
     packet = PublishPacket(
         topic="bench/codec/ingress",
         payload=b"z" * payload_bytes,

@@ -84,6 +84,10 @@ class WritePump:
         # connection.
         self._eager_generation = 0
         self._eager_rearm_scheduled = False
+        # An eager latency flush can fail after exposing bytes. Restored frames
+        # then remain ownership records only; the writer must retire them and
+        # report this failure before attempting any further transport write.
+        self._latency_failure: BaseException | None = None
 
     @property
     def queued_messages(self) -> int:
@@ -106,7 +110,11 @@ class WritePump:
         self._resident_messages -= n
 
     def stats(self) -> WriterStats:
-        """Snapshot the queue and the batching decisions taken so far."""
+        """Snapshot queue occupancy against its bounds.
+
+        The batching decision counters stay on the pump itself: they describe
+        how the writer schedules, not what the application can observe or size.
+        """
         queued_messages = self.queue.qsize()
         return WriterStats(
             queued_messages=queued_messages,
@@ -117,13 +125,6 @@ class WritePump:
             max_bytes=self.max_bytes,
             waiters=self.waiters,
             last_outbound=self.last_outbound,
-            batches=self.batches,
-            batched_items=self.batched_items,
-            batched_bytes=self.batched_bytes,
-            segmented_writes=self.segmented_writes,
-            enqueue_suspensions=self.enqueue_suspensions,
-            eager_writes=self.eager_writes,
-            eager_bytes=self.eager_bytes,
         )
 
     def _sample_high_water(self, queued_messages: int | None = None) -> None:
@@ -160,6 +161,7 @@ class WritePump:
         self.queue = asyncio.Queue()
         self.queued_bytes = 0
         self._resident_messages = 0
+        self._latency_failure = None
         # The next start() rebinds it. Until then there is no transport this
         # pump may write to.
         self._drop_eager_binding()
@@ -226,73 +228,26 @@ class WritePump:
         self.queued_bytes = 0
         self._release_resident(remaining)
 
-    def can_enqueue_size(
-        self,
-        size: int,
-        *,
-        queued_messages: int | None = None,
-        queued_bytes: int | None = None,
-    ) -> bool:
-        # queued_messages is the admission count (resident), including an
-        # in-flight writer batch. Callers that pass a running total (batch
-        # preflight) are counting the same thing.
-        messages = self._resident_messages if queued_messages is None else queued_messages
-        bytes_used = self.queued_bytes if queued_bytes is None else queued_bytes
+    def can_enqueue_size(self, size: int) -> bool:
+        # Resident count includes an in-flight writer batch, not just qsize.
+        messages = self._resident_messages
+        bytes_used = self.queued_bytes
         if messages >= self.max_messages:
             return False
         return bytes_used + size <= self.max_bytes or (messages == 0 and bytes_used == 0)
 
-    def refusal(
-        self,
-        size: int = 0,
-        *,
-        queued_messages: int | None = None,
-        queued_bytes: int | None = None,
-    ) -> str:
-        """Name the bound that is refusing, for the error path only.
-
-        The two bounds default to very different magnitudes (10 000 messages
-        against 1 MiB), so a caller who sized the queue in messages meets the
-        byte bound first as soon as payloads grow. Saying which one refused is
-        the difference between a tunable and a mystery.
-
-        The overrides mirror :meth:`can_enqueue_size`: a batch is admitted
-        against running totals rather than against the live queue, so the two
-        must be told the same state or this names the wrong bound.
-        """
-        messages = self._resident_messages if queued_messages is None else queued_messages
-        bytes_used = self.queued_bytes if queued_bytes is None else queued_bytes
-        if messages >= self.max_messages:
+    def refusal(self, size: int = 0) -> str:
+        """Name the active message or byte bound, for the error path only."""
+        if self._resident_messages >= self.max_messages:
             return (
                 "Outbound backpressure limit reached: "
-                f"max_outbound_messages={self.max_messages} is full"
+                f"max_write_queue_messages={self.max_messages} is full"
             )
         return (
             "Outbound backpressure limit reached: "
-            f"max_outbound_bytes={self.max_bytes} would be exceeded by a "
-            f"{size}-byte write with {bytes_used} bytes already queued"
+            f"max_write_queue_bytes={self.max_bytes} would be exceeded by a "
+            f"{size}-byte write with {self.queued_bytes} bytes already queued"
         )
-
-    def refusal_many(self, items: list[WriteItem]) -> str:
-        """Name the bound that refused a batch, for the error path only.
-
-        Replays the running totals ``try_enqueue_many`` admits against, so the
-        reported bound is the one that stopped the batch rather than whatever
-        the live queue happens to show.
-        """
-        messages = self._resident_messages
-        bytes_used = self.queued_bytes
-        for item in items:
-            size = item_size(item)
-            if not self.can_enqueue_size(
-                size,
-                queued_messages=messages,
-                queued_bytes=bytes_used,
-            ):
-                return self.refusal(size, queued_messages=messages, queued_bytes=bytes_used)
-            messages += 1
-            bytes_used += size
-        return self.refusal()
 
     def _try_write_data_eager(self, item: WriteItem) -> bool:
         """Write one ordinary frame straight through when doing so preserves order.
@@ -343,7 +298,7 @@ class WritePump:
     def try_enqueue(self, item: WriteItem, *, epoch: int | None = None) -> bool:
         if epoch is None:
             epoch = self.epoch
-        if epoch != self.epoch:
+        if self._latency_failure is not None or epoch != self.epoch:
             raise StaleConnectionEffect
         size = item_size(item)
         if not self.can_enqueue_size(size):
@@ -359,7 +314,7 @@ class WritePump:
         """Admit a known success ACK without classifying its wire bytes."""
         if epoch is None:
             epoch = self.epoch
-        if epoch != self.epoch:
+        if self._latency_failure is not None or epoch != self.epoch:
             raise StaleConnectionEffect
         size = len(item)
         if not self.can_enqueue_size(size):
@@ -370,6 +325,15 @@ class WritePump:
         self.queued_bytes += size
         self._admit_queued()
         return True
+
+    def _restore_latency_items(self, items: list[WriteItem]) -> None:
+        # Keep unfinished work positive throughout restoration. Completing the
+        # extracted items first could wake an already waiting join() even though
+        # the same frames still require writer ownership.
+        for item in items:
+            self.queue.put_nowait(item)
+        for _ in items:
+            self.queue.task_done()
 
     def _try_flush_latency_batch(self) -> bool:
         """Flush one short queued burst without waiting for the writer task.
@@ -402,19 +366,24 @@ class WritePump:
         self._sample_high_water(queued)
         items = [self.queue.get_nowait() for _ in range(queued)]
         if any(isinstance(item, tuple) for item in items):
-            for _ in items:
-                self.queue.task_done()
-            for item in items:
-                self.queue.put_nowait(item)
+            self._restore_latency_items(items)
             return False
 
         parts = [item for item in items if isinstance(item, bytes)]
         combined = b"".join(parts)
-        if not write_nowait(combined):
-            for _ in items:
-                self.queue.task_done()
-            for item in items:
-                self.queue.put_nowait(item)
+        try:
+            accepted = write_nowait(combined)
+        except BaseException as exc:
+            # The transport may already own any prefix of these bytes. Restore
+            # accounting ownership, never a retry: the existing writer checks
+            # this latch before wire exposure and releases its normal batch.
+            self._latency_failure = exc
+            self._drop_eager_binding()
+            self.epoch += 1
+            self._restore_latency_items(items)
+            raise
+        if not accepted:
+            self._restore_latency_items(items)
             return False
 
         for _ in items:
@@ -429,40 +398,6 @@ class WritePump:
         self.last_outbound = time.monotonic()
         return True
 
-    def try_enqueue_many(
-        self,
-        items: list[WriteItem],
-        *,
-        epoch: int | None = None,
-    ) -> bool:
-        """Atomically append a bounded ordered batch without suspending."""
-
-        if epoch is None:
-            epoch = self.epoch
-        if epoch != self.epoch:
-            raise StaleConnectionEffect
-        if not items:
-            return True
-
-        messages = self._resident_messages
-        bytes_used = self.queued_bytes
-        for item in items:
-            size = item_size(item)
-            if not self.can_enqueue_size(
-                size,
-                queued_messages=messages,
-                queued_bytes=bytes_used,
-            ):
-                return False
-            messages += 1
-            bytes_used += size
-
-        for item in items:
-            self.queue.put_nowait(item)
-        self.queued_bytes = bytes_used
-        self._admit_queued(len(items))
-        return True
-
     async def _enqueue_after_wait(
         self,
         item: WriteItem,
@@ -473,7 +408,7 @@ class WritePump:
         """Wait for writer capacity after an immediate admission attempt failed."""
         async with self.space:
             while True:
-                if epoch != self.epoch:
+                if self._latency_failure is not None or epoch != self.epoch:
                     raise StaleConnectionEffect
                 messages_full = self._resident_messages >= self.max_messages
                 # Allow a single oversized item into an empty writer (segmented
@@ -503,7 +438,7 @@ class WritePump:
                     raise
                 finally:
                     self.waiters -= 1
-            if epoch != self.epoch:
+            if self._latency_failure is not None or epoch != self.epoch:
                 raise StaleConnectionEffect
             self.queue.put_nowait(item)
             self.queued_bytes += size
@@ -593,6 +528,8 @@ class WritePump:
                 self._writing = True
                 batch_completed = False
                 try:
+                    if self._latency_failure is not None:
+                        raise self._latency_failure
                     # Coalesce contiguous small frames into one writelines call.
                     # Never await drain() after the batch (deadlocks vs reader ACK).
                     contiguous: list[bytes] = []
@@ -623,19 +560,25 @@ class WritePump:
                             # cancellation/failure, but only a successfully written
                             # batch releases usable admission capacity.
                             self.space.notify(min(self.waiters, n_batch))
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            # The transport has failed and this task is giving up on it. Drop
-            # the eager binding first: the reconnect path does not call stop()
-            # (AsyncClient only stops the pump when it will not reconnect), so
-            # without this a producer racing the reader's teardown could still
-            # write straight into the dead transport.
-            self._drop_eager_binding()
-            self._writing = False
-            # The failed batch released resident accounting without making
-            # capacity usable. Invalidate this writer generation and wake all
-            # parked producers so they fail instead of waiting on a task that
-            # has already exited.
-            await self.advance_epoch(self.epoch + 1)
-            await self.on_failure(exc)
+        except (Exception, asyncio.CancelledError) as exc:
+            # A transport can raise cancellation synchronously without this
+            # writer being cancelled. Report that latched failure; ordinary
+            # lifecycle cancellation must still leave teardown with its caller.
+            if isinstance(exc, asyncio.CancelledError) and (
+                writer_task.cancelling() or self._latency_failure is None
+            ):
+                raise
+            failure = exc
+        # The transport has failed and this task is giving up on it. Drop
+        # the eager binding first: the reconnect path does not call stop()
+        # (AsyncClient only stops the pump when it will not reconnect), so
+        # without this a producer racing the reader's teardown could still
+        # write straight into the dead transport.
+        self._drop_eager_binding()
+        self._writing = False
+        # The failed batch released resident accounting without making
+        # capacity usable. Invalidate this writer generation and wake all
+        # parked producers so they fail instead of waiting on a task that
+        # has already exited.
+        await self.advance_epoch(self.epoch + (1 if self._latency_failure is None else 0))
+        await self.on_failure(failure)

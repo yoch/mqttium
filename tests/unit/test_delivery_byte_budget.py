@@ -11,10 +11,23 @@ from mqttium.enums import MQTTProtocolVersion
 from mqttium.errors import MessageDeliveryError
 from mqttium.protocol.engine import EffectKind, EngineEffect
 from mqttium.types import Message, Properties
+from tests.support import apply_delivery_effect, deliver_message
 
 
 def _effect(topic: str, payload: bytes) -> EngineEffect:
     return EngineEffect(EffectKind.MESSAGE, Message(topic=topic, payload=payload))
+
+
+def _counting_topic(value: str) -> tuple[str, list[int]]:
+    original = str.encode
+    encodes: list[int] = []
+
+    class CountingStr(str):
+        def encode(self, *args, **kwargs):  # type: ignore[override]
+            encodes.append(1)
+            return original(self, *args, **kwargs)
+
+    return CountingStr(value), encodes
 
 
 async def test_iterator_delivery_waits_for_shared_byte_capacity() -> None:
@@ -22,94 +35,134 @@ async def test_iterator_delivery_waits_for_shared_byte_capacity() -> None:
     logical_size = len(first.topic) + len(first.payload)
     client = AsyncClient(
         message_delivery="iterator",
-        max_pending_messages=4,
-        max_pending_delivery_bytes=logical_size,
+        max_iterator_messages=4,
+        max_iterator_bytes=logical_size,
     )
 
-    await client._apply_effect(EngineEffect(EffectKind.MESSAGE, first), nowait=False)
-    blocked = asyncio.create_task(
-        client._apply_effect(_effect("delivery/other", b"x"), nowait=False)
-    )
+    await deliver_message(client, first)
+    blocked = asyncio.create_task(apply_delivery_effect(client, _effect("delivery/other", b"x")))
     await asyncio.sleep(0)
 
     assert not blocked.done()
-    assert client.pending_delivery_bytes == logical_size
-    assert client._messages.qsize() == 1
+    assert client.stats().delivery.waiters == 1
+    assert client.stats().delivery.iterator_bytes == logical_size
+    assert client._delivery.messages_queue.qsize() == 1
+    assert client._delivery.messages_queue._unfinished_tasks == 0
 
     stream = client.messages()
     assert await anext(stream) is first
     await asyncio.wait_for(blocked, timeout=1.0)
 
-    assert client._messages.qsize() == 1
-    assert client.pending_delivery_bytes == len("delivery/other") + 1
+    assert client._delivery.messages_queue.qsize() == 1
+    assert client.stats().delivery.iterator_bytes == len("delivery/other") + 1
     await stream.aclose()
 
 
-async def test_both_delivery_counts_payload_once_until_both_consumers_release() -> None:
-    callback_started = asyncio.Event()
-    callback_release = asyncio.Event()
-    message = Message(topic="delivery/both", payload=b"payload")
-    logical_size = len(message.topic) + len(message.payload)
+async def test_unbounded_iterator_skips_byte_accounting() -> None:
     client = AsyncClient(
-        message_delivery="both",
-        max_pending_delivery_bytes=logical_size,
+        message_delivery="iterator",
+        max_iterator_messages=4,
+        max_iterator_bytes=None,
     )
+    message = Message(topic="delivery/unbounded", payload=b"payload")
 
-    async def callback(received: Message) -> None:
-        assert received is message
-        callback_started.set()
-        await callback_release.wait()
+    def fail_logical_size(*_args: object, **_kwargs: object) -> int:
+        raise AssertionError("unbounded iterator must not compute logical byte size")
 
-    client.on_message = callback
-    await client._apply_effect(EngineEffect(EffectKind.MESSAGE, message), nowait=False)
-    await callback_started.wait()
+    client._delivery.logical_size = fail_logical_size  # type: ignore[method-assign]
+    await deliver_message(client, message)
 
-    assert client.pending_delivery_bytes == logical_size
+    stats = client.stats().delivery
+    assert stats.iterator_byte_limit is None
+    assert stats.iterator_bytes == 0
+    assert stats.iterator_high_water_bytes == 0
+    assert client._delivery.messages_queue.qsize() == 1
+    assert client._delivery.messages_queue._unfinished_tasks == 0
+
     stream = client.messages()
     assert await anext(stream) is message
-    assert client.pending_delivery_bytes == logical_size
-
-    callback_release.set()
-    await asyncio.wait_for(client._callback_queue.join(), timeout=1.0)
-    assert client.pending_delivery_bytes == 0
+    assert client.stats().delivery.iterator_bytes == 0
+    assert client.stats().delivery.iterator_high_water_bytes == 0
     await stream.aclose()
-    await client._shutdown_callback_worker(drain=False)
 
 
-async def test_callback_delivery_releases_bytes_after_callback_finishes() -> None:
+async def test_unbounded_iterator_keeps_count_backpressure() -> None:
+    client = AsyncClient(
+        message_delivery="iterator",
+        max_iterator_messages=1,
+        max_iterator_bytes=None,
+    )
+    first = Message(topic="delivery/first", payload=b"1")
+    second = Message(topic="delivery/second", payload=b"2")
+
+    await deliver_message(client, first)
+    blocked = asyncio.create_task(deliver_message(client, second))
+    await asyncio.sleep(0)
+
+    assert not blocked.done()
+    assert client.stats().delivery.waiters == 1
+    assert client.stats().delivery.iterator_bytes == 0
+
+    stream = client.messages()
+    assert await anext(stream) is first
+    await asyncio.wait_for(blocked, timeout=1.0)
+
+    assert client._delivery.messages_queue.qsize() == 1
+    assert client.stats().delivery.iterator_bytes == 0
+    assert await anext(stream) is second
+    await stream.aclose()
+
+
+async def test_unbounded_iterator_reset_discards_bare_messages() -> None:
+    client = AsyncClient(
+        message_delivery="iterator",
+        max_iterator_messages=2,
+        max_iterator_bytes=None,
+    )
+    await deliver_message(client, Message(topic="delivery/reset", payload=b"payload"))
+
+    client._delivery.close()
+    client._delivery.reset_stream()
+
+    stats = client.stats().delivery
+    assert client._delivery.messages_queue.empty()
+    assert stats.iterator_bytes == 0
+    assert stats.iterator_high_water_bytes == 0
+    assert stats.iterator_byte_limit is None
+    assert not client._delivery.closed.is_set()
+
+
+async def test_callback_delivery_charges_no_bytes() -> None:
     finished = asyncio.Event()
     message = Message(topic="delivery/callback", payload=b"payload")
-    logical_size = len(message.topic) + len(message.payload)
-    client = AsyncClient(
-        message_delivery="callback",
-        max_pending_delivery_bytes=logical_size,
-    )
+    client = AsyncClient(message_delivery="callback")
 
-    async def callback(received: Message) -> None:
+    def callback(received: Message) -> None:
         assert received is message
         finished.set()
 
     client.on_message = callback
-    await client._apply_effect(EngineEffect(EffectKind.MESSAGE, message), nowait=False)
-    await finished.wait()
-    await asyncio.wait_for(client._callback_queue.join(), timeout=1.0)
+    await deliver_message(client, message)
+    assert finished.is_set()
+    await deliver_message(client, message)
 
-    assert client.pending_delivery_bytes == 0
-    assert client.pending_delivery_high_water_bytes == logical_size
-    await client._shutdown_callback_worker(drain=False)
+    assert client._delivery.callback_invocations == 2
+    assert client.stats().delivery.iterator_bytes == 0
+    assert client.stats().delivery.iterator_high_water_bytes == 0
+    assert client.stats().delivery.waiters == 0
 
 
 async def test_single_message_larger_than_delivery_budget_fails_explicitly() -> None:
     client = AsyncClient(
         message_delivery="iterator",
-        max_pending_delivery_bytes=4,
+        max_iterator_bytes=4,
     )
 
     with pytest.raises(MessageDeliveryError, match="exceeding limit"):
-        await client._apply_effect(_effect("topic", b"payload"), nowait=False)
+        await apply_delivery_effect(client, _effect("topic", b"payload"))
 
-    assert client.pending_delivery_bytes == 0
-    assert client._messages.empty()
+    assert client.stats().delivery.iterator_bytes == 0
+    assert client._delivery.messages_queue.empty()
 
 
 async def test_delivery_budget_wakes_multiple_waiters_without_overcommit() -> None:
@@ -117,19 +170,15 @@ async def test_delivery_budget_wakes_multiple_waiters_without_overcommit() -> No
     logical_size = len(messages[0].topic) + len(messages[0].payload)
     client = AsyncClient(
         message_delivery="iterator",
-        max_pending_messages=4,
-        max_pending_delivery_bytes=logical_size,
+        max_iterator_messages=4,
+        max_iterator_bytes=logical_size,
     )
 
-    await client._apply_effect(EngineEffect(EffectKind.MESSAGE, messages[0]), nowait=False)
-    blocked = {
-        asyncio.create_task(
-            client._apply_effect(EngineEffect(EffectKind.MESSAGE, message), nowait=False)
-        )
-        for message in messages[1:]
-    }
+    await deliver_message(client, messages[0])
+    blocked = {asyncio.create_task(deliver_message(client, message)) for message in messages[1:]}
     await asyncio.sleep(0)
     assert not any(task.done() for task in blocked)
+    assert client.stats().delivery.waiters == 2
 
     stream = client.messages()
     assert await anext(stream) is messages[0]
@@ -140,114 +189,106 @@ async def test_delivery_budget_wakes_multiple_waiters_without_overcommit() -> No
     )
     assert len(done) == 1
     assert len(pending) == 1
-    assert client.pending_delivery_bytes == logical_size
-    assert client._messages.qsize() == 1
+    assert client.stats().delivery.iterator_bytes == logical_size
+    assert client._delivery.messages_queue.qsize() == 1
 
     assert await anext(stream) in messages[1:]
     await asyncio.wait_for(next(iter(pending)), timeout=1.0)
-    assert client.pending_delivery_bytes == logical_size
-    assert client._messages.qsize() == 1
+    assert client.stats().delivery.iterator_bytes == logical_size
+    assert client._delivery.messages_queue.qsize() == 1
 
     assert await anext(stream) in messages[1:]
-    assert client.pending_delivery_bytes == 0
+    assert client.stats().delivery.iterator_bytes == 0
     await stream.aclose()
 
 
-async def test_default_budget_reserves_count_bounded_small_message_pool() -> None:
-    callback_started = asyncio.Event()
-    callback_release = asyncio.Event()
-    client = AsyncClient(
-        message_delivery="callback",
-        max_pending_callbacks=4,
-        max_pending_delivery_bytes=64 * 1024 * 1024,
-    )
-    message = Message(topic="small/topic", payload=b"payload")
-
-    async def callback(_message: Message) -> None:
-        callback_started.set()
-        await callback_release.wait()
-
-    client.on_message = callback
-    await client._apply_effect(EngineEffect(EffectKind.MESSAGE, message), nowait=False)
-    await callback_started.wait()
-
-    assert client.delivery_small_budget_bytes == 8 * 1024 * 1024
-    assert client.delivery_small_message_limit is not None
-    assert len(message.payload) + len(message.topic) <= client.delivery_small_message_limit
-    # The small pool is statically reserved from queue-count bounds, so the
-    # exact-accounted dynamic pool remains untouched.
-    assert client.pending_delivery_bytes == 0
-
-    callback_release.set()
-    await client._callback_queue.join()
-    await client._shutdown_callback_worker(drain=False)
-
-
-def test_small_pool_is_disabled_if_it_reduces_single_packet_capacity() -> None:
-    client = AsyncClient(
-        message_delivery="iterator",
-        max_pending_delivery_bytes=8 * 1024 * 1024,
-    )
-
-    assert client.delivery_small_budget_bytes == 0
-    assert client.delivery_small_message_limit == 0
-    assert client._delivery_accounted_limit == 8 * 1024 * 1024
-
-
-def _small_pool_client(protocol: MQTTProtocolVersion) -> AsyncClient:
-    """A client whose small-message fast path is enabled (see the test above)."""
+def _byte_budget_client(protocol: MQTTProtocolVersion) -> AsyncClient:
+    """A client whose iterator uses exact finite byte accounting."""
     return AsyncClient(
         message_delivery="iterator",
-        max_pending_messages=4,
-        max_pending_delivery_bytes=64 * 1024 * 1024,
+        max_iterator_messages=4,
+        max_iterator_bytes=64 * 1024 * 1024,
         protocol=protocol,
     )
 
 
-async def test_mqtt5_publish_without_properties_uses_the_small_fast_path() -> None:
+@pytest.mark.parametrize("protocol", [MQTTProtocolVersion.MQTTv311, MQTTProtocolVersion.MQTTv5])
+async def test_bounded_iterator_ascii_topic_does_not_encode_for_sizing(
+    protocol: MQTTProtocolVersion,
+) -> None:
+    topic, encodes = _counting_topic("sensors/" + "a" * 256)
+    client = _byte_budget_client(protocol)
+    message = Message(topic=topic, payload=b"payload")
+
+    await deliver_message(client, message)
+
+    assert encodes == []
+    assert client.stats().delivery.iterator_bytes == len(topic) + len(message.payload)
+
+
+@pytest.mark.parametrize("protocol", [MQTTProtocolVersion.MQTTv311, MQTTProtocolVersion.MQTTv5])
+async def test_bounded_iterator_non_ascii_topic_encodes_once_for_sizing(
+    protocol: MQTTProtocolVersion,
+) -> None:
+    topic, encodes = _counting_topic("capteurs/été/température")
+    client = _byte_budget_client(protocol)
+    message = Message(topic=topic, payload=b"payload")
+
+    await deliver_message(client, message)
+
+    assert len(encodes) == 1
+    assert client.stats().delivery.iterator_bytes == len(topic.encode("utf-8")) + len(
+        message.payload
+    )
+    # The assertion's own encode is outside the delivery path.
+    assert len(encodes) == 2
+
+
+async def test_mqtt5_publish_without_properties_is_accounted() -> None:
     # decode_properties() returns an empty Properties() rather than None for a
     # zero-length MQTT 5 property table, so identity testing would have pushed
     # every property-less v5 PUBLISH into exact accounting.
-    client = _small_pool_client(MQTTProtocolVersion.MQTTv5)
+    client = _byte_budget_client(MQTTProtocolVersion.MQTTv5)
     message = Message(topic="small/topic", payload=b"payload", properties=Properties())
 
-    await client._apply_effect(EngineEffect(EffectKind.MESSAGE, message), nowait=False)
+    await deliver_message(client, message)
 
-    assert client.pending_delivery_bytes == 0
-    assert client._messages.qsize() == 1
+    assert client.stats().delivery.iterator_bytes == len(message.topic) + len(message.payload)
+    assert client._delivery.messages_queue.qsize() == 1
 
 
 async def test_mqtt5_publish_with_properties_stays_exactly_accounted() -> None:
-    client = _small_pool_client(MQTTProtocolVersion.MQTTv5)
+    client = _byte_budget_client(MQTTProtocolVersion.MQTTv5)
     properties = Properties()
-    properties.add_user_property("k", "v")
+    properties = Properties(
+        {**properties.values, "user_property": (*properties.get("user_property", ()), ("k", "v"))}
+    )
     message = Message(topic="small/topic", payload=b"payload", properties=properties)
 
-    await client._apply_effect(EngineEffect(EffectKind.MESSAGE, message), nowait=False)
+    await deliver_message(client, message)
 
-    assert client.pending_delivery_bytes == client._delivery_logical_size(message)
-    assert client.pending_delivery_bytes > len(message.topic) + len(message.payload)
+    assert client.stats().delivery.iterator_bytes == client._delivery.logical_size(message)
+    assert client.stats().delivery.iterator_bytes > len(message.topic) + len(message.payload)
 
 
-async def test_mqtt311_delivery_is_unchanged_by_the_truthiness_test() -> None:
-    client = _small_pool_client(MQTTProtocolVersion.MQTTv311)
+async def test_mqtt311_delivery_is_accounted() -> None:
+    client = _byte_budget_client(MQTTProtocolVersion.MQTTv311)
     message = Message(topic="small/topic", payload=b"payload")
 
-    await client._apply_effect(EngineEffect(EffectKind.MESSAGE, message), nowait=False)
+    await deliver_message(client, message)
 
-    assert client.pending_delivery_bytes == 0
-    assert client._messages.qsize() == 1
+    assert client.stats().delivery.iterator_bytes == len(message.topic) + len(message.payload)
+    assert client._delivery.messages_queue.qsize() == 1
 
 
-async def test_disabled_small_pool_still_accounts_property_less_mqtt5() -> None:
+async def test_small_budget_accounts_property_less_mqtt5() -> None:
     client = AsyncClient(
         message_delivery="iterator",
-        max_pending_delivery_bytes=8 * 1024 * 1024,
+        max_iterator_bytes=8 * 1024 * 1024,
         protocol=MQTTProtocolVersion.MQTTv5,
     )
-    assert client.delivery_small_message_limit == 0
     message = Message(topic="small/topic", payload=b"payload", properties=Properties())
 
-    await client._apply_effect(EngineEffect(EffectKind.MESSAGE, message), nowait=False)
+    await deliver_message(client, message)
 
-    assert client.pending_delivery_bytes == len(message.topic) + len(message.payload)
+    assert client.stats().delivery.iterator_bytes == len(message.topic) + len(message.payload)
