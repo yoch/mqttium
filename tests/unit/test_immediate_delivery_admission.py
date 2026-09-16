@@ -6,6 +6,7 @@ import asyncio
 
 import pytest
 
+import mqttium.api._delivery as delivery_module
 from mqttium.api import AsyncClient
 from mqttium.enums import QoS
 from mqttium.errors import MessageDeliveryError
@@ -19,7 +20,7 @@ async def test_available_capacity_avoids_timeout_and_sizes_once(monkeypatch, dea
     client = AsyncClient(iterator_admission_timeout=deadline)
     delivery = client._delivery
     sizes = []
-    original = delivery.logical_size
+    original = delivery_module.publish_logical_size
 
     def logical_size(*args):
         sizes.append(args)
@@ -28,7 +29,7 @@ async def test_available_capacity_avoids_timeout_and_sizes_once(monkeypatch, dea
     def unexpected_timeout(*args):
         raise AssertionError("immediate admission must not enter a timeout context")
 
-    monkeypatch.setattr(delivery, "logical_size", logical_size)
+    monkeypatch.setattr(delivery_module, "publish_logical_size", logical_size)
     message = Message(topic="t", payload=b"x")
     with monkeypatch.context() as patch:
         patch.setattr(asyncio, "timeout", unexpected_timeout)
@@ -50,7 +51,7 @@ async def test_callback_mode_delivers_inline_without_sizing_or_reservation(monke
     def unexpected_timeout(*args):
         raise AssertionError("callback delivery must not enter a timeout context")
 
-    monkeypatch.setattr(delivery, "logical_size", unexpected_size)
+    monkeypatch.setattr(delivery_module, "publish_logical_size", unexpected_size)
     message = Message(topic="t", payload=b"x")
     with monkeypatch.context() as patch:
         patch.setattr(asyncio, "timeout", unexpected_timeout)
