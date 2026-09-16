@@ -39,7 +39,7 @@ first.
 | Delivery choices | Async iteration with optional manual acknowledgement, or synchronous auto-ack callbacks |
 | Transports | TCP, TLS, WebSocket, and Unix-domain sockets |
 | Operations | Immutable runtime snapshots, queue high-water marks, and broker-negotiated limits |
-| Efficient native path | Progressive `publish_many()`, loop-bound `publish_nowait()`, and measured hot-path optimisation without a separate fast-mode API |
+| Efficient native path | Progressive `publish_many()`, loop-bound `publish_nowait()`, and hot paths measured under the same semantics |
 
 MQTTium keeps protocol state in a synchronous state machine and leaves sockets,
 timers, callbacks, and task ownership to the asyncio adapter. That separation
@@ -105,7 +105,7 @@ async for message in client.messages():
     await client.ack(message)
 ```
 
-For low-overhead synchronous notification, construct the client with
+For synchronous notification, construct the client with
 `message_delivery="callback"` and register `on_message` or topic-specific
 callbacks before the first connection attempt. Message callbacks are synchronous
 by contract and run inline on the delivering reader, outside protocol locks.
@@ -161,7 +161,7 @@ the native asyncio path together with MQTT semantics, bounded resource use,
 backpressure, and event-loop fairness rather than relaxing those contracts for
 a benchmark configuration.
 
-The independent
+The separate
 [`mqtt-python-client-bench`](https://github.com/yoch/mqtt-python-client-bench)
 project carries cross-client campaigns with exact source revisions, environment
 fingerprints, scenario semantics, validity labels, and raw evidence. MQTTium only
@@ -172,7 +172,7 @@ native scenarios, while Eclipse Paho is retained as a widely known synchronous
 reference rather than presented as a direct asyncio peer.
 
 For MQTTium-to-MQTTium regression work, the
-[benchmarking contract](https://mqttium.readthedocs.io/en/stable/benchmarking/)
+[benchmarking contract](https://github.com/yoch/mqttium/blob/main/docs/benchmarking.md)
 requires exact source identity and controlled paired measurements. Small
 suspected regressions are checked with same-code controls and interleaved A/B
 runs before they justify runtime complexity. Absolute throughput still depends
@@ -248,4 +248,4 @@ with historical reports.
 
 MQTTium is original software licensed under
 [Apache-2.0](https://github.com/yoch/mqttium/blob/main/LICENSE). Paho and gmqtt
-are referenced only for migration, interoperability, and independent comparison.
+are referenced only for migration, interoperability, and cross-client comparison.
