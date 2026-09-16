@@ -17,14 +17,16 @@
 
 MQTTium is an async-native MQTT 3.1.1 and MQTT 5 client for Python 3.11–3.14.
 It is designed for services, gateways, and connected devices that need explicit
-delivery semantics, bounded resource use, and predictable recovery when a
+completion semantics, bounded resource use, and predictable recovery when a
 connection or process fails.
 
 The package has no runtime dependencies and is fully typed.
 
-This checkout carries the current pre-v1 native API. Its client surface and
-SQLite format are incompatible with `1.0.0rc14`; consult `docs/migration.md`
-before reusing existing application code or databases.
+The current pre-v1 native API deliberately differs from `1.0.0rc14`, including
+message delivery, publication completion, configuration names, and the SQLite
+format. If you are upgrading an existing application or database, read the
+[migration guide](https://github.com/yoch/mqttium/blob/main/docs/migration.md)
+first.
 
 ## Why MQTTium?
 
@@ -32,12 +34,12 @@ before reusing existing application code or databases.
 | --- | --- |
 | Protocol coverage | MQTT 3.1.1 and MQTT 5, QoS 0/1/2, typed properties, Last Will, and enhanced authentication |
 | Explicit completion | Publish receipts that separate local admission from the relevant MQTT acknowledgement exchange |
-| Controlled load | Message and byte budgets, wait-or-refuse backpressure, bounded ingress, writes, and application delivery |
+| Controlled load | Independent message and byte budgets, wait-or-refuse backpressure, bounded ingress, writes, and application delivery |
 | Session continuity | Jittered reconnect plus in-memory or SQLite-backed inflight state with incremental replay |
-| Delivery choices | Async iterator, with optional manual acknowledgement, or short synchronous auto-ack callbacks |
+| Delivery choices | Async iteration with optional manual acknowledgement, or synchronous auto-ack callbacks |
 | Transports | TCP, TLS, WebSocket, and Unix-domain sockets |
 | Operations | Immutable runtime snapshots, queue high-water marks, and broker-negotiated limits |
-| Efficient production | Bounded `publish_many()` and loop-bound `publish_nowait()` without changing delivery semantics |
+| Efficient native path | Progressive `publish_many()`, loop-bound `publish_nowait()`, and measured hot-path optimisation without a separate fast-mode API |
 
 MQTTium keeps protocol state in a synchronous state machine and leaves sockets,
 timers, callbacks, and task ownership to the asyncio adapter. That separation
@@ -52,7 +54,7 @@ python -m pip install mqttium
 
 ## First round trip
 
-The example subscribes, publishes at QoS 1, waits for PUBACK, and consumes the
+This example subscribes, publishes at QoS 1, waits for PUBACK, and consumes the
 message:
 
 ```python
@@ -84,15 +86,40 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-For QoS 0, a receipt completes after writer admission because MQTT provides no
-broker acknowledgement. QoS 1 completes on PUBACK; QoS 2 completes on PUBCOMP.
-Waiting for `publish()` and waiting for `receipt.wait()` therefore answer
-different questions.
+`await client.publish(...)` waits until the publication is admitted and its
+bounded effect transfer is complete; it does not wait for the MQTT exchange to
+finish. The returned receipt observes that later completion. QoS 0 completes on
+writer handoff because MQTT defines no acknowledgement, QoS 1 on PUBACK, and
+QoS 2 on PUBCOMP.
+
+## Choose the delivery model deliberately
+
+Iterator delivery is the default and the asynchronous processing path. It is
+also the only mode that supports `manual_ack=True`:
+
+```python
+client = AsyncClient(manual_ack=True)
+
+async for message in client.messages():
+    await process(message)
+    await client.ack(message)
+```
+
+For low-overhead synchronous notification, construct the client with
+`message_delivery="callback"` and register `on_message` or topic-specific
+callbacks before the first connection attempt. Message callbacks are synchronous
+by contract and run inline on the delivering reader, outside protocol locks.
+They retain no MQTTium callback queue, so callback execution time is natural
+receive-side backpressure. Use `messages()` instead when handling needs to
+`await`, may take significant time, or needs manual acknowledgement.
+
+Message routes are frozen after the first connection attempt. Create a new
+client when a later connection needs a different routing table.
 
 ## Backpressure is part of the API
 
-`publish()` waits for capacity by default. Applications that have a defined
-shed, retry, or spill policy can request immediate refusal:
+`publish()` waits for capacity by default. Applications with a defined shed,
+retry, or spill policy can request immediate refusal instead:
 
 ```python
 from mqttium import FlowControlError
@@ -106,11 +133,13 @@ except FlowControlError:
     await shed_or_retry(payload)
 ```
 
-Outbound protocol state, encoded writes, inbound protocol state, and delivery
-queues have independent bounds because they have different lifetimes. Passing
+Outbound protocol state, encoded writes, inbound protocol state, and iterator
+delivery have independent bounds because they have different lifetimes. Passing
 `None` disables an optional bound and should be a deliberate capacity decision.
 
-For a sustained producer, `publish_many()` consumes an iterable progressively, with at most one element read ahead and returns one aggregate receipt:
+For a sustained producer, `publish_many()` walks its input progressively instead
+of materialising chunks or creating one task per publication. Admissions remain
+ordered and the returned aggregate receipt tracks the committed prefix:
 
 ```python
 from mqttium.api import PublishMessage
@@ -120,6 +149,34 @@ batch = await client.publish_many(
 )
 await batch.wait()
 ```
+
+If iteration or admission fails after earlier elements committed,
+`PublishBatchError` exposes the aggregate receipt for that committed prefix;
+MQTTium does not roll it back.
+
+## Performance
+
+Performance is a design constraint, not a separate fast mode. MQTTium measures
+the native asyncio path together with MQTT semantics, bounded resource use,
+backpressure, and event-loop fairness rather than relaxing those contracts for
+a benchmark configuration.
+
+The independent
+[`mqtt-python-client-bench`](https://github.com/yoch/mqtt-python-client-bench)
+project carries cross-client campaigns with exact source revisions, environment
+fingerprints, scenario semantics, validity labels, and raw evidence. MQTTium only
+treats cross-client points as comparable when the completion contract matches;
+unsupported capabilities remain `N/A` rather than being approximated with a
+different operation. `gmqtt` is the closest established asyncio peer for many
+native scenarios, while Eclipse Paho is retained as a widely known synchronous
+reference rather than presented as a direct asyncio peer.
+
+For MQTTium-to-MQTTium regression work, the
+[benchmarking contract](https://mqttium.readthedocs.io/en/stable/benchmarking/)
+requires exact source identity and controlled paired measurements. Small
+suspected regressions are checked with same-code controls and interleaved A/B
+runs before they justify runtime complexity. Absolute throughput still depends
+on the machine, broker, workload, and completion semantics.
 
 ## Reconnect and durable sessions
 
@@ -151,14 +208,19 @@ application owns the store and must close it after the client has shut down.
 
 ## Migration from 1.0.0rc14
 
-The current native API is the only supported surface. See `docs/migration.md`
-in this checkout for removed interfaces, frozen configuration, progressive
-batches and SQLite schema 5. Published stable documentation describes the
-`1.0.0rc14` release line.
+The current native API is the only supported client surface. The migration guide
+covers removed compatibility interfaces and helpers, the frozen constructor and
+statistics vocabulary, progressive batch publication, synchronous message
+callbacks, receipt-based publication completion, and the new SQLite schema.
+Historical databases are not upgraded automatically.
+
+Until the next release is cut, the published `stable` documentation describes
+the `1.0.0rc14` release line; the source-tree migration guide describes the
+current pre-v1 API.
 
 ## Documentation
 
-The complete documentation is available on
+The complete released documentation is available on
 [Read the Docs](https://mqttium.readthedocs.io/en/stable/).
 
 | Start here | Use it for |
@@ -169,23 +231,13 @@ The complete documentation is available on
 | [Transports and security](https://mqttium.readthedocs.io/en/stable/transports-and-tls/) | TCP, TLS, WebSocket, Unix sockets, and credential handling |
 | [MQTT 5](https://mqttium.readthedocs.io/en/stable/mqtt-5/) | Properties, authentication, topic aliases, and negotiated limits |
 | [Operations](https://mqttium.readthedocs.io/en/stable/operations/) | Runtime snapshots, pressure diagnosis, and graceful shutdown |
+| [Benchmarking](https://mqttium.readthedocs.io/en/stable/benchmarking/) | Performance methodology, regression controls, and measurement semantics |
 | [Stable API reference](https://mqttium.readthedocs.io/en/stable/reference/) | Supported imports, signatures, defaults, and exceptions |
 | [Compatibility matrix](https://mqttium.readthedocs.io/en/stable/compatibility/) | Python, platform, broker, protocol, and transport validation |
 
 Architecture, conformance, stability tiers, benchmarking methodology, and
 release evidence are documented separately so current contracts are not mixed
 with historical reports.
-
-## Performance claims
-
-Performance is treated as an evidence discipline, not a slogan. Changes must
-preserve MQTT semantics, bounded memory, backpressure, and event-loop fairness.
-The [benchmarking contract](https://mqttium.readthedocs.io/en/stable/benchmarking/)
-defines valid comparisons.
-Cross-client results will be linked only after the independent benchmark
-repository publishes reviewed MQTTium, Paho, and gmqtt runs with exact versions,
-environment details, raw artifacts, comparable completion semantics, and stated
-limitations.
 
 ## Support and contributing
 
@@ -194,6 +246,6 @@ limitations.
 - Report vulnerabilities privately as described in the [security policy](https://github.com/yoch/mqttium/blob/main/SECURITY.md).
 - See the [contribution guide](https://github.com/yoch/mqttium/blob/main/CONTRIBUTING.md) for development and validation commands.
 
-MQTTium is original software licensed under [Apache-2.0](https://github.com/yoch/mqttium/blob/main/LICENSE). Paho and
-gmqtt are referenced only for migration, interoperability, and independent
-comparison.
+MQTTium is original software licensed under
+[Apache-2.0](https://github.com/yoch/mqttium/blob/main/LICENSE). Paho and gmqtt
+are referenced only for migration, interoperability, and independent comparison.
