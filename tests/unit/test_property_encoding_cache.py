@@ -24,7 +24,12 @@ def test_delivery_logical_size_reuses_cached_mqtt5_property_body(monkeypatch) ->
 
     monkeypatch.setattr(properties_module, "_encode_properties_uncached", counting)
     properties = Properties()
-    properties.add_user_property("source", "delivery")
+    properties = Properties(
+        {
+            **properties.values,
+            "user_property": (*properties.get("user_property", ()), ("source", "delivery")),
+        }
+    )
     message = Message(topic="cache/topic", payload=b"payload", properties=properties)
     client = AsyncClient(protocol=MQTTProtocolVersion.MQTTv5)
 
@@ -35,16 +40,16 @@ def test_delivery_logical_size_reuses_cached_mqtt5_property_body(monkeypatch) ->
     assert calls == 1
 
 
-def test_binary_property_cache_detects_in_place_bytearray_mutation() -> None:
+def test_binary_property_cache_owns_its_input() -> None:
     data = bytearray(b"before")
     properties = Properties()
-    properties.set("correlation_data", data)
+    properties = Properties({**properties.values, "correlation_data": data})
 
     first = encode_properties(properties, PUBLISH)
     data[:] = b"after"
     second = encode_properties(properties, PUBLISH)
 
-    assert first != second
+    assert first is second
     decoded, pos = decode_properties(second, 0, PUBLISH)
     assert pos == len(second)
-    assert decoded.get("correlation_data") == b"after"
+    assert decoded.get("correlation_data") == b"before"

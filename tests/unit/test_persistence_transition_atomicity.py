@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests.support import stored_record
+
 import sqlite3
 from pathlib import Path
 
@@ -93,7 +95,7 @@ def test_pubrec_emits_no_pubrel_when_the_conditional_transition_is_refused() -> 
     assert record is not None
     assert record.state is OutboundQoSState.WAIT_PUBREC
     assert engine.flow.inflight == 1
-    assert engine.pending_outbound_messages == 1
+    assert engine.unacknowledged_messages == 1
 
 
 def test_manual_ack_releases_nothing_when_conditional_completion_is_refused() -> None:
@@ -164,13 +166,15 @@ def outbound(mid: int, state: OutboundQoSState) -> OutboundMessage:
 
 
 def inbound(mid: int, state: InboundQoSState) -> InboundMessage:
-    return InboundMessage(
-        mid=mid,
-        topic="a/b",
-        payload=b"payload",
-        qos=QoS.EXACTLY_ONCE,
-        retain=False,
-        state=state,
+    return stored_record(
+        InboundMessage(
+            mid=mid,
+            topic="a/b",
+            payload=b"payload",
+            qos=QoS.EXACTLY_ONCE,
+            retain=False,
+            state=state,
+        )
     )
 
 

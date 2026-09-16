@@ -389,21 +389,6 @@ async def test_stopping_drops_the_eager_path_with_its_transport() -> None:
     assert pump.queued_messages == 1
 
 
-async def test_batched_frames_are_not_counted_as_eager() -> None:
-    """try_enqueue_many keeps its atomic all-or-nothing queue admission."""
-    transport = _EagerTransport()
-    pump = _pump()
-    pump.start(transport)
-    try:
-        assert pump.try_enqueue_many([b"a", b"b", b"c"]) is True
-        assert pump.eager_writes == 0
-        assert pump.queued_messages == 3
-        await pump.join()
-        assert transport.written == [b"a", b"b", b"c"]
-    finally:
-        await pump.stop()
-
-
 class _FailingTransport(_EagerTransport):
     """Fails every awaited write, and records anything written after close."""
 

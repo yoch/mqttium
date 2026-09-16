@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests.support import stored_record
+
 from pathlib import Path
 
 from mqttium.codec.buffer import IncrementalDecoder
@@ -79,7 +81,7 @@ def test_inbound_alias_rejected_when_maximum_zero() -> None:
     _feed(engine, _connack(v5=True))
     engine.take_effects()
     props = Properties()
-    props.set("topic_alias", 1)
+    props = Properties({**props.values, "topic_alias": 1})
     pub = PublishPacket(
         topic="sensors/1",
         payload=b"x",
@@ -98,13 +100,15 @@ def test_sqlite_restart_replays_queued(tmp_path: Path) -> None:
     path = tmp_path / "s.db"
     store = SqliteInflightStore(path)
     store.put_out(
-        OutboundMessage(
-            mid=9,
-            topic="offline",
-            payload=b"1",
-            qos=QoS.AT_LEAST_ONCE,
-            retain=False,
-            state=OutboundQoSState.QUEUED,
+        stored_record(
+            OutboundMessage(
+                mid=9,
+                topic="offline",
+                payload=b"1",
+                qos=QoS.AT_LEAST_ONCE,
+                retain=False,
+                state=OutboundQoSState.QUEUED,
+            )
         )
     )
     store.close()

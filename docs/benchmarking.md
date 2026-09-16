@@ -4,6 +4,61 @@ Benchmark results are build artefacts, not permanent source-code claims. Raw
 outputs belong under `/tmp` or another external artefact directory and must not
 be committed.
 
+## Lean-native comparison harness
+
+`lean_native_compare.py` compares exact commits in fresh interpreters using
+complete ABBA cycles and same-code A/A controls. Its self-subscribed native
+client exercises both MQTT directions, QoS 0/1/2, memory/SQLite, iterator/callback,
+and bursts of 1/2/8 or a long progressive lot. A phase requires ordered,
+payload-verified delivery, publication receipts and final inbound handshakes.
+CPU covers the combined client process; the broker runs separately.
+
+Per-message latency starts when the producer constructs the element immediately
+before admission, so it includes prefetch queue residence. A long batch's overall
+elapsed time also reports work waiting before an element is read. Timing runs
+exclude tracemalloc; a separate phase measures Python peak allocations. RSS is
+diagnostic. Topic, payload, flow and queue limits are identical across arms.
+
+This explicitly authorized comparison campaign has no performance acceptance
+threshold. Functional correctness and resource bounds remain mandatory. Record
+all ratios and A/A noise, and label results diagnostic if the runner is
+ineligible. These measurements are not release qualification or public
+cross-client evidence.
+
+Record the broker's TCP settings. Small QoS 0 bursts can alternate between fast
+delivery and roughly 40-ms TCP stalls, including with identical client source;
+a short pilot may then choose an unsuitable message count. Inspect raw A/A
+durations as well as aggregate ratios. A separate broker with Mosquitto's
+`set_tcp_nodelay true` is a useful controlled condition, but it changes the
+stimulus. Preserve the original attempt and report the two conditions separately
+instead of presenting the new result as an unchanged-workload rerun.
+
+`lean_native_paced.py` supplements those saturated lots with fixed offered load.
+It freezes rates at 50/75/90% of the reference long-lot A/A median before comparing
+the two source revisions. This calibration is a fraction of that measured
+workload, not a separately established sustainable open-loop capacity. A separate
+process emits scheduled tokens; the client loop does not sleep to pace itself.
+The harness retains planned arrival, the pacer's pre-send timestamp, publication
+call, admission return, delivery, and observed receipt-completion clocks in hashed
+companion files. Include those files with the result JSON. Admission return is an API
+observation, not the internal commit instant. Report deliveries before return
+explicitly; residual latency clamps those observations to zero. Scheduled-to-call
+and scheduled-to-delivery latency retain producer backlog and pacer lateness.
+The pacer's token socket is blocking: a full buffer may delay subsequent
+emissions. The offered rate defines the fixed schedule, not guaranteed actual
+emission under overload. Inspect pre-send lateness alongside planned-to-call
+delay rather than assuming that moving the clock to another process removes
+all backpressure from the load generator.
+
+`lean_native_diagnostics.py` separates publication, ingress with iterator or
+callback delivery, callback invocation alone, and routed dispatch. Its existing
+packet-aware test transport isolates local orchestration; publication includes
+the transport's broker emulation and is not a network capacity result. Fresh
+processes run A/A and ABBA trials. Optional profiles run in separate phases and
+count Python calls and resumptions, not operating-system context switches or
+system calls. Evaluate routing candidates separately against their immediate
+predecessor and the measured same-code noise.
+
 ## What each benchmark answers
 
 - `hotpath_profile.py` counts calls, primitive calls, and allocations. These
@@ -43,6 +98,11 @@ remain separate evidence.
   against a tight writer message window. It is the contention harness for the
   targeted-wake experiment; default concurrency is 1/4/16 (64/256 are opt-in).
   It does not replace `paired_writer_capacity.py`.
+- `paired_qos1_rtt.py` measures a synchronous message handler's QoS 1 reply
+  from immediately before `publish_nowait()` to transport exposure. The
+  `publish_nowait_call_to_transport` interval includes admission and writer
+  scheduling. Historical callback-return-to-transport results use a different
+  starting point and require separate controls.
 - `application_stress.py` exercises callbacks, iterators, backpressure, memory,
   and SQLite persistence.
 - `memory_profile.py` enforces versioned tracemalloc and logical-counter limits.
@@ -135,9 +195,10 @@ five rules to prevent that:
    calibration.
 4. Open-loop calibration runs the same subscriber, completion tracking, and
    telemetry path as the paced sample. The only difference is pacing itself.
-5. Callback completion timestamps are correlated FIFO per MQTT packet
-   identifier. Packet identifiers may be reused before the observer consumes an
-   earlier queued callback, so one timestamp slot per MID is not sufficient.
+5. Each publication's start timestamp stays paired with its own receipt.
+   Receipt identity distinguishes publications even when a packet identifier
+   is reused before the observer runs. Tracking uses neither publication
+   callbacks nor a single timestamp slot per MID.
 
 When a CPU is selected, the publisher worker is pinned only after the subscriber
 and observer have started. The observer therefore does not inherit the
@@ -156,10 +217,9 @@ time. PUBACK proves broker acceptance; independent subscriber completion proves
 delivery to the observer.
 
 Receipt completion is observed by an awaiting task, so its timestamp includes
-that task's scheduling delay. At high rates this can have substantially higher
-CV than callback observation and must not be used as a neutral latency control
-unless its own A/A cell passes. Exact call/allocation profiles are the preferred
-neutral control for changes limited to callback handoff.
+that task's scheduling delay. Its own A/A cell must pass before it supports a
+latency comparison. Exact call/allocation profiles complement these timings
+when isolating changes to publication orchestration.
 
 Larger inflight windows can improve throughput through batching while increasing
 latency. Sweep the window before calling a high-window latency change a protocol
@@ -177,7 +237,7 @@ python benchmarks/runner_probe.py \
 python benchmarks/paired_open_loop.py \
   --base-root . --candidate-root . \
   --protocols 311 --payloads 64,4096 \
-  --completions receipt,callback --windows 8,32,64,128 \
+  --completions receipt --windows 8,32,64,128 \
   --target-rates 5000,10000 --repeat 12 \
   --policy strict --preflight-report /tmp/mqttium-runner.json \
   --output /tmp/mqttium-open-loop-aa.json

@@ -41,7 +41,7 @@ def _drop_and_reconnect(engine: ProtocolEngine, session_present: bool) -> list[b
 
 
 def test_qos2_loss_before_publish_clean_session() -> None:
-    engine = ProtocolEngine(EngineConfig(client_id="c", clean_start=True, local_receive_maximum=1))
+    engine = ProtocolEngine(EngineConfig(client_id="c", clean_start=True, max_inbound_inflight=1))
     # Offline queue then clean connect.
     handle = engine.queue_publish("t", b"x", qos=2)
     sends = _drop_and_reconnect(engine, session_present=False)

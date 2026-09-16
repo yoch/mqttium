@@ -3,10 +3,23 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from mqttium.types import Properties
 
 
 class MQTTError(Exception):
     """Base error for mqttium."""
+
+
+class BrokerDisconnectError(MQTTError):
+    """Broker's nonzero MQTT 5 DISCONNECT, with its immutable properties."""
+
+    def __init__(self, reason_code: int, properties: Properties | None = None) -> None:
+        self.reason_code = reason_code
+        self.properties = properties
+        super().__init__(f"Broker disconnected with reason code 0x{reason_code:02x}")
 
 
 class MalformedPacketError(MQTTError):
@@ -22,15 +35,21 @@ class PacketTooLargeError(ProtocolError):
 
 
 class MandatoryResponseTooLargeError(PacketTooLargeError):
-    """A peer limit makes a mandatory local MQTT response impossible to send."""
+    """A peer limit makes a mandatory local MQTT response impossible to send.
+
+    The broker's Maximum Packet Size is below the smallest acknowledgement the
+    client must send, so the connection is ended locally and never retried by
+    a reconnect policy. Reported through ``on_disconnect`` or raised by
+    ``connect()`` when the limit is learned from CONNACK.
+    """
 
 
 class FlowControlError(MQTTError):
-    """Outbound inflight window exhausted (raise mode)."""
+    """Immediate operation refused because bounded client capacity is unavailable."""
 
 
 class MessageDeliveryError(FlowControlError):
-    """Application delivery could not keep up within the configured deadline."""
+    """Iterator delivery cannot be admitted within its configured bounds or deadline."""
 
 
 class NotConnectedError(MQTTError):

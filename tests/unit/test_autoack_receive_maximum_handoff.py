@@ -26,7 +26,7 @@ def _engine(receive_maximum: int = 1) -> ProtocolEngine:
             client_id="autoack-window",
             protocol=MQTTProtocolVersion.MQTTv5,
             manual_ack=False,
-            local_receive_maximum=receive_maximum,
+            max_inbound_inflight=receive_maximum,
         )
     )
     engine.begin_connect()

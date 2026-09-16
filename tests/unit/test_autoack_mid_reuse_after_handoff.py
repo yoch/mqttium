@@ -23,7 +23,7 @@ def _engine() -> ProtocolEngine:
             client_id="autoack-mid-reuse",
             protocol=MQTTProtocolVersion.MQTTv5,
             manual_ack=False,
-            local_receive_maximum=1,
+            max_inbound_inflight=1,
         )
     )
     engine.begin_connect()

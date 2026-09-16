@@ -17,7 +17,6 @@ def _active_documents() -> list[Path]:
     return [
         ROOT / "README.md",
         *sorted((ROOT / "docs").rglob("*.md")),
-        ROOT / "src/mqttium/compat/README.md",
     ]
 
 
@@ -30,7 +29,12 @@ def test_relative_markdown_links_resolve() -> None:
             if not target or target.startswith("#") or EXTERNAL_SCHEME.match(target):
                 continue
             path_text = unquote(target.split("#", 1)[0])
-            if not (document.parent / path_text).resolve().exists():
+            resolved = (document.parent / path_text).resolve()
+            # Immutable reports refer to source at their recorded commit.
+            # Source removed by later experiments is not a current-doc link.
+            if document.is_relative_to(ROOT / "docs/reports") and resolved.suffix == ".py":
+                continue
+            if not resolved.exists():
                 missing.append(f"{document.relative_to(ROOT)} -> {target}")
 
     assert not missing, "missing relative Markdown targets:\n" + "\n".join(missing)
@@ -62,7 +66,6 @@ def test_documented_examples_are_shipped() -> None:
     expected = {
         "pubsub.py",
         "durable_session.py",
-        "paho_compat.py",
         "runtime_stats.py",
     }
     assert expected <= {path.name for path in (ROOT / "examples").glob("*.py")}

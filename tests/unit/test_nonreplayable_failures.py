@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from mqttium.api.async_client import _fifo_register
+
 import asyncio
 import gc
 
@@ -33,7 +35,6 @@ class _ClosedTransport:
 
 async def test_transport_loss_fails_subscriptions_but_preserves_publish_receipt() -> None:
     reconnect = ReconnectPolicy(
-        enabled=True,
         initial_delay=60.0,
         max_delay=60.0,
         stable_after=60.0,
@@ -54,7 +55,7 @@ async def test_transport_loss_fails_subscriptions_but_preserves_publish_receipt(
         mid=13,
         qos=QoS.AT_LEAST_ONCE,
     )
-    client._register_publish_receipt(13, receipt)
+    _fifo_register(client._receipts, 13, receipt)
 
     await client._read_loop()
 
@@ -82,7 +83,7 @@ async def test_fail_pending_still_fails_all_operation_types() -> None:
     client._sub_futs[1] = sub
     client._unsub_futs[2] = unsub
     receipt = PublishReceipt(mid=3, qos=QoS.AT_LEAST_ONCE)
-    client._register_publish_receipt(3, receipt)
+    _fifo_register(client._receipts, 3, receipt)
     error = MQTTError("terminal")
 
     client._fail_pending(error)
@@ -105,7 +106,7 @@ async def test_failed_receipt_that_is_never_awaited_stays_silent() -> None:
 
     client = AsyncClient(client_id="silent-receipt")
     receipt = PublishReceipt(mid=41, qos=QoS.AT_LEAST_ONCE)
-    client._register_publish_receipt(41, receipt)
+    _fifo_register(client._receipts, 41, receipt)
 
     client._fail_pending(MQTTError("terminal"))
     assert receipt.is_done()
@@ -119,7 +120,7 @@ async def test_failed_receipt_that_is_never_awaited_stays_silent() -> None:
 
 async def test_receipt_never_awaited_allocates_no_completion_primitive() -> None:
     """publish_nowait's whole point: nobody waits, so nothing is built."""
-    client = AsyncClient(client_id="lazy-receipt", max_outbound_messages=8)
+    client = AsyncClient(client_id="lazy-receipt", max_write_queue_messages=8)
     client._engine.state = ConnectionState.CONNECTED
 
     receipt = client.publish_nowait("lazy/qos1", b"x", qos=1)
@@ -134,7 +135,7 @@ async def test_receipt_never_awaited_allocates_no_completion_primitive() -> None
 
 
 async def test_receipt_awaited_before_completion_resolves_once() -> None:
-    client = AsyncClient(client_id="await-receipt", max_outbound_messages=8)
+    client = AsyncClient(client_id="await-receipt", max_write_queue_messages=8)
     client._engine.state = ConnectionState.CONNECTED
     receipt = client.publish_nowait("lazy/qos1", b"x", qos=1)
 

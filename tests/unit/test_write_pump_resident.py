@@ -128,7 +128,6 @@ async def test_qsize_drops_during_batch_but_resident_keeps_the_message_bound() -
         assert pump.resident_messages == 300
         assert pump.stats().queued_messages == 44
         assert pump.try_enqueue(b"extra") is False
-        assert pump.try_enqueue_many([b"a", b"b"]) is False
         assert pump.queued_messages == 44
         assert pump.resident_messages == 300
     finally:
@@ -136,22 +135,22 @@ async def test_qsize_drops_during_batch_but_resident_keeps_the_message_bound() -
         await pump.stop()
 
 
-async def test_try_enqueue_many_is_atomic_against_resident_while_batch_in_flight() -> None:
+async def test_individual_admission_counts_resident_items_while_batch_in_flight() -> None:
     pump = _pump(max_messages=10)
     transport = await _hold_after_fill(pump, 8)
     try:
         assert pump.queued_messages == 0
         assert pump.resident_messages == 8
-        assert pump.try_enqueue_many([b"a", b"b", b"c"]) is False
         assert pump.queued_messages == 0
         assert pump.resident_messages == 8
         assert pump.queued_bytes == 8
 
-        assert pump.try_enqueue_many([b"a", b"b"]) is True
+        assert pump.try_enqueue(b"a") is True
+
+        assert pump.try_enqueue(b"b") is True
         assert pump.queued_messages == 2
         assert pump.resident_messages == 10
         assert pump.try_enqueue(b"full") is False
-        assert pump.try_enqueue_many([b"x"]) is False
     finally:
         transport.hold.set()
         await pump.stop()
@@ -202,7 +201,9 @@ async def test_latency_microflush_success_releases_resident() -> None:
 
 def test_discard_releases_exactly_the_remaining_queued_items() -> None:
     pump = _pump(max_messages=8)
-    assert pump.try_enqueue_many([b"a", b"b", b"c"]) is True
+    assert pump.try_enqueue(b"a") is True
+    assert pump.try_enqueue(b"b") is True
+    assert pump.try_enqueue(b"c") is True
     assert pump.resident_messages == 3
     pump.discard()
     assert pump.resident_messages == 0
@@ -224,7 +225,8 @@ async def test_discard_keeps_in_flight_resident_until_writer_finally() -> None:
     pump = _pump(max_messages=16)
     transport = await _hold_after_fill(pump, 10)
     try:
-        assert pump.try_enqueue_many([b"q", b"w"]) is True
+        assert pump.try_enqueue(b"q") is True
+        assert pump.try_enqueue(b"w") is True
         assert pump.queued_messages == 2
         assert pump.resident_messages == 12
         pump.discard()
@@ -326,7 +328,9 @@ async def test_eager_write_does_not_consume_resident_budget() -> None:
 
 def test_queued_messages_still_tracks_qsize_not_resident() -> None:
     pump = _pump(max_messages=8)
-    assert pump.try_enqueue_many([b"a", b"b", b"c"]) is True
+    assert pump.try_enqueue(b"a") is True
+    assert pump.try_enqueue(b"b") is True
+    assert pump.try_enqueue(b"c") is True
     assert pump.queued_messages == 3
     assert pump.stats().queued_messages == 3
     assert pump.resident_messages == 3

@@ -35,7 +35,12 @@ def main() -> None:
     topic = "bench/nowait/request"
     payload = b"r" * 64
     properties = Properties()
-    properties.add_user_property("profile", "standard")
+    properties = Properties(
+        {
+            **properties.values,
+            "user_property": (*properties.get("user_property", ()), ("profile", "standard")),
+        }
+    )
     engine = ProtocolEngine(EngineConfig(protocol=protocol))
 
     def encode_preview() -> int:

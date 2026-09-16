@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests.support import stored_record
+
 import sys
 from pathlib import Path
 
@@ -28,29 +30,33 @@ def test_low_level_parser_exceptions_are_not_allowed() -> None:
 def test_exact_mid_invariant_detects_unreserved_store_record() -> None:
     engine = ProtocolEngine()
     engine.store.put_out(
-        OutboundMessage(
-            mid=7,
-            topic="fuzz/mid",
-            payload=b"x",
-            qos=QoS.AT_LEAST_ONCE,
-            retain=False,
-            state=OutboundQoSState.QUEUED,
+        stored_record(
+            OutboundMessage(
+                mid=7,
+                topic="fuzz/mid",
+                payload=b"x",
+                qos=QoS.AT_LEAST_ONCE,
+                retain=False,
+                state=OutboundQoSState.QUEUED,
+            )
         )
     )
-    with pytest.raises(AssertionError, match="packet-id mismatch"):
+    with pytest.raises(AssertionError, match="packet-id count mismatch"):
         fuzzmod._check_engine_invariants(engine)
 
 
 def test_exact_flow_invariant_detects_unaccounted_transaction() -> None:
     engine = ProtocolEngine()
     engine.state = ConnectionState.CONNECTED
-    message = OutboundMessage(
-        mid=9,
-        topic="fuzz/flow",
-        payload=b"x",
-        qos=QoS.AT_LEAST_ONCE,
-        retain=False,
-        state=OutboundQoSState.WAIT_PUBACK,
+    message = stored_record(
+        OutboundMessage(
+            mid=9,
+            topic="fuzz/flow",
+            payload=b"x",
+            qos=QoS.AT_LEAST_ONCE,
+            retain=False,
+            state=OutboundQoSState.WAIT_PUBACK,
+        )
     )
     engine.store.put_out(message)
     engine.packet_ids.reserve(message.mid)

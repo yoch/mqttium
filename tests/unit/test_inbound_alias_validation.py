@@ -39,7 +39,7 @@ def _connected_engine() -> ProtocolEngine:
 def test_invalid_topic_does_not_establish_inbound_alias() -> None:
     engine = _connected_engine()
     properties = Properties()
-    properties.set("topic_alias", 1)
+    properties = Properties({**properties.values, "topic_alias": 1})
 
     wire = PublishPacket(
         topic="bad/#",
@@ -62,7 +62,7 @@ def test_invalid_topic_does_not_establish_inbound_alias() -> None:
 def test_valid_topic_still_establishes_inbound_alias() -> None:
     engine = _connected_engine()
     properties = Properties()
-    properties.set("topic_alias", 1)
+    properties = Properties({**properties.values, "topic_alias": 1})
 
     first = PublishPacket(
         topic="valid/topic",

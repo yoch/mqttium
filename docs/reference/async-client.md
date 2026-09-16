@@ -1,7 +1,7 @@
 # `AsyncClient`
 
-`AsyncClient` is the Stable, async-native MQTTium API. One instance belongs to
-one asyncio event loop. It owns transport lifecycle, reader/writer work,
+`AsyncClient` is the async-native MQTTium API. One instance belongs to one
+asyncio event loop. It owns transport lifecycle, reader/writer work,
 keepalive, reconnect, receipts, and application delivery; it does not create a
 background thread.
 
@@ -20,14 +20,13 @@ background thread.
         - messages
         - ack
         - auth
-        - set_auth_handler
         - message_callback_add
         - message_callback_remove
         - stats
       inherited_members: false
       heading_level: 2
 
-## Stable state and callbacks
+## State, message callbacks and lifecycle hooks
 
 | Member | Meaning |
 | --- | --- |
@@ -35,53 +34,103 @@ background thread.
 | `is_connected` | Whether the client is currently connected |
 | `negotiated` | Broker-negotiated MQTT settings after CONNACK |
 | `effective_client_id` | Requested or broker-assigned client identifier |
-| `on_connect` | Sync or async callback after successful connection |
-| `on_disconnect` | Sync or async callback for disconnection |
-| `on_message` | Sync or async message callback |
-| `message_callback_add` / `message_callback_remove` | Topic-filtered message callbacks; matching filters run instead of `on_message` |
-| `on_publish` | Sync or async publish-completion callback |
-| `auth_handler` | MQTT 5 enhanced-authentication handler |
+| `on_connect` | Sync or async lifecycle hook after successful connection setup |
+| `on_disconnect` | Sync or async lifecycle hook after connection teardown |
+| `on_message` | Short synchronous message callback |
+| `message_callback_add` / `message_callback_remove` | Synchronous topic callbacks; matching filters run instead of `on_message` |
+| `auth_handler` | Read-only MQTT 5 protocol handler supplied at construction; sync or async |
 
-Callbacks execute outside protocol-engine critical sections. Declare synchronous
-callbacks with `def` and asynchronous callbacks with `async def`; a synchronous
-callable that returns an awaitable violates the callback contract and is reported
-as a callback `TypeError` rather than being scheduled implicitly. Synchronous
-callbacks must not block the event loop.
+`on_publish` is removed. Observe publication through `PublishReceipt` or
+`PublishBatchReceipt`; QoS 0 completion means writer admission, QoS 1 PUBACK,
+and QoS 2 PUBCOMP.
 
-Eligible idle `on_publish` and message callbacks may execute inline. For
-callback-only message delivery, an adjacent pair of small synchronous messages may
-run in the same effect-drain turn while retaining the hard
-`max_pending_callbacks` bound. Larger bursts, declared-async callbacks, and
-queued/reentrant delivery use the bounded worker. Callback failures go to the event
-loop's exception handler without silently changing protocol state.
+Declare message callbacks with `def`. Async functions and async callable objects
+are rejected before registration changes. A synchronous callback returning an
+awaitable violates the contract and is reported as a `TypeError`; MQTTium does
+not await or implicitly schedule that result. Message callbacks run
+synchronously on the reader that delivered the message, outside protocol
+critical sections and without any intermediate queue: the reader decodes no
+further packet until the current lot has been handed to the application, so
+callback cost is the natural backpressure. A callback exception is reported to
+the loop's exception handler and delivery continues with the next callback or
+message. All routes matching one message run contiguously; the reader counts
+every invocation and yields to the event loop at the next message boundary once
+its private budget is reached, carrying the excess over. That budget is not a
+time limit: synchronous user code cannot be preempted.
 
-Matching `message_callback_add` filters run instead of `on_message`, in
-registration order. Shared-subscription filters match the filter string
-literally, as in Paho. Each routed message resolves the live configuration when
-its dispatcher starts and keeps that message's matching callbacks across awaits.
-Later routed messages, including already queued messages, see updated filters
-and fallback. Eligible synchronous routes remain inline. If an inline burst's
-route becomes asynchronous, only its unstarted tail transfers to the bounded
-worker, ahead of work admitted reentrantly by the earlier callback. No callback
-prefix is replayed. Direct callbacks captured without a router keep their
-existing batch semantics. Iterator-only delivery ignores callbacks, including
-topic filters.
+Callback mode always uses automatic acknowledgement. Protocol acknowledgement
+ordering is independent of callback completion: the QoS 1 PUBACK and the QoS 2
+PUBREC are produced before application delivery. Because callbacks execute on
+the reader, later packets are not processed until the callback returns.
+`manual_ack=True` requires iterator delivery and raises `ValueError` with
+`message_delivery="callback"`.
 
-When a callback disconnects and reconnects the client before returning, the
-current worker job finishes normally. Jobs still queued for the terminally
-closed connection are discarded before the replacement connection is reopened;
-its newly admitted callbacks use the existing worker and are not discarded by
-the previous shutdown request. Already-active batch semantics are unchanged.
+Matching topic filters run in registration order instead of `on_message`.
+Shared-subscription filters match the filter string literally. Iterator mode
+ignores message callbacks and routes. `on_message` and the routes freeze
+permanently on the first connection attempt; subscriptions remain mutable.
+Use `messages()` for asynchronous processing or explicitly manage application
+work with its own bounds and overflow policy.
+
+### Lifecycle hooks
+
+`on_connect` and `on_disconnect` remain assignable sync-or-async hooks.
+Declare `async def` for a hook that awaits application or MQTT work. A
+synchronous hook returning an awaitable is reported as a `TypeError`; MQTTium
+does not await or implicitly schedule that result.
+
+The callback reference is captured when the lifecycle notification is recorded.
+They execute on their own serialized task, after the triggering protocol
+effect and connection locks have been released. A successful `connect()` and
+`disconnect()` complete their network operation without waiting for hook
+completion. `on_connect` may subscribe or publish normally; it is not a barrier
+that delays already-available incoming messages until initialization finishes.
+Use an application signal if processing depends on that initialization.
+
+Lifecycle notifications describe the latest state, not a lossless transition
+log. MQTTium retains one active hook and at most one pending notification;
+newer state replaces obsolete pending state. An external connection replacement
+or disconnect cancels an obsolete active hook. A lifecycle operation awaited
+directly by that same hook preserves its caller, so `on_connect` can await
+`disconnect()` and `on_disconnect` can await a replacement `connect()`. An
+application-created task is a separate caller. Hooks must cooperate with
+cancellation; the next hook starts only after the previous hook has ended.
+
+Overlapping explicit connection attempts are rejected before changing the
+endpoint or lifecycle ownership. Cancelling a takeover while it waits for the
+connection lock preserves future notifications from the surviving connection.
+It does not restore an obsolete hook already cancelled or a pending notification
+already replaced when the takeover began. A hook awaiting its own connection
+attempt receives that operation's failure normally; this caller preservation
+ends when the connection call exits.
+
+`on_disconnect` runs after the old connection resources are retired, with the
+original cause or `None` for clean closure. Automatic retry waits for that
+hook to finish, then rechecks explicit user intent. Hook exceptions and a
+manually raised `CancelledError` are reported to the event loop's exception
+handler; actual task cancellation retires the hook.
+
+Lifecycle hooks have no implicit execution deadline. An unfinished `on_disconnect` can
+delay automatic retry; an explicit replacement can still proceed without waiting
+for that hook. Use an application deadline when a hook must finish within a
+fixed interval, and allow cancellation to propagate.
+
+`auth_handler` accepts synchronous or asynchronous functions. Its response
+participates in AUTH, so MQTTium invokes it with `auth_timeout` and the existing
+protocol rules. Return an `AuthPacket` for a challenge response; use `async def`
+if producing it requires asynchronous work. Lifecycle reentrancy does not
+promise arbitrary reentrant operations from AUTH. See
+[enhanced authentication](../mqtt-5.md#enhanced-authentication).
 
 ## Loop confinement
 
 `publish_nowait()` and `stats()` are synchronous but must run on the owning
-event-loop thread. They are not cross-thread methods. Use the Provisional Paho
-facade only when an existing synchronous application needs a transition path.
+event-loop thread. Cross-thread handoff belongs to the application and requires
+its own bound.
 
 ## Constructor settings
 
-Constructor keywords and Stable defaults are part of the public contract. The
+Constructor keywords and defaults are recorded in the API contract. The
 generated signature above is authoritative for spelling and defaults;
 [Configuration and Sizing](../configuration-and-sizing.md) groups them by responsibility
 and explains how to choose values.

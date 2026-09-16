@@ -18,9 +18,14 @@ import subprocess
 import sys
 import time
 from collections import deque
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from itertools import product
 from pathlib import Path
+
+try:
+    from benchmark_support import runtime_counters
+except ImportError:  # imported as ``benchmarks.paired_network`` by the test suite
+    from benchmarks.benchmark_support import runtime_counters
 
 
 HEADER_HEX_BYTES = 32
@@ -52,50 +57,6 @@ class WorkerResult:
 
 class InvalidMeasurement(RuntimeError):
     """A worker could not produce a trustworthy sample."""
-
-
-@dataclass
-class CallbackGenerationTracker:
-    """Match delayed ``on_publish`` callbacks to reused MQTT packet IDs.
-
-    Packet IDs may be reused once the protocol ACK releases them, while the
-    application callback is still queued. A scalar ``mid -> timestamp`` map
-    therefore loses generations under concurrent publishing. Keep FIFO
-    generations per MID so delayed callbacks cannot consume a newer publish.
-    """
-
-    starts: dict[int, deque[int]] = field(default_factory=dict)
-    early: dict[int, deque[int]] = field(default_factory=dict)
-
-    def register(self, mid: int, sent_ns: int) -> tuple[int, int] | None:
-        starts = self.starts.setdefault(mid, deque())
-        starts.append(sent_ns)
-        early = self.early.get(mid)
-        if not early:
-            return None
-        finished_ns = early.popleft()
-        matched_sent_ns = starts.popleft()
-        if not starts:
-            self.starts.pop(mid, None)
-        if not early:
-            self.early.pop(mid, None)
-        return matched_sent_ns, finished_ns
-
-    def complete(self, mid: int, finished_ns: int) -> tuple[int, int] | None:
-        starts = self.starts.get(mid)
-        if not starts:
-            self.early.setdefault(mid, deque()).append(finished_ns)
-            return None
-        sent_ns = starts.popleft()
-        if not starts:
-            self.starts.pop(mid, None)
-        return sent_ns, finished_ns
-
-    def pending_counts(self) -> tuple[int, int]:
-        return (
-            sum(len(starts) for starts in self.starts.values()),
-            sum(len(completions) for completions in self.early.values()),
-        )
 
 
 def percentile(values: list[float], fraction: float) -> float:
@@ -215,73 +176,39 @@ async def publish(
 ) -> tuple[float, dict[str, int], list[float]]:
     from mqttium.api import AsyncClient, PublishReceipt
     from mqttium.enums import MQTTProtocolVersion
-    from mqttium.protocol.reconnect import ReconnectPolicy
 
+    if completion != "receipt":
+        raise ValueError("publication completion requires receipts")
     client = AsyncClient(
         client_id=f"paired-net-{os.getpid()}-{time.time_ns()}",
         protocol=(MQTTProtocolVersion.MQTTv5 if protocol == "5" else MQTTProtocolVersion.MQTTv311),
         max_outbound_inflight=window,
-        reconnect=ReconnectPolicy(enabled=False),
+        reconnect=None,
     )
     await client.connect(host, port, timeout=10.0)
     pending: deque[tuple[PublishReceipt, int]] = deque()
-    completed: asyncio.Queue[tuple[int, int]] = asyncio.Queue()
-    callback_generations = CallbackGenerationTracker()
     ack_latencies: list[float] = []
-    outstanding = 0
-    if completion == "callback":
-
-        def on_publish(mid: int | None, *_args: object) -> None:
-            assert mid is not None
-            finished = time.monotonic_ns()
-            match = callback_generations.complete(mid, finished)
-            if match is not None:
-                completed.put_nowait(match)
-
-        client.on_publish = on_publish
     started = time.perf_counter()
     for sequence in range(count):
         published_ns = time.monotonic_ns()
         receipt = await client.publish(topic, make_payload(sequence, size), qos=1)
-        if completion == "receipt":
-            pending.append((receipt, published_ns))
-            if len(pending) >= window:
-                oldest, sent_ns = pending.popleft()
-                await oldest.wait()
-                ack_latencies.append((time.monotonic_ns() - sent_ns) / 1_000_000)
-        else:
-            assert receipt.mid is not None
-            match = callback_generations.register(receipt.mid, published_ns)
-            if match is not None:
-                completed.put_nowait(match)
-            outstanding += 1
-            if outstanding >= window:
-                sent_ns, finished = await completed.get()
-                ack_latencies.append((finished - sent_ns) / 1_000_000)
-                outstanding -= 1
-    if completion == "receipt":
-        for receipt, sent_ns in pending:
-            await receipt.wait()
+        pending.append((receipt, published_ns))
+        if len(pending) >= window:
+            oldest, sent_ns = pending.popleft()
+            await oldest.wait()
             ack_latencies.append((time.monotonic_ns() - sent_ns) / 1_000_000)
-    else:
-        for _ in range(outstanding):
-            sent_ns, finished = await completed.get()
-            ack_latencies.append((finished - sent_ns) / 1_000_000)
-        pending_starts, early_callbacks = callback_generations.pending_counts()
-        if pending_starts or early_callbacks:
-            raise RuntimeError(
-                "callback generation accounting leaked "
-                f"starts={pending_starts} early={early_callbacks}"
-            )
+    for receipt, sent_ns in pending:
+        await receipt.wait()
+        ack_latencies.append((time.monotonic_ns() - sent_ns) / 1_000_000)
     elapsed = time.perf_counter() - started
-    effects = client.stats().effects
+    effects = runtime_counters(client, "effects")
     await client.disconnect()
     return (
         elapsed,
         {
-            "inline": effects.inline_effects,
-            "enqueued": effects.enqueued,
-            "suspensions": effects.apply_suspensions,
+            "inline": effects["inline_effects"],
+            "enqueued": effects["enqueued"],
+            "suspensions": effects["apply_suspensions"],
         },
         ack_latencies,
     )
@@ -750,7 +677,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--count", type=int, default=1_000)
     parser.add_argument("--window", type=int, default=20)
     parser.add_argument("--protocol", choices=("311", "5"), default="311")
-    parser.add_argument("--completion", choices=("receipt", "callback"), default="receipt")
+    parser.add_argument("--completion", choices=("receipt",), default="receipt")
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--cpu", type=int)
     parser.add_argument("--repeat", type=int, default=8, help="even count forming ABBA cycles")
@@ -780,8 +707,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--base-root and --candidate-root are required")
     if not (args.worker or args.observer_worker) and (args.repeat <= 0 or args.repeat % 2):
         parser.error("--repeat must be a positive even count (complete ABBA cycles)")
-    if any(value not in ("receipt", "callback") for value in args.completions.split(",")):
-        parser.error("--completions accepts receipt,callback")
+    if any(value != "receipt" for value in args.completions.split(",")):
+        parser.error("--completions accepts receipt only")
     if args.target_sample_seconds <= 0:
         parser.error("--target-sample-seconds must be positive")
     if args.max_count <= 0:

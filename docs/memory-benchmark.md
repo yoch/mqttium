@@ -142,18 +142,6 @@ Keeps one publication admitted, parks 511 callers before the commit point and
 cancels them. The scenario verifies that no cancelled caller leaves a packet id,
 store record, receipt or admission waiter behind.
 
-### `paho_saturation_4k`
-
-Submits 5,000 synchronous Paho-compatible QoS 1 publications across the network
-thread boundary with a 512-message protocol limit. Accepted and rejected return
-codes, store records and packet identifiers must agree exactly.
-
-### `shared_delivery_both_4k`
-
-Fills iterator and callback delivery with 1,500 messages. Each message has two
-references but its logical bytes are charged once, then released after both
-consumers finish.
-
 ### `websocket_batching_4k`
 
 Masks 300 MQTT parts through `write_many()`. The transport coalesces them into

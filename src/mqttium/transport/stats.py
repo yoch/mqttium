@@ -13,13 +13,12 @@ from dataclasses import dataclass
 
 @dataclass(slots=True, frozen=True)
 class TransportStats:
+    """Bytes the transport holds in either direction, and its closing state."""
+
     kind: str | None
     closing: bool
     pending_write_bytes: int
     buffered_read_bytes: int
-    fragmented_read_bytes: int
-    pending_control_frames: int
-    pending_control_bytes: int
 
     @classmethod
     def unavailable(cls, transport: object | None) -> TransportStats:
@@ -29,9 +28,6 @@ class TransportStats:
             closing=bool(getattr(transport, "is_closing", bool)()) if transport else False,
             pending_write_bytes=0,
             buffered_read_bytes=0,
-            fragmented_read_bytes=0,
-            pending_control_frames=0,
-            pending_control_bytes=0,
         )
 
 

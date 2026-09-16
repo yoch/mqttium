@@ -58,11 +58,6 @@ def test_durable_session_example(tmp_path: Path, protocol: str) -> None:
     assert database.exists()
 
 
-def test_paho_compatibility_example() -> None:
-    result = _run_example("paho_compat.py")
-    assert "hello through the Paho facade" in result.stdout
-
-
 @pytest.mark.parametrize("protocol", ["311", "5"])
 def test_runtime_stats_example(protocol: str) -> None:
     result = _run_example("runtime_stats.py", "--protocol", protocol)

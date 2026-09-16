@@ -92,7 +92,8 @@ async def test_auto_reconnect_reattaches_the_push_decoder(payload_size: int) -> 
     client = AsyncClient(
         client_id="push-reconnect",
         protocol=MQTTProtocolVersion.MQTTv311,
-        reconnect=ReconnectPolicy(enabled=True, initial_delay=0.01, max_delay=0.1),
+        reconnect=ReconnectPolicy(initial_delay=0.01, max_delay=0.1),
+        message_delivery="callback",
     )
 
     def on_message(message: object) -> None:

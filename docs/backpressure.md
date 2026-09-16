@@ -1,12 +1,12 @@
 # Writer backpressure and burst sizing
 
 `AsyncClient` bounds encoded outbound work with two independent writer limits:
-`max_outbound_messages` and `max_outbound_bytes`. The message limit controls the
+`max_write_queue_messages` and `max_write_queue_bytes`. The message limit controls the
 number of writer-resident frames. The byte limit controls how much encoded FIFO
 work may remain owned by the writer at once, including the writer's active
 batch.
 
-The default `max_outbound_bytes` is **1 MiB**. Treat it as a latency and batching
+The default `max_write_queue_bytes` is **1 MiB**. Treat it as a latency and batching
 control as well as a memory bound.
 
 ## The byte budget is a FIFO burst reservoir
@@ -17,7 +17,7 @@ wire order predictable, but it also means that queue depth has a latency cost.
 
 If a small publication is admitted after several MiB of earlier writer-resident
 traffic, its completion includes the time needed for that older FIFO work to
-progress. Raising `max_outbound_bytes` therefore allows a larger burst reservoir
+progress. Raising `max_write_queue_bytes` therefore allows a larger burst reservoir
 in front of later traffic. The effect is most visible when a large synchronous
 producer burst is followed by small latency-sensitive work.
 
@@ -27,14 +27,14 @@ increase writer batches and producer suspensions. There is no universally best
 large value: the correct setting is a workload trade-off between burst
 absorption, batching, memory and queue-residence latency.
 
-`max_outbound_messages` is not a substitute for the byte bound when payload
+`max_write_queue_messages` is not a substitute for the byte bound when payload
 sizes vary. A few large frames can consume much more queue residence and memory
 than many small telemetry frames.
 
 ## Why the default should not be raised casually
 
 A `FlowControlError`, an enqueue suspension or a full writer byte budget is
-backpressure doing its job. Increasing `max_outbound_bytes` merely to make that
+backpressure doing its job. Increasing `max_write_queue_bytes` merely to make that
 signal disappear moves more work into the FIFO reservoir; it does not make the
 network or broker faster.
 
@@ -58,13 +58,13 @@ claim that every workload should keep exactly that value.
 ## Oversized frames still make progress
 
 The byte limit is a capacity bound, not a maximum MQTT packet size. An otherwise
-empty writer admits one encoded item larger than `max_outbound_bytes` so a legal
+empty writer admits one encoded item larger than `max_write_queue_bytes` so a legal
 large packet cannot deadlock merely because it exceeds the configured queue
 budget. No second item is admitted until capacity is released.
 
 Large PUBLISH payloads may also use MQTTium's segmented write representation.
 That copy-avoidance policy is independent of the writer byte budget. Do not infer
-from `max_outbound_bytes` that payloads above the bound are rejected.
+from `max_write_queue_bytes` that payloads above the bound are rejected.
 
 ## Observe the writer before changing limits
 
@@ -75,10 +75,14 @@ fields include:
   bytes owned by the writer; `queued_bytes` remains charged while a batch is
   active;
 - `queued_messages` and `high_water_messages` for the live asyncio queue;
-- `batches`, `batched_items` and `batched_bytes` for batching behaviour;
-- `enqueue_suspensions` and `waiters` for producer-side writer pressure;
+- `waiters` for producers currently parked on the writer bound;
 - transport `pending_write_bytes` when the transport can expose its own buffered
   output.
+
+How often the writer batched, wrote eagerly or segmented a frame is a
+scheduling decision, not an application-visible queue; those counters live on
+the private write pump as maintainer diagnostics and are reported by the
+benchmark harnesses, not by `stats()`.
 
 `queued_messages` is intentionally the live queue size, not the full resident
 admission count. A writer batch that has already been extracted from the queue
@@ -86,7 +90,7 @@ still consumes writer capacity until it completes. For operational diagnosis,
 read several snapshots over time and combine message and byte fields rather
 than treating one instantaneous queue size as the whole writer state.
 
-A useful sizing exercise is to sweep `max_outbound_bytes` over a small range on
+A useful sizing exercise is to sweep `max_write_queue_bytes` over a small range on
 one stable host while keeping the workload, broker, payload distribution and
 other bounds fixed. Record completed throughput, CPU, queue high water, writer
 batch count and latency together. A setting that wins only by moving more bytes
@@ -133,7 +137,7 @@ boundaries rather than depending on private attributes.
 ## Benchmark identity includes writer bounds
 
 A latency or throughput result is incomplete unless it records
-`max_outbound_bytes` and `max_outbound_messages`. Changing either can change:
+`max_write_queue_bytes` and `max_write_queue_messages`. Changing either can change:
 
 - when producers encounter backpressure;
 - how much FIFO work can precede a later frame;

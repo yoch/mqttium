@@ -51,10 +51,10 @@ precision.
 
 ## Calibrated default cell
 
-The validated default **A/B** cell is:
+The configured default **A/B** cell is:
 
 - MQTT 3.1.1;
-- callback completion;
+- receipt completion;
 - 64-byte payloads;
 - windows **1/20/64**;
 - two blocks;
@@ -63,6 +63,10 @@ The validated default **A/B** cell is:
 - therefore **12 complete ABBA cycles / 24 paired samples per scenario**;
 - approximately two seconds target duration per low-level sample;
 - a fresh host preflight before every phase.
+
+Publication completion now uses receipts. Historical callback-completion
+calibration does not qualify this observation path: obtain fresh same-code
+controls for both trees before interpreting a new release comparison.
 
 Same-code A/A controls use the same cells, thresholds and sample duration, with
 **two blocks** and seeds `0,1,2` (six ABBA cycles). Three cycles were sufficient
@@ -185,7 +189,7 @@ validity test for `network_release_gate.py`.
 
 The wrapper therefore disables the low-level engine's legacy raw-CV and point
 ratio rejection thresholds while preserving raw values in artifacts. Worker
-failures, malformed output, incomplete callback accounting and failed fresh
+failures, malformed output, incomplete receipt accounting and failed fresh
 preflights remain hard invalidations.
 
 ## Command-line example
@@ -199,7 +203,7 @@ setarch "$(uname -m)" -R taskset -c 1,3 \
   --base-root "$BASE" \
   --candidate-root "$CANDIDATE" \
   --protocols 311 \
-  --completions callback \
+  --completions receipt \
   --payloads 64 \
   --windows 1,20,64 \
   --control-blocks 2 \

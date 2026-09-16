@@ -48,7 +48,7 @@ def _engine(store: MemoryInflightStore | SqliteInflightStore | None = None) -> P
             protocol=MQTTProtocolVersion.MQTTv5,
             clean_start=False,
             manual_ack=True,
-            local_receive_maximum=8,
+            max_inbound_inflight=8,
         ),
         store,
     )
