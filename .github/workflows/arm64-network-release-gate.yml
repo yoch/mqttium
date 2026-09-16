@@ -27,7 +27,7 @@ concurrency:
 
 jobs:
   release-gate:
-    if: inputs.confirm_trusted_code && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/codex/lean-native-experiment')
+    if: inputs.confirm_trusted_code && github.ref == 'refs/heads/main'
     name: Deep network gate (manual only)
     runs-on: [self-hosted, linux, ARM64]
     timeout-minutes: 45
