@@ -210,7 +210,8 @@ def test_sqlite_sizes_pages_without_selecting_payloads(tmp_path: Path) -> None:
     assert len(first_page) == 1
     index_selects = [line for line in trace if "FROM inbound ORDER BY seq" in line]
     assert len(index_selects) == 1
-    assert "length(payload)" in index_selects[0]
+    assert "logical_size" in index_selects[0]
+    assert "payload" not in index_selects[0]
     payload_selects = [
         line for line in trace if "properties, payload FROM inbound WHERE mid IN" in line
     ]

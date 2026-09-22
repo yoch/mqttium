@@ -87,6 +87,7 @@ class WritePump:
         # An eager latency flush can fail after exposing bytes. Restored frames
         # then remain ownership records only; the writer must retire them and
         # report this failure before attempting any further transport write.
+        self._sealed = False
         self._latency_failure: BaseException | None = None
 
     @property
@@ -162,6 +163,7 @@ class WritePump:
         self.queued_bytes = 0
         self._resident_messages = 0
         self._latency_failure = None
+        self._sealed = False
         # The next start() rebinds it. Until then there is no transport this
         # pump may write to.
         self._drop_eager_binding()
@@ -298,7 +300,7 @@ class WritePump:
     def try_enqueue(self, item: WriteItem, *, epoch: int | None = None) -> bool:
         if epoch is None:
             epoch = self.epoch
-        if self._latency_failure is not None or epoch != self.epoch:
+        if self._sealed or self._latency_failure is not None or epoch != self.epoch:
             raise StaleConnectionEffect
         size = item_size(item)
         if not self.can_enqueue_size(size):
@@ -310,11 +312,20 @@ class WritePump:
         self._admit_queued()
         return True
 
+    def try_enqueue_terminal(self, item: WriteItem, *, epoch: int) -> bool:
+        """Admit the final packet, then fence all later sends until reset."""
+        try:
+            return self.try_enqueue(item, epoch=epoch)
+        finally:
+            # Rejected work from an old connection cannot fence its replacement.
+            if epoch == self.epoch:
+                self._sealed = True
+
     def try_enqueue_ack(self, item: bytes, *, epoch: int | None = None) -> bool:
         """Admit a known success ACK without classifying its wire bytes."""
         if epoch is None:
             epoch = self.epoch
-        if self._latency_failure is not None or epoch != self.epoch:
+        if self._sealed or self._latency_failure is not None or epoch != self.epoch:
             raise StaleConnectionEffect
         size = len(item)
         if not self.can_enqueue_size(size):
@@ -408,7 +419,7 @@ class WritePump:
         """Wait for writer capacity after an immediate admission attempt failed."""
         async with self.space:
             while True:
-                if self._latency_failure is not None or epoch != self.epoch:
+                if self._sealed or self._latency_failure is not None or epoch != self.epoch:
                     raise StaleConnectionEffect
                 messages_full = self._resident_messages >= self.max_messages
                 # Allow a single oversized item into an empty writer (segmented
@@ -438,7 +449,7 @@ class WritePump:
                     raise
                 finally:
                     self.waiters -= 1
-            if self._latency_failure is not None or epoch != self.epoch:
+            if self._sealed or self._latency_failure is not None or epoch != self.epoch:
                 raise StaleConnectionEffect
             self.queue.put_nowait(item)
             self.queued_bytes += size
