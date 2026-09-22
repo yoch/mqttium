@@ -8,6 +8,10 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Keep decoded subscription packet conversion in the adapter and restrict the
+  result-model reference to its supported fields; remove the pre-v1 `from_packet`
+  factories that exposed Internal packet types (see migration guidance).
+
 - Make the existing strict open-loop release gate available on the dedicated
   ARM64 runner, with exact trusted commits and retained qualification artifacts.
   Correct remaining Internal-tier packet and engine docstrings.

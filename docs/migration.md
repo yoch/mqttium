@@ -224,3 +224,9 @@ The decoder owns packet-boundary bytes; no reusable-buffer view escapes into
 protocol state or the application. Ingress remains bounded and connection-scoped.
 The current native API removes the direct QoS 0 adapter path and uses the
 common engine/effect pipeline for every message.
+
+### Subscription result conversion
+
+The pre-v1 `SubscribeResult.from_packet()` and `UnsubscribeResult.from_packet()`
+helpers are removed. Consume results returned by the client, or construct a value
+with `mid` and `reason_codes`. Decoded SUBACK/UNSUBACK packet types remain Internal.
