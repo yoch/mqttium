@@ -366,9 +366,11 @@ def encode_properties(props: Properties | None, packet: str) -> bytes:
 # empty value is indistinguishable from a fresh one, and encode_properties()
 # returns b"\x00" for it before touching the per-instance encode cache.
 _EMPTY_PROPERTIES = Properties()
+# Bound object/CPU amplification independently of the inbound wire-byte limit.
+_MAX_REPEATABLE_PROPERTIES = 1024
 
 
-def decode_properties(
+def decode_properties(  # noqa: C901 -- keep wire validation and its resource bound together
     buf: bytes | bytearray,
     offset: int,
     packet: str,
@@ -376,7 +378,9 @@ def decode_properties(
     """Decode properties starting at *offset*.
 
     Returns ``(Properties, new_offset)``. An empty table returns a shared
-    immutable value rather than a new instance per packet.
+    immutable value rather than a new instance per packet. A property table
+    may contain at most 1024 values for repeatable property identifiers in
+    total; exceeding that local resource budget raises ``ProtocolError``.
     """
     if offset >= len(buf):
         raise MalformedPacketError("Missing properties length")
@@ -388,6 +392,7 @@ def decode_properties(
         raise MalformedPacketError("Properties length exceeds remaining data")
 
     seen: dict[str, Any] = {}
+    repeated = 0
     while pos < end:
         prop_id = buf[pos]
         pos += 1
@@ -396,6 +401,16 @@ def decode_properties(
             raise MalformedPacketError(f"Unknown property id 0x{prop_id:02x}")
         if packet not in spec.packets:
             raise MalformedPacketError(f"Property {spec.name} not allowed on {packet}")
+        if spec.multiple:
+            repeated += 1
+            if repeated > _MAX_REPEATABLE_PROPERTIES:
+                # Exceptions retain this frame. Drop the amplified collection
+                # before raising, and never decode the over-budget value.
+                seen.clear()
+                raise ProtocolError(
+                    f"Repeated MQTT 5 properties exceed the {_MAX_REPEATABLE_PROPERTIES}-value "
+                    "decode budget"
+                )
         value, pos = spec.decode(buf, pos)
         if spec.nonzero and value == 0:
             raise MalformedPacketError(f"Property {spec.name} must not be zero")
@@ -410,8 +425,7 @@ def decode_properties(
                     raise MalformedPacketError("Duplicate subscription_identifier on SUBSCRIBE")
                 seen[spec.name] = value
             else:
-                items = seen.setdefault(spec.name, [])
-                items.append(value)
+                seen.setdefault(spec.name, []).append(value)
         else:
             if spec.name in seen:
                 raise MalformedPacketError(f"Duplicate property {spec.name}")
