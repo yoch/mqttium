@@ -197,9 +197,12 @@ It distinguishes work that should wait from work that can never fit.
 
 `ApplicationDelivery` owns the bounded iterator queue and its byte
 reservations, and runs synchronous callbacks inline. Iterator (default) and
-callback are exclusive. In iterator mode each message has one byte charge and
-one queue item, released when the iterator yields the message; the reader
-waits for byte and queue capacity under one `iterator_admission_timeout` deadline.
+callback are exclusive. With a finite iterator byte limit, each message has one
+byte charge and one queue item, released when the iterator yields the message;
+the reader waits for byte and queue capacity under one
+`iterator_admission_timeout` deadline. With `max_iterator_bytes=None`, the queue
+stores bare messages without logical sizing or byte accounting; count bounds
+and the admission deadline still apply.
 
 Message callbacks are synchronous-only and execute on the reader that delivered
 the message, after the protocol lock is released and before the reader decodes

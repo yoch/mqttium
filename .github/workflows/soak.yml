@@ -15,6 +15,12 @@ on:
         required: false
         default: "500"
         type: string
+      linux_duration_seconds:
+        description: Linux Mosquitto soak duration (0 uses the cycle count)
+        required: false
+        default: "0"
+        type: choice
+        options: ["0", "7200"]
   pull_request:
     paths:
       - benchmarks/soak.py
@@ -65,7 +71,9 @@ jobs:
 
   linux-soak:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && inputs.linux_duration_seconds == '7200' && 150 || 30 }}
+    env:
+      SOAK_DURATION_SECONDS: ${{ github.event_name == 'workflow_dispatch' && inputs.linux_duration_seconds || '0' }}
     strategy:
       fail-fast: false
       matrix:
@@ -89,19 +97,25 @@ jobs:
           python tools/ci/wait_for_endpoints.py --tcp 127.0.0.1:11883
       - name: Run reconnect and backpressure soak
         run: |
+          git rev-parse HEAD > "$RUNNER_TEMP/soak-source.txt"
           python benchmarks/soak.py \
             --port 11883 \
             --protocol "${{ matrix.protocol }}" \
             --cycles "$SOAK_CYCLES" \
+            --duration-seconds "$SOAK_DURATION_SECONDS" \
             --messages-per-cycle "$SOAK_MESSAGES" \
             --output "$RUNNER_TEMP/soak-mosquitto-${{ matrix.protocol }}.json"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: always()
         with:
           name: soak-mosquitto-${{ matrix.protocol }}-${{ github.run_id }}
-          path: ${{ runner.temp }}/soak-mosquitto-${{ matrix.protocol }}.json
+          path: |
+            ${{ runner.temp }}/soak-mosquitto-${{ matrix.protocol }}.json
+            ${{ runner.temp }}/soak-source.txt
+            ${{ runner.temp }}/mosquitto.conf
+            ${{ runner.temp }}/mosquitto.log
           if-no-files-found: warn
-          retention-days: 30
+          retention-days: ${{ inputs.linux_duration_seconds == '7200' && 90 || 30 }}
 
   macos-soak:
     if: github.event_name == 'workflow_dispatch'

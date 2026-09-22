@@ -33,7 +33,7 @@ is the version an application actually upgrades from.
 | CONNECT property keys duplicating limit arguments | Use the dedicated constructor arguments |
 | Shared mutable reconnect policy | Immutable policy with private state per client |
 | `ReconnectPolicy.follow_server_reference` | Removed; inspect `BrokerDisconnectError` and explicitly choose a replacement endpoint |
-| Delivery small-message diagnostic fields | Uniform `stats().delivery.iterator_bytes` / `iterator_byte_limit` |
+| Delivery small-message diagnostic fields | Exact `stats().delivery.iterator_bytes` with a finite byte limit; zero byte occupancy/high-water values when `max_iterator_bytes=None` |
 | Custom engine/store/transport integration guarantees | Internal implementation interfaces |
 
 ## Frozen constructor and snapshot vocabulary
@@ -212,8 +212,10 @@ are not promised.
 
 The tree must pass protocol, persistence, lifecycle, backpressure, fuzz and
 real-broker tests. Performance comparisons use exact baseline/candidate commits
-and the same delivered work and resource bounds. Performance regressions are
-reported rather than used as a release gate. Historical release reports do not
+and the same delivered work and resource bounds. The lean-native diagnostic
+comparison has no performance acceptance threshold; it does not replace the
+strict release controls in the [benchmarking contract](benchmarking.md) and
+[release procedure](release-process.md). Historical release reports do not
 qualify this implementation.
 
 ## Decoder storage and ingress contract

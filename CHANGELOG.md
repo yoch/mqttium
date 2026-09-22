@@ -8,6 +8,10 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Align the maintained documentation with the current source API and its
+  unpublished status: installation instructions, explicit stability tiers,
+  public errors, iterator byte statistics, manual QoS 2 acknowledgement,
+  support boundaries and reproducible release qualification commands.
 - Correct the enhanced-authentication and long-lived-service examples to return
   AUTH responses and restore subscriptions through the connection hook.
 - Preserve writer ownership when a short queued write raises after possible

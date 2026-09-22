@@ -9,6 +9,10 @@ Python 3.11–3.14. It is built for production services, gateways, and connected
 devices that need explicit completion, bounded resource use, and reliable
 recovery.
 
+These pages describe the current source API, not the published `1.0.0rc14`
+package. Follow the [source installation instructions](getting-started.md)
+to run the examples, or select documentation for your installed release.
+
 ## Choose a path
 
 <div class="grid cards" markdown>
@@ -74,10 +78,10 @@ backpressure model that distinguishes MQTTium from a minimal MQTT wrapper.
 
 ## API support tiers
 
-The supported surface is native client operations, models, receipts, results,
-statistics and the two shipped stores. Engine, codecs, transport implementations,
-records and extension protocols are internal. See the [API Stability Policy](api-stability.md)
-for exact tiers and import paths.
+Native client operations, models, receipts and results are Stable.
+Statistics and the two shipped stores are Provisional. Engine, codecs,
+transport implementations, records and extension protocols are Internal.
+See the [API Stability Policy](api-stability.md) for exact tiers and import paths.
 
 ## Trust and evidence
 

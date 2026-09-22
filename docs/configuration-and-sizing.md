@@ -98,6 +98,12 @@ a memory bound, and is not configurable.
 | `max_iterator_bytes` | `64 MiB` | Topic, payload and property bytes retained in the iterator queue |
 | `iterator_admission_timeout` | `None` | Optional positive deadline for admitting one message into the iterator queue |
 
+`max_iterator_bytes=None` disables both the iterator byte limit and byte
+accounting: `delivery.iterator_bytes` and `iterator_high_water_bytes` remain
+zero, not an estimate of retained memory. The message-count bound still
+applies. A finite byte limit accounts for exact logical topic, payload and
+property bytes and releases the charge when the iterator yields the message.
+
 The iterator queue is the only place where the client retains messages on the
 application's behalf, so its three bounds only exist in iterator mode. In
 callback mode the reader hands each message to the synchronous callback and

@@ -45,8 +45,9 @@ def _inbound(protocol: MQTTProtocolVersion, index: int, qos: QoS) -> bytes:
 
 @pytest.mark.parametrize("protocol", [MQTTProtocolVersion.MQTTv311, MQTTProtocolVersion.MQTTv5])
 @pytest.mark.parametrize("inbound_qos", [QoS.AT_MOST_ONCE, QoS.AT_LEAST_ONCE])
+@pytest.mark.parametrize("count", [1, 2, 3, 5])
 async def test_responder_callback_publishes_from_one_delivery_lot(
-    task_factory, protocol: MQTTProtocolVersion, inbound_qos: QoS
+    task_factory, protocol: MQTTProtocolVersion, inbound_qos: QoS, count: int
 ) -> None:
     del task_factory
     broker = ScriptedBrokerTransport(protocol=protocol)
@@ -69,20 +70,20 @@ async def test_responder_callback_publishes_from_one_delivery_lot(
         broker.publishes.clear()
         # One rx chunk carries the whole lot: adjacent MESSAGE effects drain
         # from a single reader-owned collection.
-        broker.push_rx(b"".join(_inbound(protocol, index, inbound_qos) for index in range(5)))
+        broker.push_rx(b"".join(_inbound(protocol, index, inbound_qos) for index in range(count)))
 
-        await wait_until(lambda: len(broker.publishes) == 10)
+        await wait_until(lambda: len(broker.publishes) == 2 * count)
         for receipt in receipts:
             await receipt.wait()
 
-        assert seen == list(range(5))
-        # The burst was collected as one lot of five adjacent MESSAGE effects.
-        assert client._delivery_lane.high_water == 5
+        assert seen == list(range(count))
+        # Exercise singleton, pair and larger lots through the same reader lane.
+        assert client._delivery_lane.high_water == count
         assert [packet.topic for packet in broker.publishes] == [
-            f"reply/{index}/{qos}" for index in range(5) for qos in ("qos1", "qos0")
+            f"reply/{index}/{qos}" for index in range(count) for qos in ("qos1", "qos0")
         ]
         stats = client.stats()
-        assert client._delivery.callback_invocations == 5
+        assert client._delivery.callback_invocations == count
         assert stats.outbound.unacknowledged_messages == 0
         await wait_until(lambda: client.stats().inbound.inflight == 0)
         assert client.is_connected

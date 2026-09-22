@@ -11,7 +11,7 @@
   <a href="https://pypi.org/project/mqttium/"><img alt="Python versions" src="https://img.shields.io/pypi/pyversions/mqttium.svg"></a>
   <a href="https://github.com/yoch/mqttium/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/yoch/mqttium/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://codecov.io/gh/yoch/mqttium"><img alt="Coverage" src="https://codecov.io/gh/yoch/mqttium/branch/main/graph/badge.svg"></a>
-  <a href="https://mqttium.readthedocs.io/en/stable/"><img alt="Documentation" src="https://readthedocs.org/projects/mqttium/badge/?version=stable"></a>
+  <a href="https://mqttium.readthedocs.io/en/latest/"><img alt="Documentation" src="https://readthedocs.org/projects/mqttium/badge/?version=latest"></a>
   <a href="https://github.com/yoch/mqttium/blob/main/LICENSE"><img alt="Apache-2.0 license" src="https://img.shields.io/pypi/l/mqttium.svg"></a>
 </p>
 
@@ -48,9 +48,19 @@ native client free of background threads.
 
 ## Install
 
+The examples below describe the current source API, which has not yet been
+published. Install a checkout of this revision to use them:
+
 ```bash
-python -m pip install mqttium
+git clone https://github.com/yoch/mqttium.git
+cd mqttium
+python -m pip install .
 ```
+
+For the last published candidate, use `python -m pip install mqttium==1.0.0rc14`
+and its [RC14 documentation](https://github.com/yoch/mqttium/tree/v1.0.0rc14/docs).
+The source version string remains RC14 until the separate release cut; record
+the Git commit when reporting a source-build issue.
 
 ## First round trip
 
@@ -214,26 +224,28 @@ statistics vocabulary, progressive batch publication, synchronous message
 callbacks, receipt-based publication completion, and the new SQLite schema.
 Historical databases are not upgraded automatically.
 
-Until the next release is cut, the published `stable` documentation describes
-the `1.0.0rc14` release line; the source-tree migration guide describes the
-current pre-v1 API.
+Until the next release is cut, use versioned RC14 documentation for the PyPI
+package and `latest` for the current source API. Read the Docs currently
+exposes only `latest`; the RC14 link above points to the documentation retained
+at its release tag. A future `stable` alias must follow a published release.
 
 ## Documentation
 
-The complete released documentation is available on
-[Read the Docs](https://mqttium.readthedocs.io/en/stable/).
+The current source documentation is available on
+[Read the Docs latest](https://mqttium.readthedocs.io/en/latest/).
+For a released package, select its version instead.
 
 | Start here | Use it for |
 | --- | --- |
-| [Getting started](https://mqttium.readthedocs.io/en/stable/getting-started/) | Installation, lifecycle, publishing, subscribing, and delivery |
-| [Configuration and sizing](https://mqttium.readthedocs.io/en/stable/configuration-and-sizing/) | Choosing queue, byte, inflight, timeout, and reconnect settings |
-| [Sessions and persistence](https://mqttium.readthedocs.io/en/stable/sessions-and-persistence/) | Broker sessions, reconnect, SQLite, and restart recovery |
-| [Transports and security](https://mqttium.readthedocs.io/en/stable/transports-and-tls/) | TCP, TLS, WebSocket, Unix sockets, and credential handling |
-| [MQTT 5](https://mqttium.readthedocs.io/en/stable/mqtt-5/) | Properties, authentication, topic aliases, and negotiated limits |
-| [Operations](https://mqttium.readthedocs.io/en/stable/operations/) | Runtime snapshots, pressure diagnosis, and graceful shutdown |
-| [Benchmarking](https://mqttium.readthedocs.io/en/stable/benchmarking/) | Performance methodology, regression controls, and measurement semantics |
-| [Stable API reference](https://mqttium.readthedocs.io/en/stable/reference/) | Supported imports, signatures, defaults, and exceptions |
-| [Compatibility matrix](https://mqttium.readthedocs.io/en/stable/compatibility/) | Python, platform, broker, protocol, and transport validation |
+| [Getting started](https://mqttium.readthedocs.io/en/latest/getting-started/) | Installation, lifecycle, publishing, subscribing, and delivery |
+| [Configuration and sizing](https://mqttium.readthedocs.io/en/latest/configuration-and-sizing/) | Choosing queue, byte, inflight, timeout, and reconnect settings |
+| [Sessions and persistence](https://mqttium.readthedocs.io/en/latest/sessions-and-persistence/) | Broker sessions, reconnect, SQLite, and restart recovery |
+| [Transports and security](https://mqttium.readthedocs.io/en/latest/transports-and-tls/) | TCP, TLS, WebSocket, Unix sockets, and credential handling |
+| [MQTT 5](https://mqttium.readthedocs.io/en/latest/mqtt-5/) | Properties, authentication, topic aliases, and negotiated limits |
+| [Operations](https://mqttium.readthedocs.io/en/latest/operations/) | Runtime snapshots, pressure diagnosis, and graceful shutdown |
+| [Benchmarking](https://mqttium.readthedocs.io/en/latest/benchmarking/) | Performance methodology, regression controls, and measurement semantics |
+| [Native API reference](https://mqttium.readthedocs.io/en/latest/reference/) | Supported imports, signatures, defaults, and exceptions |
+| [Compatibility matrix](https://mqttium.readthedocs.io/en/latest/compatibility/) | Python, platform, broker, protocol, and transport validation |
 
 Architecture, conformance, stability tiers, benchmarking methodology, and
 release evidence are documented separately so current contracts are not mixed

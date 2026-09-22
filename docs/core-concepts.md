@@ -77,8 +77,9 @@ and outgoing admission progress independently of a full delivery queue. An ACK
 still unread behind incoming data remains subject to transport backpressure;
 see [bidirectional pressure](operations.md#bidirectional-pressure).
 
-`manual_ack=True` delays inbound MQTT acknowledgement until
-`await client.ack(message)`. Manual MQTT acknowledgement is not an application
+`manual_ack=True` delays inbound QoS 1 PUBACK and terminal QoS 2 PUBCOMP until
+`await client.ack(message)`; QoS 2 PUBREC still precedes application delivery.
+Manual MQTT acknowledgement is not an application
 transaction and does not remove the need for idempotent processing.
 
 ## Negotiated limits are authoritative

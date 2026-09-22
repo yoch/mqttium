@@ -5,6 +5,24 @@ earlier pre-v1 Stable contract and is breaking, not a deprecation bridge. The
 migration guide records the differences from `1.0.0rc14` (`c194597`); there are
 no compatibility wrappers for removed APIs.
 
+## Support tiers
+
+**Stable** covers the root operational errors and enums, the native client,
+its constructor and operations, and the models, receipts, results and settings
+listed below, except `ClientStats`. After 1.0, incompatible Stable changes
+require a major version; a deprecated API remains available throughout its
+major release line, with a documented replacement and migration guidance.
+The deliberate pre-v1 break from RC14 is recorded in the migration guide.
+
+**Provisional** covers `ClientStats`, its nested immutable snapshots,
+`MemoryInflightStore` and `SqliteInflightStore`. These remain supported and
+tested, but may evolve in a minor release with a changelog entry and migration
+guidance. Freezing their current vocabulary does not promote them to Stable.
+
+**Internal** covers engine, codec, transport and store extension protocols,
+implementation records and underscore modules. There is no compatibility
+guarantee for these objects, even when they can be imported.
+
 ## Supported surface
 
 | Entry point | Supported names |

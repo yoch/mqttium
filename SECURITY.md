@@ -6,9 +6,15 @@ Security fixes are applied to the latest stable release line and the `main`
 development branch. Users should upgrade to the newest patch release; older
 pre-release and superseded minor lines may not receive fixes.
 
+No final 1.0 release has been published yet. The latest published candidate is
+`1.0.0rc14`; `main` contains the next, incompatible native API. During this
+pre-release period, fixes land on `main` and ship in a subsequent candidate or
+final release. A source revision is not a new PyPI release, even while its
+version string still reads `1.0.0rc14`.
+
 | Version | Security fixes |
 | --- | --- |
-| Latest stable release | Supported |
+| Latest stable release, once published | Supported |
 | `main` | Supported for development and coordinated disclosure |
 | Older releases and pre-releases | Not guaranteed |
 

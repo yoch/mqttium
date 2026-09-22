@@ -22,10 +22,12 @@ At the time of the spin-out, the exact production code was validated with 245
 unit tests, Mosquitto integration on Python 3.11/3.12/3.13, Ruff, mypy,
 deterministic fuzzing, Hypothesis fuzzing, and an 80% coverage gate.
 
-This repository has moved on since: the standalone gates now run more than 300
-unit tests and Mosquitto integration across Python 3.11, 3.12, 3.13 and 3.14,
-plus Bandit and distribution validation. See `CONTRIBUTING.md` for the current
-list.
+This repository has moved on since: the standalone gates run unit, project,
+resilience and fuzz suites, and Mosquitto integration across Python 3.11, 3.12,
+3.13 and 3.14, plus Bandit and distribution validation. See
+[Contributing](CONTRIBUTING.md) for the current commands and
+[Testing](docs/testing.md) for coverage and suite definitions. The counts above
+describe the spin-out commit, not the current release candidate.
 
 The final retained `publish_many()` benchmark decision was based on a paired
 A/B run whose artifact digest was:
@@ -38,8 +40,8 @@ The initial file-level review was completed before the first package release:
 
 - MQTTium's protocol, transport, persistence and public API implementations are
   original code distributed under Apache-2.0;
-- the Paho compatibility package implements documented public behaviour and
-  does not vendor Paho source files;
+- the former Paho compatibility package implemented documented public behaviour
+  without vendoring Paho source files; the current native API removes it;
 - tests and documentation reference Paho and gmqtt for behavioural comparison
   and migration guidance only;
 - the original trie matcher, whose structure followed Paho's matcher closely,

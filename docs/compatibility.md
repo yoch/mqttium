@@ -67,9 +67,9 @@ and a minimal reproducer.
 
 ## API stability
 
-The supported surface is native client operations, models, receipts, results,
-statistics and the supplied memory/SQLite stores. The engine, codecs,
-transports, records and extension protocols are internal. See
+Native client operations, models, receipts and results are Stable. Statistics
+and the supplied memory/SQLite stores are Provisional. The engine, codecs,
+transport implementations, records and extension protocols are Internal. See
 [API Stability](api-stability.md) for exact import paths and tiers.
 
 ## What is not claimed

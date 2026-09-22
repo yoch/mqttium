@@ -97,8 +97,8 @@ episodes, and bounded event-loop yields before those boundaries. Invalid API
 operations are not generated and `--steps` is an exact exploration budget.
 After each operation the target checks exact writer resident/byte accounting,
 effect progress, outbound flow/packet-id/receipt agreement, inbound Receive
-Maximum, callback-worker ownership, completed-write epochs, application task
-outcomes, and event-loop exception contexts. A two-second whole-schedule
+Maximum, reader-owned delivery and lifecycle-task ownership, completed-write
+epochs, application task outcomes, and event-loop exception contexts. A two-second whole-schedule
 watchdog catches liveness failures outside checkpoint polling. Terminal
 checkpoints additionally require every connection-scoped waiter, queued byte,
 effect, and receipt to settle. A checkpoint that cannot be reached is reported

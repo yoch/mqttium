@@ -27,11 +27,12 @@ promise or release date.
 - Add enhanced-authentication integrations only when broker demand and a safe
   credential boundary justify them.
 
-## Paho compatibility policy
+## Native API release boundary
 
 The current pre-v1 API is native-only. The façade and helpers are removed.
-Assess the simplification and measured performance changes before any separate
-decision to publish.
+Integration into `main` and release publication are separate steps. Keep
+versioning, migration guidance, installed-artifact checks and documentation
+deployment aligned when cutting the next candidate or final version.
 
 ## Documentation and ecosystem
 
