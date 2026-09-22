@@ -8,6 +8,9 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Roll back failed SQLite commits, preserve the original failure, and prevent
+  store cleanup from committing a mutation already reported as failed.
+
 - Bound native and WebSocket stream shutdown when a peer stops reading,
   aborting stalled output after the close budget. Keep the shared stream-close
   future intact under timeout and repeated caller cancellation, and collect
