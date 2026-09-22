@@ -619,6 +619,7 @@ class AsyncClient:
 
         Raises:
             MQTTTimeoutError: If transport setup or CONNACK exceeds the deadline.
+            ValueError: If ``timeout`` is not a finite positive number.
             ProtocolError: If the client is already connecting/connected or the
                 broker refuses or violates the protocol.
             MQTTError: If :meth:`disconnect` cancels connection setup.
@@ -646,6 +647,7 @@ class AsyncClient:
 
         Raises:
             MQTTTimeoutError: If connection or CONNACK exceeds the deadline.
+            ValueError: If ``timeout`` is not a finite positive number.
             ProtocolError: If the broker refuses or violates the protocol.
             MQTTError: If a previous local terminal failure fail-stopped
                 this client; create a new one instead of reusing it.
@@ -686,6 +688,7 @@ class AsyncClient:
 
         Raises:
             MQTTTimeoutError: If connection or CONNACK exceeds the deadline.
+            ValueError: If ``timeout`` is not a finite positive number.
             ProtocolError: If the broker refuses or violates the MQTT protocol.
             MQTTError: If a previous local terminal failure fail-stopped
                 this client; create a new one instead of reusing it.
@@ -1362,6 +1365,7 @@ class AsyncClient:
 
         Raises:
             MQTTTimeoutError: If SUBACK does not arrive before the deadline.
+            ValueError: If ``timeout`` is not a finite positive number.
             ProtocolError: If a filter, option, property, or negotiated limit is
                 invalid.
             NotConnectedError: If the client cannot submit the request.
@@ -1402,6 +1406,7 @@ class AsyncClient:
 
         Raises:
             MQTTTimeoutError: If UNSUBACK does not arrive before the deadline.
+            ValueError: If ``timeout`` is not a finite positive number.
             ProtocolError: If a filter is invalid.
             NotConnectedError: If the client cannot submit the request.
         """
