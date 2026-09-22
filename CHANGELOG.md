@@ -9,7 +9,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 ### Fixed
 
 - Release caller-owned subscription futures on cancellation or transfer failure
-  without releasing the still-active MQTT packet identifier.
+  without releasing the still-active MQTT packet identifier. Transfer errors
+  keep their type; only the acknowledgement wait raises `MQTTTimeoutError`.
 
 - Settle deferred SUBACK/UNSUBACK results before reusing their packet identifier,
   so a later request cannot receive an earlier request's acknowledgement.
