@@ -118,7 +118,8 @@ class StreamTransportBase:
             kind=type(self).__name__,
             closing=self.is_closing(),
             pending_write_bytes=self.pending_write_bytes,
-            buffered_read_bytes=0,
+            # StreamReader has no public buffer-occupancy API.
+            buffered_read_bytes=None,
         )
 
     async def _drain_if_needed(self) -> None:

@@ -8,6 +8,10 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Report unknown transport receive backlog as `None` instead of a misleading
+  zero for pull streams, WebSocket and unsupported transports. Push transport
+  measurements and disconnected zero remain available (see migration guidance).
+
 - Make the existing strict open-loop release gate available on the dedicated
   ARM64 runner, with exact trusted commits and retained qualification artifacts.
   Correct remaining Internal-tier packet and engine docstrings.
