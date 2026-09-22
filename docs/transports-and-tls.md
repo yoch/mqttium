@@ -91,5 +91,20 @@ authorization failures, and malformed protocol traffic as terminal until the
 configuration changes; repeatedly retrying them adds load without improving
 availability.
 
+Automatic reconnect stops on `ssl.SSLCertVerificationError`, malformed MQTT
+packets, and peer protocol violations, including failures before CONNACK or
+during the reconnect stability window. Pending work fails with the terminal
+cause and the application message stream ends. Certificate setup failures
+are reported through `on_disconnect` even when no new reader was started.
+A later explicit connection can begin a new stream after the endpoint or
+trust configuration is repaired; these peer/security failures alone do not
+make the client permanently unusable.
+
+Ordinary connection resets, connection refusal, timeouts, and TLS EOF remain
+eligible for the existing retry policy and backoff. A valid negative CONNACK
+still follows its protocol-specific reason-code policy: transient server
+busy/unavailable responses are not confused with malformed peer traffic just
+because the refused connection is exposed as `ProtocolError`.
+
 MQTTium intentionally does not log credentials, topics, properties, or payloads.
 See [Logging and Observability](observability.md) for application-owned diagnostics.
