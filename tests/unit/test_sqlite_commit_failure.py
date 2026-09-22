@@ -1,6 +1,6 @@
 """A reported commit failure must not become durable during later cleanup."""
 
-from contextlib import nullcontext
+from contextlib import closing, nullcontext
 import sqlite3
 
 import pytest
@@ -62,11 +62,11 @@ def test_failed_commit_never_becomes_durable_on_close(tmp_path, batched, deny_ro
                     )
                 )
             )
-        with sqlite3.connect(path) as observer:
+        with closing(sqlite3.connect(path)) as observer:
             assert observer.execute("SELECT mid FROM outbound WHERE mid=1").fetchone() == (1,)
         store.close()
         store.close()
-        with sqlite3.connect(path) as observer:
+        with closing(sqlite3.connect(path)) as observer:
             assert observer.execute("SELECT mid FROM outbound WHERE mid=1").fetchone() == (1,)
             assert observer.execute("SELECT COUNT(*) FROM outbound").fetchone()[0] == (
                 1 if deny_rollback else 2
