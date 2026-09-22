@@ -926,6 +926,8 @@ class AsyncClient:
         The method is idempotent when no transport exists. A legal MQTT
         DISCONNECT is sent when possible; shutdown remains bounded when the
         writer is congested or the peer's packet limit cannot admit it.
+        Cancellation during terminal drainage still closes the connection before
+        propagating to the caller.
 
         Args:
             reason_code: MQTT 5 DISCONNECT reason code. MQTT 3 clients must use
@@ -964,41 +966,44 @@ class AsyncClient:
                 self._reconnect_task = None
         should_close = False
         packet_failure = False
-        async with self._lifecycle_lock:
-            if disconnecting_connect:
-                return
-            if self._transport is None:
-                # No live transport (e.g. called inside a reconnect gap): the
-                # intentional shutdown is still terminal for receipts and the
-                # application stream, which the reconnect loop would otherwise
-                # keep alive.
-                if not self._will_reconnect():
-                    self._terminal_shutdown(self._disconnect_exc or MQTTError("Disconnected"))
-                return
-            # Preserve validation semantics: an invalid reason code must fail
-            # before teardown, just as it did before shutdown became bounded.
-            try:
-                packet = self._engine.begin_disconnect(reason_code) if self.is_connected else None
-            except PacketTooLargeError:
-                # The peer's packet limit makes a legal DISCONNECT impossible.
-                # Closing the transport is the only conforming shutdown left.
-                packet_failure = True
-            else:
-                should_close = True
-                if packet is not None:
-                    try:
-                        await self._flush_terminal_packet(
-                            packet, _GRACEFUL_DISCONNECT_DRAIN_TIMEOUT
-                        )
-                    except StaleConnectionEffect:
-                        pass
-        if packet_failure:
-            await self._force_close_after_local_packet_failure()
-            return
-        if should_close:
-            # Transport cleanup completes before the separate lifecycle owner
-            # can notify user code; hooks never become a prerequisite here.
-            await self._force_close()
+        try:
+            async with self._lifecycle_lock:
+                if disconnecting_connect:
+                    return
+                if self._transport is None:
+                    # No live transport (e.g. called inside a reconnect gap): the
+                    # intentional shutdown is still terminal for receipts and the
+                    # application stream, which the reconnect loop would otherwise
+                    # keep alive.
+                    if not self._will_reconnect():
+                        self._terminal_shutdown(self._disconnect_exc or MQTTError("Disconnected"))
+                    return
+                # Preserve validation semantics: an invalid reason code must fail
+                # before teardown, just as it did before shutdown became bounded.
+                try:
+                    packet = (
+                        self._engine.begin_disconnect(reason_code) if self.is_connected else None
+                    )
+                except PacketTooLargeError:
+                    # The peer's packet limit makes a legal DISCONNECT impossible.
+                    # Closing the transport is the only conforming shutdown left.
+                    packet_failure = True
+                else:
+                    should_close = True
+                    if packet is not None:
+                        try:
+                            await self._flush_terminal_packet(
+                                packet, _GRACEFUL_DISCONNECT_DRAIN_TIMEOUT
+                            )
+                        except StaleConnectionEffect:
+                            pass
+        finally:
+            if packet_failure:
+                await self._force_close_after_local_packet_failure()
+            elif should_close:
+                # Transport cleanup completes before the separate lifecycle owner
+                # can notify user code; hooks never become a prerequisite here.
+                await self._force_close()
 
     def publish_nowait(
         self,
