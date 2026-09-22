@@ -8,6 +8,11 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Stop automatic reconnect on certificate verification failures, malformed
+  MQTT packets and peer protocol violations, including setup and stability
+  failures. Preserve transient backoff, validated CONNACK refusal policy and
+  explicit reconnection after configuration repair (#469).
+
 - Validate WebSocket hostnames and TLS option types before opening a socket
   or sending extra headers. Reject hostless endpoints and values that could
   silently disable TLS for a `wss://` URL (#464, #468).
