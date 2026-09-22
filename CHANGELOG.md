@@ -8,6 +8,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Complete connection teardown when a disconnect caller is cancelled during
+  terminal drainage, then propagate cancellation to the caller.
 - Bound incoming MQTT 5 repeatable properties to 1024 combined values per
   table before decoding an excess value, independently of the wire-byte
   limit. Release partial collections on rejection and preserve valid order
