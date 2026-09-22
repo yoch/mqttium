@@ -3,17 +3,39 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import suppress
 from typing import Protocol, runtime_checkable
 
 from mqttium.transport.stats import TransportStats
 
 _WRITE_BUFFER_HIGH_WATER = 64 * 1024
+_STREAM_CLOSE_TIMEOUT = 1.0
 
 
 def write_buffer_needs_drain(writer: asyncio.StreamWriter) -> bool:
     transport = writer.transport
     return transport is not None and transport.get_write_buffer_size() > _WRITE_BUFFER_HIGH_WATER
+
+
+async def close_stream_writer(writer: asyncio.StreamWriter) -> None:
+    """Flush a closing stream for a bounded time, then abort stalled output."""
+    writer.close()
+    # wait_closed() shares the protocol's close future. Do not cancel it when
+    # this caller times out: another cleanup owner may await the same writer.
+    waiter = asyncio.create_task(writer.wait_closed())
+    try:
+        done, _ = await asyncio.wait((waiter,), timeout=_STREAM_CLOSE_TIMEOUT)
+        if not done:
+            writer.transport.abort()
+    except asyncio.CancelledError:
+        writer.transport.abort()
+        raise
+    finally:
+        # abort() schedules connection_lost, which settles the stream waiter.
+        # Join our task before returning or propagating caller cancellation.
+        try:
+            await waiter
+        except Exception:
+            writer.transport.abort()
 
 
 @runtime_checkable
@@ -101,9 +123,7 @@ class StreamTransportBase:
         await self._writer.drain()
 
     async def close(self) -> None:
-        self._writer.close()
-        with suppress(Exception):
-            await self._writer.wait_closed()
+        await close_stream_writer(self._writer)
 
     def is_closing(self) -> bool:
         return self._writer.is_closing()
