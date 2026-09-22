@@ -1423,14 +1423,23 @@ class AsyncClient:
         ack_name: str,
     ) -> _AckResultT:
         """Flush effects and await one registered SUBACK/UNSUBACK future."""
-        await self._effect_pump.drain()
         try:
-            return await asyncio.wait_for(
-                fut, timeout=timeout if timeout is not None else self._subscribe_timeout
-            )
-        except TimeoutError as exc:
-            futs.pop(mid, None)
-            raise MQTTTimeoutError(f"{ack_name} timed out for mid={mid}") from exc
+            await self._effect_pump.drain()
+            try:
+                return await asyncio.wait_for(
+                    fut, timeout=timeout if timeout is not None else self._subscribe_timeout
+                )
+            except TimeoutError as exc:
+                raise MQTTTimeoutError(f"{ack_name} timed out for mid={mid}") from exc
+        finally:
+            # Caller ownership spans transfer as well as ACK waiting. Protocol
+            # identifiers remain owned by the engine until ACK or teardown.
+            if futs.get(mid) is fut:
+                del futs[mid]
+            if not fut.done():
+                fut.cancel()
+            elif not fut.cancelled():
+                fut.exception()  # Retrieve failures assigned during a failed drain.
 
     def messages(self) -> AsyncIterator[Message]:
         """Return an iterator bound to the generation when this method is called.
