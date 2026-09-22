@@ -1,0 +1,7 @@
+{
+  "pr": 484,
+  "base": "f9cce0868b0ecc38cc9d8e90c1ddc7bc4a6abb44",
+  "head": "36af27ee2a6bd9cb7683aa0fb247b8d894291688",
+  "head_branch": "fix/websocket-endpoint-validation-464-468",
+  "note": "- Validate WebSocket hostnames and TLS option types before opening a socket\n  or sending extra headers. Reject hostless endpoints and values that could\n  silently disable TLS for a `wss://` URL (#464, #468).\n"
+}
