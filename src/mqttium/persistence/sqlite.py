@@ -19,7 +19,7 @@ import sqlite3
 import threading
 from array import array
 from collections.abc import Callable, Iterator, Sequence, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Any, Literal, TypeVar
 
@@ -495,7 +495,7 @@ class SqliteInflightStore:
                         if rollback_only:
                             self._conn.rollback()
                         else:
-                            self._conn.commit()
+                            self._commit()
                 finally:
                     self._transaction_started = False
                     self._rollback_only = False
@@ -508,9 +508,24 @@ class SqliteInflightStore:
             self._conn.execute("BEGIN IMMEDIATE")
             self._transaction_started = True
 
+    def _commit(self) -> None:
+        try:
+            self._conn.commit()
+        except BaseException as failure:
+            try:
+                self._conn.rollback()
+            except BaseException as rollback_failure:
+                # A live failed transaction must never be reused or committed
+                # by a later operation. Preserve the original commit failure.
+                failure.add_note(f"Rollback also failed; closing store: {rollback_failure!r}")
+                with suppress(BaseException):
+                    self._conn.close()
+                self._closed = True
+            raise
+
     def _commit_if_needed(self) -> None:
         if self._batch_depth == 0:
-            self._conn.commit()
+            self._commit()
 
     def close(self) -> None:
         with self._lock:
@@ -518,7 +533,8 @@ class SqliteInflightStore:
                 return
             if self._batch_depth:
                 raise RuntimeError("Cannot close SQLite store inside batch()")
-            self._conn.commit()
+            # Mutations commit at their own boundary. Closing must never
+            # make an unsuccessful operation durable.
             self._conn.close()
             self._closed = True
 

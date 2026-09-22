@@ -184,6 +184,12 @@ mutations are atomic. Internal `batch()` groups protocol operations: SQLite
 uses a lazy transaction, while the engine compensates its own acquisitions.
 Memory `batch()` does not provide universal application rollback.
 
+If a SQLite commit fails, the store attempts to roll back the transaction and
+raises the original commit error. If rollback also fails, the store closes its
+connection and adds that cleanup failure as a note to the original exception;
+create a new store before further use. `close()` never commits pending work:
+successful mutations already commit at their own boundary.
+
 Backend failures retain their native exception boundary and must not be
 classified as MQTT protocol errors. A batch must not suppress an exception
 from its body or commit; the runtime needs that cause to fail-stop safely.
