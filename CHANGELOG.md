@@ -8,6 +8,9 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Reject non-finite timeouts and reconnect timing values before state changes;
+  per-call timeout overrides require the same positive finite values as defaults.
+
 - Include persisted MQTT 5 property bytes in SQLite replay pages and engine
   emission budgets, matching the memory store and preserving oversized-record progress.
   Both stores and the engine now size replay from the same persisted logical size.
