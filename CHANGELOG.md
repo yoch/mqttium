@@ -8,6 +8,9 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Close admission before draining a fatal DISCONNECT and fence later writer
+  submissions until the next connection, preserving terminal packet order.
+
 - Make the existing strict open-loop release gate available on the dedicated
   ARM64 runner, with exact trusted commits and retained qualification artifacts.
   Correct remaining Internal-tier packet and engine docstrings.

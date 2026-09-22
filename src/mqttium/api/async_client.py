@@ -906,7 +906,7 @@ class AsyncClient:
         parked. StaleConnectionEffect is deliberately not caught here: whether a
         dead epoch is an error depends on the caller.
         """
-        if not self._write_pump.try_enqueue(packet, epoch=self._connection_epoch):
+        if not self._write_pump.try_enqueue_terminal(packet, epoch=self._connection_epoch):
             return
         writer_task = self._write_pump.task
         if writer_task is None or writer_task.done():
@@ -2319,8 +2319,12 @@ class AsyncClient:
         elif isinstance(exc, MalformedPacketError):
             reason = 0x81  # Malformed Packet
         try:
-            packet = encode_disconnect(reason, MQTTProtocolVersion.MQTTv5)
-            self._engine._check_outbound_size(packet)
+            if self._engine.state in (ConnectionState.CONNECTING, ConnectionState.CONNECTED):
+                # Retire public admission before terminal drainage can suspend.
+                packet = self._engine.begin_disconnect(reason)
+            else:
+                packet = encode_disconnect(reason, MQTTProtocolVersion.MQTTv5)
+                self._engine._check_outbound_size(packet)
             await self._flush_terminal_packet(packet, _FATAL_DISCONNECT_DRAIN_TIMEOUT)
         except Exception:
             pass
