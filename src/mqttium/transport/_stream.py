@@ -19,23 +19,30 @@ def write_buffer_needs_drain(writer: asyncio.StreamWriter) -> bool:
 async def close_stream_writer(writer: asyncio.StreamWriter) -> None:
     """Flush a closing stream for a bounded time, then abort stalled output."""
     writer.close()
-    # wait_closed() shares the protocol's close future. Do not cancel it when
-    # this caller times out: another cleanup owner may await the same writer.
     waiter = asyncio.create_task(writer.wait_closed())
-    try:
-        done, _ = await asyncio.wait((waiter,), timeout=_STREAM_CLOSE_TIMEOUT)
-        if not done:
-            writer.transport.abort()
-    except asyncio.CancelledError:
-        writer.transport.abort()
-        raise
-    finally:
-        # abort() schedules connection_lost, which settles the stream waiter.
-        # Join our task before returning or propagating caller cancellation.
+    timeout: float | None = _STREAM_CLOSE_TIMEOUT
+    cancellation: asyncio.CancelledError | None = None
+    # wait_closed() shares the protocol's close future. asyncio.wait() isolates
+    # it from caller cancellation during both the flush and the final join.
+    # In particular, abort() only schedules connection_lost; cancellation can
+    # still arrive before that callback completes the shared future.
+    while not waiter.done():
         try:
-            await waiter
-        except Exception:
+            done, _ = await asyncio.wait((waiter,), timeout=timeout)
+            if not done:
+                writer.transport.abort()
+        except asyncio.CancelledError as exc:
+            cancellation = exc
             writer.transport.abort()
+        # After abort, join the owned waiter without restarting the flush
+        # budget. Repeated cancellation must not transfer to that waiter.
+        timeout = None
+    try:
+        waiter.result()
+    except Exception:
+        writer.transport.abort()
+    if cancellation is not None:
+        raise cancellation
 
 
 @runtime_checkable
