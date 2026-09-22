@@ -1,8 +1,7 @@
 {
-  "pr": 485,
-  "base": "cc1e5bcf57f0b02f9cb51e5f46ad5af389d990ba",
-  "head": "77788d4c0a541119662a80928e2fedc1089f421d",
-  "head_branch": "fix/bounded-stream-close-466",
-  "note": "",
-  "patch": "--- a/tests/unit/test_stream_close_deadline.py\n+++ b/tests/unit/test_stream_close_deadline.py\n@@ -18,7 +18,12 @@\n )\n @pytest.mark.parametrize(\"outcome\", [\"normal\", \"timeout\", \"cancel\", \"error\"])\n async def test_stream_close_owns_cleanup(monkeypatch, transport_type, outcome):\n-    monkeypatch.setattr(\"mqttium.transport._stream._STREAM_CLOSE_TIMEOUT\", 0.02, raising=False)\n+    # Exercise exactly one shutdown cause. A short real timeout can beat the\n+    # caller's cancellation on coarse or loaded event loops.\n+    monkeypatch.setattr(\n+        \"mqttium.transport._stream._STREAM_CLOSE_TIMEOUT\",\n+        0.0 if outcome == \"timeout\" else 60.0,\n+    )\n     started = asyncio.Event()\n     finished = asyncio.Event()\n     aborted = asyncio.Event()\n@@ -68,7 +73,9 @@\n @pytest.mark.parametrize(\"mode\", [\"transport\", \"client\", \"cancel\"])\n async def test_real_nonreading_peer_cannot_hold_shutdown(monkeypatch, mode):\n     public_disconnect = mode == \"client\"\n-    monkeypatch.setattr(\"mqttium.transport._stream._STREAM_CLOSE_TIMEOUT\", 0.02, raising=False)\n+    monkeypatch.setattr(\n+        \"mqttium.transport._stream._STREAM_CLOSE_TIMEOUT\", 60.0 if mode == \"cancel\" else 0.02\n+    )\n     monkeypatch.setattr(\"mqttium.api.async_client._GRACEFUL_DISCONNECT_DRAIN_TIMEOUT\", 0.02)\n     peers = []\n     peer_tasks = []\n"
+  "pr": 472,
+  "base": "600a4c59b48b18139ef863ae692fee75d0d82528",
+  "head": "299c4891caa7a73738da4136aa849dc2bc8e003a",
+  "head_branch": "codex/audit-f03-sqlite-commit-rollback",
+  "note": ""
 }
