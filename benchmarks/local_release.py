@@ -68,6 +68,7 @@ class Recorder:
             "check-wheel-contents",
             "hypothesis",
             "mypy",
+            "mkdocs",
             "psutil",
             "pytest",
             "pytest-cov",
@@ -424,10 +425,14 @@ def run_quality(recorder: Recorder, port: int) -> None:
             "pytest",
             "-q",
             "tests/unit",
+            "tests/project",
             "--cov=mqttium",
             "--cov-report=term-missing",
-            "--cov-fail-under=87.36",
         ),
+    )
+    recorder.run(
+        "docs-strict",
+        _python_tool("mkdocs", "build", "--strict", "--site-dir", str(recorder.output / "site")),
     )
     environment = os.environ.copy()
     environment["MQTTIUM_REQUIRE_BROKER"] = "1"
