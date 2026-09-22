@@ -1,8 +1,7 @@
 {
-  "pr": 486,
-  "base": "1b4d791f02578f1eaa9330d095a8eefb4ce6d150",
-  "head": "4d43bbb0245c0380c81ac6397eb6dfbbf70b68b0",
-  "head_branch": "fix/property-decode-budget-463",
-  "note": "- Bound incoming MQTT 5 repeatable properties to 1024 combined values per\n  table before decoding an excess value, independently of the wire-byte\n  limit. Release partial collections on rejection and preserve valid order\n  and outgoing encoding (#463).\n",
-  "patch": "diff --git a/tests/unit/test_permanent_reconnect_failures.py b/tests/unit/test_permanent_reconnect_failures.py\nindex 089c954..d1e1e2d 100644\n--- a/tests/unit/test_permanent_reconnect_failures.py\n+++ b/tests/unit/test_permanent_reconnect_failures.py\n@@ -5,7 +5,7 @@ import ssl\n \n import pytest\n \n-from mqttium.api import AsyncClient\n+from mqttium.api import AsyncClient, Properties\n from mqttium.enums import MQTTProtocolVersion, PacketType, QoS\n from mqttium.errors import MalformedPacketError, ProtocolError\n from mqttium.packets import PublishPacket, encode_frame\n@@ -60,6 +60,19 @@ async def stopped(client):\n         (b\"\\x30\\x07\\x00\\x01t\\x03\\x23\\x00\\x00\", MalformedPacketError),\n         # A second CONNACK on an established connection is a protocol error.\n         (b\"\\x20\\x03\\x00\\x00\\x00\", ProtocolError),\n+        # The local decode budget must also stop retry and settle pending work.\n+        pytest.param(\n+            PublishPacket(\n+                topic=\"amplified\",\n+                payload=b\"\",\n+                qos=QoS.AT_MOST_ONCE,\n+                retain=False,\n+                dup=False,\n+                properties=Properties({\"user_property\": [(\"\", \"\")] * 1025}),\n+            ).encode(MQTTProtocolVersion.MQTTv5),\n+            ProtocolError,\n+            id=\"repeatable-property-budget\",\n+        ),\n     ],\n )\n async def test_malformed_session_closes_stream_and_settles_pending(wire, error):\n"
+  "pr": 473,
+  "base": "febff4408a5403a9f1d676849bd9519e4d03a971",
+  "head": "eaa660048063e6e5fe3fdea430cfbf80a89b41f8",
+  "head_branch": "codex/audit-f04-cancelled-disconnect",
+  "note": ""
 }
