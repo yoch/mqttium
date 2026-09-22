@@ -18,7 +18,12 @@ from tests.support import wait_until
 )
 @pytest.mark.parametrize("outcome", ["normal", "timeout", "cancel", "error"])
 async def test_stream_close_owns_cleanup(monkeypatch, transport_type, outcome):
-    monkeypatch.setattr("mqttium.transport._stream._STREAM_CLOSE_TIMEOUT", 0.02, raising=False)
+    # Exercise exactly one shutdown cause. A short real timeout can beat the
+    # caller's cancellation on coarse or loaded event loops.
+    monkeypatch.setattr(
+        "mqttium.transport._stream._STREAM_CLOSE_TIMEOUT",
+        0.0 if outcome == "timeout" else 60.0,
+    )
     started = asyncio.Event()
     finished = asyncio.Event()
     aborted = asyncio.Event()
@@ -68,7 +73,9 @@ async def test_stream_close_owns_cleanup(monkeypatch, transport_type, outcome):
 @pytest.mark.parametrize("mode", ["transport", "client", "cancel"])
 async def test_real_nonreading_peer_cannot_hold_shutdown(monkeypatch, mode):
     public_disconnect = mode == "client"
-    monkeypatch.setattr("mqttium.transport._stream._STREAM_CLOSE_TIMEOUT", 0.02, raising=False)
+    monkeypatch.setattr(
+        "mqttium.transport._stream._STREAM_CLOSE_TIMEOUT", 60.0 if mode == "cancel" else 0.02
+    )
     monkeypatch.setattr("mqttium.api.async_client._GRACEFUL_DISCONNECT_DRAIN_TIMEOUT", 0.02)
     peers = []
     peer_tasks = []
