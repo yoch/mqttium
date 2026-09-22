@@ -1362,15 +1362,19 @@ class AsyncClient:
             NotConnectedError: If the client cannot submit the request.
         """
         loop = asyncio.get_running_loop()
-        async with self._engine_lock:
-            mid = self._engine.queue_subscribe(
-                topics,
-                qos=qos,
-                properties=properties,
-            )
-            fut: asyncio.Future[SubscribeResult] = loop.create_future()
-            self._sub_futs[mid] = fut
-            self._effect_pump.collect_from_engine()
+        while True:
+            async with self._engine_lock:
+                # Reject a terminal or invalid request before waiting on effects.
+                request = self._engine.prepare_subscribe(topics, qos=qos, properties=properties)
+                if not (self._effect_pump.pending or self._engine.has_pending_effects):
+                    mid = self._engine.queue_subscription_request(request)
+                    fut: asyncio.Future[SubscribeResult] = loop.create_future()
+                    self._sub_futs[mid] = fut
+                    self._effect_pump.collect_from_engine()
+                    break
+                self._effect_pump.collect_from_engine()
+            # Settle earlier results before a released identifier can be reused.
+            await self._effect_pump.drain()
         return await self._await_request_ack(fut, self._sub_futs, mid, timeout, "SUBACK")
 
     async def unsubscribe(
@@ -1395,11 +1399,19 @@ class AsyncClient:
             NotConnectedError: If the client cannot submit the request.
         """
         loop = asyncio.get_running_loop()
-        async with self._engine_lock:
-            mid = self._engine.queue_unsubscribe(topics)
-            fut: asyncio.Future[UnsubscribeResult] = loop.create_future()
-            self._unsub_futs[mid] = fut
-            self._effect_pump.collect_from_engine()
+        while True:
+            async with self._engine_lock:
+                # Reject a terminal or invalid request before waiting on effects.
+                request = self._engine.prepare_unsubscribe(topics)
+                if not (self._effect_pump.pending or self._engine.has_pending_effects):
+                    mid = self._engine.queue_subscription_request(request)
+                    fut: asyncio.Future[UnsubscribeResult] = loop.create_future()
+                    self._unsub_futs[mid] = fut
+                    self._effect_pump.collect_from_engine()
+                    break
+                self._effect_pump.collect_from_engine()
+            # Settle earlier results before a released identifier can be reused.
+            await self._effect_pump.drain()
         return await self._await_request_ack(fut, self._unsub_futs, mid, timeout, "UNSUBACK")
 
     async def _await_request_ack(

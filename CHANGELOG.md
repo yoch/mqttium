@@ -8,6 +8,11 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Settle deferred SUBACK/UNSUBACK results before reusing their packet identifier,
+  so a later request cannot receive an earlier request's acknowledgement.
+  Terminal or invalid requests are still refused immediately, even while a
+  failed connection's transport close is blocked.
+
 - Create new SQLite inflight databases with mode `0600` and missing parent
   directories with mode `0700` without changing the process umask, so new
   WAL/SHM sidecars are private too. Existing stores keep their permissions.
