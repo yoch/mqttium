@@ -31,11 +31,27 @@ python benchmarks/local_release.py rc --base-ref <approved-baseline> --cpu <elig
 ```
 
 The runner writes commands, versions, durations, logs and result artifacts under
-its versioned temporary result directory, manages Mosquitto with guaranteed cleanup, and
-fails if a local quality, performance, memory, artifact, or smoke gate is
-missing. An expected non-zero gate result exits without a Python traceback and
-prints the retained command log and manifest paths; the gate log contains the
-recorded failure or invalidation reason. Performance evidence remains local
+a fresh private temporary directory and prints its actual path. The directory
+is retained after success or failure; concurrent runs never reuse it. To choose
+the location, pass `--output-dir /trusted/existing/parent/new-run`: the parent
+must already exist and the final directory must not exist, even if it is empty.
+Pre-existing files, directories, and symbolic links are refused rather than
+overwritten. Re-running a gate requires a new output directory.
+
+On POSIX, the new output directory has mode `0700`; command logs and manifests
+have mode `0600`. Parent paths are checked for trusted ownership and unsafe
+write permissions. MQTTium does not change the process umask. Run the gate as
+the normal developer account and use a parent controlled by that account or
+root. Windows deployments remain responsible for directory ACLs. The manifest
+is replaced atomically within the private directory; a failed replacement
+preserves the previous manifest. These safeguards protect output paths, not
+against malicious code executing as the same account.
+
+The runner manages Mosquitto with guaranteed cleanup and fails if a local
+quality, performance, memory, artifact, or smoke gate is missing. An expected
+non-zero gate result exits without a Python traceback and prints the retained
+command log and manifest paths; the gate log contains the recorded failure or
+invalidation reason. Performance evidence remains local
 to an eligible dedicated machine because shared hosted timing is not stable
 enough for small regressions. This can be the remote ARM64 runner; it need not
 be the maintainer's workstation. The manual `ARM64 Network Release Gate`
