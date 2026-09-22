@@ -93,9 +93,16 @@ jobs:
               Path('CHANGELOG.md').write_text(before + '## [Unreleased]\n' + unreleased)
           assert Path('CHANGELOG.md').read_bytes().split(marker, 1)[1] == history
           git('add', 'CHANGELOG.md')
+          # Apply only the explicitly supplied, locally reviewed patch. No
+          # fuzzy/three-way application or automatic code conflict resolution.
+          if config.get('patch'):
+              patch = evidence / 'reviewed.patch'
+              patch.write_text(config['patch'])
+              git('apply', '--index', '--check', str(patch))
+              git('apply', '--index', str(patch))
           git('diff', '--cached', '--check')
           assert not git('ls-files', '.github/integration-candidate.json', '.github/workflows/integration-candidate.yml').stdout
-          git('commit', '-m', f"Integrate current main and release notes for PR #{config['pr']}")
+          git('commit', '-m', f"Integrate reviewed changes and current main for PR #{config['pr']}")
           sha = git('rev-parse', 'HEAD').stdout.decode().strip()
           git('merge-base', '--is-ancestor', config['head'], sha)
           git('merge-base', '--is-ancestor', config['base'], sha)
