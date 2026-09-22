@@ -5,7 +5,7 @@ import ssl
 
 import pytest
 
-from mqttium.api import AsyncClient
+from mqttium.api import AsyncClient, Properties
 from mqttium.enums import MQTTProtocolVersion, PacketType, QoS
 from mqttium.errors import MalformedPacketError, ProtocolError
 from mqttium.packets import PublishPacket, encode_frame
@@ -60,6 +60,19 @@ async def stopped(client):
         (b"\x30\x07\x00\x01t\x03\x23\x00\x00", MalformedPacketError),
         # A second CONNACK on an established connection is a protocol error.
         (b"\x20\x03\x00\x00\x00", ProtocolError),
+        # The local decode budget must also stop retry and settle pending work.
+        pytest.param(
+            PublishPacket(
+                topic="amplified",
+                payload=b"",
+                qos=QoS.AT_MOST_ONCE,
+                retain=False,
+                dup=False,
+                properties=Properties({"user_property": [("", "")] * 1025}),
+            ).encode(MQTTProtocolVersion.MQTTv5),
+            ProtocolError,
+            id="repeatable-property-budget",
+        ),
     ],
 )
 async def test_malformed_session_closes_stream_and_settles_pending(wire, error):

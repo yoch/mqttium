@@ -8,6 +8,11 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Bound incoming MQTT 5 repeatable properties to 1024 combined values per
+  table before decoding an excess value, independently of the wire-byte
+  limit. Release partial collections on rejection and preserve valid order
+  and outgoing encoding (#463).
+
 - Close admission before draining a fatal DISCONNECT and fence later writer
   submissions until the next connection, preserving terminal packet order.
 - Stop automatic reconnect on certificate verification failures, malformed
