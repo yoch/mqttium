@@ -8,6 +8,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Close admission before draining a fatal DISCONNECT and fence later writer
+  submissions until the next connection, preserving terminal packet order.
 - Stop automatic reconnect on certificate verification failures, malformed
   MQTT packets and peer protocol violations, including setup and stability
   failures. Preserve transient backoff, validated CONNACK refusal policy and
