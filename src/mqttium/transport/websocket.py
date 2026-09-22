@@ -64,7 +64,7 @@ class WebSocketTransport:
         *,
         ssl: Any = None,
         extra_headers: dict[str, str] | None = None,
-        timeout: float = 30.0,
+        timeout: float | None = 30.0,
         max_frame_size: int = 16 * 1024 * 1024,
         max_write_batch_bytes: int = 1 * 1024 * 1024,
     ) -> WebSocketTransport:
@@ -306,7 +306,7 @@ def _build_handshake_request(
 
 async def _read_handshake_response(
     reader: asyncio.StreamReader,
-    timeout: float,
+    timeout: float | None,
 ) -> tuple[bytes, bytes]:
     buffer = bytearray()
     delimiter = b"\r\n\r\n"

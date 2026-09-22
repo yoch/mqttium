@@ -702,6 +702,7 @@ class AsyncClient:
                 self._ws_url or host,
                 ssl=ssl if ssl is not None else self._ssl,
                 extra_headers=self._ws_headers,
+                timeout=None,  # The connection attempt owns the complete deadline.
             )
 
         return await self._connect_explicit(
@@ -808,6 +809,7 @@ class AsyncClient:
         # CONNACK; no old effect may cross into the new connection.
         await self._invalidate_connection_epoch()
         self._effect_pump.discard_connection_effects()
+        deadline = loop.time() + timeout
         try:
             try:
                 transport = await asyncio.wait_for(
@@ -848,7 +850,7 @@ class AsyncClient:
             await self._write_pump.enqueue(connect_packet)
             self._reader_task = asyncio.create_task(self._read_loop(), name="mqttium-reader")
             try:
-                connack = await self._await_connack_or_disconnect(timeout)
+                connack = await self._await_connack_or_disconnect(max(0.0, deadline - loop.time()))
             finally:
                 connect_disconnect_fut = self._connect_disconnect_fut
                 self._connect_disconnect_fut = None
