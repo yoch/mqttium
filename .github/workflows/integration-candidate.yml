@@ -1,0 +1,166 @@
+name: Prepare reviewed integration candidate
+
+on:
+  push:
+    branches: [maintenance/reviewed-pr-integration-20260922]
+    paths:
+      - .github/integration-candidate.json
+      - .github/workflows/integration-candidate.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: reviewed-pr-integration-candidate
+  cancel-in-progress: false
+
+jobs:
+  candidate:
+    if: github.repository == 'yoch/mqttium'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.12'
+      - name: Assemble exact candidate without changing PR or main
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import difflib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import tempfile
+
+          def git(*args, check=True):
+              return subprocess.run(['git', *args], check=check, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+          config = json.loads(Path('.github/integration-candidate.json').read_text())
+          assert isinstance(config['pr'], int) and 470 <= config['pr'] <= 489
+          assert all(re.fullmatch(r'[0-9a-f]{40}', config[key]) for key in ('head', 'base'))
+          assert re.fullmatch(r'[A-Za-z0-9_./-]+', config['head_branch'])
+          assert config['head_branch'] != 'main'
+          evidence = Path(os.environ['RUNNER_TEMP']) / 'integration-evidence'
+          evidence.mkdir(exist_ok=True)
+          (evidence / 'input.json').write_text(json.dumps(config, indent=2))
+          for branch, expected in [('main', config['base']), (config['head_branch'], config['head'])]:
+              remote = git('ls-remote', 'origin', 'refs/heads/' + branch).stdout.decode().split()
+              assert remote == [expected, 'refs/heads/' + branch], (branch, remote)
+          git('fetch', 'origin', config['head'], config['base'])
+          ancestor = git('merge-base', config['head'], config['base']).stdout.decode().strip()
+          changelogs = {name: git('show', ref + ':CHANGELOG.md').stdout for name, ref in [('head', config['head']), ('base', config['base']), ('ancestor', ancestor)]}
+          marker = b'\n## [1.0.0rc14]'
+          assert all(marker in data for data in changelogs.values())
+          history = changelogs['base'].split(marker, 1)[1]
+          assert all(data.split(marker, 1)[1] == history for data in changelogs.values())
+          git('checkout', '--detach', config['head'])
+          git('config', 'user.name', 'MQTTium integration')
+          git('config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com')
+          result = git('merge', '--no-ff', '--no-commit', config['base'], check=False)
+          (evidence / 'merge.log').write_bytes(result.stdout + result.stderr)
+          if result.returncode:
+              conflicts = git('diff', '--name-only', '--diff-filter=U').stdout.decode().splitlines()
+              assert conflicts == ['CHANGELOG.md'], 'Manual code conflict review required: ' + repr(conflicts)
+              with tempfile.TemporaryDirectory() as directory:
+                  paths = []
+                  for name in ('head', 'ancestor', 'base'):
+                      path = Path(directory) / name
+                      path.write_bytes(changelogs[name])
+                      paths.append(str(path))
+                  merged = git('merge-file', '--union', '-p', *paths).stdout
+              # Only additive release notes may be reconciled automatically.
+              # Existing text on either side must survive, and history is immutable.
+              for name in ('head', 'base'):
+                  edits = difflib.SequenceMatcher(None, changelogs[name].splitlines(True), merged.splitlines(True), autojunk=False).get_opcodes()
+                  assert all(tag in ('equal', 'insert') for tag, *_ in edits), 'Non-additive changelog conflict'
+              assert merged.split(marker, 1)[1] == history
+              Path('CHANGELOG.md').write_bytes(merged)
+          note = config.get('note', '').strip()
+          content = Path('CHANGELOG.md').read_text()
+          if note and note not in content:
+              assert note.startswith('- ') and '\n## ' not in note
+              before, unreleased = content.split('## [Unreleased]\n', 1)
+              assert '\n### Fixed\n\n' in unreleased
+              unreleased = unreleased.replace('\n### Fixed\n\n', '\n### Fixed\n\n' + note + '\n\n', 1)
+              Path('CHANGELOG.md').write_text(before + '## [Unreleased]\n' + unreleased)
+          assert Path('CHANGELOG.md').read_bytes().split(marker, 1)[1] == history
+          git('add', 'CHANGELOG.md')
+          git('diff', '--cached', '--check')
+          assert not git('ls-files', '.github/integration-candidate.json', '.github/workflows/integration-candidate.yml').stdout
+          git('commit', '-m', f"Integrate current main and release notes for PR #{config['pr']}")
+          sha = git('rev-parse', 'HEAD').stdout.decode().strip()
+          git('merge-base', '--is-ancestor', config['head'], sha)
+          git('merge-base', '--is-ancestor', config['base'], sha)
+          tree = git('rev-parse', 'HEAD^{tree}').stdout.decode().strip()
+          branch = f"maintenance/integration-candidate-{config['pr']}-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}"
+          config.update(candidate=sha, candidate_tree=tree, candidate_branch=branch)
+          (evidence / 'candidate.json').write_text(json.dumps(config, indent=2))
+          (evidence / 'candidate.diff').write_bytes(git('diff', config['base'], sha).stdout)
+          (evidence / 'candidate.tar').write_bytes(git('archive', '--format=tar', sha).stdout)
+          print(json.dumps(config, indent=2))
+          PY
+      - name: Install maintained quality dependencies
+        run: python -m pip install -e '.[dev,security,docs]'
+      - name: Validate the prepared source and maintained documentation
+        shell: bash
+        run: |
+          set -euo pipefail
+          ruff format --check src tests benchmarks tools
+          ruff check src tests benchmarks tools
+          mypy src/mqttium
+          bandit -q -ll -r src
+          mkdocs build --strict
+          python -m pytest -q -W error --strict-config --strict-markers tests/unit tests/project --cov=mqttium --cov-branch --cov-report=term-missing --cov-fail-under=89 | tee "$RUNNER_TEMP/integration-evidence/unit-coverage.log"
+          git diff --exit-code
+          git diff --cached --exit-code
+      - name: Publish only the isolated candidate ref after validation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import base64
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+
+          evidence = Path(os.environ['RUNNER_TEMP']) / 'integration-evidence'
+          config = json.loads((evidence / 'candidate.json').read_text())
+          def git(*args, env=None):
+              return subprocess.run(['git', *args], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env).stdout.decode().strip()
+          assert git('rev-parse', 'HEAD') == config['candidate']
+          assert git('rev-parse', 'HEAD^{tree}') == config['candidate_tree']
+          for branch, expected in [('main', config['base']), (config['head_branch'], config['head'])]:
+              assert git('ls-remote', 'origin', 'refs/heads/' + branch).split() == [expected, 'refs/heads/' + branch]
+          ref = 'refs/heads/' + config['candidate_branch']
+          assert ref.startswith('refs/heads/maintenance/integration-candidate-')
+          assert not git('ls-remote', 'origin', ref), 'Candidate ref already exists'
+          environment = os.environ.copy()
+          for name in ('GIT_TRACE', 'GIT_TRACE_CURL', 'GIT_CURL_VERBOSE'):
+              environment.pop(name, None)
+          credentials = base64.b64encode(('x-access-token:' + os.environ['GH_TOKEN']).encode()).decode()
+          environment.update(GIT_CONFIG_COUNT='1', GIT_CONFIG_KEY_0='http.https://github.com/.extraheader', GIT_CONFIG_VALUE_0='AUTHORIZATION: basic ' + credentials)
+          git('push', 'origin', 'HEAD:' + ref, env=environment)
+          assert git('ls-remote', 'origin', ref).split() == [config['candidate'], ref]
+          config['quality_preflight'] = 'passed'
+          (evidence / 'candidate.json').write_text(json.dumps(config, indent=2))
+          print(json.dumps(config, indent=2))
+          PY
+      - name: Retain exact candidate source and evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: integration-candidate-${{ github.run_id }}
+          path: ${{ runner.temp }}/integration-evidence
+          if-no-files-found: error
+          retention-days: 7
