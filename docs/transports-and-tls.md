@@ -90,9 +90,14 @@ storage, and redaction policy. See [MQTT 5](mqtt-5.md).
 
 ## Timeouts and failure handling
 
-A connect timeout covers transport setup and CONNACK; `connect_timeout` on
-the client applies to explicit calls that omit `timeout` and to every
-automatic reconnect attempt. Treat certificate failures, broker
+A connect timeout is one deadline per attempt: TCP, Unix or WebSocket setup,
+including TLS and the WebSocket upgrade, spends the same budget as the wait
+for CONNACK, which only receives what remains. `connect_timeout` on the client
+applies to explicit calls that omit `timeout` and to every automatic reconnect
+attempt. Closing a previous connection, reconnect backoff and lifecycle hooks
+are outside the attempt. Independently of that budget, asyncio aborts a TLS
+handshake that takes longer than 60 seconds with an `OSError`. Treat
+certificate failures, broker
 authorization failures, and malformed protocol traffic as terminal until the
 configuration changes; repeatedly retrying them adds load without improving
 availability.
