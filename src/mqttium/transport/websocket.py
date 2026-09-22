@@ -8,6 +8,7 @@ import hashlib
 import os
 import struct
 from contextlib import suppress
+from ssl import SSLContext
 from typing import Any
 from urllib.parse import urlparse
 
@@ -269,9 +270,13 @@ def _parse_websocket_endpoint(url: str, ssl: Any) -> tuple[str, int, str, Any]:
     parsed = urlparse(url)
     if parsed.scheme not in ("ws", "wss"):
         raise ValueError(f"Unsupported WebSocket URL scheme: {parsed.scheme}")
+    if ssl is not None and not isinstance(ssl, (bool, SSLContext)):
+        raise ValueError("ssl must be None, a bool, or an SSLContext")
     if parsed.scheme == "wss" and ssl is False:
         raise ValueError("wss:// requires TLS (ssl=False would downgrade silently)")
-    host = parsed.hostname or "localhost"
+    host = parsed.hostname
+    if not host:
+        raise ValueError("WebSocket URL must include a hostname")
     port = parsed.port or (443 if parsed.scheme == "wss" else 80)
     path = parsed.path or "/"
     if parsed.query:
