@@ -9,7 +9,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 ### Fixed
 
 - Share one connection deadline across transport setup and CONNACK, including
-  WebSocket upgrade without an independent hidden 30-second timeout.
+  WebSocket upgrade without an independent hidden 30-second timeout. Automatic
+  reconnect attempts use the same single deadline.
 
 - Reject non-finite timeouts and reconnect timing values before state changes;
   per-call timeout overrides require the same positive finite values as defaults.
