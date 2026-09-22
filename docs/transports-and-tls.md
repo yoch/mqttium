@@ -55,7 +55,13 @@ The transport uses RFC 6455 binary frames and requests the MQTT subprotocol.
 Use `wss://` outside a trusted local environment. Extra headers are visible to
 the WebSocket endpoint; do not place long-lived secrets in source code or logs.
 
-
+A WebSocket URL must include a hostname; there is no implicit `localhost`
+fallback. The `ssl` option accepts only `None`, a `bool`, or an `SSLContext`.
+For `wss://`, `None` and `True` enable Python's default TLS context, an explicit
+context is preserved, and `False` is refused. Other values, including `0` and
+an empty string from dynamic configuration, raise `ValueError`. Invalid URLs
+and TLS options are rejected before opening a socket or sending extra headers.
+Plain `ws://` retains its explicit `ssl=False` behavior.
 
 ## Unix-domain sockets
 
