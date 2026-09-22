@@ -79,9 +79,7 @@ def test_run_performance_requalifies_external_gates_and_uses_open_loop_gate(
     assert Path(_argument(network, "--preflight-report")).name == "runner-network.json"
     assert Path(open_loop[1]).name == "open_loop_release_gate.py"
     assert "--preflight-report" not in open_loop
-    assert _argument(open_loop, "--engine") == "benchmarks/open_loop_release_gate.py" or (
-        _argument(open_loop, "--engine") == "benchmarks/paired_open_loop.py"
-    )
+    assert _argument(open_loop, "--engine") == "benchmarks/paired_open_loop.py"
     assert _argument(open_loop, "--runner-probe") == "benchmarks/runner_probe.py"
     assert _argument(open_loop, "--policy") == "strict"
     assert _argument(open_loop, "--port") == "11883"
