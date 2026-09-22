@@ -1,8 +1,8 @@
 """PUBLISH encode/decode.
 
 Specialized v3.1.1 / v5.0 primitives own the common encode and inbound field
-decode paths. ``PublishPacket`` remains the Provisional typed view and the
-MQTT 3.1 fallback decoder.
+decode paths. ``PublishPacket`` is the Internal typed view used by the generic
+packet decoder.
 """
 
 from __future__ import annotations

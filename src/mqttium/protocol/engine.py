@@ -367,7 +367,7 @@ class ProtocolEngine:
         retain: bool = False,
         properties: Properties | None = None,
     ) -> PublishHandle:
-        """Provisional facade over `engine.outbound.queue_publish`.
+        """Internal facade over `engine.outbound.queue_publish`.
 
         AsyncClient calls the session directly: this is the hottest path in the
         library and the forwarder was a Python frame per publish. The

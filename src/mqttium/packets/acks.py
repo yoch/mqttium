@@ -2,7 +2,7 @@
 
 Specialized v3.1.1 / v5.0 primitives own the wire parse and frame build.
 The packet dataclasses are thin factories over those primitives for tests,
-fuzzing and Provisional ``mqttium.packets`` consumers.
+fuzzing and Internal ``mqttium.packets`` consumers.
 """
 
 from __future__ import annotations

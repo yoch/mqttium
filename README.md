@@ -58,7 +58,7 @@ python -m pip install .
 ```
 
 For the last published candidate, use `python -m pip install mqttium==1.0.0rc14`
-and its [RC14 documentation](https://github.com/yoch/mqttium/tree/v1.0.0rc14/docs).
+and its [RC14 documentation](https://mqttium.readthedocs.io/en/v1.0.0rc14/).
 The source version string remains RC14 until the separate release cut; record
 the Git commit when reporting a source-build issue.
 
@@ -225,9 +225,9 @@ callbacks, receipt-based publication completion, and the new SQLite schema.
 Historical databases are not upgraded automatically.
 
 Until the next release is cut, use versioned RC14 documentation for the PyPI
-package and `latest` for the current source API. Read the Docs currently
-exposes only `latest`; the RC14 link above points to the documentation retained
-at its release tag. A future `stable` alias must follow a published release.
+package and `latest` for the current source API. Read the Docs exposes the
+published tag under `v1.0.0rc14`; the legacy `stable` URL redirects there until
+a final release provides Read the Docs' automatic stable version.
 
 ## Documentation
 
