@@ -46,6 +46,7 @@ async def test_connect_ws_forwards_tls_and_headers(
         *,
         ssl: object = None,
         extra_headers: dict[str, str] | None = None,
+        **_options: object,
     ):
         calls.append((url, ssl, extra_headers))
         return transport

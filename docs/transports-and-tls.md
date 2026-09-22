@@ -93,3 +93,12 @@ availability.
 
 MQTTium intentionally does not log credentials, topics, properties, or payloads.
 See [Logging and Observability](observability.md) for application-owned diagnostics.
+
+### WebSocket receive bounds
+
+For `connect_ws()`, the binary frame and reassembled-message limit is the larger
+of 16 MiB and the client's effective `maximum_packet_size`. Each MQTT packet is
+still checked against `maximum_packet_size` independently. A WebSocket message
+may contain several MQTT packets, but their combined bytes must fit the message
+limit; a peer sending more data must use multiple messages. The 16 MiB floor
+preserves coalescing when a small per-packet limit is configured.
