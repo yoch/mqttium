@@ -110,6 +110,30 @@ It does not persist:
 Applications that must recreate subscriptions when the broker reports no
 session should do so from `on_connect` or their connection workflow.
 
+## SQLite file permissions
+
+On POSIX systems, a newly created database starts with mode `0600`. Every
+missing parent directory created by MQTTium starts with mode `0700`, including
+intermediate directories. The process umask may restrict these modes further;
+MQTTium never changes that process-wide setting. SQLite creates new WAL/SHM
+sidecars with the database's permission bits, so a new protected database does
+not expose topics, properties or payloads through its sidecars.
+
+Existing databases and directories retain their existing permissions, including
+permissive ones, for compatibility with deployment-owned state. MQTTium neither
+silently chmods nor claims to secure an existing store. For sensitive state,
+choose a directory controlled by the application owner, stop all users of the
+store, and restrict that directory and the database plus any retained WAL/SHM
+files before reopening it. Do not delete a WAL file to change permissions.
+This is filesystem access control, not encryption, and it is not a defense
+against an attacker who can replace entries in the chosen parent directory.
+On Windows, access is governed by the deployment's ACLs rather than POSIX mode
+bits. The special `:memory:` database creates no filesystem entry.
+
+A database path that is a symbolic link to an existing database opens that
+database unchanged. A dangling link is refused with `FileNotFoundError`
+before SQLite runs, so MQTTium never creates an unprotected link target.
+
 ## Store ownership and shutdown
 
 The store is synchronous and belongs to the application. Close it only after
@@ -150,7 +174,8 @@ hierarchy:
 
 | Failure boundary | Exception exposed |
 | --- | --- |
-| Creating the database's parent directory | `OSError`, including `PermissionError` |
+| Creating a new database file or its parent directories | `OSError`, including `PermissionError` |
+| A database path that is a dangling symbolic link | `FileNotFoundError` |
 | Opening, locking, querying, committing, or using a closed SQLite connection | the relevant `sqlite3.Error` subclass |
 | A historical, future or structurally inconsistent MQTTium schema; invalid batch/close lifecycle | `RuntimeError` |
 | Invalid persisted storage classes, enum/flag/size values, JSON syntax, or MQTTium JSON markers | `ValueError` (including `json.JSONDecodeError`) |

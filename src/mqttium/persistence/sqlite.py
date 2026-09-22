@@ -15,6 +15,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import os
 import sqlite3
 import threading
 from array import array
@@ -239,12 +240,34 @@ def _row_to_in(row: sqlite3.Row) -> InboundMessage:
     )
 
 
+def _prepare_private_path(path: Path) -> None:
+    """Create only missing state paths, without changing existing permissions."""
+    if str(path) == ":memory:":
+        return
+    missing = []
+    parent = path.parent
+    while not parent.exists():
+        missing.append(parent)
+        parent = parent.parent
+    for parent in reversed(missing):
+        parent.mkdir(mode=0o700, exist_ok=True)
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        # Refuse a dangling link: SQLite would create its target unprotected.
+        path.stat()
+        # Existing stores retain the deployment's permissions and compatibility.
+        # SQLite derives newly created WAL/SHM permissions from the database.
+        return
+    os.close(descriptor)
+
+
 class SqliteInflightStore:
     """Durable ordered store for outbound and inbound QoS state."""
 
     def __init__(self, path: str | Path) -> None:
         self._path = Path(path)
-        self._path.parent.mkdir(parents=True, exist_ok=True)
+        _prepare_private_path(self._path)
         self._lock = threading.RLock()
         self._batch_depth = 0
         self._transaction_started = False

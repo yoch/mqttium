@@ -8,6 +8,12 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Create new SQLite inflight databases with mode `0600` and missing parent
+  directories with mode `0700` without changing the process umask, so new
+  WAL/SHM sidecars are private too. Existing stores keep their permissions.
+  Refuse a dangling database symlink with `FileNotFoundError` instead of
+  creating its target (#465).
+
 - Roll back failed SQLite commits, preserve the original failure, and prevent
   store cleanup from committing a mutation already reported as failed.
 
