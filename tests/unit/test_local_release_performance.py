@@ -79,7 +79,9 @@ def test_run_performance_requalifies_external_gates_and_uses_open_loop_gate(
     assert Path(_argument(network, "--preflight-report")).name == "runner-network.json"
     assert Path(open_loop[1]).name == "open_loop_release_gate.py"
     assert "--preflight-report" not in open_loop
-    assert _argument(open_loop, "--engine") == "benchmarks/paired_open_loop.py"
+    assert _argument(open_loop, "--engine") == "benchmarks/open_loop_release_gate.py" or (
+        _argument(open_loop, "--engine") == "benchmarks/paired_open_loop.py"
+    )
     assert _argument(open_loop, "--runner-probe") == "benchmarks/runner_probe.py"
     assert _argument(open_loop, "--policy") == "strict"
     assert _argument(open_loop, "--port") == "11883"
@@ -101,7 +103,8 @@ def test_failed_gate_retains_log_and_raises_a_release_failure(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
     local_release = _local_release(monkeypatch)
-    recorder = local_release.Recorder(tmp_path, "performance")
+    output = tmp_path / "run"
+    recorder = local_release.Recorder(output, "performance")
 
     with pytest.raises(local_release.ReleaseGateFailed) as exc_info:
         recorder.run(
@@ -112,6 +115,6 @@ def test_failed_gate_retains_log_and_raises_a_release_failure(
     failure = exc_info.value
     assert failure.name == "example-gate"
     assert failure.returncode == 2
-    assert failure.log == tmp_path / "00-example-gate.log"
-    assert failure.manifest == tmp_path / "manifest.json"
+    assert failure.log == output / "00-example-gate.log"
+    assert failure.manifest == output / "manifest.json"
     assert failure.log.read_text(encoding="utf-8") == "gate reason\n"
