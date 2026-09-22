@@ -1,7 +1,7 @@
 {
-  "pr": 484,
-  "base": "f9cce0868b0ecc38cc9d8e90c1ddc7bc4a6abb44",
-  "head": "36af27ee2a6bd9cb7683aa0fb247b8d894291688",
-  "head_branch": "fix/websocket-endpoint-validation-464-468",
-  "note": "- Validate WebSocket hostnames and TLS option types before opening a socket\n  or sending extra headers. Reject hostless endpoints and values that could\n  silently disable TLS for a `wss://` URL (#464, #468).\n"
+  "pr": 489,
+  "base": "0642bc00db29c419d0ee4987f270f19e0d4cd89d",
+  "head": "6ef3036a384b451304b63c2c8ba3c09ce168b233",
+  "head_branch": "fix/permanent-reconnect-failures-469",
+  "note": "- Stop automatic reconnect on certificate verification failures, malformed\n  MQTT packets and peer protocol violations, including setup and stability\n  failures. Preserve transient backoff, validated CONNACK refusal policy and\n  explicit reconnection after configuration repair (#469).\n"
 }
