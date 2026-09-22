@@ -906,7 +906,7 @@ class AsyncClient:
         parked. StaleConnectionEffect is deliberately not caught here: whether a
         dead epoch is an error depends on the caller.
         """
-        if not self._write_pump.try_enqueue(packet, epoch=self._connection_epoch):
+        if not self._write_pump.try_enqueue_terminal(packet, epoch=self._connection_epoch):
             return
         writer_task = self._write_pump.task
         if writer_task is None or writer_task.done():
@@ -1727,14 +1727,29 @@ class AsyncClient:
             return self._last_disconnect.reason_code
         return self._last_connack_reason
 
+    def _permanent_connection_failure(self) -> bool:
+        exc = self._disconnect_exc
+        if isinstance(
+            exc,
+            (
+                MessageDeliveryError,
+                MandatoryResponseTooLargeError,
+                AssertionError,
+                ssl.SSLCertVerificationError,
+                MalformedPacketError,
+            ),
+        ):
+            return True
+        # A refused CONNACK is also exposed as ProtocolError. Its validated
+        # reason remains the policy's decision (server busy/unavailable retry).
+        # Each attempt clears this reason before opening the transport.
+        return isinstance(exc, ProtocolError) and self._last_connack_reason is None
+
     def _will_reconnect(self) -> bool:
         reason = self._retry_reason()
         return (
             self._local_terminal_failure is None
-            and not isinstance(
-                self._disconnect_exc,
-                (MessageDeliveryError, MandatoryResponseTooLargeError, AssertionError),
-            )
+            and not self._permanent_connection_failure()
             and not self._intentional_disconnect
             and self._reconnect.should_retry(reason, self._engine.config.protocol)
         )
@@ -1876,10 +1891,9 @@ class AsyncClient:
                 await self._lifecycle_hooks.wait_reconnect()
                 if self._intentional_disconnect or self.is_connected:
                     return
-                reason = self._retry_reason()
-                if not self._reconnect.should_retry(reason, self._engine.config.protocol):
-                    # Retry budget exhausted: the stream must terminate, not
-                    # park forever now that transient paths keep it open.
+                if not self._will_reconnect():
+                    # Recheck the cause after the stability window as well as
+                    # the retry budget: permanent failures terminate the stream.
                     self._terminal_shutdown(
                         self._disconnect_exc or MQTTError("Reconnect exhausted")
                     )
@@ -1896,6 +1910,7 @@ class AsyncClient:
                             return
                         self._lifecycle_hooks.begin_operation()
                         lifecycle_token = self._lifecycle_hooks.token
+                        previous_connack = self._connack_fut
                         await self._force_close(preserve_reconnect=True)
                         connack = await self._connect_once_locked(
                             self._host,
@@ -1924,12 +1939,17 @@ class AsyncClient:
                 except Exception as exc:
                     self._disconnect_exc = exc
                     cause = self._local_terminal_failure
-                    if isinstance(exc, AssertionError) or cause is not None:
-                        # Never reuse an engine after a proven local invariant
-                        # violation — or after any latched local-terminal
-                        # failure, including one raised during reconnect. The
-                        # first latched cause wins over the current exception.
-                        self._terminal_shutdown(cause if cause is not None else exc)
+                    if self._permanent_connection_failure() or cause is not None:
+                        # Stop on permanent setup/peer failures as well as
+                        # invariant failures. A latched local cause still wins;
+                        # peer/security failures alone do not poison the client
+                        # for a later explicit connect after configuration repair.
+                        terminal = cause if cause is not None else exc
+                        self._terminal_shutdown(terminal)
+                        # TLS setup can fail before allocating a new CONNACK
+                        # waiter/reader, leaving no reader to report its cause.
+                        if self._connack_fut is previous_connack:
+                            self._lifecycle_hooks.disconnected(terminal, lifecycle_token)
                         return
                     continue
         except asyncio.CancelledError:
@@ -2326,8 +2346,12 @@ class AsyncClient:
         elif isinstance(exc, MalformedPacketError):
             reason = 0x81  # Malformed Packet
         try:
-            packet = encode_disconnect(reason, MQTTProtocolVersion.MQTTv5)
-            self._engine._check_outbound_size(packet)
+            if self._engine.state in (ConnectionState.CONNECTING, ConnectionState.CONNECTED):
+                # Retire public admission before terminal drainage can suspend.
+                packet = self._engine.begin_disconnect(reason)
+            else:
+                packet = encode_disconnect(reason, MQTTProtocolVersion.MQTTv5)
+                self._engine._check_outbound_size(packet)
             await self._flush_terminal_packet(packet, _FATAL_DISCONNECT_DRAIN_TIMEOUT)
         except Exception:
             pass
