@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from mqttium.api.models import PublishBatchReceipt
     from mqttium.types import Properties
 
 
@@ -74,7 +75,7 @@ class PublishBatchError(MQTTError):
         failure_count: int | None = None,
         failure_counts: dict[str, int] | None = None,
         cause: BaseException | None = None,
-        receipt: object | None = None,
+        receipt: PublishBatchReceipt | None = None,
     ) -> None:
         self.failures = dict(failures or {})
         self.failure_count = len(self.failures) if failure_count is None else failure_count

@@ -8,6 +8,9 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Type `PublishBatchError.receipt` as `PublishBatchReceipt | None` so typed
+  consumers can inspect and await the committed prefix without a cast.
+
 - Make the existing strict open-loop release gate available on the dedicated
   ARM64 runner, with exact trusted commits and retained qualification artifacts.
   Correct remaining Internal-tier packet and engine docstrings.
