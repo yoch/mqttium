@@ -317,7 +317,9 @@ class WritePump:
         try:
             return self.try_enqueue(item, epoch=epoch)
         finally:
-            self._sealed = True
+            # Rejected work from an old connection cannot fence its replacement.
+            if epoch == self.epoch:
+                self._sealed = True
 
     def try_enqueue_ack(self, item: bytes, *, epoch: int | None = None) -> bool:
         """Admit a known success ACK without classifying its wire bytes."""

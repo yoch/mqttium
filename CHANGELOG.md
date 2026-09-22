@@ -10,6 +10,17 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 - Close admission before draining a fatal DISCONNECT and fence later writer
   submissions until the next connection, preserving terminal packet order.
+- Stop automatic reconnect on certificate verification failures, malformed
+  MQTT packets and peer protocol violations, including setup and stability
+  failures. Preserve transient backoff, validated CONNACK refusal policy and
+  explicit reconnection after configuration repair (#469).
+
+- Validate WebSocket hostnames and TLS option types before opening a socket
+  or sending extra headers. Reject hostless endpoints and values that could
+  silently disable TLS for a `wss://` URL (#464, #468).
+
+- Fail pending connections promptly with their original reader termination
+  cause instead of waiting for a misleading CONNACK timeout.
 
 - Make the existing strict open-loop release gate available on the dedicated
   ARM64 runner, with exact trusted commits and retained qualification artifacts.
