@@ -93,3 +93,21 @@ availability.
 
 MQTTium intentionally does not log credentials, topics, properties, or payloads.
 See [Logging and Observability](observability.md) for application-owned diagnostics.
+
+## Stream shutdown
+
+After requesting stream closure, MQTTium gives buffered output up to one
+second to flush before aborting a stalled transport. This applies to TCP,
+TLS, Unix sockets, WebSocket, and failed WebSocket-handshake cleanup. It is
+separate from the existing five-second MQTT DISCONNECT writer-drain budget;
+it does not replace that budget or introduce a public timeout option.
+
+Aborting discards bytes the peer has not accepted, including a terminal frame
+that could not flush. Shutdown is not evidence that the broker received those
+bytes or acknowledged an unfinished publication. A normal close still gets
+the chance to flush rather than being aborted immediately.
+
+Cancellation while waiting for stream closure aborts the transport and
+propagates to the caller after the owned close waiter has completed. The
+shared asyncio stream-close future is not cancelled by the timeout, so a
+second cleanup owner can safely await the same writer.
