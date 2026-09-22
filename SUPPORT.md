@@ -30,10 +30,17 @@ minimal reproducer identifies MQTTium behaviour.
 
 ## Supported surface
 
-The Stable native API follows SemVer. Provisional APIs—including persistence,
-transports, diagnostics, advanced protocol integrations, and Paho
-compatibility—remain tested but may evolve with a changelog entry and migration
-guidance. Internal modules have no support guarantee.
+The Stable native API follows SemVer and the documented deprecation policy.
+`ClientStats`, its nested snapshots, `MemoryInflightStore`, and
+`SqliteInflightStore` are Provisional: supported and tested, but changes require
+a changelog entry and migration guidance. Engine, codec, transport and store
+extension protocols are Internal and have no compatibility guarantee.
+The Paho facade and one-shot helpers have been removed.
+
+The current source tree contains an incompatible pre-v1 revision of the last
+published release, `1.0.0rc14`. Use documentation matching your installed
+release, or install the current source before following its examples. See the
+[migration guide](docs/migration.md) before upgrading an application or database.
 
 See [API Stability](docs/api-stability.md) and the
 [Compatibility Matrix](docs/compatibility.md).

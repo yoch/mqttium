@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests.support import stored_record
+
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -80,7 +82,7 @@ def test_puback_settles_a_sqlite_record_without_reading_the_payload(tmp_path: Pa
     engine = connected_engine(store)
     handle = engine.queue_publish("big/topic", b"x" * 4096, qos=1)
     engine.take_effects()
-    assert engine.pending_outbound_bytes == 4096 + len("big/topic")
+    assert engine.unacknowledged_bytes == 4096 + len("big/topic")
 
     with traced(store) as trace:
         feed_engine(engine, PubAckPacket(mid=handle.mid or 0).encode())
@@ -90,8 +92,8 @@ def test_puback_settles_a_sqlite_record_without_reading_the_payload(tmp_path: Pa
         for effect in engine.take_effects()
     )
     assert store.get_out(handle.mid or 0) is None
-    assert engine.pending_outbound_bytes == 0
-    assert engine.pending_outbound_messages == 0
+    assert engine.unacknowledged_bytes == 0
+    assert engine.unacknowledged_messages == 0
     assert_no_payload_reads(trace)
     store.close()
 
@@ -113,7 +115,7 @@ def test_qos2_cycle_settles_on_metadata_only(tmp_path: Path) -> None:
         effect.kind is EffectKind.PUBLISH_COMPLETE and effect.data == mid for effect in completions
     )
     assert store.get_out(mid) is None
-    assert engine.pending_outbound_bytes == 0
+    assert engine.unacknowledged_bytes == 0
     assert engine.flow.inflight == 0
     assert_no_payload_reads(trace)
     store.close()
@@ -142,7 +144,7 @@ def test_failed_pubrec_releases_budget_and_packet_id() -> None:
 
     assert any(effect.kind is EffectKind.PUBLISH_FAILED for effect in engine.take_effects())
     assert engine.store.get_out(mid) is None
-    assert engine.pending_outbound_bytes == 0
+    assert engine.unacknowledged_bytes == 0
     assert not engine.packet_ids.in_use(mid)
     assert engine.flow.inflight == 0
 
@@ -232,22 +234,21 @@ def test_manual_ack_deferred_until_after_pubrel() -> None:
     assert store.get_in(6) is None
 
 
-def test_hydration_backfills_a_legacy_logical_size(tmp_path: Path) -> None:
+def test_hydration_preserves_persisted_logical_size(tmp_path: Path) -> None:
     path = tmp_path / "legacy-size.db"
     store = SqliteInflightStore(path)
     store.put_out(
-        OutboundMessage(
-            mid=3,
-            topic="a/b",
-            payload=b"p" * 100,
-            qos=QoS.AT_LEAST_ONCE,
-            retain=False,
-            state=OutboundQoSState.WAIT_PUBACK,
+        stored_record(
+            OutboundMessage(
+                mid=3,
+                topic="a/b",
+                payload=b"p" * 100,
+                qos=QoS.AT_LEAST_ONCE,
+                retain=False,
+                state=OutboundQoSState.WAIT_PUBACK,
+            )
         )
     )
-    # Simulate a record written before the column existed.
-    store._conn.execute("UPDATE outbound SET logical_size=0 WHERE mid=3")
-    store._conn.commit()
     store.close()
 
     reopened = SqliteInflightStore(path)
@@ -255,7 +256,7 @@ def test_hydration_backfills_a_legacy_logical_size(tmp_path: Path) -> None:
         EngineConfig(client_id="transitions", clean_start=False), store=reopened
     )
     expected = 100 + len("a/b")
-    assert engine.pending_outbound_bytes == expected
+    assert engine.unacknowledged_bytes == expected
 
     persisted = reopened.get_out(3)
     assert persisted is not None
@@ -267,8 +268,8 @@ def test_hydration_backfills_a_legacy_logical_size(tmp_path: Path) -> None:
     engine.take_effects()
     feed_engine(engine, PubAckPacket(mid=3).encode())
     engine.take_effects()
-    assert engine.pending_outbound_bytes == 0
-    assert engine.pending_outbound_messages == 0
+    assert engine.unacknowledged_bytes == 0
+    assert engine.unacknowledged_messages == 0
     reopened.close()
 
 

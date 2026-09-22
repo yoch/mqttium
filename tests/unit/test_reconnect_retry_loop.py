@@ -41,18 +41,16 @@ class _ConnAckTransport:
 
 def _policy(*, max_retries: int | None = None) -> ReconnectPolicy:
     return ReconnectPolicy(
-        enabled=True,
         initial_delay=0.0,
         max_delay=0.0,
         max_retries=max_retries,
         stable_after=0.0,
-        connect_timeout=0.1,
     )
 
 
 async def test_reconnect_retries_transport_failures_until_success() -> None:
     policy = _policy()
-    client = AsyncClient(reconnect=policy)
+    client = AsyncClient(reconnect=policy, connect_timeout=0.1)
     client._host = "fake"
     client._port = 1883
     calls = 0
@@ -71,13 +69,13 @@ async def test_reconnect_retries_transport_failures_until_success() -> None:
 
     assert calls == 3
     assert client.is_connected
-    assert policy.attempt == 0  # stable success resets backoff state
+    assert client.stats().reconnect_attempt == 0  # stable success resets backoff state
     await client.disconnect()
 
 
 async def test_reconnect_exhaustion_fails_pending_receipts() -> None:
     policy = _policy(max_retries=2)
-    client = AsyncClient(reconnect=policy)
+    client = AsyncClient(reconnect=policy, connect_timeout=0.1)
     client._host = "fake"
     client._port = 1883
     receipt = PublishReceipt(mid=7, qos=QoS.AT_LEAST_ONCE)
@@ -102,7 +100,9 @@ async def test_reconnect_exhaustion_fails_pending_receipts() -> None:
 
 async def test_terminal_connack_reason_stops_reconnect_without_string_parsing() -> None:
     policy = _policy()
-    client = AsyncClient(protocol=MQTTProtocolVersion.MQTTv311, reconnect=policy)
+    client = AsyncClient(
+        protocol=MQTTProtocolVersion.MQTTv311, reconnect=policy, connect_timeout=0.1
+    )
     client._host = "fake"
     client._port = 1883
     calls = 0

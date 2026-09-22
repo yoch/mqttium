@@ -38,14 +38,14 @@ PYTHONPATH=src python benchmarks/soak.py \
 
 ## Release coverage
 
-`python benchmarks/local_release.py rc --base-ref <approved-baseline>` provides:
+`python benchmarks/local_release.py rc --base-ref <approved-baseline> --cpu <eligible-cpu>` provides:
 
 - memory, application stress and exact hot-path call/allocation profiles;
 - local unit, type, lint, security and mandatory broker integration gates;
 - short resource-aware reconnect soaks for MQTT 3.1.1 and MQTT 5;
 - strict local micro/open-loop performance gates on an eligible machine, plus
   an advisory closed-loop network diagnostic;
-- isolated wheel TCP, TLS, WebSocket, Unix, SQLite, Paho VERSION2 and shutdown
+- isolated wheel TCP, TLS, WebSocket, Unix, SQLite and shutdown
   smokes;
 - manifests, JSON artefacts and broker logs retained outside the repository.
 
@@ -57,11 +57,31 @@ numbers remain advisory.
 Installed-artifact workflows separately install the exact PyPI artifact rather
 than the checkout. Their retained matrix covers wheel/sdist metadata and Stable
 imports on Python 3.11–3.14, TCP and TLS broker round trips, SQLite restart,
-WebSocket and Unix transports, the Paho VERSION2 migration subset, cancellation
+WebSocket and Unix transports, cancellation
 and clean shutdown. They are manually dispatchable for every candidate.
 
-Multi-hour deterministic fuzz and soak campaigns are required release evidence.
-Record their exact source commit, configuration, retained artifacts, and outcome.
+Multi-hour deterministic fuzz and soak campaigns are required promotion evidence
+for a final release. The `rc-24-cpu-hours` profile of the Long fuzz campaigns
+workflow uses five shards of 288 minutes each, with deterministic codec,
+engine and WebSocket targets plus Hypothesis. This is 24 aggregate worker-hours;
+the workflow does not measure process CPU time. Record its exact source commit,
+seed, retained artifacts and outcome.
+
+For a two-hour reconnect/resource soak, run the following once for each protocol
+(`311` and `5`) on the candidate, against a dedicated broker:
+
+```bash
+PYTHONPATH=src python benchmarks/soak.py \
+  --port 11883 --protocol 311 --duration-seconds 7200 \
+  --messages-per-cycle 500 --output /tmp/mqttium-soak-311.json
+```
+
+Retain the broker configuration, source commit, resource snapshots and digest
+for each result. The manual workflow accepts `linux_duration_seconds=7200`
+for these two-hour Mosquitto runs on GitHub-hosted Linux runners. macOS, EMQX
+and HiveMQ retain the configured short cycle count. Set `0` (the default) for
+the ordinary Linux cycle-count check. Run the ARM64 CI and runtime-schedule
+workflows from trusted `main` after integration.
 
 ## Retained evidence
 

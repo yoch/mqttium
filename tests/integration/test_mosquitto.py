@@ -17,7 +17,7 @@ async def test_pubsub_roundtrip(protocol: MQTTProtocolVersion, qos: int) -> None
     topic = f"mqttium/it/{int(protocol)}/{qos}"
     got: asyncio.Future[bytes] = asyncio.get_running_loop().create_future()
 
-    sub = AsyncClient(f"sub-{protocol}-{qos}", protocol=protocol)
+    sub = AsyncClient(f"sub-{protocol}-{qos}", protocol=protocol, message_delivery="callback")
     pub = AsyncClient(f"pub-{protocol}-{qos}", protocol=protocol)
 
     def on_message(msg) -> None:  # noqa: ANN001

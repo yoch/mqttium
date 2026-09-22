@@ -119,9 +119,6 @@ class StreamTransportBase:
             closing=self.is_closing(),
             pending_write_bytes=self.pending_write_bytes,
             buffered_read_bytes=0,
-            fragmented_read_bytes=0,
-            pending_control_frames=0,
-            pending_control_bytes=0,
         )
 
     async def _drain_if_needed(self) -> None:

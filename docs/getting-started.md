@@ -9,11 +9,21 @@ delivery and shutdown.
 MQTTium supports Python 3.11 through 3.14 and has no runtime dependencies. You
 also need an MQTT 3.1.1 or MQTT 5 broker that the application can reach.
 
-Install the package:
+This documentation describes the current source API, which deliberately
+differs from the last published candidate, `1.0.0rc14`. To run these examples
+before the next release, install a checkout of the revision you are reading:
 
 ```bash
-python -m pip install mqttium
+git clone https://github.com/yoch/mqttium.git
+cd mqttium
+python -m pip install .
 ```
+
+For the published candidate, install `mqttium==1.0.0rc14` and use its
+[RC14 documentation](https://github.com/yoch/mqttium/tree/v1.0.0rc14/docs).
+Source builds retain the RC14 version string until the release cut, so record
+`git rev-parse HEAD` alongside the version. Read the [migration guide](migration.md)
+before changing an existing application or SQLite database.
 
 The examples assume a broker on `127.0.0.1:1883`. If Mosquitto is already
 installed, a development listener can be started with an explicit configuration
@@ -40,9 +50,9 @@ from mqttium.api import AsyncClient, Message
 
 async def main() -> None:
     received: asyncio.Future[Message] = asyncio.get_running_loop().create_future()
-    client = AsyncClient("getting-started")
+    client = AsyncClient("getting-started", message_delivery="callback")
 
-    async def on_message(message: Message) -> None:
+    def on_message(message: Message) -> None:
         if not received.done():
             received.set_result(message)
 
@@ -65,10 +75,11 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-The callback may be synchronous or asynchronous. MQTTium isolates callback
-exceptions from protocol processing and reports them to the event loop's
-exception handler. A callback should still avoid blocking the loop; move
-blocking work to an executor or another service boundary.
+Message callbacks must be short synchronous functions. MQTTium rejects async
+message handlers at registration and reports callback failures to the event
+loop's exception handler. Use `messages()` for asynchronous processing; a sync
+callback may offer work to an application queue with an explicit overflow policy.
+A synchronous callback cannot be preempted, so it must not block the event loop.
 
 ## What a publish receipt means
 
@@ -95,14 +106,13 @@ receipt = await client.publish_many(
 await receipt.wait()
 ```
 
-The iterable is consumed in bounded chunks. The aggregate receipt retains exact
+The iterable is consumed progressively, with at most one element read ahead. The aggregate receipt retains exact
 completion and failure counts without creating one task per publication.
 
 ## Choosing inbound delivery
 
-The default `message_delivery="auto"` chooses callback delivery when
-`on_message` is assigned or a topic-filtered callback is registered, and
-iterator delivery otherwise.
+The default `message_delivery="iterator"` delivers through `messages()`.
+Select `message_delivery="callback"` explicitly to enable message callbacks.
 
 Iterator delivery keeps control flow in the consuming task:
 
@@ -111,13 +121,14 @@ async for message in client.messages():
     await process(message)
 ```
 
-Callback delivery is useful for event-oriented applications:
+Callback delivery is useful for short synchronous handlers:
 
 ```python
-async def on_message(message) -> None:
-    await process(message)
+def on_message(message) -> None:
+    record_message(message)
 
 
+client = AsyncClient(message_delivery="callback")
 client.on_message = on_message
 ```
 
@@ -132,9 +143,10 @@ def on_sensor(message) -> None:
 client.message_callback_add("sensors/+", on_sensor)
 ```
 
-Use `message_delivery="both"` only when two independent application consumers
-really need the same message. Both queues retain a reference and participate in
-delivery backpressure.
+Set `on_message` and register all routes before the first connection attempt.
+They remain frozen after disconnect and throughout reconnect. Subscriptions
+can still change. Each matching route runs serially on the delivering reader,
+so the reader decodes no further packet until the routes for a message return.
 
 With `manual_ack=True`, inbound QoS 1 and the final QoS 2 acknowledgement wait
 for the application:
@@ -161,21 +173,19 @@ from mqttium import FlowControlError
 
 client = AsyncClient(
     "bounded-producer",
-    publish_backpressure="error",
-    max_pending_outbound_messages=2_000,
-    max_pending_outbound_bytes=16 * 1024**2,
+    max_unacknowledged_messages=2_000,
+    max_unacknowledged_bytes=16 * 1024**2,
 )
 
 try:
-    receipt = await client.publish("telemetry", payload, qos=1)
+    receipt = client.publish_nowait("telemetry", payload, qos=1)
 except FlowControlError:
     await shed_or_retry(payload)
 ```
 
 `publish_nowait()` provides the same immediate-refusal behaviour without a
 coroutine suspension, but it must run on the client's owning event-loop thread.
-It is not a thread-safe producer API. Threaded applications migrating from Paho
-should use the [VERSION2 compatibility facade](paho-compatibility.md).
+Cross-thread applications must arrange their own bounded handoff to that loop.
 
 ## MQTT versions and transports
 
@@ -202,35 +212,7 @@ silently sending unsupported QoS, retain or packet sizes.
 
 ## One-shot operations
 
-Small async programs do not need to manage a client directly:
-
-```python
-from mqttium.helpers import publish, subscribe
-
-try:
-    await publish.single(
-        "events/ready",
-        b"ready",
-        qos=1,
-        retain=True,
-        hostname="127.0.0.1",
-    )
-    message = await subscribe.simple("events/ready", hostname="127.0.0.1")
-finally:
-    # A retained publication with an empty payload clears the broker entry.
-    await publish.single(
-        "events/ready",
-        b"",
-        qos=1,
-        retain=True,
-        hostname="127.0.0.1",
-    )
-```
-
-The helpers connect, complete the requested operation and disconnect. A
-retained message makes this sequential demonstration deterministic; normal
-subscriber processes usually start before their publishers. A long-lived
-client is more efficient when an application sends or receives repeatedly.
+Use the same explicit connect, operation and disconnect lifecycle for short programs. MQTTium does not ship one-shot helpers.
 
 ## Errors and shutdown
 
@@ -249,5 +231,5 @@ Next steps:
 - [Sessions and Persistence](sessions-and-persistence.md) for reconnect and
   restart recovery;
 - [Operations](operations.md) for sizing and diagnostics;
-- [Migrating to MQTTium](migration.md) for Paho and gmqtt applications;
+- [Migrating to MQTTium](migration.md) for the breaking changes since `1.0.0rc14`;
 - [API Stability](api-stability.md) for the supported public contract.

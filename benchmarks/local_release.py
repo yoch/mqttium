@@ -683,7 +683,7 @@ def run_package(recorder: Recorder) -> None:
                 str(broker["unix"]),
             ],
         )
-        for command in ("paho", "shutdown"):
+        for command in ("shutdown",):
             recorder.run(
                 f"wheel-{command}",
                 [

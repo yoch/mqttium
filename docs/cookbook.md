@@ -16,9 +16,14 @@ async def run_service() -> None:
         "service-a",
         reconnect=ReconnectPolicy(max_retries=None),
     )
+
+    async def on_connect(connack):
+        if not connack.session_present:
+            await client.subscribe("commands/service-a", qos=1)
+
+    client.on_connect = on_connect
     try:
         await client.connect("broker.example", 8883, ssl=True)
-        await client.subscribe("commands/service-a", qos=1)
 
         async for message in client.messages():
             await handle_command(message)
@@ -28,6 +33,16 @@ async def run_service() -> None:
 
 asyncio.run(run_service())
 ```
+
+Use `on_connect` to restore subscriptions when the broker starts a new session,
+including after automatic reconnect. MQTTium does not retain application
+subscription intent. A resumed session already contains its subscriptions;
+`clean_start=True`, the default, requests a new session.
+
+`connect()` does not wait for this hook to finish. Incoming processing also
+does not wait for it; add an application readiness signal if processing depends
+on additional hook initialization. Hook failures are reported to the event
+loop's exception handler, so services should define their own failure policy.
 
 Keep blocking application work out of the event loop. If processing must be
 durable before MQTT acknowledgement, enable `manual_ack` and acknowledge only
@@ -56,7 +71,7 @@ from mqttium import FlowControlError
 
 async def offer_sample(client, sample: bytes) -> bool:
     try:
-        await client.publish("telemetry", sample, qos=1, nowait=True)
+        client.publish_nowait("telemetry", sample, qos=1)
     except FlowControlError:
         return False
     return True
@@ -64,6 +79,39 @@ async def offer_sample(client, sample: bytes) -> bool:
 
 Returning `False` is useful only if the caller actually sheds, aggregates,
 retries later, or persists the sample elsewhere.
+
+## Publishing from a message callback
+
+Message callbacks are synchronous and must finish promptly. Use a nonblocking
+publication offer with an explicit refusal policy:
+
+```python
+from mqttium import FlowControlError
+from mqttium.api import AsyncClient
+
+client = AsyncClient("responder", message_delivery="callback")
+refused_replies = 0
+
+
+def on_command(message) -> None:
+    global refused_replies
+    try:
+        client.publish_nowait("replies/service-a", message.payload, qos=1)
+    except FlowControlError:
+        refused_replies += 1
+
+
+client.message_callback_add("commands/service-a", on_command)
+# Configure routes before the first connection attempt.
+```
+
+This example explicitly sheds a refused reply and counts it. It never waits
+for an ACK inside the handler. If every reply must be retained, hand work to a
+separate application producer with its own queue/byte bounds and a nonblocking
+overflow policy; the callback must not wait on a full application queue either.
+For asynchronous message processing use `messages()`. A single iterator consumer
+awaiting outgoing capacity or receipts can still stall if the required ACK is
+unread behind a full input queue; see [bidirectional pressure](operations.md#bidirectional-pressure).
 
 ## Bounded batch publication
 
@@ -77,13 +125,14 @@ async def publish_batch(client, samples) -> None:
             PublishMessage("telemetry", sample, qos=1)
             for sample in samples
         ),
-        chunk_size=256,
     )
     await receipt.wait()
 ```
 
-Use `failure_sink` when every individual batch failure must be retained outside
-the receipt's bounded detail set.
+`max_failure_details` bounds retained error objects (default 128, optionally
+zero). Failure counts remain exact. An ordinary admission or generator error
+raises `PublishBatchError` carrying the committed prefix receipt. Cancellation
+propagates and seals the aggregate; committed publications remain active.
 
 ## Manual acknowledgement after durable work
 

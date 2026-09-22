@@ -20,6 +20,10 @@ All MQTTium-specific public errors derive from `MQTTError`.
     options:
       heading_level: 3
 
+::: mqttium.MandatoryResponseTooLargeError
+    options:
+      heading_level: 3
+
 ::: mqttium.FlowControlError
     options:
       heading_level: 3
@@ -44,6 +48,10 @@ All MQTTium-specific public errors derive from `MQTTError`.
     options:
       heading_level: 3
 
+::: mqttium.BrokerDisconnectError
+    options:
+      heading_level: 3
+
 Catch the narrowest useful error. In particular, backpressure, a terminal
 connection rejection, and a discarded durable session require different
 application responses.
@@ -62,8 +70,7 @@ application responses.
     options:
       heading_level: 3
 
-`PacketType` remains importable from `mqttium` but is Provisional and is not part
-of this Stable reference.
+`PacketType` is internal and is no longer re-exported from `mqttium`.
 
 ## Version
 

@@ -139,7 +139,7 @@ def _cycle_payload(*, ratio: float = 1.0, window: int = 8) -> dict[str, object]:
         "scenarios": [
             {
                 "protocol": "311",
-                "completion": "callback",
+                "completion": "receipt",
                 "payload_bytes": 64,
                 "window": window,
                 "pairs": [
@@ -220,7 +220,7 @@ def test_seeded_engine_cycle_sets_pythonhashseed(
         protocols="311",
         payloads="64",
         windows="8",
-        completions="callback",
+        completions="receipt",
         count_small=6_000,
         count_large=3_000,
         target_sample_seconds=2.0,
@@ -297,7 +297,7 @@ def test_raw_arm_cv_is_diagnostic_when_abba_estimator_is_precise() -> None:
         "scenarios": [
             {
                 "protocol": "311",
-                "completion": "callback",
+                "completion": "receipt",
                 "payload_bytes": 64,
                 "window": 8,
                 "pairs": pairs,

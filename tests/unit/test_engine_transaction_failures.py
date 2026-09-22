@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests.support import stored_record
+
 import pytest
 
 from mqttium.codec.buffer import IncrementalDecoder, RawPacket
@@ -136,23 +138,28 @@ class _FailPubrelReplayStore(MemoryInflightStore):
 def test_pubrel_replay_failure_does_not_release_publish_window() -> None:
     store = _FailPubrelReplayStore()
     store.put_out(
-        OutboundMessage(
-            mid=1,
-            topic="replay/publish",
-            payload=b"x",
-            qos=QoS.EXACTLY_ONCE,
-            retain=False,
-            state=OutboundQoSState.WAIT_PUBREC,
+        stored_record(
+            OutboundMessage(
+                mid=1,
+                topic="replay/publish",
+                payload=b"x",
+                qos=QoS.EXACTLY_ONCE,
+                retain=False,
+                state=OutboundQoSState.WAIT_PUBREC,
+            )
         )
     )
     store.put_out(
-        OutboundMessage(
-            mid=2,
-            topic="",
-            payload=b"",
-            qos=QoS.EXACTLY_ONCE,
-            retain=False,
-            state=OutboundQoSState.WAIT_PUBCOMP,
+        stored_record(
+            OutboundMessage(
+                mid=2,
+                topic="",
+                payload=b"",
+                qos=QoS.EXACTLY_ONCE,
+                retain=False,
+                state=OutboundQoSState.WAIT_PUBCOMP,
+                logical_size=15,  # charge retained from the original publication
+            )
         )
     )
 
@@ -192,13 +199,16 @@ def test_qos2_pubrel_replay_does_not_consume_local_publish_window() -> None:
     store = MemoryInflightStore()
     for mid in (1, 2, 3):
         store.put_out(
-            OutboundMessage(
-                mid=mid,
-                topic=f"replay/{mid}",
-                payload=b"x",
-                qos=QoS.EXACTLY_ONCE,
-                retain=False,
-                state=OutboundQoSState.WAIT_PUBCOMP,
+            stored_record(
+                OutboundMessage(
+                    mid=mid,
+                    topic=f"replay/{mid}",
+                    payload=b"x",
+                    qos=QoS.EXACTLY_ONCE,
+                    retain=False,
+                    state=OutboundQoSState.WAIT_PUBCOMP,
+                    logical_size=15,  # charge retained from the original publication
+                )
             )
         )
 

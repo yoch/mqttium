@@ -110,7 +110,7 @@ jobs:
             --policy advisory \
             --preflight-report /tmp/mqttium-paired/runner.json \
             --repeat 4 --windows 64 --protocols 311 \
-            --payloads 64 --completions receipt,callback \
+            --payloads 64 --completions receipt \
             --count-small 5000 \
             --output /tmp/mqttium-paired/qos1-completion.json
       - name: Advisory closed-loop native writer capacity

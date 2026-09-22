@@ -1,20 +1,22 @@
-"""Durable schema versioning, migration and lazy write transactions."""
+"""Durable schema versioning, refusal and lazy write transactions."""
 
 from __future__ import annotations
 
+from tests.support import stored_record, sqlite_logical_snapshot
+
 import sqlite3
 from pathlib import Path
+from contextlib import closing
 
 import pytest
 
 from mqttium.enums import InboundQoSState, OutboundQoSState, QoS
 from mqttium.persistence.sqlite import SQLITE_SCHEMA_VERSION, SqliteInflightStore
-from mqttium.protocol.engine import EngineConfig, ProtocolEngine
-from mqttium.types import InboundMessage, OutboundMessage
+from mqttium.types import OutboundMessage
 
 # The exact schema shipped before PRAGMA user_version existed: no logical_size
-# column, no seq index. Databases in this shape exist in the wild and must keep
-# opening.
+# column, no seq index. Historical files must remain intact while
+# being refused without modification.
 V1_SCHEMA = """
 CREATE TABLE outbound (
     mid INTEGER PRIMARY KEY,
@@ -119,174 +121,7 @@ def test_fresh_database_is_created_at_the_current_schema_version(tmp_path: Path)
     assert column_order(path, "inbound")[-1] == "payload"
 
 
-def test_v1_database_migrates_without_losing_or_duplicating_records(tmp_path: Path) -> None:
-    path = tmp_path / "v1.db"
-    write_v1_database(path)
-
-    store = SqliteInflightStore(path)
-    outbound = list(
-        store.get_out(summary.mid) for page in store.out_summary_pages() for summary in page
-    )
-    inbound = list(store.get_in(meta.mid) for page in store.in_index_pages() for meta in page)
-    store.close()
-
-    assert user_version(path) == SQLITE_SCHEMA_VERSION
-    assert not indices(path)
-    assert column_order(path, "outbound")[-1] == "payload"
-    assert "extra" not in column_order(path, "outbound")
-    assert [msg.mid for msg in outbound] == [1, 2, 3]
-    assert [msg.payload for msg in outbound] == [bytes([mid]) * 64 for mid in (1, 2, 3)]
-    assert [msg.state for msg in outbound] == [OutboundQoSState.QUEUED] * 3
-    # Migrated rows keep an unknown logical size, which the outbound session
-    # already recomputes lazily.
-    assert [msg.logical_size for msg in outbound] == [0, 0, 0]
-    assert [msg.mid for msg in inbound] == [9]
-    assert inbound[0].payload == b"inbound"
-    assert inbound[0].logical_size == 0
-
-
-def test_v3_inbound_size_is_backfilled_once_and_persisted(tmp_path: Path) -> None:
-    path = tmp_path / "v3-inbound.db"
-    store = SqliteInflightStore(path)
-    topic = "legacy/v3"
-    payload = b"retained"
-    store.put_in(
-        InboundMessage(
-            mid=17,
-            topic=topic,
-            payload=payload,
-            qos=QoS.EXACTLY_ONCE,
-            retain=False,
-            state=InboundQoSState.WAIT_PUBREL,
-            logical_size=len(topic) + len(payload),
-        )
-    )
-    store.close()
-
-    conn = sqlite3.connect(path)
-    conn.executescript(
-        """
-        ALTER TABLE inbound RENAME TO inbound__v4;
-        CREATE TABLE inbound (
-            mid INTEGER PRIMARY KEY,
-            seq INTEGER NOT NULL,
-            qos INTEGER NOT NULL,
-            retain INTEGER NOT NULL,
-            state INTEGER NOT NULL,
-            delivered INTEGER NOT NULL,
-            user_acked INTEGER NOT NULL,
-            topic TEXT NOT NULL,
-            properties TEXT,
-            payload BLOB NOT NULL
-        );
-        INSERT INTO inbound
-        SELECT mid, seq, qos, retain, state, delivered, user_acked,
-               topic, properties, payload
-        FROM inbound__v4;
-        DROP TABLE inbound__v4;
-        PRAGMA user_version=3;
-        """
-    )
-    conn.commit()
-    conn.close()
-
-    migrated = SqliteInflightStore(path)
-    record = migrated.get_in(17)
-    assert record is not None
-    assert record.logical_size == 0
-
-    engine = ProtocolEngine(EngineConfig(clean_start=False), store=migrated)
-    expected = len(topic) + len(payload)
-    assert engine.inbound.stats().pending_bytes == expected
-    migrated.close()
-
-    reopened = SqliteInflightStore(path)
-    persisted = reopened.get_in(17)
-    assert persisted is not None
-    assert persisted.logical_size == expected
-    reopened.close()
-
-
-def test_interrupted_migration_leaves_the_v1_database_intact(tmp_path: Path) -> None:
-    path = tmp_path / "interrupted.db"
-    write_v1_database(path)
-
-    class Interrupted(SqliteInflightStore):
-        # First rebuild a schema-1 database performs; crashing after it proves
-        # the whole upgrade is one transaction, not that a particular step is.
-        def _rebuild_outbound(self) -> None:
-            super()._rebuild_outbound()
-            raise RuntimeError("simulated crash mid-migration")
-
-    with pytest.raises(RuntimeError, match="simulated crash"):
-        Interrupted(path)
-
-    assert user_version(path) == 0
-    assert "logical_size" not in column_order(path, "outbound")
-    assert column_order(path, "outbound")[-1] != "payload"
-    assert "outbound__v2" not in tables(path)
-
-    # The retry after the crash still succeeds and still sees every record.
-    store = SqliteInflightStore(path)
-    assert [
-        msg.mid
-        for msg in (
-            store.get_out(summary.mid) for page in store.out_summary_pages() for summary in page
-        )
-    ] == [1, 2, 3]
-    store.close()
-    assert user_version(path) == SQLITE_SCHEMA_VERSION
-
-
-def test_reopening_a_migrated_database_does_not_migrate_again(tmp_path: Path) -> None:
-    path = tmp_path / "reopen.db"
-    write_v1_database(path)
-    SqliteInflightStore(path).close()
-
-    class NoSchemaWork(SqliteInflightStore):
-        def _create_schema(self) -> None:
-            raise AssertionError("schema recreated on an up-to-date database")
-
-        def _migrate_to_v2(self) -> None:
-            raise AssertionError("migration re-run on an up-to-date database")
-
-    store = NoSchemaWork(path)
-    assert [
-        msg.mid
-        for msg in (
-            store.get_out(summary.mid) for page in store.out_summary_pages() for summary in page
-        )
-    ] == [1, 2, 3]
-    store.close()
-
-
-def test_a_newer_schema_version_is_refused(tmp_path: Path) -> None:
-    path = tmp_path / "future.db"
-    SqliteInflightStore(path).close()
-    conn = sqlite3.connect(path)
-    conn.execute(f"PRAGMA user_version={SQLITE_SCHEMA_VERSION + 1}")
-    conn.commit()
-    conn.close()
-
-    with pytest.raises(RuntimeError, match="newer MQTTium"):
-        SqliteInflightStore(path)
-
-
-def test_migrated_database_replays_through_the_engine(tmp_path: Path) -> None:
-    path = tmp_path / "replay.db"
-    write_v1_database(path)
-    store = SqliteInflightStore(path)
-
-    engine = ProtocolEngine(EngineConfig(clean_start=False), store=store)
-
-    assert len(engine.outbound._queued) == 3
-    assert engine.pending_outbound_messages == 3
-    # Recomputed from topic and payload size, exactly as before the column.
-    assert engine.pending_outbound_bytes == 3 * (64 + len("legacy/topic"))
-    store.close()
-
-
-def test_logical_size_is_persisted_for_records_written_at_v2(tmp_path: Path) -> None:
+def test_logical_size_is_persisted_for_current_records(tmp_path: Path) -> None:
     path = tmp_path / "sized.db"
     store = SqliteInflightStore(path)
     store.put_out(
@@ -314,13 +149,15 @@ def test_logical_size_is_persisted_for_records_written_at_v2(tmp_path: Path) -> 
 def test_a_read_only_batch_opens_no_write_transaction(tmp_path: Path) -> None:
     store = SqliteInflightStore(tmp_path / "lazy.db")
     store.put_out(
-        OutboundMessage(
-            mid=1,
-            topic="a/b",
-            payload=b"x",
-            qos=QoS.AT_LEAST_ONCE,
-            retain=False,
-            state=OutboundQoSState.WAIT_PUBACK,
+        stored_record(
+            OutboundMessage(
+                mid=1,
+                topic="a/b",
+                payload=b"x",
+                qos=QoS.AT_LEAST_ONCE,
+                retain=False,
+                state=OutboundQoSState.WAIT_PUBACK,
+            )
         )
     )
     trace: list[str] = []
@@ -343,13 +180,15 @@ def test_a_mutating_batch_opens_exactly_one_transaction(tmp_path: Path) -> None:
     with store.batch():
         assert store.get_out(1) is None
         store.put_out(
-            OutboundMessage(
-                mid=1,
-                topic="a/b",
-                payload=b"x",
-                qos=QoS.AT_LEAST_ONCE,
-                retain=False,
-                state=OutboundQoSState.WAIT_PUBACK,
+            stored_record(
+                OutboundMessage(
+                    mid=1,
+                    topic="a/b",
+                    payload=b"x",
+                    qos=QoS.AT_LEAST_ONCE,
+                    retain=False,
+                    state=OutboundQoSState.WAIT_PUBACK,
+                )
             )
         )
         store.delete_out(1)
@@ -366,13 +205,15 @@ def test_a_failing_lazy_batch_rolls_back_its_mutations(tmp_path: Path) -> None:
     with pytest.raises(ZeroDivisionError):
         with store.batch():
             store.put_out(
-                OutboundMessage(
-                    mid=1,
-                    topic="a/b",
-                    payload=b"x",
-                    qos=QoS.AT_LEAST_ONCE,
-                    retain=False,
-                    state=OutboundQoSState.WAIT_PUBACK,
+                stored_record(
+                    OutboundMessage(
+                        mid=1,
+                        topic="a/b",
+                        payload=b"x",
+                        qos=QoS.AT_LEAST_ONCE,
+                        retain=False,
+                        state=OutboundQoSState.WAIT_PUBACK,
+                    )
                 )
             )
             raise ZeroDivisionError
@@ -381,13 +222,15 @@ def test_a_failing_lazy_batch_rolls_back_its_mutations(tmp_path: Path) -> None:
     assert store._transaction_started is False
     # The store stays usable: the failed batch left no open transaction behind.
     store.put_out(
-        OutboundMessage(
-            mid=2,
-            topic="a/b",
-            payload=b"x",
-            qos=QoS.AT_LEAST_ONCE,
-            retain=False,
-            state=OutboundQoSState.WAIT_PUBACK,
+        stored_record(
+            OutboundMessage(
+                mid=2,
+                topic="a/b",
+                payload=b"x",
+                qos=QoS.AT_LEAST_ONCE,
+                retain=False,
+                state=OutboundQoSState.WAIT_PUBACK,
+            )
         )
     )
     assert store.get_out(2) is not None
@@ -400,13 +243,15 @@ def test_a_read_only_nested_batch_still_commits_the_outer_mutation(tmp_path: Pat
     with store.batch():
         with store.batch():
             store.put_out(
-                OutboundMessage(
-                    mid=1,
-                    topic="a/b",
-                    payload=b"x",
-                    qos=QoS.AT_LEAST_ONCE,
-                    retain=False,
-                    state=OutboundQoSState.WAIT_PUBACK,
+                stored_record(
+                    OutboundMessage(
+                        mid=1,
+                        topic="a/b",
+                        payload=b"x",
+                        qos=QoS.AT_LEAST_ONCE,
+                        retain=False,
+                        state=OutboundQoSState.WAIT_PUBACK,
+                    )
                 )
             )
         assert store.get_out(1) is not None
@@ -415,3 +260,28 @@ def test_a_read_only_nested_batch_still_commits_the_outer_mutation(tmp_path: Pat
     reopened = SqliteInflightStore(tmp_path / "lazy-nested.db")
     assert reopened.get_out(1) is not None
     reopened.close()
+
+
+@pytest.mark.parametrize("version", [0, 1, 2, 3, 4, 6, 100])
+def test_other_formats_are_refused_without_logical_modification(tmp_path, version) -> None:
+    path = tmp_path / "unsupported.db"
+    write_v1_database(path)
+    with closing(sqlite3.connect(path)) as conn, conn:
+        conn.execute(f"PRAGMA user_version={version}")
+    before = sqlite_logical_snapshot(path)
+    with pytest.raises(RuntimeError):
+        SqliteInflightStore(path)
+    assert sqlite_logical_snapshot(path) == before
+    with closing(sqlite3.connect(path)) as conn:
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+
+
+def test_current_format_reopens_without_schema_work(tmp_path) -> None:
+    path = tmp_path / "current.db"
+    SqliteInflightStore(path).close()
+
+    class NoSchemaWork(SqliteInflightStore):
+        def _create_schema(self):
+            raise AssertionError("current schema recreated")
+
+    NoSchemaWork(path).close()

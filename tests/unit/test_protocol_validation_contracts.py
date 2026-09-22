@@ -142,7 +142,7 @@ def test_empty_client_id_accepts_nonempty_assigned_identifier() -> None:
     engine = ProtocolEngine(EngineConfig(client_id="", protocol=MQTTProtocolVersion.MQTTv5))
     engine.begin_connect()
     properties = Properties()
-    properties.set("assigned_client_identifier", "server-assigned")
+    properties = Properties({**properties.values, "assigned_client_identifier": "server-assigned"})
 
     _feed(engine, _connack_v5(properties))
 
@@ -153,7 +153,7 @@ def test_empty_client_id_accepts_nonempty_assigned_identifier() -> None:
 def test_server_disconnect_must_not_carry_session_expiry_interval() -> None:
     engine = _connected()
     properties = Properties()
-    properties.set("session_expiry_interval", 30)
+    properties = Properties({**properties.values, "session_expiry_interval": 30})
 
     _feed(
         engine,
@@ -172,7 +172,7 @@ def test_tiny_peer_limit_fails_before_pingreq() -> None:
     )
     engine.begin_connect()
     properties = Properties()
-    properties.set("maximum_packet_size", 1)
+    properties = Properties({**properties.values, "maximum_packet_size": 1})
     with pytest.raises(PacketTooLargeError):
         _feed(engine, _connack_v5(properties))
     assert engine.state is ConnectionState.DISCONNECTED

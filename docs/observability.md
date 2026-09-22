@@ -22,12 +22,18 @@ no sampler, logging, or formatting cost.
 | Need | API |
 | --- | --- |
 | Publish completion or failure | `await receipt.wait()` and `receipt.is_done()` |
-| Connection lifecycle | `on_connect` and `on_disconnect` |
+| Latest connection lifecycle state | `on_connect` and `on_disconnect`; obsolete pending transitions may be coalesced |
 | Incoming messages | `on_message`, `message_callback_add`, or `async for message in client.messages()` |
 | Current state | `client.is_connected`, `client.state`, `client.negotiated` |
 | Protocol failures | typed exceptions such as `ProtocolError` and `MQTTTimeoutError` |
-| Broker disconnect details | `DisconnectInfo` |
+| Nonzero broker disconnect details | `BrokerDisconnectError.reason_code` and `.properties` through `on_disconnect`, unless a more specific failure is present |
 | Queue and resource pressure | `client.stats()` |
+
+Iterator byte occupancy is measured only when `max_iterator_bytes` is finite.
+Setting that bound to `None` selects the count-bounded unaccounted path, so
+`delivery.iterator_bytes` and `delivery.iterator_high_water_bytes` remain zero;
+`iterator_queued`, `iterator_limit`, and `waiters` continue to report queue
+pressure normally.
 
 ## Add application-level instrumentation
 

@@ -95,24 +95,16 @@ path = "src/mqttium/__init__.py"
 [tool.hatch.build.targets.wheel]
 packages = ["src/mqttium"]
 
+# The source distribution carries only what identifies the project, satisfies
+# the licence obligations and rebuilds the wheel. Tests, benchmarks, docs and
+# examples live in the repository; tools/ci/validate_distribution.py fails the
+# build if any of them reappear here.
 [tool.hatch.build.targets.sdist]
 include = [
     "/src/mqttium",
-    "/tests",
-    "/docs",
-    "/examples",
-    "/benchmarks",
     "/README.md",
-    "/CHANGELOG.md",
-    "/CODE_OF_CONDUCT.md",
-    "/CONTRIBUTING.md",
     "/LICENSE",
     "/NOTICE",
-    "/PROVENANCE.md",
-    "/SECURITY.md",
-    "/SUPPORT.md",
-    "/mkdocs.yml",
-    "/.readthedocs.yaml",
     "/pyproject.toml",
 ]
 
@@ -152,7 +144,6 @@ max-complexity = 15
 "src/mqttium/protocol/__init__.py" = ["F401"]
 # The Paho façade's publish path deliberately keeps immediate/queued admission
 # and reservation cleanup together so their ordering/error semantics stay visible.
-"src/mqttium/compat/paho.py" = ["C901"]
 "tests/**" = ["B017", "E731"]
 "tests/fuzz/test_hypothesis_fuzz.py" = ["E402"]
 

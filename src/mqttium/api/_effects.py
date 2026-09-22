@@ -9,14 +9,39 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from collections.abc import Callable
 from typing import TYPE_CHECKING, Protocol
 
-from mqttium.api.stats import EffectStats
 from mqttium.protocol.effects import EffectKind, EngineEffect
 
 if TYPE_CHECKING:
+    from mqttium.api._delivery_lane import DeliveryLane
     from mqttium.protocol.engine import ProtocolEngine
+
+
+def _partition_effects(
+    effects: list[EngineEffect],
+) -> tuple[list[EngineEffect], list[EngineEffect], bool]:
+    """Preserve wire/result order while separating reader-owned delivery."""
+    sends: list[EngineEffect] = []
+    others: list[EngineEffect] = []
+    deliveries: list[EngineEffect] = []
+    reordered = False
+    for effect in effects:
+        if effect.kind is EffectKind.SEND or effect.kind is EffectKind.SEND_ACK:
+            if others or deliveries:
+                reordered = True
+            sends.append(effect)
+        elif effect.kind in (
+            EffectKind.MESSAGE,
+            EffectKind.DECODED_MESSAGE,
+            EffectKind.CONTINUE_INBOUND_REPLAY,
+        ):
+            deliveries.append(effect)
+        else:
+            others.append(effect)
+    if reordered or deliveries:
+        effects = sends + others
+    return effects, deliveries, reordered
 
 
 class StaleConnectionEffect(Exception):
@@ -27,12 +52,9 @@ class EffectOwner(Protocol):
     _connection_epoch: int
     _disconnect_exc: BaseException | None
     _engine: ProtocolEngine
+    _delivery_lane: DeliveryLane
 
     def _apply_effect_inline(self, effect: EngineEffect, epoch: int) -> bool: ...
-
-    def _apply_message_effect_batch_inline(
-        self, effects: deque[EngineEffect], epoch: int
-    ) -> int: ...
 
     async def _apply_effect(
         self,
@@ -106,98 +128,66 @@ class EffectPump:
             self.discard_connection_effects(settle_publish=True)
             return
 
-        if len(effects) == 1 and not self.pending:
-            if self.owner._apply_effect_inline(effects[0], epoch):
+        deliveries: list[EngineEffect] = []
+        if len(effects) == 1:
+            effect = effects[0]
+            if effect.kind in (
+                EffectKind.MESSAGE,
+                EffectKind.DECODED_MESSAGE,
+                EffectKind.CONTINUE_INBOUND_REPLAY,
+            ):
+                self.owner._delivery_lane.collect(effects, epoch, self.enqueued)
+                self.pending_high_water = max(
+                    self.pending_high_water,
+                    len(self.pending) + self.owner._delivery_lane.outstanding,
+                )
+                return
+            if not self.pending and self.owner._apply_effect_inline(effect, epoch):
                 self.inline_effects += 1
                 return
 
         if len(effects) > 1:
             self.multi_effect_batches += 1
-            # Partition wire effects first in one pass, and let that same pass answer
-            # whether the batch needed it: SEND/SEND_ACK after a non-wire effect is
-            # exactly the condition. The two-generator form this replaces walked
-            # the batch twice and always rebuilt the list, even for the common
-            # batch that was already ordered.
-            #
-            # Splitting this into a detect pass followed by a partition pass
-            # was tried and reverted: it saves two list allocations on an
-            # already-ordered batch but adds a scan to the batch that must be
-            # reordered, and the paired microbenchmark did not support the
-            # trade. See docs/reports/PERFORMANCE-AUDIT-0.2.0b4.md.
-            sends: list[EngineEffect] = []
-            others: list[EngineEffect] = []
-            out_of_order = False
-            for effect in effects:
-                if effect.kind is EffectKind.SEND or effect.kind is EffectKind.SEND_ACK:
-                    if others:
-                        out_of_order = True
-                    sends.append(effect)
-                else:
-                    others.append(effect)
-            if out_of_order:
-                self.reordered_batches += 1
-                effects = sends + others
+            effects, deliveries, reordered = _partition_effects(effects)
+            self.reordered_batches += reordered
         if not self.pending:
             self.pending_epoch = epoch
         self.pending.extend(effects)
         self.enqueued += len(effects)
-        pending = len(self.pending)
-        if pending > self.pending_high_water:
-            self.pending_high_water = pending
-
-    def record_inline_batch(self, count: int) -> None:
-        """Record logical effects delivered without entering the pending deque."""
-        self.batches += 1
-        if count > 1:
-            self.multi_effect_batches += 1
-        self.enqueued += count
-        self.applied += count
-        self.inline_effects += count
-        if self.waiters:
-            self.progress.set()
-
-    def stats(self) -> EffectStats:
-        """Snapshot the deque and the ordering decisions taken so far."""
-        pending = len(self.pending)
-        return EffectStats(
-            pending=pending,
-            pending_high_water=max(self.pending_high_water, pending),
-            enqueued=self.enqueued,
-            applied=self.applied,
-            waiters=self.waiters,
-            batches=self.batches,
-            multi_effect_batches=self.multi_effect_batches,
-            reordered_batches=self.reordered_batches,
-            inline_effects=self.inline_effects,
-            apply_suspensions=self.apply_suspensions,
+        if deliveries:
+            self.owner._delivery_lane.collect(deliveries, epoch, self.enqueued)
+        self.pending_high_water = max(
+            self.pending_high_water,
+            len(self.pending) + self.owner._delivery_lane.outstanding,
         )
+
+    def counters(self) -> dict[str, int]:
+        """Deque occupancy and the scheduling decisions taken so far.
+
+        Maintainer diagnostics for tests and benchmarks; not part of the
+        application snapshot, which describes queues the application can size.
+        """
+        lane = self.owner._delivery_lane
+        pending = len(self.pending) + lane.outstanding
+        return {
+            "pending": pending,
+            "pending_high_water": max(self.pending_high_water, pending),
+            "enqueued": self.enqueued + lane.enqueued,
+            "applied": self.applied + lane.applied,
+            "waiters": self.waiters,
+            "batches": self.batches,
+            "multi_effect_batches": self.multi_effect_batches,
+            "reordered_batches": self.reordered_batches,
+            "inline_effects": self.inline_effects,
+            "apply_suspensions": self.apply_suspensions,
+        }
 
     def _complete(self) -> None:
         self.applied += 1
         if self.waiters:
             self.progress.set()
 
-    def _consume_batch(
-        self,
-        apply: Callable[[deque[EngineEffect], int], int],
-        epoch: int,
-    ) -> bool:
-        """Apply a consecutive non-persisted small-message prefix.
-
-        `apply` is the owner's MESSAGE or DECODED_MESSAGE batch acceptor; only
-        which one is bound differs between the two kinds. One call per batch,
-        not per message.
-        """
-        applied = apply(self.pending, epoch)
-        if not applied:
-            return False
-        for _ in range(applied):
-            self.pending.popleft()
-            self.inline_effects += 1
-            self._complete()
-        return True
-
-    def drain_inline(self) -> None:
+    def drain_inline(self, *, target: int | None = None) -> None:
         if self.draining_inline or self.lock.locked():
             return
         if not self.pending:
@@ -210,13 +200,8 @@ class EffectPump:
             epoch = self.pending_epoch
         self.draining_inline = True
         try:
-            while self.pending:
+            while self.pending and (target is None or self.applied < target):
                 effect = self.pending[0]
-                kind = effect.kind
-                if kind is EffectKind.MESSAGE or kind is EffectKind.DECODED_MESSAGE:
-                    if self._consume_batch(self.owner._apply_message_effect_batch_inline, epoch):
-                        continue
-                    break
                 if not self.owner._apply_effect_inline(effect, epoch):
                     break
                 self.pending.popleft()
@@ -246,12 +231,6 @@ class EffectPump:
                     if epoch != self.owner._connection_epoch:
                         self.discard_connection_effects()
                         continue
-                    kind = effect.kind
-                    if kind is EffectKind.MESSAGE or kind is EffectKind.DECODED_MESSAGE:
-                        if self._consume_batch(
-                            self.owner._apply_message_effect_batch_inline, epoch
-                        ):
-                            continue
                     try:
                         await self.owner._apply_effect(effect, nowait=False, epoch=epoch)
                     except asyncio.CancelledError:
@@ -321,13 +300,14 @@ class EffectPump:
         if owned and self.flush_requested and self.pending:
             self.schedule()
 
-    async def drain(self, *, nowait: bool = False) -> None:
-        self.drain_inline()
+    async def drain(self, *, nowait: bool = False, target: int | None = None) -> None:
+        self.drain_inline(target=target)
         if nowait:
             if self.pending:
                 self.schedule()
             return
-        target = self.enqueued
+        if target is None:
+            target = self.enqueued
         if self.applied >= target:
             return
 

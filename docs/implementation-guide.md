@@ -46,7 +46,7 @@ the inbound session likewise binds one PUBLISH handler when it is constructed.
 Hot handlers therefore contain neither a per-packet protocol branch nor a
 generic codec helper call. Acknowledgement bodies treat the two-byte success
 form and the MQTT 5 three-byte explicit-reason form as primary paths; absent
-properties are ``None``. Provisional ``mqttium.packets`` dataclasses remain
+properties are ``None``. Internal ``mqttium.packets`` dataclasses remain
 thin factories over the same primitives.
 
 MQTT UTF-8 validation applies on both encode and decode. Topics reject wildcards
@@ -93,10 +93,10 @@ A broker-assigned MQTT 5 ClientID is retained by the engine as the Session
 identity for same-instance durable reconnects. It is not part of the inflight
 store contract; process-restart recovery requires a stable configured ClientID.
 
-`EngineConfig.local_receive_maximum` defaults to 65535 because the standalone
+`EngineConfig.max_inbound_inflight` defaults to 65535 because the standalone
 engine follows the protocol maximum. `AsyncClient` intentionally defaults to
-100 to provide an operationally bounded application client. This difference is
-part of the Stable API contract.
+100 to provide an operationally bounded application client. The native default remains supported; the standalone
+engine configuration is internal.
 
 Inbound and outbound topic aliases reset on every network connection. Alias
 zero, an inbound alias above the advertised maximum, or an unknown inbound
@@ -181,65 +181,106 @@ Logical outbound size is payload bytes plus encoded topic and properties. The
 admission sequence is validation, size calculation, reservation, packet-ID
 allocation, store mutation, and effect emission.
 
-Every failure path reverses acquisitions in the opposite order. A transactional
-batch restores the counter snapshot as one unit because the store may already
-have rolled back individual rows.
+Every unit failure reverses acquisitions through outbound rollback. Batch
+publication commits elements progressively and preserves its committed prefix
+on errors or cancellation; there are no chunk snapshots.
 
 Writer, outbound inflight, inbound persistence, ingress, and application
 delivery budgets are independent. Do not reuse one counter as a proxy for
-another lifetime. `max_outbound_messages` bounds writer-resident admitted
+another lifetime. `max_write_queue_messages` bounds writer-resident admitted
 frames, including the writer's active batch, not only `queue.qsize()`.
 
-`can_ever_admit_publish()` considers configured limits, not current occupancy.
+`outbound.can_ever_admit()` considers configured limits, not current occupancy.
 It distinguishes work that should wait from work that can never fit.
 
 ## Application delivery
 
-`ApplicationDelivery` is the only owner of callback and iterator queues,
-delivery bytes, user-worker state, and delivery counters. A message routed to
-multiple consumers is charged once and released after the final reference.
+`ApplicationDelivery` owns the bounded iterator queue and its byte
+reservations, and runs synchronous callbacks inline. Iterator (default) and
+callback are exclusive. With a finite iterator byte limit, each message has one
+byte charge and one queue item, released when the iterator yields the message;
+the reader waits for byte and queue capacity under one
+`iterator_admission_timeout` deadline. With `max_iterator_bytes=None`, the queue
+stores bare messages without logical sizing or byte accounting; count bounds
+and the admission deadline still apply.
 
-The small-message reserve prevents one large payload from starving telemetry.
-It is disabled when it would make a single otherwise valid packet impossible to
-admit.
+Message callbacks are synchronous-only and execute on the reader that delivered
+the message, after the protocol lock is released and before the reader decodes
+further packets. There is no callback queue, worker task or byte reservation.
+Registration rejects async functions and async callable objects before
+mutation. Returning an awaitable is reported as a callback `TypeError`; MQTTium
+does not await it or create a detached task. Ordinary failures are isolated per
+invocation; a `CancelledError` raised by user code is reported unless the reader
+itself is being cancelled. The private fairness budget counts actual callback
+invocations, including routes inside one message, and yields at the following
+message boundary; invocations beyond the budget are carried over to the next
+yield rather than reset. Synchronous user code cannot be preempted.
 
-User callbacks run outside engine critical sections. When callback delivery is
-idle, a plain synchronous `on_publish` or eligible `on_message` callback may run
-in the reader/effect-drain turn. A reentrancy guard sends callback-initiated
-delivery, async callbacks, and occupied-queue bursts through the bounded worker.
-Exceptions are isolated and reported through the established callback policy;
-they do not stop the protocol reader or leak delivery capacity. Consecutive
-small MESSAGE effects that require no persisted delivery mark (QoS 0 and fresh
-automatic QoS 1) may be applied during the inline effect drain. Persisted QoS 1,
-QoS 2 and replay deliveries keep the established awaited path and are marked
-only after application delivery accepts them.
+`on_publish` is removed: receipts settle without message-queue admission.
+`on_connect` and `on_disconnect` use separate bounded lifecycle ownership, after
+the triggering effect and connection locks. There is one active hook and one
+latest pending state; obsolete states may be coalesced. External lifecycle
+operations cancel obsolete hooks, while an operation directly awaited by the
+current hook preserves its caller. Network operation completion does not await
+hook completion. `on_connect` is not an incoming-data readiness barrier.
+Automatic retry awaits the current disconnect hook and rechecks user intent.
+Authentication alone remains awaited as protocol work with `auth_timeout`.
 
-Topic-filtered callbacks are an `AsyncClient` concern. `TopicMatcher` selects
-application callbacks after the engine has already emitted MESSAGE effects; the
-protocol layer never sees filters or user callables. The matcher exists only
-while at least one filter is registered. Inbound delivery consults an installed
-`_message_callback` pointer (`on_message`, the topic router, or `None`) so the
-unused-filter path has no matcher branch.
+
+`iterator_admission_timeout=None` has no deadline. A positive timeout covers both byte
+reservation and queue insertion with one deadline. Timeout or an impossible
+message raises `MessageDeliveryError`, releases acquired credits and leaves
+persisted delivery state unmarked. A delivered mark denotes queue acceptance
+in iterator mode and completed callback invocation in callback mode.
+
+`accept()` returns `None` after an immediate handoff and an awaitable only for
+the waiting path or the fairness yield, so the common case creates no
+coroutine. Persisted marks follow the handoff and retain fail-stop semantics;
+they run synchronously when the engine lock is free and otherwise acquire it.
+No user callback executes under that lock.
+
+`EffectPump` owns only protocol work. A reader-owned `DeliveryLane` holds MESSAGE,
+DECODED_MESSAGE and CONTINUE_INBOUND_REPLAY. Each bounded lot records an epoch
+and its protocol completion target. The reader applies that target before
+message delivery; later unrelated protocol work does not extend it. Reader
+input pauses until the current delivery lot progresses. Replay continuation
+stays behind its prior MESSAGE batch and requests only the next bounded page.
+This does not change direct `ProtocolEngine` consumers' continuation obligation.
+
+Publication and already-decoded completions therefore progress independently
+of application delivery. The pre-admission protocol drain still settles old
+receipt ownership before MID reuse. An ACK unread behind incoming traffic can
+still be delayed by bounded ingress; no speculative scanning or unbounded
+side queue is introduced. On epoch retirement, cancel the reader's delivery
+wait, release untransferred reservations and discard unaccepted effects while
+preserving accepted-queue and durable-session semantics. A protocol/writer
+failure must wake that reader without joining it from the failing task.
+
+Topic routing belongs to `AsyncClient`. The fallback and routes freeze
+permanently on the first connection attempt; MQTT subscriptions remain mutable.
+For sustained bidirectional workloads, see the explicit application overflow
+policies in [Operations](operations.md#bidirectional-pressure).
 
 ## Persistence
 
 Store transitions accept both expected and new states. A mismatch is a protocol
 or concurrency error, not a request to overwrite newer state.
 
-SQLite migrations are atomic and schema-versioned. Unknown newer schemas are
-rejected. Metadata-only acknowledgement must not read payload BLOBs.
+SQLite schema 5 accepts only fresh databases and that exact format. Historical,
+future and inconsistent schemas are refused without changing committed schema or
+data. Validation uses one SQLite read transaction, ends it before journal setup,
+and revalidates a fresh database under its creation write lock. Normal recovery
+and checkpointing may change physical files. Metadata-only acknowledgement must
+not read payload BLOBs.
 
 Paged replay preserves insertion order without duplicates or resurrection. A
 page may be shorter when records were acknowledged after the ordered snapshot;
 callers must continue until the iterator ends rather than assuming fixed page
 length.
 
-The built-in memory store's eager ``out_items()`` and ``in_items()`` iterators
-snapshot membership when they are created, while retaining references to the
-record objects rather than deep-copying them. Paged iterators in both built-in
-stores snapshot ordered identifiers when iteration starts and look up each page
-when it is consumed, so records deleted before that lookup are omitted. Runtime
-replay uses the paged interface for both built-in stores.
+Paged iterators in both stores snapshot ordered identifiers when iteration
+starts and look up each page as it is consumed. Records deleted before that
+lookup are omitted. Runtime replay uses this internal interface.
 
 ## Failure semantics
 
@@ -289,18 +330,37 @@ Covered by `tests/unit/test_ingress_failure_semantics.py`.
 
 ## API completion and errors
 
-- QoS 0 receipts complete at writer admission. When callback capacity is
-  immediately available, an idle synchronous `on_publish` may run inline;
-  otherwise it is admitted to the isolated bounded worker in the same loop
-  turn. A batch must preflight every callback before any direct writer
-  admission.
+- QoS 0 receipts complete at writer admission. A ready QoS 0
+  `publish_nowait()` validates and encodes the frame once and asks the writer
+  to admit its exact size; the generic capacity preflight runs only for QoS 1/2
+  and for QoS 0 the direct path declines, so writer refusal of a QoS 0 frame
+  follows its validation. Awaited publication waits for bounded transfer
+  independently of application-delivery capacity.
 - QoS 1 receipts complete at PUBACK.
 - QoS 2 receipts complete at PUBCOMP.
 - SUBACK and UNSUBACK return all per-filter reason codes; a reason code at or
   above `0x80` remains data in the result rather than becoming a blanket
   exception.
-- Transport loss fails work only after reconnect policy becomes terminal.
+- Each transport loss fails pending SUBSCRIBE/UNSUBSCRIBE futures; those
+  requests are not replayed. Replayable QoS 1/2 publication receipts survive
+  retry attempts but fail when retry becomes terminal or the broker session
+  cannot be resumed.
 - Public exceptions must not shadow Python built-ins.
+
+QoS 0 publication may bypass general effect creation only with the current
+writer epoch, no terminal failure, no pending protocol effects or active
+protocol-effect/engine lock. It reuses outbound preparation and registers
+the unit receipt or aggregate batch element before handing bytes to `WritePump`.
+Batch admission does not allocate a unit receipt. Topic Aliases commit after
+acceptance. A clean writer refusal rolls back only that batch registration and
+may fall back for awaited publication; writer exceptions retain the registered
+prefix and propagate without retry because handoff may already have occurred.
+`publish_many()` amortizes ready QoS 0 orchestration with a bounded private
+driver while retaining progressive admission and its existing fairness points.
+It transfers each item before advancing the source, without holding an engine
+lock across source iteration. QoS 1/2 retain ordinary per-item admission.
+The protocol-effect drain before awaited admission remains necessary for
+receipt settlement before MID reuse; it never drains application delivery.
 
 ## Required validation
 
@@ -313,7 +373,7 @@ as well as the successful path. The minimum relevant matrix includes:
 - reconnect with `session_present` both true and false;
 - memory and SQLite stores, including injected rollback failures;
 - bounded and immediate-refusal admission;
-- callback, iterator, and combined delivery;
+- exclusive callback and iterator delivery;
 - cancellation and shutdown with blocked producers;
 - malformed properties, topics, filters, and aliases.
 

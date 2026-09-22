@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+from mqttium.api.async_client import _fifo_register
+
 import asyncio
 import shutil
 import tempfile
-import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from benchmark_support import client_options
 
 
 TOPIC = "bench/sensors/temp"
@@ -51,9 +54,9 @@ def _install_discard_writer(client: Any) -> None:
     queue = _DiscardQueue()
     pump = getattr(client, "_write_pump", None)
     if pump is None:
-        client._outbound = queue
-        client._max_outbound_messages = 1 << 30
-        client._max_outbound_bytes = 1 << 60
+        client._write_pump.queue = queue
+        client._write_pump.max_messages = 1 << 30
+        client._write_pump.max_bytes = 1 << 60
     else:
         pump.queue = queue
         pump.max_messages = 1 << 30
@@ -123,8 +126,11 @@ def _persistence_cycle(scenario: str) -> ScenarioMeasurement:
         EngineConfig(
             client_id="paired-cycle",
             protocol=MQTTProtocolVersion.MQTTv311,
-            max_pending_outbound_messages=None,
-            max_pending_outbound_bytes=None,
+            **client_options(
+                EngineConfig,
+                max_unacknowledged_messages=None,
+                max_unacknowledged_bytes=None,
+            ),
         ),
         store=store,
     )
@@ -175,8 +181,11 @@ def _mqtt5_puback_reason_cycle(_scenario: str) -> ScenarioMeasurement:
         EngineConfig(
             client_id="paired-mqtt5-puback",
             protocol=MQTTProtocolVersion.MQTTv5,
-            max_pending_outbound_messages=None,
-            max_pending_outbound_bytes=None,
+            **client_options(
+                EngineConfig,
+                max_unacknowledged_messages=None,
+                max_unacknowledged_bytes=None,
+            ),
         )
     )
     engine.state = ConnectionState.CONNECTED
@@ -237,7 +246,7 @@ def _writer(scenario: str) -> ScenarioMeasurement:
     if scenario == "writer_try_enqueue":
 
         def enqueue() -> None:
-            if not client._try_enqueue_outbound(b"x"):
+            if not client._write_pump.try_enqueue(b"x"):
                 raise RuntimeError("writer try-enqueue unexpectedly refused")
 
         return _measure(enqueue, operations=160_000, warmup=3_000)
@@ -249,135 +258,33 @@ def _writer(scenario: str) -> ScenarioMeasurement:
         for index in range(warmup + operations):
             if index == warmup:
                 started = time.perf_counter()
-            await client._enqueue_outbound(b"x")
+            await client._write_pump.enqueue(b"x")
         elapsed = time.perf_counter() - started
         return ScenarioMeasurement(elapsed, operations, operations / elapsed)
 
     return asyncio.run(enqueue_async())
 
 
-def _native_publish(scenario: str) -> ScenarioMeasurement:
+def _native_publish(_scenario: str) -> ScenarioMeasurement:
     from mqttium.api.async_client import AsyncClient
     from mqttium.enums import ConnectionState
 
-    callback = scenario == "native_publish_nowait_qos0_callback"
-    client = AsyncClient(
-        client_id="paired-native-publish",
-        max_pending_callbacks=4_096,
-    )
+    client = AsyncClient(client_id="paired-native-publish")
     _install_discard_writer(client)
     client._engine.state = ConnectionState.CONNECTED
-    if callback:
-        client.on_publish = lambda _mid, _reason: None
 
     async def run() -> ScenarioMeasurement:
-        if callback:
-            batch_size = 64
-            warmup_batches = 32
-            measured_batches = 2_000
-            started = 0.0
-            for batch in range(warmup_batches + measured_batches):
-                if batch == warmup_batches:
-                    started = time.perf_counter()
-                for _ in range(batch_size):
-                    client.publish_nowait(TOPIC, b"x", qos=0)
-                await client._drain_effects()
-                await client._callback_queue.join()
-            elapsed = time.perf_counter() - started
-            await client._shutdown_callback_worker(drain=False)
-            operations = measured_batches * batch_size
-            return ScenarioMeasurement(elapsed, operations, operations / elapsed)
-
         warmup = 2_000
         operations = 60_000
         started = 0.0
         for index in range(warmup + operations):
             if index == warmup:
                 started = time.perf_counter()
-            if scenario == "native_publish_nowait_qos0" and hasattr(client, "publish_nowait"):
-                client.publish_nowait(TOPIC, b"x", qos=0)
-            else:
-                await client.publish(TOPIC, b"x", qos=0, nowait=True)
+            client.publish_nowait(TOPIC, b"x", qos=0)
         elapsed = time.perf_counter() - started
         return ScenarioMeasurement(elapsed, operations, operations / elapsed)
 
     return asyncio.run(run())
-
-
-def _compat_qos1(_scenario: str) -> ScenarioMeasurement:
-    from mqttium.compat.paho import CallbackAPIVersion, Client
-    from mqttium.enums import ConnectionState
-
-    client = Client(
-        CallbackAPIVersion.VERSION2,
-        client_id="paired-compat-qos1",
-        max_pending_outbound_messages=None,
-        max_pending_outbound_bytes=None,
-    )
-    client.loop_start()
-    try:
-        client._run_loop_mutation(
-            lambda: setattr(client._async._engine, "state", ConnectionState.CONNECTED)
-        )
-
-        def publish() -> None:
-            if client.publish(TOPIC, b"x", qos=1).mid is None:
-                raise RuntimeError("QoS 1 publish returned no MID")
-
-        return _measure(publish, operations=2_000, warmup=200)
-    finally:
-        client.loop_stop()
-
-
-def _compat_qos0(_scenario: str) -> ScenarioMeasurement:
-    from mqttium.compat.paho import CallbackAPIVersion, Client
-    from mqttium.enums import ConnectionState
-
-    client = Client(
-        CallbackAPIVersion.VERSION2,
-        client_id="paired-compat-qos0",
-        max_pending_outbound_messages=None,
-        max_pending_outbound_bytes=None,
-    )
-    client._async._max_outbound_messages = 100_000
-    client._async._max_outbound_bytes = 8 * 1024 * 1024
-    client.loop_start()
-    client._run_loop_mutation(
-        lambda: setattr(client._async._engine, "state", ConnectionState.CONNECTED)
-    )
-
-    def submit_and_drain(count: int) -> float:
-        started = time.perf_counter()
-        for _ in range(count):
-            client.publish(TOPIC, b"x", qos=0)
-        drained = threading.Event()
-
-        def fence() -> None:
-            with client._publish_schedule_lock:
-                idle = (
-                    not client._publish_drain_scheduled
-                    and client._publish_spillover is None
-                    and client._publish_pending.empty()
-                )
-            if idle:
-                drained.set()
-            else:
-                assert client._loop is not None
-                client._loop.call_soon(fence)
-
-        assert client._loop is not None
-        client._loop.call_soon_threadsafe(fence)
-        if not drained.wait(timeout=10):
-            raise RuntimeError("QoS 0 compatibility batch did not drain")
-        return time.perf_counter() - started
-
-    try:
-        submit_and_drain(1_000)
-        operations = 20_000
-        elapsed = submit_and_drain(operations)
-        return ScenarioMeasurement(elapsed, operations, operations / elapsed)
-    finally:
-        client.loop_stop()
 
 
 def _effects(scenario: str) -> ScenarioMeasurement:
@@ -394,7 +301,7 @@ def _effects(scenario: str) -> ScenarioMeasurement:
         def collect() -> None:
             for _ in range(batch_size):
                 client._engine._emit(EffectKind.SEND, b"x")
-            client._collect_effects_locked()
+            client._effect_pump.collect_from_engine()
 
         return _measure(collect, operations=100_000 if batch_size == 1 else 30_000, warmup=2_000)
 
@@ -410,10 +317,69 @@ def _effects(scenario: str) -> ScenarioMeasurement:
                 client._engine._emit(EffectKind.SEND, b"x")
             for _ in range(4):
                 client._engine._emit(EffectKind.PUBLISH_COMPLETE, None)
-        client._collect_effects_locked()
+        client._effect_pump.collect_from_engine()
         client._effect_pump.pending.clear()
 
     return _measure(collect_ordered, operations=30_000, warmup=2_000)
+
+
+async def _finish_callbacks(client: Any) -> None:
+    """Drain a callback worker when the measured source still owns one."""
+    delivery = client._delivery
+    queue = getattr(delivery, "callback_queue", None)
+    if queue is not None:
+        await queue.join()
+    shutdown = getattr(delivery, "shutdown_callbacks", None)
+    if shutdown is not None:
+        await shutdown(drain=False)
+
+
+async def _apply_delivery_effect_compat(client: Any, effect: Any) -> None:
+    """Apply one delivery effect through the private seam each source exposes."""
+    apply_delivery = getattr(client, "_apply_delivery_effect", None)
+    if apply_delivery is not None:
+        pending = apply_delivery(effect, client._connection_epoch)
+        if pending is not None:
+            await pending
+        return
+    await client._apply_effect(effect, nowait=False, epoch=client._connection_epoch)
+
+
+def _consume_iterator_message(client: Any) -> None:
+    """Consume one iterator delivery using the source's production representation."""
+    delivery = client._delivery
+    item = delivery.messages_queue.get_nowait()
+    release_nowait = getattr(delivery, "release_nowait", None)
+    if release_nowait is not None:
+        # RC14: bare Message on the unaccounted path, (Message, token) when
+        # accounted. Its _DeliveryQueue has no join/task_done bookkeeping.
+        if isinstance(item, tuple):
+            _message, token = item
+            release_nowait(token)
+        return
+    # Current source: max_iterator_bytes=None likewise stores a bare Message;
+    # finite byte bounds store (Message, logical_size). Public messages() never
+    # calls task_done(), so the benchmark must not add that cost either.
+    if isinstance(item, tuple):
+        _message, size = item
+        delivery.release(size)
+
+
+async def _drain_single_message_effect(client: Any) -> None:
+    """Drain a synthetic message through either the RC14 or current effect pipeline."""
+    collect = getattr(client, "_collect_effects_locked", None)
+    if collect is not None:
+        collect()
+    else:
+        client._effect_pump.collect_from_engine()
+    drain = getattr(client, "_drain_effects", None)
+    if drain is not None:
+        await drain()
+    else:
+        await client._effect_pump.drain()
+    lane = getattr(client, "_delivery_lane", None)
+    if lane is not None:
+        await lane.drain()
 
 
 def _delivery(scenario: str) -> ScenarioMeasurement:
@@ -423,14 +389,17 @@ def _delivery(scenario: str) -> ScenarioMeasurement:
 
     mode: Any = scenario.removeprefix("delivery_")
     client = AsyncClient(
-        message_delivery=mode,
-        max_pending_messages=100_000,
-        max_pending_callbacks=100_000,
-        # Delivery dispatch is measured independently from byte-accounting;
-        # bounded-memory costs have dedicated scenarios and profiles.
-        max_pending_delivery_bytes=None,
+        **client_options(
+            AsyncClient,
+            message_delivery=mode,
+            max_iterator_messages=100_000,
+            # Delivery dispatch is measured independently from byte-accounting;
+            # bounded-memory costs have dedicated scenarios and profiles.
+            max_iterator_bytes=None,
+            max_pending_callbacks=100_000,
+        )
     )
-    if mode in ("callback", "both"):
+    if mode == "callback":
         client.on_message = lambda _message: None
     effect = EngineEffect(EffectKind.MESSAGE, Message(topic=TOPIC, payload=b"x"))
 
@@ -441,13 +410,15 @@ def _delivery(scenario: str) -> ScenarioMeasurement:
         for index in range(warmup + operations):
             if index == warmup:
                 started = time.perf_counter()
-            await client._apply_effect(effect, nowait=False)
-            if mode in ("iterator", "both"):
-                client._messages.get_nowait()
-        if mode in ("callback", "both"):
-            await client._callback_queue.join()
+            await _apply_delivery_effect_compat(client, effect)
+            if mode == "iterator":
+                _consume_iterator_message(client)
+        if mode == "callback":
+            queue = getattr(client._delivery, "callback_queue", None)
+            if queue is not None:
+                await queue.join()
         elapsed = time.perf_counter() - started
-        await client._shutdown_callback_worker(drain=False)
+        await _finish_callbacks(client)
         return ScenarioMeasurement(elapsed, operations, operations / elapsed)
 
     return asyncio.run(run())
@@ -459,9 +430,12 @@ def _single_message_effect(_scenario: str) -> ScenarioMeasurement:
     from mqttium.types import Message
 
     client = AsyncClient(
-        message_delivery="callback",
-        max_pending_callbacks=4_096,
-        max_pending_delivery_bytes=None,
+        **client_options(
+            AsyncClient,
+            message_delivery="callback",
+            max_iterator_bytes=None,
+            max_pending_callbacks=4_096,
+        )
     )
     client.on_message = lambda _message: None
     message = Message(topic=TOPIC, payload=b"x")
@@ -478,11 +452,12 @@ def _single_message_effect(_scenario: str) -> ScenarioMeasurement:
                 message,
                 requires_delivery_mark=False,
             )
-            client._collect_effects_locked()
-            await client._drain_effects()
-        await client._callback_queue.join()
+            await _drain_single_message_effect(client)
+        queue = getattr(client._delivery, "callback_queue", None)
+        if queue is not None:
+            await queue.join()
         elapsed = time.perf_counter() - started
-        await client._shutdown_callback_worker(drain=False)
+        await _finish_callbacks(client)
         return ScenarioMeasurement(elapsed, operations, operations / elapsed)
 
     return asyncio.run(run())
@@ -543,49 +518,23 @@ def _receipt_wait(scenario: str) -> ScenarioMeasurement:
     return asyncio.run(run())
 
 
-def _publish_completion(scenario: str) -> ScenarioMeasurement:
+def _publish_completion(_scenario: str) -> ScenarioMeasurement:
     from mqttium.api import AsyncClient
     from mqttium.api.models import PublishReceipt
     from mqttium.enums import QoS
     from mqttium.protocol.effects import EffectKind
 
-    client = AsyncClient(
-        client_id="paired-publish-completion",
-        max_pending_callbacks=4_096,
-    )
-    callback = scenario.endswith("callback")
-    if callback:
-        client.on_publish = lambda _mid, _reason: None
+    client = AsyncClient(client_id="paired-publish-completion")
 
     def complete() -> None:
         receipt = PublishReceipt(mid=1, qos=QoS.AT_LEAST_ONCE)
-        client._register_publish_receipt(1, receipt)
+        _fifo_register(client._receipts, 1, receipt)
         client._engine._emit(EffectKind.PUBLISH_COMPLETE, 1)
-        client._collect_effects_locked()
-        if not callback and not receipt.is_done():
+        client._effect_pump.collect_from_engine()
+        if not receipt.is_done():
             raise RuntimeError("inline receipt completion did not settle")
 
-    if not callback:
-        return _measure(complete, operations=100_000, warmup=2_000)
-
-    async def run_callback() -> ScenarioMeasurement:
-        batch_size = 64
-        warmup_batches = 32
-        measured_batches = 2_000
-        started = 0.0
-        for batch in range(warmup_batches + measured_batches):
-            if batch == warmup_batches:
-                started = time.perf_counter()
-            for _ in range(batch_size):
-                complete()
-            await client._drain_effects()
-            await client._callback_queue.join()
-        elapsed = time.perf_counter() - started
-        await client._shutdown_callback_worker(drain=False)
-        operations = measured_batches * batch_size
-        return ScenarioMeasurement(elapsed, operations, operations / elapsed)
-
-    return asyncio.run(run_callback())
+    return _measure(complete, operations=100_000, warmup=2_000)
 
 
 def _prime_process_wide_tables() -> None:
@@ -621,23 +570,18 @@ REGISTRY: dict[str, Callable[[str], ScenarioMeasurement]] = {
     "writer_enqueue_async": _writer,
     "async_publish_nowait_qos0": _native_publish,
     "native_publish_nowait_qos0": _native_publish,
-    "native_publish_nowait_qos0_callback": _native_publish,
-    "compat_publish_qos1": _compat_qos1,
-    "compat_publish_qos0_batch": _compat_qos0,
     "effect_send_inline": _effects,
     "effect_batch_inline": _effects,
     "effect_batch_ordered": _effects,
     "effect_batch_reordered": _effects,
     "delivery_callback": _delivery,
     "delivery_iterator": _delivery,
-    "delivery_both": _delivery,
     "effect_single_message_callback": _single_message_effect,
     "websocket_mask_4k": _websocket_mask,
     "receipt_settle_unawaited": _receipt,
     "receipt_wait_single": _receipt_wait,
     "receipt_wait_concurrent": _receipt_wait,
     "publish_complete_receipt": _publish_completion,
-    "publish_complete_callback": _publish_completion,
 }
 
 

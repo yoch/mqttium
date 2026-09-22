@@ -95,12 +95,10 @@ async def _cleanup(client: AsyncClient, *tasks: asyncio.Task[object] | None) -> 
 
 def _policy(*, max_retries: int | None = 4) -> ReconnectPolicy:
     return ReconnectPolicy(
-        enabled=True,
         initial_delay=0.0,
         max_delay=0.0,
         max_retries=max_retries,
         stable_after=0.0,
-        connect_timeout=0.25,
     )
 
 
@@ -109,6 +107,7 @@ async def test_messages_iterator_survives_unexpected_reconnect() -> None:
     client = AsyncClient(
         "stream-reconnect",
         reconnect=_policy(),
+        connect_timeout=0.25,
         message_delivery="iterator",
     )
 
@@ -156,6 +155,7 @@ async def test_messages_iterator_survives_failed_reconnect_attempt() -> None:
     client = AsyncClient(
         "stream-retry",
         reconnect=_policy(),
+        connect_timeout=0.25,
         message_delivery="iterator",
     )
 
@@ -193,6 +193,7 @@ async def test_messages_iterator_closes_when_reconnect_is_exhausted() -> None:
     client = AsyncClient(
         "stream-exhausted",
         reconnect=_policy(max_retries=1),
+        connect_timeout=0.25,
         message_delivery="iterator",
     )
 
@@ -227,6 +228,7 @@ async def test_disconnect_inside_reconnect_gap_closes_stream() -> None:
     client = AsyncClient(
         "stream-gap-disconnect",
         reconnect=_policy(),
+        connect_timeout=0.25,
         message_delivery="iterator",
     )
 
@@ -279,13 +281,12 @@ async def test_explicit_connect_replaces_automatic_reconnect_generation(
     client = AsyncClient(
         "explicit-reconnect-takeover",
         reconnect=ReconnectPolicy(
-            enabled=True,
             initial_delay=1,
             max_delay=1,
             max_retries=4,
             stable_after=0,
-            connect_timeout=1,
         ),
+        connect_timeout=1,
         message_delivery="iterator",
     )
     real_sleep = asyncio.sleep
@@ -337,13 +338,12 @@ async def test_explicit_connect_waiting_on_reconnect_factory_still_takes_over() 
     client = AsyncClient(
         "explicit-connect-waits-for-reconnect",
         reconnect=ReconnectPolicy(
-            enabled=True,
             initial_delay=0,
             max_delay=0,
             max_retries=4,
             stable_after=10,
-            connect_timeout=1,
         ),
+        connect_timeout=1,
         message_delivery="iterator",
     )
 
@@ -383,6 +383,7 @@ async def test_on_disconnect_explicit_connect_owns_replacement_connection() -> N
     client = AsyncClient(
         "callback-reconnect-takeover",
         reconnect=_policy(),
+        connect_timeout=0.25,
         message_delivery="iterator",
     )
 
@@ -412,5 +413,28 @@ async def test_on_disconnect_explicit_connect_owns_replacement_connection() -> N
         await asyncio.sleep(0)
         assert client._reader_task is replacement_reader
         assert client._reconnect_task is None or client._reconnect_task.done()
+    finally:
+        await _cleanup(client)
+
+
+async def test_never_started_public_iterator_stays_terminal_after_explicit_reconnect():
+    brokers = []
+    client = AsyncClient("never-started", reconnect=None)
+
+    async def factory(*args, **kwargs):
+        broker = _Broker()
+        brokers.append(broker)
+        return broker
+
+    client._transport_factory = factory
+    try:
+        await client.connect("fake")
+        old = client.messages()
+        await client.disconnect()
+        await client.connect("fake")
+        brokers[-1].publish("new/generation", b"new")
+        with pytest.raises(StopAsyncIteration):
+            await asyncio.wait_for(anext(old), 1)
+        assert (await asyncio.wait_for(anext(client.messages()), 1)).topic == "new/generation"
     finally:
         await _cleanup(client)

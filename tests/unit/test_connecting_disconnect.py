@@ -79,12 +79,13 @@ async def test_runtime_disconnect_connecting_writes_terminal_packet(protocol):
         await connecting
     assert t.packet_types[:2] == [PacketType.CONNECT, PacketType.DISCONNECT]
     assert t.closing and c.state is ConnectionState.DISCONNECTED
-    assert c._transport is None and c._reader_task is None and c._writer_task is None
+    assert c._transport is None and c._reader_task is None and c._write_pump.task is None
     assert c._connect_disconnect_fut is None
 
 
-async def test_invalid_v5_reason_does_not_consume_connect_attempt():
-    c = AsyncClient(client_id="c", protocol=MQTTProtocolVersion.MQTTv5)
+@pytest.mark.parametrize("protocol", [MQTTProtocolVersion.MQTTv311, MQTTProtocolVersion.MQTTv5])
+async def test_invalid_reason_does_not_consume_connect_attempt(protocol):
+    c = AsyncClient(client_id="c", protocol=protocol)
     t = _Transport()
 
     async def factory(host, port, *, ssl=None):
@@ -93,10 +94,16 @@ async def test_invalid_v5_reason_does_not_consume_connect_attempt():
     c._transport_factory = factory
     connecting = asyncio.create_task(c.connect("fake", timeout=30))
     await asyncio.wait_for(t.connect_written.wait(), 1)
-    with pytest.raises((ProtocolError, ValueError)):
+    token = c._lifecycle_hooks.token
+    disconnect_fut = c._connect_disconnect_fut
+    with pytest.raises(ProtocolError):
         await c.disconnect(0x01)
     assert t.packet_types == [PacketType.CONNECT] and not t.closing
-    t.rx.put_nowait(_connack(MQTTProtocolVersion.MQTTv5))
+    assert not c._intentional_disconnect
+    assert c._lifecycle_hooks.token == token
+    assert c._connect_disconnect_fut is disconnect_fut
+    assert disconnect_fut is not None and not disconnect_fut.done()
+    t.rx.put_nowait(_connack(protocol))
     await asyncio.wait_for(connecting, 1)
     assert c.state is ConnectionState.CONNECTED
     await c.disconnect()

@@ -9,6 +9,10 @@ Python 3.11–3.14. It is built for production services, gateways, and connected
 devices that need explicit completion, bounded resource use, and reliable
 recovery.
 
+These pages describe the current source API, not the published `1.0.0rc14`
+package. Follow the [source installation instructions](getting-started.md)
+to run the examples, or select documentation for your installed release.
+
 ## Choose a path
 
 <div class="grid cards" markdown>
@@ -38,8 +42,8 @@ recovery.
 
     ---
 
-    Move from Paho or gmqtt with the [migration guide](migration.md). The Paho
-    VERSION2 facade is a Provisional transition surface, not the native API.
+    Review the breaking changes in the [migration guide](migration.md).
+    The current native API removes the Paho façade and one-shot helpers.
 
 </div>
 
@@ -51,7 +55,7 @@ recovery.
 | Completion | Per-message and aggregate receipts tied to MQTT semantics |
 | Flow control | Independent message and byte bounds for protocol, writer, ingress, and delivery state |
 | Recovery | Jittered reconnect, broker-session resumption, and optional persistent inflight state |
-| Delivery | Async iterator, synchronous or asynchronous callbacks, and manual acknowledgement |
+| Delivery | Async iterator, with optional manual acknowledgement, or short synchronous auto-ack callbacks |
 | Transports | TCP, TLS, WebSocket, and Unix-domain sockets |
 | Operations | Immutable snapshots and broker-negotiated limits without a background sampler |
 | Packaging | Typed Python package with no runtime dependencies |
@@ -63,8 +67,8 @@ backpressure model that distinguishes MQTTium from a minimal MQTT wrapper.
 
 - **Guides** solve application tasks: configuration, sessions, transports,
   MQTT 5, operations, troubleshooting, and complete recipes.
-- **Reference** records the Stable public imports, signatures, defaults,
-  exceptions, compatibility tiers, and validated environments.
+- **Reference** records the native imports, signatures, defaults, exceptions,
+  compatibility tiers, and validated environments.
 - **Concepts** explain architecture, protocol ownership, conformance, and the
   no-library-logging decision.
 - **Maintainer material** defines benchmarking, fuzzing, stability, and release
@@ -74,13 +78,10 @@ backpressure model that distinguishes MQTTium from a minimal MQTT wrapper.
 
 ## API support tiers
 
-The native entry points in `mqttium`, `mqttium.api`, and `mqttium.helpers` are
-the Stable public contract. Persistence, transports, protocol integrations,
-diagnostic snapshots, and Paho compatibility are Provisional. Implementation
-modules and underscore-prefixed objects are Internal.
-
-See the [API Stability Policy](api-stability.md) before depending on an advanced
-integration surface.
+Native client operations, models, receipts and results are Stable.
+Statistics and the two shipped stores are Provisional. Engine, codecs,
+transport implementations, records and extension protocols are Internal.
+See the [API Stability Policy](api-stability.md) for exact tiers and import paths.
 
 ## Trust and evidence
 

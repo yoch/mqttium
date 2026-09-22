@@ -24,9 +24,9 @@ properties = Properties(
     {
         "content_type": "application/json",
         "payload_format_indicator": 1,
+        "user_property": (("schema", "telemetry-v1"),),
     }
 )
-properties.add_user_property("schema", "telemetry-v1")
 
 receipt = await client.publish(
     "telemetry/device-1",
@@ -37,8 +37,9 @@ receipt = await client.publish(
 await receipt.wait()
 ```
 
-Repeated properties such as user properties are stored as lists. Do not reuse a
-mutable property bag concurrently while another operation may encode it.
+Properties deeply own their input. Repeated values become tuples and binary
+values become owned bytes. Reusing a `Properties` instance is safe; create a
+new instance when different values are needed.
 
 ## Session expiry
 
@@ -101,30 +102,67 @@ and disconnect semantics; an orderly DISCONNECT normally suppresses it.
 
 ## Enhanced authentication
 
-Register an authentication handler when the broker uses an MQTT 5 challenge
-exchange:
+Register a synchronous or asynchronous handler when the broker uses an MQTT 5
+challenge exchange. Configure the authentication method in CONNECT properties
+and return an `AuthPacket` containing the response:
 
 ```python
+from mqttium import MQTTProtocolVersion
+from mqttium.api import AsyncClient, AuthPacket, Properties
+
+
+AUTH_METHOD = "your-method"
+
+
 async def on_auth(packet):
-    response = await answer_challenge(packet)
-    await client.auth(
+    response_data = await answer_challenge(packet)
+    return AuthPacket(
         reason_code=0x18,
-        properties=response,
+        properties=Properties({
+            "authentication_method": AUTH_METHOD,
+            "authentication_data": response_data,
+        }),
     )
 
-client.set_auth_handler(on_auth)
+
+client = AsyncClient(
+    "authenticated",
+    protocol=MQTTProtocolVersion.MQTTv5,
+    connect_properties=Properties({"authentication_method": AUTH_METHOD}),
+    auth_handler=on_auth,
+)
 ```
 
-The application must verify the authentication method and protect challenge
-data. Re-authentication can be initiated with `await client.auth(...)` after
-connection, but requires a registered handler because the broker can continue
-the exchange. Each handler call is bounded by `auth_timeout` (10 seconds by
-default). Timeout, handler failure, and handler self-cancellation enter the
-configured connection lifecycle; cancellation requested on MQTTium's owning
-task still propagates normally.
+Replace `your-method` with the method agreed with the broker. The
+application-defined `answer_challenge()` verifies that method, processes the
+challenge and returns response bytes; it must protect authentication data.
+A synchronous handler can return `AuthPacket` directly. Declare `async def`
+when the handler needs to await application work. A synchronous handler
+returning an awaitable is a handler error.
+
+The handler's returned response is part of the active AUTH exchange. Return it
+instead of awaiting `client.auth()` from inside the handler. Application code
+outside the handler can initiate re-authentication with `await client.auth(...)`
+after connection; a handler is required because the broker can continue the
+exchange.
+
+Each handler call uses `auth_timeout` (10 seconds by default). Timeout, handler
+failure, and handler self-cancellation enter the configured connection lifecycle;
+cancellation requested on MQTTium's owning task still propagates normally.
+Synchronous application code must remain short because an event-loop timeout
+cannot preempt it.
 
 ## Server references
 
-MQTT 5 can ask a client to use another server. `ReconnectPolicy` does not follow
-that reference by default. Enabling `follow_server_reference` is a deployment
-trust decision; validate the target and its TLS identity.
+MQTT 5 can ask a client to use another server. `Use another server` (`0x9C`)
+and `Server moved` (`0x9D`) are terminal; MQTTium does not automatically select
+a new endpoint. `ReconnectPolicy.follow_server_reference` has been removed:
+the old flag retried the original endpoint rather than following the reference.
+
+A nonzero broker DISCONNECT produces `BrokerDisconnectError` through
+`on_disconnect(error)` when no more specific failure is already known. Read
+`error.reason_code` and `error.properties.get("server_reference")` (if properties
+are present), then explicitly choose the destination, credentials and TLS
+configuration for any new connection. The property mapping is immutable.
+Earlier protocol, transport and local failures remain authoritative. Normal
+disconnect and refused-CONNACK exception behavior is unchanged.

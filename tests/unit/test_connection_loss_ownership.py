@@ -16,6 +16,7 @@ from mqttium.errors import PacketTooLargeError
 from mqttium.packets import PublishPacket, encode_frame
 from mqttium.protocol.reconnect import ReconnectPolicy
 from mqttium.types import Properties
+from tests.support import wait_until
 
 
 class _Broker:
@@ -100,12 +101,10 @@ class _BlockedCloseBroker(_Broker):
 
 def _policy() -> ReconnectPolicy:
     return ReconnectPolicy(
-        enabled=True,
         initial_delay=0.0,
         max_delay=0.0,
         max_retries=4,
         stable_after=0.0,
-        connect_timeout=0.25,
     )
 
 
@@ -137,6 +136,7 @@ async def test_ping_timeout_reconnect_emits_one_disconnect_and_preserves_stream(
         keepalive=1,
         ping_timeout=0.01,
         reconnect=_policy(),
+        connect_timeout=0.25,
         message_delivery="iterator",
     )
     client.on_disconnect = lambda exc: disconnects.append(exc)
@@ -187,6 +187,8 @@ async def test_callback_connect_takes_over_keepalive_close_before_reader_finally
         "keepalive-callback-takeover",
         keepalive=1,
         reconnect=_policy(),
+        connect_timeout=0.25,
+        message_delivery="callback",
     )
 
     async def factory(host: str, port: int, *, ssl=None):
@@ -195,8 +197,9 @@ async def test_callback_connect_takes_over_keepalive_close_before_reader_finally
         brokers.append(broker)
         return broker
 
-    async def on_message(message: object) -> None:
-        del message
+    work: asyncio.Task[None] | None = None
+
+    async def reconnect_from_application() -> None:
         callback_entered.set()
         await release_callback.wait()
         try:
@@ -205,6 +208,11 @@ async def test_callback_connect_takes_over_keepalive_close_before_reader_finally
             callback_errors.append(exc)
         finally:
             callback_done.set()
+
+    def on_message(message: object) -> None:
+        nonlocal work
+        del message
+        work = asyncio.create_task(reconnect_from_application())
 
     client._transport_factory = factory
     client.on_message = on_message
@@ -237,7 +245,7 @@ async def test_callback_connect_takes_over_keepalive_close_before_reader_finally
     finally:
         release_callback.set()
         first.release_close.set()
-        await _cleanup(client)
+        await _cleanup(client, work)
 
 
 async def test_disconnect_in_reconnect_gap_wakes_logical_publish_waiter() -> None:
@@ -246,6 +254,7 @@ async def test_disconnect_in_reconnect_gap_wakes_logical_publish_waiter() -> Non
     client = AsyncClient(
         "gap-waiter",
         reconnect=_policy(),
+        connect_timeout=0.25,
         message_delivery="iterator",
     )
 
@@ -314,7 +323,7 @@ async def test_terminal_broker_eof_stops_connection_keepalive_task() -> None:
     client = AsyncClient(
         "eof-keepalive-owner",
         keepalive=0,
-        reconnect=ReconnectPolicy(enabled=False),
+        reconnect=None,
     )
 
     async def factory(host: str, port: int, *, ssl=None):
@@ -343,6 +352,7 @@ async def test_eof_retires_connected_state_before_joining_keepalive() -> None:
         "eof-state-owner",
         keepalive=0,
         reconnect=_policy(),
+        connect_timeout=0.25,
     )
 
     async def factory(host: str, port: int, *, ssl=None):
@@ -383,7 +393,7 @@ async def test_eof_retires_connected_state_before_joining_keepalive() -> None:
 
 async def test_tiny_peer_limit_fails_before_keepalive_owner_starts() -> None:
     properties = Properties()
-    properties.set("maximum_packet_size", 1)
+    properties = Properties({**properties.values, "maximum_packet_size": 1})
     connack = encode_frame(
         PacketType.CONNACK,
         0,
@@ -394,7 +404,7 @@ async def test_tiny_peer_limit_fails_before_keepalive_owner_starts() -> None:
         "tiny-ping-owner",
         protocol=MQTTProtocolVersion.MQTTv5,
         keepalive=1,
-        reconnect=ReconnectPolicy(enabled=False),
+        reconnect=None,
     )
 
     async def factory(host: str, port: int, *, ssl=None):
@@ -405,22 +415,24 @@ async def test_tiny_peer_limit_fails_before_keepalive_owner_starts() -> None:
         with pytest.raises(PacketTooLargeError):
             await client.connect("fake", 1, timeout=1.0)
         stats = client.stats()
+        tasks = client._running_tasks()
         assert not client.is_connected
         assert client._keepalive_task is None
         assert client._reconnect_task is None
         assert not any(
             (
-                stats.tasks.reader,
-                stats.tasks.writer,
-                stats.tasks.keepalive,
-                stats.tasks.reconnect,
-                stats.tasks.effect_flush,
-                stats.tasks.callback_worker,
+                tasks["reader"],
+                tasks["writer"],
+                tasks["keepalive"],
+                tasks["reconnect"],
+                tasks["effect_flush"],
             )
         )
         assert stats.writer.waiters == 0
-        assert stats.effects.waiters == 0
+        assert client._effect_pump.counters()["waiters"] == 0
         assert stats.delivery.waiters == 0
+        # The disconnect notification owner retires by itself without a hook.
+        await wait_until(lambda: not client._running_tasks()["lifecycle"])
     finally:
         await _cleanup(client)
 

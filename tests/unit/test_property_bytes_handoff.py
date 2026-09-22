@@ -20,11 +20,21 @@ from tests.support import feed_engine, write_item_bytes
 
 def _iot_properties() -> Properties:
     properties = Properties()
-    properties.set("content_type", "application/octet-stream")
-    properties.set("payload_format_indicator", 1)
-    properties.set("message_expiry_interval", 60)
-    properties.add_user_property("device", "probe")
-    properties.add_user_property("site", "lab")
+    properties = Properties({**properties.values, "content_type": "application/octet-stream"})
+    properties = Properties({**properties.values, "payload_format_indicator": 1})
+    properties = Properties({**properties.values, "message_expiry_interval": 60})
+    properties = Properties(
+        {
+            **properties.values,
+            "user_property": (*properties.get("user_property", ()), ("device", "probe")),
+        }
+    )
+    properties = Properties(
+        {
+            **properties.values,
+            "user_property": (*properties.get("user_property", ()), ("site", "lab")),
+        }
+    )
     return properties
 
 
@@ -121,7 +131,7 @@ def test_empty_mqtt5_table_does_not_call_encode_properties(monkeypatch, qos: QoS
     assert handle.mid is not None
 
 
-def test_queued_publish_reencodes_current_properties_when_drain_launches(monkeypatch) -> None:
+def test_queued_publish_keeps_immutable_properties_when_drain_launches(monkeypatch) -> None:
     """Admission bytes must not freeze mutable properties while a publish waits."""
 
     encoder_calls = 0
@@ -149,13 +159,14 @@ def test_queued_publish_reencodes_current_properties_when_drain_launches(monkeyp
         properties=queued_properties,
     )
     assert queued.mid is not None
-    assert engine.outbound.stats().queued_messages == 1
+    assert engine.outbound.stats().awaiting_slot == 1
     assert encoder_calls == 0
 
     # Direct mutation is part of the Properties cache contract. Keep the encoded
     # width unchanged so this test is only about which property snapshot reaches
     # the delayed wire encode, not about pending-byte accounting.
-    queued_properties.values["message_expiry_interval"] = 61
+    replacement = Properties({**queued_properties.values, "message_expiry_interval": 61})
+    assert replacement != queued_properties
 
     feed_engine(engine, PubAckPacket(mid=blocker.mid).encode(engine.config.protocol))
     effects = engine.take_effects()

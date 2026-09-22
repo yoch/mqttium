@@ -94,8 +94,8 @@ DISCONNECT as ungraceful, which may publish a configured Will — the opposite o
 what a clean shutdown intends. An absent interval in CONNECT means zero
 (§3.1.2.11.2), so both the absent and explicit-zero cases are refused, while a
 session that really was durable can still have its expiry adjusted. Validation
-uses the value actually encoded in CONNECT, not an application-owned
-`Properties` object that may have been mutated since.
+uses the value actually encoded on the wire in CONNECT, rather than retaining
+the caller's configuration state.
 
 **`[MQTT-3.2.2-1]` (MQTT 3.1.1) / `[MQTT-3.2.2-2]` (MQTT 5.0)** — after
 accepting CleanSession/Clean Start 1, the Server must set Session Present to 0.

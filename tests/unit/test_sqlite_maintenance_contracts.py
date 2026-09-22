@@ -63,5 +63,5 @@ def test_current_sqlite_schema_version_requires_both_tables(tmp_path: Path) -> N
     conn.commit()
     conn.close()
 
-    with pytest.raises(RuntimeError, match=r"missing table\(s\): inbound"):
+    with pytest.raises(RuntimeError, match="Inconsistent SQLite schema"):
         SqliteInflightStore(path)

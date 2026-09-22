@@ -10,6 +10,8 @@ retransmit a settled publication. Found by
 
 from __future__ import annotations
 
+from tests.support import stored_record
+
 from pathlib import Path
 
 import pytest
@@ -49,13 +51,15 @@ def _resume_with_parked_wait_puback(store: InflightStore) -> ProtocolEngine:
     """Resume a session whose second WAIT_PUBACK cannot fit the send quota."""
     for mid in (1, 2):
         store.put_out(
-            OutboundMessage(
-                mid=mid,
-                topic=f"t/{mid}",
-                payload=b"payload",
-                qos=QoS.AT_LEAST_ONCE,
-                retain=False,
-                state=OutboundQoSState.WAIT_PUBACK,
+            stored_record(
+                OutboundMessage(
+                    mid=mid,
+                    topic=f"t/{mid}",
+                    payload=b"payload",
+                    qos=QoS.AT_LEAST_ONCE,
+                    retain=False,
+                    state=OutboundQoSState.WAIT_PUBACK,
+                )
             )
         )
     engine = ProtocolEngine(
@@ -74,7 +78,7 @@ def _resume_with_parked_wait_puback(store: InflightStore) -> ProtocolEngine:
     # Replay retransmitted mid=1 and parked mid=2 behind the exhausted quota.
     assert _sent_packet_types(engine).count(PacketType.PUBLISH.value) == 1
     assert [stored.mid for stored in engine.outbound._queued] == [2]
-    assert engine.outbound.pending_messages == 2
+    assert engine.outbound.unacknowledged_messages == 2
     return engine
 
 
@@ -101,7 +105,7 @@ def test_puback_for_parked_exchange_removes_its_queue_entry(
             store.get_out(summary.mid) for page in store.out_summary_pages() for summary in page
         )
     ] == [1]
-    assert engine.outbound.pending_messages == 1
+    assert engine.outbound.unacknowledged_messages == 1
 
     # Settling mid=1 drains the queue again: the settled record must stay
     # deleted and nothing may retransmit its PUBLISH.
@@ -111,8 +115,8 @@ def test_puback_for_parked_exchange_removes_its_queue_entry(
         list(store.get_out(summary.mid) for page in store.out_summary_pages() for summary in page)
         == []
     )
-    assert engine.outbound.pending_messages == 0
-    assert engine.outbound.pending_bytes == 0
+    assert engine.outbound.unacknowledged_messages == 0
+    assert engine.outbound.unacknowledged_bytes == 0
     assert len(engine.packet_ids) == 0
 
 
@@ -142,7 +146,7 @@ def test_settled_parked_identifier_can_be_reused_without_collision(
         )
     }
     assert records == {1: OutboundQoSState.WAIT_PUBACK, 2: OutboundQoSState.WAIT_PUBACK}
-    assert engine.outbound.pending_messages == 2
+    assert engine.outbound.unacknowledged_messages == 2
 
     # Settling mid=1 must not resurrect anything through a stale queue entry.
     _feed(engine, encode_frame(PacketType.PUBACK, 0, b"\x00\x01"))
@@ -154,4 +158,4 @@ def test_settled_parked_identifier_can_be_reused_without_collision(
         )
     }
     assert records == {2: OutboundQoSState.WAIT_PUBACK}
-    assert engine.outbound.pending_messages == 1
+    assert engine.outbound.unacknowledged_messages == 1

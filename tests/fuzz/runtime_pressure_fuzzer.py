@@ -262,7 +262,7 @@ def _family_operations(  # noqa: C901
             _op("app", "publish_class", "1:tiny"),
             _op("checkpoint", "wire", "PUBLISH"),
             # The third concurrent publisher exceeds
-            # max_pending_outbound_messages=2 and parks on admission capacity.
+            # max_unacknowledged_messages=2 and parks on admission capacity.
             _op(
                 "app",
                 "publish_class_terminal"
@@ -536,17 +536,17 @@ class _PressureHarness(v1._RuntimeHarness):
         # Writer sizing sufficient for 4-16+ resident frames and one segmented
         # payload. Production defaults are never changed for this; the profile
         # only configures its own client (issue #388).
-        options["max_outbound_messages"] = 32
-        options["max_outbound_bytes"] = 256 * 1024
+        options["max_write_queue_messages"] = 32
+        options["max_write_queue_bytes"] = 256 * 1024
         family = self.pressure_schedule.family
         if family in _PARKED_FAMILIES or family is PressureFamily.PRESSURE_RECONNECT:
             # Two unacknowledged QoS 1 exchanges saturate admission, so the
             # third concurrent publisher parks (issue #389 part B).
-            options["max_pending_outbound_messages"] = 2
+            options["max_unacknowledged_messages"] = 2
         elif family is PressureFamily.PRESSURE_CALLBACK:
-            options["max_outbound_messages"] = 16
+            options["max_write_queue_messages"] = 16
         if self.pressure_mutation is PressureMutation.WRITER_PRESSURE_BYPASSED:
-            options["max_outbound_messages"] = 32
+            options["max_write_queue_messages"] = 32
         return options
 
     async def _factory(
@@ -643,7 +643,8 @@ class _PressureHarness(v1._RuntimeHarness):
 
     def pressure_counters(self) -> dict[str, int]:
         transports = self._pressure_transports()
-        writer = self.client.stats().writer
+        # Scheduling decisions live on the pump, not in the application snapshot.
+        writer = self.client._write_pump
         return {
             "eager_accepted": sum(t.eager_accepted for t in transports),
             "eager_refused": sum(t.eager_refused for t in transports),
@@ -741,10 +742,7 @@ class _PressureHarness(v1._RuntimeHarness):
             self.operations.append(operation.render())
             self.checkpoints.append("callbacks_drained")
             await self._wait_until(
-                lambda: (
-                    self.callback_attempted == self.callback_expected
-                    and self.client.stats().delivery.callback_queued == 0
-                ),
+                lambda: self.callback_attempted == self.callback_expected,
                 "callback deliveries did not drain",
             )
         elif actor == "checkpoint" and action in (
@@ -794,7 +792,7 @@ class _PressureHarness(v1._RuntimeHarness):
             )
         elif action == "segmented":
             await self._wait_until(
-                lambda: self.client.stats().writer.segmented_writes >= target,
+                lambda: self.client._write_pump.segmented_writes >= target,
                 "segmented write path was not reached",
             )
         elif action == "wire_bulk":
@@ -856,13 +854,13 @@ class _PressureHarness(v1._RuntimeHarness):
             return (
                 self.transport.close_entered.is_set()
                 and not self.transport.close_gate.is_set()
-                and stats.outbound.pending_messages > 0
+                and stats.outbound.unacknowledged_messages > 0
             )
         if kind == "reconnect":
             return (
                 self.factory_entered.is_set()
                 and not self.factory_gate.is_set()
-                and stats.outbound.pending_messages > 0
+                and stats.outbound.unacknowledged_messages > 0
                 and stats.receipts.publish_waiters > 0
             )
         if kind == "callback":
@@ -875,7 +873,7 @@ class _PressureHarness(v1._RuntimeHarness):
             return (
                 self.effect_entered.is_set()
                 and not self.effect_gate.is_set()
-                and stats.outbound.pending_messages > 0
+                and stats.outbound.unacknowledged_messages > 0
             )
         raise AssertionError(f"unknown pressure/lifecycle overlap kind: {kind}")
 

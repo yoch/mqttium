@@ -13,7 +13,7 @@ from mqttium.errors import NotConnectedError, ProtocolError
 from mqttium.packets import PublishPacket, encode_frame
 from mqttium.persistence.memory import MemoryInflightStore
 from mqttium.protocol.reconnect import ReconnectPolicy
-from mqttium.types import Message
+from tests.support import wait_until
 
 
 class _Transport:
@@ -102,7 +102,7 @@ async def test_concurrent_connects_open_one_transport() -> None:
 
 
 async def test_cancelled_connect_closes_transport_and_tasks() -> None:
-    reconnect = ReconnectPolicy(enabled=True, initial_delay=0.01, max_delay=0.01)
+    reconnect = ReconnectPolicy(initial_delay=0.01, max_delay=0.01)
     client = AsyncClient(client_id="cancel-connect", reconnect=reconnect)
     transport = _Transport(connack=False)
     calls = 0
@@ -124,7 +124,7 @@ async def test_cancelled_connect_closes_transport_and_tasks() -> None:
     assert transport.is_closing()
     assert client._transport is None
     assert client._reader_task is None
-    assert client._writer_task is None
+    assert client._write_pump.task is None
     assert client._keepalive_task is None
     assert client._reconnect_task is None
     assert client.state is ConnectionState.DISCONNECTED
@@ -170,10 +170,11 @@ async def test_intentional_disconnect_callback_receives_none() -> None:
     await client.connect("fake", timeout=2.0)
     await client.disconnect()
 
+    await wait_until(lambda: bool(errors))
     assert errors == [None]
 
 
-async def test_on_connect_can_disconnect_without_joining_its_callback_worker() -> None:
+async def test_on_connect_can_disconnect_without_joining_its_lifecycle_task() -> None:
     client = AsyncClient(client_id="on-connect-disconnect")
     transport = _Transport(connack=True)
     callback_finished = asyncio.Event()
@@ -192,9 +193,9 @@ async def test_on_connect_can_disconnect_without_joining_its_callback_worker() -
 
     await asyncio.wait_for(client.connect("fake", timeout=1), timeout=1)
     await asyncio.wait_for(callback_finished.wait(), timeout=1)
-    worker = client._delivery.callback_task
-    if worker is not None:
-        await asyncio.wait_for(worker, timeout=1)
+    lifecycle = client._lifecycle_hooks.task
+    if lifecycle is not None:
+        await asyncio.wait_for(lifecycle, timeout=1)
 
     assert not client.is_connected
     assert client._transport is None
@@ -203,8 +204,8 @@ async def test_on_connect_can_disconnect_without_joining_its_callback_worker() -
 async def test_disconnect_does_not_wait_for_space_in_saturated_writer_queue() -> None:
     client = AsyncClient(
         client_id="bounded-disconnect",
-        max_outbound_messages=2,
-        max_outbound_bytes=1024,
+        max_write_queue_messages=2,
+        max_write_queue_bytes=1024,
     )
     transport = _BlockedWriterTransport()
 
@@ -243,22 +244,15 @@ async def test_ack_after_transport_drop_preserves_durable_inbound_record() -> No
         protocol=MQTTProtocolVersion.MQTTv5,
         clean_start=False,
         manual_ack=True,
-        message_delivery="callback",
         store=store,
     )
-    delivered: list[Message] = []
-    message_ready = asyncio.Event()
 
     async def factory(host: str, port: int, *, ssl: object = None) -> _Transport:
         return transport
 
-    def on_message(message: Message) -> None:
-        delivered.append(message)
-        message_ready.set()
-
     client._transport_factory = factory
-    client.on_message = on_message
     await client.connect("fake", timeout=2.0)
+    stream = client.messages()
     transport._rx.put_nowait(
         PublishPacket(
             topic="manual/ack",
@@ -269,7 +263,7 @@ async def test_ack_after_transport_drop_preserves_durable_inbound_record() -> No
             mid=7,
         ).encode(MQTTProtocolVersion.MQTTv5)
     )
-    await asyncio.wait_for(message_ready.wait(), timeout=1.0)
+    delivered = [await asyncio.wait_for(anext(stream), timeout=1.0)]
     assert store.get_in(7) is not None
 
     await transport.close()

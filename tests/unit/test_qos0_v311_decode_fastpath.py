@@ -174,7 +174,7 @@ def test_mqtt5_qos0_direct_path_preserves_properties(monkeypatch) -> None:
 
     monkeypatch.setattr(PublishPacket, "decode", counted)
     props = Properties()
-    props.set("content_type", "text/plain")
+    props = Properties({**props.values, "content_type": "text/plain"})
     wire_props = encode_properties(props, PUBLISH)
     engine = _connected(MQTTProtocolVersion.MQTTv5)
     engine.handle_raw(

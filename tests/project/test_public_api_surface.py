@@ -2,17 +2,16 @@
 
 from __future__ import annotations
 
+import dataclasses
 import inspect
 from pathlib import Path
-from types import ModuleType
 
 import pytest
 
 import mqttium
 import mqttium.api as api
-import mqttium.helpers as helpers
 import mqttium.protocol as protocol
-from mqttium.api.async_client import AsyncClient, MessageDelivery, PublishBackpressure
+from mqttium.api.async_client import AsyncClient, MessageDelivery
 from mqttium.api.models import (
     PublishBatchReceipt,
     PublishMessage,
@@ -20,12 +19,23 @@ from mqttium.api.models import (
     SubscribeResult,
     UnsubscribeResult,
 )
-from mqttium.api.stats import ClientStats
+from mqttium.api.stats import (
+    ClientStats,
+    DecoderStats,
+    DeliveryStats,
+    InboundStats,
+    OutboundStats,
+    ReceiptStats,
+    TransportStats,
+    WriterStats,
+)
 from mqttium.errors import (
+    BrokerDisconnectError,
     FlowControlError,
     MQTTError,
     MQTTTimeoutError,
     MalformedPacketError,
+    MandatoryResponseTooLargeError,
     MessageDeliveryError,
     NotConnectedError,
     PacketTooLargeError,
@@ -33,7 +43,7 @@ from mqttium.errors import (
     PublishBatchError,
     SessionDiscardedError,
 )
-from mqttium.enums import ConnectionState, MQTTProtocolVersion, PacketType, QoS
+from mqttium.enums import ConnectionState, MQTTProtocolVersion, QoS
 from mqttium.packets import AuthPacket, ConnAckPacket, SubscribeOptions
 from mqttium.protocol.negotiated import NegotiatedSettings
 from mqttium.protocol.reconnect import ReconnectPolicy
@@ -41,12 +51,14 @@ from mqttium.types import Message, Properties
 
 
 STABLE_ROOT_EXPORTS = {
+    "BrokerDisconnectError": BrokerDisconnectError,
     "ConnectionState": ConnectionState,
     "FlowControlError": FlowControlError,
     "MQTTError": MQTTError,
     "MQTTProtocolVersion": MQTTProtocolVersion,
     "MQTTTimeoutError": MQTTTimeoutError,
     "MalformedPacketError": MalformedPacketError,
+    "MandatoryResponseTooLargeError": MandatoryResponseTooLargeError,
     "MessageDeliveryError": MessageDeliveryError,
     "NotConnectedError": NotConnectedError,
     "PacketTooLargeError": PacketTooLargeError,
@@ -64,7 +76,6 @@ STABLE_API_EXPORTS = {
     "MessageDelivery": MessageDelivery,
     "NegotiatedSettings": NegotiatedSettings,
     "Properties": Properties,
-    "PublishBackpressure": PublishBackpressure,
     "PublishBatchReceipt": PublishBatchReceipt,
     "PublishMessage": PublishMessage,
     "PublishReceipt": PublishReceipt,
@@ -76,7 +87,7 @@ STABLE_API_EXPORTS = {
 
 
 def test_root_exports_operational_errors_and_connection_state() -> None:
-    assert set(mqttium.__all__) == {*STABLE_ROOT_EXPORTS, "PacketType", "__version__"}
+    assert set(mqttium.__all__) == {*STABLE_ROOT_EXPORTS, "__version__"}
     for name, value in STABLE_ROOT_EXPORTS.items():
         assert getattr(mqttium, name) is value
     assert isinstance(mqttium.__version__, str)
@@ -93,20 +104,6 @@ def test_api_exports_every_type_used_by_supported_signatures() -> None:
         assert getattr(api, name) is value
 
 
-def test_helpers_export_exact_stable_surface() -> None:
-    assert helpers.__all__ == ["publish", "subscribe"]
-    assert isinstance(helpers.publish, ModuleType)
-    assert isinstance(helpers.subscribe, ModuleType)
-    assert callable(helpers.publish.single)
-    assert callable(helpers.publish.multiple)
-    assert callable(helpers.subscribe.simple)
-    assert callable(helpers.subscribe.callback)
-
-
-def test_explicitly_retained_alpha_packet_type_import() -> None:
-    assert mqttium.PacketType is PacketType
-
-
 def test_async_client_constructor_keywords_and_defaults() -> None:
     expected_defaults = {
         "client_id": "",
@@ -115,31 +112,28 @@ def test_async_client_constructor_keywords_and_defaults() -> None:
         "keepalive": 60,
         "username": None,
         "password": None,
-        "local_receive_maximum": 100,
-        "max_outbound_inflight": None,
-        "max_pending_outbound_messages": 10_000,
-        "max_pending_outbound_bytes": 64 * 1024 * 1024,
-        "max_pending_inbound_bytes": 64 * 1024 * 1024,
-        "publish_backpressure": "wait",
         "connect_properties": None,
         "will": None,
         "will_properties": None,
         "maximum_packet_size": None,
         "topic_alias_maximum": 0,
-        "reconnect": None,
-        "ping_timeout": None,
-        "ack_timeout": 30.0,
-        "max_outbound_bytes": 1 * 1024 * 1024,
-        "max_outbound_messages": 10_000,
-        "max_ingress_batch_bytes": 1 * 1024 * 1024,
-        "max_pending_messages": 65_536,
-        "max_pending_callbacks": 1_024,
-        "max_pending_delivery_bytes": 64 * 1024 * 1024,
-        "delivery_timeout": 1.0,
-        "callback_shutdown_timeout": 5.0,
-        "message_delivery": "auto",
+        "max_inbound_inflight": 100,
+        "max_inbound_inflight_bytes": 64 * 1024 * 1024,
+        "max_outbound_inflight": None,
+        "max_unacknowledged_messages": 10_000,
+        "max_unacknowledged_bytes": 64 * 1024 * 1024,
+        "max_write_queue_messages": 10_000,
+        "max_write_queue_bytes": 1 * 1024 * 1024,
+        "message_delivery": "iterator",
         "manual_ack": False,
+        "max_iterator_messages": 65_536,
+        "max_iterator_bytes": 64 * 1024 * 1024,
+        "iterator_admission_timeout": None,
         "store": None,
+        "reconnect": None,
+        "connect_timeout": 30.0,
+        "ping_timeout": None,
+        "subscribe_timeout": 30.0,
         "auth_handler": None,
         "auth_timeout": 10.0,
     }
@@ -155,28 +149,129 @@ def test_async_client_constructor_keywords_and_defaults() -> None:
     assert {name: parameter.default for name, parameter in parameters.items()} == expected_defaults
 
 
+def test_reconnect_policy_describes_only_the_retry_progression() -> None:
+    expected_defaults = {
+        "initial_delay": 1.0,
+        "multiplier": 2.0,
+        "max_delay": 60.0,
+        "max_retries": None,
+        "stable_after": 30.0,
+    }
+    parameters = inspect.signature(ReconnectPolicy).parameters
+    assert {name: parameter.default for name, parameter in parameters.items()} == expected_defaults
+
+
+def test_client_stats_fields_follow_the_constructor_vocabulary() -> None:
+    def names(cls: type) -> tuple[str, ...]:
+        return tuple(field.name for field in dataclasses.fields(cls))
+
+    assert names(ClientStats) == (
+        "state",
+        "connection_epoch",
+        "reconnect_attempt",
+        "outbound",
+        "inbound",
+        "writer",
+        "decoder",
+        "delivery",
+        "receipts",
+        "transport",
+    )
+    assert names(OutboundStats) == (
+        "unacknowledged_messages",
+        "unacknowledged_bytes",
+        "unacknowledged_high_water_messages",
+        "unacknowledged_high_water_bytes",
+        "awaiting_slot",
+        "inflight",
+        "inflight_limit",
+        "packet_ids_in_use",
+    )
+    assert names(InboundStats) == (
+        "inflight",
+        "inflight_limit",
+        "inflight_bytes",
+        "inflight_high_water_bytes",
+        "inflight_byte_limit",
+        "topic_aliases",
+        "replay_pending",
+    )
+    assert names(WriterStats) == (
+        "queued_messages",
+        "queued_bytes",
+        "high_water_messages",
+        "high_water_bytes",
+        "max_messages",
+        "max_bytes",
+        "waiters",
+        "last_outbound",
+    )
+    assert names(DecoderStats) == ("buffered_bytes", "high_water_bytes", "max_packet_size")
+    assert names(DeliveryStats) == (
+        "iterator_queued",
+        "iterator_limit",
+        "iterator_bytes",
+        "iterator_high_water_bytes",
+        "iterator_byte_limit",
+        "waiters",
+    )
+    assert names(ReceiptStats) == (
+        "publish",
+        "publish_batches",
+        "subscribe",
+        "unsubscribe",
+        "publish_waiters",
+    )
+    assert names(TransportStats) == (
+        "kind",
+        "closing",
+        "pending_write_bytes",
+        "buffered_read_bytes",
+    )
+
+
+def test_constructor_refuses_configuration_without_effect() -> None:
+    with pytest.raises(ValueError, match="iterator delivery only"):
+        AsyncClient("c", message_delivery="callback", max_iterator_messages=10)
+    with pytest.raises(ValueError, match="iterator delivery only"):
+        AsyncClient("c", message_delivery="callback", iterator_admission_timeout=1.0)
+    AsyncClient("c", message_delivery="callback")
+    # Synchronous callbacks cannot await ack(); manual acknowledgement belongs
+    # to the asynchronous processing mode.
+    with pytest.raises(ValueError, match="manual_ack requires iterator delivery"):
+        AsyncClient("c", message_delivery="callback", manual_ack=True)
+    AsyncClient("c", manual_ack=True)
+    for option in (
+        {"connect_properties": Properties({"session_expiry_interval": 10})},
+        {"will_properties": Properties({"message_expiry_interval": 10}), "will": Message("w", b"")},
+        {"topic_alias_maximum": 5},
+        {"auth_handler": lambda packet: None},
+    ):
+        with pytest.raises(ProtocolError, match="MQTT 5"):
+            AsyncClient("c", **option)
+        AsyncClient("c", protocol=MQTTProtocolVersion.MQTTv5, **option)
+    with pytest.raises(ValueError, match="connect_timeout"):
+        AsyncClient("c", connect_timeout=0)
+
+
 def test_async_client_stable_method_parameter_contract() -> None:
     expected = {
         "connect": ("self", "host", "port", "ssl", "timeout"),
         "connect_unix": ("self", "path", "timeout"),
         "connect_ws": ("self", "url", "ssl", "extra_headers", "timeout"),
         "disconnect": ("self", "reason_code"),
-        "publish": ("self", "topic", "payload", "qos", "retain", "properties", "nowait"),
+        "publish": ("self", "topic", "payload", "qos", "retain", "properties"),
         "publish_nowait": ("self", "topic", "payload", "qos", "retain", "properties"),
         "publish_many": (
             "self",
             "messages",
-            "chunk_size",
-            "nowait",
             "max_failure_details",
-            "failure_sink",
         ),
         "subscribe": ("self", "topics", "qos", "properties", "timeout"),
         "unsubscribe": ("self", "topics", "timeout"),
         "messages": ("self",),
         "ack": ("self", "message"),
         "auth": ("self", "reason_code", "properties"),
-        "set_auth_handler": ("self", "handler"),
         "message_callback_add": ("self", "topic_filter", "callback"),
         "message_callback_remove": ("self", "topic_filter"),
         "stats": ("self",),
@@ -187,7 +282,14 @@ def test_async_client_stable_method_parameter_contract() -> None:
 
 
 def test_internal_pumps_are_not_promoted_to_supported_entry_points() -> None:
-    for name in ("EffectPump", "WritePump", "InboundSession", "OutboundSession"):
+    for name in (
+        "EffectPump",
+        "DeliveryLane",
+        "LifecycleHooks",
+        "WritePump",
+        "InboundSession",
+        "OutboundSession",
+    ):
         assert name not in mqttium.__all__
         assert name not in api.__all__
         assert not hasattr(api, name)
@@ -219,3 +321,14 @@ def test_protocol_and_dispatch_do_not_import_compat() -> None:
     if "mqttium.dispatch" in engine:
         offenders.append("protocol/engine.py")
     assert not offenders
+
+
+def test_retired_entry_points_are_absent() -> None:
+    import importlib.util
+
+    assert importlib.util.find_spec("mqttium.compat") is None
+    assert importlib.util.find_spec("mqttium.helpers") is None
+    assert not hasattr(mqttium, "PacketType")
+    assert not hasattr(api, "PublishBackpressure")
+    assert not hasattr(AsyncClient, "set_auth_handler")
+    assert not hasattr(AsyncClient(), "on_publish")

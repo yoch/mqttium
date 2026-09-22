@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests.support import stored_record
+
 import asyncio
 
 import pytest
@@ -38,13 +40,15 @@ def test_engine_hydrated_store_no_mid_collision(tmp_path) -> None:
 
     store = SqliteInflightStore(tmp_path / "s.db")
     store.put_out(
-        OutboundMessage(
-            mid=1,
-            topic="t",
-            payload=b"x",
-            qos=QoS.AT_LEAST_ONCE,
-            retain=False,
-            state=OutboundQoSState.WAIT_PUBACK,
+        stored_record(
+            OutboundMessage(
+                mid=1,
+                topic="t",
+                payload=b"x",
+                qos=QoS.AT_LEAST_ONCE,
+                retain=False,
+                state=OutboundQoSState.WAIT_PUBACK,
+            )
         )
     )
     engine = ProtocolEngine(EngineConfig(client_id="c"), store=store)
@@ -100,7 +104,7 @@ def test_duplicate_connack_rejected() -> None:
 
 
 def test_replay_deferred_reencodes_dup() -> None:
-    engine = ProtocolEngine(EngineConfig(client_id="c", clean_start=False, local_receive_maximum=1))
+    engine = ProtocolEngine(EngineConfig(client_id="c", clean_start=False, max_inbound_inflight=1))
     engine.begin_connect()
     engine.take_effects()
     # CONNACK session_present=0, then publish 2 QoS1 (second queued).
@@ -270,7 +274,7 @@ def test_property_zero_one_enforced() -> None:
     from mqttium.codec.properties import PUBLISH, decode_properties, encode_properties
 
     props = Properties()
-    props.set("payload_format_indicator", 2)
+    props = Properties({**props.values, "payload_format_indicator": 2})
     with pytest.raises(Exception):
         encode_properties(props, PUBLISH)
 

@@ -1,29 +1,15 @@
-"""Engine configuration and the rules for changing it at runtime."""
+"""Immutable internal protocol configuration."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, fields, replace
-from typing import Any
+from dataclasses import dataclass, field
 
 from mqttium.enums import MQTTProtocolVersion
+from mqttium.errors import ProtocolError
 from mqttium.types import Message, Properties
 
-_RUNTIME_MUTABLE_ENGINE_CONFIG_FIELDS = frozenset(
-    {
-        "keepalive",
-        "username",
-        "password",
-        "will",
-        "will_properties",
-        "max_pending_outbound_messages",
-        "max_pending_outbound_bytes",
-        "max_pending_inbound_bytes",
-        "accept_auth",
-    }
-)
 
-
-@dataclass
+@dataclass(frozen=True)
 class EngineConfig:
     client_id: str = ""
     protocol: MQTTProtocolVersion = MQTTProtocolVersion.MQTTv311
@@ -31,17 +17,20 @@ class EngineConfig:
     keepalive: int = 60
     username: str | None = None
     password: bytes | None = field(default=None, repr=False)
-    local_receive_maximum: int = 65535
+    # Concurrent inbound QoS 1/2 exchanges; advertised as Receive Maximum on
+    # MQTT 5 and enforced locally on both protocols (DISCONNECT 0x93).
+    max_inbound_inflight: int = 65535
+    # Logical application bytes retained for inbound QoS handshakes. None
+    # disables the cap; zero rejects every new message that needs persistence
+    # (DISCONNECT 0x97).
+    max_inbound_inflight_bytes: int | None = 64 * 1024 * 1024
     # Optional local cap on outbound inflight QoS>0 (None = broker's Receive
     # Maximum only). Use to self-throttle a fast publisher.
     max_outbound_inflight: int | None = None
     # Total locally retained QoS 1/2 publications, including inflight and queued.
     # None disables the corresponding limit; zero rejects every new QoS>0 publish.
-    max_pending_outbound_messages: int | None = 10_000
-    max_pending_outbound_bytes: int | None = 64 * 1024 * 1024
-    # Logical application bytes retained for inbound QoS handshakes. None
-    # disables the cap; zero rejects every new message that needs persistence.
-    max_pending_inbound_bytes: int | None = 64 * 1024 * 1024
+    max_unacknowledged_messages: int | None = 10_000
+    max_unacknowledged_bytes: int | None = 64 * 1024 * 1024
     connect_properties: Properties | None = None
     will: Message | None = field(default=None, repr=False)
     will_properties: Properties | None = None
@@ -52,7 +41,6 @@ class EngineConfig:
     # When False, inbound AUTH is rejected with DISCONNECT 0x82. AsyncClient
     # derives this capability from whether an auth_handler is registered.
     accept_auth: bool = False
-    _attached: bool = field(default=False, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.protocol not in (
@@ -62,21 +50,29 @@ class EngineConfig:
             raise ValueError("MQTT 3.1 is not supported; use MQTT 3.1.1 or MQTT 5")
         if not 0 <= self.keepalive <= 65535:
             raise ValueError("keepalive must be between 0 and 65535")
-        if not 1 <= self.local_receive_maximum <= 65535:
-            raise ValueError("local_receive_maximum must be between 1 and 65535")
+        self._validate_bounds()
+        if self.protocol is not MQTTProtocolVersion.MQTTv5:
+            self._refuse_mqtt5_options()
+        if self.connect_properties is not None:
+            reserved = {"receive_maximum", "maximum_packet_size", "topic_alias_maximum"}
+            if reserved.intersection(self.connect_properties.values):
+                raise ProtocolError("CONNECT limits must use the dedicated constructor arguments")
+
+    def _validate_bounds(self) -> None:
+        if not 1 <= self.max_inbound_inflight <= 65535:
+            raise ValueError("max_inbound_inflight must be between 1 and 65535")
         if self.max_outbound_inflight is not None and not (
             1 <= self.max_outbound_inflight <= 65535
         ):
             raise ValueError("max_outbound_inflight must be between 1 and 65535")
-        if (
-            self.max_pending_outbound_messages is not None
-            and self.max_pending_outbound_messages < 0
+        for name in (
+            "max_unacknowledged_messages",
+            "max_unacknowledged_bytes",
+            "max_inbound_inflight_bytes",
         ):
-            raise ValueError("max_pending_outbound_messages must be non-negative or None")
-        if self.max_pending_outbound_bytes is not None and self.max_pending_outbound_bytes < 0:
-            raise ValueError("max_pending_outbound_bytes must be non-negative or None")
-        if self.max_pending_inbound_bytes is not None and self.max_pending_inbound_bytes < 0:
-            raise ValueError("max_pending_inbound_bytes must be non-negative or None")
+            value = getattr(self, name)
+            if value is not None and value < 0:
+                raise ValueError(f"{name} must be non-negative or None")
         if self.maximum_packet_size is not None and not (
             2 <= self.maximum_packet_size <= 268_435_460
         ):
@@ -84,24 +80,14 @@ class EngineConfig:
         if not 0 <= self.topic_alias_maximum <= 65535:
             raise ValueError("topic_alias_maximum must be between 0 and 65535")
 
-    def update(self, **changes: Any) -> None:
-        """Validate a candidate configuration, then commit its changed fields.
-
-        No mutation occurs when validation raises, including type errors. Once
-        attached to a ProtocolEngine, only fields without derived engine state
-        may be changed through this method.
-        """
-        known = {f.name for f in fields(self) if f.init}
-        unknown = set(changes) - known
-        if unknown:
-            raise AttributeError(f"unknown EngineConfig fields: {sorted(unknown)}")
-        if self._attached:
-            unsafe = set(changes) - _RUNTIME_MUTABLE_ENGINE_CONFIG_FIELDS
-            if unsafe:
-                raise AttributeError(
-                    "EngineConfig fields require a new ProtocolEngine once attached: "
-                    f"{sorted(unsafe)}"
-                )
-        candidate = replace(self, **changes)
-        for name in changes:
-            setattr(self, name, getattr(candidate, name))
+    def _refuse_mqtt5_options(self) -> None:
+        # MQTT 5 options are refused here rather than at CONNECT so a
+        # misconfigured client fails at construction, not at first use.
+        if self.connect_properties is not None and self.connect_properties.values:
+            raise ProtocolError("CONNECT properties require MQTT 5")
+        if self.will_properties is not None and self.will_properties.values:
+            raise ProtocolError("Will properties require MQTT 5")
+        if self.topic_alias_maximum:
+            raise ProtocolError("topic_alias_maximum requires MQTT 5")
+        if self.accept_auth:
+            raise ProtocolError("Enhanced authentication requires MQTT 5")

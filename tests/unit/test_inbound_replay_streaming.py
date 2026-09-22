@@ -263,7 +263,7 @@ def test_delivered_cursor_held_record_is_consistent_across_stores(
         store.close()
 
 
-async def test_client_replays_every_message_through_the_effect_pump() -> None:
+async def test_reader_delivers_every_replay_message_in_bounded_batches() -> None:
     store = MemoryInflightStore()
     fill(store, 400)
     client = AsyncClient(
@@ -271,17 +271,18 @@ async def test_client_replays_every_message_through_the_effect_pump() -> None:
         clean_start=False,
         store=store,
         message_delivery="iterator",
-        max_pending_messages=1024,
+        max_iterator_messages=1024,
     )
 
     async with client._engine_lock:
         resume(client._engine)
-        client._collect_effects_locked()
-    await client._drain_effects()
+        client._effect_pump.collect_from_engine()
+    await client._effect_pump.drain()
+    await client._delivery_lane.drain()
 
     received = []
-    while not client._messages.empty():
-        item = client._messages.get_nowait()
+    while not client._delivery.messages_queue.empty():
+        item = client._delivery.messages_queue.get_nowait()
         received.append(item.mid if hasattr(item, "mid") else item[0].mid)
     assert received == list(range(1, 401))
     assert client._engine.inbound.replay_pending is False
@@ -301,7 +302,7 @@ async def test_replay_peak_memory_stays_proportional_to_one_batch(tmp_path: Path
         clean_start=False,
         store=reopened,
         message_delivery="iterator",
-        max_pending_messages=64,
+        max_iterator_messages=64,
     )
     consumed = 0
 
@@ -322,8 +323,9 @@ async def test_replay_peak_memory_stays_proportional_to_one_batch(tmp_path: Path
     try:
         async with client._engine_lock:
             resume(client._engine)
-            client._collect_effects_locked()
-        await client._drain_effects()
+            client._effect_pump.collect_from_engine()
+        await client._effect_pump.drain()
+        await client._delivery_lane.drain()
         await asyncio.wait_for(consumer, timeout=30.0)
         _current, peak = tracemalloc.get_traced_memory()
     finally:

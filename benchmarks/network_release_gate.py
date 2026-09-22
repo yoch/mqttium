@@ -754,7 +754,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=11883)
     parser.add_argument("--protocols", default="311")
-    parser.add_argument("--completions", default="callback")
+    parser.add_argument("--completions", choices=("receipt",), default="receipt")
     parser.add_argument("--payloads", default="64")
     parser.add_argument("--windows", default="1,20,64")
     parser.add_argument("--control-blocks", type=int, default=2)

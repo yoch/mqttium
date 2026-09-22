@@ -29,28 +29,33 @@ def _props() -> Properties:
 def test_engine_rejects_connect_properties_without_mutating_state(
     protocol: MQTTProtocolVersion,
 ) -> None:
-    engine = ProtocolEngine(EngineConfig(protocol=protocol, connect_properties=_props()))
+    # Refused at configuration time: no engine exists whose state could change.
     with pytest.raises(ProtocolError, match="CONNECT properties require MQTT 5"):
-        engine.begin_connect()
-    assert engine.state is ConnectionState.NEW
-    assert not engine.has_pending_effects
+        EngineConfig(protocol=protocol, connect_properties=_props())
+    engine = ProtocolEngine(EngineConfig(protocol=protocol, connect_properties=Properties()))
+    engine.begin_connect()
+    assert engine.state is ConnectionState.CONNECTING
 
 
 @pytest.mark.parametrize("protocol", V3_PROTOCOLS)
 def test_engine_rejects_will_properties_without_mutating_state(
     protocol: MQTTProtocolVersion,
 ) -> None:
-    engine = ProtocolEngine(
+    with pytest.raises(ProtocolError, match="Will properties require MQTT 5"):
         EngineConfig(
             protocol=protocol,
             will=Message(topic="will/topic", payload=b"will"),
             will_properties=_props(),
         )
+    engine = ProtocolEngine(
+        EngineConfig(
+            protocol=protocol,
+            will=Message(topic="will/topic", payload=b"will"),
+            will_properties=Properties(),
+        )
     )
-    with pytest.raises(ProtocolError, match="Will properties require MQTT 5"):
-        engine.begin_connect()
-    assert engine.state is ConnectionState.NEW
-    assert not engine.has_pending_effects
+    engine.begin_connect()
+    assert engine.state is ConnectionState.CONNECTING
 
 
 @pytest.mark.parametrize("protocol", V3_PROTOCOLS)
@@ -61,7 +66,7 @@ def test_engine_rejects_publish_properties_before_admission(
     engine.state = ConnectionState.CONNECTED
     with pytest.raises(ProtocolError, match="PUBLISH properties require MQTT 5"):
         engine.queue_publish("topic", b"payload", qos=QoS.AT_LEAST_ONCE, properties=_props())
-    assert engine.pending_outbound_messages == 0
+    assert engine.unacknowledged_messages == 0
     assert len(engine.packet_ids) == 0
     assert not engine.has_pending_effects
 

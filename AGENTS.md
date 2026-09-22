@@ -52,12 +52,19 @@ clock access, or user callbacks into `protocol/`.
   timers, callbacks, receipts, delivery queues, and reconnect policy.
 - `api/_writer.py` owns every transport write, the writer queue, batching, and
   writer-side byte/count backpressure.
-- `api/_effects.py` owns the connection-scoped effect deque and deferred effect
-  processing. The client interprets effects because it owns runtime objects.
+- `api/_effects.py` owns the connection-scoped protocol effect deque and
+  deferred processing. `api/_delivery_lane.py` retains each reader-owned
+  delivery lot behind its fixed protocol fence. The client interprets effects
+  because it owns runtime objects.
+- `api/_delivery.py` runs short synchronous message callbacks inline on the
+  delivering reader, outside every protocol lock, or parks messages in the
+  bounded iterator queue; `api/_lifecycle.py` serializes asynchronous
+  lifecycle hooks after their triggering protocol transition and transport
+  cleanup.
 
-The native API must not accommodate the Paho façade. `compat/paho.py` is a
-Provisional consumer that runs `AsyncClient` on a dedicated thread and loop;
-the core never imports it.
+This is the current pre-v1 native API. Paho and one-shot helpers are removed.
+Native APIs and the two supplied stores are the supported surface; engine,
+codecs and extension protocols are Internal.
 
 ## Load-bearing invariants
 
@@ -76,7 +83,9 @@ These invariants have regression coverage and must remain explicit in reviews:
    session states. Compatibility attributes and ordered queues are views or
    indexes and must stay synchronized with their owner.
 6. **Callbacks outside critical sections.** No engine lock is held while user
-   code runs. Callback-initiated publication must not deadlock.
+   code runs. Message callbacks are synchronous; asynchronous application work
+   uses `messages()` or explicitly owned application tasks. Lifecycle hooks may
+   await the client API without waiting for their own triggering effect.
 7. **No in-session retransmission.** PUBLISH and PUBREL replay only after a
    reconnect with a present session; there is no retransmission timer.
 
@@ -90,7 +99,9 @@ step is added.
 The common single-effect case is applied inline. Deferred effects live in the
 `EffectPump`; SEND effects retain wire order before application-visible events.
 Every connection-scoped effect carries an epoch, and stale effects from a dead
-connection must not affect a new one.
+connection must not affect a new one. Application delivery pressure must not
+block already-decoded protocol work or extend an earlier collection's fence.
+The bounded reader still cannot process an ACK it has not read.
 
 `CONTINUE_INBOUND_REPLAY` is answered by re-entering the engine for the next
 bounded replay batch. This places delivery backpressure between batches and
@@ -99,10 +110,12 @@ pump `continue_inbound_replay()` while replay remains pending.
 
 ## Persistence
 
-`InflightStore` is the base protocol. Memory and SQLite stores also expose
-optional paged and conditional-transition capabilities detected once by the
-directional sessions. The store guarantees atomic mutation; it never owns the
-MQTT state machine.
+`InflightStore` is a complete internal protocol with required paged replay and
+conditional metadata transitions. Both stores guarantee atomic mutation.
+`batch()` groups writes: SQLite uses a transaction, memory a no-op context.
+The engine owns per-publication rollback, not an application transaction.
+Schema 5 only accepts fresh or current schema-5 databases; historical and
+future formats are refused before write-affecting pragmas.
 
 SQLite schema changes are transactional and versioned with
 `PRAGMA user_version`. Preserve these measured design choices unless new A/B
@@ -133,8 +146,9 @@ evidence justifies a change:
 
 ## API and documentation contracts
 
-API tiers are defined by the API stability document, not by importability or
-`__all__`:
+The current pre-v1 native API deliberately revises the `1.0.0rc14` surface. Its
+contract is defined by the API stability document, not importability or
+`__all__`. The general project tier definitions are:
 
 - **Stable** follows SemVer and the documented deprecation process.
 - **Provisional** is supported and tested but may evolve with changelog and
@@ -165,5 +179,5 @@ document.
 - Self-hosted workflows execute only trusted code, serialize access to the
   persistent runner, use run-specific temporary state, and clean up on failure.
 - Benchmark scripts emit artifacts; public cross-client evidence belongs in the
-  independent benchmark repository and never includes the Paho façade as the
+  independent benchmark repository and describes the native
   MQTTium product.

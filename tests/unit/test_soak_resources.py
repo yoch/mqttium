@@ -61,10 +61,10 @@ async def test_forced_reconnect_waits_for_reconnect_task_to_settle() -> None:
             self.settled.set()
 
         def stats(self) -> SimpleNamespace:
-            return SimpleNamespace(
-                connection_epoch=self.epoch,
-                tasks=SimpleNamespace(reconnect=self.reconnect_running),
-            )
+            return SimpleNamespace(connection_epoch=self.epoch)
+
+        def _running_tasks(self) -> dict[str, bool]:
+            return {"reconnect": self.reconnect_running}
 
     client = Client()
 
@@ -72,4 +72,4 @@ async def test_forced_reconnect_waits_for_reconnect_task_to_settle() -> None:
 
     assert client.settled.is_set()
     assert client.settle_task is not None and client.settle_task.done()
-    assert client.stats().tasks.reconnect is False
+    assert client._running_tasks()["reconnect"] is False

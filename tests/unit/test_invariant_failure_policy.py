@@ -21,11 +21,9 @@ def _raw_pingresp() -> RawPacket:
 
 def _policy() -> ReconnectPolicy:
     return ReconnectPolicy(
-        enabled=True,
         initial_delay=0.0,
         max_delay=0.0,
         stable_after=0.0,
-        connect_timeout=0.1,
     )
 
 
@@ -91,7 +89,7 @@ def test_engine_generic_handler_error_propagates_with_identity() -> None:
 
 
 async def test_runtime_invariant_failure_is_terminal_without_reconnect() -> None:
-    client = AsyncClient(reconnect=_policy(), keepalive=0)
+    client = AsyncClient(reconnect=_policy(), connect_timeout=0.1, keepalive=0)
     transport = _ConnAckTransport()
     connect_calls = 0
 
@@ -126,7 +124,7 @@ async def test_runtime_invariant_failure_is_terminal_without_reconnect() -> None
     assert client._disconnect_exc is failure
     assert client._reconnect_task is None
     assert transport.is_closing()
-    assert client._writer_task is None or client._writer_task.done()
+    assert client._write_pump.task is None or client._write_pump.task.done()
     assert receipt.is_done()
     with pytest.raises(AssertionError, match="reader invariant"):
         await receipt.wait()
@@ -135,7 +133,7 @@ async def test_runtime_invariant_failure_is_terminal_without_reconnect() -> None
 async def test_reconnect_loop_stops_if_reconnect_hits_invariant_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    client = AsyncClient(reconnect=_policy())
+    client = AsyncClient(reconnect=_policy(), connect_timeout=0.1)
     client._host = "fake"
     client._port = 1883
     client._intentional_disconnect = False

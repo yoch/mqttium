@@ -18,6 +18,7 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from benchmark_support import stored_record
 from mqttium.api import AsyncClient
 from mqttium.enums import OutboundQoSState, QoS
 from mqttium.persistence.memory import MemoryInflightStore
@@ -84,44 +85,37 @@ def message_effect(sequence: int) -> EngineEffect:
     )
 
 
-async def callback_delivery(count: int, delay: float) -> Sample:
-    client = AsyncClient(
-        message_delivery="callback",
-        max_pending_callbacks=128,
-        delivery_timeout=10.0,
-        callback_shutdown_timeout=10.0,
-    )
+async def callback_delivery(count: int) -> Sample:
+    client = AsyncClient(message_delivery="callback")
     seen: list[int] = []
 
-    async def callback(message: Message) -> None:
-        if delay:
-            await asyncio.sleep(delay)
+    def callback(message: Message) -> None:
         seen.append(int(message.payload))
 
     client.on_message = callback
     started = time.perf_counter()
     cpu_started = time.process_time()
     for sequence in range(count):
-        await client._apply_effect(message_effect(sequence), nowait=False)
-    await client._callback_queue.join()
+        pending = client._apply_delivery_effect(message_effect(sequence), client._connection_epoch)
+        if pending is not None:
+            await pending
     result = sample(
-        f"callback_delay_{delay * 1000:g}ms",
+        "callback_sync",
         count,
         started,
         cpu_started,
-        notes="bounded queue=128; single ordered worker",
+        notes="synchronous callbacks run inline on the delivering reader",
     )
     if seen != list(range(count)):
         raise RuntimeError("callback ordering or completeness violation")
-    await client._shutdown_callback_worker(drain=False)
     return result
 
 
 async def iterator_delivery(count: int, delay: float) -> Sample:
     client = AsyncClient(
         message_delivery="iterator",
-        max_pending_messages=128,
-        delivery_timeout=10.0,
+        max_iterator_messages=128,
+        iterator_admission_timeout=10.0,
     )
     seen: list[int] = []
 
@@ -137,7 +131,9 @@ async def iterator_delivery(count: int, delay: float) -> Sample:
     started = time.perf_counter()
     cpu_started = time.process_time()
     for sequence in range(count):
-        await client._apply_effect(message_effect(sequence), nowait=False)
+        pending = client._apply_delivery_effect(message_effect(sequence), client._connection_epoch)
+        if pending is not None:
+            await pending
     await consumer
     result = sample(
         f"iterator_delay_{delay * 1000:g}ms",
@@ -154,13 +150,15 @@ async def iterator_delivery(count: int, delay: float) -> Sample:
 def messages(count: int) -> list[OutboundMessage]:
     payload = b"x" * 64
     return [
-        OutboundMessage(
-            mid=mid,
-            topic="bench/persistence",
-            payload=payload,
-            qos=QoS.AT_LEAST_ONCE,
-            retain=False,
-            state=OutboundQoSState.WAIT_PUBACK,
+        stored_record(
+            OutboundMessage(
+                mid=mid,
+                topic="bench/persistence",
+                payload=payload,
+                qos=QoS.AT_LEAST_ONCE,
+                retain=False,
+                state=OutboundQoSState.WAIT_PUBACK,
+            )
         )
         for mid in range(1, count + 1)
     ]
@@ -176,7 +174,7 @@ def persistence_cycle(name: str, store, count: int, *, batched: bool) -> Sample:
             store.put_out(record)
         for record in records:
             record.dup = True
-            store.update_out(record)
+            store.put_out(record)
         for record in records:
             if not store.delete_out(record.mid):
                 raise RuntimeError(f"missing persistence record mid={record.mid}")
@@ -185,7 +183,7 @@ def persistence_cycle(name: str, store, count: int, *, batched: bool) -> Sample:
         count * 3,
         started,
         cpu_started,
-        notes=f"{count} put + update + pop operations",
+        notes=f"{count} insert + replace + delete operations",
     )
 
 
@@ -199,12 +197,11 @@ class _NoopContext:
 
 async def run(args: argparse.Namespace) -> list[Sample]:
     samples = [
-        await callback_delivery(args.count, 0.0),
-        await callback_delivery(min(500, args.count), 0.001),
-        await callback_delivery(min(100, args.count), 0.010),
-        await callback_delivery(min(20, args.count), 0.100),
+        await callback_delivery(args.count),
         await iterator_delivery(args.count, 0.0),
         await iterator_delivery(min(500, args.count), 0.001),
+        await iterator_delivery(min(100, args.count), 0.010),
+        await iterator_delivery(min(20, args.count), 0.100),
     ]
 
     persistence_count = min(args.sqlite_count, 20_000)
