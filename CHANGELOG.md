@@ -10,6 +10,7 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 - Include persisted MQTT 5 property bytes in SQLite replay pages and engine
   emission budgets, matching the memory store and preserving oversized-record progress.
+  Both stores and the engine now size replay from the same persisted logical size.
 
 - Release caller-owned subscription futures on cancellation or transfer failure
   without releasing the still-active MQTT packet identifier. Transfer errors

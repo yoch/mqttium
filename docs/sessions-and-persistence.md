@@ -198,6 +198,13 @@ payload-free metadata and then loads bounded payload pages. Reopening a large
 session therefore does not require materialising every retained payload at
 once.
 
+Replay pages and each redelivery batch are bounded by message count and by the
+persisted logical size: payload, UTF-8 topic and MQTT 5 property bytes, the
+same quantity the inbound byte budget counts. Both stores size pages from that
+stored value without re-encoding properties, and the engine applies the same
+bound to whatever page a store returns. A single record larger than the batch
+limit is replayed alone rather than blocking replay.
+
 Replay still obeys current message and byte limits. If historical state is
 already above a newly reduced outbound limit, MQTTium permits it to drain but
 does not admit more work until usage falls below the limit. Inbound replay is
