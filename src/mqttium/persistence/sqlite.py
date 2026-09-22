@@ -254,6 +254,8 @@ def _prepare_private_path(path: Path) -> None:
     try:
         descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError:
+        # Refuse a dangling link: SQLite would create its target unprotected.
+        path.stat()
         # Existing stores retain the deployment's permissions and compatibility.
         # SQLite derives newly created WAL/SHM permissions from the database.
         return

@@ -84,6 +84,41 @@ def test_existing_permissive_store_and_parent_permissions_are_preserved(tmp_path
         reopened.close()
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX symbolic-link contract")
+def test_dangling_database_symlink_is_refused_without_creating_its_target(tmp_path):
+    target = tmp_path / "target.db"
+    link = tmp_path / "link.db"
+    link.symlink_to(target)
+    with pytest.raises(FileNotFoundError):
+        SqliteInflightStore(link)
+    assert link.is_symlink()
+    for created in (target, Path(f"{target}-wal"), Path(f"{target}-shm")):
+        assert not created.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX symbolic-link contract")
+def test_existing_database_symlink_keeps_its_target_permissions(tmp_path):
+    target = tmp_path / "target.db"
+    store = SqliteInflightStore(target)
+    store.put_out(_record(1))
+    store.close()
+    target.chmod(0o640)
+    link = tmp_path / "link.db"
+    link.symlink_to(target)
+    linked = SqliteInflightStore(link)
+    try:
+        assert linked.get_out(1).payload == b"private payload"
+        linked.put_out(_record(2))
+    finally:
+        linked.close()
+    assert stat.S_IMODE(target.stat().st_mode) == 0o640
+    reopened = SqliteInflightStore(target)
+    try:
+        assert reopened.get_out(2).payload == b"private payload"
+    finally:
+        reopened.close()
+
+
 def test_protected_store_reopens_and_concurrent_connections_keep_all_commits(tmp_path):
     path = tmp_path / "private" / "state.db"
     initial = SqliteInflightStore(path)

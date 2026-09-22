@@ -130,6 +130,10 @@ against an attacker who can replace entries in the chosen parent directory.
 On Windows, access is governed by the deployment's ACLs rather than POSIX mode
 bits. The special `:memory:` database creates no filesystem entry.
 
+A database path that is a symbolic link to an existing database opens that
+database unchanged. A dangling link is refused with `FileNotFoundError`
+before SQLite runs, so MQTTium never creates an unprotected link target.
+
 ## Store ownership and shutdown
 
 The store is synchronous and belongs to the application. Close it only after
@@ -171,6 +175,7 @@ hierarchy:
 | Failure boundary | Exception exposed |
 | --- | --- |
 | Creating a new database file or its parent directories | `OSError`, including `PermissionError` |
+| A database path that is a dangling symbolic link | `FileNotFoundError` |
 | Opening, locking, querying, committing, or using a closed SQLite connection | the relevant `sqlite3.Error` subclass |
 | A historical, future or structurally inconsistent MQTTium schema; invalid batch/close lifecycle | `RuntimeError` |
 | Invalid persisted storage classes, enum/flag/size values, JSON syntax, or MQTTium JSON markers | `ValueError` (including `json.JSONDecodeError`) |
