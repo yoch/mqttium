@@ -12,6 +12,7 @@ Concurrency invariants (see docs/implementation-guide.md §1):
 from __future__ import annotations
 
 import asyncio
+import math
 import ssl
 import time
 from collections import deque
@@ -142,6 +143,8 @@ def _terminal_publish_result(effect: EngineEffect) -> tuple[int | None, BaseExce
 
 
 def _positive(name: str, value: float) -> None:
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(f"{name} must be finite")
     if value <= 0:
         raise ValueError(f"{name} must be greater than 0")
 
@@ -732,6 +735,8 @@ class AsyncClient:
         generation, and performs one connection attempt under the lifecycle
         lock.
         """
+        if timeout is not None:
+            _positive("timeout", timeout)
         if self._local_terminal_failure is not None:
             raise MQTTError(
                 "Client is unusable after a local terminal failure; "
@@ -1356,6 +1361,8 @@ class AsyncClient:
                 invalid.
             NotConnectedError: If the client cannot submit the request.
         """
+        if timeout is not None:
+            _positive("timeout", timeout)
         loop = asyncio.get_running_loop()
         async with self._engine_lock:
             mid = self._engine.queue_subscribe(
@@ -1389,6 +1396,8 @@ class AsyncClient:
             ProtocolError: If a filter is invalid.
             NotConnectedError: If the client cannot submit the request.
         """
+        if timeout is not None:
+            _positive("timeout", timeout)
         loop = asyncio.get_running_loop()
         async with self._engine_lock:
             mid = self._engine.queue_unsubscribe(topics)

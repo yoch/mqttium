@@ -224,3 +224,11 @@ The decoder owns packet-boundary bytes; no reusable-buffer view escapes into
 protocol state or the application. Ingress remains bounded and connection-scoped.
 The current native API removes the direct QoS 0 adapter path and uses the
 common engine/effect pipeline for every message.
+
+### Finite timeout values
+
+Timeout defaults and per-call overrides must be finite and positive. Replace
+NaN/infinite values with a finite deadline, or use `None` where the specific
+setting documents a default or disabled bound. Zero remains supported for
+keepalive and nonnegative reconnect durations, not timeout overrides. Invalid
+overrides now raise `ValueError` before changing the client.

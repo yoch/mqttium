@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+import math
 from dataclasses import dataclass
 
 from mqttium.enums import MQTTProtocolVersion
@@ -56,6 +57,9 @@ class ReconnectPolicy:
     stable_after: float = 30.0
 
     def __post_init__(self) -> None:
+        for name in ("initial_delay", "multiplier", "max_delay", "stable_after"):
+            if not math.isfinite(getattr(self, name)):
+                raise ValueError(f"{name} must be finite")
         if self.initial_delay < 0:
             raise ValueError("initial_delay must be non-negative")
         if self.multiplier < 1:

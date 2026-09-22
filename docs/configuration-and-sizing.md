@@ -174,3 +174,11 @@ forced reconnect. After traffic drains, pending counters should return to the
 expected idle state. See [Operations and Observability](operations.md) for the
 fields and [Writer Backpressure](backpressure.md) for encoded burst
 sizing.
+
+### Finite deadlines
+
+Timeout values must be finite and positive, including per-call `timeout`
+overrides. Invalid overrides raise `ValueError` before connection intent, routes
+or request state change. `None` retains its documented default/disabled meaning.
+Reconnect delays and `stable_after` must be finite and nonnegative; `multiplier`
+must be finite and at least one. Zero keepalive still disables keepalive.
