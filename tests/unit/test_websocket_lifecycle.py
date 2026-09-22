@@ -18,6 +18,8 @@ class _CancellableCloseWriter:
         self.entered_wait = asyncio.Event()
         self.closed = False
         self.writes: list[bytes] = []
+        self.transport = self
+        self.aborted = asyncio.Event()
 
     def write(self, data: bytes) -> None:
         self.writes.append(data)
@@ -29,9 +31,15 @@ class _CancellableCloseWriter:
     def close(self) -> None:
         self.closed = True
 
+    def abort(self) -> None:
+        # A real asyncio transport schedules connection_lost on abort, which
+        # releases the shared wait_closed future even if its peer never reads.
+        self.closed = True
+        self.aborted.set()
+
     async def wait_closed(self) -> None:
         self.entered_wait.set()
-        await asyncio.Event().wait()
+        await self.aborted.wait()
 
     def is_closing(self) -> bool:
         return self.closed
@@ -45,9 +53,10 @@ async def test_cancelled_websocket_close_has_already_closed_stream() -> None:
     await asyncio.wait_for(writer.entered_wait.wait(), timeout=1.0)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await task
+        await asyncio.wait_for(task, timeout=1.0)
 
     assert writer.closed
+    assert writer.aborted.is_set()
     assert writer.writes  # the close frame was queued before stream closure
 
 
