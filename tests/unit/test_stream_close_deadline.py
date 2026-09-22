@@ -108,7 +108,11 @@ async def test_real_nonreading_peer_cannot_hold_shutdown(monkeypatch, mode):
         if public_disconnect:
             client.publish_nowait("blocked", payload)
         else:
-            writer.write(payload)
+            # Proactor starts the first write directly as overlapped I/O; a
+            # second write exercises its queued buffer, just like publish().
+            middle = len(payload) // 2
+            writer.write(payload[:middle])
+            writer.write(payload[middle:])
         await wait_until(lambda: writer.transport.get_write_buffer_size() > 0)
         shutdown = asyncio.create_task(
             client.disconnect() if public_disconnect else transport.close()
