@@ -219,14 +219,8 @@ class MemoryInflightStore:
         mids: list[int] = []
         hydrated_bytes = 0
         for indexed_message in index:
-            message_bytes = indexed_message.logical_size or (
-                len(indexed_message.payload)
-                + (
-                    len(indexed_message.topic)
-                    if indexed_message.topic.isascii()
-                    else len(indexed_message.topic.encode("utf-8"))
-                )
-            )
+            # Same persisted size as SQLite: topic, payload and MQTT 5 properties.
+            message_bytes = indexed_message.logical_size
             if mids and (len(mids) >= max_messages or hydrated_bytes + message_bytes > max_bytes):
                 if page := hydrate_page():
                     yield page
