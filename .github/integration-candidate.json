@@ -1,7 +1,7 @@
 {
-  "pr": 473,
-  "base": "febff4408a5403a9f1d676849bd9519e4d03a971",
-  "head": "eaa660048063e6e5fe3fdea430cfbf80a89b41f8",
-  "head_branch": "codex/audit-f04-cancelled-disconnect",
-  "note": ""
+  "pr": 485,
+  "base": "cc1e5bcf57f0b02f9cb51e5f46ad5af389d990ba",
+  "head": "fb59a3296e501a7f09b2cc62118a107e3d5c80ad",
+  "head_branch": "fix/bounded-stream-close-466",
+  "note": "- Bound native and WebSocket stream shutdown when a peer stops reading,\n  aborting stalled output after the close budget. Keep the shared stream-close\n  future intact under timeout and repeated caller cancellation, and collect\n  the owned waiter before propagating cancellation (#466).\n"
 }
