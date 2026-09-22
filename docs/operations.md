@@ -183,7 +183,11 @@ Timeouts protect different boundaries:
   `connect(..., timeout=...)` overrides it for one explicit call;
 - `ping_timeout` limits the wait for PINGRESP;
 - `subscribe_timeout` is the default SUBACK/UNSUBACK deadline; `subscribe()`
-  and `unsubscribe()` accept a per-call override;
+  and `unsubscribe()` accept a per-call override. Only the acknowledgement
+  wait raises `MQTTTimeoutError`; a failure while handing the request to the
+  writer propagates unchanged. Timeout or cancellation abandons only the
+  caller's result: a request already sent stays in flight, and its packet
+  identifier is released by the late acknowledgement or connection teardown;
 - `iterator_admission_timeout=None` waits indefinitely; a positive value covers iterator
   byte reservation and queue admission with one deadline. Callback delivery has
   no queue: synchronous callbacks run on the reader and are never timed out or
