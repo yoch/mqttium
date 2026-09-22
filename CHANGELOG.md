@@ -8,6 +8,11 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Bound native and WebSocket stream shutdown when a peer stops reading,
+  aborting stalled output after the close budget. Keep the shared stream-close
+  future intact under timeout and repeated caller cancellation, and collect
+  the owned waiter before propagating cancellation (#466).
+
 - Complete connection teardown when a disconnect caller is cancelled during
   terminal drainage, then propagate cancellation to the caller.
 - Bound incoming MQTT 5 repeatable properties to 1024 combined values per
