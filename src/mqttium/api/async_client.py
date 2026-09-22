@@ -1498,6 +1498,7 @@ class AsyncClient:
         assert self._transport is not None
         lifecycle_token = self._lifecycle_hooks.token
         reader_transport = self._transport
+        reader_connack = self._connack_fut
         # Receiving is a capability, and the two are exclusive: a push
         # transport has already placed the bytes in the decoder by the time it
         # reports them, so there is nothing to feed.
@@ -1677,6 +1678,12 @@ class AsyncClient:
             terminal_cause = self._local_terminal_failure
             if terminal_cause is None:
                 terminal_cause = self._disconnect_exc
+            if (
+                reader_connack is not None
+                and not reader_connack.done()
+                and not self._intentional_disconnect
+            ):
+                reader_connack.set_exception(terminal_cause)
             self._fail_non_replayable(terminal_cause)
             will_reconnect = self._will_reconnect()
             if not will_reconnect:
