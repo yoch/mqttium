@@ -20,7 +20,7 @@ python -m pip install .
 ```
 
 For the published candidate, install `mqttium==1.0.0rc14` and use its
-[RC14 documentation](https://github.com/yoch/mqttium/tree/v1.0.0rc14/docs).
+[RC14 documentation](https://mqttium.readthedocs.io/en/v1.0.0rc14/).
 Source builds retain the RC14 version string until the release cut, so record
 `git rev-parse HEAD` alongside the version. Read the [migration guide](migration.md)
 before changing an existing application or SQLite database.

@@ -8,6 +8,12 @@ not a public issue.
 
 MQTTium uses `pip` and has no runtime dependencies:
 
+Work from a checkout of the current source. The native API on `main` differs
+from the last published package; see the [installation guide](docs/getting-started.md)
+and [RC14 migration guide](docs/migration.md). The native API is Stable,
+statistics and the two supplied stores are Provisional, and engine, codecs and
+extension protocols are Internal. Importability does not change a tier.
+
 ```bash
 python -m pip install -e ".[dev,fuzz,security,release,docs]"
 

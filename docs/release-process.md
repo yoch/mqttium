@@ -36,7 +36,14 @@ fails if a local quality, performance, memory, artifact, or smoke gate is
 missing. An expected non-zero gate result exits without a Python traceback and
 prints the retained command log and manifest paths; the gate log contains the
 recorded failure or invalidation reason. Performance evidence remains local
-because hosted timing is not stable enough for small regressions.
+to an eligible dedicated machine because shared hosted timing is not stable
+enough for small regressions. This can be the remote ARM64 runner; it need not
+be the maintainer's workstation. The manual `ARM64 Network Release Gate`
+workflow accepts `gate=network` or `gate=open-loop`, exact reviewed baseline
+and candidate SHAs, and explicit trusted-code confirmation from `main`. Both
+selections use the existing strict harness and serialize with other ARM64 work.
+The open-loop selection keeps its full default protocol/payload/load matrix;
+it is distinct from the paired workflow's fixed-rate writer checks.
 
 An open-loop run invalidated **only** because the old point-ratio screen
 overflowed its bounded confirmation budget may be reevaluated without new
@@ -89,6 +96,13 @@ search, redirects, relative links, `llms.txt` and `llms-full.txt`, then verify
 Read the Docs `latest` after integration. Keep `stable` on the published line
 until an appropriate release is available. A successful CI status is not a
 substitute for inspecting the deployed documentation.
+
+During the pre-release period, Read the Docs does not create its automatic
+`stable` version. The project has a non-forced HTTP 302 exact redirect from
+`/en/stable/*` to `/en/v1.0.0rc14/:splat`. Activate and build a newly published
+RC tag before updating this fallback. For a final release, verify the automatic
+`stable` version and remove the fallback. Never direct published-version links
+to unpublished `main` content.
 
 ## Publish
 

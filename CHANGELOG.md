@@ -8,6 +8,10 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Make the existing strict open-loop release gate available on the dedicated
+  ARM64 runner, with exact trusted commits and retained qualification artifacts.
+  Correct remaining Internal-tier packet and engine docstrings.
+
 - Align the maintained documentation with the current source API and its
   unpublished status: installation instructions, explicit stability tiers,
   public errors, iterator byte statistics, manual QoS 2 acknowledgement,
