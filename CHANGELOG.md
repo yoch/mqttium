@@ -11,6 +11,32 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - Roll back failed SQLite commits, preserve the original failure, and prevent
   store cleanup from committing a mutation already reported as failed.
 
+- Bound native and WebSocket stream shutdown when a peer stops reading,
+  aborting stalled output after the close budget. Keep the shared stream-close
+  future intact under timeout and repeated caller cancellation, and collect
+  the owned waiter before propagating cancellation (#466).
+
+- Complete connection teardown when a disconnect caller is cancelled during
+  terminal drainage, then propagate cancellation to the caller.
+- Bound incoming MQTT 5 repeatable properties to 1024 combined values per
+  table before decoding an excess value, independently of the wire-byte
+  limit. Release partial collections on rejection and preserve valid order
+  and outgoing encoding (#463).
+
+- Close admission before draining a fatal DISCONNECT and fence later writer
+  submissions until the next connection, preserving terminal packet order.
+- Stop automatic reconnect on certificate verification failures, malformed
+  MQTT packets and peer protocol violations, including setup and stability
+  failures. Preserve transient backoff, validated CONNACK refusal policy and
+  explicit reconnection after configuration repair (#469).
+
+- Validate WebSocket hostnames and TLS option types before opening a socket
+  or sending extra headers. Reject hostless endpoints and values that could
+  silently disable TLS for a `wss://` URL (#464, #468).
+
+- Fail pending connections promptly with their original reader termination
+  cause instead of waiting for a misleading CONNACK timeout.
+
 - Make the existing strict open-loop release gate available on the dedicated
   ARM64 runner, with exact trusted commits and retained qualification artifacts.
   Correct remaining Internal-tier packet and engine docstrings.
