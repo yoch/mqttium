@@ -60,10 +60,7 @@ _IN_PAGE_SQL = (
 _IN_INDEX_PAGE_SQL = (
     "SELECT mid, state, user_acked, delivered, logical_size FROM inbound WHERE mid IN"
 )
-_IN_REPLAY_INDEX_SQL = (
-    "SELECT mid, length(payload) + length(CAST(topic AS BLOB)) AS replay_size"
-    " FROM inbound ORDER BY seq"
-)
+_IN_REPLAY_INDEX_SQL = "SELECT mid, logical_size AS replay_size FROM inbound ORDER BY seq"
 
 SQLITE_SCHEMA_VERSION = 5
 """Experimental native-only format; historical formats are not migrated."""
