@@ -127,6 +127,12 @@ in the same vocabulary as the constructor bound it is measured against:
 | `receipts` | `publish`, `publish_batches`, `subscribe`, `unsubscribe`, `publish_waiters` | — |
 | `transport` | `kind`, `closing`, `pending_write_bytes`, `buffered_read_bytes` | — |
 
+`transport.buffered_read_bytes` is `None` when the transport cannot measure its
+complete receive backlog through its supported APIs (pull streams, including TLS
+and Unix, WebSocket, and transports without statistics). Push transports report
+measured decoder occupancy; a disconnected client reports zero. Do not interpret
+`None` as an empty queue. OS socket buffers are outside this metric.
+
 `waiters` fields count producers currently parked on that bound; a non-zero
 value with occupancy at the limit is sustained pressure, a high-water mark at
 the limit with zero waiters is a burst that has drained. How the runtime
@@ -183,7 +189,11 @@ Timeouts protect different boundaries:
   `connect(..., timeout=...)` overrides it for one explicit call;
 - `ping_timeout` limits the wait for PINGRESP;
 - `subscribe_timeout` is the default SUBACK/UNSUBACK deadline; `subscribe()`
-  and `unsubscribe()` accept a per-call override;
+  and `unsubscribe()` accept a per-call override. Only the acknowledgement
+  wait raises `MQTTTimeoutError`; a failure while handing the request to the
+  writer propagates unchanged. Timeout or cancellation abandons only the
+  caller's result: a request already sent stays in flight, and its packet
+  identifier is released by the late acknowledgement or connection teardown;
 - `iterator_admission_timeout=None` waits indefinitely; a positive value covers iterator
   byte reservation and queue admission with one deadline. Callback delivery has
   no queue: synchronous callbacks run on the reader and are never timed out or
