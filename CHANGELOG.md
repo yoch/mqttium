@@ -8,6 +8,10 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Align local `quick` and `rc` release quality gates with unit plus project
+  coverage and the configured threshold, and include strict documentation builds.
+  Ruff format-check and lint now cover `tools` as in CI.
+
 - Report unknown transport receive backlog as `None` instead of a misleading
   zero for pull streams, WebSocket and unsupported transports. Push transport
   measurements and disconnected zero remain available. The Provisional

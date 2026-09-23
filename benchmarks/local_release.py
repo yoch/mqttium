@@ -68,6 +68,7 @@ class Recorder:
             "check-wheel-contents",
             "hypothesis",
             "mypy",
+            "mkdocs",
             "psutil",
             "pytest",
             "pytest-cov",
@@ -413,9 +414,10 @@ def _assert_tracked_sources_clean() -> None:
 def run_quality(recorder: Recorder, port: int) -> None:
     _assert_tracked_sources_clean()
     recorder.run(
-        "ruff-format", _python_tool("ruff", "format", "--check", "src", "tests", "benchmarks")
+        "ruff-format",
+        _python_tool("ruff", "format", "--check", "src", "tests", "benchmarks", "tools"),
     )
-    recorder.run("ruff", _python_tool("ruff", "check", "src", "tests", "benchmarks"))
+    recorder.run("ruff", _python_tool("ruff", "check", "src", "tests", "benchmarks", "tools"))
     recorder.run("mypy", _python_tool("mypy", "src"))
     recorder.run("bandit", _python_tool("bandit", "-q", "-ll", "-r", "src"))
     recorder.run(
@@ -424,10 +426,14 @@ def run_quality(recorder: Recorder, port: int) -> None:
             "pytest",
             "-q",
             "tests/unit",
+            "tests/project",
             "--cov=mqttium",
             "--cov-report=term-missing",
-            "--cov-fail-under=87.36",
         ),
+    )
+    recorder.run(
+        "docs-strict",
+        _python_tool("mkdocs", "build", "--strict", "--site-dir", str(recorder.output / "site")),
     )
     environment = os.environ.copy()
     environment["MQTTIUM_REQUIRE_BROKER"] = "1"
