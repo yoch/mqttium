@@ -8,6 +8,10 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Record local release gate commands that time out or cannot start as failures,
+  and report `passed` only when the whole requested profile has completed;
+  an interrupted run is `incomplete` rather than a false success.
+
 - Accept one-shot topic iterables such as generators in `subscribe()` and
   `unsubscribe()` when admission has to wait for earlier protocol effects;
   the request was re-read after the wait and rejected as empty.
