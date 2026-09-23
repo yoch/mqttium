@@ -219,3 +219,19 @@ def test_missing_parent_is_refused_without_being_created(release, tmp_path):
     with pytest.raises(FileNotFoundError):
         release.Recorder(tmp_path / "absent" / "run", "quick")
     assert not (tmp_path / "absent").exists()
+
+
+@pytest.mark.parametrize("kind", ["existing", "missing-parent"])
+def test_cli_refuses_unusable_output_without_a_traceback(
+    release, tmp_path, monkeypatch, capsys, kind
+):
+    output = tmp_path / "existing" if kind == "existing" else tmp_path / "absent" / "run"
+    if kind == "existing":
+        output.mkdir()
+    arguments = SimpleNamespace(output_dir=output, profile="quick", port=11883)
+    monkeypatch.setattr(release, "parse_args", lambda: arguments)
+    assert release.main() == 2
+    captured = capsys.readouterr()
+    assert captured.err.startswith("local release output refused: ")
+    assert "Traceback" not in captured.err and not captured.out
+    assert not (tmp_path / "absent").exists()

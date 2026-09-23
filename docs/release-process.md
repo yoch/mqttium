@@ -36,7 +36,8 @@ is retained after success or failure; concurrent runs never reuse it. To choose
 the location, pass `--output-dir /trusted/existing/parent/new-run`: the parent
 must already exist and the final directory must not exist, even if it is empty.
 Pre-existing files, directories, and symbolic links are refused rather than
-overwritten. Re-running a gate requires a new output directory.
+overwritten; the runner then exits with status 2 and a message, without running
+any gate. Re-running a gate requires a new output directory.
 
 On POSIX, the new output directory has mode `0700`; command logs and manifests
 have mode `0600`. Parent paths are checked for trusted ownership and unsafe

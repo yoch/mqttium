@@ -818,7 +818,12 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    recorder = Recorder(args.output_dir, args.profile)
+    try:
+        recorder = Recorder(args.output_dir, args.profile)
+    except (FileExistsError, FileNotFoundError, PermissionError) as exc:
+        # An unusable output path is an expected refusal, not a crash.
+        print(f"local release output refused: {exc}", file=sys.stderr)
+        return 2
     print(f"release output: {recorder.output}", flush=True)
     try:
         with managed_mosquitto(recorder.output, args.port):
