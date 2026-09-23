@@ -120,6 +120,26 @@ because the refused connection is exposed as `ProtocolError`.
 MQTTium intentionally does not log credentials, topics, properties, or payloads.
 See [Logging and Observability](observability.md) for application-owned diagnostics.
 
+## WebSocket receive bounds
+
+`connect_ws()` applies three independent receive limits:
+
+- **Frame:** each binary frame's declared payload length must not exceed the
+  WebSocket limit, checked from the frame header before the payload is read.
+- **Message:** the fragments of one WebSocket message, reassembled, must not
+  exceed the same WebSocket limit.
+- **MQTT packet:** each MQTT packet carried in those bytes must not exceed the
+  client's `maximum_packet_size` (16 MiB when unset), whatever the WebSocket
+  sizes.
+
+The WebSocket limit is the larger of 16 MiB and the client's
+`maximum_packet_size`, the same value the decoder enforces and MQTT 5 CONNECT
+advertises. A larger packet limit therefore fits in one message, while a small
+one keeps the 16 MiB floor so a broker may still coalesce several packets into
+one message. Their combined bytes must fit that message limit; a peer sending
+more must use further messages. The TCP, TLS and Unix transports have no
+frame or message layer and apply only the MQTT packet limit.
+
 ## Stream shutdown
 
 After requesting stream closure, MQTTium gives buffered output up to one

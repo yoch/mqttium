@@ -709,6 +709,7 @@ class AsyncClient:
                 ssl=ssl if ssl is not None else self._ssl,
                 extra_headers=self._ws_headers,
                 timeout=None,  # The connection attempt owns the complete deadline.
+                max_frame_size=max(DEFAULT_MAX_PACKET_SIZE, self._decoder.max_packet_size),
             )
 
         return await self._connect_explicit(
