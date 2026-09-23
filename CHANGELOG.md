@@ -10,6 +10,7 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 - Raise the WebSocket frame/message receive ceiling when the configured MQTT
   packet limit exceeds 16 MiB, so the transport can honor the advertised limit.
+  The 16 MiB floor remains, and each MQTT packet is still checked separately.
 
 - Share one connection deadline across transport setup and CONNACK, including
   WebSocket upgrade without an independent hidden 30-second timeout. Automatic
