@@ -8,6 +8,10 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Accept one-shot topic iterables such as generators in `subscribe()` and
+  `unsubscribe()` when admission has to wait for earlier protocol effects;
+  the request was re-read after the wait and rejected as empty.
+
 - Give each local release gate run a fresh private output directory and print
   its path. An explicit `--output-dir` must be new under an existing parent;
   existing files, directories and symbolic links are refused. Logs and broker
