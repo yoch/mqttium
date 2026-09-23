@@ -8,6 +8,77 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Align local `quick` and `rc` release quality gates with unit plus project
+  coverage and the configured threshold, and include strict documentation builds.
+  Ruff format-check and lint now cover `tools` as in CI.
+
+- Report unknown transport receive backlog as `None` instead of a misleading
+  zero for pull streams, WebSocket and unsupported transports. Push transport
+  measurements and disconnected zero remain available. The Provisional
+  `transport.buffered_read_bytes` field is now `int | None` (see migration guidance).
+
+- Type `PublishBatchError.receipt` as `PublishBatchReceipt | None` so typed
+  consumers can inspect and await the committed prefix without a cast.
+
+- Raise the WebSocket frame/message receive ceiling when the configured MQTT
+  packet limit exceeds 16 MiB, so the transport can honor the advertised limit.
+  The 16 MiB floor remains, and each MQTT packet is still checked separately.
+
+- Share one connection deadline across transport setup and CONNACK, including
+  WebSocket upgrade without an independent hidden 30-second timeout. Automatic
+  reconnect attempts use the same single deadline.
+
+- Reject non-finite timeouts and reconnect timing values before state changes;
+  per-call timeout overrides require the same positive finite values as defaults.
+
+- Include persisted MQTT 5 property bytes in SQLite replay pages and engine
+  emission budgets, matching the memory store and preserving oversized-record progress.
+  Both stores and the engine now size replay from the same persisted logical size.
+
+- Release caller-owned subscription futures on cancellation or transfer failure
+  without releasing the still-active MQTT packet identifier. Transfer errors
+  keep their type; only the acknowledgement wait raises `MQTTTimeoutError`.
+
+- Settle deferred SUBACK/UNSUBACK results before reusing their packet identifier,
+  so a later request cannot receive an earlier request's acknowledgement.
+  Terminal or invalid requests are still refused immediately, even while a
+  failed connection's transport close is blocked.
+
+- Create new SQLite inflight databases with mode `0600` and missing parent
+  directories with mode `0700` without changing the process umask, so new
+  WAL/SHM sidecars are private too. Existing stores keep their permissions.
+  Refuse a dangling database symlink with `FileNotFoundError` instead of
+  creating its target (#465).
+
+- Roll back failed SQLite commits, preserve the original failure, and prevent
+  store cleanup from committing a mutation already reported as failed.
+
+- Bound native and WebSocket stream shutdown when a peer stops reading,
+  aborting stalled output after the close budget. Keep the shared stream-close
+  future intact under timeout and repeated caller cancellation, and collect
+  the owned waiter before propagating cancellation (#466).
+
+- Complete connection teardown when a disconnect caller is cancelled during
+  terminal drainage, then propagate cancellation to the caller.
+- Bound incoming MQTT 5 repeatable properties to 1024 combined values per
+  table before decoding an excess value, independently of the wire-byte
+  limit. Release partial collections on rejection and preserve valid order
+  and outgoing encoding (#463).
+
+- Close admission before draining a fatal DISCONNECT and fence later writer
+  submissions until the next connection, preserving terminal packet order.
+- Stop automatic reconnect on certificate verification failures, malformed
+  MQTT packets and peer protocol violations, including setup and stability
+  failures. Preserve transient backoff, validated CONNACK refusal policy and
+  explicit reconnection after configuration repair (#469).
+
+- Validate WebSocket hostnames and TLS option types before opening a socket
+  or sending extra headers. Reject hostless endpoints and values that could
+  silently disable TLS for a `wss://` URL (#464, #468).
+
+- Fail pending connections promptly with their original reader termination
+  cause instead of waiting for a misleading CONNACK timeout.
+
 - Make the existing strict open-loop release gate available on the dedicated
   ARM64 runner, with exact trusted commits and retained qualification artifacts.
   Correct remaining Internal-tier packet and engine docstrings.
@@ -157,6 +228,12 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   that fits neither its configured bounds nor its deadline.
 
 ### Removed
+
+- Remove `SubscribeResult.from_packet()` and `UnsubscribeResult.from_packet()`,
+  Stable in 1.0.0rc14, whose signatures required Internal SUBACK/UNSUBACK packet
+  types. This is an incompatible pre-v1 change: use the results returned by
+  `subscribe()`/`unsubscribe()` or construct them from `mid` and `reason_codes`
+  (see the migration guide).
 
 - `on_publish`; publication completion and failure use individual or aggregate
   receipts without consuming message-callback capacity.

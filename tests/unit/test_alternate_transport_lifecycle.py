@@ -38,7 +38,7 @@ async def test_connect_ws_forwards_tls_and_headers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     transport = ScriptedBrokerTransport()
-    calls: list[tuple[str, object, dict[str, str] | None]] = []
+    calls: list[tuple[str, object, dict[str, str] | None, float | None, int]] = []
     context = ssl.create_default_context()
 
     async def connect(
@@ -46,8 +46,11 @@ async def test_connect_ws_forwards_tls_and_headers(
         *,
         ssl: object = None,
         extra_headers: dict[str, str] | None = None,
+        timeout: float | None,
+        max_frame_size: int,
     ):
-        calls.append((url, ssl, extra_headers))
+        # Required keywords: a caller that stops forwarding them fails here.
+        calls.append((url, ssl, extra_headers, timeout, max_frame_size))
         return transport
 
     monkeypatch.setattr(WebSocketTransport, "connect", staticmethod(connect))
@@ -62,7 +65,8 @@ async def test_connect_ws_forwards_tls_and_headers(
     )
     try:
         assert connack.reason_code == 0
-        assert calls == [("wss://broker.example/mqtt", context, headers)]
+        # The attempt owns the deadline; frames and messages fit the MQTT limit.
+        assert calls == [("wss://broker.example/mqtt", context, headers, None, 16 * 1024 * 1024)]
         assert client.is_connected
     finally:
         await client.disconnect()

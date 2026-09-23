@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import random
 from dataclasses import dataclass
 
@@ -56,6 +57,11 @@ class ReconnectPolicy:
     stable_after: float = 30.0
 
     def __post_init__(self) -> None:
+        for name in ("initial_delay", "multiplier", "max_delay", "stable_after"):
+            value = getattr(self, name)
+            # Only floats can be non-finite; never convert an int to float here.
+            if isinstance(value, float) and not math.isfinite(value):
+                raise ValueError(f"{name} must be finite")
         if self.initial_delay < 0:
             raise ValueError("initial_delay must be non-negative")
         if self.multiplier < 1:
