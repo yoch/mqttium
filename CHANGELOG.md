@@ -6,6 +6,12 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Changed
+
+- Record per-CPU frequency, frequency residency and the Raspberry Pi firmware
+  throttling register in benchmark runner preflights, and reject samples taken
+  while the firmware reports a current limit (#493).
+
 ## [1.0.0rc15] - 2026-09-23
 
 ### Fixed

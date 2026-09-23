@@ -159,6 +159,53 @@ def _cpu_governors() -> list[str]:
     return sorted(governors)
 
 
+_CPU_ROOT = Path("/sys/devices/system/cpu")
+# Raspberry Pi firmware `get_throttled` bits that describe the current state.
+_THROTTLED_NOW = {
+    0x1: "under-voltage",
+    0x2: "ARM frequency capped",
+    0x4: "throttled",
+    0x8: "soft temperature limit",
+}
+
+
+def _cpu_frequencies(root: Path = _CPU_ROOT) -> dict[str, dict[str, Any]]:
+    """Current/max kHz and cumulative per-frequency residency for each CPU.
+
+    Differencing `time_in_state` between two samples shows how long the work
+    in between actually ran at each frequency, including short excursions.
+    """
+    cpus: dict[str, dict[str, Any]] = {}
+    for policy in sorted(root.glob("cpu[0-9]*/cpufreq")):
+        entry: dict[str, Any] = {}
+        for name in ("scaling_cur_freq", "scaling_max_freq", "cpuinfo_max_freq"):
+            raw = _read_text(policy / name)
+            entry[name] = int(raw) if raw and raw.isdigit() else None
+        residency: dict[str, int] = {}
+        for line in (_read_text(policy / "stats" / "time_in_state") or "").splitlines():
+            frequency, _, ticks = line.partition(" ")
+            if frequency.isdigit() and ticks.strip().isdigit():
+                residency[frequency] = int(ticks)
+        entry["time_in_state"] = residency or None
+        cpus[policy.parent.name] = entry
+    return cpus
+
+
+def _firmware_throttled(command: list[str] | None = None) -> int | None:
+    """Raspberry Pi `vcgencmd get_throttled` register, or None when unavailable."""
+    try:
+        completed = subprocess.run(
+            command or ["vcgencmd", "get_throttled"], capture_output=True, text=True, timeout=5
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    _, _, value = completed.stdout.strip().partition("=")
+    try:
+        return int(value, 16) if completed.returncode == 0 else None
+    except ValueError:
+        return None
+
+
 def _temperatures() -> dict[str, float]:
     readings: dict[str, float] = {}
     for path in Path("/sys/class/thermal").glob("thermal_zone*/temp"):
@@ -212,6 +259,8 @@ def runner_metadata(*, broker_version_command: list[str] | None = None) -> dict[
         "logical_cpu_count": os.cpu_count(),
         "affinity": affinity,
         "cpu_governors": _cpu_governors(),
+        "cpu_frequencies": _cpu_frequencies(),
+        "firmware_throttled": _firmware_throttled(),
         "temperatures_c": _temperatures(),
         "runner_name": os.environ.get("RUNNER_NAME"),
         "runner_environment": os.environ.get("RUNNER_ENVIRONMENT"),
@@ -252,6 +301,8 @@ def sample_runner(*, interval_s: float = 1.0) -> dict[str, Any]:
         "temperatures_c": temperatures,
         "max_temperature_c": max(temperatures.values(), default=None),
         "cpu_governors": _cpu_governors(),
+        "cpu_frequencies": _cpu_frequencies(),
+        "firmware_throttled": _firmware_throttled(),
     }
 
 
@@ -280,6 +331,11 @@ def evaluate_preflight(sample: dict[str, Any], limits: PreflightLimits) -> list[
             failures.append(
                 f"CPU governors {governors!r} do not match {limits.required_governor!r}"
             )
+    throttled = sample.get("firmware_throttled")
+    if throttled:
+        active = [label for bit, label in _THROTTLED_NOW.items() if throttled & bit]
+        if active:
+            failures.append(f"firmware reports {', '.join(active)} (0x{throttled:x})")
     return failures
 
 
