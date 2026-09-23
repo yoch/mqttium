@@ -105,6 +105,7 @@ class InboundSession:
         "_decode_pubrel",
         "_engine",
         "_inflight",
+        "_current_persisted_mids",
         "_is_v5",
         "_on_qos1",
         "_autoack_handoff_required",
@@ -142,6 +143,10 @@ class InboundSession:
         self._topic_alias_maximum = self.config.topic_alias_maximum
         self._receive_maximum = self.config.max_inbound_inflight
         self._inflight = 0
+        # Durable inbound records are MQTT Session State; Receive Maximum
+        # ownership is scoped to one Network Connection. Track only persisted
+        # exchanges whose QoS>0 PUBLISH was actually observed on this connection.
+        self._current_persisted_mids: set[int] = set()
         self._autoack_handoff_required = False
         # Auto-ACK QoS 1 identifiers whose PUBACK is still inside the current
         # effect batch. The Receive Maximum slot stays held until take_effects()
@@ -194,6 +199,7 @@ class InboundSession:
         self._receive_maximum = receive_maximum
         self._topic_alias_maximum = topic_alias_maximum
         self._inflight = 0
+        self._current_persisted_mids.clear()
         self._autoack_handoff_required = False
         self._pending_auto_qos1_mids.clear()
         self._pending_manual_qos1_acks.clear()
@@ -203,6 +209,7 @@ class InboundSession:
 
     def transport_closed(self) -> None:
         self._aliases.clear()
+        self._current_persisted_mids.clear()
         self._pending_manual_qos1_acks.clear()
         self.release_pending_auto_qos1()
         # A continuation is scoped to the connection that created its cursor.
@@ -218,6 +225,7 @@ class InboundSession:
         self._recovered_mids.clear()
         self._replay = None
         self._inflight = 0
+        self._current_persisted_mids.clear()
         self._pending_bytes = 0
         self._stored_inbound = 0
         self._session_state_qos2 = 0
@@ -398,8 +406,20 @@ class InboundSession:
             # inlined: it keeps the whole probe off the fresh-PUBLISH path.
             existing = store.in_meta(mid)
         if existing is not None:
-            if existing.state is InboundQoSState.WAIT_PUBACK:
+            state = existing.state
+            if state is InboundQoSState.WAIT_PUBACK:
                 self._reject_packet_id_collision(mid, "QoS 2", "QoS 1")
+            if state is InboundQoSState.WAIT_USER_ACK:
+                # Receipt of PUBREL proves the sender has advanced to phase 2.
+                # MQTT-4.3.3-6 forbids re-sending PUBLISH after that point.
+                self._protocol_disconnect(0x82)
+                raise ProtocolError(f"QoS 2 PUBLISH for mid={mid} received after PUBREL")
+            if state is not InboundQoSState.WAIT_PUBREL:
+                raise ProtocolError(f"QoS 2 PUBLISH for mid={mid} in invalid state {state!r}")
+            current = self._current_persisted_mids
+            if mid not in current:
+                self._acquire_slot()
+                current.add(mid)
             engine._send_ack(_encode_pubrec_success(mid))
             return
         if mid in self._pending_auto_qos1_mids:
@@ -428,6 +448,7 @@ class InboundSession:
         except Exception:
             self._release_slot(logical_size)
             raise
+        self._current_persisted_mids.add(mid)
         self._remember_inbound()
         self._session_state_qos2 += 1
         # Runtime effect application is SEND-first. Produce the protocol ACK in
@@ -462,9 +483,14 @@ class InboundSession:
         record rather than leaking it behind the automatic PUBACK that this
         retransmission triggers.
         """
-        recovered_logical_size = self._complete_stored_inbound(
-            mid, InboundQoSState.WAIT_PUBACK, "acknowledging"
-        )
+        self._acquire_slot()
+        try:
+            recovered_logical_size = self._complete_stored_inbound(
+                mid, InboundQoSState.WAIT_PUBACK, "acknowledging"
+            )
+        except Exception:
+            self._release_slot()
+            raise
         self._forget_inbound()
         self._engine._send_ack(_encode_puback_success(mid))
         # The restored Receive Maximum slot remains owned until this PUBACK
@@ -559,8 +585,16 @@ class InboundSession:
             # but is surfaced again so an application can complete manual ACK
             # after a reconnect or callback cancellation.
             if existing.state is InboundQoSState.WAIT_PUBACK:
+                current = self._current_persisted_mids
+                acquired = mid not in current
+                if acquired:
+                    self._acquire_slot()
+                    current.add(mid)
                 inbound = store.get_in(mid)
                 if inbound is None:
+                    if acquired:
+                        current.remove(mid)
+                        self._release_slot()
                     raise RuntimeError(f"Inbound mid={mid} disappeared while redelivering")
                 self._emit_message(inbound, dup=True)
                 return
@@ -585,6 +619,7 @@ class InboundSession:
         except Exception:
             self._release_slot(logical_size)
             raise
+        self._current_persisted_mids.add(mid)
         self._remember_inbound()
         self._manual_qos1_order.append(mid)
         message = Message(
@@ -638,7 +673,7 @@ class InboundSession:
         self._forget_inbound()
         self._session_state_qos2 -= 1
         engine._send_ack(_encode_pubcomp_success(mid))
-        self._release_slot(logical_size)
+        self._release_persisted_slot(mid, logical_size)
 
     # --- application acknowledgement and replay ---------------------------
 
@@ -684,7 +719,7 @@ class InboundSession:
         self._forget_inbound()
         self._session_state_qos2 -= 1
         self._engine._send_ack(wire)
-        self._release_slot(logical_size)
+        self._release_persisted_slot(mid, logical_size)
 
     def _drain_manual_qos1_acks(self) -> None:
         """Emit the ready prefix of manual QoS 1 acknowledgements in arrival order."""
@@ -702,12 +737,13 @@ class InboundSession:
             ready.remove(mid)
             self._forget_inbound()
             self._engine._send_ack(_encode_puback_success(mid))
-            self._release_slot(logical_size)
+            self._release_persisted_slot(mid, logical_size)
 
     def replay_session(self) -> None:
-        """Restore Receive Maximum accounting and start bounded redelivery."""
+        """Restore durable state without carrying connection quota across reconnect."""
         persisted = self.store.in_count()
-        self._inflight = persisted
+        self._inflight = 0
+        self._current_persisted_mids.clear()
         if persisted == 0:
             self._recovered_mids.clear()
             return
@@ -851,6 +887,15 @@ class InboundSession:
     def _release_slot(self, logical_size: int | None = None) -> None:
         if self._inflight > 0:
             self._inflight -= 1
+        self._release_pending_bytes(logical_size)
+
+    def _release_persisted_slot(self, mid: int, logical_size: int) -> None:
+        """Release durable bytes and current-connection quota owned by ``mid``."""
+        current = self._current_persisted_mids
+        if mid in current:
+            current.remove(mid)
+            if self._inflight > 0:
+                self._inflight -= 1
         self._release_pending_bytes(logical_size)
 
     def _release_pending_bytes(self, logical_size: int | None) -> None:
