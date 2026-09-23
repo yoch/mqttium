@@ -66,8 +66,7 @@ def test_qos2_publish_after_pubrel_is_protocol_error(protocol: MQTTProtocolVersi
     assert engine.store.in_meta(7).state is InboundQoSState.WAIT_USER_ACK
     assert any(effect.kind is EffectKind.PROTOCOL_ERROR for effect in effects)
     assert not any(
-        effect.kind is EffectKind.SEND_ACK
-        and effect.data == PubRecPacket(mid=7).encode(protocol)
+        effect.kind is EffectKind.SEND_ACK and effect.data == PubRecPacket(mid=7).encode(protocol)
         for effect in effects
     )
 
@@ -87,8 +86,7 @@ def test_duplicate_publish_before_pubrel_still_repeats_pubrec() -> None:
     assert engine.state is ConnectionState.CONNECTED
     assert engine.store.in_meta(7).state is InboundQoSState.WAIT_PUBREL
     assert any(
-        effect.kind is EffectKind.SEND_ACK
-        and effect.data == PubRecPacket(mid=7).encode(protocol)
+        effect.kind is EffectKind.SEND_ACK and effect.data == PubRecPacket(mid=7).encode(protocol)
         for effect in effects
     )
     assert not any(effect.kind is EffectKind.PROTOCOL_ERROR for effect in effects)
