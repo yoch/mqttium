@@ -6,6 +6,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [1.0.0rc15] - 2026-09-23
+
 ### Fixed
 
 - Record local release gate commands that time out or cannot start as failures,
@@ -1355,7 +1357,8 @@ See the [migration guide](docs/migration.md) for the breaking changes since
 - Pre-spin-out comparative analysis and generated coverage data from the
   published source tree.
 
-[Unreleased]: https://github.com/yoch/mqttium/compare/v1.0.0rc14...HEAD
+[Unreleased]: https://github.com/yoch/mqttium/compare/v1.0.0rc15...HEAD
+[1.0.0rc15]: https://github.com/yoch/mqttium/compare/v1.0.0rc14...v1.0.0rc15
 [1.0.0rc14]: https://github.com/yoch/mqttium/compare/v1.0.0rc13...v1.0.0rc14
 [1.0.0rc13]: https://github.com/yoch/mqttium/compare/v1.0.0rc12...v1.0.0rc13
 [1.0.0rc12]: https://github.com/yoch/mqttium/compare/v1.0.0rc11...v1.0.0rc12

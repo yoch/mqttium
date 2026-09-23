@@ -48,8 +48,14 @@ native client free of background threads.
 
 ## Install
 
-The examples below describe the current source API, which has not yet been
-published. Install a checkout of this revision to use them:
+The native API below is published as the pre-release `1.0.0rc15`:
+
+```bash
+python -m pip install mqttium==1.0.0rc15
+```
+
+To try unreleased changes, install a checkout instead and record the Git commit
+when reporting a source-build issue:
 
 ```bash
 git clone https://github.com/yoch/mqttium.git
@@ -57,10 +63,9 @@ cd mqttium
 python -m pip install .
 ```
 
-For the last published candidate, use `python -m pip install mqttium==1.0.0rc14`
-and its [RC14 documentation](https://mqttium.readthedocs.io/en/v1.0.0rc14/).
-The source version string remains RC14 until the separate release cut; record
-the Git commit when reporting a source-build issue.
+Applications still on `1.0.0rc14` should use its
+[RC14 documentation](https://mqttium.readthedocs.io/en/v1.0.0rc14/) and read the
+migration guide before upgrading.
 
 ## First round trip
 
@@ -224,10 +229,10 @@ statistics vocabulary, progressive batch publication, synchronous message
 callbacks, receipt-based publication completion, and the new SQLite schema.
 Historical databases are not upgraded automatically.
 
-Until the next release is cut, use versioned RC14 documentation for the PyPI
-package and `latest` for the current source API. Read the Docs exposes the
-published tag under `v1.0.0rc14`; the legacy `stable` URL redirects there until
-a final release provides Read the Docs' automatic stable version.
+Use the Read the Docs version matching your installed release: `v1.0.0rc15`
+for this API, `v1.0.0rc14` for the previous candidate, and `latest` for the
+current source. The legacy `stable` URL redirects to the latest published
+candidate until a final release provides Read the Docs' automatic stable version.
 
 ## Documentation
 
