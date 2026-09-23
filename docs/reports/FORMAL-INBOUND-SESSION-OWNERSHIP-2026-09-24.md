@@ -35,7 +35,7 @@ compared.
 
 ## Finding 1 — durable inbound state precharges replacement-connection quota
 
-Tracked as #505.
+Tracked as #498.
 
 `InboundSession.replay_session()` restored `_inflight` from `store.in_count()`.
 That made every persisted inbound row consume Receive Maximum immediately on a
@@ -61,7 +61,7 @@ connection and releases quota only for those MIDs.
 
 ## Finding 2 — QoS2 phase regression after PUBREL
 
-Tracked as #506.
+Tracked as #499.
 
 Minimal trace:
 
