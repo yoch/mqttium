@@ -158,9 +158,10 @@ def _install(monkeypatch, client, route, factory):
         monkeypatch.setattr(async_client.UnixSocketTransport, "connect", factory)
     else:
 
-        async def ws_connect(url, *, ssl=None, extra_headers=None, timeout=30.0):
+        async def ws_connect(url, *, ssl=None, extra_headers=None, timeout, max_frame_size):
             # AsyncClient owns the whole attempt; no inner WebSocket deadline.
             assert timeout is None
+            assert max_frame_size == client._decoder.max_packet_size
             return await factory(url)
 
         monkeypatch.setattr(async_client.WebSocketTransport, "connect", ws_connect)
