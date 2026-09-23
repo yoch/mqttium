@@ -37,10 +37,10 @@ a changelog entry and migration guidance. Engine, codec, transport and store
 extension protocols are Internal and have no compatibility guarantee.
 The Paho facade and one-shot helpers have been removed.
 
-The current source tree contains an incompatible pre-v1 revision of the last
-published release, `1.0.0rc14`. Use documentation matching your installed
-release, or install the current source before following its examples. See the
-[migration guide](docs/migration.md) before upgrading an application or database.
+The latest published release, `1.0.0rc15`, is an incompatible pre-v1 revision
+of `1.0.0rc14`. Use documentation matching your installed release. See the
+[migration guide](docs/migration.md) before upgrading an application or database
+from `1.0.0rc14`.
 
 See [API Stability](docs/api-stability.md) and the
 [Compatibility Matrix](docs/compatibility.md).

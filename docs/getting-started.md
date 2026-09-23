@@ -9,9 +9,15 @@ delivery and shutdown.
 MQTTium supports Python 3.11 through 3.14 and has no runtime dependencies. You
 also need an MQTT 3.1.1 or MQTT 5 broker that the application can reach.
 
-This documentation describes the current source API, which deliberately
-differs from the last published candidate, `1.0.0rc14`. To run these examples
-before the next release, install a checkout of the revision you are reading:
+The native API is published as the pre-release `1.0.0rc15`, which
+deliberately differs from `1.0.0rc14`:
+
+```bash
+python -m pip install mqttium==1.0.0rc15
+```
+
+To run a newer revision than the published release, install a checkout of the
+revision you are reading and record `git rev-parse HEAD` alongside the version:
 
 ```bash
 git clone https://github.com/yoch/mqttium.git
@@ -19,11 +25,10 @@ cd mqttium
 python -m pip install .
 ```
 
-For the published candidate, install `mqttium==1.0.0rc14` and use its
-[RC14 documentation](https://mqttium.readthedocs.io/en/v1.0.0rc14/).
-Source builds retain the RC14 version string until the release cut, so record
-`git rev-parse HEAD` alongside the version. Read the [migration guide](migration.md)
-before changing an existing application or SQLite database.
+Applications on `1.0.0rc14` should keep its
+[RC14 documentation](https://mqttium.readthedocs.io/en/v1.0.0rc14/) and read the
+[migration guide](migration.md) before changing an existing application or
+SQLite database.
 
 The examples assume a broker on `127.0.0.1:1883`. If Mosquitto is already
 installed, a development listener can be started with an explicit configuration

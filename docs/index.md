@@ -9,8 +9,8 @@ Python 3.11–3.14. It is built for production services, gateways, and connected
 devices that need explicit completion, bounded resource use, and reliable
 recovery.
 
-These pages describe the current source API, not the published `1.0.0rc14`
-package. Follow the [source installation instructions](getting-started.md)
+These pages describe the current source API; the latest published candidate
+is `1.0.0rc15`. Follow the [installation instructions](getting-started.md)
 to run the examples, or select documentation for your installed release.
 
 ## Choose a path

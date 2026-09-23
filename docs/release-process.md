@@ -7,11 +7,11 @@ published release, from that same tag. Validation mode never publishes.
 
 ## Preparing the next release
 
-The current source API is not yet published. Its version remains `1.0.0rc14`
-while the next release is being prepared; never upload this tree under that
-already-used version. Keep changes in `[Unreleased]`, record the candidate
-commit and source fingerprint, and validate the current installation and
-migration instructions before deciding between `1.0.0rc15` and `1.0.0`.
+Between releases, `main` keeps the version of the last published release
+(currently `1.0.0rc15`); never upload a tree under an already-used version.
+Keep changes in `[Unreleased]`, record the candidate commit and source
+fingerprint, and validate the current installation and migration instructions
+before deciding the next version.
 
 For the release cut, update `src/mqttium/__init__.py`, freeze the changelog
 section and comparison links, and align README installation commands, security
