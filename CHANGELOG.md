@@ -8,6 +8,12 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Give each local release gate run a fresh private output directory and print
+  its path. An explicit `--output-dir` must be new under an existing parent;
+  existing files, directories and symbolic links are refused. Logs and broker
+  configurations are created exclusively with private permissions, and the
+  manifest is replaced atomically, keeping the previous one if that fails (#467).
+
 - Align local `quick` and `rc` release quality gates with unit plus project
   coverage and the configured threshold, and include strict documentation builds.
   Ruff format-check and lint now cover `tools` as in CI.

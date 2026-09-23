@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import subprocess
 import sys
 from types import SimpleNamespace
 
@@ -160,3 +161,61 @@ def test_cli_reports_default_output_and_keeps_evidence(release, monkeypatch, cap
     output = Path(line.removeprefix("release output: "))
     assert output.is_dir()
     assert json.loads((output / "manifest.json").read_text())["status"] == "passed"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission-bit contract")
+def test_private_creation_keeps_the_process_umask(tmp_path):
+    # Change umask only in a child process; the gate must not change it itself.
+    script = f"""
+import os, stat, subprocess, sys, tempfile
+from pathlib import Path
+sys.path.insert(0, {str(Path(__file__).resolve().parents[2] / "benchmarks")!r})
+import local_release as release
+release._source_fingerprint = lambda: "fingerprint"
+tempfile.tempdir = {str(tmp_path)!r}
+os.umask(0o022)
+explicit = release.Recorder(Path({str(tmp_path / "explicit")!r}), "quick")
+explicit.run("child", [sys.executable, "-c", "print(1)"])
+explicit.write_manifest()
+default = release.Recorder(None, "quick")
+modes = [stat.S_IMODE(p.stat().st_mode) for p in (
+    explicit.output, default.output,
+    explicit.output / "00-child.log", explicit.output / "manifest.json")]
+assert modes == [0o700, 0o700, 0o600, 0o600], [oct(m) for m in modes]
+assert os.umask(0o022) == 0o022
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=30, check=False
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX sticky-directory contract")
+def test_sticky_shared_ancestor_is_within_the_threat_model(release, tmp_path):
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    shared.chmod(0o1777)
+    recorder = release.Recorder(shared / "run", "quick")
+    assert recorder.output == (shared / "run").resolve()
+
+
+def test_concurrent_explicit_output_has_exactly_one_owner(release, tmp_path):
+    output = tmp_path / "contended"
+
+    def attempt(_):
+        try:
+            return release.Recorder(output, "quick")
+        except FileExistsError as exc:
+            return exc
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        outcomes = list(executor.map(attempt, range(8)))
+    owners = [item for item in outcomes if not isinstance(item, Exception)]
+    assert len(owners) == 1
+    assert all(isinstance(item, FileExistsError) for item in outcomes if item not in owners)
+
+
+def test_missing_parent_is_refused_without_being_created(release, tmp_path):
+    with pytest.raises(FileNotFoundError):
+        release.Recorder(tmp_path / "absent" / "run", "quick")
+    assert not (tmp_path / "absent").exists()

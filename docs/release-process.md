@@ -44,8 +44,9 @@ write permissions. MQTTium does not change the process umask. Run the gate as
 the normal developer account and use a parent controlled by that account or
 root. Windows deployments remain responsible for directory ACLs. The manifest
 is replaced atomically within the private directory; a failed replacement
-preserves the previous manifest. These safeguards protect output paths, not
-against malicious code executing as the same account.
+preserves the previous manifest. Readers never see a partial manifest, but the
+runner does not flush it for durability across a power loss. These safeguards
+protect output paths, not against malicious code executing as the same account.
 
 The runner manages Mosquitto with guaranteed cleanup and fails if a local
 quality, performance, memory, artifact, or smoke gate is missing. An expected
