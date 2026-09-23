@@ -12,6 +12,12 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   throttling register in benchmark runner preflights, and reject samples taken
   while the firmware reports a current limit (#493).
 
+### Fixed
+
+- Fence iterator admissions that are still waiting for application capacity by
+  owner generation, so an uncommitted message from an old connection or stream
+  cannot wake and enter the replacement generation (#500).
+
 ## [1.0.0rc15] - 2026-09-23
 
 ### Fixed
