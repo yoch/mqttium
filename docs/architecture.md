@@ -223,6 +223,11 @@ work to the flow window. Ready QoS 0 items share a bounded private driver: each
 item transfers to the existing writer before the source iterator advances.
 Pressure or a change of QoS returns to ordinary admission; no retained payload
 prefix or input chunk sits outside resource accounting.
+SUBSCRIBE and UNSUBSCRIBE are validated under the engine lock first, so a
+terminal or invalid request is refused without waiting. Otherwise they drain
+earlier protocol effects outside the lock and allocate an identifier only
+once none remain, so a deferred SUBACK/UNSUBACK never completes a later
+request that reuses its identifier.
 
 Applications wait for capacity by default. Immediate mode raises
 `FlowControlError`. A terminal disconnect wakes blocked publishers with an

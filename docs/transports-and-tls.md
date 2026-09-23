@@ -55,7 +55,13 @@ The transport uses RFC 6455 binary frames and requests the MQTT subprotocol.
 Use `wss://` outside a trusted local environment. Extra headers are visible to
 the WebSocket endpoint; do not place long-lived secrets in source code or logs.
 
-
+A WebSocket URL must include a hostname; there is no implicit `localhost`
+fallback. The `ssl` option accepts only `None`, a `bool`, or an `SSLContext`.
+For `wss://`, `None` and `True` enable Python's default TLS context, an explicit
+context is preserved, and `False` is refused. Other values, including `0` and
+an empty string from dynamic configuration, raise `ValueError`. Invalid URLs
+and TLS options are rejected before opening a socket or sending extra headers.
+Plain `ws://` retains its explicit `ssl=False` behavior.
 
 ## Unix-domain sockets
 
@@ -84,12 +90,70 @@ storage, and redaction policy. See [MQTT 5](mqtt-5.md).
 
 ## Timeouts and failure handling
 
-A connect timeout covers transport setup and CONNACK; `connect_timeout` on
-the client applies to explicit calls that omit `timeout` and to every
-automatic reconnect attempt. Treat certificate failures, broker
+A connect timeout is one deadline per attempt: TCP, Unix or WebSocket setup,
+including TLS and the WebSocket upgrade, spends the same budget as the wait
+for CONNACK, which only receives what remains. `connect_timeout` on the client
+applies to explicit calls that omit `timeout` and to every automatic reconnect
+attempt. Closing a previous connection, reconnect backoff and lifecycle hooks
+are outside the attempt. Independently of that budget, asyncio aborts a TLS
+handshake that takes longer than 60 seconds with an `OSError`. Treat
+certificate failures, broker
 authorization failures, and malformed protocol traffic as terminal until the
 configuration changes; repeatedly retrying them adds load without improving
 availability.
 
+Automatic reconnect stops on `ssl.SSLCertVerificationError`, malformed MQTT
+packets, and peer protocol violations, including failures before CONNACK or
+during the reconnect stability window. Pending work fails with the terminal
+cause and the application message stream ends. Certificate setup failures
+are reported through `on_disconnect` even when no new reader was started.
+A later explicit connection can begin a new stream after the endpoint or
+trust configuration is repaired; these peer/security failures alone do not
+make the client permanently unusable.
+
+Ordinary connection resets, connection refusal, timeouts, and TLS EOF remain
+eligible for the existing retry policy and backoff. A valid negative CONNACK
+still follows its protocol-specific reason-code policy: transient server
+busy/unavailable responses are not confused with malformed peer traffic just
+because the refused connection is exposed as `ProtocolError`.
+
 MQTTium intentionally does not log credentials, topics, properties, or payloads.
 See [Logging and Observability](observability.md) for application-owned diagnostics.
+
+## WebSocket receive bounds
+
+`connect_ws()` applies three independent receive limits:
+
+- **Frame:** each binary frame's declared payload length must not exceed the
+  WebSocket limit, checked from the frame header before the payload is read.
+- **Message:** the fragments of one WebSocket message, reassembled, must not
+  exceed the same WebSocket limit.
+- **MQTT packet:** each MQTT packet carried in those bytes must not exceed the
+  client's `maximum_packet_size` (16 MiB when unset), whatever the WebSocket
+  sizes.
+
+The WebSocket limit is the larger of 16 MiB and the client's
+`maximum_packet_size`, the same value the decoder enforces and MQTT 5 CONNECT
+advertises. A larger packet limit therefore fits in one message, while a small
+one keeps the 16 MiB floor so a broker may still coalesce several packets into
+one message. Their combined bytes must fit that message limit; a peer sending
+more must use further messages. The TCP, TLS and Unix transports have no
+frame or message layer and apply only the MQTT packet limit.
+
+## Stream shutdown
+
+After requesting stream closure, MQTTium gives buffered output up to one
+second to flush before aborting a stalled transport. This applies to TCP,
+TLS, Unix sockets, WebSocket, and failed WebSocket-handshake cleanup. It is
+separate from the existing five-second MQTT DISCONNECT writer-drain budget;
+it does not replace that budget or introduce a public timeout option.
+
+Aborting discards bytes the peer has not accepted, including a terminal frame
+that could not flush. Shutdown is not evidence that the broker received those
+bytes or acknowledged an unfinished publication. A normal close still gets
+the chance to flush rather than being aborted immediately.
+
+Cancellation while waiting for stream closure aborts the transport and
+propagates to the caller after the owned close waiter has completed. The
+shared asyncio stream-close future is not cancelled by the timeout, so a
+second cleanup owner can safely await the same writer.
