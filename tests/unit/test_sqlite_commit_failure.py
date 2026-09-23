@@ -76,3 +76,68 @@ def test_failed_commit_never_becomes_durable_on_close(tmp_path, batched, deny_ro
             store._conn.set_authorizer(None)
             store._conn.rollback()
             store.close()
+
+
+def _record(mid):
+    return stored_record(
+        OutboundMessage(
+            mid=mid,
+            topic="t",
+            payload=b"body",
+            qos=QoS.AT_LEAST_ONCE,
+            retain=False,
+            state=OutboundQoSState.WAIT_PUBACK,
+        )
+    )
+
+
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("deny_rollback", [False, True])
+def test_failed_batch_rollback_never_becomes_durable(tmp_path, nested, deny_rollback):
+    path = tmp_path / "rollback.db"
+    store = SqliteInflightStore(path)
+    body_failure = ValueError("batch body failed")
+
+    def authorizer(action, operation, *_):
+        if deny_rollback and action == sqlite3.SQLITE_TRANSACTION and operation == "ROLLBACK":
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    store._conn.set_authorizer(authorizer)
+    try:
+        # Nested: the caller swallows the inner failure, so the outer batch is
+        # rollback-only; otherwise the body failure crosses the batch.
+        expected = RuntimeError if nested else ValueError
+        with pytest.raises(expected) as caught:
+            with store.batch():
+                if nested:
+                    with pytest.raises(ValueError):
+                        with store.batch():
+                            store.put_out(_record(1))
+                            raise body_failure
+                else:
+                    store.put_out(_record(1))
+                    raise body_failure
+        if not nested:
+            assert caught.value is body_failure
+        assert store._batch_depth == 0
+        assert not store._transaction_started
+        if deny_rollback:
+            assert store._closed
+            assert "Rollback also failed" in caught.value.__notes__[0]
+            with pytest.raises(sqlite3.ProgrammingError):
+                store.put_out(_record(2))
+        else:
+            assert not store._closed
+            assert not store._conn.in_transaction
+            store._conn.set_authorizer(None)
+            store.put_out(_record(2))
+        store.close()
+        store.close()
+        with closing(sqlite3.connect(path)) as observer:
+            mids = [row[0] for row in observer.execute("SELECT mid FROM outbound ORDER BY mid")]
+        assert mids == ([] if deny_rollback else [2])
+    finally:
+        if not store._closed:
+            store._conn.set_authorizer(None)
+            store.close()
