@@ -8,6 +8,9 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Type `PublishBatchError.receipt` as `PublishBatchReceipt | None` so typed
+  consumers can inspect and await the committed prefix without a cast.
+
 - Raise the WebSocket frame/message receive ceiling when the configured MQTT
   packet limit exceeds 16 MiB, so the transport can honor the advertised limit.
   The 16 MiB floor remains, and each MQTT packet is still checked separately.
