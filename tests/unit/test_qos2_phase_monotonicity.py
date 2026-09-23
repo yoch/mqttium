@@ -20,7 +20,7 @@ def _feed(engine: ProtocolEngine, wire: bytes) -> None:
 def _connect(engine: ProtocolEngine, protocol: MQTTProtocolVersion) -> None:
     engine.begin_connect()
     engine.take_effects()
-    body = b"\\x00\\x00\\x00" if protocol == MQTTProtocolVersion.MQTTv5 else b"\\x00\\x00"
+    body = bytes((0, 0, 0)) if protocol == MQTTProtocolVersion.MQTTv5 else bytes((0, 0))
     _feed(engine, encode_frame(PacketType.CONNACK, 0, body))
     engine.take_effects()
     assert engine.state is ConnectionState.CONNECTED
