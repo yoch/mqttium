@@ -17,10 +17,10 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - Keep inbound MQTT Session State separate from Receive Maximum ownership on a
   replacement Network Connection. Resumed durable rows no longer precharge the
   current connection's PUBLISH quota; a persisted exchange acquires a slot only
-  when its QoS>0 PUBLISH is actually observed on that connection (#505).
+  when its QoS>0 PUBLISH is actually observed on that connection (#498).
 - Reject an inbound QoS 2 PUBLISH for an exchange that has already advanced
   through PUBREL into manual `WAIT_USER_ACK`, instead of rewinding the phase
-  and sending PUBREC again (#506).
+  and sending PUBREC again (#499).
 
 ## [1.0.0rc15] - 2026-09-23
 
