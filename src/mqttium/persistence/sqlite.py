@@ -509,19 +509,21 @@ class SqliteInflightStore:
                 self._batch_depth -= 1
                 if not outermost:
                     return
-                rollback_only = self._rollback_only
+                if not self._rollback_only:
+                    try:
+                        if self._transaction_started:
+                            self._commit()
+                    finally:
+                        self._transaction_started = False
+                    return
                 refusal = RuntimeError("Cannot commit SQLite batch after nested batch failure")
                 try:
                     if self._transaction_started:
-                        if rollback_only:
-                            self._rollback_or_close(refusal)
-                        else:
-                            self._commit()
+                        self._rollback_or_close(refusal)
                 finally:
                     self._transaction_started = False
                     self._rollback_only = False
-                if rollback_only:
-                    raise refusal
+                raise refusal
 
     def _ensure_write_transaction(self) -> None:
         """Open the batch transaction on its first actual mutation."""
