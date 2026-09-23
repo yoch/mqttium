@@ -2341,6 +2341,7 @@ class AsyncClient:
     async def _invalidate_connection_epoch(self) -> None:
         self._connection_epoch += 1
         self._delivery_lane.discard()
+        self._delivery.invalidate_waiting_admissions()
         await self._write_pump.advance_epoch(self._connection_epoch)
 
     def _settle_terminal_effect(self, effect: EngineEffect) -> None:
