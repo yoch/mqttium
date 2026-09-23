@@ -220,6 +220,12 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Removed
 
+- Remove `SubscribeResult.from_packet()` and `UnsubscribeResult.from_packet()`,
+  Stable in 1.0.0rc14, whose signatures required Internal SUBACK/UNSUBACK packet
+  types. This is an incompatible pre-v1 change: use the results returned by
+  `subscribe()`/`unsubscribe()` or construct them from `mid` and `reason_codes`
+  (see the migration guide).
+
 - `on_publish`; publication completion and failure use individual or aggregate
   receipts without consuming message-callback capacity.
 - Async message/topic callbacks and their per-message classification/invocation

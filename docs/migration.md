@@ -35,6 +35,7 @@ is the version an application actually upgrades from.
 | `ReconnectPolicy.follow_server_reference` | Removed; inspect `BrokerDisconnectError` and explicitly choose a replacement endpoint |
 | Delivery small-message diagnostic fields | Exact `stats().delivery.iterator_bytes` with a finite byte limit; zero byte occupancy/high-water values when `max_iterator_bytes=None` |
 | Custom engine/store/transport integration guarantees | Internal implementation interfaces |
+| `SubscribeResult.from_packet()` / `UnsubscribeResult.from_packet()` | Use the results returned by `subscribe()` / `unsubscribe()`, or construct `SubscribeResult(mid=..., reason_codes=...)`; decoded SUBACK/UNSUBACK packets remain Internal |
 
 ## Frozen constructor and snapshot vocabulary
 

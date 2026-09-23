@@ -2049,13 +2049,13 @@ class AsyncClient:
         raise data
 
     def _resolve_suback(self, packet: SubAckPacket) -> None:
-        sub_result = SubscribeResult.from_packet(packet)
+        sub_result = SubscribeResult(mid=packet.mid, reason_codes=packet.reason_codes)
         sub_fut = self._sub_futs.pop(sub_result.mid, None)
         if sub_fut is not None and not sub_fut.done():
             sub_fut.set_result(sub_result)
 
     def _resolve_unsuback(self, packet: UnsubAckPacket) -> None:
-        unsub_result = UnsubscribeResult.from_packet(packet)
+        unsub_result = UnsubscribeResult(mid=packet.mid, reason_codes=packet.reason_codes)
         unsub_fut = self._unsub_futs.pop(unsub_result.mid, None)
         if unsub_fut is not None and not unsub_fut.done():
             unsub_fut.set_result(unsub_result)

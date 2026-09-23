@@ -9,7 +9,7 @@ from collections.abc import Mapping
 
 from mqttium.enums import QoS
 from mqttium.errors import PublishBatchError
-from mqttium.packets import ConnAckPacket, SubAckPacket, UnsubAckPacket
+from mqttium.packets import ConnAckPacket
 from mqttium.types import Message, Properties, _owned_payload
 
 
@@ -268,11 +268,6 @@ class SubscribeResult:
     mid: int
     reason_codes: tuple[int, ...]
 
-    @classmethod
-    def from_packet(cls, packet: SubAckPacket) -> SubscribeResult:
-        """Build a public result from a decoded SUBACK packet."""
-        return cls(mid=packet.mid, reason_codes=packet.reason_codes)
-
 
 @dataclass(slots=True)
 class UnsubscribeResult:
@@ -284,11 +279,6 @@ class UnsubscribeResult:
 
     mid: int
     reason_codes: tuple[int, ...]
-
-    @classmethod
-    def from_packet(cls, packet: UnsubAckPacket) -> UnsubscribeResult:
-        """Build a public result from a decoded UNSUBACK packet."""
-        return cls(mid=packet.mid, reason_codes=packet.reason_codes)
 
 
 __all__ = [
