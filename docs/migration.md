@@ -35,6 +35,7 @@ is the version an application actually upgrades from.
 | `ReconnectPolicy.follow_server_reference` | Removed; inspect `BrokerDisconnectError` and explicitly choose a replacement endpoint |
 | Delivery small-message diagnostic fields | Exact `stats().delivery.iterator_bytes` with a finite byte limit; zero byte occupancy/high-water values when `max_iterator_bytes=None` |
 | Custom engine/store/transport integration guarantees | Internal implementation interfaces |
+| `SubscribeResult.from_packet()` / `UnsubscribeResult.from_packet()` | Use the results returned by `subscribe()` / `unsubscribe()`, or construct `SubscribeResult(mid=..., reason_codes=...)`; decoded SUBACK/UNSUBACK packets remain Internal |
 
 ## Frozen constructor and snapshot vocabulary
 
@@ -232,3 +233,14 @@ Handle `None` as unavailable in displays and calculations, rather than coercing
 it to zero. Pull streams and WebSocket do not expose complete occupancy through
 public asyncio APIs; push transports retain their measured byte count and
 disconnected clients report zero. No replacement statistics field is added.
+
+### Finite timeout values
+
+Timeout defaults and per-call overrides must be finite and positive. Replace
+NaN/infinite values with a finite deadline, or use `None` where the specific
+setting documents a default or disabled bound. Zero remains supported for
+keepalive and nonnegative reconnect durations, not timeout overrides. Invalid
+overrides now raise `ValueError` before changing the client. A `ReconnectPolicy`
+with a NaN or infinite `initial_delay`, `multiplier`, `max_delay` or
+`stable_after` now raises `ValueError` when constructed; use `max_retries=None`
+rather than an infinite delay to retry indefinitely.

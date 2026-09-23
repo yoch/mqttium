@@ -15,11 +15,12 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import os
 import sqlite3
 import threading
 from array import array
 from collections.abc import Callable, Iterator, Sequence, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Any, Literal, TypeVar
 
@@ -60,10 +61,7 @@ _IN_PAGE_SQL = (
 _IN_INDEX_PAGE_SQL = (
     "SELECT mid, state, user_acked, delivered, logical_size FROM inbound WHERE mid IN"
 )
-_IN_REPLAY_INDEX_SQL = (
-    "SELECT mid, length(payload) + length(CAST(topic AS BLOB)) AS replay_size"
-    " FROM inbound ORDER BY seq"
-)
+_IN_REPLAY_INDEX_SQL = "SELECT mid, logical_size AS replay_size FROM inbound ORDER BY seq"
 
 SQLITE_SCHEMA_VERSION = 5
 """Experimental native-only format; historical formats are not migrated."""
@@ -239,12 +237,34 @@ def _row_to_in(row: sqlite3.Row) -> InboundMessage:
     )
 
 
+def _prepare_private_path(path: Path) -> None:
+    """Create only missing state paths, without changing existing permissions."""
+    if str(path) == ":memory:":
+        return
+    missing = []
+    parent = path.parent
+    while not parent.exists():
+        missing.append(parent)
+        parent = parent.parent
+    for parent in reversed(missing):
+        parent.mkdir(mode=0o700, exist_ok=True)
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        # Refuse a dangling link: SQLite would create its target unprotected.
+        path.stat()
+        # Existing stores retain the deployment's permissions and compatibility.
+        # SQLite derives newly created WAL/SHM permissions from the database.
+        return
+    os.close(descriptor)
+
+
 class SqliteInflightStore:
     """Durable ordered store for outbound and inbound QoS state."""
 
     def __init__(self, path: str | Path) -> None:
         self._path = Path(path)
-        self._path.parent.mkdir(parents=True, exist_ok=True)
+        _prepare_private_path(self._path)
         self._lock = threading.RLock()
         self._batch_depth = 0
         self._transaction_started = False
@@ -495,7 +515,7 @@ class SqliteInflightStore:
                         if rollback_only:
                             self._conn.rollback()
                         else:
-                            self._conn.commit()
+                            self._commit()
                 finally:
                     self._transaction_started = False
                     self._rollback_only = False
@@ -508,9 +528,24 @@ class SqliteInflightStore:
             self._conn.execute("BEGIN IMMEDIATE")
             self._transaction_started = True
 
+    def _commit(self) -> None:
+        try:
+            self._conn.commit()
+        except BaseException as failure:
+            try:
+                self._conn.rollback()
+            except BaseException as rollback_failure:
+                # A live failed transaction must never be reused or committed
+                # by a later operation. Preserve the original commit failure.
+                failure.add_note(f"Rollback also failed; closing store: {rollback_failure!r}")
+                with suppress(BaseException):
+                    self._conn.close()
+                self._closed = True
+            raise
+
     def _commit_if_needed(self) -> None:
         if self._batch_depth == 0:
-            self._conn.commit()
+            self._commit()
 
     def close(self) -> None:
         with self._lock:
@@ -518,7 +553,8 @@ class SqliteInflightStore:
                 return
             if self._batch_depth:
                 raise RuntimeError("Cannot close SQLite store inside batch()")
-            self._conn.commit()
+            # Mutations commit at their own boundary. Closing must never
+            # make an unsuccessful operation durable.
             self._conn.close()
             self._closed = True
 

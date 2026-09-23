@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from mqttium.api.models import PublishBatchReceipt
     from mqttium.types import Properties
 
 
@@ -65,7 +66,13 @@ class SessionDiscardedError(MQTTError):
 
 
 class PublishBatchError(MQTTError):
-    """One or more publications in a batch failed."""
+    """One or more publications in a batch failed.
+
+    Attributes:
+        receipt (PublishBatchReceipt | None): Receipt for the committed prefix
+            when submission stopped early, or ``None``. Await
+            ``receipt.wait()`` to settle that prefix.
+    """
 
     def __init__(
         self,
@@ -74,7 +81,7 @@ class PublishBatchError(MQTTError):
         failure_count: int | None = None,
         failure_counts: dict[str, int] | None = None,
         cause: BaseException | None = None,
-        receipt: object | None = None,
+        receipt: PublishBatchReceipt | None = None,
     ) -> None:
         self.failures = dict(failures or {})
         self.failure_count = len(self.failures) if failure_count is None else failure_count

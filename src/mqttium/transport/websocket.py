@@ -8,10 +8,11 @@ import hashlib
 import os
 import struct
 from contextlib import suppress
+from ssl import SSLContext
 from typing import Any
 from urllib.parse import urlparse
 
-from mqttium.transport._stream import write_buffer_needs_drain
+from mqttium.transport._stream import close_stream_writer, write_buffer_needs_drain
 from mqttium.transport.stats import TransportStats
 
 _MAX_HANDSHAKE_BYTES = 64 * 1024
@@ -64,7 +65,7 @@ class WebSocketTransport:
         *,
         ssl: Any = None,
         extra_headers: dict[str, str] | None = None,
-        timeout: float = 30.0,
+        timeout: float | None = 30.0,
         max_frame_size: int = 16 * 1024 * 1024,
         max_write_batch_bytes: int = 1 * 1024 * 1024,
     ) -> WebSocketTransport:
@@ -81,7 +82,7 @@ class WebSocketTransport:
             head, leftover = await _read_handshake_response(reader, timeout)
             _validate_handshake_response(head, key)
         except BaseException:
-            await _close_stream_writer(writer)
+            await close_stream_writer(writer)
             raise
         transport = cls(
             reader,
@@ -177,7 +178,7 @@ class WebSocketTransport:
             # open merely because drain()/wait_closed() was interrupted.
             with suppress(Exception):
                 self._writer.write(_mask_client_frame(0x8, b""))
-            await _close_stream_writer(self._writer)
+            await close_stream_writer(self._writer)
         finally:
             # No buffered frame can be reused after the underlying stream is
             # closed. Release connection-scoped storage immediately even when
@@ -264,9 +265,13 @@ def _parse_websocket_endpoint(url: str, ssl: Any) -> tuple[str, int, str, Any]:
     parsed = urlparse(url)
     if parsed.scheme not in ("ws", "wss"):
         raise ValueError(f"Unsupported WebSocket URL scheme: {parsed.scheme}")
+    if ssl is not None and not isinstance(ssl, (bool, SSLContext)):
+        raise ValueError("ssl must be None, a bool, or an SSLContext")
     if parsed.scheme == "wss" and ssl is False:
         raise ValueError("wss:// requires TLS (ssl=False would downgrade silently)")
-    host = parsed.hostname or "localhost"
+    host = parsed.hostname
+    if not host:
+        raise ValueError("WebSocket URL must include a hostname")
     port = parsed.port or (443 if parsed.scheme == "wss" else 80)
     path = parsed.path or "/"
     if parsed.query:
@@ -301,7 +306,7 @@ def _build_handshake_request(
 
 async def _read_handshake_response(
     reader: asyncio.StreamReader,
-    timeout: float,
+    timeout: float | None,
 ) -> tuple[bytes, bytes]:
     buffer = bytearray()
     delimiter = b"\r\n\r\n"
@@ -350,12 +355,6 @@ def _parse_http_headers(lines: list[bytes]) -> dict[str, str]:
         raw_name, _, raw_value = line.partition(b":")
         headers[raw_name.decode("latin1").strip().lower()] = raw_value.decode("latin1").strip()
     return headers
-
-
-async def _close_stream_writer(writer: asyncio.StreamWriter) -> None:
-    writer.close()
-    with suppress(Exception):
-        await writer.wait_closed()
 
 
 def _xor_tables() -> tuple[bytes, ...]:

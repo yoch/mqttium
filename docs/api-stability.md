@@ -158,3 +158,9 @@ effect and writer batching decisions) is not part of the snapshot.
 signatures, defaults and snapshot fields. Intentional changes update that
 test, maintained documentation, changelog and migration guidance. Historical
 reports remain evidence of the commits they describe.
+
+## Subscription result members
+
+`SubscribeResult` and `UnsubscribeResult` support value construction from `mid`
+and `reason_codes` and inspection of those fields. Internal packet conversion
+is performed by the client adapter, not exposed as a supported model factory.

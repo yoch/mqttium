@@ -732,7 +732,7 @@ class InboundSession:
                 break
             if not self._should_redeliver(inbound):
                 continue
-            message_bytes = len(inbound.payload) + len(inbound.topic.encode("utf-8"))
+            message_bytes = inbound.logical_size
             if emitted and emitted_bytes + message_bytes > REPLAY_BATCH_BYTES:
                 cursor.push_back(inbound)
                 break

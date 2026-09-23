@@ -55,6 +55,9 @@ from mqttium.errors import (
     ProtocolError,
 )
 
+# Encoder for an allocated identifier, expected ACK type and ACK entry count.
+SubscriptionRequest = tuple[Callable[[int], WriteItem], PacketType, int]
+
 
 # MQTT 5 Table 3-11: 0x00 (Success) is sent by the Server only.
 _CLIENT_AUTH_REASON_CODES = frozenset({0x18, 0x19})
@@ -385,6 +388,18 @@ class ProtocolEngine:
         qos: QoS | int = QoS.AT_MOST_ONCE,
         properties: Properties | None = None,
     ) -> int:
+        return self.queue_subscription_request(
+            self.prepare_subscribe(topics, qos=qos, properties=properties)
+        )
+
+    def prepare_subscribe(
+        self,
+        topics: str | Iterable[str | tuple[str, SubscribeOptions | int | QoS]],
+        *,
+        qos: QoS | int = QoS.AT_MOST_ONCE,
+        properties: Properties | None = None,
+    ) -> SubscriptionRequest:
+        """Validate a SUBSCRIBE without allocating an identifier."""
         if self.state != ConnectionState.CONNECTED:
             raise NotConnectedError("subscribe requires an active connection")
         if (
@@ -410,13 +425,17 @@ class ProtocolEngine:
             subscriptions.append(Subscription(topic=topic, options=options))
 
         subs = tuple(subscriptions)
-        return self._send_subscription_request(
+        return (
             lambda mid: self.codec.encode_subscribe(mid, subs, properties),
             PacketType.SUBACK,
             len(subs),
         )
 
     def queue_unsubscribe(self, topics: str | Iterable[str]) -> int:
+        return self.queue_subscription_request(self.prepare_unsubscribe(topics))
+
+    def prepare_unsubscribe(self, topics: str | Iterable[str]) -> SubscriptionRequest:
+        """Validate an UNSUBSCRIBE without allocating an identifier."""
         if self.state != ConnectionState.CONNECTED:
             raise NotConnectedError("unsubscribe requires an active connection")
         topic_list = (topics,) if isinstance(topics, str) else tuple(topics)
@@ -424,11 +443,15 @@ class ProtocolEngine:
             raise ProtocolError("unsubscribe requires at least one topic")
         for topic in topic_list:
             validate_subscribe_filter(topic)
-        return self._send_subscription_request(
+        return (
             lambda mid: self.codec.encode_unsubscribe(mid, topic_list),
             PacketType.UNSUBACK,
             len(topic_list),
         )
+
+    def queue_subscription_request(self, request: SubscriptionRequest) -> int:
+        """Send a request prepared in the same engine critical section."""
+        return self._send_subscription_request(*request)
 
     def _send_subscription_request(
         self,

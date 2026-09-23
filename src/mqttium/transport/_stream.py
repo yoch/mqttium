@@ -3,17 +3,46 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import suppress
 from typing import Protocol, runtime_checkable
 
 from mqttium.transport.stats import TransportStats
 
 _WRITE_BUFFER_HIGH_WATER = 64 * 1024
+_STREAM_CLOSE_TIMEOUT = 1.0
 
 
 def write_buffer_needs_drain(writer: asyncio.StreamWriter) -> bool:
     transport = writer.transport
     return transport is not None and transport.get_write_buffer_size() > _WRITE_BUFFER_HIGH_WATER
+
+
+async def close_stream_writer(writer: asyncio.StreamWriter) -> None:
+    """Flush a closing stream for a bounded time, then abort stalled output."""
+    writer.close()
+    waiter = asyncio.create_task(writer.wait_closed())
+    timeout: float | None = _STREAM_CLOSE_TIMEOUT
+    cancellation: asyncio.CancelledError | None = None
+    # wait_closed() shares the protocol's close future. asyncio.wait() isolates
+    # it from caller cancellation during both the flush and the final join.
+    # In particular, abort() only schedules connection_lost; cancellation can
+    # still arrive before that callback completes the shared future.
+    while not waiter.done():
+        try:
+            done, _ = await asyncio.wait((waiter,), timeout=timeout)
+            if not done:
+                writer.transport.abort()
+        except asyncio.CancelledError as exc:
+            cancellation = exc
+            writer.transport.abort()
+        # After abort, join the owned waiter without restarting the flush
+        # budget. Repeated cancellation must not transfer to that waiter.
+        timeout = None
+    try:
+        waiter.result()
+    except Exception:
+        writer.transport.abort()
+    if cancellation is not None:
+        raise cancellation
 
 
 @runtime_checkable
@@ -101,9 +130,7 @@ class StreamTransportBase:
         await self._writer.drain()
 
     async def close(self) -> None:
-        self._writer.close()
-        with suppress(Exception):
-            await self._writer.wait_closed()
+        await close_stream_writer(self._writer)
 
     def is_closing(self) -> bool:
         return self._writer.is_closing()
